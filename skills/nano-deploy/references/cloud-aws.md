@@ -1,0 +1,271 @@
+# AWS
+
+Cloud specifics for [cloud-vm.md](cloud-vm.md). Run every mutating command
+only after the operator approves that step. The commands use the operator's
+own `aws` CLI session; you never handle their keys.
+
+Set once (from the plan and intake):
+
+```bash
+export AWS_REGION=us-east-1 NAME=<cluster name> TAG="Key=nano-deployment,Value=<cluster name>"
+aws sts get-caller-identity          # show the account and principal, ask before going on
+```
+
+## Instance and disk choices
+
+`plan.py --cloud aws` picks from these families (catalog `scripts/cloud-catalog.json`,
+us-east-1 list prices verified 2026-11-10 from the AWS price-list API):
+
+| Role | Family | Disk |
+|---|---|---|
+| ClickHouse | `r7i` (8 GiB per vCPU) | gp3, IOPS and throughput provisioned from the shard's TB/day |
+| ClickHouse, large hot set | `i4i` (local NVMe, RAID 0) | instance store: ephemeral; replicas re-seed |
+| App | `c7i` | 100 GiB gp3 root (Docker on root) |
+| PostgreSQL + Keeper (+ etcd, Sentinel) | `m7i` | gp3 with provisioned IOPS |
+| Ingest | `c7i` | gp3 data disk for Docker and the Vector disk buffers |
+
+Graviton (`r7g`, `r7gd`) is not in the plan: preflight requires x86-64 with
+AVX2 for the published images. Encrypt every EBS volume (`Encrypted=true`).
+
+## Network: one VPC across 3 Availability Zones
+
+From the plan's `network` block (default `10.40.0.0/16`):
+
+| Subnet | CIDR | Purpose |
+|---|---|---|
+| private-a/b/c | `10.40.1.0/24`, `10.40.2.0/24`, `10.40.3.0/24` | every nano VM, no public IPs |
+| lb-a/b/c | `10.40.8.0/24`, `10.40.9.0/24`, `10.40.10.0/24` (inside `10.40.8.0/22`) | the two ALBs and the NAT gateways |
+
+```bash
+VPC=$(aws ec2 create-vpc --cidr-block 10.40.0.0/16 --tag-specifications "ResourceType=vpc,Tags=[{$TAG}]" --query Vpc.VpcId --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC --enable-dns-hostnames
+i=0; for az in ${AWS_REGION}a ${AWS_REGION}b ${AWS_REGION}c; do i=$((i+1))
+  aws ec2 create-subnet --vpc-id $VPC --availability-zone $az --cidr-block 10.40.$i.0/24 \
+    --tag-specifications "ResourceType=subnet,Tags=[{$TAG},{Key=Name,Value=$NAME-private-$az}]"
+  aws ec2 create-subnet --vpc-id $VPC --availability-zone $az --cidr-block 10.40.$((i+7)).0/24 \
+    --tag-specifications "ResourceType=subnet,Tags=[{$TAG},{Key=Name,Value=$NAME-lb-$az}]"
+done
+```
+
+Then: an internet gateway and a public route table for the `lb-*` subnets; one
+NAT gateway per zone in its `lb-*` subnet, and one private route table per
+zone sending `0.0.0.0/0` to that zone's NAT (a zone loss must not cut the
+others' egress); an S3 **gateway endpoint** on the private route tables so
+tiering and backup traffic stays off the NAT. Egress the hosts need: the
+registry, `api.nano.rs` (licence), the platform feeds, Ubuntu and Docker apt
+repositories. Air-gapped installs follow [operate.md](operate.md#offline-licence).
+
+Access for the operator: AWS Systems Manager Session Manager or a bastion in
+an `lb-*` subnet restricted to the management CIDR. Never give nano VMs public IPs.
+
+## Security groups
+
+One security group per firewall group: `app`, `ingest`, `control`
+(PostgreSQL + Keeper), `clickhouse`, `lb-app`, `lb-ingest`. A VM gets the
+group of every role it runs (ClickHouse VMs with co-located ingest get both
+`clickhouse` and `ingest`). The rules come from the renderer's port matrix:
+
+<!-- BEGIN plan.py --port-matrix (generated; do not edit) -->
+| Port | Key | On | Allow from | When |
+|---|---|---|---|---|
+| 80/tcp | `app` | app hosts | app load balancer | always |
+| 3000/tcp | `api_internal` | app hosts | ingest hosts | always |
+| 80/tcp | `ingest` | ingest hosts | ingest load balancer, app hosts | always |
+| 8687/tcp | `vector_tap` | ingest hosts | app hosts | always |
+| 5432/tcp | `postgres` | PostgreSQL hosts | app hosts, ClickHouse hosts, PostgreSQL hosts | always |
+| 8123/tcp | `clickhouse_http` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
+| 9000/tcp | `clickhouse_native` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
+| 9009/tcp | `clickhouse_interserver` | ClickHouse hosts | ClickHouse hosts | always |
+| 9363/tcp | `clickhouse_metrics` | ClickHouse hosts | app hosts | always |
+| 9181/tcp | `keeper_client` | Keeper hosts (= PostgreSQL hosts) | app hosts, ClickHouse hosts, Keeper hosts (= PostgreSQL hosts) | always |
+| 9234/tcp | `keeper_raft` | Keeper hosts (= PostgreSQL hosts) | Keeper hosts (= PostgreSQL hosts) | always |
+| 8008/tcp | `patroni_api` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (3 postgres hosts) |
+| 2379/tcp | `etcd_client` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
+| 2380/tcp | `etcd_peer` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
+| 6379/tcp | `valkey` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
+| 26379/tcp | `sentinel` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
+| 22/tcp | `ssh` | all | management CIDR, app hosts | always (the first app host runs scripts/nano upgrade over SSH) |
+<!-- END plan.py --port-matrix -->
+
+The `full HA` rows apply to the nano 2.0.7+ full-HA inventory (three PostgreSQL hosts;
+Valkey and Sentinel with two or more app hosts). A `pre-2.0.7` inventory needs only
+the `always` rows: `python3 scripts/plan.py --firewall-tsv --inventory-schema pre-2.0.7`.
+
+Create the groups, then apply every rule from the plan (each rule references
+the source group, never a CIDR, except `mgmt`):
+
+```bash
+# bash 3.2 compatible (macOS): one variable per group, SG_app, SG_lb_app, ...
+sg() { v="SG_$(printf %s "$1" | tr - _)"; printf %s "${!v}"; }
+for g in app ingest control clickhouse lb-app lb-ingest; do
+  id=$(aws ec2 create-security-group --vpc-id $VPC --group-name $NAME-$g \
+    --description "nano $g" --tag-specifications "ResourceType=security-group,Tags=[{$TAG}]" \
+    --query GroupId --output text)
+  eval "SG_$(printf %s "$g" | tr - _)=$id"
+done
+MGMT_CIDR=<operator management CIDR>
+python3 scripts/plan.py --firewall-tsv | tail -n +2 | while IFS=$'\t' read -r port target source key when; do
+  if [ "$source" = mgmt ]; then peer="IpRanges=[{CidrIp=$MGMT_CIDR}]"; else peer="UserIdGroupPairs=[{GroupId=$(sg "$source")}]"; fi
+  aws ec2 authorize-security-group-ingress --group-id "$(sg "$target")" \
+    --ip-permissions "IpProtocol=tcp,FromPort=$port,ToPort=$port,$peer"
+done
+# The ALBs accept HTTPS from senders and users (narrow these to known CIDRs when possible)
+aws ec2 authorize-security-group-ingress --group-id "$(sg lb-app)" --protocol tcp --port 443 --cidr <user CIDR>
+aws ec2 authorize-security-group-ingress --group-id "$(sg lb-ingest)" --protocol tcp --port 443 --cidr <sender CIDR>
+```
+
+The installer never changes host firewalls. With security groups doing the
+filtering, Docker's published ports are reachable only from the allowed
+groups.
+
+## Object storage: cold tier and backups (S3)
+
+Two buckets, both in the deployment region, Block Public Access on, default
+encryption on, versioning on:
+
+- `<name>-cold`: ClickHouse cold tier. Configure it after install in
+  **Settings → Storage & Retention** (endpoint `https://s3.<region>.amazonaws.com`).
+  Today moves are free-space driven; TTL-driven moves are NAN-5183.
+- `<name>-backup`: `scripts/nano backup` / the automatic backup service
+  (`NANO_BACKUP_DESTINATION=s3`). Backups hold metadata by default, not event
+  data. Add a lifecycle rule for old noncurrent versions.
+
+nano's S3 clients take an access key, not an instance role. Create **one IAM
+user per bucket** with only this policy (replace `<bucket>`), and have the
+operator create the access key and enter it in nano themselves:
+
+```json
+{"Version": "2012-10-17", "Statement": [
+  {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": "arn:aws:s3:::<bucket>"},
+  {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+   "Resource": "arn:aws:s3:::<bucket>/*"}]}
+```
+
+Add a bucket policy that denies requests not coming through the VPC endpoint
+(`aws:SourceVpce`). RustFS is the self-hosted S3-compatible option if the
+operator does not want S3.
+
+## IAM for the VMs and the operator
+
+- VMs need no AWS permissions to run nano. Attach no instance profile, or
+  only `AmazonSSMManagedInstanceCore` when Session Manager is the access path.
+  Require IMDSv2 (`--metadata-options HttpTokens=required`).
+- The person or agent provisioning needs EC2 (VPC, subnets, SGs, instances,
+  volumes), Elastic Load Balancing, ACM (read and request), S3 (create
+  buckets), and IAM (create the two bucket users). Nothing else.
+
+## VMs
+
+Ubuntu 24.04 LTS from Canonical's public SSM parameter (owner 099720109477):
+
+```bash
+AMI=resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+python3 scripts/plan.py <plan flags> --nodes-tsv | tail -n +2 | \
+while IFS=$'\t' read -r name kind zone addr type data_gib data_type iops mbps extra; do
+  subnet=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC Name=availability-zone,Values=$zone \
+    Name=cidr-block,Values="${addr%.*}.0/24" --query 'Subnets[0].SubnetId' --output text)
+  bdm='[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","Encrypted":true}}'
+  if [ "$data_type" = gp3 ]; then
+    bdm="$bdm"',{"DeviceName":"/dev/sdf","Ebs":{"VolumeSize":'$data_gib',"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":false'
+    [ "$iops" != 0 ] && bdm="$bdm"',"Iops":'$iops',"Throughput":'$mbps
+    bdm="$bdm"'}}'
+  fi
+  bdm="$bdm]"
+  echo "$name $type $zone $addr: $bdm"      # show, then run after approval:
+  # aws ec2 run-instances --image-id $AMI --instance-type $type --subnet-id $subnet \
+  #   --private-ip-address $addr --security-group-ids <groups for $kind> --key-name <operator key> \
+  #   --block-device-mappings "$bdm" --metadata-options HttpTokens=required,HttpEndpoint=enabled \
+  #   --tag-specifications "ResourceType=instance,Tags=[{$TAG},{Key=Name,Value=$name}]" \
+  #   "ResourceType=volume,Tags=[{$TAG},{Key=Name,Value=$name}]"
+done
+```
+
+`DeleteOnTermination=false` keeps a data volume if an instance is terminated
+by mistake. On Nitro instances EBS volumes appear as `/dev/nvme1n1`, and so
+on; match them by size with `lsblk` before formatting. `i4i` local NVMe
+devices show as `Amazon EC2 NVMe Instance Storage` in `nvme list`.
+
+**Time sync:** Ubuntu's chrony on EC2 uses the Amazon Time Sync Service
+(`169.254.169.123`). Check with `chronyc sources`; if it is missing, add
+`server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4` to
+`/etc/chrony/chrony.conf`.
+
+## Load balancers
+
+Two internet-facing **Application Load Balancers** across the three `lb-*`
+subnets, TLS certificates from ACM, forwarding HTTP to port 80 on the hosts.
+An ALB appends the client address to `X-Forwarded-For`, and nano's edges take
+the right-most address that is not in `trusted_proxy_cidrs` (the plan sets
+`10.40.8.0/22`, the LB subnets).
+
+```bash
+TG_APP=$(aws elbv2 create-target-group --name $NAME-app --protocol HTTP --port 80 --vpc-id $VPC \
+  --target-type instance --health-check-path /readyz --health-check-interval-seconds 10 \
+  --healthy-threshold-count 2 --unhealthy-threshold-count 2 --matcher HttpCode=200 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+TG_ING=$(aws elbv2 create-target-group --name $NAME-ingest --protocol HTTP --port 80 --vpc-id $VPC \
+  --target-type instance --health-check-path /healthz --health-check-interval-seconds 10 \
+  --healthy-threshold-count 2 --unhealthy-threshold-count 2 --matcher HttpCode=200 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+for tg in $TG_APP $TG_ING; do
+  aws elbv2 modify-target-group-attributes --target-group-arn $tg --attributes Key=deregistration_delay.timeout_seconds,Value=30
+done
+ALB_APP=$(aws elbv2 create-load-balancer --name $NAME-app --type application --scheme internet-facing \
+  --subnets <lb-a> <lb-b> <lb-c> --security-groups "$(sg lb-app)" --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+aws elbv2 create-listener --load-balancer-arn $ALB_APP --protocol HTTPS --port 443 \
+  --certificates CertificateArn=<ACM cert for the app hostname> --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=$TG_APP
+# same for the ingest ALB with "$(sg lb-ingest)", the ingest hostname's certificate and $TG_ING
+aws elbv2 register-targets --target-group-arn $TG_APP --targets Id=<nano-app-1 id> Id=<nano-app-2 id>
+```
+
+- **App health check `/readyz`** (nano 2.0.7+): 200 only while that host's API
+  and search are ready; 503 while the upgrade orchestrator drains it. Before
+  2.0.7 (one app host) use `/healthz`.
+- **Ingest health check `/healthz`**: Vector readiness through the ingest edge.
+- **HEC indexer acknowledgements** need the ack poll to reach the ingest host
+  that took the event. Through an ALB that holds only with stickiness and a
+  sender that keeps cookies. Otherwise send HEC without indexer acks, or put
+  an NLB with a TLS listener and source-IP stickiness in front of ingest
+  instead (then per-client rate limits key on the NLB's addresses).
+- Register targets only after each host's install has succeeded.
+- For the internal ingest endpoint the HA guide recommends
+  (`load_balancer.ingest_endpoint`), use an internal ALB whose certificate
+  chains to the cluster's private CA (import it into ACM), and pass
+  `--ingest-lb-address <its DNS name> --ingest-lb-tls-name <cert name>` to
+  `plan.py`.
+
+DNS: alias records for both hostnames to their ALBs (Route 53 or the
+operator's DNS).
+
+## Terraform starting point (optional)
+
+A sketch only, not a module nano supports. It shows the shape the CLI steps
+build; review every value against the plan.
+
+```hcl
+# Starting point only: one ClickHouse replica, as planned (repeat per plan row)
+resource "aws_instance" "ch_s1r1" {
+  ami                    = data.aws_ssm_parameter.ubuntu.value
+  instance_type          = "r7i.2xlarge"            # plan: nodes[].instance
+  subnet_id              = aws_subnet.private["a"].id
+  private_ip             = "10.40.1.12"             # plan: nodes[].address
+  vpc_security_group_ids = [aws_security_group.g["clickhouse"].id, aws_security_group.g["ingest"].id]
+  metadata_options { http_tokens = "required" }
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 100
+    encrypted   = true
+  }
+  tags = { "nano-deployment" = var.name, Name = "nano-ch-s1r1" }
+}
+resource "aws_ebs_volume" "ch_s1r1_data" {
+  availability_zone = aws_subnet.private["a"].availability_zone
+  type              = "gp3"   # plan: nodes[].disks[]
+  size              = 1500
+  iops              = 4000
+  throughput        = 150
+  encrypted         = true
+  tags = { "nano-deployment" = var.name }
+}
+```

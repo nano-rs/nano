@@ -273,6 +273,8 @@ impl AppState {
                 // the WARN names the affected shard. `CLICKHOUSE_CLUSTER` is set
                 // only on clustered ClickHouse; unset → the bare `system.
                 // dictionaries` probe, byte-identical on single-node.
+                // NAN-5215: `skip_unavailable_shards = 1` so one hard-down
+                // replica does not fail the probe for every live node.
                 let cluster = if dual_pool.is_clustered() {
                     std::env::var("CLICKHOUSE_CLUSTER")
                         .ok()
@@ -285,7 +287,8 @@ impl AppState {
                         "SELECT concat(hostName(), ' ', database, '.', name), toString(status), \
                          substring(last_exception, 1, 200) \
                          FROM clusterAllReplicas('{cl}', system.dictionaries) \
-                         WHERE name LIKE '%prevalence%'"
+                         WHERE name LIKE '%prevalence%' \
+                         SETTINGS skip_unavailable_shards = 1"
                     ),
                     None => "SELECT concat(database, '.', name), toString(status), \
                              substring(last_exception, 1, 200) \

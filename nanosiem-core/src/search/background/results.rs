@@ -42,6 +42,14 @@ pub struct StoredPage {
     pub byte_limited: bool,
 }
 
+/// Codex P1-4: a page holding more rows than PostgreSQL says exist, or fewer
+/// without having stopped at the byte budget, came from a replica that does
+/// not hold every row (yet).
+pub(crate) fn page_inconsistent(page: &StoredPage, expected: u64) -> bool {
+    let got = page.rows.len() as u64;
+    got > expected || (got < expected && !page.byte_limited)
+}
+
 /// The authorized job's lifetime, used as the `created_at` partition bound.
 #[derive(Debug, Clone, Copy)]
 pub struct JobWindow {
@@ -75,6 +83,72 @@ impl std::fmt::Debug for SearchJobResultStore {
 
 fn ch(e: clickhouse::error::Error) -> SearchError {
     crate::search::types::parse_clickhouse_error(&e.to_string())
+}
+
+/// NAN-5215: ClickHouse `TOO_FEW_LIVE_REPLICAS` (285). `insert_quorum =
+/// 'auto'` is a majority, i.e. 2 of 2 on a two-replica shard, so it raises this
+/// whenever one replica of the shard is down. The check runs before any part
+/// is written, so the same rows can be retried without a quorum.
+pub(crate) fn is_too_few_live_replicas(message: &str) -> bool {
+    message.contains("TOO_FEW_LIVE_REPLICAS") || message.contains("Code: 285")
+}
+
+/// ClickHouse errors meaning "this replica cannot serve a consistent read
+/// right now" rather than a problem with the query or the caller: the
+/// sequential-consistency check failing on a replica (quorum-less parts, a
+/// replica behind the last quorum write) or no live/fresh replica answering.
+const REPLICA_CONSISTENCY_ERRORS: &[(&str, u32)] = &[
+    ("REPLICA_IS_NOT_IN_QUORUM", 289),
+    ("ALL_REPLICAS_ARE_STALE", 232),
+    ("NO_REPLICA_HAS_PART", 234),
+    ("ALL_CONNECTION_TRIES_FAILED", 279),
+    ("TOO_FEW_LIVE_REPLICAS", 285),
+    ("UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE", 286),
+];
+
+/// NAN-5215: whether a page-read error is the replica/consistency class
+/// (worth one eventual re-read). Auth, syntax, memory and timeouts are not.
+pub(crate) fn is_replica_consistency_error(message: &str) -> bool {
+    REPLICA_CONSISTENCY_ERRORS.iter().any(|(name, code)| {
+        message.contains(name) || message.contains(&format!("Code: {code}."))
+    })
+}
+
+/// The message a replica/consistency read error surfaces as: the same
+/// retryable state the row-count check reports.
+pub(crate) const STILL_REPLICATING: &str = "Search results are still replicating; retry shortly";
+
+/// Map a page-read error. The replica/consistency class becomes the
+/// retryable [`SearchError::JobResultsUnavailable`] (the caller's cue to try
+/// an eventual read); everything else keeps its usual mapping.
+fn read_error(e: clickhouse::error::Error) -> SearchError {
+    let message = e.to_string();
+    if is_replica_consistency_error(&message) {
+        tracing::debug!(error = %message, "Background search page read hit a replica consistency error");
+        return SearchError::JobResultsUnavailable(STILL_REPLICATING.to_string());
+    }
+    ch(e)
+}
+
+/// How a page read treats replication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadConsistency {
+    /// `select_sequential_consistency = 1`: read-your-quorum-writes. Parts a
+    /// degraded (quorum-less) write left are excluded or rejected here.
+    Sequential,
+    /// Plain read of whatever the serving replica holds. The caller must still
+    /// check the row count against PostgreSQL; a lagging replica returns a
+    /// short page, never a wrong one.
+    Eventual,
+}
+
+impl ReadConsistency {
+    pub(crate) fn select_sequential_consistency(self) -> &'static str {
+        match self {
+            Self::Sequential => "1",
+            Self::Eventual => "0",
+        }
+    }
 }
 
 /// The page-read SQL. ONE `WHERE`, no `PREWHERE` (NAN-1412): the job/attempt/
@@ -124,38 +198,82 @@ impl SearchJobResultStore {
         if rows.is_empty() {
             return Ok(());
         }
-        let writer = self
+        let base = self
             .client
             .clone()
             .with_validation(false)
             .with_option("async_insert", "0")
-            .with_option("wait_end_of_query", "1")
+            .with_option("wait_end_of_query", "1");
+        let quorum_writer = base
+            .clone()
             .with_option("insert_quorum", "auto")
             .with_option("insert_quorum_parallel", "0");
+        // NAN-5215: with one replica of a two-replica shard down the majority
+        // quorum cannot be met. Fall back to a quorum-less insert (the live
+        // replica takes the part; the returning one fetches it) instead of
+        // failing the job. Readers then see the rows via an eventual read
+        // checked against the PostgreSQL row count (see `ReadConsistency`).
+        let degraded_writer = base.with_option("insert_quorum", "0");
+        let mut degraded = false;
         let mut seq: u64 = 0;
         for chunk in rows.chunks(INSERT_BATCH_ROWS) {
-            let mut insert = writer
-                .insert::<ResultRow>(&self.table_names.local("search_job_results"))
+            if !degraded {
+                match self
+                    .insert_chunk(&quorum_writer, job_id, attempt, seq, chunk)
+                    .await
+                {
+                    Ok(()) => {
+                        seq += chunk.len() as u64;
+                        continue;
+                    }
+                    Err(e) if is_too_few_live_replicas(&e.to_string()) => {
+                        tracing::warn!(
+                            job_id,
+                            attempt,
+                            error = %e,
+                            "Background search results: insert quorum unavailable (a replica is \
+                             down); retrying without quorum"
+                        );
+                        degraded = true;
+                    }
+                    Err(e) => return Err(ch(e)),
+                }
+            }
+            self.insert_chunk(&degraded_writer, job_id, attempt, seq, chunk)
                 .await
                 .map_err(ch)?;
-            for row in chunk {
-                let encoded = serde_json::to_string(row).map_err(|e| {
-                    SearchError::SqlValidationError(format!("encode result row: {e}"))
-                })?;
-                insert
-                    .write(&ResultRow {
-                        job_id: job_id.to_string(),
-                        attempt,
-                        seq,
-                        row: encoded,
-                    })
-                    .await
-                    .map_err(ch)?;
-                seq += 1;
-            }
-            insert.end().await.map_err(ch)?;
+            seq += chunk.len() as u64;
         }
         Ok(())
+    }
+
+    /// One native INSERT block of rows starting at `first_seq`.
+    async fn insert_chunk(
+        &self,
+        writer: &clickhouse::Client,
+        job_id: &str,
+        attempt: u32,
+        first_seq: u64,
+        chunk: &[serde_json::Value],
+    ) -> Result<(), clickhouse::error::Error> {
+        let mut insert = writer
+            .insert::<ResultRow>(&self.table_names.local("search_job_results"))
+            .await?;
+        for (offset, row) in chunk.iter().enumerate() {
+            // Encoding cannot fail for an in-memory `Value`; keep the error
+            // path anyway rather than panic.
+            let encoded = serde_json::to_string(row)
+                .map_err(|e| clickhouse::error::Error::Custom(format!("encode result row: {e}")))?;
+            insert
+                .write(&ResultRow {
+                    job_id: job_id.to_string(),
+                    attempt,
+                    seq: first_seq + offset as u64,
+                    row: encoded,
+                })
+                .await?;
+        }
+        insert.end().await
     }
 
     /// Rows `[offset, offset + limit)` of one attempt, in result order,
@@ -173,6 +291,7 @@ impl SearchJobResultStore {
         window: JobWindow,
         offset: u64,
         limit: u64,
+        consistency: ReadConsistency,
     ) -> Result<StoredPage, SearchError> {
         let limit = limit.min(MAX_PAGE_ROWS);
         if limit == 0 {
@@ -192,14 +311,18 @@ impl SearchJobResultStore {
             .bind(attempt)
             .bind(offset)
             .bind(offset.saturating_add(limit))
-            // Read-your-quorum-writes on replicated tables (no-op otherwise).
-            .with_option("select_sequential_consistency", "1")
+            // Read-your-quorum-writes on replicated tables (no-op otherwise);
+            // `Eventual` only after a sequential read came back inconsistent.
+            .with_option(
+                "select_sequential_consistency",
+                consistency.select_sequential_consistency(),
+            )
             .fetch::<String>()
-            .map_err(ch)?;
+            .map_err(read_error)?;
         let mut rows = Vec::new();
         let mut bytes = 0usize;
         let mut byte_limited = false;
-        while let Some(encoded) = cursor.next().await.map_err(ch)? {
+        while let Some(encoded) = cursor.next().await.map_err(read_error)? {
             if !rows.is_empty() && bytes + encoded.len() > self.page_byte_budget {
                 byte_limited = true;
                 break;
@@ -212,3 +335,7 @@ impl SearchJobResultStore {
         Ok(StoredPage { rows, byte_limited })
     }
 }
+
+#[cfg(test)]
+#[path = "results_tests.rs"]
+mod tests;

@@ -48,7 +48,9 @@ product's files.
   containers.
 - **Ingest stops when the app host is down (role split).** The ingest nodes'
   `/healthz` returns 503 about 15 seconds after the app API is unreachable.
-  Make sure senders buffer and retry.
+  Make sure senders buffer and retry. With several app hosts, each ingest
+  host's `app-api-proxy` fails over to another app host, so losing one app
+  host no longer stops ingest; losing all of them still does.
 - **Docker in LXC containers** (Proxmox CT and similar) needs `nesting=1`
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.

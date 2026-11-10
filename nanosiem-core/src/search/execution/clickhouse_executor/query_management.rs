@@ -8,7 +8,10 @@ use tracing::{debug, info};
 
 use super::sql_helpers::escape_question_marks_in_strings;
 use super::types::ClickHouseExecutor;
-use crate::db::dual_pool::{on_cluster_clause, system_processes_source};
+use crate::db::dual_pool::{
+    on_cluster_clause, processes_read_settings, runtime_on_cluster_ddl_options,
+    system_processes_source,
+};
 use crate::search::{parse_clickhouse_error, SearchError};
 use crate::sql_hygiene::escape_sql_string;
 
@@ -47,10 +50,12 @@ impl ClickHouseExecutor {
         // cluster-wide so the check finds the query wherever its initiator
         // landed — otherwise a check on the wrong node returns 0 and the KILL
         // below is skipped, leaving a runaway hunt un-cancellable from the UI.
+        let source = system_processes_source();
         let check_sql = format!(
-            "SELECT count() as cnt FROM {} WHERE query_id IN ({})",
-            system_processes_source(),
-            id_list
+            "SELECT count() as cnt FROM {} WHERE query_id IN ({}){}",
+            source,
+            id_list,
+            processes_read_settings(source)
         );
 
         debug!("Checking if queries are running: {}", check_sql);
@@ -96,14 +101,21 @@ impl ClickHouseExecutor {
         // node (the initiator may be a different node than this connection); it is
         // an empty string on single-node, so the emitted SQL is byte-identical to
         // the pre-cluster `KILL QUERY WHERE … SYNC`.
+        let on_cluster = on_cluster_clause();
         let kill_sql = format!(
             "KILL QUERY{} WHERE query_id IN ({}) SYNC",
-            on_cluster_clause(),
-            id_list
+            on_cluster, id_list
         );
         info!("Killing {} running queries: {}", running_count, kill_sql);
 
-        self.client
+        // NAN-5215: don't wait out a down replica's DDL timeout before
+        // reporting the cancel; the live hosts have already killed it.
+        let kill_client = runtime_on_cluster_ddl_options(&on_cluster)
+            .iter()
+            .fold(self.client.clone(), |client, (name, value)| {
+                client.with_option(*name, *value)
+            });
+        kill_client
             .query(&kill_sql)
             .execute()
             .await
@@ -129,10 +141,12 @@ impl ClickHouseExecutor {
         // single-node path, which reads plain `system.processes`); when it is
         // running, the initiator row carries the distributed query's aggregated
         // progress and is taken first below.
+        let source = system_processes_source();
         let sql = format!(
-            "SELECT read_rows, total_rows_approx, elapsed FROM {} WHERE query_id = '{}'",
-            system_processes_source(),
-            escaped_id
+            "SELECT read_rows, total_rows_approx, elapsed FROM {} WHERE query_id = '{}'{}",
+            source,
+            escaped_id,
+            processes_read_settings(source)
         );
 
         debug!("Getting query progress: {}", sql);

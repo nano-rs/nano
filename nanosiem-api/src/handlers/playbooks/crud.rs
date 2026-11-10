@@ -94,7 +94,7 @@ pub async fn get_playbook(
     request_body = CreatePlaybookRequest,
     responses(
         (status = 200, description = "Playbook created successfully", body = Playbook),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires playbooks:manage; creating with status `live` also requires playbooks:publish"),
         (status = 400, description = "Bad request"),
     ),
     security(("api_key" = []))
@@ -104,7 +104,7 @@ pub async fn create_playbook(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<CreatePlaybookRequest>,
 ) -> Result<Json<Playbook>, ApiError> {
-    ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
+    ensure_create_permissions(&auth, &req)?;
 
     let service = get_service(&state);
     let pb = service.create(req, Some(auth.user_id())).await?;
@@ -149,6 +149,24 @@ pub async fn update_playbook(
 fn ensure_update_permissions(
     auth: &AuthContext,
     req: &UpdatePlaybookRequest,
+) -> Result<(), ApiError> {
+    ensure_permission(auth, permissions::PLAYBOOKS_MANAGE)?;
+    if matches!(
+        req.status,
+        Some(nanosiem_core::playbooks::PlaybookStatus::Live)
+    ) {
+        ensure_permission(auth, permissions::PLAYBOOKS_PUBLISH)?;
+    }
+    Ok(())
+}
+
+/// NAN-5231: creating a playbook directly as `live` is a publish, exactly
+/// like PATCHing one to `live` ([`ensure_update_permissions`]). Omitted or
+/// non-live statuses need only `playbooks:manage` (the repository defaults
+/// an omitted status to draft).
+fn ensure_create_permissions(
+    auth: &AuthContext,
+    req: &CreatePlaybookRequest,
 ) -> Result<(), ApiError> {
     ensure_permission(auth, permissions::PLAYBOOKS_MANAGE)?;
     if matches!(
@@ -377,6 +395,10 @@ pub async fn list_approvals(
     let approvals = service.list_approvals(*id, &principal).await?;
     Ok(Json(ApprovalsResponse { approvals }))
 }
+
+#[cfg(test)]
+#[path = "crud_create_permission_tests.rs"]
+mod create_permission_tests;
 
 #[cfg(test)]
 mod tests {

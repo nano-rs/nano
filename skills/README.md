@@ -5,7 +5,7 @@ agents such as Claude Code and Codex.
 
 | Skill | What it does |
 |---|---|
-| [`nano-deploy`](nano-deploy/SKILL.md) | Sizes, deploys, verifies and operates nano Self-run (enterprise, licensed) on your own hosts: single node, 3-node HA (Compose role split) or Kubernetes (Helm). It runs a read-only preflight first, asks before every change and never prints secrets. |
+| [`nano-deploy`](nano-deploy/SKILL.md) | Sizes, deploys, verifies and operates nano Self-run (enterprise, licensed) on your own hosts: single node, 3-node HA (Compose role split), a fully highly available cluster of N VMs (yours, or new ones on AWS, Azure or GCP) laid out from your data volume, or Kubernetes (Helm). It runs a read-only preflight first, asks before every change (and before creating any cloud resource) and never prints secrets. |
 
 ## Install
 

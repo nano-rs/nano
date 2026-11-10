@@ -381,6 +381,27 @@ async fn enforce_user_status(
 ///
 /// Validates JWT tokens from Authorization header or API keys from X-API-Key header.
 /// Allows public endpoints (health, ready, metrics) without authentication.
+
+/// NAN-5214: the JWT revocation denylist (Valkey) could not be read. Refuse
+/// the request with 503 + Retry-After: never 200 for a token that may have
+/// been revoked, and never 401 (the UI would treat a store outage as a
+/// logout).
+pub fn revocation_unavailable_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(AuthErrorResponse {
+            error: "revocation_status_unavailable".to_string(),
+            message: "Session status is temporarily unavailable. Please retry shortly.".to_string(),
+        }),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("2"),
+    );
+    response
+}
+
 pub async fn auth_middleware(
     State(auth_state): State<AuthState>,
     mut request: Request,
@@ -455,6 +476,9 @@ pub async fn auth_middleware(
                 request.extensions_mut().insert(auth_context);
                 request.extensions_mut().insert(claims);
                 return Ok(next.run(request).await);
+            }
+            Err(nanosiem_core::auth::TokenError::RevocationUnavailable) => {
+                return Err(revocation_unavailable_response());
             }
             Err(e) => {
                 tracing::warn!(error = %e, "JWT validation failed");

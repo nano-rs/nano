@@ -50,3 +50,31 @@ fn global_auxiliary_tables_get_independent_replication_paths() {
         "ReplicatedMergeTree('/clickhouse/tables/nanosiem/_future_timestamp_ip_repair_rows', '{replica}')"
     );
 }
+
+#[test]
+fn tracking_presence_probe_covers_every_table_and_skips_dead_replicas() {
+    let mut migrator = ClickHouseMigrator::new(clickhouse::Client::default(), "nanosiem");
+    migrator.cluster = Some(Some("default".to_string()));
+    assert_eq!(
+        migrator.tracking_tables_presence_sql("default"),
+        "SELECT count() FROM clusterAllReplicas('default', system.tables) \
+         WHERE database = 'nanosiem' AND name IN ('_migrations', '_migration_refreshes', \
+         '_future_timestamp_repair_set', '_future_timestamp_ip_repair_rows') \
+         AND NOT (name = '_future_timestamp_ip_repair_rows' AND position(create_table_query, 'TTL') > 0) \
+         SETTINGS skip_unavailable_shards = 1"
+    );
+    assert_eq!(TRACKING_TABLES.len(), 4);
+}
+
+#[test]
+fn skip_check_only_applies_to_explicit_clusters() {
+    let mut migrator = ClickHouseMigrator::new(clickhouse::Client::default(), "nanosiem");
+    assert_eq!(migrator.explicit_cluster_name(), None);
+    migrator.cluster = Some(Some("nanosiem".to_string()));
+    assert_eq!(migrator.explicit_cluster_name(), None);
+    migrator.cluster = Some(Some("default".to_string()));
+    migrator.is_cloud = Some(true);
+    assert_eq!(migrator.explicit_cluster_name(), None);
+    migrator.is_cloud = Some(false);
+    assert_eq!(migrator.explicit_cluster_name(), Some("default"));
+}

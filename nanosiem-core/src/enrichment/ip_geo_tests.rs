@@ -84,3 +84,60 @@ fn stale_probe_reads_the_trie_and_the_staging_refresh() {
     assert!(STALE_PROBE_SQL.contains("name = 'ip_geo_trie_dict'"));
     assert!(STALE_PROBE_SQL.contains("view = 'ip_enrichment_dict_refresh'"));
 }
+
+#[test]
+fn per_replica_endpoints_win_over_shard_endpoints() {
+    // NAN-5215: the refreshed views write node-local staging tables, so every
+    // replica needs its own trigger when per-replica endpoints exist.
+    assert_eq!(
+        refresh_targets(
+            Some("http://clickhouse-proxy:18200,http://clickhouse-proxy:18201"),
+            Some("http://clickhouse-proxy:18101"),
+        )
+        .unwrap(),
+        RefreshTargets::Replicas(vec![
+            "http://clickhouse-proxy:18200".to_string(),
+            "http://clickhouse-proxy:18201".to_string(),
+        ])
+    );
+    // Unset or blank (Helm): the historical per-shard path.
+    for replicas in [None, Some(""), Some("  ")] {
+        assert_eq!(
+            refresh_targets(replicas, Some("http://clickhouse-proxy:18101")).unwrap(),
+            RefreshTargets::Shards(vec!["http://clickhouse-proxy:18101".to_string()])
+        );
+    }
+    assert!(refresh_targets(None, None).is_err());
+    assert!(refresh_targets(Some("tcp://x:9000"), None).is_err());
+}
+
+#[test]
+fn wait_probe_covers_only_triggered_replicas_and_skips_dead_ones() {
+    let sql = triggered_replicas_probe_sql(
+        "default",
+        "nanosiem",
+        "ip_enrichment_dict_refresh",
+        &["ch-1a".to_string(), "o'b".to_string()],
+    );
+    assert!(sql.contains("FROM clusterAllReplicas('default', system.view_refreshes)"), "{sql}");
+    assert!(sql.contains("getMacro('replica') IN ('ch-1a', 'o''b')"), "{sql}");
+    assert!(sql.ends_with("SETTINGS skip_unavailable_shards = 1"), "{sql}");
+    assert!(sql.contains("database = 'nanosiem' AND view = 'ip_enrichment_dict_refresh'"), "{sql}");
+    assert_eq!(sql.matches('?').count(), 2, "{sql}");
+}
+
+#[test]
+fn only_missing_servers_count_as_unreachable() {
+    use clickhouse::error::Error;
+    assert!(is_unreachable_replica_error(&Error::TimedOut));
+    assert!(is_unreachable_replica_error(&Error::Network("connection refused".into())));
+    // The proxy's own gateway error for a dead backend.
+    assert!(is_unreachable_replica_error(&Error::BadResponse(
+        "<html>502 Bad Gateway</html>".to_string()
+    )));
+    // A live server rejecting the statement is a real failure.
+    assert!(!is_unreachable_replica_error(&Error::BadResponse(
+        "Code: 497. DB::Exception: nanosiem_admin: Not enough privileges. (ACCESS_DENIED)".to_string()
+    )));
+    assert!(!is_unreachable_replica_error(&Error::Custom("x".to_string())));
+}

@@ -24,6 +24,7 @@ use nanosiem_core::{
 use nanosiem_enterprise::sovereign_license::{
     EntitlementError, LegacyUpgradeGrace, LicenseStateView,
 };
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::state::AppState;
@@ -310,11 +311,57 @@ pub async fn refresh_offline_snapshot(
 
     *state.license_status.write().await = snapshot.cached_status();
     *state.offline_license_snapshot.write().await = snapshot.clone();
+    LAST_GOOD_REFRESH_UNIX.store(Utc::now().timestamp(), Ordering::SeqCst);
     Ok(snapshot)
 }
 
 pub fn unavailable_snapshot(error: &EntitlementError) -> OfflineLicenseSnapshot {
     OfflineLicenseSnapshot::Unavailable(error.public_reason().into())
+}
+
+/// NAN-5214: how long a good snapshot survives licence-storage errors.
+///
+/// A PostgreSQL primary switch makes every query fail for seconds. Failing
+/// closed on the first error used to lock licensed routes and abort SOAR,
+/// cases and collector workers for a blip. Only `Storage` errors qualify: a
+/// refusal (revoked, expired, foreign binding, rollback) still locks at once.
+pub const STORAGE_ERROR_GRACE_SECS: i64 = 300;
+
+static LAST_GOOD_REFRESH_UNIX: AtomicI64 = AtomicI64::new(0);
+
+/// Whether a refresh failure may keep the current snapshot (pure, for tests).
+pub fn keeps_snapshot_through(
+    error: &EntitlementError,
+    current: &OfflineLicenseSnapshot,
+    last_good_unix: i64,
+    now_unix: i64,
+) -> bool {
+    matches!(error, EntitlementError::Storage(_))
+        && !matches!(current, OfflineLicenseSnapshot::Unavailable(_))
+        && last_good_unix > 0
+        && now_unix.saturating_sub(last_good_unix) <= STORAGE_ERROR_GRACE_SECS
+}
+
+/// Apply a failed refresh: keep the last good snapshot through a short
+/// storage outage, otherwise fail closed.
+pub async fn record_refresh_failure(state: &AppState, error: &EntitlementError) {
+    let keep = {
+        let current = state.offline_license_snapshot.read().await;
+        keeps_snapshot_through(
+            error,
+            &current,
+            LAST_GOOD_REFRESH_UNIX.load(Ordering::SeqCst),
+            Utc::now().timestamp(),
+        )
+    };
+    if keep {
+        tracing::warn!(%error, "licence storage unavailable; keeping the last good snapshot");
+        return;
+    }
+    tracing::error!(%error, "licence admission unavailable; failing closed");
+    let snapshot = unavailable_snapshot(error);
+    *state.license_status.write().await = snapshot.cached_status();
+    *state.offline_license_snapshot.write().await = snapshot;
 }
 
 pub fn iso(value: DateTime<Utc>) -> String {
@@ -346,6 +393,26 @@ mod tests {
             refusal: None,
             recovery_required: false,
         })
+    }
+
+    // NAN-5214: a PostgreSQL primary switch must not lock the licence.
+    #[test]
+    fn storage_error_keeps_a_recent_good_snapshot() {
+        let good = c05_with(["soar"]);
+        let storage = EntitlementError::Storage("connection reset".into());
+        assert!(keeps_snapshot_through(&storage, &good, 1_000, 1_000 + STORAGE_ERROR_GRACE_SECS));
+        assert!(!keeps_snapshot_through(&storage, &good, 1_000, 1_001 + STORAGE_ERROR_GRACE_SECS));
+        assert!(!keeps_snapshot_through(&storage, &good, 0, 10));
+        let unavailable = OfflineLicenseSnapshot::Unavailable("down".into());
+        assert!(!keeps_snapshot_through(&storage, &unavailable, 1_000, 1_001));
+    }
+
+    #[test]
+    fn refusals_fail_closed_immediately() {
+        let good = c05_with(["soar"]);
+        for refusal in [EntitlementError::Revoked, EntitlementError::Expired, EntitlementError::ForeignBinding] {
+            assert!(!keeps_snapshot_through(&refusal, &good, 1_000, 1_001));
+        }
     }
 
     #[test]

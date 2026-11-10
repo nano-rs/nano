@@ -229,6 +229,7 @@ jobs:
               cargo test -p nanosiem-core --features enterprise --test tuning_atomic_state_integration -- --ignored --test-threads=1
               NANOSIEM_ENCRYPTION_KEY="$CREDENTIAL_SUITE_ENCRYPTION_KEY" cargo test -p nanosiem-core --features enterprise --test credential_delete_in_use_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test notebook_tab_revocation_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-enterprise --test notebook_visibility_lifecycle_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test settings_integration -- --ignored
               cargo test -p nanosiem-enterprise --test playbook_acl_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test case_stats_visibility_integration -- --ignored --test-threads=1

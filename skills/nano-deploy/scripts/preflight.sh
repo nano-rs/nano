@@ -14,6 +14,7 @@
 #   --ports 80,443,8088         TCP ports that must be free (default by topology/roles)
 #   --peers 10.0.0.2,10.0.0.3   other node addresses to test reachability (TCP 22)
 #   --install-dir DIR           (default ~/nano) where the bundle will be extracted
+#   --airgap                    images come from a local bundle; registry egress is informational
 #
 # Output: one line per check, "CHECK <name> <PASS|WARN|FAIL> <detail>", then
 # "SUMMARY pass=N warn=N fail=N". Exit status 0 when there is no FAIL, 1 otherwise.
@@ -21,7 +22,7 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-topology=single roles="" min_cpu=4 min_mem=14 min_disk=50 ports="" peers="" install_dir="$HOME/nano"
+topology=single roles="" min_cpu=4 min_mem=14 min_disk=50 ports="" peers="" install_dir="$HOME/nano" airgap=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --topology) topology="$2"; shift 2 ;;
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --ports) ports="$2"; shift 2 ;;
         --peers) peers="$2"; shift 2 ;;
         --install-dir) install_dir="$2"; shift 2 ;;
+        --airgap) airgap=1; shift ;;
         --) shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -219,12 +221,44 @@ if [[ -n "$peers" ]]; then
 fi
 
 # --- outbound ------------------------------------------------------------------------
-if have curl; then
-    for url in https://api.nano.rs https://us-central1-docker.pkg.dev/v2/; do
-        code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' "$url" 2>/dev/null || true)
-        if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then row "egress" PASS "$url -> HTTP $code"
-        else row "egress" WARN "$url unreachable (fine only for an air-gapped install)"; fi
+# Every registry host the installer and upgrades pull from (third-party images
+# are NOT mirrored into the customer registry). Hosts come from the image
+# locks in the bundle; each registry also needs its auth/blob hosts.
+registry_hosts() {
+    local lock hosts="" ref host
+    for lock in "$install_dir/images.enterprise.customer.lock" "$install_dir/images.enterprise.lock" "$install_dir/images.lock"; do
+        [[ -f "$lock" ]] || continue
+        while read -r ref _; do
+            [[ -z "$ref" || "$ref" == \#* ]] && continue
+            host=${ref%%/*}
+            [[ "$ref" == */* && ( "$host" == *.* || "$host" == *:* ) ]] || host=docker.io
+            hosts+=" $host"
+        done < "$lock"
     done
+    # No bundle yet: the hosts the current enterprise release pulls from.
+    [[ -n "$hosts" ]] || hosts=" us-central1-docker.pkg.dev docker.io ghcr.io"
+    for host in $hosts; do
+        case "$host" in
+            docker.io) printf '%s\n' registry-1.docker.io auth.docker.io production.cloudflare.docker.com ;;
+            ghcr.io) printf '%s\n' ghcr.io pkg-containers.githubusercontent.com ;;
+            quay.io) printf '%s\n' quay.io cdn01.quay.io cdn02.quay.io cdn03.quay.io ;;
+            *) printf '%s\n' "$host" ;;
+        esac
+    done | sort -u
+}
+if have curl; then
+    code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' https://api.nano.rs 2>/dev/null || true)
+    if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then row "egress" PASS "https://api.nano.rs -> HTTP $code"
+    else row "egress" WARN "https://api.nano.rs unreachable (licence check-in; fine only for an offline licence)"; fi
+    # A blocked registry makes `docker compose pull` hang rather than fail
+    # (NAN-5197), so test each host's HTTPS here, in seconds.
+    while read -r host; do
+        [[ -n "$host" ]] || continue
+        code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' "https://$host/v2/" 2>/dev/null || true)
+        if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then row "registry:$host" PASS "HTTPS reachable (HTTP $code)"
+        elif (( airgap )); then row "registry:$host" WARN "HTTPS unreachable (expected for an air-gapped install)"
+        else row "registry:$host" FAIL "outbound HTTPS to $host is blocked; image pulls will hang. Allow it (directly or via HTTPS_PROXY) or use the air-gapped bundle"; fi
+    done < <(registry_hosts)
 fi
 
 printf 'SUMMARY pass=%d warn=%d fail=%d\n' "$pass" "$warn" "$fail"

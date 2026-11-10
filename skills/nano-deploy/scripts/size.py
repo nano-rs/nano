@@ -14,6 +14,10 @@ Size the host / Retention and disk, High availability, Kubernetes sizing presets
 The guide says the ratios are extrapolated until load-validated. Treat the
 output as a starting point and watch ClickHouse CPU and memory with real data.
 
+For a fully highly available cluster of cloud VMs (AWS, Azure, GCP), use
+plan.py instead: it builds on these ratios and adds the role layout, instance
+types, HA checks, tuned settings, a cost estimate and the inventory.
+
 Examples:
   size.py --eps 141 --retention-days 365 --topology single
   size.py --gb-per-day 12.5 --retention-days 365 --topology ha3

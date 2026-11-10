@@ -466,6 +466,18 @@ def probe_destination(config: Config) -> None:
 
 MARKER_NAME = ".nano-backup-destination"
 PARTIAL_PREFIX = "."  # in-flight copies: `.nano-auto-<time>.partial-<hex>`
+PARTIAL_STALE_SECS = 6 * 3600
+
+
+def newest_mtime(path: pathlib.Path) -> float:
+    """Latest modification time anywhere under an in-flight copy."""
+    newest = path.lstat().st_mtime
+    for child in path.rglob("*"):
+        try:
+            newest = max(newest, child.lstat().st_mtime)
+        except OSError:
+            continue
+    return newest
 
 
 def write_destination_marker(root: pathlib.Path, marker_id: str) -> None:
@@ -511,11 +523,15 @@ def auto_names(config: Config) -> list[str]:
 def prune(config: Config) -> list[str]:
     """Keep the newest N automatic backups. Only complete `nano-auto-*`
     bundles this scheduler wrote are ever counted; manual backups are never
-    touched. Abandoned in-flight copies (`.nano-auto-*.partial-*`) are
-    removed: runs hold the install lock, so none is still being written."""
+    touched. Abandoned in-flight copies (`.nano-auto-*.partial-*`) idle for
+    PARTIAL_STALE_SECS are removed; a younger one may belong to another app
+    host writing to the same shared destination."""
     if config.kind == "path":
+        # NAN-5215: on a destination shared by several app hosts another host
+        # may be writing its copy right now; only a long-idle copy is abandoned.
+        stale_before = time.time() - PARTIAL_STALE_SECS
         for leftover in pathlib.Path(config.path).glob(f"{PARTIAL_PREFIX}{AUTO_PREFIX}*.partial-*"):
-            if leftover.is_dir() and not leftover.is_symlink():
+            if leftover.is_dir() and not leftover.is_symlink() and newest_mtime(leftover) < stale_before:
                 shutil.rmtree(leftover, ignore_errors=True)
                 log(f"removed an incomplete copy: {leftover.name}")
     names = auto_names(config)
@@ -679,6 +695,11 @@ class Database:
         env = config.env
         self.pg_host = os.environ.get("NANO_BACKUP_PG_HOST", "postgres")
         self.pg_port = os.environ.get("NANO_BACKUP_PG_PORT", "5432")
+        # NAN-5214: verified TLS to the Patroni leader on an HA cluster.
+        self.pg_sslmode = os.environ.get("NANO_BACKUP_PG_SSLMODE", "prefer")
+        self.pg_sslrootcert = os.environ.get("NANO_BACKUP_PG_SSLROOTCERT", "")
+        if self.pg_sslmode not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+            raise BackupError("unsafe NANO_BACKUP_PG_SSLMODE")
         self.pg_db = env.get("POSTGRES_DB") or "nanosiem"
         self.pg_admin = env.get("POSTGRES_USER") or "nanosiem"
         self.pg_admin_password = env.get("POSTGRES_PASSWORD", "")
@@ -722,7 +743,9 @@ class Database:
         env.update(PGHOST=self.pg_host, PGPORT=self.pg_port, PGDATABASE=self.pg_db, PGCONNECT_TIMEOUT="15",
                    PGUSER=self.pg_admin if admin else BACKUP_ROLE,
                    PGPASSWORD=self.pg_admin_password if admin else self.backup_pg_password,
-                   PGAPPNAME="nano-backup")
+                   PGAPPNAME="nano-backup", PGSSLMODE=self.pg_sslmode)
+        if self.pg_sslmode.startswith("verify-") and self.pg_sslrootcert:
+            env["PGSSLROOTCERT"] = self.pg_sslrootcert
         return env
 
     def psql(self, sql: str, admin: bool = False) -> str:
@@ -1061,7 +1084,115 @@ class InstallLock:
         os.close(self.fd)
 
 
-def run_once(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
+# NAN-5215: every app host of a role-split cluster runs the scheduler, so the
+# daily backup survives the loss of any one of them. One PostgreSQL session
+# lock makes exactly one host take a slot; the others wait for it and then see
+# the finished bundle in the shared destination. Ids sit beside
+# nano-upgrade.py's PgMigrationLock (5_000_001 upgrade .. 5_000_003).
+CLUSTER_BACKUP_LOCK_ID = 5_000_004
+UPGRADE_LOCK_ID = 5_000_001
+# Every app host computes the same HH:MM slot; only their clocks differ (NTP:
+# seconds). A bundle started this long before the slot still counts as that
+# slot's backup. Kept small so a backup from an earlier slot or a manual run
+# never suppresses the next scheduled one.
+SLOT_SKEW = dt.timedelta(minutes=2)
+
+
+class ClusterBusy(BackupError):
+    """Another app host holds the cluster backup lock (it is taking the slot)."""
+
+
+class ClusterLock:
+    """A live PostgreSQL advisory lock, released when this psql session ends
+    (including when its host dies mid-backup, so a survivor can take over)."""
+
+    def __init__(self, config: Config, timeout: float = 30):
+        self.config = config
+        self.timeout = timeout
+        self.process: subprocess.Popen[str] | None = None
+
+    def __enter__(self) -> "ClusterLock":
+        import selectors
+        db = Database(self.config)
+        env = db.pg_env(admin=True)
+        # PostgreSQL must notice a dead holder in seconds, not after the OS
+        # keepalive default (~2 h): a host that dies mid-backup releases the
+        # slot to the next app host within about half a minute.
+        env["PGOPTIONS"] = ("-c tcp_keepalives_idle=10 -c tcp_keepalives_interval=5 "
+                            "-c tcp_keepalives_count=3 -c tcp_user_timeout=20000")
+        self.process = subprocess.Popen(
+            ["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+            env=env)
+        assert self.process.stdin is not None and self.process.stdout is not None
+        # Take the slot lock and hold it; only probe the upgrade lease (an
+        # upgrade run from any host holds it on PostgreSQL for its whole run).
+        self.process.stdin.write(
+            f"SELECT CASE WHEN NOT pg_try_advisory_lock({CLUSTER_BACKUP_LOCK_ID}) THEN '__NANO_BACKUP_BUSY__' "
+            f"WHEN NOT pg_try_advisory_lock({UPGRADE_LOCK_ID}) THEN '__NANO_BACKUP_UPGRADE__' "
+            f"WHEN pg_advisory_unlock({UPGRADE_LOCK_ID}) THEN '__NANO_BACKUP_LOCKED__' END;\n")
+        self.process.stdin.flush()
+        selector = selectors.DefaultSelector()
+        selector.register(self.process.stdout, selectors.EVENT_READ)
+        line = ""
+        if selector.select(self.timeout):
+            line = self.process.stdout.readline().strip()
+        if line == "__NANO_BACKUP_LOCKED__":
+            return self
+        self.close()
+        if line == "__NANO_BACKUP_BUSY__":
+            raise ClusterBusy("another app host is taking this backup")
+        if line == "__NANO_BACKUP_UPGRADE__":
+            raise BackupError("a cluster upgrade holds the PostgreSQL upgrade lease; the backup will be retried")
+        raise BackupError("cannot take the cluster backup lock in PostgreSQL")
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        with_suppressed(lambda: self.process.stdin.close())  # type: ignore[union-attr]
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        self.process = None
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
+def cluster_lock(config: Config) -> Any:
+    """The cluster lock on a role-split install (several app hosts may run
+    the scheduler); a single-node install has exactly one scheduler."""
+    import contextlib
+    if (config.install_dir / ".nano-role.env").is_file():
+        return ClusterLock(config)
+    return contextlib.nullcontext()
+
+
+def auto_started_at(name: str) -> dt.datetime | None:
+    if not AUTO_NAME.fullmatch(name):
+        return None
+    stamp = name[len(AUTO_PREFIX):].removesuffix(".tar")
+    return dt.datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+def slot_already_taken(config: Config, slot: dt.datetime) -> str | None:
+    """The newest complete automatic backup at or after this slot, if any
+    (written by this host or, through a shared destination, another one)."""
+    floor = slot - SLOT_SKEW
+    for name in reversed(auto_names(config)):
+        started = auto_started_at(name)
+        if started is not None and started >= floor:
+            return name
+    return None
+
+
+def run_once(config: Config, now: dt.datetime | None = None,
+             slot: dt.datetime | None = None) -> dict[str, Any]:
+    """One backup. With ``slot`` (the scheduler) the run is skipped when
+    another app host already stored that slot's backup, and reported as
+    outcome ``elsewhere`` (not recorded) while another host is taking it."""
     started = now or dt.datetime.now(dt.timezone.utc)
     name = AUTO_PREFIX + started.strftime("%Y%m%dT%H%M%SZ")
     status: dict[str, Any] = {
@@ -1072,8 +1203,16 @@ def run_once(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         "clickhouse_data": "excluded",
     }
     try:
-        with InstallLock(config.install_dir):
-            store(config, status, name)
+        with InstallLock(config.install_dir), cluster_lock(config):
+            taken = slot_already_taken(config, slot) if slot is not None else None
+            if taken:
+                log(f"backup {taken} already covers the {iso(slot)} slot; nothing to do on this host")
+                status.update(outcome="elsewhere", backup_id=taken)
+            else:
+                store(config, status, name)
+    except ClusterBusy as busy:
+        log(f"{busy}; this host stands by")
+        status.update(outcome="elsewhere")
     except Exception as error:  # every failure is reported, then retried
         status.update(outcome="failure", error=str(error)[:1000])
         log(f"backup failed: {error}")
@@ -1216,20 +1355,34 @@ def serve(install_dir: pathlib.Path, *, clock: Callable[[], dt.datetime] | None 
             sleep(min(60.0, max(1.0, (due - clock()).total_seconds())))
         if stopping["flag"]:
             break
-        for attempt in range(len(BACKOFF_MINUTES) + 1):
+        attempt = 0
+        while attempt < len(BACKOFF_MINUTES) + 1:
             config = load_config(install_dir)
-            status = run_once(config, clock())
+            status = run_once(config, clock(), slot=due)
+            if status["outcome"] == "elsewhere":
+                # Another app host owns (or finished) this slot. Its report
+                # reaches the shared API; stand by in case it dies mid-run
+                # (its lock then drops) until the slot is covered.
+                if status.get("backup_id") or clock() + dt.timedelta(seconds=30) >= next_run(config.schedule, clock()):
+                    break
+                waited = clock() + dt.timedelta(seconds=30)
+                while not stopping["flag"] and clock() < waited:
+                    sleep(min(30.0, max(1.0, (waited - clock()).total_seconds())))
+                if stopping["flag"]:
+                    break
+                continue
+            attempt += 1
             status["next_run_at"] = iso(next_run(config.schedule, clock()))
             record_status(config, status)
             # A partial backup is stored and reported; retrying would only
             # pile up more copies while ClickHouse stays unreachable.
-            if status["outcome"] in {"success", "partial"} or attempt == len(BACKOFF_MINUTES):
+            if status["outcome"] in {"success", "partial"} or attempt > len(BACKOFF_MINUTES):
                 break
-            wait = dt.timedelta(minutes=BACKOFF_MINUTES[attempt])
+            wait = dt.timedelta(minutes=BACKOFF_MINUTES[attempt - 1])
             following = next_run(config.schedule, clock())
             if clock() + wait >= following:
                 break
-            log(f"retrying in {BACKOFF_MINUTES[attempt]} minutes")
+            log(f"retrying in {BACKOFF_MINUTES[attempt - 1]} minutes")
             retry_at = clock() + wait
             while not stopping["flag"] and clock() < retry_at:
                 sleep(min(60.0, max(1.0, (retry_at - clock()).total_seconds())))
@@ -1578,6 +1731,8 @@ def main(argv: list[str] | None = None) -> int:
             if not config.enabled:
                 raise BackupError("automatic backups are not configured; run scripts/nano backup-schedule --configure")
             status = run_once(config)
+            if status["outcome"] == "elsewhere":
+                raise BackupError("another app host is taking a backup right now; try again when it finishes")
             record_status(config, status)
             return {"success": 0, "partial": 3}.get(status["outcome"], 1)
         if args.command == "status":

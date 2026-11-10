@@ -1,8 +1,8 @@
 ---
 name: nano-deploy
-description: Deploy, size, verify, upgrade and operate nano Self-run (the licensed, self-hosted enterprise edition of the nano SIEM) on the operator's own Linux hosts over SSH, as a single node, a 3-node HA Docker Compose cluster, or on Kubernetes with Helm. Use when asked to install, deploy, set up, size, upgrade, back up, restore, add a node to, rotate certificates on, troubleshoot or collect a support bundle for nano / nano SIEM / nano Self-run.
+description: Deploy, size, verify, upgrade and operate nano Self-run (the licensed, self-hosted enterprise edition of the nano SIEM) on the operator's own Linux hosts over SSH, as a single node, a 3-node HA Docker Compose cluster, a fully highly available cluster of N VMs (existing VMs, or new ones on AWS, Azure or GCP, laid out from the data volume), or on Kubernetes with Helm. Use when asked to install, deploy, set up, size, plan, upgrade, back up, restore, add a node to, rotate certificates on, troubleshoot or collect a support bundle for nano / nano SIEM / nano Self-run, including requests like "deploy nano to 8 VMs" or "…to 8 VMs in AWS".
 license: AGPL-3.0-or-later
-compatibility: Runs from the operator's workstation. Needs ssh, scp, python3 and bash locally; targets are Linux hosts reachable over SSH (or a Kubernetes cluster via kubectl and helm).
+compatibility: Runs from the operator's workstation. Needs ssh, scp, python3 and bash locally; targets are Linux hosts reachable over SSH (or a Kubernetes cluster via kubectl and helm). Cloud VM deployments also use the operator's own logged-in aws, az or gcloud CLI.
 metadata:
   product: nano Self-run
   tested-with: nano 2.0.x enterprise compose bundle
@@ -46,7 +46,12 @@ and never trade security for a green check.
    what already exists (`~/nano/.env`, running containers, the
    `.nano-role.env` on a role host). Re-running `install.sh` keeps secrets and
    data. Never delete state to "start clean" without rule 4.
-7. Keep a local work log: `./nano-deploy-work/` on the operator's machine,
+7. **Cloud resources cost money and are created only after the operator
+   confirms the plan, then each provisioning step.** Use the operator's own
+   logged-in cloud CLI. Never ask for, print or store cloud credentials or
+   object-storage keys; the operator enters those in nano or in a file they
+   name. Tag everything you create and list it in the work log.
+8. Keep a local work log: `./nano-deploy-work/` on the operator's machine,
    created at mode `0700`. Write the intake record, the plan, preflight output
    and step results there. It holds no secrets; the secret files it points to
    live elsewhere. Do not commit it.
@@ -73,7 +78,35 @@ them, and skip what the operator has already told you. Record the answers in
 Size the deployment with `python3 scripts/size.py` (see
 [references/sizing.md](references/sizing.md)) and show the result.
 
-**Gate:** confirm the intake summary and sizing with the operator.
+**N VMs, full HA** ("deploy nano to 8 VMs", "…in AWS / Azure / GCP"): do
+not use `size.py`. Follow [references/cloud-vm.md](references/cloud-vm.md)
+from start to end, in this order:
+
+1. **Intake**, including section E: the list of VMs (name, address, vCPU, RAM,
+   data disk, failure domain) or the cloud and region, the data volume, and how
+   users and senders reach nano (managed LB, HAProxy pair, or one HAProxy).
+2. **Layout:** `python3 scripts/plan.py --hosts hosts.txt ...` places the roles
+   on the operator's VMs (stacking only as far as needed), or `--cloud ...`
+   picks new VMs. It checks that losing any one VM keeps every quorum and a
+   replica of everything.
+3. **Review the plan** with the operator: VM count and spares, the nano 2.0.7
+   requirement, any `EXTRAPOLATED` figure, the load balancer, and, with one
+   HAProxy host, that **the edge is a single point of failure**.
+4. **Provision** (new cloud VMs only), **prepare** each VM (data disk at
+   `/var/lib/docker`, time sync, Docker), **preflight** every host.
+5. **Licence and download** from app.nano.rs; `sha256sum -c` the bundle before
+   extracting it; images are verified by digest at install.
+6. **Install** in the order `plan.py --install-order` prints (PostgreSQL hosts,
+   ClickHouse, app hosts one by one, ingest) with the plan's inventory, one
+   private certificate for every address, and one shared `.env`.
+7. **Load balancer:** both hostnames to the app and ingest backends with the
+   plan's health checks.
+8. **Verify:** smoke test through the load balancer, cluster health on every
+   host, then the **failover check**: one VM of each role stopped in turn while
+   the smoke test still passes.
+
+**Gate:** confirm the intake summary and sizing (or the N-VM plan) with the
+operator. For N VMs, nothing is created or installed before this "yes".
 
 ### 2. Preflight (read-only)
 
@@ -101,7 +134,10 @@ Pick the path, then follow that reference step by step:
 |---|---|
 | Single node (Compose) | [references/single-node.md](references/single-node.md) |
 | 3-node HA (Compose role split) | [references/multi-node-ha.md](references/multi-node-ha.md) |
+| No single point of failure (6+ hosts, any one may die) | [references/full-ha.md](references/full-ha.md) |
+| PostgreSQL + Valkey failover (2-3 postgres hosts) | [references/postgres-ha.md](references/postgres-ha.md) |
 | Kubernetes (Helm) | [references/helm.md](references/helm.md) |
+| N VMs, full HA (existing VMs, or AWS, Azure, GCP) | [references/cloud-vm.md](references/cloud-vm.md); new cloud VMs also [cloud-aws.md](references/cloud-aws.md), [cloud-azure.md](references/cloud-azure.md) or [cloud-gcp.md](references/cloud-gcp.md) |
 
 Check [references/known-issues.md](references/known-issues.md) for the release
 you are installing before you start.
@@ -143,7 +179,11 @@ Stop and tell the operator, quoting the exact error, when:
 - you would need to change product files, weaken a security setting, or delete
   data to proceed;
 - the hosts differ from the intake (a different OS, missing disks, other
-  services on required ports).
+  services on required ports);
+- a cloud call fails on permissions or quota: report it, never widen IAM
+  yourself;
+- `plan.py` refuses the VMs or a limit because full HA does not fit: explain,
+  never drop a replica or a quorum member to fit.
 
 Suggest contacting nano support (nano.rs/docs/support) with the deployment ID,
 the failing command, the time with timezone, and a redacted support bundle.

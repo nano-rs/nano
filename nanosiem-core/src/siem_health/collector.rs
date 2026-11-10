@@ -238,6 +238,10 @@ async fn collect_ingestion_metrics(
     }
 }
 
+/// NAN-5215: setting applied to every clustered insert-integrity probe so a
+/// down replica is skipped instead of failing the probe.
+pub(crate) const PROBE_SKIP_UNAVAILABLE_REPLICAS: (&str, &str) = ("skip_unavailable_shards", "1");
+
 /// The `system.<table>` source for an insert-integrity probe: wrapped in
 /// `clusterAllReplicas('<cluster>', system.<table>)` on a clustered deployment
 /// (so every shard's node-local system tables are read), or plain
@@ -425,6 +429,20 @@ async fn collect_insert_integrity(
         None
     };
     let cluster_ref = cluster.as_deref();
+    // NAN-5215: every probe below is read-only monitoring. With one replica
+    // hard-down, `clusterAllReplicas` would fail each of them outright and
+    // blank the whole insert-integrity section; skip the dead replica and
+    // report on the nodes that answer (a down node takes no inserts, so it
+    // cannot forge or mask the per-node inserts-vs-parts pairing).
+    let skip_down_replicas = ch.clone();
+    let ch = match cluster_ref {
+        Some(_) => {
+            let (name, value) = PROBE_SKIP_UNAVAILABLE_REPLICAS;
+            skip_down_replicas.with_option(name, value)
+        }
+        None => skip_down_replicas,
+    };
+    let ch = &ch;
 
     // 1) ACK-layer vs storage-layer pairing — the exact NAN-1404 correlation:
     // INSERT queries keep "finishing" (Vector ACKed, HTTP 200) while ZERO new

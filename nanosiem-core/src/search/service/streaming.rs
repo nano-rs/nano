@@ -391,8 +391,10 @@ impl SearchService {
                     let progress_source = crate::db::dual_pool::system_processes_source();
                     let progress_sql = format!(
                         "SELECT read_rows, total_rows_approx, elapsed \
-                         FROM {} WHERE query_id = '{}'",
-                        progress_source, safe_qid
+                         FROM {} WHERE query_id = '{}'{}",
+                        progress_source,
+                        safe_qid,
+                        crate::db::dual_pool::processes_read_settings(progress_source)
                     );
                     if let Ok(mut cursor) = client.query(&progress_sql).fetch_bytes("JSONEachRow") {
                         let mut bytes = Vec::new();

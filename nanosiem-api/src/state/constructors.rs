@@ -842,6 +842,19 @@ impl AppState {
                         state.auth_service.token_service().set_redis(denylist);
                         tracing::info!("JWT JTI denylist initialized with Redis (cross-pod revocation enabled)");
                     }
+                    Err(e) if state.token_service.revocation_fail_closed() => {
+                        // NAN-5214: HA mode never runs fail-open for life
+                        // because Valkey was down at boot; requests get 503
+                        // until the background connect succeeds.
+                        tracing::warn!(error = %e, "JWT JTI denylist unreachable at boot; retrying in the background (fail closed)");
+                        nanosiem_core::auth::token::spawn_denylist_connect_retry(
+                            redis_url.clone(),
+                            vec![
+                                state.token_service.denylist_slot(),
+                                state.auth_service.token_service().denylist_slot(),
+                            ],
+                        );
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to initialize Redis JTI denylist; falling back to per-pod denylist");
                     }

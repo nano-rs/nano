@@ -17,7 +17,9 @@ use crate::search::types::{SearchError, SearchRequest, SearchResponse};
 
 use super::identity::{freeze_time_window, identity_hash, normalize_job_request};
 use super::repository::{SearchJobRepository, attempt_query_id};
-use super::results::{JobWindow, MAX_PAGE_ROWS, SearchJobResultStore, StoredPage};
+use super::results::{
+    JobWindow, MAX_PAGE_ROWS, ReadConsistency, SearchJobResultStore, StoredPage, page_inconsistent,
+};
 use super::types::{
     DurableSearchJob, JobErrorKind, JobOrigin, JobResultsPage, NewSearchJob, SubmitOutcome,
     classify_search_error,
@@ -345,33 +347,49 @@ impl BackgroundSearchJobs {
                 "offset {offset} is beyond the {row_count} rows this job stored"
             )));
         }
+        // Codex P1-4: PostgreSQL says exactly how many rows exist. A page that
+        // comes back shorter than that — without having stopped at the byte
+        // budget — means the replica serving the read does not hold every row
+        // yet. Refuse (retryable) rather than return a short 200.
+        let expected = limit.min(row_count.saturating_sub(offset));
         let page = if row_count == 0 {
             StoredPage {
                 rows: Vec::new(),
                 byte_limited: false,
             }
         } else {
-            self.inner
-                .results
-                .read_page(
-                    &results_key(job.id),
+            let window = JobWindow {
+                created_at: job.created_at,
+                finished_at: job.finished_at,
+            };
+            let key = results_key(job.id);
+            let read = |consistency| {
+                self.inner.results.read_page(
+                    &key,
                     attempt as u32,
-                    JobWindow {
-                        created_at: job.created_at,
-                        finished_at: job.finished_at,
-                    },
+                    window,
                     offset,
                     limit,
+                    consistency,
                 )
-                .await?
+            };
+            // NAN-5215: a write taken while a replica was down skips the
+            // insert quorum, and a sequential-consistency read then hides (or
+            // rejects) those parts. Retry once as a plain read, but only for
+            // an inconsistent page or a replica/consistency error (read_page
+            // maps that class to JobResultsUnavailable); auth, syntax and
+            // timeouts surface as before. The row-count check below still
+            // refuses a lagging replica's short page.
+            match read(ReadConsistency::Sequential).await {
+                Ok(page) if !page_inconsistent(&page, expected) => page,
+                Ok(_) | Err(SearchError::JobResultsUnavailable(_)) => {
+                    read(ReadConsistency::Eventual).await?
+                }
+                Err(error) => return Err(error),
+            }
         };
-        // Codex P1-4: PostgreSQL says exactly how many rows exist. A page that
-        // comes back shorter than that — without having stopped at the byte
-        // budget — means the replica serving the read does not hold every row
-        // yet. Refuse (retryable) rather than return a short 200.
-        let expected = limit.min(row_count.saturating_sub(offset));
         let got = page.rows.len() as u64;
-        if got > expected || (got < expected && !page.byte_limited) {
+        if page_inconsistent(&page, expected) {
             tracing::warn!(
                 job_id = %job.public_id(),
                 offset,

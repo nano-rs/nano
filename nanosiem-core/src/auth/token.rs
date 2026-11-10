@@ -24,6 +24,59 @@ use super::types::{config_defaults, TokenClaims, TokenPair};
 /// Redis key prefix for revoked JTIs. The key TTL matches the remaining
 /// access-token lifetime so Redis prunes entries automatically.
 const REDIS_REVOKED_JTI_PREFIX: &str = "auth:revoked_jti:";
+/// Upper bound on the replica acknowledgement wait after a revocation.
+const REVOCATION_WAIT_TIMEOUT_MS: i64 = 500;
+/// NAN-5214: a Valkey failover closes every client connection (the router's
+/// shutdown-sessions). The ConnectionManager reconnects, but the first command
+/// on the dead socket fails ("broken pipe"). Retrying covers that reconnect,
+/// so a revocation is neither lost nor skipped (fail-open) across a failover.
+const REDIS_ATTEMPTS: u32 = 4;
+const REDIS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+/// Per-attempt bound: while reconnecting, the ConnectionManager can hold a
+/// command through its own reconnect backoff (tens of seconds). Every auth
+/// request would stall that long; bound each attempt instead (worst case
+/// about REDIS_ATTEMPTS x (timeout + delay) = 4 s, then 503).
+const REDIS_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+async fn bounded<T>(
+    attempt: impl std::future::Future<Output = redis::RedisResult<T>>,
+) -> redis::RedisResult<T> {
+    tokio::time::timeout(REDIS_ATTEMPT_TIMEOUT, attempt)
+        .await
+        .unwrap_or_else(|_| {
+            Err(redis::RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Valkey command timed out",
+            )))
+        })
+}
+
+/// NAN-5214: `NANO_AUTH_REVOCATION_FAIL_CLOSED=true` (set by the HA Compose
+/// render, alongside replicated Valkey) makes an unreadable revocation
+/// denylist refuse the request (503) instead of accepting the token.
+/// Single-node and single-app-host installs keep the original behaviour:
+/// warn and allow, so a local Valkey restart never locks every user out.
+pub fn revocation_fail_closed_from_env() -> bool {
+    std::env::var("NANO_AUTH_REVOCATION_FAIL_CLOSED")
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Bound on the replica acknowledgement round trip itself.
+const REVOCATION_WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// `NANO_VALKEY_WAIT_REPLICAS` (set by the HA Compose render): how many Valkey
+/// replicas must hold a revocation before `revoke_token` returns. Unset or 0
+/// (a single Valkey) skips the wait, which would otherwise always time out.
+fn revocation_wait_replicas() -> Option<i64> {
+    static VALUE: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("NANO_VALKEY_WAIT_REPLICAS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .filter(|count| *count > 0)
+    })
+}
 
 /// Shared Redis handle for the JTI denylist. Cloned across `TokenService`
 /// instances so revocations made on one pod are visible to all.
@@ -31,6 +84,35 @@ pub type RedisDenylist = Arc<Mutex<redis::aio::ConnectionManager>>;
 
 /// Build a [`RedisDenylist`] from a `redis://` URL. Lets callers wire the
 /// shared denylist without taking a direct dependency on the `redis` crate.
+/// NAN-5214: the shared denylist slot of a [`TokenService`] (clones of the
+/// handle see the same slot), so a background task can wire Valkey in later.
+pub type DenylistSlot = Arc<OnceLock<RedisDenylist>>;
+
+/// Keep connecting to `url` until it succeeds, then wire the denylist into
+/// every slot. Used when the revocation check fails closed: Valkey being down
+/// at boot must not leave the process fail-open for its whole life.
+pub fn spawn_denylist_connect_retry(url: String, slots: Vec<DenylistSlot>) {
+    tokio::spawn(async move {
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            match redis_denylist_from_url(&url).await {
+                Ok(denylist) => {
+                    for slot in &slots {
+                        let _ = slot.set(denylist.clone());
+                    }
+                    tracing::info!("JWT JTI denylist connected to Valkey after a failed boot attempt");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, retry_in_secs = delay.as_secs(), "JWT JTI denylist still unreachable; requests fail closed (503)");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(15));
+                }
+            }
+        }
+    });
+}
+
 pub async fn redis_denylist_from_url(url: &str) -> redis::RedisResult<RedisDenylist> {
     let client = redis::Client::open(url)?;
     let conn = redis::aio::ConnectionManager::new(client).await?;
@@ -54,6 +136,13 @@ pub enum TokenError {
 
     #[error("Token decoding failed: {0}")]
     DecodingFailed(String),
+
+    /// The shared revocation denylist could not be read. Fail closed: the
+    /// caller answers 503 + Retry-After (never 401, so the UI does not treat
+    /// a store outage as a logout, and never 200 for a possibly revoked
+    /// token).
+    #[error("Token revocation status is temporarily unavailable")]
+    RevocationUnavailable,
 }
 
 /// Default issuer for internal JWTs
@@ -210,7 +299,11 @@ pub struct TokenService {
     /// up and `REDIS_URL` is connected). When configured, `revoke_token`
     /// writes here and `validate_access_token_async` consults it on every
     /// request that misses the local `DashMap`.
-    redis: OnceLock<RedisDenylist>,
+    redis: DenylistSlot,
+    /// NAN-5214: refuse (503) instead of accepting a token whose revocation
+    /// status cannot be read. Off unless the HA render sets
+    /// `NANO_AUTH_REVOCATION_FAIL_CLOSED=true`.
+    revocation_fail_closed: std::sync::atomic::AtomicBool,
 }
 
 impl TokenService {
@@ -224,7 +317,8 @@ impl TokenService {
             encoding_key,
             decoding_key,
             revoked_jtis: Arc::new(DashMap::new()),
-            redis: OnceLock::new(),
+            redis: Arc::new(OnceLock::new()),
+            revocation_fail_closed: std::sync::atomic::AtomicBool::new(revocation_fail_closed_from_env()),
         }
     }
 
@@ -237,6 +331,21 @@ impl TokenService {
     ///
     /// Idempotent: subsequent calls are no-ops once Redis is set, so it is
     /// safe to call once at startup before any auth traffic flows.
+    /// The shared slot `set_redis` fills (for [`spawn_denylist_connect_retry`]).
+    pub fn denylist_slot(&self) -> DenylistSlot {
+        Arc::clone(&self.redis)
+    }
+
+    /// Whether an unreadable denylist refuses the token (HA) or allows it.
+    pub fn set_revocation_fail_closed(&self, fail_closed: bool) {
+        self.revocation_fail_closed
+            .store(fail_closed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn revocation_fail_closed(&self) -> bool {
+        self.revocation_fail_closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn set_redis(&self, redis: RedisDenylist) {
         let _ = self.redis.set(redis);
     }
@@ -512,11 +621,47 @@ impl TokenService {
             let now = Utc::now().timestamp();
             let ttl_secs = (exp - now).max(1) as u64;
             let key = format!("{}{}", REDIS_REVOKED_JTI_PREFIX, jti);
-            let mut conn = redis.lock().await;
-            let result: redis::RedisResult<()> = conn.set_ex(&key, 1u8, ttl_secs).await;
+            // ConnectionManager is a cheap, multiplexed clone: never hold the
+            // Mutex across retries or the WAIT (it would queue every request).
+            let mut conn = redis.lock().await.clone();
+            let mut result: redis::RedisResult<()> = bounded(conn.set_ex(&key, 1u8, ttl_secs)).await;
+            for _ in 1..REDIS_ATTEMPTS {
+                if result.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(REDIS_RETRY_DELAY).await;
+                result = bounded(conn.set_ex(&key, 1u8, ttl_secs)).await;
+            }
             if let Err(e) = result {
                 // Local + PG paths still record the revocation; log and continue.
                 tracing::warn!(jti = %jti, error = %e, "failed to write revoked JTI to Redis");
+            } else if let Some(replicas) = revocation_wait_replicas() {
+                // NAN-5214: with Sentinel-managed Valkey, replication is async.
+                // Wait (bounded) until a replica holds the revocation so a
+                // master failover right after a logout cannot lose it.
+                let acked: redis::RedisResult<i64> = tokio::time::timeout(
+                    REVOCATION_WAIT_BOUND,
+                    redis::cmd("WAIT")
+                        .arg(replicas)
+                        .arg(REVOCATION_WAIT_TIMEOUT_MS)
+                        .query_async(&mut conn),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(redis::RedisError::from(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Valkey WAIT timed out",
+                    )))
+                });
+                match acked {
+                    Ok(count) if count >= replicas => {}
+                    Ok(count) => tracing::warn!(
+                        jti = %jti,
+                        acked = count,
+                        "revoked JTI not yet on a Valkey replica"
+                    ),
+                    Err(e) => tracing::warn!(jti = %jti, error = %e, "Valkey WAIT failed"),
+                }
             }
         }
     }
@@ -535,25 +680,46 @@ impl TokenService {
 
     /// Async revocation check that consults the local `DashMap` first
     /// (cheap) and falls through to the shared Redis denylist on miss.
-    /// Returns `true` only when revocation is positively confirmed; if
-    /// Redis is unreachable we conservatively log and return the local
-    /// result to avoid locking out users during a Valkey outage.
-    async fn is_revoked_async(&self, jti: &Uuid) -> bool {
+    ///
+    /// NAN-5214: with [`TokenService::revocation_fail_closed`] (HA), a
+    /// denylist that cannot be read after [`REDIS_ATTEMPTS`] bounded tries,
+    /// or that has not connected yet, is [`TokenError::RevocationUnavailable`]
+    /// (the middleware answers 503), never "not revoked". Otherwise the
+    /// original single-node behaviour applies: warn and allow.
+    async fn is_revoked_async(&self, jti: &Uuid) -> Result<bool, TokenError> {
         if self.is_revoked(jti) {
-            return true;
+            return Ok(true);
         }
+        let fail_closed = self.revocation_fail_closed();
         let Some(redis) = self.redis.get() else {
-            return false;
+            return if fail_closed {
+                tracing::warn!(jti = %jti, "JWT JTI denylist not connected yet; refusing the token (503)");
+                Err(TokenError::RevocationUnavailable)
+            } else {
+                Ok(false)
+            };
         };
         let key = format!("{}{}", REDIS_REVOKED_JTI_PREFIX, jti);
-        let mut conn = redis.lock().await;
-        let exists: redis::RedisResult<bool> = conn.exists(&key).await;
+        // Clone the multiplexed manager; the Mutex is held only for the clone,
+        // so concurrent checks never queue behind one request's retries.
+        let mut conn = redis.lock().await.clone();
+        let mut exists: redis::RedisResult<bool> = bounded(conn.exists(&key)).await;
+        for _ in 1..REDIS_ATTEMPTS {
+            if exists.is_ok() {
+                break;
+            }
+            tokio::time::sleep(REDIS_RETRY_DELAY).await;
+            exists = bounded(conn.exists(&key)).await;
+        }
         match exists {
-            Ok(true) => true,
-            Ok(false) => false,
+            Ok(revoked) => Ok(revoked),
+            Err(e) if fail_closed => {
+                tracing::warn!(jti = %jti, error = %e, "revoked-JTI lookup failed; refusing the token (503)");
+                Err(TokenError::RevocationUnavailable)
+            }
             Err(e) => {
                 tracing::warn!(jti = %jti, error = %e, "failed to read revoked JTI from Redis");
-                false
+                Ok(false)
             }
         }
     }
@@ -567,7 +733,7 @@ impl TokenService {
         token: &str,
     ) -> Result<TokenClaims, TokenError> {
         let claims = self.decode_and_validate_claims(token)?;
-        if self.is_revoked_async(&claims.jti).await {
+        if self.is_revoked_async(&claims.jti).await? {
             return Err(TokenError::Invalid("Token has been revoked".to_string()));
         }
         Ok(claims)
@@ -597,7 +763,8 @@ impl TokenService {
             encoding_key,
             decoding_key,
             revoked_jtis: denylist,
-            redis: OnceLock::new(),
+            redis: Arc::new(OnceLock::new()),
+            revocation_fail_closed: std::sync::atomic::AtomicBool::new(revocation_fail_closed_from_env()),
         }
     }
 }
@@ -1008,12 +1175,168 @@ mod tests {
     #[tokio::test]
     async fn test_is_revoked_async_no_redis_fallback() {
         let service = create_test_service();
-        assert!(!service.is_revoked_async(&Uuid::now_v7()).await);
+        assert!(!service.is_revoked_async(&Uuid::now_v7()).await.unwrap());
         // And a positive local hit still returns true.
         let jti = Uuid::now_v7();
         service
             .revoke_token(jti, Utc::now().timestamp() + 60)
             .await;
-        assert!(service.is_revoked_async(&jti).await);
+        assert!(service.is_revoked_async(&jti).await.unwrap());
+    }
+
+    /// A RESP server that answers `+OK` to every command until killed, then
+    /// refuses connections: Valkey reachable at connect, gone afterwards.
+    async fn start_fake_valkey() -> (String, Vec<tokio::task::JoinHandle<()>>, Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tracked = Arc::clone(&connections);
+        let acceptor = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let handle = tokio::spawn(async move {
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(read) = socket.read(&mut chunk).await else { return };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        // Count complete RESP arrays; answer each with +OK.
+                        loop {
+                            let Some(consumed) = complete_resp_command(&buffer) else { break };
+                            buffer.drain(..consumed);
+                            if socket.write_all(b"+OK\r\n").await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+                tracked.lock().unwrap().push(handle);
+            }
+        });
+        (url, vec![acceptor], connections)
+    }
+
+    /// Length of the first complete RESP array command in `buffer`.
+    fn complete_resp_command(buffer: &[u8]) -> Option<usize> {
+        fn line(buffer: &[u8], at: usize) -> Option<(usize, usize)> {
+            let end = buffer[at..].windows(2).position(|w| w == b"\r\n")? + at;
+            let value = std::str::from_utf8(&buffer[at + 1..end]).ok()?.parse().ok()?;
+            Some((value, end + 2))
+        }
+        if buffer.first() != Some(&b'*') {
+            return None;
+        }
+        let (count, mut at) = line(buffer, 0)?;
+        for _ in 0..count {
+            if buffer.get(at) != Some(&b'$') {
+                return None;
+            }
+            let (len, data_at) = line(buffer, at)?;
+            at = data_at + len + 2;
+            if at > buffer.len() {
+                return None;
+            }
+        }
+        Some(at)
+    }
+
+    /// NAN-5214: a revocation check that cannot reach Valkey must FAIL
+    /// CLOSED. Before, `is_revoked_async` returned false on any Redis error,
+    /// so a logged-out token kept working through a Valkey restart/failover.
+    #[tokio::test]
+    async fn valkey_unreachable_refuses_the_token_instead_of_accepting_it() {
+        let (url, acceptor, connections) = start_fake_valkey().await;
+        let service = create_test_service();
+        service.set_revocation_fail_closed(true);
+        service.set_redis(redis_denylist_from_url(&url).await.expect("fake Valkey connects"));
+        let token = service
+            .create_access_token(Uuid::now_v7(), vec!["Admin".to_string()])
+            .unwrap();
+        // Valkey goes away: listener closed and every connection dropped.
+        for handle in acceptor {
+            handle.abort();
+        }
+        for handle in connections.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let result = service.validate_access_token_async(&token).await;
+        assert!(
+            matches!(result, Err(TokenError::RevocationUnavailable)),
+            "a token must not be accepted while the denylist is unreadable: {result:?}"
+        );
+        // Bounded: the retries cover a reconnect, not an indefinite stall.
+        assert!(started.elapsed() < std::time::Duration::from_secs(6), "took {:?}", started.elapsed());
+    }
+
+    /// Stop the fake Valkey: listener closed and every connection dropped.
+    async fn kill_fake_valkey(
+        acceptor: Vec<tokio::task::JoinHandle<()>>,
+        connections: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    ) {
+        for handle in acceptor {
+            handle.abort();
+        }
+        for handle in connections.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// NAN-5214 (review M1): single-node / one-app installs keep warn-and-
+    /// allow, so a local Valkey restart never 503s every JWT request.
+    #[tokio::test]
+    async fn without_the_ha_flag_an_unreachable_valkey_still_allows() {
+        let (url, acceptor, connections) = start_fake_valkey().await;
+        let service = create_test_service();
+        service.set_revocation_fail_closed(false);
+        service.set_redis(redis_denylist_from_url(&url).await.expect("fake Valkey connects"));
+        let token = service.create_access_token(Uuid::now_v7(), vec!["Admin".to_string()]).unwrap();
+        kill_fake_valkey(acceptor, connections).await;
+        assert!(service.validate_access_token_async(&token).await.is_ok());
+    }
+
+    /// NAN-5214 (review M1): in HA, a denylist that never connected at boot
+    /// is fail-closed too, not fail-open for the life of the process.
+    #[tokio::test]
+    async fn ha_mode_without_a_connected_denylist_refuses() {
+        let service = create_test_service();
+        service.set_revocation_fail_closed(true);
+        let token = service.create_access_token(Uuid::now_v7(), vec!["Admin".to_string()]).unwrap();
+        assert!(matches!(
+            service.validate_access_token_async(&token).await,
+            Err(TokenError::RevocationUnavailable)
+        ));
+    }
+
+    /// NAN-5214 (review M2): concurrent checks with Valkey down must not
+    /// queue behind each other's retries on the denylist Mutex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_checks_with_valkey_down_all_return_promptly() {
+        let (url, acceptor, connections) = start_fake_valkey().await;
+        let service = Arc::new(create_test_service());
+        service.set_revocation_fail_closed(true);
+        service.set_redis(redis_denylist_from_url(&url).await.expect("fake Valkey connects"));
+        let token = service.create_access_token(Uuid::now_v7(), vec!["Admin".to_string()]).unwrap();
+        kill_fake_valkey(acceptor, connections).await;
+        let started = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..50 {
+            let service = Arc::clone(&service);
+            let token = token.clone();
+            tasks.push(tokio::spawn(async move { service.validate_access_token_async(&token).await }));
+        }
+        for task in tasks {
+            assert!(matches!(task.await.unwrap(), Err(TokenError::RevocationUnavailable)));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "50 parallel checks took {:?} (serialised on the Mutex?)",
+            started.elapsed()
+        );
     }
 }

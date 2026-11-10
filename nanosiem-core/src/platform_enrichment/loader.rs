@@ -755,10 +755,11 @@ impl ClickHouseLoader {
     }
 
     /// Refresh the dictionary staging views and reload the dictionaries so a
-    /// commit stamps new events now. On a cluster the refresh runs ON CLUSTER
-    /// and the reload is issued only after EVERY replica reports the refresh
+    /// commit stamps new events now. On a cluster the refresh is triggered on
+    /// every node (`enrichment::ip_geo::refresh_view_and_wait`) and the reload
+    /// is issued only after each triggered replica reports the refresh
     /// finished after it was triggered (`clusterAllReplicas` over
-    /// `system.view_refreshes`), so no node reloads the old staging data.
+    /// `system.view_refreshes`), so no live node reloads the old staging data.
     /// Returns whether activation completed everywhere; `false` is a
     /// retryable state (the data still applies on the views' own cadence).
     pub async fn activate(&self, ip: bool, ioc: bool) -> bool {
@@ -795,7 +796,10 @@ impl ClickHouseLoader {
         if is_ip {
             crate::enrichment::ip_geo::reload_pair(&self.ch_admin, &self.ch, &self.on_cluster).await?;
         } else {
-            self.ch
+            // NAN-5215: don't wait out a down replica's DDL timeout.
+            crate::db::dual_pool::runtime_on_cluster_ddl_options(&self.on_cluster)
+                .iter()
+                .fold(self.ch.clone(), |client, (name, value)| client.with_option(*name, *value))
                 .query(&format!("SYSTEM RELOAD DICTIONARY{} {IOC_DICT}", self.on_cluster))
                 .execute()
                 .await?;

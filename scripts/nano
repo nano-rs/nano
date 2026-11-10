@@ -66,6 +66,8 @@ BUNDLE_TMP=""
 CH_CONTAINER=""
 CH_ADMIN_PASSWORD=""
 PG_CONTAINER=""
+# Compose service holding this host's PostgreSQL (postgres-ha with Patroni).
+PG_SERVICE=postgres
 PG_USER=""
 PG_DB=""
 PG_STAGE_DB=""
@@ -208,11 +210,11 @@ Do not start API, jobs, search, Vector, or connector writers until PostgreSQL
 and ClickHouse have been inspected as one recovery set.
 
 Inspect PostgreSQL database names and connection fences:
-  $compose_text exec -T postgres psql -X -U ${PG_USER:-nanosiem} -d postgres -c "SELECT datname, datallowconn FROM pg_database WHERE datname IN ('${PG_DB:-nanosiem}','${PG_STAGE_DB:-none}','${PG_ROLLBACK_DB:-none}') ORDER BY 1"
+  $compose_text exec -T ${PG_SERVICE} psql -X -U ${PG_USER:-nanosiem} -d postgres -c "SELECT datname, datallowconn FROM pg_database WHERE datname IN ('${PG_DB:-nanosiem}','${PG_STAGE_DB:-none}','${PG_ROLLBACK_DB:-none}') ORDER BY 1"
 
 After choosing the database that should remain at ${PG_DB:-nanosiem}, re-enable
 that database only (replace the name below if recovery selected another one):
-  $compose_text exec -T postgres psql -X -U ${PG_USER:-nanosiem} -d postgres -c "ALTER DATABASE \"${PG_DB:-nanosiem}\" WITH ALLOW_CONNECTIONS true; GRANT CONNECT ON DATABASE \"${PG_DB:-nanosiem}\" TO PUBLIC"
+  $compose_text exec -T ${PG_SERVICE} psql -X -U ${PG_USER:-nanosiem} -d postgres -c "ALTER DATABASE \"${PG_DB:-nanosiem}\" WITH ALLOW_CONNECTIONS true; GRANT CONNECT ON DATABASE \"${PG_DB:-nanosiem}\" TO PUBLIC"
 
 Re-run the restore from the original signed bundle after correcting the cause,
 or complete a manual rollback using ${PG_ROLLBACK_DB:-the recorded rollback DB}.
@@ -421,6 +423,8 @@ PY
         COMPOSE_PROJECT_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)"
         TOPOLOGY_MODE=role-split
         ROLE_LIST="$(role_env_value NANO_ROLE_PROFILES)"
+        # NAN-5214: two or more postgres hosts run the Patroni member.
+        [[ "$(role_env_value NANO_POSTGRES_HA)" == true ]] && PG_SERVICE=postgres-ha
         HOST_ID="$(role_env_value NANO_HOST_ID)"
         DEPLOYMENT_ID="$(role_env_value NANO_DEPLOYMENT_ID)"
         DEPLOYMENT_IDENTITY="$(role_env_value NANO_DEPLOYMENT_IDENTITY_SHA256)"
@@ -559,12 +563,29 @@ service_container() {
 }
 
 prepare_pg() {
-    PG_CONTAINER="$(service_container postgres)"
+    PG_CONTAINER="$(service_container "$PG_SERVICE")"
     PG_USER="$(env_value "$INSTALL_DIR/.env" POSTGRES_USER)"; PG_USER="${PG_USER:-nanosiem}"
     PG_DB="$(env_value "$INSTALL_DIR/.env" POSTGRES_DB)"; PG_DB="${PG_DB:-nanosiem}"
     [[ "$PG_USER" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "unsafe PostgreSQL role"
     [[ "$PG_DB" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "unsafe PostgreSQL database"
     "$DOCKER_BIN" exec "$PG_CONTAINER" pg_isready --username="$PG_USER" --dbname="$PG_DB" >/dev/null || die "PostgreSQL did not pass pg_isready"
+    [[ "$PG_SERVICE" == postgres-ha ]] && require_pg_leader
+    return 0
+}
+
+# NAN-5214: a backup snapshot, the restore cutover and the mutation fence all
+# need the Patroni leader (a replica is read-only and holds no advisory
+# locks). Refuse on a replica and name the leader's host.
+require_pg_leader() {
+    local in_recovery leader
+    in_recovery="$("$DOCKER_BIN" exec "$PG_CONTAINER" psql -X -qAt --username="$PG_USER" --dbname=postgres \
+        -c 'SELECT pg_is_in_recovery()' 2>/dev/null || true)"
+    [[ "$in_recovery" == f ]] && return 0
+    leader="$("$DOCKER_BIN" exec "$PG_CONTAINER" patronictl -c /run/patroni/patroni.yml list -f json 2>/dev/null \
+        | python3 -I -c 'import json,sys
+for m in json.load(sys.stdin):
+    if m.get("Role") == "Leader": print(m.get("Member", "") + " (" + m.get("Host", "") + ")")' 2>/dev/null || true)"
+    die "this host's PostgreSQL member is not the Patroni leader; run this on the leader's host${leader:+: $leader} (or move leadership here with 'patronictl switchover')"
 }
 
 prepare_ch() {
@@ -2272,7 +2293,7 @@ def vals(lines):
 cl=cur.read_text().splitlines();bl=bak.read_text().splitlines();c=vals(cl);b=vals(bl)
 required={"POSTGRES_PASSWORD","CLICKHOUSE_PASSWORD","CLICKHOUSE_ADMIN_PASSWORD","JWT_SECRET","NANOSIEM_ENCRYPTION_KEY"};missing=sorted(required-b.keys())
 if missing:raise SystemExit("backup .env lacks: "+", ".join(missing))
-protected={"NANO_VERSION","NANO_IMAGE_PREFIX","NANO_EDITION","NANO_DEPLOYMENT_IDENTITY_SHA256","NANO_SCHEMA_PROFILE","BASE_URL","NANOSIEM_DEV_MODE","COMPOSE_PROJECT_NAME","COMPOSE_PROFILES","POSTGRES_USER","POSTGRES_DB","CLICKHOUSE_MEM_LIMIT","NANO_VECTOR_NATIVE_BIND_ADDRESS","NANO_OTLP_BIND_ADDRESS","NANO_FLUENT_BIND_ADDRESS","NANO_TENZIR_BIND_ADDRESS"}
+protected={"NANO_PG_REPLICATION_PASSWORD","NANO_PATRONI_API_PASSWORD","NANO_VERSION","NANO_IMAGE_PREFIX","NANO_EDITION","NANO_DEPLOYMENT_IDENTITY_SHA256","NANO_SCHEMA_PROFILE","BASE_URL","NANOSIEM_DEV_MODE","COMPOSE_PROJECT_NAME","COMPOSE_PROFILES","POSTGRES_USER","POSTGRES_DB","CLICKHOUSE_MEM_LIMIT","NANO_VECTOR_NATIVE_BIND_ADDRESS","NANO_OTLP_BIND_ADDRESS","NANO_FLUENT_BIND_ADDRESS","NANO_TENZIR_BIND_ADDRESS"}
 for k in protected:
  if k in c:b[k]=c[k]
  else:b.pop(k,None)
@@ -2908,11 +2929,13 @@ PY
     log "cutting over validated databases and encrypted secrets"
     cp "$restored" "$INSTALL_DIR/.env.restore"; chmod 600 "$INSTALL_DIR/.env.restore"; mv "$INSTALL_DIR/.env.restore" "$INSTALL_DIR/.env"
     local recreate=()
-    [[ "$M_PG" != true ]] || recreate+=(postgres)
+    # NAN-5214: never recreate a Patroni leader here (that is a failover);
+    # the cutover already replicated to every member.
+    [[ "$M_PG" != true || "$PG_SERVICE" == postgres-ha ]] || recreate+=(postgres)
     (( ! recreate_ch )) || recreate+=(clickhouse)
     [[ ${#recreate[@]} -eq 0 ]] || dc up -d --force-recreate "${recreate[@]}" >/dev/null
     if [[ "$M_PG" == true ]]; then
-        PG_CONTAINER="$(service_container postgres)"
+        PG_CONTAINER="$(service_container "$PG_SERVICE")"
         wait_pg_admin
         pg_unfence_target
     fi

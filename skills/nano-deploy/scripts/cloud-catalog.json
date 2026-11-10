@@ -1,0 +1,776 @@
+{
+ "as_of": "2026-11-10",
+ "currency": "USD",
+ "hours_per_month": 730,
+ "basis": "on-demand / pay-as-you-go list prices, Linux, in the reference region of each cloud",
+ "clouds": {
+  "aws": {
+   "region": "us-east-1",
+   "zones": [
+    "us-east-1a",
+    "us-east-1b",
+    "us-east-1c"
+   ],
+   "families": {
+    "clickhouse": {
+     "family": "r7i",
+     "disk": "gp3",
+     "skus": [
+      {
+       "name": "r7i.xlarge",
+       "vcpu": 4,
+       "mem_gib": 32,
+       "usd_hour": 0.2646,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "r7i.2xlarge",
+       "vcpu": 8,
+       "mem_gib": 64,
+       "usd_hour": 0.5292,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "r7i.4xlarge",
+       "vcpu": 16,
+       "mem_gib": 128,
+       "usd_hour": 1.0584,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "r7i.8xlarge",
+       "vcpu": 32,
+       "mem_gib": 256,
+       "usd_hour": 2.1168,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "r7i.12xlarge",
+       "vcpu": 48,
+       "mem_gib": 384,
+       "usd_hour": 3.1752,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "r7i.16xlarge",
+       "vcpu": 64,
+       "mem_gib": 512,
+       "usd_hour": 4.2336,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      }
+     ]
+    },
+    "clickhouse_local": {
+     "family": "i4i",
+     "disk": "instance-store NVMe",
+     "skus": [
+      {
+       "name": "i4i.2xlarge",
+       "vcpu": 8,
+       "mem_gib": 64,
+       "usd_hour": 0.686,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json",
+       "local_nvme_gb": 1875
+      },
+      {
+       "name": "i4i.4xlarge",
+       "vcpu": 16,
+       "mem_gib": 128,
+       "usd_hour": 1.373,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json",
+       "local_nvme_gb": 3750
+      },
+      {
+       "name": "i4i.8xlarge",
+       "vcpu": 32,
+       "mem_gib": 256,
+       "usd_hour": 2.746,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json",
+       "local_nvme_gb": 7500
+      },
+      {
+       "name": "i4i.16xlarge",
+       "vcpu": 64,
+       "mem_gib": 512,
+       "usd_hour": 5.491,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json",
+       "local_nvme_gb": 15000
+      }
+     ]
+    },
+    "app": {
+     "family": "c7i",
+     "disk": "gp3",
+     "skus": [
+      {
+       "name": "c7i.xlarge",
+       "vcpu": 4,
+       "mem_gib": 8,
+       "usd_hour": 0.1785,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "c7i.2xlarge",
+       "vcpu": 8,
+       "mem_gib": 16,
+       "usd_hour": 0.357,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "c7i.4xlarge",
+       "vcpu": 16,
+       "mem_gib": 32,
+       "usd_hour": 0.714,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "c7i.8xlarge",
+       "vcpu": 32,
+       "mem_gib": 64,
+       "usd_hour": 1.428,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      }
+     ]
+    },
+    "ingest": {
+     "family": "c7i",
+     "disk": "gp3",
+     "skus": [
+      {
+       "name": "c7i.xlarge",
+       "vcpu": 4,
+       "mem_gib": 8,
+       "usd_hour": 0.1785,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "c7i.2xlarge",
+       "vcpu": 8,
+       "mem_gib": 16,
+       "usd_hour": 0.357,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "c7i.4xlarge",
+       "vcpu": 16,
+       "mem_gib": 32,
+       "usd_hour": 0.714,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "c7i.8xlarge",
+       "vcpu": 32,
+       "mem_gib": 64,
+       "usd_hour": 1.428,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      }
+     ]
+    },
+    "control": {
+     "family": "m7i",
+     "disk": "gp3",
+     "skus": [
+      {
+       "name": "m7i.large",
+       "vcpu": 2,
+       "mem_gib": 8,
+       "usd_hour": 0.1008,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "m7i.xlarge",
+       "vcpu": 4,
+       "mem_gib": 16,
+       "usd_hour": 0.2016,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "m7i.2xlarge",
+       "vcpu": 8,
+       "mem_gib": 32,
+       "usd_hour": 0.4032,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      },
+      {
+       "name": "m7i.4xlarge",
+       "vcpu": 16,
+       "mem_gib": 64,
+       "usd_hour": 0.8064,
+       "verified": true,
+       "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json"
+      }
+     ]
+    }
+   },
+   "disks": {
+    "gp3": {
+     "gb_month": 0.08,
+     "iops_month": 0.005,
+     "mbps_month": 0.04,
+     "free_iops": 3000,
+     "free_mbps": 125,
+     "max_gib": 65536,
+     "max_iops": 80000,
+     "max_mbps": 2000,
+     "verified": true,
+     "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json + https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html"
+    },
+    "os": {
+     "type": "gp3",
+     "size_gib": 100
+    }
+   },
+   "object_storage": {
+    "name": "Amazon S3 Standard",
+    "gb_month": 0.023,
+    "verified": true,
+    "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/us-east-1/index.json",
+    "s3_compatible": true,
+    "s3_endpoint": "https://s3.<region>.amazonaws.com"
+   },
+   "load_balancer": {
+    "name": "ALB (app) + NLB (ingest)",
+    "usd_hour": 0.0225,
+    "usd_per_gb_processed": 0.006,
+    "verified": false,
+    "note": "NLB hourly and LCU price verified ($0.0225/h, $0.006/LCU-h, 1 LCU ~ 1 GB/h processed); the ALB is priced at the NLB rate here and is unverified",
+    "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AWSELB/current/us-east-1/index.json"
+   },
+   "inter_zone": {
+    "usd_per_gb": 0.01,
+    "both_directions": true,
+    "verified": false,
+    "note": "rate verified ($0.01/GB, DataTransfer-Regional-Bytes); billing on both sides is the common reading but was not confirmed from a fetched page",
+    "source": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AWSDataTransfer/current/us-east-1/index.json"
+   }
+  },
+  "azure": {
+   "region": "eastus",
+   "zones": [
+    "1",
+    "2",
+    "3"
+   ],
+   "families": {
+    "clickhouse": {
+     "family": "Ebdsv5",
+     "disk": "premium-ssd-v2",
+     "skus": [
+      {
+       "name": "Standard_E4bds_v5",
+       "vcpu": 4,
+       "mem_gib": 32,
+       "usd_hour": 0.334,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_E8bds_v5",
+       "vcpu": 8,
+       "mem_gib": 64,
+       "usd_hour": 0.668,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_E16bds_v5",
+       "vcpu": 16,
+       "mem_gib": 128,
+       "usd_hour": 1.336,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_E32bds_v5",
+       "vcpu": 32,
+       "mem_gib": 256,
+       "usd_hour": 2.672,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_E48bds_v5",
+       "vcpu": 48,
+       "mem_gib": 384,
+       "usd_hour": 4.008,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_E64bds_v5",
+       "vcpu": 64,
+       "mem_gib": 512,
+       "usd_hour": 5.344,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      }
+     ]
+    },
+    "clickhouse_local": {
+     "family": "Lsv3",
+     "disk": "local NVMe",
+     "skus": [
+      {
+       "name": "Standard_L8s_v3",
+       "vcpu": 8,
+       "mem_gib": 64,
+       "usd_hour": 0.696,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages",
+       "local_nvme_gb": 1920
+      },
+      {
+       "name": "Standard_L16s_v3",
+       "vcpu": 16,
+       "mem_gib": 128,
+       "usd_hour": 1.392,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages",
+       "local_nvme_gb": 3840
+      },
+      {
+       "name": "Standard_L32s_v3",
+       "vcpu": 32,
+       "mem_gib": 256,
+       "usd_hour": 2.784,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages",
+       "local_nvme_gb": 7680
+      },
+      {
+       "name": "Standard_L48s_v3",
+       "vcpu": 48,
+       "mem_gib": 384,
+       "usd_hour": 4.176,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages",
+       "local_nvme_gb": 11520
+      },
+      {
+       "name": "Standard_L64s_v3",
+       "vcpu": 64,
+       "mem_gib": 512,
+       "usd_hour": 5.568,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages",
+       "local_nvme_gb": 15360
+      }
+     ]
+    },
+    "app": {
+     "family": "Fsv2",
+     "disk": "premium-ssd",
+     "skus": [
+      {
+       "name": "Standard_F4s_v2",
+       "vcpu": 4,
+       "mem_gib": 8,
+       "usd_hour": 0.169,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_F8s_v2",
+       "vcpu": 8,
+       "mem_gib": 16,
+       "usd_hour": 0.338,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_F16s_v2",
+       "vcpu": 16,
+       "mem_gib": 32,
+       "usd_hour": 0.677,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_F32s_v2",
+       "vcpu": 32,
+       "mem_gib": 64,
+       "usd_hour": 1.353,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      }
+     ]
+    },
+    "ingest": {
+     "family": "Fsv2",
+     "disk": "premium-ssd",
+     "skus": [
+      {
+       "name": "Standard_F4s_v2",
+       "vcpu": 4,
+       "mem_gib": 8,
+       "usd_hour": 0.169,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_F8s_v2",
+       "vcpu": 8,
+       "mem_gib": 16,
+       "usd_hour": 0.338,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_F16s_v2",
+       "vcpu": 16,
+       "mem_gib": 32,
+       "usd_hour": 0.677,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_F32s_v2",
+       "vcpu": 32,
+       "mem_gib": 64,
+       "usd_hour": 1.353,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      }
+     ]
+    },
+    "control": {
+     "family": "Dsv5",
+     "disk": "premium-ssd-v2",
+     "skus": [
+      {
+       "name": "Standard_D2s_v5",
+       "vcpu": 2,
+       "mem_gib": 8,
+       "usd_hour": 0.096,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_D4s_v5",
+       "vcpu": 4,
+       "mem_gib": 16,
+       "usd_hour": 0.192,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_D8s_v5",
+       "vcpu": 8,
+       "mem_gib": 32,
+       "usd_hour": 0.384,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      },
+      {
+       "name": "Standard_D16s_v5",
+       "vcpu": 16,
+       "mem_gib": 64,
+       "usd_hour": 0.768,
+       "verified": true,
+       "source": "https://prices.azure.com/api/retail/prices + Microsoft Learn size pages"
+      }
+     ]
+    }
+   },
+   "disks": {
+    "premium-ssd-v2": {
+     "gb_month": 0.0803,
+     "iops_month": 0.00511,
+     "mbps_month": 0.04015,
+     "free_iops": 3000,
+     "free_mbps": 125,
+     "max_gib": 65536,
+     "max_iops": 80000,
+     "max_mbps": 1200,
+     "verified": true,
+     "note": "zonal VMs only in eastus; never an OS disk; max IOPS/MBps are the documented per-disk limits and were not re-checked",
+     "source": "https://prices.azure.com/api/retail/prices (Azure Premium SSD v2) + https://learn.microsoft.com/azure/virtual-machines/disks-deploy-premium-v2"
+    },
+    "premium-ssd": {
+     "fixed": {
+      "P10": {
+       "size_gib": 128,
+       "month": 19.71
+      }
+     },
+     "verified": true,
+     "note": "Premium SSD (v1) P10 128 GiB LRS; Fsv2 is used with Premium SSD v1 because its size page lists no Premium SSD v2 support",
+     "source": "https://prices.azure.com/api/retail/prices (Premium SSD Managed Disks, P10 LRS)"
+    },
+    "os": {
+     "type": "premium-ssd",
+     "size_gib": 128
+    }
+   },
+   "object_storage": {
+    "name": "Azure Blob Storage Hot LRS",
+    "gb_month": 0.0208,
+    "verified": true,
+    "source": "https://prices.azure.com/api/retail/prices (General Block Blob v2, Hot LRS)",
+    "s3_compatible": false,
+    "note": "Blob Storage has no S3 API; nano tiering and backups speak S3, so on Azure use RustFS on managed disks or an external S3-compatible store; the Blob price is a placeholder"
+   },
+   "load_balancer": {
+    "name": "Application Gateway v2 (app) + Standard Load Balancer",
+    "usd_hour": 0.025,
+    "usd_per_gb_processed": 0.005,
+    "verified": false,
+    "note": "Standard Load Balancer rule-hour and per-GB price verified; Application Gateway v2 is not priced here (unverified, typically more)",
+    "source": "https://prices.azure.com/api/retail/prices (Load Balancer, Standard)"
+   },
+   "inter_zone": {
+    "usd_per_gb": 0.01,
+    "both_directions": true,
+    "verified": false,
+    "note": "the Retail Prices API still lists $0.01/GB in and out between zones; Microsoft has said it would not bill inter-AZ transfer; worst case shown",
+    "source": "https://prices.azure.com/api/retail/prices (Bandwidth, Standard Inter-Availability Zone Data Transfer)"
+   }
+  },
+  "gcp": {
+   "region": "us-central1",
+   "zones": [
+    "us-central1-a",
+    "us-central1-b",
+    "us-central1-c"
+   ],
+   "families": {
+    "clickhouse": {
+     "family": "n2-highmem",
+     "disk": "pd-ssd",
+     "skus": [
+      {
+       "name": "n2-highmem-4",
+       "vcpu": 4,
+       "mem_gib": 32,
+       "usd_hour": 0.262,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "n2-highmem-8",
+       "vcpu": 8,
+       "mem_gib": 64,
+       "usd_hour": 0.5241,
+       "verified": true,
+       "source": "https://gcloud-compute.com/n2-highmem-8.html"
+      },
+      {
+       "name": "n2-highmem-16",
+       "vcpu": 16,
+       "mem_gib": 128,
+       "usd_hour": 1.0481,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "n2-highmem-32",
+       "vcpu": 32,
+       "mem_gib": 256,
+       "usd_hour": 2.0962,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "n2-highmem-48",
+       "vcpu": 48,
+       "mem_gib": 384,
+       "usd_hour": 3.1443,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "n2-highmem-64",
+       "vcpu": 64,
+       "mem_gib": 512,
+       "usd_hour": 4.1924,
+       "verified": true,
+       "source": "https://gcloud-compute.com/n2-highmem-64.html"
+      }
+     ]
+    },
+    "app": {
+     "family": "c3-standard",
+     "disk": "pd-balanced",
+     "skus": [
+      {
+       "name": "c3-standard-4",
+       "vcpu": 4,
+       "mem_gib": 16,
+       "usd_hour": 0.2016,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "c3-standard-8",
+       "vcpu": 8,
+       "mem_gib": 32,
+       "usd_hour": 0.4032,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "c3-standard-22",
+       "vcpu": 22,
+       "mem_gib": 88,
+       "usd_hour": 1.1088,
+       "verified": true,
+       "source": "https://gcloud-compute.com/c3-standard-22.html"
+      },
+      {
+       "name": "c3-standard-44",
+       "vcpu": 44,
+       "mem_gib": 176,
+       "usd_hour": 2.2177,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      }
+     ]
+    },
+    "ingest": {
+     "family": "c3-standard",
+     "disk": "pd-balanced",
+     "skus": [
+      {
+       "name": "c3-standard-4",
+       "vcpu": 4,
+       "mem_gib": 16,
+       "usd_hour": 0.2016,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "c3-standard-8",
+       "vcpu": 8,
+       "mem_gib": 32,
+       "usd_hour": 0.4032,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "c3-standard-22",
+       "vcpu": 22,
+       "mem_gib": 88,
+       "usd_hour": 1.1088,
+       "verified": true,
+       "source": "https://gcloud-compute.com/c3-standard-22.html"
+      },
+      {
+       "name": "c3-standard-44",
+       "vcpu": 44,
+       "mem_gib": 176,
+       "usd_hour": 2.2177,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      }
+     ]
+    },
+    "control": {
+     "family": "n2-standard",
+     "disk": "pd-ssd",
+     "skus": [
+      {
+       "name": "n2-standard-2",
+       "vcpu": 2,
+       "mem_gib": 8,
+       "usd_hour": 0.0971,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "n2-standard-4",
+       "vcpu": 4,
+       "mem_gib": 16,
+       "usd_hour": 0.1942,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      },
+      {
+       "name": "n2-standard-8",
+       "vcpu": 8,
+       "mem_gib": 32,
+       "usd_hour": 0.3885,
+       "verified": true,
+       "source": "https://gcloud-compute.com/n2-standard-8.html"
+      },
+      {
+       "name": "n2-standard-16",
+       "vcpu": 16,
+       "mem_gib": 64,
+       "usd_hour": 0.7769,
+       "verified": false,
+       "source": "derived from N2/C3 per-vCPU and per-GiB us-central1 rates that reproduce the fetched prices to 4 decimals; vCPU/memory from https://cloud.google.com/compute/docs/general-purpose-machines"
+      }
+     ]
+    }
+   },
+   "disks": {
+    "pd-ssd": {
+     "gb_month": 0.17,
+     "max_gib": 65536,
+     "verified": true,
+     "note": "performance scales with size (no separate IOPS charge)",
+     "source": "https://cloud.google.com/compute/disks-image-pricing"
+    },
+    "pd-balanced": {
+     "gb_month": 0.1,
+     "max_gib": 65536,
+     "verified": true,
+     "source": "https://cloud.google.com/compute/disks-image-pricing"
+    },
+    "os": {
+     "type": "pd-balanced",
+     "size_gib": 100
+    }
+   },
+   "object_storage": {
+    "name": "Cloud Storage Standard (regional)",
+    "gb_month": 0.02,
+    "verified": true,
+    "source": "https://cloud.google.com/storage/pricing",
+    "s3_compatible": true,
+    "s3_endpoint": "https://storage.googleapis.com",
+    "note": "S3-compatible XML API with HMAC keys"
+   },
+   "load_balancer": {
+    "name": "external Application LB (app) + passthrough Network LB (ingest)",
+    "usd_hour": 0.025,
+    "usd_per_gb_processed": 0.008,
+    "verified": true,
+    "note": "forwarding rule $0.025/h (first 5); Application LB data processing $0.008/GiB, applied to all ingest bytes as an upper bound",
+    "source": "https://cloud.google.com/load-balancing/pricing"
+   },
+   "inter_zone": {
+    "usd_per_gb": 0.01,
+    "both_directions": false,
+    "verified": true,
+    "source": "https://cloud.google.com/vpc/network-pricing"
+   },
+   "lb_trusted_proxy_cidrs": [
+    "130.211.0.0/22",
+    "35.191.0.0/16"
+   ],
+   "lb_trusted_proxy_note": "Google Front End and health-check source ranges; add the load balancer's own address as /32 (it is appended to X-Forwarded-For)"
+  }
+ }
+}

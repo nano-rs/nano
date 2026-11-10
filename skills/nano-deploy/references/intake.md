@@ -13,6 +13,10 @@ that holds it.
      accept ingest. The app and PostgreSQL run on one host, so they are not
      HA, and ingest also pauses while that host is down.
    - **Kubernetes (Helm)**: an existing cluster the operator runs.
+   - **N VMs, full HA** ("deploy to 8 VMs", "…in AWS / Azure / GCP"): losing
+     any one VM takes nothing down (nano 2.0.7+). With existing VMs the planner
+     lays the roles out on them; in a cloud it can also pick the VMs. Ask
+     section E too, then follow [cloud-vm.md](cloud-vm.md).
 2. Expected volume: events per second (EPS) and/or GB per day of raw logs.
    If they know only one, `scripts/size.py` estimates the other (1 KB/event by
    default; ask about the average event size if they know it).
@@ -84,6 +88,38 @@ or from your nano contact while the portal delivery is rolling out.
 6. Backup: where the backup operator key will live (off the nano hosts) and
    the backup destination.
 
+## E. N VMs, full HA
+
+1. Do the VMs exist already? If so, for each one: name, private address,
+   vCPU, RAM, the size of the filesystem for `/var/lib/docker`, and what fails
+   with it (zone, rack or hypervisor host). Spot or preemptible VMs: say so.
+   If they are to be created: the cloud and region (AWS, Azure or GCP; three
+   availability zones are needed).
+2. How users and log senders reach nano: a managed cloud load balancer, two
+   HAProxy hosts with a floating address (needs VRRP and one L2 network), or
+   one HAProxy host (a single point of failure at the edge, for example when
+   there is no managed LB and no VRRP). The LB hosts' private addresses.
+3. Average event size, if known (EDR JSON is often ~2.3 KB; the default is
+   1 KB). Ask which sources dominate the volume.
+4. Retention split: how many days must be fast to search (hot, on local
+   disk), and how many may live in object storage (cold). Default: the planner
+   keeps as much hot as fits.
+5. How many analysts search at the same time of day.
+6. Limits: a maximum VM count, a monthly budget, or instance families their
+   organisation has approved or reserved. A limit never removes HA: if it is
+   too tight, the planner refuses and you explain why.
+7. Who creates cloud resources: you, with the operator's logged-in CLI
+   (`aws` / `az` / `gcloud`), or their own team or Terraform. Never ask for
+   cloud keys.
+8. Existing network: a VPC/VNet to reuse and its CIDR (default plan
+   `10.40.0.0/16`), DNS zone for the two hostnames, TLS certificates (ACM, Key
+   Vault or Google-managed for the public names), a management CIDR for SSH.
+9. Object storage for the cold tier and backups: the cloud's S3-compatible
+   store (S3, Cloud Storage), RustFS, or none (all retention local). On Azure,
+   Blob has no S3 API: RustFS or an external S3-compatible store.
+10. The nano release they will install. Full HA needs 2.0.7 or newer
+    ([known-issues.md](known-issues.md)).
+
 ## Intake record
 
 Write this to `./nano-deploy-work/intake.md`. It holds no secret values, only
@@ -91,7 +127,7 @@ paths to them:
 
 ```markdown
 # nano Self-run intake: <deployment name>
-- topology: single | ha3 | helm
+- topology: single | ha3 | helm | n-vm (existing hosts.txt | aws | azure | gcp; region, max VMs, budget, LB)
 - version: 2.0.x   bundle: <path or url>   sha256: <hex>
 - volume: <eps> EPS, <gb> GB/day, retention <days> d, 12-month growth <x>
 - hosts:

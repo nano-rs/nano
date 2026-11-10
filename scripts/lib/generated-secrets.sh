@@ -80,13 +80,18 @@ nano_cluster_shared_secret_keys() {
         NANO_VECTOR_TAP_TOKEN \
         NANO_KEEPER_PASSWORD \
         NANO_KEEPER_SUPER_DIGEST \
-        NANO_VECTOR_CONFIG_DELIVERY_TOKEN
+        NANO_VECTOR_CONFIG_DELIVERY_TOKEN \
+        NANO_PG_REPLICATION_PASSWORD \
+        NANO_PATRONI_API_PASSWORD
 }
 
 # Cluster-shared keys added after v2.0.0. A role host missing one warns
 # instead of failing; see the contract above.
 nano_transitional_secret_keys() {
-    printf '%s\n' NANO_VECTOR_CONFIG_DELIVERY_TOKEN
+    # NAN-5214: the PostgreSQL HA credentials are generated once by the
+    # canonical app host. Only HA services read them (and refuse to start
+    # without them), so an older copied .env warns instead of failing.
+    printf '%s\n' NANO_VECTOR_CONFIG_DELIVERY_TOKEN NANO_PG_REPLICATION_PASSWORD NANO_PATRONI_API_PASSWORD
 }
 
 nano_secret_is_transitional() {

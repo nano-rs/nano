@@ -460,6 +460,12 @@ impl NotebookRepository {
     /// notebook merely because `case_id IS NOT NULL`, ignoring case
     /// visibility. The case-linked branch now requires the same visibility
     /// the case itself enforces.
+    ///
+    /// NAN-5229: `visibility` is owner-only and only on a standalone
+    /// notebook — a linked notebook's access is governed by its case. Edit
+    /// shares and case collaborators keep title/summary/status edits, but a
+    /// request from them that carries `visibility` matches no row and fails
+    /// with `AccessDenied` (403) instead of being applied or silently dropped.
     pub async fn update_owned(
         &self,
         id: Uuid,
@@ -489,7 +495,9 @@ impl NotebookRepository {
                   LEFT JOIN user_groups ug ON ug.group_id = ns.shared_with_group_id AND ug.user_id = $2
                   WHERE ns.notebook_id = n.id AND ns.permission = 'edit'
                     AND (ns.shared_with_user_id = $2 OR ug.user_id IS NOT NULL)
-              )) RETURNING n.*
+              ))
+              AND ($4::text IS NULL OR (n.owner_id = $2 AND n.case_id IS NULL))
+              RETURNING n.*
         "#, visible = notebook_visible_to_user_at(2, viewer.deny_param(7)));
         let mut query = sqlx::query_as::<_, Notebook>(&sql)
             .bind(id).bind(viewer.user_id()).bind(&update.title).bind(visibility).bind(status).bind(&update.summary);

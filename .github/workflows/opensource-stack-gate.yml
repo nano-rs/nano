@@ -39,6 +39,10 @@ on:
       - scripts/tests/resource-sizing.test.sh
       - scripts/tests/clickhouse-sizing-mount.test.sh
       - scripts/tests/fixtures/resource-sizing.snap
+      - skills/nano-deploy/**
+      - scripts/tests/nano_deploy_plan_support.py
+      - scripts/tests/test_nano_deploy_plan*.py
+      - scripts/tests/fixtures/nano-deploy-plan/**
       - scripts/check-opencore-web-build.sh
       - docker-compose.yml
       - docker-compose.tls.yml
@@ -142,6 +146,20 @@ jobs:
             bash scripts/tests/clickhouse-sizing-mount.test.sh
           else
             echo "resource-sizing tests not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5216: the nano-deploy cloud planner. Its inventories must pass the
+      # renderer's validation, its overrides must pass resource-sizing.sh, and
+      # its vendored port matrix must equal the renderer's, so a change to
+      # deploy/compose or the sizing helper re-runs this. Offline, no cloud calls.
+      - name: nano-deploy cloud planner
+        run: |
+          if [ -f scripts/tests/test_nano_deploy_plan.py ]; then
+            python3 -I scripts/tests/test_nano_deploy_plan.py -v
+            python3 -I scripts/tests/test_nano_deploy_plan_ha.py -v
+            python3 -I scripts/tests/test_nano_deploy_plan_inventory.py -v
+          else
+            echo "nano-deploy planner tests not in this tree (public mirror); skipping"
           fi
 
       # Security review 2026-11-08 (NAN-5008/NAN-5038): the full published-port

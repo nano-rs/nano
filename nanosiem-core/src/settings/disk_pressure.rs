@@ -62,6 +62,34 @@ fn all_replicas_system(table: &str) -> String {
     }
 }
 
+/// NAN-5215: settings for every read that goes through
+/// [`all_replicas_system`]. A clustered install runs two replicas per shard
+/// and must keep working with one hard-down; without
+/// `skip_unavailable_shards = 1` a single dead replica fails every
+/// `clusterAllReplicas` read, which disables the whole disk-pressure valve on
+/// the healthy nodes.
+///
+/// Why skipping cannot cause a wrong (destructive) decision:
+/// - Disk usage is the max over the nodes that answer. A down node is not
+///   ingesting, so it is not the one filling; the live nodes are judged on
+///   their own disks.
+/// - Partition dates (oldest/newest, which tables hold a date) are
+///   replica-invariant: the down replica's sibling holds the same parts. If a
+///   whole shard is down, the live shards' oldest partition is still a real
+///   partition at least as old as the policy picks, and a table seen only on
+///   the down shard is simply not dropped this round (drops less, never more).
+/// - The DROP itself is `ON CLUSTER`; the returning replica replays it from
+///   the DDL queue, so the cluster converges on the same retention.
+///
+/// Byte sums keep using `cluster(...)` ([`parts_source_dedup`]), which fails
+/// over to a live replica per shard on its own and must not skip a shard.
+fn all_replicas_read_settings(cluster: Option<&str>) -> &'static [(&'static str, &'static str)] {
+    match cluster {
+        Some(_) => &[("skip_unavailable_shards", "1")],
+        None => &[],
+    }
+}
+
 /// `system.parts` source that dedupes replicas to one per shard on a cluster
 /// (`cluster(...)`), so byte sums count each shard exactly once. Plain
 /// `system.parts` on single-node.
@@ -574,6 +602,16 @@ impl DiskPressureService {
         }
     }
 
+    /// Admin client for `clusterAllReplicas` reads: skips a down replica
+    /// (see [`all_replicas_read_settings`]). Never used for DDL.
+    fn all_replicas_reader(&self) -> ClickHouseClient {
+        all_replicas_read_settings(clickhouse_cluster_name().as_deref())
+            .iter()
+            .fold(self.ch_admin.clone(), |client, (name, value)| {
+                client.with_option(*name, *value)
+            })
+    }
+
     /// (policies used by daily tables, every policy volume row, non-Local
     /// disks), read from every node (`clusterAllReplicas`) so detection is not
     /// blind to the shards the LB'd connection didn't land on (NAN-1728 H1).
@@ -583,7 +621,7 @@ impl DiskPressureService {
         let db = self.database().await?;
         let ch = |e: clickhouse::error::Error| DiskPressureError::ClickHouse(e.to_string());
         let used: Vec<String> = self
-            .ch_admin
+            .all_replicas_reader()
             .query(&used_policies_sql(&all_replicas_system("tables"), &db))
             .fetch_all::<String>()
             .await
@@ -595,7 +633,7 @@ impl DiskPressureService {
             disks: Vec<String>,
         }
         let policies = self
-            .ch_admin
+            .all_replicas_reader()
             .query(&format!(
                 "SELECT DISTINCT policy_name, toUInt64(volume_priority) AS volume_priority, disks FROM {}",
                 all_replicas_system("storage_policies")
@@ -607,7 +645,7 @@ impl DiskPressureService {
             .map(|r| (r.policy_name, r.volume_priority, r.disks))
             .collect();
         let remote_disks: Vec<String> = self
-            .ch_admin
+            .all_replicas_reader()
             .query(&format!(
                 "SELECT DISTINCT name FROM {} WHERE type != 'Local'",
                 all_replicas_system("disks")
@@ -649,7 +687,7 @@ impl DiskPressureService {
             "total_space DESC"
         };
         let row = self
-            .ch_admin
+            .all_replicas_reader()
             .query(&format!(
                 "SELECT total_space, free_space FROM {disks_src} WHERE type = 'Local' AND total_space > 0 ORDER BY {order_by} LIMIT 1"
             ))
@@ -702,7 +740,7 @@ impl DiskPressureService {
             newest: String,
         }
         let row = self
-            .ch_admin
+            .all_replicas_reader()
             .query(&query)
             .fetch_one::<Row>()
             .await
@@ -728,7 +766,7 @@ impl DiskPressureService {
 
     /// Daily tables holding an active part of partition `date` on any node.
     async fn tables_with_partition(&self, date: &str) -> Result<Vec<String>, DiskPressureError> {
-        self.ch_admin
+        self.all_replicas_reader()
             .query(&tables_with_partition_sql(&all_replicas_system("parts"), &self.database().await?))
             .bind(date)
             .fetch_all::<String>()

@@ -1,5 +1,10 @@
 # 3-node HA (Compose role split)
 
+> For N VMs with no single point of failure (nano 2.0.7+: several app hosts,
+> three PostgreSQL members, replicas in different failure domains), lay out the
+> roles with `scripts/plan.py` and follow [cloud-vm.md](cloud-vm.md). It reuses
+> Steps 1–5 below for the bundle, inventory, TLS and `.env`.
+
 Every host runs the same enterprise bundle, the same `inventory.yaml` and the
 same shared `.env`, but starts only its own roles. The authorities are the
 public guides at nano.rs/docs: **High availability** (the load balancer and
@@ -20,8 +25,12 @@ re-owned by Vector), and the install deadlocks
 redundancy.
 
 Plus a TLS-terminating load balancer for both hostnames. The installer allows
-exactly one `app` host and one `postgres` host. ClickHouse replicas, the
-3-member Keeper quorum and several ingest hosts are the HA mechanisms.
+any number of `app` hosts and one, two or three `postgres` hosts. ClickHouse
+replicas, the 3-member Keeper quorum, several ingest hosts, several app hosts
+(NAN-5213) and three postgres hosts (NAN-5214) are the HA mechanisms. See
+[Several app hosts](#several-app-hosts) to keep the UI, search and alerting up
+when an app host is lost, and [postgres-ha.md](postgres-ha.md) for automatic
+PostgreSQL and Valkey failover.
 Before you start, tell the operator what survives (see
 [sizing.md](sizing.md#what-ha-means-here)):
 
@@ -197,11 +206,45 @@ command**. Each run republishes the host's generated tree and recreates only
 its own containers, keeping the named volumes. Never `docker restart` Vector
 alone on an ingest host. Re-run the host's install command instead.
 
+## Several app hosts
+
+Offer this when the operator needs the UI, API, search, detections and
+alerting to survive the loss of an app host. Requirements and rules:
+
+- Two or more hosts with the `app` role; keep `postgres` on a host of its own
+  if the app must survive it. Default private TLS is mandatory (plaintext lab
+  mode is refused).
+- The cluster's shared Valkey runs on the `postgres` host, published on
+  `ports.valkey` (default 6379) behind mutual TLS. Allow it from the app
+  hosts only.
+- Create `.env` on the FIRST app host in the inventory and copy it to every
+  host, the other app hosts included. Other app hosts refuse to create one.
+- Install order: data roles, then the app hosts one at a time (first app host
+  first, never in parallel while debugging), then ingest.
+- LB app backend: every app host on port 80, health check `GET /readyz`
+  (200 while that host's own api and search processes are alive; 503 while an
+  upgrade drains it; shared PG/Valkey/ClickHouse outages never fail it, so a
+  PG failover cannot de-pool every app host), `retries 3`, `option redispatch`,
+  `retry-on conn-failure` (never L7 retry-on: it resends a POST the API may already have applied). No affinity needed.
+- `scripts/nano upgrade` migrates once from the first app host and drains
+  each app host before restarting it: `/readyz` 503, then wait until the edge
+  logs no client request for `NANO_LB_DRAIN_QUIET_SECONDS` (5, at most
+  `NANO_LB_DRAIN_SECONDS` 30). Rejoin needs `NANO_LB_REJOIN_CHECKS` (3)
+  consecutive `/readyz` 200s, then holds `NANO_LB_REJOIN_SECONDS` (60; at
+  least the LB's check interval x rise + one interval) before the next host.
+- Adding an app host to a running cluster: rerun postgres host, existing app
+  host, new app host, ingest hosts, each with `--accept-topology-migration`.
+  Going from one to two app hosts moves Valkey to the postgres host; JWT
+  revocations are carried over, running searches are lost.
+- Verify: `curl -fsS http://<app-host>/readyz` on each app host; exactly one
+  jobs leader (`grep 'Jobs leader elected'` in nano-jobs logs, or one granted
+  advisory lock `classid=20051 objid=1279607108` in `pg_locks`).
+
 ## Load balancer (operator-owned)
 
-Point the app hostname at `nano-1:80`, and the ingest hostname at
-`nano-2:80` and `nano-3:80`. Health-check `GET /healthz`
-everywhere. The load balancer must replace `X-Forwarded-For` with the client
+Point the app hostname at `nano-1:80` (or every app host, health-checked on
+`GET /readyz`, with several app hosts), and the ingest hostname at
+`nano-2:80` and `nano-3:80`. Health-check ingest on `GET /healthz`. The load balancer must replace `X-Forwarded-For` with the client
 address and must not use the PROXY protocol. Use the HAProxy example in the
 High availability guide. Its source address goes in
 `cluster.trusted_proxy_cidrs`. The load balancer itself must be redundant (a

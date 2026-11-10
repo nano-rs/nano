@@ -372,6 +372,26 @@ async fn enforce_user_status(
     }
 }
 
+/// NAN-5214: the JWT revocation denylist (Valkey) could not be read. Refuse
+/// the request with 503 + Retry-After: never 200 for a token that may have
+/// been revoked, and never 401 (the UI would treat a store outage as a
+/// logout).
+pub fn revocation_unavailable_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(AuthErrorResponse {
+            error: "revocation_status_unavailable".to_string(),
+            message: "Session status is temporarily unavailable. Please retry shortly.".to_string(),
+        }),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("2"),
+    );
+    response
+}
+
 /// Main authentication middleware
 ///
 /// Requirements: 8.1, 8.3, 8.4, 8.6
@@ -451,6 +471,9 @@ pub async fn auth_middleware(
                 request.extensions_mut().insert(auth_context);
                 request.extensions_mut().insert(claims);
                 return Ok(next.run(request).await);
+            }
+            Err(nanosiem_core::auth::TokenError::RevocationUnavailable) => {
+                return Err(revocation_unavailable_response());
             }
             Err(e) => {
                 tracing::warn!(error = %e, "JWT validation failed");
@@ -584,6 +607,9 @@ pub async fn auth_middleware(
                 request.extensions_mut().insert(claims);
                 return Ok(next.run(request).await);
             }
+            Err(nanosiem_core::auth::TokenError::RevocationUnavailable) => {
+                return Err(revocation_unavailable_response());
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "Cookie JWT validation failed");
             }
@@ -626,10 +652,12 @@ pub async fn optional_auth_middleware(
 
     // Try JWT token first
     if let Some(token) = extract_bearer_token(&request) {
-        if let Ok(mut claims) = auth_state
-            .token_service
-            .validate_access_token_async(&token)
-            .await
+        let validated = auth_state.token_service.validate_access_token_async(&token).await;
+        // NAN-5214: in HA mode an unreadable denylist is 503, not anonymous.
+        if matches!(validated, Err(nanosiem_core::auth::TokenError::RevocationUnavailable)) {
+            return revocation_unavailable_response();
+        }
+        if let Ok(mut claims) = validated
         {
             // Resolve permissions server-side (not stored in JWT)
             if let Some(ref resolver) = auth_state.permission_resolver {
@@ -756,3 +784,7 @@ mod tests {
     // nanosiem-api-lib (NAN-751) — see `nanosiem-api-lib/src/auth_context.rs`
     // for the test module.
 }
+
+#[cfg(test)]
+#[path = "auth_revocation_tests.rs"]
+mod auth_revocation_tests;

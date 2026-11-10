@@ -638,13 +638,21 @@ def _role_file() -> str:
     if not path.is_file():
         return ""
     try:
+        values: dict[str, str] = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             key, separator, value = line.partition("=")
             if separator and key in {"NANO_ROLE_PROFILES", "COMPOSE_PROFILES"}:
-                return value.strip().strip('"\'')
+                values.setdefault(key, value.strip().strip('"\''))
     except OSError as exc:
         raise BundleError("cannot read .nano-role.env") from exc
-    return ""
+    if values.get("NANO_ROLE_PROFILES"):
+        return values["NANO_ROLE_PROFILES"]
+    # Older role envs carry only COMPOSE_PROFILES. It can also list non-role
+    # profiles (NAN-5213 proxies, NAN-5215 app duties such as backup and
+    # pull-feeds); only the host roles matter here.
+    return ",".join(
+        item.strip() for item in values.get("COMPOSE_PROFILES", "").split(",") if item.strip() in ROLES
+    )
 
 
 def selected_roles(value: str | None = None) -> frozenset[str]:
@@ -666,14 +674,19 @@ _IMAGE_ROLES: dict[str, frozenset[str]] = {
     "connector-runner": frozenset({"app"}),
     "backup": frozenset({"app"}),
     "postgres": frozenset({"postgres"}),
+    # NAN-5214: PostgreSQL HA (Patroni member, etcd DCS, HAProxy routers).
+    "postgres-ha": frozenset({"postgres"}),
+    "etcd": frozenset({"postgres", "keeper"}),
+    "haproxy": frozenset({"app", "ingest", "clickhouse", "postgres", "keeper"}),
     "clickhouse-server": frozenset({"clickhouse"}),
     "clickhouse-keeper": frozenset({"keeper"}),
-    "valkey": frozenset({"app"}),
+    # The shared/HA Valkey and Sentinels live on postgres (and witness Keeper) hosts.
+    "valkey": frozenset({"app", "postgres", "keeper"}),
     # Pre-NAN-5082 releases (legacy N-1 locks) still carry Dragonfly.
     "dragonfly": frozenset({"app"}),
     "vector": frozenset({"ingest"}),
     "curl": frozenset({"ingest"}),
-    "nginx": frozenset({"app", "ingest", "clickhouse"}),
+    "nginx": frozenset({"app", "ingest", "clickhouse", "postgres"}),
     "tenzir": frozenset({"ingest"}),
 }
 

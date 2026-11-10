@@ -306,10 +306,14 @@ impl ClickHouseMigrator {
                     continue;
                 }
                 Err(e) => {
-                    return Err(ClickHouseMigrateError::ClickHouse(format!(
-                        "Failed to execute migration {} statement: {} - Error: {}",
-                        migration.filename, sql, e
-                    )));
+                    // NAN-5215: name any unreachable replica so a pending
+                    // migration blocked by a down replica says so.
+                    return Err(self
+                        .with_unreachable_replicas(ClickHouseMigrateError::ClickHouse(format!(
+                            "Failed to execute migration {} statement: {} - Error: {}",
+                            migration.filename, sql, e
+                        )))
+                        .await);
                 }
             }
         }
@@ -607,11 +611,15 @@ impl ClickHouseMigrator {
                             e
                         );
                     } else {
-                        return Err(ClickHouseMigrateError::ClickHouse(format!(
-                            "Failed to execute init SQL: {} - Error: {}",
-                            crate::text_bounds::prefix_at_most(&sql_stmt, 120),
-                            e
-                        )));
+                        return Err(self
+                            .with_unreachable_replicas(ClickHouseMigrateError::ClickHouse(
+                                format!(
+                                    "Failed to execute init SQL: {} - Error: {}",
+                                    crate::text_bounds::prefix_at_most(&sql_stmt, 120),
+                                    e
+                                ),
+                            ))
+                            .await);
                     }
                 }
             }

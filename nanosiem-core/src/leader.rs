@@ -75,6 +75,13 @@ pub mod lock_ids {
     pub const SIGNAL_PROCESSOR: i64 = 0x4e53_5349_4750;
     /// Disk pressure monitor leader (`NSDISC` in hex).
     pub const DISK_PRESSURE: i64 = 0x4e53_4449_534b;
+    /// Schema migrator (`NSMIGR` in hex). Held for a whole migrator run so
+    /// several app hosts starting at once apply PostgreSQL and ClickHouse
+    /// migrations exactly once, one host at a time (NAN-5213).
+    pub const SCHEMA_MIGRATOR: i64 = 0x4e53_4d49_4752;
+    /// Online licence check-in and usage report (`NSLICN` in hex): only one
+    /// process reports at a time (NAN-5213).
+    pub const LICENSE_USAGE_REPORT: i64 = 0x4e53_4c49_434e;
 }
 
 /// The election's clock. `LEADER_HEARTBEAT_SECS`, `LEADER_HEARTBEAT_TIMEOUT_SECS`,

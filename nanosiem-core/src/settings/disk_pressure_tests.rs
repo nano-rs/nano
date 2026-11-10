@@ -241,3 +241,14 @@ async fn a_candidate_vanishing_after_the_snapshot_is_skipped_not_reported_as_dro
     );
     assert_eq!(*f.parts.lock().unwrap(), vec![TODAY]);
 }
+
+#[test]
+fn all_replica_reads_skip_a_down_replica_only_on_a_cluster() {
+    // NAN-5215: single-node reads are unchanged; cluster reads tolerate one
+    // dead replica instead of disabling the valve.
+    assert!(all_replicas_read_settings(None).is_empty());
+    assert_eq!(
+        all_replicas_read_settings(Some("default")),
+        &[("skip_unavailable_shards", "1")]
+    );
+}

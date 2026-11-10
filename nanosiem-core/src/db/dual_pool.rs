@@ -508,6 +508,39 @@ pub(crate) fn system_processes_source_for_cluster(cluster: Option<&str>) -> &'st
     }
 }
 
+/// NAN-5215: trailing SETTINGS for a read of [`system_processes_source`].
+/// On a cluster the `cluster_processes` view fans out with
+/// `clusterAllReplicas`, which fails outright when any one replica is down;
+/// skipping the dead replica keeps progress, cancel preflight and the stuck-
+/// query watchdog working on the live ones (a down replica runs no queries).
+/// Empty for the single-node `system.processes` source.
+pub fn processes_read_settings(source: &str) -> &'static str {
+    if source == "cluster_processes" {
+        " SETTINGS skip_unavailable_shards = 1"
+    } else {
+        ""
+    }
+}
+
+/// NAN-5215: options for runtime `ON CLUSTER` statements that must not wait
+/// out a hard-down replica (rule views, `KILL QUERY`). The statement returns
+/// once the live hosts have run it, NULL status for the rest, which the
+/// Keeper DDL queue applies when they return. A host that reports an error
+/// still raises it, but a slow live host that fails after the short wait is
+/// NOT reported; callers whose correctness depends on every live replica
+/// (rule views) must verify the result themselves. Empty when `on_cluster`
+/// is empty (single-node).
+pub fn runtime_on_cluster_ddl_options(on_cluster: &str) -> &'static [(&'static str, &'static str)] {
+    if on_cluster.is_empty() {
+        &[]
+    } else {
+        &[
+            ("distributed_ddl_output_mode", "null_status_on_timeout"),
+            ("distributed_ddl_task_timeout", "15"),
+        ]
+    }
+}
+
 /// NAN-1728 (P1) decision (pure, testable): given the current
 /// `CLICKHOUSE_CLUSTER` env value and the cluster name probed from
 /// `system.clusters`, return `Some(name)` when we should SET the env — i.e. the
@@ -1465,6 +1498,24 @@ mod tests {
             clickhouse_error: Some("timeout".to_string()),
         };
         assert!(!unhealthy_ch.is_healthy());
+    }
+
+    #[test]
+    fn cluster_process_reads_and_runtime_ddl_tolerate_a_down_replica() {
+        // NAN-5215
+        assert_eq!(processes_read_settings("system.processes"), "");
+        assert_eq!(
+            processes_read_settings("cluster_processes"),
+            " SETTINGS skip_unavailable_shards = 1"
+        );
+        assert!(runtime_on_cluster_ddl_options("").is_empty());
+        assert_eq!(
+            runtime_on_cluster_ddl_options(" ON CLUSTER `default`"),
+            &[
+                ("distributed_ddl_output_mode", "null_status_on_timeout"),
+                ("distributed_ddl_task_timeout", "15"),
+            ]
+        );
     }
 
     #[test]

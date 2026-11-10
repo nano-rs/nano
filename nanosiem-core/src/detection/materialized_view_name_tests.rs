@@ -52,3 +52,38 @@ fn update_body_cannot_set_the_view_name() {
             .expect("unknown-to-client fields still deserialize");
     assert_eq!(update.materialized_view_name, None);
 }
+
+#[test]
+fn cluster_rule_view_ddl_does_not_wait_out_a_down_replica() {
+    assert!(MaterializedViewGenerator::ddl_settings("").is_empty());
+    assert_eq!(
+        MaterializedViewGenerator::ddl_settings(" ON CLUSTER `default`"),
+        &[
+            ("distributed_ddl_output_mode", "null_status_on_timeout"),
+            ("distributed_ddl_task_timeout", "15"),
+        ]
+    );
+}
+
+#[test]
+fn reachable_replica_catalogs_decide_rule_view_ddl_success() {
+    // NAN-5215: the catalog of every reachable replica, not the DDL status.
+    assert!(MaterializedViewGenerator::view_presence_verified(true, 3, 3));
+    assert!(!MaterializedViewGenerator::view_presence_verified(true, 3, 2));
+    assert!(MaterializedViewGenerator::view_presence_verified(false, 3, 0));
+    assert!(!MaterializedViewGenerator::view_presence_verified(false, 3, 1));
+    assert!(!MaterializedViewGenerator::view_presence_verified(true, 0, 0));
+    assert!(!MaterializedViewGenerator::view_presence_verified(false, 0, 0));
+    assert_eq!(
+        MaterializedViewGenerator::view_presence_sql(
+            "default",
+            "nanosiem",
+            "mv_rt_detection_550e8400e29b41d4a716446655440000"
+        ),
+        "SELECT count() FROM clusterAllReplicas('default', system.tables) WHERE database = 'nanosiem' AND name = 'mv_rt_detection_550e8400e29b41d4a716446655440000' SETTINGS skip_unavailable_shards = 1"
+    );
+    assert_eq!(
+        MaterializedViewGenerator::reachable_replicas_sql("default"),
+        "SELECT count() FROM clusterAllReplicas('default', system.one) SETTINGS skip_unavailable_shards = 1"
+    );
+}

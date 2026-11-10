@@ -106,13 +106,21 @@ def dependency_order(dependencies: dict[str, tuple[str, ...]]) -> tuple[str, ...
 
 ROLE_ORDER = dependency_order(ROLE_DEPENDENCIES)
 APP_SERVICES = (
-    "dragonfly", "clickhouse-proxy", "nano-api", "nano-jobs", "connector-runner",
+    # NAN-5213: valkey-proxy replaces the local dragonfly on a host of a
+    # multi-app-host cluster (the shared Valkey is on the PostgreSQL host).
+    "dragonfly", "valkey-proxy",
+    # NAN-5214: host-local HAProxy routers to the Patroni leader (`postgres`)
+    # and the Sentinel-elected Valkey master (`dragonfly`).
+    "postgres-router", "valkey-router",
+    "clickhouse-proxy", "nano-api", "nano-jobs", "connector-runner",
     "nano-search", "nano-web", "nginx", "app-internal-edge",
     # NAN-5204: the opt-in automatic-backup service runs the api image; a
     # rollout recreates it only when it is running.
     "nano-backup",
 )
-INGEST_SERVICES = ("vector", "vector-config-consumer", "vector-tap", "ingest-edge", "clickhouse-proxy")
+INGEST_SERVICES = (
+    "app-api-proxy", "vector", "vector-config-consumer", "vector-tap", "ingest-edge", "clickhouse-proxy",
+)
 APP_EDGE_SERVICES = ("nginx", "app-internal-edge")
 LEGACY_MANAGED_OTLP_CONFIG_SHA256 = (
     "1a14ffd1d41df60fa7e414593ae430c1bf6e0a3b0ecab0905e322b943b9521a7"
@@ -125,9 +133,15 @@ LEGACY_MANAGED_OTLP_CONFIG_SHA256 = (
 BACKUP_WRITER_SERVICES = ("nano-api", "nano-jobs", "connector-runner")
 BACKUP_MUTATION_CAPABILITY = "/usr/local/share/nano/capabilities/backup-mutation-fence-v1"
 ROLE_SERVICES: dict[str, tuple[str, ...]] = {
-    "keeper": ("keeper",),
+    # NAN-5214: with two postgres hosts the Keeper hosts are the etcd and
+    # Sentinel witnesses.
+    "keeper": ("keeper", "etcd", "valkey-sentinel"),
     "clickhouse": ("clickhouse",),
-    "postgres": ("postgres",),
+    # NAN-5214: the Patroni member, its etcd member and the Sentinel-managed
+    # Valkey member/Sentinel replace postgres / valkey / valkey-edge.
+    "postgres": (
+        "postgres", "postgres-ha", "etcd", "valkey", "valkey-edge", "valkey-ha", "valkey-sentinel",
+    ),
     "migration": ("clickhouse-proxy",),
     "ingest": INGEST_SERVICES,
     "app": APP_SERVICES,
@@ -169,14 +183,19 @@ BUNDLE_IMAGE_ROLES: dict[str, frozenset[str]] = {
     "connector-runner": frozenset({"app"}),
     "backup": frozenset({"app"}),
     "postgres": frozenset({"postgres"}),
+    # NAN-5214: PostgreSQL HA (Patroni member, etcd DCS, HAProxy routers).
+    "postgres-ha": frozenset({"postgres"}),
+    "etcd": frozenset({"postgres", "keeper"}),
+    "haproxy": frozenset({"app", "ingest", "clickhouse", "postgres", "keeper"}),
     "clickhouse-server": frozenset({"clickhouse"}),
     "clickhouse-keeper": frozenset({"keeper"}),
-    "valkey": frozenset({"app"}),
+    # The shared/HA Valkey and Sentinels live on postgres (and witness Keeper) hosts.
+    "valkey": frozenset({"app", "postgres", "keeper"}),
     # Pre-NAN-5082 releases (legacy N-1 locks) still carry Dragonfly.
     "dragonfly": frozenset({"app"}),
     "vector": frozenset({"ingest"}),
     "curl": frozenset({"ingest"}),
-    "nginx": frozenset({"app", "ingest", "clickhouse"}),
+    "nginx": frozenset({"app", "ingest", "clickhouse", "postgres"}),
     "tenzir": frozenset({"ingest"}),
 }
 INSTALL_OPERATION_RESERVE_BYTES = 256 * 1024**2
@@ -1458,6 +1477,9 @@ class LocalOps:
         self.roles = frozenset(filter(None, self.role_env.get("NANO_ROLE_PROFILES", "").split(",")))
         if not self.roles:
             self.roles = frozenset({"clickhouse", "postgres", "ingest", "app"})
+        # NAN-5214: a Patroni member when the inventory has 2+ postgres hosts.
+        self.pg_ha = self.role_env.get("NANO_POSTGRES_HA") == "true"
+        self.pg_service = "postgres-ha" if self.pg_ha else "postgres"
         self.host_name = self.role_env.get("NANO_HOST_NAME", "single")
         if self.legacy_layout is not None:
             self.edition = self.legacy_layout.edition
@@ -1618,9 +1640,41 @@ class LocalOps:
         ]
         return (actionable[-1] if actionable else f"process exited {result.returncode}")[:500]
 
+    def _configured_services(self) -> set[str]:
+        """Services this host's Compose project actually runs.
+
+        NAN-5213: a multi-app host keeps the `dragonfly` service defined but
+        scaled to zero (`deploy.replicas: 0`, the shared Valkey replaces it);
+        `config --services` still lists it, which would make preflight probe
+        and post-verify wait for a container that never exists.
+        """
+        result = self.compose(["config", "--format", "json"], timeout=30)
+        try:
+            services = json.loads(result.stdout).get("services")
+        except (ValueError, AttributeError):
+            services = None
+        if not isinstance(services, dict):
+            # Not JSON (an older Compose): treat the output as a name list.
+            return set(result.stdout.split())
+        active: set[str] = set()
+        for name, spec in services.items():
+            replicas = None
+            if isinstance(spec, dict):
+                deploy = spec.get("deploy")
+                if isinstance(deploy, dict):
+                    replicas = deploy.get("replicas")
+                if replicas is None:
+                    replicas = spec.get("scale")
+            try:
+                if replicas is not None and int(replicas) == 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            active.add(str(name))
+        return active
+
     def _service_exists(self, service: str) -> bool:
-        result = self.compose(["config", "--services"], timeout=30)
-        return service in result.stdout.split()
+        return service in self._configured_services()
 
     def _running_services(self, candidates: Iterable[str]) -> list[str]:
         allowed = list(dict.fromkeys(candidates))
@@ -1800,7 +1854,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         user = self.env.get("POSTGRES_USER", "nanosiem")
         database = self.env.get("POSTGRES_DB", "nanosiem")
         result = self.compose(
-            ["exec", "-T", "postgres", "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", database, "-At", "-F", "\t", "-c", query],
+            ["exec", "-T", self.pg_service, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", database, "-At", "-F", "\t", "-c", query],
             timeout=timeout,
         )
         return result.stdout.strip()
@@ -1909,7 +1963,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
 
     def _docker_filesystem_space(self) -> FilesystemSpace:
         root = self._docker_root_dir()
-        services = set(self.compose(["config", "--services"], timeout=30).stdout.split())
+        services = self._configured_services()
         probe = next((
             service
             for service in (*APP_SERVICES, *INGEST_SERVICES, "postgres", "clickhouse", "keeper")
@@ -1936,7 +1990,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             )
             stores["postgres"] = DatabaseStorage(
                 "postgres", int(raw),
-                self._service_filesystem_space("postgres", data_path),
+                self._service_filesystem_space(self.pg_service, data_path),
             )
         if "clickhouse" in self.roles:
             raw = self._ch_query(
@@ -3717,6 +3771,102 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
             raise UpgradeError(f"{variable} must name an absolute executable")
         self.runner.run([str(path), self.host_name], timeout=120)
 
+    def _env_seconds(self, name: str, default: int, maximum: int = 3600) -> int:
+        raw = os.environ.get(name, "")
+        try:
+            value = int(raw) if raw.strip() else default
+        except ValueError as error:
+            raise UpgradeError(f"{name} must be a whole number of seconds") from error
+        return max(0, min(value, maximum))
+
+    def _edge_readyz_status(self) -> str:
+        """HTTP status of this app host's own load-balancer health check."""
+        result = self.compose(
+            [
+                "exec", "-T", "nginx", "sh", "-c",
+                "wget -S -O /dev/null http://127.0.0.1:80/readyz 2>&1 "
+                "| awk '/^ *HTTP\\//{code=$2} END{print code}'",
+            ],
+            timeout=30, check=False,
+        )
+        return result.stdout.strip()
+
+    def _edge_client_requests_since(self, since: str) -> int:
+        """Client requests the app edge logged since `since` (RFC 3339).
+
+        The LB's /readyz checks are not logged, so any request line here is
+        traffic the load balancer (or a direct client) still sends this host.
+        """
+        result = self.compose(
+            ["logs", "--no-color", "--since", since, "nginx"], timeout=60, check=False,
+        )
+        return sum(
+            1 for line in result.stdout.splitlines()
+            if re.search(r'"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) /', line)
+            and not re.search(r'"[A-Z]+ /(readyz|healthz|api/health)[ ?]', line)
+        )
+
+    def _drain_app_host(self, selected: Iterable[str]) -> bool:
+        """NAN-5213: take one of several app hosts out of the load balancer.
+
+        The app edge's /readyz (the LB health check) returns 503 while
+        /tmp/nano-drain exists in the nginx container. After proving that,
+        wait until the edge stops receiving client requests for
+        NANO_LB_DRAIN_QUIET_SECONDS (the LB has removed the host), for at most
+        NANO_LB_DRAIN_SECONDS, then restart this host's services. A configured
+        NANO_UPGRADE_LB_DRAIN_COMMAND runs too.
+        """
+        role_env = getattr(self, "role_env", None) or {}
+        if int(role_env.get("NANO_APP_HOST_COUNT", "1") or "1") < 2:
+            return False
+        if "nginx" not in selected:
+            return False
+        self.compose(["exec", "-T", "nginx", "touch", "/tmp/nano-drain"], timeout=60)
+        deadline = time.monotonic() + 30
+        while self._edge_readyz_status() != "503":
+            if time.monotonic() >= deadline:
+                raise UpgradeError("the app edge did not report draining (/readyz 503) within 30s")
+            time.sleep(1)
+        self._lb_hook("drain", False)
+        max_wait = self._env_seconds("NANO_LB_DRAIN_SECONDS", 30)
+        quiet = self._env_seconds("NANO_LB_DRAIN_QUIET_SECONDS", 5)
+        started = last_traffic = time.monotonic()
+        since = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        while time.monotonic() - started < max_wait:
+            time.sleep(1)
+            now_stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if self._edge_client_requests_since(since):
+                last_traffic = time.monotonic()
+            since = now_stamp
+            if time.monotonic() - last_traffic >= quiet:
+                break
+        return True
+
+    def _rejoin_app_host(self) -> None:
+        """Put a drained app host back and let the LB re-admit it.
+
+        /readyz must answer 200 for NANO_LB_REJOIN_CHECKS consecutive checks;
+        then hold NANO_LB_REJOIN_SECONDS (default 60, at least your LB's
+        check interval x rise count) so the coordinator never drains the next
+        app host while this one is still out of the pool.
+        """
+        # A recreated nginx starts without the marker; an unchanged one keeps
+        # it until removed here.
+        self.compose(["exec", "-T", "nginx", "rm", "-f", "/tmp/nano-drain"], timeout=60, check=False)
+        needed = max(1, self._env_seconds("NANO_LB_REJOIN_CHECKS", 3, 100))
+        consecutive = 0
+        deadline = time.monotonic() + 300
+        while consecutive < needed:
+            if time.monotonic() >= deadline:
+                raise UpgradeError("the app edge /readyz did not stay 200 after the restart")
+            consecutive = consecutive + 1 if self._edge_readyz_status() == "200" else 0
+            if consecutive < needed:
+                time.sleep(1)
+        self._lb_hook("rejoin", False)
+        hold = self._env_seconds("NANO_LB_REJOIN_SECONDS", 60)
+        if hold:
+            time.sleep(hold)
+
     def _wait_app_readiness(
         self, services: Iterable[str], timeout: int,
     ) -> dict[str, Any]:
@@ -4085,6 +4235,214 @@ printf 'consumer generation %s ready\n' "$generation"
             "legacy_bridge": True,
         }
 
+    # ---- NAN-5214: PostgreSQL / Valkey HA member operations -------------
+
+    def _patroni_members(self) -> list[dict[str, Any]]:
+        result = self.compose(
+            ["exec", "-T", "postgres-ha", "patronictl", "-c", "/run/patroni/patroni.yml", "list", "-f", "json"],
+            timeout=60,
+        )
+        try:
+            members = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as error:
+            raise UpgradeError("patronictl returned invalid JSON") from error
+        if not isinstance(members, list):
+            raise UpgradeError("patronictl returned an invalid member list")
+        return [member for member in members if isinstance(member, dict)]
+
+    def pg_ha_status(self) -> dict[str, Any]:
+        """This host's Patroni member, the leader, and replica health."""
+        if not self.pg_ha:
+            return {"ha": False, "leader": "postgres" in self.roles}
+        member = self.role_env.get("NANO_HOST_ID", "")
+        members = self._patroni_members()
+        leader = next((m.get("Member") for m in members if m.get("Role") == "Leader"), None)
+        return {
+            "ha": True,
+            "member": member,
+            "leader": leader == member,
+            "leader_member": leader,
+            "members": [
+                {
+                    "member": str(m.get("Member", "")), "role": str(m.get("Role", "")),
+                    "state": str(m.get("State", "")), "lag": m.get("Replay Lag"),
+                }
+                for m in members
+            ],
+        }
+
+    def _wait_patroni_member(self, timeout: int) -> None:
+        """Wait until this member is the running leader or a streaming replica
+        with no replay lag, and the cluster has exactly one leader."""
+        member = self.role_env.get("NANO_HOST_ID", "")
+        deadline = time.monotonic() + timeout
+        last = "unknown"
+        while time.monotonic() < deadline:
+            with contextlib.suppress(UpgradeError):
+                members = self._patroni_members()
+                leaders = [m for m in members if m.get("Role") == "Leader"]
+                mine = next((m for m in members if m.get("Member") == member), None)
+                if mine is not None:
+                    last = f"{mine.get('Role')}/{mine.get('State')} lag={mine.get('Replay Lag')}"
+                if len(leaders) == 1 and mine is not None:
+                    lag = mine.get("Replay Lag", 0)
+                    if mine.get("Role") == "Leader" and mine.get("State") == "running":
+                        return
+                    if mine.get("State") == "streaming" and lag in (0, "0", None):
+                        return
+            time.sleep(2)
+        raise UpgradeError(f"Patroni member {member} did not rejoin within {timeout}s ({last})")
+
+    def _valkey_cli(self, service: str, args: list[str], timeout: int = 30) -> str:
+        return self.compose(
+            ["exec", "-T", service, "valkey-cli", "--tls", "--insecure",
+             "--cert", "/etc/nano/tls/server.crt", "--key", "/etc/nano/tls/server.key",
+             "--raw", *args],
+            timeout=timeout,
+        ).stdout.strip()
+
+    def _move_valkey_master_away(self, timeout: int) -> None:
+        """Before restarting this host's Valkey master, have Sentinel promote
+        a replica, so the restart costs one failover instead of an outage."""
+        if not self._service_exists("valkey-ha"):
+            return
+        info = self._valkey_cli("valkey-ha", ["-p", "6379", "info", "replication"], timeout=30)
+        if "role:master" not in info:
+            return
+        announce = self.role_env.get("NANO_VALKEY_HA_ANNOUNCE", "")
+        sentinels = [item for item in self.role_env.get("NANO_VALKEY_SENTINELS", "").split(",") if item]
+        name = self.role_env.get("NANO_VALKEY_MASTER_NAME", "nano")
+        for target in sentinels:
+            host, _, port = target.rpartition("@")
+            reply = self._valkey_cli(
+                "valkey-ha", ["-h", host, "-p", port, "SENTINEL", "failover", name], timeout=30,
+            ) if host else ""
+            if reply.startswith("OK"):
+                break
+        deadline = time.monotonic() + min(timeout, 120)
+        while time.monotonic() < deadline:
+            for target in sentinels:
+                host, _, port = target.rpartition("@")
+                with contextlib.suppress(UpgradeError):
+                    addr = self._valkey_cli(
+                        "valkey-ha", ["-h", host, "-p", port, "SENTINEL", "get-master-addr-by-name", name],
+                        timeout=15,
+                    ).splitlines()
+                    if len(addr) == 2 and f"{addr[0]}:{addr[1]}" != announce:
+                        return
+            time.sleep(2)
+        raise UpgradeError("Sentinel did not move the Valkey master off this host")
+
+    def _rollout_postgres_ha_member(self, selected: list[str], timeout: int) -> list[str]:
+        """Recreate this host's stateful HA members one at a time.
+
+        The orchestrator calls this for replicas first and switches leadership
+        away from a host before rolling it, so PostgreSQL stays writable.
+        """
+        status = self.pg_ha_status()
+        if status["leader"] and len(status["members"]) > 1:
+            raise UpgradeError(
+                "refusing to recreate the Patroni leader; switch leadership to an upgraded replica first"
+            )
+        if "postgres-ha" in selected:
+            # Before touching anything: a target image of another PostgreSQL
+            # major would leave the member refusing to start.
+            self.postgres_major_check()
+        services: list[str] = []
+        if "etcd" in selected:
+            services += self._up_existing(["etcd"], timeout, exact=True)
+            self._wait_container("etcd", timeout)
+        if "valkey-sentinel" in selected:
+            services += self._up_existing(["valkey-sentinel"], timeout, exact=True)
+            self._wait_container("valkey-sentinel", timeout)
+        if "valkey-ha" in selected:
+            self._move_valkey_master_away(timeout)
+            services += self._up_existing(["valkey-ha"], timeout, exact=True)
+            self._wait_container("valkey-ha", timeout)
+        if "postgres-ha" in selected:
+            services += self._up_existing(["postgres-ha"], timeout, exact=True)
+            self._wait_container("postgres-ha", timeout)
+            self._wait_patroni_member(timeout)
+            self._record_pg_ha_system_id()
+        return services
+
+    def _record_pg_ha_system_id(self) -> None:
+        """Record the cluster's system identifier in the shared .env when
+        absent; refuse when .env names a different cluster (NAN-5214)."""
+        helper = _load_pg_ha_system_id()
+        controldata = self.compose(
+            ["exec", "-T", "postgres-ha", "pg_controldata", "-D", "/var/lib/postgresql/data"],
+            timeout=60, check=False,
+        ).stdout
+        observed = helper.parse_system_id(controldata)
+        if observed is None:
+            return
+        existing = self.env_file.values().get(helper.KEY) or None
+        try:
+            action = helper.decide(existing, observed)
+        except helper.SystemIdConflict as error:
+            raise UpgradeError(f"PostgreSQL HA identity mismatch: {error}") from error
+        if action == "record":
+            self.env_file.replace(helper.KEY, observed)
+            eprint(
+                f"Recorded {helper.KEY}={observed} in .env on {self.host_name}: "
+                "copy the updated .env to every host."
+            )
+
+    def pg_switchover(self, candidate: str, timeout: int) -> dict[str, Any]:
+        """Planned leader change to `candidate` (a streaming, upgraded member)."""
+        safe_name(candidate, "switchover candidate")
+        status = self.pg_ha_status()
+        if not status.get("ha"):
+            raise UpgradeError("switchover needs PostgreSQL HA")
+        leader = status.get("leader_member")
+        if leader == candidate:
+            return {"leader": candidate, "switched": False}
+        self.compose(
+            ["exec", "-T", "postgres-ha", "patronictl", "-c", "/run/patroni/patroni.yml",
+             "switchover", "--leader", str(leader), "--candidate", candidate, "--force"],
+            timeout=min(timeout, 300),
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with contextlib.suppress(UpgradeError):
+                members = self._patroni_members()
+                roles = {m.get("Member"): (m.get("Role"), m.get("State")) for m in members}
+                if roles.get(candidate) == ("Leader", "running") and sum(
+                    1 for role, _ in roles.values() if role == "Leader"
+                ) == 1:
+                    return {"leader": candidate, "switched": True, "previous": leader}
+            time.sleep(2)
+        raise UpgradeError(f"switchover to {candidate} did not complete within {timeout}s")
+
+    def postgres_major_check(self) -> str:
+        """Refuse a PostgreSQL major-version change on an HA member.
+
+        The data directory's PG_VERSION must match the target image's
+        PG_MAJOR; a major upgrade is a documented offline procedure.
+        """
+        if not self.pg_ha or not self._service_exists("postgres-ha"):
+            return "not an HA PostgreSQL member"
+        data_major = self.compose(
+            ["exec", "-T", "postgres-ha", "cat", "/var/lib/postgresql/data/PG_VERSION"], timeout=30,
+        ).stdout.strip()
+        image = self.compose(["config", "--images", "postgres-ha"], timeout=60).stdout.strip().splitlines()
+        target_major = ""
+        if image:
+            inspected = self.runner.run(
+                ["docker", "image", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", image[0]],
+                timeout=30, check=False,
+            )
+            for line in inspected.stdout.splitlines():
+                if line.startswith("PG_MAJOR="):
+                    target_major = line.split("=", 1)[1].strip()
+        if target_major and data_major and target_major != data_major:
+            raise UpgradeError(
+                f"PostgreSQL {data_major} -> {target_major} is a major-version upgrade; "
+                "nano-upgrade refuses it on an HA cluster (see the self-run HA guide)"
+            )
+        return f"PostgreSQL major {data_major or '?'} unchanged"
+
     def rollout(self, role: str, timeout: int, require_lb_hooks: bool = False) -> dict[str, Any]:
         if getattr(self, "_legacy_bridge_rollout", False):
             return self._rollout_legacy_bridge(role, timeout)
@@ -4115,6 +4473,8 @@ printf 'consumer generation %s ready\n' "$generation"
                 self.compose(["up", "-d", "--pull", "never", "clickhouse"], timeout=timeout)
                 self._wait_container("clickhouse", timeout)
                 self._check_clickhouse()
+        elif role == "postgres" and self.pg_ha:
+            services = self._rollout_postgres_ha_member(selected, timeout)
         elif role == "postgres":
             services = self._up_existing(selected, timeout, exact=True)
             if services:
@@ -4164,11 +4524,14 @@ printf 'consumer generation %s ready\n' "$generation"
                 if "ingest-edge" in services:
                     self._lb_hook("rejoin", require_lb_hooks)
         elif role == "app":
+            drained = self._drain_app_host(selected)
             services = self._up_app_services(selected, timeout, exact=True)
             if any(service in APP_EDGE_SERVICES for service in services):
                 dependency_probe = self._wait_app_readiness(services, timeout)
             else:
                 self._wait_services(services, timeout)
+            if drained:
+                self._rejoin_app_host()
         result = {"services": services}
         if role == "app" and any(service in APP_EDGE_SERVICES for service in services):
             result["dependency_probe"] = dependency_probe
@@ -4190,8 +4553,8 @@ printf 'consumer generation %s ready\n' "$generation"
             expected.extend(service for service in APP_SERVICES if self._service_expected(service))
         if "ingest" in self.roles:
             expected.extend(service for service in INGEST_SERVICES if self._service_expected(service))
-        if "postgres" in self.roles and self._service_exists("postgres"):
-            expected.append("postgres")
+        if "postgres" in self.roles and self._service_exists(self.pg_service):
+            expected.append(self.pg_service)
         if "clickhouse" in self.roles and self._service_exists("clickhouse"):
             expected.append("clickhouse")
         if "keeper" in self.roles and self._service_exists("keeper"):
@@ -4459,7 +4822,7 @@ class PgMigrationLock:
         user = self.ops.env.get("POSTGRES_USER", "nanosiem")
         database = self.ops.env.get("POSTGRES_DB", "nanosiem")
         argv = [
-            *self.ops.compose_args, "exec", "-T", "postgres", "psql", "-X", "-qAt",
+            *self.ops.compose_args, "exec", "-T", getattr(self.ops, "pg_service", "postgres"), "psql", "-X", "-qAt",
             "-v", "ON_ERROR_STOP=1", "-U", user, "-d", database,
         ]
         try:
@@ -4606,9 +4969,12 @@ def load_inventory(path: pathlib.Path) -> tuple[list[Node], dict[str, Any]]:
             keeper_id=keeper_id, ssh_user=ssh_user, ssh_port=ssh_port,
             ssh_identity=identity, host_id=host_id,
         ))
-    for role in ("app", "postgres"):
-        if sum(role in node.roles for node in nodes) != 1:
-            raise UpgradeError(f"inventory must contain exactly one {role} host")
+    # NAN-5213: any number of stateless app hosts; still one PostgreSQL host.
+    if not any("app" in node.roles for node in nodes):
+        raise UpgradeError("inventory must contain at least one app host")
+    # NAN-5214: two or three postgres hosts are a Patroni cluster.
+    if sum("postgres" in node.roles for node in nodes) not in (1, 2, 3):
+        raise UpgradeError("inventory must contain one, two or three postgres hosts")
     if not any("ingest" in node.roles for node in nodes) or not any("clickhouse" in node.roles for node in nodes):
         raise UpgradeError("inventory requires ingest and ClickHouse hosts")
     clickhouse_nodes = [node for node in nodes if "clickhouse" in node.roles]
@@ -4817,6 +5183,19 @@ class NodeExecutor:
         if self.local:
             return self.local_ops.ledger()
         return json_object(self._remote("ledger", [], 120), "remote ledger")  # type: ignore[return-value]
+
+    def pg_ha_status(self) -> dict[str, Any]:
+        if self.local:
+            return self.local_ops.pg_ha_status()
+        return json_object(self._remote("pg-ha-status", [], 120), "remote PostgreSQL HA status")
+
+    def pg_switchover(self, candidate: str, timeout: int) -> dict[str, Any]:
+        if self.local:
+            return self.local_ops.pg_switchover(candidate, timeout)
+        return json_object(
+            self._remote("pg-switchover", ["--candidate", candidate, "--timeout", str(timeout)], timeout + 120),
+            "remote PostgreSQL switchover",
+        )
 
     def backup_gate(self, run_id: str, action: str) -> dict[str, Any]:
         if self.local:
@@ -5290,7 +5669,93 @@ def require_bundle_digest(path: pathlib.Path, expected: str) -> None:
         raise UpgradeError("bundle digest differs from the coordinator-verified bundle")
 
 
+# NAN-5214: the current Patroni leader's node name. Every coordinator path that
+# talks to "the PostgreSQL host" (fence, advisory locks, backups, ledger)
+# takes node_sort(nodes, "postgres")[0], so resolving the leader once per
+# command and sorting it first keeps those paths on the writable member.
+PG_PRIMARY_NODE: str | None = None
+
+
+def resolve_pg_primary(nodes: Sequence[Node], executors: dict[str, Any]) -> str | None:
+    """Ask each postgres node's worker which one holds Patroni leadership."""
+    global PG_PRIMARY_NODE
+    postgres = sorted((node for node in nodes if "postgres" in node.roles), key=lambda node: node.name)
+    if len(postgres) <= 1:
+        PG_PRIMARY_NODE = postgres[0].name if postgres else None
+        return PG_PRIMARY_NODE
+    errors: list[str] = []
+    for node in postgres:
+        try:
+            status = executors[node.name].pg_ha_status()
+        except UpgradeError as error:
+            errors.append(f"{node.name}: {error}")
+            continue
+        if status.get("leader"):
+            PG_PRIMARY_NODE = node.name
+            return node.name
+    raise UpgradeError(
+        "no postgres host reports Patroni leadership" + (f" ({'; '.join(errors)})" if errors else "")
+    )
+
+
+def roll_postgres_members(
+    nodes: Sequence[Node],
+    executors: dict[str, Any],
+    journal: Any,
+    state: Any,
+    step: str,
+    timeout: int,
+    action: Callable[[Node], Any],
+    before: Callable[[Node], None] | None = None,
+) -> None:
+    """NAN-5214: apply `action` to every Patroni member, replicas first.
+
+    Before the leader's turn, leadership moves to a streaming (preferably
+    synchronous) member that has already been handled, so PostgreSQL stays
+    writable and a recreate never hits the primary.
+    """
+    members = node_sort(nodes, "postgres")
+    leader_name = resolve_pg_primary(nodes, executors)
+    ordered = [n for n in members if n.name != leader_name] + [n for n in members if n.name == leader_name]
+    for node in ordered:
+        if before is not None:
+            before(node)
+        if node.name == leader_name:
+            def switch(node: Node = node) -> dict[str, Any]:
+                status = executors[node.name].pg_ha_status()
+                if not status.get("leader"):
+                    return {"switched": False, "reason": "no longer the leader"}
+                streaming = [
+                    m for m in status.get("members", [])
+                    if m.get("member") != status.get("member") and m.get("state") == "streaming"
+                ]
+                preferred = [m for m in streaming if m.get("role") == "Sync Standby"] or streaming
+                if not preferred:
+                    raise UpgradeError("no streaming replica can take PostgreSQL leadership")
+                return executors[node.name].pg_switchover(str(preferred[0]["member"]), timeout)
+
+            run_step(journal, state, f"switchover:{step}:{node.name}", switch)
+        run_step(journal, state, f"{step}:postgres:{node.name}", lambda node=node: action(node))
+    resolve_pg_primary(nodes, executors)
+
+
+def _load_pg_ha_system_id() -> Any:
+    """scripts/lib/pg_ha_system_id.py, shared with install.sh (NAN-5214)."""
+    path = pathlib.Path(__file__).resolve().parent / "lib" / "pg_ha_system_id.py"
+    spec = importlib.util.spec_from_file_location("nano_pg_ha_system_id", path)
+    if spec is None or spec.loader is None:
+        raise UpgradeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def node_sort(nodes: Iterable[Node], role: str) -> list[Node]:
+    if role == "postgres" and PG_PRIMARY_NODE is not None:
+        return sorted(
+            (node for node in nodes if role in node.roles),
+            key=lambda node: (node.name != PG_PRIMARY_NODE, node.name),
+        )
     if role == "keeper":
         return sorted((node for node in nodes if role in node.roles), key=lambda node: node.keeper_id or 0)
     if role == "clickhouse":
@@ -5336,8 +5801,8 @@ def backup_components_for(
         node for node in node_sort(nodes, "clickhouse")
         if node.clickhouse_replica == 1
     ]
-    if len(postgres) != 1:
-        raise UpgradeError("consistent backup requires exactly one PostgreSQL host")
+    if not postgres:
+        raise UpgradeError("consistent backup requires a PostgreSQL host")
     shards = {node.clickhouse_shard for node in clickhouse}
     expected = {
         node.clickhouse_shard for node in nodes if "clickhouse" in node.roles
@@ -5463,13 +5928,16 @@ def create_consistent_backup_set(
 
     try:
         if role_split:
-            if len(app_nodes) != 1 or len(postgres_nodes) != 1:
+            if not app_nodes or not postgres_nodes:
                 raise UpgradeError(
-                    "consistent backup requires exactly one app and one PostgreSQL host"
+                    "consistent backup requires at least one app host and a PostgreSQL host"
                 )
-            api_fence_capable = executors[
-                app_nodes[0].name
-            ].api_mutation_fence_capable()
+            # NAN-5213: the PostgreSQL mutation fence is honoured by an API
+            # only if its image has the capability. With several app hosts
+            # every API must have it; otherwise every API is stopped.
+            api_fence_capable = all(
+                executors[node.name].api_mutation_fence_capable() for node in app_nodes
+            )
             for component in components:
                 result = executors[component.node.name].backup_gate(
                     component_gate_id(component), "prepare",
@@ -5525,6 +5993,7 @@ def create_consistent_backup_set(
             emit(
                 "api_mutation_fence_planned", capable=api_fence_capable,
                 node=app_nodes[0].name,
+                nodes=[node.name for node in app_nodes],
                 fallback_stops_api=not api_fence_capable,
             )
             if manual_fence is not None:
@@ -5810,7 +6279,11 @@ def recover_manual_backup_fence(
     for executor, role, services in writers:
         executor.resume_writers(role, timeout, require_lb_hooks, services)
     if value.get("api_fence") is True:
-        executors[postgres_name].set_api_mutation_fence(False, run_id)
+        # NAN-5214: the fence row lives on the PostgreSQL primary, which may
+        # have moved since the journal recorded `postgres_node` (failover or
+        # switchover). Clear it on the current Patroni leader.
+        current = resolve_pg_primary(list(by_name.values()), executors) or postgres_name
+        executors[current].set_api_mutation_fence(False, run_id)
 
     cleanup_errors: list[str] = []
     for executor, gate_run_id, component in gates:
@@ -6024,9 +6497,11 @@ def backup_set_command(args: argparse.Namespace) -> int:
         if recovered:
             eprint("Recovered an incomplete manual backup fence before starting a new backup.")
         identities = validate_backup_runtime_identities(nodes, executors)
+        # NAN-5214: the Patroni leader sorts first (see resolve_pg_primary).
+        resolve_pg_primary(nodes, executors)
         postgres_nodes = node_sort(nodes, "postgres")
-        if len(postgres_nodes) != 1:
-            raise UpgradeError("backup-set requires exactly one PostgreSQL host")
+        if not postgres_nodes:
+            raise UpgradeError("backup-set requires a PostgreSQL host")
         try:
             with executors[postgres_nodes[0].name].upgrade_lock():
                 summary = create_consistent_backup_set(
@@ -6083,9 +6558,11 @@ def abandon_command(args: argparse.Namespace) -> int:
         if not args.remote_install_dir and started.get("remote_install_dir"):
             args.remote_install_dir = str(started["remote_install_dir"])
         nodes, executors, _ = make_executors(args, ops, runner)
+        # NAN-5214: the Patroni leader sorts first (see resolve_pg_primary).
+        resolve_pg_primary(nodes, executors)
         postgres_nodes = node_sort(nodes, "postgres")
-        if len(postgres_nodes) != 1:
-            raise UpgradeError("abandon requires exactly one PostgreSQL host")
+        if not postgres_nodes:
+            raise UpgradeError("abandon requires a PostgreSQL host")
         with executors[postgres_nodes[0].name].upgrade_lock():
             journal.append(
                 state, "run_abandoned", reason=reason, reconciled_by_uid=os.getuid(),
@@ -6263,9 +6740,11 @@ def upgrade_command(args: argparse.Namespace) -> int:
             # ClickHouse snapshot's short internal writer gate, its existing
             # disk buffers absorb traffic. Draining all ingest roles here
             # caused a measured 219-second total HAProxy outage.
+            # NAN-5214: the Patroni leader sorts first (see resolve_pg_primary).
+            resolve_pg_primary(nodes, executors)
             postgres_nodes = node_sort(nodes, "postgres")
-            if len(postgres_nodes) != 1:
-                raise UpgradeError("upgrade requires exactly one PostgreSQL host")
+            if not postgres_nodes:
+                raise UpgradeError("upgrade requires a PostgreSQL host")
             if not args.dry_run:
                 cluster_lease = executors[postgres_nodes[0].name].upgrade_lock()
                 cluster_lease.__enter__()
@@ -6490,9 +6969,13 @@ def upgrade_command(args: argparse.Namespace) -> int:
             for role in ROLE_ORDER:
                 if role == "migration":
                     app_nodes = node_sort(nodes, "app")
+                    # NAN-5214: the migration lock must be held on the leader.
+                    resolve_pg_primary(nodes, executors)
                     postgres_nodes = node_sort(nodes, "postgres")
-                    if len(app_nodes) != 1 or len(postgres_nodes) != 1:
-                        raise UpgradeError("migration requires exactly one app host and one PostgreSQL host")
+                    if not app_nodes or not postgres_nodes:
+                        raise UpgradeError("migration requires an app host and a PostgreSQL host")
+                    # NAN-5213: migrations run once, from the first app host;
+                    # the migrator also holds a cluster-wide PostgreSQL lock.
                     app_node = app_nodes[0]
                     postgres_node = postgres_nodes[0]
                     if app_node.name not in prepared:
@@ -6513,6 +6996,34 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     continue
                 selected_role = "app" if role == "migration" else role
                 selected = node_sort(nodes, selected_role)
+                if role == "postgres" and len(selected) > 1:
+                    # NAN-5214: roll Patroni members replicas first, then move
+                    # leadership to an upgraded replica and roll the old
+                    # leader. The cluster lease is a session on the leader,
+                    # which the switchover ends, so it is re-taken after.
+                    if cluster_lease is not None:
+                        cluster_lease.__exit__(None, None, None)
+                        cluster_lease = None
+                    def prepare_member(node: Node) -> None:
+                        if node.name not in prepared:
+                            run_step(
+                                journal, state, f"prepare:{node.name}",
+                                lambda node=node: executors[node.name].prepare(
+                                    bundle, remote_bundle, source_version, target, run_id,
+                                    bundle_digest,
+                                ),
+                            )
+                            prepared.add(node.name)
+
+                    roll_postgres_members(
+                        nodes, executors, journal, state, "rollout", args.timeout,
+                        lambda node: executors[node.name].rollout("postgres", args.timeout, require_lb_hooks),
+                        before=prepare_member,
+                    )
+                    if not args.dry_run:
+                        cluster_lease = executors[node_sort(nodes, "postgres")[0].name].upgrade_lock()
+                        cluster_lease.__enter__()
+                    continue
                 for node in selected:
                     if node.name not in prepared:
                         run_step(
@@ -6734,9 +7245,11 @@ def rollback_command(args: argparse.Namespace) -> int:
             return 3
         if any(not check.passed for check in checks):
             raise UpgradeError("rollback preflight failed; no installation state was changed")
+        # NAN-5214: the Patroni leader sorts first (see resolve_pg_primary).
+        resolve_pg_primary(nodes, executors)
         postgres_nodes = node_sort(nodes, "postgres")
-        if len(postgres_nodes) != 1:
-            raise UpgradeError("rollback requires exactly one PostgreSQL host")
+        if not postgres_nodes:
+            raise UpgradeError("rollback requires a PostgreSQL host")
         require_lb_hooks = sum("ingest" in node.roles for node in nodes) > 1
         try:
             with executors[postgres_nodes[0].name].upgrade_lock():
@@ -6744,6 +7257,14 @@ def rollback_command(args: argparse.Namespace) -> int:
                     journal.append(state, "rollback_started", from_version=target, to_version=previous)
                 for role in reversed(ROLE_ORDER):
                     if role == "migration":
+                        continue
+                    if role == "postgres" and len(node_sort(nodes, role)) > 1:
+                        roll_postgres_members(
+                            nodes, executors, journal, state, "rollback", args.timeout,
+                            lambda node: executors[node.name].rollback(
+                                "postgres", previous, target, args.timeout, require_lb_hooks,
+                            ),
+                        )
                         continue
                     for node in reversed(node_sort(nodes, role)):
                         run_step(
@@ -6799,6 +7320,10 @@ def worker_command(args: argparse.Namespace) -> int:
         ]
     elif args.worker_action == "ledger":
         value = ops.ledger()
+    elif args.worker_action == "pg-ha-status":
+        value = ops.pg_ha_status()
+    elif args.worker_action == "pg-switchover":
+        value = ops.pg_switchover(safe_name(args.candidate, "switchover candidate"), args.timeout)
     elif args.worker_action == "backup-gate":
         value = ops.backup_gate(args.run_id, args.gate_action)
     elif args.worker_action == "api-mutation-capability":
@@ -6942,8 +7467,9 @@ def parser() -> argparse.ArgumentParser:
     rollback.add_argument("--nano-cli", help=argparse.SUPPRESS)
 
     worker = commands.add_parser("_upgrade-worker", help=argparse.SUPPRESS)
-    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "rollback-preflight", "rollback"))
+    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "rollback-preflight", "rollback"))
     worker.add_argument("--install-dir", required=True)
+    worker.add_argument("--candidate", default="")
     worker.add_argument("--bundle")
     worker.add_argument("--expected-bundle-sha256", default="")
     worker.add_argument("--target", default="")

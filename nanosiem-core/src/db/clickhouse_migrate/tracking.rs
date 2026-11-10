@@ -10,6 +10,15 @@ const DATABASE_BOOTSTRAP_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 const DATABASE_BOOTSTRAP_VISIBILITY_POLL: Duration = Duration::from_millis(250);
 const DATABASE_BOOTSTRAP_DDL_OUTPUT_MODE: &str = "throw";
 
+/// Every table `ensure_migrations_table` creates. The NAN-5215 skip check
+/// requires all of them on every reachable replica.
+const TRACKING_TABLES: &[&str] = &[
+    "_migrations",
+    crate::db::migration_refresh::MIGRATION_REFRESH_TABLE,
+    crate::db::future_timestamp_repair::FUTURE_REPAIR_SET_TABLE,
+    crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
+];
+
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct DatabaseBootstrapVisibility {
     visible_nodes: u64,
@@ -102,6 +111,92 @@ impl ClickHouseMigrator {
         }
     }
 
+    /// Execute one tracking-table DDL statement; a failure names the
+    /// unreachable replicas when ON CLUSTER could not finish (NAN-5215).
+    async fn execute_tracking_ddl(&self, sql: &str) -> Result<(), ClickHouseMigrateError> {
+        match self.client.query(sql).execute().await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self
+                .with_unreachable_replicas(ClickHouseMigrateError::ClickHouse(error.to_string()))
+                .await),
+        }
+    }
+
+    /// NAN-5215: the "nothing to ensure" check for an explicit cluster. True
+    /// only when the database and every tracking table exist (and the
+    /// repair-row buffer no longer carries its retired TTL) on EVERY replica
+    /// that answers, with at least the connected one answering. Any probe
+    /// error, a missing object, or a non-cluster topology returns false so
+    /// the caller runs the unchanged bootstrap path.
+    async fn tracking_tables_present_on_reachable_replicas(
+        &self,
+        bootstrap_client: &clickhouse::Client,
+    ) -> bool {
+        let Some(cluster) = self.explicit_cluster_name() else {
+            return false;
+        };
+        let reachability = match Self::probe_reachability(bootstrap_client, cluster).await {
+            Ok(reachability) => reachability,
+            Err(error) => {
+                tracing::debug!("NAN-5215: replica reachability probe failed: {error}");
+                return false;
+            }
+        };
+        let present: u64 = match bootstrap_client
+            .query(&self.tracking_tables_presence_sql(cluster))
+            .fetch_one()
+            .await
+        {
+            Ok(present) => present,
+            Err(error) => {
+                tracing::debug!("NAN-5215: tracking-table presence probe failed: {error}");
+                return false;
+            }
+        };
+        if !super::cluster_reachability::present_on_every_reachable_replica(
+            reachability.reachable_count(),
+            TRACKING_TABLES.len() as u64,
+            present,
+        ) {
+            return false;
+        }
+        if reachability.all_reachable() {
+            tracing::debug!(
+                "Tracking tables present on every replica of '{cluster}'; skipping ON CLUSTER ensure"
+            );
+        } else {
+            tracing::warn!(
+                "NAN-5215: tracking tables present on every reachable replica of '{cluster}' \
+                 ({}); skipping ON CLUSTER ensure. The missing replica catches up from the \
+                 DDL queue when it returns.",
+                reachability.describe()
+            );
+        }
+        true
+    }
+
+    /// Count of tracking tables across the reachable replicas of `cluster`.
+    /// The repair-row buffer counts only once its retired TTL is gone, so a
+    /// pending `REMOVE TTL` still takes the full path.
+    pub(super) fn tracking_tables_presence_sql(&self, cluster: &str) -> String {
+        let cluster = crate::sql_hygiene::escape_sql_string(cluster);
+        let database = crate::sql_hygiene::escape_sql_string(&self.database);
+        let names = TRACKING_TABLES
+            .iter()
+            .map(|name| format!("'{}'", crate::sql_hygiene::escape_sql_string(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ip_rows = crate::sql_hygiene::escape_sql_string(
+            crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
+        );
+        format!(
+            "SELECT count() FROM clusterAllReplicas('{cluster}', system.tables) \
+             WHERE database = '{database}' AND name IN ({names}) \
+             AND NOT (name = '{ip_rows}' AND position(create_table_query, 'TTL') > 0) \
+             SETTINGS skip_unavailable_shards = 1"
+        )
+    }
+
     /// Ensure the _migrations table exists
     pub(super) async fn ensure_migrations_table(&self) -> Result<(), ClickHouseMigrateError> {
         // NAN-811: ensure the target database exists before any statement that
@@ -135,18 +230,42 @@ impl ClickHouseMigrator {
                 "distributed_ddl_output_mode",
                 DATABASE_BOOTSTRAP_DDL_OUTPUT_MODE,
             );
-        bootstrap_client
+
+        // NAN-5215: on an already-bootstrapped explicit cluster this whole
+        // function is a no-op, and its ON CLUSTER statements wait for EVERY
+        // replica. Skip them when every reachable replica already holds the
+        // database and all tracking tables, so one hard-down replica cannot
+        // block the migrator (and the app tier gated on it). The returning
+        // replica replays anything it missed from the Keeper DDL queue. A
+        // blank or partially bootstrapped cluster falls through to the
+        // unchanged all-node path below.
+        if self
+            .tracking_tables_present_on_reachable_replicas(&bootstrap_client)
+            .await
+        {
+            return Ok(());
+        }
+
+        if let Err(error) = bootstrap_client
             .query(&self.database_bootstrap_sql())
             .execute()
             .await
-            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        {
+            return Err(self
+                .with_unreachable_replicas(ClickHouseMigrateError::ClickHouse(error.to_string()))
+                .await);
+        }
         // Keep an explicit all-node visibility assertion after the synchronous
         // ON CLUSTER DDL barrier. Do not let init.sql or `_migrations` rely on
         // implicit observation timing or stale cluster membership on a blank
         // cluster. The non-cluster, implicit-cluster, Replicated-DB, and cloud
         // paths skip this wait and retain their historical statement/ordering.
-        self.wait_for_database_bootstrap_visibility(&bootstrap_client)
-            .await?;
+        if let Err(error) = self
+            .wait_for_database_bootstrap_visibility(&bootstrap_client)
+            .await
+        {
+            return Err(self.with_unreachable_replicas(error).await);
+        }
 
         // Pick the engine + ON CLUSTER form to match the deployment topology.
         // Three modes — same shape as `transform_for_cluster` post-NAN-1092:
@@ -202,11 +321,7 @@ impl ClickHouseMigrator {
             self.database, on_cluster, engine
         );
 
-        self.client
-            .query(&sql)
-            .execute()
-            .await
-            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        self.execute_tracking_ddl(&sql).await?;
 
         // NAN-4977: durable work queue for refreshable-view query changes.
         // It deliberately shares `_migrations`' cluster-global replication
@@ -240,11 +355,7 @@ impl ClickHouseMigrator {
             on_cluster,
             refresh_engine
         );
-        self.client
-            .query(&refresh_sql)
-            .execute()
-            .await
-            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        self.execute_tracking_ddl(&refresh_sql).await?;
 
         // NAN-4939: exact, immutable membership for an operator repair run.
         // This has the same cluster-global topology as `_migrations`, allowing
@@ -273,11 +384,7 @@ impl ClickHouseMigrator {
             on_cluster,
             repair_set_engine
         );
-        self.client
-            .query(&repair_set_sql)
-            .execute()
-            .await
-            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        self.execute_tracking_ddl(&repair_set_sql).await?;
 
         // `ip_enrichments.updated_at` is the ReplacingMergeTree version and
         // ClickHouse therefore forbids ALTER UPDATE on it. A corrected copy has
@@ -317,11 +424,7 @@ impl ClickHouseMigrator {
             on_cluster,
             ip_repair_rows_engine
         );
-        self.client
-            .query(&ip_repair_rows_sql)
-            .execute()
-            .await
-            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        self.execute_tracking_ddl(&ip_repair_rows_sql).await?;
 
         // The buffer becomes the only authoritative tombstone payload after
         // the bad ReplacingMergeTree winner is deleted. It must never expire
@@ -342,16 +445,13 @@ impl ClickHouseMigrator {
             .await
             .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
         if ip_buffer_has_ttl > 0 {
-            self.client
-                .query(&format!(
-                    "ALTER TABLE {}.{}{} REMOVE TTL",
-                    self.database,
-                    crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
-                    on_cluster
-                ))
-                .execute()
-                .await
-                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+            self.execute_tracking_ddl(&format!(
+                "ALTER TABLE {}.{}{} REMOVE TTL",
+                self.database,
+                crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
+                on_cluster
+            ))
+            .await?;
         }
 
         Ok(())

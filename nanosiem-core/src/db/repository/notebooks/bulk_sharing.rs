@@ -75,7 +75,10 @@ impl NotebookRepository {
         let notebook = self.find_by_id_for_user(id, viewer).await?;
         let user_id = viewer.user_id();
 
-        if notebook.owner_id != user_id {
+        // NAN-5229: a case-linked notebook's access is governed by its case;
+        // its visibility and group shares are not writable here (they would
+        // grant nothing while linked, and must not survive an unlink).
+        if notebook.owner_id != user_id || notebook.case_id.is_some() {
             return Err(NotebookRepositoryError::AccessDenied(id));
         }
 

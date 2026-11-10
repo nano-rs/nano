@@ -64,7 +64,17 @@ pub struct LicenseChecker {
     /// check-in. Enterprise-only; never affects admission.
     #[cfg(feature = "enterprise")]
     usage_reporter: Option<super::usage_report::UsageReporter>,
+    /// NAN-5213: with several nano-jobs processes (several app hosts), only
+    /// the jobs leader runs the periodic check-in and usage report. The
+    /// others keep their admission state current from the PostgreSQL cache.
+    leader: Option<(crate::leader::LeaderFence, sqlx::PgPool)>,
+    /// When this process last attempted a check-in.
+    last_attempt: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+/// How often a non-leading checker (or a leader that is not yet due) reloads
+/// the licence status the leader persisted.
+const FOLLOWER_REFRESH_SECS: u64 = 300;
 
 impl LicenseChecker {
     pub fn new(
@@ -85,6 +95,54 @@ impl LicenseChecker {
             license_status,
             #[cfg(feature = "enterprise")]
             usage_reporter: None,
+            leader: None,
+            last_attempt: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// NAN-5213: run the periodic check-in (and its usage report) only while
+    /// `fence` holds the jobs leadership. Every process still completes its
+    /// own boot check-in in [`Self::initialize`].
+    pub fn with_leader_fence(mut self, fence: crate::leader::LeaderFence, pool: sqlx::PgPool) -> Self {
+        if fence.is_armed() {
+            self.leader = Some((fence, pool));
+        }
+        self
+    }
+
+    fn check_in_due(&self, last_checked_at: Option<DateTime<Utc>>) -> bool {
+        let interval = Duration::from_secs(self.config.interval_secs);
+        let local_recent = self
+            .last_attempt
+            .lock()
+            .map(|guard| guard.is_some_and(|at| at.elapsed() < interval))
+            .unwrap_or(false);
+        if local_recent {
+            return false;
+        }
+        // A check-in by another (previous) leader counts too.
+        match last_checked_at {
+            Some(at) => {
+                let age = Utc::now().signed_duration_since(at);
+                age.num_seconds() < 0 || age.num_seconds() as u64 >= self.config.interval_secs
+            }
+            None => true,
+        }
+    }
+
+    async fn run_check_cycle(&self) {
+        if let Err(e) = self.check_license().await {
+            if matches!(e, LicenseCheckError::TokenRejected(_)) {
+                // NAN-5194: already recorded for SIEM Health and the
+                // admin banner; keep retrying under the same bound.
+                tracing::error!(error = %e, "Licence token rejected (will retry next interval)");
+            } else {
+                tracing::warn!(error = %e, "License check failed (will retry next interval)");
+            }
+            // On network failure, keep last known status for transient issues.
+            // But if we haven't reached the license server in STALE_LICENSE_DAYS,
+            // auto-lock to prevent DNS-blocking bypass attacks.
+            self.check_staleness().await;
         }
     }
 
@@ -162,6 +220,9 @@ impl LicenseChecker {
     /// Start the license check loop. Returns a task handle.
     /// Offset by half the interval from heartbeat to spread out requests.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        if self.leader.is_some() {
+            return self.start_leader_gated();
+        }
         tokio::spawn(async move {
             // Offset from heartbeat by half the interval
             let offset = Duration::from_secs(self.config.interval_secs / 2);
@@ -186,6 +247,46 @@ impl LicenseChecker {
                 }
             }
         })
+    }
+
+    /// NAN-5213: poll every [`FOLLOWER_REFRESH_SECS`]. The jobs leader checks
+    /// in once the interval has passed since the last check-in by any
+    /// process; everyone else reloads the status the leader persisted.
+    fn start_leader_gated(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let poll = Duration::from_secs(FOLLOWER_REFRESH_SECS.min(self.config.interval_secs.max(1)));
+            let mut ticker = interval(poll);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some((fence, pool)) = self.leader.as_ref() else {
+                    return;
+                };
+                let leading = fence.epoch().is_some() && fence.still_leader(pool).await;
+                if leading {
+                    let persisted = self.repo.get_status().await.ok().and_then(|s| s.last_checked_at);
+                    if self.check_in_due(persisted) {
+                        self.run_check_cycle().await;
+                        continue;
+                    }
+                }
+                self.refresh_cached_status().await;
+            }
+        })
+    }
+
+    /// Reload the persisted online status without the boot-time logging.
+    async fn refresh_cached_status(&self) {
+        match self.repo.get_status().await {
+            Ok(cached) if !cached.offline && cached.last_checked_at.is_some() => {
+                *self.license_status.write().await = cached.for_online_admission();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(%error, "Licence status refresh failed; keeping the current status");
+            }
+        }
+        self.check_staleness().await;
     }
 
     /// If the license server hasn't been reached in STALE_LICENSE_DAYS, auto-lock.
@@ -226,6 +327,9 @@ impl LicenseChecker {
 
     pub async fn check_license(&self) -> Result<(), LicenseCheckError> {
         tracing::debug!(url = %self.config.license_url, "Checking license status");
+        if let Ok(mut last) = self.last_attempt.lock() {
+            *last = Some(std::time::Instant::now());
+        }
 
         // NAN-5114: report the running version so nano-main can show it on
         // the deployment page and decide who still needs a new-version email.

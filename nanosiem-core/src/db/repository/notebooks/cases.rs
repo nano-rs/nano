@@ -10,6 +10,19 @@ use crate::models::notebook::{Notebook, NotebookSummary, NotebookWithOwner};
 
 use super::{notebook_visible_to_user, NotebookRepository, NotebookRepositoryError};
 
+/// Visibility a notebook takes when it leaves a case (NAN-5228), over alias `n`.
+///
+/// `link_to_case` sets `'public'` because the case ACL is the access control
+/// for a linked notebook; that value must not outlive the link. Explicit
+/// shares still grant access to a standalone notebook, so the label reflects
+/// them (`'shared'`, as `add_share` does); otherwise the notebook is private.
+/// `n.case_id` in a SET expression is the pre-update value, so an "unlink" of
+/// an already-standalone notebook keeps the owner's chosen visibility.
+const UNLINKED_VISIBILITY_SQL: &str = "CASE \
+    WHEN n.case_id IS NULL THEN n.visibility \
+    WHEN EXISTS (SELECT 1 FROM notebook_shares ns WHERE ns.notebook_id = n.id) THEN 'shared' \
+    ELSE 'private' END";
+
 impl NotebookRepository {
     /// Find notebook linked to a case
     pub async fn find_by_case_id(
@@ -119,20 +132,27 @@ impl NotebookRepository {
         Ok(result)
     }
 
-    /// Unlink a notebook from a case (make it a regular notebook again)
+    /// Unlink a notebook from a case (make it a regular notebook again).
+    ///
+    /// NAN-5228: linking forces `visibility = 'public'` because the case ACL
+    /// governs a linked notebook. Unlinking removes that governor, so the
+    /// notebook must not keep the case-era `'public'` — it returns to
+    /// [`UNLINKED_VISIBILITY_SQL`] (`'shared'` when explicit shares remain,
+    /// else `'private'`). The owner can widen it again afterwards.
     pub async fn unlink_from_case(
         &self,
         notebook_id: Uuid,
     ) -> Result<Notebook, NotebookRepositoryError> {
-        let result = sqlx::query_as::<_, Notebook>(
+        let result = sqlx::query_as::<_, Notebook>(&format!(
             r#"
-            UPDATE notebooks SET
+            UPDATE notebooks n SET
                 case_id = NULL,
+                visibility = {UNLINKED_VISIBILITY_SQL},
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE n.id = $1
             RETURNING *
             "#,
-        )
+        ))
         .bind(notebook_id)
         .fetch_optional(&self.pool)
         .await?
@@ -148,20 +168,23 @@ impl NotebookRepository {
     /// link or relink (including standalone → private case, or case A → case B)
     /// changes `case_id`, matches 0 rows, and returns `NotFound`, so the caller
     /// fails closed and an unlink never touches a relationship it never checked.
+    /// Like [`Self::unlink_from_case`], the notebook leaves the case non-public
+    /// (NAN-5228).
     pub async fn unlink_from_case_if(
         &self,
         notebook_id: Uuid,
         expected_case_id: Option<Uuid>,
     ) -> Result<Notebook, NotebookRepositoryError> {
-        sqlx::query_as::<_, Notebook>(
+        sqlx::query_as::<_, Notebook>(&format!(
             r#"
-            UPDATE notebooks SET
+            UPDATE notebooks n SET
                 case_id = NULL,
+                visibility = {UNLINKED_VISIBILITY_SQL},
                 updated_at = NOW()
-            WHERE id = $1 AND case_id IS NOT DISTINCT FROM $2
+            WHERE n.id = $1 AND n.case_id IS NOT DISTINCT FROM $2
             RETURNING *
             "#,
-        )
+        ))
         .bind(notebook_id)
         .bind(expected_case_id)
         .fetch_optional(&self.pool)

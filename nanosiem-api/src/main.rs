@@ -443,10 +443,8 @@ async fn refresh_sovereign_license_status(state: &AppState) {
             }
         }
         Err(error) => {
-            tracing::error!(%error, "C05 authority unavailable; failing closed");
-            let snapshot = nanosiem_api::license_admission::unavailable_snapshot(&error);
-            *state.license_status.write().await = snapshot.cached_status();
-            *state.offline_license_snapshot.write().await = snapshot;
+            tracing::warn!(%error, "C05 authority refresh failed");
+            nanosiem_api::license_admission::record_refresh_failure(&state, &error).await;
         }
     }
 }

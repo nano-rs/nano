@@ -117,15 +117,41 @@ fn refresh_endpoints(value: &str) -> Result<Vec<String>> {
     Ok(endpoints)
 }
 
-fn clustered_refresh_clients(on_cluster: &str) -> Result<Option<Vec<clickhouse::Client>>> {
-    if on_cluster.is_empty() {
-        return Ok(None);
-    }
+/// NAN-5215: per-replica endpoints, one per ClickHouse server in
+/// `(shard, replica)` order, each pinned to exactly that server. The compose
+/// renderer sets it; Helm does not.
+const REPLICA_ENDPOINTS_ENV: &str = "VECTOR_CLICKHOUSE_REPLICA_ENDPOINTS";
+/// One endpoint per shard; the proxy lands each request on ONE replica.
+const SHARD_ENDPOINTS_ENV: &str = "VECTOR_CLICKHOUSE_SHARD_ENDPOINTS";
 
-    let endpoints = refresh_endpoints(
-        &std::env::var("VECTOR_CLICKHOUSE_SHARD_ENDPOINTS")
-            .context("VECTOR_CLICKHOUSE_SHARD_ENDPOINTS is required for clustered view refresh")?,
-    )?;
+/// Where a clustered `SYSTEM REFRESH VIEW` is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefreshTargets {
+    /// Every replica individually. The refreshed views write per-node
+    /// `nano:keep-local-engine` staging tables, so each replica must refresh
+    /// itself; a replica that does not answer is skipped and refreshes on its
+    /// own schedule when it returns.
+    Replicas(Vec<String>),
+    /// Historical fallback (no per-replica endpoints): one request per shard,
+    /// then wait for every replica of the cluster.
+    Shards(Vec<String>),
+}
+
+/// Pick the refresh targets from the two endpoint lists: per-replica
+/// endpoints when configured, else the per-shard ones.
+pub(crate) fn refresh_targets(
+    replica_endpoints: Option<&str>,
+    shard_endpoints: Option<&str>,
+) -> Result<RefreshTargets> {
+    if let Some(replicas) = replica_endpoints.filter(|value| !value.trim().is_empty()) {
+        return Ok(RefreshTargets::Replicas(refresh_endpoints(replicas)?));
+    }
+    let shards = shard_endpoints
+        .context("VECTOR_CLICKHOUSE_SHARD_ENDPOINTS is required for clustered view refresh")?;
+    Ok(RefreshTargets::Shards(refresh_endpoints(shards)?))
+}
+
+fn refresh_client(endpoint: &str) -> clickhouse::Client {
     let runtime_user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "nanosiem".into());
     let runtime_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
     let (user, password) = match (
@@ -136,21 +162,29 @@ fn clustered_refresh_clients(on_cluster: &str) -> Result<Option<Vec<clickhouse::
         _ => (runtime_user, runtime_password),
     };
     let database = std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "nanosiem".into());
-    Ok(Some(
-        endpoints
-            .into_iter()
-            .map(|endpoint| {
-                let mut client = crate::db::clickhouse_transport::client()
-                    .with_url(endpoint)
-                    .with_database(&database)
-                    .with_user(&user);
-                if !password.is_empty() {
-                    client = client.with_password(&password);
-                }
-                client
-            })
-            .collect(),
-    ))
+    let mut client = crate::db::clickhouse_transport::client()
+        .with_url(endpoint)
+        .with_database(&database)
+        .with_user(&user);
+    if !password.is_empty() {
+        client = client.with_password(&password);
+    }
+    client
+}
+
+/// NAN-5215: whether a refresh-endpoint error means "that replica is not
+/// there" rather than "ClickHouse rejected the statement". Connection
+/// failures and timeouts qualify, and so does an HTTP error from the proxy
+/// in front of a dead server (no ClickHouse exception in the body). Any
+/// `Code: N. DB::Exception` came from a live server and is a real failure.
+pub(crate) fn is_unreachable_replica_error(error: &clickhouse::error::Error) -> bool {
+    match error {
+        clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => true,
+        clickhouse::error::Error::BadResponse(body) => {
+            !body.contains("DB::Exception") && !body.contains("Code: ")
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Row, Deserialize)]
@@ -161,9 +195,84 @@ struct RefreshRow {
     error: String,
 }
 
-/// `SYSTEM REFRESH VIEW` (ON CLUSTER when clustered) and wait until every
-/// replica finished a refresh started after the trigger. `ch_admin` must hold
-/// the REFRESH VIEW grant (the runtime user does not).
+/// NAN-5215: the wait probe restricted to the replicas that were triggered,
+/// identified by their `{replica}` macro (unique per server; `getMacro` is
+/// evaluated on each remote server). `skip_unavailable_shards = 1` so a
+/// replica that went down is not fatal to the probe.
+pub(crate) fn triggered_replicas_probe_sql(
+    cluster: &str,
+    db: &str,
+    view: &str,
+    replicas: &[String],
+) -> String {
+    let escape = |value: &str| crate::sql_hygiene::escape_sql_string(value);
+    let names = replicas
+        .iter()
+        .map(|replica| format!("'{}'", escape(replica)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT count() AS replicas, \
+                countIf(status != 'Running' AND last_success_time >= toDateTime(?)) AS done, \
+                countIf(exception != '' AND last_refresh_time >= toDateTime(?)) AS failed, \
+                any(exception) AS error \
+         FROM clusterAllReplicas('{}', system.view_refreshes) \
+         WHERE database = '{}' AND view = '{}' AND getMacro('replica') IN ({names}) \
+         SETTINGS skip_unavailable_shards = 1",
+        escape(cluster),
+        escape(db),
+        escape(view)
+    )
+}
+
+/// Trigger the refresh on every replica endpoint that answers and return the
+/// `{replica}` macro of each one triggered. Unreachable replicas are logged
+/// and skipped; at least one must be triggered.
+async fn trigger_on_replicas(endpoints: &[String], statement: &str, view: &str) -> Result<Vec<String>> {
+    let mut triggered = Vec::new();
+    for endpoint in endpoints {
+        let client = refresh_client(endpoint);
+        let replica = match client
+            .query("SELECT getMacro('replica')")
+            .fetch_one::<String>()
+            .await
+        {
+            Ok(replica) => replica,
+            Err(error) if is_unreachable_replica_error(&error) => {
+                tracing::warn!(
+                    view,
+                    endpoint = %endpoint,
+                    %error,
+                    "ClickHouse replica unreachable; skipping its view refresh (it refreshes on its own schedule when it returns)"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("identifying the ClickHouse replica behind {endpoint}"));
+            }
+        };
+        client
+            .query(statement)
+            .execute()
+            .await
+            .with_context(|| format!("refreshing {view} on ClickHouse replica {replica}"))?;
+        triggered.push(replica);
+    }
+    if triggered.is_empty() {
+        bail!("{view}: no ClickHouse replica answered the refresh trigger");
+    }
+    Ok(triggered)
+}
+
+/// `SYSTEM REFRESH VIEW` on every node and wait until each triggered node
+/// finished a refresh started after the trigger. `ch_admin` must hold the
+/// REFRESH VIEW grant (the runtime user does not).
+///
+/// Clustered (`on_cluster` set): with per-replica endpoints
+/// ([`REPLICA_ENDPOINTS_ENV`]) every replica is triggered and only the ones
+/// that answered are awaited; otherwise one request per shard endpoint and a
+/// wait for every replica (the pre-NAN-5215 behaviour).
 pub async fn refresh_view_and_wait(
     ch_admin: &clickhouse::Client,
     view: &str,
@@ -171,22 +280,41 @@ pub async fn refresh_view_and_wait(
 ) -> Result<()> {
     let started: u32 = ch_admin.query("SELECT toUInt32(now())").fetch_one().await?;
     let statement = refresh_view_statement(view);
-    if let Some(clients) = clustered_refresh_clients(on_cluster)? {
-        for client in clients {
-            client
-                .query(&statement)
-                .execute()
-                .await
-                .with_context(|| format!("refreshing {view} on a ClickHouse shard"))?;
-        }
-    } else {
-        ch_admin.query(&statement).execute().await?;
-    }
-    let source = crate::platform_enrichment::loader::refresh_status_source(
-        std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref(),
-    );
     let (db, name) = view.split_once('.').context("qualified view name")?;
-    let probe = crate::platform_enrichment::loader::refresh_probe_sql(&source, db, name);
+    let cluster = std::env::var("CLICKHOUSE_CLUSTER").ok();
+    let probe = if on_cluster.is_empty() {
+        ch_admin.query(&statement).execute().await?;
+        crate::platform_enrichment::loader::refresh_probe_sql(
+            &crate::platform_enrichment::loader::refresh_status_source(cluster.as_deref()),
+            db,
+            name,
+        )
+    } else {
+        let targets = refresh_targets(
+            std::env::var(REPLICA_ENDPOINTS_ENV).ok().as_deref(),
+            std::env::var(SHARD_ENDPOINTS_ENV).ok().as_deref(),
+        )?;
+        match (targets, cluster.as_deref().map(str::trim).filter(|c| !c.is_empty())) {
+            (RefreshTargets::Replicas(endpoints), Some(cluster)) => {
+                let triggered = trigger_on_replicas(&endpoints, &statement, view).await?;
+                triggered_replicas_probe_sql(cluster, db, name, &triggered)
+            }
+            (RefreshTargets::Replicas(endpoints), None) | (RefreshTargets::Shards(endpoints), _) => {
+                for endpoint in endpoints {
+                    refresh_client(&endpoint)
+                        .query(&statement)
+                        .execute()
+                        .await
+                        .with_context(|| format!("refreshing {view} on a ClickHouse shard"))?;
+                }
+                crate::platform_enrichment::loader::refresh_probe_sql(
+                    &crate::platform_enrichment::loader::refresh_status_source(cluster.as_deref()),
+                    db,
+                    name,
+                )
+            }
+        }
+    };
     let deadline = tokio::time::Instant::now() + REFRESH_WAIT;
     loop {
         let row: RefreshRow = ch_admin
@@ -250,8 +378,14 @@ pub async fn reload_pair(
 /// either view again. Durable migration activation uses this after its refresh
 /// phase so a reload-only retry cannot create a newer staging generation.
 pub async fn reload_pair_dictionaries(ch: &clickhouse::Client, on_cluster: &str) -> Result<()> {
+    // NAN-5215: an ON CLUSTER reload must not wait out a down replica's DDL
+    // timeout on every attempt; the live replicas reload, the returning one
+    // replays the queued reload.
+    let ch = crate::db::dual_pool::runtime_on_cluster_ddl_options(on_cluster)
+        .iter()
+        .fold(ch.clone(), |client, (name, value)| client.with_option(*name, *value));
     for sql in reload_statements(on_cluster) {
-        reload_with_retry(ch, &sql).await?;
+        reload_with_retry(&ch, &sql).await?;
     }
     Ok(())
 }

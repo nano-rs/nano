@@ -1232,7 +1232,7 @@ PY_ROLES
     if [[ -n "$installed_project" ]] && command -v docker >/dev/null 2>&1; then
         while IFS= read -r running_service; do
             case "$running_service" in
-                postgres) running_roles+=",postgres" ;;
+                postgres|postgres-ha) running_roles+=",postgres" ;;
                 clickhouse) running_roles+=",clickhouse" ;;
                 keeper) running_roles+=",keeper" ;;
                 vector|vector-config-consumer|vector-tap|ingest-edge) running_roles+=",ingest" ;;
@@ -1581,7 +1581,24 @@ if [[ -f .env ]]; then
     fi
 fi
 
-if [[ "$MULTI_NODE" == "1" && ! -f .env && ",${ROLE_ARG}," != *,app,* ]]; then
+# NAN-5213: with several app hosts only the FIRST app host in inventory order
+# may create the shared .env or generate secrets. Another app host that made
+# its own .env would sign tokens with a different JWT_SECRET and encrypt
+# credentials with a different NANOSIEM_ENCRYPTION_KEY.
+APP_SECRET_OWNER=0
+if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," == *,app,* ]]; then
+    APP_SECRET_OWNER=1
+    app_primary_json=$(python3 -I deploy/compose/render-inventory.py \
+        --inventory "$INVENTORY_PATH" --roles "$ROLE_ARG" --identity-only </dev/null) \
+        || fail "Inventory validation failed. No services have started."
+    if [[ "$(python3 -I -c 'import json,sys; print("0" if json.loads(sys.argv[1]).get("app_primary") is False else "1")' "$app_primary_json" </dev/null)" == "0" ]]; then
+        APP_SECRET_OWNER=0
+    fi
+fi
+if [[ "$MULTI_NODE" == "1" && ! -f .env && "$APP_SECRET_OWNER" != "1" ]]; then
+    if [[ ",${ROLE_ARG}," == *,app,* ]]; then
+        fail "This is not the first app host in the inventory. A role-split cluster's shared .env is created on the first app host (use NANO_PREPARE_ONLY=1 there), then copied securely to every other host, including the other app hosts, before installing role(s) $ROLE_ARG."
+    fi
     fail "A role-split cluster's shared .env must be created on an app-role host first (use NANO_PREPARE_ONLY=1), then copied securely to this host before installing role(s) $ROLE_ARG."
 fi
 
@@ -1597,7 +1614,7 @@ if [[ -f .env ]]; then
         fail "The bundled Tenzir profile is single-node only; role-split installs must use the ocsf or udm schema profile without bundled Tenzir."
     fi
     secret_mode=generate
-    if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," != *,app,* ]]; then
+    if [[ "$MULTI_NODE" == "1" && "$APP_SECRET_OWNER" != "1" ]]; then
         secret_mode=validate-only
     fi
     # NAN-5148: only an ingest host runs a Vector config consumer.
@@ -2136,7 +2153,15 @@ COMPOSE_PROFILES_RECORDED=$(env_value COMPOSE_PROFILES)
 if [[ "${BUNDLE_TENZIR:-0}" == "1" && ",$COMPOSE_PROFILES_RECORDED," != *",tenzir,"* ]]; then
     COMPOSE_PROFILES_RECORDED="${COMPOSE_PROFILES_RECORDED:+$COMPOSE_PROFILES_RECORDED,}tenzir"
 fi
-[[ -n "$COMPOSE_PROFILES_RECORDED" ]] && export COMPOSE_PROFILES="$COMPOSE_PROFILES_RECORDED"
+# NAN-5215: a role-split host takes its profiles from the rendered role env
+# alone (roles plus app duties such as backup and pull-feeds). Exporting the
+# .env value here would beat that file and, with only `backup` recorded,
+# start nothing but the backup service on an app host.
+if [[ "$MULTI_NODE" == "1" ]]; then
+    unset COMPOSE_PROFILES
+elif [[ -n "$COMPOSE_PROFILES_RECORDED" ]]; then
+    export COMPOSE_PROFILES="$COMPOSE_PROFILES_RECORDED"
+fi
 
 # Record the resolved release + image source in .env (a re-run upgrades an
 # existing install to this checkout's release) and export them, since the shell
@@ -2222,6 +2247,50 @@ if [[ "$MULTI_NODE" == "1" && "${candidate_plaintext:-0}" == "1" \
     ok "Keeper root rejects anonymous znode creation"
 fi
 
+# NAN-5213: scaling a role-split cluster from one app host to several moves
+# its Valkey from that app host to the shared one beside PostgreSQL. Carry the
+# JWT revocation denylist across, so an access token revoked in the last 15
+# minutes (logout) is not valid again after the move. Everything else in
+# Valkey is transient (search jobs, admission leases).
+VALKEY_REVOCATIONS_FILE=""
+if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," == *,app,* && "${NANO_LOCAL_VALKEY_REPLICAS:-1}" == "0" ]] \
+    && [[ -n "$(docker compose "${COMPOSE_ARGS[@]}" ps -q --status running dragonfly 2>/dev/null </dev/null)" ]]; then
+    VALKEY_REVOCATIONS_FILE=$(mktemp "${TMPDIR:-/tmp}/nano-valkey-revocations.XXXXXX")
+    chmod 600 "$VALKEY_REVOCATIONS_FILE"
+    log "Saving the JWT revocation denylist from this host's Valkey before moving to the shared Valkey"
+    # shellcheck disable=SC2016
+    docker compose "${COMPOSE_ARGS[@]}" exec -T dragonfly sh -ec '
+        valkey-cli --scan --pattern "auth:revoked_jti:*" | while IFS= read -r key; do
+            ttl=$(valkey-cli PTTL "$key")
+            value=$(valkey-cli --raw GET "$key")
+            [ "$ttl" -gt 0 ] 2>/dev/null && printf "%s %s %s\n" "$key" "$value" "$ttl"
+        done' </dev/null > "$VALKEY_REVOCATIONS_FILE" \
+        || warn "Could not read the local Valkey revocation denylist; tokens revoked in the last 15 minutes stay valid until they expire."
+fi
+
+# NAN-5214: the shared Valkey endpoint on an app host is the Sentinel-routed
+# HAProxy with two or more postgres hosts, otherwise NAN-5213's nginx proxy.
+# Decided from the rendered role env (exported above), not COMPOSE_PROFILES,
+# which this script rewrites/unsets for the backup-profile merge.
+# nano-valkey-endpoint:begin
+VALKEY_SHARED_ENDPOINT=valkey-proxy
+[[ -n "${NANO_VALKEY_SENTINELS:-}" ]] && VALKEY_SHARED_ENDPOINT=valkey-router
+# nano-valkey-endpoint:end
+
+# NAN-5214: with two or more postgres hosts the Patroni member owns this
+# host's PostgreSQL data volume. Stop and remove the standalone container
+# first (a single-postgres install converting to HA), so two postmasters
+# can never run on one data directory. The member then adopts the data
+# directory in place (first postgres host) or clones from the leader.
+if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE_ARG}," == *,postgres,* ]]; then
+    if [[ -n "$(docker compose "${COMPOSE_ARGS[@]}" ps -aq postgres 2>/dev/null </dev/null)" ]]; then
+        log "PostgreSQL HA: stopping the standalone PostgreSQL container; Patroni takes over its data volume"
+        docker compose "${COMPOSE_ARGS[@]}" stop --timeout 120 postgres </dev/null \
+            || fail "Could not stop the standalone PostgreSQL container cleanly; refusing to start Patroni on its data volume."
+        docker compose "${COMPOSE_ARGS[@]}" rm -f postgres </dev/null >/dev/null
+    fi
+fi
+
 log "Starting services"
 compose_up_args=(up -d)
 if [[ "$MULTI_NODE" == "1" && "${ROLE_CONFIG_WAS_PUBLISHED:-0}" == "1" ]]; then
@@ -2240,6 +2309,45 @@ docker compose "${COMPOSE_ARGS[@]}" "${compose_up_args[@]}" </dev/null
 # nginx so it picks up any config change and re-resolves upstream IPs, otherwise
 # it proxies dead old IPs and 502s until restarted (NAN-1237). Best-effort.
 docker compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload </dev/null >/dev/null 2>&1 || true
+
+if [[ -n "$VALKEY_REVOCATIONS_FILE" ]]; then
+    carried=0
+    while read -r key value ttl; do
+        [[ "$key" =~ ^auth:revoked_jti:[0-9A-Fa-f-]{1,64}$ && "$value" =~ ^[A-Za-z0-9:._-]{1,64}$ && "$ttl" =~ ^[0-9]{1,12}$ ]] || continue
+        { printf 'SET %s %s PX %s NX\r\n' "$key" "$value" "$ttl"; sleep 1; } \
+            | docker compose "${COMPOSE_ARGS[@]}" exec -T "$VALKEY_SHARED_ENDPOINT" nc -w 3 127.0.0.1 6379 2>/dev/null \
+            | grep -q '^+OK\|^\$-1' && carried=$((carried + 1))
+    done < "$VALKEY_REVOCATIONS_FILE"
+    rm -f -- "$VALKEY_REVOCATIONS_FILE"
+    ok "Carried $carried JWT revocation(s) to the shared Valkey"
+fi
+
+# NAN-5214: once this host's Patroni member holds the cluster's data, record its
+# system identifier in the shared .env (never overwriting a different one). The
+# first postgres host then refuses to initdb this install even if its state
+# volume and every peer are lost.
+if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE_ARG}," == *,postgres,* ]]; then
+    pg_ha_outcome="pending"
+    pg_ha_deadline=$(( $(date +%s) + ${NANO_PG_HA_SYSTEM_ID_WAIT:-60} ))
+    while (( $(date +%s) < pg_ha_deadline )); do
+        pg_ha_status=0
+        pg_ha_outcome=$(docker compose "${COMPOSE_ARGS[@]}" exec -T postgres-ha \
+                pg_controldata -D /var/lib/postgresql/data 2>/dev/null </dev/null \
+            | python3 -I scripts/lib/pg_ha_system_id.py .env) || pg_ha_status=$?
+        [[ "$pg_ha_status" == 4 ]] || break
+        sleep 5
+    done
+    case "$pg_ha_outcome" in
+        recorded*)
+            ok "Recorded the PostgreSQL cluster identity in .env (${pg_ha_outcome#recorded })"
+            warn "The shared .env changed: copy it to every host (app, ingest, ClickHouse, Keeper and postgres)." ;;
+        unchanged*) ;;
+        conflict*)
+            fail "PostgreSQL HA identity mismatch: ${pg_ha_outcome#conflict }. This host's database is not the cluster recorded in .env; do not continue. See 'Recovering after losing the bootstrap host and etcd' in the multi-node guide." ;;
+        *)
+            warn "PostgreSQL HA is still forming on this host; its cluster identity is recorded in .env on the next install.sh run." ;;
+    esac
+fi
 
 # ----------------------------------------------------------------------------
 # 5. Wait for API health
@@ -2287,8 +2395,10 @@ else
     # Stateful roles have their scenario-level readiness proven by the e2e
     # harness. Here, fail quickly if the requested long-running container died.
     for role_service in ${ROLE_ARG//,/ }; do
+        # NAN-5214: an HA postgres host runs the Patroni member instead.
+        [[ "$role_service" == postgres && "${NANO_POSTGRES_HA:-false}" == "true" ]] && role_service=postgres-ha
         case "$role_service" in
-            postgres|clickhouse|keeper)
+            postgres|postgres-ha|clickhouse|keeper)
                 docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -qx "$role_service" \
                     || fail "$role_service did not stay running. Check 'docker compose ${COMPOSE_ARGS[*]} logs $role_service'." ;;
         esac

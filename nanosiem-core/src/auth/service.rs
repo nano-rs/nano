@@ -147,6 +147,9 @@ impl From<TokenError> for AuthError {
             TokenError::ValidationFailed(_) => AuthError::InvalidToken,
             TokenError::CreationFailed(msg) => AuthError::TokenError(msg),
             TokenError::DecodingFailed(_) => AuthError::InvalidToken,
+            TokenError::RevocationUnavailable => {
+                AuthError::TokenError("token revocation status is temporarily unavailable".to_string())
+            }
         }
     }
 }

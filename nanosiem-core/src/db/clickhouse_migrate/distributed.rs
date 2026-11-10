@@ -113,6 +113,18 @@ impl ClickHouseMigrator {
             _ => String::new(),
         };
 
+        // NAN-5215: probe replica reachability once. Re-issuing `OR REPLACE
+        // ... ON CLUSTER` waits for every replica, so with one replica down it
+        // would block the migrator on every boot even though nothing changed.
+        let explicit_cluster = match &cluster_name {
+            Some(c) if c != &self.database => Some(c.clone()),
+            _ => None,
+        };
+        let reachability = match &explicit_cluster {
+            Some(cluster) => Self::probe_reachability(&self.client, cluster).await.ok(),
+            None => None,
+        };
+
         let mut applied = 0usize;
         for &(table, col) in RAWSQL_AUDIT_POLICY_TABLES {
             // Resolve the physical table: prefer `<table>_local` when it exists
@@ -130,31 +142,62 @@ impl ClickHouseMigrator {
                 .unwrap_or(0);
             let physical = if local_exists > 0 { local_name.as_str() } else { table };
 
-            let baseline = format!(
-                "CREATE ROW POLICY OR REPLACE rawsql_baseline_{name} ON {db}.{tbl}{oc} \
-                 USING 1 AS PERMISSIVE TO nanosiem_rawsql_noaudit",
-                name = table,
-                db = self.database,
-                tbl = physical,
-                oc = on_cluster,
-            );
-            let hide_audit = format!(
-                "CREATE ROW POLICY OR REPLACE rawsql_hide_audit_{name} ON {db}.{tbl}{oc} \
-                 USING lower({col}) != 'audit' AS RESTRICTIVE TO nanosiem_rawsql_noaudit",
-                name = table,
-                db = self.database,
-                tbl = physical,
-                oc = on_cluster,
-                col = col,
-            );
+            // One definition feeds both the statements and the NAN-5215
+            // "already current" comparison, so they cannot drift.
+            let desired = rawsql_policy_specs(table, col);
+            let [baseline, hide_audit] = desired.clone().map(|policy| {
+                format!(
+                    "CREATE ROW POLICY OR REPLACE {name} ON {db}.{tbl}{oc} \
+                     USING {filter} AS {kind} TO {role}",
+                    name = policy.short_name,
+                    db = self.database,
+                    tbl = physical,
+                    oc = on_cluster,
+                    filter = policy.filter,
+                    kind = if policy.restrictive { "RESTRICTIVE" } else { "PERMISSIVE" },
+                    role = RAWSQL_NOAUDIT_ROLE,
+                )
+            });
+            if self
+                .rawsql_policies_converged(
+                    &desired,
+                    physical,
+                    explicit_cluster.as_deref(),
+                    reachability.as_ref(),
+                )
+                .await
+            {
+                tracing::info!(
+                    "NAN-2001: raw-SQL audit row policies already current on {}.{} — not re-issued",
+                    self.database,
+                    physical
+                );
+                applied += 1;
+                continue;
+            }
 
+            // NAN-5215: with a replica down, `OR REPLACE ... ON CLUSTER`
+            // (idempotent) returns once the live replicas applied it; a host
+            // that finished with an error still raises it, and the down
+            // replica replays the statement from the DDL queue. A healthy
+            // cluster keeps the strict historical wait.
+            let policy_client = rawsql_policy_ddl_options(
+                explicit_cluster.is_some(),
+                reachability.as_ref().is_some_and(|r| r.all_reachable()),
+            )
+            .iter()
+            .fold(self.client.clone(), |client, (name, value)| {
+                client.with_option(*name, *value)
+            });
             for sql in [baseline, hide_audit] {
-                self.client.query(&sql).execute().await.map_err(|e| {
-                    ClickHouseMigrateError::ClickHouse(format!(
-                        "creating raw-SQL audit row policy on {}.{}: {}",
-                        self.database, physical, e
-                    ))
-                })?;
+                if let Err(e) = policy_client.query(&sql).execute().await {
+                    return Err(self
+                        .with_unreachable_replicas(ClickHouseMigrateError::ClickHouse(format!(
+                            "creating raw-SQL audit row policy on {}.{}: {}",
+                            self.database, physical, e
+                        )))
+                        .await);
+                }
             }
             tracing::info!(
                 "NAN-2001: raw-SQL audit row policies ensured on {}.{} (source col '{}'){}",
@@ -170,6 +213,86 @@ impl ClickHouseMigrator {
             applied += 1;
         }
         Ok(applied)
+    }
+
+    /// NAN-5215: whether the two raw-SQL audit policies on `physical` already
+    /// match `desired`, so `ensure_rawsql_row_policies` can skip re-issuing
+    /// them. Conservative by construction: any doubt returns false and the
+    /// caller re-issues exactly as before.
+    ///
+    /// 1. The connected node must hold both policies with the desired
+    ///    filter, kind and target role.
+    /// 2. On an explicit cluster, every reachable replica must too, read via
+    ///    `clusterAllReplicas(system.row_policies)` with
+    ///    `skip_unavailable_shards = 1`.
+    /// 3. If that cluster read fails (remote_servers authenticate as the
+    ///    runtime user, which may not see `system.row_policies`), re-issue.
+    ///    The local node alone is never enough to skip. With a replica down
+    ///    the caller re-issues with a short, non-blocking DDL wait (see
+    ///    [`rawsql_policy_ddl_options`]).
+    async fn rawsql_policies_converged(
+        &self,
+        desired: &[DesiredRowPolicy; 2],
+        physical: &str,
+        cluster: Option<&str>,
+        reachability: Option<&super::cluster_reachability::Reachability>,
+    ) -> bool {
+        let filter = rawsql_policy_filter_sql(&self.database, physical, desired);
+        let local = match self
+            .client
+            .query(&format!(
+                "SELECT toUInt32(1) AS ordinal, {RAWSQL_POLICY_COLUMNS} \
+                 FROM system.row_policies WHERE {filter}"
+            ))
+            .fetch_all::<ObservedRowPolicy>()
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!("NAN-5215: reading local row policies failed: {error}");
+                return false;
+            }
+        };
+        if !row_policies_match(desired, &local) {
+            return false;
+        }
+        let Some(cluster) = cluster else {
+            return true;
+        };
+        let Some(reachability) = reachability else {
+            return false;
+        };
+        let cluster_sql = format!(
+            "SELECT shardNum() AS ordinal, {RAWSQL_POLICY_COLUMNS} \
+             FROM clusterAllReplicas('{}', system.row_policies) WHERE {filter} \
+             SETTINGS skip_unavailable_shards = 1",
+            crate::sql_hygiene::escape_sql_string(cluster)
+        );
+        match self
+            .client
+            .query(&cluster_sql)
+            .fetch_all::<ObservedRowPolicy>()
+            .await
+        {
+            Ok(rows) => row_policies_match_on_replicas(desired, &rows, &reachability.reachable),
+            Err(error) if reachability.all_reachable() => {
+                tracing::debug!(
+                    "NAN-5215: cluster row-policy read failed with every replica up ({error}); \
+                     re-issuing ON CLUSTER"
+                );
+                false
+            }
+            Err(error) => {
+                // Fail closed: the local node alone is never evidence that
+                // every replica hides audit rows. The caller re-issues.
+                tracing::warn!(
+                    "NAN-5215: raw-SQL audit row policies cannot be read on the other replicas \
+                     ({error}); cluster '{cluster}' has {}. Re-issuing them ON CLUSTER.",
+                    reachability.describe()
+                );
+                false
+            }
+        }
     }
 
     /// NAN-2003: bootstrap the two NAN-2001 raw-SQL feature users
@@ -1104,6 +1227,126 @@ impl ClickHouseMigrator {
     }
 }
 
+/// NAN-5215: DDL options for re-issuing the audit policies. Only on an
+/// explicit cluster with a replica not answering (or reachability unknown)
+/// do they switch to the non-blocking wait; otherwise the client keeps the
+/// migrator's strict `throw` + long timeout.
+pub(super) fn rawsql_policy_ddl_options(
+    explicit_cluster: bool,
+    all_replicas_reachable: bool,
+) -> &'static [(&'static str, &'static str)] {
+    if explicit_cluster && !all_replicas_reachable {
+        crate::db::dual_pool::runtime_on_cluster_ddl_options(" ON CLUSTER")
+    } else {
+        &[]
+    }
+}
+
+/// The raw-SQL identity every NAN-2001 audit policy targets.
+const RAWSQL_NOAUDIT_ROLE: &str = "nanosiem_rawsql_noaudit";
+
+/// Columns read from `system.row_policies` for the NAN-5215 skip check.
+const RAWSQL_POLICY_COLUMNS: &str = "short_name, ifNull(select_filter, '') AS select_filter, \
+     is_restrictive, apply_to_all, apply_to_list, apply_to_except";
+
+/// One audit policy as `ensure_rawsql_row_policies` creates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DesiredRowPolicy {
+    pub short_name: String,
+    pub filter: String,
+    pub restrictive: bool,
+}
+
+/// One `system.row_policies` row; `ordinal` is the `clusterAllReplicas`
+/// replica (always 1 for the connected node's own read).
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub(super) struct ObservedRowPolicy {
+    pub ordinal: u32,
+    pub short_name: String,
+    pub select_filter: String,
+    pub is_restrictive: u8,
+    pub apply_to_all: u8,
+    pub apply_to_list: Vec<String>,
+    pub apply_to_except: Vec<String>,
+}
+
+/// The baseline + hide-audit pair for `table`, matching the statements
+/// `ensure_rawsql_row_policies` issues.
+pub(super) fn rawsql_policy_specs(table: &str, col: &str) -> [DesiredRowPolicy; 2] {
+    [
+        DesiredRowPolicy {
+            short_name: format!("rawsql_baseline_{table}"),
+            filter: "1".to_string(),
+            restrictive: false,
+        },
+        DesiredRowPolicy {
+            short_name: format!("rawsql_hide_audit_{table}"),
+            filter: format!("lower({col}) != 'audit'"),
+            restrictive: true,
+        },
+    ]
+}
+
+fn rawsql_policy_filter_sql(database: &str, physical: &str, desired: &[DesiredRowPolicy]) -> String {
+    let names = desired
+        .iter()
+        .map(|policy| format!("'{}'", crate::sql_hygiene::escape_sql_string(&policy.short_name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "database = '{}' AND \"table\" = '{}' AND short_name IN ({names})",
+        crate::sql_hygiene::escape_sql_string(database),
+        crate::sql_hygiene::escape_sql_string(physical),
+    )
+}
+
+/// Compare filters the way ClickHouse may reformat them: case, whitespace,
+/// identifier quoting and `<>` versus `!=` do not matter.
+pub(super) fn normalize_policy_filter(filter: &str) -> String {
+    filter
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '`' && *c != '"')
+        .collect::<String>()
+        .to_lowercase()
+        .replace("<>", "!=")
+}
+
+fn row_policy_matches(desired: &DesiredRowPolicy, observed: &ObservedRowPolicy) -> bool {
+    observed.short_name == desired.short_name
+        && normalize_policy_filter(&observed.select_filter) == normalize_policy_filter(&desired.filter)
+        && (observed.is_restrictive != 0) == desired.restrictive
+        && observed.apply_to_all == 0
+        && observed.apply_to_list == [RAWSQL_NOAUDIT_ROLE]
+        && observed.apply_to_except.is_empty()
+}
+
+/// True when `observed` (one node's rows) holds every desired policy exactly
+/// as specified.
+pub(super) fn row_policies_match(desired: &[DesiredRowPolicy], observed: &[ObservedRowPolicy]) -> bool {
+    desired.iter().all(|policy| {
+        observed
+            .iter()
+            .any(|row| row_policy_matches(policy, row))
+    })
+}
+
+/// True when every reachable replica's rows hold every desired policy.
+pub(super) fn row_policies_match_on_replicas(
+    desired: &[DesiredRowPolicy],
+    observed: &[ObservedRowPolicy],
+    reachable: &std::collections::HashSet<u32>,
+) -> bool {
+    !reachable.is_empty()
+        && reachable.iter().all(|ordinal| {
+            let rows: Vec<ObservedRowPolicy> = observed
+                .iter()
+                .filter(|row| row.ordinal == *ordinal)
+                .cloned()
+                .collect();
+            row_policies_match(desired, &rows)
+        })
+}
+
 /// Swap a `FROM <db>.<base>` reference in an MV SELECT body to
 /// `<db>.<base>_distributed`, boundary-aware so it never matches the
 /// already-suffixed `<db>.<base>_distributed`, nor a longer identifier that
@@ -1381,3 +1624,7 @@ pub(super) fn is_safe_identifier(s: &str) -> bool {
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
+
+#[cfg(test)]
+#[path = "distributed_policy_tests.rs"]
+mod policy_tests;

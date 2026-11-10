@@ -100,10 +100,18 @@ async fn resolve_setup_actor(
 ) -> Result<SetupActor, (StatusCode, Json<MfaApiError>)> {
     // Prefer Bearer / cookie session — keeps the voluntary path identical.
     if let Some(token) = bearer_from_headers(headers).or_else(|| access_token_cookie(headers)) {
-        if let Ok(claims) = state
-            .token_service
-            .validate_access_token_async(&token)
-            .await
+        let validated = state.token_service.validate_access_token_async(&token).await;
+        // NAN-5214: in HA mode an unreadable denylist is 503, not 401.
+        if matches!(validated, Err(nanosiem_core::auth::TokenError::RevocationUnavailable)) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(MfaApiError {
+                    error: "revocation_status_unavailable".to_string(),
+                    message: "Session status is temporarily unavailable. Please retry shortly.".to_string(),
+                }),
+            ));
+        }
+        if let Ok(claims) = validated
         {
             return Ok(SetupActor {
                 user_id: claims.sub,

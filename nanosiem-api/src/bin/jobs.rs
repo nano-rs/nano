@@ -157,11 +157,14 @@ async fn async_main() -> Result<()> {
             online.deployment_id,
             86400, // 24 hours
         );
+        // NAN-5213: with several app hosts, only the jobs leader runs the
+        // periodic check-in and usage report; the rest follow the PG cache.
         let license_checker = LicenseChecker::new(
             license_checker_config,
             state.pool.clone(),
             state.license_status.clone(),
-        );
+        )
+        .with_leader_fence(state.leader_fence.clone(), state.pool.clone());
         // NAN-5170: the jobs checker (the 24h loop) sends the daily usage
         // report after each successful check-in. Air-gapped installs never
         // reach this branch (no online licence), and are guarded regardless.
@@ -432,10 +435,8 @@ async fn run_read_only_sovereign_license_refresh(state: AppState) {
         if let Err(error) =
             nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await
         {
-            tracing::error!(%error, "C05 jobs admission refresh failed; workers fail closed");
-            let snapshot = nanosiem_api::license_admission::unavailable_snapshot(&error);
-            *state.license_status.write().await = snapshot.cached_status();
-            *state.offline_license_snapshot.write().await = snapshot;
+            tracing::warn!(%error, "C05 jobs admission refresh failed");
+            nanosiem_api::license_admission::record_refresh_failure(&state, &error).await;
         }
     }
 }

@@ -340,13 +340,15 @@ impl AppState {
 
         // Signal processor (bridges ClickHouse signals to PostgreSQL alerts)
         // Must be single-leader: serial watermark processing
-        match self.signal_processor.start().await {
-            Ok(handle) => {
-                handles.push(handle);
-                tracing::info!("Signal processor started (leader-only)");
-            }
-            Err(e) => tracing::error!("Failed to start signal processor: {}", e),
-        }
+        // NAN-5214: `start()` reads the watermark from PostgreSQL. A failover
+        // right after this node won the lease used to log one error and leave
+        // the leader with no signal -> alert pipeline for its whole term.
+        // Retry with backoff instead; the task is aborted on step-down, and the
+        // guard aborts the processor it started with it.
+        let processor = Arc::clone(&self.signal_processor);
+        handles.push(tokio::spawn(async move {
+            run_signal_processor_until_started(processor).await;
+        }));
 
         // Health monitoring can create notifications and perform paid AI
         // connectivity checks. Keep the entire check + transactional notify
@@ -754,5 +756,47 @@ mod shutdown_tests {
             }
         );
         assert!(!running.load(Ordering::SeqCst));
+    }
+}
+
+/// Aborts the wrapped task when dropped (a supervisor that is itself aborted
+/// must take the task it spawned down with it).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Start the signal processor, retrying a failed start (PostgreSQL briefly
+/// unavailable during a primary switch) with capped exponential backoff, then
+/// run it until it ends.
+async fn run_signal_processor_until_started(
+    processor: Arc<nanosiem_core::detection::signal_processor::SignalProcessor>,
+) {
+    let mut delay = std::time::Duration::from_secs(1);
+    loop {
+        match processor.start().await {
+            Ok(handle) => {
+                tracing::info!("Signal processor started (leader-only)");
+                let mut guard = AbortOnDrop(handle);
+                if let Err(error) = (&mut guard.0).await {
+                    if !error.is_cancelled() {
+                        tracing::error!(?error, "Signal processor task failed");
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    retry_in_secs = delay.as_secs(),
+                    "Failed to start signal processor; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
     }
 }

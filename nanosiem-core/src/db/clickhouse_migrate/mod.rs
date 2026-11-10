@@ -8,6 +8,7 @@
 //! Includes ClickHouse Cloud compatibility: automatically detects CH Cloud environments
 //! and strips unsupported settings/index types before executing statements.
 
+mod cluster_reachability;
 mod detection;
 mod distributed;
 mod ocsf_legacy_drop;

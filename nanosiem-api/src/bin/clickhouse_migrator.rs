@@ -98,6 +98,86 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Session-level PostgreSQL advisory lock held for one migrator run.
+struct MigrationLock {
+    connection: Option<sqlx::PgConnection>,
+}
+
+impl MigrationLock {
+    async fn acquire(postgres_url: &str) -> Result<Self> {
+        let mut connection = connect_with_retry(postgres_url).await?;
+        let lock_id = nanosiem_core::leader::lock_ids::SCHEMA_MIGRATOR;
+        let started = std::time::Instant::now();
+        loop {
+            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut connection)
+                .await
+                .context("requesting the migration lock")?;
+            if acquired {
+                if started.elapsed().as_secs() > 0 {
+                    tracing::info!(
+                        waited_secs = started.elapsed().as_secs(),
+                        "Acquired the migration lock after another migrator released it"
+                    );
+                }
+                return Ok(Self {
+                    connection: Some(connection),
+                });
+            }
+            tracing::info!(
+                waited_secs = started.elapsed().as_secs(),
+                "Another migrator holds the cluster migration lock; waiting"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+}
+
+/// The pool connect this lock now precedes retried until its acquire timeout;
+/// keep that tolerance for a PostgreSQL that is still refusing connections or
+/// reporting "the database system is starting up" (SQLSTATE 57P03) after a
+/// host restart. Any other error, or 30 s without success, fails the run.
+async fn connect_with_retry(postgres_url: &str) -> Result<sqlx::PgConnection> {
+    use sqlx::Connection;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    loop {
+        match sqlx::PgConnection::connect(postgres_url).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) if is_transient_connect_error(&error) && started.elapsed() < BUDGET => {
+                tracing::info!(%error, "PostgreSQL not accepting connections yet; retrying the migration lock connect");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context("connecting to PostgreSQL for the migration lock"));
+            }
+        }
+    }
+}
+
+fn is_transient_connect_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(db) => {
+            db.code().as_deref() == Some("57P03") || db.message().contains("starting up")
+        }
+        other => {
+            let text = other.to_string();
+            text.contains("Connection refused") || text.contains("starting up")
+        }
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        // Dropping the connection closes the session, which releases the
+        // advisory lock; the process exits right after `run` in any case.
+        drop(self.connection.take());
+    }
+}
+
 async fn activate_migration_refreshes(args: &[String]) -> ExitCode {
     let retry_exhausted = match args {
         [] => false,
@@ -494,6 +574,15 @@ async fn run() -> Result<()> {
 
     let config =
         DualPoolConfig::from_env().context("loading DualPool configuration from environment")?;
+
+    // NAN-5213: a role-split cluster with several app hosts starts one
+    // migrator per host. Serialize the whole run behind a cluster-wide
+    // PostgreSQL advisory lock: the ClickHouse `_migrations` ledger has no
+    // lock of its own, and the PostgreSQL fresh-database detection and
+    // snapshot steps run outside sqlx's migration lock. A host that waits
+    // here then finds nothing pending. The lock is session-scoped, so a
+    // migrator that dies releases it with its connection.
+    let _migration_lock = MigrationLock::acquire(&config.postgres_url).await?;
 
     // NAN-789: apply PostgreSQL migrations BEFORE any ClickHouse work. CH 26.3
     // eagerly validates dictionary sources during `CREATE TABLE nanosiem.logs`

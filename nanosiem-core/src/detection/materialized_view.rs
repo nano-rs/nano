@@ -279,6 +279,118 @@ impl MaterializedViewGenerator {
         Self::format_on_cluster(std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref())
     }
 
+    /// NAN-5215: client for rule-view DDL. On a cluster, `ON CLUSTER` waits
+    /// for every replica by default, so one hard-down replica turned every
+    /// rule create/drop into a `distributed_ddl_task_timeout` error AFTER the
+    /// live replicas had applied it (orphaned views writing signals for a
+    /// rolled-back rule). `null_status_on_timeout` returns once the live
+    /// replicas finish (NULL status for the rest); the Keeper DDL queue
+    /// applies the statement when the missing replica returns. A host that
+    /// finished WITH an error still raises it, exactly as `throw` does; a
+    /// slow replica that fails later is caught by
+    /// [`Self::verify_view_on_reachable_replicas`], which decides success.
+    /// Single-node uses the client unchanged.
+    fn ddl_client(&self) -> clickhouse::Client {
+        Self::ddl_settings(&Self::on_cluster_clause())
+            .iter()
+            .fold(self.clickhouse_client.clone(), |client, (name, value)| {
+                client.with_option(*name, *value)
+            })
+    }
+
+    /// Settings [`Self::ddl_client`] applies for a given ON CLUSTER clause.
+    fn ddl_settings(on_cluster: &str) -> &'static [(&'static str, &'static str)] {
+        crate::db::dual_pool::runtime_on_cluster_ddl_options(on_cluster)
+    }
+
+    /// NAN-5215: check that every reachable replica has (`expect_present`)
+    /// or lacks the rule view, via `clusterAllReplicas(system.tables)` with
+    /// `skip_unavailable_shards = 1`. A down replica is skipped (it replays
+    /// the queued DDL when it returns). A probe error is a failure: this
+    /// check, not the DDL status, decides. No-op on single-node.
+    async fn verify_view_on_reachable_replicas(
+        &self,
+        view_name: &str,
+        expect_present: bool,
+    ) -> Result<(), MaterializedViewError> {
+        let Some(cluster) = std::env::var("CLICKHOUSE_CLUSTER")
+            .ok()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+        else {
+            return Ok(());
+        };
+        let probe_error = |e: clickhouse::error::Error| {
+            MaterializedViewError::ClickHouseError(format!(
+                "could not verify materialized view {view_name} on the cluster replicas: {e}"
+            ))
+        };
+        let database: String = self
+            .clickhouse_client
+            .query("SELECT currentDatabase()")
+            .fetch_one()
+            .await
+            .map_err(probe_error)?;
+        let reachable: u64 = self
+            .clickhouse_client
+            .query(&Self::reachable_replicas_sql(&cluster))
+            .fetch_one()
+            .await
+            .map_err(probe_error)?;
+        let present: u64 = self
+            .clickhouse_client
+            .query(&Self::view_presence_sql(&cluster, &database, view_name))
+            .fetch_one()
+            .await
+            .map_err(probe_error)?;
+        if Self::view_presence_verified(expect_present, reachable, present) {
+            return Ok(());
+        }
+        Err(MaterializedViewError::ClickHouseError(if expect_present {
+            format!(
+                "materialized view {view_name} exists on only {present} of {reachable} reachable \
+                 replicas of cluster '{cluster}'"
+            )
+        } else {
+            format!(
+                "materialized view {view_name} still exists on {present} of {reachable} reachable \
+                 replicas of cluster '{cluster}' after DROP"
+            )
+        }))
+    }
+
+    /// Replicas of `cluster` that answer (each replica is its own shard in
+    /// `clusterAllReplicas`).
+    fn reachable_replicas_sql(cluster: &str) -> String {
+        format!(
+            "SELECT count() FROM clusterAllReplicas('{}', system.one) \
+             SETTINGS skip_unavailable_shards = 1",
+            crate::sql_hygiene::escape_sql_string(cluster)
+        )
+    }
+
+    /// Reachable replicas whose catalog holds `view_name`.
+    fn view_presence_sql(cluster: &str, database: &str, view_name: &str) -> String {
+        let escape = |value: &str| crate::sql_hygiene::escape_sql_string(value);
+        format!(
+            "SELECT count() FROM clusterAllReplicas('{}', system.tables) \
+             WHERE database = '{}' AND name = '{}' SETTINGS skip_unavailable_shards = 1",
+            escape(cluster),
+            escape(database),
+            escape(view_name)
+        )
+    }
+
+    /// Present on every reachable replica, or absent from all of them.
+    fn view_presence_verified(expect_present: bool, reachable: u64, present: u64) -> bool {
+        reachable > 0
+            && if expect_present {
+                present == reachable
+            } else {
+                present == 0
+            }
+    }
+
     /// Pure formatter for [`Self::on_cluster_clause`] (testable without env).
     /// Thin re-export of the shared formatter.
     fn format_on_cluster(cluster: Option<&str>) -> String {
@@ -378,7 +490,7 @@ impl MaterializedViewGenerator {
         debug!("Generated DDL for view {}: {}", view_name, ddl);
 
         // Execute DDL
-        self.clickhouse_client
+        self.ddl_client()
             .query(&ddl)
             .execute()
             .await
@@ -396,6 +508,22 @@ impl MaterializedViewGenerator {
                     e
                 ))
             })?;
+
+        // NAN-5215: the create returned once the LIVE replicas finished or the
+        // short DDL wait ran out, so a slow replica that later failed would
+        // look like success. The catalog of every reachable replica is the
+        // source of truth: a missing view there fails the create (the rule
+        // create then rolls back, dropping the view everywhere).
+        if let Err(error) = self.verify_view_on_reachable_replicas(&view_name, true).await {
+            tracing::error!(
+                view_name = %view_name,
+                rule_id = %rule.id,
+                rule_name = %rule.name,
+                error = %error,
+                "ALERT: materialized view for real-time detection rule is missing on a reachable replica"
+            );
+            return Err(error);
+        }
 
         info!("Successfully created materialized view {}", view_name);
 
@@ -422,7 +550,7 @@ impl MaterializedViewGenerator {
             e
         })?;
 
-        self.clickhouse_client
+        self.ddl_client()
             .query(&ddl)
             .execute()
             .await
@@ -432,6 +560,15 @@ impl MaterializedViewGenerator {
                     "Failed to drop materialized view: {}",
                     e
                 ))
+            })?;
+
+        // NAN-5215: a reachable replica still holding the view keeps writing
+        // signals, so that is a failed drop whatever the DDL status said.
+        self.verify_view_on_reachable_replicas(view_name, false)
+            .await
+            .map_err(|e| {
+                error!("Materialized view {} survived its drop: {}", view_name, e);
+                e
             })?;
 
         info!("Successfully dropped materialized view {}", view_name);

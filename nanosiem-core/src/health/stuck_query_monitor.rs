@@ -72,9 +72,10 @@ impl StuckQueryMonitor {
         } else {
             "substring(normalizeQuery(query), 1, 200) AS query_snippet"
         };
+        let settings = crate::db::dual_pool::processes_read_settings(source);
         format!(
             "SELECT query_id, user, elapsed, {snippet} \
-             FROM {source} WHERE is_cancelled = 1 AND elapsed > {threshold_secs}"
+             FROM {source} WHERE is_cancelled = 1 AND elapsed > {threshold_secs}{settings}"
         )
     }
 
@@ -167,6 +168,10 @@ mod tests {
         );
         assert!(!sql.contains("clusterAllReplicas"), "got: {sql}");
         assert!(sql.contains("elapsed > 900"), "got: {sql}");
+        // NAN-5215: a down replica is skipped, not fatal to the probe.
+        assert!(sql.ends_with(" SETTINGS skip_unavailable_shards = 1"), "got: {sql}");
+        let single = StuckQueryMonitor::probe_sql(None, 900);
+        assert!(!single.contains("SETTINGS"), "got: {single}");
     }
 
     #[test]

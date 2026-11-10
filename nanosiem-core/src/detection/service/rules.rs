@@ -5,7 +5,7 @@
 //! Create, read, update, delete operations for detection rules,
 //! including mode-based routing and lifecycle management.
 
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::models::{DetectionRule, NewDetectionRule, RuleMode, Severity, UpdateDetectionRule};
@@ -233,6 +233,19 @@ impl DetectionService {
                             "Failed to create materialized view for rule {}: {}",
                             created_rule.name, e
                         );
+                        // NAN-5215: an ON CLUSTER create can succeed on some
+                        // replicas and fail on another. Drop the deterministic
+                        // view name too so no replica keeps writing signals for
+                        // the rule being rolled back.
+                        let view_name = crate::detection::MaterializedViewGenerator::view_name_for_rule_id(
+                            created_rule.id,
+                        );
+                        if let Err(drop_error) = materialized_view_generator.drop_view(&view_name).await {
+                            warn!(
+                                "Rollback drop of materialized view {} failed: {}",
+                                view_name, drop_error
+                            );
+                        }
                         let _ = self.rule_repo.delete(created_rule.id).await;
                         Err(DetectionError::MaterializedViewError(e.to_string()))
                     }
