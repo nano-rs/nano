@@ -205,17 +205,6 @@ pub struct RuleImport {
     pub customizations: Option<serde_json::Value>,
 }
 
-/// AI-generated hints for alert triage (passed from conversion)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ConversionTriageHints {
-    /// Conditions that make this especially suspicious
-    #[serde(default)]
-    pub suspicious_when: Vec<String>,
-    /// Additional context about this detection for triage
-    #[serde(default)]
-    pub context: Option<String>,
-}
-
 /// Request to import a rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportRequest {
@@ -229,10 +218,8 @@ pub struct ImportRequest {
     pub severity: Option<String>,
     /// Override the mode (staging, live, alerting)
     pub mode: Option<String>,
-    /// Custom nPL query (overrides conversion)
+    /// Custom nPL query (overrides the rule's own query)
     pub custom_npl: Option<String>,
-    /// AI-generated triage hints from conversion
-    pub ai_triage_hints: Option<ConversionTriageHints>,
     /// Source type mappings: { original_type: replacement_type }
     pub source_type_mappings: Option<HashMap<String, String>>,
     /// Merge all source types to a single type
@@ -248,7 +235,6 @@ impl Default for ImportRequest {
             severity: None,
             mode: None,
             custom_npl: None,
-            ai_triage_hints: None,
             source_type_mappings: None,
             merge_to_single_source_type: None,
         }

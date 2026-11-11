@@ -40,6 +40,36 @@ impl RuleRepositoryService {
         is_allowed_repository(url, ALLOWED_REPOSITORIES, AIRGAP_RULES_URL)
     }
 
+    /// NAN-5272: only native nPL (`nanosiem`) repositories can be synced,
+    /// previewed, imported from or diffed. Sigma → nPL conversion was retired;
+    /// a legacy `rule_format = 'sigma'` row stays listed (and deletable) but
+    /// every content operation is refused with a clear message.
+    pub(super) fn ensure_supported_format(repo: &RuleRepository) -> Result<(), RuleRepositoryError> {
+        if repo.rule_format == "nanosiem" {
+            Ok(())
+        } else {
+            Err(RuleRepositoryError::SigmaFormatUnsupported)
+        }
+    }
+
+    /// [`Self::ensure_supported_format`] for the sync entry points: also
+    /// records the refusal as the repository's last sync result so the UI and
+    /// the scheduler's next pass show why it is not syncing.
+    pub(super) async fn refuse_unsupported_format(
+        &self,
+        repo: &RuleRepository,
+    ) -> Result<(), RuleRepositoryError> {
+        let Err(error) = Self::ensure_supported_format(repo) else {
+            return Ok(());
+        };
+        warn!(repository_id = %repo.id, rule_format = %repo.rule_format, "refusing to sync unsupported rule format");
+        let _ = self
+            .repo_repository
+            .update_sync_status(repo.id, "failed", None, None, Some(&error.to_string()))
+            .await;
+        Err(error)
+    }
+
     /// Get a repository by ID
     pub async fn get_repository(&self, id: Uuid) -> Result<RuleRepository, RuleRepositoryError> {
         let repo = self
@@ -85,6 +115,10 @@ impl RuleRepositoryService {
         if !Self::first_party(&req.url) {
             warn!("Attempted to add non-allowlisted repository: {}", repo_key);
             return Err(RuleRepositoryError::RepositoryNotAllowed(repo_key));
+        }
+        // NAN-5272: new repositories are native nPL; Sigma is no longer accepted.
+        if req.rule_format.as_deref().is_some_and(|f| f != "nanosiem") {
+            return Err(RuleRepositoryError::SigmaFormatUnsupported);
         }
         // NAN-4947: store the canonical spelling the sync parses back.
         let mut req = req;

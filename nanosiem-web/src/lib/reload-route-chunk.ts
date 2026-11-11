@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { readSearchFragment } from './search-fragment';
 
+const CHUNK_LOAD_ERROR = /ChunkLoadError|Loading (?:chunk|CSS chunk)|Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i;
+
+/** A lazy chunk or dynamic import that failed to load (stale build or network). */
+export function isChunkLoadError(error: unknown): boolean {
+  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return CHUNK_LOAD_ERROR.test(message);
+}
+
 /** Only stale/network chunk failures warrant a document reload. */
 export function reloadRouteChunk(error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  if (!/ChunkLoadError|Loading (?:chunk|CSS chunk)|Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i.test(message)) {
+  if (!isChunkLoadError(error)) {
     throw error;
   }
   const { pathname, search, hash } = window.location;

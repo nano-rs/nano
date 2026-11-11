@@ -13,6 +13,7 @@ import type {
   LogSourceWithDraftStatus,
   IngestionHistoryPoint,
   EnhancedDeploymentResponse,
+  GenerationDeliveryStatus,
   NamespaceValidationResult,
 } from './types';
 
@@ -125,6 +126,11 @@ export class LogSourcesApi {
     return this.deployRequest('/api/log-sources/deploy-all', {
       method: 'POST',
     });
+  }
+
+  /** NAN-5279: re-check a deploy's generation on the ingest hosts (one poll, no wait). */
+  async getDeliveryStatus(generation: number): Promise<GenerationDeliveryStatus> {
+    return this.request(`/api/log-sources/delivery-status?generation=${encodeURIComponent(String(generation))}`);
   }
 
   async getLogSourceDeployments(id: string): Promise<LogSourceDeployment[]> {

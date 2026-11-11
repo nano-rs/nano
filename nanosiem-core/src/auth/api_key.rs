@@ -53,8 +53,9 @@ pub(crate) fn api_key_digest(key_hash: &str, secret: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Constant-time equality for the digest comparison.
-fn digests_equal(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time equality for the digest comparison. Shared with other
+/// bearer secrets verified the same way (SCIM provisioning tokens, NAN-5274).
+pub fn digests_equal(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 

@@ -113,7 +113,7 @@ export function RuleEditorRedesign() {
   const isNewMode = location.pathname.endsWith('/new') || routeId === 'new';
   const id = isNewMode ? undefined : routeId;
 
-  // Seed params from AI / Sigma / duplicate flows — all handled identically to
+  // Seed params from AI / content / duplicate flows — all handled identically to
   // the legacy editor so existing entry points keep working.
   const duplicateId = searchParams.get('duplicate');
   const initialContent = searchParams.get('content') || '';
@@ -251,7 +251,7 @@ export function RuleEditorRedesign() {
     }
   }, [mitreData]);
 
-  // Seed editor from (in priority order): Sigma content → AI query → duplicate
+  // Seed editor from (in priority order): `content` param → AI query → duplicate
   // rule → apiRule → blank template. Each branch runs exactly once per rule ID.
   useEffect(() => {
     if (isNewMode && initialContent) {

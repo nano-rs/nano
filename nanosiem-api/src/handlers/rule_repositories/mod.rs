@@ -7,7 +7,7 @@
 //! - `crud` — list, get, create, update, delete
 //! - `sync` — repository sync and status
 //! - `rules` — folder browsing, rule listing, preview, import
-//! - `coverage` — coverage analysis, refresh, sigma conversion
+//! - `coverage` — coverage analysis, refresh
 //! - `upstream` — upstream change detection and diff
 //! - `batch` — batch import and remove operations
 
@@ -71,7 +71,6 @@ pub(crate) fn get_rule_repo_service(state: &AppState) -> Result<RuleRepositorySe
         remove_all_imported,
         get_coverage,
         refresh_coverage,
-        convert_sigma,
         get_upstream_updates,
         get_upstream_diff,
         dismiss_upstream_changes,
@@ -90,9 +89,6 @@ pub(crate) fn get_rule_repo_service(state: &AppState) -> Result<RuleRepositorySe
         BatchRemoveResponse,
         BatchFailure,
         BatchRemoveFailure,
-        ConvertSigmaRequest,
-        ConvertSigmaResponse,
-        FieldMappingResponse,
         SyncStartResponse,
         SyncStatusResponse,
         UpstreamUpdatesResponse,

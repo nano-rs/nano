@@ -39,7 +39,8 @@ mod query_checks;
 pub use cost_analysis::{analyze_query_cost, QueryCostAnalysis, QueryWarning, WarningSeverity};
 pub use derived_fields::collect_derived_fields;
 pub use field_validation::{
-    suggest_similar_fields, validate_field_name, validate_field_name_format, validate_query_fields,
+    suggest_similar_fields, suggest_similar_fields_in, validate_field_name, validate_field_name_format,
+    validate_query_fields,
     validate_query_fields_with_profile, FieldValidationError,
 };
 pub use query_checks::{

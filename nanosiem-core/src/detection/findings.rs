@@ -487,6 +487,23 @@ impl FindingEvent {
                         seen_values.insert(value_str);
                     }
                 }
+                // NAN-5271: OCSF rows carry none of the UDM keys above; take
+                // the entities from their class-correct OCSF columns
+                // (`actor.user.name`, `device.hostname`, `src_endpoint.ip`…).
+                // Dotted keys only, so a UDM row's summary is unchanged.
+                for kind in crate::schema::entities::PRIMARY_ORDER {
+                    if found.len() >= 4 {
+                        break;
+                    }
+                    let Some((key, value)) = crate::schema::entities::resolve_with_key(obj, kind) else {
+                        continue;
+                    };
+                    if !key.contains('.') || seen_values.contains(&value) {
+                        continue;
+                    }
+                    found.push((key.to_string(), value.clone()));
+                    seen_values.insert(value);
+                }
             }
         }
 

@@ -53,3 +53,17 @@ fn a_job_answer_never_serializes_a_results_key() {
     assert_eq!(json["origin"], "escalated");
     assert_eq!(json["attached"], false);
 }
+
+/// NAN-5277: a `| ai` search is never handed off to a background job (the
+/// re-run repeated the model call and held a background worker for minutes).
+#[test]
+fn ai_searches_are_not_handoff_eligible() {
+    assert!(!handoff_eligible(r#"class_uid=1007 | head 20 | ai prompt="Classify""#));
+    assert!(!handoff_eligible(
+        r#"* | ai prompt="Classify" | where ai_verdict="MALICIOUS""#
+    ));
+    assert!(handoff_eligible("* | stats count by class_uid"));
+    assert!(handoff_eligible("class_uid=3002 | timechart span=1h count by user.name"));
+    // An unparseable query keeps the existing behaviour.
+    assert!(handoff_eligible("| | |"));
+}

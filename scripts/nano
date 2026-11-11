@@ -12,7 +12,10 @@ case "${1:-}" in
         exec python3 -I "$SCRIPT_DIR/lib/nano_bundle.py" "$@"
         ;;
     backup-set|upgrade|rollback|_upgrade-worker)
-        exec python3 -I "$SCRIPT_DIR/nano-upgrade.py" "$@"
+        # NAN-5279: -u so progress reaches a non-TTY (`ssh host 'scripts/nano
+        # upgrade ...'`, a pipe, a CI log) as it happens, not at exit. -I
+        # ignores PYTHONUNBUFFERED, so the flag is the only switch.
+        exec python3 -I -u "$SCRIPT_DIR/nano-upgrade.py" "$@"
         ;;
     feeds)
         shift

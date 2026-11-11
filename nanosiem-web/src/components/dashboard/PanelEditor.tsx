@@ -421,7 +421,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                   value={query}
                   onChange={setQuery}
                   placeholder={queryMode === 'piped'
-                    ? 'source_type="apache" | stats count by status_code'
+                    ? 'metadata.log_source="apache_access" | stats count by http_response.code'
                     : 'SELECT status_code, COUNT(*) as count FROM logs GROUP BY status_code'
                   }
                   minHeight={120}
@@ -555,7 +555,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                     <Input
                       value={drilldownTemplate}
                       onChange={e => setDrilldownTemplate(e.target.value)}
-                      placeholder="e.g., source_type=$source_type status_code=$value"
+                      placeholder="e.g., metadata.log_source=$log_source http_response.code=$value"
                       className="h-[30px] text-[12px] font-mono"
                     />
                   </div>
@@ -768,7 +768,7 @@ function VisualizationConfigEditor({ type, config, onChange }: VisualizationConf
             <Input
               value={config.labelField || ''}
               onChange={e => onChange('labelField', e.target.value)}
-              placeholder="e.g., process_name"
+              placeholder="e.g., process.name"
               className="h-[28px] text-[12px] font-mono"
             />
           </ConfigField>

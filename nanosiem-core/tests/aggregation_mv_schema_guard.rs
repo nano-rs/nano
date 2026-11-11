@@ -296,8 +296,18 @@ fn migration_152_matches_init_definitions() {
     let mig = create_mv_statements(MIGRATION_152);
 
     for name in OCSF_PREVALENCE_MVS {
+        // NAN-5271: ocsf/migrations/196 later re-keys the source-side host with
+        // a src_host_unified fallback (MODIFY QUERY, pinned by
+        // tests/ocsf_prevalence_host_key_guard.rs); apply that rewrite here so
+        // 152 is compared on everything else.
+        let migrated = mig.get(*name).map(|s| {
+            s.replace(
+                "if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown')",
+                "if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown'))",
+            )
+        });
         assert_eq!(
-            mig.get(*name),
+            migrated.as_ref(),
             ocsf.get(*name),
             "{name} differs between migration 150 and clickhouse/ocsf/init.sql"
         );

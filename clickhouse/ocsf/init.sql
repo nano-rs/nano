@@ -835,7 +835,14 @@ FROM nanosiem.ip_prevalence_agg;
 -- Bodies mirror the UDM per-branch prevalence MVs; only the source columns
 -- differ (OCSF nested names). The host-identity expression mirrors UDM
 -- (src_host else src_ip else 'unknown'); OCSF's equivalents are
--- src_endpoint.hostname / src_endpoint.ip. MV NAMES ARE UNCHANGED (they retain
+-- src_endpoint.hostname / src_endpoint.ip, then src_host_unified before
+-- 'unknown' (NAN-5271): endpoint classes (Sysmon file/process/module/registry)
+-- leave src_endpoint.* empty and carry the host in device.hostname, so without
+-- that step every endpoint row counted as the single host 'unknown'.
+-- src_host_unified is used rather than `device.hostname` because it is already
+-- in nanosiem_ingest's column grant. ocsf/migrations/196 applies the same
+-- bodies to existing installs; tests/ocsf_prevalence_host_key_guard.rs pins
+-- them. MV NAMES ARE UNCHANGED (they retain
 -- the historical *_prevalence_summary_* names) so
 -- nanosiem-core/tests/aggregation_mv_schema_guard.rs keeps pinning them.
 --
@@ -872,7 +879,7 @@ AS SELECT
     lower(`file.hashes.sha256`) AS file_hash,
     multiIf(length(`file.hashes.sha256`) = 32, 'md5', length(`file.hashes.sha256`) = 40, 'sha1', length(`file.hashes.sha256`) = 64, 'sha256', 'unknown') AS hash_type,
     toStartOfHour(timestamp) AS time_bucket,
-    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS host_count,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -895,7 +902,7 @@ AS SELECT
     lower(`process.file.hashes.sha256`) AS file_hash,
     multiIf(length(`process.file.hashes.sha256`) = 32, 'md5', length(`process.file.hashes.sha256`) = 40, 'sha1', length(`process.file.hashes.sha256`) = 64, 'sha256', 'unknown') AS hash_type,
     toStartOfHour(timestamp) AS time_bucket,
-    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS host_count,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -922,7 +929,7 @@ AS SELECT
     if(length(splitByChar('.', `dst_endpoint.hostname`)) > 2, 1, 0) AS is_subdomain,
     '' AS parent_domain,
     toStartOfHour(timestamp) AS time_bucket,
-    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -948,7 +955,7 @@ AS SELECT
     if(length(splitByChar('.', `query.hostname`)) > 2, 1, 0) AS is_subdomain,
     '' AS parent_domain,
     toStartOfHour(timestamp) AS time_bucket,
-    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -974,7 +981,7 @@ AS SELECT
     if(length(splitByChar('.', `url.hostname`)) > 2, 1, 0) AS is_subdomain,
     '' AS parent_domain,
     toStartOfHour(timestamp) AS time_bucket,
-    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -1009,7 +1016,7 @@ AS SELECT
         1, 0
     ) AS is_private,
     toStartOfHour(timestamp) AS time_bucket,
-    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -1500,7 +1507,8 @@ SELECT
             length(hash_value) = 64, 'sha256', 'unknown') AS hash_type,
     toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`,
-                 if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS host_count,
+                 if(`src_endpoint.ip` != '', `src_endpoint.ip`,
+                    if(src_host_unified != '', src_host_unified, 'unknown')))) AS host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -1522,7 +1530,8 @@ SELECT
     if(length(splitByChar('.', domain_value)) > 2, 1, 0) AS is_subdomain,
     toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`,
-                 if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
+                 if(`src_endpoint.ip` != '', `src_endpoint.ip`,
+                    if(src_host_unified != '', src_host_unified, 'unknown')))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
@@ -1564,7 +1573,8 @@ FROM nanosiem.ocsf_logs
 ARRAY JOIN [
     (`dst_endpoint.ip`, 'dest',
      if(`src_endpoint.hostname` != '', `src_endpoint.hostname`,
-        if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))),
+        if(`src_endpoint.ip` != '', `src_endpoint.ip`,
+           if(src_host_unified != '', src_host_unified, 'unknown')))),
     (if(`src_endpoint.ip` != `dst_endpoint.ip`, `src_endpoint.ip`, ''), 'src',
      if(`dst_endpoint.hostname` != '', `dst_endpoint.hostname`,
         if(`dst_endpoint.ip` != '', `dst_endpoint.ip`, 'unknown')))

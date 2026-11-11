@@ -986,28 +986,19 @@ impl LateralPredicateColumns {
         terms.join(" OR ")
     }
 
-    /// OCSF auth predicate — INT taxonomy columns, no string ops on the ints.
+    /// OCSF auth predicate — the Authentication class minus Logoff
+    /// (NAN-5271 E, `Concept::AuthAttempt`).
+    ///
+    /// The previous form ORed `status_id != 0` / `auth_protocol_id != 0` into
+    /// the IAM-category test. `status_id` is a BASE-event attribute set on every
+    /// class (Success on HTTP, network, process …), so every OCSF event became
+    /// an "auth hop": proxy (4002) and Sysmon network (4001) rows used up
+    /// `MAX_EVENTS_PER_HOP` and could push real logons out. The source-name
+    /// `LIKE '%auth%'` heuristic is dropped for the same reason — under OCSF the
+    /// class says what an event is. Logoff is excluded: it ends a session, it is
+    /// not a credential use, and it doubled every edge.
     fn auth_where_ocsf(&self) -> String {
-        let mut terms: Vec<String> = Vec::new();
-        // Primary signal: IAM category (`category_uid = 3`), the canonical OCSF
-        // "this is an auth/identity event" flag — reuse the classification
-        // module's existing `OCSF_AUTH_PREDICATE` so the two stay in lockstep.
-        terms.push(crate::search::classification::OCSF_AUTH_PREDICATE.to_string());
-        // Secondary: a populated auth protocol / outcome. These columns are INTs
-        // under OCSF (auth_protocol_id, status_id) — compare to the int 0 sentinel,
-        // never the empty string and never wrapped in lower().
-        if let Some(ref c) = self.auth_type {
-            terms.push(format!("{c} != 0"));
-        }
-        if let Some(ref c) = self.auth_result {
-            terms.push(format!("{c} != 0"));
-        }
-        // NAN-1887: `self.source_type` is the OPERATIONAL String column under OCSF
-        // (`resolve("source_type")`, LowCardinality(String)) — NOT the taxonomy
-        // `class_uid`. The case-insensitive LIKE is a valid secondary signal (some
-        // producers name the source `*_auth`); the primary recall is `category_uid = 3`.
-        terms.push(format!("lower({}) LIKE '%auth%'", self.source_type));
-        terms.join(" OR ")
+        crate::schema::ocsf_predicates::Concept::AuthAttempt.sql().to_string()
     }
 
     /// WHERE body identifying network/lateral-port events for a hop. Mirrors the
@@ -1119,6 +1110,15 @@ fn build_lateral_columns(profile: &dyn crate::schema::SchemaProfile) -> String {
             // alias, so no shadow occurs.
             let col = if *field == "source_type" {
                 Some(profile.column_sql(field))
+            } else if profile.id() == crate::schema::SchemaId::Ocsf {
+                // NAN-5271 E: `auth_type` / `auth_result` resolve to enum INTs
+                // under OCSF (`auth_protocol_id`, `status_id`), so edge labels
+                // read "1"/"2". Project the sibling caption ("Kerberos",
+                // "Failure") the edge label is built from instead.
+                match crate::schema::ocsf_predicates::display_caption_column(field) {
+                    Some(caption) => Some(crate::query::escape_identifier(caption)),
+                    None => profile.udm_column_sql(field),
+                }
             } else {
                 profile.udm_column_sql(field)
             };
@@ -1137,10 +1137,9 @@ fn build_lateral_columns(profile: &dyn crate::schema::SchemaProfile) -> String {
 /// share this exact shape). Extracted into a free function so the NAN-1797
 /// source-scope gate is unit-testable without a live ClickHouse.
 ///
-/// With `scope_predicate = None` the output is byte-identical to the
-/// pre-scoping inline `format!` blocks. With a predicate, the method WHERE is
-/// parenthesized (it is an OR-chain for auth) and the predicate is ANDed in,
-/// so a scoped caller's hop expansion can never read a denied source_type.
+/// The method WHERE is always parenthesized (it is an OR-chain for UDM auth)
+/// and, when present, the scope predicate is ANDed in, so a scoped caller's
+/// hop expansion can never read a denied source_type.
 fn build_hop_sql(
     lateral_columns: &str,
     logs_table: &str,
@@ -1148,16 +1147,18 @@ fn build_hop_sql(
     method_where: &str,
     scope_predicate: Option<&str>,
 ) -> String {
-    let where_body = match scope_predicate {
-        Some(pred) => format!("({method_where}) AND {pred}"),
-        None => method_where.to_string(),
-    };
+    // NAN-1412: one WHERE (time bounds + entity + method), no explicit
+    // PREWHERE — an explicit PREWHERE disables ClickHouse's auto
+    // move-to-prewhere for every other filter.
+    let scope_and = scope_predicate
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
     format!(
         r#"SELECT {lateral_columns}
                     FROM {logs_table}
-                    PREWHERE timestamp BETWEEN ? AND ?
+                    WHERE timestamp BETWEEN ? AND ?
                         AND ({entity_clause})
-                    WHERE {where_body}
+                        AND ({method_where}){scope_and}
                     ORDER BY timestamp ASC
                     LIMIT {MAX_EVENTS_PER_HOP}"#
     )
@@ -1453,9 +1454,9 @@ mod source_scope_tests {
         let sql = build_hop_sql("a, b", "logs", "1=1", "x != ''", None);
         let expected = r#"SELECT a, b
                     FROM logs
-                    PREWHERE timestamp BETWEEN ? AND ?
+                    WHERE timestamp BETWEEN ? AND ?
                         AND (1=1)
-                    WHERE x != ''
+                        AND (x != '')
                     ORDER BY timestamp ASC
                     LIMIT 10000"#;
         assert_eq!(sql, expected);
@@ -1506,33 +1507,31 @@ mod lateral_seed_tests {
 mod auth_predicate_tests {
     use super::*;
 
-    /// NAN-1887: on OCSF the auth predicate's `source_type` term must LIKE the
-    /// OPERATIONAL String `source_type` column — NOT `class_uid`. The UDM
-    /// `source_type` concept maps to the `class_uid` UInt32 taxonomy column via the
-    /// manifest, so resolving it through `udm_column_sql` produced
-    /// `lower(class_uid) LIKE '%auth%'`, a ClickHouse type error (Code 43, Illegal
-    /// type UInt32 of argument of function lower) that broke every `| lateral` run
-    /// on an OCSF tenant (web + desktop). Empirically reproduced against local
-    /// `nanosiem.ocsf_logs` (class_uid = UInt32, source_type = LowCardinality(String)).
+    /// NAN-1887 + NAN-5271 E: on OCSF the auth hop is the Authentication class
+    /// minus Logoff. It must never `lower()` the UInt32 `class_uid` (NAN-1887's
+    /// Code 43), and it must never OR in `status_id != 0` / `auth_protocol_id
+    /// != 0` — `status_id` is set on every OCSF class, so that turned every
+    /// proxy / network / process event into an auth hop (NAN-5271 #6).
     #[test]
-    fn ocsf_auth_where_likes_operational_source_type_not_class_uid() {
+    fn ocsf_auth_where_is_the_authentication_class_only() {
         let p = crate::schema::OcsfProfile::new();
         let sql = LateralPredicateColumns::resolve(&p).auth_where();
-        // The fix: LIKE the operational String column.
-        assert!(
-            sql.contains("lower(source_type) LIKE '%auth%'"),
-            "OCSF auth predicate must LIKE the operational source_type column: {sql}"
-        );
-        // The bug: never wrap the UInt32 taxonomy column in lower().
-        assert!(
-            !sql.contains("lower(class_uid)"),
-            "OCSF auth predicate must not lower() the class_uid UInt32 column: {sql}"
-        );
-        // Primary recall is still the IAM category taxonomy.
-        assert!(
-            sql.contains(crate::search::classification::OCSF_AUTH_PREDICATE),
-            "OCSF auth predicate must retain the category_uid=3 primary signal: {sql}"
-        );
+        assert_eq!(sql, crate::schema::ocsf_predicates::AUTH_ATTEMPT);
+        assert!(!sql.contains("lower(class_uid)"), "{sql}");
+        assert!(!sql.contains("status_id"), "{sql}");
+        assert!(!sql.contains("auth_protocol_id"), "{sql}");
+        assert!(!sql.contains("source_type"), "{sql}");
+    }
+
+    /// NAN-5271 E: OCSF edge labels come from the caption columns, so a hop
+    /// reads "kerberos" / "Failure", not the enum ints "2" / "2".
+    #[test]
+    fn ocsf_projection_labels_auth_with_captions() {
+        let cols = build_lateral_columns(&crate::schema::OcsfProfile::new());
+        assert!(cols.contains("auth_protocol AS auth_type"), "{cols}");
+        assert!(cols.contains("status AS auth_result"), "{cols}");
+        assert!(!cols.contains("auth_protocol_id"), "{cols}");
+        assert!(!cols.contains("status_id"), "{cols}");
     }
 
     /// UDM stays byte-identical: `source_type` IS the operational String column, so
@@ -1575,8 +1574,7 @@ mod auth_predicate_tests {
     /// End-to-end assembled auth hop query (projection + auth WHERE + RBAC gate) —
     /// the exact shape `build_lateral_view` runs. Guards the whole NAN-1887/1892
     /// chain: the assembled SQL must carry the operational `source_type` alias and
-    /// contain NO `class_uid` anywhere (projection or predicate), so no `lower()`
-    /// ever sees a `UInt32`. Empirically confirmed to execute against local
+    /// never alias or `lower()` `class_uid`, so no `lower()` ever sees a `UInt32`. Empirically confirmed to execute against local
     /// `nanosiem.ocsf_logs`.
     #[test]
     fn ocsf_full_auth_hop_sql_has_no_class_uid_shadow() {
@@ -1593,10 +1591,16 @@ mod auth_predicate_tests {
             sql.contains("source_type AS source_type"),
             "assembled hop SQL must project the operational source_type: {sql}"
         );
+        // The shadow hazard is a projection ALIASED onto class_uid (or a
+        // `lower()` over it). NAN-5271 E's auth hop legitimately filters on the
+        // physical `class_uid` column, which no projection alias shadows.
         assert!(
-            !sql.contains("class_uid"),
-            "assembled hop SQL must not reference class_uid (would shadow → Code 43): {sql}"
+            !sql.contains("class_uid AS") && !sql.contains("lower(class_uid)"),
+            "assembled hop SQL must not alias or lower() class_uid (would shadow → Code 43): {sql}"
         );
+        assert!(sql.contains(crate::schema::ocsf_predicates::AUTH_ATTEMPT), "{sql}");
+        // NAN-1412: single WHERE, no explicit PREWHERE.
+        assert!(!sql.contains("PREWHERE"), "{sql}");
     }
 
     /// UDM projection is byte-identical: `source_type` resolves to itself under

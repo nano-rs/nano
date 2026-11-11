@@ -767,8 +767,8 @@ impl AppState {
 
     // NAN-1805: the RiskNotableScheduler (NAN-1792) is retired. Risk notables
     // are now an ordinary detection rule over `dataset=risk` (the seeded
-    // "Accumulated risk threshold exceeded" rule, enterprise migration
-    // 9000033) — grouping/cases/webhooks/cooldown ride the standard detection
+    // `accumulated_risk_threshold_exceeded` rule, enterprise migrations
+    // 9000033 + 9000091) — grouping/cases/webhooks/cooldown ride the standard detection
     // engine, with the per-(rule, entity) alert_cooldown_minutes throttle
     // carrying the scheduler's durable hysteresis. Historical
     // kind="risk_notable" alerts remain valid (migration 237's CHECK is

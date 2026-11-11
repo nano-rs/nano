@@ -162,6 +162,8 @@ pub const OCSF_EVENT_KIND_SQL: &str = concat!(
     " WHEN class_uid = 1005 THEN 'IMAGE_LOAD'",
     " WHEN class_uid = 1007 THEN 'PROCESS'",
     " WHEN class_uid = 1001 THEN 'FILE'",
+    // NAN-5271 E: Windows registry key/value classes were classified EVENT.
+    " WHEN class_uid IN (201001, 201002) THEN 'REGISTRY'",
     " WHEN category_uid = 4 THEN 'NETWORK'",
     " WHEN `dst_endpoint.ip` != '' THEN 'NETWORK'",
     " ELSE 'EVENT'",
@@ -175,15 +177,16 @@ pub const OCSF_LANE_SQL: &str = concat!(
     " WHEN category_uid = 3 THEN 0",
     " WHEN class_uid IN (1005, 1007) THEN 1",
     " WHEN (category_uid = 4 OR `dst_endpoint.ip` != '') THEN 2",
-    " WHEN class_uid = 1001 THEN 3",
+    " WHEN class_uid IN (1001, 201001, 201002) THEN 3",
     " ELSE -1",
     " END",
 );
 
 /// OCSF analog of [`AUTH_PREDICATE`] — IAM category covers the auth family.
-pub const OCSF_AUTH_PREDICATE: &str = "(category_uid = 3)";
+/// Sourced from the concept-predicate module (NAN-5271 E).
+pub const OCSF_AUTH_PREDICATE: &str = crate::schema::ocsf_predicates::IAM_EVENT;
 /// OCSF analog of [`FILE_PREDICATE`] — File System Activity class.
-pub const OCSF_FILE_PREDICATE: &str = "(class_uid = 1001)";
+pub const OCSF_FILE_PREDICATE: &str = crate::schema::ocsf_predicates::FILE_EVENT;
 
 /// Event-kind CASE expression for the active schema profile (NAN-1241). UDM
 /// returns [`EVENT_KIND_SQL`] byte-identical; OCSF returns [`OCSF_EVENT_KIND_SQL`].
@@ -316,6 +319,20 @@ mod tests {
         assert_eq!(NETWORK_PREDICATE, p_network!(), "NETWORK_PREDICATE drift");
         assert_eq!(PROCESS_PREDICATE, p_process!(), "PROCESS_PREDICATE drift");
         assert_eq!(FILE_PREDICATE, p_file!(), "FILE_PREDICATE drift");
+    }
+
+    /// NAN-5271 E: the `concat!`-built OCSF classifiers must splice the same
+    /// predicates the concept module hands every other raw-SQL builder.
+    #[test]
+    fn ocsf_classifiers_use_the_concept_predicates() {
+        use crate::schema::ocsf_predicates as p;
+        let body = |pred: &str| pred[1..pred.len() - 1].to_string();
+        for pred in [p::IAM_EVENT, p::FILE_EVENT, p::PROCESS_EVENT, p::MODULE_EVENT, p::DNS_EVENT, p::NETWORK_EVENT] {
+            assert!(OCSF_EVENT_KIND_SQL.contains(&body(pred)), "event kind lacks {pred}");
+        }
+        assert!(OCSF_EVENT_KIND_SQL.contains(&format!("WHEN {} THEN 'REGISTRY'", body(p::REGISTRY_EVENT))));
+        assert!(OCSF_LANE_SQL.contains(&body(p::IAM_EVENT)));
+        assert!(OCSF_LANE_SQL.contains("class_uid IN (1001, 201001, 201002) THEN 3"));
     }
 
     /// Windows-event parser sets `.udm.category` to one of `authentication`,

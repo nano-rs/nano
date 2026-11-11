@@ -11,7 +11,6 @@ export interface ActionAccess {
 export interface RuleImportIntent {
   outcome: 'create' | 'update' | 'skip';
   mode?: 'staging' | 'live' | 'alerting';
-  ruleFormat?: 'sigma' | 'nanosiem';
   rawContent?: string;
   /**
    * Update promotion depends on the current detection's lifecycle fields,
@@ -62,11 +61,9 @@ function frontmatterValue(rawContent: string | undefined, key: string): string |
   return match?.[1]?.toLowerCase();
 }
 
+// Mirrors the backend `ImportLifecycle::resolve` for native nPL rules (the
+// only repository format since NAN-5272).
 function ruleCreateRequiresPromote(intent: RuleImportIntent): boolean {
-  if (intent.ruleFormat !== 'nanosiem') {
-    return intent.mode === 'live' || intent.mode === 'alerting';
-  }
-
   const mode = intent.mode ?? frontmatterValue(intent.rawContent, 'mode') ?? 'staging';
   const detectionMode = frontmatterValue(intent.rawContent, 'detection_mode') ?? 'scheduled';
   return mode === 'live' || mode === 'alerting' || detectionMode === 'realtime';

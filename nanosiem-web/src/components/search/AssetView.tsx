@@ -9,6 +9,7 @@ import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { SEMANTIC_FIELDS, readSchemaField, readSchemaFieldString, type SemanticField } from '@/lib/schema-fields';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { isPrevalenceSentinelField, isPrevalenceSentinelValue } from '@/lib/prevalence-sentinels';
+import { isGeoEnrichmentField, isIocField } from '@/lib/enrichment-fields';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import {
   DropdownMenu,
@@ -727,13 +728,13 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
     // Category sort matching SearchResults: UDM first, then enrichment types
     const getFieldCat = (name: string): number => {
       if (name === 'risk_score' || name === 'risk_entity' || name === 'risk_factors' || name.startsWith('risk_')) return 1;
-      if (name.startsWith('ioc_')) return 2;
+      if (isIocField(name)) return 2;
       if (name.includes('_identity_') || name.startsWith('identity_') || name === 'is_nat_candidate') return 3;
       if (name.startsWith('prevalence_') || name === 'host_count' || name === 'is_rare' ||
           name === 'prevalence_score' || name === 'prevalence_type' || name === 'prevalence_artifact' ||
           name === 'total_occurrences' || name === 'first_seen' || name === 'last_seen') return 4;
       if (name.startsWith('lookup_')) return 5;
-      if (name.startsWith('enriched_')) return 6;
+      if (isGeoEnrichmentField(name)) return 6;
       if (name.startsWith('custom_')) return 7;
       if (name.startsWith('metadata_')) return 8;
       if (!isKnownField(name)) return 9; // ext fields
@@ -764,7 +765,7 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
   // Field name color matching SearchResults: UDM=sky, risk=orange, ioc=red, enrichment=muted
   const fieldNameColor = (k: string) =>
     (k === 'risk_score' || k === 'risk_entity' || k === 'risk_factors' || k.startsWith('risk_')) ? "text-orange-400" :
-    k.startsWith('ioc_') ? "text-red-400" :
+    isIocField(k) ? "text-red-400" :
     isKnownField(k) ? "text-sky-700 dark:text-sky-400/70" :
     "text-muted-foreground";
 

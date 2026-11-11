@@ -139,6 +139,13 @@ pub(crate) fn command_created_columns(command: &Command) -> Vec<String> {
         Command::Risk { .. } => owned(RISK_OUTPUT_COLUMNS),
         Command::Lateral { .. } => owned(LATERAL_OUTPUT_COLUMNS),
         Command::Ai { .. } => owned(AI_PIPE_OUTPUT_FIELDS),
+        // `generate_timechart_sql` projects `<bucket> AS time_bucket`.
+        // NAN-5277: without this, `… | eval … | timechart … | sort
+        // +time_bucket` on OCSF (a wide `SELECT *` base stage) read the bucket
+        // as an unmapped-tail field (`unmapped."time_bucket"`, Code 47). The
+        // timechart OTHER-series query has exactly that shape, so every
+        // `timechart … by <host>` with more than ten series failed.
+        Command::Timechart { .. } => owned(&["time_bucket"]),
         // `table f as alias` projects `f AS alias`: the alias is a real column
         // of every later stage (NAN-3314).
         Command::Table { fields } => fields.iter().filter_map(|f| f.alias.clone()).collect(),

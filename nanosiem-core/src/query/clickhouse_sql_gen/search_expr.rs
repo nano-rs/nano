@@ -1224,6 +1224,30 @@ impl ClickHouseSqlGenerator {
         if self.profile.is_array_field(field) {
             return self.generate_array_in_list_filter(field, None, values, negated);
         }
+        // NAN-5271 E: concept values (`action IN (blocked, Get)` under OCSF) OR
+        // their concept predicate with the plain membership of the remaining
+        // values; NOT IN negates the whole union. UDM → no concept → unchanged.
+        let mut concept_preds: Vec<&'static str> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for v in values {
+            if let Value::String(s) = v {
+                if let Some(pred) = self.profile.concept_value_predicate(field, s) {
+                    if !concept_preds.contains(&pred) {
+                        concept_preds.push(pred);
+                    }
+                    continue;
+                }
+            }
+            rest.push(v.clone());
+        }
+        if !concept_preds.is_empty() {
+            let mut parts: Vec<String> = concept_preds.iter().map(|p| p.to_string()).collect();
+            if !rest.is_empty() {
+                parts.push(self.generate_in_list_filter(field, &rest, false)?);
+            }
+            let any = format!("({})", parts.join(" OR "));
+            return Ok(if negated { format!("NOT {any}") } else { any });
+        }
         if list_has_cidr(values) {
             let field_expr = self.filter_field_expr(field, "String");
             if let Some(sql) = self.cidr_in_list_predicate(field, &field_expr, values, negated, |exact| {
@@ -1476,6 +1500,20 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate SQL for a field filter
+    /// NAN-5271 E: `field = value` / `field != value` where the active profile
+    /// maps the VALUE to a concept predicate on another column
+    /// ([`SchemaProfile::concept_value_predicate`]). `None` for every other
+    /// comparator / value shape and for profiles without concept translation.
+    fn concept_value_filter(&self, field: &str, op: &Comparator, value: &Value) -> Option<String> {
+        let Value::String(s) = value else { return None };
+        let pred = self.profile.concept_value_predicate(field, s)?;
+        match op {
+            Comparator::Eq => Some(pred.to_string()),
+            Comparator::Ne => Some(format!("NOT {pred}")),
+            _ => None,
+        }
+    }
+
     pub(super) fn generate_field_filter(
         &self,
         field: &str,
@@ -1497,11 +1535,33 @@ impl ClickHouseSqlGenerator {
         // `cloud_service` alias); logs byte-identical via the free alias map.
         let field = self.canonicalize_field(field);
 
+        // NAN-5271 E: a UDM value that names a concept OCSF stores on another
+        // column (`action=blocked` → `disposition_id`) translates to the
+        // concept predicate. UDM → None → byte-identical.
+        if let Some(sql) = self.concept_value_filter(field, op, value) {
+            return Ok(sql);
+        }
+
         // Splunk treats equality against CIDR notation as network membership
         // for IP fields. This must run before the known/JSON routing split so
         // OCSF UDM aliases receive the same behavior as native promoted fields.
         if let Some(sql) = self.generate_cidr_equality_filter(field, op, value)? {
             return Ok(sql);
+        }
+
+        // NAN-5271 E: a UDM alias onto a promoted Array column (OCSF `category`
+        // → `http_request.url.categories`) is not a "known field" by NAME, so it
+        // fell to the JSON arm and compiled `lower(<Array(String)>) = 'v'` — a
+        // CH Code 43 that failed the whole search. Give it the same membership
+        // semantics as the native column.
+        if !self.profile.is_known_field(field)
+            && self.profile.is_array_field(field)
+            && matches!(
+                self.profile.resolve(field),
+                crate::schema::FieldResolution::ExplicitColumn(_)
+            )
+        {
+            return self.generate_array_field_filter(field, op, value);
         }
 
         // Check if it's a UDM field (direct column) or metadata field (JSON)
@@ -2614,6 +2674,16 @@ impl ClickHouseSqlGenerator {
                 // Normalize field name (apply aliases like command_line -> process).
                 // NAN-1555: profile-aware (spans keep `service_name`); logs identical.
                 let field = self.canonicalize_field(field);
+                // NAN-5271 E: concept translation (see `generate_field_filter`),
+                // only while the stage still carries the raw event columns.
+                if !self.is_computed_field(field)
+                    && !self.is_upstream_computed_field(field)
+                    && !self.is_upstream_projected()
+                {
+                    if let Some(sql) = self.concept_value_filter(field, op, value) {
+                        return Ok(sql);
+                    }
+                }
                 // Check if field is an aggregation expression like "avg(bytes_out)"
                 // If so, extract the function name to use as the column reference
                 let column_ref = if field.contains('(') && field.contains(')') {
@@ -2962,6 +3032,18 @@ impl ClickHouseSqlGenerator {
                 values,
                 negated,
             } => {
+                // NAN-5271 E: concept values (`action IN (blocked)` under OCSF)
+                // take the same translation as the search-term IN-list, while
+                // the stage still carries the raw event columns.
+                if !self.is_computed_field(field)
+                    && !self.is_upstream_computed_field(field)
+                    && !self.is_upstream_projected()
+                    && values.iter().any(|v| {
+                        matches!(v, Value::String(s) if self.profile.concept_value_predicate(field, s).is_some())
+                    })
+                {
+                    return self.generate_in_list_filter(field, values, *negated);
+                }
                 // Check if field is an aggregation expression
                 let column_ref = if field.contains('(') && field.contains(')') {
                     if let Some(func_end) = field.find('(') {

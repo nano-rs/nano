@@ -63,6 +63,8 @@ pub async fn search_stream(
 ) -> Result<(axum::http::HeaderMap, Sse<impl Stream<Item = Result<Event, Infallible>>>), SearchError>
 {
     let handler_started = Instant::now();
+    // NAN-5277: a `| ai` search is never handed off (see `handoff_eligible`).
+    let accept_async = accept_async && super::background_jobs::handoff_eligible(&request.query);
     // NAN-3077: a progressive terminal `| tree` / `| lateral` streams only its
     // pending dispatcher; the view then pages (tree) or streams its hops
     // (lateral) itself. Never read from or written to the result cache.

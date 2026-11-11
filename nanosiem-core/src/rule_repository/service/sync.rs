@@ -17,10 +17,6 @@ use super::super::npl_parser::parse_npl;
 use super::super::repository::{
     RepositoryRulesRepository, RuleImportsRepository, RuleRepositoryRepository,
 };
-use super::super::sigma_parser::{
-    extract_mitre_tactics, extract_mitre_techniques, extract_required_fields,
-    map_logsource_to_source_types, map_severity, parse_sigma,
-};
 use super::helpers::{apply_customizations_to_query, collect_rule_files};
 use super::{RuleRepositoryService, RuleRepositoryServiceConfig};
 
@@ -40,13 +36,24 @@ impl RuleRepositoryService {
             syncing.insert(id);
         }
 
-        let repo = self.get_repository(id).await?;
+        let repo = match self.get_repository(id).await {
+            Ok(repo) => repo,
+            Err(error) => {
+                self.syncing_repos.write().await.remove(&id);
+                return Err(error);
+            }
+        };
 
         if !repo.enabled {
             // Remove from syncing set since we're not actually syncing
             let mut syncing = self.syncing_repos.write().await;
             syncing.remove(&id);
             return Err(RuleRepositoryError::RepositoryDisabled);
+        }
+
+        if let Err(error) = self.refuse_unsupported_format(&repo).await {
+            self.syncing_repos.write().await.remove(&id);
+            return Err(error);
         }
 
         // Mark sync as in progress
@@ -353,8 +360,6 @@ impl RuleRepositoryService {
 
             // NAN-1387: whether this file came from a UDM-tree fallback (no
             // `-ocsf` sibling under the OCSF profile) and must be flagged.
-            // Only nPL-native rules carry the flag — Sigma rules already
-            // surface as `pending` until conversion.
             let untranslated = untranslated_paths.contains(&entry.path);
 
             // Check if content has changed (use content hash for sparse checkout, SHA for API)
@@ -362,8 +367,7 @@ impl RuleRepositoryService {
                 // NAN-1387: a profile change can flip success ⇄ untranslated
                 // without the content changing — never skip past a stale
                 // conversion_status.
-                let status_stale = repo.rule_format != "sigma"
-                    && matches!(
+                let status_stale = matches!(
                         existing_rule.conversion_status.as_str(),
                         "success" | "untranslated"
                     )
@@ -397,52 +401,7 @@ impl RuleRepositoryService {
                 requires_fields,
                 requires_source_types,
                 conversion_status,
-            ) = if repo.rule_format == "sigma" {
-                match parse_sigma(&content) {
-                    Ok(sigma) => {
-                        let fields = extract_required_fields(&sigma);
-                        let source_types = map_logsource_to_source_types(&sigma.logsource);
-                        let tactics = extract_mitre_tactics(&sigma.tags);
-                        let techniques = extract_mitre_techniques(&sigma.tags);
-                        (
-                            Some(sigma.title),
-                            sigma.description,
-                            Some(map_severity(sigma.level.as_deref())),
-                            if tactics.is_empty() {
-                                None
-                            } else {
-                                Some(tactics)
-                            },
-                            if techniques.is_empty() {
-                                None
-                            } else {
-                                Some(techniques)
-                            },
-                            if sigma.tags.is_empty() {
-                                None
-                            } else {
-                                Some(sigma.tags)
-                            },
-                            if fields.is_empty() {
-                                None
-                            } else {
-                                Some(fields)
-                            },
-                            if source_types.is_empty() {
-                                None
-                            } else {
-                                Some(source_types)
-                            },
-                            None, // Sigma rules stay pending until AI conversion
-                        )
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse Sigma rule {}: {}", entry.path, e);
-                        // Store anyway with minimal metadata
-                        (None, None, None, None, None, None, None, None, Some("failed"))
-                    }
-                }
-            } else {
+            ) = {
                 // nano/nPL format - parse YAML frontmatter and extract metadata
                 match parse_npl(&content) {
                     Ok(npl) => (
@@ -574,6 +533,11 @@ impl RuleRepositoryService {
             return Err(RuleRepositoryError::RepositoryDisabled);
         }
 
+        if let Err(error) = self.refuse_unsupported_format(&repo).await {
+            self.syncing_repos.write().await.remove(&id);
+            return Err(error);
+        }
+
         // Mark sync as in progress
         let _ = self
             .repo_repository
@@ -697,15 +661,12 @@ impl RuleRepositoryService {
             .await
             .map_err(|e| RuleRepositoryError::Internal(e.to_string()))?;
 
-        // Get the upstream query (parse nPL or use converted)
+        // Get the upstream query from the nPL rule
         let repo = self.get_repository(repo_rule.repository_id).await?;
-        let upstream_query = if repo.rule_format == "nanosiem" {
-            parse_npl(&repo_rule.raw_content)
-                .map(|npl| npl.query)
-                .unwrap_or_else(|_| repo_rule.raw_content.clone())
-        } else {
-            repo_rule.converted_npl.clone().unwrap_or_default()
-        };
+        Self::ensure_supported_format(&repo)?;
+        let upstream_query = parse_npl(&repo_rule.raw_content)
+            .map(|npl| npl.query)
+            .unwrap_or_else(|_| repo_rule.raw_content.clone());
 
         // Apply stored customizations (source_type mappings) so diffs only show real upstream changes
         let customizations_applied = import.customizations.is_some();

@@ -18,6 +18,7 @@
 //! - POST /api/log-sources/validate-vrl - Validate VRL code
 //! - POST /api/log-sources/test-vrl - Test VRL against sample
 //! - POST /api/log-sources/deploy-all - Deploy all enabled
+//! - GET /api/log-sources/delivery-status?generation=N - Re-check a role-split deploy
 
 use super::AuditExt;
 use axum::{
@@ -35,6 +36,10 @@ use nanosiem_core::log_sources::{
     CollectorError, LogSourceHealth, LogSourceVersion, LogSourceWithDraftStatus, NewLogSource,
     ParserTestResult,
     UpdateLogSource, VrlDiagnostic, VrlValidationResult,
+};
+use nanosiem_core::parsers::vector_config_remote_delivery::{
+    self as remote_delivery, DeliveryState, GenerationDelivery, GenerationDeliveryStatus,
+    IngestHostDelivery,
 };
 use nanosiem_core::principal_gate::PrincipalGate;
 use nanosiem_core::typeid::TypeIdParam;
@@ -836,6 +841,40 @@ pub async fn deploy_all_log_sources(
     Ok(Json(serde_json::json!({"deployed": true})))
 }
 
+/// Query for [`get_delivery_status`].
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct DeliveryStatusQuery {
+    /// The generation a deploy published (its result's `delivery.generation`).
+    pub generation: i64,
+}
+
+/// Re-check where a deploy's Vector configuration generation stands on the
+/// ingest hosts (NAN-5279). One poll of every host's relay, no waiting: a
+/// deploy that returned `delivery.state = "pending"` reads `acknowledged`
+/// here once every host installed it.
+#[utoipa::path(
+    get,
+    path = "/api/log-sources/delivery-status",
+    tag = "log_sources",
+    params(DeliveryStatusQuery),
+    responses(
+        (status = 200, description = "Delivery state of the generation across the ingest hosts", body = GenerationDeliveryStatus),
+        (status = 400, description = "Invalid generation"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(("api_key" = []))
+)]
+pub async fn get_delivery_status(
+    Extension(auth): Extension<AuthContext>,
+    Query(query): Query<DeliveryStatusQuery>,
+) -> Result<Json<GenerationDeliveryStatus>, ApiError> {
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
+    if query.generation <= 0 {
+        return Err(ApiError::BadRequest("generation must be positive".to_string()));
+    }
+    Ok(Json(remote_delivery::delivery_status(query.generation).await))
+}
+
 // ============================================================================
 // Versioning Endpoints
 // ============================================================================
@@ -1059,6 +1098,7 @@ pub async fn get_log_source_draft_status(
         test_vrl,
         test_vrl_live,
         deploy_all_log_sources,
+        get_delivery_status,
         get_log_source_versions,
         publish_log_source,
         revert_log_source_version,
@@ -1086,6 +1126,11 @@ pub async fn get_log_source_draft_status(
         // drop them from the published spec.
         LogSourceHealth,
         CollectorError,
+        // NAN-5279: generation-delivery state on deploy results + re-check.
+        DeliveryState,
+        GenerationDelivery,
+        GenerationDeliveryStatus,
+        IngestHostDelivery,
     ))
 )]
 pub struct LogSourcesApiDoc;

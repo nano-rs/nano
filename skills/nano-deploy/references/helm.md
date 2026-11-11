@@ -265,7 +265,10 @@ Upgrades: pull the NEW chart over the old one first, because
 `nano/values-customer-images.yaml` pins the digests of the chart it came with
 (reusing the old `./nano` silently keeps the old images), then upgrade from it
 with exactly the install's `-f` files in the same order (dropping the HA or
-cloud file silently changes the install). Back up first
+cloud file silently changes the install). Never `--reuse-values`: it renders
+with the previous chart's values and ignores the new chart's defaults (charts
+<= 2.0.12 also kept the old images); without the original files use
+`--reset-then-reuse-values -f nano/values-customer-images.yaml`. Back up first
 ([operate.md](operate.md#kubernetes)).
 
 ```bash

@@ -78,6 +78,16 @@ pub async fn acquire_rule_runtime_lock(
     }
 }
 
+/// Where an auto-detected real-time `risk_entity` comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutoRiskEntity {
+    /// A physical field named in the WHERE. It is validated, then escaped.
+    Field(String),
+    /// A class-aware expression built from constant column names
+    /// (`schema::entities`), used as is.
+    Expr(String),
+}
+
 /// Validate that a field name is safe for interpolation into DDL statements.
 ///
 /// This prevents SQL injection via crafted `risk_entity_field` values (e.g.,
@@ -654,32 +664,62 @@ impl MaterializedViewGenerator {
         // Extract filter conditions from the query
         let where_clause = self.extract_where_clause(&query)?;
 
-        // Get risk entity field - auto-detect if not specified or empty
-        let risk_entity_field = match rule.risk_entity_field.as_ref() {
-            Some(field) if !field.is_empty() => field.clone(),
-            _ => {
-                // Auto-detect by analyzing which fields are referenced in the query
-                self.auto_detect_risk_entity(&where_clause)
+        // Resolve the `risk_entity` expression. An explicit (or auto-detected)
+        // field is ALREADY a physical column name in the active schema (UDM
+        // `src_ip`, OCSF `src_endpoint.ip`); it is validated against the profile
+        // universe BEFORE interpolation (an attacker could set
+        // risk_entity_field to `concat(currentDatabase(), ':', version())`) and
+        // then escaped, so dotted OCSF columns are quoted. `escape_identifier` is
+        // a no-op on UDM single-segment names, so UDM DDL is byte-identical.
+        //
+        // NAN-5271 C: when neither the rule nor its WHERE names an entity field,
+        // OCSF no longer defaults to `src_endpoint.ip` (empty on every Sysmon
+        // endpoint class, so every signal was attributed to `unknown` and grouped
+        // dedup collapsed into one bucket). It uses the class-aware primary-entity
+        // expression from `schema::entities`, built only from constant physical
+        // column names.
+        let risk_entity_sql = match rule.risk_entity_field.as_deref() {
+            // NAN-5271 C: on OCSF a UDM entity key (`user`, `src_ip`, …) or a
+            // `*_unified` ALIAS name is never a physical `ocsf_logs` column that
+            // the inner `SELECT *` carries, even when the profile calls it "known"
+            // (`user` is the OCSF object path). It maps to the concept's
+            // class-aware expression before validation, or the MV would emit a
+            // bare missing column and fail to CREATE.
+            Some(field)
+                if matches!(self.profile.id(), crate::schema::SchemaId::Ocsf)
+                    && crate::schema::entities::is_non_physical_entity_name(field) =>
+            {
+                // `is_non_physical_entity_name` implies a known concept.
+                let kind = crate::schema::entities::EntityKind::from_field_name(field)
+                    .expect("entity name maps to a concept");
+                crate::schema::entities::ocsf_sql_expr(kind)
             }
+            Some(field) if !field.is_empty() => {
+                match validate_ddl_field_name(field, self.profile.as_ref()) {
+                    Ok(()) => crate::query::escape_identifier(field),
+                    // NAN-5271 C (finding #29): a UDM entity name (`src_ip`)
+                    // stored on an OCSF rule maps to its class-aware concept
+                    // expression. Only a recognized concept name gets here, and
+                    // the SQL is built from constant column names.
+                    Err(e) => match (
+                        self.profile.id(),
+                        crate::schema::entities::EntityKind::from_field_name(field),
+                    ) {
+                        (crate::schema::SchemaId::Ocsf, Some(kind)) => {
+                            crate::schema::entities::ocsf_sql_expr(kind)
+                        }
+                        _ => return Err(e),
+                    },
+                }
+            }
+            _ => match self.auto_detect_risk_entity(&where_clause) {
+                AutoRiskEntity::Field(field) => {
+                    validate_ddl_field_name(&field, self.profile.as_ref())?;
+                    crate::query::escape_identifier(&field)
+                }
+                AutoRiskEntity::Expr(sql) => sql,
+            },
         };
-
-        // Validate risk_entity_field before interpolating into DDL to prevent SQL injection.
-        // An attacker could set risk_entity_field to a SQL expression like
-        // `concat(currentDatabase(), ':', version())` to exfiltrate data.
-        // Validation runs on the UNESCAPED physical name (`src_ip` /
-        // `src_endpoint.ip`) against the active profile's field universe; the
-        // identity escape below is applied only after the guard passes.
-        validate_ddl_field_name(&risk_entity_field, self.profile.as_ref())?;
-
-        // Resolve `risk_entity_field` to the physical column expression the SELECT
-        // references via `... AS risk_entity`. Mirrors the canonical scheduled path
-        // (`risk::ScoreCalculator::extract_entity`): the stored/auto-detected field
-        // is ALREADY a physical column name in the active schema (UDM `src_ip`,
-        // OCSF `src_endpoint.ip`) — it is NOT a UDM-semantic alias to translate.
-        // We only escape it so dotted OCSF columns are quoted for ClickHouse.
-        // `escape_identifier` is a no-op on UDM single-segment names, so UDM DDL
-        // is byte-identical; OCSF dotted names become `"src_endpoint.ip"`.
-        let risk_entity_sql = crate::query::escape_identifier(&risk_entity_field);
 
         // Calculate risk score (use rule's risk_score or default based on severity).
         // Severity defaults are sourced from `crate::detection::risk` so the MV path
@@ -846,41 +886,50 @@ FROM (
         Ok(())
     }
 
-    /// Auto-detect the best risk entity field by analyzing the query
+    /// Auto-detect the risk entity from the rule's WHERE clause.
     ///
-    /// Analyzes which UDM fields are referenced in the WHERE clause and picks
-    /// the most appropriate one for risk scoring based on priority:
-    /// 1. IP addresses (src_ip, dest_ip, dvc_ip, etc.)
-    /// 2. Hostnames (src_host, dest_host, host, etc.)
-    /// 3. Users (src_user, dest_user, user, etc.)
-    /// 4. File hashes (file_hash, process_hash, service_hash, ssl_hash)
+    /// The fields referenced in the WHERE are matched as whole identifiers, in
+    /// the active profile's entity-extraction priority (IPs, then hosts, then
+    /// users, then hashes). A whole-identifier match matters on OCSF: a plain
+    /// substring check picked `user.name` for a WHERE on `actor.user.name`
+    /// (NAN-5271 C).
     ///
-    /// # Arguments
-    /// * `where_clause` - The SQL WHERE clause to analyze
-    ///
-    /// # Returns
-    /// * The detected field name, or "src_ip" as default
-    fn auto_detect_risk_entity(&self, where_clause: &str) -> String {
-        // Priority order for risk entity fields, from the active profile's
-        // entity-extraction order (NAN-1241). For UDM this reproduces the
-        // previous hard-coded list (the superset list is a superset of it; the
-        // first match in priority order wins, so a UDM WHERE clause resolves to
-        // the same field). For OCSF the WHERE clause is OCSF-shaped, so the scan
-        // matches OCSF physical columns (`src_endpoint.ip`, `user.name`, …) which
-        // the order yields directly; the returned name is escaped at the DDL
-        // interpolation site (`generate_view_ddl`).
+    /// On OCSF, a WHERE on a class-split concept emits the unified column
+    /// (`src_host_unified`, `user_unified`, …). Those are ALIAS columns, which
+    /// the MV's inner `SELECT *` does not carry, so they map to the class-aware
+    /// physical-column expression for that concept. With no entity field in the
+    /// WHERE, OCSF uses the class-aware primary entity, and UDM keeps its first
+    /// extraction entry (`src_ip`).
+    fn auto_detect_risk_entity(&self, where_clause: &str) -> AutoRiskEntity {
+        let idents: std::collections::HashSet<&str> = where_clause
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .filter(|t| !t.is_empty())
+            .collect();
+
         for &(_role, field) in self.profile.entity_extraction_order() {
-            if where_clause.contains(field) {
-                tracing::debug!(
-                    "Auto-detected risk entity field: {} (found in query)",
-                    field
-                );
-                return field.to_string();
+            if idents.contains(field) {
+                tracing::debug!("Auto-detected risk entity field: {} (found in query)", field);
+                return AutoRiskEntity::Field(field.to_string());
             }
         }
 
-        // Default to the profile's risk-entity default (UDM `src_ip` via the
-        // first entity-extraction entry) if no fields found.
+        let is_ocsf = matches!(self.profile.id(), crate::schema::SchemaId::Ocsf);
+        if is_ocsf {
+            use crate::schema::entities;
+            for kind in entities::PRIMARY_ORDER
+                .iter()
+                .chain([entities::EntityKind::Process, entities::EntityKind::CommandLine].iter())
+            {
+                if let Some(col) = entities::ocsf_indexed_column(*kind) {
+                    if idents.contains(col) {
+                        return AutoRiskEntity::Expr(entities::ocsf_sql_expr(*kind));
+                    }
+                }
+            }
+            tracing::debug!("Auto-detected risk entity: class-aware primary entity (default)");
+            return AutoRiskEntity::Expr(entities::ocsf_primary_entity_sql());
+        }
+
         let default = self
             .profile
             .entity_extraction_order()
@@ -888,7 +937,7 @@ FROM (
             .map(|(_role, f)| *f)
             .unwrap_or("src_ip");
         tracing::debug!("Auto-detected risk entity field: {} (default)", default);
-        default.to_string()
+        AutoRiskEntity::Field(default.to_string())
     }
 
     /// Check if a query string contains piped commands
@@ -1473,24 +1522,73 @@ mod tests {
         let udm_gen = MaterializedViewGenerator::new(clickhouse::Client::default());
         assert_eq!(
             udm_gen.auto_detect_risk_entity("lower(src_user) = lower('alice')"),
-            "src_user"
+            AutoRiskEntity::Field("src_user".into())
         );
         // UDM default (no recognized field) is src_ip.
-        assert_eq!(udm_gen.auto_detect_risk_entity("1 = 1"), "src_ip");
+        assert_eq!(udm_gen.auto_detect_risk_entity("1 = 1"), AutoRiskEntity::Field("src_ip".into()));
 
-        // OCSF: the first entity-extraction entry (src_endpoint.ip) is the
-        // default, and a clause referencing user.name resolves to it.
+        // OCSF with no entity field in the WHERE: the class-aware primary
+        // entity, not `src_endpoint.ip` (empty on every Sysmon endpoint class).
         let ocsf = std::sync::Arc::new(crate::schema::OcsfProfile::new());
-        let ocsf_default = ocsf
-            .entity_extraction_order()
-            .first()
-            .map(|(_r, f)| f.to_string());
+        let _ = ocsf.entity_extraction_order();
         let ocsf_gen = MaterializedViewGenerator::new(clickhouse::Client::default())
             .with_profile(ocsf.clone());
         assert_eq!(
             ocsf_gen.auto_detect_risk_entity("1 = 1"),
-            ocsf_default.unwrap()
+            AutoRiskEntity::Expr(crate::schema::entities::ocsf_primary_entity_sql())
         );
+    }
+
+    /// NAN-5271 C (finding #7): whole-identifier matching. `actor.user.name`
+    /// must not be read as `user.name`, and the unified ALIAS columns map to the
+    /// class-aware physical expression (the inner `SELECT *` has no ALIAS columns).
+    #[test]
+    fn ocsf_auto_detect_matches_whole_identifiers_and_unified_columns() {
+        use crate::schema::entities::{ocsf_sql_expr, EntityKind};
+        let ocsf = std::sync::Arc::new(crate::schema::OcsfProfile::new());
+        let gen = MaterializedViewGenerator::new(clickhouse::Client::default()).with_profile(ocsf);
+        assert_eq!(
+            gen.auto_detect_risk_entity(r#"lower("actor.user.name") = 'canderson'"#),
+            AutoRiskEntity::Field("actor.user.name".into())
+        );
+        assert_eq!(
+            gen.auto_detect_risk_entity("lower(src_host_unified) = 'ws-01' AND class_uid = 1007"),
+            AutoRiskEntity::Expr(ocsf_sql_expr(EntityKind::SrcHost))
+        );
+        assert_eq!(
+            gen.auto_detect_risk_entity(r#""process.name" = 'sc.exe'"#),
+            AutoRiskEntity::Expr(crate::schema::entities::ocsf_primary_entity_sql())
+        );
+    }
+
+    /// NAN-5271 C (finding #29): a UDM entity name stored on an OCSF real-time
+    /// rule compiles to the concept's class-aware expression instead of failing.
+    #[test]
+    fn ocsf_udm_named_risk_entity_field_maps_to_concept() {
+        let ocsf = std::sync::Arc::new(crate::schema::OcsfProfile::new());
+        let gen = MaterializedViewGenerator::new(clickhouse::Client::default()).with_profile(ocsf);
+        let mut rule = create_test_rule();
+        rule.risk_entity_field = Some("src_host".to_string());
+        let ddl = gen.generate_view_ddl(&rule).unwrap();
+        let expected = crate::schema::entities::ocsf_sql_expr(
+            crate::schema::entities::EntityKind::SrcHost,
+        );
+        assert!(ddl.contains(&format!("{expected} AS risk_entity")), "{ddl}");
+        // An injection attempt is still refused.
+        rule.risk_entity_field = Some("concat(currentDatabase(), ':', version())".to_string());
+        assert!(gen.generate_view_ddl(&rule).is_err());
+        // `user` is an OCSF-known object path, so it passes DDL validation; it
+        // must still map to the concept, never a bare missing `user` column.
+        for (field, kind) in [
+            ("user", crate::schema::entities::EntityKind::User),
+            ("src_ip", crate::schema::entities::EntityKind::SrcIp),
+            ("user_unified", crate::schema::entities::EntityKind::User),
+        ] {
+            rule.risk_entity_field = Some(field.to_string());
+            let ddl = gen.generate_view_ddl(&rule).unwrap();
+            let expected = crate::schema::entities::ocsf_sql_expr(kind);
+            assert!(ddl.contains(&format!("{expected} AS risk_entity")), "{field}: {ddl}");
+        }
     }
 
     #[test]

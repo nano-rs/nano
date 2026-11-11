@@ -11,6 +11,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -118,6 +119,10 @@ APP_SERVICES = (
     # NAN-5214: host-local HAProxy routers to the Patroni leader (`postgres`)
     # and the Sentinel-elected Valkey master (`dragonfly`).
     "postgres-router", "valkey-router",
+    # NAN-5215: the app host's HAProxy to the ingest hosts. NAN-5282: without
+    # it here the app rollout never selected it, so a re-rendered
+    # haproxy/ingest-proxy.cfg (NAN-5279 F1) never reached the running proxy.
+    "ingest-proxy",
     "clickhouse-proxy", "nano-api", "nano-jobs", "connector-runner",
     "nano-search", "nano-web", "nginx", "app-internal-edge",
     # NAN-5204: the opt-in automatic-backup service runs the api image; a
@@ -823,6 +828,19 @@ def pin_compatible_delivery_mode(env_file: "EnvFile") -> bool:
     return True
 
 
+def pin_legacy_schema_profile(env_file: "EnvFile") -> bool:
+    """Write NANO_SCHEMA_PROFILE=udm into an upgraded .env that has no value
+    for it (NAN-5271). Until v2.0.12 an unset profile resolved to UDM in the
+    compose files and in the services, so such an install holds UDM data. The
+    new release defaults an unset profile to OCSF; recording the value the
+    install already runs keeps it on UDM. Idempotent; an explicit value
+    (udm or ocsf) is never changed. Same rule as install.sh (NAN-4903)."""
+    if env_file.values().get("NANO_SCHEMA_PROFILE", "").strip():
+        return False
+    env_file.replace("NANO_SCHEMA_PROFILE", "udm")
+    return True
+
+
 def eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
@@ -885,6 +903,95 @@ def siem_health_finding_signatures(snapshot: dict[str, Any]) -> set[str]:
             previous_space = False
         signatures.add("".join(normalized).strip())
     return signatures
+
+
+def env_seconds(name: str, default: int, maximum: int = 3600) -> int:
+    raw = os.environ.get(name, "")
+    try:
+        value = int(raw) if raw.strip() else default
+    except ValueError as error:
+        raise UpgradeError(f"{name} must be a whole number of seconds") from error
+    return max(0, min(value, maximum))
+
+
+def _parse_report_time(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace(" ", "T", 1)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # PostgreSQL may print a two-digit offset (+00); fromisoformat wants +00:00.
+    match = re.fullmatch(r"(.*[+-])(\d{2})", text)
+    if match:
+        text = f"{match.group(1)}{match.group(2)}:00"
+    # Older Pythons accept only 3 or 6 fractional digits.
+    match = re.fullmatch(r"([^.]*)\.(\d+)(.*)", text)
+    if match:
+        text = f"{match.group(1)}.{match.group(2)[:6].ljust(6, '0')}{match.group(3)}"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def siem_health_report_is_fresh(
+    before: dict[str, Any], after: dict[str, Any], since: str | None,
+) -> bool:
+    """NAN-5279 F5: is `after` a report generated after the upgrade?
+
+    The gate used to read the latest report straight after the rollout, which
+    was normally the pre-upgrade report itself (the scheduler runs 5 minutes
+    after the API leader starts, then every 12 hours), so it compared a report
+    with itself. A report is stale when it is the baseline report, when it was
+    created before `since` (the start of the application rollout), or when
+    none exists yet."""
+    status = str(after.get("status", ""))
+    if status == "not-present":
+        return True  # this release has no SIEM Health; nothing to wait for
+    if status == "no-report-yet":
+        return False
+    after_id, before_id = after.get("id"), before.get("id")
+    if after_id and before_id and after_id == before_id:
+        return False
+    created = _parse_report_time(after.get("created_at"))
+    threshold = _parse_report_time(since) if since else None
+    if created is not None and threshold is not None:
+        return created >= threshold
+    return True
+
+
+def wait_for_fresh_siem_health(
+    fetch: Callable[[], dict[str, Any]],
+    before: dict[str, Any],
+    since: str | None,
+    wait_seconds: int,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    poll_seconds: int = 15,
+) -> tuple[dict[str, Any], bool]:
+    """Poll for a post-upgrade SIEM Health report for at most `wait_seconds`.
+    Returns (latest report, fresh)."""
+    deadline = clock() + max(0, wait_seconds)
+    after = fetch()
+    announced = False
+    while not siem_health_report_is_fresh(before, after, since):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return after, False
+        if not announced:
+            eprint(
+                f"==> {utc_now()} waiting up to {int(remaining)}s for a SIEM Health report "
+                f"generated after the upgrade (the latest is from "
+                f"{after.get('created_at') or 'before the upgrade'})"
+            )
+            announced = True
+        sleep(min(poll_seconds, max(1.0, remaining)))
+        after = fetch()
+    return after, True
 
 
 def gate_siem_health_regressions(
@@ -1199,27 +1306,49 @@ ENV_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
 def collapse_env_duplicates(lines: list[str]) -> list[str]:
     """Keep one assignment per key: the LAST one (the value Compose uses), at the
     first one's position. An earlier installer (v2.0.8) could leave two
-    NANO_LICENSE_MODE lines; same rule as install.sh's nano_env_collapse_duplicates."""
+    NANO_LICENSE_MODE lines; same rule as install.sh's nano_env_collapse_duplicates.
+
+    Lines inside an installer-managed block (``# BEGIN NANO ...`` / ``# END NANO
+    ...``) are neither counted nor rewritten: a key there plus an operator line
+    below it is the documented override, not a duplicate (NAN-5282). The kept
+    line goes at the first outside occurrence after the key's last block
+    assignment, never above it, or the block value would take effect."""
+    managed: set[int] = set()
+    in_block = False
+    for index, line in enumerate(lines):
+        if line.startswith("# BEGIN NANO "):
+            in_block = True
+        elif line.startswith("# END NANO "):
+            in_block = False
+        elif in_block:
+            managed.add(index)
     last: dict[str, str] = {}
-    for line in lines:
-        match = ENV_ASSIGNMENT.match(line)
-        if match:
-            last[match.group(1)] = line.lstrip()
-            if last[match.group(1)].startswith("export"):
-                last[match.group(1)] = re.sub(r"^export\s+", "", last[match.group(1)])
-    out: list[str] = []
-    seen: set[str] = set()
-    for line in lines:
+    counts: dict[str, int] = {}
+    anchor: dict[str, int] = {}
+    block_line: dict[str, int] = {}
+    for index, line in enumerate(lines):
         match = ENV_ASSIGNMENT.match(line)
         if not match:
+            continue
+        key = match.group(1)
+        if index in managed:
+            block_line[key] = index
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        last[key] = re.sub(r"^export\s+", "", line.lstrip())
+        if key not in anchor or anchor[key] < block_line.get(key, -1):
+            anchor[key] = index
+    out: list[str] = []
+    for index, line in enumerate(lines):
+        match = ENV_ASSIGNMENT.match(line)
+        if not match or index in managed:
             out.append(line)
             continue
         key = match.group(1)
-        if key in seen:
-            continue
-        seen.add(key)
-        counted = sum(1 for other in lines if (m := ENV_ASSIGNMENT.match(other)) and m.group(1) == key)
-        out.append(last[key] if counted > 1 else line)
+        if counts[key] < 2:
+            out.append(line)
+        elif index == anchor[key]:
+            out.append(last[key])
     return out
 
 
@@ -2690,6 +2819,366 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 raise UpgradeError(f"Keeper leader has {synced or 'unknown'}/{members - 1} synced followers")
         return f"ruok=imok; mntr state={state}; configured members={members}"
 
+    # ---- NAN-5279 F1: per-host rendered configuration -------------------
+    #
+    # install.sh renders each host's configuration (nginx edges, HAProxy
+    # routers, ClickHouse/Keeper XML, Patroni/etcd/Valkey, monitoring) from
+    # the inventory with deploy/compose/render-inventory.py into
+    # .nano-generated and .nano-role.env. An upgrade used to keep the old
+    # render, so a release whose fix lives in a template (v2.0.12's ingest
+    # edge 503) never reached an upgraded cluster. The upgrade now re-renders
+    # with the same renderer from the unpacked bundle, and recreates every
+    # service whose mounted configuration changed.
+
+    def _renderer(self) -> Any:
+        path = self.install_dir / "deploy/compose/render-inventory.py"
+        if not path.is_file():
+            raise UpgradeError("deploy/compose/render-inventory.py is missing from this install")
+        spec = importlib.util.spec_from_file_location("nano_render_inventory", path)
+        if spec is None or spec.loader is None:
+            raise UpgradeError("cannot load the inventory renderer")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _tree_files(root: pathlib.Path) -> dict[str, bytes]:
+        files: dict[str, bytes] = {}
+        if not root.is_dir():
+            return files
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and not path.is_symlink():
+                files[path.relative_to(root).as_posix()] = path.read_bytes()
+        return files
+
+    @staticmethod
+    def _render_diff(
+        old_files: dict[str, bytes], new_files: dict[str, bytes],
+        old_env: dict[str, str], new_env: dict[str, str], limit: int = 400,
+    ) -> tuple[list[str], str]:
+        import difflib
+
+        changed: list[str] = []
+        lines: list[str] = []
+        for name in sorted(set(old_files) | set(new_files)):
+            before, after = old_files.get(name), new_files.get(name)
+            if before == after:
+                continue
+            changed.append(name)
+            if name.startswith("tls/"):
+                # Never print key material; say what changed.
+                lines.append(f"--- .nano-generated/{name}: {'added' if before is None else 'removed' if after is None else 'changed'} (contents not shown)")
+                continue
+            try:
+                old_text = (before or b"").decode("utf-8").splitlines(keepends=True)
+                new_text = (after or b"").decode("utf-8").splitlines(keepends=True)
+            except UnicodeDecodeError:
+                lines.append(f"--- .nano-generated/{name}: binary file changed")
+                continue
+            lines.extend(
+                line.rstrip("\n") for line in difflib.unified_diff(
+                    old_text, new_text,
+                    fromfile=f"a/.nano-generated/{name}" if before is not None else "/dev/null",
+                    tofile=f"b/.nano-generated/{name}" if after is not None else "/dev/null",
+                    n=2,
+                )
+            )
+        for key in sorted(set(old_env) | set(new_env)):
+            if old_env.get(key) != new_env.get(key):
+                changed.append(f".nano-role.env:{key}")
+                lines.append(f".nano-role.env: {key}: {old_env.get(key, '<unset>')!r} -> {new_env.get(key, '<unset>')!r}")
+        if len(lines) > limit:
+            lines = [*lines[:limit], f"... {len(lines) - limit} more diff lines not shown"]
+        return changed, "\n".join(lines)
+
+    def render_config(self, inventory_text: str, apply: bool, run_id: str = "") -> dict[str, Any]:
+        """Re-render this host's configuration from the installed bundle.
+
+        apply=False (dry run): render into scratch space and return the diff.
+        apply=True: publish the render with the renderer's own transaction.
+        The previous tree is kept as .nano-generated.previous (renamed, so the
+        running containers keep reading it until their role is recreated, and
+        rollback can restore it)."""
+        if not getattr(self, "role_env", None):
+            return {"host": self.host_name, "role_split": False, "changed": [], "diff": "", "applied": False}
+        renderer = self._renderer()
+        output = self.install_dir / ".nano-generated"
+        env_output = self.install_dir / ".nano-role.env"
+        retained = self.install_dir / ".nano-generated.previous"
+        retained_env = self.install_dir / ".nano-role.env.previous"
+        marker = self.install_dir / ".nano-generated.previous.json"
+        marker_value = read_json(marker) if marker.is_file() else {}
+        resumed = bool(
+            apply and run_id and marker_value.get("run_id") == run_id and retained.is_dir()
+        )
+        current_tree = output if output.is_dir() else retained if resumed else output
+        current_env_path = env_output if env_output.is_file() else retained_env
+        roles = self.role_env.get("NANO_ROLE_PROFILES", "")
+        if not roles:
+            raise UpgradeError("the installed role environment does not record NANO_ROLE_PROFILES")
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix=".nano-render-", dir=self.install_dir))
+        try:
+            inventory = scratch / "inventory.yaml"
+            descriptor = os.open(inventory, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(inventory_text)
+            staged_output = scratch / "generated"
+            staged_output.mkdir(mode=0o755)
+            staged_output.chmod(0o755)
+            staged_env = scratch / "role.env"
+            try:
+                renderer._render_host(
+                    inventory, roles, staged_output, staged_env,
+                    self.host_name, self.install_dir / ".env",
+                    published_output=output.absolute(),
+                )
+            except Exception as error:  # InventoryError, OSError, ValueError
+                raise UpgradeError(f"re-rendering this host's configuration failed: {error}") from error
+            new_env = parse_role_env(staged_env)
+            for key in ("NANO_DEPLOYMENT_ID", "NANO_HOST_ID", "NANO_DEPLOYMENT_IDENTITY_SHA256"):
+                if self.role_env.get(key) and new_env.get(key) != self.role_env.get(key):
+                    raise UpgradeError(
+                        f"the inventory no longer matches this host's installed {key} "
+                        f"({self.role_env.get(key)} -> {new_env.get(key)}); a topology change "
+                        "needs the installer's --accept-topology-migration runbook, not an upgrade"
+                    )
+            old_env = parse_role_env(current_env_path) if current_env_path.is_file() else {}
+            changed, diff = self._render_diff(
+                self._tree_files(current_tree), self._tree_files(staged_output), old_env, new_env,
+            )
+            result = {
+                "host": self.host_name, "role_split": True, "changed": changed,
+                "diff": diff, "applied": False,
+            }
+            if not apply or (not changed and output.is_dir()):
+                # Nothing to publish (a resumed step whose render already
+                # landed ends here too: never republish a tree that recreated
+                # containers may already be using).
+                return result
+            if resumed and output.exists():
+                # Resumed with a differing live tree: keep it by rename too.
+                superseded = self.install_dir / ".nano-generated.superseded"
+                if superseded.exists():
+                    shutil.rmtree(superseded)
+                os.replace(output, superseded)
+            elif not resumed:
+                # Retire the previous render by RENAME: a running container's
+                # bind mount follows the inode, so it keeps reading a complete
+                # tree (ClickHouse would otherwise hot-reload an emptied
+                # config.d) until its role is recreated onto the new one.
+                if retained.exists() or retained.is_symlink():
+                    shutil.rmtree(retained) if retained.is_dir() and not retained.is_symlink() else retained.unlink()
+                write_json_atomic(marker, {
+                    "run_id": run_id, "retained_at": utc_now(),
+                    # Full precision: rollout recreates every container that
+                    # started before this swap (_started_before_render_swap).
+                    "swapped_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "version": getattr(self, "version", ""), "state": "retained",
+                })
+                if env_output.is_file():
+                    shutil.copy2(env_output, retained_env)
+                if output.exists():
+                    os.replace(output, retained)
+            renderer._publish_render(staged_output, output, staged_env, env_output)
+            self.role_env = parse_role_env(env_output)
+            self.compose_args = self._compose_args()
+            result["applied"] = True
+            return result
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def restore_previous_render(self, run_id: str) -> bool:
+        """Rollback: put back the render the upgrade retired (same rename
+        discipline, so the running containers keep their view)."""
+        retained = self.install_dir / ".nano-generated.previous"
+        retained_env = self.install_dir / ".nano-role.env.previous"
+        marker = self.install_dir / ".nano-generated.previous.json"
+        if not getattr(self, "role_env", None) or not marker.is_file() or not retained.is_dir():
+            return False
+        value = read_json(marker)
+        if value.get("run_id") != run_id or value.get("state") != "retained":
+            return False
+        output = self.install_dir / ".nano-generated"
+        env_output = self.install_dir / ".nano-role.env"
+        rolled_back = self.install_dir / ".nano-generated.rolled-back"
+        if rolled_back.exists():
+            shutil.rmtree(rolled_back)
+        if output.exists():
+            os.replace(output, rolled_back)
+        os.replace(retained, output)
+        if retained_env.is_file():
+            os.replace(retained_env, env_output)
+        write_json_atomic(marker, {**value, "state": "restored", "restored_at": utc_now()})
+        self.role_env = parse_role_env(env_output)
+        self.compose_args = self._compose_args()
+        return True
+
+    def _mounted_digest(
+        self, container: str, destination: str, exclude: frozenset[str] = frozenset(),
+    ) -> str | None:
+        import tarfile
+
+        try:
+            # Binary tar on stdout: the text-mode Runner cannot carry it.
+            result = subprocess.run(
+                ["docker", "cp", f"{container}:{destination}", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0 or not result.stdout:
+            return None
+        digest = hashlib.sha256()
+        try:
+            with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+                members = sorted(
+                    (
+                        (member.name.split("/", 1)[1] if "/" in member.name else "", member)
+                        for member in archive.getmembers() if member.isfile()
+                    ),
+                    key=lambda item: item[0],
+                )
+                for relative, member in members:
+                    if relative in exclude:
+                        continue  # a separate bind mount nested inside this one
+                    extracted = archive.extractfile(member)
+                    digest.update(relative.encode() + b"\0")
+                    digest.update(extracted.read() if extracted is not None else b"")
+        except tarfile.TarError:
+            return None
+        return digest.hexdigest()
+
+    @staticmethod
+    def _host_digest(source: pathlib.Path, exclude: frozenset[str] = frozenset()) -> str | None:
+        digest = hashlib.sha256()
+        if source.is_file():
+            digest.update(b"\0")
+            digest.update(source.read_bytes())
+            return digest.hexdigest()
+        if source.is_dir():
+            files = sorted(
+                (path.relative_to(source).as_posix(), path)
+                for path in source.rglob("*") if path.is_file()
+                and path.relative_to(source).as_posix() not in exclude
+            )
+            for relative, path in files:
+                digest.update(relative.encode() + b"\0")
+                digest.update(path.read_bytes())
+            return digest.hexdigest()
+        return None
+
+    def _config_mounts_stale(self, service: str) -> bool:
+        """True when a running container reads different configuration than
+        its bind-mount source now holds on the host.
+
+        Compose recreates a container only when its definition changes; a
+        re-rendered file at the same path (or a bundle file replaced by the
+        unpack) is not a definition change, and the container keeps the old
+        inode. Only small renderer/bundle configuration is compared:
+        .nano-generated, config/ and deploy/ under the install directory."""
+        try:
+            container = self._service_container(service)
+        except UpgradeError:
+            return False  # not running: `up` creates it from the new files
+        inspected = self.runner.run(
+            ["docker", "inspect", "--format", "{{json .Mounts}}", container], timeout=30, check=False,
+        )
+        try:
+            mounts = json.loads(inspected.stdout or "[]")
+        except json.JSONDecodeError:
+            return False
+        roots = [
+            (self.install_dir / name).resolve()
+            for name in (".nano-generated", "config", "deploy")
+        ]
+        generated_root = roots[0]
+        if any(
+            isinstance(mount, dict) and mount.get("Type") == "bind"
+            and self._under(str(mount.get("Source", "")), generated_root)
+            for mount in (mounts if isinstance(mounts, list) else [])
+        ) and self._started_before_render_swap(container):
+            # A container created before this upgrade published the new render
+            # still has its .nano-generated mounts on the RETIRED tree (now
+            # .nano-generated.previous), even when the content is identical.
+            # The next upgrade deletes that tree, and a running container's
+            # mount would empty under it (ClickHouse hot-reloads an empty
+            # config.d, NAN-5126). Recreate it onto the published tree now,
+            # under this role's rollout, as install.sh does after a render.
+            eprint(f"note: {self.host_name}: {service} still mounts the retired configuration tree; recreating it")
+            return True
+        for mount in mounts if isinstance(mounts, list) else []:
+            if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                continue
+            source = pathlib.Path(str(mount.get("Source", "")))
+            destination = str(mount.get("Destination", ""))
+            if not source.is_absolute() or not destination.startswith("/"):
+                continue
+            try:
+                resolved = source.resolve()
+            except OSError:
+                continue
+            if not any(resolved == root or root in resolved.parents for root in roots):
+                continue
+            size = (
+                resolved.stat().st_size if resolved.is_file()
+                else sum(path.stat().st_size for path in resolved.rglob("*") if path.is_file())
+                if resolved.is_dir() else 0
+            )
+            if size > 4 * 1024 * 1024:
+                continue
+            nested = frozenset(
+                str(other.get("Destination", ""))[len(destination) + 1:]
+                for other in mounts
+                if isinstance(other, dict)
+                and str(other.get("Destination", "")).startswith(destination.rstrip("/") + "/")
+            )
+            host = self._host_digest(resolved, nested)
+            seen = self._mounted_digest(container, destination, nested)
+            if host is not None and seen is not None and host != seen:
+                eprint(f"note: {self.host_name}: {service} reads an outdated {destination}; recreating it")
+                return True
+        return False
+
+    @staticmethod
+    def _under(source: str, root: pathlib.Path) -> bool:
+        path = pathlib.Path(source)
+        if not path.is_absolute():
+            return False
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        return resolved == root or root in resolved.parents
+
+    def _started_before_render_swap(self, container: str) -> bool:
+        """True when `container` started before the render this host's
+        upgrade published (the .nano-generated.previous.json marker), i.e.
+        its bind mounts still resolve to the retired tree's inodes."""
+        marker = self.install_dir / ".nano-generated.previous.json"
+        if not marker.is_file():
+            return False
+        try:
+            value = read_json(marker)
+        except (OSError, ValueError, UpgradeError):
+            return False
+        if value.get("state") != "retained":
+            return False
+        swapped = _parse_report_time(value.get("swapped_at") or value.get("retained_at"))
+        if swapped is None:
+            return False
+        inspected = self.runner.run(
+            ["docker", "inspect", "--format", "{{.State.StartedAt}}", container],
+            timeout=30, check=False,
+        )
+        started = _parse_report_time((inspected.stdout or "").strip())
+        return started is not None and started < swapped
+
+    def _recreate_args(self, services: Iterable[str]) -> list[str]:
+        """`--force-recreate` when any of `services` runs outdated config."""
+        if getattr(self, "_legacy_bridge_rollout", False) or getattr(self, "legacy_layout", None) is not None:
+            return []
+        return ["--force-recreate"] if any(self._config_mounts_stale(s) for s in services) else []
+
     def _check_runtime_config(self) -> str:
         validated: list[str] = []
         if "ingest" in self.roles and self._service_exists("vector"):
@@ -2713,19 +3202,82 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             validated.append(edge)
         return ", ".join(validated) + " configuration validates" if validated else "no runtime renderer on this role"
 
-    def _check_lb_hooks(self) -> str:
-        for kind in ("DRAIN", "REJOIN"):
+    def _drained_roles(self, require_lb_hooks: bool) -> list[str]:
+        """NAN-5279: the roles on this host that the upgrade takes out of the
+        load balancer: ingest when the cluster has several ingest hosts, app
+        when it has several app hosts (see rollout / _drain_app_host)."""
+        roles: list[str] = []
+        if "ingest" in self.roles and require_lb_hooks:
+            roles.append("ingest")
+        role_env = getattr(self, "role_env", None) or {}
+        if "app" in self.roles and int(role_env.get("NANO_APP_HOST_COUNT", "1") or "1") >= 2:
+            roles.append("app")
+        return roles
+
+    def _check_lb_hooks(self, drained: Sequence[str] = ("ingest",), roundtrip: bool = False) -> str:
+        """Both hooks are executable and, unless this is a resumed preflight,
+        a real drain -> rejoin round trip through them succeeds.
+
+        The round trip is what proves a restricted load-balancer key still
+        drains: the example hook fails unless HAProxy confirms each state
+        (NAN-5279 F6). It runs one host at a time (preflight is sequential),
+        and a rejoin is always attempted after a drain."""
+        configured = {
+            kind: os.environ.get(f"NANO_UPGRADE_LB_{kind}_COMMAND", "")
+            for kind in ("DRAIN", "REJOIN")
+        }
+        if "ingest" not in drained and not any(configured.values()):
+            # An app host drains through its own /readyz (the LB health
+            # check); the hooks are optional there.
+            return (
+                "app host: no drain/rejoin hooks configured; the drain relies on the "
+                "load balancer health-checking /readyz"
+            )
+        for kind, value in configured.items():
             variable = f"NANO_UPGRADE_LB_{kind}_COMMAND"
-            value = os.environ.get(variable, "")
             path = pathlib.Path(value)
             if not value or not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
                 raise UpgradeError(f"{variable} must name an absolute executable")
-        return "drain and rejoin hooks are executable"
+        roles = "/".join(drained)
+        if not roundtrip:
+            return f"{roles} host: drain and rejoin hooks are executable"
+        try:
+            self._run_lb_hook_checked("drain", configured["DRAIN"])
+        except UpgradeError as drain_error:
+            # Rejoin even when the drain failed part-way (one LB of two).
+            try:
+                self._run_lb_hook_checked("rejoin", configured["REJOIN"])
+            except UpgradeError as rejoin_error:
+                raise UpgradeError(
+                    f"{drain_error}; the rejoin also failed ({rejoin_error}), so "
+                    f"{self.host_name} may be LEFT DRAINED on a load balancer. Run "
+                    f"`{configured['REJOIN']} {self.host_name}` by hand before retrying"
+                ) from drain_error
+            raise
+        try:
+            self._run_lb_hook_checked("rejoin", configured["REJOIN"])
+        except UpgradeError as rejoin_error:
+            raise UpgradeError(
+                f"{rejoin_error}. {self.host_name} is LEFT DRAINED from the load balancer; "
+                f"no other host's hooks were exercised. Run `{configured['REJOIN']} "
+                f"{self.host_name}` by hand once the hook works, then retry"
+            ) from rejoin_error
+        return (
+            f"{roles} host: drain and rejoin hooks ran a live round trip "
+            f"({pathlib.Path(configured['DRAIN']).name} -> {pathlib.Path(configured['REJOIN']).name})"
+        )
+
+    def _run_lb_hook_checked(self, kind: str, command: str) -> None:
+        result = self.runner.run([command, self.host_name], timeout=120, check=False)
+        if result.returncode != 0:
+            lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+            detail = lines[-1][:300] if lines else f"exit {result.returncode}"
+            raise UpgradeError(f"{kind} hook failed for {self.host_name}: {detail}")
 
     def preflight(
         self, manifest: dict[str, Any], bundle: pathlib.Path,
         require_lb_hooks: bool = False, prepared: bool = False,
-        test_license_rehearsal: bool = False,
+        test_license_rehearsal: bool = False, lb_roundtrip: bool = True,
     ) -> list[Check]:
         checks: list[Check] = []
 
@@ -2801,8 +3353,14 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     test_license_rehearsal, str(manifest.get("version", "")),
                 ),
             )
-        if "ingest" in self.roles and require_lb_hooks:
-            check("lb-hooks", self._check_lb_hooks)
+        drained = self._drained_roles(require_lb_hooks)
+        if drained:
+            # NAN-5279 F7: every host the upgrade drains, app hosts included.
+            roundtrip = (
+                lb_roundtrip and not prepared
+                and os.environ.get("NANO_UPGRADE_LB_HOOK_TEST", "1") != "0"
+            )
+            check("lb-hooks", lambda: self._check_lb_hooks(drained, roundtrip))
         return checks
 
     def ledger(self) -> dict[str, list[list[str]]]:
@@ -3745,6 +4303,16 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     "ingest tokens keep working; senders still sending the public token get "
                     "HTTP 401 and need a named token (Ingestion > Ingest tokens)."
                 )
+        # NAN-5271: pin the profile an older install already runs before the
+        # new release's OCSF default can apply to it.
+        pinned_schema_profile = pin_legacy_schema_profile(self.env_file)
+        if pinned_schema_profile:
+            self.env["NANO_SCHEMA_PROFILE"] = "udm"
+            self.schema_profile = "udm"
+            eprint(
+                "note: pinned NANO_SCHEMA_PROFILE=udm in .env (this install predates the "
+                "schema choice and holds UDM data). Copy the updated .env to every host."
+            )
         if current != target:
             self.env_file.replace("NANO_VERSION", target)
         verified = canonical_version(self.env_file.values().get("NANO_VERSION", ""))
@@ -3757,6 +4325,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             "legacy_transition": transition,
             "rotated_public_install_token": rotated_install_token,
             "pinned_compatible_delivery_mode": pinned_delivery_mode,
+            "pinned_schema_profile": pinned_schema_profile,
         }
 
     def _up_existing(
@@ -3766,7 +4335,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             service for service in services if self._service_expected(service)
         ]
         if selected:
-            self.compose(["up", "-d", "--no-deps", "--pull", "never", *selected], timeout=timeout)
+            self.compose(
+                ["up", "-d", "--no-deps", "--pull", "never", *self._recreate_args(selected), *selected],
+                timeout=timeout,
+            )
         return selected
 
     def _stop_exact(self, services: Iterable[str], timeout: int) -> list[str]:
@@ -3981,12 +4553,19 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         self.runner.run([str(path), self.host_name], timeout=120)
 
     def _env_seconds(self, name: str, default: int, maximum: int = 3600) -> int:
-        raw = os.environ.get(name, "")
-        try:
-            value = int(raw) if raw.strip() else default
-        except ValueError as error:
-            raise UpgradeError(f"{name} must be a whole number of seconds") from error
-        return max(0, min(value, maximum))
+        return env_seconds(name, default, maximum)
+
+    def _left_drained(self, error: UpgradeError) -> UpgradeError:
+        """NAN-5279: a rollout that drained this host and then failed (its
+        services, the probe or the rejoin) stops the upgrade with the host
+        still out of the load balancer, and says so. Nothing drains another
+        host: the coordinator rolls hosts one at a time and stops here."""
+        return UpgradeError(
+            f"{error}. {self.host_name} may still be DRAINED from the load balancer: the "
+            "upgrade stopped before rejoining it and drained no other host. Fix the cause, "
+            "then resume with `scripts/nano upgrade` (it re-runs this host's rollout and "
+            "rejoins it), or rejoin it by hand with your rejoin hook"
+        )
 
     def _edge_readyz_status(self) -> str:
         """HTTP status of this app host's own load-balancer health check."""
@@ -4103,7 +4682,7 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         edges = [service for service in APP_EDGE_SERVICES if service in selected]
         if core:
             self.compose(
-                ["up", "-d", "--no-deps", "--pull", "never", *core],
+                ["up", "-d", "--no-deps", "--pull", "never", *self._recreate_args(core), *core],
                 timeout=timeout,
             )
             self._wait_services(core, timeout)
@@ -4262,13 +4841,15 @@ printf 'consumer generation %s ready\n' "$generation"
         before_edge = [service for service in selected if service != "ingest-edge"]
         if before_edge:
             self.compose(
-                ["up", "-d", "--no-deps", "--pull", "never", *before_edge],
+                ["up", "-d", "--no-deps", "--pull", "never",
+                 *self._recreate_args(before_edge), *before_edge],
                 timeout=timeout,
             )
             self._wait_ingest_readiness(before_edge, timeout)
         if "ingest-edge" in selected:
             self.compose(
-                ["up", "-d", "--no-deps", "--pull", "never", "ingest-edge"],
+                ["up", "-d", "--no-deps", "--pull", "never",
+                 *self._recreate_args(["ingest-edge"]), "ingest-edge"],
                 timeout=timeout,
             )
             self._wait_ingest_edge_ready(timeout)
@@ -4685,7 +5266,10 @@ printf 'consumer generation %s ready\n' "$generation"
         elif role == "clickhouse":
             services = selected
             if "clickhouse" in services:
-                self.compose(["up", "-d", "--pull", "never", "clickhouse"], timeout=timeout)
+                self.compose(
+                    ["up", "-d", "--pull", "never", *self._recreate_args(["clickhouse"]), "clickhouse"],
+                    timeout=timeout,
+                )
                 self._wait_container("clickhouse", timeout)
                 self._check_clickhouse()
         elif role == "postgres" and self.pg_ha:
@@ -4736,17 +5320,19 @@ printf 'consumer generation %s ready\n' "$generation"
                         # is drained and recreated right after.
                         if self._monitoring_enabled() and self._service_expected("vector-netns"):
                             self.compose([
-                                "up", "-d", "--no-deps", "--pull", "never", "vector-netns",
+                                "up", "-d", "--no-deps", "--pull", "never",
+                                *self._recreate_args(["vector-netns"]), "vector-netns",
                             ], timeout=timeout)
                             self._wait_container("vector-netns", timeout)
                 services = self._up_ingest_services(selected, timeout, exact=True)
                 if "ingest-edge" in services:
                     route_probe = self.smoke_ingest(f"nano-rollout-{uuid.uuid4()}")
-            except BaseException:
-                raise
-            else:
                 if "ingest-edge" in services:
                     self._lb_hook("rejoin", require_lb_hooks)
+            except UpgradeError as error:
+                if "ingest-edge" in selected:
+                    raise self._left_drained(error) from error
+                raise
         elif role == "monitoring":
             # NAN-5250: Prometheus and Grafana carry no nano state; recreate
             # whatever this host runs and wait for it to be up.
@@ -4754,18 +5340,30 @@ printf 'consumer generation %s ready\n' "$generation"
             if services:
                 self._wait_services(services, timeout)
         elif role == "app":
-            drained = self._drain_app_host(selected)
-            services = self._up_app_services(selected, timeout, exact=True)
-            if any(service in APP_EDGE_SERVICES for service in services):
-                dependency_probe = self._wait_app_readiness(services, timeout)
-            else:
-                self._wait_services(services, timeout)
-            if drained:
-                self._rejoin_app_host()
+            drained = False
+            try:
+                drained = self._drain_app_host(selected)
+                services = self._up_app_services(selected, timeout, exact=True)
+                if any(service in APP_EDGE_SERVICES for service in services):
+                    dependency_probe = self._wait_app_readiness(services, timeout)
+                else:
+                    self._wait_services(services, timeout)
+                if drained:
+                    self._rejoin_app_host()
+            except UpgradeError as error:
+                if drained or "nginx" in selected and int(
+                    (getattr(self, "role_env", None) or {}).get("NANO_APP_HOST_COUNT", "1") or "1"
+                ) >= 2:
+                    raise self._left_drained(error) from error
+                raise
         # NAN-5250: node-exporter (with a monitoring host) runs on every host
         # beside whatever role this is; bring it to the target definition too.
         if role != "migration" and self._monitoring_enabled() and self._service_expected("node-exporter"):
-            self.compose(["up", "-d", "--no-deps", "--pull", "never", "node-exporter"], timeout=timeout)
+            self.compose(
+                ["up", "-d", "--no-deps", "--pull", "never",
+                 *self._recreate_args(["node-exporter"]), "node-exporter"],
+                timeout=timeout,
+            )
             services = [*services, "node-exporter"]
         result = {"services": services}
         if role == "app" and any(service in APP_EDGE_SERVICES for service in services):
@@ -5019,7 +5617,7 @@ fi
 
     def rollback_role(
         self, role: str, previous: str, target: str, timeout: int,
-        require_lb_hooks: bool = False,
+        require_lb_hooks: bool = False, run_id: str = "",
     ) -> dict[str, Any]:
         current = canonical_version(self.env_file.values().get("NANO_VERSION", ""))
         if current not in {target, previous}:
@@ -5030,8 +5628,11 @@ fi
             self.env_file.replace("NANO_VERSION", previous)
         self.env["NANO_VERSION"] = previous
         self.version = previous
+        # NAN-5279: the previous release's rendered configuration goes back
+        # with its images (once per host; later roles find it restored).
+        restored = bool(run_id) and self.restore_previous_render(run_id)
         result = self.rollout(role, timeout, require_lb_hooks)
-        return {"version": previous, "role": role, **result}
+        return {"version": previous, "role": role, "restored_config": restored, **result}
 
 
 class PgMigrationLock:
@@ -5237,6 +5838,20 @@ def load_inventory(path: pathlib.Path) -> tuple[list[Node], dict[str, Any]]:
     return nodes, cluster
 
 
+def lb_hook_arguments(require_lb_hooks: bool) -> list[str]:
+    """Worker arguments for the load-balancer hooks.
+
+    NAN-5279: the configured hooks travel to every remote worker, not only
+    when several ingest hosts make them mandatory: app hosts of a multi-app
+    cluster drain through them too."""
+    arguments = ["--require-lb-hooks"] if require_lb_hooks else []
+    for kind in ("DRAIN", "REJOIN"):
+        value = os.environ.get(f"NANO_UPGRADE_LB_{kind}_COMMAND", "")
+        if value or require_lb_hooks:
+            arguments.extend([f"--lb-{kind.lower()}-command", value])
+    return arguments
+
+
 class NodeExecutor:
     def __init__(
         self,
@@ -5254,10 +5869,14 @@ class NodeExecutor:
         self.backup_output = remote_install_dir / "backups"
         self.include_clickhouse_data = False
 
-    def _remote(self, action: str, arguments: Sequence[str], timeout: int) -> Any:
+    def _remote(
+        self, action: str, arguments: Sequence[str], timeout: int,
+        input_text: str | None = None,
+    ) -> Any:
         ssh, target, command = self._remote_command(action, arguments)
         result = self.runner.run(
             [*ssh, target, shlex.join(command)], timeout=timeout, check=False,
+            **({"input_text": input_text} if input_text is not None else {}),
         )
         if result.returncode != 0:
             # Workers emit operator-safe errors on stderr. Keep only the final
@@ -5382,7 +6001,7 @@ class NodeExecutor:
     def preflight(
         self, manifest: dict[str, Any], bundle: pathlib.Path, remote_bundle: pathlib.Path,
         require_lb_hooks: bool, expected_bundle_sha256: str, prepared: bool = False,
-        test_license_rehearsal: bool = False,
+        test_license_rehearsal: bool = False, lb_roundtrip: bool = True,
     ) -> list[Check]:
         if self.local:
             if sha256_path(bundle) != expected_bundle_sha256:
@@ -5391,7 +6010,7 @@ class NodeExecutor:
             self.local_ops.include_clickhouse_data = self.include_clickhouse_data
             return self.local_ops.preflight(
                 manifest, bundle, require_lb_hooks, prepared,
-                test_license_rehearsal,
+                test_license_rehearsal, lb_roundtrip,
             )
         arguments = [
             "--bundle", str(remote_bundle),
@@ -5402,13 +6021,11 @@ class NodeExecutor:
             arguments.append("--prepared")
         if self.include_clickhouse_data:
             arguments.append("--include-clickhouse-data")
-        if require_lb_hooks:
-            arguments.append("--require-lb-hooks")
-            for kind in ("DRAIN", "REJOIN"):
-                value = os.environ.get(f"NANO_UPGRADE_LB_{kind}_COMMAND", "")
-                arguments.extend([f"--lb-{kind.lower()}-command", value])
+        arguments.extend(lb_hook_arguments(require_lb_hooks))
         if test_license_rehearsal:
             arguments.append("--test-license-rehearsal")
+        if not lb_roundtrip:
+            arguments.append("--no-lb-roundtrip")
         value = self._remote("preflight", arguments, 600)
         if not isinstance(value, list):
             raise UpgradeError(f"host {self.node.name} returned invalid preflight results")
@@ -5492,10 +6109,7 @@ class NodeExecutor:
         arguments = ["--role", role, "--timeout", str(timeout)]
         for service in services:
             arguments.extend(["--service", service])
-        if require_lb_hooks:
-            arguments.append("--require-lb-hooks")
-            for kind in ("DRAIN", "REJOIN"):
-                arguments.extend([f"--lb-{kind.lower()}-command", os.environ.get(f"NANO_UPGRADE_LB_{kind}_COMMAND", "")])
+        arguments.extend(lb_hook_arguments(require_lb_hooks))
         return json_object(self._remote("quiesce", arguments, timeout + 60), "remote quiesce")
 
     def resume_writers(
@@ -5509,10 +6123,7 @@ class NodeExecutor:
         arguments = ["--role", role, "--timeout", str(timeout)]
         for service in services:
             arguments.extend(["--service", service])
-        if require_lb_hooks:
-            arguments.append("--require-lb-hooks")
-            for kind in ("DRAIN", "REJOIN"):
-                arguments.extend([f"--lb-{kind.lower()}-command", os.environ.get(f"NANO_UPGRADE_LB_{kind}_COMMAND", "")])
+        arguments.extend(lb_hook_arguments(require_lb_hooks))
         return json_object(self._remote("resume-writers", arguments, timeout + 60), "remote writer resume")
 
     def prepare(
@@ -5531,15 +6142,25 @@ class NodeExecutor:
             7200,
         ), "remote prepare")
 
+    def render_config(self, inventory_text: str, apply: bool, run_id: str = "") -> dict[str, Any]:
+        """NAN-5279 F1: re-render this host's configuration (see LocalOps)."""
+        if self.local:
+            return self.local_ops.render_config(inventory_text, apply, run_id)
+        arguments = ["--run-id", run_id] if run_id else []
+        if apply:
+            arguments.append("--apply")
+        # The inventory travels on stdin: hosts may keep their copy anywhere,
+        # and every host must render from the coordinator's one inventory.
+        return json_object(
+            self._remote("render-config", arguments, 300, input_text=inventory_text),
+            "remote render-config",
+        )
+
     def rollout(self, role: str, timeout: int, require_lb_hooks: bool = False) -> dict[str, Any]:
         if self.local:
             return self.local_ops.rollout(role, timeout, require_lb_hooks)
         arguments = ["--role", role, "--timeout", str(timeout)]
-        if require_lb_hooks:
-            arguments.append("--require-lb-hooks")
-            for kind in ("DRAIN", "REJOIN"):
-                value = os.environ.get(f"NANO_UPGRADE_LB_{kind}_COMMAND", "")
-                arguments.extend([f"--lb-{kind.lower()}-command", value])
+        arguments.extend(lb_hook_arguments(require_lb_hooks))
         return json_object(self._remote("rollout", arguments, timeout + 60), "remote rollout")
 
     def post_verify(self, target: str, timeout: int) -> dict[str, Any]:
@@ -5577,23 +6198,19 @@ class NodeExecutor:
 
     def rollback(
         self, role: str, previous: str, target: str, timeout: int,
-        require_lb_hooks: bool = False,
+        require_lb_hooks: bool = False, run_id: str = "",
     ) -> dict[str, Any]:
         if self.local:
             return self.local_ops.rollback_role(
-                role, previous, target, timeout, require_lb_hooks,
+                role, previous, target, timeout, require_lb_hooks, run_id,
             )
         arguments = [
             "--role", role, "--previous", previous, "--target", target,
             "--timeout", str(timeout),
         ]
-        if require_lb_hooks:
-            arguments.append("--require-lb-hooks")
-            for kind in ("DRAIN", "REJOIN"):
-                arguments.extend([
-                    f"--lb-{kind.lower()}-command",
-                    os.environ.get(f"NANO_UPGRADE_LB_{kind}_COMMAND", ""),
-                ])
+        if run_id:
+            arguments.extend(["--run-id", run_id])
+        arguments.extend(lb_hook_arguments(require_lb_hooks))
         return json_object(
             self._remote("rollback", arguments, timeout + 60), "remote rollback",
         )
@@ -6036,12 +6653,18 @@ def run_step(journal: Journal, state: RunState, step: str, function: Callable[[]
         previous = next(event for event in reversed(state.events) if event.get("event") == "step_done" and event.get("step") == step)
         return previous.get("result")
     journal.append(state, "step_started", step=step)
+    # NAN-5279: one line per step as it starts and ends, so an operator
+    # watching over plain SSH (no TTY) sees progress, not 12 silent minutes.
+    eprint(f"==> {utc_now()} {step}: started")
+    started = time.monotonic()
     try:
         result = function()
     except BaseException as error:
         journal.append(state, "step_failed", step=step, reason=str(error))
+        eprint(f"==> {utc_now()} {step}: FAILED after {time.monotonic() - started:.0f}s")
         raise
     journal.append(state, "step_done", step=step, result=result)
+    eprint(f"==> {utc_now()} {step}: done in {time.monotonic() - started:.0f}s")
     return result
 
 
@@ -7220,12 +7843,27 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         state, "api_mutation_fence_recovered_before_resume",
                         node=postgres_nodes[0].name,
                     )
+            # NAN-5279: the lb-hooks check drains and rejoins each host for
+            # real, one host at a time. After a failed round trip (a host may
+            # be left drained) no further host is drained, so a broken hook
+            # can never take every app or ingest host out of the pool.
+            lb_roundtrip = os.environ.get("NANO_UPGRADE_LB_HOOK_TEST", "1") != "0"
             for node in nodes:
-                checks.extend(executors[node.name].preflight(
+                node_checks = executors[node.name].preflight(
                     manifest, bundle, remote_bundle, require_lb_hooks, bundle_digest,
                     prepared=state is not None and f"prepare:{node.name}" in state.done_steps,
                     test_license_rehearsal=args.test_license_rehearsal,
-                ))
+                    lb_roundtrip=lb_roundtrip,
+                )
+                checks.extend(node_checks)
+                if lb_roundtrip and any(
+                    check.name == "lb-hooks" and not check.passed for check in node_checks
+                ):
+                    lb_roundtrip = False
+                    eprint(
+                        f"WARNING: the load-balancer hook round trip failed on {node.name}; "
+                        "the remaining hosts' hooks are checked without draining them"
+                    )
                 try:
                     ledgers[node.name] = executors[node.name].ledger()
                 except (UpgradeError, OSError, ValueError, json.JSONDecodeError) as error:
@@ -7248,7 +7886,33 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 f"recorded pre-upgrade status {siem_health_before.get('status', 'unknown')}",
                 postgres_nodes[0].name,
             ))
+            # NAN-5279 F1: preview each host's re-rendered configuration
+            # (the upgrade publishes exactly this render after `prepare`).
+            inventory_text = (
+                pathlib.Path(args.inventory).expanduser().resolve().read_text(encoding="utf-8")
+                if role_split and args.inventory else ""
+            )
+            render_diffs: list[tuple[str, str]] = []
+            if role_split:
+                for node in nodes:
+                    try:
+                        preview = executors[node.name].render_config(inventory_text, False)
+                    except (UpgradeError, OSError, ValueError, json.JSONDecodeError) as error:
+                        checks.append(Check("config-render", False, str(error), node.name))
+                        continue
+                    changed = [str(item) for item in preview.get("changed", [])]
+                    detail = (
+                        f"{len(changed)} rendered file(s)/setting(s) change: "
+                        + ", ".join(changed[:8]) + (" ..." if len(changed) > 8 else "")
+                        if changed else "rendered configuration is unchanged"
+                    )
+                    checks.append(Check("config-render", True, detail, node.name))
+                    if preview.get("diff"):
+                        render_diffs.append((node.name, str(preview["diff"])))
             print_checks(checks)
+            for host, diff in render_diffs:
+                print(f"\n--- rendered configuration diff for {host} (applied by the upgrade) ---")
+                print(diff)
             if any(not check.passed for check in checks):
                 raise UpgradeError("preflight failed; no installation state was changed")
             if args.dry_run:
@@ -7359,6 +8023,30 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     ]
 
             prepared: set[str] = set()
+
+            def ensure_prepared(node: Node) -> None:
+                """Load the target images, then (role-split) publish the
+                host's re-rendered configuration before any of its roles roll."""
+                if node.name in prepared:
+                    return
+                run_step(
+                    journal, state, f"prepare:{node.name}",
+                    lambda: executors[node.name].prepare(
+                        bundle, remote_bundle, source_version, target, run_id,
+                        bundle_digest,
+                    ),
+                )
+                if role_split:
+                    def render() -> dict[str, Any]:
+                        result = executors[node.name].render_config(
+                            inventory_text, True, run_id,
+                        )
+                        # The journal keeps what changed, not the diff text.
+                        return {key: value for key, value in result.items() if key != "diff"}
+
+                    run_step(journal, state, f"render-config:{node.name}", render)
+                prepared.add(node.name)
+
             for role in ROLE_ORDER:
                 if role == "migration":
                     app_nodes = node_sort(nodes, "app")
@@ -7371,15 +8059,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     # the migrator also holds a cluster-wide PostgreSQL lock.
                     app_node = app_nodes[0]
                     postgres_node = postgres_nodes[0]
-                    if app_node.name not in prepared:
-                        run_step(
-                            journal, state, f"prepare:{app_node.name}",
-                            lambda: executors[app_node.name].prepare(
-                                bundle, remote_bundle, source_version, target, run_id,
-                                bundle_digest,
-                            ),
-                        )
-                        prepared.add(app_node.name)
+                    ensure_prepared(app_node)
 
                     def migrate() -> dict[str, Any]:
                         with executors[postgres_node.name].migration_lock():
@@ -7398,15 +8078,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         cluster_lease.__exit__(None, None, None)
                         cluster_lease = None
                     def prepare_member(node: Node) -> None:
-                        if node.name not in prepared:
-                            run_step(
-                                journal, state, f"prepare:{node.name}",
-                                lambda node=node: executors[node.name].prepare(
-                                    bundle, remote_bundle, source_version, target, run_id,
-                                    bundle_digest,
-                                ),
-                            )
-                            prepared.add(node.name)
+                        ensure_prepared(node)
 
                     roll_postgres_members(
                         nodes, executors, journal, state, "rollout", args.timeout,
@@ -7418,15 +8090,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         cluster_lease.__enter__()
                     continue
                 for node in selected:
-                    if node.name not in prepared:
-                        run_step(
-                            journal, state, f"prepare:{node.name}",
-                            lambda node=node: executors[node.name].prepare(
-                                bundle, remote_bundle, source_version, target, run_id,
-                                bundle_digest,
-                            ),
-                        )
-                        prepared.add(node.name)
+                    ensure_prepared(node)
                     run_step(
                         journal, state, f"rollout:{role}:{node.name}",
                         lambda node=node, role=role: executors[node.name].rollout(role, args.timeout, require_lb_hooks),
@@ -7466,10 +8130,37 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 lambda: executors[clickhouse_node.name].smoke_search(marker, args.timeout),
             )
             def verify_siem_health_regression() -> dict[str, Any]:
-                after = executors[postgres_node.name].siem_health()
+                # NAN-5279 F5: compare against a report generated after the
+                # application rollout began, never the baseline report again.
+                rollout_started = next(
+                    (
+                        str(event.get("at"))
+                        for event in state.events
+                        if event.get("event") == "step_started"
+                        and str(event.get("step", "")).startswith(("rollout:migration:", "rollout:app:"))
+                    ),
+                    None,
+                )
+                after, fresh = wait_for_fresh_siem_health(
+                    executors[postgres_node.name].siem_health,
+                    siem_health_before, rollout_started,
+                    env_seconds("NANO_UPGRADE_SIEM_HEALTH_WAIT_SECONDS", 600),
+                )
+                if not fresh:
+                    eprint(
+                        "WARNING: no SIEM Health report was generated after the upgrade within "
+                        "the wait (NANO_UPGRADE_SIEM_HEALTH_WAIT_SECONDS); the regression gate "
+                        "was NOT evaluated. Check Settings > SIEM Health once its next report runs."
+                    )
+                    return {
+                        "before": siem_health_before, "after": after, "regressions": [],
+                        "override": False, "compared": False,
+                        "reason": "no post-upgrade SIEM Health report within the wait",
+                    }
                 result = gate_siem_health_regressions(
                     siem_health_before, after, args.allow_siem_health_regression,
                 )
+                result["compared"] = True
                 if result["override"]:
                     details = {
                         "reason": args.allow_siem_health_regression,
@@ -7658,6 +8349,7 @@ def rollback_command(args: argparse.Namespace) -> int:
                             nodes, executors, journal, state, "rollback", args.timeout,
                             lambda node: executors[node.name].rollback(
                                 "postgres", previous, target, args.timeout, require_lb_hooks,
+                                run_id=state.run_id,
                             ),
                         )
                         continue
@@ -7666,6 +8358,7 @@ def rollback_command(args: argparse.Namespace) -> int:
                             journal, state, f"rollback:{role}:{node.name}",
                             lambda node=node, role=role: executors[node.name].rollback(
                                 role, previous, target, args.timeout, require_lb_hooks,
+                                run_id=state.run_id,
                             ),
                         )
                 for node in nodes:
@@ -7712,7 +8405,7 @@ def worker_command(args: argparse.Namespace) -> int:
             check.as_dict()
             for check in ops.preflight(
                 manifest, bundle, args.require_lb_hooks, args.prepared,
-                args.test_license_rehearsal,
+                args.test_license_rehearsal, not args.no_lb_roundtrip,
             )
         ]
     elif args.worker_action == "ledger":
@@ -7769,6 +8462,8 @@ def worker_command(args: argparse.Namespace) -> int:
         value = ops.prepare(
             bundle, source, target, args.run_id, args.expected_bundle_sha256,
         )
+    elif args.worker_action == "render-config":
+        value = ops.render_config(sys.stdin.read(), args.apply, args.run_id)
     elif args.worker_action == "rollout":
         value = ops.rollout(args.role, args.timeout, args.require_lb_hooks)
     elif args.worker_action == "post-verify":
@@ -7789,7 +8484,7 @@ def worker_command(args: argparse.Namespace) -> int:
     elif args.worker_action == "rollback":
         value = ops.rollback_role(
             args.role, canonical_version(args.previous), canonical_version(args.target),
-            args.timeout, args.require_lb_hooks,
+            args.timeout, args.require_lb_hooks, args.run_id,
         )
     else:
         raise UpgradeError("unsupported worker action")
@@ -7866,7 +8561,7 @@ def parser() -> argparse.ArgumentParser:
     rollback.add_argument("--nano-cli", help=argparse.SUPPRESS)
 
     worker = commands.add_parser("_upgrade-worker", help=argparse.SUPPRESS)
-    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "rollback-preflight", "rollback"))
+    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "render-config", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "rollback-preflight", "rollback"))
     worker.add_argument("--install-dir", required=True)
     worker.add_argument("--candidate", default="")
     worker.add_argument("--bundle")
@@ -7898,6 +8593,8 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--marker", default="")
     worker.add_argument("--require-lb-hooks", action="store_true")
     worker.add_argument("--prepared", action="store_true")
+    worker.add_argument("--apply", action="store_true")
+    worker.add_argument("--no-lb-roundtrip", action="store_true")
     worker.add_argument("--test-license-rehearsal", action="store_true")
     worker.add_argument("--lb-drain-command")
     worker.add_argument("--lb-rejoin-command")
@@ -7906,6 +8603,12 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # NAN-5279: line-buffer stdout even when run without -u (scripts/nano
+    # passes -u), so a non-TTY caller sees each result line as it is printed.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(line_buffering=True)
     args = parser().parse_args()
     if args.command == "backup-set":
         if args.timeout < 1:

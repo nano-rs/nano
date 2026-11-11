@@ -69,7 +69,6 @@ fn import_request(mode: Option<&str>, severity: Option<&str>, name: Option<&str>
         severity: severity.map(str::to_string),
         mode: mode.map(str::to_string),
         custom_npl: None,
-        ai_triage_hints: None,
         source_type_mappings: None,
         merge_to_single_source_type: None,
     }
@@ -320,8 +319,9 @@ mod derivations {
         assert!(resolved.requires_promote_for_create());
     }
 
-    /// A Sigma repo (no nPL frontmatter) defaults to staging/scheduled, so a
-    /// plain import needs only `detections:create`.
+    /// A rule without parseable nPL frontmatter (imported via `custom_npl`)
+    /// defaults to staging/scheduled, so a plain import needs only
+    /// `detections:create`.
     #[test]
     fn a_non_npl_import_defaults_to_staging_scheduled() {
         let resolved = ImportLifecycle::resolve(&import_request(None, None, None), Some("high"), None);

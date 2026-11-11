@@ -36,6 +36,7 @@ impl LogSourceService {
                 message: format!("VRL validation failed: {}", validation.errors.join("; ")),
                 validation_result: Some(validation),
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -51,6 +52,7 @@ impl LogSourceService {
                     message,
                     validation_result: Some(validation),
                     deployment_id: None,
+                    delivery: None,
                 });
             }
         }
@@ -74,6 +76,7 @@ impl LogSourceService {
                             ),
                             validation_result: Some(ext_validation),
                             deployment_id: None,
+                            delivery: None,
                         });
                     }
                 }

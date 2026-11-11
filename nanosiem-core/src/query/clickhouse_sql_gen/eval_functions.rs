@@ -1794,6 +1794,18 @@ fn eval_function_to_sql(
                     "coalesce() requires at least 1 argument".into(),
                 ));
             }
+            if gen.profile.id() == crate::schema::SchemaId::Ocsf && arg_sqls.len() > 1 {
+                // NAN-5277: on OCSF '' is absent (see `isnull` below), so
+                // coalesce skips it too: every argument but the last is
+                // NULL when empty. `if(…, NULL, x)` keeps x's type (a numeric
+                // 0 stays a value). The last argument is the fallback as given.
+                let (last, rest) = arg_sqls.split_last().expect("len > 1");
+                let rest: Vec<String> = rest
+                    .iter()
+                    .map(|a| format!("if(toString({a}) = '', NULL, {a})"))
+                    .collect();
+                return Ok(format!("coalesce({}, {})", rest.join(", "), last));
+            }
             Ok(format!("coalesce({})", arg_sqls.join(", ")))
         }
         "nullif" => {
@@ -1816,12 +1828,23 @@ fn eval_function_to_sql(
             let arg = arg_sqls
                 .first()
                 .ok_or_else(|| SqlGenError::InvalidQuery("isnull() requires 1 argument".into()))?;
+            if gen.profile.id() == crate::schema::SchemaId::Ocsf {
+                // NAN-5277: OCSF columns are non-Nullable (an absent string is
+                // '') and unmapped-tail reads default to '', so a bare
+                // `isNull` was always false on OCSF data. An empty string is
+                // absent there. A numeric 0 stays a value.
+                return Ok(format!("(isNull({arg}) OR toString({arg}) = '')"));
+            }
             Ok(format!("isNull({})", arg))
         }
         "isnotnull" | "is_not_null" => {
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("isnotnull() requires 1 argument".into())
             })?;
+            if gen.profile.id() == crate::schema::SchemaId::Ocsf {
+                // NAN-5277: the complement of the OCSF `isnull` above.
+                return Ok(format!("(isNotNull({arg}) AND toString({arg}) != '')"));
+            }
             Ok(format!("isNotNull({})", arg))
         }
         // NAN-3313: Splunk type tests. They were in the `where` boolean-function

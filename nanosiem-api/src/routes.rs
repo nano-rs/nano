@@ -1117,6 +1117,11 @@ pub fn create_router(state: AppState) -> Router {
             "/api/log-sources/deploy-all",
             post(handlers::log_sources::deploy_all_log_sources),
         )
+        // NAN-5279: re-check a deploy's generation on the ingest hosts.
+        .route(
+            "/api/log-sources/delivery-status",
+            get(handlers::log_sources::get_delivery_status),
+        )
         .route(
             "/api/log-sources/ingestion-history",
             get(handlers::log_sources::get_all_ingestion_history),
@@ -2326,7 +2331,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/detection-code-targets/{id}/token",
             post(handlers::detection_code_targets::set_token),
         )
-        // Rule Repositories (external Sigma rule syncing)
+        // Rule Repositories (first-party nPL rule syncing)
         .route(
             "/api/rule-repositories",
             get(handlers::rule_repositories::list_repositories),
@@ -2403,11 +2408,6 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/detection-rules/{id}/upstream-diff/dismiss",
             post(handlers::rule_repositories::dismiss_upstream_changes),
-        )
-        // Sigma conversion (standalone)
-        .route(
-            "/api/sigma/convert",
-            post(handlers::rule_repositories::convert_sigma),
         )
         // Parser Repositories (external parser syncing)
         .route(
@@ -3317,7 +3317,7 @@ pub fn create_router(state: AppState) -> Router {
         // The recovery-set coordinator sets the cluster flag and drains one
         // shared lock per API process before opening snapshot gates.
         .layer(axum_middleware::from_fn_with_state(
-            backup_mutation_fence,
+            backup_mutation_fence.clone(),
             crate::middleware::backup_mutation_fence,
         ))
         // Demo guard (runs after auth, blocks admin endpoints for demo users)
@@ -3349,6 +3349,30 @@ pub fn create_router(state: AppState) -> Router {
             auth_state,
             auth_middleware,
         ));
+
+    // Enterprise routes that authenticate THEMSELVES (not with a session) are
+    // merged after the session auth layer, so it never sees them. They keep
+    // the backup mutation fence; the layers below (IP allowlist, request id,
+    // logging, ...) wrap them like any route. Instead of the blanket
+    // licensed-surface guard they get the effective license state as a
+    // request extension and enforce the hard stop themselves: at it they
+    // still accept operations that only narrow access (fail safe), and refuse
+    // everything else.
+    #[cfg(feature = "enterprise")]
+    {
+        let self_authenticated =
+            nanosiem_enterprise::handlers::extension_public_routes::<AppState>()
+                .route_layer(axum_middleware::from_fn_with_state(
+                    state.license_status.clone(),
+                    crate::middleware::license_state_extension,
+                ))
+                .with_state(state.clone())
+                .layer(axum_middleware::from_fn_with_state(
+                    backup_mutation_fence,
+                    crate::middleware::backup_mutation_fence,
+                ));
+        app = app.merge(self_authenticated);
+    }
 
     // Publish grace/hard-stop headers on all responses. Licensed-only denial
     // is attached directly to `licensed_app`; shared/open routes continue.

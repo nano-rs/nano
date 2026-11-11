@@ -269,19 +269,51 @@ impl SsoAccessPolicy {
             && self.email_in_verified_domain(claims)
     }
 
+    /// NAN-5274: whether an address pushed by this provider's directory
+    /// (SCIM), with no ID token behind it, may link onto an existing local
+    /// account that no SSO identity is bound to yet.
+    ///
+    /// A push carries no `email_verified`, so only the administrator-asserted
+    /// verified domains can vouch, under the same issuer rules as a sign-in
+    /// that sends no verification flag: Entra needs its tenant ID configured;
+    /// any other non-Google issuer needs NO tenant configured (domains carried
+    /// over from an Entra setup never apply elsewhere); Google never.
+    #[cfg(feature = "enterprise")]
+    pub fn trusts_directory_email(&self, issuer: &str, email: &str) -> bool {
+        if is_google_issuer(issuer) {
+            return false;
+        }
+        if is_microsoft_issuer(issuer) {
+            if self.entra_tenant_id.is_none() {
+                return false;
+            }
+        } else if self.entra_tenant_id.is_some() {
+            return false;
+        }
+        self.domain_is_verified(email)
+    }
+
     #[cfg(feature = "enterprise")]
     fn email_in_verified_domain(&self, claims: &super::IdTokenClaims) -> bool {
-        claims.email.as_ref().is_some_and(|email| {
-            let parts: Vec<_> = email.split('@').collect();
-            parts.len() == 2
-                && !parts[0].is_empty()
-                && !email.chars().any(char::is_whitespace)
-                && self.verified_domains.iter().any(|domain| {
-                    domain.eq_ignore_ascii_case(parts[1])
-                        // A domain stored before free-mail / public-suffix
-                        // validation existed is never trusted (NAN-5266 M2).
-                        && verified_domain_refusal(&domain.to_ascii_lowercase()).is_none()
-                })
-        })
+        claims
+            .email
+            .as_ref()
+            .is_some_and(|email| self.domain_is_verified(email))
+    }
+
+    /// `email` is one `local@domain` address whose domain is an exact,
+    /// still-valid verified domain.
+    #[cfg(feature = "enterprise")]
+    fn domain_is_verified(&self, email: &str) -> bool {
+        let parts: Vec<_> = email.split('@').collect();
+        parts.len() == 2
+            && !parts[0].is_empty()
+            && !email.chars().any(char::is_whitespace)
+            && self.verified_domains.iter().any(|domain| {
+                domain.eq_ignore_ascii_case(parts[1])
+                    // A domain stored before free-mail / public-suffix
+                    // validation existed is never trusted (NAN-5266 M2).
+                    && verified_domain_refusal(&domain.to_ascii_lowercase()).is_none()
+            })
     }
 }

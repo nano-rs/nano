@@ -278,6 +278,11 @@ impl SchemaProfile for SpansProfile {
         promoted().contains(self.canonicalize(name).as_ref())
     }
 
+    fn is_queryable_field(&self, name: &str) -> bool {
+        // NAN-5275: a dotted attribute path reads the `attributes` Map tail.
+        self.is_known_field(name) || name.contains('.')
+    }
+
     fn field_type(&self, field: &str) -> Option<FieldType> {
         let canonical = self.canonicalize(field);
         promoted()

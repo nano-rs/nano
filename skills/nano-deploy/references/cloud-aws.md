@@ -465,9 +465,18 @@ Teardown (only on request), in this order, so nothing hangs on a finalizer:
    `gateway.k8s.aws/gatewayclass` finalizer).
 3. Delete the PVCs, `nano-secrets`, `vector-source-credentials` and the
    namespace; then `helm uninstall aws-load-balancer-controller -n kube-system`.
-4. `eksctl delete cluster -f nano-eks.yaml --wait`, the RDS instance (and its
-   subnet and security groups), the ACM certificate and the controller's IAM
-   policy.
+4. The RDS instance, then its DB subnet group, then its security group,
+   waiting for each (`aws rds delete-db-instance ... && aws rds wait
+   db-instance-deleted ...`; retry `aws ec2 delete-security-group` on
+   `DependencyViolation` until the instance's ENI is released). They live in
+   the cluster's VPC: left there, `eksctl delete cluster` fails after ~30 min
+   with "The vpc ... has dependencies" and leaves the `eksctl-<name>-cluster`
+   stack in DELETE_FAILED, NAT gateways still billing (seen in the v2.0.12
+   retest). Recovery: delete what is left in the VPC, then
+   `aws cloudformation delete-stack --stack-name eksctl-<name>-cluster` (a
+   second `eksctl delete cluster` only says "No cluster found").
+5. `eksctl delete cluster -f nano-eks.yaml --wait`, then the ACM certificate
+   and the controller's IAM policy.
 
 ## Managed PostgreSQL (RDS)
 
@@ -511,7 +520,7 @@ kubectl create namespace nano --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n nano create secret generic pg-bootstrap \
   --from-file=admin=./pg-admin-password.txt --from-file=nano=./pg-password.txt
 kubectl -n nano run pg-bootstrap --rm -i --restart=Never --image=postgres:17-alpine --overrides='
-{"spec": {"containers": [{"name": "pg-bootstrap", "image": "postgres:17-alpine", "stdin": true,
+{"spec": {"containers": [{"name": "pg-bootstrap", "image": "postgres:17-alpine", "stdin": true, "stdinOnce": true,
   "command": ["sh", "-c", "PGPASSWORD=$(cat /s/admin) exec psql -v ON_ERROR_STOP=1 \"host=<endpoint> user=nanoadmin dbname=postgres sslmode=require\" -f -"],
   "volumeMounts": [{"name": "s", "mountPath": "/s", "readOnly": true}]}],
   "volumes": [{"name": "s", "secret": {"secretName": "pg-bootstrap"}}]}}' <<'SQL'
@@ -525,6 +534,15 @@ ALTER SCHEMA public OWNER TO nanosiem;
 SQL
 kubectl -n nano delete secret pg-bootstrap
 ```
+
+It prints psql's output (`CREATE ROLE` ... `ALTER SCHEMA`) and exits 0 in a few
+seconds. Keep `"stdinOnce": true`: the overrides replace the container
+`kubectl run` generates, and without it the attach never sees end of input, so
+the command prints nothing, hangs about 60 s and exits 1 although the SQL ran
+(seen in the v2.0.12 retest). Do not rerun it on that symptom; check with
+`pg-preflight.py` instead (a rerun fails on `role "nanosiem" already exists`).
+kubectl's "session is recorded in container logs, including credentials"
+warning is harmless here: the passwords come from the mounted Secret.
 
 From a host that already reaches the database (a bastion), the same SQL works
 in interactive `psql`, with `\password nanosiem` instead of the `\set` and

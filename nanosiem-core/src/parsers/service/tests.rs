@@ -14,6 +14,7 @@ fn test_service() -> ParserService {
 
 #[test]
 fn test_validate_parser_fields_with_valid_udm_fields() {
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let service = test_service();
 
     let vrl = r#"
@@ -34,6 +35,7 @@ fn test_validate_parser_fields_with_valid_udm_fields() {
 
 #[test]
 fn test_validate_parser_fields_with_unknown_fields() {
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let service = test_service();
 
     let vrl = r#"
@@ -54,6 +56,7 @@ fn test_validate_parser_fields_with_unknown_fields() {
 
 #[test]
 fn test_validate_parser_fields_ignores_metadata() {
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let service = test_service();
 
     let vrl = r#"
@@ -73,6 +76,7 @@ fn test_validate_parser_fields_ignores_metadata() {
 
 #[test]
 fn test_validate_parser_fields_with_mixed_fields() {
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let service = test_service();
 
     let vrl = r#"
@@ -109,4 +113,21 @@ fn test_validate_parser_fields_with_array_access() {
     assert!(result.error.is_none());
     // Should recognize src_ip even with array access
     assert!(result.warnings.is_empty());
+}
+
+/// NAN-5271: OCSF parsers write OCSF paths, so the UDM field check is skipped
+/// under OCSF (it reported every OCSF field as unknown on every save).
+#[test]
+fn ocsf_parser_fields_are_not_checked_against_udm() {
+    let _ocsf = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Ocsf);
+    let service = test_service();
+    let vrl = r#"
+        .src_endpoint.ip = .source_ip
+        .actor.user.name = .user
+        .unmapped.vendor_key = "value"
+    "#;
+    let result = service.validate_parser_fields(vrl);
+    assert!(result.valid);
+    assert!(result.error.is_none());
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
 }

@@ -26,17 +26,23 @@ import { AssetStream } from './AssetStream';
 import { computeBucketWindow, formatTimestampHMS, withAssetIdentity } from './helpers';
 import { nplExactEquals } from '@/lib/npl-quote';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
-import { isSchemaField, semanticFieldsFor, type SchemaFieldMap, type SemanticField } from '@/lib/schema-fields';
+import {
+  assetConceptDrill,
+  isSchemaField,
+  semanticFieldsFor,
+  type SchemaFieldMap,
+  type SemanticField,
+} from '@/lib/schema-fields';
 
 // nPL `| where` snippets used by more than one drilldown, built from the
 // profile-aware field map (NAN-4903) so each pivot names the active schema's
-// columns. `category`, `file_action` and `prevalence_dest_domain` have no
-// cross-profile concept and stay as-is (both read paths resolve them).
+// columns. `prevalence_dest_domain` has no cross-profile concept and stays
+// as-is. Event-KIND drilldowns (auth / logon type / file) are concepts, not
+// columns: `assetConceptDrill` (NAN-5271 E).
 function assetNpl(m: SchemaFieldMap) {
   const dnsQuery = m.field('dnsQuery');
   const destHost = m.field('destHost');
   const destIp = m.field('destIp');
-  const authType = m.field('authType');
   return {
     TOP_DOMAINS: `| where ${dnsQuery}!="" | stats count by ${dnsQuery} | sort -count`,
     // NEW_DOMAINS mirrors the backend tile: uniqExactIf(dest_host, prevalence_dest_domain < 5).
@@ -47,16 +53,10 @@ function assetNpl(m: SchemaFieldMap) {
       `| where ${destIp}!="" | stats count, sum(${m.field('bytesOut')}) as bytes by ${destIp}, ${destHost} | sort -bytes`,
     TOP_DESTINATIONS_BY_COUNT: `| where ${destIp}!="" | stats count by ${destIp}, ${destHost} | sort -count`,
     PROCESS_TREE: `| where ${m.field('processName')}!="" | tree process`,
-    FILE_EVENTS: '| where file_action!=""',
-    AUTH_INTERACTIVE: `| where category="authentication" AND lower(${authType}) LIKE "%interactive%"`,
-    AUTH_NETWORK_OR_LATERAL:
-      `| where category="authentication" AND (lower(${authType}) LIKE "%network%" OR lower(${authType}) LIKE "%lateral%")`,
     // Timeline lane → drilldown command. AUTH/PROC/NET/FILE use `| where`; ALERT
     // uses a base-search filter on source_type.
-    LANE_AUTH: '| where category="authentication" OR category="authorization"',
     LANE_PROC: `| where ${m.field('processName')}!=""`,
     LANE_NET: `| where ${destIp}!=""`,
-    LANE_FILE: '| where file_action!=""',
   };
 }
 
@@ -319,7 +319,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
         : {};
       switch (lane) {
         case 'auth':
-          handleAssetDrilldown({ ...extras, _tableCommand: npl.LANE_AUTH });
+          handleAssetDrilldown({ ...extras, ...assetConceptDrill(schemaMap.profile, 'authLane') });
           return;
         case 'proc':
           handleAssetDrilldown({ ...extras, _tableCommand: npl.LANE_PROC });
@@ -328,7 +328,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
           handleAssetDrilldown({ ...extras, _tableCommand: npl.LANE_NET });
           return;
         case 'file':
-          handleAssetDrilldown({ ...extras, _tableCommand: npl.LANE_FILE });
+          handleAssetDrilldown({ ...extras, ...assetConceptDrill(schemaMap.profile, 'fileLane') });
           return;
         case 'alert':
           handleAssetDrilldown({ ...extras, source_type: 'signal' });
@@ -337,7 +337,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
           handleAssetDrilldown(extras);
       }
     },
-    [handleAssetDrilldown, dossier?.timeline.buckets, effectiveTimeRange, npl],
+    [handleAssetDrilldown, dossier?.timeline.buckets, effectiveTimeRange, npl, schemaMap.profile],
   );
 
   // Entity context (risk + alerts + cases) fetched in parallel from nanosiem-api
@@ -487,20 +487,20 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
                 {dossier && (
                   <AuthCard
                     auth={dossier.auth}
-                    onOpenAll={onDrilldown ? () => handleAssetDrilldown({ category: 'authentication' }) : undefined}
+                    onOpenAll={onDrilldown ? () => handleAssetDrilldown(assetConceptDrill(schemaMap.profile, 'authAll')) : undefined}
                     onStatClick={onDrilldown ? (key) => {
                       switch (key) {
                         case 'SUCCESS':
-                          handleAssetDrilldown({ category: 'authentication', auth_result: 'success' });
+                          handleAssetDrilldown(assetConceptDrill(schemaMap.profile, 'authSuccess'));
                           return;
                         case 'FAILURE':
-                          handleAssetDrilldown({ category: 'authentication', auth_result: 'failure' });
+                          handleAssetDrilldown(assetConceptDrill(schemaMap.profile, 'authFailure'));
                           return;
                         case 'INTERACT':
-                          handleAssetDrilldown({ _tableCommand: npl.AUTH_INTERACTIVE });
+                          handleAssetDrilldown(assetConceptDrill(schemaMap.profile, 'interactiveLogon'));
                           return;
                         case 'NETWORK':
-                          handleAssetDrilldown({ _tableCommand: npl.AUTH_NETWORK_OR_LATERAL });
+                          handleAssetDrilldown(assetConceptDrill(schemaMap.profile, 'networkLogon'));
                           return;
                       }
                     } : undefined}
@@ -509,7 +509,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
                 {dossier && (
                   <FilesCard
                     files={dossier.files}
-                    onOpenAll={onDrilldown ? () => handleAssetDrilldown({ _tableCommand: npl.FILE_EVENTS }) : undefined}
+                    onOpenAll={onDrilldown ? () => handleAssetDrilldown(assetConceptDrill(schemaMap.profile, 'fileEvents')) : undefined}
                   />
                 )}
                 {dossier && (

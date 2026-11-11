@@ -252,6 +252,15 @@ pub async fn search(
     // row 0, so a later page (`offset > 0`) of an interactive result must stay
     // interactive rather than become a job whose first page is the wrong rows.
     let accept_async = accept_async && request.offset.unwrap_or(0) == 0;
+    // NAN-5277: a `| ai` search is never handed off (see `handoff_eligible`).
+    let ai_search = !super::background_jobs::handoff_eligible(&request.query);
+    let accept_async = accept_async && !ai_search;
+    // An explicit `async_mode` `| ai` search runs interactively instead of as
+    // a job (the web client's async fallback already handles a sync answer);
+    // `POST /api/search/jobs` refuses it.
+    if ai_search {
+        request.async_mode = false;
+    }
     if accept_async && !request.async_mode && request.request_id.is_none() {
         request.request_id = Some(uuid::Uuid::now_v7().to_string());
     }

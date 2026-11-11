@@ -61,17 +61,22 @@ fn notes_name_the_generation_and_the_unconfirmed_hosts() {
         verdict: DeliveryVerdict::Acknowledged,
     };
     assert_eq!(
-        acked.note(timeout),
+        acked.note(timeout, Duration::from_secs(5)),
         "Published generation 7 and acknowledged by 2/2 ingest host(s)."
     );
     let pending = DeliveryReport {
         generation: 7,
         host_count: 2,
-        verdict: DeliveryVerdict::Pending { hosts: vec!["http://nano-3:8687".into()] },
+        verdict: DeliveryVerdict::Pending {
+            hosts: vec!["http://nano-3:8687".into()],
+            unanswered: vec![],
+        },
     };
-    let note = pending.note(timeout);
+    let note = pending.note(timeout, Duration::from_secs(5));
     assert!(note.contains("1/2 ingest host(s) acknowledged it within 75s"), "{note}");
     assert!(note.contains("http://nano-3:8687"), "{note}");
+    assert!(note.contains("GET /api/log-sources/delivery-status?generation=7"), "{note}");
+    assert_eq!(pending.state(), DeliveryState::Pending);
 }
 
 #[test]
@@ -181,4 +186,99 @@ async fn a_rolled_back_host_grades_rejected() {
     .await;
     let result = grade_published(4, &[bad], &token(), Duration::from_secs(3)).await;
     assert!(matches!(grade_delivery(&result), Graded::Rejected(_)), "{result:?}");
+}
+
+/// NAN-5279: two back-to-back generations (import, then deploy) outlast the
+/// wait while every host answers and is still installing. That is in
+/// progress, not a failure: live (no rollback), not confirmed, state pending,
+/// with the hosts and a way to re-check named.
+#[tokio::test]
+async fn every_host_answering_but_still_installing_is_pending_not_failure() {
+    let (a, _) = serve(Arc::new(|_| r#"{"installed":35,"installing":35}"#.to_string())).await;
+    let (b, _) = serve(Arc::new(|_| r#"{"installed":35}"#.to_string())).await;
+    let result = grade_published(36, &[a.clone(), b.clone()], &token(), Duration::from_secs(3)).await;
+    let delivered = match &result {
+        Ok(delivered) => delivered.clone(),
+        other => panic!("expected pending success, got {other:?}"),
+    };
+    assert!(!delivered.confirmed);
+    assert_eq!(delivered.delivery.state, DeliveryState::Pending);
+    assert_eq!(delivered.delivery.generation, 36);
+    assert_eq!(delivered.delivery.host_count, 2);
+    assert_eq!(delivered.delivery.pending_hosts, vec![a.clone(), b.clone()]);
+    assert_eq!(
+        delivered.delivery.status_path,
+        "/api/log-sources/delivery-status?generation=36"
+    );
+    let note = &delivered.note;
+    assert!(note.contains("ingest hosts have not confirmed it yet"), "{note}");
+    assert!(note.contains("delivery polls every"), "{note}");
+    assert!(note.contains("Re-check in a minute"), "{note}");
+    assert!(!note.contains("NOT known to be live"), "{note}");
+    assert_eq!(grade_delivery(&result), Graded::Live);
+}
+
+#[tokio::test]
+async fn acknowledged_delivery_carries_the_acknowledged_state() {
+    let (a, _) = serve(Arc::new(|_| r#"{"installed":9}"#.to_string())).await;
+    let result = grade_published(9, &[a], &token(), Duration::from_secs(3)).await;
+    let delivered = result.expect("acknowledged");
+    assert!(delivered.confirmed);
+    assert_eq!(delivered.delivery.state, DeliveryState::Acknowledged);
+    assert!(delivered.delivery.pending_hosts.is_empty());
+}
+
+#[test]
+fn the_wait_covers_two_consumer_install_cycles() {
+    // Script defaults: 2 x (5 s poll + 60 s ack + 10 s overhead).
+    assert_eq!(derived_ack_timeout(5, 60), Duration::from_secs(150));
+    // Enterprise compose consumer (45 s ack): the observed ~60 s per
+    // generation twice over fits, where the old fixed 90 s did not.
+    assert_eq!(derived_ack_timeout(5, 45), Duration::from_secs(120));
+    assert!(derived_ack_timeout(5, 45) > Duration::from_secs(2 * 58));
+    // Clamped both ways.
+    assert_eq!(derived_ack_timeout(1, 1), Duration::from_secs(30));
+    assert_eq!(derived_ack_timeout(60, 600), Duration::from_secs(180));
+}
+
+#[test]
+fn status_grades_one_poll_without_waiting() {
+    let installing = [host("a", 36, None), host("b", 35, None)];
+    let status = grade_status(36, &installing);
+    assert_eq!(status.state, DeliveryState::Pending);
+    assert!(status.generation_delivery);
+    assert_eq!(status.host_count, 2);
+    assert!(status.hosts[0].confirmed && !status.hosts[1].confirmed);
+    assert!(status.message.contains("1/2 ingest host(s)"), "{}", status.message);
+    assert!(status.message.contains("Still installing: b"), "{}", status.message);
+
+    let done = [host("a", 36, None), host("b", 37, None)];
+    assert_eq!(grade_status(36, &done).state, DeliveryState::Acknowledged);
+
+    let rolled_back = [host("a", 36, None), host("b", 35, Some(36))];
+    let status = grade_status(36, &rolled_back);
+    assert_eq!(status.state, DeliveryState::Rejected);
+    assert_eq!(status.hosts[1].failed, Some(36));
+
+    let unreachable = [host("a", 35, None), ("b".to_string(), None)];
+    let status = grade_status(36, &unreachable);
+    assert_eq!(status.state, DeliveryState::Unconfirmed);
+    assert!(!status.hosts[1].reachable);
+    assert!(status.message.contains("did not answer: b"), "{}", status.message);
+}
+
+#[tokio::test]
+async fn status_without_relays_is_unconfirmed() {
+    let status = status_from_relays(4, &[], &token()).await;
+    assert_eq!(status.state, DeliveryState::Unconfirmed);
+    assert!(status.hosts.is_empty());
+}
+
+#[test]
+fn delivery_state_serializes_snake_case() {
+    assert_eq!(serde_json::to_string(&DeliveryState::Pending).unwrap(), r#""pending""#);
+    assert_eq!(
+        serde_json::to_string(&DeliveryState::NotApplicable).unwrap(),
+        r#""not_applicable""#
+    );
 }

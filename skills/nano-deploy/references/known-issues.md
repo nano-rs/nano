@@ -64,6 +64,52 @@ product's files.
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.
 
+## 2.0.12 (fixed in 2.0.13)
+
+- **`scripts/nano upgrade` keeps every host's old rendered configuration**
+  on a role split. `~/nano/.nano-generated/` keeps the earlier install's
+  files, and containers whose image did not change are not recreated. So
+  fixes that live only in templates never apply: after a 2.0.11 → 2.0.12
+  upgrade the ingest edge still answers OTLP **500** (not 503) during a
+  PostgreSQL failover, and the 2.0.12 monitoring exporters may lack their
+  config. **Handling:** after the upgrade, rerun each host's install command
+  in the planner's order, as in
+  [upgrade.md](upgrade.md#path-b-compose-from-v209-or-earlier-installer-rerun-host-by-host)
+  step 6 (complete role list, drain app and ingest hosts first). Each rerun
+  re-renders and recreates. Later upgraders re-render each host from the
+  bundle themselves and recreate every container whose mounted config
+  changed.
+- **After an app host reboots, its `app-internal-edge` can proxy to the wrong
+  container.** nginx resolved `nano-api` once at start, so it keeps the old
+  container IP. The ingest hosts' `app-api-proxy` then marks that app host
+  DOWN, and OTLP auth and ingest admission run on the other app hosts only.
+  Nothing user-facing shows it (`/readyz` 200, nano-api healthy), and SIEM
+  Health cannot see it (it has no container view). **Handling:** after any
+  app host reboot, run `scripts/nano cluster-health` (or
+  [cluster-health.py](../scripts/cluster-health.py)) on each ingest host; if
+  `gw:app-api-proxy` fails for that app host, run
+  `docker restart <project>-app-internal-edge-1` on the app host
+  (`docker ps --filter name=app-internal-edge`). Later releases resolve
+  container names through Docker's DNS at request time, and cluster-health
+  has an `edge:internal` row on app hosts that FAILs with the restart command.
+- **The load-balancer hook's forced-command advice does not work.** The
+  2.0.12 hook and docs say to restrict the LB key with a forced command
+  running `sudo socat`. A forced command replaces the hook's command and gets
+  no stdin, so socat reads nothing and the drain silently does nothing.
+  **Handling:** use the `nano-lb-haproxy` wrapper as the forced command, with
+  the matching hook ([upgrade.md](upgrade.md#path-a-compose-from-v2010-or-later-scriptsnano-upgrade)
+  prerequisites), and test a drain by hand.
+- **The dry run's `lb-hooks` row covers ingest hosts only**, and only checks
+  that the hooks are executable. The upgrade also drains app hosts. Test the
+  hooks by hand on every app and ingest host. Later dry runs check every
+  drained host with a live round trip.
+- **The post-upgrade SIEM Health gate can compare the old report with
+  itself** (no new report runs until about 5 minutes after the API leader
+  starts). Read SIEM Health yourself about 10 minutes after the upgrade.
+- **`scripts/nano upgrade` prints nothing until it exits** over a plain
+  `ssh host '...'` (no TTY). Use `ssh -t`, or follow
+  `~/nano/upgrade-journal/*.jsonl` on the coordinator.
+
 ## 2.0.11 (fixed in 2.0.12)
 
 - **`scripts/nano upgrade` from v2.0.10 to v2.0.11 fails its dry run** on

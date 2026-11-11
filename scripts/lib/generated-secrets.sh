@@ -483,7 +483,10 @@ nano_env_atomic_rewrite_locked() {
 nano_env_managed_block_writer() {
     local target="$1" tmp="$2" content="$3" begin_marker="$4" end_marker="$5"
     local line state=0 seen=0
+    # A marker line may end in CR (an .env edited on Windows): match it all the
+    # same, or the old block would survive below the new one and keep winning.
     while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
         if [[ "$line" == "$begin_marker" ]]; then
             (( state == 0 && seen == 0 )) || {
                 printf 'generated-secrets: malformed managed block; refusing to rewrite the env file.\n' >&2
@@ -509,8 +512,8 @@ nano_env_managed_block_writer() {
     printf '%s\n' "$end_marker" >> "$tmp" || return 1
     state=0
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" == "$begin_marker" ]]; then state=1; continue; fi
-        if [[ "$line" == "$end_marker" && "$state" == 1 ]]; then state=0; continue; fi
+        if [[ "${line%$'\r'}" == "$begin_marker" ]]; then state=1; continue; fi
+        if [[ "${line%$'\r'}" == "$end_marker" && "$state" == 1 ]]; then state=0; continue; fi
         (( state == 1 )) || printf '%s\n' "$line" >> "$tmp" || return 1
     done < "$target"
 }
@@ -566,14 +569,19 @@ nano_env_set_keys_writer() {
 # line's position (the same place nano_env_set_keys writes). Every host
 # collapses the same way, so copied .env files stay byte-identical. Prints the
 # collapsed key names (never values), comma-separated; nothing when clean.
-nano_env_collapse_duplicates() {
-    local env_file="$1" line had_xtrace=0 names
-    local -a kvs=()
-    [[ -f "$env_file" ]] || return 0
-    case "$-" in *x*) had_xtrace=1; set +x ;; esac
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && kvs+=("$line")
-    done < <(awk '
+#
+# Lines inside an installer-managed block (`# BEGIN NANO ...` / `# END NANO
+# ...`, e.g. the auto-sizing block) are neither counted nor rewritten: a key
+# assigned there AND again below is the documented operator override, not a
+# duplicate. Collapsing it into the block line used to let the next block
+# rewrite silently drop the operator's value (NAN-5282).
+nano_env_collapse_scan() {
+    # Prints each key (never a value) assigned more than once outside the
+    # installer-managed blocks of $1, in first-seen order.
+    awk '
+        /^# BEGIN NANO / { block = 1; next }
+        /^# END NANO / { block = 0; next }
+        block { next }
         {
             bare = $0
             sub(/^[ \t]*/, "", bare)
@@ -581,18 +589,67 @@ nano_env_collapse_duplicates() {
             if (match(bare, /^[A-Za-z_][A-Za-z0-9_]*=/)) {
                 key = substr(bare, 1, RLENGTH - 1)
                 count[key]++
-                last[key] = bare
                 if (!(key in order)) { order[key] = ++n; keys[n] = key }
             }
         }
-        END { for (i = 1; i <= n; i++) if (count[keys[i]] > 1) print last[keys[i]] }
-    ' "$env_file")
-    if ((${#kvs[@]} > 0)); then
-        names=$(printf '%s\n' "${kvs[@]}" | sed 's/=.*//' | paste -sd, - | sed 's/,/, /g')
-        nano_env_set_keys "$env_file" "${kvs[@]}" || { kvs=(); (( had_xtrace )) && set -x; return 1; }
+        END {
+            for (i = 1; i <= n; i++) if (count[keys[i]] > 1) print keys[i]
+        }
+    ' "$1"
+}
+
+# The kept line goes at the first outside occurrence that follows the key's
+# last managed-block assignment, never above it: an operator line above the
+# block plus one below must stay below the block, or the block value would take
+# effect instead (the block is rewritten only by the installer, not here).
+nano_env_collapse_writer() {
+    local target="$1" tmp="$2"
+    awk '
+        NR == FNR {
+            if ($0 ~ /^# BEGIN NANO /) { block = 1; next }
+            if ($0 ~ /^# END NANO /) { block = 0; next }
+            bare = $0
+            sub(/^[ \t]*/, "", bare)
+            sub(/^export[ \t]+/, "", bare)
+            if (match(bare, /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+                key = substr(bare, 1, RLENGTH - 1)
+                if (block) { managed[key] = FNR; next }
+                count[key]++
+                last[key] = bare
+                if (!(key in anchor) || ((key in managed) && anchor[key] < managed[key]))
+                    anchor[key] = FNR
+            }
+            next
+        }
+        /^# BEGIN NANO / { block = 1; print; next }
+        /^# END NANO / { block = 0; print; next }
+        block { print; next }
+        {
+            bare = $0
+            sub(/^[ \t]*/, "", bare)
+            sub(/^export[ \t]+/, "", bare)
+            if (match(bare, /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+                key = substr(bare, 1, RLENGTH - 1)
+                if (count[key] > 1) {
+                    if (FNR == anchor[key]) print last[key]
+                    next
+                }
+            }
+            print
+        }
+    ' "$target" "$target" > "$tmp"
+}
+
+nano_env_collapse_duplicates() {
+    local env_file="$1" had_xtrace=0 names
+    [[ -f "$env_file" ]] || return 0
+    case "$-" in *x*) had_xtrace=1; set +x ;; esac
+    names=$(nano_env_collapse_scan "$env_file" | paste -sd, - | sed 's/,/, /g')
+    if [[ -n "$names" ]]; then
+        nano_env_atomic_rewrite_locked "$env_file" "$env_file" nano_env_collapse_writer \
+            || { (( had_xtrace )) && set -x; return 1; }
         printf '%s\n' "$names"
     fi
-    kvs=()
     if (( had_xtrace )); then set -x; fi
     return 0
 }

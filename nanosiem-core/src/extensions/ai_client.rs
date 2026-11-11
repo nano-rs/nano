@@ -191,6 +191,38 @@ pub trait AiClient: Send + Sync {
         max_rows: usize,
     ) -> Result<Vec<Value>, ExtensionError>;
 
+    /// NAN-5277: charge ONE `| ai` command as one AI request, however many
+    /// chunks (model calls) it is split into. The search service calls this
+    /// at most once per command, just before the command's first model call,
+    /// so a command that never reaches the model is never charged.
+    /// `Refused(reason)` skips the command's rows with that reason (credit
+    /// limit, AI unavailable). The default is free: implementations whose
+    /// `enrich_rows` does not meter need nothing.
+    async fn charge_ai_pipe_command(&self) -> Result<AiPipeCharge, ExtensionError> {
+        Ok(AiPipeCharge::Charged)
+    }
+
+    /// NAN-5277: one chunk of an `| ai` command that
+    /// [`charge_ai_pipe_command`](Self::charge_ai_pipe_command) already paid
+    /// for: the model call only, never a second charge. Token usage goes into
+    /// `usage` instead of the per-call ledger, so the command records ONE
+    /// usage event ([`record_ai_pipe_usage`](Self::record_ai_pipe_usage)).
+    /// The default is `enrich_rows` (for clients that meter nothing).
+    async fn enrich_chunk_uncharged(
+        &self,
+        rows: Vec<Value>,
+        prompt: &str,
+        _usage: &AiUsageTally,
+    ) -> Result<Vec<Value>, ExtensionError> {
+        let n = rows.len();
+        self.enrich_rows(rows, prompt, n).await
+    }
+
+    /// NAN-5277: record the ONE usage event of an `| ai` command, with the
+    /// tokens summed over its chunks. Called once per command that captured
+    /// any usage. Default: no ledger.
+    fn record_ai_pipe_usage(&self, _totals: AiUsageTotals) {}
+
     /// Structured completion: ask the model to return a single JSON object
     /// matching `json_schema` and return it parsed (NAN-1251).
     ///
@@ -450,6 +482,70 @@ impl AiClient for NoopAiClient {
     }
 }
 
+/// The outcome of charging one `| ai` command (NAN-5277).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiPipeCharge {
+    /// Charged (or free): the command's chunks may call the model.
+    Charged,
+    /// Not charged and not run: every row is SKIPPED with this reason.
+    Refused(String),
+}
+
+/// Token usage summed over the model calls of one `| ai` command (NAN-5277).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AiUsageTotals {
+    /// Agent label of the first call.
+    pub agent_id: Option<String>,
+    /// Model and provider of the first call.
+    pub model_id: String,
+    pub provider: String,
+    /// Model calls that reported usage.
+    pub calls: u32,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    pub cache_creation_tokens: u32,
+}
+
+/// Collects the usage of one `| ai` command's model calls (NAN-5277). Cheap
+/// to clone; every clone adds to the same totals.
+#[derive(Debug, Clone, Default)]
+pub struct AiUsageTally(std::sync::Arc<std::sync::Mutex<Option<AiUsageTotals>>>);
+
+impl AiUsageTally {
+    /// Add one model call's usage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add(
+        &self,
+        agent_id: Option<String>,
+        model_id: &str,
+        provider: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: u32,
+        cache_creation_tokens: u32,
+    ) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let t = guard.get_or_insert_with(|| AiUsageTotals {
+            agent_id,
+            model_id: model_id.to_string(),
+            provider: provider.to_string(),
+            ..AiUsageTotals::default()
+        });
+        t.calls = t.calls.saturating_add(1);
+        t.prompt_tokens = t.prompt_tokens.saturating_add(prompt_tokens);
+        t.completion_tokens = t.completion_tokens.saturating_add(completion_tokens);
+        t.cached_tokens = t.cached_tokens.saturating_add(cached_tokens);
+        t.cache_creation_tokens = t.cache_creation_tokens.saturating_add(cache_creation_tokens);
+    }
+
+    /// Take the totals (None when no call reported usage). A second take
+    /// returns None, so the command records at most once.
+    pub fn take(&self) -> Option<AiUsageTotals> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+}
+
 /// Tag every row `ai_verdict = "SKIPPED"` with `reason` as `ai_reasoning`,
 /// preserving the table shape for the `| ai` pipe.
 pub fn skipped_rows(rows: Vec<Value>, reason: &str) -> Vec<Value> {
@@ -569,6 +665,33 @@ impl AiClient for DeferredAiClient {
         match self.client().await {
             Ok(client) => client.enrich_rows(rows, prompt, max_rows).await,
             Err(reason) => Ok(skipped_rows(rows, &reason)),
+        }
+    }
+
+    // NAN-5277: forward command metering to the real client, or the reason
+    // it is unavailable (never charged).
+    async fn charge_ai_pipe_command(&self) -> Result<AiPipeCharge, ExtensionError> {
+        match self.client().await {
+            Ok(client) => client.charge_ai_pipe_command().await,
+            Err(reason) => Ok(AiPipeCharge::Refused(reason)),
+        }
+    }
+
+    async fn enrich_chunk_uncharged(
+        &self,
+        rows: Vec<Value>,
+        prompt: &str,
+        usage: &AiUsageTally,
+    ) -> Result<Vec<Value>, ExtensionError> {
+        match self.client().await {
+            Ok(client) => client.enrich_chunk_uncharged(rows, prompt, usage).await,
+            Err(reason) => Ok(skipped_rows(rows, &reason)),
+        }
+    }
+
+    fn record_ai_pipe_usage(&self, totals: AiUsageTotals) {
+        if let Some(client) = self.ready.get() {
+            client.record_ai_pipe_usage(totals);
         }
     }
 }

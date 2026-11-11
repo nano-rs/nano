@@ -110,6 +110,7 @@ pub use validation::{
     is_aggregation_command,
     pre_aggregation_subquery,
     suggest_similar_fields,
+    suggest_similar_fields_in,
     validate_field_name,
     validate_field_name_format,
     validate_query_fields,

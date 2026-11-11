@@ -87,7 +87,7 @@ pub struct ApiConfig {
     /// come in via the air-gap import surface instead.
     pub airgap: bool,
     /// Active schema profile selected for this deployment (scoping §2.4).
-    /// Resolved from `NANO_SCHEMA_PROFILE` at boot (`udm` default | `ocsf`).
+    /// Resolved from `NANO_SCHEMA_PROFILE` at boot (`ocsf` default | `udm`).
     /// Boot fails fast on an unrecognized value (DualPool philosophy, NAN-800).
     /// The resolved `Arc<dyn SchemaProfile>` is threaded into the search path
     /// from `AppState`; this field records the choice for reporting.

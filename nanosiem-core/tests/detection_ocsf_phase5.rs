@@ -115,23 +115,28 @@ fn udm_score_calculator_unchanged() {
     assert_eq!(e2, "h1");
 }
 
-/// The two profiles disagree on the same event — the seam is real, not a no-op:
-/// the network fixture has both endpoints, and each profile picks its own
-/// source-IP physical field.
+/// The OCSF profile picks its own source-IP physical field from the network
+/// fixture; a UDM calculator, which finds no flat UDM field on an OCSF row,
+/// reaches the same entity through the class-aware fallback (NAN-5271 C).
 #[test]
-fn ocsf_and_udm_orders_differ_on_same_event() {
+fn udm_calculator_resolves_ocsf_event_class_aware() {
     let ocsf_event: Value = serde_json::from_str(OCSF_NETWORK_FIXTURE).unwrap();
 
     let ocsf_calc = ScoreCalculator::new().with_profile(Arc::new(OcsfProfile::new()));
-    let (_v, ocsf_field) = ocsf_calc.extract_entity(None, &[ocsf_event.clone()]);
+    let (ocsf_value, ocsf_field) = ocsf_calc.extract_entity(None, &[ocsf_event.clone()]);
     assert_eq!(ocsf_field.as_deref(), Some("src_endpoint.ip"));
+    assert_ne!(ocsf_value, "unknown");
 
     // The same OCSF event run through a UDM calculator finds no flat UDM field
-    // and falls back to "unknown" (no `src_ip` column in OCSF JSON).
+    // (no `src_ip` column in OCSF JSON). Since NAN-5271 C (#9245) it no longer
+    // collapses to "unknown": the class-aware resolver
+    // (`schema::entities::event_entity`) finds the OCSF source endpoint.
+    // `udm_score_calculator_unchanged` covers the UDM order winning when a
+    // flat UDM field is present.
     let udm_calc = ScoreCalculator::new();
     let (uv, uf) = udm_calc.extract_entity(None, &[ocsf_event]);
-    assert_eq!(uf, None);
-    assert_eq!(uv, "unknown");
+    assert_eq!(uf.as_deref(), Some("src_endpoint.ip"));
+    assert_eq!(uv, ocsf_value);
 }
 
 // ---------------------------------------------------------------------------

@@ -233,23 +233,6 @@ pub(crate) fn internal_domain_predicate(
     format!(" AND NOT arrayExists(s -> endsWith(concat('.', domain), concat('.', s)), [{list}])")
 }
 
-/// Distinct domain candidates for query-artifact discovery (NAN-3226): the
-/// internal-name exclusion runs in the WHERE, BEFORE `DISTINCT ... LIMIT`, so
-/// a query that touches many internal hosts cannot crowd external domains out
-/// of the `cap` budget.
-pub fn distinct_domain_candidates_sql(
-    host_col: &str,
-    logs_table: &str,
-    filter: &str,
-    internal: &crate::internal_domains::InternalDomains,
-    cap: usize,
-) -> String {
-    format!(
-        "SELECT DISTINCT {host_col} AS value FROM {logs_table} WHERE {filter} AND {host_col} != '' AND {not_internal} LIMIT {cap}",
-        not_internal = internal.sql_not_internal(host_col),
-    )
-}
-
 impl PrevalenceRepository {
     /// Exclude the internal suffixes from domain list reads (NAN-3226).
     pub fn with_internal_domains(

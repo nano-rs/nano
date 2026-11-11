@@ -261,7 +261,7 @@ function KeyActionRow({
           <button
             onClick={() => onPivotAction(action.action)}
             className="text-primary text-[11.5px] truncate min-w-0 hover:underline text-left"
-            title={`Filter by action=${action.action}`}
+            title={`Filter by operation ${action.action}`}
           >
             {action.action}
           </button>
@@ -275,7 +275,7 @@ function KeyActionRow({
               <button
                 onClick={() => onPivotTarget(action.target)}
                 className="text-foreground truncate text-[11.5px] min-w-0 hover:text-primary hover:underline text-left"
-                title={`Filter by resource_name=${action.target}`}
+                title={`Filter by resource ${action.target}`}
               >
                 {action.target}
               </button>

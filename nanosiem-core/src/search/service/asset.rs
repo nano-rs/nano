@@ -991,9 +991,21 @@ impl SearchService {
         if let Some(ref field) = asset_info.identifier_field {
             // Try to find a value for this field in the first result
             for result in results.iter().take(10) {
-                if let Some(value) = result.get(field).and_then(|v| v.as_str()) {
+                // The literal key first, then the class-correct column for the
+                // concept, so `field=user` finds `user.name` on an OCSF 3002 row.
+                let value = result
+                    .as_object()
+                    .and_then(|row| crate::schema::entities::resolve_field(row, field))
+                    .map(|(value, _)| value);
+                if let Some(value) = value.as_deref() {
                     if !value.is_empty() {
-                        return Ok((field.clone(), value.to_string()));
+                        // NAN-5277: an OCSF path (`user.name`, `device.hostname`)
+                        // is returned as its canonical UDM name so identity
+                        // resolution and the identity clause recognise it.
+                        let canonical = crate::search::query_processing::canonical_entity_field(field)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| field.clone());
+                        return Ok((canonical, value.to_string()));
                     }
                 }
             }
@@ -1036,6 +1048,18 @@ impl SearchService {
 
         for result in results.iter().take(10) {
             for field in &identifier_fields {
+                // NAN-5277: on OCSF, resolve the concept class-aware through the
+                // shared entity table: an Authentication (3002) row carries the
+                // account in `user.name` (actor empty), a Sysmon row in
+                // `actor.user.name`, and the host in `device.hostname`.
+                if is_ocsf {
+                    let kind = crate::schema::entities::EntityKind::from_field_name(field);
+                    if let (Some(kind), Some(row)) = (kind, result.as_object()) {
+                        if let Some(value) = crate::schema::entities::resolve(row, kind) {
+                            return Ok((field.to_string(), value));
+                        }
+                    }
+                }
                 for key in result_keys(field) {
                     if let Some(value) = result.get(&key).and_then(|v| v.as_str()) {
                         if !value.is_empty() {

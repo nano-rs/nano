@@ -13,9 +13,11 @@
 #   docker compose -f docker-compose.siem-only.yml up -d
 #
 # Requirements / notes:
-#   - Intended for the OCSF schema profile. Set NANO_SCHEMA_PROFILE=ocsf in .env
-#     (install.sh writes it, NAN-1474). Without the key, compose falls back to
-#     `udm` so a pre-profile deployment keeps its data (NAN-4903).
+#   - Intended for the OCSF schema profile, the default (NAN-5271). install.sh
+#     writes NANO_SCHEMA_PROFILE to .env (NAN-1474) and pins `udm` into an
+#     older .env without it; the migrator refuses an unset profile against a
+#     database that already holds UDM, so a pre-profile deployment keeps its
+#     data (NAN-4903).
 #     The UDM `logs` table is not direct-writable; only `ocsf_logs_raw` is.
 #     Booting this with profile=udm gives you a working SIEM with no ingestion
 #     path at all.
@@ -250,12 +252,12 @@ services:
       CLICKHOUSE_SELF_USER: nanosiem
       # NAN-1476: must match api/search/jobs — when ocsf, the migrator applies
       # the clickhouse/ocsf/init.sql overlay so ocsf_logs exists before boot.
-      # NAN-4903: set NANO_SCHEMA_PROFILE=ocsf in .env for a new SIEM-only
-      # setup (install.sh writes it). The `udm` fallback applies only to an .env
-      # WITHOUT the key, i.e. a deployment that predates the profile choice and
-      # holds UDM data; defaulting it to ocsf would silently repoint it at an
-      # empty table. Never change this fallback.
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      # NAN-4903/NAN-5271: OCSF is the default. install.sh writes the key and
+      # pins `udm` into an older .env that lacks it (that deployment holds UDM
+      # data). If it did not run, the migrator sees nanosiem.logs without
+      # nanosiem.ocsf_logs and refuses to start instead of repointing the
+      # deployment at an empty table.
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}
       # The migrator substitutes these into {pg_dict_*} placeholders in
       # clickhouse/init.sql so the PG-sourced dictionaries can authenticate
       # without hardcoded creds (NAN-807 bug #3).
@@ -326,7 +328,7 @@ services:
       # Storage schema profile (udm | ocsf). Fixed at install time by install.sh.
       # Must match nano-search or the two services read different CH tables.
       # SIEM-only / direct-ingestion deployments should run `ocsf`.
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}  # legacy-.env fallback; see the migrator service
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}  # must match the migrator service
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config staging. With no Vector to consume them, the parser-editor
       # surface still writes here harmlessly (a no-op in BYO-aggregator mode —
@@ -411,7 +413,7 @@ services:
       # Storage schema profile (udm | ocsf). Must match nano-api/nano-search —
       # the detection runner and repo sync resolve the rules repo + target
       # table from this, so a mismatch syncs the wrong rules.
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}  # legacy-.env fallback; see the migrator service
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}  # must match the migrator service
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       # NAN-1913: see nano-api note above.
@@ -485,7 +487,7 @@ services:
       AUTH_ENABLED: "true"
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
       # Storage schema profile (udm | ocsf). Must match nano-api (above).
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}  # legacy-.env fallback; see the migrator service
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}  # must match the migrator service
       REDIS_URL: redis://dragonfly:6379
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-}

@@ -11,7 +11,8 @@ interface ToastAction {
 interface ToastOptions {
   title?: string;
   description?: string;
-  variant?: 'default' | 'destructive';
+  /** `info`: neutral, e.g. a deploy still being installed (NAN-5279). */
+  variant?: 'default' | 'destructive' | 'info';
   action?: ToastAction;
   duration?: number;
 }
@@ -29,6 +30,9 @@ function toast({ title, description, variant, action, duration }: ToastOptions) 
   }
   if (variant === 'destructive') {
     return sonnerToast.error(title, opts);
+  }
+  if (variant === 'info') {
+    return sonnerToast.info(title, opts);
   }
   return sonnerToast.success(title, opts);
 }

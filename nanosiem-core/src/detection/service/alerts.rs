@@ -296,18 +296,14 @@ impl DetectionService {
         // consumer gets "who/what" without parsing the raw events.
         if let Some(ref webhook_service) = self.webhook_service {
             let severity_str = format!("{:?}", rule.severity).to_lowercase();
-            let entity = rule.risk_entity_field.as_deref().and_then(|field| {
-                alert
-                    .matched_events
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|ev| ev.get(field))
-                    .and_then(|v| match v {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        serde_json::Value::Null => None,
-                        other => Some(other.to_string()),
-                    })
-            });
+            // NAN-5271 C: resolved class-aware, so a UDM-named field on an
+            // OCSF row (or an OCSF field on the UDM-keyed real-time payload)
+            // still yields the entity, and a rule with no entity field reports
+            // its primary entity instead of nothing.
+            let entity = crate::schema::entities::alert_primary_entity(
+                rule.risk_entity_field.as_deref(),
+                &alert.matched_events,
+            );
             webhook_service
                 .fire_alert(
                     alert.id,

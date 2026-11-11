@@ -364,3 +364,40 @@ fn logs_time_bound_predicate_is_byte_identical_form() {
         "{sql}"
     );
 }
+
+/// NAN-5275: the seeded `accumulated_risk_threshold_exceeded` rule (query `*
+/// | where score_24h > … or score_7d > … | table …`, `dataset = 'risk'`)
+/// evaluates the risk scores on an OCSF tenant. The leading `*` is correct:
+/// the rule's `dataset` column, not an inline selector, swaps in the derived
+/// risk grain, and the thresholds become a WHERE over its decayed sums.
+#[test]
+fn seeded_risk_notable_rule_evaluates_risk_scores_on_ocsf() {
+    let query = crate::risk::RiskNotableConfig::default().default_rule_query();
+    let gen = ClickHouseSqlGenerator::with_table("ocsf_logs")
+        .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()))
+        .with_risk_config(risk_config())
+        .with_dataset(Dataset::Risk);
+    let sql = generate(&gen, &query);
+
+    // The derived grain over the findings stream, not a log scan.
+    let cfg = risk_config();
+    let source = RiskFindingsSource::new(true, "ocsf_logs");
+    let base = format!(
+        "({})",
+        risk_dataset_base_query(&source, cfg.now, &cfg.decay, &cfg.cleared).to_inline_sql()
+    );
+    assert!(sql.contains(&base), "must read the derived risk grain: {sql}");
+    assert!(sql.contains("source_type = 'findings'"), "{sql}");
+    // Thresholds compare the numeric decayed sums bare (no lower(), no spill).
+    assert!(
+        sql.contains("WHERE (score_24h > 500 OR score_7d > 1000)"),
+        "threshold filter missing: {sql}"
+    );
+    assert!(!sql.contains("unmapped.score_24h") && !sql.contains("lower(score_24h)"), "{sql}");
+    assert!(
+        sql.contains(
+            "SELECT entity, entity_type, score_24h, score_7d, distinct_rules_7d, last_rule_name FROM"
+        ),
+        "projection missing: {sql}"
+    );
+}

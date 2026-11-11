@@ -80,7 +80,14 @@ replica delay of 30 seconds or less, and a `PASS` on every `gw:` row: each is
 one of the host's own HAProxy gateways read from its runtime socket. A
 `gw:clickhouse-proxy` FAIL naming the local replica means the host's
 containers cannot reach the host's own address (host firewall blocking
-Docker bridges); fix it before go-live. `cluster-health.py` exits 3 with
+Docker bridges); fix it before go-live. On app hosts, the `edge:internal`
+row (from 2.0.13) checks `/livez` through `app-internal-edge`, the private
+API port the ingest hosts' `app-api-proxy` uses. A FAIL that says the edge
+"is holding a stale container address" prints the fix
+(`docker restart <edge container>`); on 2.0.12 and earlier the same fault
+shows only as that app host DOWN in `gw:app-api-proxy` on the ingest hosts
+([known-issues.md](known-issues.md#2012-fixed-after-2012)). SIEM Health
+cannot see either (it has no container view). `cluster-health.py` exits 3 with
 `INCONCLUSIVE` when `system.replicas` does not answer in time (it can block
 behind table locks on a busy, small host). That is not a pass: wait a few
 minutes and re-run it. If it persists, report it with `system.processes`

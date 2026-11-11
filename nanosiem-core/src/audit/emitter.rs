@@ -355,6 +355,19 @@ impl AuditEmitter {
             .await
     }
 
+    /// Write ONLY the OCSF `ocsf_logs` mirror rows for `events`, through the same
+    /// bounded, fire-and-forget path as routine audit events (NAN-5271). For
+    /// callers that already write their own UDM `logs` row (case lifecycle
+    /// audit) but whose events must also be searchable on an OCSF tenant. A
+    /// no-op under UDM.
+    pub async fn emit_ocsf_mirror(&self, events: &[AuditEvent]) -> Result<(), AuditEmitError> {
+        if events.is_empty() || !self.mirror_to_ocsf {
+            return Ok(());
+        }
+        self.bounded_call(self.insert_ocsf_mirror(&self.write_client(false), events))
+            .await
+    }
+
     /// Outbox-drainer delivery of the OCSF mirror half (synchronous, bounded).
     pub(crate) async fn deliver_ocsf(&self, events: &[AuditEvent]) -> Result<(), AuditEmitError> {
         if !self.mirror_to_ocsf {

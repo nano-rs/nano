@@ -135,7 +135,7 @@ def check_vector(pods: list[dict]) -> None:
 
 # Distributed DDL older than 10 min that a host has not finished. A host runs its
 # queue in order, so an entry older than one that host already Finished can't be
-# blocking it: it is a stale leftover (NAN-5269: a replica restarted while an
+# blocking it: it is a stale leftover (seen on AKS: a replica restarted while an
 # ON CLUSTER statement was issued and left it `Inactive` for good, with nothing
 # diverged). Stuck entries fail; stale ones only warn. Two TSV columns.
 DDL_SQL = ("SELECT countIf(f.last_finished = '' OR q.entry > f.last_finished), "

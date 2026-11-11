@@ -325,7 +325,7 @@ pub async fn validate_detection(
 
     let mut errors = Vec::new();
     let mut warning = None;
-    let mut referenced_fields = Vec::new();
+    let referenced_fields: Vec<String>;
 
     // Strip comments from the query before parsing
     let clean_query = strip_comments(&request.query);
@@ -374,242 +374,27 @@ pub async fn validate_detection(
         errors.push(format!("Query syntax error: {}", e));
     }
 
-    // Extract field names from the query (basic extraction)
-    // This is a simple approach - just look for field=value patterns
-    let field_regex = regex::Regex::new(r#"([a-zA-Z_][a-zA-Z0-9_]*)\s*[=!<>]"#).unwrap();
-    for cap in field_regex.captures_iter(&clean_query) {
-        if let Some(field) = cap.get(1) {
-            let field_name = field.as_str().to_string();
-            if !referenced_fields.contains(&field_name) {
-                referenced_fields.push(field_name);
-            }
-        }
-    }
-
-    // Validate field names against:
-    // 1. Direct ClickHouse columns (fast, indexed queries)
-    // 2. Valid UDM fields (can be accessed via ext.* JSON column)
-    // 3. The active schema profile's field universe — so OCSF dotted fields
-    //    (e.g. `src_endpoint.ip`, `actor.process.cmd_line`) are accepted when the
-    //    deployment runs the OCSF profile (NAN-1241). Under UDM this is a superset
-    //    of branches 1+2, so UDM validation stays byte-identical.
-    use nanosiem_core::udm::UdmField;
-
+    // Field-name check (NAN-5275): schema- and dataset-aware. A rule on
+    // `dataset=risk` validates against the risk grain's columns (`score_24h`,
+    // `entity`, …); a logs rule on an OCSF tenant validates against the OCSF
+    // columns plus the alias layer, and suggestions come from the same set.
+    referenced_fields = super::field_check::referenced_fields(&clean_query);
     let profile = state.config.schema_profile();
-
-    static CLICKHOUSE_COLUMNS: &[&str] = &[
-        "_inserted_at",
-        "answer",
-        "auth_result",
-        "auth_type",
-        "authentication_method",
-        "bytes_in",
-        "bytes_out",
-        "category",
-        "change_type",
-        "cloud_account_id",
-        "cloud_account_name",
-        "cloud_provider",
-        "cloud_region",
-        "cloud_service",
-        "cve",
-        "dest_host",
-        "dest_ip",
-        "dest_mac",
-        "dest_port",
-        "dest_user",
-        "direction",
-        "dns_answers",
-        "duration",
-        "dvc",
-        "dvc_ip",
-        "dvc_mac",
-        "enrich_time",
-        "event_type",
-        "ext",
-        "file_action",
-        "file_hash",
-        "file_name",
-        "file_path",
-        "file_size",
-        "http_content_type",
-        "http_method",
-        "http_referrer",
-        "http_user_agent",
-        "id",
-        "ingest_time",
-        "message",
-        "message_id",
-        "metadata",
-        "mfa_used",
-        "mitre_technique_id",
-        "namespace",
-        "packets_in",
-        "packets_out",
-        "command_line",
-        "parent_command_line",
-        "parent_process_guid",
-        "parent_process_id",
-        "parent_process_path",
-        "process_guid",
-        "process_hash",
-        "process_id",
-        "process_name",
-        "process_path",
-        "protocol",
-        "query",
-        "query_type",
-        "recipient",
-        "recipient_domain",
-        "record_type",
-        "registry_key_name",
-        "registry_path",
-        "registry_value_data",
-        "registry_value_name",
-        "resource_id",
-        "resource_name",
-        "resource_type",
-        "response_time",
-        "result",
-        "risk_entity",
-        "risk_factors",
-        "risk_level",
-        "risk_score",
-        "rule_id",
-        "rule_name",
-        "sender",
-        "sender_domain",
-        "session_id",
-        "severity",
-        "signature",
-        "signature_id",
-        "source",
-        "source_type",
-        "src_host",
-        "src_ip",
-        "src_mac",
-        "src_port",
-        "src_user",
-        "status",
-        "status_code",
-        "subject",
-        "timestamp",
-        "uri_path",
-        "url",
-        "url_domain",
-        "user",
-        "user_agent",
-        "user_domain",
-        "user_id",
-        "user_name",
-        "user_type",
-        "vendor_product",
-        "vlan",
-    ];
-    let keywords = [
-        "and",
-        "or",
-        "not",
-        "in",
-        "like",
-        "contains",
-        "startswith",
-        "endswith",
-        "matches",
-        "true",
-        "false",
-    ];
-
-    // Command parameters (not UDM fields)
-    let command_params = [
-        "enrich",
-        "window",
-        "current",
-        "span",
-        "limit",
-        "as",
-        "field",
-        "mode",
-        "score",
-        "entity",
-        "factor",
-        "weight",
-        "maxspan",
-        "maxevents",
-        "keeplast",
-        "case_insensitive",
-        "threshold",
-        "method",
-        "hop",
-        "parent",
-        "child",
-        "label",
-        "detail",
-        "prevalence",
-        "process",
-        "web",
-        "root",
-        "max_age",
-        "by",
-        "value",
-        "count",
-        "output",
-    ];
-
-    for field_name in &referenced_fields {
-        let lower = field_name.to_lowercase();
-        // Skip keywords
-        if keywords.contains(&lower.as_str()) {
-            continue;
+    // Unmapped UDM names on OCSF come back as warnings, not errors, so an
+    // existing rule that uses one is never blocked from being saved.
+    let mut field_warnings: Vec<String> = Vec::new();
+    match super::field_check::parse_dataset(request.dataset.as_deref()) {
+        Ok(dataset) => {
+            let check = super::field_check::check_fields(
+                &referenced_fields,
+                &derived_fields,
+                dataset,
+                &profile,
+            );
+            errors.extend(check.errors);
+            field_warnings = check.warnings;
         }
-        // Skip command parameters (score, entity, factor, etc.)
-        if command_params.contains(&lower.as_str()) {
-            continue;
-        }
-        // Skip fields created by pipeline commands (stats aliases, eval assignments, etc.)
-        if derived_fields.contains(&lower) {
-            continue;
-        }
-        // 1. Check if it's a direct ClickHouse column
-        if CLICKHOUSE_COLUMNS.contains(&lower.as_str()) {
-            continue;
-        }
-        // 2. Allow enriched_*, ioc_*, custom_* prefixes (dynamic enrichment columns)
-        if lower.starts_with("enriched_")
-            || lower.starts_with("ioc_")
-            || lower.starts_with("custom_")
-        {
-            continue;
-        }
-        // 3. Allow prevalence-enriched fields (added by `prevalence enrich=true`)
-        if lower.starts_with("prevalence_")
-            || lower == "hash_prevalence"
-            || lower == "domain_prevalence"
-            || lower == "hash_first_seen"
-            || lower == "domain_first_seen"
-            || lower == "host_count"
-            || lower == "is_rare"
-            || lower == "total_occurrences"
-            || lower == "first_seen"
-            || lower == "last_seen"
-        {
-            continue;
-        }
-        // 4. Check if it's a valid UDM field (accessible via ext.*)
-        if field_name.parse::<UdmField>().is_ok() {
-            continue;
-        }
-        // 5. Check if it's a known field in the active schema profile. For OCSF
-        //    this accepts the promoted dotted columns; for UDM it's a superset of
-        //    the checks above (no UDM field that passed before can fail here).
-        if profile.is_known_field(field_name) || profile.is_known_field(&lower) {
-            continue;
-        }
-        // Not valid - suggest common fields
-        errors.push(format!(
-            "Unknown field '{}'. Did you mean 'src_ip', 'dest_ip', 'user', 'src_host'?",
-            field_name
-        ));
+        Err(e) => errors.push(e),
     }
 
     // Determine detection mode
@@ -733,6 +518,16 @@ pub async fn validate_detection(
 
     // valid is false if parsing failed OR if we found invalid fields
     let valid = valid && errors.is_empty();
+
+    // Field warnings go after the mode / prevalence notes, which set `warning`
+    // above (`warning` is a single string on the wire).
+    if !field_warnings.is_empty() {
+        let fields = field_warnings.join(" ");
+        warning = Some(match warning {
+            Some(existing) => format!("{existing} {fields}"),
+            None => fields,
+        });
+    }
 
     Ok(Json(ValidateDetectionResponse {
         valid,

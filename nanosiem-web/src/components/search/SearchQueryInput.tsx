@@ -183,7 +183,7 @@ export function SearchQueryInput({
   }, [historySuggestions]);
 
   const placeholder = queryMode === 'piped'
-    ? 'Search logs… try source_type=syslog or status=500'
+    ? 'Search logs… try metadata.log_source=windows_sysmon or class_uid=3002 status_id=2'
     : 'SELECT … FROM logs';
 
   // Show hint when focused and not dismissed (and no dropdowns open)

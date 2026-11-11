@@ -174,10 +174,19 @@ export class DetectionsApi {
     });
   }
 
-  async validateDetection(query: string, detectionMode?: string): Promise<ValidateDetectionResult> {
+  /**
+   * Validate a rule query. `dataset` (NAN-5275) makes the field check run
+   * against the schema the rule actually queries: a `risk` rule's
+   * `score_24h` is valid there and unknown on logs.
+   */
+  async validateDetection(
+    query: string,
+    detectionMode?: string,
+    dataset?: string,
+  ): Promise<ValidateDetectionResult> {
     return this.request('/api/rules/validate', {
       method: 'POST',
-      body: JSON.stringify({ query, detection_mode: detectionMode }),
+      body: JSON.stringify({ query, detection_mode: detectionMode, dataset }),
     });
   }
 

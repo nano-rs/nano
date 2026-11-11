@@ -61,9 +61,16 @@ fn fresh_ocsf_boot_recreates_views_skipped_before_overlay() {
             OCSF_OVERLAY.contains(&overlay_create),
             "fresh OCSF overlay must create {view} after ocsf_logs exists"
         );
+        // NAN-5271: ocsf/migrations/196 later adds a src_host_unified host-key
+        // fallback (pinned by tests/ocsf_prevalence_host_key_guard.rs); compare
+        // 170 against the overlay with that rewrite applied.
+        let normalize = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
-            view_statement(MIGRATION, view),
-            view_statement(OCSF_OVERLAY, view),
+            normalize(view_statement(MIGRATION, view)).replace(
+                "if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown')",
+                "if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown'))",
+            ),
+            normalize(view_statement(OCSF_OVERLAY, view)),
             "upgrade and fresh-boot OCSF definitions must not drift for {view}"
         );
     }

@@ -203,6 +203,8 @@ jobs:
           # authority for SSO provider create/enable/issuer/client-id changes
           # and the issuer-change unlink. It sets its own disposable encryption
           # key in-process and shares provider fixtures, so single-threaded.
+          # NAN-5274: scim_provisioning_integration drives the SCIM 2.0 router
+          # (Okta/Entra shapes, deprovisioning, grants, email trust, limits).
           docker run --rm --network host \
             -v "$PWD":/ws -w /ws \
             -e CREDENTIAL_SUITE_ENCRYPTION_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
@@ -246,7 +248,8 @@ jobs:
               cargo test -p nanosiem-enterprise --test case_visibility_scope_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test case_entity_provenance_integration -- --ignored
               cargo test -p nanosiem-enterprise --test melod_parser_draft_jobs_integration -- --ignored --test-threads=1
-              cargo test -p nanosiem-enterprise --test sso_trust_authority_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-enterprise --test sso_trust_authority_integration -- --ignored --test-threads=1 &&
+              cargo test -p nanosiem-enterprise --test scim_provisioning_integration -- --ignored --test-threads=1
             '
 
       - name: Stop Postgres

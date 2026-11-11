@@ -8,11 +8,19 @@
 //! ClickHouse (the suite truncates `logs`).
 
 use nanosiem_core::internal_domains::InternalDomains;
-use nanosiem_core::prevalence::repository::distinct_domain_candidates_sql;
+use nanosiem_core::prevalence::artifact_fields::{distinct_domain_candidates_sql, ArtifactColumn, ArtifactColumns};
 
 #[derive(Debug, clickhouse::Row, serde::Deserialize)]
 struct Value {
     value: String,
+}
+
+/// Only `dest_host`, so the budget arithmetic below is about one column.
+fn dest_host_only() -> ArtifactColumns {
+    ArtifactColumns {
+        domains: vec![ArtifactColumn { sql: "dest_host".into(), is_array: false }],
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -50,7 +58,8 @@ async fn internal_names_never_consume_the_candidate_budget() {
         .expect("external rows");
 
     let internal = InternalDomains::with_suffixes(["prod", "xn--bcher-kva.example"]);
-    let sql = distinct_domain_candidates_sql("dest_host", "nanosiem.logs", "source_type = 'discovery_test'", &internal, 101);
+    let sql = distinct_domain_candidates_sql(&dest_host_only(), "nanosiem.logs", "source_type = 'discovery_test'", &internal, 101)
+        .expect("dest_host query");
     let mut got: Vec<String> = client
         .query(&sql)
         .fetch_all::<Value>()
@@ -65,12 +74,13 @@ async fn internal_names_never_consume_the_candidate_budget() {
     // Without the added suffixes only the built-in names are excluded, so the
     // budget fills with `.prod` / `.bücher.example` names again.
     let builtin_only = distinct_domain_candidates_sql(
-        "dest_host",
+        &dest_host_only(),
         "nanosiem.logs",
         "source_type = 'discovery_test'",
         &InternalDomains::builtin(),
         101,
-    );
+    )
+    .expect("dest_host query");
     let n = client.query(&builtin_only).fetch_all::<Value>().await.expect("builtin").len();
     assert_eq!(n, 101, "100 non-built-in internal names + 3 external, capped at 101");
     client.query("TRUNCATE TABLE nanosiem.logs").execute().await.expect("cleanup");

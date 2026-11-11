@@ -28,6 +28,10 @@ mod import_authz_tests;
 #[path = "import_detection_mode_tests.rs"]
 mod import_detection_mode_tests;
 
+#[cfg(test)]
+#[path = "format_support_tests.rs"]
+mod format_support_tests;
+
 pub use import::{RuleImportAction, RuleImportPlan};
 
 use sqlx::PgPool;
@@ -54,8 +58,6 @@ const AIRGAP_RULES_URL: &str = "airgap://rules";
 pub struct RuleRepositoryServiceConfig {
     /// Maximum rules to sync per repository
     pub max_rules_per_repo: usize,
-    /// Whether to auto-convert Sigma rules during sync
-    pub auto_convert_sigma: bool,
     /// Whether to auto-analyze coverage during sync
     pub auto_analyze_coverage: bool,
     /// File extensions to consider as rules
@@ -66,7 +68,6 @@ impl Default for RuleRepositoryServiceConfig {
     fn default() -> Self {
         Self {
             max_rules_per_repo: 10000,
-            auto_convert_sigma: false, // Disabled by default - conversion via AI is expensive
             auto_analyze_coverage: true,
             rule_extensions: vec!["yml".to_string(), "yaml".to_string()],
         }

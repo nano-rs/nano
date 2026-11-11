@@ -2127,7 +2127,8 @@ done
 # NANO_SERVICE_TOKEN from every non-loopback caller.
 if [[ "$MULTI_NODE" != "1" && ",$(env_value COMPOSE_PROFILES)," == *,monitoring,* \
       && -z "$(env_value NANO_JOBS_BIND_ADDR)" ]]; then
-    printf '%s\n' "NANO_JOBS_BIND_ADDR=0.0.0.0" >> .env
+    nano_env_set_keys .env "NANO_JOBS_BIND_ADDR=0.0.0.0" \
+        || fail "Could not record NANO_JOBS_BIND_ADDR in .env."
     log "Persisted NANO_JOBS_BIND_ADDR=0.0.0.0 to .env (monitoring profile scrapes nano-jobs)"
 fi
 

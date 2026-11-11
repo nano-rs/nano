@@ -265,7 +265,7 @@ fn format_count_renders_thousands() {
 
 #[test]
 fn risk_dataset_row_resolves_entity_and_label() {
-    // The seeded "Accumulated risk threshold exceeded" rule's projection —
+    // The seeded `accumulated_risk_threshold_exceeded` rule's projection —
     // `dataset=risk` carries an explicit entity pair and NO UDM/OCSF column,
     // which is what rendered the match list as `unknown` / `0 IPs`.
     let v = normalize(json!({

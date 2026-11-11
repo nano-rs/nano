@@ -704,6 +704,20 @@ const RBA_SPILL_FIELDS: &[&str] = &[
     "risk_factors",
 ];
 
+/// NAN-5275: the nano finding envelope keys (beyond [`RBA_SPILL_FIELDS`]) that
+/// the finding writer stores under `unmapped` on OCSF. They are real, queryable
+/// names on `source_type=findings` rows even though no OCSF column carries them.
+const OCSF_FINDING_SPILL_FIELDS: &[&str] = &[
+    "signal_type",
+    "rule_id",
+    "rule_name",
+    "rule_mode",
+    "risk_entity_field",
+    "risk_entity_type",
+    "mitre_tactics",
+    "mitre_techniques",
+];
+
 /// NAN-4918: explicit nPL names for the producer-reported OCSF risk attributes.
 /// The bare `risk_score` / `risk_level` stay owned by risk-based alerting (see
 /// [`RBA_SPILL_FIELDS`]); these aliases read the source's own value, exactly
@@ -1112,6 +1126,44 @@ impl SchemaProfile for OcsfProfile {
             || ocsf_registry::known(canonical.as_ref()).is_some()
     }
 
+    fn is_queryable_field(&self, name: &str) -> bool {
+        // NAN-5275: the field universe plus every name `resolve_canonical`
+        // gives a real meaning to, so the editor accepts what codegen reads and
+        // flags what would fall through to an empty `unmapped` lookup.
+        if self.is_known_field(name) {
+            return true;
+        }
+        // Bookkeeping / time columns resolved by name.
+        if matches!(name, "timestamp" | "_inserted_at" | "id" | "time" | "time_dt") {
+            return true;
+        }
+        // RBA outputs owned by risk-based alerting, and the rest of the nano
+        // finding envelope the finding writer puts in the `unmapped` spill
+        // (`detection/findings.rs`), so `source_type=findings` hunts validate.
+        if RBA_SPILL_FIELDS.contains(&name) || OCSF_FINDING_SPILL_FIELDS.contains(&name) {
+            return true;
+        }
+        // Explicit spill / event namespaces: the user named the location.
+        if let Some(rest) = name
+            .strip_prefix("ext.")
+            .or_else(|| name.strip_prefix("unmapped."))
+        {
+            return !rest.is_empty();
+        }
+        if name.starts_with("event.") {
+            // Strip every leading `event.` iteratively (as `resolve_canonical`
+            // does) so an `event.event.…` chain cannot grow the stack.
+            let mut rest = name;
+            while let Some(r) = rest.strip_prefix("event.") {
+                rest = r;
+            }
+            return !rest.starts_with("event.") && self.is_queryable_field(rest);
+        }
+        // UDM-name alias layer: the manifest correspondence plus the
+        // class-split surfaces (`user`, `src_host`, `process_name`, …).
+        self.udm_column_sql(name).is_some()
+    }
+
     fn field_type(&self, field: &str) -> Option<FieldType> {
         // The operational `source_type` column is a String (LowCardinality).
         if field == OCSF_SOURCE_TYPE_COLUMN {
@@ -1178,12 +1230,19 @@ impl SchemaProfile for OcsfProfile {
         if registry().promoted.contains(name) || name == OCSF_SOURCE_TYPE_COLUMN {
             return false;
         }
-        matches!(
-            self.resolve_canonical(name),
-            FieldResolution::JsonPath { ref col, ref path }
-                if col == OCSF_EVENT_COLUMN
+        match self.resolve_canonical(name) {
+            // NAN-5271 E: a UDM alias whose promoted target is an Array column
+            // (`category` → `http_request.url.categories`, `recipient` →
+            // `email.to`, `cve`, `answer`, `resource_*`) needs membership
+            // semantics too. Checking only the alias NAME let `category=x`
+            // compile to `lower(<Array(String)>) = 'x'` — a CH Code 43 error.
+            FieldResolution::ExplicitColumn(ref c) => registry().array_columns.contains(c),
+            FieldResolution::JsonPath { ref col, ref path } => {
+                col == OCSF_EVENT_COLUMN
                     && path.iter().any(|p| p == crate::query::JSON_ARRAY_SEGMENT)
-        )
+            }
+            _ => false,
+        }
     }
 
     fn is_lowercased_at_ingest(&self, field: &str) -> bool {
@@ -1352,6 +1411,16 @@ impl SchemaProfile for OcsfProfile {
         reg.enum_label_columns
             .get(&col)
             .map(|sibling| EnumIntMapping::LabelColumn(sibling.as_str()))
+    }
+
+    fn concept_value_predicate(&self, field: &str, value: &str) -> Option<&'static str> {
+        // NAN-5271 E: `action=blocked` → `disposition_id` / `action_id`
+        // (block/allow vocabulary only; `action=Get` keeps `activity`).
+        super::ocsf_predicates::npl_value_concept(field, value).map(|c| c.sql())
+    }
+
+    fn concept_value_columns(&self, field: &str, value: &str) -> &'static [&'static str] {
+        super::ocsf_predicates::npl_value_concept(field, value).map_or(&[], |c| c.columns())
     }
 
     fn enrichment_field(&self, semantic: EnrichmentKind) -> Option<FieldResolution> {

@@ -10,6 +10,7 @@
 //! - Rarity detection based on configurable thresholds
 //! - Configurable settings with hot-reload support
 
+pub mod artifact_fields;
 pub mod coverage;
 pub mod repository;
 pub mod service;

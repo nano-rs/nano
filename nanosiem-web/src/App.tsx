@@ -97,6 +97,7 @@ import { LayoutProvider } from '@/contexts/LayoutContext';
 import { CapabilitiesProvider } from '@/contexts/CapabilitiesProvider';
 import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
 import { AppLayout } from '@/components/layout/AppLayout';
+import { RouteErrorBoundary } from '@/components/layout/RouteErrorBoundary';
 import { PageContextProvider } from '@/contexts/PageContext';
 import { Toaster } from '@/components/ui/sonner';
 import { SupportDialogHost } from '@/components/support/SupportDialog';
@@ -507,6 +508,8 @@ function ProtectedAppRoutes() {
       <LayoutProvider>
       <PageContextProvider>
       <AppLayout>
+        {/* NAN-5273: a failed page keeps the shell; resets on navigation. */}
+        <RouteErrorBoundary resetKey={location.pathname}>
         <Routes>
           {/* Landing page - redirects based on user preference (default: home) */}
           <Route path="/" element={
@@ -1245,6 +1248,7 @@ function ProtectedAppRoutes() {
           {/* 404 catch-all */}
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
+        </RouteErrorBoundary>
       </AppLayout>
       </PageContextProvider>
       </LayoutProvider>

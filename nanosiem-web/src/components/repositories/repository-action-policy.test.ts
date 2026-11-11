@@ -46,13 +46,13 @@ test('NAN-2157: rule imports use outcome and lifecycle capabilities', () => {
   ]);
   assert.equal(
     ruleImportAccess(importAndCreate, [
-      { outcome: 'create', mode: 'staging', ruleFormat: 'sigma' },
+      { outcome: 'create', mode: 'staging' },
     ]).allowed,
     true,
   );
   assert.deepEqual(
     ruleImportAccess(importAndCreate, [
-      { outcome: 'create', mode: 'live', ruleFormat: 'sigma' },
+      { outcome: 'create', mode: 'live' },
     ]).missing,
     ['detections:promote'],
   );
@@ -61,7 +61,6 @@ test('NAN-2157: rule imports use outcome and lifecycle capabilities', () => {
       {
         outcome: 'create',
         mode: 'staging',
-        ruleFormat: 'nanosiem',
         rawContent: '---\ndetection_mode: realtime\n---\nsource_type=foo',
       },
     ]).missing,

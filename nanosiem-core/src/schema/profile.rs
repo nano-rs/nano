@@ -51,6 +51,17 @@ pub trait SchemaProfile: Send + Sync {
     /// Replaces the `UdmField::from_str` allowlist used for DDL validation.
     fn is_known_field(&self, name: &str) -> bool;
 
+    /// Whether an nPL token names something a query can actually read on this
+    /// schema. It is wider than [`is_known_field`](Self::is_known_field): it
+    /// also takes the profile's query-time alias layer (OCSF's UDM-name
+    /// aliases, explicit spill namespaces such as `unmapped.*`, the bookkeeping
+    /// columns), and for spans/metrics the dotted attribute tail. The detection
+    /// editor's field validator gates on it (NAN-5275). Default: the field
+    /// universe alone, which is exact for UDM and the derived risk grain.
+    fn is_queryable_field(&self, name: &str) -> bool {
+        self.is_known_field(name)
+    }
+
     // --- Typing & query optimization hints ---
 
     /// Value type of a field, if known.
@@ -329,6 +340,25 @@ pub trait SchemaProfile: Send + Sync {
     /// from the manifest's `enum_values` / `enum_label_column` metadata.
     fn enum_int_mapping(&self, _field: &str) -> Option<EnumIntMapping<'_>> {
         None
+    }
+
+    /// Concept translation for a `field=value` filter whose VALUE names a
+    /// concept this schema stores on a different column (NAN-5271 E): OCSF
+    /// answers `action=blocked` with `disposition_id`, not the `activity`
+    /// column the `action` alias resolves to. Returns the boolean SQL predicate
+    /// for `field == value`; `None` → normal field resolution.
+    ///
+    /// Default: `None` — UDM stores these verbs as strings on the aliased
+    /// column itself, so every UDM codegen path is byte-identical.
+    fn concept_value_predicate(&self, _field: &str, _value: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// Columns [`concept_value_predicate`](Self::concept_value_predicate)'s
+    /// predicate reads for `field == value`, so field pruning projects them
+    /// into the stage a later `| where` filters. Empty when not translated.
+    fn concept_value_columns(&self, _field: &str, _value: &str) -> &'static [&'static str] {
+        &[]
     }
 
     fn column_sql(&self, field: &str) -> String {

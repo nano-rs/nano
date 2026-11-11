@@ -82,23 +82,57 @@ rebuild, and offer to ask support to retire the old ID.
 > Path B for that one upgrade, or go straight to 2.0.12 with Path A
 > ([known-issues.md](known-issues.md#2011-fixed-in-2012)).
 
+> **Upgrading to 2.0.12 with Path A on a role split:** the 2.0.12 upgrader
+> keeps every host's old rendered configuration (`~/nano/.nano-generated/`),
+> so template-only fixes (the ingest edge's OTLP 503 during a PostgreSQL
+> failover, among others) never apply. After it completes, rerun each host's
+> install command in the planner's order, as in Path B step 6 (full role
+> list, drain app and ingest hosts first). Later upgraders re-render
+> ([known-issues.md](known-issues.md#2012-fixed-after-2012)).
+
 **Prerequisites on a role split** (check them before the dry run; the
 fresh-install flow does not set them up):
 
 - SSH from the first app host (the coordinator) to every other host, as the
   install user, non-interactively (`ssh -o BatchMode=yes $h true`).
 - Executable drain and rejoin hooks at the same absolute path on every app
-  and ingest host (mandatory with more than one ingest host). The upgrade runs
-  them on the host it is upgrading with that host's **inventory** name; the
-  load balancer knows it as `app-1`, `ingest-1`, ... (the planner's names).
-  Start from the bundle's `deploy/compose/examples/load-balancer/nano-lb-hook`
-  (one file installed as `nano-lb-drain` and `nano-lb-rejoin`; edit its
-  `SERVERS` map and `LBS`).
-- On every HAProxy host, the runtime socket at `level admin`
+  and ingest host (mandatory with more than one ingest host; used on app
+  hosts too when there are two or more). The upgrade runs them on the host it
+  is upgrading with that host's **inventory** name; the load balancer knows it
+  as `app-1`, `ingest-1`, ... (the planner's names). Start from the bundle's
+  `deploy/compose/examples/load-balancer/nano-lb-hook` (one file installed as
+  `nano-lb-drain` and `nano-lb-rejoin`; edit its `SERVERS` map and `LBS`). It
+  runs `ssh nano-lb@<lb> /usr/local/sbin/nano-lb-haproxy set <backend>/<server> drain|ready`
+  on every LB and fails unless the reply confirms the state.
+- On every HAProxy host: the runtime socket at `level admin`
   (`stats socket /run/haproxy/admin.sock mode 600 level admin`, as in the
-  bundled `haproxy.cfg` from 2.0.12; `level operator` cannot drain), and an
-  SSH key from each app and ingest host that may run only the drain/rejoin
-  command there.
+  bundled `haproxy.cfg` from 2.0.12; `level operator` cannot drain), and the
+  LB side, `deploy/compose/examples/load-balancer/nano-lb-haproxy` (its
+  header has the steps; ask before each, they need sudo on the LB):
+
+  ```bash
+  sudo useradd --system --create-home --shell /bin/sh nano-lb
+  sudo install -m 0755 nano-lb-haproxy /usr/local/sbin/nano-lb-haproxy
+  echo 'nano-lb ALL=(root) NOPASSWD: /usr/bin/socat stdio /run/haproxy/admin.sock' \
+    | sudo tee /etc/sudoers.d/nano-lb && sudo chmod 0440 /etc/sudoers.d/nano-lb
+  sudo visudo -cf /etc/sudoers.d/nano-lb
+  ```
+
+  Then each app and ingest host's upgrade-user key goes in
+  `~nano-lb/.ssh/authorized_keys` restricted to the wrapper:
+  `command="/usr/local/sbin/nano-lb-haproxy",restrict ssh-ed25519 AAAA... nano@app-1`.
+  **Never make `sudo socat` the forced command** (the advice up to 2.0.12): a
+  forced command replaces the hook's command and gets no stdin, so socat reads
+  nothing, exits 0, and the drain silently does nothing. The wrapper accepts
+  only `set <backend>/<server> drain|ready` and `state <backend>/<server>`,
+  reads the state back with `show servers state`, and fails unless HAProxy
+  confirms it. 2.0.12 bundles lack the wrapper and ship the old hook: take
+  both files from a later bundle.
+- Test the hooks by hand before the dry run, on each app and ingest host:
+  `/usr/local/sbin/nano-lb-drain <inventory-name>`, then
+  `ssh nano-lb@<lb> /usr/local/sbin/nano-lb-haproxy state <backend>/<server>`
+  (must print `drain`), then `/usr/local/sbin/nano-lb-rejoin <inventory-name>`
+  and the same `state` (must print `ready`).
 
 1. **Precheck:** `upgrade-plan.py` READY; `cluster-health.py` PASS on every
    role-split host; `smoke-test.py` PASS; read the release notes and
@@ -127,18 +161,46 @@ fresh-install flow does not set them up):
 
    With more than one ingest host behind a load balancer, add
    `--lb-drain-command` and `--lb-rejoin-command` (absolute paths on every
-   ingest host). It verifies the package signature, reads the image digests,
-   migration ledger and upgrade policy from inside it, and checks each host's
-   control tree, registry login and image pulls (by digest), disk, NTP,
-   replica lag and license. It changes nothing that runs. Every row must
-   pass.
+   app and ingest host). It verifies the package signature, reads the image
+   digests, migration ledger and upgrade policy from inside it, and checks
+   each host's control tree, registry login and image pulls (by digest), disk,
+   NTP, replica lag and license. It changes nothing that runs. Every row must
+   pass. From 2.0.13 it also:
+   - adds a `config-render` row per host and prints a unified diff of each
+     host's re-rendered configuration (key contents are never shown). Show the
+     operator the diff. A refusal naming `NANO_DEPLOYMENT_ID`/`NANO_HOST_ID`
+     means the inventory's identity changed: that is the installer's
+     `--accept-topology-migration` runbook, not an upgrade;
+   - checks the hooks (`lb-hooks` row) on every host it drains: ingest hosts
+     when there are 2+, app hosts when there are 2+. With hooks configured it
+     runs a real drain → rejoin round trip, one host at a time
+     (`NANO_UPGRADE_LB_HOOK_TEST=0` skips it); after a failed round trip it
+     drains no further host and names the one that may still be drained. An
+     app host without hooks
+     passes with a note that the drain relies on the LB checking `/readyz`.
 5. **Upgrade:** ask, then run the same command without `--dry-run`. It takes
    the backup and rolls Keeper → ClickHouse → PostgreSQL (replicas first, then
    a switchover, then the old leader; the Valkey master is moved off each
    PostgreSQL host before its Valkey and Sentinel restart) → migrations →
-   app → ingest, one host at a time. If it stops, fix the cause (usually an
-   expired registry login) and re-run with `--resume` and the same package.
-   Never delete `~/nano/upgrade-journal/`. Log out of the registry after.
+   app → ingest, one host at a time, draining each app and ingest host first.
+   If it stops, fix the cause (usually an expired registry login) and re-run
+   with `--resume` and the same package. Never delete `~/nano/upgrade-journal/`.
+   Log out of the registry after. From 2.0.13 the upgrader also:
+   - re-renders each host's configuration from the bundle right after that
+     host's `prepare` step (journal step `render-config:<host>`), keeps the
+     old render as `~/nano/.nano-generated.previous`, and recreates every
+     container whose mounted config differs from what it runs (it prints
+     `note: <host>: <service> reads an outdated <path>; recreating it`);
+     `scripts/nano rollback` puts the previous render back;
+   - waits up to `NANO_UPGRADE_SIEM_HEALTH_WAIT_SECONDS` (600) for a SIEM
+     Health report made after the rollout started (the first one runs about
+     5 minutes after the API leader starts). Without one it prints a WARNING
+     and records the gate as not evaluated: then read SIEM Health yourself
+     a few minutes later;
+   - streams its output over a plain `ssh host 'scripts/nano upgrade ...'`:
+     one `==> <time> <step>: started` and `done in Ns` line per step. With
+     2.0.12 and earlier it prints nothing until it exits unless run with
+     `ssh -t`; follow `~/nano/upgrade-journal/*.jsonl` instead.
 6. **Verify:** see [Verify every path](#verify-every-path).
 
 ## Path B: Compose, from v2.0.9 or earlier (installer rerun, host by host)
@@ -203,8 +265,12 @@ target's own `scripts/nano upgrade` is used from then on.
 3. **Pull the new chart into a fresh directory:**
    `rm -rf nano && helm pull "$CHART" --version <v> --untar`. The old
    `./nano`'s `values-customer-images.yaml` pins the old image digests.
+   Never `--reuse-values`: it renders with the previous chart's values and
+   ignores the new chart's defaults (charts <= 2.0.12 also kept the old images;
+   fixed in 2.0.13). Without the original `-f` files, use
+   `--reset-then-reuse-values -f nano/values-customer-images.yaml`.
 4. **Dry run:** `helm upgrade nano ./nano -n nano -f <the SAME value files, in the SAME order> --dry-run=server`
-   and review the changes. Apply new CRDs first if the release says so
+   and review the changes: every nano image must be the new version. Apply new CRDs first if the release says so
    (`kubectl apply --server-side -f nano/crds/...`).
 5. **Upgrade:** ask, then
    `helm upgrade nano ./nano -n nano -f <same files, same order> --wait --timeout 20m`.
@@ -227,7 +293,8 @@ target's own `scripts/nano upgrade` is used from then on.
 ## What is reversible
 
 - **Reversible:** the image swap. `scripts/nano rollback` (Compose) restores
-  the previous images while the schema is unchanged; a failed `helm upgrade`
+  the previous images (and, from 2.0.13, each host's previous rendered
+  configuration) while the schema is unchanged; a failed `helm upgrade`
   keeps the previous version serving.
 - **Not reversible:** database migrations are forward-only. Once they have
   run, `scripts/nano rollback` refuses and prints the restore commands, and

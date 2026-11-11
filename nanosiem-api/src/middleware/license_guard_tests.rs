@@ -71,3 +71,28 @@ async fn contract_expiry_remains_usable_through_exclusive_grace_boundary() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["X-License-State"], "grace_period");
 }
+
+/// Self-enforcing licensed routes get the effective state, never a denial:
+/// they must keep their narrowing-only operations open at the hard stop.
+#[tokio::test]
+async fn license_state_extension_passes_through_with_the_effective_state() {
+    async fn echo(axum::Extension(state): axum::Extension<LicenseState>) -> String {
+        format!("{state:?}")
+    }
+    for (status, expected) in [
+        (LicenseStatus::unavailable("trial hard stop"), "Locked"),
+        (LicenseStatus { state: LicenseState::Active, ..LicenseStatus::default() }, "Active"),
+    ] {
+        let status = Arc::new(RwLock::new(status));
+        let app = Router::new()
+            .route("/api/self-authenticated", get(echo))
+            .route_layer(axum_middleware::from_fn_with_state(status, license_state_extension));
+        let response = app
+            .oneshot(Request::get("/api/self-authenticated").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64).await.unwrap();
+        assert_eq!(body, expected);
+    }
+}

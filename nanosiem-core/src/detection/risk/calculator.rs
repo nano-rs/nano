@@ -321,6 +321,17 @@ impl ScoreCalculator {
                         return (value, Some(field.to_string()));
                     }
                 }
+                // NAN-5271 C: the field names an entity concept the row keys
+                // differently (a UDM `src_ip` on an OCSF row, an OCSF
+                // `src_endpoint.ip` on the UDM-keyed real-time payload). Resolve
+                // the concept class-aware instead of collapsing to `unknown`.
+                for event in events {
+                    if let Some((value, _key)) =
+                        crate::schema::entities::event_entity(event, Some(field))
+                    {
+                        return (value, Some(field.to_string()));
+                    }
+                }
                 (self.default_entity.clone(), None)
             }
             None => {
@@ -334,6 +345,16 @@ impl ScoreCalculator {
                         if let Some(value) = Self::get_string_field(event, field) {
                             return (value, Some(field.to_string()));
                         }
+                    }
+                }
+                // NAN-5271 C: nothing under the profile's own field names. The
+                // row may use the other vocabulary: the real-time matched-log
+                // JSON is UDM-keyed on OCSF, and `stats … by src_ip` on OCSF
+                // emits UDM output names. Resolve the primary entity class-aware
+                // across both before falling back to `unknown`.
+                for event in events {
+                    if let Some((value, key)) = crate::schema::entities::event_entity(event, None) {
+                        return (value, Some(key));
                     }
                 }
                 (self.default_entity.clone(), None)

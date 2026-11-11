@@ -246,8 +246,20 @@ impl BackgroundSearchJobs {
         // hand-off passes a request the handler already froze at arrival, which
         // this leaves unchanged.
         let request = &freeze_time_window(request, chrono::Utc::now())?;
-        if let Err(e) = crate::query::parse_query(request.query.trim()) {
-            return Err(SearchError::ParseError(e.to_string()));
+        match crate::query::parse_query(request.query.trim()) {
+            Err(e) => return Err(SearchError::ParseError(e.to_string())),
+            // NAN-5277: `| ai` never runs as a background job. Its time is the
+            // model call, which the interactive path bounds (chunks, budget,
+            // per-user and per-process caps); a job would hold one of the few
+            // background workers for minutes and run without a per-user cap.
+            Ok(parsed) if crate::search::query_processing::extract_ai_command(&parsed).is_some() => {
+                return Err(SearchError::SqlValidationError(
+                    "`| ai` searches run interactively and cannot be submitted as background \
+                     jobs. Run the search without async mode."
+                        .to_string(),
+                ));
+            }
+            Ok(_) => {}
         }
         let normalized = normalize_job_request(request, self.inner.config.result_cap);
         let identity = identity_hash(&normalized, owner, scope);

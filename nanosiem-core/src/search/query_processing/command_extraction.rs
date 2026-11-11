@@ -1133,9 +1133,34 @@ fn query_has_lateral(query: &Query) -> bool {
     }
 }
 
-/// Known asset identifier fields in priority order
-const ASSET_IDENTIFIER_FIELDS: &[&str] =
-    &["src_host", "dest_host", "src_ip", "dest_ip", "user", "mac"];
+/// Map an entity field name to the canonical UDM identifier name that the
+/// asset and baseline view builders key on (`src_host`, `dest_host`, `src_ip`,
+/// `dest_ip`, `user`, `mac`).
+///
+/// NAN-5277: the name can be a UDM field (`src_host`), an OCSF path
+/// (`device.hostname`, `src_endpoint.hostname`, `user.name`,
+/// `actor.user.name`, `src_endpoint.ip`, ...) or a `*_unified` column. The
+/// OCSF names resolve through the shared class-aware entity table in
+/// `schema::entities`, so `device.hostname="ws-1" | asset` and
+/// `user.name="bob" | baseline` find their entity on OCSF data. The view
+/// builders resolve the canonical name back to the class-correct OCSF columns.
+pub fn canonical_entity_field(field: &str) -> Option<&'static str> {
+    use crate::schema::entities::EntityKind;
+    let field = field.trim();
+    if field == "mac" {
+        return Some("mac");
+    }
+    match EntityKind::from_field_name(field)? {
+        EntityKind::SrcHost => Some("src_host"),
+        EntityKind::DestHost => Some("dest_host"),
+        EntityKind::SrcIp => Some("src_ip"),
+        EntityKind::DestIp => Some("dest_ip"),
+        EntityKind::User => Some("user"),
+        // `dest_user` is not an asset/baseline seed (it never was); OCSF has no
+        // reliable column for it either.
+        _ => None,
+    }
+}
 
 /// Extract an asset identifier directly from the query AST, avoiding the need to execute
 /// the initial search query. Returns `Some((field, value))` if the search expression contains
@@ -1176,13 +1201,17 @@ fn extract_eq_field_value(
             op: Comparator::Eq,
             value,
         } => {
-            let is_target = match target_field {
-                Some(t) => field == t,
-                None => ASSET_IDENTIFIER_FIELDS.contains(&field.as_str()),
+            // NAN-5277: OCSF paths count as identifiers; the canonical UDM
+            // name is returned so the view builders resolve it class-aware.
+            let canonical = canonical_entity_field(field);
+            let out_field = match target_field {
+                Some(t) if field == t => canonical.map(str::to_string).unwrap_or_else(|| field.clone()),
+                Some(t) => match (canonical, canonical_entity_field(t)) {
+                    (Some(a), Some(b)) if a == b => a.to_string(),
+                    _ => return None,
+                },
+                None => canonical?.to_string(),
             };
-            if !is_target {
-                return None;
-            }
             // Extract the string value, skip wildcards
             let str_val = match value {
                 Value::String(s) => s.clone(),
@@ -1192,7 +1221,7 @@ fn extract_eq_field_value(
             if str_val.contains('*') || str_val.contains('?') {
                 return None;
             }
-            Some((field.clone(), str_val))
+            Some((out_field, str_val))
         }
         // Walk through AND — both sides might have it, take first match
         SearchExpr::And(left, right) => extract_eq_field_value(left, target_field)
@@ -1257,6 +1286,8 @@ pub fn resolve_baseline_entity(
     }
     let expr = get_root_search_expr(query)?;
     let (field, value) = extract_eq_field_value(expr, None)?;
+    // `field` is already canonical (see `canonical_entity_field`), so OCSF
+    // paths such as `device.hostname` / `user.name` land here as UDM names.
     let entity_type = match field.as_str() {
         "src_host" | "dest_host" => "host",
         "src_ip" | "dest_ip" => "ip",
@@ -2343,3 +2374,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "command_extraction_ocsf_entity_tests.rs"]
+mod ocsf_entity_tests;

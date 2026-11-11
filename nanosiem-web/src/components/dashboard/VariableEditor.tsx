@@ -404,7 +404,7 @@ export function VariableEditor({
                             <Textarea
                               value={variable.query || ''}
                               onChange={e => handleUpdateVariable(index, { query: e.target.value })}
-                              placeholder="* | stats count by host | table host"
+                              placeholder="* | stats count by device.hostname | table device.hostname"
                               rows={2}
                               className="font-mono text-[11.5px] resize-none"
                             />

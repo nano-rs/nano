@@ -638,6 +638,8 @@ mod tests {
 
     #[test]
     fn test_extract_user() {
+        // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let extractor = EntityExtractor::new();
         let events = serde_json::json!({
             "user": "john.doe",
@@ -680,6 +682,8 @@ mod tests {
 
     #[test]
     fn test_skip_numeric_hosts() {
+        // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let extractor = EntityExtractor::new();
         // Only src_host/dest_host are UDM host fields
         let events = serde_json::json!({
@@ -699,6 +703,8 @@ mod tests {
 
     #[test]
     fn test_skip_numeric_users() {
+        // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let extractor = EntityExtractor::new();
         let events = serde_json::json!({
             "user": "admin",
@@ -736,6 +742,8 @@ mod tests {
 
     #[test]
     fn test_reject_non_user_fields() {
+        // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let extractor = EntityExtractor::new();
         let events = serde_json::json!({
             "user": "jsmith",

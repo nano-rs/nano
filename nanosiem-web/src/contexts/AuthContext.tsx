@@ -20,6 +20,7 @@ import { api } from '../lib/api';
 import { sessionCredentials } from '../lib/session-credentials';
 import { accessOnlyRefreshResult, coordinateBrowserRefresh } from '../lib/refresh-coordinator';
 import { setAccessToken, getAccessToken, clearAccessToken, persistDemoSession, restoreDemoSession, getDemoRefreshToken } from '../lib/auth-token';
+import { ProviderMissingError } from '@/lib/stale-build';
 
 // ============================================================================
 // Types
@@ -867,8 +868,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
 export function useAuth(): AuthContextType {
   const context = useContext(AuthContext);
   if (context === undefined) {
-    console.error('useAuth called outside AuthProvider. AuthContext value:', AuthContext);
-    throw new Error('useAuth must be used within an AuthProvider');
+    // NAN-5273: typed so the route boundary can recognize a stale module copy.
+    throw new ProviderMissingError('useAuth', 'AuthProvider');
   }
   return context;
 }

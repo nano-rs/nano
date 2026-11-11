@@ -64,7 +64,7 @@ impl RuleRepositoryRepository {
         // content channel (OCSF `main`, UDM `legacy/clickhouse`).
         .bind(crate::schema::default_content_branch(&repo.url, repo.branch.as_deref()))
         .bind(repo.rules_path.as_deref().unwrap_or("rules/"))
-        .bind(repo.rule_format.as_deref().unwrap_or("sigma"))
+        .bind(repo.rule_format.as_deref().unwrap_or("nanosiem"))
         // NAN-4940: the first-party catalogs follow upstream unless the caller opts out.
         .bind(repo.auto_sync_enabled.unwrap_or_else(|| crate::schema::is_first_party_content_url(&repo.url)))
         .bind(repo.sync_interval_hours.unwrap_or(24))

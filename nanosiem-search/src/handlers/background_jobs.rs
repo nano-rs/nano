@@ -63,6 +63,23 @@ impl<S: Sync> axum::extract::FromRequestParts<S> for AcceptAsync {
     }
 }
 
+/// Whether an interactive search may be handed off to a background job
+/// (NAN-4915) when it outlives the interactive budget.
+///
+/// NAN-5277: never for a `| ai` search. Its time goes to the LLM call, not to
+/// ClickHouse, so a hand-off re-ran the whole search and paid for the model
+/// call twice, and the re-run held one of the few background workers per
+/// replica (default 2) for minutes. Every other user's escalated search queued
+/// behind it. The `| ai` call is bounded in the search service instead
+/// (`ai_pipe_guard`), so the interactive request finishes on its own. A query
+/// that does not parse keeps the hand-off (the search fails fast either way).
+pub(crate) fn handoff_eligible(query: &str) -> bool {
+    match nanosiem_core::query::parse_query(query) {
+        Ok(parsed) => nanosiem_core::search::query_processing::extract_ai_command(&parsed).is_none(),
+        Err(_) => true,
+    }
+}
+
 /// The job answer for a submission / attach / hand-off.
 pub(crate) fn async_response(outcome: &SubmitOutcome) -> AsyncSearchResponse {
     AsyncSearchResponse {

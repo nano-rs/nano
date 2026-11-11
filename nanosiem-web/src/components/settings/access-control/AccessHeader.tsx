@@ -6,12 +6,13 @@
  */
 
 import { SECTION_BY_ID, GROUP_LABEL } from '@/components/layout/settings/sections';
+import { useCapabilitiesOptional } from '@/hooks/use-capabilities';
 
 export type AccessTabId = 'users' | 'groups' | 'roles' | 'api-keys' | 'sessions';
 
 const TAB_TITLES: Record<AccessTabId, { label: string; desc: string }> = {
   users: { label: 'Users', desc: 'Manage user accounts, status, and group memberships.' },
-  groups: { label: 'Groups', desc: 'Group users to share roles, scopes, and SCIM mappings.' },
+  groups: { label: 'Groups', desc: 'Group users to share roles and scopes.' },
   roles: { label: 'Roles', desc: 'Permission sets that determine what users can do.' },
   'api-keys': { label: 'API Keys', desc: 'Programmatic access for CI, automation, and integrations.' },
   sessions: { label: 'Sessions', desc: 'Active browser and API sessions across users and clients.' },
@@ -25,7 +26,16 @@ export function AccessHeader({ tab }: AccessHeaderProps) {
   // Use the registry to derive the eyebrow group label so it tracks the rail.
   const accessSection = SECTION_BY_ID['access'];
   const groupLabel = accessSection ? GROUP_LABEL[accessSection.group] : 'Administration';
-  const titleEntry = TAB_TITLES[tab];
+  // NAN-5274: SSO group mappings and SCIM provisioning exist only where SSO
+  // does (licensed enterprise builds); open builds never claim them.
+  const sso = useCapabilitiesOptional()?.capabilities.sso ?? false;
+  const titleEntry =
+    tab === 'groups' && sso
+      ? {
+          ...TAB_TITLES.groups,
+          desc: 'Group users to share roles and scopes. SSO group mappings and SCIM provisioning can manage membership.',
+        }
+      : TAB_TITLES[tab];
 
   return (
     <div className="px-5 pt-5 pb-2 shrink-0">

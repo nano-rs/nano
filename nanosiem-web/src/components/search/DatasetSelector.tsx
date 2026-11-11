@@ -15,7 +15,7 @@ interface DatasetSelectorProps {
 }
 
 const OPTIONS: { value: SearchDataset; label: string; description: string }[] = [
-  { value: 'logs', label: 'Logs', description: 'UDM / OCSF events' },
+  { value: 'logs', label: 'Logs', description: 'OCSF events' },
   { value: 'spans', label: 'Traces', description: 'OTLP spans' },
   { value: 'metrics', label: 'Metrics', description: 'OTLP metrics' },
   { value: 'risk', label: 'Risk', description: 'Accumulated entity risk' },
@@ -137,7 +137,7 @@ export function DatasetSelector({ value, onChange, disabled }: DatasetSelectorPr
                   rules and tactics over fixed 24h / 7d windows.
                 </>
               ) : (
-                <>Normalized logs (UDM/OCSF) — the default search plane.</>
+                <>Normalized OCSF logs — the default search plane.</>
               )}
             </div>
           </PopoverContent>

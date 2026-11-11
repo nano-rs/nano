@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::LogSourceService;
 use super::LogSourceServiceError;
-use crate::parsers::vector_config_remote_delivery::with_delivery_note;
+use crate::parsers::vector_config_remote_delivery::with_delivery;
 use crate::parsers::VrlValidator;
 use crate::log_sources::types::{
     DeploymentAction, DeploymentResult, DeploymentStatus, LogSourceDeployment, VrlValidationResult,
@@ -129,6 +129,7 @@ impl LogSourceService {
                     diagnostics: vec![],
                 }),
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -176,6 +177,7 @@ impl LogSourceService {
                     message: error_msg,
                     validation_result: None,
                     deployment_id: None,
+                    delivery: None,
                 });
             }
         }
@@ -203,6 +205,7 @@ impl LogSourceService {
                 message: error_msg,
                 validation_result: None,
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -245,6 +248,7 @@ impl LogSourceService {
                         message: error_msg,
                         validation_result: None,
                         deployment_id: None,
+                        delivery: None,
                     });
                 }
             }
@@ -281,6 +285,7 @@ impl LogSourceService {
                     diagnostics: vec![],
                 }),
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -354,6 +359,7 @@ impl LogSourceService {
                 message: error_msg,
                 validation_result: None,
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -406,6 +412,7 @@ impl LogSourceService {
                     message: error_msg.clone(),
                     validation_result: None,
                     deployment_id: None,
+                    delivery: None,
                 });
             }
             if !failure.rolled_back && backup.is_some() {
@@ -452,6 +459,7 @@ impl LogSourceService {
                 message,
                 validation_result: None,
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -491,16 +499,20 @@ impl LogSourceService {
             id
         );
 
+        // NAN-5279: on a role-split install the note and `delivery` say
+        // whether every ingest host installed it or some are still installing.
+        let (message, delivery) = with_delivery(format!(
+            "Log source '{}' deployed successfully",
+            log_source.name
+        ));
         Ok(DeploymentResult {
             success: true,
             log_source_id: id,
             action: DeploymentAction::Deploy.as_str().to_string(),
-            message: with_delivery_note(format!(
-                "Log source '{}' deployed successfully",
-                log_source.name
-            )),
+            message,
             validation_result: None,
             deployment_id: Some(deployment_id),
+            delivery,
         })
     }
 
@@ -539,6 +551,7 @@ impl LogSourceService {
                 message: error_msg,
                 validation_result: None,
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -591,6 +604,7 @@ impl LogSourceService {
             message: format!("Log source '{}' undeployed successfully", log_source.name),
             validation_result: None,
             deployment_id: Some(deployment_id),
+            delivery: None,
         })
     }
 

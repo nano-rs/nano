@@ -210,6 +210,26 @@ impl ParserService {
     ///
     /// Requirements: 4.2, 4.3
     pub fn validate_parser_fields(&self, vrl_code: &str) -> VrlValidationResult {
+        // NAN-5271: this checks top-level assignments against the UDM field
+        // enum. An OCSF parser writes OCSF paths (`.src_endpoint`, `.actor`…),
+        // checked by the strict OCSF validator instead, so under OCSF every save
+        // logged every field as "not in UDM schema". UDM is unchanged.
+        let ocsf = crate::schema::active_profile_from_env()
+            .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+            .unwrap_or(false);
+        Self::udm_parser_field_warnings(vrl_code, ocsf)
+    }
+
+    /// [`validate_parser_fields`](Self::validate_parser_fields) with the schema
+    /// profile explicit: no UDM field check under OCSF.
+    pub(crate) fn udm_parser_field_warnings(vrl_code: &str, ocsf: bool) -> VrlValidationResult {
+        if ocsf {
+            return VrlValidationResult {
+                valid: true,
+                error: None,
+                warnings: vec![],
+            };
+        }
         let mut warnings = Vec::new();
 
         // Extract field assignments from VRL code

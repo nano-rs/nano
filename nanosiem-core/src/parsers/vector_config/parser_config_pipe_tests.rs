@@ -116,6 +116,8 @@ fn compile_all_remaps(config: &str) {
 
 #[test]
 fn stateless_plan_renders_one_parse_remap_as_a_basic_string() {
+    // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let p = parser(&stateless_plan().stored().unwrap(), None);
     let config = manager().generate_parser_config_string(&p);
     let t = transforms(&config);
@@ -134,6 +136,8 @@ fn stateless_plan_renders_one_parse_remap_as_a_basic_string() {
 
 #[test]
 fn native_plan_splices_a_chain_into_the_parser_slot() {
+    // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let plan = native_plan();
     let p = parser(&plan.stored().unwrap(), Some(".team = \"soc\""));
     let config = manager().generate_parser_config_string(&p);

@@ -750,6 +750,12 @@ pub struct DeploymentResult {
     #[serde(with = "typeid::log_source::opt")]
     #[schema(value_type = Option<String>)]
     pub deployment_id: Option<Uuid>,
+    /// NAN-5279: role-split (generation) delivery only. `state` is
+    /// `acknowledged` when every ingest host installed the deploy's
+    /// generation, `pending` when it is published and some hosts are still
+    /// installing it (re-check at `status_path`). Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<crate::parsers::vector_config_remote_delivery::GenerationDelivery>,
 }
 
 /// Structured VRL diagnostic, extracted from the VRL compiler when possible.

@@ -250,7 +250,6 @@ export function RuleRepositories() {
           ? ('update' as const)
           : ('create' as const),
     mode,
-    ruleFormat: activeRepo?.raw.rule_format ?? 'nanosiem',
     rawContent: rule.raw.raw_content,
   });
 
@@ -724,7 +723,6 @@ export function RuleRepositories() {
           <RepoPreview
             rule={selectedRule}
             repositoryId={activeRepoId}
-            ruleFormat={activeRepo?.raw.rule_format ?? 'nanosiem'}
             availableSourceTypes={availableSourceTypes}
             onClose={() => setSelectedRuleId(null)}
             onImport={handlePreviewImport}

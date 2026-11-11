@@ -663,6 +663,14 @@ impl AppState {
         let ch_migrator =
             ClickHouseMigrator::new(admin_client, dual_config.clickhouse_database.clone());
         let ch_migrations_path = std::path::Path::new("./clickhouse");
+        // NAN-5271: an unset profile now means OCSF; refuse it on a UDM install
+        // with the fix, rather than an opaque "ocsf/ migrations behind" error.
+        ch_migrator
+            .refuse_unset_profile_on_udm_install(
+                &std::env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default(),
+            )
+            .await
+            .map_err(DualPoolError::SchemaBehind)?;
         ch_migrator
             .check_schema_up_to_date(ch_migrations_path)
             .await

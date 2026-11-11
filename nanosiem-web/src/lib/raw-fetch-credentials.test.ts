@@ -16,6 +16,10 @@ const ROOT = new URL('../', import.meta.url).pathname;
 const EXEMPT = new Set([
   'lib/authenticated-fetch.ts',  // the transport itself
   'contexts/AuthContext.tsx',    // login / refresh / me own their credentials
+  // First-admin setup runs before any session exists: its bearer is the
+  // installer's one-time setup token (0f359328a, NAN-5237), not a session
+  // credential, so authenticatedFetch's refresh/replay/expiry must not apply.
+  'pages/Setup.tsx',
 ]);
 
 function walk(dir: string, out: string[]): string[] {

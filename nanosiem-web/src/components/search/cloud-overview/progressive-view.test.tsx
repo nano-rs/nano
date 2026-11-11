@@ -6,6 +6,10 @@ import { CloudOverviewView } from './index';
 import type { CloudOverviewResponse } from '@/lib/api/types';
 const mocks = vi.hoisted(() => ({ fetch: vi.fn() }));
 vi.mock('@/lib/api', () => ({ api: { getCloudOverview: mocks.fetch }, ApiClientError: class extends Error {} }));
+vi.mock('@/hooks/useSchemaFieldMap', async () => {
+  const { schemaFieldMap } = await import('@/lib/schema-fields');
+  return { useSchemaFieldMap: () => ({ ...schemaFieldMap('ocsf'), ready: true, unresolved: false, error: false, unresolvedReason: null, retry: () => {}, guard: <A extends unknown[]>(fn: (...a: A) => void) => fn }) };
+});
 vi.mock('./CloudOverviewHeader', () => ({ CloudOverviewHeader: () => <div>Exact identity summary</div> }));
 vi.mock('./AccountsGrid', () => ({ AccountsGrid: () => null }));
 vi.mock('./RiskyPrincipals', () => ({ RiskyPrincipals: () => null }));

@@ -4,6 +4,17 @@ use super::*;
 use super::lateral::source_scope_sql_predicate;
 use crate::auth::ScopeSet;
 
+/// OCSF form of [`SearchService::cloud_enrichment_tail`]: the source endpoint's
+/// geo / ASN and the source-IP threat-intel columns, aliased to the result keys
+/// the cloud pivot and timeline sheets read.
+const OCSF_CLOUD_ENRICHMENT_TAIL: &str = ",
+                   `src_endpoint.location.country` AS enriched_src_country_code,
+                   if(`src_endpoint.autonomous_system.number` = 0, '', toString(`src_endpoint.autonomous_system.number`)) AS enriched_src_asn,
+                   `src_endpoint.autonomous_system.name` AS enriched_src_as_name,
+                   `enrichments.ioc_src_ip_threat_type` AS ioc_src_ip_threat_type,
+                   `enrichments.ioc_src_ip_malware` AS ioc_src_ip_malware,
+                   `enrichments.ioc_src_ip_confidence` AS ioc_src_ip_confidence";
+
 impl SearchService {
     /// Cloud event page size for paginated events
     const CLOUD_EVENT_PAGE_SIZE: usize = 200;
@@ -162,16 +173,21 @@ impl SearchService {
     }
 
     /// Enrichment/IOC tail appended to the user-timeline and entity-pivot event
-    /// SELECTs. These are UDM-physical MATERIALIZED columns absent from `ocsf_logs`,
-    /// so the tail is emitted only under the UDM schema; under OCSF it is empty
-    /// (the enrichment/IOC keys are simply absent from those event rows).
-    /// TODO(OCSF): emit profile-mapped enrichment/IOC columns once `ocsf_logs`
-    /// carries equivalents.
+    /// SELECTs. Under UDM these are the MATERIALIZED `enriched_*` / `ioc_*`
+    /// columns. Under OCSF (NAN-5271) the same facts live in
+    /// `src_endpoint.location.country`, `src_endpoint.autonomous_system.*` and
+    /// `enrichments.ioc_src_ip_*`; they are aliased to the same result keys the
+    /// pivot / timeline sheets read (like the cross-cutting projection), so the
+    /// country / ASN line and the threat-intel banner render on OCSF too. The ASN
+    /// is an Int64 on OCSF and a String on UDM; it is projected as a string, with
+    /// 0 (unenriched) as ''.
     fn cloud_enrichment_tail(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
-        if profile.id() == crate::schema::SchemaId::Udm {
-            ",\n                   enriched_src_country_code, enriched_src_asn, enriched_src_as_name,\n                   ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence"
-        } else {
-            ""
+        match profile.id() {
+            crate::schema::SchemaId::Udm => {
+                ",\n                   enriched_src_country_code, enriched_src_asn, enriched_src_as_name,\n                   ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence"
+            }
+            crate::schema::SchemaId::Ocsf => OCSF_CLOUD_ENRICHMENT_TAIL,
+            _ => "",
         }
     }
 
@@ -2071,3 +2087,7 @@ mod cloud_user_activity_scope_tests;
 #[cfg(test)]
 #[path = "cloud_scope_construction_tests.rs"]
 mod cloud_scope_construction_tests;
+
+#[cfg(test)]
+#[path = "cloud_enrichment_tail_tests.rs"]
+mod cloud_enrichment_tail_tests;

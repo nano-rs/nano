@@ -59,6 +59,7 @@ pub(super) use super::admission;
 pub(super) use super::execution;
 pub(super) use super::jobs;
 
+mod ai_pipe_guard;
 mod asset;
 pub use asset::{DimensionFirst, EntityActivityBucket};
 mod baseline;
@@ -68,7 +69,9 @@ pub mod cloud_dossier;
 pub mod cloud_overview;
 mod core_search;
 mod field_queries;
-pub use field_queries::DynamicFieldBucket;
+pub use field_queries::{
+    dynamic_field_names_for_predicate, queryable_table_columns, DynamicFieldBucket,
+};
 mod funnel_view;
 
 /// NAN-1506: row cap for the bulk field-stats scan (shared by the standalone

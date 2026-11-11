@@ -10,6 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Check, X, Minus, Plus, ArrowUpCircle, Rocket } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
+import { toastDeployResult } from '@/lib/deploy-delivery';
 import { useToast } from '@/hooks/use-toast';
 import { useDeployLogSource } from '@/hooks/use-api';
 import { VrlLine } from '@/components/editor/VrlHighlight';
@@ -193,7 +194,10 @@ export function ParserUpstreamDiffModal({
       const result = await deployLogSource(logSourceId);
       queryClient.invalidateQueries({ queryKey: ['log-sources'] });
       queryClient.invalidateQueries({ queryKey: ['log-source-deployments', logSourceId] });
-      toast({ title: 'Deployed', description: result?.message || 'Parser updated and deployed to Vector.' });
+      toastDeployResult(toast, (generation) => api.getDeliveryStatus(generation), result, {
+        title: 'Deployed',
+        description: 'Parser updated and deployed to Vector.',
+      });
       setAppliedNeedsDeploy(false);
       onOpenChange(false);
     } catch (err) {

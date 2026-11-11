@@ -232,7 +232,7 @@ function RuleRowExpanded({ rule }: { rule: RuleView }) {
   const logicLines = rule.query
     ? rule.query.split('\n').map((line, i) => ({ n: i + 1, t: line }))
     : [
-        { n: 1, t: 'source_type="*" tag=auto' },
+        { n: 1, t: 'metadata.log_source="*" tag=auto' },
         { n: 2, t: '| stats count() as hits by entity' },
         { n: 3, t: '| where hits > threshold' },
       ];

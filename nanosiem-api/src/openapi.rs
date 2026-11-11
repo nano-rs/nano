@@ -67,7 +67,7 @@ use crate::handlers;
         (name = "recent_activity", description = "Recent activity tracking (Continue Working feature)"),
         (name = "query_library", description = "Pre-built query library"),
         (name = "lookup", description = "Lookup table management, queries, and ingestion"),
-        (name = "rule_repositories", description = "External Sigma rule repository syncing"),
+        (name = "rule_repositories", description = "First-party nPL rule repository syncing and import"),
         (name = "parser_repositories", description = "External parser repository syncing and import"),
         (name = "playbooks", description = "SOC investigation playbook library (markdown + slash-command format)"),
         (name = "hunts", description = "Active Hunter: scheduled autonomous threat hunts, sweeps, scored leads, and triage"),
@@ -880,13 +880,28 @@ mod tests {
         // /api/settings/ingestion/pause, POST /api/settings/ingestion/resume and
         // GET /api/internal/ingest-admission. Enterprise 666 + 3 = 669; open
         // 418 + 3 = 421.
+        // NAN-5272 removes the retired POST /api/sigma/convert from both
+        // editions (open core registered a stub). Enterprise 669 - 1 = 668;
+        // open 421 - 1 = 420.
+        // NAN-5274 adds 14 ENTERPRISE templates through the extension seams:
+        // eleven SCIM 2.0 protocol templates under /api/scim/v2/{provider}
+        // (ServiceProviderConfig, ResourceTypes, ResourceTypes/{id}, Schemas,
+        // Schemas/{id}, Users, Users/.search, Users/{id}, Groups,
+        // Groups/.search, Groups/{id}) and three Settings templates
+        // (/api/settings/oidc/{id}/scim, /api/settings/oidc/{id}/scim/token,
+        // /api/settings/scim/group-sources). Enterprise 668 + 14 = 682; open
+        // is unchanged.
+        // NAN-5279 adds GET /api/log-sources/delivery-status to both editions:
+        // enterprise 683, open 421.
         #[cfg(feature = "enterprise")]
-        let min_paths = 669;
+        let min_paths = 683;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
         // owner-clamp path: 415 + 1 = 416; NAN-5204's two backup-status
-        // paths: 416 + 2 = 418; NAN-5217's three ingestion-pause paths: 421.
+        // paths: 416 + 2 = 418; NAN-5217's three ingestion-pause paths: 421;
+        // NAN-5272 drops /api/sigma/convert: 420; NAN-5279 adds
+        // /api/log-sources/delivery-status: 421.
         let min_paths = 421;
 
         assert!(

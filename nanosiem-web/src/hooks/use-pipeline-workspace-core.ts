@@ -28,6 +28,7 @@ import {
   TAP_MAX_SECONDS, type PipePreviewRequest, type PipePublicationSnapshot,
 } from '@/lib/api/pipelines';
 import type { LogSource, LogSourceWithDraftStatus } from '@/lib/api/types';
+import { DELIVERY_PENDING_TITLE, pendingDelivery } from '@/lib/deploy-delivery';
 
 export type PipelineTransport = Pick<typeof browserApi,
   'pipelines' | 'getLogSourceDraftStatus' | 'getLogSourceVersions' | 'updateLogSource' | 'validateLogSourceVrl'
@@ -496,7 +497,8 @@ export function usePipelineWorkspaceCore(sourceId: string, { api, hasPermission,
     const [refreshed] = await Promise.all([sourceQuery.refetch(), versionsQuery.refetch()]);
     if (alive.current && refreshed.data && draftRef.current && draftFingerprint(draftRef.current) === plan.fingerprint) adoptSource(refreshed.data);
     void queryClient.invalidateQueries({ queryKey: ['pipe-sources'] });
-    toast({ title: 'Published', description: result.message || 'The reviewed pipeline is the active version.' });
+    // NAN-5279: published, ingest hosts still installing it: in progress, not "Published".
+    toast({ title: pendingDelivery(result) ? DELIVERY_PENDING_TITLE : 'Published', description: result.message || 'The reviewed pipeline is the active version.' });
   });
 
   /**
@@ -528,7 +530,7 @@ export function usePipelineWorkspaceCore(sourceId: string, { api, hasPermission,
       toast({ title: 'Rollback not deployed', description: message, variant: 'destructive' });
       return;
     }
-    toast({ title: 'Rolled back and deployed', description: deployed?.message || 'Configuration rollback does not reverse events already processed.' });
+    toast({ title: pendingDelivery(deployed) ? `Rolled back. ${DELIVERY_PENDING_TITLE}` : 'Rolled back and deployed', description: deployed?.message || 'Configuration rollback does not reverse events already processed.' });
   });
   const fetchLatest = () => queryClient.fetchQuery({ queryKey: sourceKey, queryFn: () => api.getLogSourceDraftStatus(sourceId), staleTime: 0 });
   /** Conflict recovery: drop local edits and continue from the server's latest saved copy. */

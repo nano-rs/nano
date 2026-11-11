@@ -9,12 +9,15 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
 use nanosiem_core::Query as ParsedQuery;
 use nanosiem_core::auth::permissions;
+use nanosiem_core::prevalence::artifact_fields::{
+    ArtifactColumns, distinct_domain_candidates_sql, distinct_hash_candidates_sql,
+};
 use nanosiem_core::prevalence::coverage::{ArtifactKind, CoverageSource};
 use nanosiem_core::prevalence::{PrevalenceScatterData, PrevalenceSettings, TimeWindow};
 use nanosiem_core::query::{ClickHouseSqlGenerator, SearchExpr};
@@ -598,6 +601,23 @@ struct SingleStringRow {
     value: String,
 }
 
+/// Run one candidate-extraction read. A failed read degrades to "no
+/// candidates" (the endpoint still answers with the other class), but is
+/// logged: it used to be swallowed silently.
+async fn fetch_candidates(
+    ch: &clickhouse::Client,
+    sql: &str,
+    class: &str,
+) -> Vec<String> {
+    match ch.query(sql).fetch_all::<SingleStringRow>().await {
+        Ok(rows) => rows.into_iter().map(|r| r.value).collect(),
+        Err(e) => {
+            warn!("query-artifacts: {class} candidate read failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// POST /api/prevalence/query-artifacts
 ///
 /// Get prevalence data for artifacts extracted from search results.
@@ -744,17 +764,19 @@ pub async fn get_query_artifacts(
     };
     tracing::debug!("Combined filter for prevalence query: {}", combined_filter);
 
-    // Resolve the FROM table + the file-hash / dest-host columns through the
-    // active schema profile (OCSF Phase 6, NAN-1241) so the artifact extraction
-    // queries hit `ocsf_logs` and the promoted OCSF columns under the OCSF
-    // profile, and the exact UDM columns (`file_hash` / `dest_host`) under UDM.
-    // `udm_column_sql` returns `None` when the schema has no column for that UDM
-    // concept — we then skip that artifact class rather than emit an
-    // unknown-column 500.
+    // Resolve the FROM table + the artifact columns through the active schema
+    // profile (OCSF Phase 6, NAN-1241) so the extraction hits `ocsf_logs` under
+    // OCSF and `logs` under UDM. NAN-5280: the columns come from the shared
+    // artifact path lists (mirrored by the Rarity view's artifactFields.ts), so
+    // OCSF Sysmon process hashes (`process.file.hashes.sha256`), DNS names
+    // (`query.hostname`) and URL hosts are found, not only `file.hashes.sha256`
+    // and `dst_endpoint.hostname`. Paths the schema has no column for are
+    // skipped rather than emitted as an unknown-column 500.
     let profile = state.config.schema_profile();
     let logs_table = dual_pool
         .table_names()
         .read(profile.table_name().trim_start_matches("nanosiem."));
+    let artifact_columns = ArtifactColumns::resolve(profile.as_ref());
 
     // Bound the DISTINCT extraction. `get_bulk_prevalence` refuses more than
     // MAX_BULK_ARTIFACTS in one pass, and the old unbounded DISTINCT let a
@@ -766,39 +788,30 @@ pub async fn get_query_artifacts(
 
     // Query for unique file hashes (capped; over-cap is signalled, not silently dropped)
     let mut artifacts_truncated = false;
-    let hash_results: Vec<String> = if let Some(hash_col) = profile.udm_column_sql("file_hash") {
-        let hash_query = format!(
-            "SELECT DISTINCT {hash_col} AS value FROM {logs_table} WHERE {combined_filter} AND {hash_col} != '' LIMIT {distinct_cap}"
-        );
-        ch.query(&hash_query)
-            .fetch_all::<SingleStringRow>()
-            .await
-            .map(|rows| rows.into_iter().map(|r| r.value).collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let hash_results: Vec<String> = match distinct_hash_candidates_sql(
+        &artifact_columns,
+        &logs_table,
+        &combined_filter,
+        distinct_cap,
+    ) {
+        Some(hash_query) => fetch_candidates(ch, &hash_query, "hash").await,
+        None => Vec::new(),
     };
 
-    // Query for unique domains (from dest_host). NAN-3226: internal names
-    // (built-in or Settings > Risk) are excluded in the WHERE, before
-    // DISTINCT ... LIMIT, so they never consume the candidate budget; the
-    // Rust filter below is a belt for any name the SQL form misses.
+    // Query for unique domains. NAN-3226: internal names (built-in or
+    // Settings > Risk) are excluded in the WHERE, before DISTINCT ... LIMIT, so
+    // they never consume the candidate budget; the Rust filter below is a belt
+    // for any name the SQL form misses.
     let internal = nanosiem_core::internal_domains::effective(&state.pool).await;
-    let domain_results: Vec<String> = if let Some(host_col) = profile.udm_column_sql("dest_host") {
-        let domain_query = nanosiem_core::prevalence::repository::distinct_domain_candidates_sql(
-            &host_col,
-            &logs_table,
-            &combined_filter,
-            &internal,
-            distinct_cap,
-        );
-        ch.query(&domain_query)
-            .fetch_all::<SingleStringRow>()
-            .await
-            .map(|rows| rows.into_iter().map(|r| r.value).collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let domain_results: Vec<String> = match distinct_domain_candidates_sql(
+        &artifact_columns,
+        &logs_table,
+        &combined_filter,
+        &internal,
+        distinct_cap,
+    ) {
+        Some(domain_query) => fetch_candidates(ch, &domain_query, "domain").await,
+        None => Vec::new(),
     };
     let domain_results: Vec<String> = domain_results
         .into_iter()

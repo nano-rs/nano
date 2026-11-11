@@ -9,9 +9,10 @@
  *     / add-members), 4-up meta grid (default role / member count / created /
  *     updated), scope chips, members table with remove.
  *
- * SCIM-managed groups aren't in the backend schema yet — every group surfaces
- * as "Local" until the schema lands. The UI seam is in place so the SCIM
- * banner + auto-pill activate the moment `GroupDetail.scim_source` ships.
+ * NAN-5274: on enterprise builds a group that a SCIM-provisioned IdP group
+ * feeds (through an SSO group mapping) shows a "SCIM" pill and a banner naming
+ * the provider. Open builds get the stub hook, which reports no sources, so
+ * every group stays "Local" and nothing SCIM-related renders.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -33,6 +34,29 @@ import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC } from '@/lib/date-utils';
 import { CreateGroupDialog } from './CreateGroupDialog';
+import { useCapabilitiesOptional } from '@/hooks/use-capabilities';
+import { useScimGroupSources, type ScimGroupSource } from '@/enterprise/hooks/use-scim-group-sources';
+
+function SourcePill({ group, scim, size }: { group: GroupDetail; scim: ScimGroupSource[]; size: 'sm' | 'md' }) {
+  const label = group.is_system ? 'System' : scim.length > 0 ? 'SCIM' : 'Local';
+  const title = scim.length > 0
+    ? `Members also provisioned by ${scim.map(s => `${s.provider_name} (${s.idp_group})`).join(', ')}`
+    : undefined;
+  return (
+    <span
+      title={title}
+      className={cn(
+        'inline-flex items-center rounded-sm font-mono',
+        size === 'sm'
+          ? 'h-4 px-1.5 text-[9.5px] bg-foreground/[0.06] text-muted-foreground'
+          : 'h-5 px-1.5 text-[10px] border border-border bg-card text-muted-foreground',
+        label === 'SCIM' && 'text-primary',
+      )}
+    >
+      {label}
+    </span>
+  );
+}
 
 function initialsFor(name: string): string {
   if (!name) return '?';
@@ -51,11 +75,12 @@ function MemberAvatar({ name }: { name: string }) {
 
 interface GroupListItemProps {
   group: GroupDetail;
+  scim: ScimGroupSource[];
   selected: boolean;
   onSelect: (id: string) => void;
 }
 
-function GroupListItem({ group, selected, onSelect }: GroupListItemProps) {
+function GroupListItem({ group, scim, selected, onSelect }: GroupListItemProps) {
   const primaryRole = group.roles[0]?.name || '—';
   return (
     <button
@@ -77,9 +102,7 @@ function GroupListItem({ group, selected, onSelect }: GroupListItemProps) {
           <div className="text-[11px] text-muted-foreground truncate mt-0.5">{group.description}</div>
         )}
         <div className="flex items-center gap-1.5 mt-1">
-          <span className="inline-flex items-center h-4 px-1.5 rounded-sm text-[9.5px] font-mono bg-foreground/[0.06] text-muted-foreground">
-            {group.is_system ? 'System' : 'Local'}
-          </span>
+          <SourcePill group={group} scim={scim} size="sm" />
           <span className="text-[10.5px] text-muted-foreground truncate">→ {primaryRole}</span>
         </div>
       </div>
@@ -89,6 +112,7 @@ function GroupListItem({ group, selected, onSelect }: GroupListItemProps) {
 
 interface GroupDetailViewProps {
   group: GroupDetail;
+  scim: ScimGroupSource[];
   members: UserDetail[];
   membersLoading: boolean;
   onEdit: () => void;
@@ -104,7 +128,7 @@ function Labeled({ label, mono, children }: { label: string; mono?: boolean; chi
   );
 }
 
-function GroupDetailView({ group, members, membersLoading, onEdit, onDelete }: GroupDetailViewProps) {
+function GroupDetailView({ group, scim, members, membersLoading, onEdit, onDelete }: GroupDetailViewProps) {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission('groups:edit');
   const canDelete = hasPermission('groups:delete');
@@ -121,9 +145,7 @@ function GroupDetailView({ group, members, membersLoading, onEdit, onDelete }: G
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <div className="text-[17px] font-semibold text-foreground tracking-tight leading-none">{group.name}</div>
-              <span className="inline-flex items-center h-5 px-1.5 rounded-sm border border-border bg-card text-muted-foreground text-[10px] font-mono">
-                {group.is_system ? 'System' : 'Local'}
-              </span>
+              <SourcePill group={group} scim={scim} size="md" />
             </div>
             {group.description && (
               <div className="text-[12px] text-muted-foreground mt-1 max-w-[520px]">{group.description}</div>
@@ -142,6 +164,19 @@ function GroupDetailView({ group, members, membersLoading, onEdit, onDelete }: G
 
       {/* Body */}
       <div className="px-6 py-5 flex flex-col gap-6">
+        {scim.length > 0 && (
+          <div className="rounded-md border border-border bg-card/50 px-3 py-2 text-[11.5px] text-foreground/80">
+            Members are also provisioned over SCIM from{' '}
+            {scim.map((s, i) => (
+              <span key={`${s.provider_id}:${s.idp_group}`}>
+                {i > 0 && ', '}
+                <span className="text-foreground">{s.provider_name}</span>{' '}
+                <span className="font-mono text-[10.5px] text-muted-foreground">{s.idp_group}</span>
+              </span>
+            ))}
+            . The identity provider adds and removes those members; members added here stay.
+          </div>
+        )}
         {/* Meta grid */}
         <div className="grid grid-cols-4 gap-6">
           <Labeled label="Default role">
@@ -228,6 +263,9 @@ export function GroupsView() {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const canCreate = hasPermission('groups:create');
+  // SSO (and with it SCIM) exists only on licensed enterprise builds.
+  const ssoAvailable = useCapabilitiesOptional()?.capabilities.sso ?? false;
+  const scimSources = useScimGroupSources(ssoAvailable);
 
   const [groups, setGroups] = useState<GroupDetail[]>([]);
   const [users, setUsers] = useState<UserDetail[]>([]);
@@ -364,6 +402,7 @@ export function GroupsView() {
                 <GroupListItem
                   key={g.id}
                   group={g}
+                  scim={scimSources.get(g.id) ?? []}
                   selected={selected?.id === g.id}
                   onSelect={setSelectedId}
                 />
@@ -379,6 +418,7 @@ export function GroupsView() {
         {selected ? (
           <GroupDetailView
             group={selected}
+            scim={scimSources.get(selected.id) ?? []}
             members={selectedMembers}
             membersLoading={usersLoading}
             onEdit={() => setEditing(selected)}

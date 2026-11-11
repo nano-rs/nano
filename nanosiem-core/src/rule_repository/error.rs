@@ -29,8 +29,11 @@ pub enum RuleRepositoryError {
     #[error("Rate limited by GitHub API, retry after {0} seconds")]
     RateLimited(u64),
 
-    #[error("Sigma parsing error: {0}")]
-    SigmaParse(String),
+    /// NAN-5272: Sigma → nPL conversion was retired. A repository row still
+    /// marked `rule_format = 'sigma'` is refused on sync, preview, import and
+    /// upstream diff instead of being half-processed.
+    #[error("Sigma-format repositories are no longer supported; nano rules use nPL/OCSF")]
+    SigmaFormatUnsupported,
 
     #[error("Rule import failed: {0}")]
     ConversionFailed(String),
@@ -93,7 +96,7 @@ impl RuleRepositoryError {
             RuleRepositoryError::AlreadyImported { .. } => 409,
             RuleRepositoryError::InvalidUrl(_) => 400,
             RuleRepositoryError::RepositoryNotAllowed(_) => 403,
-            RuleRepositoryError::SigmaParse(_) => 400,
+            RuleRepositoryError::SigmaFormatUnsupported => 400,
             RuleRepositoryError::ConversionFailed(_) => 422,
             RuleRepositoryError::RateLimited(_) => 429,
             RuleRepositoryError::SyncInProgress(_) => 409,

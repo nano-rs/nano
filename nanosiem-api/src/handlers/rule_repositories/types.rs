@@ -116,7 +116,7 @@ pub struct ImportRuleResponse {
 }
 
 // =============================================================================
-// Coverage/Sigma Types
+// Coverage Types
 // =============================================================================
 
 /// Query parameters for coverage analysis
@@ -128,32 +128,6 @@ pub struct CoverageQuery {
     pub severity: Option<String>,
     pub mitre_tactic: Option<String>,
     pub mitre_technique: Option<String>,
-}
-
-/// Request for standalone Sigma conversion
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ConvertSigmaRequest {
-    pub sigma_yaml: String,
-}
-
-/// Response for Sigma conversion
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ConvertSigmaResponse {
-    pub npl_query: String,
-    pub confidence: f64,
-    pub field_mappings: Vec<FieldMappingResponse>,
-    pub unmapped_fields: Vec<String>,
-    pub requires_fields: Vec<String>,
-    pub warnings: Vec<String>,
-    pub needs_review: bool,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct FieldMappingResponse {
-    pub sigma_field: String,
-    pub udm_field: String,
-    pub confidence: f64,
-    pub notes: Option<String>,
 }
 
 // =============================================================================

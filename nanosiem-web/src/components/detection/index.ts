@@ -5,7 +5,6 @@ export { DetectionEditorHeader } from './editor/DetectionEditorHeader';
 export { YamlAutocompleteDropdown } from './editor/YamlAutocompleteDropdown';
 export { ValidationTestModal } from './editor/ValidationTestModal';
 // RuleTuningPanel lifted to @/enterprise/components/detection/editor/RuleTuningPanel (NAN-745).
-export { SigmaConverter, convertSigmaRule } from './editor/SigmaConverter';
 // CasePermissionsEditor lifted to @/enterprise/components/detection/editor/CasePermissionsEditor (NAN-745).
 // RulePlaybookSelector lifted to @/enterprise/components/detection/editor/RulePlaybookSelector (NAN-745).
 // LinkedPlaybooksPreview lifted to @/enterprise/components/detection/editor/LinkedPlaybooksPreview (NAN-745).

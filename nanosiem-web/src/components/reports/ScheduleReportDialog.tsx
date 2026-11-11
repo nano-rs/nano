@@ -225,7 +225,7 @@ export function ScheduleReportDialog({
               <Textarea
                 value={sourceQuery}
                 onChange={(e) => setSourceQuery(e.target.value)}
-                placeholder='auth_result="failure" | stats count by user'
+                placeholder='class_uid=3002 status_id=2 | stats count by user.name'
                 className="min-h-[64px] font-mono text-[11.5px] border-border"
               />
             </div>

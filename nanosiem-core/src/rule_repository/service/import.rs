@@ -14,7 +14,6 @@ use crate::models::{NewDetectionRule, RuleMode, Severity};
 use super::super::error::RuleRepositoryError;
 use super::super::models::{ImportOutcome, ImportRequest, ImportType, RuleImport};
 use super::super::npl_parser::parse_npl;
-use super::super::sigma_parser::parse_sigma;
 use super::helpers::{convert_mitre_tactic_to_id, parse_lookback_to_minutes, to_snake_case};
 use super::RuleRepositoryService;
 
@@ -264,6 +263,7 @@ impl RuleRepositoryService {
         req: &ImportRequest,
     ) -> Result<RuleImportPlan, RuleRepositoryError> {
         let repo = self.get_repository(repo_id).await?;
+        Self::ensure_supported_format(&repo)?;
         let repo_rule = self.get_rule(repo_id, path).await?;
 
         let existing_import: Option<RuleImport> = self
@@ -288,11 +288,7 @@ impl RuleRepositoryService {
             }
         }
 
-        let npl_parsed = if repo.rule_format == "nanosiem" {
-            parse_npl(&repo_rule.raw_content).ok()
-        } else {
-            None
-        };
+        let npl_parsed = parse_npl(&repo_rule.raw_content).ok();
         let lifecycle =
             ImportLifecycle::resolve(req, repo_rule.severity.as_deref(), npl_parsed.as_ref());
 
@@ -386,6 +382,7 @@ impl RuleRepositoryService {
         })?;
 
         let repo = self.get_repository(repo_id).await?;
+        Self::ensure_supported_format(&repo)?;
         let repo_rule = self.get_rule(repo_id, path).await?;
 
         // Existing import bookkeeping: skip if already imported AND nothing
@@ -406,26 +403,12 @@ impl RuleRepositoryService {
             }
         }
 
-        // Build detection rule based on format
         let reference_url = format!("{}/blob/{}/{}", repo.url, repo.branch, path);
 
-        // Check if this is an nPL rule (native nano format)
-        let is_npl_format = repo.rule_format == "nanosiem";
-
-        // Parse source content based on format
-        let (npl_parsed, npl_parse_error) = if is_npl_format {
-            match parse_npl(&repo_rule.raw_content) {
-                Ok(npl) => (Some(npl), None),
-                Err(e) => (None, Some(e.to_string())),
-            }
-        } else {
-            (None, None)
-        };
-
-        let sigma_parsed = if !is_npl_format {
-            parse_sigma(&repo_rule.raw_content).ok()
-        } else {
-            None
+        // Repository rules are native nPL (`ensure_supported_format` above).
+        let (npl_parsed, npl_parse_error) = match parse_npl(&repo_rule.raw_content) {
+            Ok(npl) => (Some(npl), None),
+            Err(e) => (None, Some(e.to_string())),
         };
 
         // Determine the query to use. `req` stays intact (cloned, not moved out
@@ -436,15 +419,11 @@ impl RuleRepositoryService {
         } else if let Some(ref npl) = npl_parsed {
             // For nPL rules, use the query directly from the parsed rule
             npl.query.clone()
-        } else if let Some(converted) = repo_rule.converted_npl.clone() {
-            converted
         } else {
-            let detail = if let Some(parse_err) = npl_parse_error {
-                format!("Failed to parse nPL rule: {}", parse_err)
-            } else {
-                "No nPL query available. Please provide a custom query or convert the rule first."
-                    .to_string()
-            };
+            let detail = format!(
+                "Failed to parse nPL rule: {}",
+                npl_parse_error.unwrap_or_default()
+            );
             return Err(RuleRepositoryError::ConversionFailed(detail));
         };
 
@@ -461,16 +440,10 @@ impl RuleRepositoryService {
                 .to_string()
         });
 
-        // Extract author
-        let author = if let Some(ref npl) = npl_parsed {
-            npl.author.clone()
-        } else {
-            sigma_parsed.as_ref().and_then(|r| r.author.clone())
-        };
+        let author = npl_parsed.as_ref().and_then(|npl| npl.author.clone());
 
-        // Build AI triage hints based on format
-        let ai_triage_hints = if let Some(ref npl) = npl_parsed {
-            // For nPL rules, use ai_triage_hints directly from the rule
+        // AI triage hints come straight from the nPL rule's frontmatter.
+        let ai_triage_hints = npl_parsed.as_ref().and_then(|npl| {
             npl.ai_triage_hints
                 .as_ref()
                 .map(|hints| crate::models::AiTriageHints {
@@ -478,30 +451,7 @@ impl RuleRepositoryService {
                     suspicious_when: hints.suspicious_when.clone(),
                     context: hints.context.clone(),
                 })
-        } else {
-            // For Sigma rules, build from false positives + AI hints
-            let sigma_falsepositives: Vec<String> = sigma_parsed
-                .as_ref()
-                .map(|sigma_rule| sigma_rule.falsepositives.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|fp| {
-                    let lower = fp.to_lowercase();
-                    lower != "unknown" && lower != "none" && lower != "n/a" && !lower.is_empty()
-                })
-                .collect();
-
-            if sigma_falsepositives.is_empty() && req.ai_triage_hints.is_none() {
-                None
-            } else {
-                let ai_hints = req.ai_triage_hints.clone().unwrap_or_default();
-                Some(crate::models::AiTriageHints {
-                    ignore_when: sigma_falsepositives,
-                    suspicious_when: ai_hints.suspicious_when,
-                    context: ai_hints.context,
-                })
-            }
-        };
+        });
 
         // Severity, mode, real-time flag, detection mode, schedule and lookback
         // all come from the ONE derivation `plan_import` preflighted against, so
@@ -522,15 +472,10 @@ impl RuleRepositoryService {
                 .collect()
         });
 
-        // Use tags from nPL rule if available, otherwise default to "sigma"
-        let tags = if let Some(ref npl) = npl_parsed {
-            if npl.tags.is_empty() {
-                Some(vec!["nano".to_string()])
-            } else {
-                Some(npl.tags.clone())
-            }
-        } else {
-            Some(vec!["sigma".to_string()])
+        // Use tags from the nPL rule if it carries any, otherwise "nano".
+        let tags = match npl_parsed.as_ref() {
+            Some(npl) if !npl.tags.is_empty() => Some(npl.tags.clone()),
+            _ => Some(vec!["nano".to_string()]),
         };
 
         let new_rule = NewDetectionRule {
@@ -546,7 +491,7 @@ impl RuleRepositoryService {
             reference_url: Some(reference_url),
             author,
             tags,
-            ai_generated: Some(npl_parsed.is_none() && repo_rule.converted_npl.is_some()), // Only AI-generated for Sigma conversions
+            ai_generated: Some(false),
             realtime_enabled: Some(detection_mode == crate::models::DetectionMode::RealTime),
             risk_score: None,
             risk_entity_field: None,

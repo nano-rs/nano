@@ -15,8 +15,8 @@ use crate::udm::fields::{UdmField, UdmFieldCategory};
 /// branch of the AI-context functions so the LLM is taught the schema's real
 /// field names (e.g. `src_endpoint.ip`, `api.operation`, `resources.type`)
 /// instead of the hardcoded UDM glossary. UDM-style aliases (`src_ip`, `user`,
-/// …) still resolve at query time via `OcsfProfile::resolve`, so they're noted
-/// as also-valid. (NAN-1252)
+/// …) still resolve at query time via `OcsfProfile::resolve` for user-typed
+/// queries, but the AI is taught OCSF paths only (NAN-1252, NAN-5271).
 fn schema_field_glossary(profile: &dyn SchemaProfile, names_only: bool, heading: &str) -> String {
     use std::collections::BTreeMap;
     let mut by_cat: BTreeMap<String, Vec<&crate::schema::FieldDef>> = BTreeMap::new();
@@ -28,9 +28,8 @@ fn schema_field_glossary(profile: &dyn SchemaProfile, names_only: bool, heading:
     }
     let mut out = format!("{heading}\n\n");
     out.push_str(
-        "The deployment uses the OCSF schema. Use these field names directly. UDM-style \
-         aliases (e.g. `src_ip`, `user`, `dest_ip`, `file_hash`) also resolve to the \
-         corresponding OCSF column at query time.\n\n",
+        "The deployment uses the OCSF schema. Use these OCSF field names directly; do not \
+         use short UDM-style names.\n\n",
     );
     for (cat, fields) in by_cat {
         out.push_str(&format!("### {cat}\n"));
@@ -224,9 +223,21 @@ const OCSF_FIELD_NOTES: &str = r#"SCHEMA: OCSF is active. Field guidance:
 - Prefer the canonical OCSF field names from the field list above (dotted paths,
   e.g. `src_endpoint.ip`, `actor.user.name`, `actor.process.cmd_line`,
   `file.hashes.sha256`, `api.operation`, `cloud.provider`, `resources.type`).
-- UDM-style aliases also resolve at query time (e.g. `src_ip`→`src_endpoint.ip`,
-  `user`→`user.name`, `dest_ip`→`dst_endpoint.ip`, `process`→`actor.process.cmd_line`,
-  `file_hash`→`file.hashes.sha256`), so either name is valid in nPL.
+- Use OCSF paths only. Never write short UDM-style names (`src_ip`, `dest_ip`,
+  `user`, `src_host`, `process_name`, `command_line`, `file_hash`, ...) or
+  `*_unified` columns.
+- OCSF stores some concepts in different objects by event class. When the
+  class is known, use its path (Authentication 3002: `user.name`,
+  `src_endpoint.hostname` / `device.hostname`; Process Activity 1007: the new
+  process is `process.*`, the parent is `actor.process.*`, the user is
+  `actor.user.name`, the host is `device.hostname`). For a cross-class search,
+  OR the paths together, e.g.
+  `(user.name="alice" OR actor.user.name="alice")`,
+  `(src_endpoint.hostname="ws-01" OR device.hostname="ws-01")`,
+  `(process.cmd_line="*-enc*" OR actor.process.cmd_line="*-enc*")`.
+- There is no `action` or `event_type` field under OCSF. Use `class_uid` /
+  `activity_id` / `activity_name` for what happened, `disposition_id` for
+  block/allow (2=Blocked, 1=Allowed), and `status_id` for outcome.
 - VALUE encodings differ from UDM: `status_id`, `auth_protocol_id`, and
   `activity_id` are INTEGER enums (e.g. status_id 1=Success, 2=Failure;
   activity_id 1=Create/3=Update/4=Delete on API Activity). Filter them by the

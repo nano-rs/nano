@@ -349,14 +349,19 @@ export function CloudPrincipalDossier({
                 />
                 <TopActions
                   actions={dossier.top_actions}
-                  onPivotAction={(name) => handleAddFilter('event_type', name)}
+                  onPivotAction={(name) => handleAddFilter(fieldMap.isOcsf ? 'api.operation' : 'event_type', name)}
                 />
               </div>
 
               <TopResources
                 resources={dossier.top_resources}
                 onPivotResource={(arn) =>
-                  handleAddFilter(arn.startsWith('arn:') ? 'resource_id' : 'resource_name', arn)
+                  handleAddFilter(
+                    arn.startsWith('arn:')
+                      ? fieldMap.isOcsf ? 'resources.uid' : 'resource_id'
+                      : fieldMap.isOcsf ? 'resources.name' : 'resource_name',
+                    arn,
+                  )
                 }
               />
 

@@ -208,6 +208,56 @@ impl LogTelemetryRepository {
         let rows = run_jsoneachrow(&self.client, &sql).await?;
         Ok(parse_total_events(&rows))
     }
+
+    /// Per-source event volumes over `[start, end]`, largest first, at most
+    /// `limit` sources (NAN-5271).
+    ///
+    /// This is the "which log sources have data" list pivt puts in its prompts
+    /// (available source types, briefing ingest volume). It reads the live,
+    /// profile-aware rollup lane for `schema` — the same source the log-source
+    /// health page, feed discovery, and dashboard tiles use. Both the internal
+    /// `findings` source and empty keys are excluded.
+    ///
+    /// The rollup is used whenever the window reaches into its retention. A
+    /// window that starts before retention gets the retained part only: the
+    /// list of sources is still right, and older volume is left out of the
+    /// counts. A window that ends before retention falls back to a raw count
+    /// over the active logs table.
+    ///
+    /// `deny_set` follows [`Self::stats_by_source_type`]: restricted readers
+    /// authorize on `scope_source_type` in the rollup and on the raw
+    /// `source_type` in the fallback. An empty set leaves the SQL unscoped.
+    pub async fn source_volumes_range(
+        &self,
+        schema: crate::schema::SchemaId,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        deny_set: &BTreeSet<String>,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, RepoError> {
+        let sql = if rollup_covers_window_end(end, Utc::now()) {
+            build_source_volumes_range_sql(
+                &self.table_names.read(ROLLUP_TABLE),
+                crate::schema::log_telemetry_profile_for(schema),
+                start,
+                end,
+                deny_set,
+                limit,
+            )
+        } else {
+            build_source_volumes_range_raw_sql(
+                &self
+                    .table_names
+                    .read(crate::schema::logs_table_for(schema)),
+                start,
+                end,
+                deny_set,
+                limit,
+            )
+        };
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_source_volume_rows(&rows))
+    }
 }
 
 impl LogTelemetryRepository {
@@ -598,6 +648,79 @@ pub fn build_total_events_range_raw_sql(
     )
 }
 
+/// Source keys that never belong in a "which sources have data" list: the
+/// internal detection-match source and an empty key.
+const SOURCE_VOLUME_EXCLUDED: &str = "source_type != 'findings' AND source_type != ''";
+
+/// True when the rollup still retains data for a window ending at `end`
+/// (NAN-5271). Used by [`LogTelemetryRepository::source_volumes_range`].
+pub fn rollup_covers_window_end(end: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    end > now - chrono::Duration::hours(ROLLUP_RETENTION_HOURS)
+}
+
+/// SQL for [`LogTelemetryRepository::source_volumes_range`] over the rollup.
+/// `bucket_start` is compared on 5-minute floors, so the bucket a bound falls
+/// inside is included rather than dropped.
+pub fn build_source_volumes_range_sql(
+    table: &str,
+    profile: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    deny_set: &BTreeSet<String>,
+    limit: usize,
+) -> String {
+    let scope_and = rollup_scope_and(deny_set);
+    format!(
+        "SELECT source_type, sum(events) AS events \
+         FROM {table} \
+         WHERE bucket_start >= '{}' AND bucket_start <= '{}' \
+           AND schema_profile = '{profile}' \
+           AND {SOURCE_VOLUME_EXCLUDED}{scope_and} \
+         GROUP BY source_type \
+         ORDER BY events DESC \
+         LIMIT {limit}",
+        floor_to_bucket(start).format("%Y-%m-%d %H:%M:%S"),
+        floor_to_bucket(end).format("%Y-%m-%d %H:%M:%S"),
+        profile = crate::sql_hygiene::escape_sql_string(profile),
+    )
+}
+
+/// Raw-events counterpart of [`build_source_volumes_range_sql`], for windows
+/// that end before the rollup's retention.
+pub fn build_source_volumes_range_raw_sql(
+    logs_table: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    deny_set: &BTreeSet<String>,
+    limit: usize,
+) -> String {
+    let scope_and = source_scope_sql_predicate("source_type", deny_set)
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
+    format!(
+        "SELECT source_type, count() AS events \
+         FROM {logs_table} \
+         WHERE timestamp BETWEEN '{}' AND '{}' \
+           AND {SOURCE_VOLUME_EXCLUDED}{scope_and} \
+         GROUP BY source_type \
+         ORDER BY events DESC \
+         LIMIT {limit}",
+        start.format("%Y-%m-%d %H:%M:%S"),
+        end.format("%Y-%m-%d %H:%M:%S"),
+    )
+}
+
+/// Parse `(source_type, events)` rows, keeping the SQL's order.
+pub fn parse_source_volume_rows(body: &str) -> Vec<(String, u64)> {
+    body.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|v| {
+            let source_type = v.get("source_type")?.as_str()?.to_string();
+            Some((source_type, parse_u64(&v, "events")))
+        })
+        .collect()
+}
+
 /// Raw-events counterpart of [`build_buckets_all_sql`] — see
 /// [`rollup_scope_is_authoritative`] for when this is used instead.
 pub fn build_buckets_all_raw_sql(
@@ -763,6 +886,10 @@ fn parse_clickhouse_datetime(json: &serde_json::Value, key: &str) -> Option<Date
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+#[path = "source_volumes_tests.rs"]
+mod source_volumes_tests;
 
 #[cfg(test)]
 mod tests {

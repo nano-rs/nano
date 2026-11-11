@@ -105,6 +105,7 @@ import {
   useMelodJob,
 } from '@/enterprise/hooks/use-melod-job';
 import { api, ApiClientError } from '@/lib/api';
+import { pendingDelivery, toastDeployResult } from '@/lib/deploy-delivery';
 import type {
   IngestEndpoint,
   LogSource,
@@ -1055,11 +1056,20 @@ export function AddFeed() {
         }
       }
       let parserDeployFailed = false;
+      let parserDeployPending = false;
       if (createdId) {
         try {
           const deployed = await api.deployLogSource(createdId);
           // NAN-5133: a 200 with success:false did not go live; say so.
           if (deployed && deployed.success === false) throw new Error(deployed.message || 'Log source created but parser not yet deployed.');
+          // NAN-5279: published, ingest hosts still installing it; in progress, not failed.
+          if (pendingDelivery(deployed)) {
+            parserDeployPending = true;
+            toastDeployResult(toast, (generation) => api.getDeliveryStatus(generation), deployed, {
+              title: 'Source published',
+              description: `${name} is now parsed.`,
+            });
+          }
         } catch (err) {
           parserDeployFailed = true;
           toast({
@@ -1070,7 +1080,7 @@ export function AddFeed() {
         }
       }
 
-      if (!parserDeployFailed) toast({ title: 'Source published', description: `${name} is now parsed.` });
+      if (!parserDeployFailed && !parserDeployPending) toast({ title: 'Source published', description: `${name} is now parsed.` });
       if (createdId) {
         navigate(`/ingestion/log-sources/${createdId}`);
       } else {
@@ -2637,6 +2647,7 @@ function SamplesExisting({
   setFeedId?: (v: string) => void;
 }) {
   const { toast } = useToast();
+  const sourceField = useSchemaFieldMap().field('logSource');
   const [rows, setRows] = useState<Array<{ st: string; events: number }>>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('');
@@ -2674,7 +2685,7 @@ function SamplesExisting({
         const now = new Date();
         const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
         const response = await api.search({
-          query: `source_type="${st}"`,
+          query: `${sourceField}="${st}"`,
           time_range: { start: yesterday.toISOString(), end: now.toISOString() },
           limit: 10,
           skip_field_stats: true,
@@ -2690,13 +2701,13 @@ function SamplesExisting({
         if (samples.length === 0) {
           toast({
             title: 'No samples',
-            description: `No events found for source_type="${st}".`,
+            description: `No events found for ${sourceField}="${st}".`,
             variant: 'destructive',
           });
           return;
         }
         setSampleText(samples.join('\n'));
-        toast({ title: 'Samples loaded', description: `${samples.length} event${samples.length === 1 ? '' : 's'} from source_type=${st}` });
+        toast({ title: 'Samples loaded', description: `${samples.length} event${samples.length === 1 ? '' : 's'} from ${sourceField}=${st}` });
       } catch (err) {
         toast({
           title: 'Failed to fetch samples',
@@ -2775,8 +2786,8 @@ function SamplesExisting({
         {fetchingSamples
           ? 'Fetching 10 most-recent events…'
           : selected
-            ? `Picks 10 most-recent events · source_type=${selected}`
-            : `Click a source_type to pull 10 sample events${feedId ? ` for ${feedId}` : ''}`}
+            ? `Picks 10 most-recent events · ${sourceField}=${selected}`
+            : `Click a log source to pull 10 sample events${feedId ? ` for ${feedId}` : ''}`}
       </div>
     </div>
   );

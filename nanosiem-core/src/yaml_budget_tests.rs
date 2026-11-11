@@ -18,7 +18,7 @@ fn alias_fanout(prefix: &str, key: &str) -> String {
     doc
 }
 
-const SIGMA: &str = r#"title: Suspicious PowerShell
+const PLAIN_RULE: &str = r#"title: Suspicious PowerShell
 id: 3b6ab547-8ec2-4991-b9d2-2b06702a48d7
 status: experimental
 description: Encoded PowerShell command line
@@ -46,23 +46,8 @@ fn fanout_is_rejected_quickly_and_plain_yaml_passes() {
     assert!(err.to_string().contains("aliases are not supported"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
 
-    assert_eq!(super::check(SIGMA), Ok(()));
+    assert_eq!(super::check(PLAIN_RULE), Ok(()));
     // Malformed YAML is left to the real parse, which reports it.
     assert_eq!(super::check("not: [valid"), Ok(()));
     assert!(super::from_str::<serde_yaml::Value>("not: [valid").is_err());
-}
-
-#[test]
-fn sigma_parse_rejects_fanout_and_still_parses_normal_rules() {
-    let rule = crate::rule_repository::parse_sigma(SIGMA).expect("normal Sigma parses");
-    assert_eq!(rule.title, "Suspicious PowerShell");
-
-    // The fan-out sits in the free-form `detection` block, which is kept
-    // as a generic value tree.
-    let bomb = alias_fanout("title: t\nlogsource: {product: windows}\n", "anchors_done")
-        + "detection:\n  condition: selection\n  selection:\n    CommandLine: *a9\n";
-    let started = Instant::now();
-    let err = crate::rule_repository::parse_sigma(&bomb).unwrap_err();
-    assert!(err.to_string().contains("aliases are not supported"), "{err}");
-    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
 }

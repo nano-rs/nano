@@ -9,7 +9,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ArrowLeft, Save, Play, FileCode, WandSparkles, Eye, Archive, ArchiveRestore, Trash2, MoreHorizontal, Undo2, Import, Power } from 'lucide-react';
+import { ArrowLeft, Save, Play, FileCode, WandSparkles, Eye, Archive, ArchiveRestore, Trash2, MoreHorizontal, Undo2, Power } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { Link } from 'react-router-dom';
@@ -22,7 +22,6 @@ interface DetectionEditorHeaderProps {
   archived?: boolean;
   isDraft?: boolean;
   aiGenerated?: boolean;
-  sigmaImported?: boolean;
   ruleId?: string;
 
   // Actions
@@ -58,7 +57,6 @@ export function DetectionEditorHeader({
   archived,
   isDraft,
   aiGenerated,
-  sigmaImported,
   ruleId,
   onBack,
   onSave,
@@ -98,12 +96,6 @@ export function DetectionEditorHeader({
           <Badge className="text-xs bg-purple-500/20 text-purple-400 border-0 hidden md:inline-flex">
             <PivtIcon className="w-3 h-3 mr-1" />
             AI Generated
-          </Badge>
-        )}
-        {sigmaImported && (
-          <Badge className="text-xs bg-blue-500/20 text-blue-400 border-0 hidden md:inline-flex">
-            <Import className="w-3 h-3 mr-1" />
-            Sigma Import
           </Badge>
         )}
       </div>

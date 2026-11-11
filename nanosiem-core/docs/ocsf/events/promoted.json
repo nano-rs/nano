@@ -106,7 +106,38 @@
   "category": "Taxonomy",
   "since": "1.9.0",
   "udm_fields": [],
-  "prewhere": false
+  "prewhere": false,
+  "enum_values": {
+   "unknown": 0,
+   "allowed": 1,
+   "blocked": 2,
+   "quarantined": 3,
+   "isolated": 4,
+   "deleted": 5,
+   "dropped": 6,
+   "custom action": 7,
+   "approved": 8,
+   "restored": 9,
+   "exonerated": 10,
+   "corrected": 11,
+   "partially corrected": 12,
+   "uncorrected": 13,
+   "delayed": 14,
+   "detected": 15,
+   "no action": 16,
+   "logged": 17,
+   "tagged": 18,
+   "alert": 19,
+   "count": 20,
+   "reset": 21,
+   "captcha": 22,
+   "challenge": 23,
+   "access revoked": 24,
+   "rejected": 25,
+   "unauthorized": 26,
+   "error": 27,
+   "other": 99
+  }
  },
  {
   "ocsf_path": "action_id",
@@ -118,7 +149,13 @@
   "category": "Taxonomy",
   "since": "1.9.0",
   "udm_fields": [],
-  "prewhere": false
+  "prewhere": false,
+  "enum_values": {
+   "unknown": 0,
+   "allowed": 1,
+   "denied": 2,
+   "other": 99
+  }
  },
  {
   "ocsf_path": "auth_protocol_id",
@@ -1383,7 +1420,23 @@
   "category": "Authentication",
   "since": "1.9.0",
   "udm_fields": [],
-  "prewhere": false
+  "prewhere": false,
+  "enum_values": {
+   "unknown": 0,
+   "system": 1,
+   "interactive": 2,
+   "network": 3,
+   "batch": 4,
+   "os service": 5,
+   "unlock": 7,
+   "network cleartext": 8,
+   "new credentials": 9,
+   "remote interactive": 10,
+   "cached interactive": 11,
+   "cached remote interactive": 12,
+   "cached unlock": 13,
+   "other": 99
+  }
  },
  {
   "ocsf_path": "cloud.account.name",

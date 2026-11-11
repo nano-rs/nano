@@ -84,6 +84,7 @@ import { PivtIcon } from '@/components/icons/PivtIcon';
 import { useParserSidePanelTabs } from '@/components/log-sources/parserSidePanelTabs';
 
 import { api } from '@/lib/api';
+import { toastDeployResult } from '@/lib/deploy-delivery';
 import type {
   LogSource,
   LogSourceDeployment,
@@ -299,7 +300,11 @@ export function LogSourceDetail() {
   const handleDeploy = async () => {
     try {
       const result = await deployLogSource(logSource.id);
-      toast({ title: 'Deployed', description: result?.message || `"${logSource.name}" has been deployed to Vector.` });
+      // NAN-5279: a role-split deploy still being installed reads as in progress, with a re-check.
+      toastDeployResult(toast, (generation) => api.getDeliveryStatus(generation), result, {
+        title: 'Deployed',
+        description: `"${logSource.name}" has been deployed to Vector.`,
+      });
       setDeployDialogOpen(false);
       refetch();
       refetchHealth();
@@ -2684,6 +2689,7 @@ function LogSourceAiPanel({
   baseParserVrl?: string;
 }) {
   const { toast } = useToast();
+  const sourceField = useSchemaFieldMap().field('logSource');
   const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus();
   const editParserJob = useMelodJob<MelodEditParserResponse>();
   const loading = editParserJob.loading;
@@ -2741,14 +2747,14 @@ function LogSourceAiPanel({
           const now = new Date();
           const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
           const response = await api.search({
-            query: nplFieldEquals('source_type', sourceType),
+            query: nplFieldEquals(sourceField, sourceType),
             time_range: { start: yesterday.toISOString(), end: now.toISOString() },
             limit: 5,
             skip_field_stats: true,
           });
           sampleLogsArray = extractRecentParserSamples(response.results ?? []);
           if (sampleLogsArray.length === 0) {
-            throw new Error(`No recent events found for source_type="${sourceType}". Wait for the collector to run or paste a sample with the play button.`);
+            throw new Error(`No recent events found for ${sourceField}="${sourceType}". Wait for the collector to run or paste a sample with the play button.`);
           }
           autoSamplesRef.current = { parserId, sourceType, samples: sampleLogsArray };
           setAutoSampleCount(sampleLogsArray.length);
@@ -2861,7 +2867,7 @@ function LogSourceAiPanel({
             ) : rawPassThrough ? (
               <>
                 <span className="font-medium text-foreground">pivt recognizes this raw pass-through</span> —{' '}
-                <span className="font-mono text-[10.5px]">source_type={sourceType}</span>. Recent events are fetched
+                <span className="font-mono text-[10.5px]">{sourceField}={sourceType}</span>. Recent events are fetched
                 automatically when you ask it to build the parser.
               </>
             ) : (
@@ -2923,7 +2929,7 @@ function LogSourceAiPanel({
         )}
         {autoSampleCount > 0 && !showSampleInput && (
           <div className="mb-2 font-mono text-[10px] text-muted-foreground">
-            {autoSampleCount} recent event{autoSampleCount === 1 ? '' : 's'} loaded automatically · source_type={sourceType}
+            {autoSampleCount} recent event{autoSampleCount === 1 ? '' : 's'} loaded automatically · {sourceField}={sourceType}
           </div>
         )}
         <div className="flex items-end gap-2">

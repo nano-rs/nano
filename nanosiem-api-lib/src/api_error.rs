@@ -1081,9 +1081,7 @@ impl From<nanosiem_core::RuleRepositoryError> for ApiError {
             RuleRepositoryError::InvalidUrl(url) => {
                 ApiError::BadRequest(format!("Invalid repository URL: {}", url))
             }
-            RuleRepositoryError::SigmaParse(msg) => {
-                ApiError::BadRequest(format!("Failed to parse Sigma rule: {}", msg))
-            }
+            e @ RuleRepositoryError::SigmaFormatUnsupported => ApiError::BadRequest(e.to_string()),
             RuleRepositoryError::ConversionFailed(msg) => {
                 ApiError::ValidationError(format!("Rule import failed: {}", msg))
             }

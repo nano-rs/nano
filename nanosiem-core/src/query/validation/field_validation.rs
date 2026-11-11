@@ -170,16 +170,36 @@ fn resolve_field_alias(field_name: &str) -> Option<&'static str> {
 /// ```
 pub fn suggest_similar_fields(field_name: &str, max_suggestions: usize) -> Vec<String> {
     let all_fields = UdmField::all();
-    let mut scored_fields: Vec<(String, usize)> = all_fields
-        .iter()
-        .map(|field| {
-            let field_str = field.column_name();
-            let distance = levenshtein_distance(field_name, field_str);
+    suggest_similar_fields_in(
+        field_name,
+        all_fields.iter().map(|field| field.column_name()),
+        max_suggestions,
+    )
+}
+
+/// [`suggest_similar_fields`] over an explicit candidate set (NAN-5275).
+///
+/// The detection editor suggests from the field universe of the schema the
+/// query actually runs against: OCSF promoted columns on an OCSF tenant, the
+/// risk grain's columns for `dataset=risk`. The UDM list was wrong for both.
+/// Ties keep candidate order, so pass the most useful fields first.
+pub fn suggest_similar_fields_in<'a>(
+    field_name: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+    max_suggestions: usize,
+) -> Vec<String> {
+    let needle = field_name.to_ascii_lowercase();
+    let mut seen = HashSet::new();
+    let mut scored_fields: Vec<(String, usize)> = candidates
+        .into_iter()
+        .filter(|field| seen.insert(*field))
+        .map(|field_str| {
+            let distance = levenshtein_distance(&needle, &field_str.to_ascii_lowercase());
             (field_str.to_string(), distance)
         })
         .collect();
 
-    // Sort by distance (lower is better)
+    // Sort by distance (lower is better); stable, so ties keep candidate order.
     scored_fields.sort_by_key(|(_, distance)| *distance);
 
     // Return top N suggestions, but only if they're reasonably close

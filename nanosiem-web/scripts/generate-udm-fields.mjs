@@ -5,8 +5,7 @@
  * Outputs:
  *   1. nanosiem-web/src/lib/udm-fields.ts   (frontend Set)
  *   2. docs/udm_fields_parsed.json           (full metadata JSON)
- *   3. nanosiem-enterprise/src/melod/sigma_converter/data/udm-fields.json  (sigma converter, enterprise crate; skipped if absent)
- *   4. <docs-site>/public/udm-fields.json    (docs site, if present)
+ *   3. <docs-site>/public/udm-fields.json    (docs site, if present)
  *
  * Usage:  node scripts/generate-udm-fields.mjs
  * Called automatically by:  npm run generate:udm
@@ -24,7 +23,6 @@ const CSV_PATH = resolve(ROOT, 'nanosiem-core/docs/udmfields.csv');
 const TS_OUTPUT = resolve(__dirname, '../src/lib/udm-fields.ts');
 const JSON_OUTPUTS = [
   resolve(ROOT, 'docs/udm_fields_parsed.json'),
-  resolve(ROOT, 'nanosiem-enterprise/src/melod/sigma_converter/data/udm-fields.json'),
 ];
 // Optional: docs-site in sibling directory
 const DOCS_SITE_JSON = resolve(ROOT, '../nano-main/docs-site/public/udm-fields.json');

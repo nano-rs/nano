@@ -2,7 +2,7 @@
 
 /**
  * Rule Repository API routes
- * Handles external rule repository sync, Sigma rule browsing, and imports
+ * Handles first-party rule repository sync, rule browsing, and imports
  */
 
 // =============================================================================
@@ -39,7 +39,8 @@ export interface CreateRepositoryRequest {
   description?: string;
   branch?: string;
   rules_path?: string;
-  rule_format?: 'sigma' | 'nanosiem';
+  /** Sigma-format repositories were retired (NAN-5272); only nPL is accepted. */
+  rule_format?: 'nanosiem';
   auto_sync_enabled?: boolean;
   sync_interval_hours?: number;
 }
@@ -263,27 +264,6 @@ export interface CoverageFilter {
   mitre_technique?: string;
 }
 
-export interface ConvertSigmaRequest {
-  sigma_yaml: string;
-}
-
-export interface ConvertSigmaResponse {
-  npl_query: string;
-  confidence: number;
-  field_mappings: FieldMapping[];
-  unmapped_fields: string[];
-  requires_fields: string[];
-  warnings: string[];
-  needs_review: boolean;
-}
-
-export interface FieldMapping {
-  sigma_field: string;
-  udm_field: string;
-  confidence: number;
-  notes: string | null;
-}
-
 // Batch operations
 
 export interface BatchImportItem {
@@ -430,15 +410,6 @@ export class RuleRepositoriesApi {
   async refreshCoverage(): Promise<void> {
     return this.request('/api/rule-repositories/coverage/refresh', {
       method: 'POST',
-    });
-  }
-
-  // Sigma conversion (standalone)
-
-  async convertSigma(req: ConvertSigmaRequest): Promise<ConvertSigmaResponse> {
-    return this.request('/api/sigma/convert', {
-      method: 'POST',
-      body: JSON.stringify(req),
     });
   }
 

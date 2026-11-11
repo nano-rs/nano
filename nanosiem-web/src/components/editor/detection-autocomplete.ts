@@ -98,7 +98,7 @@ export const YAML_FIELD_OPTIONS: Record<string, YamlOption[]> = {
   ],
   // NAN-1561/NAN-1805: dataset the rule queries. Non-logs values are scheduled-only.
   dataset: [
-    { value: 'logs', label: 'Logs', description: 'UDM/OCSF events (default)' },
+    { value: 'logs', label: 'Logs', description: 'OCSF events (default)' },
     { value: 'spans', label: 'Traces', description: 'OTLP spans (scheduled-only)' },
     { value: 'metrics', label: 'Metrics', description: 'OTLP metrics (scheduled-only)' },
     { value: 'risk', label: 'Risk', description: 'Accumulated entity risk (scheduled-only; rules cannot add risk)' },

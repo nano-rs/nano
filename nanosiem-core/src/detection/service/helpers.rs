@@ -740,7 +740,13 @@ impl DetectionService {
             Some(field) => {
                 // Specific field: group by that field only
                 for event in events {
+                    // NAN-5271 C: a UDM-named field on an OCSF row (or vice
+                    // versa) resolves through its entity concept.
                     let entity = Self::get_string_field_from_event(event, field)
+                        .or_else(|| {
+                            crate::schema::entities::event_entity(event, Some(field))
+                                .map(|(v, _)| v)
+                        })
                         .unwrap_or_else(|| "unknown".to_string());
                     let key = (entity, field.to_string());
                     grouped.entry(key).or_default().push(event.clone());
@@ -769,6 +775,23 @@ impl DetectionService {
                             let key = (entity_value, field.to_string());
                             grouped.entry(key).or_default().push(event.clone());
                             found_any = true;
+                        }
+                    }
+
+                    // NAN-5271 C: aggregate rows from `stats … by src_ip` on OCSF
+                    // carry UDM output names the OCSF order never lists. Resolve
+                    // every entity concept class-aware across both vocabularies.
+                    if !found_any {
+                        for kind in crate::schema::entities::PRIMARY_ORDER {
+                            if let Some(obj) = event.as_object() {
+                                if let Some((key, value)) =
+                                    crate::schema::entities::resolve_with_key(obj, kind)
+                                {
+                                    let key = (value, key.to_string());
+                                    grouped.entry(key).or_default().push(event.clone());
+                                    found_any = true;
+                                }
+                            }
                         }
                     }
 

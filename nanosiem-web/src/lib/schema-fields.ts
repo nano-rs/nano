@@ -344,3 +344,62 @@ export function schemaFieldMap(profile: SchemaProfileId): SchemaFieldMap {
     columns: (udmColumns) => profileColumns(profile, udmColumns),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Event-class concept drilldowns (NAN-5271 E)
+// ---------------------------------------------------------------------------
+
+/** An asset-view drilldown that selects a KIND of event rather than a value. */
+export type AssetEventConcept =
+  | 'authLane'
+  | 'authAll'
+  | 'authSuccess'
+  | 'authFailure'
+  | 'interactiveLogon'
+  | 'networkLogon'
+  | 'fileEvents'
+  | 'fileLane';
+
+/**
+ * OCSF `| where` bodies for each concept. These MUST stay the nPL spelling of
+ * the predicates in `nanosiem-core/src/schema/ocsf_predicates.rs` (the asset
+ * dossier counts and timeline lanes the drilldown opens are computed from
+ * those); `ocsf_concept_predicate_tests.rs` compiles these exact strings.
+ * UDM answers with string values, OCSF with enum ints — `category` is the
+ * content (URL) category and `activity` holds HTTP methods / Logon, so neither
+ * can say "auth event" or "file event" under OCSF.
+ */
+export const OCSF_ASSET_CONCEPT_WHERE: Record<AssetEventConcept, string> = {
+  authLane: 'category_uid=3',
+  authAll: 'class_uid=3002',
+  authSuccess: 'class_uid=3002 AND activity_id!=2 AND status_id=1',
+  authFailure: 'class_uid=3002 AND activity_id!=2 AND status_id=2',
+  interactiveLogon: 'class_uid=3002 AND activity_id=1 AND logon_type_id IN (2, 10, 11, 12)',
+  networkLogon: 'class_uid=3002 AND activity_id=1 AND logon_type_id IN (3, 8)',
+  fileEvents: 'class_uid=1001',
+  fileLane: 'class_uid IN (1001, 201001, 201002)',
+};
+
+/** The legacy UDM drilldowns, unchanged. */
+const UDM_ASSET_CONCEPT_DRILL: Record<AssetEventConcept, Record<string, unknown>> = {
+  authLane: { _tableCommand: '| where category="authentication" OR category="authorization"' },
+  authAll: { category: 'authentication' },
+  authSuccess: { category: 'authentication', auth_result: 'success' },
+  authFailure: { category: 'authentication', auth_result: 'failure' },
+  interactiveLogon: {
+    _tableCommand: '| where category="authentication" AND lower(auth_type) LIKE "%interactive%"',
+  },
+  networkLogon: {
+    _tableCommand:
+      '| where category="authentication" AND (lower(auth_type) LIKE "%network%" OR lower(auth_type) LIKE "%lateral%")',
+  },
+  fileEvents: { _tableCommand: '| where file_action!=""' },
+  fileLane: { _tableCommand: '| where file_action!=""' },
+};
+
+/** Drilldown filters (field=value pairs and/or `_tableCommand`) for a concept. */
+export function assetConceptDrill(profile: SchemaProfileId, concept: AssetEventConcept): Record<string, unknown> {
+  return profile === 'ocsf'
+    ? { _tableCommand: `| where ${OCSF_ASSET_CONCEPT_WHERE[concept]}` }
+    : { ...UDM_ASSET_CONCEPT_DRILL[concept] };
+}

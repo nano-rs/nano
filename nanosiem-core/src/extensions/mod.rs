@@ -24,8 +24,8 @@ pub mod siem_health_analyzer;
 pub mod tuning_proposal_generator;
 
 pub use ai_client::{
-    skipped_rows, AiAgentId, AiClient, AiClientFactory, AiMessage, AiRole, AiStream,
-    DeferredAiClient, NoopAiClient,
+    skipped_rows, AiAgentId, AiClient, AiClientFactory, AiMessage, AiPipeCharge, AiRole,
+    AiStream, AiUsageTally, AiUsageTotals, DeferredAiClient, NoopAiClient,
 };
 pub use case_grouping::{
     AlertCasePermissions, AlertGrouped, CaseGroupingHook, NoopCaseGroupingHook,

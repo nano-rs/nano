@@ -1063,6 +1063,14 @@ impl ClickHouseSqlGenerator {
                         .iter()
                         .map(|f| {
                             let (expr, _) = field_to_sql_expr(f, self);
+                            // NAN-5277: on OCSF '' is absent (non-Nullable
+                            // columns, unmapped reads default to ''), the same
+                            // rule `isnull()` applies, so fill it too.
+                            let expr = if self.profile.id() == crate::schema::SchemaId::Ocsf {
+                                format!("nullIf(toString({expr}), '')")
+                            } else {
+                                expr
+                            };
                             format!(
                                 "ifNull(toString({}), '{}') AS {}",
                                 expr,

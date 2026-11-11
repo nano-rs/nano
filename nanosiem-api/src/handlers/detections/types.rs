@@ -185,6 +185,11 @@ pub struct ValidateDetectionRequest {
     pub query: String,
     /// Desired detection mode (real-time or scheduled)
     pub detection_mode: Option<String>,
+    /// Dataset the rule queries (`logs` default, `spans`, `metrics`, `risk`).
+    /// Field names are validated against that dataset's schema (NAN-5275): a
+    /// `risk` rule's `score_24h` is valid, a log field there is not.
+    #[serde(default)]
+    pub dataset: Option<String>,
     /// MITRE ATT&CK tactic IDs the rule will carry (e.g. `TA0002`). When
     /// either list is present, validation runs the same mapping checks a
     /// create/update runs (ID shape, catalog membership, tactic/technique

@@ -266,6 +266,18 @@ function extractDetectionMode(text: string): string | undefined {
   return match ? match[1] : undefined;
 }
 
+/**
+ * Extract the rule's dataset from the YAML front matter (NAN-5275). The
+ * backend validates field names against that dataset's schema, so a
+ * `dataset: risk` rule's `score_24h` is not reported as an unknown log field.
+ */
+export function extractDataset(text: string): string | undefined {
+  const yaml = text.match(/^---\n([\s\S]*?)\n---\n/);
+  if (!yaml) return undefined;
+  const match = yaml[1].match(/^dataset:\s*['"]?(\w+)['"]?\s*$/m);
+  return match ? match[1] : undefined;
+}
+
 // Store for backend validation results
 let lastBackendResult: ValidateDetectionResult | null = null;
 let lastValidatedCacheKey = '';
@@ -306,6 +318,7 @@ async function backendValidation(view: EditorView): Promise<Diagnostic[]> {
   const text = view.state.doc.toString();
   const query = extractQuery(text);
   const detectionMode = extractDetectionMode(text);
+  const dataset = extractDataset(text);
 
   // Skip if no query
   if (!query.trim()) {
@@ -314,8 +327,8 @@ async function backendValidation(view: EditorView): Promise<Diagnostic[]> {
     return [];
   }
 
-  // Cache key includes both query and detection mode
-  const cacheKey = `${detectionMode}:${query}`;
+  // Cache key includes the query, detection mode and dataset
+  const cacheKey = `${detectionMode}:${dataset ?? 'logs'}:${query}`;
 
   // Skip if nothing has changed
   if (cacheKey === lastValidatedCacheKey && lastBackendResult) {
@@ -327,7 +340,7 @@ async function backendValidation(view: EditorView): Promise<Diagnostic[]> {
   const currentRequestId = ++validationRequestId;
 
   try {
-    const result = await api.validateDetection(query, detectionMode);
+    const result = await api.validateDetection(query, detectionMode, dataset);
 
     // Only update if this is still the latest request (handles race conditions)
     if (currentRequestId !== validationRequestId) {

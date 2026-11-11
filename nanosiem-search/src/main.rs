@@ -83,6 +83,17 @@ async fn async_main() -> Result<()> {
             dual_pool_config.clickhouse_database.clone(),
         );
         let migrations_path = std::path::Path::new("./clickhouse");
+        // NAN-5271: an unset profile now means OCSF; never serve it against a
+        // UDM install (search would query an absent `ocsf_logs`).
+        if let Err(error) = migrator
+            .refuse_unset_profile_on_udm_install(
+                &std::env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default(),
+            )
+            .await
+        {
+            tracing::error!("Refusing to start: {error}");
+            return Err(anyhow::anyhow!("Refusing to start: {error}"));
+        }
         migrator
             .check_schema_up_to_date(migrations_path)
             .await

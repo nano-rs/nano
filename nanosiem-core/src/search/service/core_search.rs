@@ -353,7 +353,13 @@ impl SearchService {
 
             // Step 3: Execute search
             let queue_wait_ms = admission_started.elapsed().as_millis() as u64;
-            let result = service.search(request_with_id, &scope).await.map(|mut response| {
+            // NAN-5277: the requesting user, for the per-user `| ai` cap.
+            let result = super::super::request_actor::with_request_actor(
+                user_id,
+                service.search(request_with_id, &scope),
+            )
+            .await
+            .map(|mut response| {
                 response.queue_wait_ms = Some(queue_wait_ms);
                 response
             });
@@ -425,7 +431,12 @@ impl SearchService {
         let Some(controller) = self.admission_controller.clone() else {
             let mut service = self.clone();
             service.timechart_presentation = true;
-            let mut response = service.search(request, scope).await?;
+            // NAN-5277: the requesting user, for the per-user `| ai` cap.
+            let mut response = super::super::request_actor::with_request_actor(
+                user_id,
+                service.search(request, scope),
+            )
+            .await?;
             response.queue_wait_ms = Some(0);
             return Ok(response);
         };
@@ -441,7 +452,12 @@ impl SearchService {
         service.active_ch_settings = Some(service.ch_settings_for_priority(priority));
         // _permit drops at end of scope, freeing the slot.
         let queue_wait_ms = admission_started.elapsed().as_millis() as u64;
-        let mut response = service.search(request, scope).await?;
+        // NAN-5277: the requesting user, for the per-user `| ai` cap.
+        let mut response = super::super::request_actor::with_request_actor(
+            user_id,
+            service.search(request, scope),
+        )
+        .await?;
         response.queue_wait_ms = Some(queue_wait_ms);
         Ok(response)
     }
@@ -1689,7 +1705,8 @@ impl SearchService {
             .ok_or_else(|| {
                 SearchError::SqlValidationError(
                     "| baseline could not determine the entity — add host=/user=/ip=\"…\" or a \
-                     src_host / src_ip / user filter to the search."
+                     host / ip / user equality filter (src_host, device.hostname, src_endpoint.ip, \
+                     user.name, actor.user.name, …) to the search."
                         .to_string(),
                 )
             })?;
@@ -1772,41 +1789,20 @@ impl SearchService {
                 ai_info.prompt,
                 ai_info.max_rows
             );
-            match self
-                .ai_client
-                .enrich_rows(results.clone(), &ai_info.prompt, ai_info.max_rows)
-                .await
-            {
-                Ok(enriched) => {
-                    results = enriched;
-                    tracing::debug!("AI pipe enrichment complete: {} results", results.len());
-                }
-                Err(e) => {
-                    tracing::warn!("AI pipe enrichment failed: {}", e);
-                    // Non-fatal: mark all rows with error
-                    for row in results.iter_mut() {
-                        if let Some(obj) = row.as_object_mut() {
-                            obj.insert(
-                                "ai_verdict".to_string(),
-                                serde_json::Value::String("ERROR".to_string()),
-                            );
-                            obj.insert(
-                                "ai_confidence".to_string(),
-                                serde_json::Value::Number(
-                                    serde_json::Number::from_f64(0.0).unwrap(),
-                                ),
-                            );
-                            obj.insert(
-                                "ai_reasoning".to_string(),
-                                serde_json::Value::String(format!(
-                                    "AI enrichment failed: {}",
-                                    e
-                                )),
-                            );
-                        }
-                    }
-                }
-            }
+            // NAN-5277: bounded — a wall-clock timeout plus process and per-user
+            // concurrency caps, so a slow or failing model cannot hold this
+            // request's admission slot (or a background worker) for minutes.
+            // Always returns the rows (SKIPPED / ERROR tagged on failure).
+            results = super::ai_pipe_guard::guard()
+                .enrich(
+                    self.ai_client.as_ref(),
+                    std::mem::take(&mut results),
+                    &ai_info.prompt,
+                    ai_info.max_rows,
+                    crate::search::request_actor::current_request_actor(),
+                )
+                .await;
+            tracing::debug!("AI pipe enrichment complete: {} results", results.len());
             // Apply post-ai commands (e.g., | where ai_verdict="TP")
             if !post_ai_commands.is_empty() {
                 tracing::debug!("Applying {} post-ai commands", post_ai_commands.len());

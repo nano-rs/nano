@@ -146,12 +146,17 @@ export function recordFailedCall(entry: FailedApiCall): void {
 }
 
 function stringifyArg(arg: unknown): string {
-  if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
-  if (typeof arg === 'string') return arg;
   try {
+    if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
+    if (typeof arg === 'string') return arg;
     return JSON.stringify(arg)?.slice(0, 200) ?? String(arg);
   } catch {
-    return String(arg);
+    // Circular values, throwing getters or toString, objects without a prototype.
+    try {
+      return String(arg);
+    } catch {
+      return '[unprintable]';
+    }
   }
 }
 
@@ -211,15 +216,27 @@ export function installSupportCapture(win: Window & typeof globalThis = window):
   };
   const originalError = win.console.error.bind(win.console);
   win.console.error = (...args: unknown[]) => {
-    try {
-      recordConsoleError(args);
-    } catch {
-      /* never let capture break logging */
-    }
+    captureSafely(args);
     originalError(...args);
   };
-  win.addEventListener('error', (event) => recordConsoleError([event.error ?? event.message]));
-  win.addEventListener('unhandledrejection', (event) => recordConsoleError(['Unhandled rejection:', event.reason]));
+  // NAN-5273: a throw from these listeners would be reported as a new error
+  // event, so capture never throws and never re-enters itself.
+  win.addEventListener('error', (event) => captureSafely([event.error ?? event.message]));
+  win.addEventListener('unhandledrejection', (event) => captureSafely(['Unhandled rejection:', event.reason]));
+}
+
+let capturing = false;
+/** Record without ever throwing or recursing (a getter or toJSON may log). */
+export function captureSafely(args: unknown[]): void {
+  if (capturing) return;
+  capturing = true;
+  try {
+    recordConsoleError(args);
+  } catch {
+    /* never let capture break logging */
+  } finally {
+    capturing = false;
+  }
 }
 
 export function getFailedCalls(): FailedApiCall[] {

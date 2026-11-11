@@ -13,6 +13,7 @@ mod detection;
 mod distributed;
 mod ocsf_legacy_drop;
 mod runner;
+mod schema_profile_guard;
 mod sql_transform;
 mod tracking;
 mod types;
@@ -26,5 +27,8 @@ pub(crate) use cluster_reachability::server_cluster_rows_predicate;
 pub(crate) use detection::configured_or_detected_cluster;
 pub use ocsf_legacy_drop::{
     LegacyDayCheck, LegacyDayStatus, OcsfLegacyDropOutcome, OcsfLegacyDropPlan, OCSF_LEGACY_TABLE,
+};
+pub use schema_profile_guard::{
+    check_unset_profile_against_install, classify_installed_logs_schema, InstalledLogsSchema,
 };
 pub use types::{ClickHouseMigrateError, ClickHouseMigrator, Migration};

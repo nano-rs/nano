@@ -113,6 +113,19 @@ describe('capture', () => {
     expect(entry.message).not.toContain(JWT);
     expect(entry.message.length).toBeLessThanOrEqual(301);
   });
+
+  it('never throws or recurses on hostile console.error arguments (NAN-5273)', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const hostile = { toJSON() { throw new Error('toJSON'); }, toString() { throw new Error('toString'); } };
+    const logging = { toJSON() { console.error('nested'); return 'logged'; } };
+    const spy = vi.spyOn(console, 'error');
+    expect(() => console.error('ctx', circular, hostile, Object.create(null), logging)).not.toThrow();
+    spy.mockRestore();
+    expect(getConsoleErrors()).toHaveLength(1);
+    expect(getConsoleErrors()[0].message).toContain('[unprintable]');
+    expect(() => window.dispatchEvent(new ErrorEvent('error', { error: hostile }))).not.toThrow();
+  });
 });
 
 describe('report', () => {

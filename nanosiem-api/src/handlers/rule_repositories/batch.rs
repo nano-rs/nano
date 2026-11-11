@@ -85,7 +85,6 @@ pub async fn batch_import_rules(
                     severity: item.severity,
                     mode: item.mode,
                     custom_npl: None,
-                    ai_triage_hints: None,
                     source_type_mappings: item.source_type_mappings,
                     merge_to_single_source_type: item.merge_to_single_source_type,
                 },

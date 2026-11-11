@@ -39,6 +39,9 @@ vi.mock('@/hooks/use-tier', () => ({
     status: mock.tierLoaded ? { limits: { sso_enabled: mock.hasSso } } : null,
   }),
 }));
+// 6153fa397 (NAN-5204) added a React Query backed backup card to the landing
+// page; it is unrelated to SSO gating, so stub it rather than mount a client.
+vi.mock('@/components/settings/LastBackupCard', () => ({ LastBackupCard: () => null }));
 vi.mock('@/hooks/use-shared-tenant', () => ({ useSharedTenant: () => false }));
 vi.mock('@/hooks/useDocumentTitle', () => ({ useDocumentTitle: vi.fn() }));
 vi.mock('@/hooks/use-api', () => ({

@@ -3,6 +3,7 @@
 import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { isClickHouseDefault } from '@/lib/utils';
 import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
+import { isGeoEnrichmentField, isIocField } from '@/lib/enrichment-fields';
 import { FIELD_BUCKET_LABELS, FIELD_BUCKET_TOOLTIPS, extendedTooltip } from './field-buckets';
 
 // OCSF `event` JSON expansion (NAN-1241 follow-up).
@@ -256,7 +257,7 @@ export function flattenEventFields(
   const getFieldCategory = (fieldName: string): number => {
     if (fieldName === 'risk_score' || fieldName === 'risk_entity' ||
         fieldName === 'risk_factors' || fieldName.startsWith('risk_')) return 1;
-    if (fieldName.startsWith('ioc_')) return 2;
+    if (isIocField(fieldName)) return 2;
     if (fieldName.includes('_identity_') || fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate') return 3;
     if (fieldName.startsWith('prevalence_') || fieldName === '_prevalence' ||
         fieldName.startsWith('_prevalence.') || fieldName === 'host_count' ||
@@ -265,7 +266,7 @@ export function flattenEventFields(
         fieldName === 'total_occurrences' || fieldName === 'first_seen' ||
         fieldName === 'last_seen') return 4;
     if (fieldName.startsWith('lookup_')) return 5;
-    if (fieldName.startsWith('enriched_')) return 6;
+    if (isGeoEnrichmentField(fieldName)) return 6;
     // UDM flattens `metadata` with underscores; OCSF surfaces dotted leaves
     // (`metadata.version`) — match both (NAN-1448).
     if (fieldName.startsWith('metadata_') || fieldName.startsWith('metadata.')) return 7;
@@ -284,9 +285,8 @@ export function flattenEventFields(
 
 // ---- Category predicates (shared by both views) ----------------------------
 
-export function isIocField(fieldName: string): boolean {
-  return fieldName.startsWith('ioc_');
-}
+// UDM `ioc_*` and OCSF `enrichments.ioc_*` (NAN-5271); see lib/enrichment-fields.
+export { isIocField, isGeoEnrichmentField };
 export function isRiskField(fieldName: string): boolean {
   return fieldName === 'risk_score' || fieldName === 'risk_entity' || fieldName === 'risk_factors';
 }
@@ -314,11 +314,11 @@ export function isIdentityField(fieldName: string): boolean {
 // ---- Enrichment-toggle hiding (shared) -------------------------------------
 
 const ENRICHMENT_CATEGORIES: Record<string, (k: string) => boolean> = {
-  ioc: (k) => k.startsWith('ioc_'),
+  ioc: (k) => isIocField(k),
   custom: (k) => k.startsWith('lookup_custom_'),
   prevalence: (k) => isPrevalenceField(k),
   lookup: (k) => k.startsWith('lookup_') && !k.startsWith('lookup_custom_'),
-  geo: (k) => k.startsWith('enriched_'),
+  geo: (k) => isGeoEnrichmentField(k),
   identity: (k) => k.includes('_identity_') || k.startsWith('identity_') || k === 'is_nat_candidate',
   // `metadata_*` (UDM flattened) and `metadata.*` (OCSF dotted leaves) — NAN-1448.
   metadata: (k) => k.startsWith('metadata_') || k.startsWith('metadata.'),
@@ -386,7 +386,7 @@ export function buildFieldCategories(
     else if (isIdentityField(k)) categories[3].fields.push(field);
     else if (isPrevalenceField(k)) categories[4].fields.push(field);
     else if (isLookupField(k)) categories[5].fields.push(field);
-    else if (k.startsWith('enriched_')) categories[6].fields.push(field);
+    else if (isGeoEnrichmentField(k)) categories[6].fields.push(field);
     else if (k.startsWith('metadata_')) categories[7].fields.push(field);
     // Core = known to the ACTIVE schema profile (OCSF promoted fields) OR a base
     // UDM column (shared operational fields not in the OCSF universe). NAN-1241.

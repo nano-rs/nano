@@ -457,7 +457,9 @@ def compose_steps(result: dict, units: list[Unit], install_dir: str) -> list[str
                + (f" --remote-bundle /srv/nano/releases/{package} --remote-install-dir {install_dir}" if role_split else "")
                + " --backup-key-file /secure/nano-backup/operator.pem"
                + (f" --backup-output /mnt/nano-backups/upgrade-{target}" if role_split else ""))
-        if len(by_role("ingest")) > 1:
+        # The upgrade drains ingest hosts (2+) and app hosts (2+).
+        drains = len(by_role("ingest")) > 1 or len(by_role("app")) > 1
+        if drains:
             cmd += " --lb-drain-command /usr/local/sbin/nano-lb-drain --lb-rejoin-command /usr/local/sbin/nano-lb-rejoin"
         if role_split:
             # None of these exist after a fresh install.
@@ -465,8 +467,10 @@ def compose_steps(result: dict, units: list[Unit], install_dir: str) -> list[str
                 f"Prerequisites (upgrade.md, Path A): non-interactive SSH from {first_app} to every other host; "
                 + ("the drain/rejoin hooks at /usr/local/sbin/nano-lb-drain and nano-lb-rejoin on every app and "
                    "ingest host, mapping inventory names to the load balancer's server names (start from "
-                   "deploy/compose/examples/load-balancer/nano-lb-hook); each HAProxy's runtime socket at "
-                   "`level admin`." if len(by_role("ingest")) > 1 else "")
+                   "deploy/compose/examples/load-balancer/nano-lb-hook); on each load balancer, "
+                   "nano-lb-haproxy (beside the hook) as the nano-lb key's forced command, never `sudo socat` "
+                   "itself; each HAProxy's runtime socket at `level admin`. The dry run drains and rejoins "
+                   "each of those hosts through the hooks to prove it." if drains else "")
             )
         steps += [
             f"Dry run (read-only; verifies the signature, policy, registry pulls, disk, license) on {first_app}: "

@@ -66,7 +66,7 @@ export function TopActions({ actions, onPivotAction }: TopActionsProps) {
                 onPivotAction && 'enabled:hover:text-primary cursor-pointer',
                 a.anomaly && 'bg-[oklch(68%_0.18_28/0.06)]'
               )}
-              title={onPivotAction ? `Filter by action=${a.name}` : undefined}
+              title={onPivotAction ? `Filter by operation ${a.name}` : undefined}
             >
               <span className="flex items-center gap-1.5 min-w-0">
                 <span

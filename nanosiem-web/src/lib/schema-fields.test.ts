@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  OCSF_ASSET_CONCEPT_WHERE,
   SEMANTIC_FIELDS,
+  assetConceptDrill,
   buildFieldFilter,
   buildMultiFieldFilter,
   conceptColumns,
@@ -177,5 +179,24 @@ describe('schema-fields: helpers', () => {
     expect(OCSF_FIELD_FALLBACKS.src_host).toEqual(['src_endpoint.hostname', 'device.hostname']);
     expect(OCSF_FIELD_FALLBACKS.file_hash).toEqual(['file.hashes.value']);
     expect(fieldVal({ 'process.name': 'cmd.exe' }, 'process_name')).toBe('cmd.exe');
+  });
+});
+
+// NAN-5271 E: asset event-kind drilldowns are profile concepts.
+describe('assetConceptDrill', () => {
+  it('keeps the legacy UDM drilldowns byte-identical', () => {
+    expect(assetConceptDrill('udm', 'authAll')).toEqual({ category: 'authentication' });
+    expect(assetConceptDrill('udm', 'authSuccess')).toEqual({ category: 'authentication', auth_result: 'success' });
+    expect(assetConceptDrill('udm', 'fileEvents')).toEqual({ _tableCommand: '| where file_action!=""' });
+  });
+
+  it('keys OCSF drilldowns off the class / enum ints, never category or activity', () => {
+    for (const where of Object.values(OCSF_ASSET_CONCEPT_WHERE)) {
+      expect(where).not.toMatch(/\bcategory=|activity\b(?!_id)|file_action/);
+    }
+    expect(assetConceptDrill('ocsf', 'interactiveLogon')).toEqual({
+      _tableCommand: '| where class_uid=3002 AND activity_id=1 AND logon_type_id IN (2, 10, 11, 12)',
+    });
+    expect(assetConceptDrill('ocsf', 'fileEvents')).toEqual({ _tableCommand: '| where class_uid=1001' });
   });
 });

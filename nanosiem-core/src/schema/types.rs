@@ -48,15 +48,17 @@ pub enum SchemaId {
 impl SchemaId {
     /// Parse the active schema id from the `NANO_SCHEMA_PROFILE` env value.
     ///
-    /// `udm` (the default) and `ocsf` are accepted, case-insensitively, with
+    /// `ocsf` (the default) and `udm` are accepted, case-insensitively, with
     /// surrounding whitespace trimmed. An empty/unset value resolves to
-    /// [`SchemaId::Udm`] so the default deployment is unchanged. Any other value
-    /// is an error — boot fails fast (DualPool fail-fast philosophy, NAN-800)
-    /// rather than silently falling back to UDM against an OCSF table.
+    /// [`SchemaId::Ocsf`] (NAN-5271). Existing UDM deployments never rely on
+    /// that: installers and nano-main pin `udm` explicitly, and the migrator
+    /// refuses an unset value against a database that already holds UDM. Any
+    /// other value is an error — boot fails fast (DualPool fail-fast
+    /// philosophy, NAN-800).
     pub fn from_env_str(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "udm" => Ok(SchemaId::Udm),
-            "ocsf" => Ok(SchemaId::Ocsf),
+            "" | "ocsf" => Ok(SchemaId::Ocsf),
+            "udm" => Ok(SchemaId::Udm),
             other => Err(format!(
                 "invalid NANO_SCHEMA_PROFILE {other:?}: expected \"udm\" or \"ocsf\""
             )),

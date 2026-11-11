@@ -253,6 +253,14 @@ alerting to survive the loss of an app host. Requirements and rules:
   `NANO_LB_DRAIN_SECONDS` 30). Rejoin needs `NANO_LB_REJOIN_CHECKS` (3)
   consecutive `/readyz` 200s, then holds `NANO_LB_REJOIN_SECONDS` (60; at
   least the LB's check interval x rise + one interval) before the next host.
+  Configured drain/rejoin hooks run on app hosts too, and (from 2.0.13) the
+  dry run tests them with a live round trip ([upgrade.md](upgrade.md)).
+- After an app host reboots, run `scripts/nano cluster-health` on each ingest
+  host: on 2.0.12 and earlier the app host's `app-internal-edge` can keep
+  nano-api's old container IP, and `gw:app-api-proxy` then shows that app
+  host DOWN while everything user-facing looks fine. Fix:
+  `docker restart` that edge container on the app host
+  ([known-issues.md](known-issues.md#2012-fixed-after-2012)).
 - Adding an app host to a running cluster: rerun postgres host, existing app
   host, new app host, ingest hosts, each with `--accept-topology-migration`.
   Going from one to two app hosts moves Valkey to the postgres host; JWT

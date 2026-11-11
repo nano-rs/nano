@@ -14,6 +14,12 @@
 // `hash_prevalence_source_ocsf_mv`: file / process.file hashes.sha256), plus
 // the HTTP-activity URL object and the `*_unified` projections the search
 // service adds. The dict keys are lowercased; callers lowercase values.
+//
+// NAN-5280: the six field lists below are mirrored server-side in
+// nanosiem-core/src/prevalence/artifact_fields.rs (POST
+// /api/prevalence/query-artifacts). nanosiem-core/tests/
+// prevalence_artifact_fields_parity.rs parses these arrays and fails on drift:
+// edit both together, keep the `export const X = [...] as const;` shape.
 
 /** UDM fields carrying a file hash. */
 export const UDM_HASH_FIELDS = ['file_hash', 'process_hash', 'metadata.file_hash', 'metadata.process_hash'] as const;

@@ -5208,6 +5208,12 @@ mod npl_eval_parity_tests;
 mod npl_batch_b_tests;
 
 #[cfg(test)]
+mod ocsf_concept_predicate_tests;
+
+#[cfg(test)]
+mod ocsf_search_command_tests;
+
+#[cfg(test)]
 #[path = "clickhouse_sql_gen/ci_like_tests.rs"]
 mod ci_like_tests;
 

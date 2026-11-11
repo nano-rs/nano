@@ -30,10 +30,12 @@
 //! - `CLICKHOUSE_ADMIN_USER`     — admin user with DDL permissions (preferred)
 //! - `CLICKHOUSE_ADMIN_PASSWORD` — admin password
 //! - `CLICKHOUSE_MIGRATIONS_DIR` — defaults to `./clickhouse`
-//! - `NANO_SCHEMA_PROFILE`       — `udm` (default) | `ocsf`. When `ocsf`, the
+//! - `NANO_SCHEMA_PROFILE`       — `ocsf` (default) | `udm`. When `ocsf`, the
 //!   OCSF table overlay `<CLICKHOUSE_MIGRATIONS_DIR>/ocsf/init.sql` is applied
 //!   after the shared init + numbered migrations (NAN-1476). Must match the
-//!   value the api/search/jobs binaries run with.
+//!   value the api/search/jobs binaries run with. When unset on a database
+//!   that already holds a UDM install, the migrator refuses to start rather
+//!   than apply the OCSF default to it (NAN-5271).
 //! - `CLICKHOUSE_ENTERPRISE_MIGRATIONS_DIR` — defaults to
 //!   `./clickhouse-enterprise`. Only consulted when this binary is built
 //!   with `--features enterprise`. Today the directory is empty and the
@@ -585,6 +587,28 @@ async fn run() -> Result<()> {
     // here then finds nothing pending. The lock is session-scoped, so a
     // migrator that dies releases it with its connection.
     let _migration_lock = MigrationLock::acquire(&config.postgres_url).await?;
+
+    // NAN-5271 (lane L): an unset NANO_SCHEMA_PROFILE now means OCSF. Refuse,
+    // before any DDL, to apply that default to a database that already runs
+    // UDM (an install whose .env never recorded the profile). install.sh and
+    // `nano upgrade` pin `udm` for those installs; this catches every path
+    // that skips them. An explicit value is always respected.
+    {
+        let schema_raw =
+            std::env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default();
+        let (probe_client, _) = config.create_admin_clickhouse_client();
+        let installed = ClickHouseMigrator::new(probe_client, config.clickhouse_database.clone())
+            .refuse_unset_profile_on_udm_install(&schema_raw)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        if let Some(installed) = installed {
+            tracing::info!(
+                ?installed,
+                "{} unset: using the OCSF default",
+                nanosiem_core::schema::SCHEMA_PROFILE_ENV
+            );
+        }
+    }
 
     // NAN-789: apply PostgreSQL migrations BEFORE any ClickHouse work. CH 26.3
     // eagerly validates dictionary sources during `CREATE TABLE nanosiem.logs`

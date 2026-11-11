@@ -44,7 +44,7 @@ export function TopChanges({ changes, onPivotActor, onPivotTarget, onPivotAccoun
                   onClick={() => onPivotActor?.(c.actor)}
                   disabled={!onPivotActor}
                   className="text-muted-foreground/80 truncate enabled:hover:text-primary enabled:hover:underline"
-                  title={onPivotActor ? `Filter by user=${c.actor}` : undefined}
+                  title={onPivotActor ? `Filter by user ${c.actor}` : undefined}
                 >
                   {c.actor}
                 </button>
@@ -54,7 +54,7 @@ export function TopChanges({ changes, onPivotActor, onPivotTarget, onPivotAccoun
                   onClick={() => onPivotTarget?.(c.target)}
                   disabled={!onPivotTarget}
                   className="text-foreground truncate enabled:hover:text-primary enabled:hover:underline"
-                  title={onPivotTarget ? `Filter by resource_name=${c.target}` : undefined}
+                  title={onPivotTarget ? `Filter by resource ${c.target}` : undefined}
                 >
                   {c.target}
                 </button>
@@ -68,7 +68,7 @@ export function TopChanges({ changes, onPivotActor, onPivotTarget, onPivotAccoun
                 onClick={() => onPivotAccount?.(c.account)}
                 disabled={!onPivotAccount}
                 className="text-muted-foreground/70 text-[10px] shrink-0 enabled:hover:text-primary enabled:hover:underline"
-                title={onPivotAccount ? `Filter by cloud_account_id=${c.account}` : undefined}
+                title={onPivotAccount ? `Filter by account ${c.account}` : undefined}
               >
                 {c.account}
               </button>

@@ -95,22 +95,22 @@ fn in_list_on_an_ocsf_array_field_is_element_membership() {
     }
 }
 
-// --- Sigma converter output parses as intended (nanosiem-web sigma-convert.ts) ---
+// --- Quoted / regex / OCSF literal forms parse as intended ---
 
 #[test]
-fn sigma_quoted_command_line_literal_parses_and_keeps_its_quotes() {
+fn quoted_command_line_literal_parses_and_keeps_its_quotes() {
     let sql = ocsf(r#"metadata.log_source="windows_security" process.cmd_line CONTAINS 'powershell -Command "Get-Process"'"#);
     assert!(sql.contains(r#"powershell -command "get-process""#), "{sql}");
 }
 
 #[test]
-fn sigma_regex_operand_parses_with_quotes_and_escapes() {
+fn regex_operand_parses_with_quotes_and_escapes() {
     let sql = ocsf(r#"process.cmd_line =~ '(?i)cmd\\.exe /c "[a-z]+"'"#);
     assert!(sql.contains(r#"(?i)cmd\\.exe /c "[a-z]+""#), "{sql}");
 }
 
 #[test]
-fn sigma_windows_4688_query_targets_ocsf_columns() {
+fn windows_4688_query_targets_ocsf_columns() {
     let sql = ocsf(r#"metadata.log_source="windows_security" (metadata.event_code=4688 AND process.file.path ENDSWITH "\\cmd.exe")"#);
     assert!(sql.contains("metadata.event_code"), "{sql}");
     assert!(sql.contains("process.file.path"), "{sql}");

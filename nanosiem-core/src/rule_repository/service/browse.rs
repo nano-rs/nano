@@ -83,6 +83,7 @@ impl RuleRepositoryService {
         access: &crate::rule_repository::LiveInventoryAccess<'_>,
     ) -> Result<ImportPreview, RuleRepositoryError> {
         let repo = self.get_repository(repo_id).await?;
+        Self::ensure_supported_format(&repo)?;
         let repo_rule = self.get_rule(repo_id, path).await?;
 
         // Check if already imported
@@ -152,14 +153,8 @@ impl RuleRepositoryService {
             })
             .collect();
 
-        // Determine the proposed query - for nPL rules, extract just the query portion
-        let proposed_query = if repo.rule_format == "nanosiem" {
-            // Parse nPL rule to extract just the query
-            parse_npl(&repo_rule.raw_content).ok().map(|npl| npl.query)
-        } else {
-            // For Sigma rules, use the converted nPL if available
-            repo_rule.converted_npl.clone()
-        };
+        // The proposed query is the nPL rule's query portion
+        let proposed_query = parse_npl(&repo_rule.raw_content).ok().map(|npl| npl.query);
 
         Ok(ImportPreview {
             repository_rule: repo_rule.clone(),

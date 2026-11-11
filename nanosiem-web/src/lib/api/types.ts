@@ -1950,6 +1950,44 @@ export interface EnhancedDeploymentResponse {
   };
   deployment_id?: string;
   recent_deployments: ParserDeployment[];
+  /**
+   * NAN-5279: role-split (generation) delivery only. `pending` = published,
+   * some ingest hosts are still installing it: in progress, not an error.
+   */
+  delivery?: GenerationDelivery;
+}
+
+/** NAN-5279: where a role-split deploy's generation stands on the ingest hosts. */
+export type DeliveryState = 'acknowledged' | 'pending' | 'rejected' | 'unconfirmed' | 'not_applicable';
+
+export interface GenerationDelivery {
+  state: DeliveryState;
+  generation: number;
+  host_count: number;
+  pending_hosts: string[];
+  sync_interval_secs: number;
+  /** GET this to re-check (returns GenerationDeliveryStatus). */
+  status_path: string;
+}
+
+export interface IngestHostDelivery {
+  relay: string;
+  reachable: boolean;
+  confirmed: boolean;
+  installed?: number | null;
+  installing?: number | null;
+  failed?: number | null;
+  failed_reason?: string | null;
+}
+
+/** GET /api/log-sources/delivery-status?generation=N */
+export interface GenerationDeliveryStatus {
+  generation_delivery: boolean;
+  generation: number;
+  state: DeliveryState;
+  host_count: number;
+  hosts: IngestHostDelivery[];
+  message: string;
 }
 
 // AI Provider Credentials types (LiteLLM multi-provider support)

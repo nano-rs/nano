@@ -28,6 +28,7 @@ on:
       - nanosiem-web/**
       - tools/sync-to-nano-mirror.sh
       - tools/scan-mirror-secrets.sh
+      - tools/check-mirror-enterprise-strip.py
       - tools/tests/**
       - scripts/tests/install-edition.test.sh
       - scripts/tests/install-env-set-keys.test.sh
@@ -272,6 +273,25 @@ jobs:
           else
             echo "ClickHouse default-user tests not in this tree (public mirror); skipping"
           fi
+
+      # NAN-5281: enterprise-only Rust modules are compiled out of the open
+      # edition by `#[cfg(feature = "enterprise")]`, but their SOURCE shipped
+      # in the public mirror unless the strip list also deleted them (hunts,
+      # playbooks, license, SSO, tuning engine all leaked). The strip script
+      # now runs tools/check-mirror-enterprise-strip.py, which derives the
+      # gated module set from the code and fails if any of it survives, so a
+      # new gated module fails this PR instead of reaching nano-rs/nano.
+      - name: Mirror strip guard (no enterprise-only source in open core)
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace:ro" -w /workspace \
+            python:3.12-slim-bookworm \
+            bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends rsync >/dev/null
+              bash tools/tests/check-mirror-enterprise-strip.test.sh
+              bash tools/sync-to-nano-mirror.sh /workspace "$(mktemp -d)/tree"
+            '
 
       # NAN-4902: the open web edition must build from the STRIPPED tree. In
       # the private tree `@/enterprise/*` still resolves to the real sources

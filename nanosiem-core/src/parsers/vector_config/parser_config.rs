@@ -365,8 +365,8 @@ impl VectorConfigManager {
     }
 
     /// NAN-1246: true only under `NANO_SCHEMA_PROFILE=ocsf` — the deployment-wide
-    /// gate for generating the native-OCSF ingestion lane. UDM (default) → false,
-    /// so no OCSF transforms/sink are emitted and the config is byte-identical.
+    /// gate for generating the native-OCSF ingestion lane (unset also means OCSF,
+    /// NAN-5271). UDM → false, so no OCSF transforms/sink are emitted.
     pub(crate) fn ocsf_mode() -> bool {
         crate::schema::active_profile_from_env()
             .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
@@ -772,6 +772,8 @@ mod tests {
     /// Without an enabled extension, output reads directly from _parse — same as before NAN-874.
     #[test]
     fn extension_disabled_keeps_parse_to_output_chain() {
+        // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let m = manager();
         let p = make_parser(".message = string!(.message)", None, false);
         let config = m.generate_parser_config_string(&p);
@@ -828,6 +830,8 @@ mod tests {
     /// Enabled extension: chain becomes _parse → _extension → _output.
     #[test]
     fn enabled_extension_chains_between_parse_and_output() {
+        // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let m = manager();
         let p = make_parser(
             ".message = string!(.message)",
@@ -881,6 +885,8 @@ mod tests {
     /// No _parse transform; extension reads from the source directly.
     #[test]
     fn stub_case_skips_parse_and_extension_reads_from_source() {
+        // NAN-5271: an unset profile now means OCSF; this asserts the UDM shape.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let m = manager();
         let p = make_parser("", Some(".message = string!(.raw)"), true);
         let config = m.generate_parser_config_string(&p);

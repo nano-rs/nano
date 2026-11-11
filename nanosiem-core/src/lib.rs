@@ -335,12 +335,12 @@ pub use risk::{
     RiskFilter, RiskLevel, RiskTimeWindow, TimeWindowedRiskScore,
 };
 pub use rule_repository::{
-    ConversionTriageHints, CoverageAnalysis, CoverageAnalyzer, CoverageFilter, CoverageResult,
+    CoverageAnalysis, CoverageAnalyzer, CoverageFilter, CoverageResult,
     FolderInfo, GitHubClient, GitHubClientError, ImportOutcome, ImportPreview, ImportRequest,
     ImportType, NewRuleRepository, RepositoryRule, RepositoryRuleFilter, RepositoryRulesRepository,
     RuleImport, RuleImportsRepository, RuleRepository, RuleRepositoryError,
-    RuleRepositoryRepository, RuleRepositoryService, RuleRepositoryServiceConfig, SigmaDetection,
-    SigmaLogsource, SigmaParseError, SigmaRule, SyncResult, SyncStatus, UpdateRuleRepository,
+    RuleRepositoryRepository, RuleRepositoryService, RuleRepositoryServiceConfig,
+    SyncResult, SyncStatus, UpdateRuleRepository,
     UpdatedRule,
 };
 pub use scheduler::{

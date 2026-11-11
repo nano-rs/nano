@@ -119,9 +119,15 @@ pub(crate) fn analyze_required_fields(
                         "severity",
                         "src_endpoint.ip",
                         "src_endpoint.hostname",
+                        // NAN-5271 C (finding #18): endpoint classes (Sysmon
+                        // process/file/module/registry) keep the host in
+                        // `device.hostname` and the user in `actor.user.name`;
+                        // without them the slim row showed no host or user.
+                        "device.hostname",
                         "dst_endpoint.ip",
                         "dst_endpoint.hostname",
                         "user.name",
+                        "actor.user.name",
                         "actor.process.name",
                         "process.name",
                         "src_endpoint.port",
@@ -317,6 +323,24 @@ fn collect_required_fields_from_query(
 }
 
 /// Collect fields from search expressions
+/// NAN-5271 E: a concept-translated filter (`action=blocked` → `disposition_id`
+/// under OCSF) reads columns other than its field's own; a pruned stage must
+/// project them or a downstream `| where` fails with Code 47.
+fn collect_concept_columns(
+    field: &str,
+    values: &[crate::query::Value],
+    fields: &mut HashSet<String>,
+    profile: &dyn crate::schema::SchemaProfile,
+) {
+    for v in values {
+        if let crate::query::Value::String(s) = v {
+            for col in profile.concept_value_columns(field, s) {
+                fields.insert((*col).to_string());
+            }
+        }
+    }
+}
+
 fn collect_fields_from_search_expr(
     expr: &SearchExpr,
     fields: &mut HashSet<String>,
@@ -326,8 +350,9 @@ fn collect_fields_from_search_expr(
         SearchExpr::Keyword(_) => {
             // Keywords search message, already in core fields
         }
-        SearchExpr::FieldFilter { field, .. } => {
+        SearchExpr::FieldFilter { field, value, .. } => {
             fields.insert(canon_collect(field, profile));
+            collect_concept_columns(field, std::slice::from_ref(value), fields, profile);
         }
         SearchExpr::FunctionFilter { function, .. } => {
             // Collect fields from function arguments
@@ -340,8 +365,9 @@ fn collect_fields_from_search_expr(
             fields.insert(canon_collect(field, profile));
             collect_fields_from_eval_expr(function, fields, profile);
         }
-        SearchExpr::InList { field, .. } => {
+        SearchExpr::InList { field, values, .. } => {
             fields.insert(canon_collect(field, profile));
+            collect_concept_columns(field, values, fields, profile);
         }
         SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
             collect_fields_from_search_expr(left, fields, profile);

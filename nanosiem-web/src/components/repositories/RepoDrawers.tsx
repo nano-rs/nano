@@ -977,7 +977,7 @@ export function FolderSelectionDrawer({
         <div className="rounded-md border border-border bg-card/30 px-3 py-2 flex items-start gap-2">
           <AlertTriangle className="w-[12px] h-[12px] text-muted-foreground mt-0.5" strokeWidth={1.5} />
           <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-            Large upstream repos (e.g. SigmaHQ has 200+ folders / 3000+ rules) get unwieldy
+            Large repos (hundreds of folders / thousands of rules) get unwieldy
             without scoping. Pick the few folders you want and resync — only matching files are
             fetched.
           </div>

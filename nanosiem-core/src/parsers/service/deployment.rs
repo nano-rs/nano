@@ -184,6 +184,7 @@ impl ParserService {
                     raw_output: String::new(),
                 }),
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -232,6 +233,7 @@ impl ParserService {
                 message: error_msg,
                 validation_result: None,
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -279,6 +281,7 @@ impl ParserService {
                         message: error_msg,
                         validation_result: None,
                         deployment_id: None,
+                        delivery: None,
                     });
                 }
             }
@@ -317,6 +320,7 @@ impl ParserService {
                 message: format!("Vector validation failed: {}", error_msg),
                 validation_result: Some(validate_result),
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -391,6 +395,7 @@ impl ParserService {
                 message: error_msg,
                 validation_result: Some(validate_result),
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -443,6 +448,7 @@ impl ParserService {
                 message: error_msg,
                 validation_result: Some(validate_result),
                 deployment_id: None,
+                delivery: None,
             });
         }
 
@@ -467,16 +473,17 @@ impl ParserService {
             parser_id
         );
 
+        let (message, delivery) = crate::parsers::vector_config_remote_delivery::with_delivery(
+            format!("Parser '{}' deployed successfully", parser.name),
+        );
         Ok(DeploymentResult {
             success: true,
             parser_id,
             action: DeploymentAction::Deploy.as_str().to_string(),
-            message: crate::parsers::vector_config_remote_delivery::with_delivery_note(format!(
-                "Parser '{}' deployed successfully",
-                parser.name
-            )),
+            message,
             validation_result: Some(validate_result),
             deployment_id: Some(deployment.id),
+            delivery,
         })
     }
 

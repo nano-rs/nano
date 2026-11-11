@@ -296,12 +296,13 @@ services:
       CLICKHOUSE_SELF_USER: nanosiem
       # NAN-1476: must match api/search/jobs — when ocsf, the migrator applies
       # the clickhouse/ocsf/init.sql overlay so ocsf_logs exists before boot.
-      # NAN-4903: new installs are OCSF — install.sh and .env.opensource.example
-      # always write the key. The `udm` fallback below applies only to an .env
-      # WITHOUT the key, i.e. an install that predates the profile choice and
-      # holds UDM data; defaulting it to ocsf would silently repoint that
-      # deployment at an empty table. Never change this fallback.
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      # NAN-4903/NAN-5271: OCSF is the default. install.sh and
+      # .env.opensource.example always write the key, and install.sh and
+      # `nano upgrade` pin NANO_SCHEMA_PROFILE=udm into an older .env that
+      # lacks it (that install holds UDM data). If neither ran, the migrator
+      # sees nanosiem.logs without nanosiem.ocsf_logs and refuses to start
+      # instead of repointing the install at an empty table.
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}
       # The migrator substitutes these into {pg_dict_*} placeholders in
       # clickhouse/init.sql so the PG-sourced dictionaries can authenticate
       # without hardcoded creds (NAN-807 bug #3).
@@ -644,7 +645,7 @@ services:
       API_PORT: "3000"
       # Storage schema profile (udm | ocsf). Fixed at install time by install.sh.
       # Must match nano-search or the two services read different CH tables.
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config delivery — api writes here, vector reads from same volume.
       VECTOR_CONFIG_DIR: /app/config/vector
@@ -791,7 +792,7 @@ services:
       # Storage schema profile (udm | ocsf). Must match nano-api/nano-search —
       # the detection runner and repo sync resolve the rules repo + target
       # table from this, so a mismatch syncs the wrong rules.
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       # NAN-1913: see nano-api — sources root as Vector sees it, not the
@@ -899,7 +900,7 @@ services:
       AUTH_ENABLED: "true"
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
       # Storage schema profile (udm | ocsf). Must match nano-api (above).
-      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}
       REDIS_URL: redis://dragonfly:6379
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-}

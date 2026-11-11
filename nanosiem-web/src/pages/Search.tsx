@@ -123,6 +123,7 @@ import {
   type HeldTimeline,
 } from './search-timeline-hold';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useNotebookCapture } from '@/enterprise/contexts/NotebookContext';
 import { TimelineVisualization, FieldsPanel, FIELD_STATS_PINNED_COLUMNS, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, DatasetSelector, type FieldStat } from '@/components/search';
@@ -143,6 +144,7 @@ import { nplQuotedBody } from '@/lib/npl-quote';
 // query-rewrite paths split the pipeline identically (regex-aware).
 import { getBaseSearch, getPipeCommands, buildGroupByQuery } from '@/lib/npl-pipeline';
 import { Checkbox } from '@/components/ui/checkbox';
+import { resultRowKeyFields, resultRowSource } from '@/lib/result-row-source';
 
 interface SearchResult {
   id: string;
@@ -360,9 +362,7 @@ function tailRowTimestamp(row: Record<string, unknown>): Date {
 }
 
 function tailRowSource(row: Record<string, unknown>): string {
-  return row.source_type === 'findings'
-    ? (row.metadata as Record<string, unknown> | undefined)?.risk_entity as string || 'finding'
-    : (row.src_host as string) || (row.src_ip as string) || 'unknown';
+  return resultRowSource(row);
 }
 
 // Map API preset format to UI display format
@@ -610,6 +610,7 @@ export function Search() {
   const [fieldsPanelVisible, setFieldsPanelVisible] = useState(false); // Hide initially for cool effect
   const userToggledFieldsPanel = useRef(false); // Track manual user toggle to not fight them
   const isMobile = useIsMobile();
+  const schemaFields = useSchemaFieldMap();
   const [mobileFieldsOpen, setMobileFieldsOpen] = useState(false);
   
   const { capabilities } = useCapabilities();
@@ -656,7 +657,7 @@ export function Search() {
           ],
           suggestions:
             displayTotalCount > 0
-              ? ['Summarize these results', 'Pivot by src_ip', 'Create a detection from this query']
+              ? ['Summarize these results', 'Pivot by source IP', 'Create a detection from this query']
               : ['Widen the time range', 'Remove a filter', 'Summarize zero-result patterns'],
         }
       : null
@@ -1391,9 +1392,7 @@ export function Search() {
       .map((r: Record<string, unknown>, i: number) => ({
         id: `result-${i}`,
         timestamp: parseUTCTimestamp(r?.timestamp as string),
-        source: r?.source_type === 'findings'
-          ? (r?.metadata as Record<string, unknown>)?.risk_entity as string || 'finding'
-          : (r?.src_host as string) || (r?.src_ip as string) || 'unknown',
+        source: resultRowSource(r),
         fields: (r && typeof r === 'object') ? r : {},
       }));
 
@@ -1524,14 +1523,8 @@ export function Search() {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
         const keyFields = results.slice(0, 3).map(r => {
-          const fields: string[] = [];
-          const event = r as unknown as Record<string, unknown>;
-          if (event.src_ip) fields.push(`src_ip: ${event.src_ip}`);
-          if (event.dst_ip) fields.push(`dst_ip: ${event.dst_ip}`);
-          if (event.user) fields.push(`user: ${event.user}`);
-          if (event.url) fields.push(`url: ${event.url}`);
-          if (event.hostname) fields.push(`hostname: ${event.hostname}`);
-          return fields.join(', ');
+          // NAN-5271: the row's own fields (OCSF paths on an OCSF row).
+          return resultRowKeyFields(r.fields as Record<string, unknown>);
         }).filter(Boolean).join(' | ');
 
         updated[lastIdx] = {
@@ -1720,9 +1713,7 @@ export function Search() {
           .map((r: Record<string, unknown>, i: number) => ({
             id: `result-${cumulativeRows + i}`,
             timestamp: parseUTCTimestamp(r?.timestamp as string),
-            source: r?.source_type === 'findings'
-              ? (r?.metadata as Record<string, unknown>)?.risk_entity as string || 'finding'
-              : (r?.src_host as string) || (r?.src_ip as string) || 'unknown',
+            source: resultRowSource(r),
             fields: r,
           }));
         cumulativeRows += newRows.length;
@@ -2118,9 +2109,7 @@ export function Search() {
         .map((r: Record<string, unknown>, i: number) => ({
           id: `result-${offset + i}`,
           timestamp: parseUTCTimestamp(r?.timestamp as string),
-          source: r?.source_type === 'findings'
-            ? (r?.metadata as Record<string, unknown>)?.risk_entity as string || 'finding'
-            : (r?.src_host as string) || (r?.src_ip as string) || 'unknown',
+          source: resultRowSource(r),
           fields: (r && typeof r === 'object') ? r : {},
         }));
       
@@ -2179,14 +2168,8 @@ export function Search() {
           const lastIdx = updated.length - 1;
           // Extract some key context from results (using dynamic field access)
           const keyFields = results.slice(0, 3).map(r => {
-            const fields: string[] = [];
-            const event = r as unknown as Record<string, unknown>;
-            if (event.src_ip) fields.push(`src_ip: ${event.src_ip}`);
-            if (event.dst_ip) fields.push(`dst_ip: ${event.dst_ip}`);
-            if (event.user) fields.push(`user: ${event.user}`);
-            if (event.url) fields.push(`url: ${event.url}`);
-            if (event.hostname) fields.push(`hostname: ${event.hostname}`);
-            return fields.join(', ');
+            // NAN-5271: the row's own fields (OCSF paths on an OCSF row).
+            return resultRowKeyFields(r.fields as Record<string, unknown>);
           }).filter(Boolean).join(' | ');
 
           updated[lastIdx] = {
@@ -2697,9 +2680,7 @@ export function Search() {
       .map((r: Record<string, unknown>, i: number) => ({
         id: `result-${startIndex + i}`,
         timestamp: parseUTCTimestamp(r?.timestamp as string),
-        source: r?.source_type === 'findings'
-          ? (r?.metadata as Record<string, unknown>)?.risk_entity as string || 'finding'
-          : (r?.src_host as string) || (r?.src_ip as string) || 'unknown',
+        source: resultRowSource(r),
         fields: r,
       })), []);
 
@@ -2801,9 +2782,7 @@ export function Search() {
         .map((r: Record<string, unknown>, i: number) => ({
           id: `result-${offset + i}`,
           timestamp: parseUTCTimestamp(r?.timestamp as string),
-          source: r?.source_type === 'findings'
-            ? (r?.metadata as Record<string, unknown>)?.risk_entity as string || 'finding'
-            : (r?.src_host as string) || (r?.src_ip as string) || 'unknown',
+          source: resultRowSource(r),
           fields: (r && typeof r === 'object') ? r : {},
         }));
 
@@ -3271,9 +3250,7 @@ export function Search() {
             .map((r: Record<string, unknown>, i: number) => ({
               id: `result-${i}`,
               timestamp: parseUTCTimestamp(r?.timestamp as string),
-              source: r?.source_type === 'findings'
-                ? (r?.metadata as Record<string, unknown>)?.risk_entity as string || 'finding'
-                : (r?.src_host as string) || (r?.src_ip as string) || 'unknown',
+              source: resultRowSource(r),
               fields: (r && typeof r === 'object') ? r : {},
             }));
           
@@ -5049,14 +5026,13 @@ export function Search() {
             // which restored the pre-drill query and clobbered the filter.
             // Escape like the field=value drilldown builder — a log-derived
             // artifact with `"`/`\` must not break out of the quoted comparison.
-            const esc = nplQuotedBody(artifact);
+            // Profile-aware columns (OCSF: file.hashes / process.file.hashes;
+            // dst_endpoint.hostname, query.hostname, http_request.url.hostname)
+            // — different classes keep the artifact in different fields.
             const artifactQuery =
               artifactType === 'hash'
-                ? // Search both file_hash and process_hash since different source types use different fields
-                  `(file_hash="${esc}" OR process_hash="${esc}")`
-                : // Search all domain-related fields since different sources use different fields
-                  // dest_host (network), query (DNS), url_domain (proxy/web)
-                  `(dest_host="${esc}" OR query="${esc}" OR url_domain="${esc}")`;
+                ? schemaFields.filterAny(['fileHash', 'processHash'], artifact)
+                : schemaFields.filterAny(['destHost', 'dnsQuery', 'domain'], artifact);
             handleDrilldown({ _rawClause: artifactQuery });
           }}
           assetContext={assetContext}

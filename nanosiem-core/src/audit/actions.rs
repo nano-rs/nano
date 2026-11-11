@@ -623,6 +623,35 @@ pub const SSO_SIGN_IN_DENIED: &str = "sso_sign_in_denied";
 pub const SSO_GROUP_GRANTS_SYNCHRONIZED: &str = "sso_group_grants_synchronized";
 
 // =============================================================================
+// SCIM provisioning Actions (NAN-5274, enterprise)
+// =============================================================================
+
+/// A SCIM bearer token was issued for an SSO provider (first issue or rotate)
+pub const SCIM_TOKEN_ISSUED: &str = "scim_token_issued";
+/// A provider's SCIM bearer token was revoked
+pub const SCIM_TOKEN_REVOKED: &str = "scim_token_revoked";
+/// A SCIM request was refused before it ran (bad or missing token, rate limit)
+pub const SCIM_REQUEST_DENIED: &str = "scim_request_denied";
+/// SCIM created a nano user, or linked an existing account to the provider
+pub const SCIM_USER_CREATED: &str = "scim_user_created";
+/// SCIM changed a user's attributes (name, email, userName, externalId)
+pub const SCIM_USER_UPDATED: &str = "scim_user_updated";
+/// SCIM deactivated a user (`active=false`); sessions, tokens and API keys revoked
+pub const SCIM_USER_DEACTIVATED: &str = "scim_user_deactivated";
+/// SCIM re-activated a user it had deactivated
+pub const SCIM_USER_REACTIVATED: &str = "scim_user_reactivated";
+/// SCIM deleted a user: disabled, credentials revoked, SSO grants removed
+pub const SCIM_USER_DELETED: &str = "scim_user_deleted";
+/// SCIM created an IdP group
+pub const SCIM_GROUP_CREATED: &str = "scim_group_created";
+/// SCIM renamed an IdP group or changed its externalId
+pub const SCIM_GROUP_UPDATED: &str = "scim_group_updated";
+/// SCIM deleted an IdP group (its members' SSO grants re-reconciled)
+pub const SCIM_GROUP_DELETED: &str = "scim_group_deleted";
+/// SCIM added or removed members of an IdP group (SSO grants re-reconciled)
+pub const SCIM_GROUP_MEMBERSHIP_CHANGED: &str = "scim_group_membership_changed";
+
+// =============================================================================
 // Playbook Repository Actions (NAN-4947)
 // =============================================================================
 
@@ -666,8 +695,6 @@ pub const RULE_REPO_UPDATED: &str = "rule_repo_updated";
 pub const RULE_REPO_DELETED: &str = "rule_repo_deleted";
 /// Rule repository was synced
 pub const RULE_REPO_SYNCED: &str = "rule_repo_synced";
-/// A standalone Sigma rule was converted to nPL by the detection agent
-pub const SIGMA_CONVERTED: &str = "sigma_converted";
 
 // Detection-as-Code push target actions (NAN-1745)
 /// Push target was created
@@ -1080,6 +1107,16 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     INGESTION_RESUMED,
     // Federated identity — JIT provisioning of a new user on first OIDC login.
     OIDC_USER_PROVISIONED,
+    // SCIM provisioning (NAN-5274) — IdP-pushed account and access changes,
+    // plus the token that authorizes them. Authenticated, low-volume (the
+    // floodable `scim_request_denied` is deliberately excluded).
+    SCIM_TOKEN_ISSUED,
+    SCIM_TOKEN_REVOKED,
+    SCIM_USER_CREATED,
+    SCIM_USER_DEACTIVATED,
+    SCIM_USER_REACTIVATED,
+    SCIM_USER_DELETED,
+    SCIM_GROUP_MEMBERSHIP_CHANGED,
     // Session termination — administrative, low-volume.
     SESSION_TERMINATED,
     USER_SESSIONS_TERMINATED,
@@ -1143,6 +1180,15 @@ mod durable_classifier_tests {
             "source_scope_unrestricted",
             "source_scope_granted",
             "source_scope_revoked",
+            // bb506d7c5 (#9259): SCIM provisioning. Token-authenticated, rate
+            // limited per provider; the floodable scim_request_denied stays out.
+            "scim_token_issued",
+            "scim_token_revoked",
+            "scim_user_created",
+            "scim_user_deactivated",
+            "scim_user_reactivated",
+            "scim_user_deleted",
+            "scim_group_membership_changed",
         ];
         let mut actual: Vec<&str> = SECURITY_CRITICAL_ACTIONS.to_vec();
         expected.sort_unstable();

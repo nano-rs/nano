@@ -238,10 +238,6 @@ pub async fn import_rule(
 
     let service = get_rule_repo_service(&state)?;
 
-    // Get the repository rule to check if it needs conversion
-    let repo_rule = service.get_rule(*id, &path).await?;
-    let repo = service.get_repository(*id).await?;
-
     let import_type = match req.import_type.as_str() {
         "forked" => nanosiem_core::ImportType::Forked,
         _ => nanosiem_core::ImportType::Linked,
@@ -250,16 +246,16 @@ pub async fn import_rule(
     // NAN-2118: `rule_repositories:import` authorizes reading the catalog — it is
     // NOT a substitute for the capabilities governing the detection this import
     // materializes or rewrites. Preflight the target outcome and enforce the
-    // complete policy HERE, before AI conversion, credit charging,
-    // materialized-view work, or any database mutation.
-    let mut import_request = ImportRequest {
+    // complete policy HERE, before materialized-view work or any database
+    // mutation. `plan_import` also refuses a legacy Sigma-format repository
+    // (NAN-5272) before anything else happens.
+    let import_request = ImportRequest {
         import_type,
         folder: req.folder.clone(),
         name: req.name.clone(),
         severity: req.severity.clone(),
         mode: req.mode.clone(),
-        custom_npl: None,
-        ai_triage_hints: None,
+        custom_npl: req.custom_npl.clone(),
         source_type_mappings: req.source_type_mappings.clone(),
         merge_to_single_source_type: req.merge_to_single_source_type.clone(),
     };
@@ -268,118 +264,6 @@ pub async fn import_rule(
     // Re-checked inside the service at the exact create/update branch so a
     // concurrent import that flips the outcome cannot launder a missing cap.
     let grants = held_target_grants(&auth);
-
-    // Determine the nPL query and triage hints - either custom, already converted, or convert now via AI
-    let (npl_query, ai_triage_hints) = if let Some(custom) = req.custom_npl.clone() {
-        // User provided custom nPL
-        (Some(custom), None)
-    } else if repo_rule.converted_npl.is_some() {
-        // Already converted
-        (None, None) // Let the service use the stored one
-    } else if repo.rule_format == "sigma" {
-        // Sigma → nPL conversion is an enterprise feature (depends on the
-        // meloD detection agent + agent registry). Open-core users must
-        // supply a custom nPL query via the `custom_npl` field, or import
-        // a repo whose rules are already in NanoSIEM format.
-        #[cfg(not(feature = "enterprise"))]
-        {
-            return Err(ApiError::BadRequest(
-                "Sigma rule conversion requires the enterprise build. \
-                Provide `custom_npl` or import a rule already in nPL format."
-                    .to_string(),
-            ));
-        }
-        #[cfg(feature = "enterprise")]
-        {
-            // Need to convert via AI — credit rate limiting
-            let cost = {
-                let registry_guard = state.agent_config_registry.read().await;
-                match registry_guard.as_ref() {
-                    Some(registry) => match registry
-                        .get_agent_config(&nanosiem_enterprise::melod::AgentId::Detection)
-                        .await
-                    {
-                        Some(config) => {
-                            nanosiem_core::resolve_ai_request_cost(&state.pool, &config.model_id)
-                                .await
-                        }
-                        None => nanosiem_core::AI_CREDIT_FULL,
-                    },
-                    None => nanosiem_core::AI_CREDIT_FULL,
-                }
-            };
-            let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
-            let tier_limits = tier_settings.get_tier_limits().await?;
-            tier_settings
-                .increment_ai_credits(cost, tier_limits.ai_credits_per_month)
-                .await?;
-
-            let melod_guard = state.melod_service.read().await;
-            let melod_service = melod_guard.as_ref().ok_or_else(|| {
-                ApiError::InternalError(
-                    "AI service not configured - cannot convert Sigma rule".to_string(),
-                )
-            })?;
-
-            let sigma_rule = nanosiem_core::rule_repository::parse_sigma(&repo_rule.raw_content)
-                .map_err(|e| ApiError::BadRequest(format!("Failed to parse Sigma rule: {}", e)))?;
-
-            // Get available source_types from the environment for smarter conversion.
-            // NAN-1801: user-initiated AI conversion — enumerate with the
-            // requester's per-source scope so restricted sources stay invisible.
-            let available_source_types = {
-                let time_range = nanosiem_core::TimeRangeInput {
-                    start: chrono::Utc::now() - chrono::Duration::days(7),
-                    end: chrono::Utc::now(),
-                };
-                let scope = auth.effective_viewer_scope();
-                melod_service
-                    .data_access()
-                    .get_source_types(&time_range, &scope)
-                    .await
-                    .map(|types| types.into_iter().map(|t| t.source_type).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            };
-
-            let ai_client = melod_service.ai_client_arc();
-            let converter = nanosiem_enterprise::melod::SigmaConverterAgent::new(
-                ai_client,
-                state.config.schema_profile(),
-            );
-            let context = nanosiem_enterprise::melod::ConversionContext {
-                available_source_types,
-                ..Default::default()
-            };
-
-            let result = converter
-                .convert(&sigma_rule, context)
-                .await
-                .map_err(|e| ApiError::InternalError(format!("AI conversion failed: {}", e)))?;
-
-            if result.npl_query.is_empty() {
-                return Err(ApiError::BadRequest(
-                    "AI conversion produced an empty query. Please provide a custom nPL query."
-                        .to_string(),
-                ));
-            }
-
-            (
-                Some(result.npl_query),
-                result
-                    .triage_hints
-                    .map(|h| nanosiem_core::ConversionTriageHints {
-                        suspicious_when: h.suspicious_when,
-                        context: h.context,
-                    }),
-            )
-        }
-    } else {
-        // NanoSIEM format - should have query in content
-        (None, None)
-    };
-
-    import_request.custom_npl = npl_query;
-    import_request.ai_triage_hints = ai_triage_hints;
 
     let mv_gen = state.materialized_view_generator.as_ref();
 

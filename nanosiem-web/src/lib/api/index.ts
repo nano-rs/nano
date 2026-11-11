@@ -36,6 +36,7 @@ import { StorageApi } from './storage';
 import { RiskApi } from '@/enterprise/api/risk';
 import { IocListsApi } from '@/enterprise/api/ioc-lists';
 import { ThreatIntelApi } from '@/enterprise/api/threat-intel';
+import { ScimApi } from '@/enterprise/api/scim';
 import { SoarApi } from '@/enterprise/api/soar';
 import { InternalDomainsApi } from './internal-domains';
 import { RiskWatchlistsApi } from '@/enterprise/api/risk-watchlists';
@@ -279,6 +280,7 @@ class ApiClient {
   private _risk: RiskApi;
   private _iocLists: IocListsApi;
   private _threatIntel: ThreatIntelApi;
+  private _scim: ScimApi;
   private _soar: SoarApi;
   private _internalDomains: InternalDomainsApi;
   private _riskWatchlists: RiskWatchlistsApi;
@@ -363,6 +365,7 @@ class ApiClient {
     this._risk = new RiskApi(this.request.bind(this));
     this._iocLists = new IocListsApi(this.request.bind(this));
     this._threatIntel = new ThreatIntelApi(this.request.bind(this));
+    this._scim = new ScimApi(this.request.bind(this));
     this._soar = new SoarApi(this.request.bind(this));
     this._internalDomains = new InternalDomainsApi(this.request.bind(this));
     this._riskWatchlists = new RiskWatchlistsApi(this.request.bind(this));
@@ -435,6 +438,11 @@ class ApiClient {
   /** Threat-intel lookups + Enrich flyout (enterprise; the open build carries a rejecting stub). */
   get threatIntel(): ThreatIntelApi {
     return this._threatIntel;
+  }
+
+  /** SCIM provisioning settings (enterprise; NAN-5274). */
+  get scim(): ScimApi {
+    return this._scim;
   }
 
   /** SOAR automation (enterprise; the open build carries a rejecting stub). */
@@ -999,8 +1007,12 @@ class ApiClient {
     return this._detections.formatQuery(query);
   }
 
-  async validateDetection(query: string, detectionMode?: string): Promise<import('./types').ValidateDetectionResult> {
-    return this._detections.validateDetection(query, detectionMode);
+  async validateDetection(
+    query: string,
+    detectionMode?: string,
+    dataset?: string,
+  ): Promise<import('./types').ValidateDetectionResult> {
+    return this._detections.validateDetection(query, detectionMode, dataset);
   }
 
   async promoteDetection(
@@ -1802,6 +1814,10 @@ class ApiClient {
 
   async undeployLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
     return this._logSources.undeployLogSource(id);
+  }
+
+  async getDeliveryStatus(generation: number): Promise<import('./types').GenerationDeliveryStatus> {
+    return this._logSources.getDeliveryStatus(generation);
   }
 
   async getLogSourceHealth(id: string): Promise<import('./types').LogSourceHealth> {

@@ -32,7 +32,7 @@ pub use backup_mutation_fence::{backup_mutation_fence, BackupMutationFence};
 pub use demo_guard::demo_guard;
 pub use ip_allowlist::{ip_allowlist_middleware, IpAllowlistState};
 #[cfg(feature = "enterprise")]
-pub use license_guard::{license_guard, licensed_surface_guard};
+pub use license_guard::{license_guard, license_state_extension, licensed_surface_guard};
 pub use logging::request_logging_layer;
 pub use nanosiem_api_lib::api_cache_control::api_default_cache_control;
 pub use rate_limit::{

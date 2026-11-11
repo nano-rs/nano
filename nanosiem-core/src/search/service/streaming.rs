@@ -60,7 +60,12 @@ impl SearchService {
             service.timechart_presentation = true;
             service.active_ch_settings =
                 Some(streaming_ch_settings(priority, self.query_memory_ceiling_bytes));
-            service.search_streaming(request, event_tx, 0, scope).await;
+            // NAN-5277: the requesting user, for the per-user `| ai` cap.
+            crate::search::request_actor::with_request_actor(
+                user_id,
+                service.search_streaming(request, event_tx, 0, scope),
+            )
+            .await;
             return;
         };
 
@@ -106,9 +111,12 @@ impl SearchService {
         let queue_wait_ms = admission_started.elapsed().as_millis() as u64;
         // `_permit` is held across the whole stream and drops when
         // `search_streaming` returns (stream complete), freeing the slot.
-        service
-            .search_streaming(request, event_tx, queue_wait_ms, scope)
-            .await;
+        // NAN-5277: the requesting user, for the per-user `| ai` cap.
+        crate::search::request_actor::with_request_actor(
+            user_id,
+            service.search_streaming(request, event_tx, queue_wait_ms, scope),
+        )
+        .await;
     }
 
     /// Execute a streaming search, sending events through an mpsc channel.

@@ -888,19 +888,19 @@ export function UserSettings() {
               </div>
               {queryMode === 'standard' ? (
                 <code className="block font-mono text-[12px] text-[var(--str)] leading-relaxed">
-                  <span className="text-muted-foreground">source_type</span>=
+                  <span className="text-muted-foreground">metadata.log_source</span>=
                   <span className="text-foreground">aws_cloudtrail</span> |{' '}
                   <span className="text-primary">stats</span> count(){' '}
-                  <span className="text-muted-foreground">by</span> user
+                  <span className="text-muted-foreground">by</span> actor.user.name
                 </code>
               ) : (
                 <code className="block font-mono text-[12px] text-[var(--str)] leading-relaxed">
-                  <span className="text-primary">SELECT</span> user,{' '}
+                  <span className="text-primary">SELECT</span> `actor.user.name`,{' '}
                   <span className="text-primary">count()</span>{' '}
                   <span className="text-primary">FROM</span> events{' '}
                   <span className="text-primary">WHERE</span> source_type=
                   <span className="text-foreground">'aws_cloudtrail'</span>{' '}
-                  <span className="text-primary">GROUP BY</span> user
+                  <span className="text-primary">GROUP BY</span> `actor.user.name`
                 </code>
               )}
             </div>

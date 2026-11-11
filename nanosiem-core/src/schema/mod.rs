@@ -14,8 +14,10 @@
 //! `OCSF_SCHEMA_SUPPORT_SCOPING.md` §2.2.
 
 mod boot_validation;
+pub mod entities;
 mod metrics;
 mod ocsf;
+pub mod ocsf_predicates;
 pub mod ocsf_registry;
 mod profile;
 mod risk;
@@ -44,7 +46,7 @@ pub use udm::UdmProfile;
 use std::sync::Arc;
 
 /// The environment variable that selects the active schema profile at boot
-/// (scoping §2.4). `udm` (default) or `ocsf`.
+/// (scoping §2.4). `ocsf` (default, NAN-5271) or `udm`.
 pub const SCHEMA_PROFILE_ENV: &str = "NANO_SCHEMA_PROFILE";
 
 /// Construct the boxed [`SchemaProfile`] for a [`SchemaId`].
@@ -66,17 +68,50 @@ pub fn profile_for_id(id: SchemaId) -> Arc<dyn SchemaProfile> {
 }
 
 /// Resolve the active profile from the `NANO_SCHEMA_PROFILE` environment
-/// variable. Unset/empty → [`UdmProfile`] (byte-identical default deployment);
-/// `ocsf` → [`OcsfProfile`]. Any other value is an error (fail-fast at boot,
-/// NAN-800) rather than a silent UDM fallback against an OCSF table.
+/// variable. Unset/empty or `ocsf` → [`OcsfProfile`] (NAN-5271); `udm` →
+/// [`UdmProfile`]. Any other value is an error (fail-fast at boot, NAN-800).
 ///
 /// This reads the process environment and is intended to be called **once** at
 /// app boot (in `nanosiem-api` config/state); the resolved `Arc` is then stored
 /// and threaded down to the search path. Core code must not scatter env reads.
 pub fn active_profile_from_env() -> Result<Arc<dyn SchemaProfile>, String> {
+    #[cfg(test)]
+    if let Some(id) = TEST_ACTIVE_SCHEMA.with(|cell| cell.get()) {
+        return Ok(profile_for_id(id));
+    }
     let raw = std::env::var(SCHEMA_PROFILE_ENV).unwrap_or_default();
     let id = SchemaId::from_env_str(&raw)?;
     Ok(profile_for_id(id))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ACTIVE_SCHEMA: std::cell::Cell<Option<SchemaId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: pin the profile [`active_profile_from_env`] resolves on the
+/// CURRENT thread until the guard drops. Unit tests that exercise an
+/// env-resolving path for one profile use this instead of mutating the
+/// process environment, which races every other test (NAN-5271: the unset
+/// default moved from UDM to OCSF, so "unset" no longer means UDM).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn pin_active_schema_for_test(id: SchemaId) -> TestActiveSchemaGuard {
+    let previous = TEST_ACTIVE_SCHEMA.with(|cell| cell.replace(Some(id)));
+    TestActiveSchemaGuard { previous }
+}
+
+#[cfg(test)]
+pub(crate) struct TestActiveSchemaGuard {
+    previous: Option<SchemaId>,
+}
+
+#[cfg(test)]
+impl Drop for TestActiveSchemaGuard {
+    fn drop(&mut self) {
+        TEST_ACTIVE_SCHEMA.with(|cell| cell.set(self.previous));
+    }
 }
 
 /// The active *ingested-events* table name for the env-configured schema profile.
@@ -425,6 +460,10 @@ pub fn active_selected_repo_path(stored_base: &str, selected: &str) -> String {
         .map(|p| selected_repo_path_for(p.id(), stored_base, selected))
         .unwrap_or_else(|_| selected.to_string())
 }
+
+#[cfg(test)]
+#[path = "ocsf_alias_semantics_tests.rs"]
+mod ocsf_alias_semantics_tests;
 
 #[cfg(test)]
 mod tests {
@@ -922,7 +961,9 @@ mod tests {
 
     #[test]
     fn schema_id_from_env_str_defaults_and_parses() {
-        assert_eq!(SchemaId::from_env_str("").unwrap(), SchemaId::Udm);
+        // NAN-5271: unset/empty now means OCSF; `udm` must be explicit.
+        assert_eq!(SchemaId::from_env_str("").unwrap(), SchemaId::Ocsf);
+        assert_eq!(SchemaId::from_env_str("  ").unwrap(), SchemaId::Ocsf);
         assert_eq!(SchemaId::from_env_str("udm").unwrap(), SchemaId::Udm);
         assert_eq!(SchemaId::from_env_str("UDM").unwrap(), SchemaId::Udm);
         assert_eq!(SchemaId::from_env_str(" ocsf ").unwrap(), SchemaId::Ocsf);

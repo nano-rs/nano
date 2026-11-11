@@ -24,6 +24,7 @@ import { AnomalyFeed } from './AnomalyFeed';
 import { ServiceHealth } from './ServiceHealth';
 import { TopChanges } from './TopChanges';
 import { nplQuotedBody } from '@/lib/npl-quote';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 
 interface CloudOverviewViewProps {
   /** The time window the initial `| cloud` query was evaluated over */
@@ -53,6 +54,11 @@ export function CloudOverviewView({
   onAddToQuery,
   onSetQuery,
 }: CloudOverviewViewProps) {
+  // Profile-aware pivot columns: OCSF API Activity keeps the caller in
+  // actor.user.name, the account in cloud.account.uid, the service in
+  // api.service.name and targets in resources.name (NAN-5271).
+  const fieldMap = useSchemaFieldMap();
+  const actorField = fieldMap.field('srcUser');
   const request = useMemo(() => {
     if (!timeRange) return null;
     return {
@@ -159,7 +165,7 @@ export function CloudOverviewView({
     // resulting overview is scoped server-side (same page, narrower data).
     const rewritten = appendCloudArg(query, { account: account.id });
     if (rewritten && onSetQuery) onSetQuery(rewritten);
-    else onAddToQuery?.('cloud_account_id', account.id, false);
+    else onAddToQuery?.(fieldMap.field('cloudAccountId'), account.id, false);
   };
   const handlePickPrincipal = (principal: CloudOverviewPrincipal) => {
     // Principal click pivots to the dossier — append `principal="..."` to the
@@ -167,13 +173,13 @@ export function CloudOverviewView({
     // frontend dispatcher renders CloudPrincipalDossier.
     const rewritten = appendCloudArg(query, { principal: principal.id });
     if (rewritten && onSetQuery) onSetQuery(rewritten);
-    else onAddToQuery?.('user', principal.id, false);
+    else onAddToQuery?.(actorField, principal.id, false);
   };
   const handleOpenAnomaly = (anomaly: CloudOverviewAnomaly) => {
     if (!anomaly.principal) return;
     const rewritten = appendCloudArg(query, { principal: anomaly.principal });
     if (rewritten && onSetQuery) onSetQuery(rewritten);
-    else onAddToQuery?.('user', anomaly.principal, false);
+    else onAddToQuery?.(actorField, anomaly.principal, false);
   };
 
   // Non-principal pivots (service, actor, target) — "leave the cloud view and
@@ -259,7 +265,7 @@ export function CloudOverviewView({
                 {sections.services === 'ready' ? (
                   <ServiceHealth
                     services={overview.service_health}
-                    onPivotService={(id) => handleAddFilterLeavingCloud('cloud_service', id)}
+                    onPivotService={(id) => handleAddFilterLeavingCloud(fieldMap.field('cloudService'), id)}
                   />
                 ) : (
                   <SectionPending name="Service health" status={sections.services} />
@@ -269,9 +275,9 @@ export function CloudOverviewView({
               {sections.changes === 'ready' && (
                 <TopChanges
                   changes={overview.changes}
-                  onPivotActor={(actor) => handleAddFilterLeavingCloud('user', actor)}
-                  onPivotTarget={(target) => handleAddFilterLeavingCloud('resource_name', target)}
-                  onPivotAccount={(acct) => handleAddFilterLeavingCloud('cloud_account_id', acct)}
+                  onPivotActor={(actor) => handleAddFilterLeavingCloud(actorField, actor)}
+                  onPivotTarget={(target) => handleAddFilterLeavingCloud(fieldMap.isOcsf ? 'resources.name' : 'resource_name', target)}
+                  onPivotAccount={(acct) => handleAddFilterLeavingCloud(fieldMap.field('cloudAccountId'), acct)}
                 />
               )}
             </>

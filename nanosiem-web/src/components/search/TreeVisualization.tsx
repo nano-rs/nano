@@ -110,11 +110,18 @@ const USER_WRITABLE_PATTERNS = [
 
 const ENC_CMDLINE_RE = /-e(?:nc|ncoded)?(?:command)?\s+[A-Za-z0-9+/=]{16,}/i;
 
-function firstString(row: Record<string, unknown> | undefined, keys: string[]): string | undefined {
+function firstString(
+  row: Record<string, unknown> | undefined,
+  keys: string[],
+  opts: { skipZero?: boolean } = {},
+): string | undefined {
   if (!row) return undefined;
   for (const k of keys) {
     const v = row[k];
     if (v == null) continue;
+    // An id column whose unset default is 0 (OCSF `process.pid`), sent as a
+    // number or, for Int64, a quoted string.
+    if (opts.skipZero && (v === 0 || v === '0')) continue;
     if (typeof v === 'string' && v.length > 0) return v;
     if (typeof v === 'number') return String(v);
   }
@@ -196,7 +203,9 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
   // extra entries are inert under UDM (firstString skips absent keys → output
   // byte-identical); under OCSF they let user/cmd/hash/signer nodes populate.
   const pid = preset === 'process'
-    ? firstString(r, ['pid', 'process_id', 'ProcessId', 'actor.process.pid'])
+    // NAN-5271: a process node is the CREATED process — OCSF `process.pid`;
+    // `actor.process.pid` is its parent. 0 is the OCSF "unset" default.
+    ? firstString(r, ['pid', 'process_id', 'ProcessId', 'process.pid', 'actor.process.pid'], { skipZero: true })
     : undefined;
 
   const user = firstString(r, [
@@ -207,7 +216,7 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
   const cmd = node.detail
     ?? firstString(r, [
       'command_line', 'CommandLine', 'cmdline', 'url', 'http_url',
-      'actor.process.cmd_line', 'process.cmd_line', 'url.url_string',
+      'process.cmd_line', 'actor.process.cmd_line', 'url.url_string',
     ]);
 
   const hashRaw = firstString(r, [

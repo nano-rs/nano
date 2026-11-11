@@ -27,6 +27,12 @@ Checks:
            blocks Docker bridges; see the Host firewall guide). The PostgreSQL and Valkey
            routers need exactly one member UP (the leader / master). System tables can
            look healthy while a gateway has silently lost a replica; this catches it.
+  edge     on app hosts: /livez through app-internal-edge (the private API port the
+           ingest hosts' app-api-proxy checks), compared with nano-api's own /livez.
+           When nano-api answers but the edge does not, the edge holds a stale
+           container address (an edge rendered before v2.0.13 resolves nano-api
+           once at start): FAIL with the restart command. Otherwise the ingest
+           hosts silently route OTLP auth and ingest admission to other app hosts.
   pg-ha    on postgres hosts with failover: Patroni has one Leader and, in synchronous
            mode, a Sync Standby, every member running/streaming with lag under 16 MiB;
            etcd endpoint health across the cluster; Sentinel quorum for the Valkey master.
@@ -177,8 +183,13 @@ def clickhouse(role: dict, env: dict, tls: bool) -> None:
     except (urllib.error.URLError, OSError, ssl.SSLError) as err:
         row("ch-keeper", False, f"system.zookeeper query failed: {err}")
     try:
-        ddl = query("SELECT count() AS pending FROM system.distributed_ddl_queue "
-                    "WHERE status NOT IN ('Finished','Removing')")[0]
+        # Stale = older than an entry the same host already Finished (it runs its
+        # queue in order, so it can't be blocked by it): harmless, not counted.
+        ddl = query("SELECT countIf(f.last_finished = '' OR q.entry > f.last_finished) AS pending "
+                    "FROM system.distributed_ddl_queue AS q LEFT JOIN "
+                    "(SELECT host, port, max(entry) AS last_finished FROM system.distributed_ddl_queue "
+                    "WHERE status = 'Finished' GROUP BY host, port) AS f ON q.host = f.host AND q.port = f.port "
+                    "WHERE q.status NOT IN ('Finished','Removing')")[0]
         row("ch-ddl", int(ddl["pending"]) == 0 or None, f"distributed DDL not finished: {ddl['pending']}")
     except (urllib.error.URLError, OSError, ssl.SSLError) as err:
         row("ch-ddl", None, f"distributed_ddl_queue not readable: {err}")
@@ -296,6 +307,92 @@ def gateways(role: dict, run=docker) -> None:
         code, out = run(["version", "--format", "{{.Server.Version}}"])
         if code != 0:
             row("gateways", None, f"docker not usable here ({out.strip()[:120]}); gateway backends NOT checked")
+
+
+# --- the app host's private API edge ------------------------------------------
+EDGE_PROBE_PATH = "/livez"
+API_LIVEZ_CMD = ["wget", "-qO-", "http://127.0.0.1:3000/livez"]
+
+
+def http_status(address: str, port: int, path: str, ctx: ssl.SSLContext | None, server_name: str | None,
+                timeout: float = 5) -> tuple[int | None, str]:
+    """(HTTP status, "") or (None, error) for one GET. Never raises.
+
+    A raw request (as the Keeper probe) so TLS can verify the cluster TLS name
+    while connecting to the private address, the way app-api-proxy does.
+    """
+    try:
+        raw = socket.create_connection((address, port), timeout=timeout)
+    except OSError as err:
+        return None, f"{type(err).__name__}: {err}"
+    conn = raw
+    try:
+        conn = ctx.wrap_socket(raw, server_hostname=server_name or address) if ctx else raw
+        conn.settimeout(timeout)
+        conn.sendall(f"GET {path} HTTP/1.1\r\nHost: {server_name or address}\r\nConnection: close\r\n\r\n".encode())
+        head = b""
+        while b"\r\n" not in head and len(head) < 4096:
+            block = conn.recv(4096)
+            if not block:
+                break
+            head += block
+        parts = head.split(b"\r\n", 1)[0].split()
+        if len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1].isdigit():
+            return int(parts[1]), ""
+        return None, f"no HTTP answer ({head[:40]!r})"
+    except (OSError, ssl.SSLError) as err:
+        return None, f"{type(err).__name__}: {err}"
+    finally:
+        conn.close()
+        raw.close()
+
+
+def judge_internal_edge(edge: str, target: str, edge_status: int | None, edge_error: str,
+                        api: str | None, api_alive: bool, api_detail: str) -> tuple[bool, str]:
+    """(healthy, detail) for app-internal-edge vs the nano-api container behind it."""
+    seen = f"{target}{EDGE_PROBE_PATH} -> {edge_status if edge_status is not None else edge_error}"
+    if edge_status == 200:
+        return True, f"{seen}; nano-api reachable through {edge}"
+    if api is None:
+        return False, f"{seen}; no running nano-api container on this host: the ingest hosts' app-api-proxy marks it DOWN"
+    if not api_alive:
+        return False, (f"{seen}; nano-api ({api}) does not answer its own /livez either ({api_detail}): "
+                       "fix nano-api first (docker logs " + api + ")")
+    if edge_status is None:
+        return False, (f"{seen}; nano-api ({api}) is alive but its private API port does not answer: the ingest hosts' "
+                       f"app-api-proxy cannot reach this app host either. Check {edge} (docker logs {edge}) and that the "
+                       "host firewall admits the private API port")
+    return False, (f"{seen}; {edge} cannot reach nano-api ({edge_status}) while nano-api ({api}) is healthy: the edge "
+                   "is holding a stale container address (it resolved nano-api before nano-api was recreated or the "
+                   "host rebooted), so the ingest hosts' app-api-proxy marks this app host DOWN and OTLP auth and "
+                   f"ingest admission run on the other app hosts only. Restart it: docker restart {edge} "
+                   "(re-render with this release's installer so the edge re-resolves by itself)")
+
+
+def internal_edge(role: dict, tls: bool, run=docker, fetch=http_status) -> None:
+    edge = service_container("app-internal-edge", run)
+    if not edge:
+        return                                   # not an app host, or the edge is not running (compose ps shows it)
+    address = role.get("NANO_HOST_ADDRESS", "127.0.0.1")
+    port = int(role.get("NANO_API_INTERNAL_PORT") or "3000")
+    target = f"{'https' if tls else 'http'}://{address}:{port}"
+    ctx = None
+    if tls:
+        try:
+            ctx = ssl.create_default_context(cafile=role.get("NANO_TLS_CA"))
+        except (OSError, ssl.SSLError) as err:
+            INCONCLUSIVE.append("edge:internal")
+            row("edge:internal", None, f"cannot load the private CA {role.get('NANO_TLS_CA')}: {err}")
+            return
+    status, error = fetch(address, port, EDGE_PROBE_PATH, ctx, role.get("NANO_TLS_SERVER_NAME") if tls else None)
+    api = service_container("nano-api", run)
+    api_alive, api_detail = False, ""
+    if api:
+        code, out = run(["exec", api, *API_LIVEZ_CMD], timeout=10)
+        api_alive = code == 0
+        api_detail = " ".join(out.split())[:120] or f"exit {code}"
+    ok, detail = judge_internal_edge(edge, target, status, error, api, api_alive, api_detail)
+    row("edge:internal", ok, detail)
 
 
 def judge_patroni(members: list[dict], sync_expected: bool) -> tuple[bool, str]:
@@ -527,6 +624,8 @@ def main(argv: list[str] | None = None, run=None) -> int:
         clickhouse(role, env, tls)
     if engine_up:
         gateways(role, run)
+        if "app" in roles:
+            internal_edge(role, tls, run)
         if "postgres" in roles:
             postgres_ha(role, run)
     verdict = "FAIL" if FAILS else ("INCONCLUSIVE" if INCONCLUSIVE else "PASS")

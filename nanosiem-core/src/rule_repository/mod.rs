@@ -2,29 +2,26 @@
 
 //! Rule Repository Module
 //!
-//! Provides functionality for syncing detection rules from external GitHub repositories.
-//! Supports Sigma rule format with AI-powered conversion to nPL.
+//! Provides functionality for syncing detection rules from nano's first-party
+//! GitHub repository (native nPL rules).
 //!
 //! ## Features
 //!
-//! - **Repository Management**: Add, sync, and browse public GitHub repositories
-//! - **Sigma Conversion**: AI-powered conversion of Sigma rules to nPL queries
+//! - **Repository Management**: Add, sync, and browse the first-party rule repository
 //! - **Linked vs Forked Rules**: Track imported rules with optional auto-updates
 //! - **Coverage Analysis**: Analyze which rules can run based on available log sources
+//!
+//! Sigma-format repositories (and Sigma → nPL conversion) were retired in
+//! NAN-5272; a row still marked `rule_format = 'sigma'` is refused with
+//! [`RuleRepositoryError::SigmaFormatUnsupported`].
 //!
 //! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────┐     ┌────────────────────┐
+//! ┌─────────────────┐     ┌──────────────────────┐
 //! │  GitHub Repos   │────►│ RuleRepositoryService│
-//! │  (public only)  │     └─────────┬──────────┘
-//! └─────────────────┘               │
-//!                                   ▼
-//! ┌─────────────────┐     ┌────────────────────┐
-//! │ Repository Rules│────►│ SigmaConverterAgent│
-//! │ (cached YAML)   │     │ (AI conversion)    │
-//! └─────────────────┘     └────────────────────┘
-//!                                   │
+//! │ (first-party)   │     └─────────┬────────────┘
+//! └─────────────────┘               │ (cached nPL YAML)
 //!                                   ▼
 //!                         ┌────────────────────┐
 //!                         │ Detection Rules    │
@@ -39,7 +36,6 @@ mod models;
 mod npl_parser;
 mod repository;
 mod service;
-mod sigma_parser;
 
 pub use coverage::{
     CoverageAnalyzer, CoverageAnalyzerError, LiveInventoryAccess, COVERAGE_STATUS_UNKNOWN,
@@ -47,7 +43,7 @@ pub use coverage::{
 pub use error::RuleRepositoryError;
 pub use github_client::{FileContent, GitHubClient, GitHubClientError, TreeEntry};
 pub use models::{
-    ConversionTriageHints, CoverageAnalysis, CoverageFilter, CoverageResult,
+    CoverageAnalysis, CoverageFilter, CoverageResult,
     FolderInfo, ImportOutcome, ImportPreview, ImportRequest, ImportType, NewRuleRepository,
     RepositoryRule, RepositoryRuleFilter, RuleBundleImportResult, RuleImport, RuleRepository,
     SourceTypeSuggestion, SyncResult, SyncStatus, UpdateRuleRepository, UpdatedRule, UpstreamDiff,
@@ -62,9 +58,4 @@ pub use repository::{
 };
 pub use service::{
     RuleImportAction, RuleImportPlan, RuleRepositoryService, RuleRepositoryServiceConfig,
-};
-pub use sigma_parser::{
-    extract_mitre_tactics, extract_mitre_techniques, extract_required_fields,
-    map_logsource_to_source_types, map_severity, parse_sigma, SigmaDetection, SigmaLogsource,
-    SigmaParseError, SigmaRule, SigmaSelection,
 };

@@ -255,7 +255,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
               <FormField
                 label="Dataset"
                 yamlKey="dataset"
-                hint="logs = UDM/OCSF events. spans/metrics query OTLP datasets; risk queries accumulated entity risk. Non-logs datasets run scheduled-only."
+                hint="logs = OCSF events. spans/metrics query OTLP datasets; risk queries accumulated entity risk. Non-logs datasets run scheduled-only."
               >
                 <div className="inline-flex rounded-md border border-border p-0.5">
                   {(['logs', 'spans', 'metrics', 'risk'] as DatasetKey[]).map((d) => {

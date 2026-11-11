@@ -18,6 +18,7 @@ import type {
 import { EventPayloadCache, eventPayloadKey } from './event-payload-cache';
 import { parseAsUTC } from './helpers';
 import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
+import { isIocField } from '@/lib/enrichment-fields';
 
 const TYPE_COLORS: Record<string, { fg: string; bg: string }> = {
   NETWORK: { fg: 'oklch(72% 0.16 160)', bg: 'oklch(72% 0.16 160 / 0.12)' },
@@ -546,7 +547,7 @@ function EventDetail({
         // teal `text-str` value, with IOC (red) / risk (orange) overrides
         // for the same fields SearchResults flags. Keeps visual language
         // consistent across the two surfaces.
-        const valueClass = k.startsWith('ioc_')
+        const valueClass = isIocField(k)
           ? 'text-red-400'
           : k === 'risk_score' || k === 'risk_entity' || k === 'risk_factors'
             ? 'text-orange-400'

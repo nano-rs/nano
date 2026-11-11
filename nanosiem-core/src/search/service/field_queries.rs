@@ -565,17 +565,10 @@ impl SearchService {
         // separately; this discovers the spill-only tail leaf paths.
         let profile = self.active_profile.as_ref();
         let table = self.table_names.read(Self::logs_table_key(profile));
-        // The OCSF spill is still nested, so the enumerator returns full leaf
-        // paths rather than collapsing to the top-level segment (which is correct
-        // for UDM's effectively-flat `ext`).
-        let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
-        let json_col = match bucket {
-            DynamicFieldBucket::Spill => profile.json_tail_column(),
-            DynamicFieldBucket::Extended => match profile.extended_json_column() {
-                Some(col) => col,
-                None => return Ok(Vec::new()),
-            },
-        };
+        // Profiles without an extended column (UDM) have no Extended bucket.
+        if bucket == DynamicFieldBucket::Extended && profile.extended_json_column().is_none() {
+            return Ok(Vec::new());
+        }
 
         let time_only = |tr: &TimeRangeInput| {
             format!(
@@ -651,30 +644,7 @@ impl SearchService {
                 None => where_predicate,
             };
 
-        let names = match ch_executor
-            .get_ext_field_names(&table, json_col, is_ocsf, extended, &where_predicate)
-            .await
-        {
-            Ok(names) => names,
-            // NAN-5265: the Extended list is an optional sidebar section; a
-            // failed scan degrades to an empty section, never a 500 (the
-            // executor's `break` settings make this rare).
-            Err(e) if extended => {
-                tracing::warn!(error = %e, "extended field names scan failed; returning none");
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(e),
-        };
-
-        if !extended {
-            // NAN-5265: bare keys. Commit 30d3228d1 prefixed OCSF names with
-            // `unmapped.` here while the web and desktop field panels already
-            // prefix them, so the sidebar listed `unmapped.unmapped.*` — and
-            // that spelling resolves to a nested `unmapped` key that does not
-            // exist, silently matching nothing.
-            return Ok(names);
-        }
-        Ok(filter_extended_names(profile, json_col, names))
+        enumerate_dynamic_field_names(ch_executor, profile, &table, bucket, &where_predicate).await
     }
 
     /// Get top values for any field the active search profile can resolve.
@@ -859,6 +829,90 @@ fn clamp_extended_scan_range(tr: &TimeRangeInput) -> TimeRangeInput {
     let floor = tr.end
         - chrono::Duration::minutes(SearchService::EXTENDED_FIELD_NAMES_WINDOW_MINUTES);
     TimeRangeInput::new(tr.start.max(floor), tr.end)
+}
+
+/// Run one dynamic-field inventory scan (the fields panel's on-demand
+/// buckets) over `table` rows matching `where_predicate`.
+///
+/// Returns spill keys BARE (the caller adds the `ext.` / `unmapped.`
+/// namespace once) and Extended names as full dotted paths that resolve back
+/// into the extended column. A failed Extended scan degrades to an empty list.
+async fn enumerate_dynamic_field_names(
+    ch_executor: &crate::search::execution::ClickHouseExecutor,
+    profile: &dyn crate::schema::SchemaProfile,
+    table: &str,
+    bucket: DynamicFieldBucket,
+    where_predicate: &str,
+) -> Result<Vec<String>, SearchError> {
+    // The OCSF spill is still nested, so the enumerator returns full leaf
+    // paths rather than collapsing to the top-level segment (which is correct
+    // for UDM's effectively-flat `ext`).
+    let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+    let extended = bucket == DynamicFieldBucket::Extended;
+    let json_col = match bucket {
+        DynamicFieldBucket::Spill => profile.json_tail_column(),
+        DynamicFieldBucket::Extended => match profile.extended_json_column() {
+            Some(col) => col,
+            None => return Ok(Vec::new()),
+        },
+    };
+    let names = match ch_executor
+        .get_ext_field_names(table, json_col, is_ocsf, extended, where_predicate)
+        .await
+    {
+        Ok(names) => names,
+        // NAN-5265: the Extended list is an optional sidebar section; a
+        // failed scan degrades to an empty section, never a 500 (the
+        // executor's `break` settings make this rare).
+        Err(e) if extended => {
+            tracing::warn!(error = %e, "extended field names scan failed; returning none");
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e),
+    };
+
+    if !extended {
+        // NAN-5265: bare keys. Commit 30d3228d1 prefixed OCSF names with
+        // `unmapped.` here while the web and desktop field panels already
+        // prefix them, so the sidebar listed `unmapped.unmapped.*` — and
+        // that spelling resolves to a nested `unmapped` key that does not
+        // exist, silently matching nothing.
+        return Ok(names);
+    }
+    Ok(filter_extended_names(profile, json_col, names))
+}
+
+/// The fields panel's dynamic-field inventory for callers that hold a
+/// ClickHouse client but no [`SearchService`] (NAN-5271: pivt's per-source
+/// field context). Same scan and filtering as
+/// [`SearchService::get_dynamic_field_names`]; the caller supplies the full
+/// predicate, including its time bounds and source scope.
+pub async fn dynamic_field_names_for_predicate(
+    client: &clickhouse::Client,
+    profile: &dyn crate::schema::SchemaProfile,
+    table: &str,
+    bucket: DynamicFieldBucket,
+    where_predicate: &str,
+) -> Result<Vec<String>, SearchError> {
+    let executor = crate::search::execution::ClickHouseExecutor::new(client.clone());
+    enumerate_dynamic_field_names(&executor, profile, table, bucket, where_predicate).await
+}
+
+/// The fields panel's promoted-column inventory for `bare_table` (NAN-5271).
+/// Same column set the search field stats enumerate: queryable scalar
+/// columns, minus internal, ALIAS, and bookkeeping columns.
+pub async fn queryable_table_columns(
+    client: &clickhouse::Client,
+    profile: &dyn crate::schema::SchemaProfile,
+    bare_table: &str,
+) -> Result<Vec<String>, SearchError> {
+    crate::search::execution::ClickHouseExecutor::new(client.clone())
+        .get_table_columns(
+            bare_table,
+            profile.materialized_columns(),
+            profile.default_view_renames(),
+        )
+        .await
 }
 
 /// Keep the Extended names that resolve back into `col`, THEN cap the list —

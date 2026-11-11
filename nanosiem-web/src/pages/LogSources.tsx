@@ -57,6 +57,7 @@ import {
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
+import { toastDeployResult } from '@/lib/deploy-delivery';
 import type { LogSource } from '@/lib/api';
 import { LogSourcesPageShell } from '@/components/add-data/LogSourcesPageShell';
 import { IngestionActivityChart } from '@/components/log-sources/IngestionActivityChart';
@@ -252,9 +253,9 @@ export function LogSources() {
     if (!logSourceToAction) return;
     try {
       const result = await deployLogSource(logSourceToAction.id);
-      toast({
+      toastDeployResult(toast, (generation) => api.getDeliveryStatus(generation), result, {
         title: 'Deployed',
-        description: result?.message || `"${logSourceToAction.name}" has been deployed to Vector.`,
+        description: `"${logSourceToAction.name}" has been deployed to Vector.`,
       });
       setDeployDialogOpen(false);
       setLogSourceToAction(null);

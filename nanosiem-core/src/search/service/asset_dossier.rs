@@ -509,7 +509,7 @@ async fn query_identity(
             formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%S.%fZ') AS first_seen_in_range,
             formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%S.%fZ') AS last_seen_in_range
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
         "#,
         hostname = arg_max("src_host", "hostname"),
         ip = arg_max("src_ip", "ip"),
@@ -554,7 +554,7 @@ async fn query_log_sources(
             count() AS event_count,
             formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%S.%fZ') AS last_event
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
         GROUP BY source_type
         ORDER BY event_count DESC
         LIMIT 16"#
@@ -596,7 +596,7 @@ async fn query_timeline(
             toInt32({lane}) AS lane,
             count() AS c
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
         GROUP BY bucket, lane
         HAVING lane >= 0 AND bucket < {buckets}"#,
         lane = lane_sql(profile),
@@ -745,7 +745,7 @@ async fn query_processes(
             {rare_expr} AS rare,
             {from_office_expr} AS from_office
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {process_name} != ''"#
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {process_name} != ''"#
     );
     let top_prev_expr = match &prev_hash {
         Some(p) => format!(
@@ -763,7 +763,7 @@ async fn query_processes(
             count() AS c,
             {top_prev_expr} AS prev
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {process_name} != ''
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {process_name} != ''
         GROUP BY {process_name}
         ORDER BY c DESC
         LIMIT {TOP_LIMIT}"#
@@ -786,7 +786,7 @@ async fn query_processes(
             avg(least(toFloat32({p}), toFloat32({fleet_size})) / {fleet_size} * 100) AS prev,
             {cmd_select} AS cmd
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
             AND {process_name} != '' AND {p} < {PREVALENCE_SENTINEL_HOST_COUNT}
             AND toFloat32({p}) / {fleet_size} * 100 < {RARE_PROCESS_THRESHOLD_PCT}
         GROUP BY {process_name}
@@ -800,7 +800,7 @@ async fn query_processes(
             toFloat32(0) AS prev,
             {cmd_select} AS cmd
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND 1 = 0
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND 1 = 0
         GROUP BY {process_name}
         LIMIT 5"#
         ),
@@ -919,7 +919,7 @@ async fn query_network(
             uniqExact({dest_ip_expr}) AS unique_dsts,
             {new_domains_expr} AS new_domains
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
     );
     let top_ip_select = dest_ip
         .as_ref()
@@ -944,7 +944,7 @@ async fn query_network(
             count() AS conns,
             {top_prev_expr} AS prev
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {dest_host_present}
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {dest_host_present}
         GROUP BY {dest_host}
         ORDER BY bytes DESC
         LIMIT {TOP_LIMIT}"#
@@ -955,7 +955,7 @@ async fn query_network(
             {c} AS country,
             count() AS conns
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
             AND {c} != ''
             AND {c} NOT IN ('US','CA','GB','FR','DE','JP','AU','NL','IE','SG')
         GROUP BY {c}
@@ -965,7 +965,7 @@ async fn query_network(
         None => format!(
             r#"SELECT '' AS country, toUInt64(0) AS conns
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND 1 = 0
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND 1 = 0
         LIMIT 5"#
         ),
     };
@@ -1111,18 +1111,37 @@ async fn query_auth(
             format!("({})", legs.join(" OR "))
         }
     };
-    let interactive_predicate = logon_predicate("interactive");
-    let network_predicate = logon_predicate("network");
+    // NAN-5271 E: OCSF keys every counter off the concept predicates. The
+    // `activity` leg above never matched (activity captions are Logon/Logoff,
+    // never "interactive"/"network"), so both logon counters were always 0, and
+    // the bare IAM-category success/failure split also counted Logoff and
+    // Authorize Session (3003) rows. Logon type lives in `logon_type_id`.
+    let (success_predicate, failure_predicate, interactive_predicate, network_predicate) = if is_ocsf {
+        use crate::schema::ocsf_predicates::Concept;
+        (
+            Concept::AuthSuccess.sql().to_string(),
+            Concept::AuthFailure.sql().to_string(),
+            Concept::InteractiveLogon.sql().to_string(),
+            Concept::NetworkLogon.sql().to_string(),
+        )
+    } else {
+        (
+            format!("{result_expr} IN ('success','succeeded','allow')"),
+            format!("{result_expr} IN ('failure','failed','denied','fail')"),
+            logon_predicate("interactive"),
+            logon_predicate("network"),
+        )
+    };
 
     let scalar_sql = format!(
         r#"SELECT
-            countIf({auth_pred} AND {result_expr} IN ('success','succeeded','allow')) AS success,
-            countIf({auth_pred} AND {result_expr} IN ('failure','failed','denied','fail')) AS failure,
+            countIf({auth_pred} AND {success_predicate}) AS success,
+            countIf({auth_pred} AND {failure_predicate}) AS failure,
             countIf({auth_pred} AND {interactive_predicate}) AS interactive,
             countIf({auth_pred} AND {network_predicate}) AS network,
             0 AS lateral
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
     );
 
     let user_select = profile
@@ -1164,7 +1183,7 @@ async fn query_auth(
             {result_expr} AS result_raw,
             {reason_select} AS reason
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {auth_pred}
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {auth_pred}
         ORDER BY timestamp DESC
         LIMIT {RECENT_LIMIT}"#
     );
@@ -1277,7 +1296,7 @@ async fn query_files(
             {sensitive_expr} AS sensitive,
             {exec_expr} AS exec_count
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_pred}"#
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_pred}"#
     );
     let size_select = file_size
         .as_ref()
@@ -1299,7 +1318,7 @@ async fn query_files(
             {action_select} AS action,
             {proc_select} AS proc
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_pred} AND {file_path} != ''
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_pred} AND {file_path} != ''
         ORDER BY timestamp DESC
         LIMIT {RECENT_LIMIT}"#
     );
@@ -1379,7 +1398,7 @@ async fn query_dns(
                 AND arrayExists(x -> endsWith(lower({query}), x),
                                 ['.ru','.cn','.tk','.top','.xyz','.ro'])) AS rare_tlds
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
     );
     let top_sql = format!(
         r#"SELECT
@@ -1387,7 +1406,7 @@ async fn query_dns(
             count() AS c,
             countIf({nx_expr}) AS nx
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {query} != ''
+        WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {query} != ''
         GROUP BY {query}
         ORDER BY c DESC
         LIMIT {TOP_LIMIT}"#

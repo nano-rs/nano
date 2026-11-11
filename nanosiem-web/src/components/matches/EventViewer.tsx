@@ -12,6 +12,7 @@ import { extractEventTime, eventLatency } from './helpers';
 import { LatencyPill } from './LatencyPill';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { schemaFieldCandidates, type SchemaProfileId, type SemanticField } from '@/lib/schema-fields';
+import { isGeoEnrichmentField, isIocField } from '@/lib/enrichment-fields';
 
 // Preview key-fields — priority order. A row picks the first N non-empty
 // values so it works across every log source without a per-source column map.
@@ -70,7 +71,9 @@ function fieldCategory(name: string): number {
     name === 'prevalence_artifact' || name === 'total_occurrences' ||
     name === 'first_seen' || name === 'last_seen'
   ) return 1;
-  if (name.startsWith('enriched.') || name.startsWith('enriched_')) return 2;
+  // UDM `enriched_*`/`ioc_*`; OCSF `*.location.*`, `*.autonomous_system.*`,
+  // `enrichments.*` (NAN-5271).
+  if (name.startsWith('enriched.') || isGeoEnrichmentField(name) || isIocField(name)) return 2;
   if (name.startsWith('lookup.') || name.startsWith('lookup_')) return 3;
   if (name.startsWith('ext.')) return 4;
   return 5;

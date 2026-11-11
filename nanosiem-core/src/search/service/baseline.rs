@@ -45,6 +45,25 @@ fn validated_new_window_days(window: std::time::Duration) -> Result<i64, SearchE
     Ok((requested.max(1)) as i64)
 }
 
+/// Map a `dims=` entry to the UDM dimension name `crate::baseline` keys on.
+/// OCSF paths resolve through the shared entity table (`process.name`,
+/// `actor.process.name` -> `process_name`; `dst_endpoint.ip` -> `dest_ip`; ...).
+/// Unknown names pass through unchanged.
+fn canonical_dimension(name: &str) -> String {
+    use crate::schema::entities::EntityKind;
+    let name = name.trim();
+    if matches!(name, "dst_endpoint.port" | "dest_port") {
+        return "dest_port".to_string();
+    }
+    if let Some(field) = crate::search::query_processing::canonical_entity_field(name) {
+        return field.to_string();
+    }
+    match EntityKind::from_field_name(name) {
+        Some(EntityKind::Process) => "process_name".to_string(),
+        _ => name.to_string(),
+    }
+}
+
 impl SearchService {
     /// Build the `| baseline` result rows for one resolved entity.
     pub(crate) async fn build_baseline_view(
@@ -61,7 +80,8 @@ impl SearchService {
         if !baseline::is_baselineable(&entity_type) {
             return Err(SearchError::SqlValidationError(format!(
                 "| baseline supports host / user / ip entities, not '{entity_type}'. Give one with \
-                 host=/user=/ip=\"…\" or a src_host / src_ip / user filter."
+                 host=/user=/ip=\"…\" or a host / ip / user filter (src_host, device.hostname, \
+                 src_endpoint.ip, user.name, actor.user.name, …)."
             )));
         }
 
@@ -118,8 +138,14 @@ impl SearchService {
         let summary = baseline::summarize_activity(&buckets, &spans);
 
         // Which dimensions the analyst asked for (None = all for the type).
+        // NAN-5277: `dims=` accepts OCSF paths (`process.name`,
+        // `dst_endpoint.ip`, ...) as well as the UDM dimension names.
+        let wanted: Option<Vec<String>> = info
+            .dims
+            .as_ref()
+            .map(|d| d.iter().map(|w| canonical_dimension(w)).collect());
         let wants = |field: &str| -> bool {
-            info.dims
+            wanted
                 .as_ref()
                 .is_none_or(|d| d.iter().any(|w| w == field))
         };
@@ -289,6 +315,21 @@ mod parse_tests {
         } else {
             panic!("expected Baseline");
         }
+    }
+
+    /// NAN-5277: `dims=` accepts OCSF paths for the UDM dimension names.
+    #[test]
+    fn dims_accept_ocsf_paths() {
+        use super::canonical_dimension as c;
+        assert_eq!(c("process.name"), "process_name");
+        assert_eq!(c("actor.process.name"), "process_name");
+        assert_eq!(c("process_name"), "process_name");
+        assert_eq!(c("dst_endpoint.ip"), "dest_ip");
+        assert_eq!(c("src_endpoint.ip"), "src_ip");
+        assert_eq!(c("dst_endpoint.port"), "dest_port");
+        assert_eq!(c("device.hostname"), "src_host");
+        assert_eq!(c("user.name"), "user");
+        assert_eq!(c("something_else"), "something_else");
     }
 
     #[test]
