@@ -82,7 +82,7 @@ impl LicenseRepository {
         Ok(())
     }
 
-    /// NAN-5194: record that the licence server refused the token. Only the
+    /// NAN-5194: record that the license server refused the token. Only the
     /// `token_rejected` key is touched, and its `first_rejected_at` survives
     /// repeated rejections. A fresh install with no row gets a locked
     /// placeholder row (never a successful observation: `last_checked_at`

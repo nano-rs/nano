@@ -56,10 +56,10 @@ confirm them. Never disable host key checking.
 4. Load balancer in front of the app and ingest hosts (3-node HA): yes or no,
    its private source CIDR, and who configures it.
 5. Firewall: who manages it. The installer never changes the firewall.
-6. Outbound access from the hosts: the registry, `api.nano.rs` for the licence
+6. Outbound access from the hosts: the registry, `api.nano.rs` for the license
    check, and the platform feeds. Or is this an air-gapped site?
 
-## D. Release, licence and credentials
+## D. Release, license and credentials
 
 All of these come from **app.nano.rs → Deployments → your Self-run
 deployment**. Only an owner or admin of the organization can open the
@@ -89,8 +89,8 @@ emails support@nano.rs.
    Only `LICENSE_TOKEN` is a secret. The deployment ID is an identifier: the
    inventory, the installer's output and `render-inventory.py --identity-only`
    print it, and that is fine.
-   Air-gapped sites get an offline licence file instead. See
-   [operate.md](operate.md#offline-licence).
+   Air-gapped sites get an offline license file instead. See
+   [operate.md](operate.md#offline-license).
 5. Admin account: email and display name. The password is generated on the
    host into a `0600` file unless the operator wants to supply one, as a file
    path.

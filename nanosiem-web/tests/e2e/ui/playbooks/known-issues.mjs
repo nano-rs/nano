@@ -8,7 +8,7 @@
 // purpose: a NEW error on the same page still fails.
 export const KNOWN_ISSUES = [
   // Unlicensed enterprise: NotebookContext + AI-availability poll call licensed
-  // APIs on every page (only stacks whose licence is locked, e.g. main after #8862).
+  // APIs on every page (only stacks whose license is locked, e.g. main after #8862).
   { id: 'legacy-apikey-form-expiry-422', issue: 'NAN-5107', note: 'legacy API key form sends datetime-local as expires_at', re: /^click "Save Changes" -> HTTP 422 PUT \/api\/api-keys\/:id$/ },
   { id: 'notebook-generate-timeline-500', issue: 'NAN-5108', note: 'Generate Timeline 500s without an AI provider; Open in Search logs an explanation-lookup 404', re: /^click "Generate Timeline" -> HTTP 500 POST \/api\/melod\/notebook\/generate-timeline$|^click ".*" -> HTTP 404 POST \/api\/search\/explanation\/lookup$/ },
   { id: 'dialog-without-title', issue: 'NAN-5109', note: 'Radix DialogContent without DialogTitle (New Dashboard, New notebook)', re: /`DialogContent` requires a `DialogTitle`/ },

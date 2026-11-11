@@ -43,11 +43,15 @@
 [sources.otlp_ingest]
 type = "opentelemetry"
 
+# NAN-5268: the Helm chart binds both to loopback (NANO_OTLP_*_ADDRESS); a
+# guard sidecar in the Vector pod accepts only the ingest edge's hop token and
+# forwards to 127.0.0.1:4318. Compose keeps the defaults (its edge shares
+# Vector's network namespace and the published ports bind to loopback).
 [sources.otlp_ingest.grpc]
-address = "0.0.0.0:4317"
+address = "${NANO_OTLP_GRPC_ADDRESS:-0.0.0.0:4317}"
 
 [sources.otlp_ingest.http]
-address = "0.0.0.0:4318"
+address = "${NANO_OTLP_HTTP_ADDRESS:-0.0.0.0:4318}"
 headers = ["x-nano-credential-id", "x-nano-source-route", "x-nano-identity-assertion"]
 
 # NAN-5004: make the success contract explicit at the source. Logs, spans, and

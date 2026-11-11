@@ -57,7 +57,7 @@ x-logging-verbose: &verbose-logging
 # unset, they stay absent, because an empty HTTPS_PROXY is not "no proxy" to
 # every reader. NO_PROXY always exempts the internal service names, loopback
 # and the private ranges (role-split hosts talk over inventory addresses), and
-# appends the operator's own NO_PROXY. Feeds, content channels, the licence
+# appends the operator's own NO_PROXY. Feeds, content channels, the license
 # check-in, OIDC and identity sync use the proxy. Clients whose destination a
 # user controls (lookup url=, AI provider base URLs, webhooks, scheduled
 # fetches, synthetic checks) never do: a proxy re-resolves the host and would
@@ -698,7 +698,7 @@ services:
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
-      # Online licence check-in (enterprise only; the open binary has no checker).
+      # Online license check-in (enterprise only; the open binary has no checker).
       # Empty on self-run installs, which use the C05 authority. Managed tenants
       # transitioned from the v0.1.x platform layout keep their .env tuple:
       # LICENSE_URL, DEPLOYMENT_TOKEN (the legacy name of LICENSE_TOKEN) and
@@ -810,7 +810,7 @@ services:
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
-      # Online licence check-in; see nano-api. NANO_DEPLOYMENT_ID is set below.
+      # Online license check-in; see nano-api. NANO_DEPLOYMENT_ID is set below.
       LICENSE_URL: ${LICENSE_URL:-}
       LICENSE_TOKEN: ${LICENSE_TOKEN:-${DEPLOYMENT_TOKEN:-}}
       REDIS_URL: redis://dragonfly:6379

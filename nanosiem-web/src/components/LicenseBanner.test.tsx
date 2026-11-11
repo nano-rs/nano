@@ -86,14 +86,14 @@ const rejected = (): LicenseStatusResponse => ({
     first_rejected_at: '2026-11-09T12:00:00Z',
     last_rejected_at: '2026-11-09T12:00:00Z',
     locks_at: '2026-11-15T09:00:00Z',
-    message: 'Licence token was rejected by app.nano.rs. Update LICENSE_TOKEN in .env and re-run ./install.sh. This install locks on 2026-11-15 09:00 UTC (14 days after the last successful check-in).',
+    message: 'License token was rejected by app.nano.rs. Update LICENSE_TOKEN in .env and re-run ./install.sh. This install locks on 2026-11-15 09:00 UTC (14 days after the last successful check-in).',
   },
 });
 
-test('NAN-5194: a rejected licence token shows the fix and lock date to admins', async () => {
+test('NAN-5194: a rejected license token shows the fix and lock date to admins', async () => {
   mock.status = rejected();
   render(<MemoryRouter><LicenseBanner /></MemoryRouter>);
-  expect(await screen.findByText('Licence token rejected')).toBeTruthy();
+  expect(await screen.findByText('License token rejected')).toBeTruthy();
   expect(screen.getByText(/Update LICENSE_TOKEN in .env and re-run .\/install.sh/)).toBeTruthy();
   expect(screen.getByText(/locks on 2026-11-15 09:00 UTC/)).toBeTruthy();
   expect(screen.queryByRole('button', { name: /dismiss/i })).toBeNull();

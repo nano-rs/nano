@@ -317,6 +317,7 @@ fn is_valid_field(
     // exempt by the early return above: codegen owns their escaping (see the
     // output-name note in `validate_command_fields`).
     validate_field_name_format(field_name)?;
+    reject_doubled_spill_namespace(field_name)?;
 
     match validate_field_name(field_name) {
         Ok(_) => Ok(()),
@@ -369,6 +370,39 @@ fn is_valid_field(
             }
         }
     }
+}
+
+/// The JSON-spill namespaces a field may be written under (`ext.foo` under UDM;
+/// `unmapped.foo` — or the UDM-muscle-memory `ext.foo` — under OCSF).
+const SPILL_NAMESPACES: [&str; 2] = ["ext", "unmapped"];
+
+/// Reject a field that repeats its spill namespace — `unmapped.unmapped.task`,
+/// `ext.ext.code` (NAN-5265).
+///
+/// Profiles strip exactly ONE namespace prefix, so the doubled form resolves to
+/// a nested key literally named `unmapped`/`ext` inside the spill. No producer
+/// writes one; the spelling only ever comes from a client prefixing a name that
+/// was already prefixed (the v2.0.10 fields panel did exactly this), and it
+/// matched nothing without any error. A 400 with the single-prefix suggestion
+/// replaces that silent zero. A genuinely nested `unmapped` object stays
+/// reachable under OCSF through the `ext.` alias (`ext.unmapped.task`), which
+/// this check does not touch.
+fn reject_doubled_spill_namespace(field_name: &str) -> Result<(), FieldValidationError> {
+    for ns in SPILL_NAMESPACES {
+        let doubled = format!("{ns}.{ns}.");
+        if let Some(rest) = field_name.strip_prefix(doubled.as_str()) {
+            let single = format!("{ns}.{rest}");
+            return Err(FieldValidationError {
+                field_name: field_name.to_string(),
+                message: format!(
+                    "Field '{field_name}' repeats the '{ns}.' namespace and would match nothing; \
+                     use '{single}'"
+                ),
+                suggestions: vec![single],
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Recursively validate field names in a query, accumulating derived fields through the pipeline.
@@ -962,6 +996,10 @@ fn validate_command_fields(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "field_validation_spill_namespace_tests.rs"]
+mod spill_namespace_tests;
 
 #[cfg(test)]
 mod tests {

@@ -53,8 +53,8 @@ NAT gateway per zone in its `lb-*` subnet, and one private route table per
 zone sending `0.0.0.0/0` to that zone's NAT (a zone loss must not cut the
 others' egress); an S3 **gateway endpoint** on the private route tables so
 tiering and backup traffic stays off the NAT. Egress the hosts need: the
-registry, `api.nano.rs` (licence), the platform feeds, Ubuntu and Docker apt
-repositories. Air-gapped installs follow [operate.md](operate.md#offline-licence).
+registry, `api.nano.rs` (license), the platform feeds, Ubuntu and Docker apt
+repositories. Air-gapped installs follow [operate.md](operate.md#offline-license).
 
 Access for the operator: AWS Systems Manager Session Manager or a bastion in
 an `lb-*` subnet restricted to the management CIDR. Never give nano VMs public IPs.
@@ -395,10 +395,11 @@ Then, in order (each is a hard stop for the chart):
    after install, CNAME both hostnames to the ALB names
    (`kubectl -n nano get gateway`).
 
-4. **PostgreSQL.** For production, RDS PostgreSQL 15+ (Multi-AZ for HA) in
-   the cluster VPC, its security group open on 5432 to the node security
+4. **PostgreSQL.** For production, RDS for PostgreSQL 16+ (Multi-AZ for HA)
+   in the cluster VPC, its security group open on 5432 to the node security
    group; `postgresql.mode: external`, `sslmode: require`, the password in a
-   Secret (`postgresql.external.passwordSecret`).
+   Secret (`postgresql.external.passwordSecret`). See
+   [Managed PostgreSQL (RDS)](#managed-postgresql-rds).
 
 5. **Registry credential.** The Self-run pull credential lasts one hour; the
    chart's `registryCredentialRefresh` CronJob keeps `nano-registry` fresh (see
@@ -408,3 +409,45 @@ Then, in order (each is a hard stop for the chart):
 Teardown (only on request): `helm uninstall nano -n nano`, delete the PVCs
 and the namespace, the ALBs disappear with the Gateways; then
 `eksctl delete cluster -f nano-eks.yaml` and the RDS instance.
+
+## Managed PostgreSQL (RDS)
+
+The production database for the Helm chart (`postgresql.mode: external`).
+The migrator checks the version and extensions before it applies anything;
+run `scripts/pg-preflight.py` first so a gap shows before `helm install`.
+
+| Item | Requirement |
+|---|---|
+| Version | PostgreSQL 16 or newer (16, 17, 18 tested). RDS PostgreSQL 16 works from nano 2.0.11; 2.0.10 and earlier need 17+ |
+| Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`. All are on RDS's supported list and trusted, so the database owner creates them. Nothing to do unless the parameter group sets `rds.allowed_extensions`: then add the three (the default `*` allows them) |
+| Parameters | None required. Default `rds.force_ssl=1` is fine (`sslmode: require`). Allow at least 200 connections (about 20 per nano pod); every class from `db.m7g.large` up does by default |
+| Network | Private subnets of the EKS VPC, `--no-publicly-accessible`, security group allowing 5432 from the node security group only |
+| HA | Multi-AZ DB instance (`--multi-az`, synchronous standby in another AZ, about 60-120 s failover), or a Multi-AZ DB cluster. Single-AZ is a single point of failure |
+
+```bash
+aws rds create-db-subnet-group --db-subnet-group-name $NAME-pg \
+  --db-subnet-group-description "nano $NAME" --subnet-ids <private subnet ids>
+aws rds create-db-instance --db-instance-identifier $NAME-pg \
+  --engine postgres --engine-version 17 --db-instance-class db.m7g.large \
+  --allocated-storage 50 --storage-type gp3 --storage-encrypted --multi-az \
+  --db-subnet-group-name $NAME-pg --vpc-security-group-ids <db sg> --no-publicly-accessible \
+  --master-username nanoadmin --manage-master-user-password \
+  --backup-retention-period 7 --tags Key=nano-deployment,Value=$NAME
+```
+
+`--manage-master-user-password` keeps the admin password in Secrets Manager;
+never pass `--master-user-password` on a command line.
+
+Create the role and database as the admin user, in `psql` (`\password`
+prompts, so the password never lands in history or on a command line):
+
+```sql
+CREATE ROLE nanosiem LOGIN;
+\password nanosiem
+GRANT nanosiem TO nanoadmin;          -- PostgreSQL 16+: needed before ... OWNER nanosiem
+CREATE DATABASE nanosiem OWNER nanosiem;
+```
+
+The owner can create the three trusted extensions itself. Use a URL-safe
+password (it is interpolated into `DATABASE_URL`), then check with
+`scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)).

@@ -176,9 +176,9 @@ impl ConsumerConfig {
     }
 }
 
-/// NAN-5220: the install's signed licence from the registered credential
+/// NAN-5220: the install's signed license from the registered credential
 /// source (enterprise builds; resolved on every check, so a renewal is used at
-/// the next one). The sovereign feed route accepts only a signed licence, so an
+/// the next one). The sovereign feed route accepts only a signed license, so an
 /// online enrollment credential is not used here: those installs take the open
 /// feed route, as before.
 async fn installed_signed_license() -> Option<Vec<u8>> {
@@ -782,7 +782,7 @@ impl PlatformFeedConsumer {
                     Err(error) => Some(format!("transport: {error}")),
                 };
                 if let Some(reason) = reason {
-                    tracing::warn!(%reason, "sovereign feed route unavailable for this licence; using the open route");
+                    tracing::warn!(%reason, "sovereign feed route unavailable for this license; using the open route");
                     refused.push(reason);
                     continue;
                 }

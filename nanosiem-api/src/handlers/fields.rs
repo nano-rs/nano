@@ -13,6 +13,7 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use nanosiem_core::auth::permissions;
+use nanosiem_core::search::service::DynamicFieldBucket;
 use nanosiem_core::udm::UdmField;
 use nanosiem_core::TimeRangeInput;
 use serde::{Deserialize, Serialize};
@@ -265,6 +266,13 @@ pub struct ExtFieldsQuery {
     pub start: Option<chrono::DateTime<chrono::Utc>>,
     /// End of the search time range (ISO 8601)
     pub end: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which inventory to enumerate (NAN-5265). `spill` (default): BARE keys of
+    /// the JSON spill — UDM `ext`, OCSF `unmapped` — which the client shows and
+    /// queries as `ext.<key>` / `unmapped.<key>`. `extended`: full dotted paths
+    /// of valid OCSF attributes stored in `event` without a promoted column
+    /// (queried as-is); always empty under UDM.
+    #[serde(default)]
+    pub bucket: Option<DynamicFieldBucket>,
 }
 
 /// Get ext field names discovered in the data.
@@ -279,7 +287,7 @@ pub struct ExtFieldsQuery {
     tag = "fields",
     params(ExtFieldsQuery),
     responses(
-        (status = 200, description = "List of ext field names", body = Vec<String>),
+        (status = 200, description = "Field names of the requested bucket: bare spill keys (default) or OCSF extended attribute paths", body = Vec<String>),
         (status = 403, description = "Missing search:execute permission"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -313,7 +321,7 @@ pub async fn get_ext_fields(
     tag = "fields",
     request_body = ExtFieldsQuery,
     responses(
-        (status = 200, description = "List of ext field names", body = Vec<String>),
+        (status = 200, description = "Field names of the requested bucket: bare spill keys (default) or OCSF extended attribute paths", body = Vec<String>),
         (status = 403, description = "Missing search:execute permission"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -346,7 +354,12 @@ async fn ext_field_names(
 
     let names = state
         .search_service
-        .get_ext_field_names(params.query.as_deref(), time_range.as_ref(), &scope)
+        .get_dynamic_field_names(
+            params.bucket.unwrap_or_default(),
+            params.query.as_deref(),
+            time_range.as_ref(),
+            &scope,
+        )
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get ext field names: {}", e)))?;
     Ok(Json(names))
@@ -688,6 +701,7 @@ mod authz_parity_tests {
             FieldValuesResponse,
             FieldValue,
             ExtFieldsQuery,
+            DynamicFieldBucket,
             UdmFieldsResponse,
             UdmFieldInfo,
             SchemaFieldsResponse,

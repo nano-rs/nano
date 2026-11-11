@@ -49,7 +49,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cluster-name", required=True)
     p.add_argument("--deployment-id", required=True,
-                   help="use the app.nano.rs NANO_DEPLOYMENT_ID so licence check-in and volume names agree")
+                   help="use the app.nano.rs NANO_DEPLOYMENT_ID so license check-in and volume names agree")
     p.add_argument("--app-hostname", required=True)
     p.add_argument("--ingest-hostname", required=True)
     p.add_argument("--node", action="append", required=True, metavar="NAME=ADDRESS",

@@ -3,9 +3,9 @@
 /**
  * NAN-5088: Create / Connect distinguishes three states from /api/capabilities.
  *   open build                         → provider tab absent (unchanged)
- *   enterprise, licence not active     → provider tab disabled + licence note
- *   enterprise, licence active         → both tabs, no note
- * And the entitlement panel names the licence, not the edition, on enterprise.
+ *   enterprise, license not active     → provider tab disabled + license note
+ *   enterprise, license active         → both tabs, no note
+ * And the entitlement panel names the license, not the edition, on enterprise.
  */
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
@@ -57,45 +57,45 @@ function setup(edition: BuildEdition, licensed: boolean, perms: string[] = AUTHO
 }
 
 describe('InventoryEditor Create / Connect', () => {
-  it('open build: no provider tab and no licence note (unchanged)', async () => {
+  it('open build: no provider tab and no license note (unchanged)', async () => {
     setup('open', false);
     expect(screen.queryByRole('button', { name: 'TI / Asset provider' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Lookup table' })).toBeTruthy();
-    expect(screen.queryByText(/active licence/)).toBeNull();
+    expect(screen.queryByText(/active license/)).toBeNull();
     expect(await screen.findByText('lookup editor')).toBeTruthy();
   });
 
-  it('enterprise without an active licence: provider tab disabled with a link to the licence page', async () => {
+  it('enterprise without an active license: provider tab disabled with a link to the license page', async () => {
     setup('enterprise', false, [...AUTHOR, 'settings:system']);
     const provider = screen.getByRole('button', { name: 'TI / Asset provider' }) as HTMLButtonElement;
     expect(provider.disabled).toBe(true);
     expect(provider.getAttribute('aria-describedby')).toBe('provider-licence-note');
-    expect(screen.getByRole('note').textContent).toMatch(/Custom providers need an active licence/);
-    expect(screen.getByRole('link', { name: /Settings › Licence/ }).getAttribute('href')).toBe('/settings/license');
+    expect(screen.getByRole('note').textContent).toMatch(/Custom providers need an active license/);
+    expect(screen.getByRole('link', { name: /Settings › License/ }).getAttribute('href')).toBe('/settings/license');
     expect(screen.getByText(/^Add a lookup table\./)).toBeTruthy();
     expect(await screen.findByText('lookup editor')).toBeTruthy();
     expect(screen.queryByText('provider wizard')).toBeNull();
   });
 
-  it('enterprise without an active licence and no settings:system: no dead link', () => {
+  it('enterprise without an active license and no settings:system: no dead link', () => {
     setup('enterprise', false);
     expect(screen.queryByRole('link')).toBeNull();
     expect(screen.getByRole('note').textContent).toMatch(/Ask an administrator/);
   });
 
-  it('enterprise without a licence and provider-only permissions: explains the licence, not permissions', () => {
+  it('enterprise without a license and provider-only permissions: explains the license, not permissions', () => {
     setup('enterprise', false, ['enrichments:custom:create', 'enrichments:code']);
-    expect(screen.getByRole('note').textContent).toMatch(/active licence/);
+    expect(screen.getByRole('note').textContent).toMatch(/active license/);
     expect(screen.queryByText('Authoring permission required.')).toBeNull();
   });
 
-  it('enterprise before /api/capabilities answers: no licence verdict on the fail-closed fallback', () => {
+  it('enterprise before /api/capabilities answers: no license verdict on the fail-closed fallback', () => {
     setup('enterprise', false, AUTHOR, true);
     expect(screen.queryByRole('button', { name: 'TI / Asset provider' })).toBeNull();
     expect(screen.queryByRole('note')).toBeNull();
   });
 
-  it('enterprise with an active licence: both tabs enabled, no note', async () => {
+  it('enterprise with an active license: both tabs enabled, no note', async () => {
     setup('enterprise', true);
     expect((screen.getByRole('button', { name: 'TI / Asset provider' }) as HTMLButtonElement).disabled).toBe(false);
     expect(screen.getByRole('button', { name: 'Lookup table' })).toBeTruthy();
@@ -112,15 +112,15 @@ describe('InventoryEntitlement', () => {
     expect(screen.getByText(/installs and runs unchanged on an enterprise deployment/)).toBeTruthy();
   });
 
-  it('enterprise without a licence names the licence and links Settings › Licence', () => {
-    render(<MemoryRouter><InventoryEntitlement requirement={{ capability: 'customEnrichment', cause: 'licence', label: 'Active licence' }} edition="enterprise" canManageLicence /></MemoryRouter>);
-    expect(screen.getByRole('status').textContent).toBe('Requires an active licence');
+  it('enterprise without a license names the license and links Settings › License', () => {
+    render(<MemoryRouter><InventoryEntitlement requirement={{ capability: 'customEnrichment', cause: 'licence', label: 'Active license' }} edition="enterprise" canManageLicence /></MemoryRouter>);
+    expect(screen.getByRole('status').textContent).toBe('Requires an active license');
     expect(screen.queryByText(/Enterprise edition|unchanged on an enterprise deployment/)).toBeNull();
-    expect(screen.getByRole('link', { name: /Settings › Licence/ }).getAttribute('href')).toBe('/settings/license');
+    expect(screen.getByRole('link', { name: /Settings › License/ }).getAttribute('href')).toBe('/settings/license');
   });
 
-  it('enterprise without a licence and no settings:system: no link', () => {
-    render(<MemoryRouter><InventoryEntitlement requirement={{ capability: 'customEnrichment', cause: 'licence', label: 'Active licence' }} edition="enterprise" /></MemoryRouter>);
+  it('enterprise without a license and no settings:system: no link', () => {
+    render(<MemoryRouter><InventoryEntitlement requirement={{ capability: 'customEnrichment', cause: 'licence', label: 'Active license' }} edition="enterprise" /></MemoryRouter>);
     expect(screen.queryByRole('link')).toBeNull();
     expect(screen.getByText(/Ask an administrator/)).toBeTruthy();
   });

@@ -49,7 +49,7 @@ pub struct SetTierRequest {
     #[serde(default)]
     pub edition: Option<nanosiem_core::EntitlementEdition>,
     /// Deployment operator. It may be echoed by clients but is controlled by
-    /// provisioning or a signed licence and cannot be changed here.
+    /// provisioning or a signed license and cannot be changed here.
     #[serde(default)]
     pub operator: Option<nanosiem_core::EntitlementOperator>,
     /// Contracted decimal GB/day capacity. Capacity never selects features.
@@ -132,7 +132,7 @@ fn validate_operator_provenance(
 ) -> Result<(), ApiError> {
     if requested.is_some_and(|operator| operator != current) {
         return Err(ApiError::ValidationError(
-            "operator is controlled by deployment provisioning or the signed licence".into(),
+            "operator is controlled by deployment provisioning or the signed license".into(),
         ));
     }
     Ok(())
@@ -216,7 +216,7 @@ pub async fn get_tier_status(
 }
 
 /// Update entitlement capacity or accept a legacy tier input. Operator is
-/// read-only provenance controlled by provisioning or the signed licence.
+/// read-only provenance controlled by provisioning or the signed license.
 #[utoipa::path(
     put,
     path = "/api/settings/tier",

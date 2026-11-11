@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 /// An event to be sent to Vector via HTTP.
 ///
-/// Vector expects: `message` (raw log), `source_type`, and `timestamp`.
+/// `message` is the raw record. The HTTP transport sends only `message`
+/// (one record per line); HEC and Tenzir carry `source_type`/`timestamp` in-band.
 /// The `message` field contains the raw Windows Event JSON or proxy log line —
 /// Vector's parsers handle UDM mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]

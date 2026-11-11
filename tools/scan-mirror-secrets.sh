@@ -160,7 +160,7 @@ fi
 
 if [ -n "$artifact_files" ]; then
     echo ""
-    echo "FAIL — C05 licence artifacts found in files that would be published:"
+    echo "FAIL — C05 license artifacts found in files that would be published:"
     echo ""
     printf '%s\n' "$artifact_files"
 fi

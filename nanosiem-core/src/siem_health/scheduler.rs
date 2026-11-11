@@ -199,8 +199,8 @@ pub async fn run_health_check_with_trigger(
         }
         Err(e) => warn!("Failed to read service health events: {}", e),
     }
-    // NAN-5194: the licence server refused this deployment's token.
-    // Enterprise only (the licence module is not in the open edition).
+    // NAN-5194: the license server refused this deployment's token.
+    // Enterprise only (the license module is not in the open edition).
     #[cfg(feature = "enterprise")]
     match crate::license::LicenseRepository::new(pool.clone())
         .get_token_rejected_notice()
@@ -210,7 +210,7 @@ pub async fn run_health_check_with_trigger(
             &mut analysis,
             notice.as_ref(),
         ),
-        Err(e) => warn!("Failed to read licence token rejection: {}", e),
+        Err(e) => warn!("Failed to read license token rejection: {}", e),
     }
 
     let duration_ms = start.elapsed().as_millis() as i32;

@@ -2,7 +2,8 @@
 //!
 //! Three wire formats:
 //!
-//! - **Vector** (`Transport::Vector`) — Vector's `http` source: NDJSON body,
+//! - **Vector** (`Transport::Vector`) — Vector's `http` source: the raw
+//!   records one per line (NDJSON for JSON sources, `text/plain` otherwise),
 //!   `X-Source-Type` header per group, Bearer auth. Events are grouped by
 //!   `source_type` because the header is per-request.
 //! - **HEC** (`Transport::Hec`) — Splunk HEC `/services/collector/event`:
@@ -771,20 +772,50 @@ pub async fn send_batch_with_retry(
 }
 
 // ---------------------------------------------------------------------------
-// Vector transport (NDJSON + X-Source-Type + Bearer)
+// Vector transport (raw records: NDJSON or text/plain + X-Source-Type + Bearer)
 // ---------------------------------------------------------------------------
 
 async fn send_event_vector(client: &Client, transport: &Transport, event: &Event) -> Result<()> {
-    let mut req = client
-        .post(transport.url())
-        .header("Content-Type", "application/json")
-        .header("X-Source-Type", &event.source_type)
-        .json(event);
-    if let Some(t) = transport.token() {
-        req = req.bearer_auth(t);
-    }
-    req.send().await?.error_for_status()?;
-    Ok(())
+    send_ndjson_group(client, transport, &event.source_type, &[event]).await
+}
+
+/// HTTP-lane request body: the RAW records, one per line, never the
+/// `{message, timestamp, source_type}` generator envelope.
+///
+/// The `/ingest` lane keeps a JSON record whole as `.message` and does not
+/// unwrap a `message` field (d068580ea, "preserve JSON records"), so parsers
+/// see exactly what is on the line. Sending the envelope made every OCSF
+/// parser read the wrapper and fall back (activity 99 / Base Event). The
+/// source is identified by the bound ingest token (or `X-Source-Type`).
+///
+/// A group whose every record is a JSON object goes as NDJSON; anything else
+/// (Apache access lines) goes as `text/plain`, one line per event. Embedded
+/// newlines would split a record under the lane's newline framing, so they
+/// are flattened to spaces (generators emit compact single-line records).
+pub(crate) fn vector_raw_body(events: &[&Event]) -> (&'static str, String) {
+    let all_json = !events.is_empty()
+        && events.iter().all(|e| {
+            // Shape check, not a full parse: blast mode sends ~50k records/s.
+            let m = e.message.trim();
+            m.starts_with('{') && m.ends_with('}')
+        });
+    let body = events
+        .iter()
+        .map(|e| {
+            if e.message.contains(['\n', '\r']) {
+                e.message.replace(['\n', '\r'], " ")
+            } else {
+                e.message.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content_type = if all_json {
+        "application/x-ndjson"
+    } else {
+        "text/plain"
+    };
+    (content_type, body)
 }
 
 async fn send_ndjson_group(
@@ -793,15 +824,11 @@ async fn send_ndjson_group(
     source_type: &str,
     events: &[&Event],
 ) -> Result<()> {
-    let body: String = events
-        .iter()
-        .map(|e| serde_json::to_string(e).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let (content_type, body) = vector_raw_body(events);
 
     let mut req = client
         .post(transport.url())
-        .header("Content-Type", "application/x-ndjson")
+        .header("Content-Type", content_type)
         .header("X-Source-Type", source_type)
         .body(body);
 
@@ -1329,3 +1356,7 @@ mod tests {
         assert!(!req.encode_to_vec().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "http_vector_body_tests.rs"]
+mod vector_body_tests;

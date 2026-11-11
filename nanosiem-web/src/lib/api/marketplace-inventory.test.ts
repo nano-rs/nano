@@ -54,12 +54,12 @@ describe('marketplace inventory projection', () => {
     expect(catalogItem(entry({}), [official], ENT, 'enterprise').requirement).toBeNull();
   });
 
-  it('NAN-5088: an enterprise build without an active licence asks for a licence, not the edition', () => {
-    // Licensed flags are all false on an enterprise build whose licence is not active.
+  it('NAN-5088: an enterprise build without an active license asks for a license, not the edition', () => {
+    // Licensed flags are all false on an enterprise build whose license is not active.
     const agent = catalogItem(entry({}), [official], OPEN, 'enterprise');
-    expect(agent.requirement).toEqual({ capability: 'agentEnrichment', cause: 'licence', label: 'Active licence' });
-    expect(inventoryAction(agent)).toBe('Active licence');
-    expect(inventoryReason(agent)).toBe('Requires an active licence.');
+    expect(agent.requirement).toEqual({ capability: 'agentEnrichment', cause: 'licence', label: 'Active license' });
+    expect(inventoryAction(agent)).toBe('Active license');
+    expect(inventoryReason(agent)).toBe('Requires an active license.');
     expect(inventoryReason(agent)).not.toMatch(/edition/i);
     expect(catalogItem(entry({ category: 'collector', execution_backend: 'collector' }), [official], OPEN, 'enterprise').requirement?.cause).toBe('licence');
     expect(catalogItem(entry({ execution_backend: 'native', category: 'agent' }), [official], OPEN, 'enterprise').requirement?.cause).toBe('licence');

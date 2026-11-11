@@ -3,9 +3,9 @@
 /**
  * NAN-5114: "Update available" for admins of a Self-run deployment.
  *
- * Driven by the last online licence check-in (`GET /api/license/update`),
+ * Driven by the last online license check-in (`GET /api/license/update`),
  * which carries only public release facts. Enterprise-only: the open edition
- * has no licence check-in, so it never polls and never renders. Air-gapped
+ * has no license check-in, so it never polls and never renders. Air-gapped
  * installs make no check-in, so the endpoint reports nothing and the banner
  * stays hidden. Dismissal is per version: a newer release shows again.
  */

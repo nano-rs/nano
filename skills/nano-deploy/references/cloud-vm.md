@@ -25,7 +25,7 @@ Hard rules on top of the [safety rules](../SKILL.md#safety-rules-always-apply):
   confirmed the plan, and then each step.** One "yes" covers one step. Cloud
   resources cost money from the first minute: say so.
 - Cloud work uses only the operator's own logged-in CLI (`aws`, `az`,
-  `gcloud`). Never ask for, print or store cloud keys, licence tokens,
+  `gcloud`). Never ask for, print or store cloud keys, license tokens,
   registry credentials or passwords. Never put a secret on a command line.
 - Read-only first: `aws sts get-caller-identity`, `az account show`,
   `gcloud config list` show who you act as. Show it and ask.
@@ -172,26 +172,81 @@ hosts, when you use HAProxy). For the host firewall itself, see step 5.
   stops), and Docker then starts on an empty `/var/lib/docker` on the root
   disk and reports "active" with none of the host's containers or data. A
   systemd drop-in stops that: Docker waits for the disk, and does not start
-  without it.
+  without it. The drop-in alone can leave the host down, though: in a
+  customer test, a hard reset lost the disk's `/dev/disk/by-uuid` link (udev
+  missed the device), the mount job timed out, Docker correctly stayed
+  stopped, and nothing retried until someone mounted the disk by hand. So the
+  recipe also installs a small self-heal timer (`scripts/data-disk-heal.sh`):
+  during the first 30 minutes after boot, while the disk is unmounted, it
+  asks udev to re-scan block devices (`udevadm trigger --action=change`),
+  starts the disk's systemd mount unit (`var-lib-docker.mount`, so
+  systemd-fsck and the unit ordering still apply; it never calls `mount`
+  directly), and only once that unit is active starts Docker. While the
+  disk's `systemd-fsck@` unit has failed it does nothing: a filesystem that
+  needs a manual check is left to the operator.
 
   ```bash
   ssh $H 'set -e; D=/dev/<data disk>; sudo mkfs.ext4 -L nano-data "$D"
     U=$(sudo blkid -s UUID -o value "$D")
     sudo mkdir -p /var/lib/docker
-    echo "UUID=$U /var/lib/docker ext4 defaults,noatime,nofail,x-systemd.device-timeout=120s 0 2" | sudo tee -a /etc/fstab
+    echo "UUID=$U /var/lib/docker ext4 defaults,noatime,nofail,x-systemd.device-timeout=90s,x-systemd.mount-timeout=300s 0 2" | sudo tee -a /etc/fstab
     sudo systemctl daemon-reload && sudo mount /var/lib/docker
     sudo mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d
     printf "[Unit]\nRequiresMountsFor=/var/lib/docker\n" | sudo tee /etc/systemd/system/docker.service.d/nano-data-disk.conf
     printf "[Unit]\nRequiresMountsFor=/var/lib/docker\n" | sudo tee /etc/systemd/system/containerd.service.d/nano-data-disk.conf
     sudo systemctl daemon-reload'
+  # The self-heal timer (after the fstab line exists):
+  scp scripts/data-disk-heal.sh $H:/tmp/data-disk-heal.sh
+  ssh $H 'sudo sh /tmp/data-disk-heal.sh install && rm /tmp/data-disk-heal.sh'
   ```
 
+  Why these options: `nofail` keeps the host bootable (and reachable over
+  SSH) when the disk is missing; `RequiresMountsFor=` keeps Docker off the
+  root disk; `x-systemd.device-timeout=90s` bounds the wait for the device,
+  `x-systemd.mount-timeout=300s` gives a large ext4 time to mount after an
+  unclean stop, and the timer (first run 120 s after boot, after the 90 s
+  device timeout has expired, then every 30 s) closes the gap when the device
+  never shows up on its own. `LABEL=nano-data` works
+  the same as `UUID=` (both are udev links; the timer covers both); a
+  `/dev/vdX` path is stable only where the hypervisor keeps device order, so
+  prefer the UUID.
+
   Run `mkfs` only on a new, empty disk (check `lsblk -f` first). Add the
-  drop-in on hosts that already have a data disk too. `RequiresMountsFor=`
-  implies `After=` the mount, so systemd mounts the disk before Docker even
+  drop-in and the timer on hosts that already have a data disk too.
+
+  **Disk maintenance within 30 minutes of a boot** (unmounting
+  `/var/lib/docker` on purpose, resizing, an `fsck`): stop the timer first,
+  or it mounts the disk again and starts Docker:
+  `ssh $H 'sudo systemctl stop nano-data-disk-heal.timer'`. It starts again
+  at the next boot. To remove it: `ssh $H 'sudo sh /tmp/data-disk-heal.sh uninstall'`
+  (copy the script over first, as for `install`), or by hand:
+  `sudo systemctl disable --now nano-data-disk-heal.timer && sudo rm /etc/systemd/system/nano-data-disk-heal.{timer,service} /usr/local/sbin/nano-data-disk-heal && sudo systemctl daemon-reload`.
+
+  **Manual recovery** (a host is up but Docker is stopped after a reboot, and
+  `findmnt /var/lib/docker` prints nothing). Mount through the systemd unit,
+  which runs the filesystem check first:
+
+  ```bash
+  ssh $H 'set -e; sudo udevadm trigger --subsystem-match=block --action=change; sudo udevadm settle --timeout=60
+    sudo systemctl reset-failed var-lib-docker.mount; sudo systemctl start var-lib-docker.mount && findmnt /var/lib/docker
+    sudo ls /var/lib/docker/volumes | head    # this host'"'"'s volumes, not an empty directory
+    sudo systemctl reset-failed docker.service containerd.service; sudo systemctl start docker
+    cd ~/nano && docker compose ps'
+  ```
+
+  If `systemctl start var-lib-docker.mount` fails because its
+  `systemd-fsck@` unit failed (`systemctl --failed`), the filesystem needs a
+  manual `sudo fsck /dev/disk/by-uuid/<uuid>` while unmounted: ask before
+  running it, then start the mount unit again.
+
+  Then run `cluster-health.py` on that host: from this release it reports
+  an unmounted data disk and a stopped Docker engine as `FAIL` (before, it
+  printed two `WARN` rows and `PASS`).
+
+  `RequiresMountsFor=` implies `After=` the mount, so systemd mounts the disk before Docker even
   with `nofail`. The installer refuses to run while the disk is unmounted and
   warns when the drop-in is missing; `cluster-health.py` reports both
-  (`disk`). After a hard reset, check `findmnt /var/lib/docker` before
+  (`disk`, and `docker` when the engine is stopped). After a hard reset, check `findmnt /var/lib/docker` before
   anything else. Docker 29 keeps **images** in the containerd image store at
   `/var/lib/containerd`, on the root disk: leave ~30 GB free there for images
   (or bind-mount `/var/lib/containerd` from the data disk too, with
@@ -229,7 +284,7 @@ hosts, when you use HAProxy). For the host firewall itself, see step 5.
   planner prints them; review them with the operator first:
 
      ```bash
-     python3 scripts/plan.py <same flags> --firewall-script > ./nano-deploy-work/firewall.sh
+     python3 scripts/plan.py <same flags> --firewall-script --edge-source-cidr <user/sender CIDR> > ./nano-deploy-work/firewall.sh
      ssh $H 'MGMT_CIDR=<where the operator SSHes from> bash -s' < ./nano-deploy-work/firewall.sh
      ```
 
@@ -255,8 +310,9 @@ ssh $H 'set -e; lsblk -o NAME,SIZE,TYPE,MOUNTPOINT'
 ssh $H "set -e; DEV=/dev/nvme1n1
   sudo mkfs.ext4 -L nano-data \$DEV
   sudo mkdir -p /var/lib/docker
-  echo \"UUID=\$(sudo blkid -s UUID -o value \$DEV) /var/lib/docker ext4 defaults,noatime,nofail 0 2\" | sudo tee -a /etc/fstab
+  echo \"UUID=\$(sudo blkid -s UUID -o value \$DEV) /var/lib/docker ext4 defaults,noatime,nofail,x-systemd.device-timeout=90s,x-systemd.mount-timeout=300s 0 2\" | sudo tee -a /etc/fstab
   sudo mount /var/lib/docker && df -h /var/lib/docker"
+# then the RequiresMountsFor drop-ins and the self-heal timer, as in step 5 above
 ```
 
 Then preflight every host ([preflight.md](preflight.md)) with the flags
@@ -265,16 +321,16 @@ roles (with `lb` on an HAProxy host), the other addresses and its exact
 requirement in this plan (`--lab` is added for a lab plan). Zero `FAIL`, and
 no `exposure` WARN left unexplained.
 
-## 6. Licence, download, verify, install
+## 6. License, download, verify, install
 
-1. **Licence (operator, in app.nano.rs → Deployments → the Self-run
+1. **License (operator, in app.nano.rs → Deployments → the Self-run
    deployment):** the three enrollment values (`LICENSE_URL`, `LICENSE_TOKEN`,
    `NANO_DEPLOYMENT_ID`) saved to a `0600` file whose path they give you.
    Nothing else is needed from the portal.
 2. **Download and verify before anything is extracted:**
    `bash scripts/fetch-bundle.sh --enrollment <file> --version <V> --out
    ./nano-deploy-work/bundle` downloads the bundle, `.sha256` and `.sha256.sig`
-   with the licence values and must print `VERIFIED`. It checks the pinned
+   with the license values and must print `VERIFIED`. It checks the pinned
    release-signing-v1 key, the signature, that the signed `.sha256` names
    exactly this bundle, and the bundle's hash; on any failure it keeps nothing.
    Never use `sha256sum -c` or a key taken from inside the archive. Just before

@@ -100,7 +100,21 @@ fn per_replica_endpoints_win_over_shard_endpoints() {
             "http://clickhouse-proxy:18201".to_string(),
         ])
     );
-    // Unset or blank (Helm): the historical per-shard path.
+    // The Helm chart's per-replica Services (NAN-5262): every replica of a
+    // `replicas: 2` install is triggered, never only the one a shard Service
+    // happens to land on.
+    assert_eq!(
+        refresh_targets(
+            Some("http://nano-clickhouse-replica-0-0:8123,http://nano-clickhouse-replica-0-1:8123"),
+            Some("http://nano-clickhouse-shard-0:8123"),
+        )
+        .unwrap(),
+        RefreshTargets::Replicas(vec![
+            "http://nano-clickhouse-replica-0-0:8123".to_string(),
+            "http://nano-clickhouse-replica-0-1:8123".to_string(),
+        ])
+    );
+    // Unset or blank (charts before 2.0.11): the historical per-shard path.
     for replicas in [None, Some(""), Some("  ")] {
         assert_eq!(
             refresh_targets(replicas, Some("http://clickhouse-proxy:18101")).unwrap(),

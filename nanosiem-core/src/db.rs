@@ -11,6 +11,7 @@ pub mod future_timestamp_repair;
 pub mod migration_refresh;
 pub mod migrations;
 pub mod pool;
+pub mod postgres_preflight;
 pub mod repo_error;
 pub mod repo_store;
 pub mod repository;
@@ -23,5 +24,9 @@ pub use migrations::{
     MigrationError, MigrationMode, SchemaCheckError,
 };
 pub use pool::Database;
+pub use postgres_preflight::{
+    check_postgres_compatibility, PostgresPreflightError, PostgresPreflightReport,
+    MIN_POSTGRES_VERSION, REQUIRED_POSTGRES_EXTENSIONS,
+};
 pub use repo_error::RepoError;
 pub use repository::*;

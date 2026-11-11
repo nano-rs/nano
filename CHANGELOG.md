@@ -70,7 +70,7 @@ changing an existing deployment.
 - New rule-lifecycle integrations must send `expected_mode`; a stale value
   returns `409 Conflict` without changing the rule.
 - Enabling tenant-health export requires a dedicated receiver-scoped health
-  token. The deployment licence token is never used as a fallback.
+  token. The deployment license token is never used as a fallback.
 - Role-split installs require private TLS unless an explicit test-only plaintext
   mode is selected, and Docker-published ports require `DOCKER-USER` filtering
   in addition to normal host firewall rules.

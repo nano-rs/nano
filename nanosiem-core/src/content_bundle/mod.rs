@@ -11,7 +11,7 @@
 //! - [`store`]: installed snapshots in PostgreSQL (migration 309).
 //! - [`source`]: first-party repository reads served from the snapshots
 //!   (`GitHubClient` and the marketplace sync call it instead of GitHub).
-//! - [`credential`]: the licence credential seam for licence-authenticated
+//! - [`credential`]: the license credential seam for license-authenticated
 //!   routes (an enterprise build registers the source; the open edition none).
 //! - [`consumer`]: fetch → verify → accept → install → apply; leader-only
 //!   schedule, check now, air-gap import.

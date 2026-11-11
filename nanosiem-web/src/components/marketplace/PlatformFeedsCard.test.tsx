@@ -74,7 +74,7 @@ it('renders every feed row with state, revision, formatted records and a compact
   expect(getByTestId('platform-feeds-card').textContent).not.toMatch(/Creative Commons|stops stamping/);
 });
 
-it('each licence chip opens the exact attribution text with its links', () => {
+it('each license chip opens the exact attribution text with its links', () => {
   const { getByTestId } = render(<PlatformFeedsCard status={base} />);
   const chip = getByTestId('platform-feed-licence-ipinfo_lite');
   expect(chip.textContent).toBe('CC-BY-SA-4.0');

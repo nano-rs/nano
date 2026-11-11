@@ -11,12 +11,12 @@
  *   created is already represented by its catalog entry and is not repeated.
  *
  * Hosted entitlements (baseline / premium, purchase, checkout) have no
- * single-tenant meaning. What still gates an item is the build and its licence:
+ * single-tenant meaning. What still gates an item is the build and its license:
  * an entry whose execution backend is unavailable here carries a `requirement`
  * derived from `/api/capabilities`, never from a hosted/shared flag. On an open
  * build the cause is the edition; on an enterprise build a licensed flag is
- * false only because licence admission failed (NAN-5088), so the cause is the
- * licence.
+ * false only because license admission failed (NAN-5088), so the cause is the
+ * license.
  */
 import type { MarketplaceCatalogEntry, EnrichmentMarketplaceRepo } from './marketplace';
 import type { BuildEdition, Capabilities } from '@/hooks/use-capabilities';
@@ -28,7 +28,7 @@ export type InventoryKind = 'platform' | 'custom';
 
 /**
  * Why an item cannot run here. `edition`: this build does not ship the runtime
- * (open). `licence`: the enterprise build ships it but licence admission is
+ * (open). `licence`: the enterprise build ships it but license admission is
  * not active, so every licensed capability reads false (NAN-5088).
  */
 export type InventoryRequirementCause = 'edition' | 'licence';
@@ -37,18 +37,18 @@ export type InventoryRequirementCause = 'edition' | 'licence';
 export interface InventoryRequirement {
   capability: keyof Capabilities;
   cause: InventoryRequirementCause;
-  /** Short label for card footers: "Enterprise edition" / "Active licence". */
+  /** Short label for card footers: "Enterprise edition" / "Active license". */
   label: string;
 }
 
-/** Sentence form of a requirement: "Requires the Enterprise edition" / "Requires an active licence". */
+/** Sentence form of a requirement: "Requires the Enterprise edition" / "Requires an active license". */
 export function requirementSentence(requirement: InventoryRequirement): string {
-  return requirement.cause === 'licence' ? 'Requires an active licence' : `Requires the ${requirement.label}`;
+  return requirement.cause === 'licence' ? 'Requires an active license' : `Requires the ${requirement.label}`;
 }
 
 function requirementFor(capability: keyof Capabilities, edition: BuildEdition): InventoryRequirement {
   return edition === 'enterprise'
-    ? { capability, cause: 'licence', label: 'Active licence' }
+    ? { capability, cause: 'licence', label: 'Active license' }
     : { capability, cause: 'edition', label: 'Enterprise edition' };
 }
 

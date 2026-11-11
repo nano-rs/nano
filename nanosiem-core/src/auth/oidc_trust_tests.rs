@@ -224,13 +224,69 @@ fn resending_or_narrowing_admission_is_not_a_change() {
     let mut request = empty();
     request.access_policy = Some(stored.clone());
     assert!(!change_with(Some("groups"), &stored, &request).requires_admin());
+    // Narrowing that keeps the tenant, or clears it along with every domain.
     request.access_policy = Some(SsoAccessPolicy {
         mapped_groups_only: false,
-        entra_tenant_id: None,
+        entra_tenant_id: stored.entra_tenant_id,
         verified_domains: vec!["a.example".into()],
         google_delegated_admin: None,
     });
     assert!(!change_with(Some("groups"), &stored, &request).requires_admin());
+    request.access_policy = Some(SsoAccessPolicy {
+        mapped_groups_only: false,
+        entra_tenant_id: None,
+        verified_domains: vec![],
+        google_delegated_admin: None,
+    });
+    assert!(!change_with(Some("groups"), &stored, &request).requires_admin());
+}
+
+/// NAN-5266 L1: on a non-Microsoft issuer, verified domains apply only while
+/// no Entra tenant is set, so clearing the tenant while keeping a domain
+/// switches generic domain trust on: administrator authority.
+#[test]
+fn clearing_the_tenant_over_kept_domains_is_widening_off_microsoft() {
+    let stored_policy = SsoAccessPolicy {
+        entra_tenant_id: Some(uuid::Uuid::new_v4()),
+        verified_domains: vec!["a.example".into()],
+        ..Default::default()
+    };
+    let cleared = SsoAccessPolicy {
+        entra_tenant_id: None,
+        verified_domains: vec!["a.example".into()],
+        ..Default::default()
+    };
+    let mut request = empty();
+    request.access_policy = Some(cleared.clone());
+    let c = change_with(Some("groups"), &stored_policy, &request);
+    assert!(c.admission && c.requires_admin());
+
+    // Same edit while the issuer is (or becomes) a Microsoft one: the
+    // domains stay inert without a tenant, so it is a narrowing.
+    for microsoft in [
+        "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
+        "https://contoso.b2clogin.com/tfp/x/v2.0/",
+    ] {
+        let stored = StoredTrust {
+            enabled: true,
+            issuer: microsoft,
+            client_id: CLIENT,
+            group_claim: Some("groups"),
+            access_policy: &stored_policy,
+        };
+        assert!(!OidcTrustChange::between(stored, &request).admission, "{microsoft}");
+    }
+    // The issuer moving OFF Microsoft in the same update is judged on the
+    // new issuer.
+    let stored = StoredTrust {
+        enabled: true,
+        issuer: "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
+        client_id: CLIENT,
+        group_claim: Some("groups"),
+        access_policy: &stored_policy,
+    };
+    request.issuer = Some(ISSUER.into());
+    assert!(OidcTrustChange::between(stored, &request).admission);
 }
 
 #[test]

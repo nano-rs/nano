@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! NAN-5194: a rejected licence token is classified apart from transient
+//! NAN-5194: a rejected license token is classified apart from transient
 //! failures, raises a critical SIEM Health finding with the 14-day lock date,
 //! and nothing else (network errors, 5xx) raises it.
 
@@ -104,7 +104,7 @@ fn notice_message_names_the_fix_and_the_lock_date() {
     assert_eq!(notice.locks_at, Some(at(2026, 11, 15, 9)));
     assert_eq!(
         notice.message,
-        "Licence token was rejected by app.nano.rs. Update LICENSE_TOKEN in .env and re-run \
+        "License token was rejected by app.nano.rs. Update LICENSE_TOKEN in .env and re-run \
          ./install.sh. This install locks on 2026-11-15 09:00 UTC (14 days after the last \
          successful check-in)."
     );
@@ -142,7 +142,7 @@ fn no_rejection_adds_nothing() {
     assert_eq!(analysis.overall_score, before);
 }
 
-/// The real check-in path against a mock licence server. PostgreSQL is
+/// The real check-in path against a mock license server. PostgreSQL is
 /// unreachable here (writes fail and are logged), so only the classification
 /// of each HTTP outcome is under test.
 fn checker(url: &str) -> LicenseChecker {

@@ -21,7 +21,7 @@ use crate::state::AppState;
 
 /// Per-surface capability flags.
 ///
-/// Licensed-only flags require both the enterprise build and live licence
+/// Licensed-only flags require both the enterprise build and live license
 /// admission. The shape exists so that
 /// clients can use one canonical per-surface check (`capabilities.cases`)
 /// rather than inferring code availability from commercial metadata. V2 does

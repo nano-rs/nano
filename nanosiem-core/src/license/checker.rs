@@ -78,7 +78,7 @@ pub struct LicenseChecker {
 }
 
 /// How often a non-leading checker (or a leader that is not yet due) reloads
-/// the licence status the leader persisted.
+/// the license status the leader persisted.
 const FOLLOWER_REFRESH_SECS: u64 = 300;
 
 impl LicenseChecker {
@@ -142,7 +142,7 @@ impl LicenseChecker {
             if matches!(e, LicenseCheckError::TokenRejected(_)) {
                 // NAN-5194: already recorded for SIEM Health and the
                 // admin banner; keep retrying under the same bound.
-                tracing::error!(error = %e, "Licence token rejected (will retry next interval)");
+                tracing::error!(error = %e, "License token rejected (will retry next interval)");
             } else {
                 tracing::warn!(error = %e, "License check failed (will retry next interval)");
             }
@@ -177,7 +177,7 @@ impl LicenseChecker {
             }
             None => tracing::warn!(
                 url = %self.config.license_url,
-                "Licence URL is not a /license/status endpoint; usage reporting disabled"
+                "License URL is not a /license/status endpoint; usage reporting disabled"
             ),
         }
         self
@@ -200,16 +200,16 @@ impl LicenseChecker {
             }
             Ok(_) => {
                 tracing::warn!(
-                    "Cached licence has no successful online observation; failing closed"
+                    "Cached license has no successful online observation; failing closed"
                 );
                 *self.license_status.write().await = LicenseStatus::unavailable(
-                    "Online licence has not completed its first successful check.",
+                    "Online license has not completed its first successful check.",
                 );
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to load cached licence status; failing closed");
+                tracing::warn!(error = %e, "Failed to load cached license status; failing closed");
                 *self.license_status.write().await =
-                    LicenseStatus::unavailable("Cached online licence status is unavailable.");
+                    LicenseStatus::unavailable("Cached online license status is unavailable.");
             }
         }
         // Check staleness immediately on boot
@@ -243,7 +243,7 @@ impl LicenseChecker {
                     if matches!(e, LicenseCheckError::TokenRejected(_)) {
                         // NAN-5194: already recorded for SIEM Health and the
                         // admin banner; keep retrying under the same bound.
-                        tracing::error!(error = %e, "Licence token rejected (will retry next interval)");
+                        tracing::error!(error = %e, "License token rejected (will retry next interval)");
                     } else {
                         tracing::warn!(error = %e, "License check failed (will retry next interval)");
                     }
@@ -290,7 +290,7 @@ impl LicenseChecker {
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::debug!(%error, "Licence status refresh failed; keeping the current status");
+                tracing::debug!(%error, "License status refresh failed; keeping the current status");
             }
         }
         self.check_staleness().await;
@@ -399,8 +399,8 @@ impl LicenseChecker {
                 // NAN-5194: not nano-main's answer, so not a token problem.
                 tracing::warn!(
                     %status,
-                    "Licence check-in refused by a proxy, WAF or CDN between this install and \
-                     the licence server (not a token rejection); check the outbound proxy \
+                    "License check-in refused by a proxy, WAF or CDN between this install and \
+                     the license server (not a token rejection); check the outbound proxy \
                      configuration. Will retry next interval."
                 );
             }
@@ -411,7 +411,7 @@ impl LicenseChecker {
                 // and the 14-day bound still applies.
                 let rejection = TokenRejection::new(http_status, Utc::now());
                 if let Err(e) = self.repo.record_token_rejection(&rejection).await {
-                    tracing::warn!(error = %e, "Failed to persist licence token rejection");
+                    tracing::warn!(error = %e, "Failed to persist license token rejection");
                 }
             }
             return Err(error);
@@ -425,7 +425,7 @@ impl LicenseChecker {
         // NAN-5194: a parsed 200 proves the token was accepted. Clear the
         // rejection now, before any later admission step can return early.
         if let Err(e) = self.repo.clear_token_rejection().await {
-            tracing::warn!(error = %e, "Failed to clear licence token rejection");
+            tracing::warn!(error = %e, "Failed to clear license token rejection");
         }
 
         let mut new_status = Self::compute_new_status(&license_resp);
@@ -582,7 +582,7 @@ fn online_tier_claim(tier: &str) -> &str {
     } else {
         tracing::warn!(
             tier,
-            "Unrecognized online licence tier claim; admitting as licensed"
+            "Unrecognized online license tier claim; admitting as licensed"
         );
         "licensed"
     }
@@ -599,7 +599,7 @@ fn admitted_grant_ai_credits(status: &LicenseStatus, resp: &LicenseResponse) -> 
 }
 
 /// NAN-5194: a 401 (or a 403 in nano-main's JSON error shape) means the
-/// licence server refused the token (never retried away); anything else
+/// license server refused the token (never retried away); anything else
 /// non-2xx is transient. The rejection carries no response body.
 pub(crate) fn classify_failure(status: reqwest::StatusCode, body: &str) -> LicenseCheckError {
     if is_credential_rejection(status, body) {
@@ -616,7 +616,7 @@ pub enum LicenseCheckError {
     #[error("Server error: {0}")]
     ServerError(String),
     /// nano-main refused the token (401, or a 403 with its JSON error body).
-    #[error("Licence token rejected by the licence server (HTTP {0})")]
+    #[error("License token rejected by the license server (HTTP {0})")]
     TokenRejected(u16),
     #[error("Parse error: {0}")]
     ParseError(String),

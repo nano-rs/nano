@@ -25,7 +25,8 @@ as before. The authority is the **Multi-node Self-run** guide, section
 
 - Loss of the leader's postgres host: writes, sign-ins and searches fail for
   about 20-25 s (measured 20-24 s on 7-host hard-kill tests: Patroni waits for
-  the dead leader's lock to expire, then promotes the synchronous standby).
+  the dead leader's lock to expire, 20 s, its minimum `ttl`, then promotes the
+  synchronous standby).
   Sign-in can return 500 rather than 503 during that window; clients should
   retry. Losing a standby, or a planned switchover, pauses writes for a few
   seconds at most. Raising
@@ -44,14 +45,28 @@ as before. The authority is the **Multi-node Self-run** guide, section
 2. Install the postgres hosts (any order, close together). The first postgres
    host in inventory order initialises; the others clone it.
 3. Check: `exec postgres-ha patronictl -c /run/patroni/patroni.yml list` shows
-   one `Leader`, one `Sync Standby`, one `Replica`, zero lag. The first postgres
-   host records `NANO_PG_HA_SYSTEM_ID` in its `.env` and prints "The shared .env
-   changed" (the others record the same value in the same place and say so):
-   stream **that postgres host's** `.env` to every other host, the
-   first app host included ([multi-node-ha.md](multi-node-ha.md) Step 5, with
-   that host as the source), before any other installer run, and check the
-   digests match. From then on, the first app host's copy is current again.
-4. Keeper, ClickHouse, app and ingest hosts as in [multi-node-ha.md](multi-node-ha.md).
+   one `Leader`, one `Sync Standby`, one `Replica`, zero lag.
+4. Record the cluster identity on the **first** postgres host. It cannot do
+   so during its own install: etcd has no quorum until the second postgres
+   host joins, so the cluster bootstraps only then, and its install says so.
+   After the last postgres host:
+
+   ```bash
+   ssh $PG1 'cd ~/nano && ./install.sh --record-pg-ha-identity'
+   ```
+
+   It reads the identity from that host's member and writes
+   `NANO_PG_HA_SYSTEM_ID` to its `.env`. It renders, pulls and restarts
+   nothing, so it never recreates the leader. It prints "The shared .env
+   changed on this host (NANO_PG_HA_SYSTEM_ID)". The other postgres hosts may
+   already have recorded the same line in the same place; they print that the
+   first postgres host records it with this command.
+5. Stream **the first postgres host's** `.env` to every other host, the first
+   app host included ([multi-node-ha.md](multi-node-ha.md) Step 5, with that
+   host as the source), before any other installer run, and check the digests
+   match. From then on, the first app host's copy is current again.
+   `plan.py --install-order` prints steps 4 and 5 in place.
+6. Keeper, ClickHouse, app and ingest hosts as in [multi-node-ha.md](multi-node-ha.md).
 
 ## Converting an existing single-postgres install
 
@@ -83,7 +98,15 @@ prints the rules).
 - Backup and restore run on the **leader's** host (`patronictl list`); a
   replica refuses and names the leader.
 - Upgrades: `scripts/nano upgrade` rolls replicas, switches over, then rolls
-  the old leader. Never recreate a leader by hand: switch over first, run
+  the old leader ([upgrade.md](upgrade.md)). From v2.0.11, an `install.sh`
+  rerun on the leader's host switches over to the synchronous standby before
+  recreating it, and stops (recreating nothing) if leadership does not move
+  within 90 s. With no healthy streaming standby (`alone`, it warns), it
+  recreates the leader without a switchover: Patroni fails over to another
+  member if one is eligible (about 20-25 s of failed writes), otherwise
+  writes pause until the member is back. Fix the standbys first. A rerun also restarts that host's Valkey and Sentinel: move
+  the Valkey master off it first. Never recreate a leader by hand: switch
+  over first, run
   **on the leader's host**, inside the container, with the Patroni config:
 
   ```bash

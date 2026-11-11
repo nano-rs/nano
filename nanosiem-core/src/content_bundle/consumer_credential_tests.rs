@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! NAN-5220: which licence an enterprise channel presents, decided without a
+//! NAN-5220: which license an enterprise channel presents, decided without a
 //! network or a database (the pool is lazy and never connected).
 use super::*;
 use crate::content_bundle::credential::{CredentialLookup, CredentialOrigin, CredentialSource, DistributionCredential};
@@ -47,8 +47,8 @@ async fn the_open_edition_has_no_source_and_presents_nothing() {
     assert!(credential::credential_source().is_none());
     let c = consumer(None, DEFAULT_BASE_URL, None);
     let err = c.enterprise_credential().await.unwrap_err();
-    assert!(err.contains("no licence installed"), "{err}");
-    // And it never subscribes to a licence-routed channel at all.
+    assert!(err.contains("no license installed"), "{err}");
+    // And it never subscribes to a license-routed channel at all.
     for profile in [SchemaId::Ocsf, SchemaId::Udm] {
         assert!(channels::subscribed(profile, false).iter().all(|c| c.route == Route::Open));
     }
@@ -76,7 +76,7 @@ async fn the_enrollment_token_goes_only_to_its_licence_server() {
     for elsewhere in ["https://mirror.example.com/api/content/v1", "http://api.nano.rs/api/content/v1"] {
         let c = consumer(None, elsewhere, Some(enrollment("https://api.nano.rs")));
         let err = c.enterprise_credential().await.unwrap_err();
-        assert!(err.contains("only to its licence server"), "{elsewhere}: {err}");
+        assert!(err.contains("only to its license server"), "{elsewhere}: {err}");
     }
 }
 

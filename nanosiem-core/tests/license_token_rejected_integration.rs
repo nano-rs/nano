@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-5194: a rejected licence token rides the real check-in path
+//! NAN-5194: a rejected license token rides the real check-in path
 //! (`LicenseChecker::check_license`) against a mock nano-main, with the
-//! cached licence status in a real Postgres.
+//! cached license status in a real Postgres.
 //!
 //! Proves: a 401 records the rejection (banner data + critical SIEM Health
 //! finding with the 14-day lock date) without changing admission; a repeat

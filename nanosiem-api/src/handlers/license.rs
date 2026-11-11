@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Hosted and C05 offline licence administration.
+//! Hosted and C05 offline license administration.
 
 use axum::{body::Bytes, extract::State, Extension, Json};
 use chrono::{DateTime, Utc};
@@ -17,7 +17,7 @@ use crate::license_admission::{iso, OfflineLicenseSnapshot};
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
-/// Licence status returned to the frontend. Hosted deployments populate the
+/// License status returned to the frontend. Hosted deployments populate the
 /// legacy fields; sovereign/offline deployments additionally populate the C05
 /// installation, revision and recovery diagnostics.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -34,10 +34,19 @@ pub struct LicenseStatusResponse {
     pub expires_at: Option<String>,
     pub enforcement_enabled: bool,
     pub airgap: bool,
-    /// `hosted`, `offline`, or `unconfigured`.
+    /// How the license is verified, NOT the deployment type: `hosted` = checked
+    /// online against nano's hosted license service (every online-licensed
+    /// install, Self-run included), `offline` = a signed license file,
+    /// `unconfigured` = no license configured. Who operates the install is
+    /// `entitlement.operator` (`self-run` / `hosted`) when an entitlement is present.
     pub mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_state: Option<String>,
+    /// NAN-5253: the app.nano.rs deployment ID (`deploy_…`, NANO_DEPLOYMENT_ID)
+    /// of an online-licensed install; omitted for offline and air-gapped ones. Not a secret: it identifies the deployment in support
+    /// reports and the app.nano.rs feedback deep link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,18 +68,18 @@ pub struct LicenseStatusResponse {
     pub notice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entitlement: Option<LicenseEntitlementResponse>,
-    /// NAN-5194: the licence server refused this deployment's token (HTTP
+    /// NAN-5194: the license server refused this deployment's token (HTTP
     /// 401/403) at the last check-in attempt. Hosted (online) mode only;
     /// omitted otherwise, and cleared by the next successful check-in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_rejected: Option<TokenRejectedResponse>,
 }
 
-/// NAN-5194: admin banner data for a rejected licence token. Never contains
+/// NAN-5194: admin banner data for a rejected license token. Never contains
 /// the token.
 #[derive(Debug, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct TokenRejectedResponse {
-    /// HTTP status the licence server answered (401 or 403).
+    /// HTTP status the license server answered (401 or 403).
     pub http_status: u16,
     pub first_rejected_at: String,
     pub last_rejected_at: String,
@@ -160,6 +169,7 @@ impl LicenseStatusResponse {
             airgap,
             mode: "offline".into(),
             runtime_state: Some(view.state.clone()),
+            deployment_id: None,
             installation_id: Some(view.installation_id.clone()),
             organization_id: Some(view.organization_id.clone()),
             installation_fingerprint: Some(view.installation_fingerprint.clone()),
@@ -192,6 +202,7 @@ impl LicenseStatusResponse {
                 airgap,
                 mode: "offline".into(),
                 runtime_state: Some("legacy_upgrade_grace".into()),
+                deployment_id: None,
                 installation_id: Some(grace.identity.installation_id.clone()),
                 organization_id: Some(grace.identity.organization_id.clone()),
                 installation_fingerprint: Some(grace.identity.installation_fingerprint.clone()),
@@ -218,6 +229,7 @@ impl LicenseStatusResponse {
             airgap,
             mode: "unconfigured".into(),
             runtime_state: Some("refused".into()),
+            deployment_id: None,
             installation_id: None,
             organization_id: None,
             installation_fingerprint: None,
@@ -317,15 +329,28 @@ fn parse_time(value: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
-/// Get the cached licence status. Durable observations are performed only by
+/// NAN-5253: the online license's deployment ID (NANO_DEPLOYMENT_ID) when it is a
+/// well-formed `deploy_` TypeID. Offline and air-gapped installs return none.
+fn configured_deployment_id(state: &AppState) -> Option<String> {
+    let online = state.config.online_license_config().ok().flatten()?;
+    Some(online.deployment_id.trim())
+        .filter(|id| {
+            id.len() == 33
+                && id.starts_with("deploy_")
+                && id[7..].bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        })
+        .map(str::to_owned)
+}
+
+/// Get the cached license status. Durable observations are performed only by
 /// the single 30-second authority refresher.
 #[utoipa::path(
     get,
     path = "/api/license",
     tag = "license",
     responses(
-        (status = 200, description = "Licence status", body = LicenseStatusResponse),
-        (status = 503, description = "Offline licence authority unavailable", body = ErrorResponse)
+        (status = 200, description = "License status", body = LicenseStatusResponse),
+        (status = 503, description = "Offline license authority unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -352,7 +377,7 @@ pub async fn get_license_status(
         .get_token_rejected_notice()
         .await
         .unwrap_or_else(|error| {
-            tracing::warn!(%error, "Licence token rejection unavailable");
+            tracing::warn!(%error, "License token rejection unavailable");
             None
         })
         .map(TokenRejectedResponse::from);
@@ -367,6 +392,7 @@ pub async fn get_license_status(
         airgap: state.config.airgap,
         mode: "hosted".into(),
         runtime_state: None,
+        deployment_id: configured_deployment_id(&state),
         installation_id: None,
         organization_id: None,
         installation_fingerprint: None,
@@ -387,10 +413,10 @@ pub async fn get_license_status(
     post,
     path = "/api/license/import",
     tag = "license",
-    request_body(content = String, description = "Exact signed C05 licence JSON file", content_type = "application/json"),
+    request_body(content = String, description = "Exact signed C05 license JSON file", content_type = "application/json"),
     responses(
-        (status = 200, description = "Licence installed", body = LicenseStatusResponse),
-        (status = 400, description = "Invalid licence file", body = ErrorResponse),
+        (status = 200, description = "License installed", body = LicenseStatusResponse),
+        (status = 400, description = "Invalid license file", body = ErrorResponse),
         (status = 403, description = "Missing settings:system permission", body = ErrorResponse),
         (status = 409, description = "Binding, revision or term refused", body = ErrorResponse)
     ),
@@ -430,7 +456,7 @@ pub async fn renew_license(
 async fn install(state: &AppState, body: &[u8]) -> Result<Json<LicenseStatusResponse>, ApiError> {
     if body.is_empty() || body.len() > MAX_LICENSE_BYTES {
         return Err(ApiError::PayloadTooLarge(format!(
-            "C05 licence files must be 1 to {MAX_LICENSE_BYTES} bytes"
+            "C05 license files must be 1 to {MAX_LICENSE_BYTES} bytes"
         )));
     }
     // Read the canonical v2 fields from the same signed artifact the stateful
@@ -438,7 +464,7 @@ async fn install(state: &AppState, body: &[u8]) -> Result<Json<LicenseStatusResp
     // binding/revision/clock transition; this first pass only makes the signed
     // commercial identity available to the shared TierSettings repository.
     let verified = verify_production(body)
-        .map_err(|_| ApiError::BadRequest("Invalid or untrusted C05 licence file".into()))?;
+        .map_err(|_| ApiError::BadRequest("Invalid or untrusted C05 license file".into()))?;
     let entitlement = nanosiem_core::Entitlement {
         edition: nanosiem_core::EntitlementEdition::Licensed,
         operator: match verified.policy.operator {
@@ -474,7 +500,7 @@ async fn install(state: &AppState, body: &[u8]) -> Result<Json<LicenseStatusResp
     responses(
         (status = 200, description = "Public clock-recovery request", body = ClockRecoveryRequest),
         (status = 403, description = "Missing settings:system permission", body = ErrorResponse),
-        (status = 409, description = "No installed licence", body = ErrorResponse)
+        (status = 409, description = "No installed license", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -525,12 +551,12 @@ pub async fn apply_clock_recovery(
 
 fn ensure_offline_admin(state: &AppState, auth: &AuthContext) -> Result<(), ApiError> {
     ensure_permission(auth, permissions::SETTINGS_SYSTEM)?;
-    // Since v2, every enterprise install without an online licence tuple is
+    // Since v2, every enterprise install without an online license tuple is
     // admitted only by C05; requiring AIRGAP_MODE here left self-run installs
-    // locked with no way to install the licence that unlocks them (NAN-5086).
+    // locked with no way to install the license that unlocks them (NAN-5086).
     if !state.config.uses_c05_authority() {
         return Err(ApiError::Conflict(
-            "C05 files are accepted only by a deployment without an online licence".into(),
+            "C05 files are accepted only by a deployment without an online license".into(),
         ));
     }
     Ok(())
@@ -556,7 +582,7 @@ fn entitlement_error(error: EntitlementError) -> ApiError {
 }
 
 /// NAN-5114: whether a newer nano release is available, from the last
-/// successful online licence check-in. Public facts only (version, links,
+/// successful online license check-in. Public facts only (version, links,
 /// security flag). Offline / air-gapped installs make no check-in, so they
 /// always answer `update_available: false` with no latest version.
 #[derive(Debug, Serialize, PartialEq, Eq, utoipa::ToSchema)]
@@ -601,7 +627,7 @@ impl UpdateStatusResponse {
 }
 
 /// Update availability for the admin "Update available" banner (NAN-5114).
-/// Exempt from the licence guard: a locked deployment must still learn that
+/// Exempt from the license guard: a locked deployment must still learn that
 /// an upgrade exists.
 #[utoipa::path(
     get,

@@ -50,7 +50,7 @@ async function fetchCapabilities(): Promise<CapabilitiesContextValue> {
     throw new Error(`Unexpected build edition: ${body.edition}`);
   }
   // Older APIs did not publish these flags. Absence is fail-closed because
-  // bundle edition alone says nothing about current licence admission.
+  // bundle edition alone says nothing about current license admission.
   if (typeof body.capabilities?.soar !== 'boolean') {
     body.capabilities = { ...body.capabilities, soar: false };
   }

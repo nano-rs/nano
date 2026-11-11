@@ -25,7 +25,7 @@
 #   NANO_HTTPS_PROXY (http://host:port), NANO_PROXY_USERNAME / NANO_PROXY_PASSWORD
 #   (raw; the installer percent-encodes them) and NANO_NO_PROXY — outbound proxy for
 #   nano's own calls; asked once, kept in .env as HTTPS_PROXY/HTTP_PROXY/NO_PROXY.
-#   Enterprise licence (NAN-5172), asked once on a TTY and kept in .env:
+#   Enterprise license (NAN-5172), asked once on a TTY and kept in .env:
 #   LICENSE_URL, LICENSE_TOKEN (or the older DEPLOYMENT_TOKEN) and
 #   NANO_DEPLOYMENT_ID from the deployment's page in app.nano.rs, or
 #   NANO_LICENSE_MODE=offline with an optional NANO_LICENSE_FILE (imported
@@ -105,6 +105,7 @@ COMPOSE_FILE="docker-compose.opensource.yml"
 ROLE_ARG=""
 INVENTORY_ARG=""
 TOPOLOGY_MIGRATION_SHA=""
+RECORD_PG_HA_IDENTITY_ONLY=0
 ENV_TEMP_FILE=""
 # NAN-5237: 0600 files holding the setup-token header / initialize response.
 SETUP_HEADER_FILE=""
@@ -131,15 +132,22 @@ while [[ $# -gt 0 ]]; do
         --accept-topology-migration)
             [[ $# -ge 2 ]] || { printf '%s\n' "--accept-topology-migration requires the currently recorded identity SHA-256" >&2; exit 2; }
             TOPOLOGY_MIGRATION_SHA="$2"; shift 2 ;;
+        --record-pg-ha-identity)
+            RECORD_PG_HA_IDENTITY_ONLY=1; shift ;;
         -h|--help)
             cat <<'EOF'
 Usage: install.sh [--role app,ingest,clickhouse,keeper,postgres --inventory inventory.yaml]
                   [--accept-topology-migration CURRENT_IDENTITY_SHA256]
+       install.sh --record-pg-ha-identity
 
 Without role/inventory arguments, installs the unchanged single-node stack.
 Enterprise bundles may select one or more roles from a shared host inventory.
 The migration acknowledgement is valid only for a role-split install after its
 data-movement runbook has completed; the exact recorded identity is required.
+
+--record-pg-ha-identity (first postgres host of a PostgreSQL HA cluster, after
+the other postgres hosts are installed) only records the cluster's identity
+(NANO_PG_HA_SYSTEM_ID) in .env. It renders, pulls and restarts nothing.
 EOF
             exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -147,6 +155,10 @@ EOF
 done
 if [[ -n "$ROLE_ARG" && -z "$INVENTORY_ARG" ]] || [[ -z "$ROLE_ARG" && -n "$INVENTORY_ARG" ]]; then
     printf '%s\n' "--role and --inventory must be provided together" >&2
+    exit 2
+fi
+if [[ "$RECORD_PG_HA_IDENTITY_ONLY" == "1" && ( -n "$ROLE_ARG" || -n "$TOPOLOGY_MIGRATION_SHA" ) ]]; then
+    printf '%s\n' "--record-pg-ha-identity takes no other argument: it reads this host's recorded roles" >&2
     exit 2
 fi
 if [[ -n "$TOPOLOGY_MIGRATION_SHA" && -z "$INVENTORY_ARG" ]]; then
@@ -158,10 +170,10 @@ if [[ -n "$TOPOLOGY_MIGRATION_SHA" && ! "$TOPOLOGY_MIGRATION_SHA" =~ ^[0-9a-f]{6
     exit 2
 fi
 ROLE_ARG=$(printf '%s' "$ROLE_ARG" | tr -d '[:space:]')
-# NAN-5172: licence inputs from the invoking environment, captured before
+# NAN-5172: license inputs from the invoking environment, captured before
 # anything else can reuse these names. The role-split renderer later exports
 # NANO_DEPLOYMENT_ID as cluster.deployment_id (volume/project identity); the
-# app.nano.rs-issued id given here is the licence id and never that.
+# app.nano.rs-issued id given here is the license id and never that.
 LICENSE_URL_INPUT="${LICENSE_URL:-}"
 LICENSE_TOKEN_INPUT="${LICENSE_TOKEN:-${DEPLOYMENT_TOKEN:-}}"
 LICENSE_DEPLOYMENT_ID_INPUT="${NANO_DEPLOYMENT_ID:-}"
@@ -364,7 +376,7 @@ valid_no_proxy() {
     [[ "${1:-}" =~ ^[A-Za-z0-9.*:/_-]+(,[A-Za-z0-9.*:/_-]+)*$ ]]
 }
 
-# Corporate egress proxy for nano's own outbound calls (licence check-in,
+# Corporate egress proxy for nano's own outbound calls (license check-in,
 # feeds, content, OIDC/identity sync, S3 tiering). Asked once, only while
 # .env has neither HTTPS_PROXY nor a recorded answer; a re-run or upgrade
 # never asks again. Unattended installs pass NANO_HTTPS_PROXY (and
@@ -501,16 +513,16 @@ configure_automatic_backups() {
 }
 
 # ----------------------------------------------------------------------------
-# Licence (NAN-5172): asked once on first install, recorded in .env.
+# License (NAN-5172): asked once on first install, recorded in .env.
 # ----------------------------------------------------------------------------
 # Enterprise api/jobs either check in online with the three values from the
 # deployment's page in app.nano.rs (LICENSE_URL, LICENSE_TOKEN,
-# NANO_DEPLOYMENT_ID) or are admitted by an offline C05 licence file imported
+# NANO_DEPLOYMENT_ID) or are admitted by an offline C05 license file imported
 # after install. NANO_LICENSE_MODE in .env records the choice
 # (online | offline | airgap) so a re-run or upgrade never asks again;
 # "pending" marks a prepared .env whose values are still to be added.
 LICENSE_DEFAULT_URL="https://api.nano.rs/api/license/status"
-LICENSE_PAGE_HINT="https://app.nano.rs → Deployments → your Self-run deployment → Licence"
+LICENSE_PAGE_HINT="https://app.nano.rs → Deployments → your Self-run deployment → License"
 # nanosiem-enterprise/src/sovereign_license/wire.rs MAX_LICENSE_BYTES.
 OFFLINE_LICENSE_MAX_BYTES=262144
 
@@ -544,23 +556,23 @@ strip_license_paste() {
     printf '%s' "$value"
 }
 
-# Offline licence file to import after install: a readable regular file of
+# Offline license file to import after install: a readable regular file of
 # 1..OFFLINE_LICENSE_MAX_BYTES bytes holding a JSON object. Prints the
 # absolute path. The signature is verified by nano-api at import.
 resolve_offline_license_file() {
     local path="$1" size first
-    [[ -f "$path" && -r "$path" ]] || { warn "Offline licence file not found or not readable: $path"; return 1; }
+    [[ -f "$path" && -r "$path" ]] || { warn "Offline license file not found or not readable: $path"; return 1; }
     size=$(wc -c < "$path" | tr -d '[:space:]')
     if (( size < 1 || size > OFFLINE_LICENSE_MAX_BYTES )); then
-        warn "Offline licence file must be 1 to $OFFLINE_LICENSE_MAX_BYTES bytes (got $size): $path"
+        warn "Offline license file must be 1 to $OFFLINE_LICENSE_MAX_BYTES bytes (got $size): $path"
         return 1
     fi
     first=$(tr -d ' \t\r\n' < "$path" | head -c 1)
-    [[ "$first" == "{" ]] || { warn "Offline licence file is not a signed licence JSON file: $path"; return 1; }
+    [[ "$first" == "{" ]] || { warn "Offline license file is not a signed license JSON file: $path"; return 1; }
     printf '%s/%s' "$(cd "$(dirname "$path")" && pwd -P)" "$(basename "$path")"
 }
 
-# Validate the licence values given in the environment. Runs before anything
+# Validate the license values given in the environment. Runs before anything
 # is written, including under NANO_CHECK_ONLY. Never prints the token.
 validate_license_inputs() {
     [[ "$NANO_EDITION" == "enterprise" ]] || return 0
@@ -574,7 +586,7 @@ validate_license_inputs() {
     if [[ -n "$LICENSE_TOKEN_INPUT" ]] && ! valid_license_token "$LICENSE_TOKEN_INPUT"; then
         fail "LICENSE_TOKEN is not an enrollment token (expected 32+ letters, digits, '-' or '_'; value not shown). Copy it from $LICENSE_PAGE_HINT."
     fi
-    # NANO_DEPLOYMENT_ID alone is not a licence input: older role-split
+    # NANO_DEPLOYMENT_ID alone is not a license input: older role-split
     # guides exported it for other purposes. It is checked with a token.
     if [[ -n "$LICENSE_TOKEN_INPUT" && -n "$LICENSE_DEPLOYMENT_ID_INPUT" ]] \
         && ! valid_deployment_id "$LICENSE_DEPLOYMENT_ID_INPUT"; then
@@ -589,9 +601,9 @@ validate_license_inputs() {
         [[ -n "$LICENSE_TOKEN_INPUT" && -n "$LICENSE_DEPLOYMENT_ID_INPUT" ]] \
             || fail "Set LICENSE_TOKEN and NANO_DEPLOYMENT_ID together (LICENSE_URL defaults to $LICENSE_DEFAULT_URL). Copy them from $LICENSE_PAGE_HINT."
         [[ "$LICENSE_MODE_INPUT" != "offline" && -z "$LICENSE_FILE_INPUT" ]] \
-            || fail "Choose one licence: the online values (LICENSE_TOKEN, NANO_DEPLOYMENT_ID) or an offline licence (NANO_LICENSE_MODE=offline / NANO_LICENSE_FILE), not both."
+            || fail "Choose one license: the online values (LICENSE_TOKEN, NANO_DEPLOYMENT_ID) or an offline license (NANO_LICENSE_MODE=offline / NANO_LICENSE_FILE), not both."
         is_truthy "${AIRGAP_MODE:-}" \
-            && fail "AIRGAP_MODE=true never checks in online; leave out LICENSE_URL/LICENSE_TOKEN and import an offline licence after install."
+            && fail "AIRGAP_MODE=true never checks in online; leave out LICENSE_URL/LICENSE_TOKEN and import an offline license after install."
     fi
     if [[ -n "$LICENSE_FILE_INPUT" ]]; then
         resolve_offline_license_file "$LICENSE_FILE_INPUT" >/dev/null \
@@ -600,7 +612,7 @@ validate_license_inputs() {
     return 0
 }
 
-# Decide the licence for this install. Sets LICENSE_ENV_LINES (assignments to
+# Decide the license for this install. Sets LICENSE_ENV_LINES (assignments to
 # set in .env, possibly empty), LICENSE_MODE and LICENSE_IMPORT_FILE. $1 is
 # 1 on first install (no .env yet), 0 when an .env is reused.
 # Prompts at most once, only with a controlling TTY.
@@ -611,7 +623,7 @@ resolve_license() {
     LICENSE_ENV_LINES="" LICENSE_MODE="" LICENSE_IMPORT_FILE="" LICENSE_DEPLOYMENT_ID=""
     if [[ "$NANO_EDITION" != "enterprise" ]]; then
         if [[ -n "$LICENSE_TOKEN_INPUT$LICENSE_FILE_INPUT" ]]; then
-            warn "Open edition has no licence check; LICENSE_TOKEN / NANO_LICENSE_FILE are ignored."
+            warn "Open edition has no license check; LICENSE_TOKEN / NANO_LICENSE_FILE are ignored."
         fi
         LICENSE_MODE=none
         return 0
@@ -629,7 +641,7 @@ resolve_license() {
     recorded_id=$(env_value NANO_DEPLOYMENT_ID)
 
     # 1. Values given to this run (first install, a prepared .env, or a new
-    #    token after "Regenerate licence token" on the deployment page).
+    #    token after "Regenerate license token" on the deployment page).
     if [[ -n "$LICENSE_TOKEN_INPUT" ]]; then
         url="${LICENSE_URL_INPUT:-${recorded_url:-$LICENSE_DEFAULT_URL}}"
         LICENSE_MODE=online LICENSE_DEPLOYMENT_ID="$LICENSE_DEPLOYMENT_ID_INPUT"
@@ -637,7 +649,7 @@ resolve_license() {
         [[ "$LICENSE_TOKEN_INPUT" == "$recorded_token" ]] || LICENSE_ENV_LINES+="LICENSE_TOKEN=$LICENSE_TOKEN_INPUT"$'\n'
         [[ "$LICENSE_DEPLOYMENT_ID_INPUT" == "$recorded_id" ]] || LICENSE_ENV_LINES+="NANO_DEPLOYMENT_ID=$LICENSE_DEPLOYMENT_ID_INPUT"$'\n'
         if [[ "$first_install" == "0" && -n "$recorded_token" && "$LICENSE_TOKEN_INPUT" != "$recorded_token" ]]; then
-            log "Replacing the licence token recorded in .env with the one given to this run (value not shown)"
+            log "Replacing the license token recorded in .env with the one given to this run (value not shown)"
         fi
     elif [[ "$LICENSE_MODE_INPUT" == "offline" || -n "$LICENSE_FILE_INPUT" ]]; then
         LICENSE_MODE=offline
@@ -655,11 +667,11 @@ resolve_license() {
     # 3. Nothing known: ask once.
     elif have_controlling_tty; then
         # A pre-2.0.5 install that reaches here was admitted by an offline
-        # licence imported in the UI (or not licensed yet): keep that default.
+        # license imported in the UI (or not licensed yet): keep that default.
         default_choice=online
         [[ "$first_install" == "0" && -z "$recorded_mode" ]] && default_choice=offline
         while :; do
-            choice=$(prompt_tty "Licence: online check-in (paste the 3 values from app.nano.rs) or offline file (path)? [online/offline]" "$default_choice")
+            choice=$(prompt_tty "License: online check-in (paste the 3 values from app.nano.rs) or offline file (path)? [online/offline]" "$default_choice")
             choice=$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
             case "$choice" in
                 online|on|1) choice=online; break ;;
@@ -671,7 +683,7 @@ resolve_license() {
             while :; do
                 url=$(strip_license_paste "$(prompt_tty "LICENSE_URL" "$LICENSE_DEFAULT_URL")" LICENSE_URL)
                 valid_license_url "$url" && break
-                warn "Enter the https:// licence URL shown on the deployment page."
+                warn "Enter the https:// license URL shown on the deployment page."
             done
             while :; do
                 token=$(strip_license_paste "$(prompt_tty "LICENSE_TOKEN (input hidden)" "" secret)" LICENSE_TOKEN)
@@ -689,22 +701,22 @@ resolve_license() {
         else
             LICENSE_MODE=offline
             while :; do
-                path=$(prompt_tty "Offline licence file path (blank = import it after install under Settings → Licence)")
+                path=$(prompt_tty "Offline license file path (blank = import it after install under Settings → License)")
                 [[ -z "$path" ]] && break
                 LICENSE_IMPORT_FILE=$(resolve_offline_license_file "$path") && break
             done
         fi
     elif [[ "$first_install" == "0" && -z "$recorded_mode" ]]; then
         # Unattended upgrade of an install from before this choice existed:
-        # it runs on the offline (C05) licence it already has. Don't block it.
+        # it runs on the offline (C05) license it already has. Don't block it.
         LICENSE_MODE=offline
     elif [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
         LICENSE_MODE=pending
         [[ "$recorded_mode" == "pending" ]] || LICENSE_ENV_LINES="NANO_LICENSE_MODE=pending"$'\n'
-        warn "No licence values yet. Before running ./install.sh, add LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID to .env (from $LICENSE_PAGE_HINT), or pass them to ./install.sh, or set NANO_LICENSE_MODE=offline."
+        warn "No license values yet. Before running ./install.sh, add LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID to .env (from $LICENSE_PAGE_HINT), or pass them to ./install.sh, or set NANO_LICENSE_MODE=offline."
         return 0
     else
-        fail "No licence for this unattended enterprise install (no TTY to ask). Pass LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID from $LICENSE_PAGE_HINT, for example: NANO_IMAGES_LOCK=images.enterprise.customer.lock LICENSE_URL=$LICENSE_DEFAULT_URL LICENSE_TOKEN=<token> NANO_DEPLOYMENT_ID=<deployment id> ./install.sh. Without access to api.nano.rs, set NANO_LICENSE_MODE=offline (import the licence file after install) or AIRGAP_MODE=true. Nothing was started."
+        fail "No license for this unattended enterprise install (no TTY to ask). Pass LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID from $LICENSE_PAGE_HINT, for example: NANO_IMAGES_LOCK=images.enterprise.customer.lock LICENSE_URL=$LICENSE_DEFAULT_URL LICENSE_TOKEN=<token> NANO_DEPLOYMENT_ID=<deployment id> ./install.sh. Without access to api.nano.rs, set NANO_LICENSE_MODE=offline (import the license file after install) or AIRGAP_MODE=true. Nothing was started."
     fi
     [[ "$LICENSE_MODE" == "$recorded_mode" ]] || LICENSE_ENV_LINES+="NANO_LICENSE_MODE=$LICENSE_MODE"$'\n'
     return 0
@@ -723,20 +735,20 @@ record_license() {
         # The first-install temp file locks on its eventual .env path, as the
         # secret backfill does, so no lock file is left beside the temp file.
         nano_env_atomic_rewrite_locked "$target" "$PWD/.env" nano_env_set_keys_writer "${license_kvs[@]}" \
-            || fail "Could not record the licence values in $target."
+            || fail "Could not record the license values in $target."
     fi
     license_kvs=()
     LICENSE_ENV_LINES=""
     case "$LICENSE_MODE" in
         online)
-            ok "Licence: online check-in for deployment $LICENSE_DEPLOYMENT_ID (LICENSE_TOKEN ******** in .env)" ;;
+            ok "License: online check-in for deployment $LICENSE_DEPLOYMENT_ID (LICENSE_TOKEN ******** in .env)" ;;
         offline)
             if [[ -n "$LICENSE_IMPORT_FILE" ]]; then
-                ok "Licence: offline; $LICENSE_IMPORT_FILE is imported after the admin account is created"
+                ok "License: offline; $LICENSE_IMPORT_FILE is imported after the admin account is created"
             else
-                ok "Licence: offline; import the licence file after install under Settings → Licence"
+                ok "License: offline; import the license file after install under Settings → License"
             fi ;;
-        airgap) ok "Licence: air-gapped (AIRGAP_MODE); import the offline licence after install" ;;
+        airgap) ok "License: air-gapped (AIRGAP_MODE); import the offline license after install" ;;
     esac
 }
 
@@ -748,13 +760,13 @@ persistable_env_value() {
     [[ -n "${1:-}" && "$1" != *[\'\"\\\`\$]* && "$1" != *[[:cntrl:]]* ]]
 }
 
-# Import the offline licence file chosen at install (NANO_LICENSE_FILE or the
+# Import the offline license file chosen at install (NANO_LICENSE_FILE or the
 # prompt) as the admin, once the account exists. Best effort: nano is already
 # up, so a refusal is reported with the manual path instead of failing.
 # Secrets go to curl through 0600 files, never its command line.
 import_offline_license() {
     [[ -n "${LICENSE_IMPORT_FILE:-}" ]] || return 0
-    local manual="Import $LICENSE_IMPORT_FILE under Settings → Licence ($BASE_URL/settings/license)."
+    local manual="Import $LICENSE_IMPORT_FILE under Settings → License ($BASE_URL/settings/license)."
     local scratch code access_token
     if [[ -z "${ADMIN_PASSWORD:-}" ]]; then
         warn "$manual The installer needs the admin password (NANO_ADMIN_PASSWORD) to import it."
@@ -766,7 +778,7 @@ import_offline_license() {
     if ! code=$(api_call "$scratch/session" -X POST -H "Content-Type: application/json" \
         --data-binary "@$scratch/login" "${API_BASE}/api/auth/login"); then
         rm -rf "$scratch"
-        warn "Could not sign in as $ADMIN_EMAIL to import the offline licence (HTTP $code). $manual"
+        warn "Could not sign in as $ADMIN_EMAIL to import the offline license (HTTP $code). $manual"
         return 0
     fi
     access_token=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tokens"]["access_token"])' "$scratch/session" </dev/null 2>/dev/null \
@@ -774,18 +786,18 @@ import_offline_license() {
         || access_token=""
     if [[ -z "$access_token" ]]; then
         rm -rf "$scratch"
-        warn "Could not read the sign-in response to import the offline licence. $manual"
+        warn "Could not read the sign-in response to import the offline license. $manual"
         return 0
     fi
     printf 'Authorization: Bearer %s\n' "$access_token" > "$scratch/auth"
     access_token=""
     if code=$(api_call /dev/null -X POST -H "@$scratch/auth" -H "Content-Type: application/json" \
         --data-binary "@$LICENSE_IMPORT_FILE" "${API_BASE}/api/license/import"); then
-        ok "Offline licence imported from $LICENSE_IMPORT_FILE"
+        ok "Offline license imported from $LICENSE_IMPORT_FILE"
     elif [[ "$code" == "409" ]]; then
-        warn "The offline licence was refused (HTTP 409): it is bound to another installation, superseded or out of term. On your deployment's page in app.nano.rs, enter this install's installation and organization IDs (Settings → Licence) and download a new file. $manual"
+        warn "The offline license was refused (HTTP 409): it is bound to another installation, superseded or out of term. On your deployment's page in app.nano.rs, enter this install's installation and organization IDs (Settings → License) and download a new file. $manual"
     else
-        warn "The offline licence was not imported (HTTP $code). $manual"
+        warn "The offline license was not imported (HTTP $code). $manual"
     fi
     rm -rf "$scratch"
 }
@@ -1188,8 +1200,8 @@ fi
 # 2. Clone or update the repo
 # ----------------------------------------------------------------------------
 if [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
-    if [[ "${NANO_SKIP_GIT_UPDATE:-0}" == "1" ]]; then
-        log "NANO_SKIP_GIT_UPDATE=1 — installing the checkout at $NANO_INSTALL_DIR as is"
+    if [[ "${NANO_SKIP_GIT_UPDATE:-0}" == "1" || "$RECORD_PG_HA_IDENTITY_ONLY" == "1" ]]; then
+        log "Not updating the checkout (NANO_SKIP_GIT_UPDATE=1 or --record-pg-ha-identity) — installing the checkout at $NANO_INSTALL_DIR as is"
     else
         # Older checkouts predate the shipped ignore rule for the helper's stable
         # flock identity. Ignore only that generated, untracked root path; any
@@ -1311,7 +1323,7 @@ fi
 
 # NAN-5251: a role-split .env must stay byte-identical on every host, so any
 # run that changes it, on any role, says so. The baseline is taken when an
-# existing .env is reused; every later writer (licence, release keys, the
+# existing .env is reused; every later writer (license, release keys, the
 # PostgreSQL HA identity, backfilled secrets, ...) is then covered by one
 # comparison instead of a message per writer. The baseline lives only in this
 # shell (never exported, never written to disk).
@@ -1366,6 +1378,59 @@ if [[ "$(uname -s)" == Linux && "${NANO_PREPARE_ONLY:-0}" != "1" ]]; then
                 ;;
         esac
     fi
+fi
+
+# NAN-5214/NAN-5263: record the PostgreSQL HA cluster's system identifier in
+# the shared .env once this host's Patroni member holds the cluster's data.
+# Prints recorded <id> | unchanged <id> | conflict <reason> | pending.
+# The first postgres host cannot record it during its own install: a 3-member
+# etcd has no quorum until a second postgres host joins, so the cluster only
+# bootstraps then. It records it with `install.sh --record-pg-ha-identity`
+# (below) after the other postgres hosts are installed, without recreating
+# any container (that member is usually the leader).
+pg_ha_record_identity() {
+    local wait_seconds="$1" deadline status outcome="pending"
+    deadline=$(( $(date +%s) + wait_seconds ))
+    while :; do
+        status=0
+        outcome=$(docker compose "${COMPOSE_ARGS[@]}" exec -T postgres-ha \
+                pg_controldata -D /var/lib/postgresql/data 2>/dev/null </dev/null \
+            | python3 -I scripts/lib/pg_ha_system_id.py .env) || status=$?
+        [[ "$status" == 4 ]] || break
+        (( $(date +%s) < deadline )) || break
+        sleep 5
+    done
+    printf '%s\n' "$outcome"
+}
+
+PG_HA_COPY_ADVICE="copy the FIRST postgres host's .env to every other host (app, ingest, ClickHouse, Keeper and postgres) before the next install.sh run anywhere, then check that 'sha256sum .env' matches on every host"
+
+if [[ "$RECORD_PG_HA_IDENTITY_ONLY" == "1" ]]; then
+    [[ -f .env && -f .nano-role.env && -f deploy/compose/docker-compose.enterprise.yml ]] \
+        || fail "--record-pg-ha-identity runs on an installed PostgreSQL HA host; $NANO_INSTALL_DIR has no .env/.nano-role.env from a role-split install."
+    grep -q '^NANO_PATRONI_BOOTSTRAP=' .nano-role.env \
+        || fail "This host runs no PostgreSQL HA member (no NANO_PATRONI_BOOTSTRAP in .nano-role.env); run --record-pg-ha-identity on the first postgres host."
+    grep -q '^NANO_PATRONI_BOOTSTRAP="true"' .nano-role.env \
+        || warn "This is not the first postgres host. The first postgres host's .env is the one to copy; run --record-pg-ha-identity there."
+    MULTI_NODE=1
+    COMPOSE_FILE="deploy/compose/docker-compose.enterprise.yml"
+    COMPOSE_ARGS=(--env-file .env --env-file .nano-role.env -f "$COMPOSE_FILE")
+    shared_env_rebaseline
+    log "Reading the PostgreSQL HA cluster identity from this host's member (nothing is rendered, pulled or restarted)"
+    pg_ha_outcome=$(pg_ha_record_identity "${NANO_PG_HA_SYSTEM_ID_WAIT:-60}")
+    case "$pg_ha_outcome" in
+        recorded*)
+            ok "Recorded the PostgreSQL cluster identity in .env (${pg_ha_outcome#recorded })"
+            shared_env_rebaseline
+            warn "The shared .env changed on this host (NANO_PG_HA_SYSTEM_ID): $PG_HA_COPY_ADVICE." ;;
+        unchanged*)
+            ok "The PostgreSQL cluster identity is already recorded in .env (${pg_ha_outcome#unchanged }); nothing changed." ;;
+        conflict*)
+            fail "PostgreSQL HA identity mismatch: ${pg_ha_outcome#conflict }. This host's database is not the cluster recorded in .env; do not continue. See 'Recovering after losing the bootstrap host and etcd' in the multi-node guide." ;;
+        *)
+            fail "This host's PostgreSQL HA member holds no cluster data yet. The cluster bootstraps once a second postgres host is installed (etcd needs 2 of 3 members); install the other postgres hosts, check 'docker compose ps postgres-ha', then run this again." ;;
+    esac
+    exit 0
 fi
 
 nano_async_loader_query() {
@@ -1568,6 +1633,10 @@ env_value() {
 }
 
 RECORDED_EDITION=$(env_value NANO_EDITION)
+# NAN-5263: the release this install ran BEFORE this run ("" for a fresh install
+# or one that predates the key). Only installs from before v2 (no ingest tokens
+# yet) can still be in the deprecated legacy multiplex ingest mode.
+PRE_RUN_NANO_VERSION=$(env_value NANO_VERSION)
 RECORDED_PREFIX=$(env_value NANO_IMAGE_PREFIX)
 if [[ -f .env && -z "$RECORDED_EDITION" ]]; then
     # A .env without NANO_EDITION was written before editions existed, when
@@ -1702,6 +1771,11 @@ if [[ -f .env ]]; then
     warn ".env already exists — keeping existing secrets, will only (re)start the stack."
     REUSE_ENV=1
     shared_env_rebaseline
+    # NAN-5263: an earlier installer (v2.0.8) could leave a key twice (a second
+    # NANO_LICENSE_MODE line). Keep the effective (last) value, once.
+    collapsed_keys=$(nano_env_collapse_duplicates .env) \
+        || fail "Could not collapse duplicate lines in .env."
+    [[ -z "$collapsed_keys" ]] || ok "Collapsed duplicate .env line(s) for $collapsed_keys (kept the value in effect)"
     # Role-split compose intentionally exposes only the five fixed roles. The
     # single-node-only Tenzir profile is not silently dropped or allowed to
     # replace the requested host profile set.
@@ -1799,7 +1873,7 @@ if [[ -f .env ]]; then
             || fail "Could not record NANO_SCHEMA_PROFILE in .env."
         log "Pinned NANO_SCHEMA_PROFILE=udm in .env (this install predates the schema choice)"
     fi
-    # Set in place only when this run adds or changes a licence value.
+    # Set in place only when this run adds or changes a license value.
     resolve_license 0
     record_license .env
 else
@@ -1879,7 +1953,7 @@ else
         fail "The bundled Tenzir profile is single-node only; role-split installs must use the ocsf or udm schema profile without bundled Tenzir."
     fi
 
-    # Licence: asked here, before anything is written, and fails closed for an
+    # License: asked here, before anything is written, and fails closed for an
     # unattended install without one.
     resolve_license 1
 
@@ -2389,6 +2463,44 @@ if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE
     fi
 fi
 
+# NAN-5263: the rerun below recreates this host's Patroni member. When it is
+# the LEADER, move leadership to a healthy standby first (a planned switchover
+# of about a second) instead of costing the cluster a failover (the 20 s
+# leader timeout plus promotion). A leader with no healthy standby (the first
+# postgres host before the others join) is recreated as before.
+if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE_ARG}," == *,postgres,* \
+        && -n "${NANO_HOST_ID:-}" \
+        && -n "$(docker compose "${COMPOSE_ARGS[@]}" ps -q --status running postgres-ha 2>/dev/null </dev/null)" ]]; then
+    pg_leader_plan=$(docker compose "${COMPOSE_ARGS[@]}" exec -T postgres-ha \
+            patronictl -c /run/patroni/patroni.yml list -f json 2>/dev/null </dev/null \
+        | python3 -I scripts/lib/pg_ha_leader_guard.py "$NANO_HOST_ID" 2>/dev/null) || pg_leader_plan=""
+    case "$pg_leader_plan" in
+        "switch "*)
+            pg_candidate=${pg_leader_plan#switch }
+            log "This host's PostgreSQL member ($NANO_HOST_ID) is the leader: switching over to $pg_candidate before recreating it"
+            docker compose "${COMPOSE_ARGS[@]}" exec -T postgres-ha patronictl -c /run/patroni/patroni.yml \
+                    switchover --leader "$NANO_HOST_ID" --candidate "$pg_candidate" --force </dev/null >/dev/null \
+                || fail "PostgreSQL switchover from $NANO_HOST_ID to $pg_candidate failed; nothing was recreated. Check 'patronictl list' and retry."
+            switch_deadline=$(( $(date +%s) + 90 ))
+            pg_leader_plan=""
+            while (( $(date +%s) < switch_deadline )); do
+                pg_leader_plan=$(docker compose "${COMPOSE_ARGS[@]}" exec -T postgres-ha \
+                        patronictl -c /run/patroni/patroni.yml list -f json 2>/dev/null </dev/null \
+                    | python3 -I scripts/lib/pg_ha_leader_guard.py "$NANO_HOST_ID" 2>/dev/null) || pg_leader_plan=""
+                [[ "$pg_leader_plan" == keep ]] && break
+                sleep 2
+            done
+            [[ "$pg_leader_plan" == keep ]] \
+                || fail "PostgreSQL leadership did not move off $NANO_HOST_ID within 90 s; nothing was recreated. Check 'patronictl list' before retrying."
+            ok "PostgreSQL leader moved to $pg_candidate" ;;
+        alone)
+            warn "This host's PostgreSQL member ($NANO_HOST_ID) is the leader and no healthy streaming standby is available for a planned switchover. Recreating it stops the leader unplanned: Patroni fails over to another member if one is eligible (about 20-25 s of failed writes), otherwise writes pause until this member is back." ;;
+        keep) ;;
+        *)
+            warn "Could not read the Patroni member list on this host; if its member is the leader, recreating it costs a failover (about 20-25 s of failed writes). Check 'patronictl list' and switch over first if needed." ;;
+    esac
+fi
+
 log "Starting services"
 compose_up_args=(up -d)
 if [[ "$MULTI_NODE" == "1" && "${ROLE_CONFIG_WAS_PUBLISHED:-0}" == "1" ]]; then
@@ -2428,34 +2540,29 @@ if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE
     # Announce anything this run changed before the identity, so the
     # identity message below stands on its own.
     report_shared_env_change
-    pg_ha_outcome="pending"
-    pg_ha_deadline=$(( $(date +%s) + ${NANO_PG_HA_SYSTEM_ID_WAIT:-60} ))
-    while (( $(date +%s) < pg_ha_deadline )); do
-        pg_ha_status=0
-        pg_ha_outcome=$(docker compose "${COMPOSE_ARGS[@]}" exec -T postgres-ha \
-                pg_controldata -D /var/lib/postgresql/data 2>/dev/null </dev/null \
-            | python3 -I scripts/lib/pg_ha_system_id.py .env) || pg_ha_status=$?
-        [[ "$pg_ha_status" == 4 ]] || break
-        sleep 5
-    done
+    pg_ha_outcome=$(pg_ha_record_identity "${NANO_PG_HA_SYSTEM_ID_WAIT:-60}")
     case "$pg_ha_outcome" in
         recorded*)
             ok "Recorded the PostgreSQL cluster identity in .env (${pg_ha_outcome#recorded })"
-            # NAN-5251: every postgres host installed before the copy records
-            # the same identifier at the same place, so their .env files stay
-            # identical. The first postgres host's copy is the one to spread;
-            # another postgres host only confirms it.
+            # NAN-5251/NAN-5263: every postgres host records the same
+            # identifier at the same place, so their .env files stay
+            # identical. The first postgres host's copy is the one to spread.
             if [[ "${NANO_PATRONI_BOOTSTRAP:-false}" == "true" ]]; then
-                report_shared_env_change
+                shared_env_rebaseline
+                warn "The shared .env changed on this host (NANO_PG_HA_SYSTEM_ID): $PG_HA_COPY_ADVICE."
             else
-                log "The first postgres host records the same NANO_PG_HA_SYSTEM_ID. Copy the first postgres host's .env to every host as usual; this host's copy then stays the same ('sha256sum .env' matches)."
+                log "This postgres host recorded NANO_PG_HA_SYSTEM_ID in its own .env. The first postgres host records the same line with 'sudo ./install.sh --record-pg-ha-identity' (run it there after the last postgres host; it restarts nothing). Then $PG_HA_COPY_ADVICE; this host's .env is then unchanged by the copy."
                 shared_env_rebaseline
             fi ;;
         unchanged*) ;;
         conflict*)
             fail "PostgreSQL HA identity mismatch: ${pg_ha_outcome#conflict }. This host's database is not the cluster recorded in .env; do not continue. See 'Recovering after losing the bootstrap host and etcd' in the multi-node guide." ;;
         *)
-            warn "PostgreSQL HA is still forming on this host; its cluster identity is recorded in .env on the next install.sh run." ;;
+            if [[ "${NANO_PATRONI_BOOTSTRAP:-false}" == "true" ]]; then
+                log "PostgreSQL HA bootstraps once a second postgres host joins (etcd needs 2 of 3 members), so its cluster identity cannot be recorded yet. Copy this host's .env to the other postgres hosts and install them; then, on THIS host, run 'sudo ./install.sh --record-pg-ha-identity' (it only records NANO_PG_HA_SYSTEM_ID; it restarts nothing) and copy this host's .env to every host."
+            else
+                warn "PostgreSQL HA is still forming on this host; that is fine. After the last postgres host, run 'sudo ./install.sh --record-pg-ha-identity' on the FIRST postgres host and copy its .env to every host."
+            fi ;;
     esac
 fi
 
@@ -2651,7 +2758,15 @@ fi
 # NAN-835 / NAN-836: surface every ingest endpoint + one-line curl so users
 # can point external Vector / Splunk forwarder / curl at the new instance
 # without spelunking through .env or docker-compose.
-if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" ]]; then
+# NAN-5263: a PostgreSQL/Keeper/ClickHouse-only host serves no ingest edge;
+# the app and ingest hosts print the ingest endpoints.
+SHOW_INGEST_SUMMARY=1
+if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," != *,app,* && ",${ROLE_ARG}," != *,ingest,* ]]; then
+    SHOW_INGEST_SUMMARY=0
+    echo
+    printf "  Ingest:   not on this host (roles %s); the app and ingest hosts print the endpoints\n" "$ROLE_ARG"
+fi
+if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" && "$SHOW_INGEST_SUMMARY" == "1" ]]; then
     INGEST_BASE_URL="$BASE_URL"
     if [[ "$MULTI_NODE" == "1" ]]; then
         case "$BASE_URL" in
@@ -2671,8 +2786,8 @@ if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" ]]; then
     # deprecated legacy multiplex mode (routed by X-Source-Type / sourcetype).
     printf "  Ingest tokens: issue one per sender in %s/ingestion/ingest-tokens\n" "$BASE_URL"
     printf "              (bound to one log source, which it decides; shown once)\n"
-    if [[ "${REUSE_ENV:-0}" == "1" ]]; then
-        printf "  Install token: VECTOR_AUTH_TOKEN in %s/.env  ← legacy multiplex (deprecated) on upgraded installs\n" "$NANO_INSTALL_DIR"
+    if [[ "${REUSE_ENV:-0}" == "1" ]] && ! is_line_release "${PRE_RUN_NANO_VERSION:-}"; then
+        printf "  Install token: VECTOR_AUTH_TOKEN in %s/.env  ← legacy multiplex (deprecated), kept for senders set up before v2\n" "$NANO_INSTALL_DIR"
     fi
     echo
     printf "  HTTP:     POST %s/ingest\n" "$INGEST_BASE_URL"

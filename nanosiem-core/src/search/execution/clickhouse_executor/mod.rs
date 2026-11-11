@@ -13,6 +13,7 @@
 //! - `paginated` - Paginated execution, streaming, and `SqlExecutor` trait impl
 
 mod field_stats;
+pub(crate) use field_stats::EXT_FIELD_NAMES_OUTPUT_LIMIT;
 mod paginated;
 mod query_execution;
 mod query_management;

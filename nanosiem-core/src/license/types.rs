@@ -17,7 +17,7 @@ pub enum LicenseState {
     Locked,
 }
 
-/// Canonical entitlement metadata returned by nano-main for a manual licence.
+/// Canonical entitlement metadata returned by nano-main for a manual license.
 /// Legacy paid/subscription responses omit it and retain their existing state
 /// machine. Field aliases accept both the online camelCase response and the
 /// signed offline claim spelling.
@@ -91,7 +91,7 @@ pub struct LicenseStatus {
     /// `false`, leaving existing behaviour byte-identical.
     #[serde(default)]
     pub offline: bool,
-    /// Present for canonical v2 manual licences. A trial carries this through
+    /// Present for canonical v2 manual licenses. A trial carries this through
     /// the cache so expiry can degrade only licensed features, never core
     /// search, ingest, or stored-data access.
     #[serde(default)]
@@ -104,7 +104,7 @@ impl Default for LicenseStatus {
             state: LicenseState::Locked,
             valid: false,
             tier: None,
-            locked_reason: Some("Licence admission has not been initialized.".into()),
+            locked_reason: Some("License admission has not been initialized.".into()),
             grace_ends_at: None,
             expires_at: None,
             last_checked_at: None,
@@ -135,7 +135,7 @@ impl LicenseStatus {
             self.clone()
         } else {
             LicenseStatus::unavailable(
-                "Online licence has not completed its first successful check.",
+                "Online license has not completed its first successful check.",
             )
         }
     }
@@ -190,7 +190,7 @@ impl LicenseStatus {
         // whatever state it cached. The checker's periodic staleness lock only
         // rewrites stored-Active rows; this read-time bound also covers a
         // cached *scheduled* trial (stored Locked, unlocked locally at its
-        // start) and cached grace, so blocking the licence server can never
+        // start) and cached grace, so blocking the license server can never
         // keep licensed features alive past STALE_LICENSE_DAYS.
         if let Some(stale) = self.stale_online_lock(now) {
             return stale;
@@ -205,7 +205,7 @@ impl LicenseStatus {
     /// window. The cached response envelope (`expiresAt`/`graceEndsAt`) is
     /// rewritten per trial state by the platform, so the trial window is the
     /// authority and is applied through the same grace/hard-stop model as
-    /// every other licence. A server-side lock is only lifted locally for a
+    /// every other license. A server-side lock is only lifted locally for a
     /// scheduled trial whose start time has arrived.
     fn trial_effective(&self, trial: &LicenseEntitlement, now: DateTime<Utc>) -> LicenseStatus {
         if trial.state == "revoked" {
@@ -305,7 +305,7 @@ impl LicenseStatus {
             valid: false,
             locked_reason: self.locked_reason.clone().or_else(|| {
                 Some(format!(
-                    "Licence reached its hard-stop boundary at {}.",
+                    "License reached its hard-stop boundary at {}.",
                     boundary.map(|value| value.to_rfc3339()).unwrap_or_default()
                 ))
             }),
@@ -464,7 +464,7 @@ fn classify_entitlement(
     match serde_json::from_value(value) {
         Ok(entitlement) => (Some(entitlement), None),
         Err(error) => {
-            tracing::warn!(%error, "Ignoring malformed online licence entitlement");
+            tracing::warn!(%error, "Ignoring malformed online license entitlement");
             (None, None)
         }
     }
@@ -713,7 +713,7 @@ mod tests {
     }
 
     /// Review fix: a box that cached one "scheduled" trial response and then
-    /// blocked the licence server must not keep licensed features past the
+    /// blocked the license server must not keep licensed features past the
     /// 14-day outage bound (it previously kept them until grace_until, even
     /// after a revocation it never saw).
     #[test]

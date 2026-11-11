@@ -317,7 +317,7 @@ pub struct AppState {
     /// read this without touching PostgreSQL or ClickHouse.
     #[cfg(feature = "enterprise")]
     pub offline_license_snapshot: Arc<RwLock<crate::license_admission::OfflineLicenseSnapshot>>,
-    /// C05 offline licence authority. PostgreSQL owns the accepted file and
+    /// C05 offline license authority. PostgreSQL owns the accepted file and
     /// monotonic floor; ClickHouse is the independent clock witness.
     #[cfg(feature = "enterprise")]
     pub sovereign_license: Arc<nanosiem_enterprise::sovereign_license::StatefulLicenseAuthority>,
@@ -336,7 +336,7 @@ pub struct AppState {
     /// Concrete shadow-investigation service retained for its licensed
     /// recovery worker. Request-time hooks use the dynamically gated trait
     /// object below; recovery itself is started only by the case worker
-    /// supervisor after initial licence admission succeeds.
+    /// supervisor after initial license admission succeeds.
     #[cfg(feature = "enterprise")]
     pub shadow_investigation_service: Arc<nanosiem_enterprise::cases::ShadowInvestigationService>,
     /// Shared Valkey-backed cache for the marketplace coverage hero

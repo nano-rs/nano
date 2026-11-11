@@ -1,7 +1,8 @@
 # Google Cloud
 
-Cloud specifics for [cloud-vm.md](cloud-vm.md). Ask before every mutating
-step. The commands use the operator's own `gcloud` session.
+Cloud specifics for [cloud-vm.md](cloud-vm.md) (VMs) and, at the end, for a
+GKE cluster for the Helm chart ([GKE](#gke-for-the-helm-chart)). Ask before
+every mutating step. The commands use the operator's own `gcloud` session.
 
 ```bash
 export PROJECT=<project id> REGION=us-central1 NAME=<cluster name>
@@ -247,3 +248,209 @@ resource "google_compute_instance" "ch_s1r1" {
   labels = { nano-deployment = var.name }
 }
 ```
+
+## Managed PostgreSQL (Cloud SQL)
+
+The production database for the Helm chart on GKE (`postgresql.mode:
+external`). The migrator checks the version and extensions before it applies
+anything; run `scripts/pg-preflight.py` first so a gap shows before `helm install`.
+
+| Item | Requirement |
+|---|---|
+| Version | PostgreSQL 16 or newer (16, 17, 18 tested). Cloud SQL may default to 16, depending on when and how the instance was created (check with `gcloud sql instances describe $NAME-pg --format='value(databaseVersion)'`). 16 works from nano 2.0.11; 2.0.10 and earlier fail in the migrator with `unrecognized configuration parameter "transaction_timeout"`, so use `POSTGRES_17` there |
+| Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`. All supported, no database flags needed. Users created through Cloud SQL (`gcloud sql users create`) are in `cloudsqlsuperuser` and can create them |
+| Parameters | No flags required. Allow at least 200 connections (about 20 per nano pod): the default depends on the tier's memory, so use 8 GB or more or set the `max_connections` flag |
+| Network | Private IP only (`--no-assign-ip`) through private services access on the GKE cluster's VPC (VPC-native cluster); require SSL |
+| HA | Regional availability (`--availability-type=REGIONAL`): a standby in another zone of the region, automatic failover. Zonal is a single point of failure |
+
+```bash
+# once per VPC: private services access
+gcloud compute addresses create google-managed-services-$NAME --global \
+  --purpose=VPC_PEERING --prefix-length=16 --network=$NAME-vpc
+gcloud services vpc-peering connect --service=servicenetworking.googleapis.com \
+  --ranges=google-managed-services-$NAME --network=$NAME-vpc
+gcloud sql instances create $NAME-pg --database-version=POSTGRES_17 --edition=ENTERPRISE \
+  --region=$REGION --tier=db-custom-2-8192 --availability-type=REGIONAL \
+  --network=projects/$PROJECT/global/networks/$NAME-vpc --no-assign-ip \
+  --ssl-mode=ENCRYPTED_ONLY --storage-type=SSD --storage-size=50 --storage-auto-increase \
+  --backup-start-time=03:00 --enable-point-in-time-recovery --labels nano-deployment=$NAME
+gcloud sql databases create nanosiem --instance=$NAME-pg
+gcloud sql users create nanosiem --instance=$NAME-pg --prompt-for-password
+```
+
+Create the user this way, not with `CREATE ROLE` in SQL: users created
+through Cloud SQL belong to `cloudsqlsuperuser` and can create the extensions;
+roles created in SQL cannot, and the migrator then stops on `pg_trgm`.
+`--prompt-for-password` keeps the password off the command line. Use a
+URL-safe password (it is interpolated into `DATABASE_URL`). The host is the
+instance's private IP (`gcloud sql instances describe $NAME-pg --format='value(ipAddresses[0].ipAddress)'`).
+Then check with `scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)).
+
+## GKE for the Helm chart
+
+The sections above build VMs for the compose topologies. For the Helm chart
+([helm.md](helm.md)) the operator brings a GKE cluster. When they have none,
+propose this and create it only after they approve (it costs money from the
+first minute). Every command uses their `gcloud` session. Product guide:
+nano.rs/docs/getting-started/kubernetes#gke.
+
+Use **GKE Standard**, not Autopilot. nano is untested on Autopilot and not
+supported there: the chart needs the ingest node pool label and taint
+(`nano.rs/pool=ingest`, from the `standard` preset up), local SSD node pools
+for `large`/`xlarge`, and a fixed number of nodes per zone for the zonal
+ClickHouse and Keeper disks. Say so if the operator asks for Autopilot.
+
+**Quota first** (read-only; show the operator the numbers). A default
+project often cannot hold the HA layout: 6 x `n2-standard-8` is 48 vCPUs
+(`CPUS_ALL_REGIONS` is often 32), and `SSD_TOTAL_GB` (often 500) counts every
+pd-balanced disk, node boot disks (100 GB each by default) included. Two
+1500Gi ClickHouse volumes plus six boot disks need about 3,900 GB. Request
+increases, or plan 90 days hot (`clickhouse.storage.size: 500Gi`) plus the
+GCS cold tier.
+
+```bash
+gcloud compute project-info describe --flatten=quotas \
+  --filter='quotas.metric=CPUS_ALL_REGIONS' --format='table(quotas.metric,quotas.limit,quotas.usage)'
+gcloud compute regions describe $REGION --flatten=quotas \
+  --filter='quotas.metric~^(CPUS|N2_CPUS|SSD_TOTAL_GB)$' --format='table(quotas.metric,quotas.limit,quotas.usage)'
+```
+
+A small HA cluster: regional, three zones, **two nodes per zone** (6 nodes).
+Persistent disks are zonal: with one node per zone, draining or losing a node
+leaves that zone's ClickHouse replica and Keeper member Pending (data safe,
+no redundancy) until a node returns to that zone. Size the machine type from
+the plan (`size.py --topology helm`). Set `clickhouse.zoneAware: true` (the
+two replicas of a shard in different zones, Keeper over three zones) with
+`antiAffinity: hard`. Reuse the VPC, subnet and Cloud NAT from
+[Network](#network-one-vpc-three-zones).
+
+```bash
+# about 5-10 minutes
+gcloud container clusters create $NAME --region $REGION \
+  --node-locations $REGION-a,$REGION-b,$REGION-c --num-nodes 2 \
+  --machine-type n2-standard-8 \
+  --network $NAME-vpc --subnetwork $NAME-private --enable-ip-alias \
+  --gateway-api=standard --enable-dataplane-v2 \
+  --workload-pool=$PROJECT.svc.id.goog \
+  --release-channel regular --labels nano-deployment=$NAME
+```
+
+- `--num-nodes` is per zone. `n2-standard-8` (8 vCPU / 32 GB) matches the
+  docs' HA sizing; a test at about 12.5 GB/day ran the HA values on 6 x
+  `n2-highmem-4` (4 vCPU / 32 GB) when quota was short. Both are x86-64 with
+  AVX2.
+- `--gateway-api=standard`: without it there is no
+  `gke-l7-global-external-managed` GatewayClass and the Gateways never get an
+  address. Existing cluster: `gcloud container clusters update $NAME
+  --region $REGION --gateway-api=standard`.
+- `--enable-dataplane-v2`: GKE Standard does **not** enforce NetworkPolicy by
+  default, so the chart's `nano-vector-ingress` policy (Vector's OTLP ports
+  only from the ingest edge) is silently ignored. Chart 2.0.10 and earlier
+  rely on it to keep unauthenticated raw OTLP out; from 2.0.11 Vector's OTLP
+  listeners only accept traffic through the authenticated ingest edge, and
+  the policy is defense in depth. Dataplane V2 is
+  creation-time only; on an existing cluster check
+  `gcloud container clusters describe $NAME --region $REGION --format='value(networkConfig.datapathProvider,networkPolicy.enabled)'`
+  (`ADVANCED_DATAPATH` or `True` = enforced); otherwise the network policy
+  add-on (`--update-addons=NetworkPolicy=ENABLED`, then
+  `--enable-network-policy`) recreates the nodes, so ask first.
+- `--workload-pool`: Workload Identity for the GCS cold tier without keys.
+- Private nodes (`--enable-private-nodes`) need Cloud NAT (the license API,
+  the nano registry and Docker Hub images) and control-plane access: they
+  turn on authorized networks, which can start empty so `kubectl` times out.
+  Add `--enable-master-authorized-networks --master-authorized-networks
+  <operator CIDR>`, or `--enable-dns-access` and
+  `gcloud container clusters get-credentials $NAME --region $REGION --dns-endpoint`.
+
+Then, in order (each is a hard stop for the chart):
+
+1. **Default StorageClass.** GKE's default is `standard-rwo` (pd-balanced,
+   zonal, `WaitForFirstConsumer`); nothing to create. Confirm with
+   `kubectl get storageclass`. `large`/`xlarge` need a local-SSD node pool and
+   a StorageClass for it in `clickhouse.storage.storageClass`.
+
+2. **Network policy check.** After install, prove enforcement (any HTTP
+   status, even 401/405, means it is NOT enforced; enforced = timeout and
+   `000`):
+
+   ```bash
+   kubectl run np-test -n default --rm -it --image=curlimages/curl:8.12.1 --restart=Never -- \
+     curl -s -m 5 -o /dev/null -w '%{http_code}\n' http://nano-vector-internal.nano.svc.cluster.local:4318/v1/logs
+   ```
+
+3. **Certificates (Certificate Manager map).** `values-gke.yaml` uses
+   `tls.mode: cloud-managed` with `tls.gke.certificateMap`. The operator
+   needs a domain they control and adds the DNS records; you never need DNS
+   credentials:
+
+   ```bash
+   gcloud certificate-manager dns-authorizations create $NAME-app --domain=<app host>
+   gcloud certificate-manager dns-authorizations create $NAME-ingest --domain=<ingest host>
+   for h in app ingest; do   # the CNAME record the operator adds for each
+     gcloud certificate-manager dns-authorizations describe $NAME-$h --format='value(dnsResourceRecord)'
+   done
+   # operator adds each CNAME, then:
+   gcloud certificate-manager certificates create $NAME-app --domains=<app host> --dns-authorizations=$NAME-app
+   gcloud certificate-manager certificates create $NAME-ingest --domains=<ingest host> --dns-authorizations=$NAME-ingest
+   gcloud certificate-manager maps create $NAME-map
+   gcloud certificate-manager maps entries create $NAME-app --map=$NAME-map --certificates=$NAME-app --hostname=<app host>
+   gcloud certificate-manager maps entries create $NAME-ingest --map=$NAME-map --certificates=$NAME-ingest --hostname=<ingest host>
+   gcloud certificate-manager certificates describe $NAME-app --format='value(managed.state)'   # ACTIVE
+   ```
+
+   No public DNS (evaluation only): upload a private-CA certificate for both
+   names (`make-private-ca.sh`, then `gcloud certificate-manager certificates
+   create <name> --certificate-file ... --private-key-file ...`), add the two
+   map entries for it, and test with `curl --resolve`.
+
+4. **Static IPs.** Reserve a global address per Gateway so DNS survives a
+   reinstall; the operator creates A records for them:
+
+   ```bash
+   gcloud compute addresses create $NAME-app-ip $NAME-ingest-ip --global --ip-version=IPV4
+   gcloud compute addresses list --global --filter="name~^$NAME-"
+   ```
+
+   Values (`values-gke-site.yaml`, after `values-gke.yaml`):
+
+   ```yaml
+   tls:
+     gke:
+       certificateMap: <name>-map
+   gateway:
+     addresses:
+       app: [{type: NamedAddress, value: <name>-app-ip}]
+       ingest: [{type: NamedAddress, value: <name>-ingest-ip}]
+   clickhouse:
+     zoneAware: true
+   ```
+
+   The chart renders the HealthCheckPolicies and a GCPBackendPolicy (310 s
+   app timeout). It has no source-range setting on GKE: both load balancers
+   are public.
+
+5. **PostgreSQL.** For production, Cloud SQL with private IP, regional HA and
+   `--ssl-mode=ENCRYPTED_ONLY` (matches `sslmode: require`; a client-cert mode
+   would refuse nano). See [Managed PostgreSQL (Cloud SQL)](#managed-postgresql-cloud-sql).
+   The first `vpc-peering connect` in a project can fail with an
+   authentication error while the Service Networking agent is provisioned;
+   retry it. A database created with `gcloud sql databases create` is owned by
+   `cloudsqlsuperuser`; that is fine. Tell the operator what a failover looks
+   like: about 10-14 s of stalled API, sign-in and OTLP requests (no errors,
+   HEC unaffected, nothing lost), and an OTLP request that timed out at the
+   client may still be stored, so a retrying sender can duplicate it.
+
+6. **Registry credential.** The chart's `registryCredentialRefresh` CronJob
+   keeps `nano-registry` fresh (see [helm.md](helm.md)). After the pull, run
+   `helm registry logout us-central1-docker.pkg.dev`: `helm registry login`
+   can leave the credential in the OS keychain.
+
+Teardown (only on request, and show the list first): `helm uninstall nano -n
+nano` (it removes the `ClickHouseCluster`/`KeeperCluster` itself), then
+`kubectl delete namespace nano` (PVCs, secret, leftover hook Jobs; the disks
+go with the PVCs); the load balancers go with the Gateways. Then
+`gcloud container clusters delete $NAME --region $REGION`, the Cloud SQL
+instance, the two global addresses, the map entries, map, certificates and DNS
+authorizations. If `gcloud services vpc-peerings delete` refuses ("producer
+services still using this connection"), use `gcloud compute networks peerings
+delete servicenetworking-googleapis-com --network $NAME-vpc`.

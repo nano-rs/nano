@@ -120,6 +120,8 @@ export interface LicenseStatusResponse {
   airgap?: boolean;
   mode: 'hosted' | 'offline' | 'unconfigured';
   runtime_state?: 'running' | 'renewal_due' | 'grace' | 'shut_off' | 'refused' | 'legacy_upgrade_grace';
+  /** NAN-5253: app.nano.rs deployment ID (`deploy_…`) when configured. */
+  deployment_id?: string;
   installation_id?: string;
   organization_id?: string;
   installation_fingerprint?: string;
@@ -145,7 +147,7 @@ export interface LicenseStatusResponse {
     days_remaining: number;
     warning_days?: 14 | 7 | 1 | 0 | null;
   };
-  /** NAN-5194: the licence server refused the token at the last check-in. */
+  /** NAN-5194: the license server refused the token at the last check-in. */
   token_rejected?: {
     http_status: number;
     first_rejected_at: string;
@@ -1138,6 +1140,10 @@ class ApiClient {
 
   async getExtFieldNames(query?: string, start?: string, end?: string, signal?: AbortSignal): Promise<string[]> {
     return this._core.getExtFieldNames(query, start, end, signal);
+  }
+
+  async getExtendedFieldNames(query?: string, start?: string, end?: string, signal?: AbortSignal): Promise<string[]> {
+    return this._core.getExtendedFieldNames(query, start, end, signal);
   }
 
   async getSourceTypes(timeRange?: { start: string; end: string }): Promise<[string, number][]> {
@@ -2771,7 +2777,7 @@ class ApiClient {
     return this.request('/api/license');
   }
 
-  // NAN-5114: whether a newer nano release is available (last licence check-in)
+  // NAN-5114: whether a newer nano release is available (last license check-in)
   async getUpdateStatus(): Promise<UpdateStatusResponse> {
     return this.request('/api/license/update');
   }
@@ -2781,7 +2787,7 @@ class ApiClient {
     return this.request('/api/license/usage');
   }
 
-  // NAN-5170: hashed daily usage record for an offline licence renewal
+  // NAN-5170: hashed daily usage record for an offline license renewal
   async exportLicenseUsage(): Promise<unknown> {
     return this.request('/api/license/usage/export');
   }

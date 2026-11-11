@@ -19,7 +19,9 @@
 //!   roles) to exactly `groups` removes a source and is not a change;
 //! - admission / account-resolution settings in `access_policy` that WIDEN
 //!   who is admitted or linked: turning mapped-group JIT on, a new Entra
-//!   tenant ID, a verified domain that was not trusted before (an email in it
+//!   tenant ID, a verified domain (Entra or generic OIDC) that was not trusted
+//!   before, clearing the Entra tenant while verified domains remain on a
+//!   non-Microsoft issuer (they then start to apply; an email in them
 //!   links onto an existing local account), or a new Google delegated admin;
 //! - a new Google service-account key — the Directory credential that
 //!   supplies Google group membership.
@@ -87,11 +89,23 @@ fn group_claim_changes(stored: Option<&str>, requested: Option<&str>) -> bool {
 }
 
 /// Whether `requested` admits or links anyone the stored policy does not.
-fn admission_widens(stored: &SsoAccessPolicy, requested: Option<&SsoAccessPolicy>) -> bool {
+/// `issuer` is the issuer the provider will have after the update.
+fn admission_widens(
+    stored: &SsoAccessPolicy,
+    requested: Option<&SsoAccessPolicy>,
+    issuer: &str,
+) -> bool {
     let Some(requested) = requested else {
         return false;
     };
-    (requested.mapped_groups_only && !stored.mapped_groups_only)
+    // NAN-5266 L1: on a non-Microsoft issuer, verified domains apply only
+    // while no Entra tenant is set, so clearing the tenant switches them on.
+    let clears_tenant_over_domains = stored.entra_tenant_id.is_some()
+        && requested.entra_tenant_id.is_none()
+        && !requested.verified_domains.is_empty()
+        && !super::sso_policy::is_microsoft_issuer(issuer);
+    clears_tenant_over_domains
+        || (requested.mapped_groups_only && !stored.mapped_groups_only)
         || (requested.entra_tenant_id.is_some()
             && requested.entra_tenant_id != stored.entra_tenant_id)
         || requested
@@ -122,7 +136,11 @@ impl OidcTrustChange {
                 .as_deref()
                 .is_some_and(|client_id| client_id != stored.client_id),
             group_claim: group_claim_changes(stored.group_claim, request.group_claim.as_deref()),
-            admission: admission_widens(stored.access_policy, request.access_policy.as_ref()),
+            admission: admission_widens(
+                stored.access_policy,
+                request.access_policy.as_ref(),
+                request.issuer.as_deref().unwrap_or(stored.issuer),
+            ),
             google_service_account: request.google_service_account.is_some(),
         }
     }

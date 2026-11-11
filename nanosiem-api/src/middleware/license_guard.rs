@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! V2 licence enforcement middleware.
+//! V2 license enforcement middleware.
 //!
 //! Enterprise-only routes receive [`licensed_surface_guard`]. Shared routes
 //! are intentionally outside that layer and remain available at hard stop,
@@ -33,14 +33,14 @@ pub async fn licensed_surface_guard(
     let body = ErrorResponse {
         error: ErrorDetail {
             code: "LICENSE_REQUIRED".to_string(),
-            message: "This licensed feature is unavailable at the licence hard stop. Open/core features and stored data remain available.".to_string(),
+            message: "This licensed feature is unavailable at the license hard stop. Open/core features and stored data remain available.".to_string(),
             details: None,
         },
     };
     Err((StatusCode::FORBIDDEN, Json(body)).into_response())
 }
 
-/// Publish the current licence state on responses from the whole API.
+/// Publish the current license state on responses from the whole API.
 ///
 /// - Active: pass through
 /// - Grace period: pass through with X-License-State header

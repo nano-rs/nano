@@ -5,7 +5,7 @@
  *
  * Fetched on app boot and refreshed from `/api/capabilities`. The endpoint is
  * public (no auth) so the SPA can render correctly before login and react to
- * licence hard stops or renewals without a reload. In open-core builds
+ * license hard stops or renewals without a reload. In open-core builds
  * (`VITE_EDITION=open` / `cargo build` with no `enterprise` feature), the
  * enterprise pages are physically excluded from the bundle anyway via the
  * `@/enterprise` alias swap; capabilities is the runtime mirror used by:
@@ -67,9 +67,9 @@ export interface CapabilitiesContextValue {
   capabilities: Capabilities;
   /**
    * Set only on the fail-closed fallback used before `/api/capabilities`
-   * answers (or when it errors). The flags are then a guess, not a licence
+   * answers (or when it errors). The flags are then a guess, not a license
    * verdict, so copy that explains WHY a flag is off (NAN-5088: "needs an
-   * active licence") must not render on it.
+   * active license") must not render on it.
    */
   fallback?: true;
 }

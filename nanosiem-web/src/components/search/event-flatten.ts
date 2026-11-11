@@ -3,6 +3,7 @@
 import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { isClickHouseDefault } from '@/lib/utils';
 import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
+import { FIELD_BUCKET_LABELS, FIELD_BUCKET_TOOLTIPS, extendedTooltip } from './field-buckets';
 
 // OCSF `event` JSON expansion (NAN-1241 follow-up).
 //
@@ -358,7 +359,7 @@ export function buildFieldCategories(
   isOcsf: boolean,
 ): FieldCategory[] {
   const categories: FieldCategory[] = [
-    { label: 'Core', color: CATEGORY_NEUTRAL, tooltip: 'Promoted, indexed schema columns for fast search (UDM or OCSF)', fields: [] },
+    { label: FIELD_BUCKET_LABELS.core, color: CATEGORY_NEUTRAL, tooltip: FIELD_BUCKET_TOOLTIPS.core, fields: [] },
     { label: 'Risk', color: CATEGORY_ACCENT, tooltip: 'Risk scores and factors from detection rules', fields: [] },
     { label: 'IOC', color: CATEGORY_ACCENT, tooltip: 'Indicators of compromise from threat intelligence feeds', fields: [] },
     { label: 'Identity', color: CATEGORY_ACCENT, tooltip: 'Resolved identity from the user registry (department, title, groups, account status)', fields: [] },
@@ -369,11 +370,12 @@ export function buildFieldCategories(
     // Non-promoted fields: UDM `ext` spill, or OCSF schema fields without a
     // promoted column (class_name, *.file.name, …). Still MAPPED — distinct from
     // `unmapped` below.
-    { label: 'Extended', color: CATEGORY_ACCENT, tooltip: 'Non-promoted fields (UDM ext spill; OCSF schema fields without a promoted column)', fields: [] },
+    // Labels + tooltips shared with the search sidebar (NAN-5265).
+    { label: FIELD_BUCKET_LABELS.extended, color: CATEGORY_ACCENT, tooltip: extendedTooltip(isOcsf), fields: [] },
     // NAN-1278: OCSF's `unmapped` object is the TRUE source spill (no OCSF
     // attribute). Own bucket so it isn't conflated with non-promoted-but-mapped
     // OCSF fields. OCSF only; empty under UDM.
-    { label: 'Unmapped', color: CATEGORY_ACCENT, tooltip: 'Source fields with no OCSF attribute (the unmapped.* spill)', fields: [] },
+    { label: FIELD_BUCKET_LABELS.unmapped, color: CATEGORY_ACCENT, tooltip: FIELD_BUCKET_TOOLTIPS.unmapped, fields: [] },
   ];
 
   for (const field of flattenedFields) {

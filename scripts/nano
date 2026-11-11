@@ -18,6 +18,17 @@ case "${1:-}" in
         shift
         exec "$SCRIPT_DIR/nano-feeds" "$@"
         ;;
+    support-bundle)
+        # NAN-5253: one redacted diagnostics archive for nano support.
+        shift
+        exec python3 -I "$SCRIPT_DIR/nano-support-bundle" \
+            --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
+        ;;
+    cluster-health)
+        shift
+        exec python3 -I "$SCRIPT_DIR/nano-cluster-health" \
+            --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
+        ;;
     backup-schedule)
         # NAN-5204: automatic backups (the nano-backup Compose service).
         shift
@@ -162,6 +173,9 @@ Usage:
   scripts/nano feeds <status | update [--file FILE]>
   scripts/nano backup-schedule [--status | --configure | --disable | --run-now
                                | --list | --probe | --fetch NAME|latest --to DIR]
+  scripts/nano support-bundle [--since 24h] [--max-log-mb 20] [--out-dir DIR]
+                              [--inventory FILE] [--local-only]
+  scripts/nano cluster-health                    (role-split hosts)
 
 Local ClickHouse archives are inside the AES-256-GCM encrypted payload.
 External disks are accepted only when ClickHouse reports disk type `encrypted`;
@@ -171,6 +185,9 @@ ClickHouse data: restore rebuilds the ClickHouse schema from the migrations,
 IOCs/lookups/enrichment re-sync from their sources and feeds, and event data
 is protected by ClickHouse replicas and object storage. --include-clickhouse-data
 (alias --include-events) also captures every ClickHouse table.
+support-bundle writes one redacted .tar.gz (mode 0600) for nano support: versions,
+host and disk state, service health and the services' own logs. It never holds
+event data, query results or secrets. Review it before sending.
 Role-split backups require a common recovery-set ID/quiesce epoch and restore
 requires the signed recovery-set manifest created after all components finish.
 EOF

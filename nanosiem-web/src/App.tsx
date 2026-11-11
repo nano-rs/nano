@@ -99,6 +99,7 @@ import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { PageContextProvider } from '@/contexts/PageContext';
 import { Toaster } from '@/components/ui/sonner';
+import { SupportDialogHost } from '@/components/support/SupportDialog';
 // Loading fallbacks
 import {
   PageLoadingFallback,
@@ -344,7 +345,7 @@ function CapabilityRoute({
     <div data-testid="licensed-feature-unavailable" className="flex h-full flex-col items-center justify-center px-8 text-center">
       <h1 className="text-xl font-semibold text-foreground">Licensed feature unavailable</h1>
       <p className="mt-2 max-w-lg text-sm text-muted-foreground">
-        This surface is not admitted by the current licence. Open/core features,
+        This surface is not admitted by the current license. Open/core features,
         ingest, search, and stored data remain available.
       </p>
       <Link className="mt-5 text-sm font-medium text-primary hover:underline" to="/">
@@ -1294,6 +1295,8 @@ function App() {
               </Routes>
               </SetupRedirect>
               <Toaster />
+              {/* NAN-5253: Help > Report a bug / Get support, from any shell. */}
+              <SupportDialogHost />
               <Suspense fallback={null}>
                 <EnrichSheetHost />
               </Suspense>

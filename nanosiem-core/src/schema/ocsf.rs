@@ -1028,6 +1028,13 @@ impl SchemaProfile for OcsfProfile {
         OCSF_TAIL_COLUMN
     }
 
+    /// The stored OCSF object: unpromoted attributes the registry knows resolve
+    /// here (NAN-4903), so it is the source of the fields panel's Extended
+    /// bucket (NAN-5265).
+    fn extended_json_column(&self) -> Option<&'static str> {
+        Some(OCSF_EVENT_COLUMN)
+    }
+
     /// NAN-1828: a bare keyword must ALSO tokenize against `raw_data`, because on
     /// OCSF the raw log lands in a different column depending on the producer.
     ///

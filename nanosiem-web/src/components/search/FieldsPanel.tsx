@@ -17,6 +17,13 @@ import { ChevronDown, Plus, Minus, Copy, Search, X, Filter, ChevronLeft, BarChar
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { schemaFieldCandidates, type SemanticField } from '@/lib/schema-fields';
+import {
+  FIELD_BUCKET_LABELS,
+  FIELD_BUCKET_TOOLTIPS,
+  buildOnDemandFields,
+  extendedTooltip,
+  type OnDemandBucket,
+} from './field-buckets';
 
 interface FieldValueInfo {
   value: string;
@@ -35,6 +42,9 @@ export interface FieldStat {
   // on demand when the row is expanded (the get_field_values path resolves
   // `ext.{field}` correctly via field_access_expr).
   onDemand?: boolean;
+  // NAN-5265: which on-demand section the entry renders under — the same
+  // bucket the event inspector files it in.
+  bucket?: OnDemandBucket;
 }
 
 // Server-side field values (fetched on-demand)
@@ -128,12 +138,14 @@ export const FIELD_STATS_PINNED_COLUMNS: string[] = Array.from(
 function SectionHdr({
   label,
   count,
+  tooltip,
   collapsible,
   open,
   onToggle,
 }: {
   label: string;
   count: number;
+  tooltip: string;
   collapsible?: boolean;
   open?: boolean;
   onToggle?: () => void;
@@ -155,12 +167,14 @@ function SectionHdr({
     <button
       type="button"
       onClick={onToggle}
+      title={tooltip}
+      aria-expanded={open}
       className={cn(cls, 'w-full hover:text-muted-foreground transition-colors')}
     >
       {inner}
     </button>
   ) : (
-    <div className={cls}>{inner}</div>
+    <div className={cls} title={tooltip}>{inner}</div>
   );
 }
 
@@ -188,7 +202,15 @@ export function FieldsPanel({
   // Extended/Unmapped (on-demand JSON fields) collapse to a single header by
   // default — there can be dozens and they'd swamp the rail. A filter term
   // force-opens the section so matches always surface.
-  const [extExpanded, setExtExpanded] = useState(false);
+  const [openOnDemand, setOpenOnDemand] = useState<Set<OnDemandBucket>>(() => new Set());
+  const toggleOnDemand = useCallback((bucket: OnDemandBucket) => {
+    setOpenOnDemand(prev => {
+      const next = new Set(prev);
+      if (next.has(bucket)) next.delete(bucket);
+      else next.add(bucket);
+      return next;
+    });
+  }, []);
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null);
   // Whether the open value-menu's label shows the full (un-clamped) value.
   // Resets whenever a different menu opens — only one menu is open at a time.
@@ -285,35 +307,39 @@ export function FieldsPanel({
   // below), so wait for one — before it the panel would fetch for the pre-run
   // window and again for the run's own. The signal aborts a superseded fetch.
   const hasFieldIndex = (showBaseFields ? baseFieldStats : fieldStats).length > 0;
+  const onDemandEnabled = !!onFetchFieldValues && !!timeRange && isExpanded && hasFieldIndex;
+  const isOcsf = schemaFields?.schema === 'ocsf';
   const { data: extFieldNames } = useQuery({
     queryKey: ['ext-field-names', query, timeRange?.start, timeRange?.end],
     queryFn: ({ signal }) => api.getExtFieldNames(query, timeRange?.start, timeRange?.end, signal),
     staleTime: 5 * 60 * 1000,
-    enabled: !!onFetchFieldValues && !!timeRange && isExpanded && hasFieldIndex,
+    enabled: onDemandEnabled,
+  });
+  // NAN-5265: OCSF's Extended bucket — valid attributes stored in the `event`
+  // JSON without a promoted column. Discovered on demand like the spill; UDM
+  // has no such inventory (its Extended bucket is the `ext` spill above).
+  const { data: extendedFieldNames } = useQuery({
+    queryKey: ['extended-field-names', query, timeRange?.start, timeRange?.end],
+    queryFn: ({ signal }) => api.getExtendedFieldNames(query, timeRange?.start, timeRange?.end, signal),
+    staleTime: 5 * 60 * 1000,
+    enabled: onDemandEnabled && isOcsf,
   });
 
   const baseStats = showBaseFields ? baseFieldStats : fieldStats;
-  // Merge in ext keys (deduped against real columns) once a search has produced
-  // a field index — before that we keep the clean "run a query" empty state.
-  // NAN-1504: render with the namespace prefix the inspector/results already use
-  // — `ext.` (UDM) / `unmapped.` (OCSF) — so the picker name matches the row
-  // view. The prefixed form is also the query form: field_access_expr strips the
-  // `ext.` prefix (NAN-1411) and OcsfProfile::resolve strips `unmapped.`, so
-  // expand + add-to-filter resolve to the same spill access as the bare key.
-  const isOcsf = schemaFields?.schema === 'ocsf';
-  const extPrefix = isOcsf ? 'unmapped.' : 'ext.';
+  // Merge in the on-demand JSON fields (deduped against real columns) once a
+  // search has produced a field index — before that we keep the clean "run a
+  // query" empty state. NAN-1504/5265: the API returns bare spill keys and
+  // `buildOnDemandFields` adds the `ext.` / `unmapped.` namespace exactly once,
+  // so the sidebar name matches the inspector's and is the query form.
   const mergedStats = useMemo<FieldStat[]>(() => {
-    if (!extFieldNames || extFieldNames.length === 0 || baseStats.length === 0) {
-      return baseStats;
-    }
+    // Wait for the profile: before it resolves, an OCSF spill key would be
+    // namespaced as UDM `ext.` and filed under the wrong section.
+    if (baseStats.length === 0 || !schemaFields) return baseStats;
     const present = new Set(baseStats.map(s => s.field));
-    const extStats: FieldStat[] = extFieldNames
-      .filter(name => !!name)
-      .map(name => `${extPrefix}${name}`)
-      .filter(name => !present.has(name))
-      .map(name => ({ field: name, count: 0, uniqueCount: 0, topValues: [], onDemand: true }));
-    return extStats.length > 0 ? [...baseStats, ...extStats] : baseStats;
-  }, [baseStats, extFieldNames, extPrefix]);
+    const onDemand: FieldStat[] = buildOnDemandFields(extFieldNames, extendedFieldNames, isOcsf, present)
+      .map(({ field, bucket }) => ({ field, count: 0, uniqueCount: 0, topValues: [], onDemand: true, bucket }));
+    return onDemand.length > 0 ? [...baseStats, ...onDemand] : baseStats;
+  }, [baseStats, extFieldNames, extendedFieldNames, isOcsf, schemaFields]);
 
   const displayStats = searchTerm
     ? mergedStats.filter(stat =>
@@ -444,7 +470,20 @@ export function FieldsPanel({
             // matching the inspector's Extended/Unmapped buckets — keep them out
             // of "Available" (which is promoted/indexed schema columns).
             const availableStats = displayStats.filter(s => !selectedFieldSet.has(s.field) && !s.onDemand);
-            const extStats = displayStats.filter(s => s.onDemand);
+            const onDemandSections: { bucket: OnDemandBucket; label: string; tooltip: string; stats: FieldStat[] }[] = [
+              {
+                bucket: 'extended',
+                label: FIELD_BUCKET_LABELS.extended,
+                tooltip: extendedTooltip(isOcsf),
+                stats: displayStats.filter(s => s.onDemand && (s.bucket ?? 'extended') === 'extended'),
+              },
+              {
+                bucket: 'unmapped',
+                label: FIELD_BUCKET_LABELS.unmapped,
+                tooltip: FIELD_BUCKET_TOOLTIPS.unmapped,
+                stats: displayStats.filter(s => s.onDemand && s.bucket === 'unmapped'),
+              },
+            ];
             const renderRow = (stat: FieldStat) => {
               const isOpen = expandedFields.has(stat.field);
               // Expanding a field fetches its values on-demand over the FULL
@@ -713,36 +752,39 @@ export function FieldsPanel({
               <>
                 {selectedStats.length > 0 && (
                   <>
-                    <SectionHdr label="Selected" count={selectedStats.length} />
+                    <SectionHdr label="Selected" count={selectedStats.length} tooltip={FIELD_BUCKET_TOOLTIPS.core} />
                     {selectedStats.map(renderRow)}
                   </>
                 )}
                 {availableStats.length > 0 && (
                   <>
-                    <SectionHdr label="Available" count={availableStats.length} />
+                    <SectionHdr label="Available" count={availableStats.length} tooltip={FIELD_BUCKET_TOOLTIPS.core} />
                     {availableStats.map(renderRow)}
                   </>
                 )}
-                {extStats.length > 0 && (() => {
-                  /* On-demand JSON spill fields — UDM `ext.*` (Extended) /
-                     OCSF `unmapped.*` (Unmapped), matching the inspector's
-                     buckets. Collapsed by default (there can be dozens); a
-                     filter term force-opens so matches always show. Values
-                     load on expand (NAN-1506). */
-                  const extOpen = !!searchTerm || extExpanded;
+                {onDemandSections.map(({ bucket, label, tooltip, stats: sectionStats }) => {
+                  /* On-demand JSON fields, bucketed like the inspector
+                     (NAN-5265): Extended = UDM `ext.*` / valid non-promoted
+                     OCSF attributes; Unmapped = OCSF `unmapped.*` only.
+                     Collapsed by default (there can be dozens); a filter term
+                     force-opens so matches always show. Values load on expand
+                     (NAN-1506). */
+                  if (sectionStats.length === 0) return null;
+                  const open = !!searchTerm || openOnDemand.has(bucket);
                   return (
-                    <>
+                    <div key={bucket}>
                       <SectionHdr
-                        label={isOcsf ? 'Unmapped' : 'Extended'}
-                        count={extStats.length}
+                        label={label}
+                        count={sectionStats.length}
+                        tooltip={tooltip}
                         collapsible
-                        open={extOpen}
-                        onToggle={() => setExtExpanded(v => !v)}
+                        open={open}
+                        onToggle={() => toggleOnDemand(bucket)}
                       />
-                      {extOpen && extStats.map(renderRow)}
-                    </>
+                      {open && sectionStats.map(renderRow)}
+                    </div>
                   );
-                })()}
+                })}
                 {isReducedFieldSet && onLoadAllFields && (
                   /* Teaser for the unindexed remainder (NAN-1427 reduced
                      fetch): kept LAST so the fading ghost rows trail off at the

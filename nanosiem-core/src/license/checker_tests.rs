@@ -12,7 +12,7 @@ use crate::{Entitlement, EntitlementEdition, EntitlementOperator, TierLimits};
 use chrono::Duration as ChronoDuration;
 
 fn response(json: serde_json::Value) -> LicenseResponse {
-    serde_json::from_value(json).expect("nano-main licence payload deserializes")
+    serde_json::from_value(json).expect("nano-main license payload deserializes")
 }
 
 fn admitted_entitlement(status: &LicenseStatus, operator: EntitlementOperator) -> Entitlement {
@@ -139,7 +139,7 @@ fn unrecognized_tier_claim_admits_as_licensed() {
     }
 }
 
-/// The trial-licence issuer adds an `entitlement` object to the same
+/// The trial-license issuer adds an `entitlement` object to the same
 /// response. A build that predates it must still deserialize the response and
 /// admit on `valid`.
 #[test]

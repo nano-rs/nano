@@ -16,7 +16,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -51,6 +51,11 @@ pub enum OidcError {
     RedirectUriMismatch,
     #[error("Missing required claim: {0}")]
     MissingClaim(String),
+    /// NAN-5266: the validated ID token (plus userinfo) carried neither an
+    /// email nor a username, usually because the `email` scope claims were
+    /// not released.
+    #[error("Missing required claim: email or preferred_username")]
+    MissingEmail,
     #[error("User provisioning failed: {0}")]
     ProvisioningError(String),
     #[error("HTTP request failed: {0}")]
@@ -79,6 +84,16 @@ pub enum OidcError {
     /// different SSO identity, so this identity cannot be linked to it.
     #[error("SSO identity cannot be linked to the local account")]
     AccountLinkRefused,
+    /// NAN-5266: the provider's userinfo response named a different `sub`
+    /// than the validated ID token (OIDC Core 5.3.2). Its claims are
+    /// discarded and the sign-in is refused.
+    #[error("OIDC userinfo subject does not match the ID token subject")]
+    UserinfoSubjectMismatch,
+    /// NAN-5266: the userinfo endpoint could not be used (not same-host
+    /// https, blocked, timed out, oversized, not JSON). Sign-in continues
+    /// with the ID-token claims alone; this is never surfaced to the user.
+    #[error("OIDC userinfo unavailable: {0}")]
+    UserinfoUnavailable(String),
 }
 
 /// A refused OIDC callback (NAN-4547). `identity` is set only once the ID
@@ -235,9 +250,32 @@ pub struct IdTokenClaims {
     pub roles: Vec<String>,
     /// Preferred username (UPN in Azure AD, fallback for email)
     pub preferred_username: Option<String>,
+    /// NAN-5266: names of the claims present in the validated ID token, so
+    /// an explicitly asserted empty `groups` / `roles` is told apart from an
+    /// absent one (both deserialize to an empty Vec). Set only by
+    /// [`IdTokenClaims::from_validated_value`]; claims added from userinfo
+    /// are recorded here too, so the merge is idempotent.
+    #[serde(skip)]
+    pub asserted_claims: BTreeSet<String>,
 }
 
 impl IdTokenClaims {
+    /// Deserialize a verified JWT payload, recording which claims it carried.
+    pub fn from_validated_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let asserted = value
+            .as_object()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut claims: Self = serde_json::from_value(value)?;
+        claims.asserted_claims = asserted;
+        Ok(claims)
+    }
+
+    /// Whether the ID token (or an earlier userinfo merge) carried `name`.
+    pub fn asserts(&self, name: &str) -> bool {
+        self.asserted_claims.contains(name)
+    }
+
     pub fn has_group_overage(&self) -> bool {
         self.hasgroups == Some(true) || self.claim_names.contains_key("groups")
     }
@@ -678,13 +716,31 @@ impl OidcService {
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<(User, OidcUser, bool), OidcCallbackError> {
-        let (provider, claims, access_token) = self
+        let (provider, mut claims, access_token, userinfo_endpoint) = self
             .validate_callback(provider_slug, code, state, redirect_uri)
             .await
             .map_err(|error| OidcCallbackError {
                 error,
                 identity: None,
             })?;
+        // NAN-5266: complete a generic provider's ID token from userinfo
+        // (Okta puts email / email_verified / profile only there when an
+        // access token is issued). A `sub` mismatch refuses the sign-in; the
+        // denial names the ID token's identity, never the userinfo claims.
+        if let Err(error) = self
+            .complete_from_userinfo(
+                &mut claims,
+                &provider,
+                userinfo_endpoint.as_deref(),
+                &access_token,
+            )
+            .await
+        {
+            return Err(OidcCallbackError {
+                identity: Some(OidcAssertedIdentity::from_validated_claims(&claims, &provider)),
+                error,
+            });
+        }
         // From here on the ID token is verified: a refusal carries the
         // IdP-asserted identity so the denial audit can name it (NAN-4547).
         let identity = OidcAssertedIdentity::from_validated_claims(&claims, &provider);
@@ -696,16 +752,55 @@ impl OidcService {
             })
     }
 
+    /// NAN-5266: fill claims the validated ID token lacks from the
+    /// provider's userinfo endpoint. See [`super::oidc_userinfo`] for the
+    /// rules. Only a `sub` mismatch is an error; an unusable endpoint is
+    /// logged and the ID-token claims are used alone (as before).
+    async fn complete_from_userinfo(
+        &self,
+        claims: &mut IdTokenClaims,
+        provider: &OidcProvider,
+        userinfo_endpoint: Option<&str>,
+        access_token: &str,
+    ) -> Result<(), OidcError> {
+        if !super::oidc_userinfo::needs_userinfo(claims) {
+            return Ok(());
+        }
+        let Some(endpoint) = userinfo_endpoint else {
+            warn!(
+                provider_id = %provider.id,
+                "OIDC ID token lacks email / email_verified and the provider advertises no userinfo endpoint"
+            );
+            return Ok(());
+        };
+        match super::oidc_userinfo::fetch_userinfo_pinned(&provider.issuer, endpoint, access_token)
+            .await
+        {
+            Ok(info) => {
+                super::oidc_userinfo::merge_userinfo(claims, info, provider.group_claim.as_deref())
+            }
+            Err(e) => {
+                warn!(
+                    provider_id = %provider.id,
+                    error = %e,
+                    "OIDC userinfo not used; continuing with ID-token claims only"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// The callback up to and including ID-token validation: provider,
     /// transaction, code exchange, signature/nonce checks. Nothing it
-    /// returns on error is trusted identity.
+    /// returns on error is trusted identity. Also returns the access token
+    /// and the discovery document's userinfo endpoint (NAN-5266).
     async fn validate_callback(
         &self,
         provider_slug: &str,
         code: &str,
         state: &str,
         redirect_uri: &str,
-    ) -> Result<(OidcProvider, IdTokenClaims, String), OidcError> {
+    ) -> Result<(OidcProvider, IdTokenClaims, String, Option<String>), OidcError> {
         // Get provider
         let provider = self
             .oidc_repo
@@ -769,7 +864,12 @@ impl OidcService {
         let claims = self
             .validate_id_token(&id_token, &provider, &discovery.jwks_uri, &transaction.nonce)
             .await?;
-        Ok((provider, claims, token_response.access_token))
+        Ok((
+            provider,
+            claims,
+            token_response.access_token,
+            discovery.userinfo_endpoint,
+        ))
     }
 
     /// The callback after ID-token validation: group resolution, user
@@ -906,11 +1006,13 @@ impl OidcService {
         // Handle audience validation (can be string or array)
         validation.set_audience(&[&provider.client_id]);
 
-        // Decode and validate token
-        let token_data = decode::<IdTokenClaims>(id_token, &decoding_key, &validation)
+        // Decode and validate token. Decoded as a JSON value first so the
+        // set of asserted claim names is kept (NAN-5266 userinfo merge).
+        let token_data = decode::<serde_json::Value>(id_token, &decoding_key, &validation)
             .map_err(|e| OidcError::InvalidIdToken(format!("Token validation failed: {}", e)))?;
 
-        let claims = token_data.claims;
+        let claims = IdTokenClaims::from_validated_value(token_data.claims)
+            .map_err(|e| OidcError::InvalidIdToken(format!("Invalid ID token claims: {}", e)))?;
 
         // Validate nonce - REQUIRED for replay attack prevention
         // The nonce must be present in the token and must match what we sent
@@ -967,37 +1069,7 @@ impl OidcService {
         claims: &IdTokenClaims,
         provider: &OidcProvider,
     ) -> Result<OidcUser, OidcError> {
-        // Try email first, fall back to preferred_username (UPN) for Azure AD cloud-only users
-        let email = claims
-            .email
-            .clone()
-            .or_else(|| claims.preferred_username.clone())
-            .ok_or_else(|| OidcError::MissingClaim("email or preferred_username".to_string()))?;
-
-        let name = claims
-            .name
-            .clone()
-            .or_else(|| {
-                // Try to construct name from given_name and family_name
-                match (&claims.given_name, &claims.family_name) {
-                    (Some(given), Some(family)) => Some(format!("{} {}", given, family)),
-                    (Some(given), None) => Some(given.clone()),
-                    (None, Some(family)) => Some(family.clone()),
-                    (None, None) => None,
-                }
-            })
-            .unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_string());
-
-        let groups = groups_from_validated_claims(claims, provider.group_claim.as_deref())?;
-
-        Ok(OidcUser {
-            subject: claims.sub.clone(),
-            email,
-            email_verified: provider.access_policy.verifies_email(claims),
-            name,
-            groups,
-            provider_id: provider.id,
-        })
+        oidc_user_from_claims(claims, provider)
     }
 
     /// Provision or update the local user for an OIDC identity (NAN-3904).
@@ -1043,6 +1115,17 @@ impl OidcService {
         .await
         .map_err(|_| failed())?;
         let linked = user.is_some();
+        // NAN-5266: an identity not yet bound to a local account needs an
+        // IdP-verified email before anything is looked up by that email. The
+        // refusal then depends only on the caller's own token (never on which
+        // local accounts exist), so it can carry a specific user hint.
+        if !linked && !oidc_user.email_verified {
+            warn!(
+                provider_id = %oidc_user.provider_id,
+                "Rejected OIDC sign-in: email not verified by the identity provider"
+            );
+            return Err(OidcError::EmailNotVerified);
+        }
         let existing = if user.is_some() {
             user
         } else {
@@ -1083,13 +1166,6 @@ impl OidcService {
             }
             tx.commit().await.map_err(|_| failed())?;
             return Err(OidcError::GroupNotAllowed);
-        }
-        if !linked && !oidc_user.email_verified {
-            warn!(
-                provider_id = %oidc_user.provider_id,
-                "Rejected OIDC sign-in: email not verified by the identity provider"
-            );
-            return Err(OidcError::EmailNotVerified);
         }
         let newly_created = existing.is_none();
         let user = if let Some(existing) = existing {
@@ -1184,10 +1260,7 @@ impl OidcService {
     }
 }
 
-/// Google's fixed issuer. Its ID tokens are never a groups source.
-pub(crate) fn is_google_issuer(issuer: &str) -> bool {
-    issuer == "https://accounts.google.com"
-}
+pub(crate) use super::sso_policy::{is_google_issuer, is_microsoft_issuer};
 
 /// `(idp_group, local_group_id)` mappings of this provider that the asserted
 /// IdP groups hit (exact, case-sensitive match).
@@ -1312,6 +1385,48 @@ pub(crate) async fn revoke_unmapped_sso_grants(
         }
     }
     Ok(affected)
+}
+
+/// The sign-in identity from validated (and userinfo-completed) claims.
+/// `email` falls back to `preferred_username` (the Entra UPN), but only a
+/// real `email` claim can ever be `email_verified` (NAN-5266 H1).
+pub fn oidc_user_from_claims(
+    claims: &IdTokenClaims,
+    provider: &OidcProvider,
+) -> Result<OidcUser, OidcError> {
+    // Try email first, fall back to preferred_username (UPN) for Azure AD cloud-only users
+    let email = claims
+        .email
+        .clone()
+        .or_else(|| claims.preferred_username.clone())
+        .ok_or(OidcError::MissingEmail)?;
+
+    let name = claims
+        .name
+        .clone()
+        .or_else(|| {
+            // Try to construct name from given_name and family_name
+            match (&claims.given_name, &claims.family_name) {
+                (Some(given), Some(family)) => Some(format!("{} {}", given, family)),
+                (Some(given), None) => Some(given.clone()),
+                (None, Some(family)) => Some(family.clone()),
+                (None, None) => None,
+            }
+        })
+        .unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_string());
+
+    let groups = groups_from_validated_claims(claims, provider.group_claim.as_deref())?;
+
+    Ok(OidcUser {
+        subject: claims.sub.clone(),
+        email,
+        // Never vouches for a `preferred_username` stand-in (NAN-5266 H1).
+        email_verified: claims.email.is_some()
+            && provider.access_policy.verifies_email(claims),
+        name,
+        groups,
+        provider_id: provider.id,
+    })
 }
 
 /// Minimal provider info for login page

@@ -1,28 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The credential an install presents on nano's licence-authenticated
+//! The credential an install presents on nano's license-authenticated
 //! distribution routes (NAN-5220): the enterprise content route
 //! (`/api/content/v1/enterprise/...`) and the sovereign feed route.
 //!
 //! This module is only the seam. The open edition registers no source, so it
 //! never sends a credential and never subscribes to an enterprise channel.
 //! An enterprise build registers one at start-up that resolves the
-//! install's current licence on every check, so a renewal, a re-imported file or a new
+//! install's current license on every check, so a renewal, a re-imported file or a new
 //! check-in is picked up without a restart.
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 
-/// A credential for the licence-authenticated routes. `Debug` never prints
-/// the licence bytes or the token.
+/// A credential for the license-authenticated routes. `Debug` never prints
+/// the license bytes or the token.
 #[derive(Clone, PartialEq, Eq)]
 pub enum DistributionCredential {
-    /// A signed C05/H01 licence artifact, sent as `X-Nano-License`. Accepted
+    /// A signed C05/H01 license artifact, sent as `X-Nano-License`. Accepted
     /// by the content and the sovereign feed routes.
     SignedLicense(Vec<u8>),
-    /// The online licence's enrollment token (`LICENSE_TOKEN`) and deployment
+    /// The online license's enrollment token (`LICENSE_TOKEN`) and deployment
     /// id, sent as `Authorization: Bearer` + `X-Nano-Deployment-Id`. Accepted
     /// by the enterprise content route only. It is a bearer credential for the
-    /// licence server, so it is sent only to `licence_origin` (the
+    /// license server, so it is sent only to `licence_origin` (the
     /// `LICENSE_URL` origin), never to a mirror or any other host.
     Enrollment { deployment_id: String, token: String, licence_origin: String },
 }
@@ -47,9 +47,9 @@ impl std::fmt::Debug for DistributionCredential {
 pub enum CredentialOrigin {
     /// `CONTENT_CHANNELS_LICENSE_FILE` / `PLATFORM_FEEDS_LICENSE_FILE`.
     File,
-    /// The online licence (`LICENSE_URL`, `LICENSE_TOKEN`, `NANO_DEPLOYMENT_ID`).
+    /// The online license (`LICENSE_URL`, `LICENSE_TOKEN`, `NANO_DEPLOYMENT_ID`).
     Online,
-    /// The signed licence installed under Settings → License (or by the
+    /// The signed license installed under Settings → License (or by the
     /// installer's `NANO_LICENSE_FILE`).
     Installed,
 }
@@ -58,7 +58,7 @@ pub enum CredentialOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialLookup {
     Found { credential: DistributionCredential, origin: CredentialOrigin },
-    /// No usable licence. `reason` is operator-facing and names what to do.
+    /// No usable license. `reason` is operator-facing and names what to do.
     Missing { reason: String },
 }
 
@@ -81,9 +81,9 @@ pub fn credential_source() -> Option<Arc<dyn CredentialSource>> {
     SOURCE.get().cloned()
 }
 
-/// Shown when an enterprise channel has no licence to present.
-pub const NO_LICENCE_REASON: &str = "no licence installed on this install: set the online licence values \
-     (LICENSE_URL, LICENSE_TOKEN, NANO_DEPLOYMENT_ID) or import a licence file under Settings → License";
+/// Shown when an enterprise channel has no license to present.
+pub const NO_LICENCE_REASON: &str = "no license installed on this install: set the online license values \
+     (LICENSE_URL, LICENSE_TOKEN, NANO_DEPLOYMENT_ID) or import a license file under Settings → License";
 
 /// `scheme://host[:port]` of a URL, lowercased; `None` when it does not parse.
 pub fn url_origin(url: &str) -> Option<String> {

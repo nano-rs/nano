@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-5194: the licence server rejected this deployment's token.
+//! NAN-5194: the license server rejected this deployment's token.
 //!
 //! A 401/403 from `/api/license/status` means the credential itself was
-//! refused (for example, the owner regenerated the licence token on
+//! refused (for example, the owner regenerated the license token on
 //! app.nano.rs and `.env` still holds the old one). Retrying never fixes that,
-//! so unlike a network error or a 5xx it is recorded with the cached licence
+//! so unlike a network error or a 5xx it is recorded with the cached license
 //! status and surfaced as a critical SIEM Health finding and an admin banner.
 //!
 //! Admission does not change: the install keeps its cached status, keeps
@@ -21,7 +21,7 @@ use crate::siem_health::types::{AnalysisResult, Recommendation};
 
 /// Stable SIEM Health finding title (suppressions key on the title, so the
 /// lock date lives in the description only).
-pub const TOKEN_REJECTED_FINDING_TITLE: &str = "Licence token rejected by app.nano.rs";
+pub const TOKEN_REJECTED_FINDING_TITLE: &str = "License token rejected by app.nano.rs";
 
 /// Whether a check-in response means nano-main refused the credential.
 ///
@@ -104,7 +104,7 @@ impl TokenRejectedNotice {
 
 /// The operator-facing message.
 pub fn message(locks_at: Option<DateTime<Utc>>) -> String {
-    const HEAD: &str = "Licence token was rejected by app.nano.rs. Update LICENSE_TOKEN in .env \
+    const HEAD: &str = "License token was rejected by app.nano.rs. Update LICENSE_TOKEN in .env \
                         and re-run ./install.sh.";
     match locks_at {
         Some(at) => format!(
@@ -124,7 +124,7 @@ pub fn recommendation(notice: &TokenRejectedNotice) -> Recommendation {
     Recommendation {
         title: TOKEN_REJECTED_FINDING_TITLE.to_string(),
         description: format!(
-            "{} The licence server has answered HTTP {} to every check-in since {}. \
+            "{} The license server has answered HTTP {} to every check-in since {}. \
              Check-ins keep retrying; this finding clears after the next successful one.",
             notice.message,
             notice.http_status,

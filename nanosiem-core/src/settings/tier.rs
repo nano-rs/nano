@@ -5,7 +5,7 @@
 //! v2 has three independent axes: edition (`open` or `licensed`), operator
 //! (`self-run` or `hosted`), and GB/day capacity. Capacity never selects
 //! features. The retired plan names remain accepted at configuration and
-//! licence boundaries, but normalize to the licensed offering with the full
+//! license boundaries, but normalize to the licensed offering with the full
 //! feature set.
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use sqlx::PgPool;
 pub enum OrganizationTier {
     Open,
     Licensed,
-    /// Compatibility-only aliases accepted from pre-v2 rows, env and licences.
+    /// Compatibility-only aliases accepted from pre-v2 rows, env and licenses.
     Unrestricted,
     Hobby,
     Startup,
@@ -184,7 +184,7 @@ impl Entitlement {
         }
     }
 
-    /// Normalize the string carried by online and legacy air-gap licences.
+    /// Normalize the string carried by online and legacy air-gap licenses.
     pub fn from_license_tier_claim(
         claim: &str,
         operator: EntitlementOperator,
@@ -513,7 +513,7 @@ impl TierSettings {
     }
 
     /// NAN-5055: record (or clear) the AI allowance granted by an admitted,
-    /// authenticated online licence check-in. The online checker is the only
+    /// authenticated online license check-in. The online checker is the only
     /// writer; boot reconciliation clears it whenever online licensing is not
     /// the admission authority, so a grant cannot outlive its source.
     pub async fn set_granted_ai_credits(&self, credits: Option<u32>) -> Result<(), TierError> {
@@ -596,7 +596,7 @@ impl TierSettings {
         self.get_tier_limits().await
     }
 
-    /// Retired setter retained for API/env/licence compatibility.
+    /// Retired setter retained for API/env/license compatibility.
     pub async fn set_tier(&self, tier: OrganizationTier) -> Result<TierLimits, TierError> {
         let current = self.get_tier_limits().await?;
         let mut entitlement = Entitlement::from_legacy_tier(tier, current.entitlement.operator);
@@ -606,7 +606,7 @@ impl TierSettings {
         self.set_entitlement(entitlement).await
     }
 
-    /// Map an old or new licence tier claim onto v2. Unknown claim values are
+    /// Map an old or new license tier claim onto v2. Unknown claim values are
     /// rejected; all accepted pre-v2 paid names gain the full licensed feature
     /// set and retain only their historical capacity metadata.
     pub async fn admit_license_tier(

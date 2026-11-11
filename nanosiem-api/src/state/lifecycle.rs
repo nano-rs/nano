@@ -95,7 +95,7 @@ impl AppState {
                         tracing::warn!(
                             worker_group = name,
                             ?capability,
-                            "Stopping licensed workers at licence hard stop"
+                            "Stopping licensed workers at license hard stop"
                         );
                         abort_component_workers(&mut workers).await;
                     }

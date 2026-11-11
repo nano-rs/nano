@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! "Update available" facts from the online licence check-in (NAN-5114).
+//! "Update available" facts from the online license check-in (NAN-5114).
 //!
 //! nano-main adds the newest published release to a Self-run deployment's
 //! `GET /api/license/status` response (`latestVersion`, `releaseNotesUrl`,

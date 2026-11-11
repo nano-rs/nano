@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Licence admission for enterprise deployments
+//! License admission for enterprise deployments
 //!
 //! Provides a license checker service that communicates with nano-main
 //! to enforce subscription status. A complete online tuple uses that checker;

@@ -34,7 +34,8 @@ Examples:
   plan.py --gb-per-day 12.5 --hosts hosts.txt --lb haproxy-single   # 8 existing VMs, no managed LB
   plan.py --gb-per-day 12.5 --hosts hosts.txt --lb haproxy-single --install-order
   plan.py --port-matrix           # firewall flows derived from the renderer port matrix
-  plan.py --gb-per-day 12.5 --hosts hosts.txt --lb haproxy-dns --firewall-script   # DOCKER-USER + UFW rules
+  plan.py --gb-per-day 12.5 --hosts hosts.txt --lb haproxy-dns --firewall-script \
+          --edge-source-cidr 10.20.0.0/16                                         # DOCKER-USER + UFW rules
   plan.py --gb-per-day 12.5 --hosts small.txt --lb haproxy-single --lab   # evaluation cluster, NOT FOR PRODUCTION
 
 Production sizing per role is the HA guide's Server sizing table
@@ -672,7 +673,7 @@ def ha_reasoning(app, ch, ing, schema, lb: dict, ctl_layout: str = "separate") -
          "choice": f"3 Patroni members {ctl_where}; etcd on the same 3; synchronous replication (on); "
                    "each app host's postgres-router follows the leader" if schema["multi_postgres"] else
                    "1 PostgreSQL host (releases before 2.0.7)",
-         "survives": "loss of any one PostgreSQL host: writes, sign-ins and searches see a short pause, typically a few seconds and up to about 30 s, while a standby is promoted (measured: under 9 s promotion, ~3 s of failed sign-ins); no acknowledged write lost" if schema["multi_postgres"] else
+         "survives": "loss of any one PostgreSQL host: writes, sign-ins and searches pause for about 20-25 s, up to about 30 s, while a standby is promoted (Patroni's leader timeout is 20 s; measured 20-24 s on a 7-host hard-kill test); a planned switchover pauses a few seconds; no acknowledged write lost" if schema["multi_postgres"] else
                      "nothing: PostgreSQL is a single point of failure until v2.0.7"},
         {"component": "Valkey (sessions, JWT revocations, search jobs)",
          "choice": "one member per PostgreSQL host + 3 Sentinels; each app host's valkey-router follows the master" if multi else
@@ -855,7 +856,7 @@ def cost_estimate(cat: dict, a, load, ch, nodes) -> dict:
             "high_note": "high end adds 25 % for snapshots, NAT/egress, monitoring and price drift (INFERRED)",
             "lines": lines, "clickhouse_extra_replicas_usd_month": round(replica_cost),
             "unverified": unverified,
-            "excludes": "commitment discounts, support plans, licence fees, taxes, internet egress to senders"}
+            "excludes": "commitment discounts, support plans, license fees, taxes, internet egress to senders"}
 
 
 # --- Port matrix -------------------------------------------------------------------
@@ -1059,8 +1060,33 @@ ExecStartPost=-{DOCKER_FIREWALL_BIN}
 """
 
 
-def firewall_script(p: dict, schema: dict) -> str:
+OPEN_TO_ALL = {"0.0.0.0/0", "::/0"}
+
+
+def edge_sources(p: dict, cidrs: list[str] | None) -> list[str]:
+    """Who may reach 443 on the HAProxy hosts (never the whole internet by default)."""
+    if not p["load_balancer"].get("lb_hosts"):
+        return []
+    if not cidrs:
+        raise PlanError(
+            "--firewall-script with HAProxy hosts needs --edge-source-cidr CIDR (repeatable): the networks your "
+            "users and log senders connect from (office LAN, VPN, sender subnets). HAProxy binds 443 for both "
+            "hostnames; the script opens 443 only to these sources. To open 443 to the whole internet, pass "
+            "--edge-source-cidr 0.0.0.0/0 explicitly.")
+    out: list[str] = []
+    for cidr in cidrs:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            raise PlanError(f"--edge-source-cidr {cidr!r} is not an IP network (e.g. 10.20.0.0/16 or 203.0.113.7/32)")
+        if str(net) not in out:
+            out.append(str(net))
+    return out
+
+
+def firewall_script(p: dict, schema: dict, edge_cidrs: list[str] | None = None) -> str:
     """Ready-to-paste host firewall for this plan: the same script on every nano host."""
+    edge = edge_sources(p, edge_cidrs)
     nodes = p["nodes"]
     by_role: dict[str, list[str]] = {}
     for n in nodes:
@@ -1155,12 +1181,19 @@ def firewall_script(p: dict, schema: dict) -> str:
     if lb_hosts:
         # HAProxy is a host service (INPUT/UFW, not Docker): it binds 443 for
         # both hostnames. Run this script on the HAProxy hosts too.
-        lines.append("# HAProxy hosts: users and senders reach the front door on 443 (both hostnames).")
+        lines.append("# HAProxy hosts: users and senders reach the front door on 443 (both hostnames),")
+        lines.append(f"# only from --edge-source-cidr: {' '.join(edge)}")
+        if OPEN_TO_ALL & set(edge):
+            lines.append("# WARNING: 443 is open to the whole internet (--edge-source-cidr 0.0.0.0/0 was given).")
         vrrp = p["load_balancer"].get("vip") is not None
         for addr in lb_hosts:
             others = [o for o in lb_hosts if o != addr]
             lines.append(f"if this_host {addr}; then")
-            lines.append("  sudo ufw allow 443/tcp")
+            # An earlier script opened 443 to every source; drop that rule (ufw
+            # removes its IPv4 and IPv6 forms together) before the scoped ones.
+            lines.append("  sudo ufw --force delete allow 443/tcp >/dev/null 2>&1 || true")
+            for cidr in edge:
+                lines.append(f"  sudo ufw allow from {cidr} to any port 443 proto tcp")
             if vrrp:
                 for o in others:
                     lines.append(f"  sudo ufw allow from {o} proto vrrp   # keepalived peer; without it both claim the VIP")
@@ -2006,8 +2039,13 @@ def print_install_order(p: dict, schema: dict) -> None:
         roles = [x for x in r[name] if x in ("postgres", "keeper")]
         steps.append((name, "install", "--role " + ",".join(roles)))
     if len(pg) >= 2:
-        # PostgreSQL HA: the first postgres host records NANO_PG_HA_SYSTEM_ID in
-        # its .env. Every later run needs that copy, or the hosts' .env drift.
+        # PostgreSQL HA: the cluster bootstraps only once a second postgres
+        # host joins (etcd quorum), so the first postgres host cannot record
+        # NANO_PG_HA_SYSTEM_ID during its own install. After the last postgres
+        # host, it records it with --record-pg-ha-identity (reads only; renders,
+        # pulls and restarts nothing), and ITS .env is the one to copy.
+        steps.append((pg[0], "record identity", "./install.sh --record-pg-ha-identity  (no --role/--inventory; "
+                      "records NANO_PG_HA_SYSTEM_ID in this host's .env; restarts nothing)"))
         steps.append((pg[0], "copy .env", f"stream {pg[0]}'s ~/nano/.env to every other host "
                       "(it now records NANO_PG_HA_SYSTEM_ID; Step 5 of multi-node-ha.md), "
                       "then check that every host's sha256sum matches"))
@@ -2079,6 +2117,9 @@ def parser() -> argparse.ArgumentParser:
                    help="print host, address and the exact preflight.sh flags for each host of this plan, and exit")
     p.add_argument("--firewall-script", action="store_true",
                    help="print ready-to-paste DOCKER-USER (iptables) and UFW rules for this plan's addresses and exit")
+    p.add_argument("--edge-source-cidr", action="append", default=[],
+                   help="with --firewall-script and HAProxy hosts: a network allowed to reach 443 on them "
+                   "(repeatable: user LAN, VPN, log senders). Required; 0.0.0.0/0 only when given explicitly")
     p.add_argument("--inventory-schema", choices=sorted(SCHEMAS), default="full-ha",
                    help=f"full-ha = nano {FULL_HA_RELEASE}+ (several app hosts, 3 postgres hosts); "
                    "pre-2.0.7 = what earlier releases accept (one app, one postgres)")
@@ -2114,7 +2155,7 @@ def main(argv: list[str] | None = None) -> int:
             print_install_order(plan, schema_for(a.inventory_schema))
             return 0
         if a.firewall_script:
-            sys.stdout.write(firewall_script(plan, schema_for(a.inventory_schema)))
+            sys.stdout.write(firewall_script(plan, schema_for(a.inventory_schema), a.edge_source_cidr))
             return 0
         if a.preflight_args:
             print("host\taddress\tpreflight.sh flags")

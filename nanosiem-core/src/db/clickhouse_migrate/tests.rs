@@ -1801,6 +1801,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn uncap_result_limits_merges_into_the_outer_settings() {
+        use crate::db::clickhouse_migrate::distributed::uncap_result_limits;
+
+        // NAN-5262: the live ip_enrichment_dict_refresh shape (outer SETTINGS).
+        assert_eq!(
+            uncap_result_limits(
+                "SELECT network FROM nanosiem.ip_enrichments_distributed GROUP BY network \
+                 SETTINGS max_threads = 2, max_insert_block_size = 262144"
+            )
+            .as_deref(),
+            Some(
+                "SELECT network FROM nanosiem.ip_enrichments_distributed GROUP BY network \
+                 SETTINGS max_threads = 2, max_insert_block_size = 262144, \
+                 max_result_rows = 0, max_result_bytes = 0"
+            )
+        );
+        // No SETTINGS: a new clause.
+        assert_eq!(
+            uncap_result_limits("SELECT 1 FROM t;").as_deref(),
+            Some("SELECT 1 FROM t SETTINGS max_result_rows = 0, max_result_bytes = 0")
+        );
+        // Only a subquery has SETTINGS: the outer query gets its own clause.
+        assert_eq!(
+            uncap_result_limits("SELECT * FROM (SELECT 1 SETTINGS max_threads = 2) WHERE x").as_deref(),
+            Some(
+                "SELECT * FROM (SELECT 1 SETTINGS max_threads = 2) WHERE x \
+                 SETTINGS max_result_rows = 0, max_result_bytes = 0"
+            )
+        );
+        // Idempotent, and an explicit cap is kept.
+        let done = uncap_result_limits("SELECT 1 SETTINGS max_threads = 2").unwrap();
+        assert_eq!(uncap_result_limits(&done), None);
+        assert_eq!(uncap_result_limits("SELECT 1 SETTINGS max_result_rows = 5000000"), None);
+        assert_eq!(uncap_result_limits("  "), None);
+    }
+
     // ── NAN-1728 C4/W2 + M-1/D4: sharding keys & wrapper drift ──
 
     #[test]

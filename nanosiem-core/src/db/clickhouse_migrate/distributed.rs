@@ -1223,8 +1223,82 @@ impl ClickHouseMigrator {
                 repointed
             );
         }
-        Ok(repointed)
+
+        // NAN-5262: lift the `default` profile's result caps on the same MVs.
+        // A refresh runs in the server's global context (the `default`
+        // profile: max_result_rows = 1M, result_overflow_mode = throw), and the
+        // remote leg of a `_distributed` read is a SELECT whose result IS
+        // capped. A 4.5M-network IPinfo Lite refresh then fails with
+        // TOO_MANY_ROWS (396) whenever a shard is read remotely, the staging
+        // table stays empty and geo enrichment is blank. Query-level SETTINGS
+        // travel with the remote query, so this is enough.
+        let mut uncapped = 0;
+        let mut seen: Vec<&str> = Vec::new();
+        for (mv, _) in Self::DICT_REFRESH_MV_BASES {
+            if seen.contains(mv) {
+                continue;
+            }
+            seen.push(mv);
+            let body: Option<String> = self
+                .client
+                .query(&format!(
+                    "SELECT as_select FROM system.tables WHERE database = '{}' AND name = '{}'",
+                    self.database, mv
+                ))
+                .fetch_all::<String>()
+                .await
+                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?
+                .into_iter()
+                .next();
+            let Some(new_body) = body.as_deref().and_then(uncap_result_limits) else {
+                continue;
+            };
+            let sql = format!(
+                "ALTER TABLE {db}.{mv}{on_cluster} MODIFY QUERY {query}",
+                db = self.database,
+                mv = mv,
+                on_cluster = on_cluster,
+                query = new_body,
+            );
+            match self.client.query(&sql).execute().await {
+                Ok(_) => uncapped += 1,
+                Err(e) => tracing::warn!(
+                    "Failed to lift result caps on dict-refresh MV {}.{}: {}",
+                    self.database,
+                    mv,
+                    e
+                ),
+            }
+        }
+        if uncapped > 0 {
+            tracing::info!("Lifted result caps on {} dict-refresh MV(s)", uncapped);
+        }
+        Ok(repointed + uncapped)
     }
+}
+
+/// Query-level settings that lift the profile's result caps (NAN-5262).
+pub(super) const UNCAPPED_RESULT_SETTINGS: &str = "max_result_rows = 0, max_result_bytes = 0";
+
+/// Append [`UNCAPPED_RESULT_SETTINGS`] to an MV's `as_select` body: merged into
+/// its trailing top-level `SETTINGS` clause, or as a new clause. `None` when
+/// the body is empty or already sets `max_result_rows` (idempotent, and an
+/// explicit operator choice is kept).
+pub(super) fn uncap_result_limits(body: &str) -> Option<String> {
+    let body = body.trim().trim_end_matches(';').trim_end();
+    if body.is_empty() || body.contains("max_result_rows") {
+        return None;
+    }
+    // ClickHouse prints the outer query's SETTINGS last. A SETTINGS followed
+    // by a `)` belongs to a subquery, so the outer query has none yet.
+    let trailing = body
+        .rfind(" SETTINGS ")
+        .is_some_and(|pos| !body[pos..].contains(')'));
+    Some(if trailing {
+        format!("{body}, {UNCAPPED_RESULT_SETTINGS}")
+    } else {
+        format!("{body} SETTINGS {UNCAPPED_RESULT_SETTINGS}")
+    })
 }
 
 /// NAN-5215: DDL options for re-issuing the audit policies. Only on an

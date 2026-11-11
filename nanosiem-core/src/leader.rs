@@ -79,7 +79,7 @@ pub mod lock_ids {
     /// several app hosts starting at once apply PostgreSQL and ClickHouse
     /// migrations exactly once, one host at a time (NAN-5213).
     pub const SCHEMA_MIGRATOR: i64 = 0x4e53_4d49_4752;
-    /// Online licence check-in and usage report (`NSLICN` in hex): only one
+    /// Online license check-in and usage report (`NSLICN` in hex): only one
     /// process reports at a time (NAN-5213).
     pub const LICENSE_USAGE_REPORT: i64 = 0x4e53_4c49_434e;
 }

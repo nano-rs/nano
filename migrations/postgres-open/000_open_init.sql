@@ -37,7 +37,12 @@
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
-SET transaction_timeout = 0;
+-- NAN-5260: transaction_timeout exists only from PostgreSQL 17. pg_dump emits
+-- a bare SET that aborts the snapshot on PG16 (Cloud SQL / RDS defaults), so
+-- apply it only when the server knows the parameter. Rewritten at generation
+-- time by tools/nan749_split_open_overlay.py.
+SELECT pg_catalog.set_config('transaction_timeout', '0', false)
+WHERE pg_catalog.current_setting('server_version_num')::integer >= 170000;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 -- (search_path setter stripped by tools/nan749_split_open_overlay.py)

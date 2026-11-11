@@ -15,9 +15,10 @@
 # Keep the port off untrusted networks either way (the open-core compose binds
 # it to loopback by default).
 
+# NAN-5268: the Helm chart binds it to loopback unless vector.native.enabled.
 [sources.vector_native]
 type = "vector"
-address = "0.0.0.0:6000"
+address = "${NANO_VECTOR_NATIVE_ADDRESS:-0.0.0.0:6000}"
 version = "2"  # Vector protocol version
 
 # Acknowledgements ensure upstream Vector knows events were received

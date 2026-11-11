@@ -49,8 +49,8 @@ export function LicenseBanner() {
   // compatibility with an older API response during rolling upgrades.
   const enforced = !!status?.enforcement_enabled || !!status?.airgap;
 
-  // NAN-5194: the licence server refused the token. Only an admin can fix
-  // it (.env + install.sh), and it outranks the other licence banners because
+  // NAN-5194: the license server refused the token. Only an admin can fix
+  // it (.env + install.sh), and it outranks the other license banners because
   // it is the cause of any lock that follows. Not dismissable; it clears after
   // the next successful check-in.
   if (isEnterprise && isAdmin && status?.token_rejected) {
@@ -124,7 +124,7 @@ export function LicenseBanner() {
           </div>
           <span className="text-amber-700 dark:text-amber-300">
             {legacyUpgrade
-              ? status.notice || 'Import a C05 licence before the legacy upgrade grace ends.'
+              ? status.notice || 'Import a C05 license before the legacy upgrade grace ends.'
               : `Your subscription is expiring${graceEnd ? ` on ${graceEnd.toLocaleDateString()}` : ''}. Update your billing to avoid service interruption.`}
           </span>
         </div>
@@ -134,7 +134,7 @@ export function LicenseBanner() {
               to="/settings/license"
               className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 transition-colors"
             >
-              {legacyUpgrade ? 'Import C05 licence' : 'Upload renewal'}
+              {legacyUpgrade ? 'Import C05 license' : 'Upload renewal'}
             </Link>
           ) : (
             <a
@@ -172,7 +172,7 @@ function LicenseHardStopBanner({ status }: { status: LicenseStatusResponse }) {
             Licensed features are unavailable
           </div>
           <div className="text-red-700/90 dark:text-red-300/90">
-            {status.locked_reason || 'This licence reached its hard-stop boundary.'}{' '}
+            {status.locked_reason || 'This license reached its hard-stop boundary.'}{' '}
             Open/core features, ingest, search, and stored data remain available.
           </div>
         </div>
@@ -183,7 +183,7 @@ function LicenseHardStopBanner({ status }: { status: LicenseStatusResponse }) {
           className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-700"
         >
           <KeyRound className="h-3.5 w-3.5" />
-          Import licence
+          Import license
         </Link>
       ) : (
         <a
@@ -192,7 +192,7 @@ function LicenseHardStopBanner({ status }: { status: LicenseStatusResponse }) {
           rel="noopener noreferrer"
           className="inline-flex shrink-0 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-700"
         >
-          Renew licence
+          Renew license
         </a>
       )}
     </div>
@@ -205,7 +205,7 @@ function LicenseTokenRejectedBanner({ rejection }: { rejection: NonNullable<Lice
       <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" strokeWidth={1.5} />
       <div className="min-w-0">
         <div className="font-medium text-red-700 dark:text-red-300">
-          Licence token rejected <span className="font-mono text-[10.5px]">HTTP {rejection.http_status}</span>
+          License token rejected <span className="font-mono text-[10.5px]">HTTP {rejection.http_status}</span>
         </div>
         <div className="text-red-700/90 dark:text-red-300/90">{rejection.message}</div>
       </div>

@@ -119,7 +119,7 @@ fn refresh_endpoints(value: &str) -> Result<Vec<String>> {
 
 /// NAN-5215: per-replica endpoints, one per ClickHouse server in
 /// `(shard, replica)` order, each pinned to exactly that server. The compose
-/// renderer sets it; Helm does not.
+/// renderer and the Helm chart (per-replica Services, NAN-5262) both set it.
 const REPLICA_ENDPOINTS_ENV: &str = "VECTOR_CLICKHOUSE_REPLICA_ENDPOINTS";
 /// One endpoint per shard; the proxy lands each request on ONE replica.
 const SHARD_ENDPOINTS_ENV: &str = "VECTOR_CLICKHOUSE_SHARD_ENDPOINTS";

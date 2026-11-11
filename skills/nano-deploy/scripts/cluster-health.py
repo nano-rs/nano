@@ -30,10 +30,15 @@ Checks:
   pg-ha    on postgres hosts with failover: Patroni has one Leader and, in synchronous
            mode, a Sync Standby, every member running/streaming with lag under 16 MiB;
            etcd endpoint health across the cluster; Sentinel quorum for the Valkey master.
+  docker   the Docker engine answers. Every nano service on a role-split host runs in
+           Docker, so an engine that is stopped (for example held back by
+           RequiresMountsFor= because the data disk did not mount) is a FAIL.
   disk     the data disk that holds Docker's data (an /etc/fstab mount at or above
            DockerRootDir) is mounted, and docker.service requires it
            (RequiresMountsFor=). A disk that failed to mount at boot leaves Docker
-           running empty on the root disk while systemd reports it "active".
+           running empty on the root disk while systemd reports it "active". With
+           Docker stopped, the configured data-root (/etc/docker/daemon.json, default
+           /var/lib/docker) is checked instead, so an unmounted disk is still a FAIL.
 Exit 0 = healthy, 1 = a check failed, 3 = inconclusive (re-run), 2 = not a role-split host / usage error.
 """
 from __future__ import annotations
@@ -54,6 +59,9 @@ import urllib.request
 
 FAILS: list[str] = []
 INCONCLUSIVE: list[str] = []
+FSTAB_PATH = "/etc/fstab"
+DAEMON_JSON = "/etc/docker/daemon.json"
+DEFAULT_DOCKER_ROOT = "/var/lib/docker"
 
 
 def row(check: str, ok: bool | None, detail: str) -> None:
@@ -186,10 +194,17 @@ PG_LAG_LIMIT_BYTES = 16 * 1024 * 1024
 
 
 def docker(args: list[str], timeout: float = 20) -> tuple[int, str]:
-    """Run the docker CLI (the installer user is in the docker group). Never raises."""
+    """Run the docker CLI (the installer user is in the docker group). Never raises.
+
+    On a non-zero exit the output is stdout followed by stderr: some tools
+    (etcdctl endpoint health) print their full JSON report on stdout and still
+    exit 1 when one member is unhealthy.
+    """
     try:
         done = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
-        return done.returncode, done.stdout if done.returncode == 0 else (done.stderr or done.stdout)
+        if done.returncode == 0:
+            return 0, done.stdout
+        return done.returncode, "\n".join(part for part in (done.stdout, done.stderr) if part.strip())
     except (OSError, subprocess.TimeoutExpired) as err:
         return 127, f"{type(err).__name__}: {err}"
 
@@ -313,6 +328,36 @@ def patroni_synchronous(role: dict) -> bool:
         return True
 
 
+def parse_etcd_health(out: str) -> list[dict] | None:
+    """The JSON array from `etcdctl endpoint health --cluster -w json`, wherever it
+    sits in the output (etcdctl exits 1 and adds an error line when a member is down)."""
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return None
+
+
+def judge_etcd(out: str) -> tuple[bool, str]:
+    health = parse_etcd_health(out)
+    if not health:
+        first = next((line.strip() for line in out.splitlines() if line.strip()), "no output")
+        return False, f"etcd endpoint health unreadable: {first[:160]}"
+    healthy = [h for h in health if h.get("health")]
+    down = [str(h.get("endpoint", "?")) for h in health if not h.get("health")]
+    quorum = len(health) // 2 + 1
+    detail = f"etcd members healthy {len(healthy)}/{len(health)}"
+    if down:
+        held = "quorum held" if len(healthy) >= quorum else "QUORUM LOST: Patroni cannot elect a leader"
+        detail += f" -> {held} ({len(healthy)} of {quorum} needed); down: {', '.join(down)}"
+    return not down, detail
+
+
 def postgres_ha(role: dict, run=docker) -> None:
     pg = service_container("postgres-ha", run)
     if not pg:
@@ -334,13 +379,8 @@ def postgres_ha(role: dict, run=docker) -> None:
                          "--cacert=/etc/nano/tls/ca.crt", "--cert=/etc/nano/tls/server.crt",
                          "--key=/etc/nano/tls/server.key", "--insecure-skip-tls-verify",
                          "--command-timeout=5s", "endpoint", "health", "--cluster", "-w", "json"], timeout=30)
-        try:
-            health = json.loads(out) if out.strip().startswith("[") else []
-        except ValueError:
-            health = []
-        healthy = sum(1 for h in health if h.get("health"))
-        row("pg-etcd", bool(health) and healthy == len(health),
-            f"etcd members healthy {healthy}/{len(health)}" + ("" if health else f": {out.strip()[:120]}"))
+        ok, detail = judge_etcd(out)
+        row("pg-etcd", ok, detail)
     sentinel = service_container("valkey-sentinel", run)
     if sentinel:
         code, out = run(["exec", sentinel, "valkey-cli", "--tls", "--insecure", "--cert", "/etc/nano/tls/server.crt",
@@ -389,27 +429,63 @@ def mountinfo_mounted(path: str, mountinfo: str = "/proc/self/mountinfo") -> boo
     return False
 
 
-def data_disk(run=None, fstab_path: str = "/etc/fstab", ismount=mountinfo_mounted, unit_mounts=None) -> None:
+def configured_docker_root(daemon_json: str | None = None) -> str:
+    """Docker's data-root from daemon.json (Docker stopped), default /var/lib/docker."""
+    try:
+        with open(daemon_json or DAEMON_JSON, encoding="utf-8") as fh:
+            config = json.load(fh)
+        value = config.get("data-root") or config.get("graph")
+    except (OSError, ValueError, AttributeError):
+        value = None
+    return value if isinstance(value, str) and value.startswith("/") else DEFAULT_DOCKER_ROOT
+
+
+def docker_engine(run=None) -> bool:
+    """FAIL when the Docker engine does not answer: every service on this host is down."""
     run = run or docker
+    code, out = run(["version", "--format", "{{.Server.Version}}"])
+    if code == 0 and out.strip():
+        row("docker", True, f"Docker engine {out.strip()} is running")
+        return True
+    message = " ".join(out.split())[:160]
+    if "permission denied" in message.lower():
+        INCONCLUSIVE.append("docker")
+        row("docker", None, f"cannot use the Docker socket as this user ({message}): INCONCLUSIVE, re-run as a "
+            "member of the docker group")
+        return False
+    row("docker", False, f"the Docker engine is not running ({message}): every nano service on this host is down. "
+        "If the disk row below says the data disk is not mounted, mount it first; then sudo systemctl start docker")
+    return False
+
+
+def data_disk(run=None, fstab_path: str | None = None, ismount=None, unit_mounts=None,
+              daemon_json: str | None = None) -> None:
+    run = run or docker
+    ismount = ismount or mountinfo_mounted
     code, out = run(["info", "--format", "{{.DockerRootDir}}"])
     root = out.strip()
+    note = ""
     if code != 0 or not root.startswith("/"):
-        row("disk", None, "cannot read Docker's root directory (docker info)")
-        return
+        # Docker stopped (often BECAUSE the disk did not mount and
+        # RequiresMountsFor= held it back). Check the configured data-root.
+        root = configured_docker_root(daemon_json)
+        note = f" (Docker not reachable; checked its configured data-root {root})"
+    fstab_path = fstab_path or FSTAB_PATH
     try:
         with open(fstab_path, encoding="utf-8") as fh:
             mount, options = fstab_entry_for(root, fh.read())
     except OSError:
         mount, options = "", ""
     if not mount:
-        row("disk", True, f"{root} is on the root disk (no separate data disk in {fstab_path})")
+        row("disk", True, f"{root} is on the root disk (no separate data disk in {fstab_path}){note}")
         return
     if not ismount(mount):
-        row("disk", False, f"data disk {mount} is NOT mounted: Docker is running on the root disk "
-            f"without this host's data. Stop Docker, mount {mount}, start Docker")
+        row("disk", False, f"data disk {mount} is NOT mounted{note}: Docker would run on the root disk without "
+            f"this host's data. Recover: sudo udevadm settle; sudo mount {mount}; check {root} holds this host's "
+            "data; sudo systemctl start docker (see the install guide's data-disk recovery)")
         return
     if not {"nofail", "noauto"} & set(options.split(",")):
-        row("disk", True, f"data disk {mount} is mounted and required at boot (no nofail in {fstab_path})")
+        row("disk", True, f"data disk {mount} is mounted and required at boot (no nofail in {fstab_path}){note}")
         return
     if unit_mounts is None:
         try:
@@ -419,19 +495,20 @@ def data_disk(run=None, fstab_path: str = "/etc/fstab", ismount=mountinfo_mounte
         except (OSError, subprocess.TimeoutExpired):
             unit_mounts = None
     if unit_mounts is None:
-        row("disk", None, f"data disk {mount} is mounted; cannot read docker.service dependencies")
+        row("disk", None, f"data disk {mount} is mounted; cannot read docker.service dependencies{note}")
     elif any(item.rstrip("/") == mount or item.startswith(mount + "/") for item in unit_mounts):
-        row("disk", True, f"data disk {mount} is mounted and docker.service requires it")
+        row("disk", True, f"data disk {mount} is mounted and docker.service requires it{note}")
     else:
         row("disk", None, f"data disk {mount} is mounted, but docker.service does not require it: after a "
             f"reboot where it fails to mount, Docker starts empty. Add RequiresMountsFor={mount} "
             "(see the install guide's data-disk step)")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None, run=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--install-dir", default="~/nano")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    run = run or docker
     d = os.path.expanduser(a.install_dir)
     role_path = os.path.join(d, ".nano-role.env")
     if not os.path.isfile(role_path):
@@ -442,14 +519,16 @@ def main() -> int:
     roles = set(role.get("NANO_ROLE_PROFILES", "").split(","))
     tls = role.get("NANO_PRIVATE_TLS") == "true"
     print(f"HOST {role.get('NANO_HOST_NAME')} roles={','.join(sorted(roles))} private_tls={tls}")
-    data_disk()
+    engine_up = docker_engine(run)
+    data_disk(run)
     if "keeper" in roles:
         keeper(role, tls)
     if "clickhouse" in roles:
         clickhouse(role, env, tls)
-    gateways(role)
-    if "postgres" in roles:
-        postgres_ha(role)
+    if engine_up:
+        gateways(role, run)
+        if "postgres" in roles:
+            postgres_ha(role, run)
     verdict = "FAIL" if FAILS else ("INCONCLUSIVE" if INCONCLUSIVE else "PASS")
     print(f"CLUSTER-HEALTH {verdict} failed={len(FAILS)} inconclusive={len(INCONCLUSIVE)}")
     return 1 if FAILS else (3 if INCONCLUSIVE else 0)

@@ -496,6 +496,14 @@ impl SearchService {
     /// the real bound on the scan and why it must stay small.
     pub(crate) const EXT_FIELD_NAMES_DISCOVERY_WINDOW_MINUTES: u32 = 15;
 
+    /// The OCSF Extended scan reads only the LAST N minutes of the search range
+    /// (NAN-5265). It re-casts the full `event` object per row and the
+    /// per-source slice does not bound the read (NAN-2174), so a 7-day Sysmon
+    /// search otherwise hit the 10s cap on every run. Same width as the
+    /// discovery fallback above, which returned the identical key set as a 3h
+    /// window on Saturn; the executor also caps rows read in `break` mode.
+    pub(crate) const EXTENDED_FIELD_NAMES_WINDOW_MINUTES: i64 = 15;
+
     /// Get ext field names that exist in the data, scoped to the active search.
     ///
     /// NAN-1510: when `query` + `time_range` are given, enumeration is scoped to
@@ -510,8 +518,33 @@ impl SearchService {
     /// the scan predicate below — including the time-only and `now()-3h`
     /// fallbacks, which previously applied NO source gate at all, leaking
     /// audit/denied sources' ext keys to any caller.
+    ///
+    /// Returns BARE keys relative to the spill column for every profile (UDM
+    /// `ext` → `error_code`; OCSF `unmapped` → `event_data.utc_time`). The
+    /// caller adds the display/query namespace (`ext.` / `unmapped.`) exactly
+    /// once — see [`DynamicFieldBucket`] (NAN-5265).
     pub async fn get_ext_field_names(
         &self,
+        query: Option<&str>,
+        time_range: Option<&TimeRangeInput>,
+        scope: &ScopeSet,
+    ) -> Result<Vec<String>, SearchError> {
+        self.get_dynamic_field_names(DynamicFieldBucket::Spill, query, time_range, scope)
+            .await
+    }
+
+    /// Enumerate the on-demand JSON field names of one [`DynamicFieldBucket`],
+    /// scoped exactly like [`Self::get_ext_field_names`] (NAN-5265).
+    ///
+    /// - `Spill`: bare keys of the profile's spill column (`ext` / `unmapped`).
+    /// - `Extended`: full dotted OCSF attribute paths stored in `event` that
+    ///   have no promoted column (`module.file.company_name`). Each is kept only
+    ///   when the active profile resolves that bare name back into `event`, so
+    ///   every listed name is a query that reads the value it was listed for.
+    ///   Profiles without an extended column (UDM) return an empty list.
+    pub async fn get_dynamic_field_names(
+        &self,
+        bucket: DynamicFieldBucket,
         query: Option<&str>,
         time_range: Option<&TimeRangeInput>,
         scope: &ScopeSet,
@@ -536,7 +569,13 @@ impl SearchService {
         // paths rather than collapsing to the top-level segment (which is correct
         // for UDM's effectively-flat `ext`).
         let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
-        let json_col = profile.json_tail_column();
+        let json_col = match bucket {
+            DynamicFieldBucket::Spill => profile.json_tail_column(),
+            DynamicFieldBucket::Extended => match profile.extended_json_column() {
+                Some(col) => col,
+                None => return Ok(Vec::new()),
+            },
+        };
 
         let time_only = |tr: &TimeRangeInput| {
             format!(
@@ -557,6 +596,15 @@ impl SearchService {
         // returns an empty list rather than broadening to the time-only window
         // (which would re-list the cross-source-type keys this fix removes); a query
         // that already ran for the search will parse + generate here too.
+        let extended = bucket == DynamicFieldBucket::Extended;
+        let clamped;
+        let time_range = match time_range {
+            Some(tr) if extended => {
+                clamped = clamp_extended_scan_range(tr);
+                Some(&clamped)
+            }
+            other => other,
+        };
         let where_predicate = match (query.map(str::trim).filter(|q| !q.is_empty()), time_range) {
             (Some(q), Some(tr)) => {
                 let Ok(parsed) = parse_query(q) else {
@@ -603,14 +651,30 @@ impl SearchService {
                 None => where_predicate,
             };
 
-        let names = ch_executor
-            .get_ext_field_names(&table, json_col, is_ocsf, &where_predicate)
-            .await?;
+        let names = match ch_executor
+            .get_ext_field_names(&table, json_col, is_ocsf, extended, &where_predicate)
+            .await
+        {
+            Ok(names) => names,
+            // NAN-5265: the Extended list is an optional sidebar section; a
+            // failed scan degrades to an empty section, never a 500 (the
+            // executor's `break` settings make this rare).
+            Err(e) if extended => {
+                tracing::warn!(error = %e, "extended field names scan failed; returning none");
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
 
-        Ok(names
-            .into_iter()
-            .map(|name| canonical_dynamic_field_name(json_col, is_ocsf, &name))
-            .collect())
+        if !extended {
+            // NAN-5265: bare keys. Commit 30d3228d1 prefixed OCSF names with
+            // `unmapped.` here while the web and desktop field panels already
+            // prefix them, so the sidebar listed `unmapped.unmapped.*` — and
+            // that spelling resolves to a nested `unmapped` key that does not
+            // exist, silently matching nothing.
+            return Ok(names);
+        }
+        Ok(filter_extended_names(profile, json_col, names))
     }
 
     /// Get top values for any field the active search profile can resolve.
@@ -772,15 +836,55 @@ impl SearchService {
     }
 }
 
-/// Convert a discovered dynamic JSON path into the field spelling nPL accepts.
-/// UDM's `ext` inventory intentionally stays bare for backwards compatibility;
-/// OCSF paths must name their stored spill (`unmapped`) or a bare name may be
-/// interpreted as an unrelated schema field.
-fn canonical_dynamic_field_name(json_col: &str, nested: bool, name: &str) -> String {
-    if nested {
-        format!("{json_col}.{name}")
-    } else {
-        name.to_string()
+/// Which on-demand JSON field inventory the fields panel asks for (NAN-5265).
+///
+/// The search fields panel mirrors the event inspector's buckets: the profile's
+/// spill (UDM `ext.*` "Extended", OCSF `unmapped.*` "Unmapped") and, under
+/// OCSF only, valid attributes stored in `event` without a promoted column
+/// ("Extended").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DynamicFieldBucket {
+    /// Keys of the spill column (`ext` / `unmapped`), returned bare.
+    #[default]
+    Spill,
+    /// Full dotted paths of valid, non-promoted attributes (OCSF `event`).
+    Extended,
+}
+
+/// Narrow the Extended scan to its last
+/// [`SearchService::EXTENDED_FIELD_NAMES_WINDOW_MINUTES`] (NAN-5265). A range
+/// already that short is returned unchanged.
+fn clamp_extended_scan_range(tr: &TimeRangeInput) -> TimeRangeInput {
+    let floor = tr.end
+        - chrono::Duration::minutes(SearchService::EXTENDED_FIELD_NAMES_WINDOW_MINUTES);
+    TimeRangeInput::new(tr.start.max(floor), tr.end)
+}
+
+/// Keep the Extended names that resolve back into `col`, THEN cap the list —
+/// the SQL fetches a wider alphabetical list so late-alphabet attributes are
+/// not lost to names the filter drops (NAN-5265).
+fn filter_extended_names(
+    profile: &dyn crate::schema::SchemaProfile,
+    col: &str,
+    names: Vec<String>,
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| resolves_into_column(profile, name, col))
+        .take(crate::search::execution::clickhouse_executor::EXT_FIELD_NAMES_OUTPUT_LIMIT)
+        .collect()
+}
+
+/// True when `name`, typed as a bare field, resolves into JSON column `col` —
+/// i.e. the name is a working query for the value the inventory found there.
+/// A promoted attribute (an explicit column) or an unknown path (which would
+/// fall through to the spill) is not (NAN-5265).
+fn resolves_into_column(profile: &dyn crate::schema::SchemaProfile, name: &str, col: &str) -> bool {
+    use crate::schema::FieldResolution as R;
+    match profile.resolve(name) {
+        R::JsonPath { col: c, .. } | R::ArrayElement { col: c, .. } => c == col,
+        _ => false,
     }
 }
 

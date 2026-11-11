@@ -23,6 +23,15 @@ pub const UNCONFIRMED_STATUS: &str = "unconfirmed";
 /// Vector could not be confirmed (the source may still be consuming).
 pub const QUARANTINE_UNCONFIRMED_STATUS: &str = "quarantine_unconfirmed";
 
+/// What [`SourceConfigService::settle_activation`] decided.
+pub(super) enum Settlement {
+    /// The deploy is over: report this result (not live, quarantined, ...).
+    Final(DeploymentResult),
+    /// The source is live (or published for pull delivery, with `note`
+    /// saying why it is not verified): continue the success path.
+    Live { note: Option<String> },
+}
+
 /// What isolation concluded about a pull source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Isolation {
@@ -234,7 +243,7 @@ impl SourceConfigService {
 
     /// Wait for Vector's verdict on a pull source that was just written into
     /// the live tree. `Ok(None)` means it is live and the caller records the
-    /// success; `Ok(Some(result))` is the failure result to return instead.
+    /// success; `Settlement::Final(result)` is the result to return instead.
     ///
     /// * Rejected, and only the in-process preflight vouched for the source:
     ///   the source we just added is the likeliest culprit (a revoked key, a
@@ -251,10 +260,13 @@ impl SourceConfigService {
         watch: ReloadWatch,
         rendered: &str,
         vector_built: bool,
-    ) -> Result<Option<DeploymentResult>, SourceConfigServiceError> {
+    ) -> Result<Settlement, SourceConfigServiceError> {
         let row = &config.config;
         match watch.outcome().await {
-            ActivationOutcome::Accepted => Ok(None),
+            ActivationOutcome::Accepted => Ok(Settlement::Live { note: None }),
+            // NAN-5267: published for the Vector pods to pull; success, with
+            // the reason it is not verified here recorded on the deployment.
+            ActivationOutcome::Published(note) => Ok(Settlement::Live { note: Some(note) }),
             ActivationOutcome::Rejected if !vector_built => {
                 let mut fresh = config.clone();
                 fresh.config.deployed = true;
@@ -264,7 +276,7 @@ impl SourceConfigService {
                     Some(rendered),
                 )
                 .await
-                .map(Some)
+                .map(Settlement::Final)
             }
             ActivationOutcome::Rejected => {
                 let reason = "Vector refused the configuration after this source was added, but the                               source builds in isolation, so the refusal is elsewhere in the config.                               Vector is still running the previous topology.";
@@ -272,7 +284,7 @@ impl SourceConfigService {
                     .repository
                     .add_deployment(row.id, "deploy", "failure", Some(reason), Some(&redact_config_snapshot(rendered)))
                     .await?;
-                Ok(Some(DeploymentResult {
+                Ok(Settlement::Final(DeploymentResult {
                     success: false,
                     source_configuration_id: row.id,
                     action: "deploy".to_string(),
@@ -286,7 +298,7 @@ impl SourceConfigService {
                     .repository
                     .add_deployment(row.id, "deploy", UNCONFIRMED_STATUS, Some(&reason), Some(&redact_config_snapshot(rendered)))
                     .await?;
-                Ok(Some(DeploymentResult {
+                Ok(Settlement::Final(DeploymentResult {
                     success: false,
                     source_configuration_id: row.id,
                     action: "deploy".to_string(),
@@ -374,7 +386,9 @@ impl SourceConfigService {
         let (status, recorded_reason, removal_note) = match watch {
             None => (QUARANTINED_STATUS, reason.to_string(), String::new()),
             Some(watch) => match watch.outcome().await {
-                ActivationOutcome::Accepted => (QUARANTINED_STATUS, reason.to_string(), String::new()),
+                ActivationOutcome::Accepted | ActivationOutcome::Published(_) => {
+                    (QUARANTINED_STATUS, reason.to_string(), String::new())
+                }
                 ActivationOutcome::Rejected => {
                     let note = "Vector refused the configuration without this source, so it may \
                                 still be running the previous topology (with this source)";
@@ -423,6 +437,12 @@ impl SourceConfigService {
                 "success",
                 None,
                 format!("Undeployed '{name}' successfully"),
+            ),
+            ActivationOutcome::Published(note) => (
+                true,
+                "success",
+                Some(note.clone()),
+                format!("Undeployed '{name}' successfully ({note})"),
             ),
             ActivationOutcome::Rejected => {
                 let reason = "removed from the config, but Vector refused the resulting \

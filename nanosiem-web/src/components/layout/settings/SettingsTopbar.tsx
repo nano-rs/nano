@@ -22,6 +22,7 @@ import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import type { PivtState } from '@/enterprise/hooks/use-pivt-state';
 import { NotificationBell } from '@/components/NotificationBell';
+import { HelpMenu } from '@/components/support/HelpMenu';
 import { GROUP_LABEL, SECTION_BY_ID, resolveActiveSection } from './sections';
 import { useRecentAuditChanges } from '@/hooks/use-api';
 
@@ -108,6 +109,7 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
       )}
 
       <NotificationBell />
+      <HelpMenu />
 
       <Tooltip>
         <TooltipTrigger asChild>

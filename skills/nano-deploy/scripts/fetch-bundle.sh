@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Download and verify the nano enterprise compose bundle with ONLY the licence
+# Download and verify the nano enterprise compose bundle with ONLY the license
 # (enrollment) values, without a portal login. Never prints the token.
 #
 #   bash scripts/fetch-bundle.sh --enrollment ./nano-deploy-work/enrollment.env \
 #       [--version 2.0.7] [--out ./nano-deploy-work/bundle] [--registry-cred ./nano-deploy-work/registry.cred]
 #
 # 1. Downloads nano-compose-enterprise-<V>.tar.gz, .sha256 and .sha256.sig through
-#    GET <licence API>/api/license/self-run/bundle (Authorization: Bearer
+#    GET <license API>/api/license/self-run/bundle (Authorization: Bearer
 #    LICENSE_TOKEN, X-Nano-Deployment-Id). The token goes to curl on stdin
-#    (-K -), never in argv, and only to the licence API: each file is answered
+#    (-K -), never in argv, and only to the license API: each file is answered
 #    with a 302 that is read, not followed, and the signed URL is fetched
 #    without it.
 # 2. Verifies, before anything is extracted: the pinned release-signing-v1 key's
@@ -22,7 +22,7 @@
 #
 # If a download or a check fails, or it is interrupted (Ctrl-C, TERM) before
 # printing VERIFIED, it exits non-zero and removes the three downloaded files and
-# the key file it wrote. Bad arguments or licence values exit 2 before anything
+# the key file it wrote. Bad arguments or license values exit 2 before anything
 # is downloaded. A registry-credential failure after VERIFIED exits non-zero but
 # keeps the verified bundle. Prints paths, version and VERIFIED, never secrets.
 set -euo pipefail
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
 done
 die() { echo "fetch-bundle: $*" >&2; exit 1; }
 
-# ── licence values (same rules as apply-enrollment.sh) ──────────────────────
+# ── license values (same rules as apply-enrollment.sh) ──────────────────────
 [[ -n "$enrollment" && -f "$enrollment" ]] || { echo "enrollment file not found: ${enrollment:-<unset>}" >&2; exit 2; }
 LICENSE_URL="" LICENSE_TOKEN="" NANO_DEPLOYMENT_ID=""
 while IFS= read -r line || [[ -n "$line" ]]; do
@@ -78,7 +78,7 @@ done < "$enrollment"
     || { echo "enrollment file needs LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID" >&2; exit 2; }
 [[ "$LICENSE_TOKEN" =~ ^[A-Za-z0-9_-]+$ && ${#LICENSE_TOKEN} -ge 32 && ${#LICENSE_TOKEN} -le 512 ]] || { echo "LICENSE_TOKEN is not an enrollment token (value not shown)" >&2; exit 2; }
 [[ "$NANO_DEPLOYMENT_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || { echo "NANO_DEPLOYMENT_ID is malformed" >&2; exit 2; }
-# The token goes only to the licence API: https, or a loopback address for tests.
+# The token goes only to the license API: https, or a loopback address for tests.
 if [[ "$LICENSE_URL" =~ ^(https://[A-Za-z0-9.-]+(:[0-9]+)?)/ || "$LICENSE_URL" =~ ^(http://(127\.0\.0\.1|localhost)(:[0-9]+)?)/ ]]; then
     API=${BASH_REMATCH[1]}
 else
@@ -108,9 +108,9 @@ json_field() { python3 -I -c 'import json,sys; v=json.load(sys.stdin).get(sys.ar
 
 if [[ -z "$version" ]]; then
     version=$(api "bundle?edition=enterprise" | json_field version) \
-        || die "the licence API refused the bundle request (check the licence values, that the deployment is paid or in trial, and that this machine reaches $API)"
+        || die "the license API refused the bundle request (check the license values, that the deployment is paid or in trial, and that this machine reaches $API)"
 fi
-[[ "$version" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$ ]] || die "the licence API returned an unexpected version"
+[[ "$version" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$ ]] || die "the license API returned an unexpected version"
 
 bundle="nano-compose-enterprise-$version.tar.gz"
 mkdir -p "$out"
@@ -122,8 +122,8 @@ trap 'cleanup; echo "fetch-bundle: interrupted; nothing was kept" >&2; exit 130'
 
 fetch() { local kind=$1 name=$2 url
     url=$(api "bundle?version=$version&edition=enterprise&file=$kind" -o /dev/null -w '%{redirect_url}') \
-        || fail "the licence API refused $kind for $version (check the licence values, that the deployment is paid or in trial, and that the release exists)"
-    [[ "$url" == https://* || "$url" =~ ^http://(127\.0\.0\.1|localhost)[:/] ]] || fail "the licence API returned no download link for $kind"
+        || fail "the license API refused $kind for $version (check the license values, that the deployment is paid or in trial, and that the release exists)"
+    [[ "$url" == https://* || "$url" =~ ^http://(127\.0\.0\.1|localhost)[:/] ]] || fail "the license API returned no download link for $kind"
     curl -fsSL --proto '=https,http' -o "$name" "$url" || fail "downloading $name failed; run again (the links last 15 minutes)"
 }
 fetch compose_bundle "$bundle"
@@ -148,7 +148,7 @@ echo "sha256:   $(cut -d ' ' -f 1 "$bundle.sha256")"
 
 # ── optional: one-hour registry credential, password only, 0600 ─────────────
 if [[ -n "$cred" ]]; then
-    reply=$(api "registry-token?deploymentId=$NANO_DEPLOYMENT_ID") || die "the licence API refused the registry credential"
+    reply=$(api "registry-token?deploymentId=$NANO_DEPLOYMENT_ID") || die "the license API refused the registry credential"
     registry=$(printf '%s' "$reply" | json_field registry) || die "the registry credential reply was malformed"
     username=$(printf '%s' "$reply" | json_field username) || die "the registry credential reply was malformed"
     expires=$(printf '%s' "$reply" | json_field expiresAt) || die "the registry credential reply was malformed"

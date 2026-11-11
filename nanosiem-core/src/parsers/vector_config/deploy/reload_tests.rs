@@ -647,3 +647,15 @@ async fn a_reload_request_with_no_responder_fails_loudly() {
     let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("reload")).unwrap().flatten().collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
+
+/// NAN-5267: on Kubernetes (`NANO_VECTOR_LOCAL_RELOAD=off`) Vector pods pull
+/// published generations; the api has no Vector to signal.
+#[test]
+fn local_reload_switch_is_off_only_when_explicitly_off() {
+    assert!(local_reload_disabled_from(Some("off")));
+    assert!(local_reload_disabled_from(Some(" OFF ")));
+    assert!(!local_reload_disabled_from(None));
+    assert!(!local_reload_disabled_from(Some("")));
+    assert!(!local_reload_disabled_from(Some("on")));
+    assert!(!local_reload_disabled_from(Some("generation")));
+}

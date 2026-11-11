@@ -177,7 +177,7 @@ async fn async_main() -> Result<()> {
         .with_leader_fence(state.leader_fence.clone(), state.pool.clone());
         // NAN-5170: the jobs checker (the 24h loop) sends the daily usage
         // report after each successful check-in. Air-gapped installs never
-        // reach this branch (no online licence), and are guarded regardless.
+        // reach this branch (no online license), and are guarded regardless.
         let license_checker = Arc::new(if state.config.airgap {
             license_checker
         } else {
@@ -185,7 +185,7 @@ async fn async_main() -> Result<()> {
                 .with_usage_reporting(state.pool.clone(), Some(state.audit_emitter.clone()))
         });
         if let Err(error) = license_checker.initialize().await {
-            tracing::error!(%error, "Initial online licence check failed; licensed workers remain fail-closed without a successful bounded cache");
+            tracing::error!(%error, "Initial online license check failed; licensed workers remain fail-closed without a successful bounded cache");
         }
 
         let lc_handle = license_checker.start();
@@ -194,7 +194,7 @@ async fn async_main() -> Result<()> {
     } else if state.config.online_license_config().is_ok() {
         match nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await {
             Ok(snapshot) if snapshot.legacy_grace().is_some() => tracing::warn!(
-                "Legacy offline licence upgrade grace active in jobs; import a C05 licence"
+                "Legacy offline license upgrade grace active in jobs; import a C05 license"
             ),
             Ok(_) => tracing::info!("Loaded read-only C05 component admission for jobs"),
             Err(error) => {
@@ -215,7 +215,7 @@ async fn async_main() -> Result<()> {
             .config
             .online_license_config()
             .expect_err("branch checked incomplete configuration");
-        tracing::error!(%error, "Incomplete online licence configuration; failing closed");
+        tracing::error!(%error, "Incomplete online license configuration; failing closed");
         let snapshot =
             nanosiem_api::license_admission::OfflineLicenseSnapshot::Unavailable(error.to_string());
         *state.license_status.write().await = snapshot.cached_status();

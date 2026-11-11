@@ -54,7 +54,7 @@ release. Ask before each step.
   `NANO_LAB_ONLY_PLAINTEXT=1` on every installer run.
 - `cluster.deployment_id` must be the app.nano.rs deployment ID
   (`NANO_DEPLOYMENT_ID`) exactly. The renderer writes it into each host's
-  `.nano-role.env`, which overrides `.env`, and the licence check uses it. In
+  `.nano-role.env`, which overrides `.env`, and the license check uses it. In
   a lab with no enrollment yet, use a clear placeholder such as
   `lab-<name>`. It cannot be changed later, so a lab inventory is never
   reused for production.
@@ -171,13 +171,14 @@ inventory's `deployment_id`. If they differ, stop.
 
 ## Step 5: distribute .env (secret)
 
-One rule, every time: after any installer run that changed `.env` (the first
-app host's prepare or a topology change, or the postgres host that prints
-"The shared .env changed" when it records `NANO_PG_HA_SYSTEM_ID`), stream
-**that host's** `.env` to every other host, the first app host included,
-before the next installer run anywhere. Never stream the first app host's
-older copy over a newer one: it would drop `NANO_PG_HA_SYSTEM_ID`. Below,
-`$H1` is the host whose run changed it.
+One rule, every time: after any run that changed `.env` (the first app
+host's prepare or a topology change, or `./install.sh --record-pg-ha-identity`
+on the FIRST postgres host, which records `NANO_PG_HA_SYSTEM_ID`; see
+[postgres-ha.md](postgres-ha.md)), stream **that host's** `.env` to every
+other host, the first app host included, before the next installer run
+anywhere. Never stream the first app host's older copy over a newer one: it
+would drop `NANO_PG_HA_SYSTEM_ID`. Below, `$H1` is the host whose run changed
+it.
 
 Stream it host to host. It is never written to the workstation and never
 printed:
@@ -306,13 +307,18 @@ prints the whole set for your addresses; run it on every nano host and every
 HAProxy host:
 
 ```bash
-python3 scripts/plan.py --hosts ./nano-deploy-work/hosts.txt <plan flags> --firewall-script > ./nano-deploy-work/firewall.sh
+python3 scripts/plan.py --hosts ./nano-deploy-work/hosts.txt <plan flags> --firewall-script \
+  --edge-source-cidr <user/VPN network> --edge-source-cidr <log-sender subnet> > ./nano-deploy-work/firewall.sh
 ssh $H 'MGMT_CIDR=<where the operator SSHes from> bash -s' < ./nano-deploy-work/firewall.sh
 ```
 
 For a hand-made 3-node layout, the public guide's
 [Host firewall](https://nano.rs/docs/getting-started/high-availability#host-firewall)
-section has the same rules with variables to fill in. Re-run the script after
+section has the same rules with variables to fill in. With HAProxy hosts the
+planner needs `--edge-source-cidr` (repeatable): it opens 443 on them only to
+those networks. Ask the operator where users and log senders connect from;
+open 443 to the internet (`--edge-source-cidr 0.0.0.0/0`) only when they say
+so. Re-run the script after
 any address change, and test from outside with
 `bash scripts/preflight.sh --exposure-probe <every host address>` (every row
 `PASS`) and from one allowed source.

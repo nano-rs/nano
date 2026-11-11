@@ -270,7 +270,7 @@ async fn async_main() -> Result<()> {
     #[cfg(feature = "enterprise")]
     {
         // Ingest is part of the open/core continuity boundary and remains
-        // available after a commercial licence hard stop.
+        // available after a commercial license hard stop.
         state.install_generation_delivery();
         let vector_config_handle = state.start_vector_config_publication_reconciler();
         state.add_task_handle(vector_config_handle).await;
@@ -310,9 +310,9 @@ async fn async_main() -> Result<()> {
             run_sovereign_license_refresh(refresh_state).await;
         });
         state.add_task_handle(refresh_handle).await;
-        tracing::info!("C05/legacy licence refresh started (30s interval)");
+        tracing::info!("C05/legacy license refresh started (30s interval)");
     } else {
-        tracing::error!("Incomplete online licence configuration remains locked until restart");
+        tracing::error!("Incomplete online license configuration remains locked until restart");
     }
 
     // === Per-instance tasks (API-specific) ===
@@ -415,12 +415,12 @@ async fn initialize_license_admission(state: &AppState) {
                 state.license_status.clone(),
             );
             if let Err(error) = checker.initialize().await {
-                tracing::error!(%error, "Initial online licence check failed; using only a previously successful bounded cache");
+                tracing::error!(%error, "Initial online license check failed; using only a previously successful bounded cache");
             }
         }
         Ok(None) => refresh_sovereign_license_status(state).await,
         Err(error) => {
-            tracing::error!(%error, "Incomplete online licence configuration; failing closed");
+            tracing::error!(%error, "Incomplete online license configuration; failing closed");
             let snapshot = nanosiem_api::license_admission::OfflineLicenseSnapshot::Unavailable(
                 error.to_string(),
             );
@@ -437,7 +437,7 @@ async fn refresh_sovereign_license_status(state: &AppState) {
             if let Some(grace) = snapshot.legacy_grace() {
                 tracing::warn!(
                     grace_until = %grace.grace_until,
-                    "Legacy offline licence upgrade grace active; import a C05 licence"
+                    "Legacy offline license upgrade grace active; import a C05 license"
                 );
             } else if let Some(view) = snapshot.c05_view() {
                 if !view.valid {
@@ -446,7 +446,7 @@ async fn refresh_sovereign_license_status(state: &AppState) {
                             .refusal
                             .as_deref()
                             .or(view.notice.as_deref())
-                            .unwrap_or("C05 licence refused"),
+                            .unwrap_or("C05 license refused"),
                         "Air-gapped deployment is locked by the C05 authority"
                     );
                 }

@@ -2,8 +2,8 @@
 
 //! Install identity (NAN-5249).
 //!
-//! A Self-run licence covers two installs: production plus one for dev, DR or
-//! backup. nano-main counts the installs behind one licence (one deployment
+//! A Self-run license covers two installs: production plus one for dev, DR or
+//! backup. nano-main counts the installs behind one license (one deployment
 //! ID) by this random ID, and sums their daily usage.
 //!
 //! Wire contract: the ID is sent as the `X-Nano-Install-Id` request header on

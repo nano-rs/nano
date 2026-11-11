@@ -21,6 +21,8 @@
 //! - `DATABASE_URL`              — required; PG migrations are applied first
 //!   (NAN-789) so CH dictionary sources can resolve their PG tables before
 //!   `CREATE TABLE nanosiem.logs` validates materialized-column dict refs.
+//!   A preflight (NAN-5260) first checks PostgreSQL >= 16 and that every
+//!   required extension (pg_trgm, pgcrypto, uuid-ossp) can be created.
 //! - `CLICKHOUSE_URL`            — required
 //! - `CLICKHOUSE_DATABASE`       — defaults to `nanosiem`
 //! - `CLICKHOUSE_USER`           — runtime user (fallback for migrations)
@@ -600,6 +602,19 @@ async fn run() -> Result<()> {
         .await
         .context("connecting to PostgreSQL for migration preflight")?;
     let pg_pool = pg_db.pool();
+    // NAN-5260: refuse before any DDL when the server is older than the
+    // supported floor or a required extension is not allow-listed (Azure
+    // flexible server `azure.extensions`, RDS `rds.allowed_extensions`).
+    // A half-applied snapshot is far harder to recover than a clear message.
+    let preflight = nanosiem_core::db::check_postgres_compatibility(pg_pool)
+        .await
+        .context("PostgreSQL compatibility preflight")?;
+    tracing::info!(
+        server_version = %preflight.server_version,
+        platform = ?preflight.platform,
+        to_create = ?preflight.creatable,
+        "PostgreSQL preflight passed"
+    );
     nanosiem_core::db::run_postgres_migrations(pg_pool)
         .await
         .context("running PostgreSQL migrations")?;
@@ -699,7 +714,7 @@ async fn run() -> Result<()> {
 
     // Enterprise overlay is mandatory in enterprise builds. A missing image
     // payload must stop migration instead of silently booting without the
-    // licence witness (or any future enterprise-only schema).
+    // license witness (or any future enterprise-only schema).
     #[cfg(feature = "enterprise")]
     {
         let enterprise_dir: PathBuf = std::env::var("CLICKHOUSE_ENTERPRISE_MIGRATIONS_DIR")
@@ -807,7 +822,7 @@ async fn run() -> Result<()> {
         .context("repointing dict-refresh MVs to distributed reference-table wrappers")?;
     if repointed_mvs > 0 {
         tracing::info!(
-            "Repointed {} dict-refresh MV(s) to distributed reference-table wrappers",
+            "Updated {} dict-refresh MV query(ies) (distributed repoint / NAN-5262 result caps)",
             repointed_mvs
         );
     }

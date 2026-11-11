@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""nano post-install smoke test: health -> login -> licence -> ingest -> search.
+"""nano post-install smoke test: health -> login -> license -> ingest -> search.
 
 Run it ON THE APP HOST (standard library only; secrets never leave the host and
 are never printed):
@@ -21,7 +21,12 @@ What it does, like the product's Add-source flow:
      exceeds --write-sla (default 60 s) even if the event arrives later: a write stall
      that outlasts a failover must not read as a pass. The search keeps polling until
      --timeout only to report how late the event was.
-  7. revokes the token it issued (the log source is kept; it is harmless and reused)
+  7. optional: --hec posts one event to <ingest-url>/services/collector/event (with a
+     channel, as every nano HEC request needs), --otlp posts one OTLP/HTTP protobuf log
+     record to <ingest-url>/otlp/v1/logs. Each FAILS on a non-2xx answer; whether the
+     event becomes searchable is reported as a WARN only (it depends on the source the
+     token is bound to)
+  8. revokes the token it issued (the log source is kept; it is harmless and reused)
 
 Failover drills: run it while a host is down. Deploying a log source publishes a new
 Vector configuration to every ingest host, so it never redeploys one that is
@@ -38,12 +43,14 @@ import argparse
 import datetime as dt
 import json
 import os
+import socket
 import ssl
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 RESULTS: list[tuple[str, str, str]] = []
 
@@ -106,6 +113,57 @@ class Client:
         return self.http(method, base + path, body, headers, timeout)
 
 
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _field(num: int, payload: bytes) -> bytes:  # length-delimited (wire type 2)
+    return _varint(num << 3 | 2) + _varint(len(payload)) + payload
+
+
+def otlp_logs_request(message: str, service: str = "nano-deploy-smoke") -> bytes:
+    """A minimal OTLP ExportLogsServiceRequest (protobuf; nano's OTLP/HTTP
+    endpoint answers 415 to JSON): one resource with service.name, one log
+    record with time_unix_nano and a string body."""
+    def any_str(v: str) -> bytes:
+        return _field(1, v.encode())  # AnyValue.string_value
+    now = time.time_ns()
+    attr = _field(1, b"service.name") + _field(2, any_str(service))       # KeyValue
+    resource = _field(1, attr)                                            # Resource.attributes
+    record = (_varint(1 << 3 | 1) + now.to_bytes(8, "little")            # time_unix_nano (fixed64)
+              + _varint(11 << 3 | 1) + now.to_bytes(8, "little")         # observed_time_unix_nano
+              + _field(5, any_str(message)))                              # body
+    scope_logs = _field(2, record)                                        # ScopeLogs.log_records
+    resource_logs = _field(1, resource) + _field(2, scope_logs)           # ResourceLogs
+    return _field(1, resource_logs)                                       # ExportLogsServiceRequest
+
+
+def install_resolve(pairs: list[str]) -> None:
+    """--resolve HOST:IP: pin HOST to IP for every connection (TLS still
+    verifies the certificate for HOST)."""
+    pins = {}
+    for pair in pairs:
+        host, sep, ip = pair.partition(":")  # a hostname has no ':'; the IP may be IPv6
+        port, colon, rest = ip.partition(":")
+        if colon and port.isdigit() and rest:  # curl form HOST:PORT:IP
+            ip = rest
+        if not sep or not host or not ip:
+            raise SystemExit(f"--resolve expects HOST:IP, got {pair!r}")
+        pins[host.lower()] = ip.strip("[]")
+    if not pins:
+        return
+    real = socket.getaddrinfo
+
+    def pinned(host, *args, **kwargs):
+        return real(pins.get(str(host).lower(), host), *args, **kwargs)
+    socket.getaddrinfo = pinned
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--app-url", default="http://localhost")
@@ -120,8 +178,16 @@ def main() -> int:
                     help="FAIL when the event takes longer than this many seconds to become searchable")
     ap.add_argument("--redeploy", action="store_true",
                     help="deploy the smoke log source even if it is already deployed (never during a failover drill)")
-    ap.add_argument("--require-licence", action="store_true", help="fail (not warn) when the licence is not valid")
+    ap.add_argument("--require-license", "--require-licence", dest="require_licence", action="store_true",
+                    help="fail (not warn) when the license is not valid (--require-licence is the original spelling, still accepted)")
+    ap.add_argument("--resolve", action="append", default=[], metavar="HOST:IP",
+                    help="connect to IP for HOST, keeping HOST for TLS/SNI and the Host header "
+                         "(repeatable). Also accepts curl's HOST:PORT:IP form (the port is ignored: "
+                         "every port of HOST goes to IP). E.g. before DNS points at the load balancers")
+    ap.add_argument("--hec", action="store_true", help="also send one event through HEC (/services/collector/event)")
+    ap.add_argument("--otlp", action="store_true", help="also send one OTLP/HTTP protobuf log record (/otlp/v1/logs)")
     a = ap.parse_args()
+    install_resolve(a.resolve)
     app = a.app_url.rstrip("/")
     ingest = (a.ingest_url or a.app_url).rstrip("/")
     c = Client(a.ca_file)
@@ -155,24 +221,36 @@ def main() -> int:
     if not token:
         return finish()
 
-    # 3. licence
+    # 3. license
     st, data, raw = c.api("GET", app, "/api/license")
     if st == 200 and isinstance(data, dict):
         ent = data.get("entitlement") or {}
-        detail = (f"state={data.get('state')} valid={data.get('valid')} mode={data.get('mode')} "
-                  f"enforcement={data.get('enforcement_enabled')} tier={data.get('tier')} "
-                  f"expires={data.get('expires_at') or ent.get('expires_at')} "
-                  f"offering={ent.get('offering')} capacity_gb_day={ent.get('capacity_gb_per_day')} "
-                  f"locked_reason={data.get('locked_reason')}")
-        # "valid" alone is not proof of a licence: an install with no licence configured
-        # can report state=active with no entitlement, expiry or licence id bound to it.
+        # /api/license carries an `entitlement` object only for an evaluation
+        # license; an online or offline paid license reports its contracted
+        # capacity through /api/license/usage. Print what is known, never "None".
+        capacity = ent.get("capacity_gb_per_day")
+        if capacity is None:
+            ust, usage, _ = c.api("GET", app, "/api/license/usage")
+            if ust == 200 and isinstance(usage, dict):
+                capacity = usage.get("capacity_gb_per_day")
+        known = {"state": data.get("state"), "valid": data.get("valid"), "mode": data.get("mode"),
+                 "enforcement": data.get("enforcement_enabled"), "tier": data.get("tier"),
+                 "expires": data.get("expires_at") or ent.get("expires_at"), "offering": ent.get("offering")}
+        fields = [f"{key}={value}" for key, value in known.items() if value is not None and value != ""]
+        fields.append(f"capacity_gb_day={capacity:g}" if isinstance(capacity, (int, float))
+                      else "capacity_gb_day=not set")
+        if data.get("locked_reason"):
+            fields.append(f"locked_reason={data['locked_reason']}")
+        detail = " ".join(fields)
+        # "valid" alone is not proof of a license: an install with no license configured
+        # can report state=active with no entitlement, expiry or license id bound to it.
         bound = bool(ent or data.get("expires_at") or data.get("license_id"))
         ok = bool(data.get("valid")) and bound
         if data.get("valid") and not bound:
-            detail += " -> NO LICENCE BOUND (no entitlement/expiry): enrollment not applied or not reaching the API"
-        add("licence", "PASS" if ok else ("FAIL" if a.require_licence else "WARN"), detail)
+            detail += " -> NO LICENSE BOUND (no entitlement/expiry): enrollment not applied or not reaching the API"
+        add("license", "PASS" if ok else ("FAIL" if a.require_licence else "WARN"), detail)
     else:
-        add("licence", "FAIL" if a.require_licence else "WARN", f"GET /api/license -> {st} {short(raw, 80)}")
+        add("license", "FAIL" if a.require_licence else "WARN", f"GET /api/license -> {st} {short(raw, 80)}")
 
     # 4. source + token
     profile = a.profile or read_env(a.env_file).get("NANO_SCHEMA_PROFILE") or "ocsf"
@@ -287,8 +365,48 @@ def main() -> int:
             detail += f" -> not searchable after {latency:.0f}s, last status {st}"
         add("search", "PASS" if on_time else "FAIL", detail)
         add("latency", "PASS" if on_time else "FAIL", f"write_latency_seconds={latency:.1f} bound={a.write_sla}")
+
+        # 7. optional protocols: HEC and OTLP/HTTP through the same ingest frontend.
+        def searchable(marker: str, wait: float = 60.0) -> int:
+            end_t = time.time() + wait
+            while time.time() < end_t:
+                end = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+                _, data, _ = c.api("POST", app, "/api/search", {
+                    "query": f'"{marker}"', "time_range": {"start": start, "end": end}, "limit": 10,
+                    "skip_field_stats": True, "skip_histogram": True})
+                hits = (data or {}).get("results") or [] if isinstance(data, dict) else []
+                n = sum(1 for r in hits if marker in json.dumps(r))
+                if n:
+                    return n
+                time.sleep(3)
+            return 0
+
+        if a.hec:
+            hmark = f"{run}-hec"
+            body = json.dumps({"event": {"message": f"nano-deploy smoke test {hmark}", "smoke_mark": hmark,
+                                         "hostname": "nano-deploy-smoke"}, "sourcetype": "_json"}).encode()
+            st, data, raw = c.http("POST", ingest + "/services/collector/event", body,
+                                   {"Authorization": "Splunk " + ingest_token,
+                                    "X-Splunk-Request-Channel": str(uuid.uuid4())})
+            ok = 200 <= st < 300 and (not isinstance(data, dict) or data.get("code", 0) == 0)
+            add("hec", "PASS" if ok else "FAIL", f"POST {ingest}/services/collector/event -> {st} {short(raw, 80)}")
+            if ok:
+                n = searchable(hmark)
+                add("hec-search", "PASS" if n else "WARN",
+                    f'search "{hmark}" -> {n} hit(s)' + ("" if n else " (accepted but not searchable within 60 s:"
+                                                         " check the token's source and its parser)"))
+        if a.otlp:
+            omark = f"{run}-otlp"
+            st, _, raw = c.http("POST", ingest + "/otlp/v1/logs", otlp_logs_request(f"nano-deploy smoke test {omark}"),
+                                {"Authorization": "Bearer " + ingest_token, "Content-Type": "application/x-protobuf"})
+            ok = 200 <= st < 300
+            add("otlp", "PASS" if ok else "FAIL", f"POST {ingest}/otlp/v1/logs (protobuf) -> {st} {short(raw, 80)}")
+            if ok:
+                n = searchable(omark)
+                add("otlp-search", "PASS" if n else "WARN",
+                    f'search "{omark}" -> {n} hit(s)' + ("" if n else " (accepted but not searchable within 60 s)"))
     finally:
-        # 7. cleanup
+        # 8. cleanup
         if cred_id:
             st = c.api("POST", app, f"/api/ingest-tokens/{cred_id}/revoke", {})[0]
             add("cleanup", "PASS" if st in (200, 204) else "WARN", f"revoked smoke token -> {st}")

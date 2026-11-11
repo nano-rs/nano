@@ -77,9 +77,9 @@ confirm it before you accept it. Never use `StrictHostKeyChecking=no`.
 | virt=lxc | Docker in a container. Fine for labs; prefer VMs in production |
 | time | clock sync not proven. `scripts/nano upgrade` refuses unsynchronized clocks, so fix it now |
 | ports | something already listens. Fine only when it is this host's existing nano |
-| existing | an install exists. Switch to the upgrade/re-run path and do not reinstall over it |
+| existing | an install exists. Switch to the upgrade path ([upgrade.md](upgrade.md)) and do not reinstall over it |
 | enrichment | ClickHouse would get less than 6 GB. Geo/ASN enrichment will not load |
-| egress | registry or licence endpoint unreachable. Fine only for air-gapped installs |
+| egress | registry or license endpoint unreachable. Fine only for air-gapped installs |
 | exposure | the host has a public address and `DOCKER-USER` has no nano rules (or can't be read without sudo), or it has only private interface addresses and no nano rules. A cloud 1:1 NAT or floating IP is invisible from inside the host, so "no public address" proves nothing. Docker-published ports bypass UFW. Apply `plan.py --firewall-script` before installing, then run `--exposure-probe` against the public addresses from outside |
 | ufw | UFW denies incoming by default with no allow for `docker0`/`br-+` (or can't be read without sudo). This host's own containers then can't reach its ClickHouse, Keeper or etcd ports, the local replica is silently DOWN in clickhouse-proxy, and losing the other replica stops all writes. Apply `plan.py --firewall-script` |
 | firewall-pattern | `DOCKER-USER` holds an earlier nano firewall pattern whose drops aren't limited to NEW inbound connections from outside (the first version also blocked this host's containers connecting out on those ports). Re-apply `plan.py --firewall-script` |

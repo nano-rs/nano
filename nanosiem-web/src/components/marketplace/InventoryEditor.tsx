@@ -26,10 +26,10 @@ export function InventoryEditor({ definitionId, onClose, onSaved, initialMode }:
   // Custom providers run on the enterprise enrichment runtime. The open
   // edition offers lookups and Git bundles only, so the tab is simply absent
   // there. On an enterprise build `customEnrichment` is false only when the
-  // licence is not active (NAN-5088): the tab stays visible but disabled with
+  // license is not active (NAN-5088): the tab stays visible but disabled with
   // a note saying why, instead of vanishing silently.
   const canProvider = capabilities.customEnrichment && providerPermitted;
-  // Not on the pre-fetch fallback: its all-false flags are not a licence verdict.
+  // Not on the pre-fetch fallback: its all-false flags are not a license verdict.
   const licenceBlocked = edition === 'enterprise' && !fallback && !capabilities.customEnrichment && providerPermitted;
   const canLookup = hasPermission('lookup:create') && hasPermission('lookup:view');
   const [mode, setMode] = useState<InventoryEditorMode>(definitionId !== 'new' ? 'provider'
@@ -49,9 +49,9 @@ export function InventoryEditor({ definitionId, onClose, onSaved, initialMode }:
         {canLookup && <Button size="sm" variant="outline" className={tab('lookup')} aria-pressed={mode === 'lookup'} onClick={() => setMode('lookup')}>Lookup table</Button>}
       </div>}
       {definitionId === 'new' && licenceBlocked && <p id="provider-licence-note" role="note" className="mb-3 rounded-md border border-border px-3 py-2 text-[11.5px] text-muted-foreground">
-        <span className="text-foreground">Custom providers need an active licence.</span>{' '}
+        <span className="text-foreground">Custom providers need an active license.</span>{' '}
         {hasPermission('settings:system')
-          ? <Link to="/settings/license" className="text-primary hover:underline">Settings › Licence</Link>
+          ? <Link to="/settings/license" className="text-primary hover:underline">Settings › License</Link>
           : 'Ask an administrator to install or renew it.'}
       </p>}
       {lookupSaved && <p role="status">Saved lookup <span className="font-mono">{lookupSaved}</span></p>}

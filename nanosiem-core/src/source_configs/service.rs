@@ -1740,10 +1740,11 @@ impl SourceConfigService {
             // Update dynamic router — include this config's route transform in inputs
             self.update_dynamic_router_locked().await?;
 
+            let mut activation_note: Option<String> = None;
             if let Some(watch) = watch {
                 // A system listener's routing file is nano-rendered and VRL-checked;
                 // a refusal is reported, never quarantined (`vector_built: true`).
-                if let Some(result) = self
+                match self
                     .settle_activation(
                         &config_with_rules,
                         watch,
@@ -1752,7 +1753,8 @@ impl SourceConfigService {
                     )
                     .await?
                 {
-                    return Ok(result);
+                    activation::Settlement::Final(result) => return Ok(result),
+                    activation::Settlement::Live { note } => activation_note = note,
                 }
                 self.stamp_activated(id, rendered, rendered_at).await?;
             }
@@ -1760,7 +1762,7 @@ impl SourceConfigService {
             let snapshot = vector_config.as_deref().map(redact_config_snapshot);
             let deployment = self
                 .repository
-                .add_deployment(id, "deploy", "success", None, snapshot.as_deref())
+                .add_deployment(id, "deploy", "success", activation_note.as_deref(), snapshot.as_deref())
                 .await?;
 
             tracing::info!(
@@ -1779,14 +1781,15 @@ impl SourceConfigService {
                 source_configuration_id: id,
                 action: "deploy".to_string(),
                 message: format!(
-                    "Deployed '{}' successfully (system-level {} source{})",
+                    "Deployed '{}' successfully (system-level {} source{}){}",
                     config.name,
                     config.config_type,
                     if has_meaningful_rules {
                         " with routing rules"
                     } else {
                         ""
-                    }
+                    },
+                    activation_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
                 ),
                 deployment_id: Some(deployment.id),
             });
@@ -1866,12 +1869,14 @@ impl SourceConfigService {
         // Update dynamic router to include this source
         self.update_dynamic_router_locked().await?;
 
+        let mut activation_note: Option<String> = None;
         if let Some(watch) = watch {
-            if let Some(result) = self
+            match self
                 .settle_activation(&config_with_rules, watch, &vector_config, vector_built)
                 .await?
             {
-                return Ok(result);
+                activation::Settlement::Final(result) => return Ok(result),
+                activation::Settlement::Live { note } => activation_note = note,
             }
             self.stamp_activated(id, rendered, rendered_at).await?;
         }
@@ -1882,7 +1887,7 @@ impl SourceConfigService {
         let snapshot = redact_config_snapshot(&vector_config);
         let deployment = self
             .repository
-            .add_deployment(id, "deploy", "success", None, Some(&snapshot))
+            .add_deployment(id, "deploy", "success", activation_note.as_deref(), Some(&snapshot))
             .await?;
 
         tracing::info!(
@@ -1900,6 +1905,9 @@ impl SourceConfigService {
             .map(|t| t.is_pull_source())
             .unwrap_or(false);
         let mut message = format!("Deployed '{}' successfully", config.name);
+        if let Some(note) = &activation_note {
+            message.push_str(&format!(" ({note})"));
+        }
         if is_pull && Self::pull_routing_emits_unknown(&config_with_rules) {
             let warning = format!(
                 "Warning: pull source '{}' has no routing rule or default source type — \

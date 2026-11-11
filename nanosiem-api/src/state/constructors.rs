@@ -193,7 +193,7 @@ impl AppState {
         #[cfg(feature = "enterprise")]
         nanosiem_enterprise::content_channels::install(pg_pool.clone(), audit_emitter.clone());
         // NAN-5220: those channels (and the sovereign feed route) present this
-        // install's licence: the online token, else the installed C05 file,
+        // install's license: the online token, else the installed C05 file,
         // looked up on every check (a partial online tuple presents only an
         // installed file, which nano verifies itself).
         #[cfg(feature = "enterprise")]
@@ -616,7 +616,7 @@ impl AppState {
             } else {
                 nanosiem_core::EntitlementEdition::Open
             },
-            // A signed air-gap licence is authoritative for its operator. All
+            // A signed air-gap license is authoritative for its operator. All
             // other installs derive the value from platform provisioning; an
             // API caller cannot rewrite it later to evade hosted AI metering.
             operator: if !cfg!(feature = "enterprise") {
@@ -634,7 +634,7 @@ impl AppState {
             .set_entitlement(entitlement)
             .await
             .map_err(|error| DualPoolError::PostgresHealthCheckError(error.to_string()))?;
-        // NAN-5055: only the online licence check-in may grant an AI
+        // NAN-5055: only the online license check-in may grant an AI
         // allowance. When it is not the admission authority (open build,
         // C05/air-gap, no or partial tuple), clear any grant a previous
         // online configuration left behind so it cannot outlive its source.

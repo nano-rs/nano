@@ -11,7 +11,7 @@ ssh $H 'cd ~/nano && docker compose -f docker-compose.opensource.yml ps --format
 ssh $H 'python3 -I - --app-url http://localhost' < scripts/smoke-test.py
 ```
 
-`smoke-test.py` checks health, admin login, the licence state, ingest of a
+`smoke-test.py` checks health, admin login, the license state, ingest of a
 uniquely marked JSON event through `/ingest/` with a short-lived source-bound
 token (revoked afterwards), and search for that marker. It reports the write
 latency and FAILS when the event takes longer than `--write-sla` (default
@@ -110,26 +110,26 @@ Optional failover drill, with operator approval: stop ClickHouse on `nano-3`
 again. Show that `cluster-health.py` returns to `PASS` and the replica delay
 recovers.
 
-## Licence
+## License
 
 `smoke-test.py` prints `state`, `valid`, `expires` and the entitlement
 (offering, capacity). Report them as they are:
 
-- `valid=True`, `mode=hosted` (online licence) **and** an entitlement or
+- `valid=True`, `mode=hosted` (online license) **and** an entitlement or
   expiry: done.
-- `valid=True` with no entitlement, expiry or licence ID (the smoke test says
-  `NO LICENCE BOUND`): there is no licence. The API may say "active" because
-  no licence URL is configured. Report it as unlicensed, never as licensed.
+- `valid=True` with no entitlement, expiry or license ID (the smoke test says
+  `NO LICENSE BOUND`): there is no license. The API may say "active" because
+  no license URL is configured. Report it as unlicensed, never as licensed.
 - Not valid with enrollment applied: check outbound HTTPS to `LICENSE_URL`,
-  `docker logs` of `nano-api` and `nano-jobs` for licence lines, and
-  [known-issues.md](known-issues.md). Never edit licence tables or fabricate
-  licence state.
+  `docker logs` of `nano-api` and `nano-jobs` for license lines, and
+  [known-issues.md](known-issues.md). Never edit license tables or fabricate
+  license state.
 - No enrollment yet: report "running unlicensed; apply the enrollment values
   before production use". Do not promise that the enterprise features are
   locked or unlocked. That depends on the release (see
   [known-issues.md](known-issues.md)).
 
-The app.nano.rs deployment page should also show the install's licence
+The app.nano.rs deployment page should also show the install's license
 check-in within a few minutes.
 
 ## Report format
@@ -139,7 +139,7 @@ check-in within a few minutes.
 | containers healthy | node-1 | PASS | 14/14 running (healthy) |
 | health | app | PASS | GET /api/health 200 |
 | login | app | PASS | admin@... 200 |
-| licence | app | WARN | state=... valid=False (no enrollment yet) |
+| license | app | WARN | state=... valid=False (no enrollment yet) |
 | ingest → search | app via node-2 | PASS | marker found after 12 s |
 | keeper quorum | all | PASS | leader + 2 followers |
 | ch replicas | all | PASS | 3/3 active, max delay 0 s |

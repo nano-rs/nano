@@ -15,6 +15,17 @@ describe('query-bearing lookups use POST bodies', () => {
     expect(JSON.parse(options.body)).toEqual({ query: 'user="secret hunt"', start: '2026-11-03T00:00:00Z', end: '2026-11-03T01:00:00Z' });
   });
 
+  it('OCSF extended field names (NAN-5265)', async () => {
+    const request = vi.fn().mockResolvedValue([]);
+    await new CoreApi(request).getExtendedFieldNames('user="secret hunt"', '2026-11-03T00:00:00Z', '2026-11-03T01:00:00Z');
+    const [endpoint, options] = request.mock.calls[0];
+    expect(endpoint).toBe('/api/fields/ext');
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(options.body)).toEqual({
+      query: 'user="secret hunt"', start: '2026-11-03T00:00:00Z', end: '2026-11-03T01:00:00Z', bucket: 'extended',
+    });
+  });
+
   it('query explanation lookup', async () => {
     const request = vi.fn().mockResolvedValue({});
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -134,6 +134,7 @@ import { useHereCardOverride } from '@/contexts/PageContext';
 import { isPageInStoredRange, jobFailureCode, jobPollPolicy, nextContinuationPage, pageableRowCount } from '@/lib/search-job';
 import type { SearchJobSummary } from '@/lib/api';
 import { registerDynamicFields } from '@/components/editor';
+import { spillFieldName } from '@/components/search/field-buckets';
 import { SearchDemoHint } from '@/components/DemoHints';
 import { SearchStatsBar } from '@/components/search/SearchStatsBar';
 import { AddToDashboardDialog } from '@/components/dashboard';
@@ -3636,10 +3637,14 @@ export function Search() {
   useEffect(() => {
     if (!isAuthenticated || extFieldsFetchedRef.current) return;
     extFieldsFetchedRef.current = true;
-    api.getExtFieldNames()
-      .then((names: string[]) => {
+    // NAN-5265: the API returns BARE spill keys; register the namespaced form
+    // the fields panel shows (`ext.x` / `unmapped.x`) plus the bare key, which
+    // both profiles also resolve into the spill.
+    Promise.all([api.getExtFieldNames(), api.getSchemaFields().catch(() => null)])
+      .then(([names, schema]) => {
         if (names.length > 0) {
-          registerDynamicFields(names);
+          const isOcsf = schema?.schema === 'ocsf';
+          registerDynamicFields([...names, ...names.map((n) => spillFieldName(n, isOcsf))]);
         }
       })
       .catch(() => {

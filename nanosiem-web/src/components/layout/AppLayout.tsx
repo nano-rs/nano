@@ -75,6 +75,7 @@ import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { PivtShellOverlay } from '@/enterprise/components/pivt/PivtShellOverlay';
 import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
 import { NotificationBell } from '@/components/NotificationBell';
+import { HelpMenu } from '@/components/support/HelpMenu';
 
 import { SettingsLayout } from '@/components/layout/settings/SettingsLayout';
 const CommandPalette = lazy(() => import('@/components/shared/CommandPalette').then(m => ({ default: m.CommandPalette })));
@@ -366,6 +367,7 @@ function TopBar({
         <ApprovalsBell />
         {melodEnabled && <PivtSummon state={pivt} />}
         <NotificationBell />
+        <HelpMenu />
       </div>
     </div>
   );

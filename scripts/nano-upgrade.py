@@ -1143,6 +1143,36 @@ def secure_append_line(path: pathlib.Path, encoded: str, label: str) -> None:
             os.close(descriptor)
 
 
+ENV_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def collapse_env_duplicates(lines: list[str]) -> list[str]:
+    """Keep one assignment per key: the LAST one (the value Compose uses), at the
+    first one's position. An earlier installer (v2.0.8) could leave two
+    NANO_LICENSE_MODE lines; same rule as install.sh's nano_env_collapse_duplicates."""
+    last: dict[str, str] = {}
+    for line in lines:
+        match = ENV_ASSIGNMENT.match(line)
+        if match:
+            last[match.group(1)] = line.lstrip()
+            if last[match.group(1)].startswith("export"):
+                last[match.group(1)] = re.sub(r"^export\s+", "", last[match.group(1)])
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        match = ENV_ASSIGNMENT.match(line)
+        if not match:
+            out.append(line)
+            continue
+        key = match.group(1)
+        if key in seen:
+            continue
+        seen.add(key)
+        counted = sum(1 for other in lines if (m := ENV_ASSIGNMENT.match(other)) and m.group(1) == key)
+        out.append(last[key] if counted > 1 else line)
+    return out
+
+
 class EnvFile:
     def __init__(self, path: pathlib.Path):
         self.path = path
@@ -1188,7 +1218,7 @@ class EnvFile:
                 raise UpgradeError("unsafe environment value")
         lines = secure_read_text(self.path, "environment file").splitlines()
         prefixes = tuple(f"{key}=" for key in replacements)
-        kept = [line for line in lines if not line.startswith(prefixes)]
+        kept = collapse_env_duplicates([line for line in lines if not line.startswith(prefixes)])
         kept.extend(f"{key}={value}" for key, value in replacements.items())
         descriptor, temporary = tempfile.mkstemp(prefix=".env.upgrade.", dir=self.path.parent)
         try:
@@ -2380,7 +2410,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         return "reachable; no lock wait older than 60 seconds"
 
     def _online_license_tuple(self) -> str:
-        """Classify the licence tuple nano-api boots with (NAN-5121).
+        """Classify the license tuple nano-api boots with (NAN-5121).
 
         Mirrors ``ApiConfig::online_license_config``: AIRGAP_MODE, or no URL and no token, is the
         C05 authority (``"none"``); URL, token and deployment id all populated
@@ -2388,7 +2418,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         tuple the API refuses (``"partial"``). The values are resolved the way
         Compose hands them to nano-api: ``LICENSE_TOKEN`` falls back to the
         legacy ``DEPLOYMENT_TOKEN``, and on a role-split host the rendered
-        licence deployment id (NAN-5120) or the inventory deployment id stands
+        license deployment id (NAN-5120) or the inventory deployment id stands
         in for ``NANO_DEPLOYMENT_ID``.
         """
         env = getattr(self, "env", None) or {}
@@ -2418,12 +2448,12 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
 
     def _check_license(self, test_rehearsal: bool = False, target_version: str = "") -> str:
         if self.edition != "enterprise":
-            return "open edition does not require a C05 licence"
+            return "open edition does not require a C05 license"
         tuple_state = self._online_license_tuple()
         if tuple_state == "partial":
             raise UpgradeError(
-                "online licence tuple is incomplete: LICENSE_URL, LICENSE_TOKEN and "
-                "NANO_DEPLOYMENT_ID must all be set (or none, for a C05 licence)"
+                "online license tuple is incomplete: LICENSE_URL, LICENSE_TOKEN and "
+                "NANO_DEPLOYMENT_ID must all be set (or none, for a C05 license)"
             )
         if tuple_state == "complete":
             # Online authority: the API admits on the cached check-in, never on
@@ -2456,33 +2486,33 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     )
                 )
             ):
-                raise UpgradeError("online licence check-in is not active and unexpired")
+                raise UpgradeError("online license check-in is not active and unexpired")
             if fields[3] != "false":
                 raise UpgradeError(
-                    "licence cache was written by an offline import, but this install "
+                    "license cache was written by an offline import, but this install "
                     "is configured for online licensing"
                 )
             if fields[4] != "true":
                 raise UpgradeError(
-                    "online licence has not checked in successfully within "
+                    "online license has not checked in successfully within "
                     f"{ONLINE_LICENSE_STALE_DAYS} days; restore reachability to the "
-                    "licence server before upgrading"
+                    "license server before upgrading"
                 )
             if upgrade_gate:
                 # NAN-5251: app.nano.rs locks Self-run v2 builds below the
                 # licensed minimum until they upgrade; this upgrade is the cure.
                 return (
-                    f"licence locked only by the Self-run upgrade-required gate; "
+                    f"license locked only by the Self-run upgrade-required gate; "
                     f"upgrading to {target_version} clears it at the next check-in"
                 )
-            return f"licence status {fields[0]}; authority online"
+            return f"license status {fields[0]}; authority online"
         row = self._pg_query(
             "SELECT status || E'\\t' || valid::text || E'\\t' || "
             "COALESCE((expires_at > clock_timestamp())::text,'true') FROM license_status WHERE id=TRUE"
         )
         fields = row.split("\t")
         if len(fields) != 3 or fields[0] not in {"active", "grace_period"} or fields[1:] != ["true", "true"]:
-            raise UpgradeError("C05 cached licence is not active and unexpired")
+            raise UpgradeError("C05 cached license is not active and unexpired")
         sovereign = self._pg_query(
             "SELECT (to_regclass('sovereign_license_state') IS NOT NULL)::text"
         )
@@ -2498,16 +2528,16 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             # production's to_regclass probe returns only true/false.
             c05 = "invalid"
         elif sovereign != "false":
-            raise UpgradeError("cannot determine C05 licence schema state")
+            raise UpgradeError("cannot determine C05 license schema state")
         if c05 == "invalid":
             if test_rehearsal:
                 key_id = embedded_test_root_key_id(self.install_dir)
                 return (
-                    f"licence status {fields[0]}; authority TEST-only rehearsal "
-                    f"root {key_id} (no licence state written)"
+                    f"license status {fields[0]}; authority TEST-only rehearsal "
+                    f"root {key_id} (no license state written)"
                 )
-            raise UpgradeError("C05 licence state is missing or expired")
-        return f"licence status {fields[0]}; authority {c05}"
+            raise UpgradeError("C05 license state is missing or expired")
+        return f"license status {fields[0]}; authority {c05}"
 
     def _check_clickhouse(self) -> str:
         cluster = self.role_env.get("CLICKHOUSE_CLUSTER", self.env.get("CLICKHOUSE_CLUSTER", ""))
@@ -2710,12 +2740,12 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             check("clickhouse", self._check_clickhouse)
         if "keeper" in self.roles:
             check("keeper", self._check_keeper)
-        # The authoritative cached licence state lives in PostgreSQL. On a
+        # The authoritative cached license state lives in PostgreSQL. On a
         # role-split install the app host has no local postgres service, so
         # perform this cluster-wide gate on the database host.
         if "postgres" in self.roles:
             check(
-                "licence",
+                "license",
                 lambda: self._check_license(
                     test_license_rehearsal, str(manifest.get("version", "")),
                 ),
@@ -5897,7 +5927,7 @@ def bundle_for_version(args: argparse.Namespace, ops: LocalOps, runner: Runner) 
             f"could not download the image bundle for {version} from {url}. Enterprise image "
             "bundles are not published for registry installs: download the signed installer "
             f"package nano-compose-{ops.edition}-{version}.tar.gz (with .sha256 and .sha256.sig) "
-            "with your licence values, verify its signature, then extract it over the install "
+            "with your license values, verify its signature, then extract it over the install "
             "directory on every host and pass the package with --bundle (see the Upgrade guide)"
         ) from error
     os.chmod(destination, 0o600)

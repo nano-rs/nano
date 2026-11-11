@@ -24,6 +24,8 @@ pub mod login_throttle;
 pub mod mfa;
 #[cfg(feature = "enterprise")]
 pub mod oidc;
+#[cfg(feature = "enterprise")]
+pub mod oidc_userinfo;
 pub mod oidc_trust;
 pub mod password;
 pub mod permission;
@@ -53,6 +55,8 @@ mod group_membership_tests;
 mod service_credential_tests;
 #[cfg(all(test, feature = "enterprise"))]
 mod sso_admission_tests;
+#[cfg(all(test, feature = "enterprise"))]
+mod oidc_userinfo_tests;
 #[cfg(test)]
 mod reserved_source_types_tests;
 #[cfg(test)]
@@ -68,6 +72,8 @@ pub use grant_authority::*;
 pub use mfa::*;
 #[cfg(feature = "enterprise")]
 pub use oidc::*;
+#[cfg(feature = "enterprise")]
+pub use oidc_userinfo::{merge_userinfo, UserInfoClaims};
 pub use oidc_trust::OidcTrustChange;
 pub use password::*;
 pub use permission::*;

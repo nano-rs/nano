@@ -14,7 +14,7 @@
  * for air-gapped installs. Both are optional (omit for a read-only card).
  *
  * NAN-5087 — dense layout: provenance in a mono meta row, explanations behind
- * `?` tooltips, and each feed's third-party attribution behind a licence chip
+ * `?` tooltips, and each feed's third-party attribution behind a license chip
  * (popover with the exact NOTICE text and links). The full bundle NOTICE stays
  * one click away from the header: it is a redistribution requirement.
  *
@@ -115,7 +115,7 @@ function LicenceChip({ feed, notice }: { feed: PlatformFeedStatus; notice: FeedN
         <button
           type="button"
           data-testid={`platform-feed-licence-${feed.feed_id}`}
-          aria-label={`Licence and attribution for ${feed.name}`}
+          aria-label={`License and attribution for ${feed.name}`}
           title={licenseId ?? undefined}
           className="inline-flex items-center h-[17px] max-w-[150px] px-1.5 rounded border border-border font-mono text-[10px] text-muted-foreground hover:text-foreground hover:bg-foreground/5"
         >
@@ -124,7 +124,7 @@ function LicenceChip({ feed, notice }: { feed: PlatformFeedStatus; notice: FeedN
       </PopoverTrigger>
       <PopoverContent align="start" className="w-[360px] p-0" data-testid={`platform-feed-notice-${feed.feed_id}`}>
         <div className="px-3 py-2 border-b border-border font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-          {feed.name} · licence
+          {feed.name} · license
         </div>
         <div className="px-3 py-2.5 space-y-1.5">
           <div className="font-mono text-[11px] text-foreground break-all">{licenseId ?? '—'}</div>
@@ -273,7 +273,7 @@ export function PlatformFeedsCard({ status, onCheck, onImport, busy }: PlatformF
             <TableHeader>
               <TableRow className="border-border/60 hover:bg-transparent">
                 <TableHead className={cn(HEAD, 'pl-4')}>Feed</TableHead>
-                <TableHead className={HEAD}>Licence</TableHead>
+                <TableHead className={HEAD}>License</TableHead>
                 <TableHead className={HEAD}>
                   <span className="inline-flex items-center gap-1">
                     State

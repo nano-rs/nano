@@ -68,6 +68,7 @@ pub mod cloud_dossier;
 pub mod cloud_overview;
 mod core_search;
 mod field_queries;
+pub use field_queries::DynamicFieldBucket;
 mod funnel_view;
 
 /// NAN-1506: row cap for the bulk field-stats scan (shared by the standalone

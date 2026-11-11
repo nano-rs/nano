@@ -862,7 +862,7 @@ mod tests {
         // NAN-4973 adds /api/internal/vector-config/ingest-tokens (GET) to
         // both editions (the Helm chart's `http` ingest-token delivery).
         // All landed: enterprise 654 + 1 = 655; open 480 + 1 = 481.
-        // NAN-4987 replaces the legacy offline-bundle licence import with four
+        // NAN-4987 replaces the legacy offline-bundle license import with four
         // C05 path templates: import, renew, recovery request and recovery apply.
         // `/api/license` already existed. Enterprise 655 + 4 = 659.
         // NAN-5044 adds /api/settings/api-keys/owner-clamp (GET + PUT) to both
@@ -896,7 +896,7 @@ mod tests {
         #[cfg(feature = "enterprise")]
         assert!(
             !spec.paths.paths.contains_key("/api/airgap/license/import"),
-            "generic content-bundle keys must not be exposed as a licence authority"
+            "generic content-bundle keys must not be exposed as a license authority"
         );
     }
 

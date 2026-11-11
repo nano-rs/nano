@@ -1149,7 +1149,7 @@ pub async fn fixup_match_values(
     ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
     // NAN-2120: this rewrites `log_sources.match_values` — LIVE ingestion-routing
     // metadata deciding which upstream source-type aliases activate a parser.
-    // Repository management is not a licence to edit those targets; require the
+    // Repository management is not a license to edit those targets; require the
     // canonical parser and log-source edit capabilities too. Re-checked inside
     // the service. The route is also repository-scoped now: the old global
     // `/api/parser-repositories/fixup-match-values` rewrote every import in the

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-5055: an AI allowance granted by the online licence check-in reaches
+//! NAN-5055: an AI allowance granted by the online license check-in reaches
 //! the meter that actually enforces credits (`charge_ai_credits` →
 //! `get_tier_limits` → `increment_ai_credits`), not just a parsed struct.
 //!

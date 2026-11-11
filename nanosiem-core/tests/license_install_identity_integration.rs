@@ -4,11 +4,11 @@
 //!
 //! Proves: migration 327 creates exactly one ID; reading it is stable and
 //! idempotent; if the row is missing, many hosts creating it at once agree on
-//! one ID; the ID rides on the licence check-in as `X-Nano-Install-Id`.
+//! one ID; the ID rides on the license check-in as `X-Nano-Install-Id`.
 //!
 //! DB-backed: `#[ignore]`d; run with `-- --ignored` against a disposable
 //! `DATABASE_URL` (and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1). Enterprise only (the
-//! licence module is not in the open build).
+//! license module is not in the open build).
 #![cfg(feature = "enterprise")]
 
 mod common;

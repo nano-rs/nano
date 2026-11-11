@@ -79,7 +79,7 @@ impl FileParser {
                 .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()))
     }
 
-    /// Comment marker for indicator feeds (`# updated 2026-11-02`, licence
+    /// Comment marker for indicator feeds (`# updated 2026-11-02`, license
     /// banners). Only honoured when the payload OPENS with a comment block;
     /// see [`Self::starts_with_comment`].
     pub const COMMENT_PREFIX: char = '#';

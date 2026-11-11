@@ -3,10 +3,11 @@
 The `nano` Helm chart is the only Kubernetes path. The authority is the
 product guide (nano.rs/docs → Kubernetes (Helm)). This page is the agent
 procedure. It assumes the operator's cluster exists. You do not create or
-resize clusters or node pools unless they ask. On AWS with no cluster yet,
-[cloud-aws.md](cloud-aws.md#amazon-eks-for-the-helm-chart) has an eksctl
-starting point and the EKS add-ons the chart needs; propose it, and create
-it only after the operator approves.
+resize clusters or node pools unless they ask. With no cluster yet, propose
+one from [cloud-aws.md](cloud-aws.md#amazon-eks-for-the-helm-chart) (EKS),
+[cloud-gcp.md](cloud-gcp.md#gke-for-the-helm-chart) (GKE) or
+[cloud-azure.md](cloud-azure.md#aks-for-the-helm-chart) (AKS), and create it
+only after the operator approves.
 
 The chart lives in the customer registry repository, the one the Self-run
 pull credential can read:
@@ -40,6 +41,28 @@ On x86-64, nodes need AVX2 for ClickHouse. From the `standard` preset up you
 need an ingest node pool labelled and tainted `nano.rs/pool=ingest`, or
 override `ingest.nodeSelector`/`ingest.tolerations`. Report gaps and stop.
 
+External PostgreSQL (`postgresql.mode: external`, every production install):
+check it before `helm install`, read-only. The probe needs PostgreSQL 16+ and
+that the nano user can create `pg_trgm`, `pgcrypto` and `uuid-ossp`; each
+CREATE EXTENSION is rolled back. Run it from inside the cluster (it reaches
+private-IP databases) once the namespace and the password Secret exist (Step 2):
+
+```bash
+python3 -I scripts/pg-preflight.py kube --namespace nano --host DB_HOST \
+  --user nanosiem --database nanosiem --password-secret nano-postgres --password-key password
+# or with postgresql.external.urlSecret:
+python3 -I scripts/pg-preflight.py kube --namespace nano --url-secret NAME --url-key database_url
+```
+
+From a machine with `psql` and network access, `pg-preflight.py local --host
+DB_HOST` uses the operator's `PGPASSWORD` / `~/.pgpass`. `POSTGRES-NOT-READY`
+is a hard stop; it prints the fix (the per-cloud details are in
+[cloud-aws.md](cloud-aws.md#managed-postgresql-rds), [cloud-gcp.md](cloud-gcp.md#managed-postgresql-cloud-sql)
+and [cloud-azure.md](cloud-azure.md#managed-postgresql-azure-flexible-server)). The
+migrator runs the same check before it applies anything (2.0.11+), so a
+missed one fails `nano-migrate-r1` with the same message instead of a
+half-applied schema.
+
 ## Step 1: choose the presets
 
 - Sizing preset: the one `size.py --topology helm` printed
@@ -60,13 +83,46 @@ The presets ship inside the chart, with the release's customer image lock
 
 ```bash
 kubectl create namespace nano --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n nano create secret docker-registry nano-registry \
-  --docker-server=REGISTRY_HOST --docker-username=REGISTRY_USER \
-  --docker-password="$(cat "$REGISTRY_CRED_FILE")" --dry-run=client -o yaml | kubectl apply -f -
+# Build the dockerconfigjson in a 0600 file: the password is read from the
+# credential file by python and never appears in any process's arguments.
+( umask 077; python3 -I - "$REGISTRY_CRED_FILE" REGISTRY_HOST REGISTRY_USER \
+    > ./nano-deploy-work/dockerconfig.json <<'PY'
+import base64, json, sys
+cred, host, user = sys.argv[1:4]
+password = open(cred, encoding="utf-8").read().rstrip("\n")
+auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+print(json.dumps({"auths": {host: {"username": user, "password": password, "auth": auth}}},
+                 separators=(",", ":")))
+PY
+)
+kubectl -n nano create secret generic nano-registry \
+  --type=kubernetes.io/dockerconfigjson \
+  --from-file=.dockerconfigjson=./nano-deploy-work/dockerconfig.json \
+  --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+rm -f ./nano-deploy-work/dockerconfig.json
 ```
 
-The password is read inside the command substitution and is not echoed.
-Never put it in a values file.
+Do not use `kubectl create secret docker-registry --docker-password=...`:
+the password lands on kubectl's command line, visible in `ps` and shell
+history. Never put it in a values file. The registry credential refresh
+CronJob merges into this Secret's `.dockerconfigjson`, so keep the type
+`kubernetes.io/dockerconfigjson`. Apply Secrets with `--server-side`: a
+client-side `kubectl apply` also copies the whole Secret, credential included,
+into the `kubectl.kubernetes.io/last-applied-configuration` annotation, where a
+stale copy can linger after the value rotates (the 2.0.11 refresh job removes
+it). `--force-conflicts` is needed on a re-run because the refresh CronJob
+owns `.dockerconfigjson` once it has run.
+
+External PostgreSQL password (when `postgresql.mode: external`), also from a
+file and never on a command line:
+
+```bash
+kubectl -n nano create secret generic nano-postgres \
+  --from-file=password="$PG_PASSWORD_FILE" --dry-run=client -o yaml | kubectl apply --server-side -f -
+```
+
+The file must hold only the URL-safe password, with no trailing newline
+(`printf %s`); it is interpolated into `DATABASE_URL`.
 
 ## Step 3: values (local files)
 
@@ -129,6 +185,16 @@ helm upgrade --install nano ./nano -n nano --wait --timeout 20m \
 kubectl -n nano get pods -w
 kubectl -n nano logs -f job/nano-migrate-r1
 ```
+
+The first migration can take 10+ minutes against a remote managed PostgreSQL.
+Keep `--timeout` at or below `migrations.dependentProgressDeadlineSeconds`
+(1800 s from 2.0.11): use `--wait --timeout 30m` there. If the install still
+fails, read the migration Job's log first, fix the cause, and run the same
+`helm upgrade --install` again ([known-issues.md](known-issues.md)).
+
+Before go-live, confirm the cluster ENFORCES NetworkPolicy (GKE Dataplane V2,
+EKS VPC CNI network policy agent, AKS `--network-policy`): the chart's policy
+protects Vector's in-cluster ports only where it is enforced.
 
 `upgrade --install` is idempotent. Point DNS for both hostnames at the two
 Gateways (`kubectl -n nano get gateway`).

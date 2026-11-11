@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({ ext: vi.fn() }));
 vi.mock('@/lib/api', () => ({
   api: {
     getExtFieldNames: mocks.ext,
+    getExtendedFieldNames: async () => [],
     getSchemaFields: async () => ({ schema: 'udm', fields: [] }),
     sourceScopes: { listRestricted: async () => ({ restricted: [] }) },
   },

@@ -553,6 +553,43 @@ nano_env_set_keys_writer() {
     done
 }
 
+# Collapse duplicate assignments in an env file (NAN-5263). An earlier
+# installer (v2.0.8) could append a second NANO_LICENSE_MODE line; Compose and
+# env readers use the LAST assignment, so that value is kept, at the FIRST
+# line's position (the same place nano_env_set_keys writes). Every host
+# collapses the same way, so copied .env files stay byte-identical. Prints the
+# collapsed key names (never values), comma-separated; nothing when clean.
+nano_env_collapse_duplicates() {
+    local env_file="$1" line had_xtrace=0 names
+    local -a kvs=()
+    [[ -f "$env_file" ]] || return 0
+    case "$-" in *x*) had_xtrace=1; set +x ;; esac
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && kvs+=("$line")
+    done < <(awk '
+        {
+            bare = $0
+            sub(/^[ \t]*/, "", bare)
+            sub(/^export[ \t]+/, "", bare)
+            if (match(bare, /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+                key = substr(bare, 1, RLENGTH - 1)
+                count[key]++
+                last[key] = bare
+                if (!(key in order)) { order[key] = ++n; keys[n] = key }
+            }
+        }
+        END { for (i = 1; i <= n; i++) if (count[keys[i]] > 1) print last[keys[i]] }
+    ' "$env_file")
+    if ((${#kvs[@]} > 0)); then
+        names=$(printf '%s\n' "${kvs[@]}" | sed 's/=.*//' | paste -sd, - | sed 's/,/, /g')
+        nano_env_set_keys "$env_file" "${kvs[@]}" || { kvs=(); (( had_xtrace )) && set -x; return 1; }
+        printf '%s\n' "$names"
+    fi
+    kvs=()
+    if (( had_xtrace )); then set -x; fi
+    return 0
+}
+
 nano_env_set_keys() {
     local env_file="$1"
     shift

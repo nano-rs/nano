@@ -50,11 +50,15 @@ on:
       - scripts/tests/test_nano_deploy_plan*.py
       - scripts/tests/test_nano_deploy_customer_run.py
       - scripts/tests/test_nano_deploy_health_checks.py
+      - scripts/tests/test_nano_deploy_pg_preflight.py
       - scripts/tests/fixtures/nano-deploy-health/**
       - scripts/tests/test_otlp_edge_content_type.py
       - deploy/helm/nano/templates/ingest/**
       - scripts/tests/test_nano_deploy_fetch_bundle.py
       - scripts/tests/test_valkey_ha_entrypoint.py
+      - scripts/nano-support-bundle
+      - scripts/nano-cluster-health
+      - scripts/tests/test_nano_support_bundle.py
       - scripts/tests/fixtures/nano-deploy-plan/**
       - scripts/check-opencore-web-build.sh
       - docker-compose.yml
@@ -196,10 +200,20 @@ jobs:
             python3 -I scripts/tests/test_nano_deploy_plan_inventory.py -v
             python3 -I scripts/tests/test_nano_deploy_customer_run.py -v
             python3 -I scripts/tests/test_nano_deploy_health_checks.py -v
+            python3 -I scripts/tests/test_nano_deploy_pg_preflight.py -v
             python3 -I scripts/tests/test_otlp_edge_content_type.py -v
             python3 -I scripts/tests/test_nano_deploy_fetch_bundle.py -v
           else
             echo "nano-deploy planner tests not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5253: support-bundle redaction, packaging and stub-docker fixture runs.
+      - name: nano support-bundle
+        run: |
+          if [ -f scripts/tests/test_nano_support_bundle.py ]; then
+            python3 -I scripts/tests/test_nano_support_bundle.py -v
+          else
+            echo "support-bundle test not in this tree (public mirror); skipping"
           fi
 
       # NAN-5248: the Valkey HA entrypoint acts only on a Sentinel majority

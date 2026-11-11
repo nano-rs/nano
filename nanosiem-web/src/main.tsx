@@ -16,6 +16,11 @@ import App from './App.tsx';
 import './index.css';
 import { toast } from 'sonner';
 import { watchForNewBuild } from './lib/build-update';
+import { installSupportCapture } from './lib/support-diagnostics';
+
+// NAN-5253: remember the last failed API calls and console errors (in memory,
+// this tab only) for Help > Report a bug. Nothing is sent anywhere.
+installSupportCapture();
 
 if (import.meta.env.PROD) {
   watchForNewBuild(() => {

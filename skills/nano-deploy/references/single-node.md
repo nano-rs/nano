@@ -16,11 +16,11 @@ changes):
 
 The operator downloads three files from the deployment's page in app.nano.rs
 (**1 · Get the installer**; only an owner or admin can, and no API fetches
-them with the licence token): `nano-compose-enterprise-$V.tar.gz`, `.sha256`
+them with the license token): `nano-compose-enterprise-$V.tar.gz`, `.sha256`
 and `.sha256.sig`. Verify the signature, then the checksum, with nano's
 release key from the public Self-run install guide (never from inside the
 archive). The exact commands and the key are in
-[cloud-vm.md](cloud-vm.md#6-licence-download-verify-install), step 2:
+[cloud-vm.md](cloud-vm.md#6-license-download-verify-install), step 2:
 
 ```bash
 bash scripts/fetch-bundle.sh --enrollment ./nano-deploy-work/enrollment.env \
@@ -55,7 +55,7 @@ Re-run preflight until it shows zero `FAIL`.
 
 ```bash
 scp -p nano-compose-enterprise-$V.tar.gz $H:~/
-$SSH $H 'set -e; test ! -e ~/nano || { echo "~/nano exists: this is an upgrade, see operate.md"; exit 3; }
+$SSH $H 'set -e; test ! -e ~/nano || { echo "~/nano exists: this is an upgrade, see upgrade.md"; exit 3; }
   tar -xzf ~/nano-compose-enterprise-'$V'.tar.gz -C ~ && mv ~/nano-'$V' ~/nano
   cat ~/nano/.nano-edition; grep "^# Release:" ~/nano/images.enterprise.lock'
 ```
@@ -67,7 +67,7 @@ the compose files, scripts and image lock are one release artifact.
 
 The registry host is the prefix of the image lines in `images.enterprise.customer.lock`
 (for example `us-central1-docker.pkg.dev`). Get a one-hour credential with the
-licence values just before this step (`bash scripts/fetch-bundle.sh --enrollment
+license values just before this step (`bash scripts/fetch-bundle.sh --enrollment
 ./nano-deploy-work/enrollment.env --version $V --registry-cred
 ./nano-deploy-work/registry.cred`, user `oauth2accesstoken`), or use the
 operator's credential file. Copy it and log in from stdin:
@@ -114,8 +114,9 @@ pull or start the application. The schema profile is fixed at first install.
 ## Step 7: enrollment (mutating, secret)
 
 ```bash
-scp -p "$ENROLLMENT_FILE" $H:~/.nano-enrollment.env
-$SSH $H 'bash -s' -- --env ~/nano/.env --from ~/.nano-enrollment.env < scripts/apply-enrollment.sh
+scp -p "$ENROLLMENT_FILE" $H:.nano-enrollment.env
+# Arguments INSIDE the single quotes: an unquoted ~ expands on this workstation.
+$SSH $H 'bash -s -- --env "$HOME/nano/.env" --from "$HOME/.nano-enrollment.env"' < scripts/apply-enrollment.sh
 ```
 
 If the operator has no enrollment yet (the trial is still pending), say that

@@ -5,7 +5,7 @@
 Writes two files on the operator's workstation:
   <out>/values-site.yaml     non-secret: URLs, hostnames, pull secret, TLS issuer,
                              schema, retention, ClickHouse storage/replicas. Reviewable.
-  <out>/values-licence.yaml  SECRET (mode 0600): licence URL, deployment id, licence token,
+  <out>/values-licence.yaml  SECRET (mode 0600): license URL, deployment id, license token,
                              read from the app.nano.rs enrollment file. Never commit or print it.
 
   helm show values oci://us-central1-docker.pkg.dev/nano-rs/nanosiem-customer/charts/nano --version <chart-version> > chart-values.yaml
@@ -106,7 +106,7 @@ def main() -> int:
 
     if a.enrollment:
         e = read_enrollment(a.enrollment)
-        lic = ["# SECRET: nano licence values. Mode 0600. Never commit, print or paste this file.",
+        lic = ["# SECRET: nano license values. Mode 0600. Never commit, print or paste this file.",
                "nano:", "  license:", f"    url: {y(e['LICENSE_URL'])}"]
         if top_level_deployment_id(a.chart_values):
             lic.append(f"  deploymentId: {y(e['NANO_DEPLOYMENT_ID'])}")

@@ -1,7 +1,8 @@
 # Azure
 
-Cloud specifics for [cloud-vm.md](cloud-vm.md). Ask before every mutating
-step. The commands use the operator's own `az` session.
+Cloud specifics for [cloud-vm.md](cloud-vm.md) (VMs) and, at the end, for an
+AKS cluster for the Helm chart ([AKS](#aks-for-the-helm-chart)). Ask before
+every mutating step. The commands use the operator's own `az` session.
 
 ```bash
 export LOC=eastus RG=<cluster name>-rg NAME=<cluster name> TAGS="nano-deployment=<cluster name>"
@@ -258,3 +259,224 @@ resource "azurerm_managed_disk" "ch_s1r1_data" {
   disk_mbps_read_write = 150
 }
 ```
+
+## Managed PostgreSQL (Azure flexible server)
+
+The production database for the Helm chart on AKS (`postgresql.mode:
+external`). The migrator checks the version and extensions before it applies
+anything; run `scripts/pg-preflight.py` first so a gap shows before `helm install`.
+
+| Item | Requirement |
+|---|---|
+| Version | PostgreSQL 16 or newer (16, 17 and 18 tested). 2.0.10 and earlier need 17+ |
+| Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`, **allow-listed in the `azure.extensions` server parameter**. Without it the migrator stops with `extension "pg_trgm" is not allow-listed`. Nothing else is needed (no `shared_preload_libraries`); `btree_gin`, `btree_gist` and `citext` are not used |
+| Parameters | `azure.extensions` as above. Default `require_secure_transport=ON` is fine (`sslmode: require`). Allow at least 200 connections (about 20 per nano pod): avoid Burstable B1ms/B1s (50 connections, no HA) |
+| Network | Private access (VNet integration): a subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers` in, or peered with, the AKS VNet, and a private DNS zone linked to the AKS VNet. Or a private endpoint. No public access |
+| HA | `--high-availability ZoneRedundant` (standby in another zone). Not every region, and not the Burstable tier, offers it; then use `SameZone` (standby in the same zone, protects against a server failure only) and say so to the operator |
+
+The operator creates the server (portal, Terraform with the admin password
+from Key Vault, or `az postgres flexible-server create` with `--version 17
+--tier GeneralPurpose --sku-name Standard_D2ds_v5 --high-availability
+ZoneRedundant --zone 1 --standby-zone 2 --vnet ... --subnet ...
+--private-dns-zone ...`). Never pass `--admin-password` on a command line.
+Then allow the extensions, keeping any value already there:
+
+```bash
+az postgres flexible-server parameter show -g $RG --server-name $NAME-pg \
+  --name azure.extensions --query value -o tsv
+az postgres flexible-server parameter set -g $RG --server-name $NAME-pg \
+  --name azure.extensions --value <existing>,pg_trgm,pgcrypto,uuid-ossp   # drop '<existing>,' if it was empty
+```
+
+The change applies without a restart. If zone-redundant HA is refused
+("not supported in this region" or for the SKU), create it with `SameZone`.
+
+Create the role and database as the admin user, in `psql` (`\password`
+prompts, so the password never lands in history or on a command line):
+
+```sql
+CREATE ROLE nanosiem LOGIN;
+\password nanosiem
+GRANT nanosiem TO <admin user>;          -- PostgreSQL 16+: needed before ... OWNER nanosiem
+CREATE DATABASE nanosiem OWNER nanosiem;
+```
+
+The owner can create the three trusted extensions itself. Use a URL-safe
+password (it is interpolated into `DATABASE_URL`), then check with
+`scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)).
+
+## AKS for the Helm chart
+
+The sections above build VMs for the compose topologies. For the Helm chart
+([helm.md](helm.md)) the operator brings an AKS cluster. When they have none,
+propose this and create it only after they approve (it costs money from the
+first minute). Every command uses their `az` session. Product guide:
+nano.rs/docs/getting-started/kubernetes#azure-aks-with-application-gateway-for-containers.
+Microsoft's Application Gateway for Containers (AGC) quickstarts are the
+reference for the Azure steps; this lists what nano needs from them.
+
+**Quota first** (read-only; show the operator the numbers). New subscriptions
+often have 10 regional vCPUs and 0 for a VM family. Six 8-vCPU nodes need 48
+in both the regional total and the family:
+
+```bash
+az vm list-usage -l $LOC -o table | grep -Ei 'Total Regional vCPUs|DDSv6|DDSv5'
+```
+
+Raising them (`az quota update`, or the portal) is the operator's call; in
+one test Ddsv6 was granted in minutes while a DDSv5 request was refused, so
+offer the other family when one is refused. Also check that managed
+PostgreSQL is offered in the region (some subscriptions are refused in
+eastus) before you pick `$LOC`.
+
+Register the providers AGC needs (once per subscription):
+
+```bash
+for p in Microsoft.ContainerService Microsoft.Network Microsoft.NetworkFunction Microsoft.ServiceNetworking; do
+  az provider register --namespace $p
+done
+az extension add --name alb
+```
+
+A small HA cluster: three zones, **two nodes per zone** (6 nodes), Azure CNI
+overlay with the Cilium dataplane, OIDC issuer and workload identity, in a
+VNet with a subnet for the nodes and a /24 delegated to AGC. Azure Disk LRS
+volumes are zonal: with one node per zone, draining or losing a node leaves
+that zone's ClickHouse replica and Keeper member Pending (data safe, no
+redundancy) until a node returns to that zone. Size the VM from the plan
+(`size.py --topology helm`). Set `clickhouse.zoneAware: true` with
+`antiAffinity: hard`.
+
+```bash
+az network vnet create -g $RG -n $NAME-aks-vnet --address-prefixes 10.50.0.0/16 --tags $TAGS
+az network vnet subnet create -g $RG --vnet-name $NAME-aks-vnet -n aks --address-prefixes 10.50.0.0/20
+az network vnet subnet create -g $RG --vnet-name $NAME-aks-vnet -n agc --address-prefixes 10.50.16.0/24 \
+  --delegations Microsoft.ServiceNetworking/trafficControllers
+# about 5 minutes
+az aks create -g $RG -n $NAME -l $LOC --tags $TAGS --nodepool-tags $TAGS \
+  --tier standard --zones 1 2 3 --node-count 6 --node-vm-size Standard_D8ds_v6 \
+  --network-plugin azure --network-plugin-mode overlay --network-dataplane cilium \
+  --vnet-subnet-id $(az network vnet subnet show -g $RG --vnet-name $NAME-aks-vnet -n aks --query id -o tsv) \
+  --enable-oidc-issuer --enable-workload-identity --no-ssh-key
+```
+
+- One pool with `--zones 1 2 3 --node-count 6` spreads nodes best-effort; to
+  guarantee two per zone, add one node pool per zone (`az aks nodepool add
+  --zones <z> --node-count 2`). `Standard_D8ds_v6` and `_v5` are x86-64 with
+  AVX2.
+- `--network-dataplane cilium` makes Cilium **enforce NetworkPolicy**.
+  Without it (or `--network-policy azure|calico`), AKS stores the chart's
+  `nano-vector-ingress` policy and silently ignores it; chart 2.0.10 and
+  earlier rely on it to keep unauthenticated raw OTLP out of Vector (from
+  2.0.11 Vector's OTLP listeners only accept traffic through the
+  authenticated ingest edge, and the policy is defense in depth). Existing
+  cluster: `az aks show -g $RG -n $NAME --query networkProfile.networkPolicy`
+  (`none` or empty = not enforced). After install, prove it (enforced =
+  timeout and `000`; any HTTP status means it is not):
+
+  ```bash
+  kubectl run np-test -n default --rm -it --image=curlimages/curl:8.12.1 --restart=Never -- \
+    curl -s -m 5 -o /dev/null -w '%{http_code}\n' http://nano-vector-internal.nano.svc.cluster.local:4318/v1/logs
+  ```
+
+- With a VNet you bring, the cluster's identity needs Network Contributor on
+  it. A user-assigned control-plane identity (`--assign-identity`) lets you
+  grant that before the create.
+
+Then, in order (each is a hard stop for the chart):
+
+1. **Default StorageClass.** AKS ships `default` (Azure Disk CSI, LRS,
+   zonal); nothing to create. Confirm with `kubectl get storageclass`.
+
+2. **ALB controller (workload identity, no secrets).** As in Microsoft's
+   quickstart: a managed identity with a federated credential for the
+   controller's service account, **Reader** on the node resource group, then
+   the controller's Helm chart:
+
+   ```bash
+   az identity create -g $RG -n azure-alb-identity --tags $TAGS
+   ALB_ID=$(az identity show -g $RG -n azure-alb-identity --query principalId -o tsv)
+   MC_RG=$(az aks show -g $RG -n $NAME --query nodeResourceGroup -o tsv)
+   az role assignment create --assignee-object-id $ALB_ID --assignee-principal-type ServicePrincipal \
+     --role Reader --scope $(az group show -n $MC_RG --query id -o tsv)
+   az identity federated-credential create -g $RG --identity-name azure-alb-identity -n azure-alb-identity \
+     --issuer $(az aks show -g $RG -n $NAME --query oidcIssuerProfile.issuerUrl -o tsv) \
+     --subject system:serviceaccount:azure-alb-system:alb-controller-sa
+   helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
+     --namespace azure-alb-helm --create-namespace --version <current, e.g. 1.13.0> \
+     --set albController.namespace=azure-alb-system \
+     --set albController.podIdentity.clientID=$(az identity show -g $RG -n azure-alb-identity --query clientId -o tsv)
+   ```
+
+   Then give the identity **Network Contributor** on the `agc` subnet, and
+   **AppGw for Containers Configuration Manager** on the resource group that
+   holds the AGC.
+
+3. **AGC: bring your own (recommended) or managed.** BYO was the tested path:
+   the frontend host names are known before install, and the AGC outlives a
+   reinstall.
+
+   ```bash
+   az network alb create -g $RG -n $NAME-agc --tags $TAGS
+   az network alb frontend create -g $RG --alb-name $NAME-agc -n fe-app
+   az network alb frontend create -g $RG --alb-name $NAME-agc -n fe-ingest
+   # about 5-6 minutes
+   az network alb association create -g $RG --alb-name $NAME-agc -n assoc-aks \
+     --subnet $(az network vnet subnet show -g $RG --vnet-name $NAME-aks-vnet -n agc --query id -o tsv)
+   az network alb frontend show -g $RG --alb-name $NAME-agc -n fe-app --query fqdn -o tsv
+   ```
+
+   Values (`values-aks.yaml`, after `values-azure.yaml`):
+
+   ```yaml
+   gateway:
+     annotations:
+       alb.networking.azure.io/alb-id: /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.ServiceNetworking/trafficControllers/<name>-agc
+     addresses:
+       app: [{type: alb.networking.azure.io/alb-frontend, value: fe-app}]
+       ingest: [{type: alb.networking.azure.io/alb-frontend, value: fe-ingest}]
+   clickhouse:
+     zoneAware: true
+   ```
+
+   Managed instead: create an `ApplicationLoadBalancer` resource naming the
+   `agc` subnet in a namespace of your choice; the controller creates the AGC
+   and a frontend per Gateway. Then set only
+   `gateway.annotations: {alb.networking.azure.io/alb-namespace: <ns>,
+   alb.networking.azure.io/alb-name: <name>}`, and read the frontend host
+   names from `kubectl -n nano get gateway` after install.
+
+   The operator CNAMEs the app and ingest host names to the two frontend
+   FQDNs (`*.alb.azure.com`). AGC gets no backend timeout or health-check
+   policy from the chart: the AGC default request timeout applies to long
+   searches (untested), and readiness probes serve as health checks.
+
+4. **Certificates.** `values-azure.yaml` uses `tls.mode: cert-manager`
+   (`cloud-managed` is refused on Azure). Install cert-manager and a
+   ClusterIssuer for both host names; set `tls.certManager.issuerRef.name`.
+   Use the operator's own domain: Let's Encrypt on `*.alb.azure.com` names
+   shares azure.com's rate limit. Evaluation without a domain: a private CA
+   ClusterIssuer (`make-private-ca.sh`) on the frontend FQDNs.
+
+5. **PostgreSQL.** For production, flexible server with the three extensions
+   allow-listed **before** install (otherwise the first migration burns its
+   retries on `not allow-listed`). See
+   [Managed PostgreSQL (Azure flexible server)](#managed-postgresql-azure-flexible-server).
+   Keep it in the cluster's region; a cross-region server slows the first
+   migration enough to hit Deployment progress deadlines on chart 2.0.10.
+   Tell the operator what a failover looks like: same-zone HA forced
+   failover gave about 30 s of failed sign-ins and API writes, no HEC loss.
+
+6. **Registry credential.** The chart's `registryCredentialRefresh` CronJob
+   keeps `nano-registry` fresh (see [helm.md](helm.md)). After the pull, run
+   `helm registry logout us-central1-docker.pkg.dev`.
+
+Teardown (only on request, and show the list first): `helm uninstall nano -n
+nano` (it removes the `ClickHouseCluster`/`KeeperCluster` itself), then
+`kubectl delete namespace nano` (PVCs, secret, leftover hook Jobs). With
+everything in one resource group, `az group delete -n $RG` also removes the
+cluster's `MC_` node resource group, the AGC, identities and role assignments
+at those scopes. It leaves subscription-level changes (quota increases,
+registered providers) and the `NetworkWatcher_<region>` resources Azure
+auto-creates in `NetworkWatcherRG`, which other workloads may share: tell the
+operator, don't delete them.

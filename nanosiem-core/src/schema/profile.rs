@@ -146,6 +146,16 @@ pub trait SchemaProfile: Send + Sync {
         "ext"
     }
 
+    /// The stored JSON column holding VALID schema attributes that have no
+    /// promoted column — OCSF's `event` object (NAN-4903). `None` (the default)
+    /// means the profile has no such column: UDM's only JSON column is the `ext`
+    /// spill. The search fields panel lists this column's paths as "Extended",
+    /// apart from the [`json_tail_column`](Self::json_tail_column) spill
+    /// (NAN-5265).
+    fn extended_json_column(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The secondary `Map` column tried when a [`FieldResolution::MapKey`] key is
     /// absent in the primary [`json_tail_column`](Self::json_tail_column) — spans'
     /// `resource_attributes` (NAN-1555). `None` (the default) means no fallback:

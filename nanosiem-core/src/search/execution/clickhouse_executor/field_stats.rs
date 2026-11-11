@@ -30,7 +30,13 @@ use crate::sql_hygiene::escape_sql_string;
 /// reduced to its top-level segment — the same key form the results-driven field list
 /// registers. `max_execution_time` keeps this best-effort, fire-and-forget query from
 /// ever hanging.
-fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_predicate: &str) -> String {
+fn build_ext_field_names_sql(
+    table: &str,
+    json_col: &str,
+    nested: bool,
+    extended: bool,
+    where_predicate: &str,
+) -> String {
     // NAN-1241: the dynamic-JSON column is `ext` under UDM, `event` under OCSF.
     //
     // UDM `ext` is effectively flat — keys are bare identifiers (`foo`) the
@@ -46,6 +52,43 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_pr
         "path"
     } else {
         "splitByChar('.', path)[1]"
+    };
+    // NAN-5265: `distinctJSONPaths` reports every TYPED path of the column
+    // (`JSON(... \`actor.process.file.name\` Nullable(String) ...)`) whether or
+    // not any row carries a value, so on the OCSF `event` column a Sysmon search
+    // would list `firewall_rule.name` / `http_response.status` as present.
+    // Re-casting to an untyped `JSON` drops NULL typed values (measured on
+    // 26.10: a typed path with no value disappears, a populated one stays), so
+    // the inventory names only paths that actually hold data. The cast only
+    // touches rows that survive the per-source slice, but the slice does NOT
+    // bound the READ (see NAN-2174 below): every row the predicate matches is
+    // still read, and `event` is the full OCSF object, far wider than a spill.
+    // The Extended scan therefore carries its own hard bounds — the caller
+    // clamps its window (`SearchService::EXTENDED_FIELD_NAMES_WINDOW_MINUTES`
+    // at the end of the search range) and the SETTINGS below cap rows read and runtime in
+    // `break` mode, so a 7-day Sysmon search returns a partial list instead of
+    // timing out (measured on 26.10: the same query with `read_overflow_mode =
+    // 'throw'` fails at the cap — the slice reads every row). The `unmapped`
+    // spill and UDM `ext` have no typed paths and keep the native aggregate.
+    let paths_input = if extended {
+        format!("CAST({json_col}, 'JSON')")
+    } else {
+        json_col.to_string()
+    };
+    // Extended: fetch a wider list, because the service drops names that do
+    // not resolve back into `event` BEFORE applying the 512 cap — filtering a
+    // 512-row alphabetical head would lose late-alphabet attributes.
+    let (output_limit, settings) = if extended {
+        (
+            EXTENDED_FIELD_NAMES_SQL_LIMIT,
+            format!(
+                "max_execution_time = 10, timeout_overflow_mode = 'break', \
+                 max_rows_to_read = {EXTENDED_FIELD_NAMES_MAX_ROWS_TO_READ}, \
+                 read_overflow_mode = 'break'"
+            ),
+        )
+    } else {
+        (EXT_FIELD_NAMES_OUTPUT_LIMIT, "max_execution_time = 10".to_string())
     };
     // `where_predicate` is the bare predicate (no `WHERE` keyword) scoping the
     // scan. NAN-1510: the service passes the SAME query+time predicate the
@@ -86,7 +129,7 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_pr
     format!(
         "SELECT DISTINCT {name_expr} AS name \
          FROM ( \
-             SELECT arrayJoin(distinctJSONPaths({json_col})) AS path \
+             SELECT arrayJoin(distinctJSONPaths({paths_input})) AS path \
              FROM ( \
                  SELECT {json_col}, source_type \
                  FROM {table} \
@@ -96,10 +139,24 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_pr
          ) \
          WHERE name != '' \
          ORDER BY name \
-         LIMIT 512 \
-         SETTINGS max_execution_time = 10"
+         LIMIT {output_limit} \
+         SETTINGS {settings}"
     )
 }
+
+/// Names returned by one ext-field-names inventory (the `LIMIT` of the spill
+/// scan, and the cap the service applies to the filtered Extended list).
+pub(crate) const EXT_FIELD_NAMES_OUTPUT_LIMIT: usize = 512;
+
+/// SQL-side output limit of the Extended scan: wider than
+/// [`EXT_FIELD_NAMES_OUTPUT_LIMIT`] so the service's resolve filter runs before
+/// the cap (NAN-5265).
+const EXTENDED_FIELD_NAMES_SQL_LIMIT: usize = 4096;
+
+/// Hard cap on rows the Extended scan reads, in `read_overflow_mode = 'break'`
+/// (partial result, never an error). `LIMIT ... BY source_type` does not bound
+/// the read (NAN-2174), and `event` is the full OCSF object (NAN-5265).
+const EXTENDED_FIELD_NAMES_MAX_ROWS_TO_READ: usize = 200_000;
 
 /// Per-`source_type` row slice for the ext-field-names discovery scan (NAN-2174,
 /// replacing NAN-1653's ineffective global row cap).
@@ -609,9 +666,10 @@ impl ClickHouseExecutor {
         table: &str,
         json_col: &str,
         nested: bool,
+        extended: bool,
         where_predicate: &str,
     ) -> Result<Vec<String>, SearchError> {
-        let sql = build_ext_field_names_sql(table, json_col, nested, where_predicate);
+        let sql = build_ext_field_names_sql(table, json_col, nested, extended, where_predicate);
 
         debug!("Querying ext field names: {}", sql);
 
@@ -867,7 +925,7 @@ mod tests {
     fn ext_field_names_sql_is_bounded_and_native() {
         // UDM `ext` is flat → nested=false. Recent-window predicate (highlighter).
         let sql =
-            build_ext_field_names_sql("nanosiem.logs", "ext", false, "timestamp >= now() - INTERVAL 3 HOUR");
+            build_ext_field_names_sql("nanosiem.logs", "ext", false, false, "timestamp >= now() - INTERVAL 3 HOUR");
 
         // Targets the resolved table.
         assert!(sql.contains("FROM nanosiem.logs"), "sql: {sql}");
@@ -887,6 +945,7 @@ mod tests {
             "nanosiem.ocsf_logs",
             "unmapped",
             true,
+            false,
             "timestamp >= now() - INTERVAL 3 HOUR",
         );
         assert!(ocsf_sql.contains("distinctJSONPaths(unmapped)"), "sql: {ocsf_sql}");
@@ -901,6 +960,7 @@ mod tests {
         let scoped = build_ext_field_names_sql(
             "nanosiem.logs",
             "ext",
+            false,
             false,
             "timestamp BETWEEN '2026-05-30 02:00:00.000000' AND '2026-05-30 03:00:00.000000' AND (source_type = 'sysmon')",
         );
@@ -951,6 +1011,41 @@ mod tests {
 
         assert!(sql.contains("LIMIT 512"), "sql: {sql}");
         assert!(sql.contains("max_execution_time"), "sql: {sql}");
+    }
+
+    /// NAN-5265: the OCSF Extended inventory scans the stored `event` object,
+    /// whose typed paths `distinctJSONPaths` would report even when every row
+    /// is NULL there. The re-cast drops them; the spill scan stays native.
+    #[test]
+    fn extended_inventory_drops_null_typed_paths() {
+        let sql = build_ext_field_names_sql(
+            "nanosiem.ocsf_logs",
+            "event",
+            true,
+            true,
+            "timestamp >= now() - INTERVAL 15 MINUTE",
+        );
+        assert!(sql.contains("distinctJSONPaths(CAST(event, 'JSON'))"), "sql: {sql}");
+        assert!(sql.contains("SELECT event, source_type"), "sql: {sql}");
+        assert!(sql.contains("LIMIT 5000 BY source_type"), "sql: {sql}");
+        assert!(sql.contains("SELECT DISTINCT path AS name"), "sql: {sql}");
+
+        // Read bounds: the slice does not bound the read (NAN-2174), so the
+        // Extended scan caps rows read and runtime in `break` mode — a partial
+        // list, never a timeout 500 on a wide search.
+        assert!(sql.contains("max_rows_to_read = 200000"), "sql: {sql}");
+        assert!(sql.contains("read_overflow_mode = 'break'"), "sql: {sql}");
+        assert!(sql.contains("timeout_overflow_mode = 'break'"), "sql: {sql}");
+        assert!(sql.contains("max_execution_time = 10"), "sql: {sql}");
+        // Filter-then-cap: the SQL limit is wider than the 512 the service keeps.
+        assert!(sql.contains("LIMIT 4096 SETTINGS"), "sql: {sql}");
+
+        let spill = build_ext_field_names_sql("nanosiem.ocsf_logs", "unmapped", true, false, "1");
+        assert!(spill.contains("distinctJSONPaths(unmapped)"), "sql: {spill}");
+        assert!(!spill.contains("CAST("), "sql: {spill}");
+        // The spill scan's SQL is unchanged by NAN-5265.
+        assert!(spill.ends_with("LIMIT 512 SETTINGS max_execution_time = 10"), "sql: {spill}");
+        assert!(!spill.contains("max_rows_to_read"), "sql: {spill}");
     }
 
     /// NAN-2174: the context-free discovery window is the only thing bounding

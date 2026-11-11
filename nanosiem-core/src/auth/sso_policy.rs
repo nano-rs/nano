@@ -21,7 +21,23 @@ pub struct SsoAccessPolicy {
     /// `email_verified`; with this set, an email in an exact
     /// `verified_domains` entry is trusted for account linking.
     pub entra_tenant_id: Option<Uuid>,
-    /// Exact lowercase domains the Entra tenant has verified.
+    /// Exact lowercase email domains whose addresses this provider is trusted
+    /// to have verified.
+    ///
+    /// * Entra: the domains verified in `entra_tenant_id` (needs the tenant).
+    /// * Generic OIDC (Okta, Auth0, Keycloak, ...; NAN-5266): the
+    ///   administrator asserts that this IdP only issues addresses in these
+    ///   domains to the people who own them (for example, the IdP's email
+    ///   attribute is set by the directory, not by users). An address in one
+    ///   of them is then treated as verified when the IdP sends no
+    ///   `email_verified`; an explicit `false` always wins. Do not list a
+    ///   domain for an IdP that lets users register or edit their own email
+    ///   address. Free-mail providers and public suffixes are refused, and on
+    ///   a Microsoft issuer the tenant ID is required.
+    /// * Google: not used (Google always sends `email_verified`).
+    ///
+    /// Adding a domain widens account linking, so it needs administrator
+    /// authority (see `oidc_trust`).
     pub verified_domains: Vec<String>,
     /// Google Workspace administrator the service account impersonates to
     /// read group membership (Google ID tokens carry no groups claim).
@@ -37,6 +53,106 @@ impl Default for SsoAccessPolicy {
             google_delegated_admin: None,
         }
     }
+}
+
+/// Google's fixed issuer. Its ID tokens are never a groups source.
+pub fn is_google_issuer(issuer: &str) -> bool {
+    issuer == "https://accounts.google.com"
+}
+
+/// Any Microsoft identity platform issuer: Entra ID in every cloud
+/// (public, US Government, China / 21Vianet, legacy Germany), v1
+/// (`sts.windows.net`) and v2, and Azure AD B2C / Entra External ID
+/// (`*.b2clogin.com`, `*.ciamlogin.com`). Microsoft issuers never get the
+/// generic userinfo or verified-domain paths: a multi-tenant or B2C issuer
+/// lets anyone mint tokens with an arbitrary, unverified email (nOAuth).
+pub fn is_microsoft_issuer(issuer: &str) -> bool {
+    let Ok(url) = url::Url::parse(issuer) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "login.microsoftonline.com"
+            | "login.microsoftonline.us"
+            | "login.partner.microsoftonline.cn"
+            | "login.chinacloudapi.cn"
+            | "login.microsoftonline.de"
+            | "login.microsoft.com"
+            | "login.windows.net"
+            | "sts.windows.net"
+            | "sts.chinacloudapi.cn"
+    ) || host.ends_with(".b2clogin.com")
+        || host.ends_with(".ciamlogin.com")
+        || host.ends_with(".b2clogin.us")
+        || host.ends_with(".b2clogin.cn")
+}
+
+/// Mailbox providers anyone can sign up to. An address at one of these
+/// proves nothing about who owns it, so none can be a verified domain.
+const FREE_MAIL_DOMAINS: &[&str] = &[
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com",
+    "passport.com", "yahoo.com", "ymail.com", "rocketmail.com", "icloud.com", "me.com",
+    "mac.com", "aol.com", "aim.com", "proton.me", "protonmail.com", "protonmail.ch",
+    "pm.me", "gmx.com", "gmx.net", "gmx.de", "web.de", "t-online.de", "mail.com",
+    "mail.ru", "inbox.ru", "list.ru", "bk.ru", "yandex.com", "yandex.ru", "ya.ru",
+    "zoho.com", "zohomail.com", "qq.com", "foxmail.com", "163.com", "126.com",
+    "yeah.net", "sina.com", "sina.cn", "sohu.com", "aliyun.com", "naver.com",
+    "daum.net", "hanmail.net", "rediffmail.com", "tutanota.com", "tutanota.de",
+    "tuta.io", "tuta.com", "fastmail.com", "fastmail.fm", "hey.com", "mailfence.com",
+    "posteo.de", "hushmail.com", "inbox.com", "gmx.at", "gmx.ch", "laposte.net",
+    "orange.fr", "free.fr", "libero.it", "seznam.cz", "wp.pl", "o2.pl", "interia.pl",
+    "duck.com", "skiff.com", "mailinator.com", "guerrillamail.com", "yopmail.com",
+];
+
+/// Free-mail brands that also run country domains (`hotmail.fr`,
+/// `yahoo.co.uk`, `live.com.au`, ...): refused under any public suffix.
+const FREE_MAIL_BRANDS: &[&str] = &[
+    "gmail", "googlemail", "hotmail", "outlook", "live", "msn", "yahoo", "ymail", "aol",
+    "icloud", "gmx", "yandex", "protonmail", "zoho", "mail",
+];
+
+/// Why `domain` cannot be a verified domain, beyond its syntax (NAN-5266).
+/// A public suffix (`com`, `co.uk`, `github.io`) or a free-mail provider
+/// would make every address there "verified" for account linking.
+fn verified_domain_refusal(domain: &str) -> Option<&'static str> {
+    if FREE_MAIL_DOMAINS.contains(&domain) {
+        return Some("Verified domains cannot be free email providers (for example gmail.com)");
+    }
+    if domain.split('.').count() == 2 {
+        let (first, tld) = domain.split_once('.').unwrap_or_default();
+        // Without the bundled list (open build), refuse the common
+        // second-level registry shapes: `co.uk`, `com.au`, `ac.jp`, ...
+        if tld.len() == 2
+            && matches!(
+                first,
+                "co" | "com" | "net" | "org" | "gov" | "edu" | "ac" | "or" | "ne" | "go"
+                    | "gob" | "gouv" | "mil" | "nom" | "ltd" | "plc" | "me" | "info" | "biz"
+            )
+        {
+            return Some("Verified domains cannot be public suffixes (for example co.uk)");
+        }
+    }
+    #[cfg(feature = "enterprise")]
+    {
+        if psl::suffix(domain.as_bytes())
+            .is_some_and(|found| found.is_known() && found.as_bytes() == domain.as_bytes())
+        {
+            return Some("Verified domains cannot be public suffixes (for example co.uk)");
+        }
+        if let Some(registrable) = psl::domain_str(domain) {
+            let brand = registrable.split('.').next().unwrap_or_default();
+            if FREE_MAIL_BRANDS.contains(&brand) || FREE_MAIL_DOMAINS.contains(&registrable) {
+                return Some(
+                    "Verified domains cannot be free email providers (for example gmail.com)",
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Validate one IdP group name as a mapping key (exact match, no trimming).
@@ -73,6 +189,9 @@ impl SsoAccessPolicy {
             {
                 return Err("Use exact lowercase verified domains");
             }
+            if let Some(reason) = verified_domain_refusal(domain) {
+                return Err(reason);
+            }
         }
         if self.google_delegated_admin.as_ref().is_some_and(|v| {
             v.len() > 254
@@ -83,6 +202,22 @@ impl SsoAccessPolicy {
                 || v.chars().any(|c| c.is_control() || c.is_whitespace())
         }) {
             return Err("Invalid delegated administrator");
+        }
+        Ok(())
+    }
+
+    /// Settings that are only safe for some issuers (NAN-5266): verified
+    /// domains on a Microsoft issuer require the directory (tenant) ID, so a
+    /// multi-tenant or B2C issuer can never vouch for an address (nOAuth).
+    pub fn validate_for_issuer(&self, issuer: &str) -> Result<(), &'static str> {
+        self.validate()?;
+        if is_microsoft_issuer(issuer)
+            && self.entra_tenant_id.is_none()
+            && !self.verified_domains.is_empty()
+        {
+            return Err(
+                "Verified domains on a Microsoft issuer need the directory (tenant) ID",
+            );
         }
         Ok(())
     }
@@ -101,24 +236,52 @@ impl SsoAccessPolicy {
     /// Whether the IdP verified this email, for linking onto an existing
     /// local account or creating a new one. Only called after signature,
     /// exact issuer, audience and nonce validation.
+    ///
+    /// Always false without a non-empty `email` claim: a verification flag
+    /// never vouches for `preferred_username` or any other stand-in.
+    ///
+    /// Entra: `xms_edov`, or the configured tenant plus a verified domain.
+    /// Google: `email_verified` only. Any other issuer: `email_verified`, or
+    /// (NAN-5266) an admin-asserted `verified_domains` entry when the IdP sent
+    /// NO `email_verified` (an explicit `false` always wins), and only while
+    /// no Entra tenant is configured, so domains carried over from an Entra
+    /// configuration never start applying to a different issuer.
     #[cfg(feature = "enterprise")]
     pub fn verifies_email(&self, claims: &super::IdTokenClaims) -> bool {
+        if !claims
+            .email
+            .as_deref()
+            .is_some_and(|email| !email.trim().is_empty())
+        {
+            return false;
+        }
         if claims.verified_email() {
             return true;
         }
-        let Some(tid) = claims.entra_tenant().and_then(|s| Uuid::parse_str(s).ok()) else {
+        if let Some(tid) = claims.entra_tenant().and_then(|s| Uuid::parse_str(s).ok()) {
+            return self.entra_tenant_id == Some(tid) && self.email_in_verified_domain(claims);
+        }
+        if is_google_issuer(&claims.iss) || is_microsoft_issuer(&claims.iss) {
             return false;
-        };
-        self.entra_tenant_id == Some(tid)
-            && claims.email.as_ref().is_some_and(|email| {
-                let parts: Vec<_> = email.split('@').collect();
-                parts.len() == 2
-                    && !parts[0].is_empty()
-                    && !email.chars().any(char::is_whitespace)
-                    && self
-                        .verified_domains
-                        .iter()
-                        .any(|domain| domain.eq_ignore_ascii_case(parts[1]))
-            })
+        }
+        claims.email_verified.is_none()
+            && self.entra_tenant_id.is_none()
+            && self.email_in_verified_domain(claims)
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn email_in_verified_domain(&self, claims: &super::IdTokenClaims) -> bool {
+        claims.email.as_ref().is_some_and(|email| {
+            let parts: Vec<_> = email.split('@').collect();
+            parts.len() == 2
+                && !parts[0].is_empty()
+                && !email.chars().any(char::is_whitespace)
+                && self.verified_domains.iter().any(|domain| {
+                    domain.eq_ignore_ascii_case(parts[1])
+                        // A domain stored before free-mail / public-suffix
+                        // validation existed is never trusted (NAN-5266 M2).
+                        && verified_domain_refusal(&domain.to_ascii_lowercase()).is_none()
+                })
+        })
     }
 }

@@ -491,6 +491,12 @@ pub enum ActivationOutcome {
     /// No evidence either way (metrics unreadable, nothing acknowledged in the
     /// window, or checking switched off). The string says which.
     Unconfirmed(String),
+    /// NAN-5267: Kubernetes (`NANO_VECTOR_LOCAL_RELOAD=off`). The change was
+    /// published as a Vector config generation that the Vector pods' consumers
+    /// pull and install; there is no local Vector to verify against. Reported
+    /// as a success with "verification disabled", like a parser deploy's
+    /// `ReloadAck::VerificationDisabled`.
+    Published(String),
 }
 
 /// NAN-4936: the reload-acknowledgement protocol for callers that write into the
@@ -615,6 +621,11 @@ impl ReloadWatch {
                 }
             };
         }
+        // NAN-5267: Kubernetes. Nothing local to signal; the change is
+        // published and the Vector pods' consumers apply it asynchronously.
+        if local_reload_disabled() {
+            return ActivationOutcome::Published(format!("verification disabled: {PULL_DELIVERY_NOTE}"));
+        }
         if let Some(marker) = self.marker.as_ref() {
             if let Err(error) = write_marker(marker).await {
                 return ActivationOutcome::Unconfirmed(format!(
@@ -704,6 +715,26 @@ pub(super) fn reload_signal_argv(container: &str) -> Vec<String> {
 /// (Vector may still reload from its `--watch-config` watcher, which the
 /// acknowledgement check confirms or denies, but a deploy that is not
 /// acknowledged says why no signal was sent).
+/// NAN-5267: `NANO_VECTOR_LOCAL_RELOAD=off` (set by the Helm chart). No Vector
+/// shares this process's config tree: Vector pods pull every change as a
+/// published config generation through their consumer sidecar, so there is
+/// nothing to signal. Without it, every deploy on Kubernetes tried `docker
+/// kill` and the validation-volume responder and logged "Failed to deploy
+/// Vector pipeline configs ... docker unavailable" while ingest worked.
+pub(super) const LOCAL_RELOAD_ENV: &str = "NANO_VECTOR_LOCAL_RELOAD";
+
+pub(super) fn local_reload_disabled() -> bool {
+    local_reload_disabled_from(std::env::var(LOCAL_RELOAD_ENV).ok().as_deref())
+}
+
+pub(super) fn local_reload_disabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
+}
+
+/// What a deploy reports when Vector pulls published generations.
+pub(super) const PULL_DELIVERY_NOTE: &str =
+    "published as a Vector config generation; each Vector pod's config consumer installs it";
+
 async fn deliver_reload_signal() -> Result<&'static str, String> {
     let docker = deliver_via_docker().await;
     if docker.is_ok() {
@@ -2906,6 +2937,12 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                     Err(VectorConfigError::ReloadUnconfirmed(message)),
                 ),
             };
+        }
+        // NAN-5267: Kubernetes. The api only renders and publishes; Vector
+        // pods pull the generation. No signal to send, nothing local to grade.
+        if local_reload_disabled() {
+            tracing::info!("Vector config {PULL_DELIVERY_NOTE}");
+            return (ReloadAck::VerificationDisabled, Ok(()));
         }
         let probe = ReloadAckProbe::from_env();
         let marker = activation_marker_enabled().then(|| ActivationMarker {

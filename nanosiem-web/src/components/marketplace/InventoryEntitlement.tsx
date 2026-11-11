@@ -6,17 +6,17 @@ import type { BuildEdition } from '@/hooks/use-capabilities';
 /**
  * What an item is entitled to on this deployment (NAN-4946). Main showed the
  * hosted purchase state here; a single-tenant install has no purchase, so the
- * entitlement is the build and its licence: the capability the item needs and
+ * entitlement is the build and its license: the capability the item needs and
  * why it is missing. Read from `/api/capabilities`, never a hosted flag.
  *
  * NAN-5088: on an enterprise build a licensed capability is false only when
- * licence admission is not active, so that case points at Settings › Licence
+ * license admission is not active, so that case points at Settings › License
  * instead of claiming the edition lacks the runtime.
  */
 export function InventoryEntitlement({ requirement, edition, canManageLicence = false }: {
   requirement: InventoryRequirement;
   edition: BuildEdition;
-  /** `settings:system`: the licence page is reachable, so link it. */
+  /** `settings:system`: the license page is reachable, so link it. */
   canManageLicence?: boolean;
 }) {
   const licence = requirement.cause === 'licence';
@@ -25,13 +25,13 @@ export function InventoryEntitlement({ requirement, edition, canManageLicence = 
     <dl className="my-2 grid grid-cols-[110px_1fr] gap-1.5 text-[11.5px]">
       <dt className="text-muted-foreground">Capability</dt><dd className="font-mono">{requirement.capability}</dd>
       <dt className="text-muted-foreground">This build</dt><dd className="font-mono">{edition}</dd>
-      {licence && <><dt className="text-muted-foreground">Licence</dt><dd className="font-mono">not active</dd></>}
+      {licence && <><dt className="text-muted-foreground">License</dt><dd className="font-mono">not active</dd></>}
     </dl>
     {licence
       ? <p className="text-[11px] leading-[1.45] text-muted-foreground">
-          Licensed features are unavailable on this deployment, so this integration cannot be installed or run until a licence is active.{' '}
+          Licensed features are unavailable on this deployment, so this integration cannot be installed or run until a license is active.{' '}
           {canManageLicence
-            ? <Link to="/settings/license" className="text-primary hover:underline">Install or renew it in Settings › Licence</Link>
+            ? <Link to="/settings/license" className="text-primary hover:underline">Install or renew it in Settings › License</Link>
             : 'Ask an administrator to install or renew it.'}
         </p>
       : <p className="text-[11px] leading-[1.45] text-muted-foreground">

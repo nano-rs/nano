@@ -36,13 +36,37 @@ export class CoreApi {
   // uses a recent default window.
   // NAN-4928: POST with the query in the body, so the hunt never lands in a
   // GET URL (server and proxy logs). The GET form is deprecated.
+  // NAN-5265: returns BARE spill keys on every profile (`error_code`,
+  // `event_data.utc_time`); the caller adds `ext.` / `unmapped.` once
+  // (`spillFieldName`).
   async getExtFieldNames(query?: string, start?: string, end?: string, signal?: AbortSignal): Promise<string[]> {
-    const body: { query?: string; start?: string; end?: string } = {};
+    return this.postDynamicFieldNames('spill', query, start, end, signal);
+  }
+
+  /**
+   * OCSF Extended inventory (NAN-5265): full dotted paths of valid OCSF
+   * attributes stored in the `event` JSON without a promoted column
+   * (`module.file.company_name`), used as-is. Empty under UDM.
+   */
+  async getExtendedFieldNames(query?: string, start?: string, end?: string, signal?: AbortSignal): Promise<string[]> {
+    return this.postDynamicFieldNames('extended', query, start, end, signal);
+  }
+
+  private async postDynamicFieldNames(
+    bucket: 'spill' | 'extended',
+    query?: string,
+    start?: string,
+    end?: string,
+    signal?: AbortSignal,
+  ): Promise<string[]> {
+    const body: { query?: string; start?: string; end?: string; bucket?: 'extended' } = {};
     if (query) body.query = query;
     if (start && end) {
       body.start = start;
       body.end = end;
     }
+    // The spill is the server default; leave the legacy body byte-identical.
+    if (bucket === 'extended') body.bucket = 'extended';
     return this.request('/api/fields/ext', { method: 'POST', body: JSON.stringify(body), ...(signal ? { signal } : {}) });
   }
 

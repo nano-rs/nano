@@ -15,7 +15,7 @@ pub enum DeploymentMode {
     Demo,
 }
 
-/// Complete online licence tuple. Partial tuples are configuration errors and
+/// Complete online license tuple. Partial tuples are configuration errors and
 /// must never disable enforcement.
 #[derive(Debug, Clone)]
 pub struct OnlineLicenseConfig {
@@ -25,7 +25,7 @@ pub struct OnlineLicenseConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("incomplete online licence configuration; missing {missing}")]
+#[error("incomplete online license configuration; missing {missing}")]
 pub struct LicenseConfigError {
     missing: String,
 }
@@ -166,15 +166,15 @@ impl ApiConfig {
     /// Resolve the explicit online admission mode. `None` selects the signed
     /// C05/legacy authority. A partial tuple is an error, never a bypass.
     ///
-    /// Online intent is expressed by the licence credentials
+    /// Online intent is expressed by the license credentials
     /// (`LICENSE_URL`/`LICENSE_TOKEN`). `NANO_DEPLOYMENT_ID` alone is not
     /// online intent: it is also the installation identity written by the
     /// installer/inventory renderer and the tenant-health exporter identity,
     /// so every multi-node Compose jobs container and every health-exporting
-    /// Helm jobs pod carries it without any online licence. Treating it as a
+    /// Helm jobs pod carries it without any online license. Treating it as a
     /// partial online tuple would lock those installs even with a valid C05.
     /// Selecting C05 here is still fail-closed: C05 admits nothing without a
-    /// verified signed licence or the bounded legacy upgrade grace.
+    /// verified signed license or the bounded legacy upgrade grace.
     pub fn online_license_config(&self) -> Result<Option<OnlineLicenseConfig>, LicenseConfigError> {
         if self.airgap {
             return Ok(None);
@@ -228,13 +228,13 @@ impl ApiConfig {
         Err(LicenseConfigError { missing })
     }
 
-    /// Returns true only for a complete online licence tuple.
+    /// Returns true only for a complete online license tuple.
     pub fn is_license_enabled(&self) -> bool {
         matches!(self.online_license_config(), Ok(Some(_)))
     }
 
     /// Whether the offline C05 authority admits this install, and therefore
-    /// whether its licence admin endpoints (import/renew/clock recovery) may
+    /// whether its license admin endpoints (import/renew/clock recovery) may
     /// accept C05 files. Boot selects the same authority on the same
     /// condition; it is not tied to AIRGAP_MODE (NAN-5086). A partial online
     /// tuple fails closed and accepts no C05 file.
@@ -334,7 +334,7 @@ mod tests {
     }
 
     /// Regression: the v2 multi-node Compose inventory and the Helm health
-    /// exporter give jobs `NANO_DEPLOYMENT_ID` with no licence credentials.
+    /// exporter give jobs `NANO_DEPLOYMENT_ID` with no license credentials.
     /// That is an installation identity, not a partial online tuple, so it must
     /// select the fail-closed C05 authority rather than a permanent lock.
     #[test]

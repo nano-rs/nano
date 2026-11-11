@@ -105,7 +105,7 @@ On a shared machine, wrap the runner in the codex Docker gate
 (`CODEX/docker-slot.sh <lane> -- …`). It refuses to start with less than
 100 GiB free and tears its stack down on exit unless you pass `--keep`.
 
-**Licensing.** e2e stacks carry no licence. When `/api/capabilities` reports a
+**Licensing.** e2e stacks carry no license. When `/api/capabilities` reports a
 surface as unlicensed (cases, notebooks, shadow investigation, AI providers),
 its flows are recorded as SKIP with the reason. Its routes are still walked:
 they must render the "Licensed feature unavailable" gate, not crash.
@@ -161,7 +161,7 @@ Every user is also in the built-in Everyone group (ReadOnly role).
   - users, roles and groups: invite, edit, disable/enable, password reset,
     MFA reset
   - API keys: create, edit expiry, rotate
-  - SIEM health, audit log export, licence, marketplace
+  - SIEM health, audit log export, license, marketplace
 - *Denied source*: the `scoped` user must never see the restricted source's
   events or `source_type` in search results, explain/SQL, alerts, cases,
   notebooks, report artifacts or recon. Every `/api` response body of that

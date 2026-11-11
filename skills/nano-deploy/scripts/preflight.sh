@@ -440,7 +440,7 @@ registry_hosts() {
 if have curl; then
     code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' https://api.nano.rs 2>/dev/null || true)
     if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then row "egress" PASS "https://api.nano.rs -> HTTP $code"
-    else row "egress" WARN "https://api.nano.rs unreachable (licence check-in; fine only for an offline licence)"; fi
+    else row "egress" WARN "https://api.nano.rs unreachable (license check-in; fine only for an offline license)"; fi
     # A blocked registry makes `docker compose pull` hang rather than fail
     # rather than fail, so test each host's HTTPS here, in seconds.
     while read -r host; do

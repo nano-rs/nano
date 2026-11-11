@@ -14,8 +14,8 @@
 //!    bundle_sha256}`. `<base>` is `https://api.nano.rs/api/content/v1` or an
 //!    operator mirror (`CONTENT_CHANNELS_URL`). Open channels use the open
 //!    route; enterprise channels use the license-authenticated route with
-//!    the install's licence ([`credential`]: the env file override, else the
-//!    online enrollment token or the installed signed licence, resolved on
+//!    the install's license ([`credential`]: the env file override, else the
+//!    online enrollment token or the installed signed license, resolved on
 //!    every check) and are skipped, with the reason recorded, without one.
 //! 2. The descriptor is verified against the compiled-in content ring and must
 //!    name the channel that was asked for. Identical to the installed one: done
@@ -72,7 +72,7 @@ pub struct ContentConfig {
     pub base_url: String,
     /// `base_url` is an operator mirror (reported as route `mirror`).
     pub mirror: bool,
-    /// Explicit signed licence override (`CONTENT_CHANNELS_LICENSE_FILE`).
+    /// Explicit signed license override (`CONTENT_CHANNELS_LICENSE_FILE`).
     /// Without it, enterprise channels use the registered [`credential`]
     /// source.
     pub license: Option<Vec<u8>>,
@@ -168,7 +168,7 @@ fn read_license(path: Option<String>) -> Option<Vec<u8>> {
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "content channel license file unreadable; using the installed licence instead");
+            tracing::warn!(path = %path.display(), %error, "content channel license file unreadable; using the installed license instead");
             return None;
         }
     };
@@ -503,14 +503,14 @@ pub struct ChannelsStatus {
     /// `production`, or `production+acceptance` in the non-shippable proof build.
     pub trust: String,
     pub poll_interval_secs: u64,
-    /// The licence enterprise channels present (`null` when this install
+    /// The license enterprise channels present (`null` when this install
     /// subscribes to none, e.g. the open edition).
     pub license: Option<LicenseAvailability>,
     pub channels: Vec<ChannelStatus>,
 }
 
-/// Whether enterprise channels have a licence to present at the next check
-/// (NAN-5220). Never carries the licence or the token.
+/// Whether enterprise channels have a license to present at the next check
+/// (NAN-5220). Never carries the license or the token.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct LicenseAvailability {
     pub available: bool,
@@ -597,7 +597,7 @@ impl ContentConsumer {
 
     /// The credential enterprise channels present now: the explicit file
     /// override, else the registered source (looked up on every call, so a
-    /// renewed or newly installed licence is used at the next check).
+    /// renewed or newly installed license is used at the next check).
     pub async fn enterprise_credential(&self) -> Result<(DistributionCredential, CredentialOrigin), String> {
         if let Some(license) = &self.config.license {
             return Ok((DistributionCredential::SignedLicense(license.clone()), CredentialOrigin::File));
@@ -609,12 +609,12 @@ impl ContentConsumer {
             CredentialLookup::Found { credential, origin } => {
                 if let DistributionCredential::Enrollment { licence_origin, .. } = &credential {
                     // The enrollment token is a bearer credential for the
-                    // licence server: never send it to a mirror or any host
+                    // license server: never send it to a mirror or any host
                     // other than the LICENSE_URL origin.
                     if credential::url_origin(&self.config.base_url).as_deref() != Some(licence_origin.as_str()) {
                         return Err(format!(
-                            "the online licence token is sent only to its licence server ({licence_origin}), and content \
-                             checks go to {}; set CONTENT_CHANNELS_LICENSE_FILE or import a licence file under Settings → License",
+                            "the online license token is sent only to its license server ({licence_origin}), and content \
+                             checks go to {}; set CONTENT_CHANNELS_LICENSE_FILE or import a license file under Settings → License",
                             self.config.base_url
                         ));
                     }
@@ -704,8 +704,8 @@ impl ContentConsumer {
         let credential = if self.has_enterprise_channels() {
             let resolved = self.enterprise_credential().await;
             match &resolved {
-                Ok((_, origin)) => tracing::debug!(?origin, "enterprise content channels: licence available"),
-                Err(reason) => tracing::warn!(%reason, "enterprise content channels skipped: no licence to present"),
+                Ok((_, origin)) => tracing::debug!(?origin, "enterprise content channels: license available"),
+                Err(reason) => tracing::warn!(%reason, "enterprise content channels skipped: no license to present"),
             }
             Some(resolved)
         } else {
@@ -977,10 +977,10 @@ impl ContentConsumer {
             }
             if self.has_enterprise_channels() {
                 match self.enterprise_credential().await {
-                    Ok((_, origin)) => tracing::info!(?origin, "enterprise content channels will use this install's licence"),
+                    Ok((_, origin)) => tracing::info!(?origin, "enterprise content channels will use this install's license"),
                     Err(reason) => tracing::warn!(
                         %reason,
-                        "enterprise content channels (soar-catalog) will be skipped until a licence is installed"
+                        "enterprise content channels (soar-catalog) will be skipped until a license is installed"
                     ),
                 }
             }

@@ -846,7 +846,7 @@ const apiKeysFlow = {
   },
 };
 
-// ------------------------------------------------------------------ settings / health / audit / licence / marketplace
+// ------------------------------------------------------------------ settings / health / audit / license / marketplace
 const platformFlow = {
   name: 'platform',
   roles: ['admin'],
@@ -879,7 +879,7 @@ const platformFlow = {
     await c.step(c.role, 'licence/page-and-api', async (rec) => {
       rec.sess = c.sess;
       const l = await c.api.get('/api/license');
-      // The licence surface is enterprise-only: the open build answers 404.
+      // The license surface is enterprise-only: the open build answers 404.
       c.must(c.EDITION === 'open' ? l.status === 404 : l.status === 200, `GET /api/license -> ${l.status} (${c.EDITION})`);
       await ui.goto(c, '/settings/license');
       if (c.EDITION === 'enterprise') await ui.text(c, 'License');

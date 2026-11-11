@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-NanoSIEM-Enterprise
 
-//! Cached offline-licence admission shared by HTTP routes and workers.
+//! Cached offline-license admission shared by HTTP routes and workers.
 //!
 //! Only the API's 30-second authority refresher performs durable C05
 //! observations. Request handlers and background-worker startup consume this
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::state::AppState;
 
 const LEGACY_NOTICE: &str =
-    "Legacy offline licence accepted temporarily after upgrade. Import a C05 licence before the upgrade grace ends.";
+    "Legacy offline license accepted temporarily after upgrade. Import a C05 license before the upgrade grace ends.";
 
 #[derive(Debug, Clone)]
 pub enum OfflineLicenseSnapshot {
@@ -41,7 +41,7 @@ pub enum OfflineLicenseSnapshot {
 
 impl Default for OfflineLicenseSnapshot {
     fn default() -> Self {
-        Self::Unavailable("Licence admission has not been initialized.".into())
+        Self::Unavailable("License admission has not been initialized.".into())
     }
 }
 
@@ -254,7 +254,7 @@ impl SiemHealthAiAnalyzer for LicensedSiemHealthAiAnalyzer {
     ) -> Result<AnalysisResult, ExtensionError> {
         if !live_admission(&self.status).await {
             return Err(ExtensionError::Unavailable(
-                "SIEM Health AI is unavailable at the licence hard stop",
+                "SIEM Health AI is unavailable at the license hard stop",
             ));
         }
         self.inner.analyze_with_ai(metrics, suppressions).await
@@ -319,7 +319,7 @@ pub fn unavailable_snapshot(error: &EntitlementError) -> OfflineLicenseSnapshot 
     OfflineLicenseSnapshot::Unavailable(error.public_reason().into())
 }
 
-/// NAN-5214: how long a good snapshot survives licence-storage errors.
+/// NAN-5214: how long a good snapshot survives license-storage errors.
 ///
 /// A PostgreSQL primary switch makes every query fail for seconds. Failing
 /// closed on the first error used to lock licensed routes and abort SOAR,
@@ -355,10 +355,10 @@ pub async fn record_refresh_failure(state: &AppState, error: &EntitlementError) 
         )
     };
     if keep {
-        tracing::warn!(%error, "licence storage unavailable; keeping the last good snapshot");
+        tracing::warn!(%error, "license storage unavailable; keeping the last good snapshot");
         return;
     }
-    tracing::error!(%error, "licence admission unavailable; failing closed");
+    tracing::error!(%error, "license admission unavailable; failing closed");
     let snapshot = unavailable_snapshot(error);
     *state.license_status.write().await = snapshot.cached_status();
     *state.offline_license_snapshot.write().await = snapshot;
@@ -395,7 +395,7 @@ mod tests {
         })
     }
 
-    // NAN-5214: a PostgreSQL primary switch must not lock the licence.
+    // NAN-5214: a PostgreSQL primary switch must not lock the license.
     #[test]
     fn storage_error_keeps_a_recent_good_snapshot() {
         let good = c05_with(["soar"]);
