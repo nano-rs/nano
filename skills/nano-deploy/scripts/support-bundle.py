@@ -456,7 +456,10 @@ def collect_postgres(run_sql, since_s: int) -> tuple:
     body = ""
     install_id = None
     ok, text = run_sql("SELECT install_id::text, created_at FROM install_identity LIMIT 1")
-    first = text.strip().splitlines()[-1] if ok and text.strip() else ""
+    # psql -A prints a header and a "(1 row)" footer around the row;
+    # reading the last line found the footer, so every bundle said None.
+    first = next((line for line in (text.splitlines() if ok else [])
+                  if re.match(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}\t", line)), "")
     m = re.match(r"([0-9a-fA-F-]{36})", first)
     if m:
         install_id = install_typeid(m.group(1))

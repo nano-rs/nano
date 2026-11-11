@@ -8,6 +8,10 @@ preflight checks, but before anything is deployed:
 
   version    PostgreSQL 16 or newer.
   platform   RDS / Cloud SQL / Azure flexible server / other (for the fix text).
+  schema     the nano user can CREATE in schema `public`. PostgreSQL 15+ no
+             longer grants that to every role, and Azure flexible server makes
+             azure_pg_admin the owner of `public` in new databases, so the
+             first migration fails with "permission denied for schema public".
   extensions pg_trgm, pgcrypto and uuid-ossp are installed or the nano user can
              create them. Each CREATE EXTENSION runs in a transaction that is
              rolled back: nothing is installed or changed.
@@ -54,6 +58,10 @@ SELECT 'NANO_PLATFORM ' || CASE
   WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cloudsqlsuperuser') THEN 'cloudsql'
   ELSE 'other' END;
 SELECT 'NANO_AZURE_EXTENSIONS ' || coalesce(current_setting('azure.extensions', true), '');
+SELECT 'NANO_SCHEMA ' || coalesce((SELECT CASE WHEN has_schema_privilege(current_user, n.oid, 'CREATE')
+         THEN 'create' ELSE 'nocreate' END || '|' || quote_ident(pg_get_userbyid(n.nspowner)::text)
+       FROM pg_namespace n WHERE n.nspname = 'public'), 'absent|')
+  || '|' || quote_ident(current_user::text) || '|' || quote_ident(current_database()::text);
 BEGIN;
 DO $nano$
 DECLARE e text;
@@ -114,10 +122,32 @@ FIXES = {
 }
 
 
+ADMIN_BY_PLATFORM = {
+    "azure": "the server admin user",
+    "cloudsql": "the postgres user",
+    "rds": "the master user",
+    "other": "a superuser or the schema owner",
+}
+
+
+def schema_fix(platform: str, schema: dict) -> str:
+    user = schema.get("user") or "<nano user>"
+    db = schema.get("database") or "<nano database>"
+    admin = ADMIN_BY_PLATFORM.get(platform, ADMIN_BY_PLATFORM["other"])
+    if schema.get("state") == "absent":
+        return (f"database {db} has no schema public. As {admin}, connected to database {db}, run:\n"
+                f"    CREATE SCHEMA public AUTHORIZATION {user};")
+    return (f"as {admin}, connected to database {db} (psql -d {db}), run:\n"
+            f"    ALTER SCHEMA public OWNER TO {user};\n"
+            f"  or, to keep the current owner:\n"
+            f"    GRANT ALL ON SCHEMA public TO {user};\n"
+            f"  (ALTER SCHEMA ... OWNER needs the admin to be a member of {user}: GRANT {user} TO <admin>.)")
+
+
 def parse_probe(output: str) -> dict:
     """Parse the probe's tagged lines (stdout and NOTICE lines on stderr mixed)."""
     result = {"version_num": None, "version": "", "platform": "other", "extensions": {},
-              "azure_extensions": None, "done": False}
+              "azure_extensions": None, "schema": None, "done": False}
     for raw in output.splitlines():
         line = raw.strip()
         idx = line.find("NANO_")
@@ -135,6 +165,10 @@ def parse_probe(output: str) -> dict:
             result["platform"] = line.split(" ", 1)[1].strip() or "other"
         elif line.startswith("NANO_AZURE_EXTENSIONS"):
             result["azure_extensions"] = line[len("NANO_AZURE_EXTENSIONS"):].strip()
+        elif line.startswith("NANO_SCHEMA "):
+            parts = (line[len("NANO_SCHEMA "):].split("|") + ["", "", "", ""])[:4]
+            result["schema"] = {"state": parts[0].strip(), "owner": parts[1].strip(),
+                                "user": parts[2].strip(), "database": parts[3].strip()}
         elif line.startswith("NANO_EXT "):
             name, _, rest = line[len("NANO_EXT "):].partition("|")
             state, _, reason = rest.partition("|")
@@ -156,6 +190,17 @@ def evaluate(result: dict) -> tuple[list[tuple[str, bool | None, str]], bool]:
                  + ("" if vnum >= MIN_VERSION_NUM else f": nano needs {MIN_VERSION} or newer")))
     platform = result.get("platform") or "other"
     rows.append(("platform", None if platform == "other" else True, platform))
+    schema = result.get("schema")
+    if not schema:
+        rows.append(("schema", False, "probe did not report CREATE on schema public"))
+    elif schema["state"] == "create":
+        rows.append(("schema", True, f"{schema['user']} can CREATE in public (owner {schema['owner']})"))
+    else:
+        detail = ("schema public does not exist" if schema["state"] == "absent" else
+                  f"{schema['user']} cannot CREATE in schema public (owner {schema['owner']}); "
+                  "the first migration would fail with 'permission denied for schema public'")
+        rows.append(("schema", False, detail))
+        rows.append(("fix", False, schema_fix(platform, schema)))
     exts = result.get("extensions", {})
     missing = []
     for ext in REQUIRED_EXTENSIONS:

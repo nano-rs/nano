@@ -128,6 +128,10 @@ if nano_credential_id != "" {
         if source_type != "unknown" && source_type != bound_source_type {
             .claimed_source_type = source_type
             %nano_claimed_source_type = source_type
+            # NAN-5264: the claim is ignored, so say so. Source health counts
+            # these per source (source_claims_ignored_24h); this is the
+            # operator-side trace. Rate-limited: one sender repeats it per event.
+            log("Ignoring declared source_type " + replace(truncate(source_type, 64), r'[^\w.-]', "_") + " (HEC sourcetype): the ingest token is bound to " + bound_source_type + ". Use that source's token, or a token for the declared source.", level: "warn", rate_limit_secs: 60)
         }
         source_type = bound_source_type
     }

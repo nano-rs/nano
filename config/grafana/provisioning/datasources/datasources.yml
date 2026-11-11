@@ -1,8 +1,11 @@
-# Grafana Datasource Provisioning
+# Grafana datasource provisioning (dev stack, and the Self-run `monitoring`
+# profile and role, NAN-5250). In every shape the Prometheus service is named
+# `prometheus` on the same Compose network as Grafana.
 apiVersion: 1
 
 datasources:
   - name: Prometheus
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090

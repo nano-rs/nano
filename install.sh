@@ -136,7 +136,7 @@ while [[ $# -gt 0 ]]; do
             RECORD_PG_HA_IDENTITY_ONLY=1; shift ;;
         -h|--help)
             cat <<'EOF'
-Usage: install.sh [--role app,ingest,clickhouse,keeper,postgres --inventory inventory.yaml]
+Usage: install.sh [--role app,ingest,clickhouse,keeper,postgres,monitoring --inventory inventory.yaml]
                   [--accept-topology-migration CURRENT_IDENTITY_SHA256]
        install.sh --record-pg-ha-identity
 
@@ -1294,12 +1294,13 @@ PY_ROLES
                 keeper) running_roles+=",keeper" ;;
                 vector|vector-config-consumer|vector-tap|ingest-edge) running_roles+=",ingest" ;;
                 nano-api|nano-jobs|nano-search|nano-web|nginx|app-internal-edge) running_roles+=",app" ;;
+                prometheus|grafana) running_roles+=",monitoring" ;;
             esac
         done < <(docker ps --filter "label=com.docker.compose.project=$installed_project" \
             --format '{{.Label "com.docker.compose.service"}}' </dev/null 2>/dev/null || true)
     fi
     effective_roles=""
-    for canonical_role in app ingest clickhouse keeper postgres; do
+    for canonical_role in app ingest clickhouse keeper postgres monitoring; do
         if [[ ",${ROLE_ARG},${installed_roles},${running_roles}," == *,"$canonical_role",* ]]; then
             effective_roles+="${effective_roles:+,}$canonical_role"
         fi
@@ -1377,6 +1378,20 @@ if [[ "$(uname -s)" == Linux && "${NANO_PREPARE_ONLY:-0}" != "1" ]]; then
                 ok "Data disk ${data_mount% *} is mounted under Docker"
                 ;;
         esac
+        # NAN-5269: after a hard reset udev can miss the data disk; Docker then
+        # (correctly) stays stopped and the host stays down until someone
+        # mounts the disk by hand. The self-heal timer retries during the
+        # first 30 minutes after boot.
+        if [[ "$data_mount_state" == "mounted "* ]]; then
+            data_mount=${data_mount_state#mounted }
+            data_mount=${data_mount% *}
+            heal_state=$(nano_ensure_data_disk_heal "$data_mount" scripts/lib/data-disk-heal.sh)
+            case "$heal_state" in
+                current) ok "Data disk self-heal timer is installed (nano-data-disk-heal.timer)" ;;
+                installed) ok "Installed the data disk self-heal timer (nano-data-disk-heal.timer; remove: sudo sh scripts/lib/data-disk-heal.sh uninstall)" ;;
+                manual*) warn "The data disk $data_mount has no self-heal timer: after a hard reset that misses the disk, Docker stays stopped until someone mounts it by hand. Install it once (it needs root): ${heal_state#manual }. Remove it later with: sudo sh scripts/lib/data-disk-heal.sh uninstall. Set NANO_DATA_DISK_HEAL=off to stop this check." ;;
+            esac
+        fi
     fi
 fi
 
@@ -2045,6 +2060,9 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     export NANO_VECTOR_DATA_STORAGE_MODE
     sizing_roles=app,ingest,clickhouse,postgres
     [[ "${BUNDLE_TENZIR:-0}" == "1" ]] && sizing_roles+=,tenzir
+    # NAN-5250: the optional monitoring profile keeps its fixed limits out of
+    # the budget the nano services share.
+    [[ ",$(env_value COMPOSE_PROFILES)," == *,monitoring,* ]] && sizing_roles+=,monitoring
     sizing_defaults=$(mktemp .nano-sizing.defaults.XXXXXX)
     "$RESOURCE_SIZING" \
         --topology single \
@@ -2102,6 +2120,16 @@ for key in NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_OTLP_BIND_ADDRESS NANO_FLUENT_BI
         log "Persisted $key=${!key} to .env (re-exposes an unauthenticated ingest port)"
     fi
 done
+
+# NAN-5250: the single-node monitoring profile scrapes nano-jobs over the
+# install's private Compose network, so jobs must leave loopback. Persist the
+# widening once (an operator value in .env always wins); /metrics still needs
+# NANO_SERVICE_TOKEN from every non-loopback caller.
+if [[ "$MULTI_NODE" != "1" && ",$(env_value COMPOSE_PROFILES)," == *,monitoring,* \
+      && -z "$(env_value NANO_JOBS_BIND_ADDR)" ]]; then
+    printf '%s\n' "NANO_JOBS_BIND_ADDR=0.0.0.0" >> .env
+    log "Persisted NANO_JOBS_BIND_ADDR=0.0.0.0 to .env (monitoring profile scrapes nano-jobs)"
+fi
 
 # Build the compose invocation only after edition resolution and .env creation.
 # The role env contains no secrets: it is a validated rendering of inventory
@@ -2512,7 +2540,47 @@ if [[ "$MULTI_NODE" == "1" && "${ROLE_CONFIG_WAS_PUBLISHED:-0}" == "1" ]]; then
     compose_up_args+=(--force-recreate)
     log "Recreating selected role services to attach the newly published configuration"
 fi
-docker compose "${COMPOSE_ARGS[@]}" "${compose_up_args[@]}" </dev/null
+# NAN-5269: `up -d` waits for clickhouse-migrate to complete, and a v2.0.11
+# install sat there for ten minutes with nothing to show for it. The migrator
+# now ends a stuck PostgreSQL snapshot itself; this bounds the whole wait too,
+# so the installer never hangs forever. Stopping the wait does not stop the
+# containers: a migration that is merely slow keeps running.
+compose_up_timeout=${NANO_COMPOSE_UP_TIMEOUT:-3600}
+[[ "$compose_up_timeout" =~ ^[0-9]+$ && "$compose_up_timeout" -ge 60 ]] || compose_up_timeout=3600
+compose_up_hint() {
+    local service
+    for service in clickhouse-migrate postgres-ha clickhouse keeper; do
+        docker compose "${COMPOSE_ARGS[@]}" ps -a --format '{{.Service}}' "$service" </dev/null 2>/dev/null \
+            | grep -qx "$service" || continue
+        printf '\n--- last lines of %s ---\n' "$service" >&2
+        docker compose "${COMPOSE_ARGS[@]}" logs --no-color --tail 15 "$service" </dev/null 2>&1 \
+            | sed -e 's/\x1b\[[0-9;]*m//g' | cut -c1-400 >&2 || true
+    done
+}
+docker compose "${COMPOSE_ARGS[@]}" "${compose_up_args[@]}" </dev/null &
+compose_up_pid=$!
+# A background job of a non-interactive shell ignores Ctrl-C; pass it on so an
+# interrupted install stops `up` as it did when it ran in the foreground.
+trap 'kill "$compose_up_pid" 2>/dev/null; exit 130' INT
+trap 'kill "$compose_up_pid" 2>/dev/null; exit 143' TERM
+compose_up_deadline=$(( $(date +%s) + compose_up_timeout ))
+while kill -0 "$compose_up_pid" 2>/dev/null && (( $(date +%s) < compose_up_deadline )); do
+    sleep 2
+done
+if kill -0 "$compose_up_pid" 2>/dev/null; then
+    kill "$compose_up_pid" 2>/dev/null || true
+    wait "$compose_up_pid" 2>/dev/null || true
+    trap - INT TERM
+    compose_up_hint
+    fail "Services did not finish starting within ${compose_up_timeout} s (usually the one-shot migrator, clickhouse-migrate; its last lines are above). The containers keep running. If the migrator log is still advancing, wait for it and rerun install.sh on this host; if it stopped advancing, check the PostgreSQL leader (patronictl list on a postgres host) and ClickHouse, then rerun install.sh on this host. Raise the wait with NANO_COMPOSE_UP_TIMEOUT=<seconds>."
+fi
+compose_up_rc=0
+wait "$compose_up_pid" || compose_up_rc=$?
+trap - INT TERM
+if (( compose_up_rc != 0 )); then
+    compose_up_hint
+    fail "Starting services failed (see the docker compose output and the last log lines above). Fix the cause, then rerun install.sh on this host; reruns are safe."
+fi
 
 # On a re-run/upgrade, `up -d` recreates the app containers (new IPs) but leaves
 # nginx as-is — and it won't have loaded an updated nginx.conf either. Reload
@@ -2551,7 +2619,7 @@ if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE
                 shared_env_rebaseline
                 warn "The shared .env changed on this host (NANO_PG_HA_SYSTEM_ID): $PG_HA_COPY_ADVICE."
             else
-                log "This postgres host recorded NANO_PG_HA_SYSTEM_ID in its own .env. The first postgres host records the same line with 'sudo ./install.sh --record-pg-ha-identity' (run it there after the last postgres host; it restarts nothing). Then $PG_HA_COPY_ADVICE; this host's .env is then unchanged by the copy."
+                log "This postgres host recorded NANO_PG_HA_SYSTEM_ID in its own .env. The first postgres host records the same line with './install.sh --record-pg-ha-identity' (as the install user, without sudo) (run it there after the last postgres host; it restarts nothing). Then $PG_HA_COPY_ADVICE; this host's .env is then unchanged by the copy."
                 shared_env_rebaseline
             fi ;;
         unchanged*) ;;
@@ -2559,9 +2627,9 @@ if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE
             fail "PostgreSQL HA identity mismatch: ${pg_ha_outcome#conflict }. This host's database is not the cluster recorded in .env; do not continue. See 'Recovering after losing the bootstrap host and etcd' in the multi-node guide." ;;
         *)
             if [[ "${NANO_PATRONI_BOOTSTRAP:-false}" == "true" ]]; then
-                log "PostgreSQL HA bootstraps once a second postgres host joins (etcd needs 2 of 3 members), so its cluster identity cannot be recorded yet. Copy this host's .env to the other postgres hosts and install them; then, on THIS host, run 'sudo ./install.sh --record-pg-ha-identity' (it only records NANO_PG_HA_SYSTEM_ID; it restarts nothing) and copy this host's .env to every host."
+                log "PostgreSQL HA bootstraps once a second postgres host joins (etcd needs 2 of 3 members), so its cluster identity cannot be recorded yet. Copy this host's .env to the other postgres hosts and install them; then, on THIS host, run './install.sh --record-pg-ha-identity' (as the install user, without sudo) (it only records NANO_PG_HA_SYSTEM_ID; it restarts nothing) and copy this host's .env to every host."
             else
-                warn "PostgreSQL HA is still forming on this host; that is fine. After the last postgres host, run 'sudo ./install.sh --record-pg-ha-identity' on the FIRST postgres host and copy its .env to every host."
+                warn "PostgreSQL HA is still forming on this host; that is fine. After the last postgres host, run './install.sh --record-pg-ha-identity' (as the install user, without sudo) on the FIRST postgres host and copy its .env to every host."
             fi ;;
     esac
 fi
@@ -2618,6 +2686,12 @@ else
             postgres|postgres-ha|clickhouse|keeper)
                 docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -qx "$role_service" \
                     || fail "$role_service did not stay running. Check 'docker compose ${COMPOSE_ARGS[*]} logs $role_service'." ;;
+            # NAN-5250: the monitoring role is Prometheus + Grafana.
+            monitoring)
+                for monitoring_service in prometheus grafana; do
+                    docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -qx "$monitoring_service" \
+                        || fail "$monitoring_service did not stay running. Check 'docker compose ${COMPOSE_ARGS[*]} logs $monitoring_service'."
+                done ;;
         esac
     done
     ok "Requested role container(s) running"

@@ -64,21 +64,37 @@ subnet. The rules come from the renderer's port matrix:
 | Port | Key | On | Allow from | When |
 |---|---|---|---|---|
 | 80/tcp | `app` | app hosts | app load balancer | always |
-| 3000/tcp | `api_internal` | app hosts | ingest hosts | always |
+| 3000/tcp | `api_internal` | app hosts | ingest hosts, the monitoring host | always (monitoring: with a monitoring host) |
 | 80/tcp | `ingest` | ingest hosts | ingest load balancer, app hosts | always |
 | 8687/tcp | `vector_tap` | ingest hosts | app hosts | always |
 | 5432/tcp | `postgres` | PostgreSQL hosts | app hosts, ClickHouse hosts, PostgreSQL hosts | always |
 | 8123/tcp | `clickhouse_http` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
 | 9000/tcp | `clickhouse_native` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
 | 9009/tcp | `clickhouse_interserver` | ClickHouse hosts | ClickHouse hosts | always |
-| 9363/tcp | `clickhouse_metrics` | ClickHouse hosts | app hosts | always |
+| 9363/tcp | `clickhouse_metrics` | ClickHouse hosts | app hosts, the monitoring host | always |
 | 9181/tcp | `keeper_client` | Keeper hosts (= PostgreSQL hosts) | app hosts, ClickHouse hosts, Keeper hosts (= PostgreSQL hosts) | always |
 | 9234/tcp | `keeper_raft` | Keeper hosts (= PostgreSQL hosts) | Keeper hosts (= PostgreSQL hosts) | always |
-| 8008/tcp | `patroni_api` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (3 postgres hosts) |
-| 2379/tcp | `etcd_client` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
+| 3030/tcp | `grafana` | the monitoring host | management CIDR | monitoring host |
+| 9090/tcp | `prometheus` | the monitoring host | the monitoring host | monitoring host (loopback only: never open it) |
+| 9100/tcp | `node_exporter` | app hosts | the monitoring host | monitoring host |
+| 8405/tcp | `clickhouse_proxy_metrics` | app hosts | the monitoring host | monitoring host |
+| 8406/tcp | `ingest_proxy_metrics` | app hosts | the monitoring host | monitoring host |
+| 8408/tcp | `postgres_router_metrics` | app hosts | the monitoring host | monitoring host |
+| 8409/tcp | `valkey_router_metrics` | app hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | ingest hosts | the monitoring host | monitoring host |
+| 9598/tcp | `vector_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 8405/tcp | `clickhouse_proxy_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 8407/tcp | `app_api_proxy_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | ClickHouse hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | Keeper hosts (= PostgreSQL hosts) | the monitoring host | monitoring host |
+| 9364/tcp | `keeper_metrics` | Keeper hosts (= PostgreSQL hosts) | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | PostgreSQL hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | the monitoring host | the monitoring host | monitoring host |
+| 8008/tcp | `patroni_api` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (3 postgres hosts) |
+| 2379/tcp | `etcd_client` | PostgreSQL hosts | PostgreSQL hosts, the monitoring host | full HA (3 postgres hosts) |
 | 2380/tcp | `etcd_peer` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
-| 6379/tcp | `valkey` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
-| 26379/tcp | `sentinel` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
+| 6379/tcp | `valkey` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (2+ app hosts) |
+| 26379/tcp | `sentinel` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (2+ app hosts) |
 | 22/tcp | `ssh` | all | management CIDR, app hosts | always (the first app host runs scripts/nano upgrade over SSH) |
 <!-- END plan.py --port-matrix -->
 
@@ -271,14 +287,27 @@ anything; run `scripts/pg-preflight.py` first so a gap shows before `helm instal
 | Version | PostgreSQL 16 or newer (16, 17 and 18 tested). 2.0.10 and earlier need 17+ |
 | Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`, **allow-listed in the `azure.extensions` server parameter**. Without it the migrator stops with `extension "pg_trgm" is not allow-listed`. Nothing else is needed (no `shared_preload_libraries`); `btree_gin`, `btree_gist` and `citext` are not used |
 | Parameters | `azure.extensions` as above. Default `require_secure_transport=ON` is fine (`sslmode: require`). Allow at least 200 connections (about 20 per nano pod): avoid Burstable B1ms/B1s (50 connections, no HA) |
+| Schema | The nano user needs `CREATE` on schema `public` in its database. On flexible server `public` belongs to `azure_pg_admin` in new databases, so the database owner can't create tables there and the first migration fails with `permission denied for schema public`. The bootstrap SQL below fixes it (`ALTER SCHEMA public OWNER TO nanosiem`) |
 | Network | Private access (VNet integration): a subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers` in, or peered with, the AKS VNet, and a private DNS zone linked to the AKS VNet. Or a private endpoint. No public access |
-| HA | `--high-availability ZoneRedundant` (standby in another zone). Not every region, and not the Burstable tier, offers it; then use `SameZone` (standby in the same zone, protects against a server failure only) and say so to the operator |
+| HA | Zone-redundant HA (standby in another zone): `--zonal-resiliency Enabled --zone 1 --standby-zone 2` on az 2.88 and newer (older az: `--high-availability ZoneRedundant`). Not every region, and not the Burstable tier, offers it; then use same-zone HA (`--zonal-resiliency Enabled --allow-same-zone`; older az: `--high-availability SameZone`), which protects against a server failure only, and say so to the operator |
 
 The operator creates the server (portal, Terraform with the admin password
 from Key Vault, or `az postgres flexible-server create` with `--version 17
---tier GeneralPurpose --sku-name Standard_D2ds_v5 --high-availability
-ZoneRedundant --zone 1 --standby-zone 2 --vnet ... --subnet ...
---private-dns-zone ...`). Never pass `--admin-password` on a command line.
+--tier GeneralPurpose --sku-name <SKU> --zonal-resiliency Enabled --zone 1
+--standby-zone 2 --vnet ... --subnet ... --private-dns-zone ... --tags $TAGS`).
+Never pass `--admin-password` on a command line. Check `az --version` first:
+az 2.88 removed `--high-availability` (`unrecognized arguments`).
+
+Pick the SKU from what the region offers, not from an example:
+
+```bash
+az postgres flexible-server list-skus -l $PG_LOC -o table   # GeneralPurpose, 2+ vCores, HA column
+```
+
+A listed SKU can still be refused at create time (`SkuNotAvailable`: in one
+test `Standard_D2ds_v5` was refused in eastus2 while `Standard_D2ads_v5`
+worked). Each failed create costs about 5 minutes; on a refusal try the
+other family of the same size (`ds` / `ads`) before another region.
 Then allow the extensions, keeping any value already there:
 
 ```bash
@@ -292,18 +321,52 @@ The change applies without a restart. If zone-redundant HA is refused
 ("not supported in this region" or for the SKU), create it with `SameZone`.
 
 Create the role and database as the admin user, in `psql` (`\password`
-prompts, so the password never lands in history or on a command line):
+prompts, so the password never lands in history or on a command line), then
+give the nano user schema `public` in its database:
 
 ```sql
 CREATE ROLE nanosiem LOGIN;
 \password nanosiem
 GRANT nanosiem TO <admin user>;          -- PostgreSQL 16+: needed before ... OWNER nanosiem
 CREATE DATABASE nanosiem OWNER nanosiem;
+\connect nanosiem
+ALTER SCHEMA public OWNER TO nanosiem;   -- flexible server: public belongs to azure_pg_admin
 ```
 
-The owner can create the three trusted extensions itself. Use a URL-safe
+Without the last statement the first migration fails with `permission denied
+for schema public` (`GRANT ALL ON SCHEMA public TO nanosiem;` works too). The
+owner can create the three trusted extensions itself. Use a URL-safe
 password (it is interpolated into `DATABASE_URL`), then check with
-`scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)).
+`scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)); from
+2.0.12 it fails (`FAIL schema`) with this fix when the step was missed.
+
+**Private-only server: run `psql` in a one-off pod.** The server has no
+public address, so `psql` from a workstation can't reach it. Run the SQL above
+from a temporary pod in the AKS cluster, with both passwords in a temporary
+Secret and never on a command line: the "Reaching a private RDS or Azure
+server" block in the product guide
+(nano.rs/docs/getting-started/kubernetes#managed-postgresql-requirements),
+with `user=<admin user> host=<server>.postgres.database.azure.com`. Delete
+the Secret afterwards. (Alternative: `az postgres flexible-server execute`
+needs a temporary public firewall rule; don't open one on a private server.)
+
+**PostgreSQL in another region.** Some subscriptions are refused flexible
+server in the cluster's region (`Provisioning is restricted in this region`).
+Prefer asking for access in that region. If the operator accepts another
+region, the private layout is:
+
+1. a VNet in the PostgreSQL region with a subnet delegated to
+   `Microsoft.DBforPostgreSQL/flexibleServers` (non-overlapping with the AKS
+   VNet, e.g. `10.60.0.0/16`);
+2. **global VNet peering in both directions** between that VNet and the AKS
+   VNet (`az network vnet peering create ... --allow-vnet-access` twice);
+3. **one** private DNS zone (`<name>.private.postgres.database.azure.com`)
+   linked to **both** VNets (`az network private-dns link vnet create` twice),
+   passed to the server create with `--private-dns-zone`.
+
+Cross-region traffic is billed and adds latency to every query; with 2.0.11
+the first migration took about 6 minutes cross-region (eastus to eastus2),
+well inside `--timeout 30m`.
 
 ## AKS for the Helm chart
 
@@ -418,8 +481,8 @@ Then, in order (each is a hard stop for the chart):
 
    ```bash
    az network alb create -g $RG -n $NAME-agc --tags $TAGS
-   az network alb frontend create -g $RG --alb-name $NAME-agc -n fe-app
-   az network alb frontend create -g $RG --alb-name $NAME-agc -n fe-ingest
+   az network alb frontend create -g $RG --alb-name $NAME-agc -n fe-app --tags $TAGS
+   az network alb frontend create -g $RG --alb-name $NAME-agc -n fe-ingest --tags $TAGS
    # about 5-6 minutes
    az network alb association create -g $RG --alb-name $NAME-agc -n assoc-aks \
      --subnet $(az network vnet subnet show -g $RG --vnet-name $NAME-aks-vnet -n agc --query id -o tsv)
@@ -455,17 +518,76 @@ Then, in order (each is a hard stop for the chart):
    (`cloud-managed` is refused on Azure). Install cert-manager and a
    ClusterIssuer for both host names; set `tls.certManager.issuerRef.name`.
    Use the operator's own domain: Let's Encrypt on `*.alb.azure.com` names
-   shares azure.com's rate limit. Evaluation without a domain: a private CA
-   ClusterIssuer (`make-private-ca.sh`) on the frontend FQDNs.
+   shares azure.com's rate limit. To bring certificates instead, set
+   `tls.mode: existingSecret` in `values-aks.yaml` (layered after
+   `values-azure.yaml`, so it wins; that is the one exception to "don't set
+   `tls.mode`").
+
+   **Evaluation without a domain:** use the AGC frontends' own host names
+   (`az network alb frontend show ... --query fqdn`) as the app and ingest
+   host names, with a private CA issued by cert-manager itself
+   (`make-private-ca.sh` is not this: it makes a server certificate for
+   role-split private transport). Senders and browsers must trust
+   `nano-private-ca`'s `ca.crt`:
+
+   ```yaml
+   apiVersion: cert-manager.io/v1
+   kind: ClusterIssuer
+   metadata: {name: selfsigned-bootstrap}
+   spec: {selfSigned: {}}
+   ---
+   apiVersion: cert-manager.io/v1
+   kind: Certificate
+   metadata: {name: nano-private-ca, namespace: cert-manager}
+   spec:
+     isCA: true
+     commonName: nano-private-ca
+     secretName: nano-private-ca
+     privateKey: {algorithm: ECDSA, size: 256}
+     issuerRef: {name: selfsigned-bootstrap, kind: ClusterIssuer}
+   ---
+   apiVersion: cert-manager.io/v1
+   kind: ClusterIssuer
+   metadata: {name: nano-private-ca}
+   spec: {ca: {secretName: nano-private-ca}}
+   ```
+
+   Then `tls.certManager.issuerRef.name: nano-private-ca`. Read the CA for
+   clients with `kubectl -n cert-manager get secret nano-private-ca -o
+   jsonpath='{.data.ca\.crt}' | base64 -d > nano-ca.crt`.
 
 5. **PostgreSQL.** For production, flexible server with the three extensions
    allow-listed **before** install (otherwise the first migration burns its
    retries on `not allow-listed`). See
    [Managed PostgreSQL (Azure flexible server)](#managed-postgresql-azure-flexible-server).
-   Keep it in the cluster's region; a cross-region server slows the first
-   migration enough to hit Deployment progress deadlines on chart 2.0.10.
-   Tell the operator what a failover looks like: same-zone HA forced
-   failover gave about 30 s of failed sign-ins and API writes, no HEC loss.
+   Keep it in the cluster's region when you can; a cross-region server
+   slows the first migration enough to hit Deployment progress deadlines on
+   chart 2.0.10 (for the cross-region layout see
+   [PostgreSQL in another region](#managed-postgresql-azure-flexible-server)).
+   Tell the operator what a failover looks like: a forced failover (same-zone
+   or zone-redundant) gave about 30 s of failed sign-ins and API writes and no
+   HEC loss. On 2.0.11, OTLP failed with HTTP 500 for about 48 s (senders drop
+   500); from 2.0.12 it answers 503 with `Retry-After` until the API is back
+   ([known-issues.md](known-issues.md)).
+
+7. **Tag what AKS creates.** `--tags` on the commands above does not reach
+   resources Azure creates for you: the PVC disks in the `MC_` group (the AGC
+   frontends get tags only from their own `--tags`, as above). After install,
+   tag the disks of the `nano` namespace and check nothing is left untagged:
+
+   ```bash
+   MC_RG=$(az aks show -g $RG -n $NAME --query nodeResourceGroup -o tsv)
+   for id in $(az disk list -g $MC_RG --query "[?tags.\"kubernetes.io-created-for-pvc-namespace\"=='nano'].id" -o tsv); do
+     az resource tag --is-incremental --ids "$id" --tags $TAGS -o none
+   done
+   az resource list -g $MC_RG --query "[?tags.\"nano-deployment\"==null].{name:name,type:type}" -o table
+   az resource list -g $RG --query "[?tags.\"nano-deployment\"==null].{name:name,type:type}" -o table
+   ```
+
+   To tag disks as they are created, give the chart a StorageClass that
+   copies `default` with the Azure Disk CSI parameter
+   `tags: nano-deployment=<cluster name>`, and set it as `global.storageClass`
+   and `clickhouse.storage.storageClass` (both `""` = the cluster default).
 
 6. **Registry credential.** The chart's `registryCredentialRefresh` CronJob
    keeps `nano-registry` fresh (see [helm.md](helm.md)). After the pull, run

@@ -44,6 +44,7 @@ import { api } from '@/lib/api';
 import type { ArtifactOccurrence as ApiArtifactOccurrence } from '@/lib/api/types';
 import { formatInTimeZone } from 'date-fns-tz';
 import { CHART_AXIS_LINE, CHART_AXIS_TEXT } from '@/lib/chart-colors';
+import { artifactCandidates } from '@/lib/prevalence/artifactFields';
 import { buildTimelinePlotData, timelinePlotDomain, timelineSeriesData, resolveBucketStart, type TimelinePlotPoint } from './timeline-fill';
 import {
   buildObservationQueries,
@@ -355,17 +356,6 @@ function extractArtifactsWithTimestamps(
       }
     };
 
-    // Extract file hashes
-    addHash(fields.file_hash);
-    addHash(fields.process_hash);
-
-    // Also check for hashes in metadata
-    const metadata = fields.metadata as Record<string, unknown> | undefined;
-    if (metadata) {
-      addHash(metadata.file_hash);
-      addHash(metadata.process_hash);
-    }
-
     // Helper to extract domain from URL
     const extractDomainFromUrl = (url: unknown) => {
       if (!url || typeof url !== 'string') return;
@@ -380,18 +370,13 @@ function extractArtifactsWithTimestamps(
       }
     };
 
-    // Extract domains from various fields
-    addDomain(fields.dest_host);
-    addDomain(fields.dest_domain);
-    addDomain(fields.domain);
-    addDomain(fields.query);       // DNS queries (Sysmon Event 22)
-    addDomain(fields.url_domain);  // Proxy/web logs
-    addDomain(fields.http_host);   // HTTP Host header
-
-    // Extract domains from URL fields
-    extractDomainFromUrl(fields.url);
-    extractDomainFromUrl(fields.http_referrer);
-    extractDomainFromUrl(fields.file_path);  // Sometimes contains URLs
+    // NAN-5270: UDM + OCSF artifact fields (OCSF rows carry flat dotted keys
+    // like `dst_endpoint.hostname`; reading UDM names only left OCSF searches
+    // with zero artifacts → Rarity "0 unique").
+    const candidates = artifactCandidates(fields as Record<string, unknown>);
+    candidates.hashes.forEach(addHash);
+    candidates.domains.forEach(addDomain);
+    candidates.urls.forEach(extractDomainFromUrl);
   }
 
   // NAN-1701: no arbitrary 50-cap — an analyst must see every artifact. The only

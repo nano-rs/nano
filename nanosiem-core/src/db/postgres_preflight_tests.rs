@@ -106,6 +106,122 @@ fn missing_extension_message_names_extensions_and_leads_with_the_platform_fix() 
     assert!(msg.contains("rds.allowed_extensions"), "{msg}");
 }
 
+#[test]
+fn only_a_checksum_mismatch_is_not_pending_work() {
+    use crate::db::{schema_check_means_pending, SchemaCheckError};
+    let pending = SchemaCheckError::Pending { label: "core", version: 1, description: "x".into() };
+    let failed = SchemaCheckError::Failed { label: "core", version: 1, description: "x".into() };
+    let drift = SchemaCheckError::ChecksumMismatch { label: "core", version: 1, description: "x".into() };
+    let fresh = SchemaCheckError::HistoryUnavailable { label: "core", source: sqlx::Error::RowNotFound };
+    assert!(schema_check_means_pending(&pending));
+    assert!(schema_check_means_pending(&failed));
+    assert!(schema_check_means_pending(&fresh));
+    assert!(!schema_check_means_pending(&drift));
+}
+
+#[test]
+fn schema_create_message_names_the_user_and_both_fixes() {
+    let access = PublicSchemaAccess {
+        user: "nanosiem".into(),
+        database: "nanosiem".into(),
+        owner: Some("azure_pg_admin".into()),
+        can_create: false,
+    };
+    let msg = schema_create_message(&PostgresPlatform::AzureFlexibleServer, &access);
+    assert!(msg.contains("Azure Database for PostgreSQL flexible server"), "{msg}");
+    assert!(msg.contains("schema owner: azure_pg_admin"), "{msg}");
+    assert!(msg.contains("ALTER SCHEMA public OWNER TO nanosiem;"), "{msg}");
+    assert!(msg.contains("GRANT ALL ON SCHEMA public TO nanosiem;"), "{msg}");
+    assert!(msg.contains("as the server admin user, connected to database nanosiem"), "{msg}");
+    assert!(msg.contains("Nothing was applied"), "{msg}");
+
+    let absent = PublicSchemaAccess { owner: None, ..access };
+    let msg = schema_create_message(&PostgresPlatform::Rds, &absent);
+    assert!(msg.contains("CREATE SCHEMA public AUTHORIZATION nanosiem;"), "{msg}");
+    assert!(msg.contains("the master user"), "{msg}");
+}
+
+/// NAN-5269: a role that owns the database but not schema `public` and has no
+/// CREATE on it (Azure flexible server's layout) must be refused before any DDL.
+/// Needs `NANOSIEM_TEST_DATABASE_URL` to connect as a superuser of a disposable
+/// server; creates and drops its own role and database.
+#[tokio::test]
+async fn preflight_refuses_a_role_without_create_on_public() {
+    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else {
+        return;
+    };
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect test database");
+    let suffix = format!("{:08x}", rand::random::<u32>());
+    let role = format!("nano_pf_{suffix}");
+    let db = format!("nano_pf_{suffix}");
+    let password = format!("pw{suffix}");
+    for sql in [
+        format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'"),
+        format!("CREATE DATABASE {db} OWNER {role}"),
+    ] {
+        sqlx::query(&sql).execute(&admin).await.expect("setup");
+    }
+    let mut opts: sqlx::postgres::PgConnectOptions = url.parse().expect("parse url");
+    let admin_db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts.clone().database(&db))
+        .await
+        .expect("connect new database as admin");
+    // Azure flexible server's layout: someone else owns `public`, the
+    // database owner keeps only USAGE.
+    for sql in [
+        "ALTER SCHEMA public OWNER TO CURRENT_USER".to_string(),
+        "REVOKE ALL ON SCHEMA public FROM PUBLIC".to_string(),
+        "GRANT USAGE ON SCHEMA public TO PUBLIC".to_string(),
+    ] {
+        sqlx::query(&sql).execute(&admin_db).await.expect("schema setup");
+    }
+    opts = opts.database(&db).username(&role).password(&password);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts.clone())
+        .await
+        .expect("connect as nano role");
+    let err = check_postgres_compatibility(&pool, true).await.expect_err("must refuse");
+    let msg = err.to_string();
+    assert!(matches!(err, PostgresPreflightError::NoCreateOnPublicSchema { .. }), "{msg}");
+    assert!(msg.contains(&format!("ALTER SCHEMA public OWNER TO {role};")), "{msg}");
+
+    // Nothing pending (an existing, working install): warn with the same fix
+    // and carry on; this check must never stop an install that runs.
+    let report = check_postgres_compatibility(&pool, false)
+        .await
+        .expect("nothing pending: warn, don't fail");
+    let warning = report.schema_warning.expect("the warning carries the fix");
+    assert!(warning.contains("no migration pending, continuing"), "{warning}");
+    assert!(warning.contains(&format!("ALTER SCHEMA public OWNER TO {role};")), "{warning}");
+    assert!(warning.contains(&format!("GRANT ALL ON SCHEMA public TO {role};")), "{warning}");
+    // This database has no migration history, so the core migrations are pending.
+    assert!(crate::db::postgres_migrations_pending(&pool).await);
+    pool.close().await;
+
+    // The documented fix makes the same role pass.
+    sqlx::query(&format!("GRANT ALL ON SCHEMA public TO {role}"))
+        .execute(&admin_db)
+        .await
+        .unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    let report = check_postgres_compatibility(&pool, true).await.expect("passes after GRANT");
+    assert!(report.schema_warning.is_none());
+    pool.close().await;
+    admin_db.close().await;
+    sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("DROP ROLE {role}")).execute(&admin).await.unwrap();
+}
+
 #[tokio::test]
 async fn preflight_passes_on_a_stock_server_and_installs_nothing() {
     let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else {
@@ -120,7 +236,7 @@ async fn preflight_passes_on_a_stock_server_and_installs_nothing() {
         .fetch_all(&pool)
         .await
         .unwrap();
-    let report = check_postgres_compatibility(&pool).await.expect("preflight passes");
+    let report = check_postgres_compatibility(&pool, true).await.expect("preflight passes");
     assert!(report.server_version_num >= MIN_POSTGRES_VERSION_NUM);
     let after: Vec<String> = sqlx::query_scalar("SELECT extname::text FROM pg_extension ORDER BY 1")
         .fetch_all(&pool)

@@ -261,6 +261,7 @@ pub fn field(value: &str) -> Result<String, String> {
         // Protected parser-health identity stamped after the pipeline runs.
         "_nano_parser_id",
         "_nano_parser_failure",
+        "_nano_parser_fallback",
     ]
     .contains(&parts[0])
         || parts[0] == "metadata"

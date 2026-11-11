@@ -154,7 +154,14 @@ change that briefly breaks trust between hosts. Plan it with nano support.
 ## Support bundle
 
 Every install ships `scripts/nano support-bundle` (v2.0.11 and later). Run it
-on any one host; on a role split it collects every inventory host over SSH:
+on any one host; on a role split it collects every inventory host over SSH.
+That needs SSH trust from the host it runs on to every other host (the
+install user's key, non-interactive: `ssh -o BatchMode=yes <address> true`),
+which a fresh install does not set up. Without it the archive holds only the
+local host and `MANIFEST.json` lists each other host with `Permission denied
+(publickey)`; run it from the first app host after the
+[upgrade prerequisites](upgrade.md#path-a-compose-from-v2010-or-later-scriptsnano-upgrade)
+are in place, or use the per-host fallback below:
 
 ```bash
 ssh $H 'cd ~/nano && scripts/nano support-bundle --since 24h'      # prints the archive path

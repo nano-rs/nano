@@ -14,7 +14,8 @@ pull credential can read:
 
 ```bash
 export CHART=oci://us-central1-docker.pkg.dev/nano-rs/nanosiem-customer/charts/nano
-export V=<chart version = release version, e.g. 2.0.10>
+# The current release (or the version the operator chose):
+export V=$(curl -fsS https://api.nano.rs/api/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
 ```
 
 (`.../nano-rs/charts/nano` is not readable with a customer credential: 403.)
@@ -42,9 +43,10 @@ need an ingest node pool labelled and tainted `nano.rs/pool=ingest`, or
 override `ingest.nodeSelector`/`ingest.tolerations`. Report gaps and stop.
 
 External PostgreSQL (`postgresql.mode: external`, every production install):
-check it before `helm install`, read-only. The probe needs PostgreSQL 16+ and
-that the nano user can create `pg_trgm`, `pgcrypto` and `uuid-ossp`; each
-CREATE EXTENSION is rolled back. Run it from inside the cluster (it reaches
+check it before `helm install`, read-only. The probe needs PostgreSQL 16+,
+that the nano user can CREATE in schema `public` (Azure flexible server gives
+`public` to `azure_pg_admin`), and that it can create `pg_trgm`, `pgcrypto` and
+`uuid-ossp`; each CREATE EXTENSION is rolled back. Run it from inside the cluster (it reaches
 private-IP databases) once the namespace and the password Secret exist (Step 2):
 
 ```bash
@@ -59,9 +61,17 @@ DB_HOST` uses the operator's `PGPASSWORD` / `~/.pgpass`. `POSTGRES-NOT-READY`
 is a hard stop; it prints the fix (the per-cloud details are in
 [cloud-aws.md](cloud-aws.md#managed-postgresql-rds), [cloud-gcp.md](cloud-gcp.md#managed-postgresql-cloud-sql)
 and [cloud-azure.md](cloud-azure.md#managed-postgresql-azure-flexible-server)). The
-migrator runs the same check before it applies anything (2.0.11+), so a
-missed one fails `nano-migrate-r1` with the same message instead of a
-half-applied schema.
+migrator runs the same check before it applies anything (2.0.11+; the
+schema check from 2.0.12), so a missed one fails `nano-migrate-r1` with the
+same message instead of a half-applied schema. With 2.0.11 and the skill
+before 2.0.12, a missing `CREATE` on `public` passed both checks and failed
+the first migration with `permission denied for schema public`
+([known-issues.md](known-issues.md)).
+
+After a failed first migration is fixed, the failed `nano-migrate-r1` pods
+stay behind and keep `k8s-health.py` at `WARN jobs` until the next `helm
+upgrade` replaces the Job. Once the install is healthy, delete them:
+`kubectl -n nano delete pod -l job-name=nano-migrate-r1 --field-selector=status.phase=Failed`.
 
 ## Step 1: choose the presets
 
@@ -145,6 +155,11 @@ it and put the certificate references in `values-site.yaml`, e.g.
 `values-licence.yaml` is secret: mode `0600`, never committed. Alternatively,
 the operator manages the whole secret (`secrets.existingSecret`, for example
 External Secrets or Vault) with the keys listed in the product guide.
+The product guide passes the token with `--set-file
+secrets.licenseToken=./license-token.txt` instead; both set the same key. An
+upgrade that leaves the token out keeps the one already installed (the chart
+reuses every key of the existing `nano-secrets`), so the guide's upgrade
+command omits it safely. Pass a new token only to replace it.
 
 For about 10–15 GB/day, the Kubernetes guide's "Example: about 12.5 GB/day"
 layers `values-small.yaml` with larger ClickHouse resources and 1500Gi of
@@ -193,8 +208,20 @@ fails, read the migration Job's log first, fix the cause, and run the same
 `helm upgrade --install` again ([known-issues.md](known-issues.md)).
 
 Before go-live, confirm the cluster ENFORCES NetworkPolicy (GKE Dataplane V2,
-EKS VPC CNI network policy agent, AKS `--network-policy`): the chart's policy
-protects Vector's in-cluster ports only where it is enforced.
+EKS VPC CNI network policy agent, set at creation in
+[cloud-aws.md](cloud-aws.md#amazon-eks-for-the-helm-chart); AKS
+`--network-policy`): the chart's policy protects Vector's in-cluster ports
+only where it is enforced. Check from another namespace (prints `000` when
+enforced, `401` when not; the pod ends normally either way):
+
+```bash
+kubectl run np-test -n default --rm -i --image=curlimages/curl:8.12.1 --restart=Never --command -- \
+  sh -c 'curl -s -m 5 -o /dev/null -w "%{http_code}\n" http://nano-vector-internal.nano.svc.cluster.local:4318/v1/logs; true'
+```
+
+Vector's metrics port (9598, no credential, read-only counters) stays open
+to every pod on 2.0.11 even with enforcement; from 2.0.12 only to nano's
+namespace (`vector.metrics.networkPolicyFrom` adds a scraper's namespace).
 
 `upgrade --install` is idempotent. Point DNS for both hostnames at the two
 Gateways (`kubectl -n nano get gateway`).

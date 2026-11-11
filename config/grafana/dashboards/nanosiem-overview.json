@@ -1,573 +1,789 @@
 {
+  "uid": "nanosiem-overview",
+  "title": "nano Overview",
+  "description": "Is nano up, ingesting and searching? Start here.",
+  "tags": [
+    "nano",
+    "overview"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "version": 1,
+  "links": [
+    {
+      "type": "dashboards",
+      "tags": [
+        "nano"
+      ],
+      "asDropdown": true,
+      "title": "nano dashboards"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(up, host)",
+          "refId": "host"
+        },
+        "definition": "label_values(up, host)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1,
+        "hide": 0
+      }
+    ]
+  },
   "annotations": {
     "list": []
   },
-  "editable": true,
-  "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
-  "id": null,
-  "links": [],
-  "liveNow": false,
   "panels": [
     {
+      "type": "row",
+      "title": "Services",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "API up",
+      "description": "nano-api targets answering scrapes.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(up{job=\"nano-api\", host=~\"$host\"} == 1) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 0 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
-          "unit": "short"
+          "mappings": []
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "id": 1,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
+        "colorMode": "background",
+        "graphMode": "none",
         "textMode": "auto"
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "up{job=\"nanosiem-api\"}",
-          "legendFormat": "API",
-          "refId": "A"
-        }
-      ],
-      "title": "API Status",
-      "type": "stat"
+      "id": 2
     },
     {
+      "type": "stat",
+      "title": "Search up",
+      "description": "nano-search targets answering scrapes.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 4,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(up{job=\"nano-search\", host=~\"$host\"} == 1) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 0 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
-          "unit": "short"
+          "mappings": []
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
-      "id": 2,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
+        "colorMode": "background",
+        "graphMode": "none",
         "textMode": "auto"
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "up{job=\"vector\"}",
-          "legendFormat": "Vector",
-          "refId": "A"
-        }
-      ],
-      "title": "Vector Status",
-      "type": "stat"
+      "id": 3
     },
     {
+      "type": "stat",
+      "title": "Jobs up",
+      "description": "nano-jobs targets answering scrapes.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(up{job=\"nano-jobs\", host=~\"$host\"} == 1) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 0 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
-          "unit": "short"
+          "mappings": []
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
-      "id": 3,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
+        "colorMode": "background",
+        "graphMode": "none",
         "textMode": "auto"
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "up{job=\"postgres\"}",
-          "legendFormat": "PostgreSQL",
-          "refId": "A"
-        }
-      ],
-      "title": "PostgreSQL Status",
-      "type": "stat"
+      "id": 4
     },
     {
+      "type": "stat",
+      "title": "Vector up",
+      "description": "nano-vector targets answering scrapes.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(up{job=\"nano-vector\", host=~\"$host\"} == 1) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 0 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
-          "unit": "short"
+          "mappings": []
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
-      "id": 4,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
+        "colorMode": "background",
+        "graphMode": "none",
         "textMode": "auto"
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "up{job=\"clickhouse\"}",
-          "legendFormat": "ClickHouse",
-          "refId": "A"
-        }
-      ],
-      "title": "ClickHouse Status",
-      "type": "stat"
+      "id": 5
     },
     {
+      "type": "stat",
+      "title": "ClickHouse up",
+      "description": "clickhouse targets answering scrapes.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 16,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(up{job=\"clickhouse\", host=~\"$host\"} == 1) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
-          "unit": "reqps"
+          "mappings": []
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
-      "id": 5,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "id": 6
+    },
+    {
+      "type": "stat",
+      "title": "Alerts firing",
+      "description": "nano alert rules firing now (Prometheus ALERTS).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(ALERTS{alertstate=\"firing\", alertname=~\"Nano.*\", alertname!=\"NanoHeartbeat\"}) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "id": 7
+    },
+    {
+      "type": "row",
+      "title": "Ingest",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "id": 8
+    },
+    {
+      "type": "timeseries",
+      "title": "Events written to ClickHouse",
+      "description": "Events per second Vector's ClickHouse sinks sent, per ingest host.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (host) (rate(nanosiem_vector_component_sent_events_total{job=\"nano-vector\", component_type=\"clickhouse\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{host}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "eps"
+        },
+        "overrides": []
+      },
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "none"
+          "sort": "desc"
         }
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(rate(axum_http_requests_total{job=\"nanosiem-api\"}[5m]))",
-          "legendFormat": "Total Requests",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(axum_http_requests_total{job=\"nanosiem-api\", status=~\"2..\"}[5m]))",
-          "legendFormat": "2xx Success",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(axum_http_requests_total{job=\"nanosiem-api\", status=~\"4..\"}[5m]))",
-          "legendFormat": "4xx Client Errors",
-          "refId": "C"
-        },
-        {
-          "expr": "sum(rate(axum_http_requests_total{job=\"nanosiem-api\", status=~\"5..\"}[5m]))",
-          "legendFormat": "5xx Server Errors",
-          "refId": "D"
-        }
-      ],
-      "title": "API Request Rate",
-      "type": "timeseries"
+      "id": 9
     },
     {
+      "type": "timeseries",
+      "title": "Events received by Vector",
+      "description": "Events per second arriving at Vector's sources (internal sources excluded).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (host) (rate(nanosiem_vector_component_received_events_total{job=\"nano-vector\", component_kind=\"source\", component_type!~\"internal_.*\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{host}}"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
-          "unit": "short"
+          "unit": "eps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
-      "id": 6,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "none"
+          "sort": "desc"
         }
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(rate(nanosiem_vector_component_sent_events_total{job=\"vector\"}[5m]))",
-          "legendFormat": "Events/sec",
-          "refId": "A"
-        }
-      ],
-      "title": "Vector Events Ingested",
-      "type": "timeseries"
+      "id": 10
     },
     {
+      "type": "row",
+      "title": "API",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      },
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "API requests",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (status) (rate(axum_http_requests_total{job=\"nano-api\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "unit": "reqps",
           "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
             "stacking": {
-              "group": "A",
-              "mode": "none"
+              "mode": "normal"
             },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "fillOpacity": 20
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 12
+    },
+    {
+      "type": "timeseries",
+      "title": "API latency",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(axum_http_requests_duration_seconds_bucket{job=\"nano-api\", host=~\"$host\"}[$__rate_interval])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(axum_http_requests_duration_seconds_bucket{job=\"nano-api\", host=~\"$host\"}[$__rate_interval])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(axum_http_requests_duration_seconds_bucket{job=\"nano-api\", host=~\"$host\"}[$__rate_interval])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
           "unit": "s"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "id": 7,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "none"
+          "sort": "desc"
         }
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, sum(increase(axum_http_requests_duration_seconds_bucket{job=\"nanosiem-api\"}[15m])) by (le))",
-          "legendFormat": "P50",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum(increase(axum_http_requests_duration_seconds_bucket{job=\"nanosiem-api\"}[15m])) by (le))",
-          "legendFormat": "P95",
-          "refId": "B"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum(increase(axum_http_requests_duration_seconds_bucket{job=\"nanosiem-api\"}[15m])) by (le))",
-          "legendFormat": "P99",
-          "refId": "C"
-        }
-      ],
-      "title": "API Response Latency",
-      "type": "timeseries"
+      "id": 13
     },
     {
+      "type": "row",
+      "title": "Health",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 1
+      },
+      "id": 14
+    },
+    {
+      "type": "table",
+      "title": "Firing alerts",
+      "description": "Every alert firing now, with its labels.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "ALERTS{alertstate=\"firing\", alertname!=\"NanoHeartbeat\"}",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
-          "unit": "bytes"
+          "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-      "id": 8,
-      "options": {
-        "legend": {
-          "calcs": ["mean", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
+      "options": {},
+      "transformations": [
         {
-          "expr": "nanosiem_vector_buffer_size_bytes{job=\"vector\"}",
-          "legendFormat": "{{ component_id }}",
-          "refId": "A"
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            }
+          }
         }
       ],
-      "title": "Vector Buffer Size",
-      "type": "timeseries"
-    }
-  ],
-  "refresh": "30s",
-  "schemaVersion": 38,
-  "tags": ["nanosiem", "overview"],
-  "templating": {
-    "list": [
-      {
-        "current": {
-          "selected": false,
-          "text": "Prometheus",
-          "value": "Prometheus"
+      "id": 15
+    },
+    {
+      "type": "table",
+      "title": "Scrape targets down",
+      "description": "Targets Prometheus cannot scrape. Empty is good.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "up{host=~\"$host\"} == 0",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
         },
-        "hide": 0,
-        "includeAll": false,
-        "multi": false,
-        "name": "datasource",
-        "options": [],
-        "query": "prometheus",
-        "queryValue": "",
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "type": "datasource"
-      }
-    ]
-  },
-  "time": {
-    "from": "now-1h",
-    "to": "now"
-  },
-  "timepicker": {},
-  "timezone": "",
-  "title": "NanoSIEM Overview",
-  "uid": "nanosiem-overview",
-  "version": 1,
-  "weekStart": ""
+        "overrides": []
+      },
+      "options": {},
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            }
+          }
+        }
+      ],
+      "id": 16
+    }
+  ]
 }

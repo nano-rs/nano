@@ -42,7 +42,7 @@ pub(super) fn effective_match_scope(auth: &AuthContext) -> MatchScope {
         ("id" = String, Path, description = "Detection rule ID")
     ),
     responses(
-        (status = 200, description = "Rule triggered successfully", body = inline(Object)),
+        (status = 200, description = "Rule ran now: `{triggered, rule_id (TypeID), window_start, window_end}`. A manual run does not change `last_run_at` (the scheduler's coverage mark)", body = inline(Object)),
         (status = 403, description = "Missing permission: detections:promote", body = ErrorResponse),
         (status = 404, description = "Rule not found", body = ErrorResponse),
         (status = 500, description = "Scheduler not running or failed to trigger", body = ErrorResponse),
@@ -81,7 +81,16 @@ pub async fn trigger_detection(
             .build(),
     );
 
-    Ok(Json(serde_json::json!({"triggered": true, "rule_id": *id})))
+    // NAN-5269: the rule's TypeID (`rule_...`), as every other rule API
+    // returns it, and the window this run scanned. A manual run does not
+    // move `last_run_at`: that is the scheduler's coverage high-water mark,
+    // and advancing it from an ad-hoc window could skip unscanned minutes.
+    Ok(Json(serde_json::json!({
+        "triggered": true,
+        "rule_id": nanosiem_core::typeid::encode("rule", &*id),
+        "window_start": start.to_rfc3339(),
+        "window_end": end.to_rfc3339(),
+    })))
 }
 
 /// Get daily stats for all detection rules (for sparkline charts)

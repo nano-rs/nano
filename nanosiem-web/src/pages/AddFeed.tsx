@@ -1142,7 +1142,8 @@ export function AddFeed() {
     const parser = catalog.data?.find((p) => p.id === id);
     if (!parser) return;
     nameTouched.current = true;
-    setFeedId(parserSlug(parser)); setName(parser.display_name ?? parser.name ?? parserSlug(parser));
+    // NAN-5264: the parser's own match value, not its name (windows_sysmon, not windows_sysmon_ocsf).
+    setFeedId(parser.match_value); setName(parser.display_name ?? parser.name ?? parser.match_value);
     setVendor(parser.vendor ?? ''); setProduct(parser.product ?? ''); setCategory(parser.category ?? ''); setDescription(parser.description ?? '');
     setVrl(parser.parser_vrl ?? '');
   }, [catalog.data]);
@@ -1150,7 +1151,7 @@ export function AddFeed() {
   useEffect(() => {
     const type = searchParams.get('type');
     if (!type || catalogDeepLinkApplied.current || !catalog.data) return;
-    const parser = catalog.data.find((p) => p.id === type || parserSlug(p) === type);
+    const parser = catalog.data.find((p) => p.id === type || p.match_value === type || parserSlug(p) === type);
     if (parser) { catalogDeepLinkApplied.current = true; chooseCatalog(parser.id); }
   }, [searchParams, catalog.data, chooseCatalog]);
 
@@ -1920,8 +1921,9 @@ function SourceStep({
           {repositories.size > 0 && <CommandGroup heading="From repositories" forceMount>
             {Array.from(repositories, ([id, repoName]) => <CommandGroup heading={repoName} key={id}>
               {(catalog.data ?? []).filter((parser) => parser.repository_id === id).map((parser) => {
-                const slug = parserSlug(parser);
-                const existing = tenantSources.find((source) => (source.match_values ?? []).includes(slug));
+                // Sources imported before NAN-5264 were keyed on the parser name.
+                const keys = [parser.match_value, parserSlug(parser)];
+                const existing = tenantSources.find((source) => (source.match_values ?? []).some((value) => keys.includes(value)));
                 return <CommandItem className="text-[11.5px]" key={parser.id}
                   value={`${repoName} ${parser.display_name ?? parser.name} ${parser.vendor ?? ''}`} onSelect={() => {
                     if (existing) navigate(`/ingestion/log-sources/${existing.id}?action=add-credential#source-credentials`);

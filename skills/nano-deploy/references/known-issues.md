@@ -6,6 +6,13 @@ product's files.
 
 ## All 2.0.x releases
 
+- **Sign-in rate limit.** nano allows 100 sign-in requests per client
+  address in a 5-minute window, successful or not; after that
+  `POST /api/auth/login` answers `429 Too many login attempts` with
+  `Retry-After` (up to 300 s). A probe that signed in every second hit it.
+  Synthetic sign-in monitors and failover probes must stay below it (one
+  sign-in every 10 s is fine), or authenticate with an API key instead.
+
 - **TLS overlay during first install.** With `docker-compose.tls.yml` active,
   plain-HTTP `localhost` calls get a 301 redirect, and the installer's health
   and admin-creation calls can treat it as success. Install first without the
@@ -56,6 +63,94 @@ product's files.
 - **Docker in LXC containers** (Proxmox CT and similar) needs `nesting=1`
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.
+
+## 2.0.11 (fixed in 2.0.12)
+
+- **`scripts/nano upgrade` from v2.0.10 to v2.0.11 fails its dry run** on
+  every role-split cluster, with two false positives (nothing is wrong with the
+  cluster, and nothing was changed):
+  - `registry-login ... not logged in to ghcr.io` on every host. The check
+    treated any image under `nano-rs` as private, including the public
+    `ghcr.io/nano-rs/vector`, which pulls anonymously; the license only issues
+    a credential for the customer registry, so there is no ghcr.io login to
+    give.
+  - `ledger-clickhouse ... not in target ocsf/193,ocsf/194` on OCSF installs.
+    The 2.0.11 upgrader's list of OCSF ClickHouse migrations stopped at
+    `ocsf/190`, while 2.0.10 applies 193 and 194. The 2.0.11 migrator itself
+    accepts the database.
+
+  **Handling for v2.0.10 → v2.0.11:** upgrade with Path B instead (rerun each
+  host's install command from the 2.0.11 package, host by host, with the
+  load-balancer drain and rejoin by hand) ([upgrade.md](upgrade.md#path-b-compose-from-v209-or-earlier-installer-rerun-host-by-host)).
+  Never bypass a preflight row or edit `scripts/nano-upgrade.py`. Or skip
+  2.0.11: 2.0.12 upgrades a v2.0.10 or v2.0.11 cluster with Path A (extract
+  the 2.0.12 package over `~/nano` first, as Path A says; its own upgrader
+  runs). A v2.0.11 cluster upgrading to 2.0.12 with Path A is not affected.
+- **First app host's migrator can hang on a fresh install** at "Applying
+  open-init snapshot" (no CPU, PostgreSQL sessions idle, no tables), holding
+  the installer at "clickhouse-migrate Waiting". Seen once, about two minutes
+  after the PostgreSQL HA cluster formed; a rerun applied the snapshot in
+  seconds. Interrupt the install after 5 minutes without progress (Ctrl-C;
+  the snapshot is one transaction, so nothing is half-applied), check
+  `patronictl list` on a postgres host (one Leader, one streaming Sync
+  Standby), and rerun the same install command on that host. 2.0.12 bounds
+  the snapshot (`NANO_PG_SNAPSHOT_TIMEOUT_SECS`, default 600 s), refuses it up
+  front while no synchronous standby is streaming, ends a stuck session, and
+  bounds the installer's wait for the services (`NANO_COMPOSE_UP_TIMEOUT`,
+  default 3600 s).
+- **The installer does not install the data-disk self-heal timer.** Install it
+  per host as in [cloud-vm.md](cloud-vm.md) step 5. From 2.0.12 the installer
+  installs it on a host whose Docker data is on a separate `nofail` disk
+  (with passwordless sudo; otherwise it prints the one command to run).
+- **The `--record-pg-ha-identity` message says `sudo ./install.sh`.** Run it
+  as the install user, without sudo: `cd ~/nano && ./install.sh --record-pg-ha-identity`.
+- **`support-bundle` reports `install_id: null`** although the install has
+  one (it read psql's "(1 row)" footer). Read it with `GET /api/license`
+  or from PostgreSQL if support asks. It also collects only the local host
+  unless the host it runs on can SSH to every other host (see
+  [operate.md](operate.md)).
+- **OTLP senders saw a 500 or a stall while an app host was upgraded** (HEC
+  did not): the ingest edge's OTLP auth check asks an app host and was not
+  retried on another one. Make OTLP senders retry on 5xx and timeouts. 2.0.12
+  retries that read-only check on another app host.
+- **Helm: OTLP writes failed with HTTP 500 during a PostgreSQL failover.** On
+  AKS, a forced failover of zone-redundant Azure flexible server made both api
+  pods unready for about 48 s. The ingest edge's OTLP auth check then failed,
+  and nginx answered OTLP requests with 500 (which OTLP exporters drop, unlike
+  503) or a 15 s stall. HEC and `/ingest` were not affected (their admission
+  check admits when the API is unreachable). Tell the operator to buffer OTLP
+  in a collector with retry on all 5xx. From 2.0.12 every edge answers 503 with
+  `Retry-After: 5` when the check can't be made, and the Helm edge bounds the
+  check (1 s connect, 4 s read) and retries it once, so senders get an answer
+  within 10 s. OTLP still pauses for the failover; nothing accepted is lost.
+- **Azure flexible server, PostgreSQL 15+: the first migration fails with
+  `permission denied for schema public`** although `pg-preflight.py` printed
+  `POSTGRES-READY` and the migrator's preflight passed. In new databases there,
+  schema `public` is owned by `azure_pg_admin`, so the database owner can't
+  create tables in it. Fix, as the server admin, connected to the nano
+  database: `ALTER SCHEMA public OWNER TO nanosiem;` (or `GRANT ALL ON SCHEMA
+  public TO nanosiem;`), then delete the failed migrate pods and rerun the same
+  `helm upgrade --install` (the snapshot is one transaction; nothing to clean
+  up). The bootstrap SQL in [cloud-azure.md](cloud-azure.md#managed-postgresql-azure-flexible-server)
+  does it up front. From 2.0.12 both preflights check `CREATE` on `public` and
+  print this fix.
+- **Helm: `k8s-health.py` stays UNHEALTHY with `distributed DDL entries
+  pending > 10 min` after a ClickHouse pod restart.** An `ON CLUSTER`
+  statement issued while a replica restarted can stay `Inactive` on that
+  replica for good, although the replica runs every later entry and nothing
+  diverged. Tell stuck from stale: `SELECT entry, host, status, query FROM
+  system.distributed_ddl_queue WHERE status != 'Finished'`. If that host shows
+  a later entry `Finished`, the old one is stale and harmless; ClickHouse
+  removes it after `distributed_ddl.task_max_lifetime` (7 days). Don't delete
+  Keeper nodes by hand. From 2.0.12 `k8s-health.py` and `cluster-health.py`
+  only warn on stale entries and still fail on a stuck one.
+- **Events written in the second a ClickHouse replica is deleted can be stored
+  twice.** In an AKS drill, 150 HEC and 150 OTLP events sent during a pod
+  delete were all accepted, and 10 of each were stored twice (same
+  `metadata.uid`). Delivery from the ingest buffer to ClickHouse is
+  at-least-once: a batch whose acknowledgement was lost is retried. Counts and
+  detections over that minute can be inflated; `dc(metadata.uid)` gives the
+  true count. Tell the operator; no repair is needed.
 
 ## External PostgreSQL, 2.0.10 and earlier (fixed in 2.0.11)
 

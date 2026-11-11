@@ -1,953 +1,1135 @@
 {
+  "uid": "nanosiem-api",
+  "title": "nano API, Search and Jobs",
+  "description": "Request rates and latency of api and search, search admission, the jobs leader and detection schedule lag.",
+  "tags": [
+    "nano",
+    "api",
+    "search",
+    "jobs"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "version": 1,
+  "links": [
+    {
+      "type": "dashboards",
+      "tags": [
+        "nano"
+      ],
+      "asDropdown": true,
+      "title": "nano dashboards"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(up, host)",
+          "refId": "host"
+        },
+        "definition": "label_values(up, host)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1,
+        "hide": 0
+      }
+    ]
+  },
   "annotations": {
     "list": []
   },
-  "editable": true,
-  "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
-  "id": null,
-  "links": [],
-  "liveNow": false,
   "panels": [
     {
+      "type": "row",
+      "title": "API",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "id": 1
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests per host",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (host) (rate(axum_http_requests_total{job=\"nano-api\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{host}}"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
           "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "id": 1,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(rate(axum_http_requests_total{job=\"nanosiem-api\"}[5m]))",
-          "legendFormat": "Requests/sec",
-          "refId": "A"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
-      ],
-      "title": "Request Rate",
-      "type": "stat"
+      },
+      "id": 2
     },
     {
+      "type": "timeseries",
+      "title": "5xx ratio",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (host) (rate(axum_http_requests_total{job=\"nano-api\", status=~\"5..\", host=~\"$host\"}[$__rate_interval])) / sum by (host) (rate(axum_http_requests_total{job=\"nano-api\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{host}}"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.01 },
-              { "color": "red", "value": 0.05 }
-            ]
-          },
           "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
-      "id": 2,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(rate(axum_http_requests_total{job=\"nanosiem-api\", status=~\"5..\"}[5m])) / sum(rate(axum_http_requests_total{job=\"nanosiem-api\"}[5m]))",
-          "legendFormat": "Error Rate",
-          "refId": "A"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
-      ],
-      "title": "Error Rate",
-      "type": "stat"
+      },
+      "id": 3
     },
     {
+      "type": "timeseries",
+      "title": "p95 latency by endpoint (top 10)",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, endpoint) (rate(axum_http_requests_duration_seconds_bucket{job=\"nano-api\", host=~\"$host\"}[$__rate_interval]))))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "red", "value": 1 }
-            ]
-          },
           "unit": "s"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
-      "id": 3,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.95, sum(increase(axum_http_requests_duration_seconds_bucket{job=\"nanosiem-api\"}[15m])) by (le))",
-          "legendFormat": "P95 Latency",
-          "refId": "A"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
-      ],
-      "title": "P95 Latency",
-      "type": "stat"
+      },
+      "id": 4
     },
     {
+      "type": "timeseries",
+      "title": "Requests by endpoint (top 10)",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 2 }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
       },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
-      "id": 4,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.2.2",
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum(increase(axum_http_requests_duration_seconds_bucket{job=\"nanosiem-api\"}[15m])) by (le))",
-          "legendFormat": "P99 Latency",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(10, sum by (endpoint) (rate(axum_http_requests_total{job=\"nano-api\", host=~\"$host\"}[$__rate_interval])))",
+          "legendFormat": "{{endpoint}}"
         }
       ],
-      "title": "P99 Latency",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
           "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
-      "id": 5,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "topk(10, sum(rate(axum_http_requests_total{job=\"nanosiem-api\"}[5m])) by (endpoint))",
-          "legendFormat": "{{ endpoint }}",
-          "refId": "A"
-        }
-      ],
-      "title": "Request Rate by Endpoint",
-      "type": "timeseries"
+      "id": 5
     },
     {
+      "type": "timeseries",
+      "title": "Requests in flight",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (host, job) (axum_http_requests_pending{job=~\"nano-api|nano-search\", host=~\"$host\"})",
+          "legendFormat": "{{job}} {{host}}"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 6
+    },
+    {
+      "type": "timeseries",
+      "title": "Audit outbox",
+      "description": "Security audit events queued, delivered and failed. Failures should stay at zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+          "expr": "sum(rate(nanosiem_audit_outbox_deferred_total{host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "deferred"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
+          "expr": "sum(rate(nanosiem_audit_outbox_delivered_total{host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "delivered"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
+          "expr": "sum(rate(nanosiem_audit_emit_failures_total{host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "emit failures"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 7
+    },
+    {
+      "type": "row",
+      "title": "Search",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
+      "id": 8
+    },
+    {
+      "type": "timeseries",
+      "title": "Search query time",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (type, quantile) (nanosiem_search_query_duration_seconds{job=\"nano-search\", success=\"true\", host=~\"$host\"})",
+          "legendFormat": "{{type}} p{{quantile}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
           "unit": "s"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
-      "id": 6,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "topk(10, histogram_quantile(0.95, sum(increase(axum_http_requests_duration_seconds_bucket{job=\"nanosiem-api\"}[15m])) by (le, endpoint)))",
-          "legendFormat": "{{ endpoint }}",
-          "refId": "A"
-        }
-      ],
-      "title": "P95 Latency by Endpoint",
-      "type": "timeseries"
+      "id": 9
     },
     {
+      "type": "timeseries",
+      "title": "Search admission",
+      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(nanosiem_search_active_queries{job=\"nano-search\", host=~\"$host\"})",
+          "legendFormat": "running"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(nanosiem_search_queue_depth{job=\"nano-search\", host=~\"$host\"})",
+          "legendFormat": "queued"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 10
+    },
+    {
+      "type": "timeseries",
+      "title": "Admitted searches by priority",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
+          "expr": "sum by (priority) (rate(nanosiem_search_jobs_admitted_total{job=\"nano-search\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{priority}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
           "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            }
+            "stacking": {
+              "mode": "normal"
+            },
+            "fillOpacity": 20
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejected searches by reason",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason) (rate(nanosiem_search_jobs_rejected_total{job=\"nano-search\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "fillOpacity": 20
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 12
+    },
+    {
+      "type": "timeseries",
+      "title": "Search queue wait",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nanosiem_search_queue_wait_seconds_bucket{job=\"nano-search\", host=~\"$host\"}[$__rate_interval])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(nanosiem_search_queue_wait_seconds_bucket{job=\"nano-search\", host=~\"$host\"}[$__rate_interval])))",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 13
+    },
+    {
+      "type": "timeseries",
+      "title": "Search requests per host",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (host) (rate(axum_http_requests_total{job=\"nano-search\", host=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "{{host}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 14
+    },
+    {
+      "type": "row",
+      "title": "Jobs and detections",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 24,
+        "h": 1
+      },
+      "id": 15
+    },
+    {
+      "type": "stat",
+      "title": "Jobs leaders",
+      "description": "Exactly one jobs instance holds the scheduler lease. 0 or 2 is an incident.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(nano_jobs_leader{job=\"nano-jobs\"}) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
           },
           "mappings": []
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 },
-      "id": 7,
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true,
-          "values": ["value", "percent"]
-        },
-        "pieType": "pie",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(increase(axum_http_requests_total{job=\"nanosiem-api\"}[1h])) by (status)",
-          "legendFormat": "{{ status }}",
-          "refId": "A"
-        }
-      ],
-      "title": "HTTP Status Distribution (1h)",
-      "type": "piechart"
+      "id": 16
     },
     {
+      "type": "table",
+      "title": "Jobs leader",
+      "description": "The host whose nano-jobs holds the lease now.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 4,
+        "y": 51,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "nano_jobs_leader{job=\"nano-jobs\"} == 1",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 },
-      "id": 8,
-      "options": {
-        "legend": {
-          "calcs": ["mean", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
+      "options": {},
+      "transformations": [
         {
-          "expr": "pg_stat_activity_count{datname=\"nanosiem\", state=\"active\"}",
-          "legendFormat": "Active",
-          "refId": "A"
+          "id": "merge",
+          "options": {}
         },
         {
-          "expr": "pg_stat_activity_count{datname=\"nanosiem\", state=\"idle\"}",
-          "legendFormat": "Idle",
-          "refId": "B"
-        },
-        {
-          "expr": "pg_settings_max_connections",
-          "legendFormat": "Max",
-          "refId": "C"
-        }
-      ],
-      "title": "PostgreSQL Connection Pool",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
             }
+          }
+        }
+      ],
+      "id": 17
+    },
+    {
+      "type": "stat",
+      "title": "Rules behind schedule",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
-          "mappings": [],
+          "expr": "max(nanosiem_detection_rules_behind_schedule{host=~\"$host\"}) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "id": 18
+    },
+    {
+      "type": "stat",
+      "title": "Schedule degraded",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(nanosiem_detection_schedule_degraded{host=~\"$host\"}) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "OK"
+                },
+                "1": {
+                  "text": "DEGRADED"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "id": 19
+    },
+    {
+      "type": "stat",
+      "title": "Panics (1h)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(nano_panics_total{host=~\"$host\"}[1h])) or vector(0)",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "id": 20
+    },
+    {
+      "type": "timeseries",
+      "title": "Detection schedule lag",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(nanosiem_detection_schedule_lag_p95_seconds{host=~\"$host\"})",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(nanosiem_detection_schedule_lag_max_seconds{host=~\"$host\"})",
+          "legendFormat": "max"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
           "unit": "s"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 },
-      "id": 9,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "nanosiem_search_query_duration_seconds{job=\"nanosiem-search\", type=\"piped\", success=\"true\", quantile=\"0.95\"}",
-          "legendFormat": "Piped P95",
-          "refId": "A"
-        },
-        {
-          "expr": "nanosiem_search_query_duration_seconds{job=\"nanosiem-search\", type=\"sql\", success=\"true\", quantile=\"0.95\"}",
-          "legendFormat": "SQL P95",
-          "refId": "B"
-        },
-        {
-          "expr": "nanosiem_search_query_duration_seconds{job=\"nanosiem-search\", type=\"piped\", success=\"true\", quantile=\"0.5\"}",
-          "legendFormat": "Piped P50",
-          "refId": "C"
-        },
-        {
-          "expr": "nanosiem_search_query_duration_seconds{job=\"nanosiem-search\", type=\"sql\", success=\"true\", quantile=\"0.5\"}",
-          "legendFormat": "SQL P50",
-          "refId": "D"
-        }
-      ],
-      "title": "Search Query Latency",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 },
-      "id": 20,
-      "title": "Search Admission Control",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 21 },
-      "id": 21,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "nanosiem_search_active_queries{job=\"nanosiem-search\"}",
-          "legendFormat": "Active",
-          "refId": "A"
-        }
-      ],
-      "title": "Active Queries",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 10 },
-              { "color": "red", "value": 50 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 21 },
-      "id": 22,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "nanosiem_search_queue_depth{job=\"nanosiem-search\"}",
-          "legendFormat": "Queued",
-          "refId": "A"
-        }
-      ],
-      "title": "Queue Depth",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 21 },
-      "id": 23,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_rejected_total{job=\"nanosiem-search\"}[5m]))",
-          "legendFormat": "Rejected/s",
-          "refId": "A"
-        }
-      ],
-      "title": "Rejection Rate",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 21 },
-      "id": 24,
-      "options": {
-        "legend": {
-          "calcs": ["mean", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, rate(nanosiem_search_queue_wait_seconds_bucket{job=\"nanosiem-search\"}[5m]))",
-          "legendFormat": "P50 Wait",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.95, rate(nanosiem_search_queue_wait_seconds_bucket{job=\"nanosiem-search\"}[5m]))",
-          "legendFormat": "P95 Wait",
-          "refId": "B"
-        },
-        {
-          "expr": "histogram_quantile(0.99, rate(nanosiem_search_queue_wait_seconds_bucket{job=\"nanosiem-search\"}[5m]))",
-          "legendFormat": "P99 Wait",
-          "refId": "C"
-        }
-      ],
-      "title": "Queue Wait Time",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
-          "custom": {
-            "fillOpacity": 20,
-            "lineWidth": 1,
-            "stacking": { "mode": "normal" }
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
-      "id": 25,
-      "options": {
-        "legend": {
-          "calcs": ["sum"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_admitted_total{job=\"nanosiem-search\", priority=\"interactive\"}[5m])) or vector(0)",
-          "legendFormat": "Interactive",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_admitted_total{job=\"nanosiem-search\", priority=\"analytics\"}[5m])) or vector(0)",
-          "legendFormat": "Analytics",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_admitted_total{job=\"nanosiem-search\", priority=\"detection\"}[5m])) or vector(0)",
-          "legendFormat": "Detection",
-          "refId": "C"
-        },
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_admitted_total{job=\"nanosiem-search\", priority=\"near_realtime\"}[5m])) or vector(0)",
-          "legendFormat": "Near-Realtime",
-          "refId": "D"
-        }
-      ],
-      "title": "Admitted Searches by Priority",
-      "type": "timeseries"
+      "id": 21
     },
     {
+      "type": "timeseries",
+      "title": "Jobs leader over time",
+      "description": "A handover shows as the 1 moving from one host to another.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "nano_jobs_leader{job=\"nano-jobs\"}",
+          "legendFormat": "{{host}}"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          },
+          "unit": "short",
           "custom": {
-            "fillOpacity": 20,
-            "lineWidth": 1
+            "stacking": {
+              "mode": "normal"
+            },
+            "fillOpacity": 20
           }
         },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "User Limit" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
-          },
-          {
-            "matcher": { "id": "byName", "options": "Queue Full" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
-          },
-          {
-            "matcher": { "id": "byName", "options": "Queue Timeout" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "dark-red", "mode": "fixed" } }]
-          }
-        ]
+        "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 29 },
-      "id": 26,
       "options": {
         "legend": {
-          "calcs": ["sum"],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "10.2.2",
-      "targets": [
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_rejected_total{job=\"nanosiem-search\", reason=\"user_limit\"}[5m])) or vector(0)",
-          "legendFormat": "User Limit",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_rejected_total{job=\"nanosiem-search\", reason=\"queue_full\"}[5m])) or vector(0)",
-          "legendFormat": "Queue Full",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(nanosiem_search_jobs_rejected_total{job=\"nanosiem-search\", reason=\"queue_timeout\"}[5m])) or vector(0)",
-          "legendFormat": "Queue Timeout",
-          "refId": "C"
-        }
-      ],
-      "title": "Rejected Searches by Reason",
-      "type": "timeseries"
+      "id": 22
     }
-  ],
-  "refresh": "30s",
-  "schemaVersion": 38,
-  "tags": ["nanosiem", "api"],
-  "templating": {
-    "list": [
-      {
-        "current": {
-          "selected": false,
-          "text": "Prometheus",
-          "value": "Prometheus"
-        },
-        "hide": 0,
-        "includeAll": false,
-        "multi": false,
-        "name": "datasource",
-        "options": [],
-        "query": "prometheus",
-        "queryValue": "",
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "type": "datasource"
-      }
-    ]
-  },
-  "time": {
-    "from": "now-1h",
-    "to": "now"
-  },
-  "timepicker": {},
-  "timezone": "",
-  "title": "NanoSIEM API Performance",
-  "uid": "nanosiem-api",
-  "version": 1,
-  "weekStart": ""
+  ]
 }

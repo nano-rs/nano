@@ -13,10 +13,14 @@ interface PrevalenceSliderProps {
   disabled?: boolean;
 }
 
+// NAN-5270: the value IS the host-count ceiling — Search injects
+// `| where prevalence_min <= value` (prevalence_min = the event's least
+// prevalent artifact's host count). Labels must state that, not a % or a
+// different count.
 const PRESETS = [
-  { label: 'Very Rare', value: 10, description: '<5 hosts' },
-  { label: 'Rare', value: 25, description: '<12 hosts' },
-  { label: 'Uncommon', value: 50, description: '<25 hosts' },
+  { label: 'Very Rare', value: 10, description: '≤10 hosts' },
+  { label: 'Rare', value: 25, description: '≤25 hosts' },
+  { label: 'Uncommon', value: 50, description: '≤50 hosts' },
   { label: 'All', value: 100, description: 'no filter' },
 ];
 
@@ -57,7 +61,7 @@ export function PrevalenceSlider({ value, onChange, disabled }: PrevalenceSlider
     if (localValue <= 10) return 'Very Rare';
     if (localValue <= 25) return 'Rare';
     if (localValue <= 50) return 'Uncommon';
-    return `<${localValue}`;
+    return `≤${localValue}`;
   };
 
   const isFiltering = localValue < 100;
@@ -105,7 +109,7 @@ export function PrevalenceSlider({ value, onChange, disabled }: PrevalenceSlider
                   isFiltering ? 'text-primary' : 'text-muted-foreground/70'
                 )}
               >
-                {isFiltering ? `<${localValue}%` : 'all'}
+                {isFiltering ? `≤${localValue} hosts` : 'all'}
               </span>
             </div>
 

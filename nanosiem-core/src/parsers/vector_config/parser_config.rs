@@ -116,6 +116,30 @@ if is_object(ocsf_event) {
 pub(super) const OCSF_PARSER_FAILURE_VRL: &str =
     "._nano_parser_failure = !is_nullish(.event.unmapped.parse_error)";
 
+/// NAN-5264: an OCSF record the parser could not really parse, but did not
+/// report as a failure either. First-party OCSF parsers handle input they do
+/// not recognise by emitting a minimal record that still lands with its raw
+/// body, so a source receiving the wrong shape looked 100% healthy.
+///
+/// The ONLY signal is the explicit marker `unmapped.parse_fallback` (any value
+/// but null / `false`), which the first-party fallback branches set
+/// (nano-rs/parsers#65). Rejected signals, each of which flags correct parses:
+///
+/// - `metadata.log_level = "error"`: several parsers carry the source's own
+///   severity there.
+/// - `class_uid` 0: Base Event is a correct parse for many sources
+///   (windows_event_xml's unmapped EventIDs, journald, RouterOS, Sophos and
+///   Azure Monitor default branches, nano's own logs).
+/// - no event time (`time` missing or <= 0): every year-less RFC3164 syslog
+///   line, and well-formed Proofpoint DLP / Qualys / Rapid7 records, parse
+///   correctly with `time` 0 (`_ocsf_prepare` falls back to ingest time).
+///
+/// A record that already counts as a failure is not also a fallback. Runs
+/// after [`OCSF_PARSER_FAILURE_VRL`], on the prepared row (OCSF under `.event`).
+pub(super) const OCSF_PARSER_FALLBACK_VRL: &str = r#"nano_fallback_marker = .event.unmapped.parse_fallback
+nano_marked = !is_nullish(nano_fallback_marker) && nano_fallback_marker != false
+._nano_parser_fallback = is_nullish(.event.unmapped.parse_error) && nano_marked"#;
+
 /// NAN-4963: suffix of the per-parser OCSF lane-stamp remap.
 pub(super) const OCSF_LANE_STAMP_SUFFIX: &str = "_source_lane";
 
@@ -381,9 +405,11 @@ impl VectorConfigManager {
              # The OCSF ClickHouse sink ignores this internal field.\n\
              ._nano_parser_id = \"{parser_id}\"\n\
              {failure}\n\
+             {fallback}\n\
              '''\n",
             vrl = OCSF_PREPARE_VRL,
-            failure = OCSF_PARSER_FAILURE_VRL
+            failure = OCSF_PARSER_FAILURE_VRL,
+            fallback = OCSF_PARSER_FALLBACK_VRL
         )
     }
 

@@ -103,6 +103,7 @@ import { LogSourceHealthPanel } from '@/components/log-sources/LogSourceHealthCh
 import type { LogSourceHealth } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 import { nplFieldEquals } from '@/lib/npl-quote';
+import { fallbackRate, fallbackWarns, formatShare } from '@/lib/parse-health';
 import {
   buildLogSourceParserPrompt,
   extractRecentParserSamples,
@@ -715,6 +716,7 @@ export function LogSourceDetail() {
             <VersionsTab
               versions={versions ?? null}
               hasDraft={hasDraft}
+              deployed={logSource.deployed}
               publishing={publishing}
               validated={logSource.validated}
               openVersion={openVersion}
@@ -1188,6 +1190,9 @@ function OverviewTab({
         parse_errors_24h?: number;
         parse_attempts_24h?: number;
         parse_success_rate_24h?: number | null;
+        parse_fallbacks_24h?: number;
+        parse_fallback_rate_24h?: number | null;
+        source_claims_ignored_24h?: number;
         events_last_24h?: number;
         events_last_hour?: number;
         last_event_at?: string | null;
@@ -1203,6 +1208,11 @@ function OverviewTab({
   const parseErrors = health?.parse_errors_24h ?? 0;
   const parseAttempts = health?.parse_attempts_24h ?? 0;
   const parseSuccessRate = health?.parse_success_rate_24h;
+  // NAN-5264: fallbacks (the parser's unmapped.parse_fallback marker) are degraded parses.
+  const parseFallbacks = health?.parse_fallbacks_24h ?? 0;
+  const parseFallbackRate = fallbackRate(health);
+  const fallbackWarning = source.deployed && fallbackWarns(health);
+  const claimsIgnored = health?.source_claims_ignored_24h ?? 0;
   // NAN-2196. A failing collector produces no events, so every volume-derived
   // status reads it as "quiet" — the state this outranks below.
   const collectorErrors = health?.collector_errors ?? [];
@@ -1281,7 +1291,7 @@ function OverviewTab({
                 <XCircle className="w-3.5 h-3.5" />
                 <span className="text-[12px]">Errors detected</span>
               </span>
-            ) : source.deployed && parseErrors > 0 ? (
+            ) : source.deployed && (parseErrors > 0 || fallbackWarning) ? (
               <span className="inline-flex items-center gap-1.5 text-amber-500">
                 <AlertTriangle className="w-3.5 h-3.5" />
                 <span className="text-[12px]">Parsing degraded</span>
@@ -1331,6 +1341,29 @@ function OverviewTab({
               )}
             </div>
           </LSRow>
+          <LSRow label="Fallbacks (24h)" mono>
+            <div>
+              <span className={fallbackWarning ? 'text-amber-500' : 'text-foreground'}>
+                {fmtCount(parseFallbacks)}
+              </span>
+              {parseFallbackRate != null && parseFallbacks > 0 && (
+                <span className="ml-1.5 text-[10.5px] text-muted-foreground">{formatShare(parseFallbackRate)}</span>
+              )}
+              <div className="mt-0.5 text-[10.5px] font-sans text-muted-foreground">
+                Parser marked the event as a fallback
+              </div>
+            </div>
+          </LSRow>
+          {claimsIgnored > 0 && (
+            <LSRow label="Ignored claims (24h)" mono>
+              <div>
+                <span className="text-amber-500">{fmtCount(claimsIgnored)}</span>
+                <div className="mt-0.5 text-[10.5px] font-sans text-muted-foreground">
+                  Sender declared another <span className="font-mono">X-Source-Type</span>; the token decides
+                </div>
+              </div>
+            </LSRow>
+          )}
           <LSRow label="Events (24h)" mono>
             <span className="text-foreground">{fmtCount(health?.events_last_24h)}</span>
           </LSRow>
@@ -1345,10 +1378,18 @@ function OverviewTab({
           <LSRow label="Deployed" mono>
             <span className="text-foreground/80">{source.deployed_at ? formatUTCCompact(source.deployed_at) : '—'}</span>
           </LSRow>
+          {fallbackWarning && parseFallbackRate != null && (
+            <div className="px-4 py-2.5 text-[11.5px] leading-relaxed text-amber-600 dark:text-amber-500 border-b border-border">
+              {formatShare(parseFallbackRate)} of events in the last 24h were not fully parsed: the parser fell back
+              (<code className="font-mono">unmapped.parse_fallback</code>). The input likely
+              doesn&apos;t match what this parser expects, for example a JSON envelope around the raw log line. Compare a stored event&apos;s{' '}
+              <code className="font-mono">raw_data</code> with the parser&apos;s samples.
+            </div>
+          )}
           <div className="px-4 py-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
             Runtime failures are preserved as searchable events in{' '}
-            <code className="font-mono text-foreground/70">metadata.parse_error</code>. Static VRL validation is not
-            included.
+            <code className="font-mono text-foreground/70">metadata.parse_error</code>. Parse success counts only fully
+            parsed events: fallbacks are excluded. Static VRL validation is not included.
           </div>
         </LSCard>
       </div>
@@ -2195,6 +2236,7 @@ function DeploymentsTab({ deployments }: { deployments: LogSourceDeployment[] | 
 function VersionsTab({
   versions,
   hasDraft,
+  deployed,
   publishing,
   validated,
   openVersion,
@@ -2204,6 +2246,7 @@ function VersionsTab({
 }: {
   versions: LogSourceVersion[] | null;
   hasDraft: boolean;
+  deployed: boolean;
   publishing: boolean;
   validated: boolean;
   openVersion: number | null;
@@ -2218,8 +2261,11 @@ function VersionsTab({
           <div className="flex flex-col items-center justify-center py-12 gap-2 text-muted-foreground">
             <GitCommit className="w-5 h-5 opacity-40" />
             <div className="text-[11.5px]">No published versions yet.</div>
+            {/* NAN-5264: an unversioned source deploys its working copy, so a deployed one is live as saved. */}
             <div className="text-[10.5px] text-muted-foreground/70">
-              Publish this log source to create the first version.
+              {deployed && !hasDraft
+                ? 'Live from the saved parser. Publish to start version history.'
+                : 'Publish this log source to create the first version.'}
             </div>
           </div>
         </LSCard>

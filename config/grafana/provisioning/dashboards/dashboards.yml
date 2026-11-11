@@ -1,14 +1,16 @@
-# Grafana Dashboard Provisioning
+# Grafana dashboard provisioning: the dashboards in config/grafana/dashboards
+# (dev stack, and the Self-run `monitoring` profile and role, NAN-5250). They
+# are read-only here; save a copy in Grafana to change one.
 apiVersion: 1
 
 providers:
-  - name: 'NanoSIEM'
+  - name: nano
     orgId: 1
-    folder: 'NanoSIEM'
-    folderUid: 'nanosiem'
+    folder: nano
+    folderUid: nano
     type: file
-    disableDeletion: false
-    updateIntervalSeconds: 30
-    allowUiUpdates: true
+    disableDeletion: true
+    updateIntervalSeconds: 60
+    allowUiUpdates: false
     options:
       path: /var/lib/grafana/dashboards

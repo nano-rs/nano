@@ -29,7 +29,7 @@ usage() {
     cat <<'EOF'
 Usage: resource-sizing.sh [options]
   --topology single|role
-  --roles app,ingest,clickhouse,keeper,postgres,tenzir
+  --roles app,ingest,clickhouse,keeper,postgres,tenzir,monitoring
   --cpu CORES                  Override detected logical CPUs (tests/inventory)
   --memory-mib MIB             Override detected RAM (tests/inventory)
   --shards COUNT               ClickHouse shard count (for per-shard buffers)
@@ -209,7 +209,7 @@ has_role() {
 
 for role in ${roles//,/ }; do
     case "$role" in
-        app|ingest|clickhouse|keeper|postgres|tenzir) ;;
+        app|ingest|clickhouse|keeper|postgres|tenzir|monitoring) ;;
         *) fail "unknown role $role" ;;
     esac
 done
@@ -267,6 +267,13 @@ os_reserve_mib=$(( memory_mib / 10 ))
 (( os_reserve_mib < 384 )) && os_reserve_mib=384
 (( os_reserve_mib > 8192 )) && os_reserve_mib=8192
 allocatable_mib=$(( memory_mib - os_reserve_mib ))
+# NAN-5250: a host that also runs the monitoring role (Prometheus, Grafana and
+# exporters) sets that stack's fixed limits aside first, so the nano roles are
+# sized from what is left and the monitoring stack can never take their memory.
+# Keep in step with the monitoring services' limits in the Compose files.
+monitoring_reserve_mib="${NANO_MONITORING_RESERVE_MIB:-1024}"
+[[ "$monitoring_reserve_mib" =~ ^[0-9]+$ ]] || fail "NANO_MONITORING_RESERVE_MIB must be a non-negative integer"
+has_role monitoring && allocatable_mib=$(( allocatable_mib - monitoring_reserve_mib ))
 
 ch_weight=0; pg_weight=0; ingest_weight=0; app_weight=0; keeper_weight=0; tenzir_weight=0
 has_role clickhouse && ch_weight=55

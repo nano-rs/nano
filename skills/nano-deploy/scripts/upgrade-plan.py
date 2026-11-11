@@ -51,6 +51,14 @@ from dataclasses import asdict, dataclass, field
 LATEST_URL = "https://api.nano.rs/api/releases/latest"
 UPGRADE_DOC = "https://nano.rs/docs/releases/upgrading"
 SCRIPTS_NANO_UPGRADE_FROM = (2, 0, 10)   # first release whose scripts/nano does registry upgrades
+# Targets whose own `scripts/nano upgrade` dry run fails on every
+# cluster (false positives); plan the installer rerun instead.
+UPGRADER_DRY_RUN_BROKEN = {
+    "2.0.11": ("v2.0.11's `scripts/nano upgrade` dry run fails on every cluster (registry-login on "
+               "ghcr.io; ledger-clickhouse ocsf/193,194 on OCSF), both false positives fixed in v2.0.12: "
+               "re-run the installer host by host instead, or upgrade straight to v2.0.12 "
+               "(known-issues.md, 2.0.11)"),
+}
 DISK_FAIL_BYTES = 10 * 1024 ** 3
 DISK_WARN_USE_PCT = 85
 VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -400,10 +408,17 @@ def assess(kind: str, units: list[Unit], latest: dict | None, target: tuple | No
         path = "nano-upgrade"
     else:
         path = "rerun"
+    forced_rerun = False
+    if path == "nano-upgrade" and target and vstr(target) in UPGRADER_DRY_RUN_BROKEN:
+        # That release's own upgrader refuses every cluster with
+        # false positives; its installer rerun works.
+        path = "rerun"
+        forced_rerun = True
+        findings.append(Finding("WARN", "known-issue", UPGRADER_DRY_RUN_BROKEN[vstr(target)]))
     return {
         "kind": kind, "current": vstr(current), "target": vstr(target), "latest": latest or {},
         "up_to_date": bool(current and target and current >= target),
-        "path": path, "stops": stops, "upgrade_required_lock": upgrade_required,
+        "path": path, "forced_rerun": forced_rerun, "stops": stops, "upgrade_required_lock": upgrade_required,
         "pg_leader": leader_of(reachable),
         "valkey_master": next((u.name for u in reachable if u.valkey_role == "master"), ""),
         "findings": [asdict(f) for f in findings],
@@ -444,6 +459,15 @@ def compose_steps(result: dict, units: list[Unit], install_dir: str) -> list[str
                + (f" --backup-output /mnt/nano-backups/upgrade-{target}" if role_split else ""))
         if len(by_role("ingest")) > 1:
             cmd += " --lb-drain-command /usr/local/sbin/nano-lb-drain --lb-rejoin-command /usr/local/sbin/nano-lb-rejoin"
+        if role_split:
+            # None of these exist after a fresh install.
+            steps.append(
+                f"Prerequisites (upgrade.md, Path A): non-interactive SSH from {first_app} to every other host; "
+                + ("the drain/rejoin hooks at /usr/local/sbin/nano-lb-drain and nano-lb-rejoin on every app and "
+                   "ingest host, mapping inventory names to the load balancer's server names (start from "
+                   "deploy/compose/examples/load-balancer/nano-lb-hook); each HAProxy's runtime socket at "
+                   "`level admin`." if len(by_role("ingest")) > 1 else "")
+            )
         steps += [
             f"Dry run (read-only; verifies the signature, policy, registry pulls, disk, license) on {first_app}: "
             f"`{ssh_cmd(first_app)} '{cmd} --dry-run'`. Every row must pass; never bypass a gate.",
@@ -570,7 +594,9 @@ def render(result: dict, steps: list[str]) -> str:
         out.append(f"UP TO DATE: {result['current']} is the target release. Nothing to do.")
         return "\n".join(out) + "\n"
     label = {"nano-upgrade": "from v2.0.10 or later: scripts/nano upgrade with the package",
-             "rerun": "from v2.0.9 or earlier: re-run the installer host by host",
+             "rerun": ("re-run the installer host by host (this target's scripts/nano upgrade has a known issue)"
+                       if result.get("forced_rerun") else
+                       "from v2.0.9 or earlier: re-run the installer host by host"),
              "helm": "Helm: pull the new chart, upgrade with the same values"}[result["path"]]
     if result["stops"]:
         out.append(f"Required stops: upgrade to {', '.join(result['stops'])} first, then to {result['target']}; "

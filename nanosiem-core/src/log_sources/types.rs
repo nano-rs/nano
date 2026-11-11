@@ -473,9 +473,26 @@ pub struct LogSourceHealth {
     /// Events evaluated by this parser in the last 24 hours, counted before
     /// optional log sampling.
     pub parse_attempts_24h: i64,
-    /// Runtime parse success ratio over the last 24 hours. `None` means no
-    /// production events were available; static VRL validation is not counted.
+    /// Fully parsed ratio over the last 24 hours: events that were neither a
+    /// runtime failure nor a fallback (NAN-5264). `None` means no production
+    /// events were available; static VRL validation is not counted.
     pub parse_success_rate_24h: Option<f64>,
+    /// NAN-5264: events in the last 24 hours the parser handled with its
+    /// fallback branch: the record carries the parser's `unmapped.parse_fallback`
+    /// marker. A record with no event time, or a correctly parsed Base Event
+    /// (`class_uid` 0), is not a fallback. Not counted in `parse_errors_24h`.
+    #[serde(default)]
+    pub parse_fallbacks_24h: i64,
+    /// NAN-5264: `parse_fallbacks_24h / parse_attempts_24h`. `None` when there
+    /// were no production events.
+    #[serde(default)]
+    pub parse_fallback_rate_24h: Option<f64>,
+    /// NAN-5264: events in the last 24 hours whose sender declared a different
+    /// source (`X-Source-Type`, HEC `sourcetype`, a body `source_type`) than the
+    /// one its ingest token is bound to. The token decides; the claim is kept
+    /// only as `claimed_source_type`.
+    #[serde(default)]
+    pub source_claims_ignored_24h: i64,
 
     // Collector errors (NAN-2196)
     //

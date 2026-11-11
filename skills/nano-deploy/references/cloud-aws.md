@@ -70,21 +70,37 @@ group of every role it runs (ClickHouse VMs with co-located ingest get both
 | Port | Key | On | Allow from | When |
 |---|---|---|---|---|
 | 80/tcp | `app` | app hosts | app load balancer | always |
-| 3000/tcp | `api_internal` | app hosts | ingest hosts | always |
+| 3000/tcp | `api_internal` | app hosts | ingest hosts, the monitoring host | always (monitoring: with a monitoring host) |
 | 80/tcp | `ingest` | ingest hosts | ingest load balancer, app hosts | always |
 | 8687/tcp | `vector_tap` | ingest hosts | app hosts | always |
 | 5432/tcp | `postgres` | PostgreSQL hosts | app hosts, ClickHouse hosts, PostgreSQL hosts | always |
 | 8123/tcp | `clickhouse_http` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
 | 9000/tcp | `clickhouse_native` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
 | 9009/tcp | `clickhouse_interserver` | ClickHouse hosts | ClickHouse hosts | always |
-| 9363/tcp | `clickhouse_metrics` | ClickHouse hosts | app hosts | always |
+| 9363/tcp | `clickhouse_metrics` | ClickHouse hosts | app hosts, the monitoring host | always |
 | 9181/tcp | `keeper_client` | Keeper hosts (= PostgreSQL hosts) | app hosts, ClickHouse hosts, Keeper hosts (= PostgreSQL hosts) | always |
 | 9234/tcp | `keeper_raft` | Keeper hosts (= PostgreSQL hosts) | Keeper hosts (= PostgreSQL hosts) | always |
-| 8008/tcp | `patroni_api` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (3 postgres hosts) |
-| 2379/tcp | `etcd_client` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
+| 3030/tcp | `grafana` | the monitoring host | management CIDR | monitoring host |
+| 9090/tcp | `prometheus` | the monitoring host | the monitoring host | monitoring host (loopback only: never open it) |
+| 9100/tcp | `node_exporter` | app hosts | the monitoring host | monitoring host |
+| 8405/tcp | `clickhouse_proxy_metrics` | app hosts | the monitoring host | monitoring host |
+| 8406/tcp | `ingest_proxy_metrics` | app hosts | the monitoring host | monitoring host |
+| 8408/tcp | `postgres_router_metrics` | app hosts | the monitoring host | monitoring host |
+| 8409/tcp | `valkey_router_metrics` | app hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | ingest hosts | the monitoring host | monitoring host |
+| 9598/tcp | `vector_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 8405/tcp | `clickhouse_proxy_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 8407/tcp | `app_api_proxy_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | ClickHouse hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | Keeper hosts (= PostgreSQL hosts) | the monitoring host | monitoring host |
+| 9364/tcp | `keeper_metrics` | Keeper hosts (= PostgreSQL hosts) | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | PostgreSQL hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | the monitoring host | the monitoring host | monitoring host |
+| 8008/tcp | `patroni_api` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (3 postgres hosts) |
+| 2379/tcp | `etcd_client` | PostgreSQL hosts | PostgreSQL hosts, the monitoring host | full HA (3 postgres hosts) |
 | 2380/tcp | `etcd_peer` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
-| 6379/tcp | `valkey` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
-| 26379/tcp | `sentinel` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
+| 6379/tcp | `valkey` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (2+ app hosts) |
+| 26379/tcp | `sentinel` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (2+ app hosts) |
 | 22/tcp | `ssh` | all | management CIDR, app hosts | always (the first app host runs scripts/nano upgrade over SSH) |
 <!-- END plan.py --port-matrix -->
 
@@ -304,7 +320,8 @@ vpc:
 iam:
   withOIDC: true
 addons:
-  - name: vpc-cni
+  - name: vpc-cni                 # NetworkPolicy enforcement: set it here, at creation
+    configurationValues: '{"enableNetworkPolicy": "true"}'
   - name: coredns
   - name: kube-proxy
   - name: eks-pod-identity-agent
@@ -316,7 +333,8 @@ managedNodeGroups:               # one group per zone, 2 nodes each
     instanceType: m6i.2xlarge     # x86-64 with AVX2 (ClickHouse)
     minSize: 2
     desiredCapacity: 2
-    maxSize: 3
+    maxSize: 2                    # 6 nodes in all; no cluster autoscaler
+    tags: {nano-deployment: nano}
     volumeSize: 100
     volumeType: gp3
     privateNetworking: true
@@ -325,7 +343,8 @@ managedNodeGroups:               # one group per zone, 2 nodes each
     instanceType: m6i.2xlarge     # x86-64 with AVX2 (ClickHouse)
     minSize: 2
     desiredCapacity: 2
-    maxSize: 3
+    maxSize: 2                    # 6 nodes in all; no cluster autoscaler
+    tags: {nano-deployment: nano}
     volumeSize: 100
     volumeType: gp3
     privateNetworking: true
@@ -334,7 +353,8 @@ managedNodeGroups:               # one group per zone, 2 nodes each
     instanceType: m6i.2xlarge     # x86-64 with AVX2 (ClickHouse)
     minSize: 2
     desiredCapacity: 2
-    maxSize: 3
+    maxSize: 2                    # 6 nodes in all; no cluster autoscaler
+    tags: {nano-deployment: nano}
     volumeSize: 100
     volumeType: gp3
     privateNetworking: true
@@ -343,6 +363,27 @@ managedNodeGroups:               # one group per zone, 2 nodes each
 
 A 3-node layout (one per zone) also works but tolerates a node loss
 only with reduced redundancy, as above.
+
+**NetworkPolicy on an existing cluster.** The `vpc-cni` line above turns on
+the network policy agent (VPC CNI v1.14+) at creation. On an existing
+cluster, never run a bare `aws eks update-addon ... --configuration-values`:
+eksctl created the add-on with a service account role, a bare update drops
+it, and the new `aws-node` pods crash-loop (`MissingIAMPermissions:
+ec2:DescribeNetworkInterfaces`) while the add-on sits in UPDATING with no
+health issue (seen in a 2.0.11 test). Ask first, then:
+
+```bash
+ROLE=$(aws eks describe-addon --cluster-name nano --addon-name vpc-cni --query 'addon.serviceAccountRoleArn' --output text)
+aws eks update-addon --cluster-name nano --addon-name vpc-cni \
+  --service-account-role-arn "$ROLE" --resolve-conflicts PRESERVE \
+  --configuration-values '{"enableNetworkPolicy": "true"}'     # drop --service-account-role-arn if $ROLE is None
+aws eks wait addon-active --cluster-name nano --addon-name vpc-cni
+kubectl -n kube-system rollout status daemonset/aws-node --timeout=10m
+```
+
+If an `aws-node` pod crash-loops: `kubectl -n kube-system annotate sa aws-node
+eks.amazonaws.com/role-arn=<role> --overwrite`, delete that pod, and rerun the
+update with the role.
 
 Then, in order (each is a hard stop for the chart):
 
@@ -356,7 +397,9 @@ Then, in order (each is a hard stop for the chart):
      name: gp3
      annotations: {storageclass.kubernetes.io/is-default-class: "true"}
    provisioner: ebs.csi.aws.com
-   parameters: {type: gp3}
+   parameters:
+     type: gp3
+     tagSpecification_1: "nano-deployment=nano"
    volumeBindingMode: WaitForFirstConsumer
    allowVolumeExpansion: true
    YAML
@@ -368,7 +411,9 @@ Then, in order (each is a hard stop for the chart):
    the controller release), its gateway CRDs (`config/crd/gateway/gateway-crds.yaml`
    of the same controller release) and the Gateway API feature gate
    (`--set controllerConfig.featureGates.ALBGatewayAPI=true` on the controller
-   chart). Create the GatewayClass `values-aws.yaml` expects:
+   chart). Pin the controller chart (`--version`) and tag what it creates
+   (`--set defaultTags.nano-deployment=nano`: the ALBs, target groups and
+   security groups). Create the GatewayClass `values-aws.yaml` expects:
 
    ```bash
    kubectl apply -f - <<'YAML'
@@ -395,6 +440,12 @@ Then, in order (each is a hard stop for the chart):
    after install, CNAME both hostnames to the ALB names
    (`kubectl -n nano get gateway`).
 
+   **Restrict exposure** (ask; matches the docs' "Restrict exposure"): both
+   ALBs are internet-facing and open to 0.0.0.0/0 by default. Set
+   `gateway.aws.sourceRanges.app` (users' and admins' CIDRs) and
+   `gateway.aws.sourceRanges.ingest` (the senders' CIDRs), or
+   `gateway.aws.scheme: internal` when everyone reaches the VPC privately.
+
 4. **PostgreSQL.** For production, RDS for PostgreSQL 16+ (Multi-AZ for HA)
    in the cluster VPC, its security group open on 5432 to the node security
    group; `postgresql.mode: external`, `sslmode: require`, the password in a
@@ -406,9 +457,17 @@ Then, in order (each is a hard stop for the chart):
    [helm.md](helm.md)). Do not disable it unless images come from a mirror
    (`global.imageRegistry`, e.g. ECR).
 
-Teardown (only on request): `helm uninstall nano -n nano`, delete the PVCs
-and the namespace, the ALBs disappear with the Gateways; then
-`eksctl delete cluster -f nano-eks.yaml` and the RDS instance.
+Teardown (only on request), in this order, so nothing hangs on a finalizer:
+1. `helm uninstall nano -n nano` (deletes the Gateways); wait until
+   `kubectl -n nano get gateway` lists none and the ALBs are gone.
+2. `kubectl delete gatewayclass aws-alb` while the AWS Load Balancer
+   Controller is still running (after it, the class hangs on the
+   `gateway.k8s.aws/gatewayclass` finalizer).
+3. Delete the PVCs, `nano-secrets`, `vector-source-credentials` and the
+   namespace; then `helm uninstall aws-load-balancer-controller -n kube-system`.
+4. `eksctl delete cluster -f nano-eks.yaml --wait`, the RDS instance (and its
+   subnet and security groups), the ACM certificate and the controller's IAM
+   policy.
 
 ## Managed PostgreSQL (RDS)
 
@@ -438,16 +497,54 @@ aws rds create-db-instance --db-instance-identifier $NAME-pg \
 `--manage-master-user-password` keeps the admin password in Secrets Manager;
 never pass `--master-user-password` on a command line.
 
-Create the role and database as the admin user, in `psql` (`\password`
-prompts, so the password never lands in history or on a command line):
+Create the role and database as the admin user. The instance is private, so
+reach it from a one-off pod in the cluster (passwords from a temporary
+Secret, never on a command line; the docs' "Reaching a private RDS or Azure
+server" has the same recipe). The admin password is in Secrets Manager
+(`aws secretsmanager get-secret-value --secret-id <MasterUserSecret arn>
+--query SecretString --output text | python3 -c 'import json,sys;
+print(json.load(sys.stdin)["password"], end="")' > pg-admin-password.txt`);
+the operator writes the nano password to `pg-password.txt`:
+
+```bash
+kubectl create namespace nano --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n nano create secret generic pg-bootstrap \
+  --from-file=admin=./pg-admin-password.txt --from-file=nano=./pg-password.txt
+kubectl -n nano run pg-bootstrap --rm -i --restart=Never --image=postgres:17-alpine --overrides='
+{"spec": {"containers": [{"name": "pg-bootstrap", "image": "postgres:17-alpine", "stdin": true,
+  "command": ["sh", "-c", "PGPASSWORD=$(cat /s/admin) exec psql -v ON_ERROR_STOP=1 \"host=<endpoint> user=nanoadmin dbname=postgres sslmode=require\" -f -"],
+  "volumeMounts": [{"name": "s", "mountPath": "/s", "readOnly": true}]}],
+  "volumes": [{"name": "s", "secret": {"secretName": "pg-bootstrap"}}]}}' <<'SQL'
+\set pw `cat /s/nano`
+CREATE ROLE nanosiem LOGIN;
+ALTER ROLE nanosiem PASSWORD :'pw';
+GRANT nanosiem TO CURRENT_USER;
+CREATE DATABASE nanosiem OWNER nanosiem;
+\connect nanosiem
+ALTER SCHEMA public OWNER TO nanosiem;
+SQL
+kubectl -n nano delete secret pg-bootstrap
+```
+
+From a host that already reaches the database (a bastion), the same SQL works
+in interactive `psql`, with `\password nanosiem` instead of the `\set` and
+`ALTER ROLE` lines:
 
 ```sql
 CREATE ROLE nanosiem LOGIN;
 \password nanosiem
 GRANT nanosiem TO nanoadmin;          -- PostgreSQL 16+: needed before ... OWNER nanosiem
 CREATE DATABASE nanosiem OWNER nanosiem;
+\connect nanosiem
+ALTER SCHEMA public OWNER TO nanosiem;
 ```
 
-The owner can create the three trusted extensions itself. Use a URL-safe
+The last two lines make sure the nano user can create tables in schema
+`public`. PostgreSQL 15 and newer no longer grant that to every role; on RDS
+the database owner normally has it already (through `pg_database_owner`), so
+this is a no-op there, but a database created another way fails the first
+migration with `permission denied for schema public`. `pg-preflight.py`
+checks it (`FAIL schema` prints the fix). The owner can create the three
+trusted extensions itself. Use a URL-safe
 password (it is interpolated into `DATABASE_URL`), then check with
 `scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)).

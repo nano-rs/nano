@@ -22,11 +22,12 @@ pub use dual_pool::{DualPool, DualPoolConfig, DualPoolError, HealthStatus, Table
 pub use migrations::{
     ensure_migrator_is_current, ensure_postgres_schema_is_current, run_postgres_migrations,
     MigrationError, MigrationMode, SchemaCheckError,
+    migrator_has_pending_work, postgres_migrations_pending, schema_check_means_pending,
 };
 pub use pool::Database;
 pub use postgres_preflight::{
     check_postgres_compatibility, PostgresPreflightError, PostgresPreflightReport,
-    MIN_POSTGRES_VERSION, REQUIRED_POSTGRES_EXTENSIONS,
+    PublicSchemaAccess, MIN_POSTGRES_VERSION, REQUIRED_POSTGRES_EXTENSIONS,
 };
 pub use repo_error::RepoError;
 pub use repository::*;

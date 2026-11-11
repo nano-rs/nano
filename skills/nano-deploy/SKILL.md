@@ -173,8 +173,10 @@ with `Authorization: Bearer <license token>` read from the enrollment file
 digest-pinned image values inside) from the customer registry. With an
 external (managed) PostgreSQL, run
 [scripts/pg-preflight.py](scripts/pg-preflight.py) before `helm install`:
-PostgreSQL 16+ and the extensions `pg_trgm`, `pgcrypto`, `uuid-ossp` (on Azure
-flexible server they must be in `azure.extensions`).
+PostgreSQL 16+, `CREATE` on schema `public` for the nano user (on Azure
+flexible server, `ALTER SCHEMA public OWNER TO nanosiem` as the admin), and the
+extensions `pg_trgm`, `pgcrypto`, `uuid-ossp` (on Azure flexible server they
+must be in `azure.extensions`).
 
 **Get the bundle with the license values.** Run
 [scripts/fetch-bundle.sh](scripts/fetch-bundle.sh) on the workstation (it needs
@@ -268,6 +270,10 @@ cannot resolve from [references/known-issues.md](references/known-issues.md):
    (`tar -xzf FILE -O | less`) and to send it to support@nano.rs or their
    app.nano.rs ticket. In the UI, Help > Report a bug formats the browser
    side (failed request IDs, page, version) the same way.
+
+To give the operator dashboards and alerts (optional, off by default), follow
+[references/monitoring.md](references/monitoring.md): "Monitor your Self-run
+install" for single node, role split and Helm.
 
 ## Stop and escalate
 

@@ -606,9 +606,22 @@ async fn run() -> Result<()> {
     // supported floor or a required extension is not allow-listed (Azure
     // flexible server `azure.extensions`, RDS `rds.allowed_extensions`).
     // A half-applied snapshot is far harder to recover than a clear message.
-    let preflight = nanosiem_core::db::check_postgres_compatibility(pg_pool)
+    // NAN-5269: the schema-`public` CREATE check only blocks when there is
+    // something to apply; an up-to-date install with nothing pending warns.
+    let core_pending = nanosiem_core::db::postgres_migrations_pending(pg_pool).await;
+    #[cfg(feature = "enterprise")]
+    let migrations_pending = core_pending || {
+        let overlay = sqlx::migrate!("../migrations/postgres-enterprise");
+        nanosiem_core::db::migrator_has_pending_work(pg_pool, &overlay, "enterprise").await
+    };
+    #[cfg(not(feature = "enterprise"))]
+    let migrations_pending = core_pending;
+    let preflight = nanosiem_core::db::check_postgres_compatibility(pg_pool, migrations_pending)
         .await
         .context("PostgreSQL compatibility preflight")?;
+    if let Some(warning) = &preflight.schema_warning {
+        tracing::warn!("{warning}");
+    }
     tracing::info!(
         server_version = %preflight.server_version,
         platform = ?preflight.platform,

@@ -53,15 +53,70 @@ fn rollup_scope_and(scope: &ScopeSet) -> String {
     format!(" AND scope_source_type_complete = 1 AND {predicate}")
 }
 
+/// Pre-sampling production parser counters over the last 24h, as read from
+/// the `parser_health_5m` rollup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ParseHealthCounts {
+    /// Every event the parser emitted.
+    attempts: i64,
+    /// Runtime failures (`metadata.parse_error` / `unmapped.parse_error`).
+    errors: i64,
+    /// NAN-5264: degraded parses that are not failures: the record landed as
+    /// with the parser's `unmapped.parse_fallback` marker or without an event
+    /// time (see
+    /// `OCSF_PARSER_FALLBACK_VRL`). Disjoint from `errors`.
+    fallbacks: i64,
+    /// NAN-5264: events whose sender declared a different source than the one
+    /// its ingest token is bound to. The token decided; the claim was ignored.
+    claims_ignored: i64,
+}
+
+/// Parser rates derived from [`ParseHealthCounts`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ParseHealthRates {
+    /// Runtime failures / attempts. 0.0 when there were no attempts.
+    error_rate: f64,
+    /// Fully parsed / attempts: neither a failure nor a fallback (NAN-5264: a
+    /// fallback used to count as a success, so a source whose every event fell
+    /// back reported 100%). `None` when there were no attempts.
+    success_rate: Option<f64>,
+    /// Fallbacks / attempts. `None` when there were no attempts.
+    fallback_rate: Option<f64>,
+}
+
 /// Derive parser rates from the pre-sampling production counters.
-fn parse_health_rates(attempts: i64, parse_errors_24h: i64) -> (f64, Option<f64>) {
-    let error_rate = if attempts > 0 {
-        (parse_errors_24h as f64 / attempts as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let success_rate = (attempts > 0).then_some(1.0 - error_rate);
-    (error_rate, success_rate)
+fn parse_health_rates(counts: ParseHealthCounts) -> ParseHealthRates {
+    if counts.attempts <= 0 {
+        return ParseHealthRates {
+            error_rate: 0.0,
+            success_rate: None,
+            fallback_rate: None,
+        };
+    }
+    let attempts = counts.attempts as f64;
+    let ratio = |n: i64| (n.max(0) as f64 / attempts).clamp(0.0, 1.0);
+    let error_rate = ratio(counts.errors);
+    let fallback_rate = ratio(counts.fallbacks);
+    ParseHealthRates {
+        error_rate,
+        success_rate: Some((1.0 - error_rate - fallback_rate).clamp(0.0, 1.0)),
+        fallback_rate: Some(fallback_rate),
+    }
+}
+
+/// Read the single `JSONEachRow` row of [`LogSourceRepository::build_parse_health_query`].
+/// No row (or an unreadable one) is "no production events", not an error.
+fn parse_health_counts_row(body: &str) -> ParseHealthCounts {
+    body.lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|json| ParseHealthCounts {
+            attempts: parse_json_i64(&json, "parser_events_24h"),
+            errors: parse_json_i64(&json, "parse_errors_24h"),
+            fallbacks: parse_json_i64(&json, "parse_fallbacks_24h"),
+            claims_ignored: parse_json_i64(&json, "source_claims_ignored_24h"),
+        })
+        .unwrap_or_default()
 }
 
 /// How many recent collector errors the detail page renders (NAN-2196).
@@ -444,6 +499,9 @@ impl LogSourceRepository {
             parse_errors_24h: 0,
             parse_attempts_24h: 0,
             parse_success_rate_24h: None,
+            parse_fallbacks_24h: 0,
+            parse_fallback_rate_24h: None,
+            source_claims_ignored_24h: 0,
             // No ClickHouse client, so no collector error history to read.
             // Empty is honest here — it means "unknown", and the surrounding
             // metrics are all zeroed for the same reason.
@@ -589,11 +647,10 @@ impl LogSourceRepository {
         // with the immutable parser UUID. A narrow Vector branch counts every
         // output before optional sampling; the Null-engine ClickHouse ingress
         // retains only five-minute aggregates.
-        let (parse_attempts_24h, parse_errors_24h) = self
+        let parse_counts = self
             .get_parse_health_counts_clickhouse(ch_client, log_source, scope)
             .await?;
-        let (error_rate_24h, parse_success_rate_24h) =
-            parse_health_rates(parse_attempts_24h, parse_errors_24h);
+        let parse_rates = parse_health_rates(parse_counts);
 
         // NAN-2196. A source that cannot reach its queue and a source with no
         // traffic both report zero events; only this distinguishes them.
@@ -639,10 +696,13 @@ impl LogSourceRepository {
             health_status,
             total_size_bytes,
             avg_event_size_bytes,
-            error_rate_24h,
-            parse_errors_24h,
-            parse_attempts_24h,
-            parse_success_rate_24h,
+            error_rate_24h: parse_rates.error_rate,
+            parse_errors_24h: parse_counts.errors,
+            parse_attempts_24h: parse_counts.attempts,
+            parse_success_rate_24h: parse_rates.success_rate,
+            parse_fallbacks_24h: parse_counts.fallbacks,
+            parse_fallback_rate_24h: parse_rates.fallback_rate,
+            source_claims_ignored_24h: parse_counts.claims_ignored,
             collector_errors,
             collector_errors_24h,
             collector_error_hint,
@@ -815,7 +875,7 @@ impl LogSourceRepository {
         ch_client: &ClickHouseClient,
         log_source: &LogSource,
         scope: &ScopeSet,
-    ) -> Result<(i64, i64), LogSourceRepositoryError> {
+    ) -> Result<ParseHealthCounts, LogSourceRepositoryError> {
         let rollup = self.table_names.read_bare("parser_health_5m");
         let sql = Self::build_parse_health_query(log_source, scope, &rollup);
         let mut cursor = ch_client
@@ -837,18 +897,7 @@ impl LogSourceRepository {
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             LogSourceRepositoryError::ClickHouseError(format!("Invalid UTF-8: {}", e))
         })?;
-        let counts = response_str
-            .lines()
-            .next()
-            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .map(|json| {
-                (
-                    parse_json_i64(&json, "parser_events_24h"),
-                    parse_json_i64(&json, "parse_errors_24h"),
-                )
-            })
-            .unwrap_or((0, 0));
-        Ok(counts)
+        Ok(parse_health_counts_row(&response_str))
     }
 
     /// Pure SQL builder for production parse health. Keeping this separate makes
@@ -870,7 +919,9 @@ impl LogSourceRepository {
         };
         format!(
             "SELECT sum(events) AS parser_events_24h, \
-                    sum(parse_errors) AS parse_errors_24h \
+                    sum(parse_errors) AS parse_errors_24h, \
+                    sum(parse_fallbacks) AS parse_fallbacks_24h, \
+                    sum(source_claims_ignored) AS source_claims_ignored_24h \
              FROM {rollup} \
              WHERE bucket_start >= now() - INTERVAL 24 HOUR \
                AND parser_id = '{parser_id}'\
@@ -1587,10 +1638,86 @@ mod tests {
 
     #[test]
     fn parse_health_rates_use_pre_sampling_attempts() {
-        let (error_rate, success_rate) = parse_health_rates(100, 4);
-        assert!((error_rate - 0.04).abs() < f64::EPSILON);
-        assert_eq!(success_rate, Some(0.96));
-        assert_eq!(parse_health_rates(0, 0), (0.0, None));
+        let rates = parse_health_rates(ParseHealthCounts {
+            attempts: 100,
+            errors: 4,
+            ..Default::default()
+        });
+        assert!((rates.error_rate - 0.04).abs() < f64::EPSILON);
+        assert_eq!(rates.success_rate, Some(0.96));
+        assert_eq!(rates.fallback_rate, Some(0.0));
+        let idle = parse_health_rates(ParseHealthCounts::default());
+        assert_eq!(idle.error_rate, 0.0);
+        assert_eq!(idle.success_rate, None);
+        assert_eq!(idle.fallback_rate, None);
+    }
+
+    /// NAN-5264: the reported case. 16 of 17 Apache events fell back to a
+    /// Base Event with no runtime error; health used to say 100% success.
+    #[test]
+    fn fallbacks_are_not_counted_as_successes() {
+        let rates = parse_health_rates(ParseHealthCounts {
+            attempts: 17,
+            errors: 0,
+            fallbacks: 16,
+            claims_ignored: 0,
+        });
+        assert_eq!(rates.error_rate, 0.0, "a fallback is not a runtime failure");
+        let fallback = rates.fallback_rate.unwrap();
+        assert!((fallback - 16.0 / 17.0).abs() < 1e-12, "{fallback}");
+        let success = rates.success_rate.unwrap();
+        assert!((success - 1.0 / 17.0).abs() < 1e-12, "{success}");
+        assert!(success < 0.1, "the source must not read as healthy: {success}");
+    }
+
+    #[test]
+    fn success_rate_excludes_both_failures_and_fallbacks_and_never_goes_negative() {
+        let rates = parse_health_rates(ParseHealthCounts {
+            attempts: 10,
+            errors: 2,
+            fallbacks: 3,
+            claims_ignored: 0,
+        });
+        assert!((rates.success_rate.unwrap() - 0.5).abs() < 1e-12);
+        // Counters from separate 5m buckets can disagree by a merge; clamp.
+        let skewed = parse_health_rates(ParseHealthCounts {
+            attempts: 10,
+            errors: 6,
+            fallbacks: 6,
+            claims_ignored: 0,
+        });
+        assert_eq!(skewed.success_rate, Some(0.0));
+    }
+
+    #[test]
+    fn parse_health_query_reads_fallbacks_and_ignored_claims() {
+        let ls = log_source(serde_json::json!({ "match_values": ["apache_access"] }));
+        let sql = LogSourceRepository::build_parse_health_query(
+            &ls,
+            &ScopeSet::unrestricted(),
+            "parser_health_5m",
+        );
+        assert!(sql.contains("sum(parse_fallbacks) AS parse_fallbacks_24h"), "{sql}");
+        assert!(
+            sql.contains("sum(source_claims_ignored) AS source_claims_ignored_24h"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn parse_health_row_reads_every_counter() {
+        // ClickHouse quotes UInt64 sums in JSONEachRow by default.
+        let row = r#"{"parser_events_24h":"17","parse_errors_24h":"0","parse_fallbacks_24h":"16","source_claims_ignored_24h":"5"}"#;
+        assert_eq!(
+            parse_health_counts_row(row),
+            ParseHealthCounts {
+                attempts: 17,
+                errors: 0,
+                fallbacks: 16,
+                claims_ignored: 5,
+            }
+        );
+        assert_eq!(parse_health_counts_row(""), ParseHealthCounts::default());
     }
 
     // ---------------------------------------------------------------------

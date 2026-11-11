@@ -1,0 +1,17 @@
+# nano monitoring heartbeat (NAN-5250), Compose installs only (Helm does not
+# ship it: kube-prometheus-stack has its own Watchdog).
+#
+# Always firing. With self-ingest on, Alertmanager re-sends it to nano every
+# 5 minutes, so a nano detection can alert when the heartbeat stops (the
+# monitoring host, Prometheus, Alertmanager or the ingest path is down).
+# Dashboards and the "alerts firing" counts leave it out.
+groups:
+  - name: nano_heartbeat
+    rules:
+      - alert: NanoHeartbeat
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: "nano monitoring is alive"
+          description: "Always firing. Its absence in nano means self-ingest or the monitoring stack has stopped."

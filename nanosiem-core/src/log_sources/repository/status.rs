@@ -121,11 +121,13 @@ impl LogSourceRepository {
     /// source is a no-op here. Called from the deploy success path so a feed
     /// onboarded via the AddFeed wizard leaves the Draft state once it's live.
     /// Returns the number of rows flipped (0 when the feed was already active).
+    ///
+    /// NAN-5264: also re-stamps `deployed_at`. The `updated_at` trigger fires on
+    /// this UPDATE, a statement after `mark_deployed`, so a wizard feed read as
+    /// "edited since deploy" (a draft) the moment its first deploy succeeded.
+    /// It only runs on the deploy success path, so the deploy time is true.
     pub async fn mark_lifecycle_active(&self, id: Uuid) -> Result<u64, LogSourceRepositoryError> {
-        let result = sqlx::query(
-            "UPDATE log_sources SET lifecycle_status = 'active' \
-             WHERE id = $1 AND lifecycle_status = 'draft'",
-        )
+        let result = sqlx::query(MARK_LIFECYCLE_ACTIVE_SQL)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -146,5 +148,20 @@ impl LogSourceRepository {
         }
 
         Ok(())
+    }
+}
+
+/// See [`LogSourceRepository::mark_lifecycle_active`]. `deployed_at` and the
+/// trigger-set `updated_at` both take this statement's `NOW()`.
+const MARK_LIFECYCLE_ACTIVE_SQL: &str = "UPDATE log_sources SET lifecycle_status = 'active', \
+     deployed_at = NOW() WHERE id = $1 AND lifecycle_status = 'draft'";
+
+#[cfg(test)]
+mod lifecycle_sql_tests {
+    #[test]
+    fn activating_a_wizard_feed_restamps_the_deploy_time() {
+        let sql = super::MARK_LIFECYCLE_ACTIVE_SQL;
+        assert!(sql.contains("deployed_at = NOW()"), "{sql}");
+        assert!(sql.contains("lifecycle_status = 'draft'"), "only drafts flip: {sql}");
     }
 }

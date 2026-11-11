@@ -200,6 +200,15 @@ hosts, when you use HAProxy). For the host firewall itself, see step 5.
   ssh $H 'sudo sh /tmp/data-disk-heal.sh install && rm /tmp/data-disk-heal.sh'
   ```
 
+  From 2.0.12 the package ships the same script as
+  `~/nano/scripts/lib/data-disk-heal.sh`, and `install.sh` installs the timer
+  itself on a host whose Docker data is on a separate `nofail` disk: with
+  passwordless sudo it runs the install (idempotent; it reports "Data disk
+  self-heal timer is installed" on later runs), otherwise it prints the one
+  `sudo sh scripts/lib/data-disk-heal.sh install /var/lib/docker` command to
+  run. `NANO_DATA_DISK_HEAL=off` skips it; remove it with
+  `sudo sh ~/nano/scripts/lib/data-disk-heal.sh uninstall`.
+
   Why these options: `nofail` keeps the host bootable (and reachable over
   SSH) when the disk is missing; `RequiresMountsFor=` keeps Docker off the
   root disk; `x-systemd.device-timeout=90s` bounds the wait for the device,

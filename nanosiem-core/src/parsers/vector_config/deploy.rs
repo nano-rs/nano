@@ -1580,11 +1580,20 @@ impl VectorConfigManager {
                  if source_type == \"\" {{ source_type = \"unknown\" }}\n\
                  failed = to_bool(._nano_parser_failure) ?? false\n\
                  parse_failure = if failed {{ 1 }} else {{ 0 }}\n\
+                 # NAN-5264: a degraded (fallback) parse that is not a failure.\n\
+                 fell_back = to_bool(._nano_parser_fallback) ?? false\n\
+                 parse_fallback = if fell_back && !failed {{ 1 }} else {{ 0 }}\n\
+                 # NAN-5264: the sender declared a source its token is not bound\n\
+                 # to; the token won and the claim was ignored (NAN-4912 stash).\n\
+                 claimed = to_string(%nano_claimed_source_type) ?? \"\"\n\
+                 source_claim_ignored = if claimed != \"\" {{ 1 }} else {{ 0 }}\n\
                  . = {{\n\
                      \"parser_id\": parser_id,\n\
                      \"source_type\": source_type,\n\
                      \"observed_at\": now(),\n\
-                     \"parse_failure\": parse_failure\n\
+                     \"parse_failure\": parse_failure,\n\
+                     \"parse_fallback\": parse_fallback,\n\
+                     \"source_claim_ignored\": source_claim_ignored\n\
                  }}\n\
                  '''\n",
                 persisted_inputs.join(", "),

@@ -38,7 +38,11 @@ DEFAULT_INSTALL_DIR = SCRIPT_DIR.parent
 SEMVER_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
-ROLES = {"keeper", "clickhouse", "postgres", "ingest", "app"}
+ROLES = {"keeper", "clickhouse", "postgres", "ingest", "app", "monitoring"}
+# NAN-5250: RAM the optional monitoring role (Prometheus, Grafana, exporters)
+# needs when a release manifest predates it. Matches the Compose limits and
+# resource-sizing.sh's NANO_MONITORING_RESERVE_MIB default.
+MONITORING_ROLE_MIN_BYTES = 1024 * 1024 * 1024
 
 _LEGACY_SPEC = importlib.util.spec_from_file_location(
     "nano_legacy_layout", SCRIPT_DIR / "lib/nano_legacy_layout.py"
@@ -63,6 +67,8 @@ ROLE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "migration": ("clickhouse", "postgres"),
     "app": ("migration",),
     "ingest": ("app",),
+    # NAN-5250: metrics only; rolled last so it watches the upgrade.
+    "monitoring": ("ingest",),
 }
 
 
@@ -145,6 +151,7 @@ ROLE_SERVICES: dict[str, tuple[str, ...]] = {
     "migration": ("clickhouse-proxy",),
     "ingest": INGEST_SERVICES,
     "app": APP_SERVICES,
+    "monitoring": ("prometheus", "alertmanager", "grafana", "redis-exporter"),
 }
 
 
@@ -197,6 +204,13 @@ BUNDLE_IMAGE_ROLES: dict[str, frozenset[str]] = {
     "curl": frozenset({"ingest"}),
     "nginx": frozenset({"app", "ingest", "clickhouse", "postgres"}),
     "tenzir": frozenset({"ingest"}),
+    # NAN-5250: the optional monitoring role. node-exporter runs on every host
+    # of a cluster that has a monitoring host; the rest only on that host.
+    "node-exporter": frozenset({"app", "ingest", "clickhouse", "keeper", "postgres", "monitoring"}),
+    "prometheus": frozenset({"monitoring"}),
+    "grafana": frozenset({"monitoring"}),
+    "redis_exporter": frozenset({"monitoring"}),
+    "alertmanager": frozenset({"monitoring"}),
 }
 INSTALL_OPERATION_RESERVE_BYTES = 256 * 1024**2
 DOCKER_OPERATION_RESERVE_BYTES = 1024**3
@@ -507,8 +521,12 @@ def role_ram_requirement(requires: dict[str, Any], roles: Iterable[str]) -> tupl
     selected: list[str] = []
     role_total = 0
     for role in sorted(set(roles)):
+        raw_minimum = role_minimums.get(role)
+        if raw_minimum is None and role == "monitoring":
+            # A manifest signed before NAN-5250 has no monitoring entry.
+            raw_minimum = MONITORING_ROLE_MIN_BYTES
         minimum = _positive_policy_bytes(
-            role_minimums.get(role), f"manifest.requires.ram.role_min_bytes.{role}"
+            raw_minimum, f"manifest.requires.ram.role_min_bytes.{role}"
         )
         selected.append(f"{role}={minimum}")
         role_total += minimum
@@ -615,10 +633,42 @@ def cgroup_memory_limits(
 # of to one target release number. A later signed target still carries the
 # shared migration index, while these rows describe legitimate source state;
 # every unknown namespace/version and every checksum drift remains rejected.
+#
+# NAN-5269: the list is derived from the target control tree's
+# per-profile migrations directory (shipped in the signed package, the same
+# files the target images apply), never hand-maintained. A hand-kept list
+# that stopped at ocsf/190 refused every v2.0.10 OCSF cluster (193, 194).
+# Versions and checksums follow the Rust migrator exactly: the filename
+# prefix before the first `_`, namespaced `<profile>/`, and the SHA-256 of
+# the file bytes.
+PROFILE_MIGRATION_DIRS: dict[str, str] = {"ocsf": "clickhouse/ocsf/migrations"}
+_PROFILE_MIGRATION_FILENAME = re.compile(r"^([0-9]+[a-z]*)_.+\.sql$")
+
+
+def profile_ledger_allowlist(root: pathlib.Path, profile: str) -> dict[str, str]:
+    """The exact `<profile>/<version>` -> sha256 rows the target can hold."""
+    relative = PROFILE_MIGRATION_DIRS.get(profile)
+    if relative is None:
+        return {}
+    directory = root / relative
+    if not directory.is_dir():
+        raise RuntimeError(f"{profile} ClickHouse migrations are missing from the control tree: {directory}")
+    result: dict[str, str] = {}
+    for path in sorted(directory.iterdir()):
+        match = _PROFILE_MIGRATION_FILENAME.fullmatch(path.name)
+        if match is None or not path.is_file():
+            continue
+        version = f"{profile}/{match.group(1)}"
+        if version in result:
+            raise RuntimeError(f"{directory} repeats migration version {version}")
+        result[version] = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+    if not result:
+        raise RuntimeError(f"{profile} ClickHouse migrations directory is empty: {directory}")
+    return result
+
+
 PROFILE_LEDGER_ALLOWLIST: dict[str, dict[str, str]] = {
-    "ocsf": {
-        "ocsf/190": "sha256:5f88ea84c3a4d30c340d36544fb31d7836a07b3a025b3dafa511e2c22caf9033",
-    },
+    "ocsf": profile_ledger_allowlist(SCRIPT_DIR.parent, "ocsf"),
     "udm": {},
 }
 def _clickhouse_baseline_allowlist() -> dict[str, str]:
@@ -1762,6 +1812,11 @@ class LocalOps:
             raise UpgradeError("PostgreSQL backup mutation fence row is missing")
         return {"active": active, "owner": owner if active else None}
 
+    def _monitoring_enabled(self) -> bool:
+        """NAN-5250: the inventory has a monitoring host (the renderer's flag)."""
+        role_env = getattr(self, "role_env", None) or {}
+        return role_env.get("NANO_MONITORING_ENABLED") == "true"
+
     def _service_expected(self, service: str) -> bool:
         if service == "vector-tap" and not self.env.get("NANO_VECTOR_TAP_TOKEN"):
             return False
@@ -1931,12 +1986,8 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
 
     def _registry_auth_probe(self, manifest: dict[str, Any]) -> str:
         """Ask the registry itself: a cached image never proves the login works."""
-        private = [
-            image for image in manifest.get("images", [])
-            if isinstance(image, dict) and "nano-rs" in str(image.get("ref", ""))
-            and str(image.get("ref", "")).count("/") >= 2
-        ]
-        if manifest.get("edition") != "enterprise" or not private:
+        private = private_registry_images(manifest)
+        if not private:
             return ""
         ref, digest = str(private[0]["ref"]), str(private[0]["digest"])
         head, _, last = ref.rpartition("/")
@@ -4679,6 +4730,15 @@ printf 'consumer generation %s ready\n' "$generation"
                             self._wait_container("vector-netns", timeout)
                     else:
                         self._drain_vector(min(timeout, 300))
+                        # NAN-5250: the namespace anchor publishes Vector's
+                        # ports (the monitoring host scrapes :9598 through it).
+                        # Recreated only when its definition changed; Vector
+                        # is drained and recreated right after.
+                        if self._monitoring_enabled() and self._service_expected("vector-netns"):
+                            self.compose([
+                                "up", "-d", "--no-deps", "--pull", "never", "vector-netns",
+                            ], timeout=timeout)
+                            self._wait_container("vector-netns", timeout)
                 services = self._up_ingest_services(selected, timeout, exact=True)
                 if "ingest-edge" in services:
                     route_probe = self.smoke_ingest(f"nano-rollout-{uuid.uuid4()}")
@@ -4687,6 +4747,12 @@ printf 'consumer generation %s ready\n' "$generation"
             else:
                 if "ingest-edge" in services:
                     self._lb_hook("rejoin", require_lb_hooks)
+        elif role == "monitoring":
+            # NAN-5250: Prometheus and Grafana carry no nano state; recreate
+            # whatever this host runs and wait for it to be up.
+            services = self._up_existing(selected, timeout, exact=True)
+            if services:
+                self._wait_services(services, timeout)
         elif role == "app":
             drained = self._drain_app_host(selected)
             services = self._up_app_services(selected, timeout, exact=True)
@@ -4696,6 +4762,11 @@ printf 'consumer generation %s ready\n' "$generation"
                 self._wait_services(services, timeout)
             if drained:
                 self._rejoin_app_host()
+        # NAN-5250: node-exporter (with a monitoring host) runs on every host
+        # beside whatever role this is; bring it to the target definition too.
+        if role != "migration" and self._monitoring_enabled() and self._service_expected("node-exporter"):
+            self.compose(["up", "-d", "--no-deps", "--pull", "never", "node-exporter"], timeout=timeout)
+            services = [*services, "node-exporter"]
         result = {"services": services}
         if role == "app" and any(service in APP_EDGE_SERVICES for service in services):
             result["dependency_probe"] = dependency_probe
@@ -5648,16 +5719,41 @@ def check_registry_control_tree(install_dir: pathlib.Path, target: str) -> str:
     return f"control tree is v{target}"
 
 
+def image_needs_registry_login(ref: str) -> bool:
+    """NAN-5269: only nano's enterprise application images are private.
+
+    They are the `nanosiem-*` repositories (nanosiem-api, -search, -jobs, ...)
+    in the customer registry the license issues a pull credential for (or
+    nano's own registry for internal builds). Everything else an enterprise
+    package pins is public and pulls anonymously: Docker Hub and quay.io
+    base images and nano's public ghcr.io/nano-rs/vector. Deciding by the
+    `nano-rs` substring refused ghcr.io for every customer, who can never log
+    in there. The registry-pull check still pulls every image by digest, so
+    a repository that does need a credential still fails before any change.
+    """
+    head, _, last = ref.rpartition("/")
+    if not head or "/" not in head:
+        return False  # a Docker Hub name such as postgres:17 or a two-part Hub path
+    repository = last.split("@", 1)[0].split(":", 1)[0]
+    return repository.startswith("nanosiem-")
+
+
+def private_registry_images(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    if manifest.get("edition") != "enterprise":
+        return []
+    return [
+        image for image in manifest.get("images", [])
+        if isinstance(image, dict) and image_needs_registry_login(str(image.get("ref", "")))
+    ]
+
+
 def check_registry_login(manifest: dict[str, Any]) -> str:
     """Pulls happen mid-upgrade; refuse up front when no credential is configured."""
     if manifest.get("edition") != "enterprise":
         return "open images come from a public registry"
     registries = sorted({
         str(image.get("ref", "")).split("/", 1)[0]
-        for image in manifest.get("images", [])
-        if isinstance(image, dict)
-        and str(image.get("ref", "")).count("/") >= 2
-        and "nano-rs" in str(image.get("ref", ""))
+        for image in private_registry_images(manifest)
     })
     if not registries:
         return "no private registry images"

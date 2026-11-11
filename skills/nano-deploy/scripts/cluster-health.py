@@ -177,8 +177,13 @@ def clickhouse(role: dict, env: dict, tls: bool) -> None:
     except (urllib.error.URLError, OSError, ssl.SSLError) as err:
         row("ch-keeper", False, f"system.zookeeper query failed: {err}")
     try:
-        ddl = query("SELECT count() AS pending FROM system.distributed_ddl_queue "
-                    "WHERE status NOT IN ('Finished','Removing')")[0]
+        # Stale = older than an entry the same host already Finished (it runs its
+        # queue in order, so it can't be blocked by it): harmless, not counted.
+        ddl = query("SELECT countIf(f.last_finished = '' OR q.entry > f.last_finished) AS pending "
+                    "FROM system.distributed_ddl_queue AS q LEFT JOIN "
+                    "(SELECT host, port, max(entry) AS last_finished FROM system.distributed_ddl_queue "
+                    "WHERE status = 'Finished' GROUP BY host, port) AS f ON q.host = f.host AND q.port = f.port "
+                    "WHERE q.status NOT IN ('Finished','Removing')")[0]
         row("ch-ddl", int(ddl["pending"]) == 0 or None, f"distributed DDL not finished: {ddl['pending']}")
     except (urllib.error.URLError, OSError, ssl.SSLError) as err:
         row("ch-ddl", None, f"distributed_ddl_queue not readable: {err}")

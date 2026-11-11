@@ -165,6 +165,17 @@ PORT_DEFAULTS = {
     "clickhouse_metrics": 9363,
     "keeper_client": 9181,
     "keeper_raft": 9234,
+    # the optional monitoring role and the exporters it scrapes.
+    "grafana": 3030,
+    "prometheus": 9090,
+    "node_exporter": 9100,
+    "vector_metrics": 9598,
+    "keeper_metrics": 9364,
+    "clickhouse_proxy_metrics": 8405,
+    "ingest_proxy_metrics": 8406,
+    "app_api_proxy_metrics": 8407,
+    "postgres_router_metrics": 8408,
+    "valkey_router_metrics": 8409,
 }
 ROLE_PORTS = {
     "app": ("app", "api_internal"),
@@ -172,6 +183,18 @@ ROLE_PORTS = {
     "postgres": ("postgres",),
     "clickhouse": ("clickhouse_http", "clickhouse_native", "clickhouse_interserver", "clickhouse_metrics"),
     "keeper": ("keeper_client", "keeper_raft"),
+    "monitoring": ("grafana", "prometheus"),
+}
+# exporter ports each role publishes when the inventory has a
+# monitoring host (vendored from the renderer's METRICS_ROLE_PORTS).
+METRICS_ROLE_PORTS = {
+    "app": ("node_exporter", "clickhouse_proxy_metrics", "ingest_proxy_metrics",
+            "postgres_router_metrics", "valkey_router_metrics"),
+    "ingest": ("node_exporter", "vector_metrics", "clickhouse_proxy_metrics", "app_api_proxy_metrics"),
+    "clickhouse": ("node_exporter",),
+    "keeper": ("node_exporter", "keeper_metrics"),
+    "postgres": ("node_exporter",),
+    "monitoring": ("node_exporter",),
 }
 # The stateful-tier failover ports (render_ha.py). With three postgres hosts,
 # etcd and Sentinel run on the postgres hosts, so every one of these lives on
@@ -195,10 +218,25 @@ PORT_SOURCES = {
     "clickhouse_http": ("app", "ingest", "clickhouse"),
     "clickhouse_native": ("app", "ingest", "clickhouse"),
     "clickhouse_interserver": ("clickhouse",),
-    "clickhouse_metrics": ("app",),
+    "clickhouse_metrics": ("app", "monitoring"),
     "keeper_client": ("app", "clickhouse", "keeper"),
     "keeper_raft": ("keeper",),
+    # Grafana is for people (the management network); Prometheus is
+    # published on loopback only and never opened. Every exporter is opened
+    # to the monitoring host alone.
+    "grafana": ("management CIDR",),
+    "prometheus": ("monitoring",),   # published on the monitoring host's loopback only
+    "node_exporter": ("monitoring",),
+    "vector_metrics": ("monitoring",),
+    "keeper_metrics": ("monitoring",),
+    "clickhouse_proxy_metrics": ("monitoring",),
+    "ingest_proxy_metrics": ("monitoring",),
+    "app_api_proxy_metrics": ("monitoring",),
+    "postgres_router_metrics": ("monitoring",),
+    "valkey_router_metrics": ("monitoring",),
 }
+# what the monitoring host also reaches on ports that already exist.
+MONITORING_EXTRA_SOURCES = ("api_internal", "patroni_api", "etcd_client", "valkey", "sentinel")
 
 # =============================================================================
 # Inventory schemas. Full HA (several app hosts, three postgres hosts with
@@ -595,10 +633,13 @@ def build_nodes(a, cat, app, ctl, ch, ing, vpc) -> list[dict]:
 
 def roles_for(node: dict, schema: dict) -> list[str]:
     if "roles" in node:                      # existing-VM layouts carry explicit (possibly stacked) roles
-        return list(node["roles"])
-    roles = list(schema["roles"][node["kind"]])
-    if node["kind"] == "clickhouse" and node.get("ingest"):
-        roles = roles + ["ingest"]
+        roles = list(node["roles"])
+    else:
+        roles = list(schema["roles"][node["kind"]])
+        if node["kind"] == "clickhouse" and node.get("ingest"):
+            roles = roles + ["ingest"]
+    if node.get("monitoring") and "monitoring" not in roles:
+        roles.append("monitoring")           # co-located monitoring role
     return roles
 
 
@@ -864,12 +905,31 @@ def port_matrix(schema: dict) -> list[dict]:
     rows = []
     for role, keys in ROLE_PORTS.items():
         for key in keys:
+            if role == "monitoring":
+                continue
+            sources = [s for s in PORT_SOURCES[key]]
+            if key in MONITORING_EXTRA_SOURCES:
+                sources.append("monitoring")
+            rows.append({"port": PORT_DEFAULTS[key], "key": key, "on": role, "from": sources,
+                         "proto": "tcp", "status": "always (monitoring: with a monitoring host)"
+                         if "monitoring" in sources and key != "clickhouse_metrics" else "always"})
+    # only when the inventory has a monitoring host.
+    rows.append({"port": PORT_DEFAULTS["grafana"], "key": "grafana", "on": "monitoring",
+                 "from": list(PORT_SOURCES["grafana"]), "proto": "tcp", "status": "monitoring host"})
+    rows.append({"port": PORT_DEFAULTS["prometheus"], "key": "prometheus", "on": "monitoring",
+                 "from": list(PORT_SOURCES["prometheus"]), "proto": "tcp",
+                 "status": "monitoring host (loopback only: never open it)"})
+    for role, keys in METRICS_ROLE_PORTS.items():
+        for key in keys:
             rows.append({"port": PORT_DEFAULTS[key], "key": key, "on": role, "from": list(PORT_SOURCES[key]),
-                         "proto": "tcp", "status": "always"})
+                         "proto": "tcp", "status": "monitoring host"})
     if schema["multi_postgres"]:
         for key in HA_PORTS:
             when = "2+ app hosts" if key in ("valkey", "sentinel") else "3 postgres hosts"
-            rows.append({"port": PORT_DEFAULTS[key], "key": key, "on": "postgres", "from": list(PORT_SOURCES[key]),
+            sources = list(PORT_SOURCES[key])
+            if key in MONITORING_EXTRA_SOURCES:
+                sources.append("monitoring")
+            rows.append({"port": PORT_DEFAULTS[key], "key": key, "on": "postgres", "from": sources,
                          "proto": "tcp", "status": f"full HA ({when})"})
     rows.append({"port": 22, "key": "ssh", "on": "all", "from": ["management CIDR", "app"], "proto": "tcp",
                  "status": "always (the first app host runs scripts/nano upgrade over SSH)"})
@@ -878,7 +938,8 @@ def port_matrix(schema: dict) -> list[dict]:
 
 ROLE_HOSTS = {"app": "app hosts", "ingest": "ingest hosts", "postgres": "PostgreSQL hosts",
               "clickhouse": "ClickHouse hosts", "keeper": "Keeper hosts (= PostgreSQL hosts)",
-              "lb:app": "app load balancer", "lb:ingest": "ingest load balancer"}
+              "lb:app": "app load balancer", "lb:ingest": "ingest load balancer",
+              "monitoring": "the monitoring host"}
 
 
 def port_matrix_markdown(schema: dict) -> str:
@@ -894,7 +955,7 @@ def port_matrix_markdown(schema: dict) -> str:
 # of every role it runs (stacked layouts join several).
 FIREWALL_GROUP = {"app": "app", "ingest": "ingest", "postgres": "control", "keeper": "control",
                   "clickhouse": "clickhouse", "lb:app": "lb-app", "lb:ingest": "lb-ingest",
-                  "management CIDR": "mgmt", "all": "all"}
+                  "management CIDR": "mgmt", "all": "all", "monitoring": "monitoring"}
 
 
 def firewall_rules(schema: dict) -> list[tuple[int, str, str, str, str]]:
@@ -944,6 +1005,11 @@ def role_floor(roles: set[str]) -> tuple[int, int, int]:
         add(4, 16, INGEST_DATA_DISK_MIN_GIB)
     if "keeper" in roles and not roles & {"postgres", "clickhouse"}:
         add(*KEEPER_COLOCATED, 0)
+    if "monitoring" in roles:
+        if cpu == 0:
+            add(*MONITORING_HOST)          # a dedicated monitoring VM
+        else:
+            add(0, 1, 10)                  # co-located: its fixed ~1 GiB and 15 d of metrics
     if cpu == 0:
         add(*(LB_HOST if "lb" in roles else (APP_MIN[0], APP_MIN[1], 50)))
     return cpu, mem, disk
@@ -984,7 +1050,14 @@ def preflight_args(p: dict, schema: dict) -> list[tuple[str, str, str]]:
 BRIDGE_PORT_KEYS = ("app", "api_internal", "vector_tap", "postgres", "patroni_api", "etcd_client", "etcd_peer",
                     "valkey", "sentinel")
 HOST_PORT_KEYS = ("clickhouse_http", "clickhouse_native", "clickhouse_interserver", "clickhouse_metrics",
-                  "keeper_client", "keeper_raft")
+                  "keeper_client", "keeper_raft",
+                  # Host-networked exporters (node-exporter, Keeper), with a monitoring host.
+                  "node_exporter", "keeper_metrics")
+MONITORING_HOST_PORT_KEYS = ("node_exporter", "keeper_metrics")
+# Docker-published exporter ports. Opened to the monitoring host
+# only, even from the other cluster hosts.
+METRICS_BRIDGE_PORT_KEYS = ("vector_metrics", "clickhouse_proxy_metrics", "ingest_proxy_metrics",
+                            "app_api_proxy_metrics", "postgres_router_metrics", "valkey_router_metrics")
 DOCKER_FIREWALL_BIN = "/usr/local/sbin/nano-docker-firewall"
 DOCKER_FIREWALL_UNIT = "nano-docker-firewall.service"
 
@@ -993,7 +1066,9 @@ def _is_v6(addr: str) -> bool:
     return ipaddress.ip_network(addr, strict=False).version == 6
 
 
-def docker_firewall_rules(peers: list[str], lb: list[str], ports: list[int]) -> str:
+def docker_firewall_rules(peers: list[str], lb: list[str], ports: list[int],
+                          monitoring: list[str] | None = None, metrics_ports: list[int] | None = None,
+                          grafana_port: int | None = None) -> str:
     """The DOCKER-USER program, live-tested on Docker 29 / Ubuntu 24.04.
 
     Drops only NEW connections to a published port that arrive from outside
@@ -1006,6 +1081,31 @@ def docker_firewall_rules(peers: list[str], lb: list[str], ports: list[int]) -> 
     """
     v4 = lambda xs: " ".join(x for x in xs if not _is_v6(x))   # noqa: E731
     v6 = lambda xs: " ".join(x for x in xs if _is_v6(x))       # noqa: E731
+    monitoring = monitoring or []
+    metrics_ports = metrics_ports or []
+    metrics_vars = metrics_chain = ""
+    if monitoring and metrics_ports:
+        # Exporter ports, opened to the monitoring host only (before the peers' RETURN).
+        port_list = " ".join(str(x) for x in metrics_ports)
+        metrics_vars = (f'\n# Exporter ports, opened to the monitoring host only.\n'
+                        f'METRICS_PORTS="{port_list}"\n'
+                        f'MON4="{v4(monitoring)}"\nMON6="{v6(monitoring)}"\n'
+                        f'# Grafana (monitoring host), opened to the management network only. The firewall\n'
+                        f'# script writes MGMT_CIDR in place of the marker below.\n'
+                        f'GRAFANA_PORT="{grafana_port or 3030}"\n'
+                        f'GRAFANA_FROM="@MGMT_CIDR@"')
+        metrics_chain = ('\n  for p in $METRICS_PORTS; do\n'
+                         '    for s in $3; do echo "-A NANO-DOCKER -s $s -p tcp -m conntrack --ctorigdstport $p -j RETURN"; done\n'
+                         '    echo "-A NANO-DOCKER -p tcp -m conntrack --ctstate NEW --ctorigdstport $p -j DROP"\n'
+                         '  done\n'
+                         '  for s in $GRAFANA_FROM; do\n'
+                         '    case "$s" in *:*) [ "$4" = 6 ] || continue ;; *) [ "$4" = 4 ] || continue ;; esac\n'
+                         '    echo "-A NANO-DOCKER -s $s -p tcp -m conntrack --ctorigdstport $GRAFANA_PORT -j RETURN"\n'
+                         '  done\n'
+                         '  echo "-A NANO-DOCKER -p tcp -m conntrack --ctstate NEW --ctorigdstport $GRAFANA_PORT -j DROP"')
+    mon4, mon6 = (' "$MON4" 4', ' "$MON6" 6') if metrics_vars else ("", "")
+    chain_args = ' "$2" "$3" "$4" "$5"' if metrics_vars else ' "$2" "$3"'
+    chain_doc = "<peers> <lb> <monitoring> <4|6>" if metrics_vars else "<peers> <lb>"
     return f"""#!/bin/sh
 # nano: filter NEW inbound connections to Docker-published ports.
 # Generated by nano-deploy plan.py --firewall-script; regenerate it, don't hand-edit.
@@ -1015,25 +1115,25 @@ PORTS="{' '.join(str(x) for x in ports)}"
 PEERS4="{v4(peers)}"
 PEERS6="{v6(peers)}"
 LB4="{v4(lb)}"
-LB6="{v6(lb)}"
-chain() {{ # chain <peers> <lb>: the NANO-DOCKER chain as iptables-restore input
+LB6="{v6(lb)}"{metrics_vars}
+chain() {{ # chain {chain_doc}: the NANO-DOCKER chain as iptables-restore input
   echo "*filter"
   echo ":NANO-DOCKER - [0:0]"
   echo "-A NANO-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
-  for i in lo docker0 br-+; do echo "-A NANO-DOCKER -i $i -j RETURN"; done
+  for i in lo docker0 br-+; do echo "-A NANO-DOCKER -i $i -j RETURN"; done{metrics_chain}
   for s in $1; do echo "-A NANO-DOCKER -s $s -j RETURN"; done
   for s in $2; do echo "-A NANO-DOCKER -s $s -p tcp -m conntrack --ctorigdstport 80 -j RETURN"; done
   for p in $PORTS; do echo "-A NANO-DOCKER -p tcp -m conntrack --ctstate NEW --ctorigdstport $p -j DROP"; done
   echo "COMMIT"
 }}
-apply() {{ # apply <iptables|ip6tables> <peers> <lb>
+apply() {{ # apply <iptables|ip6tables> {chain_doc}
   $1 -w -N DOCKER-USER 2>/dev/null || true
-  chain "$2" "$3" | "$1-restore" -w --noflush
+  chain{chain_args} | "$1-restore" -w --noflush
   $1 -w -C DOCKER-USER -j NANO-DOCKER 2>/dev/null || $1 -w -I DOCKER-USER 1 -j NANO-DOCKER
 }}
-apply iptables "$PEERS4" "$LB4"
+apply iptables "$PEERS4" "$LB4"{mon4}
 if command -v ip6tables >/dev/null 2>&1 && ip6tables -w -S >/dev/null 2>&1; then
-  apply ip6tables "$PEERS6" "$LB6"
+  apply ip6tables "$PEERS6" "$LB6"{mon6}
 fi
 """
 
@@ -1105,7 +1205,7 @@ def firewall_script(p: dict, schema: dict, edge_cidrs: list[str] | None = None) 
                             "Firewall rules match packets by address; list each host's private IP in --hosts.")
     lb_sources = [c for c in p["network"]["trusted_proxy_cidrs"] if c.split("/")[0] not in peers]
     src = {"lb:app": lb_sources, "lb:ingest": lb_sources}
-    for role in ("app", "ingest", "postgres", "clickhouse", "keeper"):
+    for role in ("app", "ingest", "postgres", "clickhouse", "keeper", "monitoring"):
         src[role] = by_role.get(role, [])
 
     def sources(key: str) -> list[str]:
@@ -1117,7 +1217,8 @@ def firewall_script(p: dict, schema: dict, edge_cidrs: list[str] | None = None) 
         return out
     # Every bridge port, HA or not: a DROP for a port nothing publishes is harmless.
     ports = sorted({PORT_DEFAULTS[k] for k in BRIDGE_PORT_KEYS})
-    host_ports = ",".join(str(PORT_DEFAULTS[k]) for k in HOST_PORT_KEYS)
+    host_keys = [k for k in HOST_PORT_KEYS if by_role.get("monitoring") or k not in MONITORING_HOST_PORT_KEYS]
+    host_ports = ",".join(str(PORT_DEFAULTS[k]) for k in host_keys)
     lines = ["#!/usr/bin/env bash",
              "# nano host firewall, generated by nano-deploy plan.py. Run the SAME script on every nano host",
              "# and every HAProxy host.",
@@ -1133,6 +1234,7 @@ def firewall_script(p: dict, schema: dict, edge_cidrs: list[str] | None = None) 
              "# MGMT_CIDR is where you SSH from; the script stops before changing anything without it (no lock-out).",
              "set -euo pipefail",
              'MGMT_CIDR="${MGMT_CIDR:?set MGMT_CIDR to the network you SSH from, e.g. MGMT_CIDR=203.0.113.0/24}"',
+             '[[ "$MGMT_CIDR" =~ ^[0-9A-Fa-f.:]+/[0-9]+$ ]] || { echo "MGMT_CIDR must be one CIDR, e.g. 203.0.113.0/24" >&2; exit 1; }',
              "command -v ufw >/dev/null || { echo 'ufw not found. This script targets Debian/Ubuntu with ufw. On RHEL"
              " (firewalld), install the DOCKER-USER part below as-is and express the ufw rules as firewalld rich"
              f" rules: {FIREWALL_DOC}' >&2; exit 1; }}",
@@ -1146,11 +1248,16 @@ def firewall_script(p: dict, schema: dict, edge_cidrs: list[str] | None = None) 
              "this_host() { ip -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -qxF \"$1\"; }"]
     if p.get("lab"):
         lines.insert(1, f"# {LAB_BANNER}")
-    rules = docker_firewall_rules(peers, lb_sources, ports)
+    monitoring = by_role.get("monitoring", [])
+    metrics_ports = sorted({PORT_DEFAULTS[k] for k in METRICS_BRIDGE_PORT_KEYS}) if monitoring else []
+    rules = docker_firewall_rules(peers, lb_sources, ports, monitoring, metrics_ports,
+                                  PORT_DEFAULTS["grafana"])
     lines += [f"sudo tee {DOCKER_FIREWALL_BIN} >/dev/null <<'NANO_DOCKER_FIREWALL'",
               rules.rstrip("\n"),
               "NANO_DOCKER_FIREWALL",
               f"sudo chmod 0755 {DOCKER_FIREWALL_BIN}",
+              *([f"# Grafana on the monitoring host answers only the management network (MGMT_CIDR).",
+                 f"sudo sed -i \"s#@MGMT_CIDR@#$MGMT_CIDR#\" {DOCKER_FIREWALL_BIN}"] if monitoring else []),
               f"sudo tee /etc/systemd/system/{DOCKER_FIREWALL_UNIT} >/dev/null <<'NANO_DOCKER_FIREWALL_UNIT'",
               DOCKER_FIREWALL_UNIT_TEXT.rstrip("\n"),
               "NANO_DOCKER_FIREWALL_UNIT",
@@ -1167,7 +1274,7 @@ def firewall_script(p: dict, schema: dict, edge_cidrs: list[str] | None = None) 
     for addr in first_app:
         lines.append(f"sudo ufw allow from {addr} to any port 22 proto tcp   # first app host runs scripts/nano upgrade")
     lines.append("sudo ufw default deny incoming")
-    for key in HOST_PORT_KEYS:
+    for key in host_keys:
         for addr in sources(key):
             lines.append(f"sudo ufw allow from {addr} to any port {PORT_DEFAULTS[key]} proto tcp")
     # This host's own containers reach the host-networked ports (e.g. the app
@@ -1599,6 +1706,56 @@ def nodes_from_hosts(layout: dict) -> list[dict]:
     return nodes
 
 
+# --- Monitoring ---------------------------------------------------------------
+MONITORING_HOST = (2, 4, 50)   # INFERRED: Prometheus 512 MiB + Grafana 256 MiB + exporters, 15 d / 4 GB retention
+
+
+def place_monitoring(a: argparse.Namespace, nodes: list[dict], cat: dict | None, layout: dict | None,
+                     vpc: ipaddress.IPv4Network | None) -> str | None:
+    """Put the optional monitoring role on one host. Metrics only: it never
+    counts toward HA (losing it loses dashboards, never ingest or search).
+
+    colocate   on the first PostgreSQL/Keeper (control) host, else the first app host;
+    dedicated  a small extra VM (cloud), or the first spare host (--hosts).
+    Returns a one-line note for the warnings, or None for --monitoring none.
+    """
+    mode = getattr(a, "monitoring", "none") or "none"
+    if mode == "none":
+        return None
+    if mode == "colocate":
+        target = next((n for n in nodes if n["kind"] == "control"), None) or next(
+            (n for n in nodes if n["kind"] == "app"), None)
+        if target is None:
+            raise PlanError("--monitoring colocate needs a PostgreSQL/Keeper or app host")
+        target["monitoring"] = True
+        return (f"monitoring (Prometheus + Grafana, about 1 GiB) runs on {target['name']}; "
+                "its memory is set aside before nano's roles are sized")
+    if layout is not None:
+        if not layout["spare"]:
+            raise PlanError("--monitoring dedicated with --hosts needs one more host in the list "
+                            "(or use --monitoring colocate)")
+        host = layout["spare"].pop(0)
+        nodes.append({"kind": "monitoring", "name": host["name"], "zone": host["zone"] or host["name"],
+                      "zone_index": None, "address": host["address"], "instance": "existing",
+                      "vcpu": host["vcpu"], "mem_gib": host["mem_gib"], "usd_hour": 0.0, "price_verified": True,
+                      "roles": ["monitoring"], "requirement": list(MONITORING_HOST),
+                      "disks": [{"purpose": "docker data filesystem", "type": "existing", "size_gib": host["disk_gib"]}]})
+        return f"monitoring (Prometheus + Grafana) runs on the spare host {host['name']}"
+    assert cat is not None and vpc is not None
+    sku = choose_sku(cat, a.cloud, "app", MONITORING_HOST[0], MONITORING_HOST[1])
+    if sku is None:
+        raise PlanError(f"no monitoring size in the {a.cloud} catalog fits")
+    os_disk = cat["clouds"][a.cloud]["disks"]["os"]
+    zone_ordinal = sum(1 for n in nodes if n.get("zone_index") == 0)
+    nodes.append({"kind": "monitoring", "name": "nano-monitoring-1", "zone": cat["clouds"][a.cloud]["zones"][0],
+                  "zone_index": 0, "address": node_ip(vpc, 0, zone_ordinal), "instance": sku["name"],
+                  "vcpu": sku["vcpu"], "mem_gib": sku["mem_gib"], "usd_hour": sku["usd_hour"],
+                  "price_verified": sku["verified"], "roles": ["monitoring"],
+                  "disks": [{"purpose": "os+docker (15 d of metrics)", "type": os_disk["type"],
+                             "size_gib": max(os_disk["size_gib"], MONITORING_HOST[2])}]})
+    return "monitoring (Prometheus + Grafana) runs on its own small VM, nano-monitoring-1"
+
+
 # --- Load balancer ---------------------------------------------------------------------
 def lb_plan(a: argparse.Namespace, nodes: list[dict], net: dict, schema: dict, cloud_mode: bool,
             spare: list[dict] | None = None) -> dict:
@@ -1871,6 +2028,9 @@ def make_plan(a: argparse.Namespace, cat: dict | None = None) -> dict:
             warnings.insert(1, f"LAB: the smallest ClickHouse disk holds about {days} d of events at this volume "
                             f"(estimate), not the {a.retention_days} d asked for. Shorten retention in Settings -> "
                             "Storage & Retention, or add S3-compatible tiering, before it fills")
+    monitoring_note = place_monitoring(a, nodes, cat, layout, None if hosts_mode else vpc)
+    if monitoring_note:
+        warnings.append(monitoring_note)
     plan = {
         "plan_version": PLAN_VERSION,
         "input": {"cloud": None if hosts_mode else a.cloud,
@@ -2062,6 +2222,12 @@ def print_install_order(p: dict, schema: dict) -> None:
         name = n["name"]
         if "ingest" in r[name]:
             steps.append((name, "install", "--role " + ",".join(r[name])))
+    for n in nodes:
+        name = n["name"]
+        # the monitoring role goes last; on a co-located host the
+        # rerun keeps the host's other roles (install.sh never narrows).
+        if "monitoring" in r[name]:
+            steps.append((name, "install", "--role " + ",".join(r[name]) + "  (monitoring last)"))
     print("step\thost\taction\tcommand (NANO_HOST_NAME=<host> NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh ... --inventory /etc/nano/inventory.yaml)")
     for i, (host, action, cmd) in enumerate(steps, 1):
         print(f"{i}\t{host}\t{action}\t{cmd}")
@@ -2117,6 +2283,9 @@ def parser() -> argparse.ArgumentParser:
                    help="print host, address and the exact preflight.sh flags for each host of this plan, and exit")
     p.add_argument("--firewall-script", action="store_true",
                    help="print ready-to-paste DOCKER-USER (iptables) and UFW rules for this plan's addresses and exit")
+    p.add_argument("--monitoring", choices=["none", "colocate", "dedicated"], default="none",
+                   help="optional Prometheus + Grafana: co-located on a PostgreSQL/Keeper host, or on its "
+                        "own small VM (the first spare host with --hosts)")
     p.add_argument("--edge-source-cidr", action="append", default=[],
                    help="with --firewall-script and HAProxy hosts: a network allowed to reach 443 on them "
                    "(repeatable: user LAN, VPN, log senders). Required; 0.0.0.0/0 only when given explicitly")

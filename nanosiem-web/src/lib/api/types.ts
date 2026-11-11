@@ -5452,7 +5452,20 @@ export interface LogSourceHealth {
   error_rate_24h: number;
   parse_errors_24h: number;
   parse_attempts_24h: number;
+  /** Fully parsed share: neither a runtime failure nor a fallback (NAN-5264). */
   parse_success_rate_24h: number | null;
+  /**
+   * NAN-5264: events the parser handled with its fallback branch (marked
+   * `unmapped.parse_fallback`). Not counted in `parse_errors_24h`.
+   */
+  parse_fallbacks_24h?: number;
+  parse_fallback_rate_24h?: number | null;
+  /**
+   * NAN-5264: events whose sender declared a different source (X-Source-Type,
+   * HEC sourcetype, body source_type) than the one its ingest token is bound
+   * to. The token decides; the claim was ignored.
+   */
+  source_claims_ignored_24h?: number;
   /**
    * Recent collector failures, newest first (NAN-2196).
    *

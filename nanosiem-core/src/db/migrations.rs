@@ -74,6 +74,18 @@ pub enum MigrationError {
     #[error("open-init snapshot apply failed: {0}")]
     SnapshotFailed(#[source] sqlx::Error),
 
+    /// NAN-5269: the open-init snapshot did not finish (or could not start)
+    /// within its budget. The snapshot is one implicit transaction; the
+    /// diagnosis says whether it was rolled back or is still committing.
+    #[error(
+        "open-init snapshot did not finish within {timeout_secs} s: {diagnosis}. \
+         Check the PostgreSQL leader (patronictl list on a postgres host: one Leader and, \
+         with synchronous_mode on, a streaming Sync Standby) and the network path from \
+         this host to it, then rerun install.sh on this host. Raise the budget with \
+         NANO_PG_SNAPSHOT_TIMEOUT_SECS only if the leader is healthy but slow."
+    )]
+    SnapshotTimedOut { timeout_secs: u64, diagnosis: String },
+
     /// Backfilling `_sqlx_migrations` with rows for the legacy
     /// 1..=[`OPEN_INIT_BASELINE_VERSION`] history failed. Rare; usually only
     /// fires if the DB privilege model blocks INSERT into `_sqlx_migrations`.
@@ -449,10 +461,256 @@ pub async fn ensure_migrator_is_current(
     validate_migrator_is_current(migrator, &applied, label)
 }
 
+/// Whether `migrator` still has work to do on this database: a fresh database
+/// (no history), a migration not yet applied, or one recorded as failed. A
+/// checksum mismatch is not pending work (the run refuses it for its own
+/// reason). Used to decide whether a missing `CREATE` on schema `public` must
+/// stop the migrator or only warn (NAN-5269).
+pub async fn migrator_has_pending_work(
+    pool: &PgPool,
+    migrator: &Migrator,
+    label: &'static str,
+) -> bool {
+    match ensure_migrator_is_current(pool, migrator, label).await {
+        Ok(()) => false,
+        Err(err) => schema_check_means_pending(&err),
+    }
+}
+
+/// Pure mapping behind [`migrator_has_pending_work`]; split out for tests.
+pub fn schema_check_means_pending(err: &SchemaCheckError) -> bool {
+    !matches!(err, SchemaCheckError::ChecksumMismatch { .. })
+}
+
+/// Whether the open/core PostgreSQL migrations have work to do here.
+pub async fn postgres_migrations_pending(pool: &PgPool) -> bool {
+    let migrator = sqlx::migrate!("../migrations/postgres");
+    migrator_has_pending_work(pool, &migrator, "core").await
+}
+
 /// Validate the open/core PostgreSQL schema embedded in every serving binary.
 pub async fn ensure_postgres_schema_is_current(pool: &PgPool) -> Result<(), SchemaCheckError> {
     let migrator = sqlx::migrate!("../migrations/postgres");
     ensure_migrator_is_current(pool, &migrator, "core").await
+}
+
+/// Default budget for the open-init snapshot. It applies in a few seconds on
+/// any supported PostgreSQL; ten minutes leaves ample room for a slow disk
+/// while still ending a run that would otherwise wait forever (NAN-5269).
+const DEFAULT_SNAPSHOT_TIMEOUT_SECS: u64 = 600;
+/// Budget for each diagnostic query after a snapshot timeout.
+const SNAPSHOT_DIAGNOSTIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long to wait for a synchronous standby before the snapshot starts
+/// (never longer than the snapshot budget itself).
+const SYNC_STANDBY_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn snapshot_timeout_from_env() -> std::time::Duration {
+    parse_snapshot_timeout(std::env::var("NANO_PG_SNAPSHOT_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn parse_snapshot_timeout(value: Option<&str>) -> std::time::Duration {
+    let secs = value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| (30..=86_400).contains(secs))
+        .unwrap_or(DEFAULT_SNAPSHOT_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+async fn bounded<T>(
+    future: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(SNAPSHOT_DIAGNOSTIC_TIMEOUT, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!(
+            "no answer within {} s",
+            SNAPSHOT_DIAGNOSTIC_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// What the server says about its commit path. `Some(names)` means commits
+/// wait for a synchronous standby (`synchronous_standby_names` = names) and
+/// none is streaming; `None` means commits can complete, or the state is not
+/// visible to this role (then nothing is assumed).
+async fn missing_sync_standby(pool: &PgPool) -> Result<Option<String>, String> {
+    let (names, hidden, streaming): (String, i64, i64) = bounded(
+        sqlx::query_as(
+            "SELECT current_setting('synchronous_standby_names'), \
+             (SELECT count(*) FROM pg_stat_replication WHERE state IS NULL), \
+             (SELECT count(*) FROM pg_stat_replication \
+              WHERE state = 'streaming' AND sync_state IN ('sync', 'quorum'))",
+        )
+        .fetch_one(pool),
+    )
+    .await?;
+    Ok(missing_sync_standby_from(&names, hidden, streaming))
+}
+
+fn missing_sync_standby_from(names: &str, hidden: i64, streaming: i64) -> Option<String> {
+    let names = names.trim();
+    (!names.is_empty() && hidden == 0 && streaming == 0).then(|| names.to_string())
+}
+
+/// NAN-5269: apply the open-init snapshot on one dedicated connection with a
+/// bounded wait. A v2.0.11 role-split install hung here for ten minutes with
+/// no CPU and no tables, and only a manual abort ended it. `statement_timeout`
+/// cannot help (the snapshot sets it to 0 itself), and neither PostgreSQL nor
+/// this client notices a session stuck on a stalled network path or on a
+/// synchronous standby that never confirms.
+///
+/// 1. Before any DDL: when commits would wait for a synchronous standby and
+///    none is streaming (Patroni `synchronous_mode` while a replica is still
+///    joining), wait up to two minutes for one (capped by the snapshot
+///    budget), then fail with nothing
+///    applied. Without this the snapshot's single commit waits forever.
+/// 2. Apply with a bounded wait (`NANO_PG_SNAPSHOT_TIMEOUT_SECS`, default
+///    600). On timeout, report what the session was doing and end it unless
+///    it is already committing (a SyncRep wait), then fail so the migrator
+///    exits (and Compose restarts it) instead of holding the install forever.
+async fn apply_open_init_snapshot(
+    pool: &PgPool,
+    timeout: std::time::Duration,
+) -> Result<(), MigrationError> {
+    let sync_wait = SYNC_STANDBY_WAIT.min(timeout);
+    let waited = std::time::Instant::now();
+    loop {
+        match missing_sync_standby(pool).await {
+            Ok(None) => break,
+            Ok(Some(names)) if waited.elapsed() < sync_wait => {
+                warn!(
+                    synchronous_standby_names = %names,
+                    waited_secs = waited.elapsed().as_secs(),
+                    "PostgreSQL commits wait for a synchronous standby and none is streaming; \
+                     waiting before applying the open-init snapshot"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Ok(Some(names)) => {
+                return Err(MigrationError::SnapshotTimedOut {
+                    timeout_secs: sync_wait.as_secs(),
+                    diagnosis: format!(
+                        "nothing was applied: synchronous_standby_names is '{names}' but no \
+                         synchronous standby has streamed for {} s, so the snapshot's commit \
+                         could never complete",
+                        sync_wait.as_secs()
+                    ),
+                });
+            }
+            Err(error) => {
+                // Unknown is not a reason to block an install.
+                warn!(%error, "could not read the PostgreSQL replication state; applying the snapshot anyway");
+                break;
+            }
+        }
+    }
+
+    let mut connection = pool.acquire().await.map_err(MigrationError::SnapshotFailed)?;
+    let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(MigrationError::SnapshotFailed)?;
+    let applied = tokio::time::timeout(
+        timeout,
+        sqlx::raw_sql(OPEN_INIT_SNAPSHOT).execute(&mut *connection),
+    )
+    .await;
+    match applied {
+        Ok(result) => {
+            result.map_err(MigrationError::SnapshotFailed)?;
+            Ok(())
+        }
+        Err(_) => {
+            // Never return this connection to the pool: its protocol state is
+            // unknown mid-query. Dropping it closes the socket.
+            drop(connection.detach());
+            let diagnosis = diagnose_stuck_snapshot(pool, backend_pid).await;
+            tracing::error!(
+                backend_pid,
+                timeout_secs = timeout.as_secs(),
+                %diagnosis,
+                "open-init snapshot timed out"
+            );
+            Err(MigrationError::SnapshotTimedOut {
+                timeout_secs: timeout.as_secs(),
+                diagnosis,
+            })
+        }
+    }
+}
+
+/// Read what the snapshot session was doing, then end it unless it is
+/// already committing. Every query is bounded; an unreachable server is
+/// itself the diagnosis.
+async fn diagnose_stuck_snapshot(pool: &PgPool, backend_pid: i32) -> String {
+    let mut parts = Vec::new();
+    let mut committing = false;
+    let activity: Result<Option<(Option<String>, Option<String>, Option<String>)>, String> =
+        bounded(
+            sqlx::query_as(
+                "SELECT state, wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+            )
+            .bind(backend_pid)
+            .fetch_optional(pool),
+        )
+        .await;
+    match activity {
+        Ok(Some((state, wait_type, wait_event))) => {
+            let state = state.unwrap_or_else(|| "unknown".into());
+            committing = wait_event.as_deref() == Some("SyncRep");
+            let waiting = match (wait_type, wait_event) {
+                (Some(kind), Some(event)) => format!(", waiting on {kind}/{event}"),
+                _ => String::new(),
+            };
+            parts.push(format!("session {backend_pid} is {state}{waiting}"));
+            if state.starts_with("idle") {
+                parts.push(
+                    "PostgreSQL never received the whole snapshot: suspect the network path \
+                     or the postgres-router between this host and the leader"
+                        .into(),
+                );
+            }
+            if committing {
+                parts.push(
+                    "the snapshot is committed on the leader and waits for a synchronous \
+                     standby to confirm; restore replication (patronictl list), then run \
+                     install.sh again: a database that holds the snapshot without its \
+                     migration history needs support before a rerun"
+                        .into(),
+                );
+            }
+        }
+        Ok(None) => parts.push(format!(
+            "session {backend_pid} is gone from the server this host now reaches (a leader change?)"
+        )),
+        Err(error) => parts.push(format!("cannot read pg_stat_activity: {error}")),
+    }
+    match missing_sync_standby(pool).await {
+        Ok(Some(names)) => parts.push(format!(
+            "synchronous_standby_names is '{names}' but no synchronous standby is streaming, \
+             so every commit waits for one"
+        )),
+        Ok(None) => {}
+        Err(error) => parts.push(format!("cannot read replication state: {error}")),
+    }
+    if !committing {
+        match bounded(
+            sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+                .bind(backend_pid)
+                .fetch_one(pool),
+        )
+        .await
+        {
+            Ok(true) => parts.push(format!(
+                "ended session {backend_pid}, so its transaction rolled back"
+            )),
+            Ok(false) => {}
+            Err(error) => {
+                parts.push(format!("could not end session {backend_pid}: {error}"))
+            }
+        }
+    }
+    parts.join("; ")
 }
 
 /// Run open-tier PostgreSQL migrations.
@@ -510,10 +768,7 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
 
     if take_fresh_path {
         info!("Applying open-init snapshot (migrations/postgres-open/000_open_init.sql)");
-        sqlx::raw_sql(OPEN_INIT_SNAPSHOT)
-            .execute(pool)
-            .await
-            .map_err(MigrationError::SnapshotFailed)?;
+        apply_open_init_snapshot(pool, snapshot_timeout_from_env()).await?;
         // Defense-in-depth: `tools/nan749_split_open_overlay.py` strips
         // `set_config('search_path', '', false)` from the snapshot at
         // generation time (load-bearing fix), but if a regenerated
@@ -591,6 +846,35 @@ mod tests {
         let migrator = sqlx::migrate!("../migrations/postgres");
         let applied = applied_rows(&migrator);
         validate_migrator_is_current(&migrator, &applied, "core").unwrap();
+    }
+
+    #[test]
+    fn a_sync_standby_is_missing_only_when_commits_need_one_and_none_streams() {
+        assert_eq!(missing_sync_standby_from("", 0, 0), None, "async replication");
+        assert_eq!(
+            missing_sync_standby_from("\"vm-6\"", 0, 0),
+            Some("\"vm-6\"".to_string())
+        );
+        assert_eq!(missing_sync_standby_from("\"vm-6\"", 0, 1), None);
+        assert_eq!(
+            missing_sync_standby_from("\"vm-6\"", 1, 0),
+            None,
+            "rows this role cannot read are never treated as missing"
+        );
+    }
+
+    #[test]
+    fn snapshot_timeout_is_bounded_and_overridable() {
+        let default = std::time::Duration::from_secs(DEFAULT_SNAPSHOT_TIMEOUT_SECS);
+        assert_eq!(parse_snapshot_timeout(None), default);
+        assert_eq!(parse_snapshot_timeout(Some("garbage")), default);
+        assert_eq!(parse_snapshot_timeout(Some("0")), default, "0 must never mean forever");
+        assert_eq!(parse_snapshot_timeout(Some("5")), default, "too short to apply the snapshot");
+        assert_eq!(parse_snapshot_timeout(Some("999999")), default);
+        assert_eq!(
+            parse_snapshot_timeout(Some(" 1800 ")),
+            std::time::Duration::from_secs(1800)
+        );
     }
 
     #[test]

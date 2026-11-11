@@ -22,7 +22,8 @@ Checks:
             rows only: the operator's Replicated `default` database lists the
             hosts a second time), no read-only replicated tables, replication
             delay <= 30 s, Keeper session alive, no distributed DDL older than
-            10 min still pending.
+            10 min still pending (an entry older than one its host already
+            finished is stale, not stuck: it only warns).
   registry  the registry credential refresh CronJob (when present) succeeded
             within the last hour.
 Exit 0 = healthy, 1 = a check failed, 2 = usage error / kubectl unavailable.
@@ -132,6 +133,19 @@ def check_vector(pods: list[dict]) -> None:
         + ("" if not unready else f"; not ready: {', '.join(unready)} (kubectl logs <pod> -c config-consumer)"))
 
 
+# Distributed DDL older than 10 min that a host has not finished. A host runs its
+# queue in order, so an entry older than one that host already Finished can't be
+# blocking it: it is a stale leftover (NAN-5269: a replica restarted while an
+# ON CLUSTER statement was issued and left it `Inactive` for good, with nothing
+# diverged). Stuck entries fail; stale ones only warn. Two TSV columns.
+DDL_SQL = ("SELECT countIf(f.last_finished = '' OR q.entry > f.last_finished), "
+           "countIf(f.last_finished != '' AND q.entry < f.last_finished) "
+           "FROM system.distributed_ddl_queue AS q LEFT JOIN "
+           "(SELECT host, port, max(entry) AS last_finished FROM system.distributed_ddl_queue "
+           "WHERE status = 'Finished' GROUP BY host, port) AS f ON q.host = f.host AND q.port = f.port "
+           "WHERE q.status NOT IN ('Finished', 'Removing') AND q.query_create_time < now() - 600")
+
+
 CH_SQL = {
     "replicas": "SELECT (SELECT count() FROM system.clusters WHERE cluster='default' AND database_replica_name='') AS configured, "
                 "(SELECT count() FROM clusterAllReplicas('default', system.one) SETTINGS skip_unavailable_shards=1) AS answering",
@@ -139,7 +153,7 @@ CH_SQL = {
                 "SETTINGS skip_unavailable_shards=1",
     "delay": "SELECT max(absolute_delay) FROM clusterAllReplicas('default', system.replicas) SETTINGS skip_unavailable_shards=1",
     "keeper": "SELECT count() FROM system.zookeeper_connection WHERE NOT is_expired",
-    "ddl": "SELECT count() FROM system.distributed_ddl_queue WHERE status != 'Finished' AND query_create_time < now() - 600",
+    "ddl": DDL_SQL,
 }
 
 
@@ -165,7 +179,13 @@ def check_clickhouse(kube: Kube, pods: list[dict]) -> None:
     delay = int(float(results["delay"][0] or 0)) if results["delay"] else 0
     row("ch", delay <= 30, f"max replication delay {delay}s")
     row("ch", int(results["keeper"][0]) > 0, "Keeper session alive" if int(results["keeper"][0]) else "no live Keeper session")
-    row("ch", int(results["ddl"][0]) == 0, f"{results['ddl'][0]} distributed DDL entries pending > 10 min")
+    stuck, stale = (int(x) for x in (results["ddl"] + ["0", "0"])[:2])
+    row("ch", stuck == 0, f"{stuck} distributed DDL entries pending > 10 min"
+        + ("" if not stuck else " (SELECT entry, host, status, exception_text, query FROM system.distributed_ddl_queue "
+                                "WHERE status != 'Finished'; see known-issues.md)"))
+    if stale:
+        row("ch", None, f"{stale} stale distributed DDL entries: never run on a host that has finished later ones; "
+            "harmless, ClickHouse drops them after distributed_ddl.task_max_lifetime (7 days)")
 
 
 def check_registry(kube: Kube, release_prefix: str) -> None:

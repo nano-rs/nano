@@ -83,7 +83,9 @@ nano_cluster_shared_secret_keys() {
         NANO_VECTOR_CONFIG_DELIVERY_TOKEN \
         NANO_PG_REPLICATION_PASSWORD \
         NANO_PATRONI_API_PASSWORD \
-        NANO_SETUP_TOKEN
+        NANO_SETUP_TOKEN \
+        NANO_SERVICE_TOKEN \
+        NANO_GRAFANA_ADMIN_PASSWORD
 }
 
 # Cluster-shared keys added after v2.0.0. A role host missing one warns
@@ -94,7 +96,12 @@ nano_transitional_secret_keys() {
     # NAN-5214: the PostgreSQL HA credentials are generated once by the
     # canonical app host. Only HA services read them (and refuse to start
     # without them), so an older copied .env warns instead of failing.
-    printf '%s\n' NANO_VECTOR_CONFIG_DELIVERY_TOKEN NANO_PG_REPLICATION_PASSWORD NANO_PATRONI_API_PASSWORD NANO_SETUP_TOKEN
+    # NAN-5250: NANO_SERVICE_TOKEN (the /metrics bearer credential for
+    # Prometheus) and NANO_GRAFANA_ADMIN_PASSWORD (the monitoring role's
+    # Grafana admin; never a default). Without them metrics stay closed and
+    # the monitoring profile refuses to start, so an older copied .env warns.
+    printf '%s\n' NANO_VECTOR_CONFIG_DELIVERY_TOKEN NANO_PG_REPLICATION_PASSWORD NANO_PATRONI_API_PASSWORD NANO_SETUP_TOKEN \
+        NANO_SERVICE_TOKEN NANO_GRAFANA_ADMIN_PASSWORD
 }
 
 nano_secret_is_transitional() {

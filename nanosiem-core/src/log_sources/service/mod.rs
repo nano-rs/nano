@@ -30,6 +30,10 @@ mod match_field_tests;
 #[path = "identity_guard_tests.rs"]
 mod identity_guard_tests;
 
+#[cfg(test)]
+#[path = "draft_status_tests.rs"]
+mod draft_status_tests;
+
 use clickhouse::Client as ClickHouseClient;
 use sqlx::PgPool;
 use std::sync::Arc;

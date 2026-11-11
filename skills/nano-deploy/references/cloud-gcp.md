@@ -7,10 +7,16 @@ every mutating step. The commands use the operator's own `gcloud` session.
 ```bash
 export PROJECT=<project id> REGION=us-central1 NAME=<cluster name>
 gcloud config list                     # show account and project, ask before going on
-gcloud config set project $PROJECT
+export CLOUDSDK_CORE_PROJECT=$PROJECT  # this shell only; never `gcloud config set project`
 ```
 
-Label every resource `--labels nano-deployment=$NAME`.
+`gcloud config set project` changes the operator's global default for every
+other terminal; the environment variable scopes it to this session.
+
+Label every resource `--labels nano-deployment=$NAME` where the command takes
+it. `gcloud sql instances create` and `gcloud compute addresses create` have
+no label flag in GA gcloud (checked on 564): label those through the REST API
+(below).
 
 ## Instance and disk choices
 
@@ -62,21 +68,37 @@ rules come from the renderer's port matrix:
 | Port | Key | On | Allow from | When |
 |---|---|---|---|---|
 | 80/tcp | `app` | app hosts | app load balancer | always |
-| 3000/tcp | `api_internal` | app hosts | ingest hosts | always |
+| 3000/tcp | `api_internal` | app hosts | ingest hosts, the monitoring host | always (monitoring: with a monitoring host) |
 | 80/tcp | `ingest` | ingest hosts | ingest load balancer, app hosts | always |
 | 8687/tcp | `vector_tap` | ingest hosts | app hosts | always |
 | 5432/tcp | `postgres` | PostgreSQL hosts | app hosts, ClickHouse hosts, PostgreSQL hosts | always |
 | 8123/tcp | `clickhouse_http` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
 | 9000/tcp | `clickhouse_native` | ClickHouse hosts | app hosts, ingest hosts, ClickHouse hosts | always |
 | 9009/tcp | `clickhouse_interserver` | ClickHouse hosts | ClickHouse hosts | always |
-| 9363/tcp | `clickhouse_metrics` | ClickHouse hosts | app hosts | always |
+| 9363/tcp | `clickhouse_metrics` | ClickHouse hosts | app hosts, the monitoring host | always |
 | 9181/tcp | `keeper_client` | Keeper hosts (= PostgreSQL hosts) | app hosts, ClickHouse hosts, Keeper hosts (= PostgreSQL hosts) | always |
 | 9234/tcp | `keeper_raft` | Keeper hosts (= PostgreSQL hosts) | Keeper hosts (= PostgreSQL hosts) | always |
-| 8008/tcp | `patroni_api` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (3 postgres hosts) |
-| 2379/tcp | `etcd_client` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
+| 3030/tcp | `grafana` | the monitoring host | management CIDR | monitoring host |
+| 9090/tcp | `prometheus` | the monitoring host | the monitoring host | monitoring host (loopback only: never open it) |
+| 9100/tcp | `node_exporter` | app hosts | the monitoring host | monitoring host |
+| 8405/tcp | `clickhouse_proxy_metrics` | app hosts | the monitoring host | monitoring host |
+| 8406/tcp | `ingest_proxy_metrics` | app hosts | the monitoring host | monitoring host |
+| 8408/tcp | `postgres_router_metrics` | app hosts | the monitoring host | monitoring host |
+| 8409/tcp | `valkey_router_metrics` | app hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | ingest hosts | the monitoring host | monitoring host |
+| 9598/tcp | `vector_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 8405/tcp | `clickhouse_proxy_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 8407/tcp | `app_api_proxy_metrics` | ingest hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | ClickHouse hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | Keeper hosts (= PostgreSQL hosts) | the monitoring host | monitoring host |
+| 9364/tcp | `keeper_metrics` | Keeper hosts (= PostgreSQL hosts) | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | PostgreSQL hosts | the monitoring host | monitoring host |
+| 9100/tcp | `node_exporter` | the monitoring host | the monitoring host | monitoring host |
+| 8008/tcp | `patroni_api` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (3 postgres hosts) |
+| 2379/tcp | `etcd_client` | PostgreSQL hosts | PostgreSQL hosts, the monitoring host | full HA (3 postgres hosts) |
 | 2380/tcp | `etcd_peer` | PostgreSQL hosts | PostgreSQL hosts | full HA (3 postgres hosts) |
-| 6379/tcp | `valkey` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
-| 26379/tcp | `sentinel` | PostgreSQL hosts | app hosts, PostgreSQL hosts | full HA (2+ app hosts) |
+| 6379/tcp | `valkey` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (2+ app hosts) |
+| 26379/tcp | `sentinel` | PostgreSQL hosts | app hosts, PostgreSQL hosts, the monitoring host | full HA (2+ app hosts) |
 | 22/tcp | `ssh` | all | management CIDR, app hosts | always (the first app host runs scripts/nano upgrade over SSH) |
 <!-- END plan.py --port-matrix -->
 
@@ -260,6 +282,7 @@ anything; run `scripts/pg-preflight.py` first so a gap shows before `helm instal
 | Version | PostgreSQL 16 or newer (16, 17, 18 tested). Cloud SQL may default to 16, depending on when and how the instance was created (check with `gcloud sql instances describe $NAME-pg --format='value(databaseVersion)'`). 16 works from nano 2.0.11; 2.0.10 and earlier fail in the migrator with `unrecognized configuration parameter "transaction_timeout"`, so use `POSTGRES_17` there |
 | Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`. All supported, no database flags needed. Users created through Cloud SQL (`gcloud sql users create`) are in `cloudsqlsuperuser` and can create them |
 | Parameters | No flags required. Allow at least 200 connections (about 20 per nano pod): the default depends on the tier's memory, so use 8 GB or more or set the `max_connections` flag |
+| Schema | The nano user needs `CREATE` on schema `public` in the `nanosiem` database (PostgreSQL 15+ no longer grants it to every role). A database made with `gcloud sql databases create` and a user made through Cloud SQL have it (the user is in `cloudsqlsuperuser`, which owns the database). `pg-preflight.py` checks it; on `FAIL schema`, run `GRANT ALL ON SCHEMA public TO nanosiem;` as the `postgres` user, connected to `nanosiem` |
 | Network | Private IP only (`--no-assign-ip`) through private services access on the GKE cluster's VPC (VPC-native cluster); require SSL |
 | HA | Regional availability (`--availability-type=REGIONAL`): a standby in another zone of the region, automatic failover. Zonal is a single point of failure |
 
@@ -267,22 +290,41 @@ anything; run `scripts/pg-preflight.py` first so a gap shows before `helm instal
 # once per VPC: private services access
 gcloud compute addresses create google-managed-services-$NAME --global \
   --purpose=VPC_PEERING --prefix-length=16 --network=$NAME-vpc
-gcloud services vpc-peering connect --service=servicenetworking.googleapis.com \
+gcloud services vpc-peerings connect --service=servicenetworking.googleapis.com \
   --ranges=google-managed-services-$NAME --network=$NAME-vpc
+gcloud services vpc-peerings list --network=$NAME-vpc   # must list servicenetworking; don't pipe the connect into tail
 gcloud sql instances create $NAME-pg --database-version=POSTGRES_17 --edition=ENTERPRISE \
   --region=$REGION --tier=db-custom-2-8192 --availability-type=REGIONAL \
   --network=projects/$PROJECT/global/networks/$NAME-vpc --no-assign-ip \
   --ssl-mode=ENCRYPTED_ONLY --storage-type=SSD --storage-size=50 --storage-auto-increase \
-  --backup-start-time=03:00 --enable-point-in-time-recovery --labels nano-deployment=$NAME
+  --backup-start-time=03:00 --enable-point-in-time-recovery
 gcloud sql databases create nanosiem --instance=$NAME-pg
-gcloud sql users create nanosiem --instance=$NAME-pg --prompt-for-password
+```
+
+Labels and the database user go through the Cloud SQL Admin REST API, with
+the access token in a header file and the password read from a file, so
+neither is ever on a command line. (`gcloud sql users create` takes the
+password only as `--password=...`, which shows in `ps` and the shell history;
+it has no `--prompt-for-password`.) The operator writes the password to
+`pg-password.txt` themselves (mode 0600):
+
+```bash
+( umask 077; printf 'Authorization: Bearer %s\n' "$(gcloud auth print-access-token)" > gcp-auth-header.txt
+  python3 -c 'import json,sys; print(json.dumps({"name": "nanosiem", "password": open(sys.argv[1]).read().strip()}))' \
+    pg-password.txt > pg-user.json )
+API=https://sqladmin.googleapis.com/v1/projects/$PROJECT/instances/$NAME-pg
+curl -fsS -X POST -H @gcp-auth-header.txt -H 'Content-Type: application/json' --data-binary @pg-user.json "$API/users"
+curl -fsS -X PATCH -H @gcp-auth-header.txt -H 'Content-Type: application/json' \
+  --data "{\"settings\": {\"userLabels\": {\"nano-deployment\": \"$NAME\"}}}" "$API"
+rm -f pg-user.json gcp-auth-header.txt
+gcloud sql users list --instance=$NAME-pg --format='table(name,type)'   # nanosiem, BUILT_IN
 ```
 
 Create the user this way, not with `CREATE ROLE` in SQL: users created
-through Cloud SQL belong to `cloudsqlsuperuser` and can create the extensions;
-roles created in SQL cannot, and the migrator then stops on `pg_trgm`.
-`--prompt-for-password` keeps the password off the command line. Use a
-URL-safe password (it is interpolated into `DATABASE_URL`). The host is the
+through Cloud SQL (gcloud or the API) belong to `cloudsqlsuperuser` and can
+create the extensions; roles created in SQL cannot, and the migrator then
+stops on `pg_trgm`. Use a URL-safe password (it is interpolated into
+`DATABASE_URL`). The host is the
 instance's private IP (`gcloud sql instances describe $NAME-pg --format='value(ipAddresses[0].ipAddress)'`).
 Then check with `scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)).
 
@@ -304,15 +346,20 @@ ClickHouse and Keeper disks. Say so if the operator asks for Autopilot.
 project often cannot hold the HA layout: 6 x `n2-standard-8` is 48 vCPUs
 (`CPUS_ALL_REGIONS` is often 32), and `SSD_TOTAL_GB` (often 500) counts every
 pd-balanced disk, node boot disks (100 GB each by default) included. Two
-1500Gi ClickHouse volumes plus six boot disks need about 3,900 GB. Request
-increases, or plan 90 days hot (`clickhouse.storage.size: 500Gi`) plus the
-GCS cold tier.
+1500Gi ClickHouse volumes plus six boot disks need about 3,900 GB, and even
+90 days hot (`clickhouse.storage.size: 500Gi`) with two replicas is 1,000 GB
+before the boot disks: more than the default 500 GB. Request increases, or
+plan 90 days hot plus the GCS cold tier. Node boot disks on `pd-standard`
+(`--disk-type pd-standard` on the cluster) move 600 GB off the SSD quota. For a
+lab or test only, `clickhouse.storage.size: 150Gi` fits the default quota (a
+GKE test ran on it); it is not a production size.
 
 ```bash
+# `describe` has no --filter: flatten, then filter the output.
 gcloud compute project-info describe --flatten=quotas \
-  --filter='quotas.metric=CPUS_ALL_REGIONS' --format='table(quotas.metric,quotas.limit,quotas.usage)'
+  --format='csv[no-heading](quotas.metric,quotas.limit,quotas.usage)' | grep -E '^CPUS_ALL_REGIONS,'
 gcloud compute regions describe $REGION --flatten=quotas \
-  --filter='quotas.metric~^(CPUS|N2_CPUS|SSD_TOTAL_GB)$' --format='table(quotas.metric,quotas.limit,quotas.usage)'
+  --format='csv[no-heading](quotas.metric,quotas.limit,quotas.usage)' | grep -E '^(CPUS|N2_CPUS|SSD_TOTAL_GB),'
 ```
 
 A small HA cluster: regional, three zones, **two nodes per zone** (6 nodes).
@@ -324,7 +371,12 @@ two replicas of a shard in different zones, Keeper over three zones) with
 `antiAffinity: hard`. Reuse the VPC, subnet and Cloud NAT from
 [Network](#network-one-vpc-three-zones).
 
+`clusters create` adds the cluster to the kubeconfig and **switches its
+current-context**. Point `KUBECONFIG` at a working-directory file first, so
+the operator's `~/.kube/config` (and its production contexts) stays as it was:
+
 ```bash
+export KUBECONFIG=$PWD/nano-deploy-work/kubeconfig
 # about 5-10 minutes
 gcloud container clusters create $NAME --region $REGION \
   --node-locations $REGION-a,$REGION-b,$REGION-c --num-nodes 2 \
@@ -342,13 +394,21 @@ gcloud container clusters create $NAME --region $REGION \
 - `--gateway-api=standard`: without it there is no
   `gke-l7-global-external-managed` GatewayClass and the Gateways never get an
   address. Existing cluster: `gcloud container clusters update $NAME
-  --region $REGION --gateway-api=standard`.
+  --region $REGION --gateway-api=standard`. The class appears a few minutes
+  **after** the cluster reports RUNNING (about 3 minutes in a test), so a
+  Step 0 preflight straight after creation reads "no Gateway implementation".
+  Wait for it first:
+  `until kubectl get gatewayclass gke-l7-global-external-managed >/dev/null 2>&1; do sleep 10; done`
+  (bound it, e.g. 10 minutes).
 - `--enable-dataplane-v2`: GKE Standard does **not** enforce NetworkPolicy by
   default, so the chart's `nano-vector-ingress` policy (Vector's OTLP ports
   only from the ingest edge) is silently ignored. Chart 2.0.10 and earlier
   rely on it to keep unauthenticated raw OTLP out; from 2.0.11 Vector's OTLP
   listeners only accept traffic through the authenticated ingest edge, and
-  the policy is defense in depth. Dataplane V2 is
+  the policy is defense in depth. Vector's Prometheus metrics (`:9598`, no
+  credential, read-only counters) are open to every pod on 2.0.11; from 2.0.12
+  the policy admits them only from the nano namespace (add a scraper elsewhere
+  with `vector.metrics.networkPolicyFrom`). Dataplane V2 is
   creation-time only; on an existing cluster check
   `gcloud container clusters describe $NAME --region $REGION --format='value(networkConfig.datapathProvider,networkPolicy.enabled)'`
   (`ADVANCED_DATAPATH` or `True` = enforced); otherwise the network policy
@@ -432,13 +492,14 @@ Then, in order (each is a hard stop for the chart):
 5. **PostgreSQL.** For production, Cloud SQL with private IP, regional HA and
    `--ssl-mode=ENCRYPTED_ONLY` (matches `sslmode: require`; a client-cert mode
    would refuse nano). See [Managed PostgreSQL (Cloud SQL)](#managed-postgresql-cloud-sql).
-   The first `vpc-peering connect` in a project can fail with an
+   The first `vpc-peerings connect` in a project can fail with an
    authentication error while the Service Networking agent is provisioned;
    retry it. A database created with `gcloud sql databases create` is owned by
    `cloudsqlsuperuser`; that is fine. Tell the operator what a failover looks
    like: about 10-14 s of stalled API, sign-in and OTLP requests (no errors,
    HEC unaffected, nothing lost), and an OTLP request that timed out at the
-   client may still be stored, so a retrying sender can duplicate it.
+   client may or may not have been stored (a 2.0.11 GKE test found it was
+   not), so a retrying sender at worst duplicates it.
 
 6. **Registry credential.** The chart's `registryCredentialRefresh` CronJob
    keeps `nano-registry` fresh (see [helm.md](helm.md)). After the pull, run

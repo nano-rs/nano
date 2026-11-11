@@ -42,8 +42,11 @@ MIGRATION_GROUPS = (
     "postgres_enterprise",
     "clickhouse_enterprise",
 )
-ROLES = frozenset({"app", "ingest", "clickhouse", "keeper", "postgres"})
-RESOURCE_ROLES = ROLES | {"tenzir"}
+ROLES = frozenset({"app", "ingest", "clickhouse", "keeper", "postgres", "monitoring"})
+# The signed RAM policy keys (manifest.requires.ram.role_min_bytes), exactly.
+# NAN-5250: `monitoring` is a host role but not a policy key: releases signed
+# before it have none, and nano-upgrade falls back to a fixed minimum for it.
+RESOURCE_ROLES = frozenset({"app", "ingest", "clickhouse", "keeper", "postgres", "tenzir"})
 ARCHITECTURES = frozenset({"amd64", "arm64"})
 
 _SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
@@ -1055,6 +1058,13 @@ _IMAGE_ROLES: dict[str, frozenset[str]] = {
     "curl": frozenset({"ingest"}),
     "nginx": frozenset({"app", "ingest", "clickhouse", "postgres"}),
     "tenzir": frozenset({"ingest"}),
+    # NAN-5250: the optional monitoring role. node-exporter runs on every host
+    # of a cluster that has a monitoring host; the rest only on that host.
+    "node-exporter": frozenset({"app", "ingest", "clickhouse", "keeper", "postgres", "monitoring"}),
+    "prometheus": frozenset({"monitoring"}),
+    "grafana": frozenset({"monitoring"}),
+    "redis_exporter": frozenset({"monitoring"}),
+    "alertmanager": frozenset({"monitoring"}),
 }
 
 

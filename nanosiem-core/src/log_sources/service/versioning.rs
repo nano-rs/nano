@@ -230,13 +230,7 @@ impl LogSourceService {
                     Some(v.parser_vrl.clone()),
                 )
             }
-            // No active version yet — source has never been published.
-            // If it has parser VRL or an extension, that's an unpublished draft.
-            None => (
-                !ls.parser_vrl.is_empty() || ls.extension_vrl.is_some(),
-                None,
-                None,
-            ),
+            None => (unversioned_has_draft(&ls), None, None),
         };
 
         Ok(LogSourceWithDraftStatus {
@@ -246,6 +240,36 @@ impl LogSourceService {
             active_parser_vrl,
         })
     }
+}
+
+/// Draft state of a source that has never been published (no active version).
+///
+/// With zero versions, deploy renders the WORKING COPY (the backwards-compat
+/// path in `list_enabled_for_deploy`), so what is live is the working copy as
+/// of the last deploy. A repository import is created linked and deployed
+/// without a publish (NAN-5264): reporting it as an unpublished draft was
+/// wrong (nothing differs from what runs) and pushed operators toward Publish
+/// as if the parser were not live. Only working-copy changes saved after the
+/// last deploy are a draft. Every write bumps `updated_at` (trigger), and the
+/// deploy's own `UPDATE` sets `deployed_at` and `updated_at` to the same
+/// statement timestamp, so `updated_at > deployed_at` is "edited since deploy"
+/// (the same rule the pipeline list uses).
+///
+/// This never hides an edit: an undeployed source, or any save after the
+/// deploy, still reports a draft. It does not create a version either, so the
+/// "deploy ships the ACTIVE version" trap (NAN-2293) cannot start here: a
+/// later upstream update or edit still deploys from the working copy until
+/// the first publish.
+pub(crate) fn unversioned_has_draft(ls: &LogSource) -> bool {
+    let has_content = !ls.parser_vrl.is_empty() || ls.extension_vrl.is_some();
+    if !has_content {
+        return false;
+    }
+    let live_as_saved = ls.deployed
+        && ls
+            .deployed_at
+            .is_some_and(|deployed_at| ls.updated_at <= deployed_at);
+    !live_as_saved
 }
 
 /// Refuse when a caller-observed `updated_at` no longer matches the row.

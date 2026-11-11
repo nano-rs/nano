@@ -19,6 +19,15 @@ use std::future::Future;
 #[cfg(feature = "enterprise")]
 use std::sync::Arc;
 
+/// NAN-5250: 1 while this jobs instance holds the scheduler lease, else 0.
+/// Exactly one instance per cluster reports 1; the monitoring dashboards and
+/// alert rules read it to show the leader and catch zero or two leaders.
+const JOBS_LEADER_GAUGE: &str = "nano_jobs_leader";
+
+fn set_jobs_leader(leading: bool) {
+    metrics::gauge!(JOBS_LEADER_GAUGE).set(if leading { 1.0 } else { 0.0 });
+}
+
 /// The leader-only schedulers, started on election and stopped (aborted and
 /// awaited) before the lease can pass to another instance.
 struct JobsLeaderTasks {
@@ -34,9 +43,11 @@ impl LeaderHooks for JobsLeaderTasks {
         // them without exiting.
         let started = self.state.start_leader_schedulers().await;
         self.handles = self.state.supervise_tasks("leader_scheduler", started);
+        set_jobs_leader(true);
     }
 
     async fn stepped_down(&mut self) {
+        set_jobs_leader(false);
         abort_and_await_leader_tasks(&mut self.handles).await;
     }
 }
@@ -108,6 +119,11 @@ async fn async_main() -> Result<()> {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
 
     tracing::info!("Starting NanoSIEM Jobs Service");
+    // NAN-5250: install the Prometheus recorder before anything can record.
+    // The leader election below sets nano_jobs_leader as soon as it wins,
+    // and a gauge set before the recorder exists is silently dropped.
+    let (app_metrics, prometheus_layer) = AppMetrics::new();
+    set_jobs_leader(false);
     // Security review 2026-11-08: surface insecure-but-accepted deployment
     // settings (public install token, config delivery on the install token).
     nanosiem_core::deployment_posture::log_posture_at_boot("nano-jobs");
@@ -316,6 +332,7 @@ async fn async_main() -> Result<()> {
         for handle in state.supervise_tasks("leader_scheduler", started) {
             state.add_task_handle(handle).await;
         }
+        set_jobs_leader(true);
     }
 
     // OIDC auth-transaction cleanup task. Each /authorize creates a row that's
@@ -363,8 +380,6 @@ async fn async_main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3001);
-
-    let (app_metrics, prometheus_layer) = AppMetrics::new();
 
     let health_router = axum::Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))

@@ -1,118 +1,360 @@
-# NanoSIEM Alert Rules
+# nano alert rules (NAN-5250).
+#
+# One rule set for every install shape: the dev stack, the single-node
+# `monitoring` profile, the role-split `monitoring` role and Helm (shipped as
+# a PrometheusRule). Job names are the same everywhere: nano-api, nano-search,
+# nano-jobs, nano-vector, clickhouse, keeper, node, haproxy, patroni, etcd,
+# valkey, valkey-sentinel. A rule whose job is not scraped (for example
+# patroni on a single PostgreSQL host) has no series and never fires.
+#
+# The HA rules mirror skills/nano-deploy/scripts/cluster-health.py: a
+# ClickHouse replica read-only, lagging or down; PostgreSQL or Valkey with no
+# primary or two; etcd without a leader or quorum; a host-local router with no
+# healthy backend; and disk pressure. Every alert carries `severity`
+# (critical = act now, warning = look today) and a one-line summary.
 groups:
-  - name: nanosiem_api
+  - name: nano_availability
     rules:
-      # High API error rate
-      - alert: HighAPIErrorRate
-        expr: |
-          (
-            sum(rate(http_requests_total{job="nanosiem-api", status=~"5.."}[5m]))
-            /
-            sum(rate(http_requests_total{job="nanosiem-api"}[5m]))
-          ) > 0.05
-        for: 5m
+      - alert: NanoTargetDown
+        expr: up == 0
+        for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "High API error rate"
-          description: "API error rate is above 5% for the last 5 minutes (current: {{ $value | humanizePercentage }})"
+          summary: "{{ $labels.job }} on {{ $labels.host }} is not answering scrapes"
+          description: "Prometheus cannot scrape {{ $labels.instance }} ({{ $labels.job }}) for 2 minutes. The process is down, or the host firewall does not open its metrics port to the monitoring host."
 
-      # High API latency (P95)
-      - alert: HighAPILatency
-        expr: |
-          histogram_quantile(0.95,
-            sum(rate(http_request_duration_seconds_bucket{job="nanosiem-api"}[5m])) by (le)
-          ) > 2
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High API latency"
-          description: "P95 API latency is above 2 seconds (current: {{ $value | humanizeDuration }})"
-
-      # API down
-      - alert: APIDown
-        expr: up{job="nanosiem-api"} == 0
+      - alert: NanoApiDown
+        expr: (count(up{job="nano-api"} == 1) or on() vector(0)) == 0 and on() count(up{job="nano-api"}) > 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "NanoSIEM API is down"
-          description: "The NanoSIEM API has been unreachable for more than 1 minute"
+          summary: "No nano API instance is up"
+          description: "Every nano-api target has failed its scrape for 1 minute. Users cannot sign in or search."
 
-  - name: nanosiem_databases
-    rules:
-      # PostgreSQL connection pool exhaustion
-      - alert: PostgresPoolExhaustion
-        expr: |
-          (pg_stat_activity_count{job="postgres"} / pg_settings_max_connections{job="postgres"}) > 0.8
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "PostgreSQL connection pool near exhaustion"
-          description: "PostgreSQL connection usage is above 80% (current: {{ $value | humanizePercentage }})"
-
-      # PostgreSQL down
-      - alert: PostgresDown
-        expr: up{job="postgres"} == 0
+      - alert: NanoSearchDown
+        expr: (count(up{job="nano-search"} == 1) or on() vector(0)) == 0 and on() count(up{job="nano-search"}) > 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "PostgreSQL exporter is down"
-          description: "Cannot reach PostgreSQL metrics exporter"
+          summary: "No nano search instance is up"
+          description: "Every nano-search target has failed its scrape for 1 minute. Searches and detections that query ClickHouse fail."
 
-      # ClickHouse down
-      - alert: ClickHouseDown
+  - name: nano_app
+    rules:
+      - alert: NanoApiErrorRate
+        expr: |
+          sum(rate(axum_http_requests_total{job="nano-api", status=~"5.."}[5m]))
+            / sum(rate(axum_http_requests_total{job="nano-api"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of API requests fail"
+          description: "nano-api answered 5xx for {{ $value | humanizePercentage }} of requests over 5 minutes."
+
+      - alert: NanoApiLatency
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(axum_http_requests_duration_seconds_bucket{job="nano-api"}[5m]))) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p95 latency above 2 s"
+          description: "The 95th percentile of nano-api request time is {{ $value | humanizeDuration }}."
+
+      - alert: NanoJobsNoLeader
+        expr: (sum(nano_jobs_leader{job="nano-jobs"}) or on() vector(0)) < 1 and on() count(up{job="nano-jobs"} == 1) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No nano-jobs instance holds the scheduler lease"
+          description: "Detections, retention and feed updates are not scheduled. A jobs leader takes over within about 30 s of a lost one; 2 minutes without one means the PostgreSQL lease cannot be taken."
+
+      - alert: NanoJobsTwoLeaders
+        expr: sum(nano_jobs_leader{job="nano-jobs"}) > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} nano-jobs instances report the scheduler lease"
+          description: "More than one jobs instance believes it is the leader. Leader-only writes are fenced by the lease epoch, but check PostgreSQL connectivity of every app host."
+
+      - alert: NanoDetectionScheduleLag
+        expr: max(nanosiem_detection_schedule_degraded{job="nano-jobs"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduled detections are running behind"
+          description: "At least one scheduled rule has run more than twice its interval late for 10 minutes. See Detections > Health in nano."
+
+  - name: nano_ingest
+    rules:
+      # Events still arrive at Vector's sources but none reach a ClickHouse
+      # sink: the pipeline is stalled (ClickHouse down, read-only, or a
+      # wedged sink). Internal sources (Vector's own metrics/logs) are ignored.
+      - alert: NanoIngestStalled
+        expr: |
+          sum(rate(nanosiem_vector_component_received_events_total{job="nano-vector", component_kind="source", component_type!~"internal_.*"}[10m])) > 0
+            and on()
+          (sum(rate(nanosiem_vector_component_sent_events_total{job="nano-vector", component_type="clickhouse"}[10m])) or on() vector(0)) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingest is stalled: events arrive but none reach ClickHouse"
+          description: "Vector received events for 10 minutes and its ClickHouse sinks sent none. Check ClickHouse health and the Vector logs on the ingest hosts."
+
+      - alert: NanoIngestErrors
+        expr: sum by (host, component_id) (rate(nanosiem_vector_component_errors_total{job="nano-vector"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vector component {{ $labels.component_id }} on {{ $labels.host }} reports errors"
+          description: "{{ $value | humanize }} errors per second for 10 minutes."
+
+      - alert: NanoIngestDropping
+        expr: sum by (host, component_id) (rate(nanosiem_vector_component_discarded_events_total{job="nano-vector", intentional="false"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Vector on {{ $labels.host }} drops events at {{ $labels.component_id }}"
+          description: "Unintentional discards for 5 minutes: events are being lost."
+
+      - alert: NanoIngestBufferFilling
+        expr: |
+          max by (host, component_id) (nanosiem_vector_buffer_size_bytes{job="nano-vector"})
+            / max by (host, component_id) (nanosiem_vector_buffer_max_size_bytes{job="nano-vector"} > 0) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vector disk buffer {{ $labels.component_id }} on {{ $labels.host }} is {{ $value | humanizePercentage }} full"
+          description: "ClickHouse is not keeping up with ingest. When the buffer is full, senders get back-pressure."
+
+  - name: nano_clickhouse
+    rules:
+      - alert: NanoClickHouseReplicaDown
         expr: up{job="clickhouse"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "ClickHouse exporter is down"
-          description: "Cannot reach ClickHouse metrics exporter"
+          summary: "ClickHouse on {{ $labels.host }} (shard {{ $labels.shard }}, replica {{ $labels.replica }}) is down"
+          description: "With replicas, the shard keeps serving from the other replica; without, that shard's data is unavailable."
 
-      # ClickHouse high memory usage
-      - alert: ClickHouseHighMemory
-        expr: clickhouse_asynchronous_metrics_MemoryTracking > 8e9
+      - alert: NanoClickHouseReadonlyReplica
+        expr: ClickHouseMetrics_ReadonlyReplica{job="clickhouse"} > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse on {{ $labels.host }} has {{ $value }} read-only replicated table(s)"
+          description: "A replica lost its Keeper session. Inserts to those tables fail until it reconnects. Check Keeper."
+
+      - alert: NanoClickHouseReplicationLag
+        expr: ClickHouseAsyncMetrics_ReplicasMaxAbsoluteDelay{job="clickhouse"} > 30
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "ClickHouse high memory usage"
-          description: "ClickHouse memory usage is above 8GB (current: {{ $value | humanize1024 }}B)"
+          summary: "ClickHouse replica on {{ $labels.host }} is {{ $value | humanizeDuration }} behind"
+          description: "The same 30 s bound the upgrade preflight and cluster-health.py use."
 
-  - name: nanosiem_vector
-    rules:
-      # Vector down
-      - alert: VectorDown
-        expr: up{job="vector"} == 0
+      - alert: NanoClickHouseReplicationQueue
+        expr: ClickHouseAsyncMetrics_ReplicasMaxQueueSize{job="clickhouse"} > 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse replication queue on {{ $labels.host }} holds {{ $value }} entries"
+
+      - alert: NanoClickHouseTooManyParts
+        expr: ClickHouseAsyncMetrics_MaxPartCountForPartition{job="clickhouse"} > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A ClickHouse partition on {{ $labels.host }} has {{ $value }} parts"
+          description: "Merges are not keeping up. ClickHouse rejects inserts at 3000 parts per partition."
+
+      - alert: NanoClickHouseDistributedBacklog
+        expr: ClickHouseMetrics_DistributedFilesToInsert{job="clickhouse"} > 1000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse on {{ $labels.host }} has {{ $value }} Distributed files waiting to send"
+          description: "A shard is unreachable or slow; cross-shard writes queue on disk."
+
+      - alert: NanoKeeperDown
+        expr: up{job="keeper"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "Vector is down"
-          description: "Vector ingestion pipeline has been unreachable for more than 1 minute"
+          summary: "Keeper on {{ $labels.host }} is down"
+          description: "With three Keepers, one may be lost. With one, every replicated table goes read-only."
 
-      # Vector buffer filling up
-      - alert: VectorBufferHigh
+  - name: nano_postgres
+    rules:
+      - alert: NanoPostgresNoPrimary
+        expr: (sum(patroni_primary{job="patroni"}) or on() vector(0)) < 1 and on() count(up{job="patroni"}) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL has no primary"
+          description: "No Patroni member is the leader. Writes fail until one is elected (normally within 15 s)."
+
+      - alert: NanoPostgresTwoPrimaries
+        expr: sum(patroni_primary{job="patroni"}) > 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} PostgreSQL members claim to be primary"
+          description: "Split brain risk. The app routers send writes only to the first; check etcd and Patroni now."
+
+      - alert: NanoPostgresMemberDown
+        expr: up{job="patroni"} == 0 or patroni_postgres_running{job="patroni"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL member on {{ $labels.host }} is down"
+
+      - alert: NanoPostgresReplicaLag
         expr: |
-          (vector_buffer_size_events{job="vector"} / vector_buffer_max_size_events{job="vector"}) > 0.8
+          ((scalar(max(patroni_xlog_location{job="patroni"})) - patroni_xlog_replayed_location{job="patroni"}) > 16777216)
+            and on(instance) (patroni_replica{job="patroni"} == 1)
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Vector buffer filling up"
-          description: "Vector buffer usage is above 80% (current: {{ $value | humanizePercentage }})"
+          summary: "PostgreSQL replica on {{ $labels.host }} is {{ $value | humanize1024 }}B behind"
+          description: "The same 16 MiB bound cluster-health.py uses."
 
-      # High event drop rate
-      - alert: VectorHighDropRate
-        expr: |
-          rate(vector_events_discarded_total{job="vector"}[5m]) > 100
-        for: 5m
+      - alert: NanoEtcdNoLeader
+        expr: etcd_server_has_leader{job="etcd"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "etcd member on {{ $labels.host }} has no leader"
+          description: "Patroni cannot renew the PostgreSQL leader key without an etcd quorum."
+
+      - alert: NanoEtcdQuorumAtRisk
+        expr: count(up{job="etcd"} == 1) < 2 and on() count(up{job="etcd"}) >= 3
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fewer than two etcd members answer"
+          description: "The three-member etcd has lost its majority. PostgreSQL failover is not possible."
+
+  - name: nano_valkey
+    rules:
+      - alert: NanoValkeyNoMaster
+        expr: (count(redis_instance_info{job="valkey", role="master"}) or on() vector(0)) < 1 and on() count(redis_up{job="valkey"}) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "The shared Valkey has no master"
+          description: "Sessions, search jobs and logouts fail until Sentinel promotes a member."
+
+      - alert: NanoValkeyTwoMasters
+        expr: count(redis_instance_info{job="valkey", role="master"}) > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} Valkey members report role master"
+          description: "An isolated old master still claims the role. The routers follow the Sentinel majority; check Sentinel quorum."
+
+      - alert: NanoValkeyMemberDown
+        expr: redis_up{job="valkey"} == 0
+        for: 1m
         labels:
           severity: warning
         annotations:
-          summary: "High event drop rate in Vector"
-          description: "Vector is dropping more than 100 events per second"
+          summary: "Valkey member {{ $labels.instance }} is down"
+
+      - alert: NanoSentinelQuorumLost
+        expr: redis_sentinel_master_ok_sentinels{job="valkey-sentinel"} < 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sentinel on {{ $labels.host }} sees {{ $value }} healthy Sentinel(s)"
+          description: "Two of three Sentinels must agree to fail Valkey over."
+
+  - name: nano_routers
+    rules:
+      # cluster-health.py "one": exactly one PostgreSQL member behind each app
+      # host's router.
+      - alert: NanoPostgresRouterNotOnePrimary
+        expr: haproxy_backend_active_servers{job="haproxy", proxy="postgres_primary"} != 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "The PostgreSQL router on {{ $labels.host }} routes to {{ $value }} members"
+          description: "0 = writes refused on that app host; 2 = split routing."
+
+      # cluster-health.py "all": every backend server of the ClickHouse,
+      # ingest and app-API gateways is UP.
+      - alert: NanoRouterBackendDown
+        expr: haproxy_server_status{job="haproxy", proxy=~"clickhouse_all|ingest_http|app_api", state="DOWN"} == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.proxy }} on {{ $labels.host }} marks {{ $labels.server }} DOWN"
+          description: "That host cannot reach the peer. If the peer is this host's own address, check the host firewall lets Docker bridges reach it."
+
+      - alert: NanoRouterNoBackend
+        expr: haproxy_backend_active_servers{job="haproxy", proxy=~"clickhouse_all|ingest_http|app_api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.proxy }} on {{ $labels.host }} has no healthy backend"
+
+  - name: nano_hosts
+    rules:
+      - alert: NanoDiskPressure
+        expr: |
+          (node_filesystem_avail_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}
+            / node_filesystem_size_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}) < 0.15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.host }} has {{ $value | humanizePercentage }} free"
+
+      - alert: NanoDiskCritical
+        expr: |
+          (node_filesystem_avail_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}
+            / node_filesystem_size_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}) < 0.08
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.host }} is nearly full ({{ $value | humanizePercentage }} free)"
+          description: "ClickHouse stops merging and Vector buffers stop accepting events when the disk fills."
+
+      - alert: NanoHostMemoryPressure
+        expr: node_memory_MemAvailable_bytes{job="node"} / node_memory_MemTotal_bytes{job="node"} < 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host }} has {{ $value | humanizePercentage }} memory available"

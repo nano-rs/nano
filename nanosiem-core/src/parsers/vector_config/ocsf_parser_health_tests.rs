@@ -17,7 +17,9 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::parser_config::{OCSF_LANE_STAMP_SUFFIX, OCSF_PARSER_FAILURE_VRL};
+use super::parser_config::{
+    OCSF_LANE_STAMP_SUFFIX, OCSF_PARSER_FAILURE_VRL, OCSF_PARSER_FALLBACK_VRL,
+};
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
 
@@ -133,12 +135,23 @@ struct Outcome {
 }
 
 fn through(parser_cfg: &str, combiner: &str, message: &str) -> Outcome {
+    through_named(parser_cfg, combiner, "json_generic", message, json!({}))
+}
+
+/// [`through`] for a parser named `name`, starting from event `metadata`
+/// (where the ingest lanes stash e.g. `nano_claimed_source_type`).
+fn through_named(
+    parser_cfg: &str,
+    combiner: &str,
+    name: &str,
+    message: &str,
+    metadata: Value,
+) -> Outcome {
     let t = transforms(parser_cfg);
     let c = transforms(combiner);
-    let name = "json_generic";
-    let event = json!({ "message": message, "source_type": "json_generic" });
+    let event = json!({ "message": message, "source_type": name });
     let stamp = format!("{name}{OCSF_LANE_STAMP_SUFFIX}");
-    let (_, event, meta) = run(&source(&t, &stamp), event, json!({})).unwrap();
+    let (_, event, meta) = run(&source(&t, &stamp), event, metadata).unwrap();
     let (_, parsed, meta) = run(&source(&t, &format!("{name}_parse")), event, meta).unwrap();
 
     let ocsf_lane = takes_ocsf_lane(&t, name, &parsed);
@@ -205,4 +218,215 @@ fn only_a_present_parse_error_is_a_failure() {
         let (_, out, _) = run(OCSF_PARSER_FAILURE_VRL, row, json!({})).unwrap();
         assert_eq!(out["_nano_parser_failure"], failed, "unmapped={unmapped}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// NAN-5264: a fallback parse is degraded, not healthy.
+// ---------------------------------------------------------------------------
+
+/// The shape of the first-party Apache (OCSF) parser: HTTP Activity on a
+/// matching line, a Base Event with no event time on anything else.
+const APACHE_LIKE_VRL: &str = r#"raw_log = to_string(.message) ?? ""
+parsed, err = parse_regex(raw_log, r'^(?P<host>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+)')
+if err == null {
+    t = parse_timestamp(parsed.ts, "%d/%b/%Y:%H:%M:%S %z") ?? now()
+    . = {
+        "class_uid": 4002,
+        "activity_id": 3,
+        "time": to_unix_timestamp(t, unit: "milliseconds"),
+        "http_request": { "http_method": parsed.method, "url": { "path": parsed.path } },
+        "metadata": { "product": { "name": "Apache HTTP Server" } }
+    }
+} else {
+    . = {
+        "class_uid": 0,
+        "class_name": "Base Event",
+        "activity_id": 99,
+        "time": 0,
+        "raw_data": raw_log,
+        "metadata": { "product": { "name": "Apache HTTP Server" }, "log_level": "error" },
+        "unmapped": { "parse_fallback": "unparsable input" }
+    }
+}"#;
+
+/// The shape of the first-party Sysmon (OCSF) parser: it accepts any JSON
+/// object, so an envelope it does not understand lands as Process Activity /
+/// Other with no event time and no process name.
+const SYSMON_LIKE_VRL: &str = r#"raw_log = to_string(.message) ?? ""
+parsed, err = parse_json(raw_log)
+if err != null || !is_object(parsed) {
+    . = { "class_uid": 1007, "activity_id": 99, "time": 0, "raw_data": raw_log, "metadata": { "log_level": "error" } }
+} else {
+    p = object!(parsed)
+    eid = to_int(p.event_id) ?? 0
+    time_ms = 0
+    ts = string(p.timestamp) ?? ""
+    if ts != "" {
+        t, terr = parse_timestamp(ts, "%+")
+        if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+    }
+    activity = if eid == 1 { 1 } else { 99 }
+    . = {
+        "class_uid": 1007,
+        "activity_id": activity,
+        "time": time_ms,
+        "process": { "name": string(p.event_data.Image) ?? "" },
+        "metadata": { "product": { "name": "Sysmon" } }
+    }
+}"#;
+
+fn rendered(name: &str, vrl: &str) -> (String, String) {
+    let mut p = parser(Uuid::new_v4(), vrl);
+    p.name = name.into();
+    p.match_values = Some(vec![name.into()]);
+    let m = VectorConfigManager::new("/tmp/nanosiem-test");
+    let cfg = m.generate_parser_config_for(&p, true);
+    let combiner = VectorConfigManager::combiner_config_content_for(std::slice::from_ref(&p), true);
+    (cfg, combiner)
+}
+
+#[test]
+fn an_apache_base_event_fallback_counts_as_a_fallback_not_a_success() {
+    let (cfg, combiner) = rendered("apache_access", APACHE_LIKE_VRL);
+    let good = r#"127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache_pb.gif HTTP/1.0" 200 2326"#;
+    let ok = through_named(&cfg, &combiner, "apache_access", good, json!({}));
+    assert!(ok.ocsf_lane);
+    assert_eq!(ok.health["parse_failure"], 0, "{}", ok.health);
+    assert_eq!(ok.health["parse_fallback"], 0, "{}", ok.health);
+
+    // The reported input: the raw line wrapped in a JSON envelope.
+    let wrapped = format!(r#"{{"message":"{}","host":"web-1"}}"#, good.replace('"', "\\\""));
+    let fell_back = through_named(&cfg, &combiner, "apache_access", &wrapped, json!({}));
+    assert!(fell_back.ocsf_lane, "a fallback still lands in ocsf_logs");
+    assert_eq!(fell_back.health["parse_failure"], 0, "not a runtime failure: {}", fell_back.health);
+    assert_eq!(fell_back.health["parse_fallback"], 1, "{}", fell_back.health);
+
+    // The defect: before NAN-5264 the prepare step stamped no fallback marker.
+    let pre_fix = cfg.replace(OCSF_PARSER_FALLBACK_VRL, "");
+    assert_ne!(pre_fix, cfg);
+    let silent = through_named(&pre_fix, &combiner, "apache_access", &wrapped, json!({}));
+    assert_eq!(silent.health["parse_failure"], 0);
+    assert_eq!(silent.health["parse_fallback"], 0, "pre-fix render reports the fallback as healthy");
+}
+
+/// NAN-5264 review: a record with no event time is NOT a fallback by itself.
+/// Every year-less RFC3164 syslog line (and well-formed Proofpoint DLP,
+/// Qualys and Rapid7 records) parses correctly with `time` 0; the first rule
+/// flagged them all. Only the parser's explicit marker counts.
+#[test]
+fn a_correct_parse_without_an_event_time_is_healthy() {
+    let (cfg, combiner) = rendered("windows_sysmon", SYSMON_LIKE_VRL);
+    let event = r#"{"event_id":1,"timestamp":"2026-08-18T10:15:00Z","event_data":{"Image":"C:\\Windows\\System32\\cmd.exe"}}"#;
+    let ok = through_named(&cfg, &combiner, "windows_sysmon", event, json!({}));
+    assert_eq!(ok.health["parse_fallback"], 0, "{}", ok.health);
+
+    let no_time = r#"{"event_id":1,"event_data":{"Image":"C:\\Windows\\System32\\cmd.exe"}}"#;
+    let out = through_named(&cfg, &combiner, "windows_sysmon", no_time, json!({}));
+    assert!(out.ocsf_lane);
+    assert_eq!(out.health["parse_failure"], 0, "{}", out.health);
+    assert_eq!(out.health["parse_fallback"], 0, "no event time alone is not a fallback: {}", out.health);
+}
+
+#[test]
+fn a_failed_parse_is_not_also_a_fallback() {
+    // json_generic's failure branch is class 0 too; it must count once.
+    let p = parser(Uuid::new_v4(), JSON_GENERIC_LIKE_VRL);
+    let m = VectorConfigManager::new("/tmp/nanosiem-test");
+    let cfg = m.generate_parser_config_for(&p, true);
+    let combiner = VectorConfigManager::combiner_config_content_for(std::slice::from_ref(&p), true);
+    let bad = through(&cfg, &combiner, r#"{"unterminated":"#);
+    assert_eq!(bad.health["parse_failure"], 1, "{}", bad.health);
+    assert_eq!(bad.health["parse_fallback"], 0, "{}", bad.health);
+}
+
+#[test]
+fn the_fallback_rule_reads_only_the_marker() {
+    let t = 1762164000000_i64;
+    for (event, fallback) in [
+        (json!({ "class_uid": 4002, "time": t }), false),
+        // A correctly parsed Base Event (windows_event_xml's unmapped EventIDs,
+        // journald, nano's own logs) is NOT a fallback.
+        (json!({ "class_uid": 0, "time": t }), false),
+        (json!({ "class_uid": 0, "time": t, "metadata": { "log_level": "error" } }), false),
+        // The explicit marker the first-party fallback branches set.
+        (json!({ "class_uid": 0, "time": t, "unmapped": { "parse_fallback": "unparsable input" } }), true),
+        (json!({ "class_uid": 4001, "time": t, "unmapped": { "parse_fallback": true } }), true),
+        (json!({ "class_uid": 4001, "time": t, "unmapped": { "parse_fallback": false } }), false),
+        (json!({ "class_uid": 4001, "time": t, "unmapped": { "parse_fallback": null } }), false),
+        // No event time alone is NOT a fallback (year-less RFC3164 syslog).
+        (json!({ "class_uid": 3002, "time": 0 }), false),
+        (json!({ "class_uid": 1007 }), false),
+        (json!({ "class_uid": 1007, "time": 0, "unmapped": { "parse_fallback": "unparsable input" } }), true),
+        // A failure is counted once, as a failure.
+        (json!({ "class_uid": 0, "time": 0, "unmapped": { "parse_error": "bad", "parse_fallback": "x" } }), false),
+    ] {
+        let row = json!({ "event": event, "source_type": "x" });
+        let (_, out, _) = run(OCSF_PARSER_FALLBACK_VRL, row, json!({})).unwrap();
+        assert_eq!(out["_nano_parser_fallback"], fallback, "event={event}");
+    }
+}
+
+#[test]
+fn an_ignored_source_claim_is_counted_on_the_bound_source() {
+    let (cfg, combiner) = rendered("apache_access", APACHE_LIKE_VRL);
+    let line = r#"10.1.2.3 - - [12/Aug/2026:09:15:22 +0000] "POST /wp-login.php HTTP/1.1" 500 0"#;
+    let honest = through_named(&cfg, &combiner, "apache_access", line, json!({}));
+    assert_eq!(honest.health["source_claim_ignored"], 0, "{}", honest.health);
+    // source_type_extract / the HEC lane stash a differing claim here.
+    let claimed = through_named(
+        &cfg,
+        &combiner,
+        "apache_access",
+        line,
+        json!({ "nano_claimed_source_type": "nginx" }),
+    );
+    assert_eq!(claimed.health["source_claim_ignored"], 1, "{}", claimed.health);
+    assert_eq!(claimed.health["source_type"], "apache_access");
+}
+
+/// The shape of windows_event_xml: unmapped EventIDs become a Base Event with
+/// the event's real time. That is a correct parse and must stay healthy
+/// (NAN-5264 review: the first rule flagged every class 0 record).
+const BASE_EVENT_BY_DESIGN_VRL: &str = r#"raw_log = to_string(.message) ?? ""
+parsed = parse_json(raw_log) ?? {}
+eid = to_int(parsed.EventID) ?? 0
+t = parse_timestamp(to_string(parsed.TimeCreated) ?? "", "%+") ?? now()
+cls = if eid == 4624 { 3002 } else { 0 }
+. = {
+    "class_uid": cls,
+    "activity_id": 99,
+    "time": to_unix_timestamp(t, unit: "milliseconds"),
+    "raw_data": raw_log,
+    "metadata": { "product": { "name": "Windows" } }
+}"#;
+
+/// A parser that keeps the real event time on its fallback branch, so only
+/// the explicit marker can report it.
+const MARKED_FALLBACK_VRL: &str = r#"raw_log = to_string(.message) ?? ""
+parsed, err = parse_json(raw_log)
+. = { "class_uid": 0, "activity_id": 99, "time": 1762164000000, "raw_data": raw_log, "metadata": { "log_level": "error" } }
+if err == null && is_object(parsed) {
+    .class_uid = 4001
+} else {
+    . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+}"#;
+
+#[test]
+fn a_correctly_parsed_base_event_is_healthy() {
+    let (cfg, combiner) = rendered("windows_event", BASE_EVENT_BY_DESIGN_VRL);
+    let unmapped_eid = r#"{"EventID":5156,"TimeCreated":"2026-11-10T10:00:00Z"}"#;
+    let out = through_named(&cfg, &combiner, "windows_event", unmapped_eid, json!({}));
+    assert!(out.ocsf_lane);
+    assert_eq!(out.health["parse_failure"], 0, "{}", out.health);
+    assert_eq!(out.health["parse_fallback"], 0, "Base Event by design: {}", out.health);
+}
+
+#[test]
+fn the_explicit_fallback_marker_is_counted() {
+    let (cfg, combiner) = rendered("marked_source", MARKED_FALLBACK_VRL);
+    let ok = through_named(&cfg, &combiner, "marked_source", r#"{"a":1}"#, json!({}));
+    assert_eq!(ok.health["parse_fallback"], 0, "{}", ok.health);
+    let bad = through_named(&cfg, &combiner, "marked_source", "not json", json!({}));
+    assert_eq!(bad.health["parse_failure"], 0, "{}", bad.health);
+    assert_eq!(bad.health["parse_fallback"], 1, "{}", bad.health);
 }

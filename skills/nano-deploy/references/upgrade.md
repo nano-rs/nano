@@ -76,6 +76,30 @@ rebuild, and offer to ask support to retire the old ID.
 
 ## Path A: Compose, from v2.0.10 or later (`scripts/nano upgrade`)
 
+> **v2.0.10 → v2.0.11:** the 2.0.11 dry run fails on every role-split cluster
+> (`registry-login ... ghcr.io` and, on OCSF, `ledger-clickhouse ... not in
+> target ocsf/193,ocsf/194`). Both are false positives fixed in 2.0.12. Use
+> Path B for that one upgrade, or go straight to 2.0.12 with Path A
+> ([known-issues.md](known-issues.md#2011-fixed-in-2012)).
+
+**Prerequisites on a role split** (check them before the dry run; the
+fresh-install flow does not set them up):
+
+- SSH from the first app host (the coordinator) to every other host, as the
+  install user, non-interactively (`ssh -o BatchMode=yes $h true`).
+- Executable drain and rejoin hooks at the same absolute path on every app
+  and ingest host (mandatory with more than one ingest host). The upgrade runs
+  them on the host it is upgrading with that host's **inventory** name; the
+  load balancer knows it as `app-1`, `ingest-1`, ... (the planner's names).
+  Start from the bundle's `deploy/compose/examples/load-balancer/nano-lb-hook`
+  (one file installed as `nano-lb-drain` and `nano-lb-rejoin`; edit its
+  `SERVERS` map and `LBS`).
+- On every HAProxy host, the runtime socket at `level admin`
+  (`stats socket /run/haproxy/admin.sock mode 600 level admin`, as in the
+  bundled `haproxy.cfg` from 2.0.12; `level operator` cannot drain), and an
+  SSH key from each app and ingest host that may run only the drain/rejoin
+  command there.
+
 1. **Precheck:** `upgrade-plan.py` READY; `cluster-health.py` PASS on every
    role-split host; `smoke-test.py` PASS; read the release notes and
    [known-issues.md](known-issues.md).

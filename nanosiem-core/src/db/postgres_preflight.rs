@@ -9,6 +9,12 @@
 //! pod in `Init:Error` with a raw SQL error. This check turns both cases into
 //! one actionable message before any DDL runs.
 //!
+//! It also checks that the connected role can `CREATE` in schema `public`.
+//! PostgreSQL 15+ no longer grants that to every role, and Azure flexible
+//! server makes `azure_pg_admin` (not the database owner) the owner of
+//! `public` in new databases, so the snapshot failed with "permission denied
+//! for schema public" after every other check had passed (NAN-5269).
+//!
 //! The extension probe is side-effect free: every `CREATE EXTENSION` runs
 //! inside a transaction that is always rolled back, so it tests the real
 //! permission and allow-list path without installing anything.
@@ -79,11 +85,63 @@ pub enum PostgresPreflightError {
     )]
     UnsupportedVersion { found: String, min: &'static str },
 
+    #[error("{}", schema_create_message(.platform, .access))]
+    NoCreateOnPublicSchema {
+        platform: PostgresPlatform,
+        access: PublicSchemaAccess,
+    },
+
     #[error("{}", missing_extensions_message(.platform, .missing))]
     MissingExtensions {
         platform: PostgresPlatform,
         missing: Vec<MissingExtension>,
     },
+}
+
+/// What the connected role can do in schema `public`, as the server reports it.
+/// Identifiers are already quoted with `quote_ident`, ready to paste into SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicSchemaAccess {
+    pub user: String,
+    pub database: String,
+    /// `None` when schema `public` does not exist in the database.
+    pub owner: Option<String>,
+    pub can_create: bool,
+}
+
+/// Builds the operator-facing message for [`PostgresPreflightError::NoCreateOnPublicSchema`].
+pub fn schema_create_message(platform: &PostgresPlatform, access: &PublicSchemaAccess) -> String {
+    let user = &access.user;
+    let db = &access.database;
+    let admin = match platform {
+        PostgresPlatform::AzureFlexibleServer => "the server admin user",
+        PostgresPlatform::CloudSql => "the `postgres` user",
+        PostgresPlatform::Rds => "the master user",
+        PostgresPlatform::Other => "a superuser or the schema owner",
+    };
+    match &access.owner {
+        None => format!(
+            "PostgreSQL preflight failed on {}: database {db} has no schema `public`, and nano \
+             creates its tables there. Nothing was applied.\n\
+             Fix: as {admin}, connected to database {db}, run:\n  \
+             CREATE SCHEMA public AUTHORIZATION {user};\n\
+             then rerun.",
+            platform.label(),
+        ),
+        Some(owner) => format!(
+            "PostgreSQL preflight failed on {}: the database user {user} cannot create objects in \
+             schema `public` of database {db} (schema owner: {owner}). PostgreSQL 15 and newer no \
+             longer let every role create in `public`, and Azure flexible server makes \
+             azure_pg_admin its owner in new databases. Nothing was applied.\n\
+             Fix: as {admin}, connected to database {db}, run:\n  \
+             ALTER SCHEMA public OWNER TO {user};\n\
+             or, to leave the owner as it is:\n  \
+             GRANT ALL ON SCHEMA public TO {user};\n\
+             then rerun. (ALTER SCHEMA ... OWNER needs the admin to be a member of {user}: \
+             GRANT {user} TO <admin>.)",
+            platform.label(),
+        ),
+    }
 }
 
 /// Builds the operator-facing message for [`PostgresPreflightError::MissingExtensions`].
@@ -147,12 +205,23 @@ pub struct PostgresPreflightReport {
     pub platform: PostgresPlatform,
     /// Required extensions that were not yet installed but can be created.
     pub creatable: Vec<String>,
+    /// Set when the role lacks `CREATE` on schema `public` but no migration is
+    /// pending, so nothing needs it now: the caller logs it as a warning and
+    /// carries on. The next release with a new migration would fail on it.
+    pub schema_warning: Option<String>,
 }
 
-/// Checks the server version and that every required extension is installed
-/// or creatable by the connected role. Never changes the database.
+/// Checks the server version, that the connected role can create objects in
+/// schema `public`, and that every required extension is installed or
+/// creatable by the connected role. Never changes the database.
+///
+/// A missing `CREATE` on `public` fails only when `migrations_pending` (a fresh
+/// install, or an upgrade that brings new migrations): then the run would fail
+/// part-way. With nothing to apply, a working install must keep starting, so
+/// it is returned as [`PostgresPreflightReport::schema_warning`] instead.
 pub async fn check_postgres_compatibility(
     pool: &PgPool,
+    migrations_pending: bool,
 ) -> Result<PostgresPreflightReport, PostgresPreflightError> {
     let (server_version, version_num): (String, String) = sqlx::query_as(
         "SELECT current_setting('server_version'), current_setting('server_version_num')",
@@ -168,6 +237,22 @@ pub async fn check_postgres_compatibility(
     }
 
     let platform = detect_platform(pool).await?;
+
+    // Before the extension probe: without CREATE on `public` that probe can
+    // fail too, and its allow-list advice would point at the wrong fix.
+    let access = public_schema_access(pool).await?;
+    let mut schema_warning = None;
+    if !access.can_create {
+        if migrations_pending {
+            return Err(PostgresPreflightError::NoCreateOnPublicSchema { platform, access });
+        }
+        schema_warning = Some(schema_create_message(&platform, &access).replacen(
+            "PostgreSQL preflight failed",
+            "PostgreSQL preflight warning (no migration pending, continuing; the next \
+             release that adds a migration will stop here)",
+            1,
+        ));
+    }
 
     let installed: Vec<String> = sqlx::query_scalar("SELECT extname::text FROM pg_extension")
         .fetch_all(pool)
@@ -211,6 +296,28 @@ pub async fn check_postgres_compatibility(
         server_version_num,
         platform,
         creatable,
+        schema_warning,
+    })
+}
+
+/// Reads whether `current_user` holds CREATE on schema `public` (directly,
+/// through a role, or as its owner) plus the names the fix message needs.
+async fn public_schema_access(pool: &PgPool) -> Result<PublicSchemaAccess, sqlx::Error> {
+    let (user, database, owner, can_create): (String, String, Option<String>, Option<bool>) =
+        sqlx::query_as(
+            "SELECT quote_ident(current_user::text), quote_ident(current_database()::text), \
+                    (SELECT quote_ident(pg_get_userbyid(n.nspowner)::text) \
+                       FROM pg_namespace n WHERE n.nspname = 'public'), \
+                    (SELECT has_schema_privilege(current_user, n.oid, 'CREATE') \
+                       FROM pg_namespace n WHERE n.nspname = 'public')",
+        )
+        .fetch_one(pool)
+        .await?;
+    Ok(PublicSchemaAccess {
+        user,
+        database,
+        can_create: owner.is_some() && can_create.unwrap_or(false),
+        owner,
     })
 }
 

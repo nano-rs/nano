@@ -107,3 +107,60 @@ nano_check_data_mount() {
 nano_docker_mount_dropin() {
     printf '[Unit]\nRequiresMountsFor=%s\n' "$1"
 }
+
+# NAN-5269: the data-disk self-heal timer (scripts/lib/data-disk-heal.sh, the
+# same file the nano-deploy skill ships). Only a `nofail`/`noauto` fstab mount
+# can be skipped at boot, so only such a disk needs the timer.
+#   nano_data_mount_skippable MOUNT  -> 0 when fstab marks MOUNT nofail/noauto
+nano_data_mount_skippable() {
+    local mount=${1%/}
+    awk -v m="$mount" '
+        $1 !~ /^#/ && NF >= 4 {
+            p = $2
+            sub(/\/+$/, "", p)
+            if (p == m && ("," $4 ",") ~ /,(nofail|noauto),/) found = 1
+        }
+        END { exit !found }' "${NANO_FSTAB_PATH:-/etc/fstab}" 2>/dev/null
+}
+
+# 0 when the timer is enabled and the installed copy is this release's script.
+# Tests replace this function.
+nano_data_disk_heal_current() {
+    local script=$1 installed=${NANO_HEAL_BIN:-/usr/local/sbin/nano-data-disk-heal}
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [[ -f "$installed" ]] && cmp -s "$script" "$installed" \
+        && systemctl is-enabled --quiet nano-data-disk-heal.timer 2>/dev/null
+}
+
+# 0 when sudo works without a password prompt. Tests replace this function.
+nano_can_sudo() {
+    command -v sudo >/dev/null 2>&1 && sudo -n true </dev/null >/dev/null 2>&1
+}
+
+# nano_ensure_data_disk_heal MOUNT SCRIPT
+#   prints one of: skipped <why> | current | installed | manual <command>
+#   Idempotent: an up-to-date, enabled timer is left alone. Installing needs
+#   root; install.sh itself runs without sudo, so this uses `sudo -n` only
+#   where that never prompts, and otherwise prints the one command to run.
+#   NANO_DATA_DISK_HEAL=off skips it. Remove it with
+#   `sudo sh SCRIPT uninstall`.
+nano_ensure_data_disk_heal() {
+    local mount=${1%/} script=$2
+    case "${NANO_DATA_DISK_HEAL:-auto}" in
+        off|false|0|no) printf 'skipped NANO_DATA_DISK_HEAL=%s\n' "$NANO_DATA_DISK_HEAL"; return 0 ;;
+    esac
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf 'skipped no systemd\n'; return 0
+    fi
+    if ! nano_data_mount_skippable "$mount"; then
+        printf 'skipped %s is not a nofail fstab mount\n' "$mount"; return 0
+    fi
+    if nano_data_disk_heal_current "$script"; then
+        printf 'current\n'; return 0
+    fi
+    if nano_can_sudo && sudo -n sh "$script" install "$mount" </dev/null >/dev/null 2>&1 \
+        && nano_data_disk_heal_current "$script"; then
+        printf 'installed\n'; return 0
+    fi
+    printf 'manual sudo sh %s install %s\n' "$script" "$mount"
+}
