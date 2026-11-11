@@ -8,7 +8,7 @@ Writes two files on the operator's workstation:
   <out>/values-licence.yaml  SECRET (mode 0600): licence URL, deployment id, licence token,
                              read from the app.nano.rs enrollment file. Never commit or print it.
 
-  helm show values oci://us-central1-docker.pkg.dev/nano-rs/charts/nano --version <chart-version> > chart-values.yaml
+  helm show values oci://us-central1-docker.pkg.dev/nano-rs/nanosiem-customer/charts/nano --version <chart-version> > chart-values.yaml
   helm-values.py --chart-values chart-values.yaml --enrollment ~/nano-enrollment.env \
      --base-url https://nano.example.com --app-host nano.example.com --ingest-host ingest.nano.example.com \
      --pull-secret nano-registry --issuer letsencrypt --storage-gi 600 --hot-days 365 --out ./nano-deploy-work/helm

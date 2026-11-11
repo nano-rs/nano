@@ -1,6 +1,7 @@
 # AWS
 
-Cloud specifics for [cloud-vm.md](cloud-vm.md). Run every mutating command
+Cloud specifics for [cloud-vm.md](cloud-vm.md) (VMs) and, at the end, for an
+EKS cluster for the Helm chart ([Amazon EKS](#amazon-eks-for-the-helm-chart)). Run every mutating command
 only after the operator approves that step. The commands use the operator's
 own `aws` CLI session; you never handle their keys.
 
@@ -269,3 +270,141 @@ resource "aws_ebs_volume" "ch_s1r1_data" {
   tags = { "nano-deployment" = var.name }
 }
 ```
+
+## Amazon EKS for the Helm chart
+
+The sections above build VMs for the compose topologies. For the Helm chart
+([helm.md](helm.md)) the operator brings an EKS cluster. When they have none,
+propose this and create it only after they approve (it costs money from the
+first minute). Every command uses their `aws`/`eksctl` session.
+
+A small HA cluster: 3 Availability Zones, a NAT gateway per zone, OIDC for
+IRSA, the EBS CSI driver, and **two nodes per zone**. EBS volumes are bound to
+their zone: with one node per zone, draining or losing a node leaves that
+zone's ClickHouse replica and Keeper member Pending (data safe, no redundancy)
+until a node returns to that zone. One managed node group per zone keeps the
+count per zone fixed. Size the instance type from the plan
+(`size.py --topology helm`). Set `clickhouse.zoneAware: true` (the two
+replicas of a shard in different zones, Keeper over three zones) with
+`antiAffinity: hard`.
+
+```yaml
+# eksctl create cluster -f nano-eks.yaml   (about 15-20 minutes)
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: nano
+  region: us-east-1
+  version: "1.37"
+  tags: {nano-deployment: nano}
+availabilityZones: ["us-east-1a", "us-east-1b", "us-east-1c"]
+vpc:
+  cidr: 10.42.0.0/16
+  nat: {gateway: HighlyAvailable}
+iam:
+  withOIDC: true
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: eks-pod-identity-agent
+  - name: metrics-server          # Vector HPA from the standard preset up
+  - name: aws-ebs-csi-driver
+    wellKnownPolicies: {ebsCSIController: true}
+managedNodeGroups:               # one group per zone, 2 nodes each
+  - name: ng-a
+    instanceType: m6i.2xlarge     # x86-64 with AVX2 (ClickHouse)
+    minSize: 2
+    desiredCapacity: 2
+    maxSize: 3
+    volumeSize: 100
+    volumeType: gp3
+    privateNetworking: true
+    availabilityZones: ["us-east-1a"]
+  - name: ng-b
+    instanceType: m6i.2xlarge     # x86-64 with AVX2 (ClickHouse)
+    minSize: 2
+    desiredCapacity: 2
+    maxSize: 3
+    volumeSize: 100
+    volumeType: gp3
+    privateNetworking: true
+    availabilityZones: ["us-east-1b"]
+  - name: ng-c
+    instanceType: m6i.2xlarge     # x86-64 with AVX2 (ClickHouse)
+    minSize: 2
+    desiredCapacity: 2
+    maxSize: 3
+    volumeSize: 100
+    volumeType: gp3
+    privateNetworking: true
+    availabilityZones: ["us-east-1c"]
+```
+
+A 3-node layout (one per zone) also works but tolerates a node loss
+only with reduced redundancy, as above.
+
+Then, in order (each is a hard stop for the chart):
+
+1. **Default StorageClass.** EKS ships none that the EBS CSI driver serves.
+
+   ```bash
+   kubectl apply -f - <<'YAML'
+   apiVersion: storage.k8s.io/v1
+   kind: StorageClass
+   metadata:
+     name: gp3
+     annotations: {storageclass.kubernetes.io/is-default-class: "true"}
+   provisioner: ebs.csi.aws.com
+   parameters: {type: gp3}
+   volumeBindingMode: WaitForFirstConsumer
+   allowVolumeExpansion: true
+   YAML
+   ```
+
+2. **Gateway API.** The standard CRDs (`kubectl apply -f
+   https://github.com/kubernetes-sigs/gateway-api/releases/download/<v>/standard-install.yaml`),
+   then the AWS Load Balancer Controller v2.13+ with IRSA (its IAM policy from
+   the controller release), its gateway CRDs (`config/crd/gateway/gateway-crds.yaml`
+   of the same controller release) and the Gateway API feature gate
+   (`--set controllerConfig.featureGates.ALBGatewayAPI=true` on the controller
+   chart). Create the GatewayClass `values-aws.yaml` expects:
+
+   ```bash
+   kubectl apply -f - <<'YAML'
+   apiVersion: gateway.networking.k8s.io/v1
+   kind: GatewayClass
+   metadata: {name: aws-alb}
+   spec: {controllerName: gateway.k8s.aws/alb}
+   YAML
+   ```
+
+   The chart renders a `TargetGroupConfiguration` with `targetType: ip` for
+   both backends (2.0.10+), so the controller's default instance targets need
+   no change. On chart 2.0.9 and earlier, install the controller with
+   `--set defaultTargetType=ip`, or the ALBs never get targets ("TargetGroup
+   port is empty"). On controller v3.x set
+   `gateway.aws.crdApiVersion: gateway.k8s.aws/v1` to silence its v1beta1
+   deprecation warning.
+
+3. **Certificates.** `values-aws.yaml` terminates TLS on the ALBs with ACM
+   (`tls.mode: cloud-managed`): an ACM certificate in the cluster's region
+   for the app hostname and one for the ingest hostname (one certificate with
+   both names is fine), set as `tls.aws.appCertificateArn` and
+   `tls.aws.ingestCertificateArn`. The operator needs a domain they control;
+   after install, CNAME both hostnames to the ALB names
+   (`kubectl -n nano get gateway`).
+
+4. **PostgreSQL.** For production, RDS PostgreSQL 15+ (Multi-AZ for HA) in
+   the cluster VPC, its security group open on 5432 to the node security
+   group; `postgresql.mode: external`, `sslmode: require`, the password in a
+   Secret (`postgresql.external.passwordSecret`).
+
+5. **Registry credential.** The Self-run pull credential lasts one hour; the
+   chart's `registryCredentialRefresh` CronJob keeps `nano-registry` fresh (see
+   [helm.md](helm.md)). Do not disable it unless images come from a mirror
+   (`global.imageRegistry`, e.g. ECR).
+
+Teardown (only on request): `helm uninstall nano -n nano`, delete the PVCs
+and the namespace, the ALBs disappear with the Gateways; then
+`eksctl delete cluster -f nano-eks.yaml` and the RDS instance.

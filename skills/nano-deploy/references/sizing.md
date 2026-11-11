@@ -67,7 +67,7 @@ hypervisor HA restart of `nano-1`, tested backups, or Kubernetes with
 Two or more app hosts (see multi-node-ha.md, "Several app hosts") keep the
 UI, search and alerting up through the loss of an app host. With three
 `postgres` hosts (nano 2.0.7+, [postgres-ha.md](postgres-ha.md)) PostgreSQL
-fails over too, with a short pause (typically seconds, up to about 30 s).
+fails over too: about 20-25 s of failed writes and sign-ins when the leader's host dies, a few seconds for a planned switchover.
 Say this plainly to the operator.
 
 ## Cloud planner model

@@ -30,6 +30,10 @@ Checks:
   pg-ha    on postgres hosts with failover: Patroni has one Leader and, in synchronous
            mode, a Sync Standby, every member running/streaming with lag under 16 MiB;
            etcd endpoint health across the cluster; Sentinel quorum for the Valkey master.
+  disk     the data disk that holds Docker's data (an /etc/fstab mount at or above
+           DockerRootDir) is mounted, and docker.service requires it
+           (RequiresMountsFor=). A disk that failed to mount at boot leaves Docker
+           running empty on the root disk while systemd reports it "active".
 Exit 0 = healthy, 1 = a check failed, 3 = inconclusive (re-run), 2 = not a role-split host / usage error.
 """
 from __future__ import annotations
@@ -344,6 +348,86 @@ def postgres_ha(role: dict, run=docker) -> None:
         row("pg-sentinel", code == 0 and out.strip().startswith("OK"), f"sentinel ckquorum nano: {out.strip()[:120]}")
 
 
+def fstab_mount_for(path: str, fstab_text: str) -> str:
+    """The fstab mountpoint (longest, never "/") that holds ``path``."""
+    return fstab_entry_for(path, fstab_text)[0]
+
+
+def fstab_entry_for(path: str, fstab_text: str) -> tuple[str, str]:
+    """(mountpoint, options) of the fstab entry that holds ``path``."""
+    path = path.rstrip("/") or "/"
+    best, options = "", ""
+    for line in fstab_text.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[0].startswith("#"):
+            continue
+        mount, fstype = fields[1].rstrip("/"), fields[2]
+        if not mount.startswith("/") or fstype == "swap" or not mount:
+            continue
+        if (path == mount or path.startswith(mount + "/")) and len(mount) > len(best):
+            best, options = mount, (fields[3] if len(fields) > 3 else "defaults")
+    return best, options
+
+
+def mountinfo_mounted(path: str, mountinfo: str = "/proc/self/mountinfo") -> bool:
+    """True when ``path`` is a mount point, bind mounts included.
+
+    os.path.ismount compares device numbers, so a bind mount from the same
+    filesystem reads as "not mounted"; /proc/self/mountinfo lists every mount.
+    """
+    target = path.rstrip("/") or "/"
+    try:
+        with open(mountinfo, encoding="utf-8") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) > 4:
+                    point = fields[4].encode("utf-8").decode("unicode_escape").rstrip("/") or "/"
+                    if point == target:
+                        return True
+    except OSError:
+        return os.path.ismount(path)
+    return False
+
+
+def data_disk(run=None, fstab_path: str = "/etc/fstab", ismount=mountinfo_mounted, unit_mounts=None) -> None:
+    run = run or docker
+    code, out = run(["info", "--format", "{{.DockerRootDir}}"])
+    root = out.strip()
+    if code != 0 or not root.startswith("/"):
+        row("disk", None, "cannot read Docker's root directory (docker info)")
+        return
+    try:
+        with open(fstab_path, encoding="utf-8") as fh:
+            mount, options = fstab_entry_for(root, fh.read())
+    except OSError:
+        mount, options = "", ""
+    if not mount:
+        row("disk", True, f"{root} is on the root disk (no separate data disk in {fstab_path})")
+        return
+    if not ismount(mount):
+        row("disk", False, f"data disk {mount} is NOT mounted: Docker is running on the root disk "
+            f"without this host's data. Stop Docker, mount {mount}, start Docker")
+        return
+    if not {"nofail", "noauto"} & set(options.split(",")):
+        row("disk", True, f"data disk {mount} is mounted and required at boot (no nofail in {fstab_path})")
+        return
+    if unit_mounts is None:
+        try:
+            done = subprocess.run(["systemctl", "show", "docker.service", "-p", "RequiresMountsFor", "--value"],
+                                  capture_output=True, text=True, timeout=10)
+            unit_mounts = done.stdout.split() if done.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            unit_mounts = None
+    if unit_mounts is None:
+        row("disk", None, f"data disk {mount} is mounted; cannot read docker.service dependencies")
+    elif any(item.rstrip("/") == mount or item.startswith(mount + "/") for item in unit_mounts):
+        row("disk", True, f"data disk {mount} is mounted and docker.service requires it")
+    else:
+        row("disk", None, f"data disk {mount} is mounted, but docker.service does not require it: after a "
+            f"reboot where it fails to mount, Docker starts empty. Add RequiresMountsFor={mount} "
+            "(see the install guide's data-disk step)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--install-dir", default="~/nano")
@@ -358,6 +442,7 @@ def main() -> int:
     roles = set(role.get("NANO_ROLE_PROFILES", "").split(","))
     tls = role.get("NANO_PRIVATE_TLS") == "true"
     print(f"HOST {role.get('NANO_HOST_NAME')} roles={','.join(sorted(roles))} private_tls={tls}")
+    data_disk()
     if "keeper" in roles:
         keeper(role, tls)
     if "clickhouse" in roles:

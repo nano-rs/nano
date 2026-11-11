@@ -110,6 +110,11 @@ ENV_TEMP_FILE=""
 SETUP_HEADER_FILE=""
 SETUP_RESPONSE_FILE=""
 cleanup_env_temp() {
+    # NAN-5251: on every exit (success, prepare-only, or a failure after .env
+    # was written) say so when this run changed the shared .env.
+    if declare -F report_shared_env_change >/dev/null 2>&1; then
+        report_shared_env_change || true
+    fi
     [[ -z "$ENV_TEMP_FILE" ]] || rm -f -- "$ENV_TEMP_FILE"
     [[ -z "$SETUP_HEADER_FILE" ]] || rm -f -- "$SETUP_HEADER_FILE"
     [[ -z "$SETUP_RESPONSE_FILE" ]] || rm -f -- "$SETUP_RESPONSE_FILE"
@@ -421,15 +426,19 @@ configure_outbound_proxy() {
         url="${url%%://*}://$(pct_encode "$user"):$(pct_encode "$pass")@${url#*://}"
     fi
     user="" pass="" confirm=""
-    # Append the effective assignments so a symlinked .env remains a link
-    # (and keeps its 0600 mode).
+    # Set in place (NAN-5251): a symlinked .env stays a link and keeps its
+    # 0600 mode, and no key is ever duplicated.
     if [[ -n "$url" ]]; then
-        printf 'HTTPS_PROXY=%s\nHTTP_PROXY=%s\n' "$url" "$url" >> .env
-        [[ -n "$extra" ]] && printf 'NO_PROXY=%s\n' "$extra" >> .env
+        nano_env_set_keys .env "HTTPS_PROXY=$url" "HTTP_PROXY=$url" \
+            || fail "Could not record the outbound proxy in .env."
+        if [[ -n "$extra" ]]; then
+            nano_env_set_keys .env "NO_PROXY=$extra" || fail "Could not record NO_PROXY in .env."
+        fi
         log "nano's outbound calls use the proxy $(redact_proxy_url "$url") (HTTPS_PROXY in .env; internal services and private ranges bypass it)"
         log "Docker image pulls use the Docker daemon's own proxy settings (a systemd drop-in for docker.service), not nano's: https://nano.rs/docs/getting-started/self-run#corporate-proxy"
     fi
-    printf 'NANO_OUTBOUND_PROXY_ASKED=true\n' >> .env
+    nano_env_set_keys .env "NANO_OUTBOUND_PROXY_ASKED=true" \
+        || fail "Could not record NANO_OUTBOUND_PROXY_ASKED in .env."
 }
 
 # Private-address AI providers (a BYO local LLM on 10.x / 192.168.x). The AI
@@ -458,8 +467,9 @@ configure_private_ai_endpoints() {
     else
         PRIVATE_AI_ENDPOINTS=false
     fi
-    # Append the effective assignment so a symlinked .env remains a link.
-    printf 'NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=%s\n' "$PRIVATE_AI_ENDPOINTS" >> .env
+    # Set in place (NAN-5251); a symlinked .env stays a link.
+    nano_env_set_keys .env "NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=$PRIVATE_AI_ENDPOINTS" \
+        || fail "Could not record NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS in .env."
     if [[ "$PRIVATE_AI_ENDPOINTS" == "true" ]]; then
         log "AI providers on private addresses are allowed (NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=true in .env)"
     fi
@@ -591,7 +601,7 @@ validate_license_inputs() {
 }
 
 # Decide the licence for this install. Sets LICENSE_ENV_LINES (assignments to
-# append to .env, possibly empty), LICENSE_MODE and LICENSE_IMPORT_FILE. $1 is
+# set in .env, possibly empty), LICENSE_MODE and LICENSE_IMPORT_FILE. $1 is
 # 1 on first install (no .env yet), 0 when an .env is reused.
 # Prompts at most once, only with a controlling TTY.
 LICENSE_ENV_LINES="" LICENSE_MODE="" LICENSE_IMPORT_FILE="" LICENSE_DEPLOYMENT_ID=""
@@ -700,10 +710,22 @@ resolve_license() {
     return 0
 }
 
-# Append LICENSE_ENV_LINES to $1 and say what was decided (token redacted).
+# Set LICENSE_ENV_LINES in $1 and say what was decided (token redacted).
+# NAN-5251: each key is replaced in place (pending -> online keeps one
+# NANO_LICENSE_MODE line where it was); appending left two.
 record_license() {
-    local target="$1"
-    [[ -z "$LICENSE_ENV_LINES" ]] || printf '%s' "$LICENSE_ENV_LINES" >> "$target"
+    local target="$1" license_line
+    local -a license_kvs=()
+    while IFS= read -r license_line; do
+        [[ -n "$license_line" ]] && license_kvs+=("$license_line")
+    done <<< "$LICENSE_ENV_LINES"
+    if ((${#license_kvs[@]} > 0)); then
+        # The first-install temp file locks on its eventual .env path, as the
+        # secret backfill does, so no lock file is left beside the temp file.
+        nano_env_atomic_rewrite_locked "$target" "$PWD/.env" nano_env_set_keys_writer "${license_kvs[@]}" \
+            || fail "Could not record the licence values in $target."
+    fi
+    license_kvs=()
     LICENSE_ENV_LINES=""
     case "$LICENSE_MODE" in
         online)
@@ -1286,6 +1308,28 @@ fi
     || fail "scripts/lib/generated-secrets.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
 # shellcheck source=scripts/lib/generated-secrets.sh
 . scripts/lib/generated-secrets.sh
+
+# NAN-5251: a role-split .env must stay byte-identical on every host, so any
+# run that changes it, on any role, says so. The baseline is taken when an
+# existing .env is reused; every later writer (licence, release keys, the
+# PostgreSQL HA identity, backfilled secrets, ...) is then covered by one
+# comparison instead of a message per writer. The baseline lives only in this
+# shell (never exported, never written to disk).
+SHARED_ENV_BASELINE=""
+SHARED_ENV_TRACKED=0
+shared_env_rebaseline() {
+    [[ -f .env ]] || return 0
+    SHARED_ENV_BASELINE="$(cat .env; printf .)"
+    SHARED_ENV_BASELINE="${SHARED_ENV_BASELINE%.}"
+    SHARED_ENV_TRACKED=1
+}
+report_shared_env_change() {
+    local notice
+    [[ "${MULTI_NODE:-0}" == "1" && "$SHARED_ENV_TRACKED" == "1" && -f .env ]] || return 0
+    notice="$(nano_shared_env_change_notice "$SHARED_ENV_BASELINE" .env)" || return 0
+    [[ -n "$notice" ]] && warn "$notice"
+    shared_env_rebaseline
+}
 [[ -r scripts/lib/async-loader-readiness.sh ]] \
     || fail "scripts/lib/async-loader-readiness.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
 # shellcheck source=scripts/lib/async-loader-readiness.sh
@@ -1294,6 +1338,35 @@ fi
     || fail "scripts/lib/image-pull.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
 # shellcheck source=scripts/lib/image-pull.sh
 . scripts/lib/image-pull.sh
+[[ -r scripts/lib/data-mount.sh ]] \
+    || fail "scripts/lib/data-mount.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+# shellcheck source=scripts/lib/data-mount.sh
+. scripts/lib/data-mount.sh
+
+# NAN-5251: a data disk that did not mount at boot leaves Docker running on an
+# empty directory of the root disk. Installing there would start a new, empty
+# member (or a fresh database) beside the real data. Linux only: Docker Desktop
+# keeps its data inside its own VM.
+if [[ "$(uname -s)" == Linux && "${NANO_PREPARE_ONLY:-0}" != "1" ]]; then
+    docker_root_dir=$(docker info --format '{{.DockerRootDir}}' </dev/null 2>/dev/null || true)
+    if [[ -n "$docker_root_dir" ]]; then
+        if ! data_mount_state=$(nano_check_data_mount "$docker_root_dir"); then
+            data_mount=${data_mount_state#unmounted }
+            fail "The data disk for $docker_root_dir ($data_mount in /etc/fstab) is not mounted, so Docker is running on the root disk without this host's data. Nothing was changed. Stop Docker (sudo systemctl stop docker.socket docker), mount the disk (sudo mount $data_mount), check that $docker_root_dir holds the previous data, start Docker, then add the docker.service drop-in from the install guide so Docker never starts without the disk again. If this host's storage is managed some other way, set NANO_DATA_MOUNT=<mount point> (or NANO_DATA_MOUNT=none to skip this check)."
+        fi
+        case "$data_mount_state" in
+            "mounted "*" no")
+                data_mount=${data_mount_state#mounted }
+                data_mount=${data_mount% no}
+                warn "docker.service does not require the data disk $data_mount: after a reboot where the disk fails to mount, Docker starts empty on the root disk. Add a drop-in: sudo mkdir -p /etc/systemd/system/docker.service.d && printf '[Unit]\\nRequiresMountsFor=$data_mount\\n' | sudo tee /etc/systemd/system/docker.service.d/nano-data-disk.conf && sudo systemctl daemon-reload"
+                ;;
+            "mounted "*)
+                data_mount=${data_mount_state#mounted }
+                ok "Data disk ${data_mount% *} is mounted under Docker"
+                ;;
+        esac
+    fi
+fi
 
 nano_async_loader_query() {
     local admin_password curl_password endpoint query resolve_address url_address
@@ -1628,6 +1701,7 @@ fi
 if [[ -f .env ]]; then
     warn ".env already exists — keeping existing secrets, will only (re)start the stack."
     REUSE_ENV=1
+    shared_env_rebaseline
     # Role-split compose intentionally exposes only the five fixed roles. The
     # single-node-only Tenzir profile is not silently dropped or allowed to
     # replace the requested host profile set.
@@ -1683,8 +1757,8 @@ if [[ -f .env ]]; then
     # the load balancer drops the host. Pin the compatible mode explicitly and
     # say how to finish. Fresh installs write true (below).
     if [[ "$MULTI_NODE" == "1" ]] && ! grep -qE '^[[:space:]]*NANO_VECTOR_CONFIG_DELIVERY_STRICT=' .env; then
-        # Appended (symlink-safe; the last assignment wins).
-        echo "NANO_VECTOR_CONFIG_DELIVERY_STRICT=false" >> .env
+        nano_env_set_keys .env "NANO_VECTOR_CONFIG_DELIVERY_STRICT=false" \
+            || fail "Could not record NANO_VECTOR_CONFIG_DELIVERY_STRICT in .env."
         warn "Pinned NANO_VECTOR_CONFIG_DELIVERY_STRICT=false in .env: this cluster predates strict Vector config delivery, so nano-api still accepts a private install token from an ingest host whose .env lacks NANO_VECTOR_CONFIG_DELIVERY_TOKEN (warned per host)."
         warn "To finish: copy the app host's .env to every inventory host and re-run install.sh there, then set NANO_VECTOR_CONFIG_DELIVERY_STRICT=true in the app host's .env and re-run install.sh on it. v2.1 enforces strict delivery regardless."
     fi
@@ -1721,12 +1795,11 @@ if [[ -f .env ]]; then
     SCHEMA_PROFILE=$(env_value NANO_SCHEMA_PROFILE)
     if [[ -z "$SCHEMA_PROFILE" ]]; then
         SCHEMA_PROFILE=udm
-        # Append the effective assignment so a symlinked .env remains a link.
-        echo "NANO_SCHEMA_PROFILE=udm" >> .env
+        nano_env_set_keys .env "NANO_SCHEMA_PROFILE=udm" \
+            || fail "Could not record NANO_SCHEMA_PROFILE in .env."
         log "Pinned NANO_SCHEMA_PROFILE=udm in .env (this install predates the schema choice)"
     fi
-    # Appended (symlink-safe; the last assignment wins) only when this run
-    # adds or changes a licence value.
+    # Set in place only when this run adds or changes a licence value.
     resolve_license 0
     record_license .env
 else
@@ -1950,9 +2023,8 @@ fi
 # `docker compose up`, which reads only .env, so persist it there.
 for key in NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_OTLP_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS NANO_TENZIR_BIND_ADDRESS; do
     if [[ -n "${!key:-}" ]]; then
-        # The last assignment wins in Compose and append follows a symlinked
-        # .env without replacing the link.
-        printf '%s=%s\n' "$key" "${!key}" >> .env
+        # Set in place (NAN-5251): re-runs used to append one more line each.
+        nano_env_set_keys .env "$key=${!key}" || fail "Could not record $key in .env."
         log "Persisted $key=${!key} to .env (re-exposes an unauthenticated ingest port)"
     fi
 done
@@ -2096,7 +2168,8 @@ PY
     [[ "$NANO_DEPLOYMENT_IDENTITY_SHA256" == "$candidate_identity" ]] \
         || fail "Renderer identity changed between preflight and publication; refusing to continue."
     if [[ -z "$recorded_identity" || "$topology_migration_accepted" == "1" ]]; then
-        printf 'NANO_DEPLOYMENT_IDENTITY_SHA256=%s\n' "$candidate_identity" >> .env
+        nano_env_set_keys .env "NANO_DEPLOYMENT_IDENTITY_SHA256=$candidate_identity" \
+            || fail "Could not record NANO_DEPLOYMENT_IDENTITY_SHA256 in .env."
     fi
 
     if [[ ! -e "$host_identity_file" && ! -L "$host_identity_file" ]]; then
@@ -2352,6 +2425,9 @@ fi
 # first postgres host then refuses to initdb this install even if its state
 # volume and every peer are lost.
 if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE_ARG}," == *,postgres,* ]]; then
+    # Announce anything this run changed before the identity, so the
+    # identity message below stands on its own.
+    report_shared_env_change
     pg_ha_outcome="pending"
     pg_ha_deadline=$(( $(date +%s) + ${NANO_PG_HA_SYSTEM_ID_WAIT:-60} ))
     while (( $(date +%s) < pg_ha_deadline )); do
@@ -2365,7 +2441,16 @@ if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE
     case "$pg_ha_outcome" in
         recorded*)
             ok "Recorded the PostgreSQL cluster identity in .env (${pg_ha_outcome#recorded })"
-            warn "The shared .env changed: copy it to every host (app, ingest, ClickHouse, Keeper and postgres)." ;;
+            # NAN-5251: every postgres host installed before the copy records
+            # the same identifier at the same place, so their .env files stay
+            # identical. The first postgres host's copy is the one to spread;
+            # another postgres host only confirms it.
+            if [[ "${NANO_PATRONI_BOOTSTRAP:-false}" == "true" ]]; then
+                report_shared_env_change
+            else
+                log "The first postgres host records the same NANO_PG_HA_SYSTEM_ID. Copy the first postgres host's .env to every host as usual; this host's copy then stays the same ('sha256sum .env' matches)."
+                shared_env_rebaseline
+            fi ;;
         unchanged*) ;;
         conflict*)
             fail "PostgreSQL HA identity mismatch: ${pg_ha_outcome#conflict }. This host's database is not the cluster recorded in .env; do not continue. See 'Recovering after losing the bootstrap host and etcd' in the multi-node guide." ;;
@@ -2458,13 +2543,17 @@ else
                 have_controlling_tty || fail "$not_initialized"
                 ADMIN_EMAIL=$(prompt_tty "Admin email")
                 [[ -n "$ADMIN_EMAIL" ]] || fail "Admin email is required."
-                persistable_env_value "$ADMIN_EMAIL" && printf "NANO_ADMIN_EMAIL='%s'\n" "$ADMIN_EMAIL" >> .env
+                if persistable_env_value "$ADMIN_EMAIL"; then
+                    nano_env_set_keys .env "NANO_ADMIN_EMAIL='$ADMIN_EMAIL'" || fail "Could not record NANO_ADMIN_EMAIL in .env."
+                fi
             fi
             if [[ -z "$ADMIN_NAME" ]]; then
                 have_controlling_tty || fail "$not_initialized"
                 ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
                 [[ -n "$ADMIN_NAME" ]] || fail "Admin name is required."
-                persistable_env_value "$ADMIN_NAME" && printf "NANO_ADMIN_NAME='%s'\n" "$ADMIN_NAME" >> .env
+                if persistable_env_value "$ADMIN_NAME"; then
+                    nano_env_set_keys .env "NANO_ADMIN_NAME='$ADMIN_NAME'" || fail "Could not record NANO_ADMIN_NAME in .env."
+                fi
             fi
             if [[ -z "$ADMIN_PASSWORD" ]]; then
                 ADMIN_PASSWORD=$(env_value INITIAL_ADMIN_PASSWORD)
@@ -2476,7 +2565,13 @@ else
                 if [[ -z "$ADMIN_PASSWORD" ]]; then
                     ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
                     GENERATED_PASSWORD=1
-                    printf '\n# Autogenerated initial admin password — printed by install.sh on success.\n# Safe to delete once you have signed in and confirmed the credentials.\nINITIAL_ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> .env
+                    if grep -qE '^[[:space:]]*(export[[:space:]]+)?INITIAL_ADMIN_PASSWORD=' .env; then
+                        # An empty leftover line: set it in place (NAN-5251).
+                        nano_env_set_keys .env "INITIAL_ADMIN_PASSWORD=$ADMIN_PASSWORD" \
+                            || fail "Could not record INITIAL_ADMIN_PASSWORD in .env."
+                    else
+                        printf '\n# Autogenerated initial admin password — printed by install.sh on success.\n# Safe to delete once you have signed in and confirmed the credentials.\nINITIAL_ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> .env
+                    fi
                 fi
             fi
             validate_admin_password "$ADMIN_PASSWORD"

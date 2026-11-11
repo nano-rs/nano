@@ -23,9 +23,12 @@ as before. The authority is the **Multi-node Self-run** guide, section
 
 ## What survives (tell the operator)
 
-- Loss of any one postgres host: writes, sign-ins and searches pause about
-  a short pause, typically a few seconds and up to about 30 s, while a standby
-  is promoted. Raising
+- Loss of the leader's postgres host: writes, sign-ins and searches fail for
+  about 20-25 s (measured 20-24 s on 7-host hard-kill tests: Patroni waits for
+  the dead leader's lock to expire, then promotes the synchronous standby).
+  Sign-in can return 500 rather than 503 during that window; clients should
+  retry. Losing a standby, or a planned switchover, pauses writes for a few
+  seconds at most. Raising
   `cluster.postgres_ha.ttl` on a slow network avoids false failovers but makes
   the pause longer. Valkey fails over in about 10 s. Logins, rules, alerting and search continue; in-flight
   requests during the window fail and are retried by the UI and agents.
@@ -41,9 +44,10 @@ as before. The authority is the **Multi-node Self-run** guide, section
 2. Install the postgres hosts (any order, close together). The first postgres
    host in inventory order initialises; the others clone it.
 3. Check: `exec postgres-ha patronictl -c /run/patroni/patroni.yml list` shows
-   one `Leader`, one `Sync Standby`, one `Replica`, zero lag. One postgres host
-   records `NANO_PG_HA_SYSTEM_ID` in its `.env` and prints "The shared .env
-   changed": stream **that postgres host's** `.env` to every other host, the
+   one `Leader`, one `Sync Standby`, one `Replica`, zero lag. The first postgres
+   host records `NANO_PG_HA_SYSTEM_ID` in its `.env` and prints "The shared .env
+   changed" (the others record the same value in the same place and say so):
+   stream **that postgres host's** `.env` to every other host, the
    first app host included ([multi-node-ha.md](multi-node-ha.md) Step 5, with
    that host as the source), before any other installer run, and check the
    digests match. From then on, the first app host's copy is current again.
@@ -79,8 +83,27 @@ prints the rules).
 - Backup and restore run on the **leader's** host (`patronictl list`); a
   replica refuses and names the leader.
 - Upgrades: `scripts/nano upgrade` rolls replicas, switches over, then rolls
-  the old leader. Never recreate a leader by hand: use
-  `patronictl switchover --leader <m> --candidate <m> --force` first.
+  the old leader. Never recreate a leader by hand: switch over first, run
+  **on the leader's host**, inside the container, with the Patroni config:
+
+  ```bash
+  ssh $PG 'cd ~/nano && docker compose --env-file .env --env-file .nano-role.env \
+    -f deploy/compose/docker-compose.enterprise.yml exec -T postgres-ha \
+    patronictl -c /run/patroni/patroni.yml list'
+  # candidate = the member whose Role is "Sync Standby" (synchronous mode is on
+  # by default); any other replica is refused with
+  # "412, candidate name does not match with sync_standby"
+  ssh $PG 'cd ~/nano && docker compose --env-file .env --env-file .nano-role.env \
+    -f deploy/compose/docker-compose.enterprise.yml exec -T postgres-ha \
+    patronictl -c /run/patroni/patroni.yml switchover --leader <leader> --candidate <sync standby> --force'
+  ```
+
+  `patronictl` exits 0 even when it refuses the switchover, so never chain the
+  recreate on its exit code. Run `list` again and recreate the old leader only
+  once the candidate shows `Leader` / `running`. Without `-c` it fails with
+  "Can not find suitable configuration of distributed configuration store". A
+  planned switchover pauses writes for a few seconds; an unplanned leader loss
+  (hard kill) takes about 20-25 s before a new leader serves writes.
 - A PostgreSQL major-version change is refused. Escalate; it is a planned
   maintenance window.
 - Never start the standalone `postgres` service on an HA host (it is scaled to

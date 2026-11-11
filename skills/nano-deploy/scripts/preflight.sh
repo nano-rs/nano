@@ -253,7 +253,7 @@ if [[ -z "$missing" ]]; then row tools PASS "curl openssl tar python3 ss$([[ $to
 else row tools FAIL "missing: $missing"; fi
 if have python3; then
     pv=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
-    vercmp_ge "${pv:-0}" 3.8 || row python FAIL "python3 $pv is older than 3.8"
+    vercmp_ge "${pv:-0}" 3.9 || row python FAIL "python3 $pv is older than 3.9 (nano's upgrade and backup tools need 3.9 or later)"
 fi
 
 # --- docker --------------------------------------------------------------------
@@ -367,8 +367,13 @@ if [[ "$topology" == ha ]] && ! [[ "$roles" == lb ]]; then
     fi
     if ! have ip; then
         row exposure WARN "cannot list this host's addresses (no ip command); if it has a public address, Docker-published ports bypass UFW: apply plan.py --firewall-script and run --exposure-probe from outside"
+    elif [[ -z "$public" && "$filtered" == yes ]]; then
+        row exposure PASS "no public address on this host's interfaces and DOCKER-USER filters published ports (a cloud 1:1 NAT or floating IP is invisible from inside: verify with --exposure-probe from outside)"
     elif [[ -z "$public" ]]; then
-        row exposure PASS "no public address on this host; still restrict Docker-published ports to cluster sources (DOCKER-USER)"
+        # Cloud 1:1 NAT (and floating IPs) map a public address to a
+        # private interface address. Nothing on the host shows it, so "no public
+        # address" is not evidence that Docker-published ports are unreachable.
+        row exposure WARN "no public address on this host's interfaces, but a cloud 1:1 NAT or floating IP cannot be detected from inside the host. If the host is reachable on a public address, Docker-published ports bypass UFW: apply plan.py --firewall-script and run --exposure-probe <public addresses> from outside"
     elif [[ "$filtered" == yes ]]; then
         row exposure PASS "public address ${public% }; DOCKER-USER filters published ports (verify with --exposure-probe from outside)"
     elif [[ "$filtered" == no ]]; then

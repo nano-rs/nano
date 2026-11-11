@@ -89,7 +89,7 @@ Ship the tested examples in the bundle:
 | A ClickHouse replica down > ~40 min | Its prevalence verdicts for keys that changed meanwhile stay stale until the key is seen again |
 | The load balancer | Operator-owned; must be redundant itself (managed LB, keepalived pair, or DNS failover across two HAProxy hosts) |
 | `scripts/nano upgrade`, `backup-set` | Refuse while any host is unreachable (by design). Replace or restore the host first. Per-host `scripts/nano backup` still works |
-| A PostgreSQL primary dies (three `postgres` hosts) | Writes, sign-ins and searches see a short pause, typically a few seconds and up to about 30 s, while a standby is promoted. No acknowledged write is lost |
+| A PostgreSQL primary dies (three `postgres` hosts) | Writes, sign-ins and searches fail for about 20-25 s (hard kill, measured 20-24 s) while a standby is promoted; a planned switchover takes a few seconds. No acknowledged write is lost |
 | A layout with one `postgres` host | Logins, rules and alerting stop while it is down; ingest keeps accepting for up to 300 s, then senders get 503 |
 
 ## Proof

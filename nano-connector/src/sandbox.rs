@@ -5,7 +5,9 @@
 //! 1. **Spawn** (`pre_exec`, always): cleared environment, new session,
 //!    `no_new_privs`, rlimits (address space, CPU seconds, no file writes, no
 //!    core dumps, 8 fds, `RLIMIT_NPROC` 0 so it cannot fork even without
-//!    seccomp, a 64 MiB stack so deep VRL nesting fails cleanly).
+//!    seccomp, a 64 MiB stack so deep VRL nesting fails cleanly). Each limit
+//!    is clamped to the hard limit the child inherits: an unprivileged
+//!    process cannot raise one (NAN-5255).
 //! 2. **In the worker, before it reads any tenant input** (always): turns
 //!    every fatal signal into a plain `_exit(128 + signal)` (so a crashing,
 //!    CPU-limited or seccomp-stopped worker never reaches the core-dump
@@ -180,6 +182,16 @@ pub struct Rlimits {
     pub stack_bytes: u64,
 }
 
+/// The (soft, hard) pair actually set for a limit requested as
+/// (`soft`, `hard`) when the inherited hard limit is `inherited_hard`: never
+/// above `inherited_hard` (raising it needs CAP_SYS_RESOURCE, EPERM
+/// otherwise), soft never above hard. Never looser than requested.
+pub const fn clamp_rlimit(soft: u64, hard: u64, inherited_hard: u64) -> (u64, u64) {
+    let hard = if hard < inherited_hard { hard } else { inherited_hard };
+    let soft = if soft < hard { soft } else { hard };
+    (soft, hard)
+}
+
 /// Configure `cmd` for a sandboxed child: cleared env, null stderr, rlimits,
 /// `no_new_privs`, new session.
 pub fn harden_command(cmd: &mut tokio::process::Command, lim: Rlimits) {
@@ -192,7 +204,19 @@ pub fn harden_command(cmd: &mut tokio::process::Command, lim: Rlimits) {
     // allocation (the closure captures plain integers).
     unsafe {
         cmd.pre_exec(move || {
+            // Every limit is clamped to the hard limit the child inherited:
+            // raising a hard limit needs CAP_SYS_RESOURCE, and without it
+            // setrlimit fails with EPERM, which made the whole spawn fail
+            // ("VRL worker died: Operation not permitted", NAN-5255) on
+            // hosts whose container runtime sets a finite hard limit (e.g.
+            // RLIMIT_STACK 8 MiB) for a non-root, all-caps-dropped pod.
+            // Clamping only ever makes a limit stricter than asked.
             let set = |res, soft: u64, hard: u64| {
+                let mut cur = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                if libc::getrlimit(res, &mut cur) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let (soft, hard) = clamp_rlimit(soft, hard, cur.rlim_max);
                 let lim = libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
                 if libc::setrlimit(res, &lim) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -211,19 +235,11 @@ pub fn harden_command(cmd: &mut tokio::process::Command, lim: Rlimits) {
             set(libc::RLIMIT_MEMLOCK, 0, 0)?;
             #[cfg(target_os = "linux")]
             set(libc::RLIMIT_MSGQUEUE, 0, 0)?;
-            #[cfg(target_os = "linux")]
+            // The stack hard limit can sit below 64 MiB (macOS: 65532 KiB;
+            // some container runtimes: 8 MiB). `set` clamps it; the worker
+            // then runs with the smaller stack and absurd nesting fails
+            // sooner, still inside the worker.
             set(libc::RLIMIT_STACK, stack_bytes, stack_bytes)?;
-            // Elsewhere the stack hard limit can sit below 64 MiB (macOS:
-            // 65532 KiB) and an unprivileged process cannot raise it: clamp.
-            #[cfg(not(target_os = "linux"))]
-            {
-                let mut cur = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-                if libc::getrlimit(libc::RLIMIT_STACK, &mut cur) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let stack = (stack_bytes as libc::rlim_t).min(cur.rlim_max);
-                set(libc::RLIMIT_STACK, stack as u64, stack as u64)?;
-            }
             // Fork fallback when seccomp is unavailable. Not enforced for
             // root or CAP_SYS_RESOURCE; the jobs pods run unprivileged.
             set(libc::RLIMIT_NPROC, 0, 0)?;
@@ -698,6 +714,20 @@ mod tests {
             let e = SandboxPolicy::from_lookup(env(pairs)).expect_err(v);
             assert!(e.contains(k), "{e}");
         }
+    }
+
+    #[test]
+    fn rlimits_never_raise_the_inherited_hard_limit() {
+        const INF: u64 = libc::RLIM_INFINITY;
+        // NAN-5255: a finite inherited hard limit (EKS: RLIMIT_STACK 8 MiB)
+        // is kept, never raised (that is EPERM without CAP_SYS_RESOURCE).
+        assert_eq!(clamp_rlimit(64 << 20, 64 << 20, 8 << 20), (8 << 20, 8 << 20));
+        // Unlimited or higher: the requested limit, unchanged.
+        assert_eq!(clamp_rlimit(64 << 20, 64 << 20, INF), (64 << 20, 64 << 20));
+        assert_eq!(clamp_rlimit(30, 31, INF), (30, 31));
+        // soft stays <= hard once hard is clamped.
+        assert_eq!(clamp_rlimit(30, 31, 10), (10, 10));
+        assert_eq!(clamp_rlimit(0, 0, 0), (0, 0));
     }
 
     #[test]

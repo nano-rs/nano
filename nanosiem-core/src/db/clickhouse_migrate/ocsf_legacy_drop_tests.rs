@@ -96,7 +96,7 @@ fn cluster_proof_reads_every_shard_and_checks_ids_shard_locally() {
 fn shard_coverage_and_proof_settings() {
     assert_eq!(
         expected_shards_sql("nanosiem_cluster"),
-        "SELECT uniqExact(shard_num) FROM system.clusters WHERE cluster = 'nanosiem_cluster'"
+        "SELECT uniqExact(shard_num) FROM system.clusters WHERE cluster = 'nanosiem_cluster' AND (database_replica_name = '' OR (SELECT countIf(database_replica_name = '') FROM system.clusters WHERE cluster = 'nanosiem_cluster') = 0)"
     );
     assert_eq!(
         answered_shards_sql("nanosiem_cluster"),
@@ -123,5 +123,8 @@ fn cluster_drop_uses_the_migrator_transform() {
 fn quoting_cannot_break_out_of_literals() {
     assert_eq!(all_shards_ref(Some("c' OR 1"), "db", "t"), "cluster('c\\' OR 1', 'db', 't')");
     assert_eq!(all_shards_ref(None, "d`b", "t"), "`d\\`b`.`t`");
-    assert_eq!(expected_shards_sql("c' OR 1"), "SELECT uniqExact(shard_num) FROM system.clusters WHERE cluster = 'c\\' OR 1'");
+    assert_eq!(
+        expected_shards_sql("c' OR 1"),
+        "SELECT uniqExact(shard_num) FROM system.clusters WHERE cluster = 'c\\' OR 1' AND (database_replica_name = '' OR (SELECT countIf(database_replica_name = '') FROM system.clusters WHERE cluster = 'c\\' OR 1') = 0)"
+    );
 }

@@ -57,6 +57,39 @@ product's files.
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.
 
+## Helm chart 2.0.9 and earlier (fixed in 2.0.10)
+
+Found on EKS (AL2023, AWS Load Balancer Controller). Install 2.0.10 or later;
+on an older chart use the handling here and report it to the operator.
+
+- **`values-small.yaml` crash-loops ClickHouse 26.10** (exit 36,
+  `number_of_free_entries_in_pool_to_execute_mutation ... > 8*2`). Add
+  `clickhouse.server.background_pool_size: "16"`. If ClickHouse is already
+  crash-looping, `helm upgrade` cannot deliver the fix (the migration hook
+  waits for ClickHouse first): patch the ClickHouseCluster
+  (`kubectl -n nano patch clickhousecluster nano --type merge -p
+  '{"spec":{"settings":{"extraConfig":{"background_pool_size":"16"}}}}'`), wait
+  for the pods, then rerun the upgrade. 2.0.10 refuses such values at render
+  time and heals a down ClickHouse from a pre-upgrade hook.
+- **`clickhouse.replicas: 2` never finishes migrating** ("database visible on
+  2/4 nodes", blaming a replica that is up). The ClickHouse operator's database
+  sync makes database `default` a Replicated database, which lists the
+  `default` cluster twice. No values workaround; use 2.0.10 (its migrator
+  counts only the configured cluster).
+- **Vector never becomes ready** (Permission denied on
+  `/etc/vector/runtime/current/...`, exit 78, the config consumer rolls back).
+  Vector ran as root without capabilities and cannot read the consumer's
+  0600 files. Use 2.0.10 (both run as uid 100).
+- **AWS: "TargetGroup port is empty".** Install the AWS Load Balancer
+  Controller with `--set defaultTargetType=ip`. 2.0.10 renders ip-target
+  TargetGroupConfigurations.
+- **`smoke-test.py` fails `ingest-hz`** (`/healthz` 404 on the ingest host):
+  the ingest Gateway did not route it. Treat it as a WARN when every ingest
+  check passes; 2.0.10 routes it.
+- **Pods rescheduled after an hour fail with ImagePullBackOff.** The pull
+  credential expired. Recreate `nano-registry` with a fresh credential; 2.0.10
+  refreshes it with a CronJob.
+
 ## 2.0.0
 
 - **Role split: `ingest` on the `app` host deadlocks the install.** On a host

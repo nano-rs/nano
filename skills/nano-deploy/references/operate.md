@@ -40,6 +40,20 @@ ssh $H1 'cd ~/nano && scripts/nano backup-set --inventory /etc/nano/inventory.ya
   --backup-output /mnt/backup/nano-$(date -u +%Y%m%dT%H%M%SZ)'
 ```
 
+Tell the operator what a role-split backup pauses (by design, for one
+consistent PostgreSQL + ClickHouse recovery set): ingest, search, dashboards
+and sign-in keep working, but `nano-jobs` (scheduled and real-time detections,
+alerting) and `connector-runner` stop on every app host, and API writes
+(acknowledging an alert, editing a case or rule) return 503 "temporarily
+paused for a consistent backup". The output reports the pause as
+`writers_down_ms`; a 7-host test measured about 86 s. It grows with the number
+of app hosts and the size of lookup tables, not with event volume. Nothing is
+lost: scheduled rules resume from their last completed window and scan the
+paused interval (a rule with a custom lookback shorter than its interval plus
+the pause rescans only that lookback), and real-time signals become alerts from their saved
+position, so alerts are delayed. Schedule backups for a quiet period, and have
+API automation retry on 503.
+
 A backup left on the same host is not disaster recovery. Copy it off-host.
 Offer to schedule it (systemd timer or cron as the install owner) and to alert
 on a non-zero exit. Never wrap backup automation in `set -x`.
@@ -62,53 +76,80 @@ a stored credential. A health check alone is not enough.
 
 ## Upgrade
 
-1. Read the release notes and [known-issues.md](known-issues.md). Get the
-   signed release tar `nano-<version>-enterprise.tar` (the upgrade artifact):
-   an owner or admin downloads it from the deployment's page in app.nano.rs,
-   under **Advanced: firewall, proxy and air-gapped installs** (the link lasts
-   15 minutes). Verify its digest. Do not unpack or repack it. This is the one
-   upgrade procedure for Compose installs, single node and role split alike,
-   as in the public Upgrade guide; do not upgrade by re-running `install.sh`
-   from a new bundle.
-2. Make sure the backup key exists.
-3. **Dry run** (read-only), single node:
+Enterprise releases are published as the signed installer package only
+(`nano-compose-enterprise-<version>.tar.gz` with `.sha256` and `.sha256.sig`).
+The images come from the registry. There is no offline image bundle
+(`nano-<version>-enterprise.tar`) for registry installs; the Downloads page and
+the licence API do not list one. Two procedures, by target version:
 
-   ```bash
-   ssh $H 'cd ~/nano && scripts/nano upgrade --bundle /srv/nano/releases/nano-<v>-enterprise.tar \
-     --backup-key-file /secure/nano-backup/operator.pem --dry-run'
-   ```
+### From v2.0.10 or later: `scripts/nano upgrade` with the package
 
-   Role split, from the app host. The bundle, install directory and key must
-   exist at the same paths on every host, and the backup output must be a
-   shared directory:
+The cluster already runs v2.0.10 or later.
+
+1. Read the release notes and [known-issues.md](known-issues.md). Download the
+   package for the target version with its `.sha256` and `.sha256.sig`
+   (`scripts/fetch-bundle.sh`, it must print `VERIFIED`) and put all three at
+   the same path on every host, for example `/srv/nano/releases/`.
+2. On **every** host, extract the package over the install directory. It
+   carries no `.env`, `.nano-role.env` or generated state, so those are kept:
+   `ssh $h 'tar -xzf /srv/nano/releases/nano-compose-enterprise-<v>.tar.gz --strip-components=1 -C ~/nano'`.
+   The running containers are unaffected until the upgrade restarts them.
+3. Log in to the registry on every host with a fresh pull credential (it
+   lasts about an hour, so do this right before the run) and make sure the
+   backup key exists.
+4. **Dry run** (read-only), from the first app host (single node: drop
+   `--inventory`, `--remote-*` and `--backup-output`):
 
    ```bash
    ssh $H1 'cd ~/nano && scripts/nano upgrade --inventory /etc/nano/inventory.yaml \
-     --bundle /srv/nano/releases/nano-<v>-enterprise.tar --remote-bundle /srv/nano/releases/nano-<v>-enterprise.tar \
+     --bundle /srv/nano/releases/nano-compose-enterprise-<v>.tar.gz \
+     --remote-bundle /srv/nano/releases/nano-compose-enterprise-<v>.tar.gz \
      --remote-install-dir ~/nano --backup-key-file /secure/nano-backup/operator.pem \
      --backup-output /mnt/nano-backups/upgrade-<v> --dry-run'
    ```
 
    With more than one ingest host behind a load balancer, add
    `--lb-drain-command` and `--lb-rejoin-command` (absolute paths on every
-   ingest host).
-4. Every dry-run row must pass. A failed row is a hard refusal. Fix the cause
-   (disk, NTP, replica lag, licence) and repeat. Never bypass a gate.
-5. Ask, then run the same command without `--dry-run`. The tool takes the
-   mandatory backup and rolls Keeper → ClickHouse → PostgreSQL → migrations →
-   app → ingest, one host at a time.
-6. If it stops: fix the cause and re-run with `--resume` and the same bundle.
-   Never delete the journal (`~/nano/upgrade-journal/`).
-7. Verify ([verify.md](verify.md)).
+   ingest host). The tool verifies the package signature, reads the image
+   digests, migration ledger and upgrade policy from inside it, and checks
+   each host's `control-tree` (the package is extracted there),
+   `registry-login`, and `registry-pull`: the registry must accept the
+   host's credential, and every image the host needs is pulled and its digest
+   checked now, before the backup or any restart. The dry run therefore fills
+   each host's image cache; it changes nothing that runs.
+5. Every dry-run row must pass. A failed row is a hard refusal. Fix the cause
+   (disk, NTP, replica lag, licence, registry login) and repeat. Never bypass
+   a gate.
+6. Ask, then run the same command without `--dry-run`. The tool takes the
+   mandatory backup, pulls each host's images by signed digest, and rolls
+   Keeper → ClickHouse → PostgreSQL → migrations → app → ingest, one host at
+   a time.
+7. If it stops: fix the cause (an expired registry login is the usual one:
+   log in again) and re-run with `--resume` and the same package. Never delete
+   the journal (`~/nano/upgrade-journal/`).
+8. Log out of the registry on every host, then verify ([verify.md](verify.md)).
+
+### From v2.0.9 or earlier: re-run the installer, host by host, to v2.0.10
+
+The installed `scripts/nano upgrade` predates registry upgrades. Upgrade to
+v2.0.10 by re-running each host's install command from the v2.0.10 package,
+in order (the path a 7-host customer test completed with no lost events).
+Every later upgrade uses the section above:
+
+1. Take a backup first (`scripts/nano backup-set`, see Back up above).
+2. Download and verify the package, then on each host in turn: extract it
+   over `~/nano` as above, log in to the registry, take the host out of the
+   load balancer if it is an app or ingest host (wait for the drain), re-run
+   its exact `install.sh` command with the full role list, wait for
+   `cluster-health.py` to pass, and put it back in the load balancer.
+3. Order: Keeper/ClickHouse hosts, then PostgreSQL (replicas first, then the
+   leader after a switchover, see [postgres-ha.md](postgres-ha.md)), then the
+   app hosts one at a time, then ingest.
 
 `scripts/nano rollback` works only while the schema is unchanged. Otherwise it
 refuses and prints the exact restore commands. Explain that before anyone
 runs a restore.
 
-If the signed release tar is not available for the target version, the
-documented fallback is to replace the extracted bundle and re-run each host's
-`install.sh` command in the same role order (Keeper/ClickHouse hosts, then
-PostgreSQL, app, ingest). Take a backup first.
 
 ## Add a node
 
@@ -195,7 +236,11 @@ nano.rs/docs.
 
 ## Kubernetes
 
-- Upgrade: `helm upgrade` with the same value files and the new `--version`.
+- Upgrade: pull the new chart first (`rm -rf nano && helm pull "$CHART"
+  --version <new> --untar`: the old `./nano`'s `values-customer-images.yaml`
+  pins the old image digests), then `helm upgrade nano ./nano` with exactly the
+  install's value files, in the same order, and `--wait --timeout 20m`
+  ([helm.md](helm.md)).
   Migrations run as a pre-upgrade hook. Apply new ClickHouse operator CRDs
   first if the release says so (`kubectl apply --server-side -f crds/...`).
   `helm rollback` across a schema change is not supported. Roll forward.
@@ -203,4 +248,14 @@ nano.rs/docs.
   Secret (out of band, encrypted), PostgreSQL (managed snapshots, or `pg_dump`
   from `nano-postgres-0` when bundled), and ClickHouse (`BACKUP ... TO S3`
   per shard, or PVC snapshots).
-- `scripts/nano` is not a Kubernetes tool.
+- `scripts/nano` is not a Kubernetes tool. For health use
+  `python3 -I scripts/k8s-health.py --namespace nano` (pods with their failure
+  reason, workloads, Vector generations, ClickHouse replicas / Keeper / DDL
+  queue through `kubectl exec`, the registry credential refresh), then
+  `smoke-test.py` against both hostnames. `helm test` alone misses a Vector
+  that never starts.
+- After a drain or node loss: a ClickHouse or Keeper pod that stays Pending
+  with "volume node affinity conflict" waits for a node in its volume's zone.
+  Plan at least two nodes per zone (cloud-aws.md, Amazon EKS).
+- Recovery when it fails is in the product
+  guide (nano.rs/docs/getting-started/kubernetes#upgrade-recovery).

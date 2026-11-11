@@ -2005,6 +2005,12 @@ def print_install_order(p: dict, schema: dict) -> None:
     for name in pg:   # the first postgres host in inventory order bootstraps; the others clone it
         roles = [x for x in r[name] if x in ("postgres", "keeper")]
         steps.append((name, "install", "--role " + ",".join(roles)))
+    if len(pg) >= 2:
+        # PostgreSQL HA: the first postgres host records NANO_PG_HA_SYSTEM_ID in
+        # its .env. Every later run needs that copy, or the hosts' .env drift.
+        steps.append((pg[0], "copy .env", f"stream {pg[0]}'s ~/nano/.env to every other host "
+                      "(it now records NANO_PG_HA_SYSTEM_ID; Step 5 of multi-node-ha.md), "
+                      "then check that every host's sha256sum matches"))
     for n in nodes:
         name = n["name"]
         if "clickhouse" in r[name]:
@@ -2021,6 +2027,8 @@ def print_install_order(p: dict, schema: dict) -> None:
     print("step\thost\taction\tcommand (NANO_HOST_NAME=<host> NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh ... --inventory /etc/nano/inventory.yaml)")
     for i, (host, action, cmd) in enumerate(steps, 1):
         print(f"{i}\t{host}\t{action}\t{cmd}")
+    print("rule\t-\tcopy .env\twhenever a run prints 'The shared .env changed', stream that host's .env "
+          "to every other host before the next run anywhere")
 
 
 def parser() -> argparse.ArgumentParser:

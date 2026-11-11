@@ -36,6 +36,8 @@ on:
       - scripts/tests/install-bind-address-probes.test.sh
       - scripts/tests/test_nano_upgrade_bind_address.py
       - scripts/tests/install-image-pull.test.sh
+      - scripts/lib/data-mount.sh
+      - scripts/tests/install-data-mount.test.sh
       - scripts/lib/image-pull.sh
       - scripts/tests/install-umask.test.sh
       - scripts/tests/install-umask.live.sh
@@ -149,6 +151,16 @@ jobs:
             bash scripts/tests/install-image-pull.test.sh
           else
             echo "install-image-pull test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5251: never install onto Docker's root disk while the data disk
+      # that should hold DockerRootDir is unmounted.
+      - name: install.sh data-disk guard
+        run: |
+          if [ -f scripts/tests/install-data-mount.test.sh ]; then
+            bash scripts/tests/install-data-mount.test.sh
+          else
+            echo "install-data-mount test not in this tree (public mirror); skipping"
           fi
 
       # NAN-5006: prove the documented streamed installer cannot lose its

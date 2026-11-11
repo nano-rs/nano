@@ -17,7 +17,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+
+UTC = timezone.utc  # the datetime module constant is 3.11+; hosts may run Python 3.9
 from typing import Any
 
 

@@ -24,6 +24,41 @@ curl -fsS https://APP_FQDN/api/health          # through the LB / TLS overlay
 curl -sS -o /dev/null -w '%{http_code}\n' http://APP_FQDN/   # expect 301 to https with the overlay
 ```
 
+## Kubernetes (Helm)
+
+```bash
+python3 -I scripts/k8s-health.py --namespace nano          # read-only; exit 0 = healthy
+python3 scripts/smoke-test.py --app-url https://APP_FQDN --ingest-url https://INGEST_FQDN --creds ./admin-creds.env
+```
+
+`ingest-hz` (`GET https://INGEST_FQDN/healthz`) is a 404 on chart 2.0.9 and
+earlier, where the ingest Gateway did not route it: a WARN there, not a
+failure, when every ingest check passes. From 2.0.10 it must be 200.
+
+## Limits and delays that look like failures
+
+Tell the operator about these before a test or a drill, so a 401 or a 429 is not
+read as a broken install:
+
+- **Sign-in is rate limited**: 100 attempts per client IP per 5 minutes and
+  10 per account per 10 minutes, successful ones included. Over the limit the
+  API answers 429 with `Retry-After`. A probe that signs in every few seconds
+  as one user hits the per-account limit; reuse the session token instead.
+- **A new ingest token** is accepted by each ingest host within a few seconds
+  (each host polls the token list every 2 s, then reloads Vector). The first
+  requests with a brand-new token can get 401 from a host that has not picked
+  it up yet; retry, or wait about 10 s before sending. Revocation takes effect
+  the same way.
+- **HEC admission** (multi-node ingest edge): per token 100 requests/s with a
+  burst of 200, per client IP 50 requests/s with a burst of 100, per ingest
+  host 1000 requests/s with a burst of 2000, at most 16 concurrent
+  connections per client IP, and 8 MiB per request. Over the limit: 429; the
+  sender should back off and retry. Batch events into fewer, larger requests
+  rather than raising the request rate. `/ingest` and `/enrichment` allow
+  1000 requests/s per client IP with a burst of 500 (100 MiB per request).
+  OTLP/HTTP has no request-rate limit at the edge (100 MiB per request; every
+  request is authenticated against its token).
+
 ## 3-node HA
 
 ```bash

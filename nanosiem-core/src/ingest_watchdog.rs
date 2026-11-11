@@ -1020,10 +1020,16 @@ async fn discover_endpoint_groups(
     };
     let hosts = client
         .query(
-            "SELECT toUInt64(shard_num), toUInt64(replica_num), host_name \
-             FROM system.clusters WHERE cluster = ? ORDER BY shard_num, replica_num",
+            // NAN-5255: remote_servers rows only; a same-named Replicated
+            // database (the operator's `default`) lists the hosts again.
+            &format!(
+                "SELECT toUInt64(shard_num), toUInt64(replica_num), host_name \
+                 FROM system.clusters WHERE {} ORDER BY shard_num, replica_num",
+                crate::db::clickhouse_migrate::server_cluster_rows_predicate("?")
+            ),
         )
-        .bind(cluster)
+        .bind(cluster.as_str())
+        .bind(cluster.as_str())
         .fetch_all::<(u64, u64, String)>()
         .await
         .map_err(ch_error)?;

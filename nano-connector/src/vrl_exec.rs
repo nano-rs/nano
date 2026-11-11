@@ -178,7 +178,11 @@ impl VrlWorker {
             &mut cmd,
             Rlimits { address_space_bytes: limits.address_space_bytes, cpu_secs: limits.cpu_secs, stack_bytes: WORKER_STACK_BYTES },
         );
-        let mut child = cmd.spawn().map_err(|e| VrlError::WorkerDied(e.to_string()))?;
+        // A spawn error is fork, the pre-exec hardening (rlimits, setsid,
+        // no_new_privs) or exec failing: say so, a bare errno is opaque.
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| VrlError::WorkerDied(format!("cannot start {} (fork, rlimits, setsid, no_new_privs or exec): {e}", exe.display())))?;
         let cgroup = match (&leaf, child.id()) {
             (Some(l), Some(pid)) => match l.add(pid) {
                 Ok(()) => "enforced".to_string(),

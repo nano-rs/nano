@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
+use super::install_identity::{InstallIdentityRepository, INSTALL_ID_HEADER};
 use super::repository::LicenseRepository;
 use super::token_rejection::{is_credential_rejection, is_intermediary_refusal, TokenRejection};
 use super::types::{LicenseResponse, LicenseState, LicenseStatus};
@@ -58,6 +59,10 @@ pub struct LicenseChecker {
     config: LicenseCheckerConfig,
     http_client: reqwest::Client,
     repo: LicenseRepository,
+    /// NAN-5249: this install's ID, sent as `X-Nano-Install-Id`.
+    install_identity: InstallIdentityRepository,
+    /// The install ID once read; it never changes for the life of the database.
+    install_id: std::sync::Mutex<Option<String>>,
     tier_settings: TierSettings,
     license_status: Arc<RwLock<LicenseStatus>>,
     /// NAN-5170: optional daily usage report, sent only after a successful
@@ -91,6 +96,8 @@ impl LicenseChecker {
             config,
             http_client,
             repo: LicenseRepository::new(pool.clone()),
+            install_identity: InstallIdentityRepository::new(pool.clone()),
+            install_id: std::sync::Mutex::new(None),
             tier_settings: TierSettings::new(pool),
             license_status,
             #[cfg(feature = "enterprise")]
@@ -325,11 +332,48 @@ impl LicenseChecker {
         }
     }
 
+    /// Unit tests with no PostgreSQL: seed the cached install ID.
+    #[cfg(test)]
+    pub(crate) fn with_install_id(self, id: &str) -> Self {
+        if let Ok(mut cached) = self.install_id.lock() {
+            *cached = Some(id.to_string());
+        }
+        self
+    }
+
+    /// NAN-5249: this install's ID (cached after the first read), or `None`
+    /// when it cannot be read (PostgreSQL unavailable).
+    pub(crate) async fn install_id(&self) -> Option<String> {
+        if let Some(id) = self.install_id.lock().ok().and_then(|g| g.clone()) {
+            return Some(id);
+        }
+        match self.install_identity.get_or_create().await {
+            Ok(id) => {
+                if let Ok(mut cached) = self.install_id.lock() {
+                    *cached = Some(id.clone());
+                }
+                Some(id)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Install ID unavailable; checking in without it");
+                None
+            }
+        }
+    }
+
     pub async fn check_license(&self) -> Result<(), LicenseCheckError> {
         tracing::debug!(url = %self.config.license_url, "Checking license status");
         if let Ok(mut last) = self.last_attempt.lock() {
             *last = Some(std::time::Instant::now());
         }
+        // NAN-5249: nano-main answers a v2 Self-run check-in without an
+        // install ID with "upgrade required" (a lock). An ID that can't be
+        // read is a local PostgreSQL problem, so don't ask: fail this attempt
+        // like a network error and keep the last known status (bounded by the
+        // 14-day staleness lock, as for any outage).
+        let Some(install_id) = self.install_id().await else {
+            return Err(LicenseCheckError::InstallIdUnavailable);
+        };
 
         // NAN-5114: report the running version so nano-main can show it on
         // the deployment page and decide who still needs a new-version email.
@@ -343,6 +387,7 @@ impl LicenseChecker {
             .http_client
             .get(&url)
             .bearer_auth(&self.config.token)
+            .header(INSTALL_ID_HEADER, install_id.as_str())
             .send()
             .await
             .map_err(|e| LicenseCheckError::Network(e.to_string()))?;
@@ -458,7 +503,9 @@ impl LicenseChecker {
         // check-in has fully completed; its outcome is recorded, never returned.
         #[cfg(feature = "enterprise")]
         if let Some(reporter) = self.usage_reporter.as_ref() {
-            reporter.report(Utc::now().date_naive()).await;
+            reporter
+                .report(Utc::now().date_naive(), Some(install_id.as_str()))
+                .await;
         }
         Ok(())
     }
@@ -575,6 +622,10 @@ pub enum LicenseCheckError {
     ParseError(String),
     #[error("Entitlement error: {0}")]
     Entitlement(String),
+    /// NAN-5249: this install's ID could not be read from PostgreSQL; the
+    /// check-in is not attempted and the last known status is kept.
+    #[error("Install ID unavailable; check-in skipped")]
+    InstallIdUnavailable,
 }
 
 #[cfg(test)]

@@ -164,6 +164,13 @@ you are installing before you start.
 Each reference lists its steps with the gate before each mutating step. The
 Self-run order is always: **fetch and verify the bundle → stage it → prepare
 (no services start) → add enrollment values → install → verify.**
+**Kubernetes (Helm) does not use the compose bundle**: skip the bundle fetch,
+get only the registry credential from
+`GET https://api.nano.rs/api/license/self-run/registry-token?deploymentId=<id>`
+with `Authorization: Bearer <licence token>` read from the enrollment file
+(the JSON `password` is the one-hour pull password; never print it), and follow
+[references/helm.md](references/helm.md), which pulls the chart (presets and
+digest-pinned image values inside) from the customer registry.
 
 **Get the bundle with the licence values.** Run
 [scripts/fetch-bundle.sh](scripts/fetch-bundle.sh) on the workstation (it needs

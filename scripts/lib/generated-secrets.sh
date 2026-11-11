@@ -514,23 +514,42 @@ nano_replace_managed_env_block() {
         "$content" "$begin_marker" "$end_marker"
 }
 
-# Set KEY=VALUE pairs in an env file: every earlier line for each key is
-# dropped and one assignment per key is appended, so re-runs never pile up
-# duplicates (hosts that copy .env stay byte-identical) and the last-wins
-# meaning is unchanged. Atomic, locked, metadata-preserving, symlink-safe.
+# Set KEY=VALUE pairs in an env file IN PLACE: the first line for each key is
+# replaced where it stands, any later duplicate of it is dropped, and a key
+# that has no line yet is appended at the end. Line order is preserved, so a
+# re-run that sets the same values leaves the file byte-identical and hosts
+# that copy .env stay identical (NAN-5251: the earlier drop-and-append moved
+# keys to the end and reordered copied files; appends duplicated keys).
+# Atomic, locked, metadata-preserving, symlink-safe.
 nano_env_set_keys_writer() {
-    local target="$1" tmp="$2" line key kv drop
+    local target="$1" tmp="$2" line bare i matched
     shift 2
+    local -a kvs=("$@") keys=() written=()
+    for i in "${!kvs[@]}"; do
+        keys[i]="${kvs[i]%%=*}"
+        written[i]=0
+    done
     while IFS= read -r line || [[ -n "$line" ]]; do
-        drop=0
-        for kv in "$@"; do
-            key="${kv%%=*}"
-            [[ "$line" == "$key="* ]] && { drop=1; break; }
+        matched=-1
+        # Match `KEY=`, `  KEY=` and `export KEY=` alike (Compose and the
+        # shell both read those), so no form survives as a second assignment.
+        bare="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$bare" == export[[:space:]]* ]]; then
+            bare="${bare#export}"
+            bare="${bare#"${bare%%[![:space:]]*}"}"
+        fi
+        for i in "${!keys[@]}"; do
+            [[ "$bare" == "${keys[i]}="* ]] && { matched=$i; break; }
         done
-        (( drop )) || printf '%s\n' "$line" >> "$tmp" || return 1
+        if (( matched < 0 )); then
+            printf '%s\n' "$line" >> "$tmp" || return 1
+        elif (( written[matched] == 0 )); then
+            printf '%s\n' "${kvs[matched]}" >> "$tmp" || return 1
+            written[matched]=1
+        fi
     done < "$target"
-    for kv in "$@"; do
-        printf '%s\n' "$kv" >> "$tmp" || return 1
+    for i in "${!kvs[@]}"; do
+        (( written[i] )) || printf '%s\n' "${kvs[i]}" >> "$tmp" || return 1
     done
 }
 
@@ -538,6 +557,53 @@ nano_env_set_keys() {
     local env_file="$1"
     shift
     nano_env_atomic_rewrite_locked "$env_file" "$env_file" nano_env_set_keys_writer "$@"
+}
+
+# Names (never values) of the keys whose assignments differ between BEFORE
+# (the earlier file content, as a string) and ENV_FILE, comma-separated and
+# sorted. "line order" is reported when the bytes differ but no key's
+# assignments do (reordered lines, edited comments). Prints nothing when the
+# content is identical. Values reach awk on stdin only, never on argv.
+nano_env_changed_keys() {
+    local before="$1" env_file="$2" had_xtrace=0 status=0
+    case "$-" in *x*) had_xtrace=1; set +x ;; esac
+    {
+        printf '%s' "$before" | awk '{ print "B " $0 }'
+        awk '{ print "A " $0 }' "$env_file"
+    } | awk '
+        {
+            side = substr($0, 1, 1)
+            line = substr($0, 3)
+            all[side] = all[side] "\n" line
+            name = line
+            sub(/^[ \t]*export[ \t]+/, "", name)
+            if (match(name, /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=/)) {
+                name = substr(name, 1, RLENGTH)
+                sub(/[ \t]*=$/, "", name)
+                gsub(/[ \t]/, "", name)
+                seen[name] = 1
+                val[side, name] = val[side, name] "\n" line
+            }
+        }
+        END {
+            n = 0
+            for (k in seen) if (val["B", k] != val["A", k]) { print k; n++ }
+            if (n == 0 && all["B"] != all["A"]) print "line order"
+        }
+    ' | LC_ALL=C sort | paste -sd, - | sed 's/,/, /g' || status=1
+    if (( had_xtrace )); then set -x; fi
+    return "$status"
+}
+
+# Every key in a role-split .env is shared: the file must stay byte-identical
+# on every host (host-specific values live in .nano-role.env and the host
+# identity file). Prints the operator notice when ENV_FILE differs from
+# BEFORE, nothing otherwise. Used by install.sh on every host role.
+nano_shared_env_change_notice() {
+    local before="$1" env_file="$2" changed
+    changed="$(nano_env_changed_keys "$before" "$env_file")" || return 1
+    [[ -n "$changed" ]] || return 0
+    printf "The shared .env changed on this host (%s): copy this host's .env to every other host (app, ingest, ClickHouse, Keeper and postgres) before the next install.sh run anywhere, then check that 'sha256sum .env' matches on every host.\n" "$changed"
 }
 
 nano_secret_add_missing() {

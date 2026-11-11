@@ -155,6 +155,8 @@ fn checker(url: &str) -> LicenseChecker {
         pool,
         Arc::new(RwLock::new(LicenseStatus::default())),
     )
+    // NAN-5249: no PostgreSQL here, so seed the install ID the check-in needs.
+    .with_install_id("inst_01jcz8m0f6e9w3t5y7r2q4p6n8")
 }
 
 async fn check_in_answering(status: u16) -> LicenseCheckError {

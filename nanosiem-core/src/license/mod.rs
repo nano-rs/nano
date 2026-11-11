@@ -8,6 +8,7 @@
 //! legacy-upgrade grace) and otherwise fail closed for licensed-only features.
 
 pub mod checker;
+pub mod install_identity;
 pub mod release_notice;
 mod repository;
 pub mod token_rejection;
@@ -18,6 +19,7 @@ mod types;
 pub mod usage_report;
 
 pub use checker::LicenseChecker;
+pub use install_identity::{InstallIdentityRepository, INSTALL_ID_HEADER};
 pub use release_notice::ReleaseNotice;
 pub use repository::LicenseRepository;
 pub use token_rejection::{TokenRejectedNotice, TokenRejection};

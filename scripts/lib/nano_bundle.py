@@ -23,7 +23,10 @@ import tarfile
 import tempfile
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+
+# Python 3.9 floor (RHEL 9, Ubuntu 20.04): datetime.UTC is 3.11+.
+UTC = timezone.utc
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -577,8 +580,15 @@ def _stream_hash(tf: tarfile.TarFile, member: tarfile.TarInfo, output: Any | Non
     return digest.hexdigest(), total
 
 
-def verify_bundle(path: Path | str, roots: Sequence[Root] | None = None) -> VerifiedBundle:
+def verify_bundle(
+    path: Path | str,
+    roots: Sequence[Root] | None = None,
+    *,
+    image_prefix: str | None = None,
+) -> VerifiedBundle:
     bundle = Path(path)
+    if compose_package_identity(bundle) is not None:
+        return verify_compose_package(bundle, roots, image_prefix=image_prefix)
     roots = VERIFICATION_ROOTS if roots is None else roots
     root_ids = [root.key_id for root in roots]
     if not roots or len(root_ids) != len(set(root_ids)):
@@ -628,6 +638,363 @@ def verify_bundle(path: Path | str, roots: Sequence[Root] | None = None) -> Veri
         if unexpected:
             raise BundleError(f"bundle contains unexpected member {unexpected[0]!r}")
     return VerifiedBundle(path=bundle, manifest=manifest)
+
+
+# NAN-5251: registry-pull upgrades from the signed compose package.
+#
+# GCP KMS Ed25519 signs at most 64 KiB and the enterprise image manifest
+# outgrew that (NAN-5165), so enterprise releases publish only the signed
+# compose package `nano-compose-<edition>-<version>.tar.gz` with its detached
+# `.sha256` statement and `.sha256.sig`. That signature covers the archive
+# digest, so everything inside the archive is release-signed too: the version,
+# the edition, the digest-pinned image locks, the migration files and the
+# upgrade policy. `nano bundle verify|load` accept that package in place of the
+# offline image bundle. The manifest is derived from the signed archive and the
+# images are pulled from the registry by digest instead of loaded from a tar.
+COMPOSE_PACKAGE_NAME = re.compile(
+    r"^nano-compose-(open|enterprise)-"
+    r"((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\.tar\.gz$"
+)
+MAX_COMPOSE_STATEMENT_BYTES = 512
+MAX_COMPOSE_PACKAGE_BYTES = 512 * 1024 * 1024
+MAX_COMPOSE_MEMBER_BYTES = 16 * 1024 * 1024
+# Disk planning for a pulled image. The registry does not tell us the unpacked
+# size before the pull; this deliberately errs high (the largest nano images
+# unpack to well under 1 GiB) so preflight never under-reserves.
+REGISTRY_IMAGE_PLAN_BYTES = 1024**3
+_REGISTRY_MANIFEST_KEYS = {
+    "schema_version",
+    "source",
+    "version",
+    "edition",
+    "architecture",
+    "created_at",
+    "package_sha256",
+    "images",
+    "min_from_version",
+    "required_stops",
+    "migrations",
+    "requires",
+    "key_id",
+}
+_COMPOSE_MIGRATION_DIRS = (
+    ("postgres", "migrations/postgres", "sha384", "all"),
+    ("clickhouse", "clickhouse", "sha256", "all"),
+    ("postgres_enterprise", "migrations/postgres-enterprise", "sha384", "enterprise"),
+    ("clickhouse_enterprise", "clickhouse-enterprise", "sha256", "enterprise"),
+)
+_COMPOSE_LOCKS = {
+    # The customer lock names the customer-pullable repository; the plain
+    # enterprise lock names nano's own (same digests, NAN-5123).
+    "enterprise": ("images.enterprise.customer.lock", "images.enterprise.lock"),
+    "open": ("images.lock",),
+}
+
+
+def compose_package_identity(path: Path | str) -> tuple[str, str] | None:
+    """Return (edition, version) when ``path`` is named like a compose package."""
+    match = COMPOSE_PACKAGE_NAME.fullmatch(Path(path).name)
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _read_sidecar(path: Path, label: str, maximum: int) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise BundleError(
+            f"{label} {path.name} must sit next to the compose package as a regular file "
+            "(download it with the package)"
+        )
+    data = path.read_bytes()
+    if len(data) > maximum:
+        raise BundleError(f"{label} {path.name} has an invalid size")
+    return data
+
+
+def _verify_compose_signature(
+    package: Path, roots: Sequence[Root]
+) -> tuple[str, str]:
+    """Verify the detached statement; return (archive sha256, signing key id)."""
+    statement = _read_sidecar(
+        package.with_name(f"{package.name}.sha256"), "checksum statement",
+        MAX_COMPOSE_STATEMENT_BYTES,
+    )
+    signature = _read_sidecar(
+        package.with_name(f"{package.name}.sha256.sig"), "signature", 64,
+    )
+    match = re.fullmatch(rb"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n", statement)
+    if match is None or match.group(2).decode("ascii") != package.name:
+        raise BundleError("checksum statement is not canonical for the compose package")
+    key_id = None
+    for root in roots:
+        try:
+            _verify_signature(statement, signature, root)
+        except BundleError:
+            continue
+        key_id = root.key_id
+        break
+    if key_id is None:
+        raise BundleError("compose package signature is invalid for every trusted release key")
+    return match.group(1).decode("ascii"), key_id
+
+
+def _registry_architecture() -> str:
+    return _architecture(platform.machine() or "unknown", "host architecture")
+
+
+def verify_compose_package(
+    path: Path | str,
+    roots: Sequence[Root] | None = None,
+    *,
+    image_prefix: str | None = None,
+) -> VerifiedBundle:
+    package = Path(path)
+    identity = compose_package_identity(package)
+    if identity is None:
+        raise BundleError(
+            "compose package must be named nano-compose-<open|enterprise>-X.Y.Z.tar.gz"
+        )
+    edition, version = identity
+    if package.is_symlink() or not package.is_file():
+        raise BundleError(f"compose package must be a regular non-symlink file: {package}")
+    if package.stat().st_size > MAX_COMPOSE_PACKAGE_BYTES:
+        raise BundleError("compose package is larger than any nano release")
+    roots = VERIFICATION_ROOTS if roots is None else roots
+    if not roots:
+        raise BundleError("embedded release root set is invalid")
+    package_sha, key_id = _verify_compose_signature(package, roots)
+    # Hash and parse the same open file, so the archive that is read is the
+    # archive that matched the signed statement.
+    handle = package.open("rb")
+    try:
+        digest = hashlib.sha256()
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+        if digest.hexdigest() != package_sha:
+            raise BundleError("compose package SHA-256 does not match its signed statement")
+        handle.seek(0)
+        return _parse_compose_package(
+            package, handle, edition, version, package_sha, key_id, image_prefix,
+        )
+    finally:
+        handle.close()
+
+
+def _parse_compose_package(
+    package: Path,
+    handle: Any,
+    edition: str,
+    version: str,
+    package_sha: str,
+    key_id: str,
+    image_prefix: str | None,
+) -> VerifiedBundle:
+
+    top = f"nano-{version}"
+    wanted_files = {".nano-bundle", ".nano-edition", "deploy/release/upgrade-policy.json"}
+    wanted_files.update(name for names in _COMPOSE_LOCKS.values() for name in names)
+    files: dict[str, bytes] = {}
+    created_at = ""
+    migration_hashes: dict[str, list[tuple[str, str]]] = {group: [] for group in MIGRATION_GROUPS}
+    migration_dirs = {
+        directory: (group, algorithm)
+        for group, directory, algorithm, scope in _COMPOSE_MIGRATION_DIRS
+        if scope == "all" or edition == "enterprise"
+    }
+    try:
+        with tarfile.open(fileobj=handle, mode="r:gz") as tf:
+            count = 0
+            seen: set[str] = set()
+            for member in tf:
+                count += 1
+                if count > MAX_MEMBERS:
+                    raise BundleError("compose package has an invalid member count")
+                name, _ = _safe_member_name(member.name)
+                if name in seen:
+                    raise BundleError(f"compose package repeats member {name}")
+                seen.add(name)
+                if name != top and not name.startswith(f"{top}/"):
+                    raise BundleError(f"compose package member {name} is outside {top}/")
+                if not member.isreg():
+                    continue
+                relative = name[len(top) + 1:]
+                directory, _, base = relative.rpartition("/")
+                if relative in wanted_files:
+                    files[relative] = _read_member(
+                        tf, member, maximum=MAX_MANIFEST_BYTES, label=relative,
+                    )
+                    if relative == ".nano-bundle":
+                        created_at = datetime.fromtimestamp(
+                            member.mtime, UTC
+                        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                elif directory in migration_dirs and base.endswith(".sql"):
+                    version_match = re.match(r"^([0-9]+[a-z]*)_", base)
+                    if version_match is None:
+                        continue
+                    group, algorithm = migration_dirs[directory]
+                    data = _read_member(
+                        tf, member, maximum=MAX_COMPOSE_MEMBER_BYTES, label=relative,
+                    )
+                    checksum = hashlib.new(algorithm, data).hexdigest()
+                    migration_hashes[group].append(
+                        (base, f"{algorithm}:{checksum}")
+                    )
+    except BundleError:
+        raise
+    except (OSError, EOFError, tarfile.TarError) as exc:
+        raise BundleError("compose package is not a valid gzip tar archive") from exc
+
+    marker = files.get(".nano-bundle", b"").decode("utf-8", "replace").strip()
+    if marker != f"nano compose release v{version}":
+        raise BundleError("compose package release marker does not match its name")
+    if files.get(".nano-edition", b"").decode("utf-8", "replace").strip() != edition:
+        raise BundleError("compose package edition marker does not match its name")
+    policy = files.get("deploy/release/upgrade-policy.json")
+    if policy is None:
+        raise BundleError(
+            f"compose package {package.name} predates registry upgrades (v2.0.10); "
+            "upgrade to it by re-running install.sh on each host as the Upgrade guide describes"
+        )
+    min_from, stops, requires = _policy_from_bytes(
+        policy, "deploy/release/upgrade-policy.json", version,
+    )
+
+    available_locks = {name for name in files if name.startswith("images.")}
+    lock_name = None
+    lock_images: list[tuple[str, str, str]] = []
+    for candidate in _COMPOSE_LOCKS[edition]:
+        if candidate not in available_locks:
+            continue
+        entries = _lock_images_text(files[candidate].decode("utf-8"), version)
+        if image_prefix is None or any(
+            ref.rsplit(":", 1)[0] == f"{image_prefix}-api" for _, ref, _ in entries
+        ):
+            lock_name, lock_images = candidate, entries
+            break
+    if lock_name is None:
+        raise BundleError(
+            f"compose package has no {edition} image lock for this install's image "
+            f"source {image_prefix}-*"
+            if image_prefix else f"compose package carries no {edition} image lock"
+        )
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "source": "registry",
+        "version": version,
+        "edition": edition,
+        "architecture": _registry_architecture(),
+        "created_at": created_at,
+        "package_sha256": package_sha,
+        "images": [
+            {"name": name, "ref": ref, "digest": digest, "size": REGISTRY_IMAGE_PLAN_BYTES}
+            for name, ref, digest in sorted(lock_images)
+        ],
+        "min_from_version": min_from,
+        "required_stops": stops,
+        "migrations": {
+            group: [
+                {"version": re.match(r"^([0-9]+[a-z]*)_", base).group(1), "checksum": checksum}
+                for base, checksum in sorted(migration_hashes[group])
+            ]
+            for group in MIGRATION_GROUPS
+        },
+        "requires": requires,
+        "key_id": key_id,
+    }
+    return VerifiedBundle(path=package, manifest=_validate_registry_manifest(manifest))
+
+
+def _validate_registry_manifest(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BundleError("registry manifest must be a JSON object")
+    _exact_keys(value, _REGISTRY_MANIFEST_KEYS, "registry manifest")
+    if value["source"] != "registry":
+        raise BundleError("registry manifest source must be registry")
+    _text(value["package_sha256"], "manifest.package_sha256", re.compile(r"^[0-9a-f]{64}$"))
+    images = value["images"]
+    if not isinstance(images, list) or not images or len(images) > 256:
+        raise BundleError("manifest.images must be a non-empty bounded array")
+    names: set[str] = set()
+    refs: set[str] = set()
+    for index, image in enumerate(images):
+        label = f"manifest.images[{index}]"
+        if not isinstance(image, dict):
+            raise BundleError(f"{label} must be an object")
+        _exact_keys(image, {"name", "ref", "digest", "size"}, label)
+        name = _text(image["name"], f"{label}.name", _IDENTIFIER)
+        ref = _text(image["ref"], f"{label}.ref")
+        _text(image["digest"], f"{label}.digest", _SHA256)
+        if "@" in ref or any(character.isspace() for character in ref):
+            raise BundleError(f"{label}.ref must be a plain tagged reference")
+        if type(image["size"]) is not int or image["size"] <= 0:
+            raise BundleError(f"{label}.size must be a positive integer")
+        if name in names or ref in refs:
+            raise BundleError("manifest.images contains a duplicate name or ref")
+        names.add(name)
+        refs.add(ref)
+    # Everything else has the image-bundle shape: reuse that validator on a
+    # probe that carries placeholder archive fields.
+    probe = {
+        key: value[key]
+        for key in _REGISTRY_MANIFEST_KEYS - {"source", "package_sha256", "images"}
+    }
+    probe["git_sha"] = "0" * 40
+    probe["images"] = [
+        {
+            "name": image["name"],
+            "ref": image["ref"],
+            "digest": image["digest"],
+            "platform_digest": image["digest"],
+            "archive_ref": f"nano-bundle.invalid/{image['name']}:" + "0" * 32,
+            "file": f"images/{image['name']}.tar",
+            "sha256": "0" * 64,
+            "size": image["size"],
+        }
+        for image in images
+    ]
+    _validate_manifest(probe)
+    return value
+
+
+def _image_repository(ref: str) -> str:
+    """``registry:5000/a/b:tag`` -> ``registry:5000/a/b``."""
+    head, _, last = ref.rpartition("/")
+    repository = last.split(":", 1)[0]
+    return f"{head}/{repository}" if head else repository
+
+
+def load_registry_images(
+    verified: VerifiedBundle,
+    *,
+    roles: frozenset[str] | None = None,
+    docker: Sequence[str] = ("docker",),
+) -> list[str]:
+    """Pull the host-role image subset by signed digest and tag it for Compose."""
+    architecture = _docker_host_architecture(docker)
+    chosen_roles = selected_roles() if roles is None else roles
+    pulled: list[str] = []
+    for image in verified.manifest["images"]:
+        if not _selected_image(image["name"], chosen_roles):
+            continue
+        ref, digest = image["ref"], image["digest"]
+        immutable = f"{_image_repository(ref)}@{digest}"
+        _run(
+            [*docker, "pull", "--quiet", "--platform", f"linux/{architecture}", immutable],
+            error=(
+                f"cannot pull {immutable} (log in to {ref.split('/', 1)[0]} with a fresh "
+                "registry credential on this host, then retry)"
+            ),
+        )
+        image_id, repo_digests = _docker_identity(docker, immutable)
+        if not _digest_matches(immutable, digest, image_id, repo_digests):
+            raise BundleError(f"pulled image {immutable} does not match its signed digest")
+        _run([*docker, "tag", image_id, ref], error=f"cannot tag pulled image {ref}")
+        tagged_id, _ = _docker_identity(docker, ref)
+        if tagged_id != image_id:
+            raise BundleError(f"pulled image {ref} changed while it was tagged")
+        pulled.append(image["name"])
+    return pulled
 
 
 def _role_file() -> str:
@@ -817,8 +1184,11 @@ def load_bundle(
     *,
     roles: frozenset[str] | None = None,
     docker: Sequence[str] = ("docker",),
+    image_prefix: str | None = None,
 ) -> list[str]:
-    verified = verify_bundle(path, roots)
+    verified = verify_bundle(path, roots, image_prefix=image_prefix)
+    if verified.manifest.get("source") == "registry":
+        return load_registry_images(verified, roles=roles, docker=docker)
     bundle_architecture = _architecture(
         verified.manifest["architecture"], "manifest.architecture"
     )
@@ -993,7 +1363,10 @@ def create_bundle(
         with tarfile.open(temporary, mode="w", format=tarfile.PAX_FORMAT) as tf:
             _tar_bytes(tf, "manifest.json", body, timestamp)
             _tar_bytes(tf, "manifest.sig", signature, timestamp)
-            for image, item in zip(sorted(images, key=lambda source: source.name), image_manifest, strict=True):
+            ordered_images = sorted(images, key=lambda source: source.name)
+            if len(ordered_images) != len(image_manifest):  # zip strict mode needs Python 3.10
+                raise BundleError("image manifest and payload list differ")
+            for image, item in zip(ordered_images, image_manifest):
                 _tar_file(tf, item["file"], image.archive, timestamp)
             _tar_bytes(tf, "migrations/index.json", _canonical_json(migrations), timestamp)
         os.replace(temporary, output)
@@ -1069,9 +1442,18 @@ def load_policy(
     path: Path, version: str, *, require_exact_release: bool = False
 ) -> tuple[str, list[str], dict[str, Any]]:
     try:
-        value = _unique_json(path.read_bytes(), str(path))
+        data = path.read_bytes()
     except OSError as exc:
         raise BundleError(f"cannot read upgrade policy {path}") from exc
+    return _policy_from_bytes(
+        data, str(path), version, require_exact_release=require_exact_release
+    )
+
+
+def _policy_from_bytes(
+    data: bytes, label: str, version: str, *, require_exact_release: bool = False
+) -> tuple[str, list[str], dict[str, Any]]:
+    value = _unique_json(data, label)
     if not isinstance(value, dict):
         raise BundleError("upgrade policy must be an object")
     _exact_keys(value, {"schema_version", "default", "releases", "requires"}, "upgrade policy")
@@ -1174,9 +1556,14 @@ def _image_name(repo: str) -> str:
 
 def _lock_images(path: Path, version: str) -> list[tuple[str, str, str]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise BundleError(f"cannot read image lock {path}") from exc
+    return _lock_images_text(text, version)
+
+
+def _lock_images_text(text: str, version: str) -> list[tuple[str, str, str]]:
+    lines = text.splitlines()
     header = next((line.removeprefix("# Release: v") for line in lines if line.startswith("# Release: v")), None)
     if header != version:
         raise BundleError(f"image lock release {header!r} does not match requested {version!r}")
@@ -1458,8 +1845,16 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="verify a signed bundle offline")
     verify.add_argument("file")
     verify.add_argument("--json", action="store_true")
-    load = commands.add_parser("load", help="verify, then load the host-role image subset")
+    verify.add_argument(
+        "--image-prefix",
+        help="registry installs: the install's NANO_IMAGE_PREFIX, which selects the image lock",
+    )
+    load = commands.add_parser(
+        "load",
+        help="verify, then load (image bundle) or pull (compose package) the host-role image subset",
+    )
     load.add_argument("file")
+    load.add_argument("--image-prefix")
     return parser
 
 
@@ -1469,18 +1864,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parser().parse_args(arguments)
         if args.command == "verify":
-            verified = verify_bundle(args.file)
+            verified = verify_bundle(args.file, image_prefix=args.image_prefix or None)
             if args.json:
                 print(json.dumps(verified.manifest, sort_keys=True, separators=(",", ":")))
             else:
+                kind = (
+                    "compose package (registry images)"
+                    if verified.manifest.get("source") == "registry" else "bundle"
+                )
                 print(
                     f"verified nano {verified.manifest['version']} {verified.manifest['edition']} "
-                    f"bundle ({len(verified.manifest['images'])} images)"
+                    f"{kind} ({len(verified.manifest['images'])} images)"
                 )
         elif args.command == "load":
-            loaded = load_bundle(args.file)
+            loaded = load_bundle(args.file, image_prefix=args.image_prefix or None)
             role_text = _role_file() or "all"
-            print(f"loaded {len(loaded)} image(s) for host roles: {role_text}")
+            action = "pulled" if compose_package_identity(args.file) else "loaded"
+            print(f"{action} {len(loaded)} image(s) for host roles: {role_text}")
         else:  # pragma: no cover - argparse enforces this
             raise BundleError("unknown bundle command")
         return 0

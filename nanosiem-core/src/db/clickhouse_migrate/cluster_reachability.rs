@@ -80,13 +80,40 @@ impl Reachability {
     }
 }
 
+/// NAN-5255: `system.clusters` predicate selecting the rows of the
+/// `remote_servers` cluster named `cluster` -- the topology
+/// `clusterAllReplicas('<cluster>', ...)` and `ON CLUSTER '<cluster>'` fan out
+/// to.
+///
+/// A `Replicated` database registers its OWN cluster in `system.clusters`
+/// under the database's name, with `database_shard_name` /
+/// `database_replica_name` set and `host_name` = the replica's FQDN. The
+/// ClickHouse operator's database sync (`enableDatabaseSync`, default on)
+/// turns database `default` into a Replicated database, so a remote_servers
+/// cluster also called `default` shows up twice: a 1x2 install lists 4 rows
+/// while `clusterAllReplicas('default', ...)` reaches 2 nodes. Counting every
+/// row made the migrator wait for 2/4 forever and blame a replica that was
+/// reachable.
+///
+/// Prefer the remote_servers rows (`database_replica_name = ''`); a name that
+/// exists ONLY as a Replicated database keeps its rows so that topology is not
+/// reported as empty. `cluster` must already be a quoted SQL literal.
+pub(crate) fn server_cluster_rows_predicate(cluster_literal: &str) -> String {
+    format!(
+        "cluster = {cluster_literal} AND (database_replica_name = '' OR \
+         (SELECT countIf(database_replica_name = '') FROM system.clusters \
+         WHERE cluster = {cluster_literal}) = 0)"
+    )
+}
+
 /// `system.clusters` rows for `cluster`, ordered like `clusterAllReplicas`
 /// numbers its per-replica shards.
 pub(super) fn cluster_replicas_sql(cluster: &str) -> String {
     let cluster = crate::sql_hygiene::escape_sql_string(cluster);
+    let rows = server_cluster_rows_predicate(&format!("'{cluster}'"));
     format!(
         "SELECT shard_num, replica_num, host_name, port FROM system.clusters \
-         WHERE cluster = '{cluster}' ORDER BY shard_num, replica_num"
+         WHERE {rows} ORDER BY shard_num, replica_num"
     )
 }
 

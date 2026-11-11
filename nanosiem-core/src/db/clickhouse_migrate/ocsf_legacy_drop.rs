@@ -202,7 +202,10 @@ pub(super) fn duplicate_ids_sql(
 
 /// Shards the cluster defines.
 pub(super) fn expected_shards_sql(cluster: &str) -> String {
-    format!("SELECT uniqExact(shard_num) FROM system.clusters WHERE cluster = {}", quote(cluster))
+    format!(
+        "SELECT uniqExact(shard_num) FROM system.clusters WHERE {}",
+        super::cluster_reachability::server_cluster_rows_predicate(&quote(cluster))
+    )
 }
 
 /// Shards that answered a `cluster()` read.

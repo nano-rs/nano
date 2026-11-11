@@ -1013,7 +1013,9 @@ def recover_legacy_backup_services(
     if len(raw_compose) == 2:
         expected_names.append("docker-compose.override.yml")
     compose_files: list[pathlib.Path] = []
-    for raw, expected_name in zip(raw_compose, expected_names, strict=True):
+    if len(raw_compose) != len(expected_names):  # zip strict mode needs Python 3.10
+        raise UpgradeError("legacy compose file list changed while it was read")
+    for raw, expected_name in zip(raw_compose, expected_names):
         if not isinstance(raw, str):
             raise UpgradeError("legacy backup recovery Compose plan is invalid")
         compose = pathlib.Path(raw)
@@ -1875,8 +1877,85 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 raise UpgradeError("manifest image size is invalid")
             image_roles = BUNDLE_IMAGE_ROLES.get(name)
             if image_roles is None or not roles or image_roles & roles:
+                if manifest.get("source") == "registry" and self._registry_image_present(entry):
+                    # NAN-5251: a pull of an image already here by its signed
+                    # digest (unchanged third-party images, a resumed run)
+                    # writes nothing; the plan size is only an estimate.
+                    size = 0
                 selected.append(size)
         return selected
+
+    def _bundle_load(self, bundle: pathlib.Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        load_environment = dict(env or os.environ)
+        # The loader selects this host's images from its roles; pass them
+        # explicitly instead of relying on the worker's working directory.
+        if getattr(self, "role_env", None) and getattr(self, "roles", None):
+            load_environment.setdefault("NANO_ROLE_PROFILES", ",".join(sorted(self.roles)))
+        return self.runner.run(
+            [str(self.nano_cli), "bundle", "load", str(bundle),
+             *bundle_cli_arguments(bundle, self.env.get("NANO_IMAGE_PREFIX", ""))],
+            timeout=7200,
+            env=load_environment,
+            check=False,
+        )
+
+    def _registry_auth_probe(self, manifest: dict[str, Any]) -> str:
+        """Ask the registry itself: a cached image never proves the login works."""
+        private = [
+            image for image in manifest.get("images", [])
+            if isinstance(image, dict) and "nano-rs" in str(image.get("ref", ""))
+            and str(image.get("ref", "")).count("/") >= 2
+        ]
+        if manifest.get("edition") != "enterprise" or not private:
+            return ""
+        ref, digest = str(private[0]["ref"]), str(private[0]["digest"])
+        head, _, last = ref.rpartition("/")
+        target = f"{head}/{last.split(':', 1)[0]}@{digest}"
+        probe = self.runner.run(
+            ["docker", "buildx", "imagetools", "inspect", "--raw", target],
+            timeout=60, check=False,
+        )
+        if probe.returncode == 0:
+            return f"registry accepted this host's credential for {head.split('/', 1)[0]}"
+        detail = " ".join((probe.stderr or "").split())
+        if (
+            "unknown command" in detail
+            or "is not a docker command" in detail
+            or ("buildx" in detail and "not found" in detail)
+        ):
+            return ""  # no buildx: the digest pulls below are the auth test
+        raise UpgradeError(
+            f"the registry refused this host's credential for {target.split('@', 1)[0]} "
+            f"({detail[-160:] or f'exit {probe.returncode}'}): log in again with a fresh "
+            "pull credential from app.nano.rs, then rerun"
+        )
+
+    def _pull_registry_images(self, bundle: pathlib.Path, manifest: dict[str, Any] | None = None) -> str:
+        auth = self._registry_auth_probe(manifest or {})
+        pulled = self._bundle_load(bundle)
+        if pulled.returncode != 0:
+            reason = (pulled.stderr or "").strip().splitlines()
+            raise UpgradeError(
+                f"{reason[-1] if reason else f'image pull failed (exit {pulled.returncode})'}"
+            )
+        summary = (pulled.stdout or "").strip().splitlines()
+        result = summary[-1] if summary else "pulled this host's images by signed digest"
+        return f"{auth}; {result}" if auth else result
+
+    def _registry_image_present(self, entry: dict[str, Any]) -> bool:
+        ref, digest = str(entry.get("ref", "")), str(entry.get("digest", ""))
+        if not ref or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            return False
+        head, _, last = ref.rpartition("/")
+        repository = f"{head}/{last.split(':', 1)[0]}" if head else last.split(":", 1)[0]
+        try:
+            result = self.runner.run(
+                ["docker", "image", "inspect", "--format", "{{.Id}}", f"{repository}@{digest}"],
+                timeout=30, check=False,
+            )
+        except UpgradeError:
+            return False
+        return result.returncode == 0
 
     @staticmethod
     def _filesystem_space(
@@ -2337,7 +2416,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         )
         return "complete" if url and token and deployment else "partial"
 
-    def _check_license(self, test_rehearsal: bool = False) -> str:
+    def _check_license(self, test_rehearsal: bool = False, target_version: str = "") -> str:
         if self.edition != "enterprise":
             return "open edition does not require a C05 licence"
         tuple_state = self._online_license_tuple()
@@ -2354,14 +2433,28 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 "COALESCE((expires_at > clock_timestamp())::text,'true') || E'\\t' || "
                 "COALESCE(offline, FALSE)::text || E'\\t' || "
                 "COALESCE((last_checked_at > clock_timestamp() - "
-                f"interval '{ONLINE_LICENSE_STALE_DAYS} days')::text,'false') "
+                f"interval '{ONLINE_LICENSE_STALE_DAYS} days')::text,'false') || E'\\t' || "
+                # 'r:' keeps an empty reason from being trimmed off the row.
+                "'r:' || replace(replace(COALESCE(locked_reason,''),E'\\t',' '),E'\\n',' ') "
                 "FROM license_status WHERE id=TRUE"
             )
             fields = row.split("\t")
+            if len(fields) == 5:
+                fields.append("r:")
+            upgrade_gate = (
+                len(fields) == 6
+                and fields[5].startswith("r:")
+                and is_selfrun_upgrade_gate(fields[0], fields[1], fields[5][2:], target_version)
+            )
             if (
-                len(fields) != 5
-                or fields[0] not in {"active", "grace_period"}
-                or fields[1:3] != ["true", "true"]
+                len(fields) != 6
+                or (
+                    not upgrade_gate
+                    and (
+                        fields[0] not in {"active", "grace_period"}
+                        or fields[1:3] != ["true", "true"]
+                    )
+                )
             ):
                 raise UpgradeError("online licence check-in is not active and unexpired")
             if fields[3] != "false":
@@ -2374,6 +2467,13 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     "online licence has not checked in successfully within "
                     f"{ONLINE_LICENSE_STALE_DAYS} days; restore reachability to the "
                     "licence server before upgrading"
+                )
+            if upgrade_gate:
+                # NAN-5251: app.nano.rs locks Self-run v2 builds below the
+                # licensed minimum until they upgrade; this upgrade is the cure.
+                return (
+                    f"licence locked only by the Self-run upgrade-required gate; "
+                    f"upgrading to {target_version} clears it at the next check-in"
                 )
             return f"licence status {fields[0]}; authority online"
         row = self._pg_query(
@@ -2555,6 +2655,26 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 checks.append(Check(name, False, str(error), self.host_name))
 
         check("disk", lambda: self._check_disk(manifest, bundle, prepared))
+        if manifest.get("source") == "registry":
+            check(
+                "control-tree",
+                lambda: check_registry_control_tree(self.install_dir, str(manifest.get("version", ""))),
+            )
+            if not prepared:
+                login: list[str] = []
+
+                def registry_login() -> str:
+                    detail = check_registry_login(manifest)
+                    login.append(detail)
+                    return detail
+
+                check("registry-login", registry_login)
+                if login:
+                    # NAN-5251: pull (and digest-check) this host's images now,
+                    # before the backup and before any host restarts, so an
+                    # expired or unreachable registry fails while nothing has
+                    # changed. Pulling only fills the local image cache.
+                    check("registry-pull", lambda: self._pull_registry_images(bundle, manifest))
         check("ram", lambda: self._check_ram(manifest))
         check("cpu", lambda: self._check_cpu(manifest))
         check("ntp", self._check_ntp)
@@ -2596,7 +2716,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         if "postgres" in self.roles:
             check(
                 "licence",
-                lambda: self._check_license(test_license_rehearsal),
+                lambda: self._check_license(
+                    test_license_rehearsal, str(manifest.get("version", "")),
+                ),
             )
         if "ingest" in self.roles and require_lb_hooks:
             check("lb-hooks", self._check_lb_hooks)
@@ -3088,7 +3210,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             nano_legacy_bridge.SOURCE_VERSION, nano_legacy_bridge.TARGET_VERSION,
         }:
             raise UpgradeError("legacy bridge resolver selected an unsupported source release")
-        manifest = verify_manifest(self.nano_cli, bundle, self.runner)
+        manifest = verify_manifest(
+            self.nano_cli, bundle, self.runner, self.env.get("NANO_IMAGE_PREFIX", ""),
+        )
         architecture = self._docker_architecture()
         try:
             images = nano_legacy_bridge.validate_manifest(
@@ -3490,11 +3614,15 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         load_environment["NANO_BUNDLE_TMPDIR"] = str(
             self.install_dir / ".nano-bundle-scratch"
         )
-        self.runner.run(
-            [str(self.nano_cli), "bundle", "load", str(bundle)],
-            timeout=7200,
-            env=load_environment,
-        )
+        loaded = self._bundle_load(bundle, load_environment)
+        if loaded.returncode != 0:
+            # `nano bundle` prints one safe reason line (no credentials).
+            reason = (loaded.stderr or "").strip().splitlines()
+            action = "pull the release images" if is_compose_package(bundle) else "load the bundle images"
+            raise UpgradeError(
+                f"could not {action} on {self.host_name}: "
+                f"{reason[-1] if reason else f'exit {loaded.returncode}'}"
+            )
         if legacy_bridge:
             bridge_record = self._publish_legacy_bridge(
                 bridge_images, bridge_record,
@@ -5439,14 +5567,139 @@ class RemoteMigrationLock:
                     stream.close()
 
 
-def verify_manifest(nano_cli: pathlib.Path, bundle: pathlib.Path, runner: Runner) -> dict[str, Any]:
+# NAN-5251 / NAN-5249: app.nano.rs answers a Self-run v2 build below the
+# licensed minimum with this exact lock reason. It is the only lock the upgrade
+# preflight accepts, and only for a target at or above that minimum.
+SELFRUN_UPGRADE_GATE_REASON = (
+    "Upgrade required: this release can't be licensed for Self-run. Install v"
+)
+SELFRUN_LICENSED_MINIMUM = (2, 0, 10)
+
+
+def is_selfrun_upgrade_gate(status: str, valid: str, reason: str, target: str) -> bool:
+    if status != "locked" or valid != "false":
+        return False
+    match = re.fullmatch(
+        re.escape(SELFRUN_UPGRADE_GATE_REASON)
+        + r"([0-9]+)\.([0-9]+)\.([0-9]+) or later\.",
+        reason.strip(),
+    )
+    if match is None:
+        return False
+    minimum = tuple(int(part) for part in match.groups())
+    try:
+        target_key = semver(target)
+    except (UpgradeError, ValueError):
+        return False
+    return target_key >= max(minimum, SELFRUN_LICENSED_MINIMUM)
+
+
+def check_registry_control_tree(install_dir: pathlib.Path, target: str) -> str:
+    """NAN-5251: a registry upgrade runs the target's Compose files and scripts.
+
+    The image bundle carries only images; a registry upgrade has no images to
+    carry, so the operator extracts the signed package over the install
+    directory on every host first (it never contains .env or host state).
+    """
+    marker = install_dir / ".nano-bundle"
+    try:
+        value = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+    except OSError as error:
+        raise UpgradeError(f"cannot read {marker}") from error
+    if value != f"nano compose release v{target}":
+        found = value.rsplit(" ", 1)[-1] if value else "none"
+        raise UpgradeError(
+            f"install directory holds the {found} control tree, not v{target}. Verify "
+            f"nano-compose-<edition>-{target}.tar.gz against its .sha256 and .sha256.sig "
+            "(scripts/nano bundle verify <package>, or the Upgrade guide's check) and only "
+            f"then extract it over {install_dir} on this host "
+            f"(tar -xzf <package> --strip-components=1 -C {install_dir}); it keeps .env"
+        )
+    return f"control tree is v{target}"
+
+
+def check_registry_login(manifest: dict[str, Any]) -> str:
+    """Pulls happen mid-upgrade; refuse up front when no credential is configured."""
+    if manifest.get("edition") != "enterprise":
+        return "open images come from a public registry"
+    registries = sorted({
+        str(image.get("ref", "")).split("/", 1)[0]
+        for image in manifest.get("images", [])
+        if isinstance(image, dict)
+        and str(image.get("ref", "")).count("/") >= 2
+        and "nano-rs" in str(image.get("ref", ""))
+    })
+    if not registries:
+        return "no private registry images"
+    config_dir = pathlib.Path(os.environ.get("DOCKER_CONFIG") or pathlib.Path.home() / ".docker")
+    try:
+        config = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    if config.get("credsStore"):
+        return f"credential store {config['credsStore']} configured (checked by registry-pull)"
+    auths = config.get("auths") if isinstance(config.get("auths"), dict) else {}
+    helpers = config.get("credHelpers") if isinstance(config.get("credHelpers"), dict) else {}
+    missing = [
+        registry for registry in registries
+        if registry not in helpers and not any(
+            key == registry or key.rstrip("/").endswith(f"//{registry}") for key in auths
+        )
+    ]
+    if missing:
+        raise UpgradeError(
+            f"not logged in to {', '.join(missing)}: log in with a fresh registry credential "
+            "from app.nano.rs on this host (it lasts about an hour), then rerun"
+        )
+    return f"logged in to {', '.join(registries)}"
+
+
+COMPOSE_PACKAGE_RE = re.compile(
+    r"^nano-compose-(open|enterprise)-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$"
+)
+
+
+def is_compose_package(bundle: pathlib.Path) -> bool:
+    """NAN-5251: the signed installer package, used for registry-pull upgrades."""
+    return COMPOSE_PACKAGE_RE.fullmatch(bundle.name) is not None
+
+
+def bundle_cli_arguments(bundle: pathlib.Path, image_prefix: str) -> list[str]:
+    """Extra `nano bundle verify|load` arguments for a registry-pull package."""
+    if is_compose_package(bundle) and image_prefix:
+        return ["--image-prefix", image_prefix]
+    return []
+
+
+def verify_manifest(
+    nano_cli: pathlib.Path, bundle: pathlib.Path, runner: Runner, image_prefix: str = "",
+) -> dict[str, Any]:
     if bundle.is_symlink() or not bundle.is_file():
         raise UpgradeError(f"bundle must be a regular non-symlink file: {bundle}")
-    result = runner.run([str(nano_cli), "bundle", "verify", str(bundle), "--json"], timeout=7200)
+    if bundle.name.endswith(".tar.gz") and not is_compose_package(bundle):
+        raise UpgradeError(
+            f"{bundle.name} is not a nano release artifact; pass the signed image bundle "
+            "nano-<version>-<edition>.tar or the signed installer package "
+            "nano-compose-<edition>-<version>.tar.gz with its .sha256 and .sha256.sig beside it"
+        )
+    result = runner.run(
+        [str(nano_cli), "bundle", "verify", str(bundle), "--json",
+         *bundle_cli_arguments(bundle, image_prefix)],
+        timeout=7200, check=False,
+    )
     try:
         manifest = json_object(json.loads(result.stdout), "bundle verification result")
     except json.JSONDecodeError as error:
-        raise UpgradeError("bundle verifier returned invalid JSON") from error
+        raise UpgradeError(
+            f"bundle verifier failed (exit {result.returncode}) for {bundle.name}"
+        ) from error
+    if result.returncode != 0 or "error" in manifest:
+        # `nano bundle verify --json` reports a safe, user-facing reason.
+        raise UpgradeError(
+            f"cannot verify {bundle.name}: {manifest.get('error', f'exit {result.returncode}')}"
+        )
     if manifest.get("schema_version") != 1:
         raise UpgradeError("bundle verifier returned an unsupported schema")
     canonical_version(str(manifest.get("version", "")))
@@ -5640,7 +5893,13 @@ def bundle_for_version(args: argparse.Namespace, ops: LocalOps, runner: Runner) 
             shutil.copyfileobj(response, output)
     except OSError as error:
         temporary.cleanup()
-        raise UpgradeError(f"could not download release bundle for {version}") from error
+        raise UpgradeError(
+            f"could not download the image bundle for {version} from {url}. Enterprise image "
+            "bundles are not published for registry installs: download the signed installer "
+            f"package nano-compose-{ops.edition}-{version}.tar.gz (with .sha256 and .sha256.sig) "
+            "with your licence values, verify its signature, then extract it over the install "
+            "directory on every host and pass the package with --bundle (see the Upgrade guide)"
+        ) from error
     os.chmod(destination, 0o600)
     return destination, temporary
 
@@ -6653,7 +6912,9 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     args.include_clickhouse_data = True
             bundle, temporary = bundle_for_version(args, ops, runner)
             bundle_digest = sha256_path(bundle)
-            manifest = verify_manifest(nano_cli, bundle, runner)
+            manifest = verify_manifest(
+                nano_cli, bundle, runner, ops.env.get("NANO_IMAGE_PREFIX", ""),
+            )
             require_bundle_digest(bundle, bundle_digest)
             target = canonical_version(str(manifest["version"]))
             mandatory_backup = enforce_signed_backup_policy(
@@ -7146,7 +7407,9 @@ def ledger_map(value: Any, nodes: Sequence[Node], label: str) -> dict[str, Any]:
             raise UpgradeError(f"{label} does not cover the pinned inventory")
         return value
     if isinstance(value, list) and len(value) == len(nodes):
-        return {node.name: item for node, item in zip(nodes, value, strict=True)}
+        if len(nodes) != len(value):  # zip strict mode needs Python 3.10
+            raise UpgradeError("parallel worker results do not match the host list")
+        return {node.name: item for node, item in zip(nodes, value)}
     raise UpgradeError(f"{label} is not an all-node ledger snapshot")
 
 
@@ -7315,7 +7578,9 @@ def worker_command(args: argparse.Namespace) -> int:
             ops.backup_output = pathlib.Path(args.backup_output).expanduser()
         ops.include_clickhouse_data = getattr(args, "include_clickhouse_data", False)
         require_bundle_digest(bundle, args.expected_bundle_sha256)
-        manifest = verify_manifest(nano_cli, bundle, runner)
+        manifest = verify_manifest(
+            nano_cli, bundle, runner, ops.env.get("NANO_IMAGE_PREFIX", ""),
+        )
         require_bundle_digest(bundle, args.expected_bundle_sha256)
         value = [
             check.as_dict()
@@ -7367,7 +7632,9 @@ def worker_command(args: argparse.Namespace) -> int:
     elif args.worker_action == "prepare":
         assert bundle is not None
         require_bundle_digest(bundle, args.expected_bundle_sha256)
-        manifest = verify_manifest(nano_cli, bundle, runner)
+        manifest = verify_manifest(
+            nano_cli, bundle, runner, ops.env.get("NANO_IMAGE_PREFIX", ""),
+        )
         require_bundle_digest(bundle, args.expected_bundle_sha256)
         target = canonical_version(args.target)
         source = canonical_version(args.source)

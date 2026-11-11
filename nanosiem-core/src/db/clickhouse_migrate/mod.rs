@@ -22,6 +22,7 @@ mod tests;
 #[cfg(test)]
 mod soft_fail_tests;
 
+pub(crate) use cluster_reachability::server_cluster_rows_predicate;
 pub(crate) use detection::configured_or_detected_cluster;
 pub use ocsf_legacy_drop::{
     LegacyDayCheck, LegacyDayStatus, OcsfLegacyDropOutcome, OcsfLegacyDropPlan, OCSF_LEGACY_TABLE,

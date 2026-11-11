@@ -7,7 +7,7 @@ install.sh and nano-upgrade call this after a member runs:
 
     pg_controldata -D <data> | python3 -I pg_ha_system_id.py <.env>
 
-Exit 0 and print `recorded <id>` (appended; copy .env to every host) or
+Exit 0 and print `recorded <id>` (written in place; copy .env to every host) or
 `unchanged <id>`. Exit 3 when .env already names a DIFFERENT identifier (never
 overwritten: this host holds another cluster's data). Exit 4 when the input
 has no identifier yet (the member is still cloning or waiting).
@@ -15,8 +15,11 @@ has no identifier yet (the member is still cloning or waiting).
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 KEY = "NANO_PG_HA_SYSTEM_ID"
@@ -50,6 +53,41 @@ def decide(existing: str | None, observed: str) -> str:
     )
 
 
+def record(env_path: Path, observed: str) -> None:
+    """Write KEY=observed without reordering the file (NAN-5251).
+
+    A key that is absent is appended (a symlinked .env stays a link and keeps
+    its mode). An empty assignment already in the file (`KEY=`) is replaced
+    where it stands, through an atomic rewrite of the link's target that keeps
+    its mode and owner, so the key never appears twice.
+    """
+    text = env_path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    present = [i for i, line in enumerate(lines) if line.startswith(f"{KEY}=")]
+    if not present:
+        separator = "" if text.endswith("\n") or not text else "\n"
+        with env_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{separator}{KEY}={observed}\n")
+        return
+    first = present[0]
+    lines[first] = f"{KEY}={observed}\n"
+    kept = [line for i, line in enumerate(lines) if i == first or i not in present]
+    target = env_path.resolve()
+    stat = target.stat()
+    fd, tmp = tempfile.mkstemp(prefix=".env.tmp.", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("".join(kept))
+        os.chmod(tmp, stat.st_mode & 0o7777)
+        with contextlib.suppress(PermissionError):
+            os.chown(tmp, stat.st_uid, stat.st_gid)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
 def main() -> int:
     env_path = Path(sys.argv[1])
     observed = parse_system_id(sys.stdin.read())
@@ -62,11 +100,7 @@ def main() -> int:
         print(f"conflict {error}")
         return 3
     if action == "record":
-        text = env_path.read_text(encoding="utf-8")
-        separator = "" if text.endswith("\n") or not text else "\n"
-        # Append (as install.sh does): keeps a symlinked .env a link and its mode.
-        with env_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{separator}{KEY}={observed}\n")
+        record(env_path, observed)
         print(f"recorded {observed}")
     else:
         print(f"unchanged {observed}")

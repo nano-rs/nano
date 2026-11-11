@@ -167,9 +167,44 @@ hosts, when you use HAProxy). For the host firewall itself, see step 5.
   `/var/lib/docker` *before* installing Docker, so the Docker volumes
   (ClickHouse, PostgreSQL, Keeper, etcd and the Vector buffers) land on it. Use
   ext4 with `noatime` (ClickHouse's recommended filesystem). Mount by UUID
-  with `nofail`. Docker 29 keeps **images** in the containerd image store at
+  with `nofail`, **and make Docker require the mount**. `nofail` alone lets
+  the host boot when the disk fails to mount (a slow device, an fsck that
+  stops), and Docker then starts on an empty `/var/lib/docker` on the root
+  disk and reports "active" with none of the host's containers or data. A
+  systemd drop-in stops that: Docker waits for the disk, and does not start
+  without it.
+
+  ```bash
+  ssh $H 'set -e; D=/dev/<data disk>; sudo mkfs.ext4 -L nano-data "$D"
+    U=$(sudo blkid -s UUID -o value "$D")
+    sudo mkdir -p /var/lib/docker
+    echo "UUID=$U /var/lib/docker ext4 defaults,noatime,nofail,x-systemd.device-timeout=120s 0 2" | sudo tee -a /etc/fstab
+    sudo systemctl daemon-reload && sudo mount /var/lib/docker
+    sudo mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d
+    printf "[Unit]\nRequiresMountsFor=/var/lib/docker\n" | sudo tee /etc/systemd/system/docker.service.d/nano-data-disk.conf
+    printf "[Unit]\nRequiresMountsFor=/var/lib/docker\n" | sudo tee /etc/systemd/system/containerd.service.d/nano-data-disk.conf
+    sudo systemctl daemon-reload'
+  ```
+
+  Run `mkfs` only on a new, empty disk (check `lsblk -f` first). Add the
+  drop-in on hosts that already have a data disk too. `RequiresMountsFor=`
+  implies `After=` the mount, so systemd mounts the disk before Docker even
+  with `nofail`. The installer refuses to run while the disk is unmounted and
+  warns when the drop-in is missing; `cluster-health.py` reports both
+  (`disk`). After a hard reset, check `findmnt /var/lib/docker` before
+  anything else. Docker 29 keeps **images** in the containerd image store at
   `/var/lib/containerd`, on the root disk: leave ~30 GB free there for images
-  (or bind-mount `/var/lib/containerd` from the data disk too).
+  (or bind-mount `/var/lib/containerd` from the data disk too, with
+  `x-systemd.requires-mounts-for=/var/lib/docker` on the bind).
+
+  The installer's guard reads `/etc/fstab`: it refuses while the entry that
+  holds Docker's directory is unmounted, and warns about the drop-in only for
+  a `nofail` or `noauto` entry (a plain partition, `/var` for example, is
+  required at boot already). Storage that fstab doesn't describe (a systemd
+  `.mount` unit, a SAN the host mounts itself): run the installer with
+  `NANO_DATA_MOUNT=<mount point>` so it checks that mount instead, or
+  `NANO_DATA_MOUNT=none` to skip the check. Only skip it when the operator
+  confirms Docker's data can't come up on the wrong disk.
 - **Local NVMe (ClickHouse `local-nvme` cloud plans):** RAID 0 the devices
   with `mdadm`, ext4, at `/var/lib/docker`. It is ephemeral: a stop, resize or
   host failure wipes it, and the other replica re-seeds it. Never stop both
@@ -314,6 +349,17 @@ Pick one:
 | Two HAProxy hosts + health-checked DNS (`--lb haproxy-dns`) | no managed LB and no VRRP; a DNS provider with health checks, TTL 60 s or less | survives either HAProxy host once DNS drops it (TTL + check interval, roughly 1-2 min; not measured by nano). Senders must retry and re-resolve DNS; clients that cache DNS forever do not fail over |
 | One HAProxy host (`--lb haproxy-single`) | nothing above is possible | **single point of failure at the edge** |
 
+No floating IP and no DNS provider with health checks? Then no option above
+removes the edge as a single point of failure, and say so plainly. The choices,
+best first: (1) ask for one of them: most clouds and many hosting providers sell
+a floating or reserved IP, and a DNS zone with health-checked records costs
+little; (2) run two HAProxy hosts and give senders and the app hosts both
+addresses (log shippers that accept a list of endpoints, `/etc/hosts` or a
+resolver with both A records): senders fail over, but browsers do not, so
+users switch address by hand while one LB host is down; (3) `--lb
+haproxy-single` and accept the edge outage while that host is down. Record the
+choice in the plan.
+
 For HAProxy, copy `deploy/compose/examples/load-balancer/haproxy.cfg` (and
 `keepalived.conf` for a pair) from the installed bundle onto the LB host(s),
 replace the certificate paths, hostnames and the `server` lines with the ones
@@ -328,7 +374,7 @@ Where HAProxy goes: with no `--lb-address`, the planner puts it on spare VMs.
 With no spare, it puts it on PostgreSQL-only hosts and says so: they are the
 lightest-loaded role, while app, ingest and ClickHouse hosts carry the request
 path (and the app and ingest edges own port 80). Losing such a host then also
-costs a PostgreSQL member (a short write pause: seconds, up to about 30 s). Recommend a small
+costs a PostgreSQL member (a write pause of about 20-25 s when it was the leader). Recommend a small
 spare VM (2 vCPU / 2 GB) per HAProxy host instead. With one HAProxy host,
 losing it takes the edge down whatever it shares.
 
@@ -412,7 +458,7 @@ guide's full-HA failover test:
 | VM stopped | Must keep working |
 |---|---|
 | an app host | UI, search and ingest, once the LB's `/readyz` checks drop it |
-| the Patroni leader | writes, sign-ins and searches see a short pause, typically a few seconds and up to about 30 s, while a standby is promoted (a 7-host test measured ~3 s of failed sign-ins), then resume; nothing acknowledged is lost; HEC/HTTP ingest continues |
+| the Patroni leader | writes, sign-ins and searches fail while a standby is promoted, then resume: a hard kill (power off, reset) measured 20-24 s on 7-host tests, because Patroni first waits for the dead leader's lock to expire; a planned switchover (upgrades) takes a few seconds. Nothing acknowledged is lost; HEC/HTTP ingest continues |
 | a ClickHouse replica | search and ingest on the other replica |
 | an ingest host | ingest on the others |
 | one HAProxy host | keepalived pair: about 3 s; DNS pair: after the TTL and health check (about 1-2 min) |

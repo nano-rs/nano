@@ -31,7 +31,7 @@ fn probes_skip_dead_replicas_and_follow_cluster_order() {
     );
     assert_eq!(
         cluster_replicas_sql("o'brien"),
-        "SELECT shard_num, replica_num, host_name, port FROM system.clusters WHERE cluster = 'o''brien' ORDER BY shard_num, replica_num"
+        "SELECT shard_num, replica_num, host_name, port FROM system.clusters WHERE cluster = 'o''brien' AND (database_replica_name = '' OR (SELECT countIf(database_replica_name = '') FROM system.clusters WHERE cluster = 'o''brien') = 0) ORDER BY shard_num, replica_num"
     );
 }
 
@@ -84,4 +84,17 @@ fn nothing_to_ensure_only_when_every_reachable_replica_has_every_object() {
     // Degenerate inputs never skip.
     assert!(!present_on_every_reachable_replica(0, 4, 0));
     assert!(!present_on_every_reachable_replica(3, 0, 0));
+}
+
+/// NAN-5255: the operator's Replicated `default` database registers a second
+/// `default` cluster in system.clusters. Only the remote_servers rows (empty
+/// `database_replica_name`) count, unless the name exists only as a
+/// Replicated database.
+#[test]
+fn server_cluster_rows_ignore_a_same_named_replicated_database() {
+    let predicate = server_cluster_rows_predicate("'default'");
+    assert_eq!(
+        predicate,
+        "cluster = 'default' AND (database_replica_name = '' OR (SELECT countIf(database_replica_name = '') FROM system.clusters WHERE cluster = 'default') = 0)"
+    );
 }

@@ -22,7 +22,30 @@ const TRACKING_TABLES: &[&str] = &[
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct DatabaseBootstrapVisibility {
     visible_nodes: u64,
+    /// Nodes that answered the `clusterAllReplicas` read (NAN-5255): tells
+    /// "a replica is down" apart from "every replica answers but the
+    /// database is missing on some".
+    answering_nodes: u64,
     expected_nodes: Option<u64>,
+}
+
+/// NAN-5255: operator-facing summary of one visibility observation. Never
+/// blames an unreachable replica when every configured replica answered.
+fn describe_visibility(visible: u64, answering: u64, expected: Option<u64>) -> String {
+    match expected {
+        None => format!(
+            "database visible on {visible} of {answering} answering nodes; cluster size unavailable"
+        ),
+        Some(expected) if answering < expected => format!(
+            "database visible on {visible}/{expected} nodes; only {answering}/{expected} \
+             configured replicas answer"
+        ),
+        Some(expected) => format!(
+            "database visible on {visible}/{expected} nodes although all {answering} configured \
+             replicas answer (CREATE DATABASE ON CLUSTER has not reached every replica: check \
+             system.distributed_ddl_queue)"
+        ),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -56,9 +79,14 @@ impl ClickHouseMigrator {
 
         let database = crate::sql_hygiene::escape_sql_string(&self.database);
         let cluster = crate::sql_hygiene::escape_sql_string(cluster);
+        // NAN-5255: count only the remote_servers rows. The operator's
+        // Replicated `default` database registers a second `default` cluster
+        // in system.clusters that clusterAllReplicas never reaches.
+        let rows = super::cluster_reachability::server_cluster_rows_predicate(&format!("'{cluster}'"));
         Some(format!(
             "SELECT countIf(name = '{database}') AS visible_nodes, \
-             (SELECT count() FROM system.clusters WHERE cluster = '{cluster}') AS expected_nodes \
+             uniqExact(shardNum()) AS answering_nodes, \
+             (SELECT count() FROM system.clusters WHERE {rows}) AS expected_nodes \
              FROM clusterAllReplicas('{cluster}', system.databases)"
         ))
     }
@@ -82,22 +110,16 @@ impl ClickHouseMigrator {
                     Ok(DatabaseBootstrapVisibility {
                         visible_nodes,
                         expected_nodes: Some(expected_nodes),
+                        ..
                     }) if expected_nodes > 0 && visible_nodes == expected_nodes =>
                     {
                         return Ok(());
                     }
                     Ok(DatabaseBootstrapVisibility {
                         visible_nodes,
-                        expected_nodes: Some(expected_nodes),
-                    }) => {
-                        format!("database visible on {visible_nodes}/{expected_nodes} nodes")
-                    }
-                    Ok(DatabaseBootstrapVisibility {
-                        visible_nodes,
-                        expected_nodes: None,
-                    }) => {
-                        format!("database visible on {visible_nodes} nodes; cluster size unavailable")
-                    }
+                        answering_nodes,
+                        expected_nodes,
+                    }) => describe_visibility(visible_nodes, answering_nodes, expected_nodes),
                     Err(error) => format!("cluster visibility query failed: {error}"),
                 };
 

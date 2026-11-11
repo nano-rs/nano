@@ -30,7 +30,7 @@ mod tests {
         assert_eq!(
             migrator.database_bootstrap_visibility_sql().as_deref(),
             Some(
-                "SELECT countIf(name = 'nanosiem') AS visible_nodes, (SELECT count() FROM system.clusters WHERE cluster = 'default') AS expected_nodes FROM clusterAllReplicas('default', system.databases)"
+                "SELECT countIf(name = 'nanosiem') AS visible_nodes, uniqExact(shardNum()) AS answering_nodes, (SELECT count() FROM system.clusters WHERE cluster = 'default' AND (database_replica_name = '' OR (SELECT countIf(database_replica_name = '') FROM system.clusters WHERE cluster = 'default') = 0)) AS expected_nodes FROM clusterAllReplicas('default', system.databases)"
             )
         );
 
