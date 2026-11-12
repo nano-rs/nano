@@ -8,6 +8,7 @@
 //! Includes ClickHouse Cloud compatibility: automatically detects CH Cloud environments
 //! and strips unsupported settings/index types before executing statements.
 
+mod busy_retry;
 mod cluster_reachability;
 mod detection;
 mod distributed;
@@ -22,6 +23,8 @@ mod types;
 mod tests;
 #[cfg(test)]
 mod soft_fail_tests;
+#[cfg(test)]
+mod busy_retry_tests;
 
 pub(crate) use cluster_reachability::server_cluster_rows_predicate;
 pub(crate) use detection::configured_or_detected_cluster;

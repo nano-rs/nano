@@ -35,6 +35,7 @@ fn load_parsers(dir: &Path, n: usize) -> Vec<Parser> {
             let y = parse_parser_yaml(&raw).expect("parse parser.yaml");
             let now = chrono::Utc::now();
             Parser {
+                activation_parked: false,
                 // Deterministic ids so two runs over the same set render the
                 // same `_nano_parser_id` stamps.
                 id: stable_id(&y.name),

@@ -51,6 +51,12 @@ pub use vector_config::{
     VectorConfigPublisher,
 };
 pub use vector_config::delivery as vector_config_delivery;
+pub use vector_config::{
+    BackupGeneration as VectorBackupGeneration, VerifyFailure as VectorVerifyFailure,
+    fanin_slots_enabled as vector_config_fanin_slots_enabled,
+    is_router_fed as vector_config_is_router_fed,
+    local_reload_disabled as vector_config_local_reload_disabled,
+};
 pub use vector_config::remote_delivery as vector_config_remote_delivery;
 #[cfg(test)]
 pub(crate) use vector_config::test_hooks as vector_config_test_hooks;

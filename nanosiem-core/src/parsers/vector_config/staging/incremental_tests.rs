@@ -22,6 +22,7 @@ fn parser(name: &str, vrl: &str, match_values: Option<Vec<&str>>) -> Parser {
     let id = uuid::Uuid::from_bytes(bytes);
     let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     Parser {
+        activation_parked: false,
         id,
         name: name.to_string(),
         description: None,

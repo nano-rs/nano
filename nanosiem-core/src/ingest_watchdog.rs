@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::clickhouse_transport;
+use crate::ingest_stall::{IngestStallProbe, StallAlert, StallTracker};
 use crate::sql_hygiene::escape_sql_identifier;
 
 const DATABASE: &str = "nanosiem";
@@ -119,6 +120,10 @@ pub struct WatchdogSample {
     pub memory_limit_bytes: u64,
     pub refreshes_running: u64,
     pub disabled_views: Vec<String>,
+    /// NAN-5296 stall signals. Alert-only: they never count as HOT, because
+    /// stopping refreshable views cannot release a stuck flush.
+    #[serde(default)]
+    pub stall: IngestStallProbe,
 }
 
 impl WatchdogSample {
@@ -323,6 +328,7 @@ impl From<SampleRow> for WatchdogSample {
             memory_limit_bytes: row.memory_limit_bytes,
             refreshes_running: row.refreshes_running,
             disabled_views: row.disabled_views,
+            stall: IngestStallProbe::default(),
         }
     }
 }
@@ -351,6 +357,7 @@ struct WatchdogNode {
     state: Mutex<WatchdogState>,
     state_loaded: Mutex<bool>,
     reachable_replicas: Mutex<BTreeSet<String>>,
+    stall: Mutex<StallTracker>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +472,7 @@ impl IngestWatchdog {
                     state: Mutex::new(WatchdogState::default()),
                     state_loaded: Mutex::new(false),
                     reachable_replicas: Mutex::new(BTreeSet::new()),
+                    stall: Mutex::new(StallTracker::default()),
                 })
             })
             .collect();
@@ -515,9 +523,12 @@ impl IngestWatchdog {
     async fn tick_node(&self, node: &WatchdogNode) -> Result<(), IngestWatchdogError> {
         let observations = sample_replicas(node).await;
         invalidate_state_when_coverage_changes(node, &observations).await;
+        let sample = aggregate_sample(&observations);
+        // Before anything that writes: during a stall every INSERT waits or
+        // fails with 202, so the alert must not queue behind them.
+        report_stall(node, &sample).await;
         persist_replica_status(node, &observations, &self.config).await;
         let all_reachable = observations.iter().all(ReplicaObservation::reachable);
-        let sample = aggregate_sample(&observations);
         self.ensure_state_loaded(node, &observations).await?;
         if self.reconcile_pending(node, &sample).await? {
             return Ok(());
@@ -1111,6 +1122,7 @@ fn aggregate_sample(observations: &[ReplicaObservation]) -> WatchdogSample {
             .oldest_flush_age_seconds
             .max(sample.oldest_flush_age_seconds);
         result.running_queries = result.running_queries.max(sample.running_queries);
+        result.stall = result.stall.merge(sample.stall);
         // Keep usage and limit from the same replica. Independent maxima could
         // hide a hot small replica behind a larger replica's denominator, which
         // would violate the "HOT if any target is hot" contract.
@@ -1269,7 +1281,45 @@ async fn catch_up(node: &WatchdogNode, views: &[OwnedView]) -> Result<(), Ingest
     }
 }
 
+/// NAN-5296: raise the ingest-stall alert. It is a log line on purpose: the
+/// journal and SIEM Health tables need INSERTs, which fail with 202 for as
+/// long as the stall lasts. SIEM Health reads the same signal from
+/// system.processes on its own pass.
+async fn report_stall(node: &WatchdogNode, sample: &WatchdogSample) {
+    let alert = node.stall.lock().await.observe(&sample.stall, Utc::now());
+    match alert {
+        StallAlert::Calm => {}
+        StallAlert::Firing(reasons) => tracing::error!(
+            node = %node.name,
+            alert = "ingest_stall",
+            stuck_async_flushes = sample.stall.stuck_async_flushes,
+            longest_async_flush_seconds = sample.stall.longest_async_flush_seconds,
+            reasons = %reasons.join("; "),
+            "ALERT ingest stalled: async-insert flushes are not completing; every insert will \
+             fail with code 202 once the insert slots fill. Inspect system.stack_trace for the \
+             AsyncInsertFlush query IDs (CPULeaseAllocation::renew = workload CPU cap deadlock, \
+             NAN-5296)"
+        ),
+        StallAlert::Cleared => tracing::warn!(
+            node = %node.name,
+            alert = "ingest_stall",
+            "Ingest stall cleared: async-insert flushes are completing again"
+        ),
+    }
+}
+
 async fn collect_sample(client: &Client) -> Result<WatchdogSample, IngestWatchdogError> {
+    let mut sample = collect_pressure_sample(client).await?;
+    // The stall probe reads system.scheduler, which a locked-down user may not
+    // see. Missing it must not cost the pressure sample its coverage.
+    match crate::ingest_stall::probe(client).await {
+        Ok(stall) => sample.stall = stall,
+        Err(error) => tracing::warn!(%error, "Ingest-stall probe failed; stall alerting is blind on this replica"),
+    }
+    Ok(sample)
+}
+
+async fn collect_pressure_sample(client: &Client) -> Result<WatchdogSample, IngestWatchdogError> {
     client
         .query(
             "SELECT \

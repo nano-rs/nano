@@ -286,6 +286,11 @@
             <wait_for_async_insert>1</wait_for_async_insert>
             <async_insert_max_data_size>104857600</async_insert_max_data_size> <!-- 100MB -->
             <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
+            <!-- NAN-5296: the default profile's adaptive floor (2000 ms) sits
+                 above this profile's 1000 ms ceiling, and ClickHouse warned on
+                 every flush. Pin the floor to the ceiling: the flush cadence
+                 stays exactly 1 s. -->
+            <async_insert_busy_timeout_min_ms>1000</async_insert_busy_timeout_min_ms>
             <async_insert_stale_timeout_ms>5000</async_insert_stale_timeout_ms>
 
             <!-- Allow deduplication for idempotent inserts -->

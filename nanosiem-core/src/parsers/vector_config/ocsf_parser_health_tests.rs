@@ -46,6 +46,7 @@ if ok {
 
 fn parser(id: Uuid, vrl: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id,
         name: "json_generic".into(),
         description: None,

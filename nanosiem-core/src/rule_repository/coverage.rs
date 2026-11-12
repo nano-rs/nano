@@ -5,12 +5,17 @@
 //! Analyzes which rules can run based on available log sources and UDM fields.
 
 use serde::Deserialize;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::ScopeSet;
 use crate::db::DualPool;
+use crate::schema::{SchemaId, SchemaProfile};
+
+use super::field_census;
 
 use super::models::{
     normalize_coverage_severity, normalize_coverage_tactic, CoverageAnalysis, CoverageBySeverity,
@@ -21,6 +26,12 @@ use super::models::{
 #[derive(clickhouse::Row, Deserialize)]
 struct SourceTypeRow {
     source_type: String,
+}
+
+/// Row for the census column-inventory query
+#[derive(clickhouse::Row, Deserialize)]
+struct ColumnNameRow {
+    name: String,
 }
 
 #[derive(Debug, Error)]
@@ -81,16 +92,26 @@ pub const COVERAGE_STATUS_UNKNOWN: &str = "unknown";
 /// therefore takes an explicit [`ScopeSet`] and filters against it at read time.
 pub struct CoverageAnalyzer {
     dual_pool: DualPool,
-    /// Raw, unscoped cache of available fields per source type. Never returned
-    /// directly — always filtered through the calling principal's scope.
+    /// The active schema profile: resolves rule field names to the columns /
+    /// spill keys the census records (NAN-5271 #28).
+    profile: Arc<dyn SchemaProfile>,
+    /// Raw, unscoped cache of available fields per source type, as census keys
+    /// (see [`field_census`]). An EMPTY set means the census is unknown for that
+    /// source, not that it has no fields. Never returned directly — always
+    /// filtered through the calling principal's scope.
     available_fields: HashMap<String, HashSet<String>>,
 }
 
 impl CoverageAnalyzer {
     /// Create a new coverage analyzer with DualPool
     pub fn new(dual_pool: DualPool) -> Self {
+        // Same profile the active logs table is chosen from; a malformed env
+        // falls back to UDM exactly like `active_logs_table`.
+        let profile = crate::schema::active_profile_from_env()
+            .unwrap_or_else(|_| crate::schema::profile_for_id(SchemaId::Udm));
         Self {
             dual_pool,
+            profile,
             available_fields: HashMap::new(),
         }
     }
@@ -125,16 +146,60 @@ impl CoverageAnalyzer {
             .await
             .map_err(|e| CoverageAnalyzerError::Query(e.to_string()))?;
 
+        // NAN-5271 #28: record which fields each source actually carries. A
+        // failed column inventory leaves every census unknown (empty), which
+        // coverage reads as "can't judge fields" — never as "no fields".
+        let bare_table = crate::schema::active_logs_table();
+        let columns: Vec<String> = match ch_client
+            .query(&field_census::build_census_columns_sql(bare_table))
+            .fetch_all::<ColumnNameRow>()
+            .await
+        {
+            Ok(rows) => rows.into_iter().map(|r| r.name).collect(),
+            Err(e) => {
+                warn!(error = %e, "rule coverage: column inventory failed; field census skipped");
+                Vec::new()
+            }
+        };
+
+        let now = chrono::Utc::now();
+        let profile = self.profile.clone();
+        let censuses: Vec<(String, HashSet<String>)> =
+            futures::stream::iter(result.into_iter().map(|row| row.source_type))
+                .map(|source_type| {
+                    let profile = profile.clone();
+                    let columns = &columns;
+                    let logs_table = &logs_table;
+                    async move {
+                        let census = field_census::census_source(
+                            ch_client,
+                            profile.as_ref(),
+                            logs_table,
+                            columns,
+                            &source_type,
+                            now,
+                        )
+                        .await;
+                        (source_type, census)
+                    }
+                })
+                .buffer_unordered(field_census::CENSUS_CONCURRENCY)
+                .collect()
+                .await;
+
         self.available_fields.clear();
-        for row in result {
-            // Store source type with empty field set (fields not tracked for now)
-            self.available_fields
-                .insert(row.source_type, HashSet::new());
+        let mut censused = 0usize;
+        for (source_type, census) in censuses {
+            if !census.is_empty() {
+                censused += 1;
+            }
+            self.available_fields.insert(source_type, census);
         }
 
         info!(
-            "Refreshed available source types: {} found",
-            self.available_fields.len()
+            "Refreshed available source types: {} found, {} with a field census",
+            self.available_fields.len(),
+            censused
         );
         Ok(())
     }
@@ -208,7 +273,7 @@ impl CoverageAnalyzer {
         rule: &RepositoryRule,
         access: &LiveInventoryAccess<'_>,
     ) -> CoverageResult {
-        check_rule_coverage_in(&self.available_fields, rule, access)
+        check_rule_coverage_in(self.profile.as_ref(), &self.available_fields, rule, access)
     }
 
     /// Analyze coverage for multiple rules against the sources `access` permits.
@@ -235,7 +300,7 @@ impl CoverageAnalyzer {
                 .into_iter()
                 .map(|(source_type, fields)| (source_type.clone(), fields.clone()))
                 .collect();
-        analyze_coverage_with(rules, filter, &visible_fields, |rule| {
+        analyze_coverage_with(self.profile.as_ref(), rules, filter, &visible_fields, |rule| {
             self.check_rule_coverage(rule, access)
         })
     }
@@ -246,7 +311,8 @@ impl CoverageAnalyzer {
 /// Free-standing (rather than a method) so the authorization behavior can be
 /// exercised over a synthetic inventory without a live `DualPool` — the shape
 /// the NAN-2081 regressions need.
-fn check_rule_coverage_in(
+pub(crate) fn check_rule_coverage_in(
+    profile: &dyn SchemaProfile,
     inventory: &HashMap<String, HashSet<String>>,
     rule: &RepositoryRule,
     access: &LiveInventoryAccess<'_>,
@@ -278,9 +344,9 @@ fn check_rule_coverage_in(
         };
     };
 
-    // Find which source types have the required fields
-    let mut available_fields = HashSet::new();
     let mut available_source_types = Vec::new();
+    // Census sets of the relevant sources whose census is KNOWN (non-empty).
+    let mut known_censuses: Vec<&HashSet<String>> = Vec::new();
 
     // Collect the source types this caller may observe. A source denied by
     // per-source RBAC must not appear in the inventory, the suggestions, or the
@@ -291,56 +357,83 @@ fn check_rule_coverage_in(
 
         available_source_types.push(source_type.clone());
 
-        // Check if this source type might be relevant for field tracking
+        // Only sources the rule targets (or every source, for a rule that
+        // names none) count toward its field coverage.
         let is_suggested = suggested_source_types.is_empty()
             || suggested_source_types.iter().any(|s| {
                 st_lower.contains(&s.to_lowercase()) || s.to_lowercase().contains(&st_lower)
             });
 
-        if is_suggested {
-            // Add fields from this source type
-            for field in fields {
-                // Map common field names
-                let normalized = normalize_field_name(field);
-                if required_fields.contains(&normalized) || required_fields.contains(field) {
-                    available_fields.insert(field.clone());
-                }
-            }
+        if is_suggested && !fields.is_empty() {
+            known_censuses.push(fields);
         }
     }
 
     // Sort source types alphabetically
     available_source_types.sort();
 
-    // Calculate missing fields
-    let missing_fields: Vec<String> = required_fields
-        .iter()
-        .filter(|f| {
-            !available_fields.contains(*f) && !available_fields.contains(&normalize_field_name(f))
-        })
-        .cloned()
-        .collect();
+    let spill = profile.json_tail_column();
+    let mut available_fields = Vec::new();
+    let mut missing_fields = Vec::new();
+    let mut judged_present = 0usize;
+    for field in &required_fields {
+        // NAN-5271 #28: judge a field only when it resolves to something the
+        // census records AND at least one relevant source has a known census.
+        // An unknown census, or a field the census cannot see (an OCSF
+        // attribute living only in the stored `event` object), is never
+        // reported missing — "we don't know" must not read as "none".
+        let key = field_key(profile, field);
+        match key {
+            Some(key) if !known_censuses.is_empty() => {
+                if known_censuses
+                    .iter()
+                    .any(|census| field_census::census_has(census, spill, &key))
+                {
+                    judged_present += 1;
+                    available_fields.push(field.clone());
+                } else {
+                    missing_fields.push(field.clone());
+                }
+            }
+            _ => available_fields.push(field.clone()),
+        }
+    }
+    available_fields.sort();
+    missing_fields.sort();
 
-    // Determine coverage status
-    let status = if required_fields.is_empty() || missing_fields.is_empty() {
-        "full".to_string()
-    } else if available_fields.is_empty() {
-        "none".to_string()
+    let status = if missing_fields.is_empty() {
+        "full"
+    } else if judged_present == 0 {
+        "none"
     } else {
-        "partial".to_string()
+        "partial"
     };
 
     CoverageResult {
-        status,
+        status: status.to_string(),
         required_fields: required_fields.into_iter().collect(),
-        available_fields: available_fields.into_iter().collect(),
+        available_fields,
         missing_fields,
         suggested_source_types,
         available_source_types,
     }
 }
 
+/// The census key for a rule field: the Sigma-era spellings are normalized
+/// first, then the active profile resolves the name (UDM name, OCSF path, or
+/// a UDM-name alias under OCSF) to its physical column or spill key.
+fn field_key(profile: &dyn SchemaProfile, field: &str) -> Option<String> {
+    let normalized = if field.contains('.') {
+        field.to_string()
+    } else {
+        normalize_field_name(field)
+    };
+    field_census::census_key(profile, &normalized)
+        .or_else(|| field_census::census_key(profile, field))
+}
+
 fn analyze_coverage_with<F>(
+    profile: &dyn SchemaProfile,
     rules: &[RepositoryRule],
     filter: &CoverageFilter,
     available_fields: &HashMap<String, HashSet<String>>,
@@ -439,9 +532,15 @@ where
     let mut missing_fields: Vec<MissingFieldCount> = missing_field_counts
         .into_iter()
         .map(|(field, count)| {
+            let key = field_key(profile, &field);
+            let spill = profile.json_tail_column();
             let source_types_with_field = available_fields
                 .iter()
-                .filter(|(_, fields)| fields.contains(&field))
+                .filter(|(_, fields)| {
+                    key.as_deref().is_some_and(|k| {
+                        !fields.is_empty() && field_census::census_has(fields, spill, k)
+                    })
+                })
                 .map(|(st, _)| st.clone())
                 .collect();
             MissingFieldCount {
@@ -516,6 +615,10 @@ fn tactic_to_name(tactic: &str) -> String {
         _ => tactic.replace('_', " ").replace('-', " "),
     }
 }
+
+#[cfg(test)]
+#[path = "coverage_census_tests.rs"]
+mod coverage_census_tests;
 
 #[cfg(test)]
 mod tests {
@@ -654,7 +757,7 @@ mod tests {
             let rule = repository_rule(uuid::Uuid::now_v7(), "high", &[], &[]);
             let inv = inventory(&["windows_sysmon", "apache_http_server"]);
 
-            let denied = check_rule_coverage_in(&inv, &rule, &LiveInventoryAccess::Denied);
+            let denied = check_rule_coverage_in(&crate::schema::UdmProfile::new(), &inv, &rule, &LiveInventoryAccess::Denied);
             assert!(denied.available_source_types.is_empty());
             assert!(denied.available_fields.is_empty());
             assert_eq!(denied.status, COVERAGE_STATUS_UNKNOWN);
@@ -663,7 +766,7 @@ mod tests {
             // With the capability, the same inventory answers normally.
             let unrestricted = ScopeSet::unrestricted();
             let allowed = LiveInventoryAccess::Scoped(&unrestricted);
-            let granted = check_rule_coverage_in(&inv, &rule, &allowed);
+            let granted = check_rule_coverage_in(&crate::schema::UdmProfile::new(), &inv, &rule, &allowed);
             assert_eq!(granted.available_source_types.len(), 2);
             assert_ne!(granted.status, COVERAGE_STATUS_UNKNOWN);
             assert!(allowed.permits_live_data());
@@ -678,7 +781,7 @@ mod tests {
             let restricted = scope(&["windows_sysmon"]);
 
             let result =
-                check_rule_coverage_in(&inv, &rule, &LiveInventoryAccess::Scoped(&restricted));
+                check_rule_coverage_in(&crate::schema::UdmProfile::new(), &inv, &rule, &LiveInventoryAccess::Scoped(&restricted));
             assert_eq!(
                 result.available_source_types,
                 vec!["apache_http_server".to_string()]
@@ -748,7 +851,13 @@ mod tests {
             mitre_technique: Some("T1059.001".to_string()),
         };
 
-        let analysis = analyze_coverage_with(&rules, &filter, &HashMap::new(), |_| full_coverage());
+        let analysis = analyze_coverage_with(
+            &crate::schema::UdmProfile::new(),
+            &rules,
+            &filter,
+            &HashMap::new(),
+            |_| full_coverage(),
+        );
 
         assert_eq!(analysis.total_rules, 1);
         assert_eq!(analysis.full_coverage, 1);

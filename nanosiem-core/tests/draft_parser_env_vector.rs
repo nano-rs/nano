@@ -45,6 +45,7 @@ fn repo() -> PathBuf {
 
 fn parser(name: &str, source_type: &str, enabled: bool, vrl: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id: Uuid::new_v4(),
         name: name.to_string(),
         description: None,

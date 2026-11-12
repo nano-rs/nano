@@ -16,6 +16,15 @@ use uuid::Uuid;
 
 use super::{RuleVersion, VersionChangeReason};
 
+// Enterprise AI-tuning rollbacks of a tuning log (plan, lock/validate, mark
+// reverted). A child module so the open-core mirror strip removes the source,
+// not just the build (NAN-5281).
+#[cfg(feature = "enterprise")]
+#[path = "versions_tuning_revert.rs"]
+mod tuning_revert;
+#[cfg(feature = "enterprise")]
+pub use tuning_revert::TuningRevertPlan;
+
 /// Errors that can occur during version management operations
 #[derive(Error, Debug)]
 pub enum VersionManagerError {
@@ -57,12 +66,6 @@ pub struct VersionRevertResult {
     pub runtime_sync_claimed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TuningRevertPlan {
-    Ready,
-    Replayed(VersionRevertResult),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRuntimeSync {
     pub rule_id: Uuid,
@@ -73,14 +76,6 @@ impl From<sqlx::Error> for VersionManagerError {
     fn from(err: sqlx::Error) -> Self {
         VersionManagerError::DatabaseError(err.to_string())
     }
-}
-
-// Only the enterprise AI-tuning / DaC push paths call this.
-#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
-fn tuning_log_is_revertible(status: &str, already_reverted: bool, proposal_type: &str) -> bool {
-    proposal_type == "query_tuning"
-        && !already_reverted
-        && matches!(status, "promoted" | "manually_approved")
 }
 
 fn same_rule_content(left: &RuleVersion, right: &RuleVersion) -> bool {
@@ -452,171 +447,6 @@ impl RuleVersionManager {
         .await
     }
 
-    /// Validate that a tuning-log rollback points at the version immediately
-    /// preceding the version applied by that log. This check runs again under
-    /// the commit transaction; the preflight lets handlers reject a bad target
-    /// before doing any external runtime work.
-    #[cfg(feature = "enterprise")]
-    pub async fn plan_tuning_revert(
-        &self,
-        rule_id: Uuid,
-        version_id: i32,
-        log_id: Uuid,
-    ) -> Result<TuningRevertPlan, VersionManagerError> {
-        let state: Option<(
-            Uuid,
-            String,
-            Option<chrono::DateTime<Utc>>,
-            Option<i32>,
-            Option<i32>,
-            Option<i32>,
-            String,
-        )> = sqlx::query_as(
-            r#"
-                SELECT tl.rule_id, tl.status, tl.reverted_at,
-                       tl.reverted_to_version_id, tl.reverted_result_version_id,
-                       tl.applied_version_id, tp.proposal_type
-                FROM tuning_logs tl
-                INNER JOIN tuning_proposals tp ON tp.id = tl.proposal_id
-                WHERE tl.id = $1
-                "#,
-        )
-        .bind(log_id)
-        .fetch_optional(&self.pg_pool)
-        .await?;
-
-        let Some((
-            log_rule_id,
-            status,
-            reverted_at,
-            reverted_to_version_id,
-            reverted_result_version_id,
-            applied_version_id,
-            proposal_type,
-        )) = state
-        else {
-            return Err(VersionManagerError::TuningLogNotFound(log_id));
-        };
-
-        if log_rule_id == rule_id
-            && status == "reverted"
-            && reverted_to_version_id == Some(version_id)
-        {
-            if let Some(result_version_id) = reverted_result_version_id {
-                let runtime_sync_required: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM detection_rule_runtime_sync_jobs
-                        WHERE rule_id = $1 AND desired_version_id = $2
-                    )",
-                )
-                .bind(rule_id)
-                .bind(result_version_id)
-                .fetch_one(&self.pg_pool)
-                .await?;
-                return Ok(TuningRevertPlan::Replayed(VersionRevertResult {
-                    version_id: result_version_id,
-                    changed: false,
-                    replayed: true,
-                    runtime_sync_required,
-                    runtime_sync_claimed: false,
-                }));
-            }
-        }
-
-        let predecessor_id = self
-            .tuning_predecessor_id(log_rule_id, applied_version_id)
-            .await?;
-        if log_rule_id != rule_id
-            || predecessor_id != Some(version_id)
-            || !tuning_log_is_revertible(&status, reverted_at.is_some(), &proposal_type)
-        {
-            return Err(VersionManagerError::TuningLogNotRevertible(log_id));
-        }
-
-        Ok(TuningRevertPlan::Ready)
-    }
-
-    #[cfg(feature = "enterprise")]
-    async fn tuning_predecessor_id(
-        &self,
-        rule_id: Uuid,
-        applied_version_id: Option<i32>,
-    ) -> Result<Option<i32>, VersionManagerError> {
-        let Some(applied_version_id) = applied_version_id else {
-            return Ok(None);
-        };
-        Ok(sqlx::query_scalar(
-            r#"
-            SELECT previous.id
-            FROM detection_rule_versions applied
-            INNER JOIN LATERAL (
-                SELECT id
-                FROM detection_rule_versions
-                WHERE rule_id = applied.rule_id
-                  AND version_number < applied.version_number
-                ORDER BY version_number DESC
-                LIMIT 1
-            ) previous ON TRUE
-            WHERE applied.id = $1 AND applied.rule_id = $2
-            "#,
-        )
-        .bind(applied_version_id)
-        .bind(rule_id)
-        .fetch_optional(&self.pg_pool)
-        .await?)
-    }
-
-    /// Revert a rule and mark its tuning log in the same transaction.
-    #[cfg(feature = "enterprise")]
-    pub async fn revert_tuning_log(
-        &self,
-        rule_id: Uuid,
-        version_id: i32,
-        reverted_by: Uuid,
-        log_id: Uuid,
-        reason: String,
-    ) -> Result<VersionRevertResult, VersionManagerError> {
-        if reason.trim().is_empty() {
-            return Err(VersionManagerError::TuningLogNotRevertible(log_id));
-        }
-        self.revert_to_version_inner(
-            rule_id,
-            version_id,
-            reverted_by,
-            Some((log_id, reason)),
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// Revert a tuning log and claim any runtime reconciliation for this node.
-    #[cfg(feature = "enterprise")]
-    pub async fn revert_tuning_log_claimed(
-        &self,
-        rule_id: Uuid,
-        version_id: i32,
-        reverted_by: Uuid,
-        log_id: Uuid,
-        reason: String,
-        sync_owner: &str,
-        expected_rule_mode: &str,
-        expected_detection_mode: &str,
-    ) -> Result<VersionRevertResult, VersionManagerError> {
-        if reason.trim().is_empty() {
-            return Err(VersionManagerError::TuningLogNotRevertible(log_id));
-        }
-        self.revert_to_version_inner(
-            rule_id,
-            version_id,
-            reverted_by,
-            Some((log_id, reason)),
-            Some(sync_owner),
-            Some((expected_rule_mode, expected_detection_mode)),
-        )
-        .await
-    }
-
     async fn revert_to_version_inner(
         &self,
         rule_id: Uuid,
@@ -663,116 +493,21 @@ impl RuleVersionManager {
             }
         }
 
+        // Enterprise AI tuning: lock and validate the tuning log being reverted
+        // (an already-committed revert replays instead).
         #[cfg(feature = "enterprise")]
         if let Some((log_id, _)) = tuning_log.as_ref() {
-            let log_state: Option<(
-                Uuid,
-                String,
-                Option<chrono::DateTime<Utc>>,
-                Option<i32>,
-                Option<i32>,
-                Option<i32>,
-                String,
-            )> = sqlx::query_as(
-                r#"
-                SELECT tl.rule_id, tl.status, tl.reverted_at,
-                       tl.reverted_to_version_id, tl.reverted_result_version_id,
-                       tl.applied_version_id, tp.proposal_type
-                FROM tuning_logs tl
-                INNER JOIN tuning_proposals tp ON tp.id = tl.proposal_id
-                WHERE tl.id = $1
-                FOR UPDATE OF tl
-                "#,
+            if let Some(replayed) = tuning_revert::lock_and_check_tuning_log(
+                &mut tx,
+                rule_id,
+                version_id,
+                *log_id,
+                runtime_sync_owner,
             )
-            .bind(log_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            let Some((
-                log_rule_id,
-                status,
-                reverted_at,
-                reverted_to_version_id,
-                reverted_result_version_id,
-                applied_version_id,
-                proposal_type,
-            )) = log_state
-            else {
-                return Err(VersionManagerError::TuningLogNotFound(*log_id));
-            };
-            if log_rule_id == rule_id
-                && status == "reverted"
-                && reverted_to_version_id == Some(version_id)
+            .await?
             {
-                if let Some(result_version_id) = reverted_result_version_id {
-                    let claimed = if let Some(owner) = runtime_sync_owner {
-                        sqlx::query_scalar::<_, Uuid>(
-                            r#"
-                            UPDATE detection_rule_runtime_sync_jobs
-                            SET claimed_by = $3, claimed_at = NOW(), updated_at = NOW()
-                            WHERE rule_id = $1 AND desired_version_id = $2
-                              AND (claimed_by IS NULL OR claimed_by = $3
-                                   OR claimed_at < NOW() - INTERVAL '5 minutes')
-                            RETURNING rule_id
-                            "#,
-                        )
-                        .bind(rule_id)
-                        .bind(result_version_id)
-                        .bind(owner)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                        .is_some()
-                    } else {
-                        false
-                    };
-                    let runtime_sync_required: bool = sqlx::query_scalar(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM detection_rule_runtime_sync_jobs
-                            WHERE rule_id = $1 AND desired_version_id = $2
-                        )",
-                    )
-                    .bind(rule_id)
-                    .bind(result_version_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    tx.commit().await?;
-                    return Ok(VersionRevertResult {
-                        version_id: result_version_id,
-                        changed: false,
-                        replayed: true,
-                        runtime_sync_required,
-                        runtime_sync_claimed: claimed,
-                    });
-                }
-            }
-            let predecessor_id: Option<i32> = if let Some(applied_version_id) = applied_version_id {
-                sqlx::query_scalar(
-                    r#"
-                    SELECT previous.id
-                    FROM detection_rule_versions applied
-                    INNER JOIN LATERAL (
-                        SELECT id
-                        FROM detection_rule_versions
-                        WHERE rule_id = applied.rule_id
-                          AND version_number < applied.version_number
-                        ORDER BY version_number DESC
-                        LIMIT 1
-                    ) previous ON TRUE
-                    WHERE applied.id = $1 AND applied.rule_id = $2
-                    "#,
-                )
-                .bind(applied_version_id)
-                .bind(log_rule_id)
-                .fetch_optional(&mut *tx)
-                .await?
-            } else {
-                None
-            };
-            if log_rule_id != rule_id
-                || predecessor_id != Some(version_id)
-                || !tuning_log_is_revertible(&status, reverted_at.is_some(), &proposal_type)
-            {
-                return Err(VersionManagerError::TuningLogNotRevertible(*log_id));
+                tx.commit().await?;
+                return Ok(replayed);
             }
         }
 
@@ -925,24 +660,14 @@ impl RuleVersionManager {
 
         #[cfg(feature = "enterprise")]
         if let Some((log_id, reason)) = tuning_log {
-            sqlx::query(
-                r#"
-                UPDATE tuning_logs
-                SET status = 'reverted',
-                    reverted_at = NOW(),
-                    reverted_by = $1,
-                    reverted_to_version_id = $2,
-                    reverted_result_version_id = $3,
-                    revert_reason = $4
-                WHERE id = $5
-                "#,
+            tuning_revert::mark_tuning_log_reverted(
+                &mut tx,
+                log_id,
+                &reason,
+                reverted_by,
+                version_id,
+                revert_version_id,
             )
-            .bind(reverted_by)
-            .bind(version_id)
-            .bind(revert_version_id)
-            .bind(reason)
-            .bind(log_id)
-            .execute(&mut *tx)
             .await?;
         }
 
@@ -1274,19 +999,6 @@ mod tests {
 
         let err = VersionManagerError::NoActiveVersion(Uuid::now_v7());
         assert!(err.to_string().contains("No active version found"));
-    }
-
-    #[test]
-    fn only_applied_unreverted_tuning_logs_can_revert() {
-        assert!(tuning_log_is_revertible("promoted", false, "query_tuning"));
-        assert!(tuning_log_is_revertible(
-            "manually_approved",
-            false,
-            "query_tuning"
-        ));
-        assert!(!tuning_log_is_revertible("proposed", false, "query_tuning"));
-        assert!(!tuning_log_is_revertible("promoted", true, "query_tuning"));
-        assert!(!tuning_log_is_revertible("promoted", false, "hint_update"));
     }
 
     #[test]

@@ -341,12 +341,12 @@ impl ParserRepositoryService {
             INSERT INTO log_sources (
                 id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, match_field, match_values,
-                validated, validation_error, lifecycle_status
+                validated, validation_error, lifecycle_status, stale_threshold_minutes
             )
             VALUES (
                 $1, $2, $3, 'default', 'UTC', 'routed',
                 '. = .', NULL, 'application', 'source_type', ARRAY[$4]::text[],
-                true, NULL, 'active'
+                true, NULL, 'active', $5
             )
             "#,
         )
@@ -354,6 +354,12 @@ impl ParserRepositoryService {
         .bind(&name)
         .bind(&description)
         .bind(source_type)
+        // NAN-3659: a sparse collector stream (Workspace, Okta, ...) starts
+        // with its cadence, not the 15-minute default.
+        .bind(crate::log_sources::cadence::initial_stale_threshold_minutes(
+            source_type,
+            None,
+        ))
         .execute(&mut *tx)
         .await
         .map_err(ParserRepositoryError::Database)?;
@@ -1174,13 +1180,15 @@ impl ParserRepositoryService {
                 match_field, match_pattern, match_values, dispatch_source_config_id,
                 validated, validation_error,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
-                kind, enrich_kind, enrich_source, target_table, normalize_vrl
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
+                stale_threshold_minutes
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                     $13, $14, $15, $16,
                     $25, $26,
                     $17, $18, $19,
-                    $20, $21, $22, $23, $24)
+                    $20, $21, $22, $23, $24,
+                    $27)
             RETURNING id
             "#,
         )
@@ -1210,6 +1218,11 @@ impl ParserRepositoryService {
         .bind(&normalize_vrl)
         .bind(import_validation.is_ok())
         .bind(import_validation.as_ref().err())
+        // NAN-3659: catalog sparse audit streams start with their cadence.
+        .bind(crate::log_sources::cadence::initial_stale_threshold_minutes(
+            &new_log_source.source_type,
+            new_log_source.match_values.as_deref(),
+        ))
         .fetch_one(&mut *tx)
         .await
         .map_err(ParserRepositoryError::Database)?;

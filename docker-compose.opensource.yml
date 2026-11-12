@@ -78,8 +78,14 @@ x-nano-egress-env: &nano-egress-env
 # longer rebuilds the shared fan-ins or the disk-buffered OCSF sink, so the
 # ingest stall on deploy drops (15.7 s to 2.2 s at 20 sources). It costs
 # Vector memory and CPU on every event; check the Vector memory limit first.
+# NAN-5287: disk-buffer acknowledgement durability, rendered into the
+# generated Vector config: fsync (default; a 2xx survives a power or host
+# failure) or page_cache (about 1.7-2.2x the request rate per Vector; a host
+# failure can lose up to ~500 ms of acknowledged events). Every ingest host
+# installs the same rendered value.
 x-nano-vector-render-env: &nano-vector-render-env
   VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
+  NANO_INGEST_ACK_DURABILITY: ${NANO_INGEST_ACK_DURABILITY:-fsync}
 
 # Feed/content update and integration-egress settings read by nano-api and
 # nano-jobs. Empty keeps each built-in default (auto-update on, nano.rs URLs).
@@ -491,7 +497,7 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.10-debian@sha256:5d71a7b2bb1a0fd4e56941cb0be0590d8d74eb0f23cadab33f18510f2664fee7
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.11-debian@sha256:27e8dc155770379cef504fe647d7611cad527143120a17e2e1bfae8ab4bc54c2
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped

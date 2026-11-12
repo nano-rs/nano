@@ -140,6 +140,10 @@ pub enum DeployPhase {
     /// Reloading Vector (or publishing a generation to the ingest hosts) and
     /// waiting for the correlated acknowledgement and health.
     Reloading,
+    /// NAN-5132 (two-phase activation): every ingest host acknowledged the
+    /// staged (parked) generation; routing traffic to the source (or, for an
+    /// undeploy, dropping its parked chain) and waiting for the acknowledgement.
+    Activating,
     /// Vector refused the config; restoring the previous one.
     RollingBack,
     Done,
@@ -155,6 +159,7 @@ impl DeployPhase {
             Self::ValidatingConfig => "validating_config",
             Self::Promoting => "promoting",
             Self::Reloading => "reloading",
+            Self::Activating => "activating",
             Self::RollingBack => "rolling_back",
             Self::Done => "done",
         }
@@ -169,6 +174,7 @@ impl DeployPhase {
             "validating_config" => Self::ValidatingConfig,
             "promoting" => Self::Promoting,
             "reloading" => Self::Reloading,
+            "activating" => Self::Activating,
             "rolling_back" => Self::RollingBack,
             "done" => Self::Done,
             _ => return None,

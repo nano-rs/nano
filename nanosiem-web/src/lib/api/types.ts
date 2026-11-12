@@ -1968,6 +1968,7 @@ export type DeployJobPhase =
   | 'validating_config'
   | 'promoting'
   | 'reloading'
+  | 'activating'
   | 'rolling_back'
   | 'done';
 

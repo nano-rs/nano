@@ -301,7 +301,94 @@ pub fn extract_required_fields(query: &str) -> Vec<String> {
         }
     }
 
+    // NAN-5271 #28: OCSF rules name OCSF paths (`process.cmd_line`,
+    // `class_uid`), which the UDM list above never matched — so every OCSF
+    // rule looked field-free. Add the native OCSF field references too.
+    for field in extract_ocsf_field_refs(query) {
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    }
+
     fields
+}
+
+/// Routing and bookkeeping names: they select rows, they are not fields a
+/// source can lack.
+const NON_REQUIRED_FIELD_TOKENS: &[&str] = &[
+    "source_type",
+    "sourcetype",
+    "metadata.log_source",
+    "timestamp",
+    "_time",
+    "time",
+    "time_dt",
+    "_inserted_at",
+    "id",
+];
+
+/// OCSF field paths the query filters or groups on (NAN-5271 #28).
+///
+/// A token counts when the OCSF profile knows it under its own name: a
+/// promoted column (`class_uid`, `actor.user.name`) or a dotted attribute of
+/// the stored `event` object. UDM-name aliases (`src_ip`) are left to the UDM
+/// list in [`extract_required_fields`], so a UDM rule gains no OCSF fields.
+fn extract_ocsf_field_refs(query: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static QUOTED: OnceLock<Regex> = OnceLock::new();
+    static COMPARISON: OnceLock<Regex> = OnceLock::new();
+    static BY_LIST: OnceLock<Regex> = OnceLock::new();
+    static PROFILE: OnceLock<crate::schema::OcsfProfile> = OnceLock::new();
+
+    let quoted = QUOTED.get_or_init(|| Regex::new(r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#).unwrap());
+    let comparison = COMPARISON.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:!=|<=|>=|=|<|>|\s+(?:NOT\s+)?(?:IN|LIKE|CONTAINS)\b)",
+        )
+        .unwrap()
+    });
+    let by_list =
+        BY_LIST.get_or_init(|| Regex::new(r"(?i)\bby\s+([A-Za-z0-9_.,\s]+?)\s*(?:\||$)").unwrap());
+    let profile = PROFILE.get_or_init(crate::schema::OcsfProfile::new);
+
+    // Quoted values can hold anything (`"a=b"`); drop them before matching.
+    let stripped = quoted.replace_all(query, "\"\"");
+
+    let mut tokens: Vec<String> = comparison
+        .captures_iter(&stripped)
+        .map(|c| c[1].to_ascii_lowercase())
+        .collect();
+    for caps in by_list.captures_iter(&stripped) {
+        tokens.extend(
+            caps[1]
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|t| !t.is_empty())
+                .map(str::to_ascii_lowercase),
+        );
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for token in tokens {
+        if out.contains(&token) || !is_ocsf_field_token(profile, &token) {
+            continue;
+        }
+        out.push(token);
+    }
+    out
+}
+
+fn is_ocsf_field_token(profile: &crate::schema::OcsfProfile, token: &str) -> bool {
+    use crate::schema::{FieldResolution, SchemaProfile};
+    if NON_REQUIRED_FIELD_TOKENS.contains(&token) || !profile.is_known_field(token) {
+        return false;
+    }
+    match profile.resolve(token) {
+        FieldResolution::ExplicitColumn(col) => col == token,
+        FieldResolution::JsonPath { .. } | FieldResolution::ArrayElement { .. } => {
+            token.contains('.')
+        }
+        _ => false,
+    }
 }
 
 /// Validate source types against available source types in the environment

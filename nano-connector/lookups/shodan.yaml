@@ -1,14 +1,17 @@
 # NAN-3763 official lookup spec. Matches the nano-enrichments `shodan`
 # agent catalog entry (host information). Shodan describes exposure, not
 # reputation: a verdict is only set for C2 / compromise tags or known CVEs.
+# NAN-5286: a domain is resolved through Shodan DNS (`/dns/resolve`, no query
+# credits), then its address is looked up as an IP. The key rides in the
+# query string of both requests (`api_key_query`).
 version: 1
 name: shodan
 display_name: Shodan
-description: Open ports, services, banners and known vulnerabilities of an internet-facing IP.
+description: Open ports, services, banners and known vulnerabilities of an internet-facing IP (or of the address a domain resolves to).
 homepage: https://account.shodan.io/
 allow:
   - host: api.shodan.io
-    path_prefixes: ["/shodan/host"]
+    path_prefixes: ["/shodan/host", "/dns/resolve"]
 auth: { type: api_key_query, param: key, credential: API_KEY }
 credentials:
   - { name: API_KEY, label: API key }
@@ -44,3 +47,12 @@ types:
         vulns: vulns
         last_update: last_update
       tags: [tags]
+pivots:
+  domain:
+    request:
+      url: "https://api.shodan.io/dns/resolve"
+      query: { hostnames: "{{input.artifact}}" }
+    # {"example.com": "93.184.216.34"} (null when it does not resolve).
+    select: artifact_key
+    to: ip
+    link: "https://www.shodan.io/domain/{{input.artifact}}"

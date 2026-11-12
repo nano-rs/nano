@@ -522,6 +522,7 @@ pub(super) fn builtin_identity_parser(
 ) -> Parser {
     let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::nil(),
         name: builtin.parser_name.to_string(),
         description: Some("built-in identity normalizer".to_string()),
@@ -1362,6 +1363,7 @@ source = ".source_type = \"foo\""
 
     fn parser_for_claim_tests(source_type: &str, dispatch: Option<&str>) -> Parser {
         Parser {
+            activation_parked: false,
             id: Uuid::new_v4(),
             name: "Apache HTTP Server".to_string(),
             description: None,

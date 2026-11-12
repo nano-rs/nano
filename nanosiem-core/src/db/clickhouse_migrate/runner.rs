@@ -286,7 +286,7 @@ impl ClickHouseMigrator {
             // statement still aborts (the marker only tolerates absence).
             let skip_if_unknown_table = Self::has_skip_if_unknown_table_marker(&sql);
 
-            match self.client.query(&full_sql).execute().await {
+            match self.execute_with_busy_retry(&full_sql).await {
                 Ok(_) => {}
                 Err(e) if skip_if_unknown_table && Self::is_unknown_table_error(&e.to_string()) => {
                     tracing::warn!(
@@ -579,7 +579,7 @@ impl ClickHouseMigrator {
                 || sql_upper.starts_with("GRANT ")
                 || sql_upper.starts_with("CREATE SETTINGS PROFILE");
 
-            match self.client.query(&full_sql).execute().await {
+            match self.execute_with_busy_retry(&full_sql).await {
                 Ok(_) => {}
                 Err(e) if is_soft_fail => {
                     tracing::warn!(

@@ -31,6 +31,7 @@
 
 mod coverage;
 mod error;
+mod field_census;
 mod github_client;
 mod models;
 mod npl_parser;

@@ -94,6 +94,9 @@ SELECT
     ls.namespace, ls.timezone, ls.match_values, ls.category, ls.vendor, ls.product,
     ls.kind, ls.enrich_kind, ls.enrich_source, ls.target_table, ls.normalize_vrl,
     ls.sampling_ratio, ls.sampling_exclude_condition,
+    EXISTS (
+        SELECT 1 FROM log_source_activation_holds h WHERE h.log_source_id = ls.id
+    ) AS activation_parked,
     ls.created_at, ls.updated_at
 FROM log_sources ls
 LEFT JOIN LATERAL (
@@ -757,6 +760,8 @@ fn row_to_parser(row: &sqlx::postgres::PgRow) -> Parser {
         enrich_source: row.try_get("enrich_source").unwrap_or(None),
         target_table: row.try_get("target_table").unwrap_or(None),
         normalize_vrl: row.try_get("normalize_vrl").unwrap_or(None),
+        // NAN-5132: only the effective-deployed query selects it.
+        activation_parked: row.try_get("activation_parked").unwrap_or(false),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -770,6 +775,7 @@ mod tests {
 
     fn parser_with_dispatch(name: &str, dispatch_id: Option<Uuid>) -> Parser {
         Parser {
+            activation_parked: false,
             id: Uuid::new_v4(),
             name: name.to_string(),
             description: None,

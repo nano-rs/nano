@@ -102,6 +102,83 @@ fn vector_disk_buffer_contract_value(key: &str) -> usize {
         .unwrap_or_else(|| panic!("disk-buffer manifest is missing a numeric {key}"))
 }
 
+/// NAN-5287: when a disk buffer acknowledges a record a source waits on
+/// (nano-rs/vector 0.61.0-nano.10+): `fsync` (default) syncs it to disk first;
+/// `page_cache` acknowledges once it is in the page cache (about 1.7–2.2x the
+/// request rate, but a host crash can lose up to ~500 ms of acknowledged
+/// events).
+///
+/// Rendered as a LITERAL from the rendering process's environment, not as a
+/// Vector-side `${...}`: Vector cannot deserialize an interpolated string
+/// anywhere in a `buffer` table ("data did not match any variant of untagged
+/// enum BufferConfig", nano.8 and nano.10 alike). Rendering it here also makes
+/// it consistent across ingest hosts by construction: every host installs the
+/// same published generation. Compose sets it for nano-api and nano-jobs from
+/// the shared `.env`; Helm from `vector.ackDurability`.
+pub const ACK_DURABILITY_ENV: &str = "NANO_INGEST_ACK_DURABILITY";
+
+/// The configured mode. Anything but `fsync` or `page_cache` renders `fsync`
+/// (the durable choice) and logs an error; the installer and the chart refuse
+/// such a value before it gets here.
+pub(super) fn ack_durability() -> &'static str {
+    #[cfg(test)]
+    if let Some(forced) = ACK_DURABILITY_FORCED.with(|f| f.get()) {
+        return forced;
+    }
+    ack_durability_from(std::env::var(ACK_DURABILITY_ENV).ok().as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the mode [`ack_durability`] returns on this thread (env
+    /// writes race across parallel tests).
+    pub(super) static ACK_DURABILITY_FORCED: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn ack_durability_from(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        None | Some("") | Some("fsync") => "fsync",
+        Some("page_cache") => "page_cache",
+        Some(other) => {
+            tracing::error!(
+                value = other,
+                "{ACK_DURABILITY_ENV} must be fsync or page_cache; rendering fsync"
+            );
+            "fsync"
+        }
+    }
+}
+
+/// The line a disk buffer carries for `mode`. `fsync` is the fork's default
+/// and renders NOTHING: the default config stays byte-identical to before
+/// NAN-5287, and a Vector older than nano.10 (which rejects the key) still
+/// loads it.
+pub(super) fn ack_durability_line(mode: &str) -> String {
+    if mode == "fsync" {
+        String::new()
+    } else {
+        format!("acknowledgement_durability = \"{mode}\"\n")
+    }
+}
+
+/// `nano_owned` (never tenant text) with [`ack_durability_line`] after every
+/// blocking disk buffer's `when_full` line.
+pub(super) fn with_ack_durability(nano_owned: &str, mode: &str) -> String {
+    let line = ack_durability_line(mode);
+    if line.is_empty() {
+        return nano_owned.to_string();
+    }
+    let mut out = String::with_capacity(nano_owned.len() + 256);
+    for chunk in nano_owned.split_inclusive('\n') {
+        out.push_str(chunk);
+        if chunk.trim_end() == "when_full = \"block\"" {
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
 fn disk_buffer_component_count(content: &str) -> usize {
     content
         .lines()
@@ -1481,6 +1558,7 @@ impl VectorConfigManager {
              type = \"disk\"\n\
              max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\n\
              when_full = \"block\"\n\
+             {ack}\
              \n\
              [sinks.clickhouse_ocsf_logs.acknowledgements]\n\
              enabled = false\n\
@@ -1495,7 +1573,8 @@ impl VectorConfigManager {
              timeout_secs = 120\n\
              retry_initial_backoff_secs = 1\n\
              retry_max_duration_secs = 300\n",
-            inputs = inputs.join(", ")
+            inputs = inputs.join(", "),
+            ack = ack_durability_line(ack_durability()),
         )
     }
 
@@ -2345,7 +2424,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// route and one sink per shard; retries remain pinned to the same shard.
     /// With zero/one endpoint the single-node config is byte-identical.
     pub(super) fn full_pipeline_config_content() -> String {
-        let mut content = Self::pipeline_config_content().to_string();
+        let mut content = with_ack_durability(Self::pipeline_config_content(), ack_durability());
         if Self::ocsf_mode() {
             content.push_str(Self::GENERIC_OCSF_PREPARE_BLOCK);
         }
@@ -2715,7 +2794,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         dead_letter_inputs.extend(builtins.iter().map(|(t, _)| format!("\"{t}.dropped\"")));
         dead_letter_inputs.extend(Self::unrouted_identity_dead_letter_inputs());
 
-        let source = Self::enrichment_lane_content();
+        let source = with_ack_durability(Self::enrichment_lane_content(), ack_durability());
         let sink_inputs = "[sinks.clickhouse_user_registry]\ntype = \"clickhouse\"\ninputs = [\"enrichment_normalize_ad\"]";
         assert_eq!(
             source.matches(sink_inputs).count(),
@@ -2850,7 +2929,8 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                  [sinks.{sink}.buffer]\n\
                  type = \"disk\"\n\
                  max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\n\
-                 when_full = \"block\"\n\n\
+                 when_full = \"block\"\n\
+                 {ack}\n\
                  [sinks.{sink}.acknowledgements]\n\
                  enabled = false\n\n\
                  [sinks.{sink}.batch]\n\
@@ -2862,6 +2942,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                  retry_initial_backoff_secs = 1\n\
                  retry_max_duration_secs = 60\n\n",
                 inputs = inputs.join(", "),
+                ack = ack_durability_line(ack_durability()),
             ));
         }
 
@@ -2902,7 +2983,8 @@ if skew_seconds < 0 { skew_seconds = 86400 }
              [sinks.enrichment_dead_letter.buffer]\n\
              type = \"disk\"\n\
              max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-{VECTOR_DISK_BUFFER_MIN_BYTES}}}\n\
-             when_full = \"block\"\n\n\
+             when_full = \"block\"\n\
+             {}\n\
              [sinks.enrichment_dead_letter.acknowledgements]\n\
              enabled = false\n\n\
              [sinks.enrichment_dead_letter.batch]\n\
@@ -2913,7 +2995,8 @@ if skew_seconds < 0 { skew_seconds = 86400 }
              timeout_secs = 60\n\
              retry_initial_backoff_secs = 1\n\
              retry_max_duration_secs = 60\n",
-            dropped_inputs.join(", ")
+            dropped_inputs.join(", "),
+            ack_durability_line(ack_durability()),
         ));
 
         out
@@ -3485,3 +3568,5 @@ mod buffer_budget_contract_tests;
 mod json_ingest_contract_tests;
 #[cfg(test)]
 mod metrics_scrape_contract_tests;
+#[cfg(test)]
+mod ack_durability_contract_tests;

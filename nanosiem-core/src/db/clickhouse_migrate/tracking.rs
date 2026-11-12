@@ -544,11 +544,18 @@ impl ClickHouseMigrator {
             checksum
         );
 
-        self.client
-            .query(&sql)
-            .execute()
-            .await
-            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        // NAN-5296: by now every statement of the migration has applied. Say
+        // so, because a failure here looks like a failed migration when only
+        // the ledger row is missing. Re-running is safe: migrations are
+        // idempotent and this version is still pending.
+        self.execute_with_busy_retry(&sql).await.map_err(|e| {
+            ClickHouseMigrateError::ClickHouse(format!(
+                "migration {} applied all of its statements, but recording it in \
+                 {}._migrations failed; re-run the migrator once ClickHouse accepts \
+                 inserts again: {e}",
+                migration.filename, self.database
+            ))
+        })?;
 
         Ok(())
     }
@@ -578,11 +585,9 @@ impl ClickHouseMigrator {
                         'refresh', 0, now64(6) \
                  FROM {table} FINAL WHERE version = '{version}' AND view = '{view}'"
             );
-            self.client
-                .query(&sql)
-                .execute()
+            self.execute_with_busy_retry(&sql)
                 .await
-                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+                .map_err(ClickHouseMigrateError::ClickHouse)?;
         }
         Ok(directives.len())
     }

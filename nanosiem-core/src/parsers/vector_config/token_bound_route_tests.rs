@@ -32,6 +32,7 @@ const ASA_LIKE_VRL: &str = r#"m = parse_regex!(to_string!(.message), r'%ASA-(?P<
 
 fn parser(name: &str, source_type: &str, keys: &[&str], enabled: bool) -> Parser {
     Parser {
+        activation_parked: false,
         id: Uuid::new_v4(),
         name: name.into(),
         description: None,

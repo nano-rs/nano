@@ -32,6 +32,7 @@ on:
       - tools/tests/**
       - scripts/tests/install-edition.test.sh
       - scripts/tests/install-env-set-keys.test.sh
+      - scripts/tests/install-ingest-ack-durability.test.sh
       - scripts/lib/generated-secrets.sh
       - scripts/tests/install-api-call.test.sh
       - scripts/tests/install-bind-address-probes.test.sh
@@ -128,6 +129,7 @@ jobs:
           if [ -f scripts/tests/install-edition.test.sh ]; then
             bash scripts/tests/install-edition.test.sh
             bash scripts/tests/install-env-set-keys.test.sh
+            bash scripts/tests/install-ingest-ack-durability.test.sh
           else
             echo "install-edition test not in this tree (public mirror); skipping"
           fi

@@ -5,6 +5,11 @@
 //! Unified log source management combining ingestion configuration,
 //! VRL transformation, and metadata into a single entity.
 
+pub mod activation;
+pub mod cadence;
+#[cfg(test)]
+#[path = "cadence_tests.rs"]
+mod cadence_tests;
 pub mod connect;
 pub mod deploy_jobs;
 #[cfg(test)]

@@ -7,6 +7,7 @@ use crate::parsers::vrl_functions::parser_vrl_functions;
 
 fn parser() -> Parser {
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::new_v4(),
         name: "acme".into(),
         description: None,

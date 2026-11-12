@@ -29,6 +29,7 @@ fn load(raw: &str) -> toml::Table {
 
 fn parser(name: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::new_v4(),
         name: name.to_string(),
         description: None,

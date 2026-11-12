@@ -337,6 +337,10 @@ fn score_ingestion(m: &IngestionMetrics) -> i32 {
     if ii.ingest_watchdog.iter().any(watchdog_views_stopped) {
         integrity_penalty += 10;
     }
+    // NAN-5296: a stuck flush halts every insert on the server.
+    if ii.stuck_async_flushes > 0 {
+        integrity_penalty += 40;
+    }
     if ii.ingest_watchdog.iter().any(|state| {
         state.replicas.iter().any(|replica| !replica.reachable)
     }) {
@@ -411,12 +415,45 @@ fn dictionary_memory_recommendation(ii: &InsertIntegrityMetrics) -> Option<Recom
     })
 }
 
+/// NAN-5296: an async-insert flush that has run for more than five minutes
+/// holds an async-insert thread forever. Once every thread is held, new
+/// inserts queue without a timeout and then fail with code 202, so ingest
+/// stops on the whole server. Critical: nothing is landing.
+fn stuck_async_flush_recommendation(ii: &InsertIntegrityMetrics) -> Option<Recommendation> {
+    if ii.stuck_async_flushes == 0 {
+        return None;
+    }
+    Some(Recommendation {
+        title: "Async-insert flushes are stuck; ingestion is halted".to_string(),
+        description: format!(
+            "{} AsyncInsertFlush quer{} on ClickHouse {} been running for more than {} \
+             seconds (longest {}s). While they hold the async-insert threads, every new insert \
+             waits and then fails with code 202 (TOO_MANY_SIMULTANEOUS_QUERIES). Check \
+             system.stack_trace for the flush query IDs. If they wait in \
+             CPULeaseAllocation::renew, a workload CPU cap is starving nested materialized-view \
+             executors: run the ClickHouse migrator (migration 198 removes the ingest cap) or \
+             `CREATE OR REPLACE WORKLOAD ingest IN nano SETTINGS weight = 10`. Otherwise \
+             `KILL QUERY WHERE query_kind = 'AsyncInsertFlush'`; Vector retries the rejected \
+             batches.",
+            ii.stuck_async_flushes,
+            if ii.stuck_async_flushes == 1 { "y" } else { "ies" },
+            if ii.stuck_async_flushes == 1 { "has" } else { "have" },
+            crate::ingest_stall::STUCK_FLUSH_ALERT_SECS,
+            ii.longest_async_flush_secs,
+        ),
+        priority: "critical".to_string(),
+    })
+}
+
 /// Recommendations for fired insert-integrity signals (NAN-1405). Used by the
 /// heuristic fallback path; the enterprise AI analyzer sees the same metrics
 /// JSON and produces its own. Each maps a signal to the diagnostic recipe
 /// proven during NAN-1404 (dict status → part_log → system.errors).
 fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommendation> {
     let mut recs = Vec::new();
+    if let Some(rec) = stuck_async_flush_recommendation(ii) {
+        recs.push(rec);
+    }
     if let Some(rec) = dictionary_memory_recommendation(ii) {
         recs.push(rec);
     }

@@ -1,0 +1,25 @@
+-- NAN-5296: remove the hard CPU-slot cap that migration 189 (NAN-4988) put on
+-- the `ingest` workload. Keep its weight, so ingest still wins CPU under
+-- contention through weighted-fair scheduling.
+--
+-- Why the cap had to go: every executor in an async-insert flush takes its own
+-- CPU lease from the workload's semaphore. That includes the inner executor of
+-- each materialized view in the ocsf_logs_raw -> ocsf_logs -> MV fan-out (and
+-- logs_ingest -> logs). With cpu_slot_preemption on (the 26.x default), the
+-- outer executor keeps its lease while its thread runs the inner one. Two
+-- concurrent flushes could hold all four `max_concurrent_threads` slots and
+-- each wait for one more. Neither finished. Both async-insert threads stayed
+-- stuck, every other insert queued behind them, and once
+-- max_concurrent_insert_queries filled, every INSERT failed with code 202.
+--
+-- The weight alone gives NAN-4988 what it needed: refreshable views and
+-- analyst queries can no longer starve ingest. The server-wide
+-- concurrent_threads_soft_limit still bounds total CPU threads.
+--
+-- CREATE OR REPLACE swaps the scheduler node in place. Queries already linked
+-- to `ingest` keep running, and a wedged flush waiting on the old semaphore is
+-- released when the node is replaced. Idempotent: re-running converges on the
+-- same definition. The migrator adds ON CLUSTER on multi-node deployments,
+-- because workloads are server-scoped and a Replicated database does not
+-- propagate them.
+CREATE OR REPLACE WORKLOAD ingest IN nano SETTINGS weight = 10;

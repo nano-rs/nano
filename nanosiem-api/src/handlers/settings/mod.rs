@@ -25,6 +25,8 @@ mod ingestion;
 mod operational;
 mod retention;
 mod risk;
+#[cfg(feature = "enterprise")]
+mod risk_enterprise;
 mod tier;
 mod tiering;
 mod webhooks;
@@ -37,6 +39,8 @@ pub use ingestion::*;
 pub use operational::*;
 pub use retention::*;
 pub use risk::*;
+#[cfg(feature = "enterprise")]
+pub use risk_enterprise::*;
 pub use tier::*;
 pub use tiering::*;
 pub use webhooks::*;
@@ -81,10 +85,10 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 retention::run_retention_now,
                 risk::get_risk_config,
                 risk::update_risk_config,
-                risk::get_risk_decay_config,
-                risk::update_risk_decay_config,
-                risk::get_risk_notable_config,
-                risk::update_risk_notable_config,
+                risk_enterprise::get_risk_decay_config,
+                risk_enterprise::update_risk_decay_config,
+                risk_enterprise::get_risk_notable_config,
+                risk_enterprise::update_risk_notable_config,
                 internal_domains::get_internal_domains,
                 internal_domains::update_internal_domains,
                 retention::get_storage_overview,
@@ -150,8 +154,8 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     retention::StorageStatsResponse,
                     risk::RiskConfigResponse,
                     risk::UpdateRiskConfigRequest,
-                    risk::RiskDecayConfigResponse,
-                    risk::UpdateRiskDecayConfigRequest,
+                    risk_enterprise::RiskDecayConfigResponse,
+                    risk_enterprise::UpdateRiskDecayConfigRequest,
                     nanosiem_core::risk::RiskNotableConfig,
                     nanosiem_core::risk::RiskNotableTypeThresholds,
                     nanosiem_core::internal_domains::store::InternalDomainsSettings,

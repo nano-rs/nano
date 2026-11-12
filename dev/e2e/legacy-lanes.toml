@@ -90,6 +90,22 @@ needs = ["docker", "cargo"]
 timeout_min = 30
 
 [[lane]]
+name = "upgrade-197"
+issue = "NAN-5271"
+# OCSF migration 197 (prevalence for parent/actor process hashes and HTTP URL
+# hosts): drives the real migrator on its own infra-only nanoe2e stack (ocsf
+# profile), base tree -> this checkout and fresh (twice); writes as
+# nanosiem_ingest and asserts the new producers count hosts in the agg and
+# source agg without double counting, the MATERIALIZED columns resolve for
+# actor-only / HTTP / DNS rows, no backfill or mutation, and upgrade/fresh
+# converge.
+kind = "script"
+cmd = ["scripts/e2e/lanes/upgrade-197.sh"]
+stack = false
+needs = ["docker", "cargo"]
+timeout_min = 30
+
+[[lane]]
 name = "upgrade-from-v01"
 issue = "NAN-4972"
 # v2.0.0 gate: the real customer path. Installs the last shipped ClickHouse
@@ -326,3 +342,19 @@ threads = 1
 enterprise = true
 needs = ["cargo"]
 timeout_min = 30
+
+[[lane]]
+name = "ingest-workload-deadlock"
+issue = "NAN-5296"
+# Migration 189's ingest max_concurrent_threads = 4 deadlocked concurrent
+# async-insert flushes through the ocsf_logs_raw -> ocsf_logs -> MV chain
+# (nested view executors each take a CPU lease). On its own infra-only nanoe2e
+# stack (ocsf profile, ClickHouse 26.10.3.7): base tree + concurrent load must
+# reproduce the deadlock and the watchdog stall probe must fire; the fix
+# migrator applies 198 on the wedged server and clears it; the same load then
+# runs with no parked flush, no 159 timeouts and a calm probe.
+kind = "script"
+cmd = ["scripts/e2e/lanes/ingest-workload-deadlock.sh"]
+stack = false
+needs = ["docker", "cargo"]
+timeout_min = 45

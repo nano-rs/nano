@@ -132,3 +132,28 @@ fn unreachable_replica_is_a_visible_health_finding() {
     assert_eq!(finding.priority, "high");
     assert!(finding.description.contains("replica-2"));
 }
+
+/// NAN-5296: a flush stuck past five minutes is a critical finding and drags
+/// the ingestion score, independent of the (unwritable) watchdog journal.
+#[test]
+fn stuck_async_flush_is_a_critical_health_finding() {
+    let calm = InsertIntegrityMetrics::default();
+    assert!(!insert_integrity_recommendations(&calm)
+        .iter()
+        .any(|recommendation| recommendation.title.contains("Async-insert flushes are stuck")));
+
+    let stuck = InsertIntegrityMetrics {
+        stuck_async_flushes: 2,
+        longest_async_flush_secs: 34_211,
+        ..Default::default()
+    };
+    let recommendations = insert_integrity_recommendations(&stuck);
+    let finding = recommendations
+        .iter()
+        .find(|recommendation| recommendation.title.contains("Async-insert flushes are stuck"))
+        .expect("stuck-flush finding");
+    assert_eq!(finding.priority, "critical");
+    assert!(finding.description.contains("2 AsyncInsertFlush queries"));
+    assert!(finding.description.contains("longest 34211s"));
+    assert!(finding.description.contains("migration 198"));
+}

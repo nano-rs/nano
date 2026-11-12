@@ -14,6 +14,25 @@ impl VectorConfigManager {
     /// For "routed" source type, no source is created - the parser takes input
     /// from the HTTP router (source_router.{parser_name}) instead.
     pub(super) fn generate_source_config(&self, parser: &Parser) -> (String, String) {
+        let (config, input) = self.generate_unparked_source_config(parser);
+        // NAN-5132 (two-phase activation): a parked router-fed parser reads the
+        // never-matching slot filter, so its chain builds on every ingest host
+        // while no event reaches it. Its route is left out of `source_router`
+        // ([`Self::source_router_parsers`] keys on this input), so its source
+        // types keep falling through to `generic` as before the deploy. The
+        // parked filter exists only with fan-in slots; without them a hold is
+        // never taken and this renders the source live.
+        if parser.activation_parked
+            && super::fanin_slots::enabled()
+            && input == format!("source_router.{}", Self::safe_name(&parser.name))
+        {
+            return (config, super::fanin_slots::PARKED.to_string());
+        }
+        (config, input)
+    }
+
+    /// [`Self::generate_source_config`] without the activation hold.
+    fn generate_unparked_source_config(&self, parser: &Parser) -> (String, String) {
         let safe_name = Self::safe_name(&parser.name);
 
         // NAN-2267: `routed` is still matched by name because it is the only
@@ -307,6 +326,7 @@ mod dispatch_source_tests {
 
     fn make_parser(source_type: &str, dispatch_route: Option<&str>) -> Parser {
         Parser {
+            activation_parked: false,
             id: Uuid::new_v4(),
             name: "Apache HTTP Server".to_string(),
             description: None,

@@ -721,9 +721,11 @@ impl ClickHouseMigrator {
         // Workload scheduling objects are server-scoped rather than database
         // metadata. A Replicated database therefore does NOT propagate them;
         // they always need explicit cluster fan-out (NAN-4988).
-        if upper.starts_with("CREATE WORKLOAD") {
+        // `CREATE OR REPLACE WORKLOAD` (NAN-5296 migration 198) fans out the
+        // same way.
+        if upper.starts_with("CREATE WORKLOAD") || upper.starts_with("CREATE OR REPLACE WORKLOAD") {
             let re = Regex::new(
-                r"(?i)(CREATE\s+WORKLOAD\s+(?:IF\s+NOT\s+EXISTS\s+)?)(`[^`]+`|'[^']+'|\w+)",
+                r"(?i)(CREATE\s+(?:OR\s+REPLACE\s+)?WORKLOAD\s+(?:IF\s+NOT\s+EXISTS\s+)?)(`[^`]+`|'[^']+'|\w+)",
             )
             .unwrap();
             return re

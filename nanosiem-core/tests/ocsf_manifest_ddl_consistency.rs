@@ -356,6 +356,19 @@ fn migration_180_preserves_ocsf_logs_and_drops_only_recreated_views() {
         }
     }
     assert!(overlay_views.len() >= 20, "{overlay_views:?}");
+    // Views first created AFTER 180 (on an upgrade they are created by a later
+    // OCSF migration, which runs after 180 and the overlay), so 180 never sees
+    // them and has nothing to drop.
+    const CREATED_AFTER_180: &[&str] = &[
+        // ocsf/197 (NAN-5271 #23)
+        "ocsf_hash_prevalence_summary_actor_process_hash_mv",
+        "ocsf_domain_prevalence_summary_http_url_mv",
+        "hash_prevalence_source_ocsf_actor_process_mv",
+        "domain_prevalence_source_ocsf_http_url_mv",
+    ];
+    for v in CREATED_AFTER_180 {
+        assert!(overlay_views.remove(*v), "{v} is no longer an overlay view over ocsf_logs");
+    }
     let missing: Vec<_> = overlay_views.difference(&dropped_views).collect();
     assert!(missing.is_empty(), "overlay MVs on ocsf_logs that 180 does not drop: {missing:?}");
 }

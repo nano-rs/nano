@@ -187,6 +187,8 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::parser_repositories::ParserRepositoriesApiDoc::openapi(),
         handlers::marketplace::MarketplaceApiDoc::openapi(),
         #[cfg(feature = "enterprise")]
+        handlers::marketplace::MarketplacePreviewApiDoc::openapi(),
+        #[cfg(feature = "enterprise")]
         handlers::integrations::IntegrationsApiDoc::openapi(),
         handlers::upload::UploadApiDoc::openapi(),
         handlers::gdpr::GdprApiDoc::openapi(),

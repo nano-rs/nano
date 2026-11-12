@@ -65,7 +65,9 @@
     <max_concurrent_select_queries>30</max_concurrent_select_queries>
     <concurrent_threads_scheduler>round_robin</concurrent_threads_scheduler>
 
-    <async_insert_threads>2</async_insert_threads>
+    <!-- NAN-5296: one stuck flush pair used to take the whole pool of 2,
+         and every later insert queued behind it with no timeout. -->
+    <async_insert_threads>4</async_insert_threads>
 
     <!-- Reduce connections (was 4096) -->
     <max_connections>100</max_connections>

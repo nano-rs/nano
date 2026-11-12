@@ -58,6 +58,7 @@ fn stamp() -> Value {
 
 fn parser(vrl: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id: Uuid::new_v4(),
         name: "acme_vpn".into(),
         description: None,

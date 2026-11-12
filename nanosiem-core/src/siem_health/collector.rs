@@ -745,6 +745,24 @@ async fn collect_insert_integrity(
         ),
     }
 
+    // NAN-5296: a deadlocked async-insert flush blocks every later insert,
+    // the watchdog's journal included, so read the stall straight from
+    // system.processes on every replica instead of from a table it writes.
+    let sql = format!(
+        "SELECT countIf(elapsed > {limit}) AS stuck, toUInt64(max(elapsed)) AS longest \
+         FROM {source} WHERE query_kind = 'AsyncInsertFlush'",
+        limit = crate::ingest_stall::STUCK_FLUSH_ALERT_SECS,
+        source = probe_source(cluster_ref, "processes"),
+    );
+    match ch.query(&sql).fetch_one::<(u64, u64)>().await {
+        Ok((stuck, longest)) => {
+            m.probes_available = true;
+            m.stuck_async_flushes = stuck;
+            m.longest_async_flush_secs = longest;
+        }
+        Err(e) => warn!("Insert-integrity probe: async-insert flush ages unavailable: {}", e),
+    }
+
     // The watchdog journals transitions on each shard. Read through the
     // distributed wrapper in cluster mode and retain the latest state per node
     // so SIEM Health can distinguish automatic shedding from a manual stop.
@@ -1114,6 +1132,17 @@ fn build_lowercase_invariant_sql(logs_table: &str, scope: &ScopeSet) -> String {
     )
 }
 
+/// Percentage of rows with an IOC hit. OCSF keeps the IOC confidence in
+/// `enrichments.ioc_confidence` (NAN-5293: this used to be a constant 0 there,
+/// so the SIEM Health card always read 0% IOC hits on OCSF).
+pub(crate) fn ioc_hit_pct_expr(ocsf: bool) -> &'static str {
+    if ocsf {
+        "countIf(`enrichments.ioc_confidence` > 0) * 100.0 / count()"
+    } else {
+        "countIf(ioc_confidence > 0) * 100.0 / count()"
+    }
+}
+
 /// Collect enrichment health metrics from ClickHouse.
 ///
 /// Computes fleet-wide fill rates for GeoIP / ASN / IOC / user-identity
@@ -1149,9 +1178,11 @@ async fn collect_enrichment_metrics(
     // private-IP traffic that can never be geo-located. A proxy whose src_ip
     // is all 10.x but whose dest_ip is fully enriched scored 0% — see NAN-1178.
     // NAN-1241: under OCSF, geo/ASN enrichment lands in the OCSF-native objects
-    // (src_endpoint.location.country / *.autonomous_system.number); ioc + identity
-    // have no promoted OCSF column yet, so they report 0 there rather than erroring
-    // on the UDM-only columns. UDM path byte-identical.
+    // (src_endpoint.location.country / *.autonomous_system.number). IOC hits
+    // land in `enrichments.ioc_confidence` (NAN-5293: this used to report a
+    // constant 0 on OCSF). Identity has no promoted OCSF column yet, so it
+    // reports 0 there rather than erroring on the UDM-only column. UDM path
+    // byte-identical.
     let ocsf = crate::schema::active_profile_from_env()
         .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
         .unwrap_or(false);
@@ -1174,11 +1205,7 @@ async fn collect_enrichment_metrics(
     } else {
         "enriched_src_asn != '' OR enriched_dest_asn != ''"
     };
-    let ioc_pct_expr = if ocsf {
-        "0.0"
-    } else {
-        "countIf(ioc_confidence > 0) * 100.0 / count()"
-    };
+    let ioc_pct_expr = ioc_hit_pct_expr(ocsf);
     let identity_pct_expr = if ocsf {
         "0.0"
     } else {

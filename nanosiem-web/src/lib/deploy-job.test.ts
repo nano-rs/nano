@@ -191,6 +191,7 @@ describe('labels', () => {
     expect(phaseStep('validating')).toBe(0);
     expect(phaseStep('validating_config')).toBe(1);
     expect(phaseStep('reloading')).toBe(3);
+    expect(phaseStep('activating')).toBe(3);
     expect(phaseStep('rolling_back')).toBe(3);
     expect(phaseStep('done')).toBe(4);
   });

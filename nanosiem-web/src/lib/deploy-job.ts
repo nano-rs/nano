@@ -42,6 +42,8 @@ export function phaseLabel(phase: DeployJobPhase): string {
       return 'Promoting';
     case 'reloading':
       return 'Reloading Vector';
+    case 'activating':
+      return 'Activating';
     case 'rolling_back':
       return 'Rolling back';
     case 'done':
@@ -83,6 +85,8 @@ export function phaseStep(phase: DeployJobPhase): number {
   if (phase === 'done') return PHASE_STEPS.length;
   if (phase === 'validating_config') return PHASE_STEPS.indexOf('rendering');
   if (phase === 'rolling_back') return PHASE_STEPS.indexOf('reloading');
+  // NAN-5132: the second reload of a two-phase activation.
+  if (phase === 'activating') return PHASE_STEPS.indexOf('reloading');
   return PHASE_STEPS.indexOf(phase);
 }
 

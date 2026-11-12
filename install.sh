@@ -42,6 +42,10 @@
 #   first install and immutable afterward; see the prompt below. New installs
 #   are OCSF-first (NAN-4903); an existing install keeps the profile recorded in
 #   its .env (a .env without one predates the choice and is pinned to udm).
+#   NANO_INGEST_ACK_DURABILITY (fsync | page_cache, default fsync) — when HEC,
+#   HTTP and OTLP acknowledge: after the disk buffer fsyncs, or once the record
+#   is in the page cache (faster; a host failure loses acknowledged events).
+#   Recorded in .env; one value for every ingest host.
 #
 # Override defaults: NANO_INSTALL_DIR, NANO_REPO_URL, NANO_BRANCH, NANO_VERSION.
 # NANO_VERSION defaults to the release recorded in the edition's images lock
@@ -485,6 +489,53 @@ configure_private_ai_endpoints() {
     if [[ "$PRIVATE_AI_ENDPOINTS" == "true" ]]; then
         log "AI providers on private addresses are allowed (NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=true in .env)"
     fi
+}
+
+# NAN-5287: disk-buffer acknowledgement durability for every ingest host.
+# fsync (the default) syncs each buffered record to disk before HEC, HTTP or
+# OTLP answers 2xx, so an acknowledged event survives a power or host failure.
+# page_cache acknowledges once the record is in the page cache: about 1.7-2.2x
+# the request rate per Vector, but a host failure can lose up to ~500 ms of
+# acknowledged events. nano-api renders NANO_INGEST_ACK_DURABILITY from the
+# shared .env into the generated Vector config every ingest host installs, so
+# all of them run one mode; a role-split host other than the app host refuses
+# a value that differs from its .env (change it in the app host's .env and copy
+# that .env to every host).
+valid_ingest_ack_durability() {
+    [[ "$1" == "fsync" || "$1" == "page_cache" ]]
+}
+
+validate_ingest_ack_durability_input() {
+    local input="${NANO_INGEST_ACK_DURABILITY:-}" recorded
+    if [[ -n "$input" ]] && ! valid_ingest_ack_durability "$input"; then
+        fail "NANO_INGEST_ACK_DURABILITY must be fsync or page_cache (got '$input')."
+    fi
+    recorded=$(env_value NANO_INGEST_ACK_DURABILITY)
+    if [[ -n "$recorded" ]] && ! valid_ingest_ack_durability "$recorded"; then
+        fail "NANO_INGEST_ACK_DURABILITY in .env must be fsync or page_cache (got '$recorded'). Fix .env; Vector refuses to start with any other value."
+    fi
+    return 0
+}
+
+configure_ingest_ack_durability() {
+    local input="${NANO_INGEST_ACK_DURABILITY:-}" recorded effective
+    validate_ingest_ack_durability_input
+    recorded=$(env_value NANO_INGEST_ACK_DURABILITY)
+    effective="${recorded:-fsync}"
+    if [[ -n "$input" && "$input" != "$effective" ]]; then
+        if [[ "${MULTI_NODE:-0}" == "1" && ",${ROLE_ARG:-}," != *,app,* ]]; then
+            fail "NANO_INGEST_ACK_DURABILITY=$input differs from this host's .env ($effective). Every ingest host must run the same mode: set it in the app host's .env, copy that .env to every host, then re-run install.sh here."
+        fi
+        nano_env_set_keys .env "NANO_INGEST_ACK_DURABILITY=$input" \
+            || fail "Could not record NANO_INGEST_ACK_DURABILITY in .env."
+        effective="$input"
+        log "Recorded NANO_INGEST_ACK_DURABILITY=$effective in .env"
+    fi
+    if [[ "$effective" == "page_cache" ]]; then
+        warn "Ingest acknowledgement durability is page_cache: HEC, HTTP and OTLP answer 2xx before the record is fsynced, so a power or host failure can lose up to ~500 ms of acknowledged events. Set NANO_INGEST_ACK_DURABILITY=fsync to restore the default."
+    fi
+    # Compose gives the shell environment precedence over .env.
+    export NANO_INGEST_ACK_DURABILITY="$effective"
 }
 
 # Automatic backups (NAN-5204). Asked once on a TTY, only while .env records
@@ -1737,6 +1788,7 @@ if [[ -n "${NANO_PROXY_USERNAME:-}${NANO_PROXY_PASSWORD:-}" ]]; then
 fi
 
 validate_license_inputs
+validate_ingest_ack_durability_input
 
 if [[ "${NANO_CHECK_ONLY:-0}" == "1" ]]; then
     printf 'edition=%s\nversion=%s\nimage_prefix=%s\nlock=%s\n' "$NANO_EDITION" "$NANO_VERSION" "$NANO_IMAGE_PREFIX" "$IMAGES_LOCK"
@@ -2027,6 +2079,7 @@ EOF
 fi
 configure_outbound_proxy
 configure_private_ai_endpoints
+configure_ingest_ack_durability
 configure_automatic_backups
 
 # Resolve overlays before sizing as well as startup: an overlay can replace the

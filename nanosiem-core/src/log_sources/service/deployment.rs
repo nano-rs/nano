@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 use super::LogSourceService;
 use super::LogSourceServiceError;
-use crate::parsers::vector_config_remote_delivery::with_delivery;
-use crate::parsers::VrlValidator;
+use crate::log_sources::activation::{self, HoldPurpose};
+use crate::parsers::vector_config_remote_delivery::{take_delivery, with_delivery};
+use crate::parsers::{VectorConfigManager, VrlValidator};
 use crate::log_sources::deploy_jobs::{DeployPhase, DeployProgress, NoProgress};
 use crate::log_sources::types::{
     DeploymentAction, DeploymentResult, DeploymentStatus, LogSourceDeployment, VrlValidationResult,
@@ -41,6 +42,9 @@ impl LogSourceService {
         progress.phase(DeployPhase::Validating);
 
         let log_source = self.repository().find_by_id(id).await?;
+        // NAN-5132: a hold on this source can only be left by an earlier
+        // deploy of it that died between its phases (deploys hold the lock).
+        release_leftover_holds(&self.pool, id).await;
 
         // NAN-4952: the deploy enables the source before it renders (the
         // render reads the enabled set from the database). If the deploy then
@@ -49,7 +53,14 @@ impl LogSourceService {
         // source renders it again and fails the same way, until someone
         // deletes it. That is the second half of the draft-deploy wedge.
         let was_enabled = log_source.enabled;
-        let result = self.deploy_locked(id, log_source, progress).await;
+        // NAN-5132 (PR 5): adding a router-fed source goes out in two
+        // generations, staged (parked) then activated. See `activation`.
+        let mut two_phase = TwoPhase::new(
+            !was_enabled
+                && activation::available()
+                && activation::eligible(&log_source.kind, &log_source.source_type),
+        );
+        let result = self.deploy_locked(id, log_source, progress, &mut two_phase).await;
         let live = matches!(&result, Ok(r) if r.success);
         if !live && !was_enabled {
             match self.repository().disable(id).await {
@@ -65,6 +76,23 @@ impl LogSourceService {
                 ),
             }
         }
+        // NAN-5132: released only after the disable above, so no render ever
+        // sees the source enabled without its hold (that is the live config).
+        two_phase.release(&self.pool, id).await;
+        // Role split: the hosts run what the database renders, not this API's
+        // tree, so a withdrawn two-phase deploy is republished from the
+        // reverted rows instead of waiting for the 5 s reconciler.
+        if two_phase.published && !live && VectorConfigManager::generation_delivery_active() {
+            progress.phase(DeployPhase::RollingBack);
+            if let Err(e) = self.vector_config.reload_vector().await {
+                tracing::warn!(
+                    log_source_id = %id,
+                    error = %e,
+                    "could not republish the configuration after withdrawing a two-phase deploy; \
+                     the publication reconciler retries"
+                );
+            }
+        }
         result
     }
 
@@ -74,6 +102,7 @@ impl LogSourceService {
         id: Uuid,
         log_source: crate::log_sources::types::LogSource,
         progress: &dyn DeployProgress,
+        two_phase: &mut TwoPhase,
     ) -> Result<DeploymentResult, LogSourceServiceError> {
         tracing::info!(
             "Starting deployment for log source '{}' ({})",
@@ -157,6 +186,10 @@ impl LogSourceService {
         // Step 2: Get all enabled log sources and deploy them all
         // Enable this log source for deployment
         progress.phase(DeployPhase::Rendering);
+        // NAN-5132: hold BEFORE enabling, so every render from here on (this
+        // one, another app host's, the publication reconciler's) sees the
+        // source parked until phase A is verified on every ingest host.
+        two_phase.hold(&self.pool, id, HoldPurpose::Deploy).await;
         self.repository().enable(id).await?;
 
         // NAN-928: the helper also resolves dispatch source-config route names
@@ -391,10 +424,48 @@ impl LogSourceService {
         //
         // `_locked`: this method already holds the deploy guard (NAN-2297).
         progress.phase(DeployPhase::Reloading);
+        two_phase.published = two_phase.held;
         if let Err(failure) = self
             .vector_config
             .reload_and_verify_locked(backup.as_ref())
             .await
+        {
+            return self
+                .reload_failure_result(id, &log_source, backup.is_some(), failure, progress)
+                .await;
+        }
+
+        // NAN-5132 (PR 5): phase A (the parked chain) is live on every host;
+        // activate it. A failure here withdraws the whole deploy.
+        if two_phase.held {
+            if let Some(failed) = self
+                .activate_held_deploy(id, &log_source, backup.as_ref(), progress, two_phase)
+                .await?
+            {
+                return Ok(failed);
+            }
+        }
+
+        // Success! The deploy regenerated the whole Vector config from EVERY
+        // enabled source, so they're all live now — mark the explicit target
+        // (refreshing its deployed_at) and flip any other enabled-but-never-
+        // deployed source to deployed too. Without this, sources included in the
+        // config but never individually published (e.g. batch-imported parsers)
+        // keep showing "ready" though they're live (NAN-1275). Best-effort: a
+        // bookkeeping miss must not fail an otherwise-successful deploy.
+        self.finish_successful_deploy(id, &log_source, two_phase.activated).await
+    }
+
+    /// The deploy result for a failed [`VectorConfigManager::reload_and_verify_locked`]
+    /// (shared by the one-phase reload and both phases of a two-phase one).
+    async fn reload_failure_result(
+        &self,
+        id: Uuid,
+        log_source: &crate::log_sources::types::LogSource,
+        had_backup: bool,
+        failure: crate::parsers::VectorVerifyFailure,
+        progress: &dyn DeployProgress,
+    ) -> Result<DeploymentResult, LogSourceServiceError> {
         {
             let error_msg = format!("{}", failure);
             tracing::error!(
@@ -434,7 +505,7 @@ impl LogSourceService {
                     delivery: None,
                 });
             }
-            if !failure.rolled_back && backup.is_some() {
+            if !failure.rolled_back && had_backup {
                 let error_msg = format!("Reload failed and rollback also failed: {}", error_msg);
                 let _ = self
                     .repository()
@@ -474,7 +545,7 @@ impl LogSourceService {
                 format!("Reload failed and was NOT rolled back: {}", error_msg)
             };
 
-            return Ok(DeploymentResult {
+            Ok(DeploymentResult {
                 success: false,
                 log_source_id: id,
                 action: DeploymentAction::Deploy.as_str().to_string(),
@@ -482,16 +553,149 @@ impl LogSourceService {
                 validation_result: None,
                 deployment_id: None,
                 delivery: None,
-            });
+            })
+        }
+    }
+
+    /// NAN-5132 (PR 5): phase B of a two-phase deploy. Phase A (the source
+    /// parked) is installed; confirm every ingest host acknowledged it, then
+    /// release the hold, render, promote and reload once more. `Some` is the
+    /// failed result (the caller withdraws the deploy); `None` means active.
+    async fn activate_held_deploy(
+        &self,
+        id: Uuid,
+        log_source: &crate::log_sources::types::LogSource,
+        backup: Option<&crate::parsers::VectorBackupGeneration>,
+        progress: &dyn DeployProgress,
+        two_phase: &mut TwoPhase,
+    ) -> Result<Option<DeploymentResult>, LogSourceServiceError> {
+        // Role split: "live" includes hosts still installing (NAN-5279). The
+        // point of phase A is that EVERY host built the chain, so anything but
+        // a full acknowledgement stops here, before routing changes anywhere.
+        if VectorConfigManager::generation_delivery_active() {
+            if let Err(detail) = activation::staged_on_every_host(take_delivery()) {
+                return Ok(Some(
+                    self.withdraw_two_phase(
+                        id,
+                        backup,
+                        progress,
+                        format!(
+                            "Not every ingest host acknowledged the staged configuration, so the \
+                             source was not activated anywhere and the deploy was withdrawn: {detail}"
+                        ),
+                    )
+                    .await,
+                ));
+            }
         }
 
-        // Success! The deploy regenerated the whole Vector config from EVERY
-        // enabled source, so they're all live now — mark the explicit target
-        // (refreshing its deployed_at) and flip any other enabled-but-never-
-        // deployed source to deployed too. Without this, sources included in the
-        // config but never individually published (e.g. batch-imported parsers)
-        // keep showing "ready" though they're live (NAN-1275). Best-effort: a
-        // bookkeeping miss must not fail an otherwise-successful deploy.
+        progress.phase(DeployPhase::Activating);
+        if let Err(e) = activation::release(&self.pool, id).await {
+            return Ok(Some(
+                self.withdraw_two_phase(
+                    id,
+                    backup,
+                    progress,
+                    format!("Could not activate the staged source: {e}"),
+                )
+                .await,
+            ));
+        }
+        two_phase.held = false;
+        let parsers = self.effective_deployed_parsers().await?;
+        // Phase A already passed `vector validate` (when enabled) on the same
+        // set; B only adds the route and re-points the chain's entry.
+        let promoted = match self.vector_config.stage_parsers(&parsers).await {
+            Ok(()) => self.vector_config.promote_staged().await,
+            Err(e) => {
+                let _ = self.vector_config.cleanup_staging().await;
+                Err(e)
+            }
+        };
+        if let Err(e) = promoted {
+            return Ok(Some(
+                self.withdraw_two_phase(
+                    id,
+                    backup,
+                    progress,
+                    format!("Could not render the activated configuration: {e}"),
+                )
+                .await,
+            ));
+        }
+        if let Err(failure) = self.vector_config.reload_and_verify_locked(backup).await {
+            return self
+                .reload_failure_result(id, log_source, backup.is_some(), failure, progress)
+                .await
+                .map(Some);
+        }
+        two_phase.activated = true;
+        Ok(None)
+    }
+
+    /// NAN-5132: put the pre-deploy configuration back after a two-phase
+    /// deploy stopped between its phases. Local install: restore the snapshot
+    /// taken before phase A and reload. Role split: the caller republishes
+    /// once the database is reverted (the hosts run what it renders).
+    async fn withdraw_two_phase(
+        &self,
+        id: Uuid,
+        backup: Option<&crate::parsers::VectorBackupGeneration>,
+        progress: &dyn DeployProgress,
+        reason: String,
+    ) -> DeploymentResult {
+        tracing::warn!(log_source_id = %id, "{reason}");
+        progress.phase(DeployPhase::RollingBack);
+        let mut message = reason;
+        if !VectorConfigManager::generation_delivery_active() {
+            match backup {
+                Some(backup) => match self.vector_config.restore_backup(backup).await {
+                    Ok(()) => {
+                        if let Err(e) = self.vector_config.reload_vector().await {
+                            tracing::error!(error = %e, "reload after withdrawing a two-phase deploy failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not restore the configuration from before the deploy");
+                        message.push_str(&format!(
+                            ". Restoring the previous configuration also failed ({e}); check the Vector config"
+                        ));
+                    }
+                },
+                None => message.push_str(
+                    ". No snapshot was taken before the deploy, so the staged (parked) chain stays \
+                     installed until the next deploy; it receives no events",
+                ),
+            }
+        }
+        let _ = self
+            .repository()
+            .record_deployment(
+                id,
+                DeploymentAction::Rollback.as_str(),
+                DeploymentStatus::RolledBack.as_str(),
+                Some(&message),
+                None,
+            )
+            .await;
+        DeploymentResult {
+            success: false,
+            log_source_id: id,
+            action: DeploymentAction::Deploy.as_str().to_string(),
+            message,
+            validation_result: None,
+            deployment_id: None,
+            delivery: None,
+        }
+    }
+
+    /// Bookkeeping and the result for a deploy that went live.
+    async fn finish_successful_deploy(
+        &self,
+        id: Uuid,
+        log_source: &crate::log_sources::types::LogSource,
+        two_phase: bool,
+    ) -> Result<DeploymentResult, LogSourceServiceError> {
         self.repository().mark_deployed(id).await?;
         if let Err(e) = self.repository().mark_enabled_deployed().await {
             tracing::warn!(error = %e, "deploy succeeded but failed to mark sibling enabled sources deployed");
@@ -523,10 +727,14 @@ impl LogSourceService {
 
         // NAN-5279: on a role-split install the note and `delivery` say
         // whether every ingest host installed it or some are still installing.
-        let (message, delivery) = with_delivery(format!(
-            "Log source '{}' deployed successfully",
-            log_source.name
-        ));
+        let (message, delivery) = with_delivery(if two_phase {
+            format!(
+                "Log source '{}' deployed successfully (staged on every ingest host, then activated)",
+                log_source.name
+            )
+        } else {
+            format!("Log source '{}' deployed successfully", log_source.name)
+        });
         Ok(DeploymentResult {
             success: true,
             log_source_id: id,
@@ -558,17 +766,39 @@ impl LogSourceService {
         progress.phase(DeployPhase::WaitingForLock);
         let _deploy_guard = self.vector_config.lock_deploys().await;
         progress.phase(DeployPhase::Rendering);
+        release_leftover_holds(&self.pool, id).await;
 
         tracing::info!("Undeploying log source '{}' ({})", log_source.name, id);
 
-        // Disable and mark as undeployed
+        // NAN-5132 (PR 5): removing a live router-fed source goes out in two
+        // generations too. A: unroute it and park its chain (it stops
+        // receiving events on every host); B: drop the chain. A failure in A
+        // leaves the source deployed and routed, exactly as before the call.
+        let mut two_phase = TwoPhase::new(
+            log_source.enabled
+                && activation::available()
+                && activation::eligible(&log_source.kind, &log_source.source_type),
+        );
+        two_phase.hold(&self.pool, id, HoldPurpose::Undeploy).await;
+        if two_phase.held {
+            if let Some(stopped) = self.stage_held_undeploy(id, &log_source, progress, &mut two_phase).await {
+                return Ok(stopped);
+            }
+            progress.phase(DeployPhase::Activating);
+        }
+
+        // Disable and mark as undeployed. The hold goes only after the
+        // disable: in between, the source must never render live again.
         self.repository().disable(id).await?;
+        two_phase.release(&self.pool, id).await;
         self.repository().mark_undeployed(id).await?;
 
         // Redeploy all remaining enabled log sources (using active versions)
         let parsers = self.effective_deployed_parsers().await?;
 
-        progress.phase(DeployPhase::Reloading);
+        if !two_phase.held && !two_phase.published {
+            progress.phase(DeployPhase::Reloading);
+        }
         if let Err(e) = self.vector_config.deploy_and_reload_locked(&parsers).await {
             let error_msg = format!("Failed to redeploy after undeploy: {}", e);
             tracing::error!("{}", error_msg);
@@ -648,6 +878,78 @@ impl LogSourceService {
         })
     }
 
+    /// NAN-5132 (PR 5): phase A of a two-phase undeploy: render the held
+    /// source parked (unrouted, chain disconnected) and confirm every ingest
+    /// host installed it. `Some` is the result of an undeploy that stopped
+    /// here: the hold is released and the source stays deployed and routed.
+    async fn stage_held_undeploy(
+        &self,
+        id: Uuid,
+        log_source: &crate::log_sources::types::LogSource,
+        progress: &dyn DeployProgress,
+        two_phase: &mut TwoPhase,
+    ) -> Option<DeploymentResult> {
+        progress.phase(DeployPhase::Reloading);
+        two_phase.published = true;
+        let staged = match self.effective_deployed_parsers().await {
+            Ok(parsers) => self
+                .vector_config
+                .deploy_and_reload_locked(&parsers)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let role_split = VectorConfigManager::generation_delivery_active();
+        let verdict = match staged {
+            Err(e) => Err(e),
+            Ok(()) if role_split => activation::staged_on_every_host(take_delivery()),
+            Ok(()) => Ok(()),
+        };
+        let reason = verdict.err()?;
+
+        progress.phase(DeployPhase::RollingBack);
+        two_phase.release(&self.pool, id).await;
+        // Local: `deploy_and_reload_locked` already restored its snapshot on a
+        // rejection. Role split: republish the routed state from the database.
+        if role_split {
+            if let Err(e) = self.vector_config.reload_vector().await {
+                tracing::warn!(error = %e, "could not republish after a withdrawn undeploy; the reconciler retries");
+            }
+        } else if let Ok(parsers) = self.effective_deployed_parsers().await {
+            // A staged tree Vector accepted but did not stay healthy on is
+            // still on disk: render the routed state again.
+            if let Err(e) = self.vector_config.deploy_and_reload_locked(&parsers).await {
+                tracing::error!(error = %e, "could not restore the routed config after a withdrawn undeploy");
+            }
+        }
+        let message = format!(
+            "Undeploy of '{}' stopped before anything was removed: not every ingest host \
+             installed the staged (unrouted) configuration, so the source stays deployed and \
+             routed. {reason}",
+            log_source.name
+        );
+        tracing::warn!(log_source_id = %id, "{message}");
+        let _ = self
+            .repository()
+            .record_deployment(
+                id,
+                DeploymentAction::Undeploy.as_str(),
+                DeploymentStatus::RolledBack.as_str(),
+                Some(&message),
+                None,
+            )
+            .await;
+        Some(DeploymentResult {
+            success: false,
+            log_source_id: id,
+            action: DeploymentAction::Undeploy.as_str().to_string(),
+            message,
+            validation_result: None,
+            deployment_id: None,
+            delivery: None,
+        })
+    }
+
     /// Deploy all enabled log sources (using active version VRL)
     pub async fn deploy_all(&self) -> Result<(), LogSourceServiceError> {
         self.deploy_all_with_progress(&NoProgress).await
@@ -700,5 +1002,73 @@ impl LogSourceService {
             }
         }
         Ok(deployments)
+    }
+}
+
+/// NAN-5132: release holds a dead deploy left (this source's, and any older
+/// than [`activation::STALE_HOLD_AFTER`]). Best effort.
+async fn release_leftover_holds(pool: &sqlx::PgPool, id: Uuid) {
+    match activation::release(pool, id).await {
+        Ok(true) => tracing::warn!(
+            log_source_id = %id,
+            "released an activation hold left by an interrupted deploy of this source"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(log_source_id = %id, error = %e, "could not release a leftover activation hold"),
+    }
+    if let Err(e) = activation::release_stale(pool).await {
+        tracing::warn!(error = %e, "could not release stale log-source activation holds");
+    }
+}
+
+/// NAN-5132 (PR 5): where a two-phase deploy or undeploy stands.
+pub(super) struct TwoPhase {
+    /// Eligible and available when the call started.
+    enabled: bool,
+    /// The source has a hold row (renders parked).
+    held: bool,
+    /// Phase A was handed to Vector / the ingest hosts.
+    published: bool,
+    /// Phase B went live.
+    activated: bool,
+}
+
+impl TwoPhase {
+    pub(super) fn new(enabled: bool) -> Self {
+        Self { enabled, held: false, published: false, activated: false }
+    }
+
+    /// Take the hold. A failure falls back to a one-phase deploy.
+    async fn hold(&mut self, pool: &sqlx::PgPool, id: Uuid, purpose: HoldPurpose) {
+        if !self.enabled {
+            return;
+        }
+        match activation::hold(pool, id, purpose).await {
+            Ok(()) => self.held = true,
+            Err(e) => {
+                tracing::warn!(
+                    log_source_id = %id,
+                    error = %e,
+                    "could not stage the source for two-phase activation; deploying in one phase"
+                );
+                self.enabled = false;
+            }
+        }
+    }
+
+    /// Release the hold if this call still has one. Best effort: a stale hold
+    /// is released by the next deploy or API start.
+    async fn release(&mut self, pool: &sqlx::PgPool, id: Uuid) {
+        if !self.held {
+            return;
+        }
+        match activation::release(pool, id).await {
+            Ok(_) => self.held = false,
+            Err(e) => tracing::error!(
+                log_source_id = %id,
+                error = %e,
+                "could not release the activation hold; the source renders parked until the next deploy"
+            ),
+        }
     }
 }

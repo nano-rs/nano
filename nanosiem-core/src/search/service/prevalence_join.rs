@@ -463,82 +463,23 @@ impl SearchService {
     /// `_hash_lookup`). Shared by `generate_prevalence_join_sql` and the
     /// NAN-1705 rescue probe so both key off byte-identical expressions.
     ///
-    /// NAN-1241: resolve the UDM-semantic lookup columns to the active schema's
-    /// physical columns. UDM returns the same bare literal (byte-identical
-    /// output); OCSF returns the promoted dotted column (e.g.
-    /// `"dst_endpoint.hostname"`). `None` => the schema has no column for that
-    /// concept, so that lookup branch is dropped rather than referencing a
-    /// missing column (which would 500 on OCSF).
+    /// NAN-5293: every key derives from the canonical artifact column list
+    /// (`prevalence::artifact_fields`), the same list the query-artifacts
+    /// endpoint, the in-memory path, the drawer and the scatter read. The
+    /// pre-5293 keys resolved UDM concepts one by one, so the domain key fell
+    /// back to `src_host` (`device.hostname` on OCSF) before ever reaching
+    /// `query.hostname` and keyed every Sysmon DNS row on the workstation.
+    /// `"NULL"` => the schema has no column for that class (dictGet then
+    /// falls through to the 9999 "not tracked" sentinel).
     fn prevalence_lookup_exprs(&self) -> PrevalenceLookupExprs {
-        let profile = self.active_profile.as_ref();
-        let dest_host_col = profile.udm_column_sql("dest_host");
-        let src_host_col = profile.udm_column_sql("src_host");
-        let query_col = profile.udm_column_sql("query");
-        let dest_ip_col = profile.udm_column_sql("dest_ip");
-        let src_ip_col = profile.udm_column_sql("src_ip");
-        let file_hash_col = profile.udm_column_sql("file_hash");
-        let process_hash_col = profile.udm_column_sql("process_hash");
-
-        // Domain lookup key: first non-empty non-IP domain field. Skip any branch whose column
-        // is unmapped; if no domain column maps at all, emit NULL (dictGet then falls through to
-        // the 9999 sentinel — i.e. "not tracked").
-        let domain = {
-            let mut branches: Vec<String> = Vec::new();
-            if let Some(c) = &dest_host_col {
-                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
-            }
-            if let Some(c) = &src_host_col {
-                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
-            }
-            if let Some(c) = &query_col {
-                branches.push(format!("nullIf(lower({c}), '')"));
-            }
-            if branches.is_empty() {
-                "NULL".to_string()
-            } else {
-                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
-            }
-        };
-
-        // IP lookup key: first non-empty IP field (or dest_host when it's an IP literal).
-        let ip = {
-            let mut branches: Vec<String> = Vec::new();
-            if let Some(c) = &dest_ip_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if let Some(c) = &src_ip_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if let Some(c) = &dest_host_col {
-                branches.push(format!("nullIf(CASE WHEN match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') THEN {c} ELSE '' END, '')"));
-            }
-            if branches.is_empty() {
-                "NULL".to_string()
-            } else {
-                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
-            }
-        };
-
-        // Hash lookup key: first non-empty hash field, lowercased for case-insensitive match.
-        let hash = {
-            let mut branches: Vec<String> = Vec::new();
-            if let Some(c) = &file_hash_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if let Some(c) = &process_hash_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if branches.is_empty() {
-                "NULL".to_string()
-            } else {
-                format!(
-                    "lower(COALESCE(\n            {}\n        ))",
-                    branches.join(",\n            ")
-                )
-            }
-        };
-
-        PrevalenceLookupExprs { domain, ip, hash }
+        use crate::prevalence::artifact_fields::{ArtifactColumns, ArtifactKind};
+        let cols = ArtifactColumns::resolve(self.active_profile.as_ref());
+        let key = |kind| cols.lookup_key_sql(kind).unwrap_or_else(|| "NULL".to_string());
+        PrevalenceLookupExprs {
+            domain: key(ArtifactKind::Domain),
+            ip: key(ArtifactKind::Ip),
+            hash: key(ArtifactKind::Hash),
+        }
     }
 
     /// NAN-1705 (D4b): re-resolve dict-blind artifacts against the real-time
@@ -888,80 +829,21 @@ impl SearchService {
         let ip_dict = "nanosiem.ip_prevalence_dict".to_string();
         let hash_dict = "nanosiem.hash_prevalence_dict".to_string();
 
-        // NAN-1241: resolve the UDM-semantic lookup columns to the active schema's physical
-        // columns (see `prevalence_lookup_exprs` — shared with the NAN-1705 rescue probe so
+        // The lookup keys come from the canonical artifact list (see
+        // `prevalence_lookup_exprs` — shared with the NAN-1705 rescue probe so
         // both key off byte-identical expressions).
-        let profile = self.active_profile.as_ref();
-        let dest_host_col = profile.udm_column_sql("dest_host");
-        let src_host_col = profile.udm_column_sql("src_host");
-        let query_col = profile.udm_column_sql("query");
-        let dest_ip_col = profile.udm_column_sql("dest_ip");
-        let src_ip_col = profile.udm_column_sql("src_ip");
-        let file_hash_col = profile.udm_column_sql("file_hash");
-        let process_hash_col = profile.udm_column_sql("process_hash");
-
         let PrevalenceLookupExprs {
             domain: domain_lookup_expr,
             ip: ip_lookup_expr,
             hash: hash_lookup_expr,
         } = self.prevalence_lookup_exprs();
 
-        // `prevalence_artifact` CASE arms project the human-facing artifact value per winning
-        // entity type from whichever columns the schema maps.
-        //
-        // `udm_column_sql` returns a bare column for UDM, but for some OCSF fields
-        // (e.g. process_hash) a class-spanning EXPRESSION like
-        // `if(`process.file.hashes.sha256` != '', …, `actor.…`)`. A bare column is
-        // `l.`-qualified against `FROM base_logs l`; an expression must NOT be —
-        // `l.if(…)` is a bogus function call (CH: "Function `l.if` does not exist",
-        // NAN-1291). Its inner column refs resolve unqualified against the single
-        // source table. UDM (always a bare column) is byte-identical.
-        let artifact_col = |c: &str| -> String {
-            if c.contains('(') {
-                format!("nullIf({c}, '')")
-            } else {
-                format!("nullIf(l.{c}, '')")
-            }
-        };
-        let domain_artifact_expr = {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(c) = &dest_host_col {
-                parts.push(artifact_col(c));
-            }
-            if let Some(c) = &src_host_col {
-                parts.push(artifact_col(c));
-            }
-            if let Some(c) = &query_col {
-                parts.push(artifact_col(c));
-            }
-            parts.push("''".to_string());
-            format!("COALESCE({})", parts.join(", "))
-        };
-        let ip_artifact_expr = {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(c) = &dest_ip_col {
-                parts.push(artifact_col(c));
-            }
-            if let Some(c) = &src_ip_col {
-                parts.push(artifact_col(c));
-            }
-            if let Some(c) = &dest_host_col {
-                parts.push(artifact_col(c));
-            }
-            parts.push("''".to_string());
-            format!("COALESCE({})", parts.join(", "))
-        };
-        let hash_artifact_expr = {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(c) = &file_hash_col {
-                parts.push(artifact_col(c));
-            }
-            if let Some(c) = &process_hash_col {
-                parts.push(artifact_col(c));
-            }
-            parts.push("''".to_string());
-            format!("COALESCE({})", parts.join(", "))
-        };
+        // NAN-5293: `prevalence_artifact` is the lookup key that won, so the
+        // artifact shown is exactly the one whose prevalence was read (before,
+        // a separate COALESCE could name a different column than the key).
+        let domain_artifact_expr = "l._domain_lookup";
+        let ip_artifact_expr = "l._ip_lookup";
+        let hash_artifact_expr = "l._hash_lookup";
 
         // Build the WHERE clause and EVAL expressions from post-prevalence commands
         // EVAL expressions must be processed first so WHERE can reference them

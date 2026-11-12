@@ -354,6 +354,7 @@
     /// Build a minimal enrichment `Parser` for generator tests.
     fn enrichment_test_parser(enrich_kind: &str, target_table: &str, normalize_vrl: &str) -> Parser {
         Parser {
+            activation_parked: false,
             id: uuid::Uuid::new_v4(),
             name: format!("test_{enrich_kind}"),
             description: None,
@@ -389,6 +390,7 @@
     /// Build a minimal enabled/disabled log `Parser` for OCSF-sink wiring tests.
     fn log_test_parser(name: &str, enabled: bool) -> Parser {
         Parser {
+            activation_parked: false,
             id: uuid::Uuid::new_v4(),
             name: name.to_string(),
             description: None,

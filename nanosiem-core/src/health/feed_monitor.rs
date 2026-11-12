@@ -70,7 +70,7 @@ impl FeedMonitor {
     async fn get_log_sources_with_alerts_enabled(&self) -> Result<Vec<LogSourceInfo>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, stale_threshold_minutes, match_pattern, match_values
+            SELECT id, name, source_type, stale_threshold_minutes, match_pattern, match_values
             FROM log_sources
             WHERE enabled = true AND stale_alert_enabled = true
             "#,
@@ -80,12 +80,26 @@ impl FeedMonitor {
 
         Ok(rows
             .iter()
-            .map(|r| LogSourceInfo {
-                id: r.get("id"),
-                name: r.get("name"),
-                stale_threshold_minutes: r.get("stale_threshold_minutes"),
-                match_pattern: r.get("match_pattern"),
-                match_values: r.get::<Option<Vec<String>>, _>("match_values"),
+            .map(|r| {
+                let match_values = r.get::<Option<Vec<String>>, _>("match_values");
+                let source_type: String = r.get("source_type");
+                // NAN-3659: a sparse audit stream still on the 15-minute
+                // default is judged against its stream's cadence.
+                let stale_threshold_minutes =
+                    crate::log_sources::cadence::effective_stale_threshold_minutes(
+                        r.get("stale_threshold_minutes"),
+                        &crate::log_sources::cadence::route_keys(
+                            &source_type,
+                            match_values.as_deref(),
+                        ),
+                    );
+                LogSourceInfo {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    stale_threshold_minutes,
+                    match_pattern: r.get("match_pattern"),
+                    match_values,
+                }
             })
             .collect())
     }

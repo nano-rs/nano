@@ -18,6 +18,7 @@ use tempfile::TempDir;
 
 fn parser(name: &str, source_type: &str, enabled: bool) -> Parser {
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::new_v4(),
         name: name.to_string(),
         description: None,

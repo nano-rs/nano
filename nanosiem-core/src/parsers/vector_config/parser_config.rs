@@ -731,6 +731,7 @@ mod tests {
         extension_enabled: bool,
     ) -> Parser {
         Parser {
+            activation_parked: false,
             id: Uuid::new_v4(),
             name: "test_apache".to_string(),
             description: None,

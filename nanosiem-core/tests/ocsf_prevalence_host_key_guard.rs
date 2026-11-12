@@ -39,6 +39,15 @@ const HOST_KEYED_MVS: &[&str] = &[
     "ip_prevalence_source_ocsf_mv",
 ];
 
+/// Producers created by ocsf/197 (NAN-5271 #23) with the fixed host key from
+/// the start; tests/ocsf_prevalence_actor_http_guard.rs pins them.
+const ADDED_IN_197: &[&str] = &[
+    "ocsf_hash_prevalence_summary_actor_process_hash_mv",
+    "ocsf_domain_prevalence_summary_http_url_mv",
+    "hash_prevalence_source_ocsf_actor_process_mv",
+    "domain_prevalence_source_ocsf_http_url_mv",
+];
+
 const OLD_TAIL: &str = "if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown')";
 const NEW_TAIL: &str =
     "if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown'))";
@@ -100,7 +109,10 @@ fn every_overlay_mv_with_a_source_host_key_is_covered() {
             continue;
         }
         let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-        assert!(HOST_KEYED_MVS.contains(&name.as_str()), "{name} is not covered by ocsf/196");
+        assert!(
+            HOST_KEYED_MVS.contains(&name.as_str()) || ADDED_IN_197.contains(&name.as_str()),
+            "{name} is not covered by ocsf/196 (or created with the fixed key by ocsf/197)"
+        );
     }
 }
 

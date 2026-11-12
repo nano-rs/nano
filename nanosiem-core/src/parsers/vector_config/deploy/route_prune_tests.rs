@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 fn kafka_parser(name: &str, route: Option<&str>) -> Parser {
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::new_v4(),
         name: name.to_string(),
         description: None,

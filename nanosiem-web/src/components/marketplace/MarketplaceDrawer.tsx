@@ -29,6 +29,7 @@ import { humanizeEnum } from '@/lib/marketplace-labels';
 import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard';
 import { BundleFeedStatus } from './BundleFeedStatus';
 import { bundleProvisions, platformFeedForEntry, type BundleProvision } from '@/lib/api/marketplace-inventory';
+import { useCapabilitiesOptional } from '@/hooks/use-capabilities';
 
 const TABS = [
   { id: 'about',  label: 'About',       icon: Info },
@@ -68,10 +69,18 @@ export function MarketplaceDrawer({
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const canPreview = hasPermission('enrichments:configure');
+  // Collector connections (`/api/integrations/*`) and the sandbox preview
+  // (`POST /api/marketplace/catalog/{slug}/preview`) exist only in enterprise
+  // builds, behind the same `customEnrichment` capability the catalog uses to
+  // gate collector and Deno entries. Without it the tab and the button would be
+  // dead affordances in the open edition (NAN-5281).
+  const sandboxAvailable = !!useCapabilitiesOptional()?.capabilities.customEnrichment;
+  // Deleting a custom collector first lists its connections, so it needs the
+  // same capability.
+  const canDeleteCustomCollector =
+    sandboxAvailable && hasPermission('log_sources:delete') && hasPermission('enrichments:code');
   const canViewCode =
     hasPermission('enrichments:view') && hasPermission('enrichments:code');
-  const canDeleteCustomCollector =
-    hasPermission('log_sources:delete') && hasPermission('enrichments:code');
   // Air-gap mode — shared cache with the catalog page's query key. When the
   // entry needs network, the egress "Sync now" action is replaced by an
   // import-from-file route so the drawer stays honest offline (NAN-1212).
@@ -123,12 +132,12 @@ export function MarketplaceDrawer({
     setShowSecrets({});
     setCredsDirty(false);
     setDeleteOpen(false);
-    setTab(initialTab);
+    setTab(initialTab === 'connections' && !sandboxAvailable ? 'config' : initialTab);
     api.marketplace.getCatalogEntry(slug)
       .then(loaded => setEntry(loaded))
       .catch(() => toast({ title: 'Error', description: 'Failed to load details', variant: 'destructive' }))
       .finally(() => setLoading(false));
-  }, [slug, open, toast, initialTab]);
+  }, [slug, open, toast, initialTab, sandboxAvailable]);
 
   // Re-read this drawer's own entry. `onUpdated()` only refreshes the parent
   // catalog list, which the drawer does not read from (NAN-2343).
@@ -428,6 +437,7 @@ export function MarketplaceDrawer({
               exporting={exporting}
               savingCreds={savingCreds}
               canPreview={canPreview}
+              sandboxAvailable={sandboxAvailable}
               onOpenPreview={() => setPreviewOpen(true)}
               bundleProvision={platformFeedForEntry(entry) ? bundleProvisions(feedBundle.data).get(platformFeedForEntry(entry) ?? entry.slug) ?? null : null}
             />
@@ -489,6 +499,8 @@ interface DrawerInnerProps {
   exporting: boolean;
   savingCreds: boolean;
   canPreview: boolean;
+  /** Enterprise sandbox surfaces (collector connections, preview) are available. */
+  sandboxAvailable: boolean;
   onOpenPreview: () => void;
   /** NAN-4959: the bundle status of a bundle-only feed (IPinfo Lite); null when unknown. */
   bundleProvision: BundleProvision | null;
@@ -502,7 +514,7 @@ function DrawerInner(props: DrawerInnerProps) {
     handleToggleEnabled, handleSync, handleUninstall, prepareCustomCollectorDelete,
     handleUpdate, handleExport, handleSaveCredentials,
     syncing, updating, exporting, savingCreds,
-    canPreview, canDeleteCustomCollector, checkingDelete,
+    canPreview, canDeleteCustomCollector, checkingDelete, sandboxAvailable,
     onOpenPreview, bundleProvision,
   } = props;
 
@@ -538,7 +550,7 @@ function DrawerInner(props: DrawerInnerProps) {
       <div className="border-b border-border flex items-center px-2 bg-muted/20">
         {TABS
           .filter(t => t.id !== 'code' || canViewCode)
-          .filter(t => t.id !== 'connections' || entry.execution_backend === 'collector')
+          .filter(t => t.id !== 'connections' || (entry.execution_backend === 'collector' && sandboxAvailable))
           .map(t => {
           const Tg = t.icon;
           return (
@@ -559,9 +571,11 @@ function DrawerInner(props: DrawerInnerProps) {
         <button
           type="button"
           onClick={onOpenPreview}
-          disabled={!entry.installed || !canPreview}
+          disabled={!entry.installed || !canPreview || !sandboxAvailable}
           title={
-            !canPreview
+            !sandboxAvailable
+              ? 'Requires the Enterprise edition'
+              : !canPreview
               ? 'Requires permission to configure enrichments'
               : entry.installed
                 ? 'Run the enrichment against a sample artifact'
@@ -604,7 +618,7 @@ function DrawerInner(props: DrawerInnerProps) {
             updating={updating}
           />
         )}
-        {tab === 'connections' && entry.execution_backend === 'collector' && (
+        {tab === 'connections' && entry.execution_backend === 'collector' && sandboxAvailable && (
           <ConnectionsTab entry={entry} />
         )}
         {tab === 'code' && canViewCode && (

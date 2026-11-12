@@ -1294,6 +1294,9 @@ mod cloud_resource_column_tests;
 #[cfg(test)]
 #[path = "npl_golden_corpus_tests.rs"]
 pub(crate) mod npl_golden_corpus_tests;
+#[cfg(test)]
+#[path = "prevalence_canonical_keys_tests.rs"]
+mod prevalence_canonical_keys_tests;
 
 #[cfg(test)]
 #[path = "npl_injection_canary_tests.rs"]

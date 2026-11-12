@@ -154,6 +154,9 @@ mod ocsf_parser_health_tests;
 #[cfg(test)]
 #[path = "token_bound_route_tests.rs"]
 mod token_bound_route_tests;
+#[cfg(test)]
+#[path = "two_phase_activation_tests.rs"]
+mod two_phase_activation_tests;
 mod credentials;
 pub mod delivery;
 mod deploy;
@@ -172,7 +175,8 @@ pub use publication::{
     PublicationOutcome, SnapshotBundle, VectorConfigPublicationError, VectorConfigPublisher,
 };
 pub use redaction::redact_config_snapshot;
-pub use deploy::{ActivationOutcome, ReloadWatch};
+pub use backup::BackupGeneration;
+pub use deploy::{ActivationOutcome, ReloadWatch, VerifyFailure};
 
 /// NAN-4936: hooks for tests elsewhere in the crate (the entrypoint tests).
 #[cfg(test)]
@@ -180,6 +184,32 @@ pub(crate) mod test_hooks {
     pub(crate) use super::deploy::request_reload_in;
 }
 pub use router::{base_router_inputs, hec_normalize_present};
+
+/// NAN-5132 (two-phase activation): stable fan-in slots are on, so the parked
+/// filter a held source reads exists.
+pub fn fanin_slots_enabled() -> bool {
+    fanin_slots::enabled()
+}
+
+/// NAN-5132: Vector pulls generations with no acknowledgement to wait for
+/// (Kubernetes), so a staged phase cannot be verified.
+pub fn local_reload_disabled() -> bool {
+    deploy::local_reload_disabled()
+}
+
+/// NAN-5132: a parser of this source type reads `source_router` (HTTP, Vector
+/// native, unknown labels), not the HEC, OTLP or a pull lane.
+pub fn is_router_fed(source_type: &str) -> bool {
+    matches!(router::transport_of(source_type), router::Transport::Routed)
+}
+
+impl VectorConfigManager {
+    /// NAN-5132: this process grades reloads by ingest-host acknowledgement
+    /// (role split) and publishes from the database, not from its own tree.
+    pub fn generation_delivery_active() -> bool {
+        remote_delivery::active_publisher().is_some()
+    }
+}
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

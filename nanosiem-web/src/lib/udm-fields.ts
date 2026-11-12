@@ -156,11 +156,13 @@ export function filterUdmFields(prefix: string, limit = 12): string[] {
 }
 
 /**
- * Prefix-filter the union of UDM field names and the active schema's field names
- * (NAN-1241). Under UDM (`extraFields` empty/undefined) this is byte-identical to
- * `filterUdmFields`; under OCSF the promoted columns (`src_endpoint.ip`, …) are
- * offered too. The union is sorted, de-duplicated, and matched both on the full
- * name and on the dotted leaf so a partial leaf still suggests dotted columns.
+ * Prefix-filter the active schema's field names (NAN-1241). Under UDM
+ * (`extraFields` empty/undefined) this is byte-identical to `filterUdmFields`.
+ * With schema fields (OCSF) ONLY those are suggested — the UDM short names are
+ * never offered there (NAN-5292, same rule as `eventFieldLabels`, NAN-5271);
+ * a typed UDM alias still validates and runs. The list is sorted,
+ * de-duplicated, and matched both on the full name and on the dotted leaf so
+ * a partial leaf still suggests dotted columns.
  */
 export function filterFieldsWithSchema(
   prefix: string,
@@ -170,8 +172,8 @@ export function filterFieldsWithSchema(
   if (!extraFields || extraFields.length === 0) {
     return filterUdmFields(prefix, limit);
   }
-  const seen = new Set(UDM_FIELD_LIST);
-  const merged = [...UDM_FIELD_LIST];
+  const seen = new Set<string>();
+  const merged: string[] = [];
   for (const f of extraFields) {
     if (!seen.has(f)) {
       seen.add(f);

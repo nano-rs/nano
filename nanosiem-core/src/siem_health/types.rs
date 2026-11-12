@@ -434,6 +434,15 @@ pub struct InsertIntegrityMetrics {
     /// Stored reports predating NAN-4988 deserialize with an empty list.
     #[serde(default)]
     pub ingest_watchdog: Vec<IngestWatchdogHealth>,
+    /// `AsyncInsertFlush` queries running longer than
+    /// `ingest_stall::STUCK_FLUSH_ALERT_SECS`, summed over every replica
+    /// (NAN-5296). Read from `system.processes`, so it still reports when every
+    /// INSERT (including the watchdog's journal) fails with code 202.
+    #[serde(default)]
+    pub stuck_async_flushes: u64,
+    /// Elapsed seconds of the longest-running `AsyncInsertFlush`.
+    #[serde(default)]
+    pub longest_async_flush_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

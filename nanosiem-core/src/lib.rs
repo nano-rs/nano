@@ -55,6 +55,7 @@ pub mod hunts;
 pub mod identity;
 /// Named, revocable per-source ingest tokens (NAN-4907, ported from NAN-3770/3806).
 pub mod ingest_tokens;
+pub mod ingest_stall;
 pub mod ingest_watchdog;
 pub mod ingestion;
 pub mod inputlookup;

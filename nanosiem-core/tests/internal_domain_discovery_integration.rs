@@ -18,7 +18,7 @@ struct Value {
 /// Only `dest_host`, so the budget arithmetic below is about one column.
 fn dest_host_only() -> ArtifactColumns {
     ArtifactColumns {
-        domains: vec![ArtifactColumn { sql: "dest_host".into(), is_array: false }],
+        domains: vec![ArtifactColumn::scalar("dest_host")],
         ..Default::default()
     }
 }

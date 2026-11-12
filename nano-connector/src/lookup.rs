@@ -271,9 +271,14 @@ pub struct LookupSpec {
     #[serde(default)]
     pub credentials: Vec<CredentialField>,
     pub defaults: ProviderDefaults,
-    /// Per artifact type: the request and its mapping. A type not listed is
-    /// unsupported by this provider.
+    /// Per artifact type: the request and its mapping. A type listed neither
+    /// here nor in `pivots` is unsupported by this provider.
     pub types: BTreeMap<ArtifactType, TypeSpec>,
+    /// NAN-5286: two-step lookups. An artifact of a pivot type is first
+    /// resolved through the provider (e.g. Shodan `/dns/resolve`: domain ->
+    /// IP) and the resolved artifact is then looked up as its own type.
+    #[serde(default)]
+    pub pivots: BTreeMap<ArtifactType, PivotSpec>,
     /// HTTP statuses that mean "quota exhausted" (default 429).
     #[serde(default = "default_quota_status")]
     pub quota_status: Vec<u16>,
@@ -330,6 +335,39 @@ pub struct TypeSpec {
     #[serde(default)]
     pub link_path: Option<String>,
 }
+
+/// NAN-5286: resolve an artifact to another artifact type first, then look
+/// that up (`to` must be one of the spec's `types`).
+///
+/// The resolved value is validated exactly like a caller-supplied artifact
+/// (`Artifact::parse`), so an internal address a provider answers with is
+/// never sent anywhere, and a malformed one never reaches a request URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PivotSpec {
+    /// The resolve request (same allowlist, auth and limits as a lookup).
+    pub request: RequestTemplate,
+    /// Where the resolved value is in the answer. `artifact_key`: the answer
+    /// is an object keyed by the artifact itself (Shodan
+    /// `{"example.com": "93.184.216.34"}`; a dotted path cannot name such a
+    /// key). Otherwise a dotted body path; an array yields its first entry.
+    pub select: PivotSelect,
+    /// The artifact type the resolved value is looked up as.
+    pub to: ArtifactType,
+    /// Link when nothing resolved (`{{input.*}}` = the original artifact).
+    #[serde(default)]
+    pub link: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PivotSelect {
+    ArtifactKey,
+    Path(String),
+}
+
+/// Summary key holding the value a pivot resolved to.
+pub const RESOLVED_SUMMARY_KEY: &str = "resolved";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -507,21 +545,7 @@ impl LookupSpec {
             return Err(bad("allow must list literal hosts".into()));
         }
         for (t, ts) in &self.types {
-            // The request host is literal and allowlisted up front, so a spec
-            // can never be loaded that points anywhere else (the engine
-            // re-checks every request at run time).
-            let url = &ts.request.url;
-            let rest = url.strip_prefix("https://").ok_or_else(|| bad(format!("{}: request url must be https", t.as_str())))?;
-            let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-            let literal_path = &path[..path.find("{{").unwrap_or(path.len())];
-            let allowed = self.allow.iter().any(|r| {
-                r.host.as_deref() == Some(host)
-                    && (r.path_prefixes.is_empty()
-                        || r.path_prefixes.iter().any(|p| literal_path == p.as_str() || literal_path.starts_with(&format!("{}/", p.trim_end_matches('/')))))
-            });
-            if host.contains("{{") || !allowed {
-                return Err(bad(format!("{}: request url is not on the allowlist", t.as_str())));
-            }
+            self.check_request_url(&ts.request).map_err(|e| bad(format!("{}: {e}", t.as_str())))?;
             // Compiling also checks templates, allowlist and auth.
             let spec = self.connector_spec(*t).map_err(|e| bad(format!("{}: {e}", t.as_str())))?;
             engine::compile(&spec, &engine::default_ceilings()).map_err(|e| bad(format!("{}: {e}", t.as_str())))?;
@@ -534,23 +558,72 @@ impl LookupSpec {
                 }
             }
         }
+        for (t, p) in &self.pivots {
+            let at = |m: String| bad(format!("{} pivot: {m}", t.as_str()));
+            if self.types.contains_key(t) {
+                return Err(at("the type is also looked up directly".into()));
+            }
+            if *t == p.to || !self.types.contains_key(&p.to) {
+                return Err(at(format!("`to: {}` must be another type this spec looks up", p.to.as_str())));
+            }
+            if matches!(&p.select, PivotSelect::Path(path) if path.is_empty()) {
+                return Err(at("select path must not be empty".into()));
+            }
+            self.check_request_url(&p.request).map_err(at)?;
+            let spec = self.pivot_connector_spec(*t).map_err(at)?;
+            engine::compile(&spec, &engine::default_ceilings()).map_err(|e| at(e.to_string()))?;
+            if let Some(link) = &p.link {
+                template::references(link).map_err(|e| at(format!("link: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The request host is literal and allowlisted up front, so a spec can
+    /// never be loaded that points anywhere else (the engine re-checks every
+    /// request at run time).
+    fn check_request_url(&self, request: &RequestTemplate) -> Result<(), String> {
+        let url = &request.url;
+        let rest = url.strip_prefix("https://").ok_or("request url must be https")?;
+        let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        let literal_path = &path[..path.find("{{").unwrap_or(path.len())];
+        let allowed = self.allow.iter().any(|r| {
+            r.host.as_deref() == Some(host)
+                && (r.path_prefixes.is_empty()
+                    || r.path_prefixes.iter().any(|p| literal_path == p.as_str() || literal_path.starts_with(&format!("{}/", p.trim_end_matches('/')))))
+        });
+        if host.contains("{{") || !allowed {
+            return Err("request url is not on the allowlist".into());
+        }
         Ok(())
     }
 
     pub fn supports(&self, t: ArtifactType) -> bool {
-        self.types.contains_key(&t)
+        self.types.contains_key(&t) || self.pivots.contains_key(&t)
     }
 
     pub fn supported_types(&self) -> Vec<ArtifactType> {
-        self.types.keys().copied().collect()
+        let mut v: Vec<ArtifactType> = self.types.keys().chain(self.pivots.keys()).copied().collect();
+        v.sort();
+        v
     }
 
     /// The single-request `agent_enrichment` connector spec for one type.
     pub fn connector_spec(&self, t: ArtifactType) -> Result<ConnectorSpec, String> {
         let ts = self.types.get(&t).ok_or_else(|| format!("{} does not look up {}", self.name, t.as_str()))?;
+        self.single_request_spec(&format!("{}_{}", self.name, t.as_str()), &ts.request)
+    }
+
+    /// The resolve step of a pivot: the same single-request shape.
+    pub fn pivot_connector_spec(&self, t: ArtifactType) -> Result<ConnectorSpec, String> {
+        let p = self.pivots.get(&t).ok_or_else(|| format!("{} does not resolve {}", self.name, t.as_str()))?;
+        self.single_request_spec(&format!("{}_{}_resolve", self.name, t.as_str()), &p.request)
+    }
+
+    fn single_request_spec(&self, name: &str, request: &RequestTemplate) -> Result<ConnectorSpec, String> {
         let v = json!({
             "version": 1,
-            "name": format!("{}_{}", self.name, t.as_str()),
+            "name": name,
             "kind": "agent_enrichment",
             "allow": self.allow,
             "auth": self.auth,
@@ -563,7 +636,7 @@ impl LookupSpec {
             // A 429 is the quota answer, never retried: the tenant's limiter
             // and the caller decide what happens next.
             "rate_limit": { "min_interval_ms": 0, "max_retries_429": 0, "max_retries_5xx": 1, "backoff_ms": 500, "max_wait_ms": 2000, "remaining_floor": 0 },
-            "streams": [{ "id": "lookup", "request": ts.request }],
+            "streams": [{ "id": "lookup", "request": request }],
         });
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
@@ -817,8 +890,63 @@ fn not_found(ts: &TypeSpec, artifact: &Artifact) -> LookupVerdict {
     LookupVerdict { verdict: Verdict::NotFound, score: None, link: render_link(ts.link.as_deref().unwrap_or_default(), artifact, &Map::new()), tags: vec![], summary: Map::new() }
 }
 
+/// One engine run's answer: the 2xx body (None = not found), or the
+/// outcome that ends the lookup.
+async fn run_one(
+    cfg: &EngineConfig,
+    spec: &LookupSpec,
+    cs: &ConnectorSpec,
+    artifact: &Artifact,
+    credentials: &HashMap<String, String>,
+    tenant: Option<String>,
+) -> Result<Option<Value>, LookupOutcome> {
+    // Secret values, to scrub from any error text that reaches the caller.
+    let secrets: Vec<String> = credentials.values().filter(|v| v.len() >= 4).cloned().collect();
+    let input = RunInput {
+        credentials: Credentials::new(credentials.clone()),
+        artifact: Some((artifact.value.clone(), artifact.kind.as_str().to_string())),
+        artifact_extra: artifact.template_input(),
+        tenant,
+        ..Default::default()
+    };
+    let out = engine::run(cfg, cs, input, Arc::new(MemorySink::default()), Arc::new(MemoryStore::default())).await;
+    match out {
+        Ok(o) => Ok(o.result.filter(|b| !b.is_null())),
+        Err(EngineError::Upstream { status, .. }) if spec.quota_status.contains(&status) => Err(LookupOutcome::QuotaExhausted { retry_after_secs: None }),
+        Err(EngineError::Upstream { status, .. }) if spec.not_found_status.contains(&status) => Ok(None),
+        Err(EngineError::Upstream { status: 401 | 403, .. }) => Err(LookupOutcome::AuthFailed),
+        Err(EngineError::Upstream { status, .. }) => Err(LookupOutcome::Failed(format!("provider returned HTTP {status}"))),
+        Err(EngineError::Auth(e)) => Err(LookupOutcome::Failed(scrub(&format!("credential: {e}"), &secrets))),
+        Err(e) => Err(LookupOutcome::Failed(scrub(&e.to_string(), &secrets))),
+    }
+}
+
+/// The value a pivot answer resolved to, validated as an artifact of the
+/// pivot's target type. None: nothing (usable) resolved.
+fn resolved_artifact(p: &PivotSpec, artifact: &Artifact, body: &Value) -> Option<Artifact> {
+    let v = match &p.select {
+        PivotSelect::ArtifactKey => body.as_object()?.get(&artifact.value)?,
+        PivotSelect::Path(path) => get_path(body, path)?,
+    };
+    let v = match v {
+        Value::Array(a) => a.first()?,
+        other => other,
+    };
+    let raw = match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    // Same validation as a caller's artifact: a private or reserved address
+    // (or any malformed value) is never looked up.
+    Artifact::parse(&raw, Some(p.to)).ok()
+}
+
 /// Run one lookup through the connector engine.
 pub async fn execute(cfg: &EngineConfig, spec: &LookupSpec, artifact: &Artifact, credentials: HashMap<String, String>, tenant: Option<String>) -> LookupOutcome {
+    if let Some(p) = spec.pivots.get(&artifact.kind) {
+        return execute_pivot(cfg, spec, p, artifact, credentials, tenant).await;
+    }
     let Some(ts) = spec.types.get(&artifact.kind) else {
         return LookupOutcome::Unsupported;
     };
@@ -826,31 +954,59 @@ pub async fn execute(cfg: &EngineConfig, spec: &LookupSpec, artifact: &Artifact,
         Ok(cs) => cs,
         Err(e) => return LookupOutcome::Failed(format!("spec: {e}")),
     };
-    // Secret values, to scrub from any error text that reaches the caller.
-    let secrets: Vec<String> = credentials.values().filter(|v| v.len() >= 4).cloned().collect();
-    let input = RunInput {
-        credentials: Credentials::new(credentials),
-        artifact: Some((artifact.value.clone(), artifact.kind.as_str().to_string())),
-        artifact_extra: artifact.template_input(),
-        tenant,
-        ..Default::default()
-    };
-    let out = engine::run(cfg, &cs, input, Arc::new(MemorySink::default()), Arc::new(MemoryStore::default())).await;
-    match out {
-        Ok(o) => {
-            let body = o.result.unwrap_or(Value::Null);
-            if body.is_null() {
-                return LookupOutcome::Answered(not_found(ts, artifact));
-            }
-            LookupOutcome::Answered(evaluate(ts, artifact, &body))
-        }
-        Err(EngineError::Upstream { status, .. }) if spec.quota_status.contains(&status) => LookupOutcome::QuotaExhausted { retry_after_secs: None },
-        Err(EngineError::Upstream { status, .. }) if spec.not_found_status.contains(&status) => LookupOutcome::Answered(not_found(ts, artifact)),
-        Err(EngineError::Upstream { status: 401 | 403, .. }) => LookupOutcome::AuthFailed,
-        Err(EngineError::Upstream { status, .. }) => LookupOutcome::Failed(format!("provider returned HTTP {status}")),
-        Err(EngineError::Auth(e)) => LookupOutcome::Failed(scrub(&format!("credential: {e}"), &secrets)),
-        Err(e) => LookupOutcome::Failed(scrub(&e.to_string(), &secrets)),
+    match run_one(cfg, spec, &cs, artifact, &credentials, tenant).await {
+        Ok(Some(body)) => LookupOutcome::Answered(evaluate(ts, artifact, &body)),
+        Ok(None) => LookupOutcome::Answered(not_found(ts, artifact)),
+        Err(outcome) => outcome,
     }
+}
+
+/// NAN-5286: resolve, then look the resolved artifact up as its own type.
+/// The answer is the target type's, with the resolved value in the summary
+/// (`resolved`). Nothing resolved: `not_found` for the original artifact.
+async fn execute_pivot(
+    cfg: &EngineConfig,
+    spec: &LookupSpec,
+    p: &PivotSpec,
+    artifact: &Artifact,
+    credentials: HashMap<String, String>,
+    tenant: Option<String>,
+) -> LookupOutcome {
+    let Some(ts) = spec.types.get(&p.to) else {
+        return LookupOutcome::Unsupported;
+    };
+    let unresolved = || {
+        LookupOutcome::Answered(LookupVerdict {
+            verdict: Verdict::NotFound,
+            score: None,
+            link: render_link(p.link.as_deref().unwrap_or_default(), artifact, &Map::new()),
+            tags: vec![],
+            summary: Map::new(),
+        })
+    };
+    let cs = match spec.pivot_connector_spec(artifact.kind) {
+        Ok(cs) => cs,
+        Err(e) => return LookupOutcome::Failed(format!("spec: {e}")),
+    };
+    let body = match run_one(cfg, spec, &cs, artifact, &credentials, tenant.clone()).await {
+        Ok(Some(body)) => body,
+        Ok(None) => return unresolved(),
+        Err(outcome) => return outcome,
+    };
+    let Some(target) = resolved_artifact(p, artifact, &body) else {
+        return unresolved();
+    };
+    let cs = match spec.connector_spec(target.kind) {
+        Ok(cs) => cs,
+        Err(e) => return LookupOutcome::Failed(format!("spec: {e}")),
+    };
+    let mut v = match run_one(cfg, spec, &cs, &target, &credentials, tenant).await {
+        Ok(Some(body)) => evaluate(ts, &target, &body),
+        Ok(None) => not_found(ts, &target),
+        Err(outcome) => return outcome,
+    };
+    v.summary.insert(RESOLVED_SUMMARY_KEY.into(), Value::String(target.value));
+    LookupOutcome::Answered(v)
 }
 
 /// Error text for callers, audit and the notebook: query strings dropped
@@ -910,7 +1066,7 @@ mod tests {
         assert_eq!(names, OFFICIAL.iter().map(|(n, _)| *n).collect::<Vec<_>>(), "a shipped spec failed to load");
         for s in official_specs() {
             for t in s.supported_types() {
-                let cs = s.connector_spec(t).unwrap();
+                let cs = if s.pivots.contains_key(&t) { s.pivot_connector_spec(t) } else { s.connector_spec(t) }.unwrap();
                 assert!(cs.streams.iter().all(|st| st.program.is_none()), "{}: lookup specs never carry VRL", s.name);
                 engine::compile(&cs, &engine::default_ceilings()).unwrap();
             }

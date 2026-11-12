@@ -14,6 +14,7 @@ fn calm() -> WatchdogSample {
         memory_limit_bytes: 1_000,
         refreshes_running: 0,
         disabled_views: vec![],
+        stall: Default::default(),
     }
 }
 

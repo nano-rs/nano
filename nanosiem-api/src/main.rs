@@ -246,7 +246,15 @@ async fn async_main() -> Result<()> {
     // Vector config from the database) and prune old jobs.
     {
         let deploy_jobs = state.log_source_deploy_jobs.clone();
+        let holds_pool = state.pool.clone();
         tokio::spawn(async move {
+            // NAN-5132 (PR 5): a two-phase deploy that died between its phases
+            // left its source parked; release holds older than any deploy.
+            if let Err(error) =
+                nanosiem_core::log_sources::activation::release_stale(&holds_pool).await
+            {
+                tracing::warn!(%error, "Releasing stale log-source activation holds failed");
+            }
             match deploy_jobs.recover().await {
                 Ok((interrupted, pruned)) => {
                     tracing::info!(interrupted, pruned, "Deploy job recovery done")

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::prevalence::artifact_fields::{first_row_artifact, row_keys, row_values, ArtifactKind};
 
 impl SearchService {
     /// Check if a search expression references _prevalence nested fields
@@ -151,44 +152,17 @@ impl SearchService {
             return Ok(results);
         }
 
-        // Determine which result-row key(s) to extract artifacts from based on PrevalenceField.
-        //
-        // NAN-1241: these are the RESULT-ROW output field names (the keys serde produced from
-        // the SELECT aliases), not raw SQL columns — so they follow the active schema's output
-        // naming. Resolve the UDM-semantic concept(s) through the profile: UDM yields the same
-        // `file_hash`/`process_hash`/`dest_host` literals (byte-identical), OCSF yields its
-        // promoted output column names. If the active schema maps NONE of the concepts, the
-        // filter cannot apply — short-circuit gracefully rather than scanning fields that never
-        // exist.
-        //
-        // NAN-1691 LOCK-STEP: this residual in-memory path MUST agree with the WHERE pushdown
-        // (`prevalence_filter_condition_to_sql`), which keys HashPrevalence on
-        // `lower(COALESCE(file_hash, process_hash))` via the JOIN's `_hp_host_count` alias — so
-        // a sysmon row carrying only a process_hash still matches. Hence hash lookups here try
-        // `file_hash` first and fall back to `process_hash` (COALESCE semantics). DomainPrevalence
-        // stays `dest_host`, matching the domain alias. Keep the two paths in lock-step or the
-        // filter form returns different row sets depending on whether it pushed down.
-        let profile = self.active_profile.as_ref();
-        let udm_concepts = prevalence_filter_udm_concepts(field);
-        // udm_column_sql returns the SQL-escaped column; strip the OCSF double-quotes so we index
-        // the JSON result map by the bare output key. UDM is unquoted → unchanged (byte-identical).
-        // TODO(OCSF): the result-row KEY equals the promoted column's serde name; if OCSF
-        // serialization ever renames it (vs the bare dotted column), these keys must follow.
-        let artifact_fields: Vec<String> = udm_concepts
-            .iter()
-            .filter_map(|concept| {
-                profile
-                    .udm_column_sql(concept)
-                    .map(|col| col.trim_matches('"').to_string())
-            })
-            .collect();
-        if artifact_fields.is_empty() {
-            debug!(
-                "Prevalence filtering: active schema has no column for {:?}; skipping filter",
-                udm_concepts
-            );
-            return Ok(results);
-        }
+        // NAN-5293: the artifact a row is filtered on comes from the canonical
+        // artifact list (`prevalence::artifact_fields`), in the same COALESCE
+        // order the JOIN pushdown's `_hash_lookup` / `_domain_lookup` use
+        // (NAN-1691 LOCK-STEP: both paths must key a row on the same artifact,
+        // or the filter returns different rows depending on whether it pushed
+        // down). These are RESULT-ROW keys: the native columns
+        // (`process.file.hashes.sha256`, `query.hostname`), not the `*_unified`
+        // ALIAS columns `SELECT *` omits. The pre-5293 keys resolved UDM
+        // concepts through `udm_column_sql` to those ALIAS names, so no Sysmon
+        // process row ever carried one and every row was dropped.
+        let kind = prevalence_filter_kind(field);
 
         // NAN-4372: resolve the comparison up front. A first_seen field takes a
         // `now() - <duration>` cutoff and a count field takes a number; the
@@ -208,7 +182,7 @@ impl SearchService {
         // Extract unique artifacts from results
         let artifacts: Vec<String> = results
             .iter()
-            .filter_map(|row| extract_prevalence_artifact(row, &artifact_fields))
+            .filter_map(|row| extract_prevalence_artifact(row, kind))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -218,8 +192,8 @@ impl SearchService {
             // filter (a row without one is excluded below, like the JOIN
             // path's NULL). Returning `results` here passed every row.
             debug!(
-                "No artifacts found in fields {:?} for prevalence filtering; excluding all rows",
-                artifact_fields
+                "No {:?} artifacts found for prevalence filtering; excluding all rows",
+                kind
             );
             return Ok(Vec::new());
         }
@@ -315,7 +289,7 @@ impl SearchService {
                 // COALESCE across the resolved fields (file_hash → process_hash for hashes),
                 // matching the pushdown. A row with none of them is excluded (mirrors the JOIN
                 // path where a NULL host_count is dropped by the WHERE).
-                let artifact = match extract_prevalence_artifact(row, &artifact_fields) {
+                let artifact = match extract_prevalence_artifact(row, kind) {
                     Some(a) => a,
                     None => return false,
                 };
@@ -368,93 +342,47 @@ impl SearchService {
             results.len()
         );
 
-        // Extract all unique hashes, domains, and IPs from results
-        // Support multiple field names for hashes, domains, and IPs based on UDM fields.
+        // Extract all unique hashes, domains, and IPs from results.
         //
-        // NAN-1241: these are RESULT-ROW output keys (the keys serde produced from the SELECT
-        // aliases), not raw SQL columns — so they follow the active schema's output naming. Under
-        // the OCSF profile the promoted columns serialize under their dotted names (e.g.
-        // `dst_endpoint.hostname`, `file.hashes.sha256`), so the hardcoded UDM keys never match
-        // and enrichment silently no-ops.
-        //
-        // The fix is SCHEMA-GATED, not blanket profile-resolution. Many of the UDM artifact field
-        // names below are NOT in EXPLICIT_COLUMNS (service_hash, service_dll_hash, dest_nt_domain,
-        // src_nt_domain, http_referrer_domain, src_user_domain, client_ip, server_ip, nat_dest_ip,
-        // nat_src_ip) — for those the *default UDM profile's* `udm_column_sql` would resolve to
-        // `ext.<name>`, which is the WRONG result-row key and would silently break UDM. So:
-        //   - UDM (default): use the exact previous literal arrays, byte-for-byte unchanged. No
-        //     profile resolution is applied — UDM result-row keys ARE these bare names.
-        //   - OCSF: resolve the UDM-semantic concepts through `udm_column_sql` (quotes stripped to
-        //     get the bare dotted result-row key); concepts OCSF doesn't map return `None` and are
-        //     dropped. Legacy/common aliases (md5, domain, ip, …) are not UDM-semantic and have no
-        //     OCSF mapping; they are kept verbatim (UDM-only — they may also coincidentally appear
-        //     as raw `ext` keys on OCSF rows, where matching them is harmless).
-        let profile = self.active_profile.as_ref();
-        let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
-
-        // OCSF only: resolve a UDM-semantic field to its dotted result-row key (quotes stripped),
-        // mirroring `apply_prevalence_filtering` above. None → schema has no column → drop.
-        let resolve_ocsf = |udm_field: &str| -> Option<String> {
-            profile
-                .udm_column_sql(udm_field)
-                .map(|col| col.trim_matches('"').to_string())
+        // NAN-5293: the field lists start from the canonical artifact list
+        // (`prevalence::artifact_fields`, UDM + OCSF row keys: native columns
+        // such as `process.file.hashes.sha256`, `query.hostname`,
+        // `http_request.url.hostname`), then the UDM-only legacy aliases. The
+        // pre-5293 OCSF lists resolved UDM concepts to `*_unified` ALIAS names
+        // no result row carries, had no DNS query at all, and listed
+        // `src_host`, which keyed a workstation's own name as a domain.
+        let build = |kind: ArtifactKind, legacy: &[&str]| -> Vec<String> {
+            row_keys(kind)
+                .map(str::to_string)
+                .chain(legacy.iter().map(|s| s.to_string()))
+                .collect()
         };
-
-        // Build a field list. UDM: literal `udm_concepts` + `legacy` verbatim (byte-identical to
-        // the prior hardcoded arrays). OCSF: profile-resolved `udm_concepts` (None dropped) +
-        // `legacy` verbatim.
-        let build = |udm_concepts: &[&str], legacy: &[&str]| -> Vec<String> {
-            let mut out: Vec<String> = Vec::new();
-            for f in udm_concepts {
-                if is_ocsf {
-                    if let Some(key) = resolve_ocsf(f) {
-                        out.push(key);
-                    }
-                } else {
-                    out.push((*f).to_string());
-                }
-            }
-            for f in legacy {
-                out.push((*f).to_string());
-            }
-            out
-        };
-
-        // UDM-semantic concepts (per-profile) + legacy aliases (UDM-only literals).
-        // Under UDM these reduce to the exact previous arrays, byte-identical.
         let hash_fields = build(
-            &[
-                "file_hash",        // Generic file hash (any algorithm)
-                "process_hash",     // Process/executable hash (Sysmon, EDR)
-                "service_hash",     // Windows service executable hash
-                "service_dll_hash", // Windows service DLL hash
-            ],
-            &["hash", "md5", "sha256", "sha1"],
+            ArtifactKind::Hash,
+            &["service_hash", "service_dll_hash", "hash", "md5", "sha256", "sha1"],
         );
         let domain_fields = build(
+            ArtifactKind::Domain,
             &[
-                "dest_host",            // Destination hostname (most common)
-                "src_host",             // Source hostname
-                "dest_nt_domain",       // Windows NT domain (destination)
-                "src_nt_domain",        // Windows NT domain (source)
-                "http_referrer_domain", // HTTP referrer domain
-                "recipient_domain",     // Email recipient domain
-                "src_user_domain",      // Source user's domain
-                "url_domain",           // Domain extracted from URL
+                "dest_nt_domain",
+                "src_nt_domain",
+                "http_referrer_domain",
+                "recipient_domain",
+                "src_user_domain",
+                "query_name",
+                "dns_query",
+                "hostname",
             ],
-            &["domain", "query_name", "dns_query", "hostname"],
         );
         let ip_fields = build(
-            &[
-                "dest_ip",     // Destination IP address (most common)
-                "src_ip",      // Source IP address
-                "client_ip",   // Client IP (web logs)
-                "server_ip",   // Server IP
-                "nat_dest_ip", // NAT destination IP
-                "nat_src_ip",  // NAT source IP
-            ],
-            &["ip", "remote_ip", "target_ip"],
+            ArtifactKind::Ip,
+            &["client_ip", "server_ip", "nat_dest_ip", "nat_src_ip", "ip", "remote_ip", "target_ip"],
         );
+        // First non-empty value of `field` in `row` (flat dotted key, nested
+        // walk, or array element).
+        let first = |row: &serde_json::Map<String, serde_json::Value>, field: &str| {
+            row_values(row, field).into_iter().next()
+        };
 
         let mut hashes: Vec<String> = Vec::new();
         let mut domains: Vec<String> = Vec::new();
@@ -463,10 +391,7 @@ impl SearchService {
         for row in &results {
             // Try multiple hash field names
             for field in &hash_fields {
-                if let Some(hash) = row
-                    .get(field.as_str())
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
+                if let Some(hash) = row.as_object().and_then(|o| first(o, field))
                 {
                     hashes.push(hash.to_string());
                     break; // Only take first hash found
@@ -477,10 +402,7 @@ impl SearchService {
             let mut found_domain = false;
             let mut found_ip_in_domain_field = false;
             for field in &domain_fields {
-                if let Some(value) = row
-                    .get(field.as_str())
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
+                if let Some(value) = row.as_object().and_then(|o| first(o, field))
                 {
                     if value.parse::<std::net::IpAddr>().is_ok() {
                         // It's an IP in a domain field (e.g., dest_host: 193.32.162.159)
@@ -498,10 +420,7 @@ impl SearchService {
             // Try multiple IP field names (if we didn't already find an IP in domain fields)
             if !found_ip_in_domain_field {
                 for field in &ip_fields {
-                    if let Some(ip) = row
-                        .get(field.as_str())
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
+                    if let Some(ip) = row.as_object().and_then(|o| first(o, field))
                     {
                         // Validate it's an IP address
                         if ip.parse::<std::net::IpAddr>().is_ok() {
@@ -602,10 +521,7 @@ impl SearchService {
 
                 // Try to find hash in multiple possible fields
                 for field in &hash_fields {
-                    if let Some(hash) = obj
-                        .get(field.as_str())
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
+                    if let Some(hash) = first(obj, field)
                     {
                         if let Some(data) = hash_prevalence.get(&hash.to_lowercase()) {
                             enriched_count += 1;
@@ -631,15 +547,12 @@ impl SearchService {
                 // Try to find domain in multiple possible fields
                 // If the field contains an IP address instead of a domain, fall back to IP prevalence
                 for field in &domain_fields {
-                    if let Some(value) = obj
-                        .get(field.as_str())
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
+                    if let Some(value) = first(obj, field)
                     {
                         // Check if this is an IP address in a domain field (e.g., dest_host: 185.220.101.35)
                         if value.parse::<std::net::IpAddr>().is_ok() {
                             // It's an IP - try IP prevalence instead
-                            if let Some(data) = ip_prevalence.get(value) {
+                            if let Some(data) = ip_prevalence.get(value.as_str()) {
                                 found_ip = Some(value.to_string());
                                 prevalence_info.insert("ip".to_string(), serde_json::json!({
                                     "artifact": value,
@@ -683,12 +596,9 @@ impl SearchService {
                 // Try to find IP in multiple possible fields (if not already found from domain field fallback)
                 if found_ip.is_none() {
                     for field in &ip_fields {
-                        if let Some(ip) = obj
-                            .get(field.as_str())
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
+                        if let Some(ip) = first(obj, field)
                         {
-                            if let Some(data) = ip_prevalence.get(ip) {
+                            if let Some(data) = ip_prevalence.get(ip.as_str()) {
                                 found_ip = Some(ip.to_string());
                                 prevalence_info.insert("ip".to_string(), serde_json::json!({
                                     "artifact": ip,
@@ -1010,47 +920,19 @@ impl SearchService {
         let profile = self.active_profile.as_ref();
         let logs_table = self.table_names.read(Self::logs_table_key(profile));
 
-        let dest_host_col = profile.udm_column_sql("dest_host");
-        let src_host_col = profile.udm_column_sql("src_host");
-        let query_col = profile.udm_column_sql("query");
-        let dest_ip_col = profile.udm_column_sql("dest_ip");
-        let src_ip_col = profile.udm_column_sql("src_ip");
-        let file_hash_col = profile.udm_column_sql("file_hash");
-        let process_hash_col = profile.udm_column_sql("process_hash");
-
-        // The matching_logs CTE projects each resolved artifact column under a
-        // STABLE ALIAS (`_dest_host`, `_process_hash`, …); every DISTINCT branch
-        // references that alias, never the raw resolved expression. Under OCSF the
-        // resolved columns are class-split `if("a" != '', "a", "b")` expressions
-        // over dotted columns the CTE does not otherwise expose, so re-referencing
-        // them outside matching_logs threw `Code 47 UNKNOWN_IDENTIFIER`
-        // (NAN-1301, same scope class as NAN-1306). UDM columns are bare, so the
-        // alias is a harmless rename. `domain`/`hash`/`ip` stay the final
-        // sub-select alias names the row reader expects.
-        let dest_host_a = dest_host_col.as_ref().map(|_| "_dest_host");
-        let src_host_a = src_host_col.as_ref().map(|_| "_src_host");
-        let query_a = query_col.as_ref().map(|_| "_query");
-        let dest_ip_a = dest_ip_col.as_ref().map(|_| "_dest_ip");
-        let src_ip_a = src_ip_col.as_ref().map(|_| "_src_ip");
-        let file_hash_a = file_hash_col.as_ref().map(|_| "_file_hash");
-        let process_hash_a = process_hash_col.as_ref().map(|_| "_process_hash");
-
-        let mut select_cols: Vec<String> = Vec::new();
-        for (col, alias) in [
-            (&dest_host_col, "_dest_host"),
-            (&src_host_col, "_src_host"),
-            (&query_col, "_query"),
-            (&dest_ip_col, "_dest_ip"),
-            (&src_ip_col, "_src_ip"),
-            (&file_hash_col, "_file_hash"),
-            (&process_hash_col, "_process_hash"),
-        ] {
-            if let Some(c) = col {
-                select_cols.push(format!("{c} AS {alias}"));
-            }
-        }
-        // Guard: nothing to extract under this schema → empty scatter data, no SQL.
-        if select_cols.is_empty() {
+        // NAN-5293: the artifact columns come from the canonical artifact list
+        // (`prevalence::artifact_fields`), shared with the JOIN, the in-memory
+        // path, the drawer and `/api/prevalence/query-artifacts`. The pre-5293
+        // list read `src_host` as a domain (`device.hostname` on OCSF, so every
+        // workstation FQDN became a "domain") and had no HTTP URL hostnames.
+        let columns = crate::prevalence::artifact_fields::ArtifactColumns::resolve(profile);
+        let Some(artifacts_sql) = crate::prevalence::artifact_fields::scatter_artifacts_sql(
+            &columns,
+            &logs_table,
+            &where_clause,
+            100_000,
+        ) else {
+            // Nothing to extract under this schema → empty scatter data, no SQL.
             return Ok(PrevalenceScatterData {
                 hash_points: Vec::new(),
                 domain_points: Vec::new(),
@@ -1058,97 +940,7 @@ impl SearchService {
                 rarity_threshold: 3,
                 product_state: None,
             });
-        }
-
-        // Unpivot every mapped artifact column in a SINGLE pass over `matching_logs`
-        // via ARRAY JOIN. The prior shape ran one `SELECT DISTINCT … FROM matching_logs`
-        // per artifact column (up to 7 branches). A ClickHouse `WITH … AS` CTE is INLINED,
-        // not materialized, so each branch re-scanned the whole base query — ~7.5x read
-        // amplification. arrayConcat of per-column conditional singleton arrays collapses
-        // that to one scan; the outer `SELECT DISTINCT` dedups across columns.
-        //
-        // Domain columns (dest_host / src_host) now exclude ONLY actual IPv4 literals via
-        // `isIPv4String`, not everything with >=3 dots. The old `NOT LIKE '%.%.%.%'` dropped
-        // legit deep subdomains (e.g. `a.b.c.example.com`) along with IPs. The `query`
-        // branch keeps its "must contain a dot" gate. Domain artifacts are lowercased to
-        // match the dict keyspace; hash/ip stay raw (mirroring the union wrappers this
-        // replaces: `lower(domain)`, raw `hash`, raw `ip`). Each `if(cond, [tuple], [])`
-        // emits zero-or-one `(artifact_type, artifact)` tuple; the empty `[]` inherits the
-        // `Array(Tuple(String, String))` type from the populated arm.
-        let mut artifact_entries: Vec<String> = Vec::new();
-        if let Some(c) = &dest_host_a {
-            artifact_entries.push(format!(
-                "if({c} != '' AND NOT isIPv4String({c}), [('domain', lower({c}))], [])"
-            ));
-        }
-        if let Some(c) = &src_host_a {
-            artifact_entries.push(format!(
-                "if({c} != '' AND NOT isIPv4String({c}), [('domain', lower({c}))], [])"
-            ));
-        }
-        if let Some(c) = &query_a {
-            artifact_entries.push(format!(
-                "if({c} != '' AND position({c}, '.') > 0, [('domain', lower({c}))], [])"
-            ));
-        }
-        if let Some(c) = &file_hash_a {
-            artifact_entries.push(format!(
-                "if({c} != '' AND length({c}) >= 32, [('hash', {c})], [])"
-            ));
-        }
-        if let Some(c) = &process_hash_a {
-            artifact_entries.push(format!(
-                "if({c} != '' AND length({c}) >= 32, [('hash', {c})], [])"
-            ));
-        }
-        if let Some(c) = &dest_ip_a {
-            artifact_entries.push(format!(
-                "if({c} != '' AND isIPv4String({c}), [('ip', {c})], [])"
-            ));
-        }
-        if let Some(c) = &src_ip_a {
-            artifact_entries.push(format!(
-                "if({c} != '' AND isIPv4String({c}), [('ip', {c})], [])"
-            ));
-        }
-
-        // No artifact columns mapped under this schema → nothing to extract.
-        if artifact_entries.is_empty() {
-            return Ok(PrevalenceScatterData {
-                hash_points: Vec::new(),
-                domain_points: Vec::new(),
-                ip_points: Vec::new(),
-                rarity_threshold: 3,
-                product_state: None,
-            });
-        }
-
-        let artifacts_sql = format!(
-            r#"
-            WITH matching_logs AS (
-                SELECT
-                    {select_cols}
-                FROM {logs_table}
-                WHERE {where_clause}
-                LIMIT 100000
-            )
-            SELECT DISTINCT artifact_type, artifact
-            FROM (
-                SELECT
-                    tupleElement(pair, 1) AS artifact_type,
-                    tupleElement(pair, 2) AS artifact
-                FROM matching_logs
-                ARRAY JOIN arrayConcat(
-                    {entries}
-                ) AS pair
-            )
-            WHERE artifact != ''
-            "#,
-            select_cols = select_cols.join(",\n                    "),
-            logs_table = logs_table,
-            where_clause = where_clause,
-            entries = artifact_entries.join(",\n                    "),
-        );
+        };
 
         tracing::debug!("Prevalence artifacts SQL: {}", artifacts_sql);
 
@@ -1196,7 +988,6 @@ impl SearchService {
                 )
                 .await;
             let state = {
-                use crate::prevalence::coverage::ArtifactKind;
                 let mut kinds = Vec::new();
                 for (asked, kind) in [
                     (!hashes.is_empty(), ArtifactKind::Hash),
@@ -1409,39 +1200,27 @@ pub(crate) fn prevalence_passes_filter(
     }
 }
 
-/// The ordered UDM-semantic concept list a prevalence FILTER keys on, in COALESCE
-/// priority order.
-///
-/// NAN-1691 LOCK-STEP: hash filters try `file_hash` first, then `process_hash`, matching
-/// the pushdown's `lower(COALESCE(file_hash, process_hash))` (the JOIN's `_hp_host_count`
-/// alias) — so a sysmon row carrying ONLY a process_hash matches on BOTH the in-memory
-/// path and the pushed-down path. Domain filters use `dest_host`, matching the domain
-/// alias. If this diverges from `prevalence_filter_condition_to_sql`, the filter form
-/// returns different row sets depending on whether it pushed down.
-pub(crate) fn prevalence_filter_udm_concepts(
-    field: &PrevalenceField,
-) -> &'static [&'static str] {
+/// The artifact class a prevalence FILTER keys on (NAN-5293). Row keys and
+/// their COALESCE order come from [`row_keys`], the same list
+/// the pushdown's lookup keys resolve from.
+pub(crate) fn prevalence_filter_kind(field: &PrevalenceField) -> ArtifactKind {
     match field {
-        PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => {
-            &["file_hash", "process_hash"]
+        PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => ArtifactKind::Hash,
+        PrevalenceField::DomainPrevalence | PrevalenceField::DomainFirstSeen => {
+            ArtifactKind::Domain
         }
-        PrevalenceField::DomainPrevalence | PrevalenceField::DomainFirstSeen => &["dest_host"],
     }
 }
 
-/// COALESCE artifact extraction: the first non-empty string value across `fields`
-/// (result-row output keys), in order. Mirrors the SQL `COALESCE(...)` the pushdown
-/// emits — a hash row falls back from `file_hash` to `process_hash`.
+/// COALESCE artifact extraction: the first non-empty `kind` value across the
+/// canonical row keys, in order. Mirrors the SQL lookup key the pushdown
+/// emits — a hash row falls back from `file.hashes.sha256` to the process
+/// hash, then the parent-process hash.
 pub(crate) fn extract_prevalence_artifact(
     row: &serde_json::Value,
-    fields: &[String],
+    kind: ArtifactKind,
 ) -> Option<String> {
-    fields.iter().find_map(|f| {
-        row.get(f.as_str())
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    })
+    first_row_artifact(row.as_object()?, kind).map(|(_, v)| v)
 }
 
 /// Map a single `| prevalence <field> <op> <threshold>` condition to a SQL predicate over

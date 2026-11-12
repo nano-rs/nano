@@ -1274,6 +1274,42 @@ mod tests {
     }
 
     #[test]
+    fn create_or_replace_workload_gets_on_cluster_even_with_replicated_database() {
+        for cluster in ["nanosiem_cluster", "nanosiem"] {
+            let result = ClickHouseMigrator::transform_for_cluster(
+                "CREATE OR REPLACE WORKLOAD ingest IN nano SETTINGS weight = 10",
+                cluster,
+                "nanosiem",
+                false,
+            );
+            assert_eq!(
+                result,
+                format!("CREATE OR REPLACE WORKLOAD ingest ON CLUSTER '{cluster}' IN nano SETTINGS weight = 10"),
+            );
+        }
+    }
+
+    /// NAN-5296: migration 198 must lift 189's hard `max_concurrent_threads`
+    /// cap on `ingest` (nested MV executors deadlocked on it) and keep the
+    /// weight that gives ingest CPU priority.
+    #[test]
+    fn migration_198_uncaps_the_ingest_workload_and_keeps_its_weight() {
+        let migration = ClickHouseMigrator::strip_sql_line_comments(include_str!(
+            "../../../../clickhouse/198_ingest_workload_uncap.sql"
+        ));
+        let statements: Vec<&str> = migration
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect();
+        assert_eq!(
+            statements,
+            vec!["CREATE OR REPLACE WORKLOAD ingest IN nano SETTINGS weight = 10"]
+        );
+        assert!(!migration.to_lowercase().contains("max_concurrent_threads"));
+    }
+
+    #[test]
     fn migration_189_uses_a_definer_landing_view_for_udm_logs() {
         let migration = include_str!("../../../../clickhouse/189_ingest_watchdog.sql");
         assert!(migration.contains(

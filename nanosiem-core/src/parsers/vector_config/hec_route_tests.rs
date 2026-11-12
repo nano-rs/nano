@@ -18,6 +18,7 @@ use crate::parsers::types::Parser;
 
 fn hec_parser() -> Parser {
     Parser {
+        activation_parked: false,
         id: Uuid::new_v4(),
         name: "Windows Sysmon (HEC)".to_string(),
         description: None,

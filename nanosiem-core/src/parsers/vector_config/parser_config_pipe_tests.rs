@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 fn parser(parser_vrl: &str, extension: Option<&str>) -> Parser {
     Parser {
+        activation_parked: false,
         id: Uuid::new_v4(),
         name: "hec_app".to_string(),
         description: None,

@@ -247,8 +247,8 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     `url_unified` String ALIAS if(notEmpty(`http_request.url.url_string`), `http_request.url.url_string`, `url.url_string`),
     `src_host_unified` String ALIAS if(notEmpty(`src_endpoint.hostname`), `src_endpoint.hostname`, `device.hostname`),
     `prevalence_file_hash` UInt16 MATERIALIZED if(`file.hashes.sha256` != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', `file.hashes.sha256`, toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_process_hash` UInt16 MATERIALIZED if(`process.file.hashes.sha256` != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', `process.file.hashes.sha256`, toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_dest_domain` UInt16 MATERIALIZED if(`dst_endpoint.hostname` != '' AND NOT match(`dst_endpoint.hostname`, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(`dst_endpoint.hostname`), toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_process_hash` UInt16 MATERIALIZED if(if(`process.file.hashes.sha256` != '', `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`) != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', if(`process.file.hashes.sha256` != '', `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`), toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_dest_domain` UInt16 MATERIALIZED if(multiIf(`dst_endpoint.hostname` != '' AND NOT match(`dst_endpoint.hostname`, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), `dst_endpoint.hostname`, `http_request.url.hostname` != '', `http_request.url.hostname`, `url.hostname` != '', `url.hostname`, `query.hostname`) != '' AND NOT match(multiIf(`dst_endpoint.hostname` != '' AND NOT match(`dst_endpoint.hostname`, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), `dst_endpoint.hostname`, `http_request.url.hostname` != '', `http_request.url.hostname`, `url.hostname` != '', `url.hostname`, `query.hostname`), '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(multiIf(`dst_endpoint.hostname` != '' AND NOT match(`dst_endpoint.hostname`, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), `dst_endpoint.hostname`, `http_request.url.hostname` != '', `http_request.url.hostname`, `url.hostname` != '', `url.hostname`, `query.hostname`)), toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
     `prevalence_dest_ip` UInt16 MATERIALIZED if(`dst_endpoint.ip` != '' AND NOT (match(`dst_endpoint.ip`, '^10\\.') OR match(`dst_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') OR match(`dst_endpoint.ip`, '^192\\.168\\.') OR match(`dst_endpoint.ip`, '^127\\.') OR match(`dst_endpoint.ip`, '^169\\.254\\.') OR match(`dst_endpoint.ip`, '^100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.') OR startsWith(`dst_endpoint.ip`, 'fe80:') OR startsWith(`dst_endpoint.ip`, 'fc') OR startsWith(`dst_endpoint.ip`, 'fd') OR `dst_endpoint.ip` = '::1'), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', `dst_endpoint.ip`, toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
     `prevalence_min` UInt16 MATERIALIZED least(if(prevalence_file_hash = 65535, toUInt16(9999), prevalence_file_hash), if(prevalence_process_hash = 65535, toUInt16(9999), prevalence_process_hash), if(prevalence_dest_domain = 65535, toUInt16(9999), prevalence_dest_domain), if(prevalence_dest_ip = 65535, toUInt16(9999), prevalence_dest_ip)) CODEC(T64, LZ4),
     `event_bytes` UInt32 CODEC(T64, LZ4),
@@ -990,6 +990,64 @@ WHERE (`url.hostname` != '') AND (position(`url.hostname`, '.') > 0) AND (NOT ma
     AND (lower(splitByChar('.', `url.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
 GROUP BY domain, is_subdomain, time_bucket;
 
+-- NAN-5271 #23 (ocsf/migrations/197): the parent/actor process hash and the
+-- HTTP request URL host are their own producers. Same validity filters and
+-- host key as the branches above; each skips a value an earlier branch on the
+-- same row already counted, so total_count is not doubled. SQL SECURITY
+-- DEFINER: they read `http_request.url.hostname`, which nanosiem_ingest is not
+-- granted, and a grant cannot reach ClickHouse before the Helm migrate hook
+-- runs (see ocsf/197).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_hash_prevalence_summary_actor_process_hash_mv
+TO nanosiem.hash_prevalence_agg
+(
+    `file_hash` String,
+    `hash_type` String,
+    `time_bucket` DateTime('UTC'),
+    `host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `total_count` UInt64
+)
+DEFINER = CURRENT_USER SQL SECURITY DEFINER
+AS SELECT
+    lower(`actor.process.file.hashes.sha256`) AS file_hash,
+    multiIf(length(`actor.process.file.hashes.sha256`) = 32, 'md5', length(`actor.process.file.hashes.sha256`) = 40, 'sha1', length(`actor.process.file.hashes.sha256`) = 64, 'sha256', 'unknown') AS hash_type,
+    toStartOfHour(timestamp) AS time_bucket,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS host_count,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS total_count
+FROM nanosiem.ocsf_logs
+WHERE (`actor.process.file.hashes.sha256` != '') AND ((length(`actor.process.file.hashes.sha256`) = 32) OR (length(`actor.process.file.hashes.sha256`) = 40) OR (length(`actor.process.file.hashes.sha256`) = 64)) AND match(`actor.process.file.hashes.sha256`, '^[a-fA-F0-9]+$') AND ((`file.hashes.sha256` = '') OR (lower(`file.hashes.sha256`) != lower(`actor.process.file.hashes.sha256`))) AND ((`process.file.hashes.sha256` = '') OR (lower(`process.file.hashes.sha256`) != lower(`actor.process.file.hashes.sha256`)))
+GROUP BY file_hash, hash_type, time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_http_url_mv
+TO nanosiem.domain_prevalence_agg
+(
+    `domain` String,
+    `is_subdomain` UInt8,
+    `parent_domain` String,
+    `time_bucket` DateTime('UTC'),
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `total_count` UInt64
+)
+DEFINER = CURRENT_USER SQL SECURITY DEFINER
+AS SELECT
+    lower(`http_request.url.hostname`) AS domain,
+    if(length(splitByChar('.', `http_request.url.hostname`)) > 2, 1, 0) AS is_subdomain,
+    '' AS parent_domain,
+    toStartOfHour(timestamp) AS time_bucket,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS source_host_count,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS total_count
+FROM nanosiem.ocsf_logs
+WHERE (`http_request.url.hostname` != '') AND (position(`http_request.url.hostname`, '.') > 0) AND (NOT match(`http_request.url.hostname`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND (NOT (position(`http_request.url.hostname`, ':') > 0)) AND match(`http_request.url.hostname`, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', `http_request.url.hostname`)[-1]) >= 2) AND (NOT match(splitByChar('.', `http_request.url.hostname`)[-1], '^[0-9]+$')) AND (length(`http_request.url.hostname`) <= 253) AND ((`dst_endpoint.hostname` = '') OR (lower(`dst_endpoint.hostname`) != lower(`http_request.url.hostname`))) AND ((`query.hostname` = '') OR (lower(`query.hostname`) != lower(`http_request.url.hostname`))) AND ((`url.hostname` = '') OR (lower(`url.hostname`) != lower(`http_request.url.hostname`)))
+    AND (lower(splitByChar('.', `http_request.url.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
+GROUP BY domain, is_subdomain, time_bucket;
+
 -- IP prevalence (dst_endpoint.ip / src_endpoint.ip), OCSF columns ->
 -- ip_prevalence_summary. is_private classification mirrors UDM.
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_ip_prevalence_summary_dest_ip_mv
@@ -1551,6 +1609,55 @@ WHERE domain_value != ''
   AND NOT match(splitByChar('.', domain_value)[-1], '^[0-9]+$')
   AND length(domain_value) <= 253
   AND lower(splitByChar('.', domain_value)[-1]) NOT IN
+      ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa')
+GROUP BY schema_profile, source_type, domain, is_subdomain, time_bucket;
+
+-- NAN-5271 #23 (ocsf/migrations/197): source-attributed producers for the
+-- parent/actor process hash and the HTTP request URL host. Separate views so
+-- the 170/196 bodies above stay untouched; each skips values the views above
+-- already count on the same row. SQL SECURITY DEFINER for the same reason as
+-- the two producers above (see ocsf/197).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.hash_prevalence_source_ocsf_actor_process_mv
+TO nanosiem.hash_prevalence_source_agg
+DEFINER = CURRENT_USER SQL SECURITY DEFINER
+AS SELECT
+    'ocsf' AS schema_profile,
+    lower(trimBoth(source_type)) AS source_type,
+    lower(`actor.process.file.hashes.sha256`) AS file_hash,
+    multiIf(length(`actor.process.file.hashes.sha256`) = 32, 'md5', length(`actor.process.file.hashes.sha256`) = 40, 'sha1',
+            length(`actor.process.file.hashes.sha256`) = 64, 'sha256', 'unknown') AS hash_type,
+    toStartOfHour(timestamp) AS time_bucket,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS host_count,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS total_count
+FROM nanosiem.ocsf_logs
+WHERE `actor.process.file.hashes.sha256` != ''
+  AND length(`actor.process.file.hashes.sha256`) IN (32, 40, 64)
+  AND match(`actor.process.file.hashes.sha256`, '^[a-fA-F0-9]+$')
+  AND lower(`actor.process.file.hashes.sha256`) != lower(`file.hashes.sha256`)
+  AND lower(`actor.process.file.hashes.sha256`) != lower(`process.file.hashes.sha256`)
+GROUP BY schema_profile, source_type, file_hash, hash_type, time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_source_ocsf_http_url_mv
+TO nanosiem.domain_prevalence_source_agg
+DEFINER = CURRENT_USER SQL SECURITY DEFINER
+AS SELECT
+    'ocsf' AS schema_profile,
+    lower(trimBoth(source_type)) AS source_type,
+    lower(`http_request.url.hostname`) AS domain,
+    if(length(splitByChar('.', `http_request.url.hostname`)) > 2, 1, 0) AS is_subdomain,
+    toStartOfHour(timestamp) AS time_bucket,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown')))) AS source_host_count,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS total_count
+FROM nanosiem.ocsf_logs
+WHERE (`http_request.url.hostname` != '') AND (position(`http_request.url.hostname`, '.') > 0) AND (NOT match(`http_request.url.hostname`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND (NOT (position(`http_request.url.hostname`, ':') > 0)) AND match(`http_request.url.hostname`, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', `http_request.url.hostname`)[-1]) >= 2) AND (NOT match(splitByChar('.', `http_request.url.hostname`)[-1], '^[0-9]+$')) AND (length(`http_request.url.hostname`) <= 253)
+  AND lower(`http_request.url.hostname`) != lower(`dst_endpoint.hostname`)
+  AND lower(`http_request.url.hostname`) != lower(`query.hostname`)
+  AND lower(`http_request.url.hostname`) != lower(`url.hostname`)
+  AND lower(splitByChar('.', `http_request.url.hostname`)[-1]) NOT IN
       ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa')
 GROUP BY schema_profile, source_type, domain, is_subdomain, time_bucket;
 

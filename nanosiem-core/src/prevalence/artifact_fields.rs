@@ -24,6 +24,7 @@
 //! process hashes and DNS query names never reached it.
 
 use crate::internal_domains::InternalDomains;
+pub use crate::prevalence::coverage::ArtifactKind;
 use crate::schema::{FieldResolution, SchemaProfile};
 
 /// UDM fields carrying a file hash.
@@ -75,6 +76,28 @@ pub const OCSF_URL_FIELDS: &[&str] = &[
     "url_unified",
 ];
 
+/// UDM fields carrying an IP artifact (NAN-5293). Server-only: the Rarity
+/// view does not extract IPs, so there is no TS copy to keep in parity.
+pub const UDM_IP_FIELDS: &[&str] = &["dest_ip", "src_ip"];
+
+/// OCSF fields carrying an IP artifact (NAN-5293). Server-only, see above.
+pub const OCSF_IP_FIELDS: &[&str] = &["dst_endpoint.ip", "src_endpoint.ip"];
+
+/// Every result-row key `kind` may be read from, in COALESCE priority order:
+/// the UDM list, then the OCSF list (NAN-5293). These are the bare paths, NOT
+/// profile-resolved columns: result rows carry the native columns
+/// (`process.file.hashes.sha256`), never the `*_unified` ALIAS columns
+/// `SELECT *` omits, so resolving through the profile produced keys no row
+/// has. A row only ever carries one schema's names, so listing both is safe.
+pub fn row_keys(kind: ArtifactKind) -> impl Iterator<Item = &'static str> {
+    let (udm, ocsf): (&[&str], &[&str]) = match kind {
+        ArtifactKind::Hash => (UDM_HASH_FIELDS, OCSF_HASH_FIELDS),
+        ArtifactKind::Domain => (UDM_DOMAIN_FIELDS, OCSF_DOMAIN_FIELDS),
+        ArtifactKind::Ip => (UDM_IP_FIELDS, OCSF_IP_FIELDS),
+    };
+    udm.iter().chain(ocsf.iter()).copied()
+}
+
 /// One physical column an artifact class is read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactColumn {
@@ -82,6 +105,15 @@ pub struct ArtifactColumn {
     pub sql: String,
     /// `Array(String)` column (`file.hashes.value`): every element is a candidate.
     pub is_array: bool,
+    /// Lowercased at ingest: compare it raw so its bloom / text index prunes.
+    pub lowered: bool,
+}
+
+impl ArtifactColumn {
+    /// A scalar column that is not lowercased at ingest.
+    pub fn scalar(sql: impl Into<String>) -> Self {
+        Self { sql: sql.into(), is_array: false, lowered: false }
+    }
 }
 
 /// The columns each artifact class is read from under one schema profile.
@@ -92,7 +124,12 @@ pub struct ArtifactColumns {
     pub domains: Vec<ArtifactColumn>,
     /// Columns holding a full URL; the hostname is parsed out.
     pub urls: Vec<ArtifactColumn>,
+    /// Columns holding an IP address.
+    pub ips: Vec<ArtifactColumn>,
 }
+
+/// IPv4 literal, as a ClickHouse `match()` pattern inside a Rust string.
+const IPV4_RE: &str = "'^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$'";
 
 impl ArtifactColumns {
     /// Resolve the shared UDM + OCSF path lists against `profile`, keeping only
@@ -102,7 +139,118 @@ impl ArtifactColumns {
             hashes: resolve_columns(profile, &[UDM_HASH_FIELDS, OCSF_HASH_FIELDS]),
             domains: resolve_columns(profile, &[UDM_DOMAIN_FIELDS, OCSF_DOMAIN_FIELDS]),
             urls: resolve_columns(profile, &[UDM_URL_FIELDS, OCSF_URL_FIELDS]),
+            ips: resolve_columns(profile, &[UDM_IP_FIELDS, OCSF_IP_FIELDS]),
         }
+    }
+
+    fn of(&self, kind: ArtifactKind) -> &[ArtifactColumn] {
+        match kind {
+            ArtifactKind::Hash => &self.hashes,
+            ArtifactKind::Domain => &self.domains,
+            ArtifactKind::Ip => &self.ips,
+        }
+    }
+
+    fn scalars(&self, kind: ArtifactKind) -> impl Iterator<Item = &ArtifactColumn> {
+        self.of(kind).iter().filter(|c| !c.is_array)
+    }
+
+    /// Per-row prevalence lookup key for `kind`: the first non-empty scalar
+    /// artifact column, in list order (NAN-5293). This is the key the
+    /// prevalence JOIN (`_hash_lookup` / `_domain_lookup` / `_ip_lookup`) and
+    /// its NAN-1705 rescue probe look up. Hash and domain keys are lowercased
+    /// (the dicts key on `lower(..)`); domain columns holding an IPv4 literal
+    /// are skipped for the domain key and become the IP key's last fallback.
+    /// The source host (`src_host`) is deliberately absent: under OCSF it
+    /// falls back to `device.hostname`, so it keyed every DNS row on the
+    /// workstation instead of `query.hostname`. `None` when the schema has no
+    /// column for `kind`.
+    pub fn lookup_key_sql(&self, kind: ArtifactKind) -> Option<String> {
+        let mut branches: Vec<String> = Vec::new();
+        match kind {
+            ArtifactKind::Hash => {
+                branches.extend(self.scalars(kind).map(|c| format!("nullIf({}, '')", c.sql)));
+            }
+            ArtifactKind::Domain => {
+                branches.extend(self.scalars(kind).map(|c| {
+                    format!(
+                        "nullIf(CASE WHEN {c} != '' AND match({c}, {IPV4_RE}) = 0 THEN lower({c}) ELSE '' END, '')",
+                        c = c.sql
+                    )
+                }));
+            }
+            ArtifactKind::Ip => {
+                branches.extend(self.scalars(kind).map(|c| format!("nullIf({}, '')", c.sql)));
+                if let Some(c) = self.scalars(ArtifactKind::Domain).next() {
+                    branches.push(format!(
+                        "nullIf(CASE WHEN match({c}, {IPV4_RE}) THEN {c} ELSE '' END, '')",
+                        c = c.sql
+                    ));
+                }
+            }
+        }
+        if branches.is_empty() {
+            return None;
+        }
+        let coalesce = format!("COALESCE(\n            {}\n        )", branches.join(",\n            "));
+        Some(match kind {
+            ArtifactKind::Hash => format!("lower({coalesce})"),
+            _ => coalesce,
+        })
+    }
+
+    /// "This row carries `value` in any `kind` column" (NAN-5293): an OR over
+    /// every column of the class, arrays included. Hash and domain values are
+    /// compared lowercased (`lower(col)`, or the raw column when it is
+    /// lowercased at ingest); IPs compare raw. `None` when the schema has no
+    /// column for `kind`.
+    pub fn match_sql(&self, kind: ArtifactKind, value: &str) -> Option<String> {
+        self.match_any_sql(kind, std::slice::from_ref(&value.to_string()))
+    }
+
+    /// [`Self::match_sql`] over a value list (`col IN (..)`).
+    pub fn match_any_sql(&self, kind: ArtifactKind, values: &[String]) -> Option<String> {
+        let cols = self.of(kind);
+        if cols.is_empty() || values.is_empty() {
+            return None;
+        }
+        let fold = kind != ArtifactKind::Ip;
+        let list = value_list_sql(kind, values);
+        let preds: Vec<String> = cols
+            .iter()
+            .map(|c| {
+                let col = if fold && !c.lowered { lowered(&c.sql) } else { c.sql.clone() };
+                if c.is_array {
+                    let elems = if fold && !c.lowered {
+                        format!("arrayMap(x -> lower(x), {})", c.sql)
+                    } else {
+                        c.sql.clone()
+                    };
+                    format!("hasAny({elems}, [{list}])")
+                } else if values.len() == 1 {
+                    format!("{col} = {list}")
+                } else {
+                    format!("{col} IN ({list})")
+                }
+            })
+            .collect();
+        Some(format!("({})", preds.join(" OR ")))
+    }
+
+    /// Every distinct non-empty `kind` artifact a row carries, as one
+    /// `Array(String)` expression (hash / domain lowercased). For an
+    /// `ARRAY JOIN` that attributes a row to each artifact it holds, where a
+    /// single COALESCE key would credit only the first.
+    pub fn candidates_sql(&self, kind: ArtifactKind) -> Option<String> {
+        let cols = self.of(kind);
+        if cols.is_empty() {
+            return None;
+        }
+        let value: fn(&str) -> String = if kind == ArtifactKind::Ip { raw } else { lowered };
+        let pairs: Vec<(&ArtifactColumn, fn(&str) -> String)> =
+            cols.iter().map(|c| (c, value)).collect();
+        let (array, _) = candidate_array(&pairs);
+        Some(format!("arrayDistinct(arrayFilter(x -> x != '', {array}))"))
     }
 }
 
@@ -119,9 +267,121 @@ fn resolve_columns(profile: &dyn SchemaProfile, lists: &[&[&str]]) -> Vec<Artifa
         out.push(ArtifactColumn {
             sql: crate::query::escape_identifier(&col),
             is_array: profile.is_array_field(&col),
+            lowered: profile.is_lowercased_at_ingest(&col),
         });
     }
     out
+}
+
+/// `values` as an escaped SQL literal list (`'a', 'b'`), lowercased for hash
+/// and domain (their keys are lowercase), raw for IP.
+pub fn value_list_sql(kind: ArtifactKind, values: &[String]) -> String {
+    values
+        .iter()
+        .map(|v| {
+            let v = if kind == ArtifactKind::Ip { v.clone() } else { v.to_lowercase() };
+            format!("'{}'", crate::sql_hygiene::escape_sql_string(&v))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Read `path` from a result row: the flat dotted key first (what the search
+/// API returns for OCSF columns), then a nested walk that maps over arrays.
+/// Mirrors `readField` in `artifactFields.ts`. Returns every non-empty string
+/// value found, in order (a scalar yields at most one).
+pub fn row_values(row: &serde_json::Map<String, serde_json::Value>, path: &str) -> Vec<String> {
+    fn collect(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) if !s.is_empty() => out.push(s.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|i| collect(i, out)),
+            _ => {}
+        }
+    }
+    fn walk(v: &serde_json::Value, parts: &[&str], out: &mut Vec<String>) {
+        match (v, parts.split_first()) {
+            (_, None) => collect(v, out),
+            (serde_json::Value::Array(items), Some(_)) => {
+                items.iter().for_each(|i| walk(i, parts, out))
+            }
+            (serde_json::Value::Object(m), Some((head, rest))) => {
+                if let Some(child) = m.get(*head) {
+                    walk(child, rest, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(v) = row.get(path) {
+        collect(v, &mut out);
+    } else if path.contains('.') {
+        let parts: Vec<&str> = path.split('.').collect();
+        if let Some(first) = row.get(parts[0]) {
+            walk(first, &parts[1..], &mut out);
+        }
+    }
+    out
+}
+
+/// The row's `kind` artifact under COALESCE semantics (NAN-5293): the first
+/// non-empty value across [`row_keys`], the same order
+/// [`ArtifactColumns::lookup_key_sql`] uses, so the in-memory prevalence path
+/// and the JOIN pushdown key a row on the same artifact. Domain keys skip IP
+/// literals, as the SQL key does. Returns the key and the value.
+pub fn first_row_artifact(
+    row: &serde_json::Map<String, serde_json::Value>,
+    kind: ArtifactKind,
+) -> Option<(&'static str, String)> {
+    row_keys(kind).find_map(|key| {
+        row_values(row, key)
+            .into_iter()
+            .find(|v| kind != ArtifactKind::Domain || v.parse::<std::net::IpAddr>().is_err())
+            .map(|v| (key, v))
+    })
+}
+
+/// Distinct `(artifact_type, artifact)` pairs over every artifact column, for
+/// the `/api/search/prevalence-artifacts` scatter (NAN-5293). Domains come
+/// from the hostname columns plus the hosts of URL columns (as
+/// [`distinct_domain_candidates_sql`]), never the source host. Hashes keep the
+/// `length >= 32` floor, IPs the IPv4 gate, domains drop IPv4 literals and
+/// anything without a dot. `None` when the schema has no artifact column.
+pub fn scatter_artifacts_sql(
+    columns: &ArtifactColumns,
+    logs_table: &str,
+    where_clause: &str,
+    row_cap: usize,
+) -> Option<String> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut push = |kind: &str, cols: &[ArtifactColumn], value: fn(&str) -> String, gate: &str| {
+        for c in cols {
+            let tuple = |x: &str| format!("('{kind}', {x})");
+            if c.is_array {
+                entries.push(format!(
+                    "arrayMap(y -> {}, arrayFilter(y -> {}, arrayMap(x -> {}, {})))",
+                    tuple("y"),
+                    gate.replace("{v}", "y"),
+                    value("x"),
+                    c.sql
+                ));
+            } else {
+                let v = value(&c.sql);
+                entries.push(format!("if({}, [{}], [])", gate.replace("{v}", &v), tuple(&v)));
+            }
+        }
+    };
+    push("domain", &columns.domains, lowered, "{v} != '' AND NOT isIPv4String({v}) AND position({v}, '.') > 0");
+    push("domain", &columns.urls, url_host, "{v} != '' AND NOT isIPv4String({v}) AND position({v}, '.') > 0");
+    push("hash", &columns.hashes, lowered, "length({v}) >= 32");
+    push("ip", &columns.ips, raw, "{v} != '' AND isIPv4String({v})");
+    if entries.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "WITH matching_logs AS (\n    SELECT arrayConcat(\n        {entries}\n    ) AS pairs\n    FROM {logs_table}\n    WHERE {where_clause}\n    LIMIT {row_cap}\n)\nSELECT DISTINCT tupleElement(pair, 1) AS artifact_type, tupleElement(pair, 2) AS artifact\nFROM matching_logs\nARRAY JOIN pairs AS pair\nWHERE artifact != ''",
+        entries = entries.join(",\n        "),
+    ))
 }
 
 /// Alias of the ARRAY JOINed candidate value. Deliberately not a column name
@@ -159,6 +419,10 @@ fn candidate_array(cols: &[(&ArtifactColumn, fn(&str) -> String)]) -> (String, S
 
 fn lowered(expr: &str) -> String {
     format!("lower({expr})")
+}
+
+fn raw(expr: &str) -> String {
+    expr.to_string()
 }
 
 /// Hostname of a value that looks like an absolute URL, else `''`. The scheme

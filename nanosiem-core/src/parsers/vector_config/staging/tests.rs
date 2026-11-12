@@ -114,6 +114,7 @@ async fn quarantined_names(manager: &VectorConfigManager) -> Vec<String> {
 /// varies; everything else is inert.
 fn test_parser(name: &str, kind: &str, source_type: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::new_v4(),
         name: name.to_string(),
         description: None,
@@ -855,6 +856,7 @@ async fn fixed_name_infrastructure_is_owned_without_a_manifest() {
 /// `match_values` matter to the staging guard.
 fn staging_test_parser(id: u128, name: &str, match_value: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::from_u128(id),
         name: name.to_string(),
         description: None,

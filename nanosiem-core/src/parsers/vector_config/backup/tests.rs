@@ -762,6 +762,7 @@ async fn an_unparseable_router_silences_the_route_checks() {
 
 fn log_parser(name: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::new_v4(),
         name: name.to_string(),
         description: None,

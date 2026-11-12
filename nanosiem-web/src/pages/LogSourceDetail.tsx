@@ -111,6 +111,7 @@ import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { SourceWritersCard } from '@/components/add-data/SourceWritersCard';
 import { LogSourceDelivery } from '@/components/log-sources/LogSourceDelivery';
 import { LogSourceHealthPanel } from '@/components/log-sources/LogSourceHealthChart';
+import { PublishDraftButton, SAVE_DRAFT_TOOLTIP } from '@/components/log-sources/PublishDraftButton';
 import type { LogSourceHealth } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 import { nplFieldEquals } from '@/lib/npl-quote';
@@ -1129,15 +1130,13 @@ function DraftBanner({
           {discarding ? <LoadingIcon className="w-3 h-3" /> : <RotateCcw className="w-3 h-3" />}
           Discard draft
         </Button>
-        <Button
-          size="sm"
-          className="h-7 text-[11.5px] bg-amber-600 hover:bg-amber-700 text-white"
-          disabled={publishing || !validated}
-          onClick={onPublish}
-        >
-          {publishing ? <LoadingIcon className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
-          Publish
-        </Button>
+        <PublishDraftButton
+          label="Publish"
+          className="bg-amber-600 hover:bg-amber-700 text-white"
+          publishing={publishing}
+          validated={validated}
+          onPublish={onPublish}
+        />
       </div>
     </div>
   );
@@ -2013,15 +2012,22 @@ function VrlEditorTab({
           </>
         ) : isEditing ? (
           <>
-            <Button
-              size="sm"
-              className="h-7 text-[11.5px] gap-1.5"
-              onClick={onSaveVrl}
-              disabled={updating || validating}
-            >
-              {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
-              Save VRL
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex" tabIndex={updating || validating ? 0 : undefined}>
+                  <Button
+                    size="sm"
+                    className="h-7 text-[11.5px] gap-1.5"
+                    onClick={onSaveVrl}
+                    disabled={updating || validating}
+                  >
+                    {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+                    Save VRL
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent className="text-[11px]">{SAVE_DRAFT_TOOLTIP}</TooltipContent>
+            </Tooltip>
             <Button
               variant="outline"
               size="sm"
@@ -2336,15 +2342,12 @@ function VersionsTab({
               {versions.length} version{versions.length === 1 ? '' : 's'}
             </span>
             {hasDraft && (
-              <Button
-                size="sm"
-                className="h-7 text-[11.5px] gap-1.5"
-                disabled={publishing || !validated}
-                onClick={onPublish}
-              >
-                {publishing ? <LoadingIcon className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
-                Publish current draft
-              </Button>
+              <PublishDraftButton
+                label="Publish current draft"
+                publishing={publishing}
+                validated={validated}
+                onPublish={onPublish}
+              />
             )}
           </div>
         }

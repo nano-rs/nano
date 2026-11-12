@@ -497,6 +497,14 @@ pub struct Parser {
     /// Toggle whether extension_vrl is deployed (NAN-874).
     #[serde(default)]
     pub extension_enabled: bool,
+    /// NAN-5132 (two-phase activation): this source renders PARKED while a
+    /// deploy or undeploy verifies it on every ingest host. Its chain reads the
+    /// never-matching fan-in slot filter instead of `source_router`, and the
+    /// router has no route for it, so ingest routing is unchanged. Loaded from
+    /// `log_source_activation_holds` by the effective-deployed query; not
+    /// persisted on the source and not part of the API.
+    #[serde(default, skip)]
+    pub activation_parked: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

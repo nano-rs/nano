@@ -18,6 +18,13 @@ use crate::search::service::source_scope_sql_predicate;
 
 use super::types::{Feed, FeedHealthMetrics, FeedHistoryPoint, FeedStats, NewFeed, UpdateFeed};
 
+// Legacy PostgreSQL-log statistics, kept for enterprise installs that still
+// retain logs in PostgreSQL. A child module so the open-core mirror strip
+// removes the source, not just the build (NAN-5281).
+#[cfg(feature = "enterprise")]
+#[path = "repository_legacy_pg.rs"]
+mod legacy_pg;
+
 #[derive(Error, Debug)]
 pub enum FeedRepositoryError {
     #[error("Database error: {0}")]
@@ -459,40 +466,6 @@ impl FeedRepository {
         Ok(stats)
     }
 
-    /// Get feed statistics from PostgreSQL (legacy)
-    #[cfg(feature = "enterprise")]
-    async fn get_stats_postgres(
-        &self,
-        _feeds: &[Feed],
-    ) -> Result<Vec<FeedStats>, FeedRepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT 
-                f.id as feed_id,
-                f.name as feed_name,
-                COALESCE(COUNT(l.id), 0) as event_count,
-                MAX(l.timestamp) as last_event_at
-            FROM feeds f
-            LEFT JOIN logs l ON COALESCE(l.sourcetype, l.metadata->>'source_type') = f.name
-            WHERE f.enabled = true
-            GROUP BY f.id, f.name
-            ORDER BY event_count DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .iter()
-            .map(|row| FeedStats {
-                feed_id: row.get("feed_id"),
-                feed_name: row.get("feed_name"),
-                event_count: row.get::<i64, _>("event_count"),
-                last_event_at: row.get("last_event_at"),
-            })
-            .collect())
-    }
-
     /// Get detailed health metrics for a specific feed
     ///
     /// NAN-1801: empty deny set — see [`Self::get_stats`] for the threading
@@ -725,135 +698,6 @@ impl FeedRepository {
         })
     }
 
-    /// Get health metrics from PostgreSQL (legacy)
-    #[cfg(feature = "enterprise")]
-    async fn get_health_metrics_postgres(
-        &self,
-        feed: &Feed,
-    ) -> Result<FeedHealthMetrics, FeedRepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT 
-                f.id as feed_id,
-                f.name as feed_name,
-                COALESCE(COUNT(l.id), 0) as total_events,
-                COALESCE(COUNT(l.id) FILTER (WHERE l.timestamp >= NOW() - INTERVAL '24 hours'), 0) as events_last_24h,
-                COALESCE(COUNT(l.id) FILTER (WHERE l.timestamp >= NOW() - INTERVAL '1 hour'), 0) as events_last_hour,
-                MAX(l.timestamp) as last_event_at,
-                MIN(l.timestamp) as first_event_at,
-                CASE 
-                    WHEN MAX(l.timestamp) IS NULL THEN NULL
-                    ELSE CAST(EXTRACT(EPOCH FROM (NOW() - MAX(l.timestamp))) / 3600.0 AS FLOAT8)
-                END as data_freshness_hours,
-                COALESCE(SUM(
-                    LENGTH(l.message) + 
-                    LENGTH(l.metadata::text) + 
-                    COALESCE(LENGTH(l.sourcetype), 0) +
-                    -- Add estimated overhead for other columns (timestamps, IDs, etc.)
-                    200
-                ), 0) as total_size_bytes,
-                -- Error metrics from ingestion_errors table
-                COALESCE((
-                    SELECT COUNT(*) 
-                    FROM ingestion_errors e 
-                    WHERE e.source_type = f.name 
-                      AND e.error_type = 'parse_error'
-                      AND e.timestamp >= NOW() - INTERVAL '24 hours'
-                ), 0) as parse_errors_24h,
-                COALESCE((
-                    SELECT COUNT(*) 
-                    FROM ingestion_errors e 
-                    WHERE e.source_type = f.name 
-                      AND e.error_type = 'storage_error'
-                      AND e.timestamp >= NOW() - INTERVAL '24 hours'
-                ), 0) as storage_errors_24h
-            FROM feeds f
-            LEFT JOIN logs l ON COALESCE(l.sourcetype, l.metadata->>'source_type') = f.name
-            WHERE f.id = $1
-            GROUP BY f.id, f.name
-            "#
-        )
-        .bind(feed.id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let total_events: i64 = row.get("total_events");
-        let events_last_24h: i64 = row.get("events_last_24h");
-        let events_last_hour: i64 = row.get("events_last_hour");
-        let data_freshness_hours: Option<f64> = row.get("data_freshness_hours");
-        let total_size_bytes: i64 = row.get("total_size_bytes");
-        let parse_errors_24h: i64 = row.get("parse_errors_24h");
-        let storage_errors_24h: i64 = row.get("storage_errors_24h");
-
-        // Calculate average events per hour (over last 24h if we have data)
-        let avg_events_per_hour = if events_last_24h > 0 {
-            events_last_24h as f64 / 24.0
-        } else {
-            0.0
-        };
-
-        // Calculate average event size
-        let avg_event_size_bytes = if total_events > 0 {
-            total_size_bytes as f64 / total_events as f64
-        } else {
-            0.0
-        };
-
-        // Calculate error rate (errors / total attempts in last 24h)
-        let total_errors_24h = parse_errors_24h + storage_errors_24h;
-        let total_attempts_24h = events_last_24h + total_errors_24h;
-        let error_rate_24h = if total_attempts_24h > 0 {
-            total_errors_24h as f64 / total_attempts_24h as f64
-        } else {
-            0.0
-        };
-
-        // Determine ingestion rate trend (simplified - could be enhanced with more historical data)
-        let ingestion_rate_trend = if total_events == 0 {
-            "no_data".to_string()
-        } else if events_last_hour > (avg_events_per_hour * 1.2) as i64 {
-            "increasing".to_string()
-        } else if events_last_hour < (avg_events_per_hour * 0.8) as i64 {
-            "decreasing".to_string()
-        } else {
-            "stable".to_string()
-        };
-
-        // Determine health status
-        let health_status = if !feed.enabled {
-            "disabled".to_string()
-        } else if total_events == 0 {
-            "no_data".to_string()
-        } else if let Some(freshness) = data_freshness_hours {
-            if freshness > 24.0 {
-                "stale".to_string()
-            } else {
-                "healthy".to_string()
-            }
-        } else {
-            "no_data".to_string()
-        };
-
-        Ok(FeedHealthMetrics {
-            feed_id: feed.id,
-            feed_name: row.get("feed_name"),
-            total_events,
-            events_last_24h,
-            events_last_hour,
-            avg_events_per_hour,
-            last_event_at: row.get("last_event_at"),
-            first_event_at: row.get("first_event_at"),
-            data_freshness_hours,
-            ingestion_rate_trend,
-            health_status,
-            total_size_bytes,
-            avg_event_size_bytes,
-            error_rate_24h,
-            parse_errors_24h,
-            storage_errors_24h,
-        })
-    }
-
     /// Get historical ingestion data for charts (last 24 hours)
     pub async fn get_ingestion_history(
         &self,
@@ -944,43 +788,6 @@ impl FeedRepository {
             .collect();
 
         Ok(history)
-    }
-
-    /// Get ingestion history from PostgreSQL (legacy)
-    #[cfg(feature = "enterprise")]
-    async fn get_ingestion_history_postgres(
-        &self,
-        feed: &Feed,
-    ) -> Result<Vec<FeedHistoryPoint>, FeedRepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT 
-                date_trunc('hour', l.timestamp) as hour_bucket,
-                COUNT(*) as event_count
-            FROM logs l
-            WHERE COALESCE(l.sourcetype, l.metadata->>'source_type') = $1
-              AND l.timestamp >= NOW() - INTERVAL '24 hours'
-            GROUP BY hour_bucket
-            ORDER BY hour_bucket ASC
-            "#,
-        )
-        .bind(&feed.name)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let time: chrono::DateTime<chrono::Utc> = row.get("hour_bucket");
-                let event_count: i64 = row.get("event_count");
-
-                FeedHistoryPoint {
-                    time,
-                    event_count,
-                    hour_label: time.format("%H:%M").to_string(),
-                }
-            })
-            .collect())
     }
 
     /// Get distinct sourcetypes from logs (for discovery)
@@ -1075,39 +882,6 @@ impl FeedRepository {
         Ok(sourcetypes)
     }
 
-    /// Get discovered sourcetypes from PostgreSQL (legacy)
-    #[cfg(feature = "enterprise")]
-    async fn get_discovered_sourcetypes_postgres(
-        &self,
-    ) -> Result<Vec<(String, i64)>, FeedRepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT 
-                COALESCE(
-                    sourcetype,
-                    metadata->>'source_type',
-                    'unknown'
-                ) as sourcetype,
-                COUNT(*) as count
-            FROM logs
-            WHERE timestamp > NOW() - INTERVAL '7 days'
-            GROUP BY COALESCE(sourcetype, metadata->>'source_type', 'unknown')
-            ORDER BY count DESC
-            LIMIT 100
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let sourcetype: String = r.try_get("sourcetype").unwrap_or_default();
-                let count: i64 = r.try_get("count").unwrap_or(0);
-                (sourcetype, count)
-            })
-            .collect())
-    }
 }
 
 #[cfg(test)]

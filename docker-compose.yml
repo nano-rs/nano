@@ -109,6 +109,9 @@ services:
       # NAN-5132: stable fan-in slots, off by default (opt-in for installs that
       # add sources often). Every API replica must use the same value.
       VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
+      # NAN-5287: disk-buffer acknowledgement durability (fsync | page_cache),
+      # rendered into the generated Vector config.
+      NANO_INGEST_ACK_DURABILITY: ${NANO_INGEST_ACK_DURABILITY:-fsync}
       # NAN-1151: enrichment-lane ingest — identity providers POST raw records
       # to the dedicated nano_enrich source instead of writing ClickHouse
       # directly. Token must match the Vector service's VECTOR_AUTH_TOKEN.
@@ -458,7 +461,7 @@ services:
     #            the token. Silent.
     # So never drop the flag, and after any Vector bump confirm env-driven values
     # resolve at runtime (send HEC with the real token and with the literal).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.10-debian@sha256:5d71a7b2bb1a0fd4e56941cb0be0590d8d74eb0f23cadab33f18510f2664fee7
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.11-debian@sha256:27e8dc155770379cef504fe647d7611cad527143120a17e2e1bfae8ab4bc54c2
     container_name: nanosiem-vector
     network_mode: "service:vector-netns"
     security_opt:

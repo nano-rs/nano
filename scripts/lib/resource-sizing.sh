@@ -414,7 +414,9 @@ ch_cores=$(clamp "$ch_cores" 2 64)
 if (( ch_mib <= 4096 )); then
     ch_background_pool=2
     ch_background_ratio=2
-    ch_async_threads=2
+    # NAN-5296: never 2. With two threads one stuck flush pair held the whole
+    # pool and every later insert queued behind it without a timeout.
+    ch_async_threads=4
     ch_concurrent=50
     ch_concurrent_insert=20
     ch_concurrent_select=30
@@ -422,7 +424,7 @@ if (( ch_mib <= 4096 )); then
 else
     ch_background_pool=$(clamp "$(( ch_cores * 2 ))" 4 64)
     (( ch_cores >= 8 )) && ch_background_ratio=4 || ch_background_ratio=2
-    ch_async_threads=$(clamp "$(( (ch_cores + 1) / 2 ))" 2 32)
+    ch_async_threads=$(clamp "$(( (ch_cores + 1) / 2 ))" 4 32)
     ch_concurrent=$(clamp "$(( ch_cores * 25 ))" 50 1600)
     ch_concurrent_insert=$(clamp "$(( ch_cores * 8 ))" 20 512)
     ch_concurrent_select=$(clamp "$(( ch_cores * 19 ))" 30 1200)

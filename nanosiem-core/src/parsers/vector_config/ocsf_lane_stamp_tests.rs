@@ -48,6 +48,7 @@ fn okta_event() -> Value {
 
 fn parser(name: &str, source_type: &str, lanes: &[&str], vrl: &str) -> Parser {
     Parser {
+        activation_parked: false,
         id: Uuid::new_v4(),
         name: name.into(),
         description: None,

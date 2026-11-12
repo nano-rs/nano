@@ -46,7 +46,7 @@ fn columns_are_deduplicated() {
         ArtifactColumns::resolve(&OcsfProfile::new()),
         ArtifactColumns::resolve(&UdmProfile::new()),
     ] {
-        for list in [&cols.hashes, &cols.domains, &cols.urls] {
+        for list in [&cols.hashes, &cols.domains, &cols.urls, &cols.ips] {
             let set: std::collections::HashSet<_> = list.iter().map(|c| &c.sql).collect();
             assert_eq!(set.len(), list.len(), "duplicate column in {list:?}");
         }
@@ -69,9 +69,9 @@ fn udm_reads_its_own_columns_and_never_ocsf_paths() {
 fn hash_sql_concatenates_scalars_and_arrays_and_lowercases() {
     let cols = ArtifactColumns {
         hashes: vec![
-            ArtifactColumn { sql: "\"file.hashes.sha256\"".into(), is_array: false },
-            ArtifactColumn { sql: "\"process.file.hashes.sha256\"".into(), is_array: false },
-            ArtifactColumn { sql: "\"file.hashes.value\"".into(), is_array: true },
+            ArtifactColumn::scalar("\"file.hashes.sha256\""),
+            ArtifactColumn::scalar("\"process.file.hashes.sha256\""),
+            ArtifactColumn { is_array: true, ..ArtifactColumn::scalar("\"file.hashes.value\"") },
         ],
         ..Default::default()
     };
@@ -90,8 +90,8 @@ fn hash_sql_concatenates_scalars_and_arrays_and_lowercases() {
 #[test]
 fn domain_sql_reads_hostnames_and_url_hosts_and_excludes_internal_before_limit() {
     let cols = ArtifactColumns {
-        domains: vec![ArtifactColumn { sql: "\"query.hostname\"".into(), is_array: false }],
-        urls: vec![ArtifactColumn { sql: "\"url.url_string\"".into(), is_array: false }],
+        domains: vec![ArtifactColumn::scalar("\"query.hostname\"")],
+        urls: vec![ArtifactColumn::scalar("\"url.url_string\"")],
         ..Default::default()
     };
     let internal = InternalDomains::builtin();

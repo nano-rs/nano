@@ -893,28 +893,22 @@ mod decorated_filter {
 // `hash_prevalence` filter on both paths.
 // ---------------------------------------------------------------------------
 mod coalesce_extraction {
-    use super::super::{extract_prevalence_artifact, prevalence_filter_udm_concepts};
+    use super::super::{extract_prevalence_artifact, prevalence_filter_kind};
+    use crate::prevalence::artifact_fields::ArtifactKind;
     use crate::query::PrevalenceField;
     use serde_json::json;
 
     #[test]
-    fn hash_filter_coalesces_file_hash_then_process_hash() {
-        // The COALESCE concept order the pushdown mirrors.
+    fn filter_fields_map_to_their_artifact_kind() {
+        assert_eq!(prevalence_filter_kind(&PrevalenceField::HashPrevalence), ArtifactKind::Hash);
+        assert_eq!(prevalence_filter_kind(&PrevalenceField::HashFirstSeen), ArtifactKind::Hash);
         assert_eq!(
-            prevalence_filter_udm_concepts(&PrevalenceField::HashPrevalence),
-            &["file_hash", "process_hash"]
+            prevalence_filter_kind(&PrevalenceField::DomainPrevalence),
+            ArtifactKind::Domain
         );
         assert_eq!(
-            prevalence_filter_udm_concepts(&PrevalenceField::HashFirstSeen),
-            &["file_hash", "process_hash"]
-        );
-    }
-
-    #[test]
-    fn domain_filter_keys_on_dest_host() {
-        assert_eq!(
-            prevalence_filter_udm_concepts(&PrevalenceField::DomainPrevalence),
-            &["dest_host"]
+            prevalence_filter_kind(&PrevalenceField::DomainFirstSeen),
+            ArtifactKind::Domain
         );
     }
 
@@ -923,13 +917,9 @@ mod coalesce_extraction {
         // Sysmon-shaped row: no file_hash, only a process_hash. Before the fix the
         // in-memory path keyed on file_hash ONLY and skipped this row, diverging from
         // the pushdown. Now it must fall back to process_hash.
-        let fields: Vec<String> = prevalence_filter_udm_concepts(&PrevalenceField::HashPrevalence)
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
         let row = json!({ "process_hash": "abc123", "process_name": "evil.exe" });
         assert_eq!(
-            extract_prevalence_artifact(&row, &fields),
+            extract_prevalence_artifact(&row, ArtifactKind::Hash),
             Some("abc123".to_string())
         );
     }
@@ -937,13 +927,9 @@ mod coalesce_extraction {
     #[test]
     fn file_hash_wins_when_both_present() {
         // COALESCE priority: file_hash before process_hash.
-        let fields: Vec<String> = prevalence_filter_udm_concepts(&PrevalenceField::HashPrevalence)
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
         let row = json!({ "file_hash": "file_h", "process_hash": "proc_h" });
         assert_eq!(
-            extract_prevalence_artifact(&row, &fields),
+            extract_prevalence_artifact(&row, ArtifactKind::Hash),
             Some("file_h".to_string())
         );
     }
@@ -951,24 +937,16 @@ mod coalesce_extraction {
     #[test]
     fn empty_file_hash_falls_back_to_process_hash() {
         // An empty-string file_hash is treated as absent (COALESCE skips it).
-        let fields: Vec<String> = prevalence_filter_udm_concepts(&PrevalenceField::HashPrevalence)
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
         let row = json!({ "file_hash": "", "process_hash": "proc_h" });
         assert_eq!(
-            extract_prevalence_artifact(&row, &fields),
+            extract_prevalence_artifact(&row, ArtifactKind::Hash),
             Some("proc_h".to_string())
         );
     }
 
     #[test]
     fn row_with_no_hash_yields_none() {
-        let fields: Vec<String> = prevalence_filter_udm_concepts(&PrevalenceField::HashPrevalence)
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
         let row = json!({ "process_name": "evil.exe" });
-        assert_eq!(extract_prevalence_artifact(&row, &fields), None);
+        assert_eq!(extract_prevalence_artifact(&row, ArtifactKind::Hash), None);
     }
 }

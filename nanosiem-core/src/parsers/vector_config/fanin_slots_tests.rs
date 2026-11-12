@@ -16,6 +16,7 @@ fn parser(name: &str, nth: i64) -> Parser {
     }
     let at = chrono::DateTime::from_timestamp(1_700_000_000 + nth * 60, 0).unwrap();
     Parser {
+        activation_parked: false,
         id: uuid::Uuid::from_bytes(bytes),
         name: name.to_string(),
         description: None,
