@@ -132,7 +132,7 @@ export class EnrichmentApi {
 
   // NAN-1111: ThreatFox and TOR Exit Nodes configure / sync methods,
   // plus the shared `/api/enrichment/ioc/{lookup,stats}` endpoints,
-  // lived here. Both providers moved to the marketplace + Deno
+  // lived here. Both providers moved to the marketplace + sandboxed code
   // (nano-rs/nano-enrichments); the IOC lookup endpoints had no
   // remaining UI callers. IPinfo Lite comes from nano's signed platform
   // feed bundle (NAN-4959 removed its configure / sync / auto-sync calls).

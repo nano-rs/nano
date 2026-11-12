@@ -61,6 +61,12 @@ keepalive.max_connection_age_secs = 300  # 5 minutes
 # a saturated buffer applies backpressure instead of destroying a finalizer as
 # `Dropped` (which Vector intentionally folds into Delivered). Request admission
 # limits live at the nginx edge, where rejection is an explicit HTTP 429.
+# NAN-5285: "accepts" includes the fsync. From nano-rs/vector 0.61.0-nano.10 the
+# disk buffer syncs its data file and ledger before it acknowledges a record a
+# source waits on, so the 2xx survives a power loss or hard reset of the host,
+# not only a Vector kill (earlier images synced every 500 ms; the v2.0.13 HA
+# drill lost an OTLP event answered ~370 ms before a reset). One sync covers
+# every record buffered since the last flush.
 [sources.http_ingest.acknowledgements]
 enabled = true
 

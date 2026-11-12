@@ -35,7 +35,8 @@ const MAX_MANIFEST_SIZE: u64 = 1_048_576;
 /// History:
 /// - 0: rows synced before the version was recorded (column default).
 /// - 1: NAN-3514 introduced the version (every existing repo re-parses once).
-pub const SYNC_SCHEMA_VERSION: i32 = 1;
+/// - 2: NAN-5284 `runtime: connector` agent entries map to `lookup`.
+pub const SYNC_SCHEMA_VERSION: i32 = 2;
 
 /// Whether `repo` is already synced at `commit` by the running sync code.
 ///
@@ -353,6 +354,7 @@ fn validate_branch(branch: &str) -> Result<(), MarketplaceError> {
 }
 
 /// Sanitize git stderr output to remove embedded credentials from URLs
+#[cfg(test)]
 fn sanitize_git_stderr(stderr: &str) -> String {
     let cred_re = Regex::new(r"://[^@\s]+@").unwrap();
     cred_re.replace_all(stderr, "://***@").to_string()
@@ -395,24 +397,12 @@ pub(super) async fn run_sync(
 
     let repo_dir = data_dir.join("enrichment_repos").join(&repo.slug);
 
-    // NAN-4955: a first-party catalog is never cloned from GitHub; its tree
-    // is the installed nano content channel snapshot. Only non-first-party
-    // origins (unit tests' local repositories) keep the git path.
-    let first_party = first_party_repo(&repo.url).filter(|_| !test_git_source());
-    // NAN-4946: a checkout whose origin is not the validated URL is
-    // discarded and re-cloned, so a fetch never reaches another remote.
-    if first_party.is_none() && repo_dir.exists() && !checkout_matches(&repo_dir, &repo.url).await {
-        warn!(repo_id = %repo.id, "marketplace checkout origin differs from the repository URL; re-cloning");
-        tokio::fs::remove_dir_all(&repo_dir).await.map_err(|e| {
-            MarketplaceError::GitError(format!("Failed to remove stale checkout: {e}"))
-        })?;
-    }
-    let commit = if let Some((owner, name)) = first_party {
-        snapshot_into(&repo_dir, &owner, &name, &repo.branch).await?
-    } else if repo_dir.exists() {
-        git_pull(&repo_dir, &repo.branch).await?
-    } else {
-        git_clone(&repo.url, &repo_dir, &repo.branch).await?
+    // NAN-4955: a catalog is never cloned from GitHub; its tree is the
+    // installed nano content channel snapshot. Only unit tests drive a local
+    // git repository (`test_git_checkout`); production has no git path.
+    let commit = match first_party_repo(&repo.url).filter(|_| !test_git_source()) {
+        Some((owner, name)) => snapshot_into(&repo_dir, &owner, &name, &repo.branch).await?,
+        None => test_git_checkout(repo, &repo_dir).await?,
     };
 
     // Skip only when neither the content (commit) nor the sync code
@@ -586,31 +576,15 @@ pub(super) async fn run_sync(
     })
 }
 
-/// Whether the checkout's `origin` is exactly `url`. Unit tests drive
-/// `run_sync` against a local repository whose origin is a filesystem path,
-/// so the check is compiled out under `cfg(test)`.
-async fn checkout_matches(repo_dir: &PathBuf, url: &str) -> bool {
-    if cfg!(test) {
-        return true;
-    }
-    let output = tokio::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo_dir)
-        .output()
-        .await;
-    matches!(output, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == url.trim())
-}
-
-/// A `git` command for network operations against a validated first-party
-/// URL (NAN-4946): HTTPS only, no redirects, no credential helpers or
-/// prompts, no system/global config influence.
+/// A `git` command for the unit tests' local repositories: no redirects,
+/// credential helpers, prompts or system/global config influence.
+#[cfg(test)]
 fn hardened_git() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args([
         "-c", "protocol.allow=never",
         "-c", "protocol.https.allow=always",
-        // Unit tests pull from a local repository.
-        "-c", if cfg!(test) { "protocol.file.allow=always" } else { "protocol.file.allow=never" },
+        "-c", "protocol.file.allow=always",
         "-c", "http.followRedirects=false",
         "-c", "credential.helper=",
         "-c", "core.askPass=",
@@ -637,6 +611,27 @@ fn test_git_source() -> bool {
 #[cfg(not(test))]
 fn test_git_source() -> bool {
     false
+}
+
+/// Production: a repository that is not a first-party content channel is
+/// refused (admission already rejects one; this keeps sync fail closed).
+#[cfg(not(test))]
+async fn test_git_checkout(repo: &EnrichmentMarketplaceRepo, _repo_dir: &PathBuf) -> Result<String, MarketplaceError> {
+    Err(MarketplaceError::GitError(format!(
+        "{} is not a nano content channel; third-party repositories are not fetched",
+        repo.url
+    )))
+}
+
+/// Unit tests: drive the manifest parse/record logic through a local git
+/// repository (NAN-3514 / NAN-4946).
+#[cfg(test)]
+async fn test_git_checkout(repo: &EnrichmentMarketplaceRepo, repo_dir: &PathBuf) -> Result<String, MarketplaceError> {
+    if repo_dir.exists() {
+        git_pull(repo_dir, &repo.branch).await
+    } else {
+        git_clone(&repo.url, repo_dir, &repo.branch).await
+    }
 }
 
 /// `(owner, repo)` of a first-party catalog URL (`nano-rs` / `nanos-sh`).
@@ -690,6 +685,7 @@ async fn snapshot_into(repo_dir: &PathBuf, owner: &str, name: &str, branch: &str
 }
 
 /// Clone a git repo (shallow)
+#[cfg(test)]
 async fn git_clone(url: &str, target: &PathBuf, branch: &str) -> Result<String, MarketplaceError> {
     // Create parent directory
     if let Some(parent) = target.parent() {
@@ -724,9 +720,9 @@ async fn git_clone(url: &str, target: &PathBuf, branch: &str) -> Result<String, 
 }
 
 /// Pull latest changes
+#[cfg(test)]
 async fn git_pull(repo_dir: &PathBuf, branch: &str) -> Result<String, MarketplaceError> {
-    // `origin` is the validated URL the checkout was cloned from (callers
-    // re-clone when it differs, see `checkout_matches`).
+    // `origin` is the local test repository the checkout was cloned from.
     let output = hardened_git()
         .args(["fetch", "--depth=1", "origin", branch])
         .current_dir(repo_dir)
@@ -762,6 +758,7 @@ async fn git_pull(repo_dir: &PathBuf, branch: &str) -> Result<String, Marketplac
 }
 
 /// Get HEAD commit hash
+#[cfg(test)]
 async fn get_head_commit(repo_dir: &PathBuf) -> Result<String, MarketplaceError> {
     let output = tokio::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -787,9 +784,22 @@ fn is_collector_manifest(manifest: &MarketplaceManifest) -> bool {
 fn execution_backend_for(manifest: &MarketplaceManifest) -> &'static str {
     if is_collector_manifest(manifest) {
         "collector"
+    } else if is_official_lookup_manifest(manifest) {
+        "lookup"
     } else {
         "deno"
     }
+}
+
+/// NAN-5284: an agent manifest that asks for its connector runtime and names
+/// an official lookup spec installs that lookup instead of `code.ts`.
+/// Enterprise only: the open edition has no threat-intel service, so the row
+/// stays `deno` and its install keeps being refused as enterprise-only.
+pub(crate) fn is_official_lookup_manifest(manifest: &MarketplaceManifest) -> bool {
+    cfg!(feature = "enterprise")
+        && manifest.category == "agent"
+        && manifest.runtime.as_deref().map(str::trim) == Some("connector")
+        && super::types::OFFICIAL_LOOKUP_PROVIDERS.contains(&manifest.slug.as_str())
 }
 
 /// Fold the collector-only manifest fields into the catalog row's `config`

@@ -44,6 +44,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { DeliveryAttentionBadge } from '@/components/log-sources/DeliveryAttentionBadge';
+import { useDeployJob } from '@/hooks/use-deploy-job';
+import { isTerminal, phaseLabel, stateLabel } from '@/lib/deploy-job';
 import { deliveryAttentionBySource, type DeliveryAttention } from '@/lib/delivery-attention';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import {
@@ -251,8 +253,10 @@ export function LogSources() {
 
   const handleDeploy = async () => {
     if (!logSourceToAction) return;
+    // NAN-5132: the row shows the job's phase; the dialog need not stay open.
+    setDeployDialogOpen(false);
     try {
-      const result = await deployLogSource(logSourceToAction.id);
+      const result = await deployLogSource({ id: logSourceToAction.id });
       toastDeployResult(toast, (generation) => api.getDeliveryStatus(generation), result, {
         title: 'Deployed',
         description: `"${logSourceToAction.name}" has been deployed to Vector.`,
@@ -276,6 +280,7 @@ export function LogSources() {
 
   const handleUndeploy = async () => {
     if (!logSourceToAction) return;
+    setUndeployDialogOpen(false);
     try {
       await undeployLogSource(logSourceToAction.id);
       toast({
@@ -710,6 +715,8 @@ function LogSourceRow({
   const [params] = useSearchParams();
   const highlighted = params.get('highlight') === source.id;
   const status = deriveStatus(source);
+  // NAN-5132: a deploy job this tab started for the row (phase, then outcome).
+  const deployJob = useDeployJob(source.id, { fetchOnMount: false });
   const pending = derivePendingDeploy(source);
   const warn = pending; // single warn signal until backend ships richer health data
   const transportLabel = logSourceTransportLabel(source);
@@ -832,6 +839,15 @@ function LogSourceRow({
       {/* Status */}
       <td className="py-3 align-top">
         <StatusBadge notParsed={notParsed} status={status} validated={source.validated} validationError={source.validation_error} />
+        {deployJob && (
+          <span
+            data-testid="row-deploy-job"
+            className="block mt-1 text-[10.5px] font-mono text-muted-foreground truncate"
+            title={deployJob.message ?? undefined}
+          >
+            {isTerminal(deployJob) ? stateLabel(deployJob) : phaseLabel(deployJob.phase)}
+          </span>
+        )}
         {connect && <ConnectLine connect={connect} />}
         {status === 'draft' && (
           <Link

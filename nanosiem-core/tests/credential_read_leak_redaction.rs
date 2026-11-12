@@ -236,6 +236,7 @@ fn log_source_model_carries_no_credential_surface_at_all() {
             has_draft_changes: true,
             active_version_number: Some(3),
             active_parser_vrl: Some(".foo = 1".to_string()),
+            ocsf_attestation: None,
         },
         "GET /api/log-sources/{id}/draft-status",
     );

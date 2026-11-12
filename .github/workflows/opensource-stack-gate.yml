@@ -61,6 +61,8 @@ on:
       - deploy/helm/nano/templates/ingest/**
       - scripts/tests/test_nano_deploy_fetch_bundle.py
       - scripts/tests/test_valkey_ha_entrypoint.py
+      - scripts/tests/test_etcd_leader_steer.py
+      - deploy/compose/postgres-ha/nano-etcd-leader-steer
       - scripts/nano-support-bundle
       - scripts/nano-cluster-health
       - scripts/tests/test_nano_support_bundle.py
@@ -231,6 +233,16 @@ jobs:
             python3 -I scripts/tests/test_valkey_ha_entrypoint.py -v
           else
             echo "Valkey HA entrypoint test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5241: the postgres-ha member moves etcd leadership off the
+      # PostgreSQL primary's host only when it leads both (no containers).
+      - name: etcd leader steer
+        run: |
+          if [ -f scripts/tests/test_etcd_leader_steer.py ]; then
+            python3 -I scripts/tests/test_etcd_leader_steer.py -v
+          else
+            echo "etcd leader steer test not in this tree (public mirror); skipping"
           fi
 
       # Security review 2026-11-08 (NAN-5008/NAN-5038): the full published-port

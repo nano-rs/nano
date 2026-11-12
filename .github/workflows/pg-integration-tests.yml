@@ -235,6 +235,7 @@ jobs:
               NANOSIEM_ALLOW_DEFAULT_KEYS=true cargo test -p nanosiem-core --test source_config_credential_retarget_integration -- --ignored --test-threads=1
               NANOSIEM_ALLOW_DEFAULT_KEYS=true cargo test -p nanosiem-core --test source_config_deployed_edit_requires_deploy_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test lookup_create_owns_physical_table_integration -- --ignored
+              cargo test -p nanosiem-core --test log_source_deploy_jobs_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test custom_enrichment_catalog_slug_guard_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --features enterprise --test tuning_atomic_state_integration -- --ignored --test-threads=1
               NANOSIEM_ENCRYPTION_KEY="$CREDENTIAL_SUITE_ENCRYPTION_KEY" cargo test -p nanosiem-core --features enterprise --test credential_delete_in_use_integration -- --ignored --test-threads=1

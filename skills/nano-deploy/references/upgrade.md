@@ -147,7 +147,15 @@ fresh-install flow does not set them up):
    one hour) right before the dry run.
 3. **Backup:** the upgrade takes a mandatory backup itself
    (`--backup-key-file`, and `--backup-output` on a role split). Make sure the
-   key exists and the output has room (the planner's disk row).
+   key exists and the output has room (the planner's disk row). On a role
+   split, create the `--backup-output` folder, owned by the install user, on
+   the coordinator **and on every postgres host** (and every ClickHouse host
+   with `--include-clickhouse-data`):
+   each component's archive is written on the host that owns it, and the
+   PostgreSQL dump on whichever postgres host leads at backup time. For
+   example `ssh $h 'sudo install -d -o $(id -un) -g $(id -gn) -m 0700 /mnt/nano-backups/upgrade-<v>'`
+   on each of them. The dry run's `backup-output` row checks it on every
+   host that writes a backup component and on the coordinator (from 2.0.14).
 4. **Dry run** from the first app host (single node: drop `--inventory`,
    `--remote-*` and `--backup-output`):
 

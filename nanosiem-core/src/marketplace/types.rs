@@ -61,7 +61,8 @@ impl std::str::FromStr for MarketplaceCategory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionBackend {
-    /// TypeScript code running in Deno sandbox
+    /// TypeScript code on the embedded wasm sandbox. The wire value `deno` is
+    /// historical (Deno was removed in 2.0.14, NAN-5100); catalogs keep it.
     Deno,
     /// Built-in Rust implementation (IPinfo, native agent providers)
     Native,
@@ -69,7 +70,25 @@ pub enum ExecutionBackend {
     Identity,
     /// Sandboxed pull collector streaming events onto the ingest lane (NAN-2189)
     Collector,
+    /// NAN-5284: an official declarative lookup (`nano-connector/lookups`)
+    /// run by the enterprise threat-intel service. Installing one configures
+    /// that provider; no code is installed or run in a sandbox.
+    Lookup,
 }
+
+/// NAN-5284: the official lookup specs (`nano-connector/lookups/*.yaml`) a
+/// `runtime: connector` agent manifest may name by slug. Kept in step with
+/// `nano_connector::lookup::official_specs()` by an enterprise test (core does
+/// not depend on nano-connector).
+pub const OFFICIAL_LOOKUP_PROVIDERS: &[&str] = &[
+    "virustotal",
+    "abuseipdb",
+    "greynoise",
+    "urlhaus",
+    "threatfox",
+    "malwarebazaar",
+    "shodan",
+];
 
 impl std::fmt::Display for ExecutionBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -78,6 +97,7 @@ impl std::fmt::Display for ExecutionBackend {
             ExecutionBackend::Native => write!(f, "native"),
             ExecutionBackend::Identity => write!(f, "identity"),
             ExecutionBackend::Collector => write!(f, "collector"),
+            ExecutionBackend::Lookup => write!(f, "lookup"),
         }
     }
 }
@@ -91,6 +111,7 @@ impl std::str::FromStr for ExecutionBackend {
             "native" => Ok(ExecutionBackend::Native),
             "identity" => Ok(ExecutionBackend::Identity),
             "collector" => Ok(ExecutionBackend::Collector),
+            "lookup" => Ok(ExecutionBackend::Lookup),
             _ => Err(format!("Invalid execution backend: {}", s)),
         }
     }
@@ -356,6 +377,8 @@ impl MarketplaceCatalogEntry {
             // may live in config rather than `allowed_domains`, so this is
             // always true even when the static list is empty.
             "collector" => true,
+            // NAN-5284: an external threat-intel API.
+            "lookup" => true,
             _ => false,
         }
     }
@@ -563,6 +586,16 @@ pub struct MarketplaceManifest {
     /// non-empty `streams` list is what makes a manifest a collector.
     #[serde(default)]
     pub streams: Vec<StreamDef>,
+
+    /// NAN-3490 / NAN-5284: which implementation nano runs. `deno` (or
+    /// absent) installs `code.ts`; `connector` on an agent entry whose slug
+    /// is in [`OFFICIAL_LOOKUP_PROVIDERS`] installs the official lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+
+    /// The declarative spec next to the manifest (`connector.yaml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_spec: Option<String>,
 }
 
 /// The inverse of `sync_service::effective_config`: pulls a collector's

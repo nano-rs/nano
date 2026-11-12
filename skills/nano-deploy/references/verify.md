@@ -122,8 +122,10 @@ recovers.
 `smoke-test.py` prints `state`, `valid`, `expires` and the entitlement
 (offering, capacity). Report them as they are:
 
-- `valid=True`, `mode=hosted` (online license) **and** an entitlement or
-  expiry: done.
+- `valid=True`, `mode=online` (online license; `mode=hosted` before 2.0.14,
+  which means the same thing, not a nano-hosted install) **and** an
+  entitlement or expiry: done. Who runs the install is
+  `entitlement.operator` (`self-run` on Helm and Compose).
 - `valid=True` with no entitlement, expiry or license ID (the smoke test says
   `NO LICENSE BOUND`): there is no license. The API may say "active" because
   no license URL is configured. Report it as unlicensed, never as licensed.

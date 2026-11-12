@@ -6,6 +6,7 @@
 //! VRL transformation, and metadata into a single entity.
 
 pub mod connect;
+pub mod deploy_jobs;
 #[cfg(test)]
 #[path = "connect_tests.rs"]
 mod connect_tests;
@@ -22,7 +23,9 @@ mod version_repository;
 
 pub use repository::{LogSourceRepository, LogSourceRepositoryError};
 pub use service::pipe::{pipe_route_key, pipe_tap_component, MAX_PIPE_SAMPLES};
-pub use service::{LogSourceService, LogSourceServiceError};
+pub use service::{
+    LogSourceService, LogSourceServiceError, OcsfGateInput, OcsfGateOutcome, OcsfPrecheck,
+};
 pub use tier_guard::{data_source_cap, enforce_data_source_limit, DataSourceCap};
 pub use types::*;
 pub use version_repository::{DiscardOutcome, LogSourceVersionError, LogSourceVersionRepository};

@@ -842,6 +842,14 @@ impl SearchService {
             })
             .collect();
 
+        // NAN-5285 (F9): on OCSF, say that a displayed `action` is the activity.
+        if let Some(w) = crate::search::query_processing::ocsf_action_column_note(
+            query,
+            self.active_profile.id() == crate::schema::SchemaId::Ocsf,
+        ) {
+            all_warnings.push(w);
+        }
+
         // See `should_emit_partial_time_range_warning` for rationale.
         if should_emit_partial_time_range_warning(
             chunks_queried_all,

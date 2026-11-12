@@ -1059,7 +1059,14 @@ export function AddFeed() {
       let parserDeployPending = false;
       if (createdId) {
         try {
-          const deployed = await api.deployLogSource(createdId);
+          // NAN-5079: on OCSF the first go-live re-checks the samples server-side
+          // (VRL + OCSF) and records a receipt; with no samples it goes live as a
+          // system-initiated unattested install (audited as such; the operator
+          // was not asked to acknowledge anything).
+          const ocsfSamples = entryPath === 'manual' ? [] : splitSamples(sampleText).slice(0, 50);
+          const deployed = await api.deployLogSource(createdId, {
+            ocsf: { ocsfSampleLogs: ocsfSamples, unattestedSystemInstall: ocsfSamples.length === 0 },
+          });
           // NAN-5133: a 200 with success:false did not go live; say so.
           if (deployed && deployed.success === false) throw new Error(deployed.message || 'Log source created but parser not yet deployed.');
           // NAN-5279: published, ingest hosts still installing it; in progress, not failed.
@@ -1096,7 +1103,7 @@ export function AddFeed() {
     } finally {
       setDeploying(false);
     }
-  }, [matchValuesFor, canDeploy, category, description, feedId, name, namespaceFull, navigate, product, settleAutoPersist, sourceConfigId, timezone, toast, transport, vendor, vrl]);
+  }, [matchValuesFor, canDeploy, category, description, entryPath, feedId, name, namespaceFull, navigate, product, sampleText, settleAutoPersist, sourceConfigId, timezone, toast, transport, vendor, vrl]);
 
   // ------------ Connect (NAN-4912): the draft exists before any parser ------------
   // Creates the draft now if auto-persist has not, and flushes the current
@@ -1192,7 +1199,10 @@ export function AddFeed() {
         if (!id) return;
       }
       if (repositorySource && id && !repositoryDeployed) {
-        const result = await api.deployLogSource(id);
+        // NAN-5079: a library parser is checked against its bundled samples;
+        // one that ships none goes live as a system-initiated unattested
+        // install (audited as such, not as an operator acknowledgement).
+        const result = await api.deployLogSource(id, { ocsf: { unattestedSystemInstall: true } });
         if (result.success === false) throw new Error(result.message || 'The repository source could not be deployed.');
         setRepositoryDeployed(true);
       }

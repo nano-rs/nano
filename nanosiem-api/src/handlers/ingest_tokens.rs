@@ -180,7 +180,14 @@ pub struct IssuedIngestToken {
     /// On a rotation: the replaced token, now revoked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced: Option<IngestToken>,
+    /// NAN-5285 (F7): seconds until every ingest host accepts the new token
+    /// (each host pulls the token list every 2 s; Vector re-reads it every
+    /// 2 s). A sender that gets 401 inside this window should retry.
+    pub active_within_secs: u64,
 }
+
+/// Upper bound on a new token's propagation to every ingest host.
+pub const TOKEN_ACTIVE_WITHIN_SECS: u64 = 10;
 
 impl std::fmt::Debug for IssuedIngestToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -382,6 +389,7 @@ pub async fn create_ingest_token(
             credential,
             token,
             replaced: None,
+            active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
         }),
     )
         .into_response();
@@ -474,6 +482,7 @@ pub async fn rotate_ingest_token(
             credential: new,
             token,
             replaced: Some(old),
+            active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
         }),
     )
         .into_response();

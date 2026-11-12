@@ -157,6 +157,7 @@ mod token_bound_route_tests;
 mod credentials;
 pub mod delivery;
 mod deploy;
+mod fanin_slots;
 pub mod hec_route;
 mod parser_config;
 mod publication;

@@ -395,6 +395,18 @@ fn collect_fields_from_search_expr(
     }
 }
 
+/// Whether a search expression contains a bare keyword term.
+fn search_expr_has_keyword(expr: &SearchExpr) -> bool {
+    match expr {
+        SearchExpr::Keyword(_) => true,
+        SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+            search_expr_has_keyword(left) || search_expr_has_keyword(right)
+        }
+        SearchExpr::Not(inner) | SearchExpr::Group(inner) => search_expr_has_keyword(inner),
+        _ => false,
+    }
+}
+
 /// Collect fields from commands
 fn collect_fields_from_command(
     cmd: &Command,
@@ -509,6 +521,15 @@ fn collect_fields_from_command(
             // `SELECT * FROM prev WHERE …` over whatever the base projected.
             *wants_full_rows = true;
             collect_fields_from_search_expr(condition, fields, profile);
+            // NAN-5285 (F9): a piped `| search "kw"` runs over the stage, not
+            // the table. On OCSF a keyword also tokenizes `raw_data` (NAN-1828),
+            // which the pruned stage did not project: "Field 'raw_data' does
+            // not exist". A base-search keyword reads the table and needs none.
+            if search_expr_has_keyword(condition) {
+                for column in profile.keyword_search_columns() {
+                    fields.insert(column.to_string());
+                }
+            }
         }
         Command::Sort {
             fields: sort_fields,

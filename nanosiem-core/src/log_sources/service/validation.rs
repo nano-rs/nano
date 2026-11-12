@@ -63,7 +63,7 @@ fn count_extracted_fields(output: &Option<serde_json::Value>) -> u32 {
     }
 }
 
-fn live_parser_result(
+pub(super) fn live_parser_result(
     sample_log: &str,
     result: crate::parsers::ParserTestResult,
 ) -> ParserTestResult {
@@ -74,6 +74,7 @@ fn live_parser_result(
         output: result.output,
         error: result.error,
         extracted_field_count,
+        schema_validation: None,
     }
 }
 
@@ -244,6 +245,7 @@ impl LogSourceService {
                     output: result.output,
                     error: result.error,
                     extracted_field_count,
+                    schema_validation: None,
                 }
             }
             Err(VrlValidatorError::Busy(message)) => {
@@ -255,6 +257,7 @@ impl LogSourceService {
                 output: None,
                 error: Some(format!("VRL execution error: {}", e)),
                 extracted_field_count: 0,
+                schema_validation: None,
             },
         })
     }

@@ -20,7 +20,7 @@
  */
 import type { MarketplaceCatalogEntry, EnrichmentMarketplaceRepo } from './marketplace';
 import type { BuildEdition, Capabilities } from '@/hooks/use-capabilities';
-import type { CustomEnrichmentSummary } from '@/enterprise/api/custom-enrichment';
+import type { CustomEnrichmentSummary, CustomEnrichmentWasmStatus } from '@/enterprise/api/custom-enrichment';
 import type { PlatformFeedsStatus } from './enrichment';
 
 /** `platform`: first-party nano content. `custom`: hand-authored or third-party repository content. */
@@ -83,6 +83,8 @@ export interface InventoryItem {
   entry: MarketplaceCatalogEntry | null;
   /** NAN-4948: nano's signed platform feed bundle provides this feed. */
   provided_by_bundle?: BundleProvision | null;
+  /** NAN-5097: wasm-sandbox readiness of the custom enrichment behind this item. */
+  sandbox?: CustomEnrichmentWasmStatus | null;
 }
 
 /** NAN-4948 / NAN-4959: how nano's signed platform feed bundle provides a feed. */
@@ -234,6 +236,10 @@ export function entryRequirement(entry: MarketplaceCatalogEntry, caps: Capabilit
   }
   // A native agent entry is backed by an agent enrichment provider, which only
   // the enterprise edition ships; the open server refuses its install (403).
+  // NAN-5284: an official lookup installs as an enterprise threat-intel provider.
+  if (entry.execution_backend === 'lookup') {
+    return caps.agentEnrichment ? null : requirementFor('agentEnrichment', edition);
+  }
   if (entry.execution_backend === 'native' && entry.category === 'agent') {
     return caps.agentEnrichment ? null : requirementFor('agentEnrichment', edition);
   }
@@ -252,7 +258,8 @@ function entryReason(entry: MarketplaceCatalogEntry, requirement: InventoryRequi
   if (requirement) return 'requires_capability';
   if (!entry.installed) return 'not_installed';
   if (!entry.enabled) return 'disabled';
-  if (entry.requires_credential === 'required' && !entry.has_credentials) return 'missing_credentials';
+  // A lookup's key lives on its threat-intel provider, not on the catalog row.
+  if (entry.requires_credential === 'required' && !entry.has_credentials && entry.execution_backend !== 'lookup') return 'missing_credentials';
   if (entry.last_sync_status === 'failed' || entry.last_error) return 'sync_failed';
   const syncs = entry.category === 'data' || entry.execution_backend === 'native' || entry.category === 'identity';
   if (syncs && !entry.last_sync_at && !entry.is_syncing) return 'not_synced';
@@ -346,6 +353,7 @@ export function customItem(def: CustomEnrichmentSummary): InventoryItem {
     can_toggle: def.status === 'active' || !def.enabled,
     can_edit: true,
     entry: null,
+    sandbox: def.wasm_status ?? null,
   };
 }
 
@@ -358,11 +366,22 @@ export function customItem(def: CustomEnrichmentSummary): InventoryItem {
  */
 export function buildInventory(entries: MarketplaceCatalogEntry[], customs: CustomEnrichmentSummary[], repos: EnrichmentMarketplaceRepo[], caps: Capabilities, edition: BuildEdition, connectorNames: ReadonlySet<string> = new Set()): InventoryItem[] {
   const fromCatalog = new Set(entries.map(e => e.custom_enrichment_id).filter((id): id is string => !!id));
+  const sandboxById = new Map(customs.flatMap(c => c.wasm_status ? [[c.id, c.wasm_status] as const] : []));
   const visible = entries.filter(e => !(e.category === 'collector' && connectorNames.has(e.slug) && !e.installed));
   return [
-    ...visible.map(entry => catalogItem(entry, repos, caps, edition)),
+    ...visible.map(entry => {
+      const item = catalogItem(entry, repos, caps, edition);
+      const sandbox = entry.custom_enrichment_id ? sandboxById.get(entry.custom_enrichment_id) : undefined;
+      return sandbox ? { ...item, sandbox } : item;
+    }),
     ...customs.filter(def => !fromCatalog.has(def.id)).map(customItem),
   ];
+}
+
+/** NAN-5097: sandbox label for an item backed by a custom enrichment, or null. */
+export function inventorySandboxLabel(item: InventoryItem): string | null {
+  if (!item.sandbox) return null;
+  return item.sandbox.compile_status === 'compiled' ? 'wasm ready' : 'needs attention · not running';
 }
 
 export function inventoryAction(item: InventoryItem): string {

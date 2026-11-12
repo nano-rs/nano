@@ -439,15 +439,13 @@ impl VectorConfigManager {
             .join(", ");
 
         let mut config = format!(
-            "# Auto-generated dynamic router for staged validation\n\
-             # Generated at: {}\n\n\
+            "# Auto-generated dynamic router for staged validation\n\n\
              {}\
              # Accepts input from HTTP pipeline, Vector native protocol, and source configurations.\n\
              [transforms.source_router]\n\
              type = \"route\"\n\
              inputs = [{}]\n\n\
              [transforms.source_router.route]\n",
-            chrono::Utc::now().to_rfc3339(),
             unclaimed_filter_blocks,
             inputs_formatted
         );
@@ -611,12 +609,26 @@ impl VectorConfigManager {
         let mut promoted: HashSet<String> = HashSet::new();
         if staging_parsers_dir.exists() {
             let mut entries = fs::read_dir(&staging_parsers_dir).await?;
+            let mut unchanged = 0usize;
             while let Some(entry) = entries.next_entry().await? {
                 let dest = self.parsers_dir.join(entry.file_name());
-                fs::copy(entry.path(), &dest).await?;
                 promoted.insert(entry.file_name().to_string_lossy().to_string());
+                // NAN-5132: write only what changed. The render is
+                // deterministic, so adding one source leaves every other
+                // parser's file byte-identical; rewriting them anyway made
+                // Vector's watcher re-read the whole tree on every deploy.
+                if Self::same_bytes(&entry.path(), &dest).await {
+                    unchanged += 1;
+                    continue;
+                }
+                fs::copy(entry.path(), &dest).await?;
                 tracing::debug!("Promoted {} to {}", entry.path().display(), dest.display());
             }
+            tracing::info!(
+                written = promoted.len() - unchanged,
+                unchanged,
+                "Promoted staged parser files (unchanged files not rewritten)"
+            );
         }
 
         // NAN-2296: promotion must MIRROR the staged tree, not overlay it.
@@ -733,6 +745,19 @@ impl VectorConfigManager {
 
         tracing::info!("Promoted staged config to {}", self.parsers_dir.display());
         Ok(())
+    }
+
+    /// Whether `staged` and `active` hold the same bytes. Any read error
+    /// (missing active file included) means "different": the copy runs.
+    async fn same_bytes(staged: &Path, active: &Path) -> bool {
+        match (fs::metadata(staged).await, fs::metadata(active).await) {
+            (Ok(a), Ok(b)) if a.len() == b.len() => {}
+            _ => return false,
+        }
+        match (fs::read(staged).await, fs::read(active).await) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
     }
 
     /// Get the staging directory path
@@ -868,3 +893,5 @@ impl VectorConfigManager {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod incremental_tests;

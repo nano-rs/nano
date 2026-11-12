@@ -147,14 +147,82 @@ fn seal_refuses_a_key_outside_the_ring() {
 }
 
 #[test]
-fn production_ring_holds_the_platform_key_only() {
+fn production_ring_holds_the_platform_key_and_the_kms_key_only() {
+    // Exactly these two entries: a rotation appends, it never adds a third key by accident.
+    assert_eq!(
+        CONTENT_PRODUCTION_KEYS,
+        &[
+            ("platform-ad038f5046fb19e51bf310e0", "54022ca65c169394eb131164b596d5b1265670289959604405be7da64dcdc516"),
+            ("content-signing-v1", "85e132520acab941d01e0a43aa61ba75c411b7da905db46c8dc28ececd7cd4cd"),
+        ]
+    );
     let ring = production_key_ring();
     assert!(ring.key("platform-ad038f5046fb19e51bf310e0").is_some());
+    // NAN-5283 overlap: the Cloud KMS content key is trusted beside the platform key.
+    assert_eq!(
+        ring.key("content-signing-v1").map(|k| hex::encode(k.as_bytes())).as_deref(),
+        Some("85e132520acab941d01e0a43aa61ba75c411b7da905db46c8dc28ececd7cd4cd")
+    );
     assert!(ring.key("content-dev-nan4955").is_none());
     assert!(ring.key("content-acceptance-nan4955").is_none());
     #[cfg(not(nano_content_acceptance))]
     {
         assert!(content_key_ring().key("content-dev-nan4955").is_none(), "normal builds never trust the dev key");
         assert!(content_key_ring().key("content-acceptance-nan4955").is_none(), "normal builds never trust the public RFC test key");
+    }
+}
+
+/// Re-frame a container around `signed_json` with the original payload.
+fn reframe(bytes: &[u8], signed_json: &[u8]) -> Vec<u8> {
+    let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let mut out = MAGIC.to_vec();
+    out.extend((signed_json.len() as u64).to_le_bytes());
+    out.extend(signed_json);
+    out.extend(&bytes[16 + len..]);
+    out
+}
+
+#[test]
+fn missing_or_malformed_signature_is_refused() {
+    let (signed, bytes) = sealed("rules.main", 10, Utc::now(), &sample_files());
+    // No `signature` field at all: the container does not parse.
+    let mut v = serde_json::to_value(&signed).unwrap();
+    v.as_object_mut().unwrap().remove("signature");
+    let out = reframe(&bytes, &serde_json::to_vec(&v).unwrap());
+    assert!(matches!(verify_bytes(&out, &ring()), Err(ContentError::Invalid(_))));
+    // Empty, truncated, non-hex and non-canonical (uppercase) signatures.
+    let upper = signed.signature.to_uppercase();
+    for sig in [String::new(), signed.signature[..64].to_string(), "zz".repeat(64), upper] {
+        let forged = SignedContentDescriptor { descriptor: signed.descriptor.clone(), signature: sig.clone() };
+        let out = reframe(&bytes, &serde_json::to_vec(&forged).unwrap());
+        assert!(matches!(verify_bytes(&out, &ring()), Err(ContentError::BadSignature)), "{sig:?}");
+        assert!(matches!(forged.verify(&ring()), Err(ContentError::BadSignature)), "{sig:?}");
+    }
+}
+
+#[test]
+fn validly_signed_format_downgrade_is_refused() {
+    // Even a signature that verifies cannot carry an older (or newer) format.
+    let (signed, bytes) = sealed("rules.main", 10, Utc::now(), &sample_files());
+    let mut d = signed.descriptor.clone();
+    d.format_version = FORMAT_VERSION - 1;
+    let signature = hex::encode(key().sign(&d.canonical().unwrap()).to_bytes());
+    let downgraded = SignedContentDescriptor { descriptor: d, signature };
+    assert!(matches!(downgraded.verify(&ring()), Err(ContentError::Invalid(_))));
+    let out = reframe(&bytes, &serde_json::to_vec(&downgraded).unwrap());
+    assert!(matches!(verify_bytes(&out, &ring()), Err(ContentError::Invalid(_))));
+}
+
+#[test]
+fn replay_of_an_older_sequence_is_refused_online_and_offline() {
+    let now = Utc::now();
+    let (installed, _) = sealed("rules.main", 50, now, &sample_files());
+    let (_, old_bytes) = sealed("rules.main", 49, now, &sample_files());
+    let old = verify_bytes(&old_bytes, &ring()).unwrap();
+    for offline in [false, true] {
+        assert!(
+            matches!(old.accept_after(Some(&installed.descriptor), now, offline), Err(ContentError::Rollback("sequence"))),
+            "offline={offline}"
+        );
     }
 }

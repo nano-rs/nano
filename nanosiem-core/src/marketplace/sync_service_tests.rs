@@ -155,3 +155,39 @@ fn local_git_repo_commit() -> Option<(tempfile::TempDir, String, String)> {
     let head = git(&clone, &["rev-parse", "HEAD"])?;
     Some((data_dir, slug, String::from_utf8(head.stdout).ok()?.trim().to_string()))
 }
+
+// ---- NAN-5284: `runtime: connector` maps to the official lookup -------------
+
+fn agent_manifest(slug: &str, runtime: Option<&str>) -> MarketplaceManifest {
+    let yaml = format!(
+        "name: {slug}\nslug: {slug}\ncategory: agent\ndescription: d\n{}",
+        runtime.map(|r| format!("runtime: {r}\nconnector_spec: connector.yaml\n")).unwrap_or_default()
+    );
+    serde_yaml::from_str(&yaml).expect("manifest")
+}
+
+#[test]
+fn nan5284_connector_runtime_selects_the_official_lookup_only_in_enterprise() {
+    let shodan = agent_manifest("shodan", Some("connector"));
+    assert_eq!(shodan.runtime.as_deref(), Some("connector"));
+    assert_eq!(shodan.connector_spec.as_deref(), Some("connector.yaml"));
+    let expected = if cfg!(feature = "enterprise") { "lookup" } else { "deno" };
+    assert_eq!(execution_backend_for(&shodan), expected);
+}
+
+#[test]
+fn nan5284_other_manifests_keep_their_backend() {
+    // `runtime: deno` (today's manifests), no runtime, or a slug with no
+    // official spec all stay on Deno.
+    assert_eq!(execution_backend_for(&agent_manifest("shodan", Some("deno"))), "deno");
+    assert_eq!(execution_backend_for(&agent_manifest("shodan", None)), "deno");
+    assert_eq!(execution_backend_for(&agent_manifest("acme-intel", Some("connector"))), "deno");
+    let mut data = agent_manifest("shodan", Some("connector"));
+    data.category = "data".into();
+    assert_eq!(execution_backend_for(&data), "deno");
+}
+
+#[test]
+fn nan5284_sync_schema_version_was_bumped_for_the_new_derivation() {
+    const _: () = assert!(SYNC_SCHEMA_VERSION >= 2);
+}

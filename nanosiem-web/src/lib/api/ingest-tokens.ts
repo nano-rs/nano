@@ -80,6 +80,8 @@ export interface IssuedIngestToken {
   token: string;
   /** On a rotation: the replaced token, now revoked. */
   replaced?: IngestToken | null;
+  /** Seconds until every ingest host accepts the token (NAN-5285). */
+  active_within_secs?: number;
 }
 
 export const INGEST_TOKENS_QUERY_KEY = ['ingest-tokens'] as const;

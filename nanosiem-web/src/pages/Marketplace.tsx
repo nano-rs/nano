@@ -267,7 +267,7 @@ export function Marketplace() {
 
   const busy = mutation.isPending;
   // NAN-4959: a feed the bundle provides (IPinfo Lite, ThreatFox, Tor) has
-  // nothing to configure or toggle here: no direct fetcher. A Deno ThreatFox /
+  // nothing to configure or toggle here: no direct fetcher. A code ThreatFox /
   // Tor install from before keeps Uninstall (it removes stored credentials).
   const bundleManaged = !!selected?.provided_by_bundle;
   const keepsUninstall = !!selected?.installed && selected.entry?.execution_backend !== 'native';

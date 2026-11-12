@@ -184,7 +184,7 @@ it('lists repository parsers without system slugs, and imports + deploys a repos
   fireEvent.click(await screen.findByTestId('details-continue'));
   fireEvent.click(await screen.findByTestId('transport-continue'));
   await waitFor(() => expect(mocks.importParser).toHaveBeenCalledWith('repo', 'okta.yaml', expect.objectContaining({ import_type: 'linked', source_type: 'okta' })));
-  await waitFor(() => expect(mocks.deployLogSource).toHaveBeenCalledWith('lsrc_okta'));
+  await waitFor(() => expect(mocks.deployLogSource).toHaveBeenCalledWith('lsrc_okta', { ocsf: { unattestedSystemInstall: true } }));
   expect(mocks.createLogSource).not.toHaveBeenCalled();
   expect(await screen.findByTestId('connect-finish')).toBeTruthy();
   expect(screen.queryByTestId('connect-continue')).toBeNull();

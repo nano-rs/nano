@@ -158,6 +158,8 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::prevalence::PrevalenceApiDoc::openapi(),
         handlers::mitre::MitreApiDoc::openapi(),
         handlers::log_sources::LogSourcesApiDoc::openapi(),
+        // NAN-5132: background deploy jobs
+        handlers::log_source_deploy_jobs::LogSourceDeployJobsApiDoc::openapi(),
         handlers::pipelines::PipelinesApiDoc::openapi(),
         handlers::pipeline_tap::PipelineTapApiDoc::openapi(),
         handlers::source_configs::SourceConfigsApiDoc::openapi(),
@@ -727,7 +729,7 @@ mod tests {
         // NAN-2189 added 3 ENTERPRISE path templates for integration collectors:
         // /api/integrations/instances (GET, POST), /api/integrations/instances/{id}
         // (GET, PUT, DELETE) and /api/integrations/instances/{id}/run (POST).
-        // Enterprise-only — collectors need egress and the Deno runtime, neither
+        // Enterprise-only — collectors need egress and the wasm sandbox runtime, neither
         // of which the open edition ships. Enterprise floor 521 + 3 = 524.
         // NAN-2238 added 20 shared path templates (Active Hunter), counted in
         // both editions. A hunt definition is a `playbooks` row and the whole
@@ -893,16 +895,20 @@ mod tests {
         // is unchanged.
         // NAN-5279 adds GET /api/log-sources/delivery-status to both editions:
         // enterprise 683, open 421.
+        // NAN-5132 adds the two deploy-job GETs to both editions: 685 / 423.
+        // NAN-5285 adds /api/internal/vector-config/install-lease (POST +
+        // DELETE, one template) to both editions: 686 / 424.
         #[cfg(feature = "enterprise")]
-        let min_paths = 683;
+        let min_paths = 686;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
         // owner-clamp path: 415 + 1 = 416; NAN-5204's two backup-status
         // paths: 416 + 2 = 418; NAN-5217's three ingestion-pause paths: 421;
         // NAN-5272 drops /api/sigma/convert: 420; NAN-5279 adds
-        // /api/log-sources/delivery-status: 421.
-        let min_paths = 421;
+        // /api/log-sources/delivery-status: 421. NAN-5132's two deploy-job
+        // GETs: 423. NAN-5285's install-lease template: 424.
+        let min_paths = 424;
 
         assert!(
             path_count >= min_paths,

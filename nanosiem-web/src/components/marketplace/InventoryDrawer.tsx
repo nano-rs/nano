@@ -6,6 +6,7 @@ import { inventoryAction, inventoryReason, type InventoryItem } from '@/lib/api/
 import { capabilityLabel, executionStageLabel, humanizeEnum, inventoryHealthLabel } from '@/lib/marketplace-labels';
 import { formatUTCCompact } from '@/lib/date-utils';
 import { BundleFeedStatus } from './BundleFeedStatus';
+import { SandboxBadge } from './InventoryCard';
 
 export interface InventoryDrawerActions {
   onInstall?: () => void;
@@ -43,6 +44,16 @@ export function InventoryDrawer({ item, onClose, busy, entitlement, actions }: {
       <dt className="text-muted-foreground">Category</dt><dd>{humanizeEnum(item.category)}</dd>
       <dt className="text-muted-foreground">Execution</dt><dd className="font-mono">{executionStageLabel(item.execution_stage)}</dd>
       <dt className="text-muted-foreground">Health</dt><dd>{item.reason ? `${inventoryHealthLabel(item.effective_health)} · ${inventoryReason(item)}` : inventoryHealthLabel(item.effective_health)}</dd>
+      {item.sandbox && <><dt className="text-muted-foreground">Sandbox</dt><dd data-testid="inventory-sandbox">
+        <SandboxBadge item={item} />
+        {item.sandbox.compile_status === 'needs_attention' && <p className="mt-1 text-[11.5px] text-muted-foreground break-words">
+          {item.sandbox.reason ?? 'It cannot run on the wasm sandbox; open the enrichment code to see why.'}
+        </p>}
+        {item.sandbox.compile_status === 'needs_attention' && <p className="mt-1 text-[11.5px] text-muted-foreground break-words" data-testid="inventory-sandbox-fixes">
+          Runs are refused until it is fixed; other enrichments are unaffected. Common fixes: use the vendor's https endpoint, send credentials as-is in request headers (not the URL or body), pick an auth type instead of encoding or signing a key in code, or switch to a declarative connector.
+        </p>}
+        {!item.sandbox.current && <p className="mt-1 text-[11.5px] text-muted-foreground">Changed since the last check; rechecking.</p>}
+      </dd></>}
       <dt className="text-muted-foreground">Version</dt><dd className="font-mono">{item.version ?? '—'}</dd>
       <dt className="text-muted-foreground">Last sync</dt><dd className="font-mono">{item.last_sync ? formatUTCCompact(item.last_sync) : 'Not recorded'}</dd>
       {item.record_count !== null && <><dt className="text-muted-foreground">Records</dt><dd className="font-mono tabular-nums">{item.record_count}</dd></>}

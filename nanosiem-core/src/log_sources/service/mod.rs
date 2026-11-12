@@ -17,6 +17,8 @@ mod crud;
 mod deployment;
 mod health;
 mod helpers;
+pub mod ocsf_attestation;
+pub use ocsf_attestation::{OcsfGateInput, OcsfGateOutcome, OcsfPrecheck};
 pub mod pipe;
 mod status;
 mod validation;
@@ -79,6 +81,10 @@ pub enum LogSourceServiceError {
     DeploymentFailed(String),
     #[error("Reload failed")]
     ReloadFailed,
+    /// NAN-5079: an OCSF parser generation was refused at publish/deploy:
+    /// a sample failed, the payload is over limit, or no receipt exists.
+    #[error("OCSF validation failed: {0}")]
+    OcsfValidationFailed(String),
     #[error("Rollback failed: {0}")]
     RollbackFailed(String),
     #[error("Version error: {0}")]

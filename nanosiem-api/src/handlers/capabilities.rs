@@ -37,7 +37,7 @@ pub struct Capabilities {
     pub risk: bool,
     /// meloD AI agents — chat, parser, query, detection, dashboard, summarize.
     pub melod: bool,
-    /// Deno-sandbox custom enrichments + their AI codegen.
+    /// Sandboxed custom enrichments (wasm) + their AI codegen.
     pub custom_enrichment: bool,
     /// AI-powered IOC enrichment providers.
     pub agent_enrichment: bool,

@@ -58,13 +58,31 @@ pub const VALIDITY: Duration = Duration::days(30);
 
 /// Production content signing keys: `(key id, Ed25519 public key hex)`.
 ///
-/// NAN-4955 proposal (pending Dan): the platform feed key that every shipped
-/// install already trusts for `NANFEED1`, used here under the content domain.
+/// The platform feed key that every shipped install already trusts for
+/// `NANFEED1`, used here under the content domain (NAN-4955).
 /// Rotate by appending, never by configuration.
-const CONTENT_PRODUCTION_KEYS: &[(&str, &str)] = &[(
-    "platform-ad038f5046fb19e51bf310e0",
-    "54022ca65c169394eb131164b596d5b1265670289959604405be7da64dcdc516",
-)];
+///
+/// NAN-5283 moves content signing to Cloud KMS (`nano-content/content-signing-v1`,
+/// `EC_SIGN_ED25519`, the custody of `release-signing-v1`):
+/// 1. a release appends the KMS key here (the overlap release, v2.0.14);
+/// 2. the app co-signs every sequence with it (`alternates` in the metadata
+///    response; [`consumer::parse_current`](super::consumer::parse_current)
+///    takes the first entry whose signer is in this list);
+/// 3. once the minimum supported release holds the KMS key, the app signs with
+///    it alone; a later release drops the platform key from this list.
+const CONTENT_PRODUCTION_KEYS: &[(&str, &str)] = &[
+    (
+        "platform-ad038f5046fb19e51bf310e0",
+        "54022ca65c169394eb131164b596d5b1265670289959604405be7da64dcdc516",
+    ),
+    // NAN-5283: projects/nano-rs/locations/global/keyRings/nano-content/
+    // cryptoKeys/content-signing-v1/cryptoKeyVersions/1 (EC_SIGN_ED25519,
+    // SOFTWARE). SPKI SHA-256 3d17fd634bea45a629df95cfa7d959d276726eea01a11379cda9681959b5634b.
+    (
+        "content-signing-v1",
+        "85e132520acab941d01e0a43aa61ba75c411b7da905db46c8dc28ececd7cd4cd",
+    ),
+];
 
 /// The compiled-in trust ring for content bundles.
 pub fn content_key_ring() -> KeyRing {
@@ -196,6 +214,27 @@ impl ContentDescriptor {
         Ok(bytes)
     }
 
+    /// The exact bytes a signature covers once `signer_key_id` is `key_id`
+    /// (`DOMAIN || canonical JSON`). Validates first, like [`Self::sign`].
+    pub fn signing_message(mut self, key_id: &str) -> Result<(Self, Vec<u8>)> {
+        self.signer_key_id = key_id.to_owned();
+        self.validate()?;
+        let message = self.canonical()?;
+        Ok((self, message))
+    }
+
+    /// Same publication, possibly under another signer: every field equal
+    /// except `signer_key_id`. During a key rotation the app publishes one
+    /// sequence under both keys (NAN-5283); an install that moves from one
+    /// signature to the other is not being handed different content.
+    pub fn same_content(&self, other: &Self) -> bool {
+        let mut a = self.clone();
+        a.signer_key_id.clear();
+        let mut b = other.clone();
+        b.signer_key_id.clear();
+        a == b
+    }
+
     pub fn sign(mut self, key_id: &str, key: &SigningKey) -> Result<SignedContentDescriptor> {
         self.signer_key_id = key_id.to_owned();
         self.validate()?;
@@ -315,7 +354,7 @@ impl VerifiedContent {
             if d.sequence < prev.sequence {
                 return Err(ContentError::Rollback("sequence"));
             }
-            if d.sequence == prev.sequence && d != prev {
+            if d.sequence == prev.sequence && !d.same_content(prev) {
                 return Err(ContentError::Rollback("same sequence, different content"));
             }
         }
@@ -394,8 +433,17 @@ pub fn seal(
     if !ring.contains(key_id, &key.verifying_key()) {
         return Err(ContentError::UntrustedSigner);
     }
+    let signed = unsigned_descriptor(input, payload, summary)?.sign(key_id, key)?;
+    container(signed, payload, ring)
+}
+
+/// The descriptor [`seal`] signs, before a signer is chosen
+/// (`signer_key_id` empty). Used by signers whose private key is not in
+/// process (NAN-5283: Cloud KMS): take [`ContentDescriptor::signing_message`]
+/// for a key id, sign it remotely, then [`assemble`].
+pub fn unsigned_descriptor(input: SealInput<'_>, payload: &[u8], summary: &TreeSummary) -> Result<ContentDescriptor> {
     let channel = channels::by_id(input.channel).ok_or_else(|| invalid("unknown channel"))?;
-    let signed = ContentDescriptor {
+    Ok(ContentDescriptor {
         format: FORMAT.into(),
         format_version: FORMAT_VERSION,
         channel: channel.id.into(),
@@ -417,8 +465,26 @@ pub fn seal(
             sha256: summary.sha256.clone(),
         },
         signer_key_id: String::new(),
-    }
-    .sign(key_id, key)?;
+    })
+}
+
+/// Attach a remotely made signature to `descriptor` (whose `signer_key_id`
+/// must already name the signing key) and build the container, re-verified
+/// against `ring` exactly as [`seal`] does. A signature that does not verify
+/// under the ring's key for that id is refused, so a wrong key, a wrong key
+/// version or a corrupted response never reaches the bucket.
+pub fn assemble(
+    descriptor: ContentDescriptor,
+    signature: &[u8; 64],
+    payload: &[u8],
+    ring: &KeyRing,
+) -> Result<(SignedContentDescriptor, Vec<u8>)> {
+    let signed = SignedContentDescriptor { descriptor, signature: hex::encode(signature) };
+    signed.verify(ring)?;
+    container(signed, payload, ring)
+}
+
+fn container(signed: SignedContentDescriptor, payload: &[u8], ring: &KeyRing) -> Result<(SignedContentDescriptor, Vec<u8>)> {
     let json = serde_json::to_vec(&signed).map_err(|_| invalid("descriptor json"))?;
     if json.len() as u64 > MAX_DESCRIPTOR_BYTES {
         return Err(invalid("descriptor size"));

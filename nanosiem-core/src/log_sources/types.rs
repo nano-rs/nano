@@ -660,6 +660,32 @@ pub struct LogSourceWithDraftStatus {
     pub has_draft_changes: bool,
     pub active_version_number: Option<i32>,
     pub active_parser_vrl: Option<String>,
+    /// NAN-5079: the OCSF sample-validation receipt for the working copy's
+    /// generation. Present only on an OCSF deployment for `kind = "log"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocsf_attestation: Option<OcsfAttestationStatus>,
+}
+
+/// Whether the working copy's parser generation passed nano's OCSF sample
+/// gate (NAN-5079). Hashes stay server-side; no sample content is stored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcsfAttestationState {
+    /// A receipt matches this generation and the embedded contract.
+    Current,
+    /// A receipt exists for a different generation or contract version.
+    Stale,
+    /// No receipt (never validated, or live before the gate existed).
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OcsfAttestationStatus {
+    pub status: OcsfAttestationState,
+    /// Contract version the receipt was issued against.
+    pub schema_version: Option<String>,
+    pub sample_count: Option<i32>,
+    pub validated_at: Option<DateTime<Utc>>,
 }
 
 /// Deployment action types
@@ -802,6 +828,10 @@ pub struct ParserTestResult {
     /// Number of top-level fields in `output` (0 when output is None or not an object).
     #[serde(default)]
     pub extracted_field_count: u32,
+    /// OCSF contract result for `output` (NAN-5079). Present only when the
+    /// caller asked for OCSF validation and the VRL ran successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_validation: Option<crate::parsers::OcsfValidationResult>,
 }
 
 /// Result of testing VRL against a real event, comparing current vs new parse

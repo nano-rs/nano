@@ -1021,6 +1021,47 @@ def gate_siem_health_regressions(
     }
 
 
+def check_backup_output_writable(output: pathlib.Path) -> str:
+    """NAN-5285 (v2.0.13 retest F1): the upgrade's backup writes each
+    component's archive on the host that owns it (the PostgreSQL dump on the
+    current leader, wherever it is), under ``--backup-output``. A parent that
+    exists only on the coordinator passed the dry run and then stopped the real
+    run at ``backup:consistent-set`` with ``mkdir: Permission denied``.
+
+    Passes when ``output`` is a writable directory, or when its nearest
+    existing ancestor is a directory this user can create entries in (the
+    backup's own ``mkdir -p`` will then succeed). Otherwise raises with the
+    exact command that fixes this host."""
+    output = pathlib.Path(output)
+    if not output.is_absolute():
+        output = pathlib.Path.cwd() / output
+    ancestor = output
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    try:
+        import grp
+        import pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+        group = grp.getgrgid(os.getgid()).gr_name
+    except (ImportError, KeyError):
+        user, group = str(os.getuid()), str(os.getgid())
+    fix_dir = output if ancestor == output else output.parent
+    fix = (
+        f"on this host run: sudo install -d -o {user} -g {group} -m 0700 {fix_dir} "
+        "(create it on every postgres host: the backup is written on the "
+        "PostgreSQL leader, which can be any of them)"
+    )
+    if not ancestor.is_dir():
+        raise UpgradeError(f"backup output {output}: {ancestor} is not a directory; {fix}")
+    if not os.access(ancestor, os.W_OK | os.X_OK):
+        raise UpgradeError(
+            f"backup output {output}: {ancestor} is not writable by {user}; {fix}"
+        )
+    if ancestor == output:
+        return f"{output} is writable"
+    return f"{output} will be created under {ancestor}"
+
+
 def legacy_backup_retention_check(
     backup_output: str | None, install_dir: pathlib.Path,
 ) -> Check:
@@ -1352,6 +1393,67 @@ def collapse_env_duplicates(lines: list[str]) -> list[str]:
     return out
 
 
+def _managed_env_lines(lines: list[str]) -> set[int]:
+    """Indexes of lines inside installer-managed ``# BEGIN NANO`` blocks."""
+    managed: set[int] = set()
+    in_block = False
+    for index, line in enumerate(lines):
+        if line.startswith("# BEGIN NANO "):
+            in_block = True
+        elif line.startswith("# END NANO "):
+            in_block = False
+        elif in_block:
+            managed.add(index)
+    return managed
+
+
+def duplicate_env_keys(lines: list[str]) -> list[str]:
+    """Keys (never values) assigned more than once outside managed blocks, in
+    first-seen order: what ``collapse_env_duplicates`` will collapse."""
+    managed = _managed_env_lines(lines)
+    counts: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        match = ENV_ASSIGNMENT.match(line)
+        if match and index not in managed:
+            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
+    return [key for key, count in counts.items() if count > 1]
+
+
+def set_env_keys_in_place(lines: list[str], replacements: dict[str, str]) -> list[str]:
+    """Set each key where it already is (NAN-5285, v2.0.13 retest F6).
+
+    The upgrade used to delete a replaced key and append it, so NANO_VERSION
+    moved from line 1 to the end and every upgrade reordered an operator's
+    .env. Now the assignment that takes effect (the last outside a managed
+    block, else the last inside one) is rewritten in its line; any other
+    assignment of the key is dropped, as before. Only a key the file does not
+    have is appended. Same rule as install.sh's nano_env_set_keys."""
+    managed = _managed_env_lines(lines)
+    target: dict[str, int] = {}
+    target_managed: dict[str, bool] = {}
+    for index, line in enumerate(lines):
+        match = ENV_ASSIGNMENT.match(line)
+        if not match or match.group(1) not in replacements:
+            continue
+        key = match.group(1)
+        inside = index in managed
+        if key in target and not target_managed[key] and inside:
+            continue  # an outside assignment already wins over the block
+        target[key] = index
+        target_managed[key] = inside
+    out: list[str] = []
+    for index, line in enumerate(lines):
+        match = ENV_ASSIGNMENT.match(line)
+        if match and match.group(1) in replacements:
+            key = match.group(1)
+            if target[key] == index:
+                out.append(f"{key}={replacements[key]}")
+            continue
+        out.append(line)
+    out.extend(f"{key}={value}" for key, value in replacements.items() if key not in target)
+    return out
+
+
 class EnvFile:
     def __init__(self, path: pathlib.Path):
         self.path = path
@@ -1396,9 +1498,13 @@ class EnvFile:
             if "\n" in value or "\r" in value:
                 raise UpgradeError("unsafe environment value")
         lines = secure_read_text(self.path, "environment file").splitlines()
-        prefixes = tuple(f"{key}=" for key in replacements)
-        kept = collapse_env_duplicates([line for line in lines if not line.startswith(prefixes)])
-        kept.extend(f"{key}={value}" for key, value in replacements.items())
+        collapsed = duplicate_env_keys(lines)
+        if collapsed:
+            eprint(
+                "Collapsed duplicate .env line(s) for "
+                f"{', '.join(collapsed)} (kept the value in effect)"
+            )
+        kept = set_env_keys_in_place(collapse_env_duplicates(lines), replacements)
         descriptor, temporary = tempfile.mkstemp(prefix=".env.upgrade.", dir=self.path.parent)
         try:
             os.fchmod(descriptor, 0o600)
@@ -3268,7 +3374,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         )
 
     def _run_lb_hook_checked(self, kind: str, command: str) -> None:
+        at = utc_now()
+        started = time.monotonic()
         result = self.runner.run([command, self.host_name], timeout=120, check=False)
+        self._record_lb_hook(kind, result.returncode, started, at)
         if result.returncode != 0:
             lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
             detail = lines[-1][:300] if lines else f"exit {result.returncode}"
@@ -3288,6 +3397,21 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 checks.append(Check(name, False, str(error), self.host_name))
 
         check("disk", lambda: self._check_disk(manifest, bundle, prepared))
+        # NAN-5285 F1: every host that writes a backup component (PostgreSQL
+        # on whichever member leads at backup time; ClickHouse only with
+        # --include-clickhouse-data, see backup_components_for) needs a
+        # writable --backup-output, not only the coordinator. A ClickHouse
+        # host writes nothing by default, so it is not asked for the folder.
+        if "postgres" in self.roles or (
+            "clickhouse" in self.roles
+            and getattr(self, "include_clickhouse_data", False)
+        ):
+            check(
+                "backup-output",
+                lambda: check_backup_output_writable(pathlib.Path(
+                    getattr(self, "backup_output", self.install_dir / "backups")
+                )),
+            )
         if manifest.get("source") == "registry":
             check(
                 "control-tree",
@@ -3361,6 +3485,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 and os.environ.get("NANO_UPGRADE_LB_HOOK_TEST", "1") != "0"
             )
             check("lb-hooks", lambda: self._check_lb_hooks(drained, roundtrip))
+        # The round trip's hook calls are reported by the lb-hooks check (in
+        # the journaled preflight); never attribute them to a later step.
+        self._take_lb_hook_calls()
         return checks
 
     def ledger(self) -> dict[str, list[list[str]]]:
@@ -3444,6 +3571,12 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         clickhouse_disk: str = "backups", component: str | None = None,
         include_clickhouse_data: bool = False,
     ) -> str:
+        try:
+            check_backup_output_writable(output)
+        except UpgradeError as error:
+            raise UpgradeError(
+                f"host {getattr(self, 'host_name', 'single')}: {error}"
+            ) from error
         arguments = [str(self.nano_cli), "backup", "--key-file", str(key_file), "--output", str(output), "--install-dir", str(self.install_dir)]
         if include_clickhouse_data:
             arguments.append("--include-clickhouse-data")
@@ -4550,7 +4683,40 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         path = pathlib.Path(command)
         if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
             raise UpgradeError(f"{variable} must name an absolute executable")
-        self.runner.run([str(path), self.host_name], timeout=120)
+        at = utc_now()
+        started = time.monotonic()
+        result = self.runner.run([str(path), self.host_name], timeout=120, check=False)
+        self._record_lb_hook(kind, result.returncode, started, at)
+        if result.returncode != 0:
+            lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+            detail = lines[-1][:300] if lines else f"exit {result.returncode}"
+            raise UpgradeError(f"{kind} hook failed for {self.host_name}: {detail}")
+
+    def _record_lb_hook(self, kind: str, returncode: int, started: float, at: str) -> None:
+        """NAN-5285 (v2.0.13 retest F8): every drain/rejoin hook call goes into
+        the upgrade journal (host, kind, exit code, duration; never the hook's
+        output). The worker collects them here and returns them with the
+        action's result; the coordinator journals one `lb_hook` event each."""
+        calls = getattr(self, "_lb_hook_calls", None)
+        if calls is None:
+            calls = []
+            self._lb_hook_calls = calls
+        calls.append({
+            "host": getattr(self, "host_name", "single"), "kind": kind,
+            "rc": int(returncode), "at": at,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        })
+
+    def _take_lb_hook_calls(self) -> list[dict[str, Any]]:
+        calls = list(getattr(self, "_lb_hook_calls", None) or [])
+        self._lb_hook_calls = []
+        return calls
+
+    def _with_lb_hooks(self, result: dict[str, Any]) -> dict[str, Any]:
+        calls = self._take_lb_hook_calls()
+        if calls:
+            result["lb_hooks"] = calls
+        return result
 
     def _env_seconds(self, name: str, default: int, maximum: int = 3600) -> int:
         return env_seconds(name, default, maximum)
@@ -4560,8 +4726,13 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         services, the probe or the rejoin) stops the upgrade with the host
         still out of the load balancer, and says so. Nothing drains another
         host: the coordinator rolls hosts one at a time and stops here."""
+        calls = getattr(self, "_lb_hook_calls", None) or []
+        made = "; ".join(
+            f"{call['kind']} rc={call['rc']} at {call['at']}" for call in calls
+        )
+        hooks = f" (load-balancer hook calls on this host: {made})" if made else ""
         return UpgradeError(
-            f"{error}. {self.host_name} may still be DRAINED from the load balancer: the "
+            f"{error}{hooks}. {self.host_name} may still be DRAINED from the load balancer: the "
             "upgrade stopped before rejoining it and drained no other host. Fix the cause, "
             "then resume with `scripts/nano upgrade` (it re-runs this host's rollout and "
             "rejoins it), or rejoin it by hand with your rejoin hook"
@@ -4873,7 +5044,7 @@ printf 'consumer generation %s ready\n' "$generation"
             stopped = self._stop_exact(selected, timeout)
         else:
             raise UpgradeError(f"cannot quiesce non-writer role {role}")
-        return {"role": role, "services": stopped}
+        return self._with_lb_hooks({"role": role, "services": stopped})
 
     def resume_writers(
         self, role: str, timeout: int, require_lb_hooks: bool = False,
@@ -4897,7 +5068,7 @@ printf 'consumer generation %s ready\n' "$generation"
             result["dependency_probe"] = dependency_probe
         elif "ingest-edge" in started:
             result["route_probe"] = route_probe
-        return result
+        return self._with_lb_hooks(result)
 
     def migration_lock(self) -> Any:
         return PgMigrationLock(self, "migration")
@@ -5370,7 +5541,7 @@ printf 'consumer generation %s ready\n' "$generation"
             result["dependency_probe"] = dependency_probe
         elif role == "ingest" and "ingest-edge" in services:
             result["route_probe"] = route_probe
-        return result
+        return self._with_lb_hooks(result)
 
     def post_verify(self, target: str, timeout: int) -> dict[str, Any]:
         if getattr(self, "_legacy_bridge_rollout", False):
@@ -6647,6 +6818,27 @@ def bundle_for_version(args: argparse.Namespace, ops: LocalOps, runner: Runner) 
     return destination, temporary
 
 
+@contextlib.contextmanager
+def preflight_progress(label: str, summary: Callable[[], str] | None = None) -> Any:
+    """NAN-5285 (v2.0.13 retest F5): the preflight / dry run printed nothing
+    until every host's checks were done (2.5-4.5 minutes over plain ssh: image
+    pulls, hook round trips, renders). Stream one line when each phase starts
+    and one when it ends, on stderr like the upgrade steps, so an operator
+    sees progress as it happens."""
+    started = time.monotonic()
+    eprint(f"==> {utc_now()} preflight {label}: started")
+    try:
+        yield
+    except BaseException:
+        eprint(f"==> {utc_now()} preflight {label}: FAILED after {time.monotonic() - started:.0f}s")
+        raise
+    detail = ""
+    if summary is not None:
+        with contextlib.suppress(Exception):
+            detail = f" ({summary()})"
+    eprint(f"==> {utc_now()} preflight {label}: done in {time.monotonic() - started:.0f}s{detail}")
+
+
 def run_step(journal: Journal, state: RunState, step: str, function: Callable[[], Any]) -> Any:
     if step in state.done_steps:
         eprint(f"==> resume: already completed {step}")
@@ -6663,9 +6855,25 @@ def run_step(journal: Journal, state: RunState, step: str, function: Callable[[]
         journal.append(state, "step_failed", step=step, reason=str(error))
         eprint(f"==> {utc_now()} {step}: FAILED after {time.monotonic() - started:.0f}s")
         raise
+    journal_lb_hook_calls(journal, state, step, result)
     journal.append(state, "step_done", step=step, result=result)
     eprint(f"==> {utc_now()} {step}: done in {time.monotonic() - started:.0f}s")
     return result
+
+
+def journal_lb_hook_calls(journal: Journal, state: RunState, step: str, result: Any) -> None:
+    """NAN-5285 F8: one `lb_hook` journal event per drain/rejoin hook call a
+    step's worker made (host, kind, rc, duration). A resumed step that already
+    completed is not re-run, so its calls are never journaled twice; a step
+    re-run after a failure journals the calls it makes again."""
+    if not isinstance(result, dict):
+        return
+    for call in result.get("lb_hooks") or []:
+        if isinstance(call, dict):
+            journal.append(
+                state, "lb_hook", step=step,
+                **{key: call[key] for key in ("host", "kind", "rc", "at", "duration_ms") if key in call},
+            )
 
 
 def sha256_path(path: pathlib.Path) -> str:
@@ -6864,6 +7072,15 @@ def create_consistent_backup_set(
     capture."""
     started = time.monotonic()
     emit = record_event or (lambda *_args, **_fields: None)
+
+    def emit_lb_hooks(step: str, result: Any) -> None:
+        # NAN-5285 F8: the drain/rejoin calls the backup's writer fence made.
+        for call in (result.get("lb_hooks") or []) if isinstance(result, dict) else []:
+            if isinstance(call, dict):
+                emit("lb_hook", step=step, **{
+                    key: call[key] for key in ("host", "kind", "rc", "at", "duration_ms")
+                    if key in call
+                })
     components = backup_components_for(nodes, role_split, include_clickhouse_data)
     writer_resume_pairs = role_node_pairs(nodes, ("app",)) if role_split else []
     writer_quiesce_pairs = (
@@ -6935,6 +7152,7 @@ def create_consistent_backup_set(
                     role, timeout, require_lb_hooks, writer_plans[key_pair],
                 )
                 resumed.add(key_pair)
+                emit_lb_hooks("backup:writer-resume", result)
                 emit("writer_resumed", node=node.name, role=role, result=result)
             except BaseException as error:
                 errors.append(f"{node.name}/{role}: {error}")
@@ -7059,6 +7277,7 @@ def create_consistent_backup_set(
                 result = executors[node.name].quiesce(
                     role, timeout, require_lb_hooks, writer_plans[key_pair],
                 )
+                emit_lb_hooks("backup:writer-quiesce", result)
                 emit("writer_quiesced", node=node.name, role=role, result=result)
             boundary("stopped")
             for component in components:
@@ -7713,9 +7932,10 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 raise UpgradeError("legacy managed layout transition never permits the backup override")
             if state is not None and started.get("deployment") != normalized_deployment:
                 raise UpgradeError("normalized inventory/deployment identity differs from the journal")
-            runtime_identities = {
-                node.name: executors[node.name].runtime_identity() for node in nodes
-            }
+            runtime_identities = {}
+            with preflight_progress(f"identity of {len(nodes)} host(s)"):
+                for node in nodes:
+                    runtime_identities[node.name] = executors[node.name].runtime_identity()
             recorded_workers = started.get("workers", {}) if state is not None else {}
             if not isinstance(recorded_workers, dict):
                 raise UpgradeError("journaled worker identities are invalid")
@@ -7849,12 +8069,22 @@ def upgrade_command(args: argparse.Namespace) -> int:
             # can never take every app or ingest host out of the pool.
             lb_roundtrip = os.environ.get("NANO_UPGRADE_LB_HOOK_TEST", "1") != "0"
             for node in nodes:
-                node_checks = executors[node.name].preflight(
-                    manifest, bundle, remote_bundle, require_lb_hooks, bundle_digest,
-                    prepared=state is not None and f"prepare:{node.name}" in state.done_steps,
-                    test_license_rehearsal=args.test_license_rehearsal,
-                    lb_roundtrip=lb_roundtrip,
-                )
+                node_checks: list[Check] = []
+
+                def node_summary(results: list[Check] = node_checks) -> str:
+                    failed = [check.name for check in results if not check.passed]
+                    passed = len(results) - len(failed)
+                    return f"{passed}/{len(results)} PASS" + (
+                        f"; FAIL: {', '.join(failed)}" if failed else ""
+                    )
+
+                with preflight_progress(f"checks on {node.name}", node_summary):
+                    node_checks.extend(executors[node.name].preflight(
+                        manifest, bundle, remote_bundle, require_lb_hooks, bundle_digest,
+                        prepared=state is not None and f"prepare:{node.name}" in state.done_steps,
+                        test_license_rehearsal=args.test_license_rehearsal,
+                        lb_roundtrip=lb_roundtrip,
+                    ))
                 checks.extend(node_checks)
                 if lb_roundtrip and any(
                     check.name == "lb-hooks" and not check.passed for check in node_checks
@@ -7869,6 +8099,19 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 except (UpgradeError, OSError, ValueError, json.JSONDecodeError) as error:
                     checks.append(Check("migration-ledger", False, str(error), node.name))
                     ledgers[node.name] = {"postgres": [], "clickhouse": []}
+            if role_split:
+                # NAN-5285 F1: the coordinator collects every component's
+                # archive under --backup-output too.
+                try:
+                    checks.append(Check(
+                        "backup-output", True,
+                        check_backup_output_writable(preflight_backup_root),
+                        f"{ops.host_name} (coordinator)",
+                    ))
+                except UpgradeError as error:
+                    checks.append(Check(
+                        "backup-output", False, str(error), f"{ops.host_name} (coordinator)",
+                    ))
             checks.extend(validate_manifest_ledgers(
                 manifest, list(ledgers.values()), schema_profile=schema_profile,
             ))
@@ -7896,7 +8139,8 @@ def upgrade_command(args: argparse.Namespace) -> int:
             if role_split:
                 for node in nodes:
                     try:
-                        preview = executors[node.name].render_config(inventory_text, False)
+                        with preflight_progress(f"config render preview on {node.name}"):
+                            preview = executors[node.name].render_config(inventory_text, False)
                     except (UpgradeError, OSError, ValueError, json.JSONDecodeError) as error:
                         checks.append(Check("config-render", False, str(error), node.name))
                         continue

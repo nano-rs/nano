@@ -507,27 +507,25 @@
             "UDM must not emit an OCSF sink"
         );
 
-        // OCSF: enabled log parsers' forks + generic; disabled + enrichment excluded.
+        // OCSF: enabled log parsers' forks + generic; disabled + enrichment
+        // excluded. NAN-5132: reached through the fixed OCSF slots defined in
+        // the combiner, so the sink's own `inputs` never change.
         let inputs = VectorConfigManager::ocsf_sink_inputs_for(true, &parsers);
+        let content = VectorConfigManager::ocsf_sink_content(&inputs);
+        assert!(content.contains("[sinks.clickhouse_ocsf_logs]"), "{content}");
+        let combiner = VectorConfigManager::combiner_config_content_for(&parsers, true);
+        let mut reached =
+            crate::parsers::vector_config::fanin_slots::resolved_inputs(&[&combiner, &content], "clickhouse_ocsf_logs");
+        reached.sort();
         assert_eq!(
-            inputs,
+            reached,
             vec![
-                "\"apache_ocsf_prepare\"".to_string(),
-                "\"sysmon_json_ocsf_prepare\"".to_string(),
-                "\"generic_ocsf_prepare\"".to_string(),
+                "apache_ocsf_prepare".to_string(),
+                "generic_ocsf_prepare".to_string(),
+                "sysmon_json_ocsf_prepare".to_string(),
             ],
             "OCSF sink must fork every enabled log parser + the generic lane, \
              excluding disabled and enrichment parsers"
-        );
-
-        // The rendered sink wires exactly those inputs into the ocsf_logs sink.
-        let content = VectorConfigManager::ocsf_sink_content(&inputs);
-        assert!(content.contains("[sinks.clickhouse_ocsf_logs]"), "{content}");
-        assert!(
-            content.contains(
-                "inputs = [\"apache_ocsf_prepare\", \"sysmon_json_ocsf_prepare\", \"generic_ocsf_prepare\"]"
-            ),
-            "{content}"
         );
     }
 
@@ -537,24 +535,26 @@
         sampled.sampling_ratio = Some(0.1);
         let disabled = log_test_parser("disabled_src", false);
 
+        // NAN-5132: fan-ins read slots; resolve them to the parser components.
+        use crate::parsers::vector_config::fanin_slots::resolved_inputs;
         let udm =
             VectorConfigManager::combiner_config_content_for(&[sampled.clone(), disabled.clone()], false);
-        assert!(
-            udm.contains("inputs = [\"limacharlie_sample\"]"),
+        assert_eq!(
+            resolved_inputs(&[&udm], "db_parsers_combined"),
+            vec!["limacharlie_sample".to_string()],
             "persisted UDM stream must retain configured sampling: {udm}"
         );
-        assert!(
-            udm.contains("[transforms.db_parser_health]")
-                && udm.contains("inputs = [\"limacharlie_output\"]"),
+        assert_eq!(
+            resolved_inputs(&[&udm], "db_parser_health"),
+            vec!["limacharlie_output".to_string()],
             "health must observe the unsampled output and exclude disabled parsers: {udm}"
         );
         assert!(!udm.contains("disabled_src_output"), "{udm}");
 
         let ocsf = VectorConfigManager::combiner_config_content_for(&[sampled, disabled], true);
-        assert!(
-            ocsf.contains(
-                "inputs = [\"limacharlie_output\", \"limacharlie_ocsf_prepare\"]"
-            ),
+        assert_eq!(
+            resolved_inputs(&[&ocsf], "db_parser_health"),
+            vec!["limacharlie_output".to_string(), "limacharlie_ocsf_prepare".to_string()],
             "OCSF health must combine UDM fallback/failures with native successes: {ocsf}"
         );
 

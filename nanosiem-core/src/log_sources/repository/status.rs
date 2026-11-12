@@ -9,6 +9,86 @@ use super::{LogSourceRepository, LogSourceRepositoryError};
 use crate::log_sources::types::LogSource;
 
 impl LogSourceRepository {
+    /// Whether this exact parser generation already passed nano's OCSF sample
+    /// gate (NAN-5079). The receipt stores no customer event content.
+    pub async fn has_ocsf_validation_attestation(
+        &self,
+        id: Uuid,
+        schema_version: &str,
+        parser_sha256: &str,
+    ) -> Result<bool, LogSourceRepositoryError> {
+        let present = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                SELECT 1 FROM log_sources \
+                WHERE id = $1 \
+                  AND ocsf_validation_schema_version = $2 \
+                  AND ocsf_validation_parser_sha256 = $3 \
+                  AND ocsf_validation_sample_count > 0 \
+                  AND ocsf_validated_at IS NOT NULL\
+            )",
+        )
+        .bind(id)
+        .bind(schema_version)
+        .bind(parser_sha256)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(present)
+    }
+
+    /// Advance the sample-validation receipt for a parser generation after
+    /// every supplied sample passed VRL execution and OCSF validation.
+    pub async fn set_ocsf_validation_attestation(
+        &self,
+        id: Uuid,
+        schema_version: &str,
+        parser_sha256: &str,
+        sample_sha256: &str,
+        sample_count: i32,
+    ) -> Result<(), LogSourceRepositoryError> {
+        let result = sqlx::query(
+            "UPDATE log_sources SET \
+                ocsf_validation_schema_version = $2, \
+                ocsf_validation_parser_sha256 = $3, \
+                ocsf_validation_sample_sha256 = $4, \
+                ocsf_validation_sample_count = $5, \
+                ocsf_validated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(schema_version)
+        .bind(parser_sha256)
+        .bind(sample_sha256)
+        .bind(sample_count)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LogSourceRepositoryError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The stored OCSF receipt, if any: (schema version, parser fingerprint,
+    /// sample count, validated at).
+    pub async fn ocsf_validation_attestation(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<(String, String, i32, chrono::DateTime<chrono::Utc>)>, LogSourceRepositoryError>
+    {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<i32>, Option<chrono::DateTime<chrono::Utc>>)>(
+            "SELECT ocsf_validation_schema_version, ocsf_validation_parser_sha256, \
+                    ocsf_validation_sample_count, ocsf_validated_at \
+             FROM log_sources WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| LogSourceRepositoryError::NotFound(id.to_string()))?;
+        Ok(match row {
+            (Some(version), Some(parser), Some(count), Some(at)) => Some((version, parser, count, at)),
+            _ => None,
+        })
+    }
+
     /// Enable a log source
     pub async fn enable(&self, id: Uuid) -> Result<LogSource, LogSourceRepositoryError> {
         let row = sqlx::query(

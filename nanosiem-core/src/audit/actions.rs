@@ -236,7 +236,7 @@ pub const MARKETPLACE_UNINSTALLED: &str = "marketplace_uninstalled";
 pub const MARKETPLACE_UPDATED: &str = "marketplace_updated";
 /// Marketplace enrichment was configured (enabled/disabled/credentials)
 pub const MARKETPLACE_CONFIGURED: &str = "marketplace_configured";
-/// Marketplace enrichment preview was attempted in the Deno sandbox
+/// Marketplace enrichment preview was attempted in the code sandbox (wasm)
 pub const MARKETPLACE_PREVIEW_EXECUTED: &str = "marketplace_preview_executed";
 /// Marketplace enrichment data sync triggered
 pub const MARKETPLACE_SYNC_TRIGGERED: &str = "marketplace_sync_triggered";
@@ -347,6 +347,13 @@ pub const LOG_SOURCE_DEPLOYED: &str = "log_source_deployed";
 pub const LOG_SOURCE_UNDEPLOYED: &str = "log_source_undeployed";
 /// Log source was published
 pub const LOG_SOURCE_PUBLISHED: &str = "log_source_published";
+/// NAN-5079 (D2): an OCSF parser went live on its first publish without a
+/// passing sample, on the operator's explicit acknowledgement.
+pub const LOG_SOURCE_OCSF_UNATTESTED_PUBLISH: &str = "log_source_ocsf_unattested_publish";
+/// NAN-5079: the Add data flow put a parser live on its first deploy without
+/// a passing OCSF sample; system-initiated, no operator acknowledgement.
+pub const LOG_SOURCE_OCSF_UNATTESTED_SYSTEM_INSTALL: &str =
+    "log_source_ocsf_unattested_system_install";
 /// Log source was reverted to a previous version
 pub const LOG_SOURCE_REVERTED: &str = "log_source_reverted";
 /// All log sources were deployed

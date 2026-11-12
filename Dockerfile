@@ -116,6 +116,17 @@ RUN if [ "$EDITION" = "enterprise" ]; then \
         && cargo build --release -p nanosiem-api --bin clickhouse_migrator; \
     fi
 
+# NAN-5094: the wasm sandbox's save-time compiler (enterprise only). Pinned
+# Node plus the exact-pinned componentize-js worker go to /opt/nano-sandbox.
+# The api and jobs stages copy that directory; in the open edition it stays
+# empty. Customer code never runs in Node: it is compiled here and executed in
+# the embedded wasmtime sandbox. See scripts/ci/install-node-sandbox-compiler.sh.
+ARG TARGETARCH
+RUN mkdir -p /opt/nano-sandbox \
+    && if [ "$EDITION" = "enterprise" ]; then \
+        bash scripts/ci/install-node-sandbox-compiler.sh nanosiem-enterprise/sandbox-compiler /opt/nano-sandbox; \
+    fi
+
 # A lab may build a later candidate that carries one real migration without
 # adding that fixture to the production migration tree. Both arguments are
 # required, the fixture stays under scripts/tests, and release workflows leave
@@ -156,23 +167,16 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     wget \
     curl \
-    unzip \
     git \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Deno runs custom enrichment and collector code (nanosiem-enterprise only).
-# NAN-3485 / NAN-4908: pinned version, SHA-256-checked official release zip
-# (no `curl | sh`); the version and per-arch sums live in
-# scripts/ci/install-deno.sh. The open edition is built without
-# --features enterprise and never spawns deno, so its image does not ship it.
 ARG EDITION=enterprise
-ARG TARGETARCH
-RUN --mount=type=bind,source=scripts/ci/install-deno.sh,target=/tmp/install-deno.sh \
-    if [ "$EDITION" = "enterprise" ]; then \
-      bash /tmp/install-deno.sh /usr/local/bin; \
-    else \
-      echo "EDITION=$EDITION: no Deno (sandbox code is enterprise-only)"; \
-    fi
+
+# NAN-5094: wasm sandbox compiler (empty in the open edition). Custom
+# enrichment and collector code runs in-process on the embedded wasm sandbox;
+# there is no Deno in any image since 2.0.14 (NAN-5100).
+COPY --from=builder /opt/nano-sandbox /opt/nano-sandbox
 
 # Copy api binary and the standalone ClickHouse migrator (NAN-607).
 # The api image hosts the migrator binary so the same image can be used as
@@ -279,25 +283,21 @@ LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
 WORKDIR /app
 
 # Install runtime dependencies
-# Needs git for repo sync schedulers; curl and unzip for the Deno install
+# Needs git for repo sync schedulers.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     wget \
     curl \
-    unzip \
     git \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Deno for the custom enrichment and collector schedulers (enterprise only);
-# see the api stage and scripts/ci/install-deno.sh (NAN-3485 / NAN-4908).
 ARG EDITION=enterprise
-ARG TARGETARCH
-RUN --mount=type=bind,source=scripts/ci/install-deno.sh,target=/tmp/install-deno.sh \
-    if [ "$EDITION" = "enterprise" ]; then \
-      bash /tmp/install-deno.sh /usr/local/bin; \
-    else \
-      echo "EDITION=$EDITION: no Deno (sandbox code is enterprise-only)"; \
-    fi
+
+# NAN-5094: wasm sandbox compiler (empty in the open edition). Custom
+# enrichment and collector code runs in-process on the embedded wasm sandbox;
+# there is no Deno in any image since 2.0.14 (NAN-5100).
+COPY --from=builder /opt/nano-sandbox /opt/nano-sandbox
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/nanosiem-jobs /usr/local/bin/

@@ -1014,7 +1014,12 @@ impl SearchService {
     /// through the tenant-aware `table_names` registry for the profile's logs
     /// table key, and the profile is injected so resolution/typing/default-view
     /// projection follow the active schema.
-    fn ch_generator_for_pool(
+    ///
+    /// NAN-5285: public so every surface that turns nPL into a logs filter
+    /// outside the search service (the Rarity view's query-artifacts) builds it
+    /// exactly as search does. A bare `ClickHouseSqlGenerator::with_table` is
+    /// UDM-only and emits `ext.<field>` for every OCSF path.
+    pub fn ch_generator_for_pool(
         dual_pool: &DualPool,
         profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
     ) -> ClickHouseSqlGenerator {

@@ -3,7 +3,7 @@
 # =============================================================================
 # This compose file is for local development. Every published port is bound to
 # 127.0.0.1, including the internal services: Postgres (5432), ClickHouse
-# HTTP/native (8123/9000), Prometheus (9090), Grafana (3001), Dragonfly and the
+# HTTP/native (8123/9000), Prometheus (9090), Grafana (3001), Valkey (6379) and the
 # exporters. Use an SSH tunnel to reach them from another machine. Never widen a
 # binding to 0.0.0.0: these services are unauthenticated or use dev credentials.
 # scripts/tests/compose-published-ports.sh enforces the loopback-only rule.
@@ -106,6 +106,9 @@ services:
     environment:
       # Vector config directory (must match volume mount)
       VECTOR_CONFIG_DIR: /etc/vector
+      # NAN-5132: stable fan-in slots, off by default (opt-in for installs that
+      # add sources often). Every API replica must use the same value.
+      VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
       # NAN-1151: enrichment-lane ingest — identity providers POST raw records
       # to the dedicated nano_enrich source instead of writing ClickHouse
       # directly. Token must match the Vector service's VECTOR_AUTH_TOKEN.
@@ -455,7 +458,7 @@ services:
     #            the token. Silent.
     # So never drop the flag, and after any Vector bump confirm env-driven values
     # resolve at runtime (send HEC with the real token and with the literal).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.8-debian@sha256:da4473df93316e11ede7417f521c734c42defe11134cfe591bf815a54b19355f
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.10-debian@sha256:5d71a7b2bb1a0fd4e56941cb0be0590d8d74eb0f23cadab33f18510f2664fee7
     container_name: nanosiem-vector
     network_mode: "service:vector-netns"
     security_opt:
@@ -603,13 +606,13 @@ services:
     restart: unless-stopped
 
   # =============================================================================
-  # Cache (Dragonfly — Redis-compatible, used for search result caching)
+  # Cache (Valkey — Redis-compatible: search result cache, job store, admission)
   # =============================================================================
 
   dragonfly:
     # NAN-5082: Valkey replaced Dragonfly (relicensed off open source). The
     # service key stays `dragonfly`: it is the hostname in REDIS_URL.
-    image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    image: valkey/valkey:9.1.3@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
     container_name: nanosiem-valkey
     command: ["valkey-server", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction", "--io-threads", "2", "--save", "", "--appendonly", "no"]
     security_opt:

@@ -1,36 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! GitHub API client for fetching repository contents
+//! Repository content reader for parser, rule, playbook and model
+//! repositories (the name predates NAN-4955 and is kept for its callers).
 //!
-//! Uses unauthenticated access for public repositories only.
-//! Rate limit: 60 requests/hour for unauthenticated requests.
-//!
-//! NAN-4955: first-party repositories (`nano-rs/*`, `nanos-sh/*`) are NEVER
-//! fetched from GitHub. Every read of one is served from the installed nano
-//! content channel snapshot (`content_bundle::source`), delivered by the app
-//! as a signed bundle. Only non-first-party URLs (being removed by
-//! NAN-4946/4947) still reach the network here.
+//! NAN-4955: no install talks to GitHub for content. First-party repositories
+//! (`nano-rs/*`, `nanos-sh/*`) are served from the installed nano content
+//! channel snapshot (`content_bundle::source`), which the app delivers as a
+//! signed bundle. Every other owner is refused here, fail closed, with no
+//! network request: third-party repositories can no longer be admitted
+//! (NAN-4946/4947, PG 307/308), and this keeps a row that slips past
+//! admission from reaching GitHub.
 
-use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
-use tracing::{debug, warn};
 
 /// Errors from GitHub API operations
 #[derive(Debug, Error)]
 pub enum GitHubClientError {
-    #[error("HTTP request failed: {0}")]
-    Request(#[from] reqwest::Error),
-
     #[error("GitHub API error ({status}): {message}")]
     Api { status: u16, message: String },
 
-    #[error("Rate limited, retry after {retry_after} seconds")]
-    RateLimited { retry_after: u64 },
-
-    #[error("Repository not found or not public: {owner}/{repo}")]
-    NotFound { owner: String, repo: String },
+    /// NAN-4955: a repository outside the first-party owners. Content comes
+    /// only from nano content channels, so it is never fetched.
+    #[error("{owner}/{repo} is not a nano content channel; third-party repositories are not fetched")]
+    NotFirstParty { owner: String, repo: String },
 
     #[error("Invalid GitHub URL: {0}")]
     InvalidUrl(String),
@@ -65,64 +58,6 @@ pub struct FileContent {
     pub size: i64,
 }
 
-/// GitHub API response for tree
-#[derive(Debug, Deserialize)]
-struct GitHubTreeResponse {
-    #[allow(dead_code)]
-    sha: String,
-    #[allow(dead_code)]
-    url: String,
-    tree: Vec<GitHubTreeEntry>,
-    truncated: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubTreeEntry {
-    path: String,
-    #[serde(rename = "type")]
-    entry_type: String,
-    sha: String,
-    size: Option<i64>,
-    url: Option<String>,
-}
-
-/// GitHub API response for file content
-#[derive(Debug, Deserialize)]
-struct GitHubContentResponse {
-    #[allow(dead_code)]
-    name: String,
-    path: String,
-    sha: String,
-    size: i64,
-    content: Option<String>,
-    encoding: Option<String>,
-    #[allow(dead_code)]
-    download_url: Option<String>,
-}
-
-/// GitHub API response for commit
-#[derive(Debug, Deserialize)]
-struct GitHubCommitResponse {
-    sha: String,
-}
-
-/// GitHub API response for branch
-#[derive(Debug, Deserialize)]
-struct GitHubBranchResponse {
-    commit: GitHubCommitResponse,
-}
-
-/// GitHub API response for contents (single entry)
-#[derive(Debug, Deserialize)]
-struct GitHubContentEntry {
-    path: String,
-    #[serde(rename = "type")]
-    entry_type: String, // "file" or "dir"
-    sha: String,
-    size: Option<i64>,
-    url: Option<String>,
-}
-
 fn content_error(e: crate::content_bundle::source::SourceError) -> GitHubClientError {
     use crate::content_bundle::source::SourceError;
     match e {
@@ -137,31 +72,24 @@ fn content_entries(rows: Vec<(String, &'static str, String, Option<i64>)>) -> Ve
         .collect()
 }
 
-/// Client for interacting with GitHub API (public repos only)
-#[derive(Clone)]
-pub struct GitHubClient {
-    http_client: reqwest::Client,
-    rate_limit_remaining: std::sync::Arc<AtomicU32>,
-}
-
-impl Default for GitHubClient {
-    fn default() -> Self {
-        Self::new()
+/// First-party owners are served from content channels; anything else is
+/// refused without a network request.
+fn first_party(owner: &str, repo: &str) -> Result<(), GitHubClientError> {
+    if crate::content_bundle::source::is_first_party(owner) {
+        Ok(())
+    } else {
+        Err(GitHubClientError::NotFirstParty { owner: owner.to_string(), repo: repo.to_string() })
     }
 }
 
-impl GitHubClient {
-    /// Create a new GitHub client
-    pub fn new() -> Self {
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
+/// Reader for first-party repository content, backed by the installed nano
+/// content channel snapshots. Holds no network client.
+#[derive(Clone, Default)]
+pub struct GitHubClient;
 
-        Self {
-            http_client,
-            rate_limit_remaining: std::sync::Arc::new(AtomicU32::new(60)),
-        }
+impl GitHubClient {
+    pub fn new() -> Self {
+        Self
     }
 
     /// Parse owner and repo from a GitHub URL
@@ -172,60 +100,18 @@ impl GitHubClient {
         crate::schema::github_owner_repo(url).ok_or_else(|| GitHubClientError::InvalidUrl(url.to_string()))
     }
 
-    /// Get current rate limit remaining
-    pub fn rate_limit_remaining(&self) -> u32 {
-        self.rate_limit_remaining.load(Ordering::Relaxed)
-    }
-
-    /// Get the latest commit SHA for a branch
+    /// The commit of the installed channel snapshot for `owner/repo@branch`.
     pub async fn get_latest_commit(
         &self,
         owner: &str,
         repo: &str,
         branch: &str,
     ) -> Result<String, GitHubClientError> {
-        if crate::content_bundle::source::is_first_party(owner) {
-            return crate::content_bundle::source::commit(owner, repo, branch).await.map_err(content_error);
-        }
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/branches/{}",
-            owner, repo, branch
-        );
-
-        debug!("Fetching latest commit from {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header(USER_AGENT, "NanoSIEM/1.0")
-            .header(ACCEPT, "application/vnd.github.v3+json")
-            .send()
-            .await?;
-
-        self.update_rate_limit(&response);
-
-        if response.status() == 404 {
-            return Err(GitHubClientError::NotFound {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-            });
-        }
-
-        if response.status() == 403 {
-            return self.handle_rate_limit(&response).await;
-        }
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(GitHubClientError::Api { status, message });
-        }
-
-        let branch_info: GitHubBranchResponse = response.json().await?;
-        Ok(branch_info.commit.sha)
+        first_party(owner, repo)?;
+        crate::content_bundle::source::commit(owner, repo, branch).await.map_err(content_error)
     }
 
-    /// Get the tree for a repository at a specific path
+    /// Every entry of the snapshot under `path` (all entries when `None`).
     pub async fn get_tree(
         &self,
         owner: &str,
@@ -233,88 +119,15 @@ impl GitHubClient {
         branch: &str,
         path: Option<&str>,
     ) -> Result<Vec<TreeEntry>, GitHubClientError> {
-        if crate::content_bundle::source::is_first_party(owner) {
-            let rows = crate::content_bundle::source::tree_entries(owner, repo, branch, path.unwrap_or(""))
-                .await
-                .map_err(content_error)?;
-            return Ok(content_entries(rows));
-        }
-        // First get the tree SHA for the branch
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-            owner, repo, branch
-        );
-
-        debug!("Fetching tree from {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header(USER_AGENT, "NanoSIEM/1.0")
-            .header(ACCEPT, "application/vnd.github.v3+json")
-            .send()
-            .await?;
-
-        self.update_rate_limit(&response);
-
-        if response.status() == 404 {
-            return Err(GitHubClientError::NotFound {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-            });
-        }
-
-        if response.status() == 403 {
-            return self.handle_rate_limit(&response).await;
-        }
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(GitHubClientError::Api { status, message });
-        }
-
-        let tree_response: GitHubTreeResponse = response.json().await?;
-
-        if tree_response.truncated {
-            warn!(
-                "GitHub tree response was truncated for {}/{}, some files may be missing. Consider selecting specific folders.",
-                owner, repo
-            );
-        }
-
-        // Filter by path prefix if specified
-        let entries: Vec<TreeEntry> = tree_response
-            .tree
-            .into_iter()
-            .filter(|e| {
-                if let Some(prefix) = path {
-                    let prefix = prefix.trim_start_matches('/').trim_end_matches('/');
-                    // Empty prefix means root of repo - no filtering needed
-                    if prefix.is_empty() {
-                        return true;
-                    }
-                    // Must match exactly "rules/" not "rules-emerging/"
-                    e.path == prefix || e.path.starts_with(&format!("{}/", prefix))
-                } else {
-                    true
-                }
-            })
-            .map(|e| TreeEntry {
-                path: e.path,
-                entry_type: e.entry_type,
-                sha: e.sha,
-                size: e.size,
-                url: e.url,
-            })
-            .collect();
-
-        debug!("Found {} entries in tree", entries.len());
-        Ok(entries)
+        first_party(owner, repo)?;
+        let rows = crate::content_bundle::source::tree_entries(owner, repo, branch, path.unwrap_or(""))
+            .await
+            .map_err(content_error)?;
+        Ok(content_entries(rows))
     }
 
-    /// Get the tree for a specific subdirectory using the Contents API
-    /// This avoids truncation issues with large repos by fetching one directory at a time
+    /// Every entry below `path`, excluding `path` itself (the shape of the
+    /// GitHub contents API this replaced).
     pub async fn get_directory_contents_recursive(
         &self,
         owner: &str,
@@ -322,75 +135,15 @@ impl GitHubClient {
         branch: &str,
         path: &str,
     ) -> Result<Vec<TreeEntry>, GitHubClientError> {
-        if crate::content_bundle::source::is_first_party(owner) {
-            let rows = crate::content_bundle::source::tree_entries(owner, repo, branch, path)
-                .await
-                .map_err(content_error)?;
-            // The contents API never lists the requested directory itself.
-            let path = path.trim_matches('/');
-            return Ok(content_entries(rows).into_iter().filter(|e| e.path != path).collect());
-        }
-        let mut all_entries = Vec::new();
-        let mut dirs_to_process = vec![path.to_string()];
-
-        while let Some(current_path) = dirs_to_process.pop() {
-            let url = format!(
-                "https://api.github.com/repos/{}/{}/contents/{}?ref={}",
-                owner, repo, current_path, branch
-            );
-
-            debug!("Fetching contents from {}", url);
-
-            let response = self
-                .http_client
-                .get(&url)
-                .header(USER_AGENT, "NanoSIEM/1.0")
-                .header(ACCEPT, "application/vnd.github.v3+json")
-                .send()
-                .await?;
-
-            self.update_rate_limit(&response);
-
-            if response.status() == 404 {
-                // Directory doesn't exist, skip it
-                continue;
-            }
-
-            if response.status() == 403 {
-                return self.handle_rate_limit(&response).await;
-            }
-
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                return Err(GitHubClientError::Api { status, message });
-            }
-
-            let contents: Vec<GitHubContentEntry> = response.json().await?;
-
-            for entry in contents {
-                if entry.entry_type == "dir" {
-                    dirs_to_process.push(entry.path.clone());
-                }
-                all_entries.push(TreeEntry {
-                    path: entry.path,
-                    entry_type: if entry.entry_type == "file" {
-                        "blob".to_string()
-                    } else {
-                        "tree".to_string()
-                    },
-                    sha: entry.sha,
-                    size: entry.size,
-                    url: entry.url,
-                });
-            }
-        }
-
-        debug!("Found {} entries via contents API", all_entries.len());
-        Ok(all_entries)
+        first_party(owner, repo)?;
+        let rows = crate::content_bundle::source::tree_entries(owner, repo, branch, path)
+            .await
+            .map_err(content_error)?;
+        let path = path.trim_matches('/');
+        Ok(content_entries(rows).into_iter().filter(|e| e.path != path).collect())
     }
 
-    /// Get the content of a file
+    /// One file of the snapshot.
     pub async fn get_file(
         &self,
         owner: &str,
@@ -398,87 +151,22 @@ impl GitHubClient {
         path: &str,
         branch: &str,
     ) -> Result<FileContent, GitHubClientError> {
-        if crate::content_bundle::source::is_first_party(owner) {
-            let (bytes, sha) = crate::content_bundle::source::file(owner, repo, branch, path)
-                .await
-                .map_err(content_error)?;
-            let size = bytes.len() as i64;
-            return Ok(FileContent {
-                path: path.trim_start_matches('/').to_string(),
-                sha,
-                content: String::from_utf8_lossy(&bytes).to_string(),
-                encoding: "utf-8".to_string(),
-                size,
-            });
-        }
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/contents/{}?ref={}",
-            owner, repo, path, branch
-        );
-
-        debug!("Fetching file from {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header(USER_AGENT, "NanoSIEM/1.0")
-            .header(ACCEPT, "application/vnd.github.v3+json")
-            .send()
-            .await?;
-
-        self.update_rate_limit(&response);
-
-        if response.status() == 404 {
-            return Err(GitHubClientError::Api {
-                status: 404,
-                message: format!("File not found: {}", path),
-            });
-        }
-
-        if response.status() == 403 {
-            return self.handle_rate_limit(&response).await;
-        }
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(GitHubClientError::Api { status, message });
-        }
-
-        let content_response: GitHubContentResponse = response.json().await?;
-
-        // Decode base64 content
-        let content = if let Some(encoded) = content_response.content {
-            // GitHub returns base64 with newlines, remove them
-            let cleaned = encoded.replace('\n', "");
-            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &cleaned) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                Err(e) => {
-                    return Err(GitHubClientError::Parse(format!(
-                        "Failed to decode base64 content: {}",
-                        e
-                    )))
-                }
-            }
-        } else {
-            return Err(GitHubClientError::Parse(
-                "File content is empty or binary".to_string(),
-            ));
-        };
-
+        first_party(owner, repo)?;
+        let (bytes, sha) = crate::content_bundle::source::file(owner, repo, branch, path)
+            .await
+            .map_err(content_error)?;
+        let size = bytes.len() as i64;
         Ok(FileContent {
-            path: content_response.path,
-            sha: content_response.sha,
-            content,
-            encoding: content_response
-                .encoding
-                .unwrap_or_else(|| "utf-8".to_string()),
-            size: content_response.size,
+            path: path.trim_start_matches('/').to_string(),
+            sha,
+            content: String::from_utf8_lossy(&bytes).to_string(),
+            encoding: "utf-8".to_string(),
+            size,
         })
     }
 
-    /// Clone a repository with sparse-checkout for specific paths
-    /// This avoids API rate limits by using git protocol
+    /// Materialize the snapshot's files under `paths` into `target_dir`,
+    /// with a commit marker read by [`Self::get_local_commit`].
     pub async fn sparse_clone(
         &self,
         owner: &str,
@@ -487,174 +175,23 @@ impl GitHubClient {
         paths: &[String],
         target_dir: &std::path::Path,
     ) -> Result<(), GitHubClientError> {
-        use tokio::process::Command;
-
-        if crate::content_bundle::source::is_first_party(owner) {
-            crate::content_bundle::source::materialize(owner, repo, branch, paths, target_dir)
-                .await
-                .map_err(content_error)?;
-            return Ok(());
-        }
-
-        let repo_url = format!("https://github.com/{}/{}.git", owner, repo);
-
-        debug!(
-            "Sparse cloning {} to {:?} with paths: {:?}",
-            repo_url, target_dir, paths
-        );
-
-        // Initialize empty repo
-        let init_output = Command::new("git")
-            .args(["init"])
-            .current_dir(target_dir)
-            .output()
+        first_party(owner, repo)?;
+        crate::content_bundle::source::materialize(owner, repo, branch, paths, target_dir)
             .await
-            .map_err(|e| GitHubClientError::Parse(format!("Failed to run git init: {}", e)))?;
-
-        if !init_output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git init failed: {}",
-                String::from_utf8_lossy(&init_output.stderr)
-            )));
-        }
-
-        // Add remote
-        let remote_output = Command::new("git")
-            .args(["remote", "add", "origin", &repo_url])
-            .current_dir(target_dir)
-            .output()
-            .await
-            .map_err(|e| GitHubClientError::Parse(format!("Failed to add remote: {}", e)))?;
-
-        if !remote_output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git remote add failed: {}",
-                String::from_utf8_lossy(&remote_output.stderr)
-            )));
-        }
-
-        // Enable sparse-checkout
-        let sparse_output = Command::new("git")
-            .args(["sparse-checkout", "init", "--cone"])
-            .current_dir(target_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                GitHubClientError::Parse(format!("Failed to init sparse-checkout: {}", e))
-            })?;
-
-        if !sparse_output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git sparse-checkout init failed: {}",
-                String::from_utf8_lossy(&sparse_output.stderr)
-            )));
-        }
-
-        // Set sparse-checkout paths
-        let mut sparse_set_args = vec!["sparse-checkout", "set"];
-        let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-        sparse_set_args.extend(path_refs);
-
-        let set_output = Command::new("git")
-            .args(&sparse_set_args)
-            .current_dir(target_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                GitHubClientError::Parse(format!("Failed to set sparse-checkout: {}", e))
-            })?;
-
-        if !set_output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git sparse-checkout set failed: {}",
-                String::from_utf8_lossy(&set_output.stderr)
-            )));
-        }
-
-        // Fetch and checkout (shallow, single branch)
-        let fetch_output = Command::new("git")
-            .args(["fetch", "--depth=1", "origin", branch])
-            .current_dir(target_dir)
-            .output()
-            .await
-            .map_err(|e| GitHubClientError::Parse(format!("Failed to fetch: {}", e)))?;
-
-        if !fetch_output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git fetch failed: {}",
-                String::from_utf8_lossy(&fetch_output.stderr)
-            )));
-        }
-
-        // Checkout
-        let checkout_output = Command::new("git")
-            .args(["checkout", branch])
-            .current_dir(target_dir)
-            .output()
-            .await
-            .map_err(|e| GitHubClientError::Parse(format!("Failed to checkout: {}", e)))?;
-
-        if !checkout_output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git checkout failed: {}",
-                String::from_utf8_lossy(&checkout_output.stderr)
-            )));
-        }
-
-        // Get the commit SHA
-        let rev_output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(target_dir)
-            .output()
-            .await
-            .map_err(|e| GitHubClientError::Parse(format!("Failed to get commit: {}", e)))?;
-
-        if !rev_output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git rev-parse failed: {}",
-                String::from_utf8_lossy(&rev_output.stderr)
-            )));
-        }
-
-        debug!(
-            "Sparse clone complete, commit: {}",
-            String::from_utf8_lossy(&rev_output.stdout).trim()
-        );
-
+            .map_err(content_error)?;
         Ok(())
     }
 
-    /// Get the HEAD commit SHA from a local git repo
+    /// The commit of a directory written by [`Self::sparse_clone`].
     pub async fn get_local_commit(dir: &std::path::Path) -> Result<String, GitHubClientError> {
-        use tokio::process::Command;
-
-        // NAN-4955: a snapshot materialized from a content channel carries
-        // its commit in a marker file (it is not a git checkout).
-        if let Ok(commit) =
-            tokio::fs::read_to_string(dir.join(crate::content_bundle::source::COMMIT_MARKER)).await
-        {
-            return Ok(commit.trim().to_string());
-        }
-
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
-            .output()
+        let marker = dir.join(crate::content_bundle::source::COMMIT_MARKER);
+        tokio::fs::read_to_string(&marker)
             .await
-            .map_err(|e| GitHubClientError::Parse(format!("Failed to get commit: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(GitHubClientError::Parse(format!(
-                "git rev-parse failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .map(|commit| commit.trim().to_string())
+            .map_err(|e| GitHubClientError::Parse(format!("no content snapshot commit in {}: {e}", dir.display())))
     }
 
-    /// Get raw file content directly (bypasses base64 encoding)
-    /// More efficient for larger files
+    /// One file of the snapshot as text.
     pub async fn get_raw_file(
         &self,
         owner: &str,
@@ -662,95 +199,14 @@ impl GitHubClient {
         path: &str,
         branch: &str,
     ) -> Result<String, GitHubClientError> {
-        if crate::content_bundle::source::is_first_party(owner) {
-            let (bytes, _) = crate::content_bundle::source::file(owner, repo, branch, path)
-                .await
-                .map_err(content_error)?;
-            return Ok(String::from_utf8_lossy(&bytes).to_string());
-        }
-        let url = format!(
-            "https://raw.githubusercontent.com/{}/{}/{}/{}",
-            owner, repo, branch, path
-        );
-
-        debug!("Fetching raw file from {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header(USER_AGENT, "NanoSIEM/1.0")
-            .send()
-            .await?;
-
-        if response.status() == 404 {
-            return Err(GitHubClientError::Api {
-                status: 404,
-                message: format!("File not found: {}", path),
-            });
-        }
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(GitHubClientError::Api { status, message });
-        }
-
-        Ok(response.text().await?)
-    }
-
-    fn update_rate_limit(&self, response: &reqwest::Response) {
-        if let Some(remaining) = response.headers().get("x-ratelimit-remaining") {
-            if let Ok(remaining_str) = remaining.to_str() {
-                if let Ok(remaining_num) = remaining_str.parse::<u32>() {
-                    self.rate_limit_remaining
-                        .store(remaining_num, Ordering::Relaxed);
-                    if remaining_num < 10 {
-                        warn!("GitHub API rate limit low: {} remaining", remaining_num);
-                    }
-                }
-            }
-        }
-    }
-
-    async fn handle_rate_limit<T>(
-        &self,
-        response: &reqwest::Response,
-    ) -> Result<T, GitHubClientError> {
-        let retry_after = response
-            .headers()
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|reset| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                reset.saturating_sub(now)
-            })
-            .unwrap_or(60);
-
-        Err(GitHubClientError::RateLimited { retry_after })
+        first_party(owner, repo)?;
+        let (bytes, _) = crate::content_bundle::source::file(owner, repo, branch, path)
+            .await
+            .map_err(content_error)?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_url() {
-        let cases = vec![
-            ("https://github.com/SigmaHQ/sigma", ("SigmaHQ", "sigma")),
-            ("https://github.com/owner/repo.git", ("owner", "repo")),
-            ("github.com/foo/bar", ("foo", "bar")),
-            ("https://github.com/owner/repo/", ("owner", "repo")),
-        ];
-
-        for (url, expected) in cases {
-            let (owner, repo) = GitHubClient::parse_url(url).unwrap();
-            assert_eq!(owner, expected.0);
-            assert_eq!(repo, expected.1);
-        }
-    }
-}
+#[path = "github_client_tests.rs"]
+mod tests;

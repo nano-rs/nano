@@ -26,13 +26,33 @@
 #
 # Usage:
 #   tools/scan-mirror-secrets.sh /tmp/nano-mirror
+#   some-report-generator | tools/scan-mirror-secrets.sh --mask
 #
 # Exit 0 = clean, 1 = credential-shaped strings found (job should fail).
 
 set -uo pipefail
 
-TREE="${1:?usage: scan-mirror-secrets.sh <tree>}"
-[ -d "$TREE" ] || { echo "not a directory: $TREE" >&2; exit 2; }
+# Mask every credential-shaped value on stdin, keeping only a short prefix, so
+# neither this gate nor anything piped through it prints the secret. Shared by
+# the failure report below.
+mask_secrets() {
+    sed -E \
+        -e 's/(cfut_[A-Za-z0-9]{6})[A-Za-z0-9]*/\1…REDACTED/g' \
+        -e 's/(sk-[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+        -e 's/(sk_live_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+        -e 's/(rk_live_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+        -e 's/(ghp_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+        -e 's/(gho_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+        -e 's/(github_pat_[A-Za-z0-9_]{6})[A-Za-z0-9_]*/\1…REDACTED/g' \
+        -e 's/(glpat-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]*/\1…REDACTED/g' \
+        -e 's/(xox[baprs]-[A-Za-z0-9-]{4})[A-Za-z0-9-]*/\1…REDACTED/g' \
+        -e 's/(AIza[0-9A-Za-z_-]{4})[0-9A-Za-z_-]*/\1…REDACTED/g' \
+        -e 's/(AKIA[0-9A-Z]{4})[0-9A-Z]*/\1…REDACTED/g' \
+        -e 's/(dop_v1_[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
+        -e 's/(pul-[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
+        -e 's/(nsiem-docs-)[A-Za-z0-9]*/\1…REDACTED/g' \
+        -e 's/(PRIVATE KEY-----[[:space:]]*)[A-Za-z0-9+\/]+/\1…REDACTED/g'
+}
 
 # Provider-prefixed token shapes. Deliberately anchored on vendor prefixes plus
 # a length floor rather than generic entropy heuristics — a noisy gate gets
@@ -59,6 +79,34 @@ PATTERNS+='|-----BEGIN [A-Z ]*PRIVATE KEY-----[[:space:]]*[A-Za-z0-9+/]{40,}'
 #   AKIAIOSFODNN7EXAMPLE — AWS's own published documentation example key,
 #                          used as a test fixture in nanosiem-core/src/crypto.rs.
 ALLOW='AKIAIOSFODNN7EXAMPLE'
+
+# `--mask`: a stdin -> stdout filter for generated reports that quote old
+# revisions (scripts/release/git-tree-diff.sh). A secret removed from the tree
+# still lives in history, and a diff spanning its removal re-publishes it
+# (NAN-5025). Masks exactly what this gate would flag (same PATTERNS, same
+# length floors, ALLOW honoured), keeping a 6-character prefix for reference,
+# so ordinary text such as `risk-score` is never touched.
+#
+# A PEM private key in a diff spans lines: the BEGIN line ends at its marker
+# and the body follows one base64 line at a time, which the line-based
+# PATTERNS never see. So a BEGIN line that ENDS at its marker starts a key
+# body, and each following line that is nothing but base64 (after the diff's
+# -/+/space column) is masked; the first other line (END, or anything else)
+# ends it, so a stray BEGIN in prose cannot swallow the rest of the report.
+if [ "${1:-}" = "--mask" ]; then
+    SCAN_PATTERNS="$PATTERNS" SCAN_ALLOW="$ALLOW" exec perl -pe '
+        BEGIN { $p = qr/$ENV{SCAN_PATTERNS}/; $a = qr/$ENV{SCAN_ALLOW}/; $k = 0; }
+        if ($k) {
+            if (/^([-+ ]?)[ \t]*[A-Za-z0-9+\/=]{16,}[ \t]*\r?$/) { $_ = "$1\[REDACTED]\n"; }
+            else { $k = 0; }
+        }
+        $k = 1 if /-----BEGIN [A-Z ]*PRIVATE KEY-----[ \t]*\r?$/;
+        s/$p/$& =~ $a ? $& : substr($&, 0, 6) . "[REDACTED]"/ge;
+    '
+fi
+
+TREE="${1:?usage: scan-mirror-secrets.sh <tree>}"
+[ -d "$TREE" ] || { echo "not a directory: $TREE" >&2; exit 2; }
 
 echo "Scanning $TREE for credential-shaped strings..."
 
@@ -181,20 +229,7 @@ echo "FAIL — credential-shaped strings found in the tree that would be publish
 echo ""
 # Mask the matched value so the gate does not itself print the secret into
 # public CI logs.
-printf '%s\n' "$hits" | sed -E \
-    -e 's/(cfut_[A-Za-z0-9]{6})[A-Za-z0-9]*/\1…REDACTED/g' \
-    -e 's/(sk-[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
-    -e 's/(sk_live_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
-    -e 's/(ghp_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
-    -e 's/(github_pat_[A-Za-z0-9_]{6})[A-Za-z0-9_]*/\1…REDACTED/g' \
-    -e 's/(glpat-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]*/\1…REDACTED/g' \
-    -e 's/(xox[baprs]-[A-Za-z0-9-]{4})[A-Za-z0-9-]*/\1…REDACTED/g' \
-    -e 's/(AIza[0-9A-Za-z_-]{4})[0-9A-Za-z_-]*/\1…REDACTED/g' \
-    -e 's/(AKIA[0-9A-Z]{4})[0-9A-Z]*/\1…REDACTED/g' \
-    -e 's/(dop_v1_[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
-    -e 's/(pul-[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
-    -e 's/(nsiem-docs-)[A-Za-z0-9]*/\1…REDACTED/g' \
-    -e 's/(PRIVATE KEY-----[[:space:]]*)[A-Za-z0-9+\/]+/\1…REDACTED/g'
+printf '%s\n' "$hits" | mask_secrets
 echo ""
 echo "Remove the credential, then ROTATE it — assume anything that reached this"
 echo "point is compromised. If a match is a genuine false positive, add it to"

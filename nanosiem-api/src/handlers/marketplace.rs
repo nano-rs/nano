@@ -216,7 +216,32 @@ pub async fn install_enrichment(
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let service = MarketplaceInstallService::new(state.pool.clone());
-    let entry = service.install(&slug, &request, auth.user_id()).await?;
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+    let mut entry = service.install(&slug, &request, auth.user_id()).await?;
+
+    // NAN-5284: an official lookup installs as its threat-intel provider
+    // (credentials into the credentials store, same checks and audit as the
+    // threat-intel settings). On failure the catalog install is undone so no
+    // half-installed entry remains. The open edition refused it above.
+    #[cfg(feature = "enterprise")]
+    if entry.execution_backend == "lookup" {
+        if let Err(e) = nanosiem_enterprise::handlers::threat_intel::configure_from_marketplace(
+            state.clone(),
+            auth.clone(),
+            client.clone(),
+            &entry.slug,
+            request.credentials.as_ref(),
+            Some(true),
+        )
+        .await
+        {
+            if let Err(undo) = service.uninstall(&slug).await {
+                tracing::warn!(slug = %slug, error = %undo, "Failed to undo a lookup install whose provider was refused");
+            }
+            return Err(e);
+        }
+        entry = MarketplaceRepository::new(state.pool.clone()).get_catalog_entry(&slug).await?;
+    }
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Marketplace, MARKETPLACE_INSTALLED)
@@ -251,6 +276,22 @@ pub async fn uninstall_enrichment(
     Path(slug): Path<String>,
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
+
+    // NAN-5284: an official lookup's provider (and its managed credential) is
+    // removed first, so a failure leaves the entry installed and retryable.
+    #[cfg(feature = "enterprise")]
+    {
+        let current = MarketplaceRepository::new(state.pool.clone()).get_catalog_entry(&slug).await?;
+        if current.installed && current.execution_backend == "lookup" {
+            nanosiem_enterprise::handlers::threat_intel::uninstall_from_marketplace(
+                state.clone(),
+                auth.clone(),
+                client.clone(),
+                &current.slug,
+            )
+            .await?;
+        }
+    }
 
     let service = MarketplaceInstallService::new(state.pool.clone());
     let entry = service.uninstall(&slug).await?;
@@ -306,9 +347,33 @@ pub async fn configure_enrichment(
         return Err(nanosiem_core::MarketplaceError::ProvidedByPlatformFeed(slug).into());
     }
 
+    // NAN-5284: an official lookup's key and enabled flag live on its
+    // threat-intel provider.
+    #[cfg(feature = "enterprise")]
+    {
+        let current = repo.get_catalog_entry(&slug).await?;
+        if current.execution_backend == "lookup" {
+            if !current.installed {
+                return Err(nanosiem_core::MarketplaceError::NotInstalled(slug).into());
+            }
+            if request.credentials.is_some() || request.enabled.is_some() {
+                nanosiem_enterprise::handlers::threat_intel::configure_from_marketplace(
+                    state.clone(),
+                    auth.clone(),
+                    client.clone(),
+                    &current.slug,
+                    request.credentials.as_ref(),
+                    request.enabled,
+                )
+                .await?;
+            }
+        }
+    }
+
     // Handle credential update if provided
     let creds_updated = request.credentials.is_some();
-    if let Some(ref credentials) = request.credentials {
+    let is_lookup = repo.get_catalog_entry(&slug).await?.execution_backend == "lookup";
+    if let (Some(credentials), false) = (&request.credentials, is_lookup) {
         let install_service = MarketplaceInstallService::new(state.pool.clone());
         install_service
             .update_credentials(&slug, credentials)
@@ -507,12 +572,12 @@ pub async fn sync_enrichment(
                         )
                         .await
                         {
-                            tracing::error!(slug = %slug_spawn, error = %e, "Deno enrichment sync failed");
+                            tracing::error!(slug = %slug_spawn, error = %e, "code enrichment sync failed");
                         }
                     });
                 } else {
                     return Err(ApiError::BadRequest(
-                        "Deno enrichment has no custom_enrichment_id".to_string(),
+                        "code enrichment has no custom_enrichment_id".to_string(),
                     ));
                 }
             }
@@ -520,9 +585,15 @@ pub async fn sync_enrichment(
             {
                 let _ = entry;
                 return Err(ApiError::BadRequest(
-                    "Deno enrichment runtime is not available in the open-core build".to_string(),
+                    "Custom code enrichments are not available in the open-core build".to_string(),
                 ));
             }
+        }
+        "lookup" => {
+            // NAN-5284: an official threat-intel lookup runs on demand.
+            return Err(ApiError::BadRequest(
+                "This threat-intel lookup runs on demand; there is nothing to sync".to_string(),
+            ));
         }
         "identity" => {
             // Same fire-and-forget treatment as the deno path (NAN-1113):
@@ -670,6 +741,9 @@ pub async fn export_enrichment(
         config_fields: collector.config_fields,
         allowed_domain_suffixes: collector.allowed_domain_suffixes,
         streams: collector.streams,
+        // NAN-5284: an official lookup round-trips as its connector runtime.
+        runtime: (entry.execution_backend == "lookup").then(|| "connector".to_string()),
+        connector_spec: (entry.execution_backend == "lookup").then(|| "connector.yaml".to_string()),
     };
 
     let manifest_yaml = serde_yaml::to_string(&manifest)
@@ -1196,7 +1270,7 @@ async fn run_marketplace_preview<R: MarketplacePreviewRuntime>(
             stderr: String::new(),
             duration_ms: 0,
             note: Some(format!(
-                "Preview is only available for `deno`-backed enrichments. \
+                "Preview is only available for code enrichments (run on the wasm sandbox). \
                  `{}` uses the `{}` backend, which is invoked directly by the engine.",
                 entry.slug, entry.execution_backend
             )),

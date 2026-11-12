@@ -28,3 +28,6 @@ pub mod credential;
 pub mod source;
 pub mod store;
 pub mod tree;
+
+#[cfg(all(test, unix))]
+mod key_rotation_tests;

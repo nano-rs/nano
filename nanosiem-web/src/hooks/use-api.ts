@@ -646,12 +646,15 @@ export function useTestLogSourceVrl() {
       vrlCode,
       sampleLog,
       extensionVrl,
+      logSourceId,
     }: {
       vrlCode: string;
       sampleLog: string;
       /** NAN-874: when present, run vrlCode → extensionVrl as a chain. */
       extensionVrl?: string;
-    }) => api.testLogSourceVrl(vrlCode, sampleLog, extensionVrl)
+      /** NAN-5079: attest a passing OCSF test of this source's stored generation. */
+      logSourceId?: string;
+    }) => api.testLogSourceVrl(vrlCode, sampleLog, extensionVrl, logSourceId)
   );
 }
 
@@ -680,7 +683,8 @@ async function requireDeploySuccess(
 }
 
 export function useDeployLogSource() {
-  return useMutation((id: string) => requireDeploySuccess(api.deployLogSource(id)));
+  return useMutation(({ id, ocsf }: { id: string; ocsf?: import('@/lib/api/types').OcsfGateRequest }) =>
+    requireDeploySuccess(api.deployLogSource(id, { ocsf })));
 }
 
 export function useUndeployLogSource() {
@@ -722,7 +726,8 @@ export function useLogSourceVersions(id: string | undefined) {
 }
 
 export function usePublishLogSource() {
-  return useMutation((id: string) => api.publishLogSource(id));
+  return useMutation(({ id, ocsf }: { id: string; ocsf?: import('@/lib/api/types').OcsfGateRequest }) =>
+    api.publishLogSource(id, undefined, { ocsf }));
 }
 
 export function useRevertLogSourceVersion() {

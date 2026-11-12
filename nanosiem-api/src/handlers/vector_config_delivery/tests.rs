@@ -248,12 +248,12 @@ mod delivery_credential {
         // Ingest host not upgraded yet: consumer falls back to the install token.
         assert_eq!(
             authorize_with(&bearer("install-token"), Some(&peer), app_host.clone()),
-            Ok(())
+            Ok(DeliveryAuth::InstallTokenFallback)
         );
         // Ingest host upgraded: consumer presents the dedicated token.
         assert_eq!(
             authorize_with(&bearer("delivery-secret"), Some(&peer), app_host.clone()),
-            Ok(())
+            Ok(DeliveryAuth::Dedicated)
         );
         assert_eq!(
             authorize_with(&bearer("forwarder-guess"), Some(&peer), app_host),
@@ -271,7 +271,7 @@ mod delivery_credential {
         );
         assert_eq!(
             authorize_with(&bearer("delivery-secret"), None, credential),
-            Ok(())
+            Ok(DeliveryAuth::Dedicated)
         );
     }
 
@@ -305,7 +305,7 @@ mod delivery_credential {
         let peer: SocketAddr = "10.20.0.7:51515".parse().unwrap();
         assert_eq!(
             authorize_with(&bearer("install-token"), Some(&peer), credential.clone()),
-            Ok(())
+            Ok(DeliveryAuth::InstallTokenFallback)
         );
         assert_eq!(
             authorize_with(&bearer("wrong"), Some(&peer), credential),
@@ -339,7 +339,7 @@ mod delivery_credential {
             );
             assert_eq!(
                 authorize_with(&bearer("delivery-secret"), Some(&peer), both),
-                Ok(()),
+                Ok(DeliveryAuth::Dedicated),
                 "strict={strict}"
             );
         }
@@ -359,8 +359,210 @@ mod delivery_credential {
         ] {
             assert_eq!(
                 authorize_with(&bearer("9f2c-private-install"), Some(&peer), credential),
+                Ok(DeliveryAuth::InstallTokenFallback)
+            );
+        }
+    }
+
+    // ── NAN-5042: disabling the install token revokes config delivery ───────
+
+    /// The exploit: the install token is a semi-trusted forwarder credential.
+    /// An admin disables it (Settings > Ingest tokens), which re-rendered only
+    /// Vector's tokens file; the delivery fallback still matched it, so the
+    /// forwarder could keep downloading rendered configs. Now refused.
+    #[test]
+    fn disabled_install_token_no_longer_opens_delivery() {
+        for credential in [
+            resolve_vector_config_delivery(None, None, Some("install-token"), false),
+            resolve_vector_config_delivery(None, Some("delivery-secret"), Some("install-token"), false),
+        ] {
+            let auth = authorize_with(&bearer("install-token"), None, credential).unwrap();
+            assert_eq!(auth, DeliveryAuth::InstallTokenFallback);
+            assert_eq!(
+                admit_install_token_fallback(Ok(false)),
+                Err(StatusCode::UNAUTHORIZED)
+            );
+        }
+    }
+
+    /// Upgrade compatibility: an enabled install token still serves a consumer
+    /// whose .env predates the dedicated token.
+    #[test]
+    fn enabled_install_token_fallback_keeps_an_upgraded_consumer_working() {
+        assert_eq!(admit_install_token_fallback(Ok(true)), Ok(()));
+    }
+
+    /// Fail closed when the switch cannot be read; 503 (not 401) so the
+    /// consumer keeps its current generation and retries.
+    #[test]
+    fn unreadable_install_token_switch_fails_closed_with_503() {
+        assert_eq!(
+            admit_install_token_fallback(Err(())),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// The dedicated credential never consults the install-token switch: an
+    /// admin disabling forwarders' install token must not cut off a consumer
+    /// that already uses its own delivery token.
+    #[test]
+    fn dedicated_token_is_independent_of_the_install_token_switch() {
+        for strict in [false, true] {
+            let credential = resolve_vector_config_delivery(
+                None,
+                Some("delivery-secret"),
+                Some("install-token"),
+                strict,
+            );
+            assert_eq!(
+                authorize_with(&bearer("delivery-secret"), None, credential),
+                Ok(DeliveryAuth::Dedicated)
+            );
+        }
+    }
+}
+
+/// NAN-5042 end to end against a real PostgreSQL: the delivery gate reads the
+/// install-token switch the admin flips, through the same service the
+/// Settings page uses. Needs a disposable `NANOSIEM_TEST_DATABASE_URL`.
+mod install_token_switch_db {
+    use super::*;
+    use nanosiem_core::deployment_posture::resolve_vector_config_delivery;
+    use nanosiem_core::ingest_tokens::IngestTokenService;
+
+    const MIGRATION: &str =
+        include_str!("../../../../migrations/postgres/290_ingest_tokens.sql");
+
+    async fn service() -> Option<(IngestTokenService, sqlx::PgPool, String)> {
+        let url = std::env::var("NANOSIEM_TEST_DATABASE_URL").ok()?;
+        let schema = format!("nan5042_{}", uuid::Uuid::new_v4().simple());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect({
+                let schema = schema.clone();
+                move |conn, _| {
+                    let schema = schema.clone();
+                    Box::pin(async move {
+                        sqlx::Executor::execute(conn, format!("SET search_path TO {schema}").as_str())
+                            .await
+                            .map(|_| ())
+                    })
+                }
+            })
+            .connect(&url)
+            .await
+            .expect("connect");
+        // An UPGRADED install (a real user exists), so migration 290 starts the
+        // install token in legacy multiplex mode, enabled: the exact state in
+        // which the v2.0.x delivery fallback is in use.
+        sqlx::raw_sql(&format!(
+            "CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), status TEXT);
+             INSERT INTO {schema}.users (status) VALUES ('system'), ('active');
+             CREATE TABLE {schema}.log_sources (
+                 id UUID PRIMARY KEY, name TEXT NOT NULL, source_type TEXT NOT NULL,
+                 match_values TEXT[], enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                 deployed BOOLEAN NOT NULL DEFAULT FALSE,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"
+        ))
+        .execute(&pool)
+        .await
+        .expect("setup");
+        sqlx::raw_sql(&MIGRATION.replace("SET LOCAL lock_timeout = '5s';", ""))
+            .execute(&pool)
+            .await
+            .expect("migration 290");
+        let dir = std::env::temp_dir().join(&schema);
+        std::fs::create_dir_all(&dir).unwrap();
+        let svc = IngestTokenService::with_paths(
+            pool.clone(),
+            dir.join("tokens.json"),
+            String::new(),
+            Some("install-token".into()),
+        );
+        Some((svc, pool, schema))
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL"]
+    async fn disabling_the_install_token_revokes_config_delivery() {
+        let Some((svc, pool, schema)) = service().await else {
+            return;
+        };
+        let peer: SocketAddr = "10.30.0.21:40000".parse().unwrap();
+        // Compose role-split upgrade (strict pinned false) and an unprovisioned
+        // deployment: the two shapes in which the fallback is live.
+        let shapes = [
+            resolve_vector_config_delivery(None, Some("delivery-secret"), Some("install-token"), false),
+            resolve_vector_config_delivery(None, None, Some("install-token"), false),
+        ];
+
+        // Enabled (as upgraded): the older consumer keeps receiving config.
+        for credential in &shapes {
+            assert_eq!(
+                authorize_request(&svc, &bearer("install-token"), Some(&peer), credential.clone(), DeliveryResource::Config).await,
                 Ok(())
             );
         }
+
+        // The admin disables the install token. Before NAN-5042 this changed
+        // only Vector's tokens file; delivery still answered 200.
+        svc.set_install_token_enabled(false, None).await.unwrap();
+        for credential in &shapes {
+            assert_eq!(
+                authorize_request(&svc, &bearer("install-token"), Some(&peer), credential.clone(), DeliveryResource::Config).await,
+                Err(StatusCode::UNAUTHORIZED),
+                "a disabled install token still opened config delivery"
+            );
+        }
+        // ...but the hashed tokens file still reaches a fallback consumer: it is
+        // what makes that host refuse the disabled install token for ingest.
+        // Refusing it would strand the host on a cached `fallback_enabled: true`.
+        for credential in &shapes {
+            assert_eq!(
+                authorize_request(&svc, &bearer("install-token"), Some(&peer), credential.clone(), DeliveryResource::TokensFile).await,
+                Ok(()),
+                "the revocation never reaches a fallback consumer"
+            );
+            assert_eq!(
+                authorize_request(&svc, &bearer("forwarder-guess"), Some(&peer), credential.clone(), DeliveryResource::TokensFile).await,
+                Err(StatusCode::UNAUTHORIZED)
+            );
+        }
+        // The file that fallback consumer now receives drops the install token
+        // (this test service publishes it to disk, the same render).
+        let rendered =
+            std::fs::read_to_string(std::env::temp_dir().join(&schema).join("tokens.json")).unwrap();
+        assert!(rendered.contains("\"fallback_enabled\": false"), "{rendered}");
+        // A consumer on the dedicated token is unaffected.
+        assert_eq!(
+            authorize_request(&svc, &bearer("delivery-secret"), Some(&peer), shapes[0].clone(), DeliveryResource::Config).await,
+            Ok(())
+        );
+
+        // Re-enabling restores the fallback on the next request (no cache).
+        svc.set_install_token_enabled(true, None).await.unwrap();
+        assert_eq!(
+            authorize_request(&svc, &bearer("install-token"), Some(&peer), shapes[1].clone(), DeliveryResource::Config).await,
+            Ok(())
+        );
+
+        // The switch unreadable (table gone) fails closed with 503.
+        sqlx::raw_sql("DROP TABLE ingest_token_settings CASCADE").execute(&pool).await.ok();
+        assert_eq!(
+            authorize_request(&svc, &bearer("install-token"), Some(&peer), shapes[1].clone(), DeliveryResource::Config).await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&pool).await.unwrap();
     }
 }

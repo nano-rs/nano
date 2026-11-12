@@ -212,6 +212,19 @@ struct Args {
     /// scale: spans/s ≈ eps × threads × otlp-batch × spans-per-trace.
     #[arg(long, default_value = "1")]
     otlp_batch: usize,
+
+    // --- Deploy-interruption measurement — NAN-5132 -------------------------
+    /// Blast mode: retries per batch before it counts as failed (default 3).
+    /// Use 0 to measure a config rollout: every refused or timed-out request
+    /// is then a counted failure instead of being absorbed by a retry.
+    #[arg(long, default_value = "3")]
+    max_retries: u32,
+
+    /// Blast mode: append one CSV row per batch,
+    /// `start_unix_ms,latency_ms,events,ok,error`, to this file. Lets a
+    /// rollout's stall and every rejected batch be read off a timeline.
+    #[arg(long)]
+    request_log: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -727,6 +740,18 @@ async fn run_blast_mode(
     let running = Arc::new(AtomicBool::new(true));
 
     let inflight_per_thread: usize = 4;
+    let max_retries = args.max_retries;
+    let failed_batches = Arc::new(AtomicU64::new(0));
+    let failed_events = Arc::new(AtomicU64::new(0));
+    let request_log = match args.request_log.as_ref() {
+        Some(path) => {
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            use std::io::Write as _;
+            writeln!(file, "start_unix_ms,latency_ms,events,ok,error")?;
+            Some(Arc::new(parking_lot::Mutex::new(file)))
+        }
+        None => None,
+    };
     let mut handles = Vec::new();
     for thread_id in 0..args.threads {
         let transport = transport.clone();
@@ -736,6 +761,9 @@ async fn run_blast_mode(
         let worker_world = world.clone();
         let batch_size = effective_batch_size;
         let max_inflight = inflight_per_thread;
+        let failed_batches = failed_batches.clone();
+        let failed_events = failed_events.clone();
+        let request_log = request_log.clone();
 
         let handle = tokio::spawn(async move {
             let client = Client::builder()
@@ -787,9 +815,36 @@ async fn run_blast_mode(
                 let transport = transport.clone();
                 let events_sent = events_sent.clone();
                 let response_latencies_us = response_latencies_us.clone();
+                let failed_batches = failed_batches.clone();
+                let failed_events = failed_events.clone();
+                let request_log = request_log.clone();
                 tokio::spawn(async move {
                     let request_started = Instant::now();
-                    match send_batch_with_retry(&client, &transport, &batch, 3).await {
+                    let started_unix_ms = Utc::now().timestamp_millis();
+                    let outcome =
+                        send_batch_with_retry(&client, &transport, &batch, max_retries).await;
+                    if let Some(log) = request_log.as_ref() {
+                        use std::io::Write as _;
+                        let error = outcome
+                            .as_ref()
+                            .err()
+                            .map(|e| e.to_string().replace([',', '\n'], " "))
+                            .unwrap_or_default();
+                        let _ = writeln!(
+                            log.lock(),
+                            "{},{:.1},{},{},{}",
+                            started_unix_ms,
+                            request_started.elapsed().as_secs_f64() * 1000.0,
+                            batch_len,
+                            outcome.is_ok(),
+                            error
+                        );
+                    }
+                    if outcome.is_err() {
+                        failed_batches.fetch_add(1, Ordering::Relaxed);
+                        failed_events.fetch_add(batch_len, Ordering::Relaxed);
+                    }
+                    match outcome {
                         Ok(()) => {
                             events_sent.fetch_add(batch_len, Ordering::Relaxed);
                             let mut latencies = response_latencies_us.lock();
@@ -857,6 +912,12 @@ async fn run_blast_mode(
 
     let total = events_sent.load(Ordering::Relaxed);
     info!("Total events sent: {}", total);
+    info!(
+        "Failed batches: {} ({} events) after {} retr(ies) each",
+        failed_batches.load(Ordering::Relaxed),
+        failed_events.load(Ordering::Relaxed),
+        max_retries
+    );
     let mut latencies: Vec<u64> = response_latencies_us.lock().iter().copied().collect();
     latencies.sort_unstable();
     if !latencies.is_empty() {

@@ -241,6 +241,21 @@ async fn async_main() -> Result<()> {
         }
     }
 
+    // NAN-5132: a deploy job a stopped API process left running never
+    // finishes; report it interrupted (the boot render above rewrote the
+    // Vector config from the database) and prune old jobs.
+    {
+        let deploy_jobs = state.log_source_deploy_jobs.clone();
+        tokio::spawn(async move {
+            match deploy_jobs.recover().await {
+                Ok((interrupted, pruned)) => {
+                    tracing::info!(interrupted, pruned, "Deploy job recovery done")
+                }
+                Err(error) => tracing::warn!(%error, "Deploy job recovery failed"),
+            }
+        });
+    }
+
     // Publish only a complete DB-derived generation. The same reconciler runs
     // on every API replica so a new emptyDir can recover the committed
     // generation; the PostgreSQL CAS prevents stale replicas from advancing it.

@@ -119,7 +119,10 @@ export interface LicenseStatusResponse {
   enforcement_enabled: boolean;
   /** Air-gapped deployment (AIRGAP_MODE on); recovery uses a signed C05 file. */
   airgap?: boolean;
-  mode: 'hosted' | 'offline' | 'unconfigured';
+  /** How the license is verified (not who operates the install: see
+   * entitlement.operator). `online` = online check-in; `hosted` is the same,
+   * from an API before v2.0.14 (NAN-5285). */
+  mode: 'online' | 'hosted' | 'offline' | 'unconfigured';
   runtime_state?: 'running' | 'renewal_due' | 'grace' | 'shut_off' | 'refused' | 'legacy_upgrade_grace';
   /** NAN-5253: app.nano.rs deployment ID (`deploy_…`) when configured. */
   deployment_id?: string;
@@ -356,7 +359,12 @@ class ApiClient {
     // NAN-5131: deploys outlast the default 60 s client timeout.
     const longRequest = <T,>(endpoint: string, options: RequestInit, timeoutMs: number) =>
       this.request<T>(endpoint, options, { timeoutMs });
-    this._logSources = new LogSourcesApi(this.request.bind(this), longRequest);
+    // NAN-5132: a failed deploy job throws the ApiClientError the synchronous call would have.
+    this._logSources = new LogSourcesApi(
+      this.request.bind(this),
+      longRequest,
+      (message, code, status) => new ApiClientError(message, code, undefined, status),
+    );
     this._sourceConfigs = new SourceConfigsApi(this.request.bind(this), longRequest);
     this._sourceScopes = new SourceScopesApi(this.request.bind(this));
     this._accessControl = new AccessControlApi(this.request.bind(this));
@@ -1808,12 +1816,22 @@ class ApiClient {
     return this._logSources.toggleLogSource(id, enabled);
   }
 
-  async deployLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
-    return this._logSources.deployLogSource(id);
+  async deployLogSource(id: string, options?: import('./log-sources').DeployCallOptions): Promise<import('./types').EnhancedDeploymentResponse> {
+    return this._logSources.deployLogSource(id, options);
   }
 
-  async undeployLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
-    return this._logSources.undeployLogSource(id);
+  async undeployLogSource(id: string, options?: import('./log-sources').DeployCallOptions): Promise<import('./types').EnhancedDeploymentResponse> {
+    return this._logSources.undeployLogSource(id, options);
+  }
+
+  /** NAN-5132: one log-source deploy job. */
+  async getLogSourceDeployJob(id: string): Promise<import('./types').DeployJob> {
+    return this._logSources.getDeployJob(id);
+  }
+
+  /** NAN-5132: recent deploy jobs for a log source. */
+  async listLogSourceDeployJobs(id: string, limit?: number): Promise<import('./types').DeployJob[]> {
+    return this._logSources.listLogSourceDeployJobs(id, limit);
   }
 
   async getDeliveryStatus(generation: number): Promise<import('./types').GenerationDeliveryStatus> {
@@ -1852,16 +1870,17 @@ class ApiClient {
     vrlCode: string,
     sampleLog: string,
     extensionVrl?: string,
+    logSourceId?: string,
   ): Promise<import('./types').LogSourceTestResult> {
-    return this._logSources.testLogSourceVrl(vrlCode, sampleLog, extensionVrl);
+    return this._logSources.testLogSourceVrl(vrlCode, sampleLog, extensionVrl, logSourceId);
   }
 
   async testLogSourceVrlLive(vrlCode: string, sourceType: string, currentVrl?: string, limit?: number): Promise<import('./types').LiveTestResult[]> {
     return this._logSources.testLogSourceVrlLive(vrlCode, sourceType, currentVrl, limit);
   }
 
-  async deployAllLogSources(): Promise<{ deployed: boolean }> {
-    return this._logSources.deployAllLogSources();
+  async deployAllLogSources(options?: import('./log-sources').DeployCallOptions): Promise<{ deployed: boolean }> {
+    return this._logSources.deployAllLogSources(options);
   }
 
   async getLogSourceDeployments(id: string): Promise<import('./types').LogSourceDeployment[]> {
@@ -1872,8 +1891,8 @@ class ApiClient {
     return this._logSources.getLogSourceVersions(id);
   }
 
-  async publishLogSource(id: string, expectedUpdatedAt?: string): Promise<import('./types').EnhancedDeploymentResponse> {
-    return this._logSources.publishLogSource(id, expectedUpdatedAt);
+  async publishLogSource(id: string, expectedUpdatedAt?: string, options?: import('./log-sources').DeployCallOptions): Promise<import('./types').EnhancedDeploymentResponse> {
+    return this._logSources.publishLogSource(id, expectedUpdatedAt, options);
   }
 
   async revertLogSourceVersion(id: string, versionId: number): Promise<import('./types').LogSourceVersion> {
@@ -2455,7 +2474,7 @@ class ApiClient {
 
   // NAN-1111: ThreatFox + TOR Exit Nodes delegate methods and the shared
   // lookupIoc / getIocStats delegates were deleted alongside the legacy
-  // backend routes. Both providers moved to the marketplace + Deno
+  // backend routes. Both providers moved to the marketplace + sandboxed code
   // (nano-rs/nano-enrichments). IPinfo Lite comes from nano's signed
   // platform feed bundle (NAN-4959).
 

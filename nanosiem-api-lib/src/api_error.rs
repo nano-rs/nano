@@ -525,6 +525,9 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             nanosiem_core::LogSourceServiceError::DeploymentFailed(msg) => {
                 ApiError::InternalError(format!("Deployment failed: {}", msg))
             }
+            nanosiem_core::LogSourceServiceError::OcsfValidationFailed(msg) => {
+                ApiError::ValidationError(format!("OCSF validation failed: {msg}"))
+            }
             nanosiem_core::LogSourceServiceError::ReloadFailed => {
                 ApiError::InternalError("Vector reload failed".to_string())
             }

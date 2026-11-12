@@ -105,8 +105,12 @@ impl MarketplaceInstallService {
             validate_credential_values(&entry, creds)?;
         }
 
-        // Encrypt credentials if provided
-        let (ciphertext, nonce) = if let Some(ref creds) = request.credentials {
+        // Encrypt credentials if provided. NAN-5284: a lookup's key lives in
+        // the credentials store, bound to its threat-intel provider by the API
+        // layer; the catalog keeps no copy.
+        let (ciphertext, nonce) = if backend == ExecutionBackend::Lookup {
+            (None, None)
+        } else if let Some(ref creds) = request.credentials {
             let (ct, n) = self.encrypt_credentials(creds)?;
             (Some(ct), Some(n))
         } else {
@@ -146,6 +150,17 @@ impl MarketplaceInstallService {
                     "Integration collectors".to_string(),
                 ));
             }
+            // NAN-5284: the API layer configures the threat-intel provider
+            // right after this marks the entry installed (and rolls the
+            // install back if that fails).
+            #[cfg(feature = "enterprise")]
+            ExecutionBackend::Lookup => {}
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Lookup => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Threat-intel lookups".to_string(),
+                ));
+            }
         }
 
         // Mark as installed in catalog, storing encrypted credentials
@@ -160,7 +175,7 @@ impl MarketplaceInstallService {
         // NULL URL while the UI reported the enrichment as configured.
         // Runs against `updated` so `installed`/`native_source_id` reflect the
         // row we just wrote.
-        if let Some(ref creds) = request.credentials {
+        if let (Some(creds), false) = (&request.credentials, backend == ExecutionBackend::Lookup) {
             self.push_native_credentials(&updated, creds).await?;
         }
 
@@ -262,6 +277,8 @@ impl MarketplaceInstallService {
                     "Integration collectors".to_string(),
                 ));
             }
+            // NAN-5284: the API layer removed the threat-intel provider first.
+            ExecutionBackend::Lookup => {}
         }
 
         let updated = self
@@ -362,6 +379,12 @@ impl MarketplaceInstallService {
                     "Integration collectors".to_string(),
                 ));
             }
+            // NAN-5284: an on-demand lookup has nothing to sync.
+            ExecutionBackend::Lookup => {
+                return Err(MarketplaceError::Internal(
+                    "on-demand threat-intel lookups have nothing to sync".to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -410,8 +433,9 @@ impl MarketplaceInstallService {
                     "Custom enrichments".to_string(),
                 ));
             }
-            ExecutionBackend::Native | ExecutionBackend::Identity => {
-                // Native/identity enrichments don't have deployable code to update
+            ExecutionBackend::Native | ExecutionBackend::Identity | ExecutionBackend::Lookup => {
+                // Native/identity enrichments and official lookups (the spec
+                // ships in the binary) have no deployable code to update.
             }
             #[cfg(feature = "enterprise")]
             ExecutionBackend::Collector => {
@@ -478,6 +502,14 @@ impl MarketplaceInstallService {
                 "Skipping credential update — payload contains only empty values or masked placeholders (NAN-1107)"
             );
             return Ok(());
+        }
+
+        // NAN-5284: a lookup's credentials belong to its threat-intel
+        // provider; the API layer routes them there and never reaches this.
+        if entry.execution_backend == "lookup" {
+            return Err(MarketplaceError::Internal(
+                "threat-intel lookup credentials are configured on the provider".to_string(),
+            ));
         }
 
         // Open edition: refuse before anything is persisted when the entry's
@@ -598,6 +630,7 @@ impl MarketplaceInstallService {
         let surface = match backend {
             ExecutionBackend::Deno => Some("Custom enrichments"),
             ExecutionBackend::Collector => Some("Integration collectors"),
+            ExecutionBackend::Lookup => Some("Threat-intel lookups"),
             ExecutionBackend::Identity => None,
             ExecutionBackend::Native => match entry.native_source_id.as_deref() {
                 None => None,

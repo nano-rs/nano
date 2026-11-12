@@ -1634,7 +1634,7 @@ export interface IpLookupResult {
 
 // NAN-1111: IocLookupResult, IocStats, ThreatFoxConfig, and
 // TorExitNodesConfig used to live here. Both providers and the shared
-// IOC lookup/stats endpoints moved to the marketplace + Deno
+// IOC lookup/stats endpoints moved to the marketplace + sandboxed code
 // (nano-rs/nano-enrichments). IPinfo Lite comes from nano's signed platform
 // feed bundle (NAN-4959).
 
@@ -1955,6 +1955,42 @@ export interface EnhancedDeploymentResponse {
    * some ingest hosts are still installing it: in progress, not an error.
    */
   delivery?: GenerationDelivery;
+}
+
+/** NAN-5132: a log-source deploy, undeploy, publish or deploy-all running as a background job. */
+export type DeployJobKind = 'deploy' | 'undeploy' | 'publish' | 'deploy_all';
+export type DeployJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'rolled_back' | 'interrupted';
+export type DeployJobPhase =
+  | 'queued'
+  | 'waiting_for_lock'
+  | 'validating'
+  | 'rendering'
+  | 'validating_config'
+  | 'promoting'
+  | 'reloading'
+  | 'rolling_back'
+  | 'done';
+
+export interface DeployJob {
+  /** `djob_…` */
+  id: string;
+  kind: DeployJobKind;
+  /** null for deploy-all. */
+  log_source_id: string | null;
+  state: DeployJobState;
+  phase: DeployJobPhase;
+  message: string | null;
+  /** The deploy result once finished (not for deploy-all). Carries NAN-5279 `delivery`. */
+  result: EnhancedDeploymentResponse | null;
+  /** HTTP status the synchronous call would have returned for an error (404, 409, …). */
+  error_status: number | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  heartbeat_at: string;
+  /** True when this request joined a job already queued for the same target. */
+  coalesced: boolean;
+  status_path: string;
 }
 
 /** NAN-5279: where a role-split deploy's generation stands on the ingest hosts. */
@@ -5658,6 +5694,44 @@ export interface LogSourceTestResult {
   error?: string;
   /** Optional count of fields the parser extracted from this sample. */
   extracted_field_count?: number;
+  /** NAN-5079: OCSF contract result, present when the VRL ran on an OCSF deployment. */
+  schema_validation?: OcsfValidationResult;
+}
+
+/** NAN-5079: one OCSF contract finding, path-exact (array indexes included). */
+export interface OcsfValidationDiagnostic {
+  code: string;
+  attribute_path: string;
+  message: string;
+}
+
+export interface OcsfValidationResult {
+  valid: boolean;
+  schema_version: string;
+  errors: OcsfValidationDiagnostic[];
+  warnings: OcsfValidationDiagnostic[];
+}
+
+/** NAN-5079: OCSF gate input for publish / first deploy. */
+export interface OcsfGateRequest {
+  /** Representative raw events; each must pass VRL then OCSF validation. */
+  ocsfSampleLogs?: string[];
+  /** Go live without a sample (first go-live only; audited). */
+  acknowledgeUnattested?: boolean;
+  /**
+   * The Add data flow's own first go-live without a sample (the operator was
+   * not asked). Audited as a system-initiated unattested install, never as an
+   * operator acknowledgement.
+   */
+  unattestedSystemInstall?: boolean;
+}
+
+/** NAN-5079: receipt state of the working copy's parser generation. */
+export interface OcsfAttestationStatus {
+  status: 'current' | 'stale' | 'none';
+  schema_version?: string | null;
+  sample_count?: number | null;
+  validated_at?: string | null;
 }
 
 /** NAN-522: namespace validation response. */
@@ -5719,6 +5793,8 @@ export interface LogSourceWithDraftStatus extends LogSource {
   has_draft_changes: boolean;
   active_version_number?: number;
   active_parser_vrl?: string;
+  /** NAN-5079: present on OCSF deployments for log parsers. */
+  ocsf_attestation?: OcsfAttestationStatus;
 }
 
 // ============================================================================

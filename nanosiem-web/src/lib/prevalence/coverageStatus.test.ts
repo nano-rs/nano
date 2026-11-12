@@ -23,11 +23,30 @@ describe('prevalence coverage status', () => {
 
   it('distinguishes warming from a definitive empty result', () => {
     const empty = { ...base, state: 'warming' as const, warming: true, covered_since: null, retry_after_s: 600 };
-    expect(prevalenceStatusLabel(empty)).toContain('no prevalence aggregated yet');
+    expect(prevalenceStatusLabel(empty)).toContain('no prevalence yet for at least one artifact kind');
     expect(prevalenceStatusLabel(empty)).toContain('10 min');
     const young = { ...base, state: 'warming' as const, warming: true, covered_since: '2026-11-01T08:00:00Z' };
     expect(prevalenceStatusLabel(young)).toContain('2026-11-01 08:00 UTC');
     expect(shouldPollPrevalence(young)).toBe(true);
+  });
+
+  // NAN-5285 (v2.0.13 Helm retest): a fresh install's 30-day Rarity window
+  // warms for 30 days, not "about 10 min"; the label must say until when.
+  it('says when a young install covers the whole window', () => {
+    const now = Date.parse('2026-11-11T12:00:00Z');
+    const thirtyDays = {
+      ...base,
+      state: 'warming' as const,
+      warming: true,
+      retry_after_s: 600,
+      covered_since: '2026-11-10T09:00:00Z',
+      window_start: '2026-10-12T12:00:00Z',
+    };
+    const label = prevalenceStatusLabel(thirtyDays, now)!;
+    expect(label).toContain('2026-11-10 09:00 UTC');
+    expect(label).toContain('fully covered from about 2026-12-10 09:00 UTC');
+    expect(label).toContain('unknown, not rare');
+    expect(label).not.toContain('next refresh');
   });
 
   it('labels stale snapshots and partial coverage', () => {

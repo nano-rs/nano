@@ -210,6 +210,9 @@ pub struct AppState {
     pub parser_service: ParserService,
     /// Log source service
     pub log_source_service: LogSourceService,
+    /// NAN-5132: runs log-source deploys as background jobs (detached from
+    /// the request, progress in `log_source_deploy_jobs`).
+    pub log_source_deploy_jobs: Arc<nanosiem_core::log_sources::deploy_jobs::DeployJobRunner>,
     /// Log telemetry rollup service (per-source_type events/bytes/last_event_at)
     pub log_telemetry_service: LogTelemetryService,
     /// Source configuration service

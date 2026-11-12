@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import type { ReactNode } from 'react';
-import { inventoryAction, inventoryReason, type InventoryItem } from '@/lib/api/marketplace-inventory';
+import { inventoryAction, inventoryReason, inventorySandboxLabel, type InventoryItem } from '@/lib/api/marketplace-inventory';
 import { AirgapBadge } from './IntegrationCard';
 import { MonoSwatch } from './MonoSwatch';
 import { executionStageLabel, humanizeEnum, inventoryHealthLabel } from '@/lib/marketplace-labels';
@@ -54,9 +54,19 @@ export function InventoryCard({ item, onOpen, airGap = false }: { item: Inventor
   // reason takes over the body.
   const body = item.reason && item.reason !== 'not_installed' ? inventoryReason(item) : item.description || inventoryReason(item);
   return <CatalogCard id={item.id} name={item.name} onOpen={onOpen}
-    meta={<>{item.provided_by_bundle ? <><MetaBadge>nano feed bundle</MetaBadge> · {item.provided_by_bundle.revision !== null && <span data-testid="inventory-card-bundle-rev">rev {item.provided_by_bundle.revision} · </span>}</> : null}{item.kind} · {humanizeEnum(item.category)} · {inventoryHealthLabel(item.effective_health)}</>}
+    meta={<>{item.provided_by_bundle ? <><MetaBadge>nano feed bundle</MetaBadge> · {item.provided_by_bundle.revision !== null && <span data-testid="inventory-card-bundle-rev">rev {item.provided_by_bundle.revision} · </span>}</> : null}{item.kind} · {humanizeEnum(item.category)} · {inventoryHealthLabel(item.effective_health)}{item.sandbox && <> · <SandboxBadge item={item} /></>}</>}
     body={body}
     footerLabel={executionStageLabel(item.execution_stage)}
     footerAction={<span className={item.requirement || item.provided_by_bundle ? 'text-muted-foreground' : 'text-primary'}>{inventoryAction(item)}</span>}
     trailing={airGap && <AirgapBadge requiresNetwork={item.requires_network} />} />;
+}
+
+/** NAN-5097: which sandbox runs a custom enrichment; amber when it cannot move to wasm yet. */
+export function SandboxBadge({ item }: { item: InventoryItem }) {
+  const label = inventorySandboxLabel(item);
+  if (!label) return null;
+  const attention = item.sandbox?.compile_status === 'needs_attention';
+  return <span data-testid="inventory-sandbox-badge"
+    title={attention ? item.sandbox?.reason ?? 'Open the enrichment to see why it cannot run on the wasm sandbox.' : 'Compiles for the wasm sandbox and runs there.'}
+    className={`inline-flex items-center h-[15px] px-1 border rounded-sm font-mono text-[10.5px] leading-none align-[1px] ${attention ? 'border-amber-500/60 text-amber-600 dark:text-amber-400' : 'border-border text-muted-foreground'}`}>{label}</span>;
 }

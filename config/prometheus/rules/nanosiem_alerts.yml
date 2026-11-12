@@ -211,7 +211,7 @@ groups:
           severity: critical
         annotations:
           summary: "PostgreSQL has no primary"
-          description: "No Patroni member is the leader. Writes fail until one is elected (normally within 15 s)."
+          description: "No Patroni member is the leader. Writes fail until one is elected (normally within about 20-25 s of losing the primary)."
 
       - alert: NanoPostgresTwoPrimaries
         expr: sum(patroni_primary{job="patroni"}) > 1

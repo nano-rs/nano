@@ -378,6 +378,15 @@ impl AppState {
         handles.push(self.start_migration_refresh_scheduler());
         tracing::info!("Post-migration refresh activation started (leader-only, 60s tick)");
 
+        // NAN-5097: wasm readiness of custom enrichments. Local work (no
+        // egress), so it runs in air-gapped installs too.
+        #[cfg(feature = "enterprise")]
+        handles.push(self.start_component_worker_supervisor(
+            crate::license_admission::WorkerCapability::Collectors,
+            "leader_enrichment_wasm_reconcile",
+            |state| vec![state.start_enrichment_wasm_reconciler()],
+        ));
+
         // === Egress schedulers — skipped in air-gap mode ===
         // Air-gapped installs have no outbound internet, so any job that fetches
         // from the internet (GitHub repo sync, model/MITRE catalogs)
@@ -392,7 +401,7 @@ impl AppState {
             // NAN-4959: no native IPinfo download job. IPinfo Lite comes only
             // from the signed platform feed bundle (consumer started below).
 
-            // Custom enrichment scheduler — runs Deno data enrichments on their
+            // Custom enrichment scheduler — runs code data enrichments on their
             // cron schedules. Enterprise only after Phase 3.3 of NAN-744 (the
             // sandbox runtime + scheduler live in nanosiem-enterprise).
             #[cfg(feature = "enterprise")]

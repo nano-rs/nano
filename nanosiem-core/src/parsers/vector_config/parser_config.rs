@@ -212,10 +212,8 @@ impl VectorConfigManager {
         // line (e.g. a fresh [sinks.X] section).
         let mut config = format!(
             "# Auto-generated Vector configuration for parser: {}\n\
-             # DO NOT EDIT - changes will be overwritten\n\
-             # Generated at: {}\n\n",
+             # DO NOT EDIT - changes will be overwritten\n\n",
             safe_for_toml_comment(&parser.name),
-            chrono::Utc::now().to_rfc3339()
         );
 
         let safe_name = Self::safe_name(&parser.name);

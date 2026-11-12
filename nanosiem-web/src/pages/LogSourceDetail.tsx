@@ -48,6 +48,8 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
+import { useDeployJob } from '@/hooks/use-deploy-job';
+import { DeployJobProgress } from '@/components/log-sources/DeployJobProgress';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
@@ -75,6 +77,14 @@ import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/componen
 import { useDefaultLayout } from 'react-resizable-panels';
 import { computeDiff, type DiffLine, type VrlUpdateInfo } from '@/lib/parser-diff';
 import { ParserTestLab } from '@/components/parser/ParserTestLab';
+import {
+  EMPTY_OCSF_GATE,
+  OcsfAttestationBadge,
+  OcsfGateFields,
+  ocsfGateNeeded,
+  ocsfGateRequest,
+  type OcsfGateDraft,
+} from '@/components/log-sources/OcsfGate';
 import { Markdown } from '@/components/ui/markdown';
 import { PARSER_JOB_MAX_WAIT_MS, useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useMelodStatus } from '@/hooks/use-api';
@@ -176,6 +186,8 @@ export function LogSourceDetail() {
   const { mutate: deployLogSource, loading: deploying } = useDeployLogSource();
   const { mutate: undeployLogSource, loading: undeploying } = useUndeployLogSource();
   const { mutate: publishLogSource, loading: publishing } = usePublishLogSource();
+  // NAN-5132: the running (or just finished) deploy job for this source.
+  const deployJob = useDeployJob(id);
   const { mutate: discardDraft, loading: discarding } = useDiscardLogSourceDraft();
 
   // Deployed source-config list (used by the Configuration tab's source-type dropdown)
@@ -236,6 +248,8 @@ export function LogSourceDetail() {
   const [saveVrlDialogOpen, setSaveVrlDialogOpen] = useState(false);
   const [acceptDiffDialogOpen, setAcceptDiffDialogOpen] = useState(false);
   const [publishDialogOpen, setPublishDialogOpen] = useState(false);
+  // NAN-5079: OCSF sample / unattested acknowledgement for publish and a first deploy.
+  const [ocsfGate, setOcsfGate] = useState<OcsfGateDraft>(EMPTY_OCSF_GATE);
   const [discardDraftDialogOpen, setDiscardDraftDialogOpen] = useState(false);
   const [revertVersionTarget, setRevertVersionTarget] = useState<LogSourceVersion | null>(null);
 
@@ -279,6 +293,12 @@ export function LogSourceDetail() {
   const currentVrl = isEditingVrl ? editedVrl : logSource.parser_vrl;
   const vrlDirty = isEditingVrl && editedVrl !== logSource.parser_vrl;
   const hasDraft = draftStatus?.has_draft_changes ?? false;
+  // NAN-5079: a source with no published version is going live for the first
+  // time; only then may the OCSF sample be skipped (audited).
+  const firstGoLive = !draftStatus?.active_version_number;
+  const ocsfAttestation = draftStatus?.ocsf_attestation;
+  const publishNeedsOcsf = ocsfGateNeeded(ocsfAttestation);
+  const deployNeedsOcsf = publishNeedsOcsf && firstGoLive && !logSource?.deployed;
 
   // ----- mutation handlers -----
 
@@ -298,14 +318,21 @@ export function LogSourceDetail() {
   };
 
   const handleDeploy = async () => {
+    // NAN-5132: the progress strip follows the job; the dialog need not.
+    setDeployDialogOpen(false);
     try {
-      const result = await deployLogSource(logSource.id);
+      const result = await deployLogSource({
+        id: logSource.id,
+        ocsf: deployNeedsOcsf ? ocsfGateRequest(ocsfGate, true) : undefined,
+      });
       // NAN-5279: a role-split deploy still being installed reads as in progress, with a re-check.
       toastDeployResult(toast, (generation) => api.getDeliveryStatus(generation), result, {
         title: 'Deployed',
         description: `"${logSource.name}" has been deployed to Vector.`,
       });
       setDeployDialogOpen(false);
+      setOcsfGate(EMPTY_OCSF_GATE);
+      refetchDraftStatus();
       refetch();
       refetchHealth();
       refetchDeployments();
@@ -320,6 +347,7 @@ export function LogSourceDetail() {
   };
 
   const handleUndeploy = async () => {
+    setUndeployDialogOpen(false);
     try {
       const result = await undeployLogSource(logSource.id);
       toast({ title: 'Undeployed', description: result?.message || `"${logSource.name}" has been removed from Vector.` });
@@ -338,8 +366,12 @@ export function LogSourceDetail() {
   };
 
   const handlePublish = async () => {
+    setPublishDialogOpen(false);
     try {
-      const result = await publishLogSource(logSource.id);
+      const result = await publishLogSource({
+        id: logSource.id,
+        ocsf: publishNeedsOcsf ? ocsfGateRequest(ocsfGate, firstGoLive) : undefined,
+      });
       if (result.success) {
         toast({
           title: 'Published & deployed',
@@ -366,6 +398,7 @@ export function LogSourceDetail() {
         toast({ title: 'Publish failed', description: result.message, variant: 'destructive' });
       }
       setPublishDialogOpen(false);
+      setOcsfGate(EMPTY_OCSF_GATE);
       refetch();
       refetchHealth();
       refetchDeployments();
@@ -622,6 +655,7 @@ export function LogSourceDetail() {
       <div className="flex flex-col min-h-0 -m-3 bg-background h-[calc(100%+1.5rem)]">
         <LogSourceHero
           source={logSource}
+          ocsfAttestation={ocsfAttestation}
           dirty={vrlDirty}
           health={health}
           deploying={deploying}
@@ -636,6 +670,11 @@ export function LogSourceDetail() {
             )
           }
         />
+        {deployJob && (
+          <div className="px-4 pt-1.5">
+            <DeployJobProgress job={deployJob} />
+          </div>
+        )}
         <DraftBanner
           show={hasDraft}
           activeVersion={draftStatus?.active_version_number}
@@ -742,7 +781,9 @@ export function LogSourceDetail() {
           confirmIcon={deploying ? <LoadingIcon className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
           onConfirm={handleDeploy}
           disabled={deploying}
-        />
+        >
+          {deployNeedsOcsf && <OcsfGateFields draft={ocsfGate} onChange={setOcsfGate} firstGoLive />}
+        </ConfirmDialog>
         <ConfirmDialog
           open={undeployDialogOpen}
           onOpenChange={setUndeployDialogOpen}
@@ -773,7 +814,9 @@ export function LogSourceDetail() {
           confirmIcon={publishing ? <LoadingIcon className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
           onConfirm={handlePublish}
           disabled={publishing}
-        />
+        >
+          {publishNeedsOcsf && <OcsfGateFields draft={ocsfGate} onChange={setOcsfGate} firstGoLive={firstGoLive} />}
+        </ConfirmDialog>
         <ConfirmDialog
           open={discardDraftDialogOpen}
           onOpenChange={setDiscardDraftDialogOpen}
@@ -825,6 +868,7 @@ export function LogSourceDetail() {
 
 function LogSourceHero({
   source,
+  ocsfAttestation,
   dirty,
   health,
   deploying,
@@ -836,6 +880,7 @@ function LogSourceHero({
   onViewLogs,
 }: {
   source: LogSource;
+  ocsfAttestation?: import('@/lib/api/types').OcsfAttestationStatus;
   dirty: boolean;
   health: { events_last_24h?: number; events_last_hour?: number; last_event_at?: string } | null | undefined;
   deploying: boolean;
@@ -895,6 +940,7 @@ function LogSourceHero({
                 <AlertTriangle className="w-3 h-3" /> Not validated
               </span>
             )}
+            <OcsfAttestationBadge attestation={ocsfAttestation} />
             {dirty && (
               <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-amber-500 bg-amber-500/15 rounded px-1.5 py-0.5">
                 <Edit className="w-3 h-3" /> Unsaved VRL changes
@@ -2071,6 +2117,7 @@ function VrlEditorTab({
             </div>
             <div className={cn('h-full overflow-auto', sidePanel.active === 'test' ? 'block' : 'hidden')}>
               <ParserTestLab
+                logSourceId={source.id}
                 vrlCode={editedVrl || source.parser_vrl}
                 sourceType={source.match_values?.[0] || source.source_type}
                 currentDeployedVrl={source.parser_vrl}
@@ -3042,6 +3089,7 @@ function ConfirmDialog({
   confirmTone = 'default',
   onConfirm,
   disabled,
+  children,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -3052,6 +3100,7 @@ function ConfirmDialog({
   confirmTone?: 'default' | 'warn' | 'danger';
   onConfirm: () => void;
   disabled?: boolean;
+  children?: ReactNode;
 }) {
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
@@ -3062,6 +3111,7 @@ function ConfirmDialog({
             {description}
           </AlertDialogDescription>
         </AlertDialogHeader>
+        {children != null && children !== false && <div className="px-5 py-3">{children}</div>}
         <AlertDialogFooter className="border-t border-border px-5 py-3">
           <AlertDialogCancel className="h-8 text-[11.5px]">Cancel</AlertDialogCancel>
           <AlertDialogAction
@@ -3273,6 +3323,7 @@ function ExtensionTab({
                 </div>
                 <div className={cn('h-full overflow-auto', sidePanel.active === 'test' ? 'block' : 'hidden')}>
                   <ParserTestLab
+                    logSourceId={source.id}
                     vrlCode={source.parser_vrl}
                     sourceType={effectiveSourceType(source)}
                     extensionVrl={editedExt}

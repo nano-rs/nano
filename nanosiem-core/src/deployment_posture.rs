@@ -279,7 +279,8 @@ pub fn posture_findings(inputs: &PostureInputs) -> Vec<PostureFinding> {
                      ingest-token changes. nano-api logs each caller that still uses the \
                      install token, with its IP address: copy the updated shared .env to that \
                      host and re-run install.sh there. Then set {DELIVERY_STRICT_ENV}=true on \
-                     nano-api to refuse the install token now; v2.1 refuses it regardless."
+                     nano-api to refuse the install token now; v2.1 refuses it regardless. \
+                     Disabling the install token also refuses it here."
                 ),
                 priority: if install_public { "critical" } else { "medium" },
             })
@@ -293,8 +294,8 @@ pub fn posture_findings(inputs: &PostureInputs) -> Vec<PostureFinding> {
                  (`openssl rand -hex 32`) on nano-api, nano-jobs and every Vector config \
                  consumer (install.sh and the Helm chart do this), or set \
                  {DELIVERY_SWITCH_ENV}=off when nothing pulls config over HTTP. nano-api logs \
-                 each caller that still uses the install token, with its IP address. From v2.1 \
-                 the install token is refused here."
+                 each caller that still uses the install token, with its IP address. Disabling \
+                 the install token also refuses it here; from v2.1 it is refused regardless."
             ),
             priority: if install_public { "critical" } else { "high" },
         }),

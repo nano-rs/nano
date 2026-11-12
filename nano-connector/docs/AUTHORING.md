@@ -22,7 +22,7 @@ integration's `manifest.yaml` (and, until cutover, its `code.ts`):
 The manifest names the spec and says which runtime runs the entry:
 
 ```yaml
-runtime: connector          # or deno (the default) while code.ts still runs
+runtime: connector          # or deno (the default): code.ts, run on the wasm sandbox since 2.0.14
 connector_spec: connector.yaml
 ```
 
@@ -30,13 +30,15 @@ Marketplace sync copies the spec into the catalog row's `config` as
 `runtime`, `connector_spec` and `connector_spec_sha256`. A feed pins the
 sha256 it was configured against. The `execution_backend` column is unchanged.
 
-Only first-party content is ported. Custom Deno scripts that operators wrote
-themselves have no conversion path and stop running at cutover.
+Only first-party content is ported. `runtime: deno` is a historical value:
+since 2.0.14 the `code.ts` script runs on the embedded wasm sandbox, not Deno.
+Operator-written scripts keep running there; one that cannot (plain http, a
+credential outside a header) is marked needs attention until it is fixed.
 
 `nano-connector/tests/fixtures/specs` holds frozen copies for the engine's own
 tests; they are not the shipped specs.
 
-## Shadow runs: prove a port against the Deno script
+## Shadow runs: prove a port against the original script (dev tooling; needs a local Deno)
 
 Each content repo has `testing/shadow/`. It runs the Deno script and the
 connector against the same vendor mock and diffs what each one ships:

@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Open-edition stub for CustomEnrichmentApi. User-defined enrichments (Deno sandbox) are enterprise-only.
+// Open-edition stub for CustomEnrichmentApi. User-defined enrichments (sandboxed code) are enterprise-only.
 
 const ENTERPRISE_ONLY = (): Promise<never> =>
   Promise.reject(new Error('CustomEnrichmentApi is enterprise-only'));
+
+/** NAN-5097: whether a custom enrichment runs on the wasm sandbox. */
+export interface CustomEnrichmentWasmStatus {
+  compile_status: 'compiled' | 'needs_attention';
+  /** Why it cannot run (and its runs are refused); only for callers who may read the code. */
+  reason: string | null;
+  checked_at: string;
+  /** False when the code changed after the check (a recheck is due). */
+  current: boolean;
+}
 
 export interface CustomEnrichmentSummary {
   id: string;
@@ -16,6 +26,8 @@ export interface CustomEnrichmentSummary {
   last_run_at: string | null;
   last_run_status: string | null;
   created_at: string;
+  /** Absent until the readiness check has run. */
+  wasm_status?: CustomEnrichmentWasmStatus;
 }
 
 export interface CustomEnrichmentDetail extends CustomEnrichmentSummary {

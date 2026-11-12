@@ -1360,7 +1360,7 @@ fn native_provider_run_status(
 /// last run errored). NAN-1178.
 ///
 /// Two sources are unioned:
-/// - `custom_enrichments` — installed Deno data/agent feeds. Enterprise-managed;
+/// - `custom_enrichments` — installed code (wasm sandbox) data/agent feeds. Enterprise-managed;
 ///   absent on open-core builds (treated as "nothing configured"). `agent`-type
 ///   on-demand lookups get their null status normalized to `on_demand` via
 ///   [`normalize_provider_run_status`] so they aren't flagged as broken
@@ -1374,7 +1374,7 @@ fn native_provider_run_status(
 async fn collect_enrichment_providers(pool: &PgPool) -> Vec<EnrichmentProviderStatus> {
     let mut providers = Vec::new();
 
-    // Installed Deno data/agent enrichments (enterprise overlay).
+    // Installed code data/agent enrichments (enterprise overlay).
     #[cfg(feature = "enterprise")]
     match sqlx::query_as::<_, (String, String, bool, Option<String>)>(
         "SELECT name, enrichment_type, enabled, last_run_status \

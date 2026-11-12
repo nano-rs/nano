@@ -27,7 +27,9 @@ use axum::{
 };
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, LOG_SOURCE_CREATED, LOG_SOURCE_DELETED,
-    LOG_SOURCE_DEPLOYED, LOG_SOURCE_DEPLOY_ALL, LOG_SOURCE_PUBLISHED, LOG_SOURCE_REVERTED,
+    LOG_SOURCE_DEPLOYED, LOG_SOURCE_DEPLOY_ALL, LOG_SOURCE_OCSF_UNATTESTED_PUBLISH,
+    LOG_SOURCE_OCSF_UNATTESTED_SYSTEM_INSTALL,
+    LOG_SOURCE_PUBLISHED, LOG_SOURCE_REVERTED,
     LOG_SOURCE_TOGGLED, LOG_SOURCE_UNDEPLOYED, LOG_SOURCE_UPDATED,
 };
 use nanosiem_core::log_sources::{
@@ -48,8 +50,10 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 
+use super::log_source_deploy_jobs::{run_deploy_job, DeployAudit, DeployOk, DeployWaitQuery};
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
+use nanosiem_core::log_sources::deploy_jobs::{DeployJob, DeployJobKind};
 
 // Permission constants for log sources
 const LOG_SOURCES_VIEW: &str = "log_sources:view";
@@ -352,15 +356,23 @@ pub async fn validate_log_source(
 }
 
 /// Deploy a log source to Vector
+///
+/// NAN-5132: runs as a background deploy job. `?wait=false` answers 202 with
+/// the job (poll its `status_path`); the default waits and answers 200 as
+/// before. The deploy finishes or rolls back even if the client disconnects.
 #[utoipa::path(
     post,
     path = "/api/log-sources/{id}/deploy",
     tag = "log_sources",
     params(
-        ("id" = String, Path, description = "Log source ID")
+        ("id" = String, Path, description = "Log source ID"),
+        DeployWaitQuery,
     ),
+    request_body(content = Option<DeployLogSourceRequest>, description = "Optional: OCSF samples or the unattested acknowledgement for a source's first go-live"),
     responses(
-        (status = 200, description = "Deployment result", body = DeploymentResult),
+        (status = 200, description = "Deployment result (wait=true)", body = DeploymentResult),
+        (status = 202, description = "Deploy job accepted (wait=false)", body = DeployJob),
+        (status = 422, description = "OCSF validation failed, or no OCSF receipt for a first go-live (checked before any job is created)"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -371,8 +383,11 @@ pub async fn deploy_log_source(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
-) -> Result<Json<DeploymentResult>, ApiError> {
+    Query(wait): Query<DeployWaitQuery>,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
+    let request = DeployLogSourceRequest::from_body(&body)?;
 
     // Tier enforcement at the draft→active transition (NAN-1920): a draft is
     // exempt from the data-source cap, so activating one via deploy is the point
@@ -383,33 +398,54 @@ pub async fn deploy_log_source(
         enforce_data_source_limit(&state).await?;
     }
 
-    let result = state.log_source_service.deploy(*id).await?;
+    let id = *id;
+    // NAN-5079: the OCSF gate runs BEFORE the job is enqueued, so a refusal is
+    // a 422 on both wait=true and wait=false and no job is created.
+    let gate = nanosiem_core::log_sources::OcsfGateInput {
+        samples: request.ocsf_sample_logs,
+        acknowledge_unattested: request.acknowledge_unattested
+            || request.unattested_system_install,
+    };
+    let checked = state.log_source_service.ocsf_deploy_precheck(id, &gate).await?;
+    if checked.outcome == nanosiem_core::log_sources::OcsfGateOutcome::Unattested {
+        audit_unattested_go_live(&state, &auth, &client, id, "deploy", request.unattested_system_install);
+    }
 
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_DEPLOYED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("log_source", Some(*id), None::<String>)
-            .client_context(&client)
-            .details(serde_json::json!({
-                "success": result.success,
-            }))
-            .build(),
-    );
-
-    Ok(Json(result))
+    let audit = DeployAudit {
+        action: LOG_SOURCE_DEPLOYED,
+        auth: auth.clone(),
+        client,
+        extra: Some(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) })),
+    };
+    run_deploy_job(&state, audit, DeployJobKind::Deploy, Some(id), wait.wait, move |state, progress| async move {
+        // A save between the check and the job must not go live unchecked.
+        state
+            .log_source_service
+            .ensure_ocsf_generation_unchanged(id, &checked)
+            .await?;
+        let result = state
+            .log_source_service
+            .deploy_with_progress(id, progress.as_ref())
+            .await?;
+        Ok(DeployOk::Result(result))
+    })
+    .await
 }
 
 /// Undeploy a log source from Vector
+///
+/// NAN-5132: a background deploy job; `?wait=` as for deploy.
 #[utoipa::path(
     post,
     path = "/api/log-sources/{id}/undeploy",
     tag = "log_sources",
     params(
-        ("id" = String, Path, description = "Log source ID")
+        ("id" = String, Path, description = "Log source ID"),
+        DeployWaitQuery,
     ),
     responses(
-        (status = 200, description = "Undeployment result", body = DeploymentResult),
+        (status = 200, description = "Undeployment result (wait=true)", body = DeploymentResult),
+        (status = 202, description = "Undeploy job accepted (wait=false)", body = DeployJob),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -420,24 +456,23 @@ pub async fn undeploy_log_source(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
-) -> Result<Json<DeploymentResult>, ApiError> {
+    Query(wait): Query<DeployWaitQuery>,
+) -> Result<Response, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
-    let result = state.log_source_service.undeploy(*id).await?;
+    // 404 before a job exists for a source that does not.
+    state.log_source_service.get(*id).await?;
 
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_UNDEPLOYED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("log_source", Some(*id), None::<String>)
-            .client_context(&client)
-            .details(serde_json::json!({
-                "success": result.success,
-            }))
-            .build(),
-    );
-
-    Ok(Json(result))
+    let id = *id;
+    let audit = DeployAudit { action: LOG_SOURCE_UNDEPLOYED, auth: auth.clone(), client, extra: None };
+    run_deploy_job(&state, audit, DeployJobKind::Undeploy, Some(id), wait.wait, move |state, progress| async move {
+        let result = state
+            .log_source_service
+            .undeploy_with_progress(id, progress.as_ref())
+            .await?;
+        Ok(DeployOk::Result(result))
+    })
+    .await
 }
 
 /// Get deployment history for a log source
@@ -631,6 +666,18 @@ pub struct TestVrlRequest {
     /// When present, the request tests the combined pipeline: parse → extension.
     #[serde(default)]
     pub extension_vrl: Option<String>,
+    /// NAN-5079: also validate the output against the embedded OCSF
+    /// contract (after VRL ran). The result carries `schema_validation`.
+    /// Ignored when the deployment's schema profile is not OCSF.
+    #[serde(default)]
+    pub validate_ocsf: bool,
+    /// NAN-5079: bind a passing OCSF test to this source's STORED parser
+    /// generation (only for a caller with `log_sources:edit`; otherwise the
+    /// test still runs, unattested). An unsaved buffer is validated but never
+    /// attested.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub log_source_id: Option<TypeIdParam>,
 }
 
 /// Test VRL against a sample log
@@ -653,23 +700,53 @@ pub async fn test_vrl(
     Json(request): Json<TestVrlRequest>,
 ) -> Result<Json<ParserTestResult>, Response> {
     ensure_permission(&auth, LOG_SOURCES_VIEW).map_err(IntoResponse::into_response)?;
+    // Attesting writes the source's receipt, so it needs log_sources:edit. A
+    // viewer's test (the Test Lab sends the id for everyone) is still
+    // validated, just never attested: refusing it would break read-only use.
+    let attest_id = request
+        .log_source_id
+        .as_ref()
+        .filter(|_| auth.has_permission(LOG_SOURCES_EDIT))
+        .map(|id| **id);
     check_test_sample(&request.sample_log).map_err(IntoResponse::into_response)?;
     let permit = parser_test_gate()
         .try_acquire(&principal_key(&auth))
         .map_err(refused)?;
 
     let service = state.log_source_service.clone();
+    let validate_ocsf = request.validate_ocsf;
+    let vrl_code = request.vrl_code.clone();
+    let extension_vrl = request.extension_vrl.clone();
+    let sample_log = request.sample_log.clone();
     let result = run_admitted(permit, async move {
-        service
-            .test_vrl_chain(
-                &request.vrl_code,
-                request.extension_vrl.as_deref(),
-                &request.sample_log,
-            )
-            .await
+        if validate_ocsf {
+            service
+                .test_vrl_chain_ocsf(&vrl_code, extension_vrl.as_deref(), &sample_log)
+                .await
+        } else {
+            service
+                .test_vrl_chain(&vrl_code, extension_vrl.as_deref(), &sample_log)
+                .await
+        }
     })
     .await?
     .map_err(parser_test_error)?;
+
+    // NAN-5079: a passing OCSF test of the STORED generation is a receipt.
+    if validate_ocsf && result.success {
+        if let Some(id) = attest_id {
+            state
+                .log_source_service
+                .record_ocsf_test_attestation(
+                    id,
+                    &request.vrl_code,
+                    request.extension_vrl.as_deref(),
+                    &request.sample_log,
+                )
+                .await
+                .map_err(|e| ApiError::from(e).into_response())?;
+        }
+    }
     Ok(Json(result))
 }
 
@@ -811,12 +888,16 @@ fn check_test_sample(sample: &str) -> Result<(), ApiError> {
 }
 
 /// Deploy all enabled log sources
+///
+/// NAN-5132: a background deploy job; `?wait=` as for deploy.
 #[utoipa::path(
     post,
     path = "/api/log-sources/deploy-all",
     tag = "log_sources",
+    params(DeployWaitQuery),
     responses(
-        (status = 200, description = "All enabled log sources deployed"),
+        (status = 200, description = "All enabled log sources deployed (wait=true)"),
+        (status = 202, description = "Deploy-all job accepted (wait=false)", body = DeployJob),
         (status = 403, description = "Forbidden"),
     ),
     security(("api_key" = []))
@@ -825,20 +906,22 @@ pub async fn deploy_all_log_sources(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Query(wait): Query<DeployWaitQuery>,
+) -> Result<Response, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
-    state.log_source_service.deploy_all().await?;
-
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_DEPLOY_ALL)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .client_context(&client)
-            .build(),
-    );
-
-    Ok(Json(serde_json::json!({"deployed": true})))
+    let audit = DeployAudit { action: LOG_SOURCE_DEPLOY_ALL, auth: auth.clone(), client, extra: None };
+    run_deploy_job(&state, audit, DeployJobKind::DeployAll, None, wait.wait, move |state, progress| async move {
+        state
+            .log_source_service
+            .deploy_all_with_progress(progress.as_ref())
+            .await?;
+        Ok(DeployOk::Done(
+            serde_json::json!({"deployed": true}),
+            "All enabled log sources deployed".to_string(),
+        ))
+    })
+    .await
 }
 
 /// Query for [`get_delivery_status`].
@@ -912,6 +995,90 @@ pub struct ExpectedRevision {
     pub expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Publish body (all optional; an empty body is a plain publish).
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct PublishLogSourceRequest {
+    /// NAN-4919 compare-and-swap guard (see [`ExpectedRevision`]).
+    #[serde(default)]
+    pub expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// NAN-5079: representative raw events for the OCSF gate. On an OCSF
+    /// deployment a changed parser goes live only after each sample passes
+    /// VRL execution and OCSF validation; at most 50, 256 KiB each.
+    #[serde(default)]
+    pub ocsf_sample_logs: Vec<String>,
+    /// NAN-5079 (D2): publish a source's FIRST parser without a sample. The
+    /// publish is audited, and the next parser change needs a passing sample.
+    #[serde(default)]
+    pub acknowledge_unattested: bool,
+}
+
+/// Deploy body (all optional; an empty body is a plain deploy). Only a
+/// source's first go-live (not deployed, never published) is gated.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct DeployLogSourceRequest {
+    /// NAN-5079: representative raw events for the OCSF gate; at most 50,
+    /// 256 KiB each, 2 MiB total.
+    #[serde(default)]
+    pub ocsf_sample_logs: Vec<String>,
+    /// NAN-5079 (D2): go live without a sample. Audited; the next parser
+    /// change needs a passing sample.
+    #[serde(default)]
+    pub acknowledge_unattested: bool,
+    /// NAN-5079: the Add data flow's own first go-live without a sample (the
+    /// operator was not asked). Gated exactly like `acknowledge_unattested`
+    /// but audited as a system-initiated unattested install, not as an
+    /// operator acknowledgement.
+    #[serde(default)]
+    pub unattested_system_install: bool,
+}
+
+/// NAN-5079: audit a first go-live without a passing OCSF sample. An operator's
+/// explicit acknowledgement and Add data's system-initiated install (the user
+/// never ticked anything) are distinct actions.
+fn audit_unattested_go_live(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    id: uuid::Uuid,
+    action: &str,
+    system_install: bool,
+) {
+    let (event, initiator) = if system_install {
+        (LOG_SOURCE_OCSF_UNATTESTED_SYSTEM_INSTALL, "system")
+    } else {
+        (LOG_SOURCE_OCSF_UNATTESTED_PUBLISH, "user_acknowledged")
+    };
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::LogSource, event)
+            .actor(Some(auth.user_id()), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .resource("log_source", Some(id), None::<String>)
+            .client_context(client)
+            .details(serde_json::json!({ "action": action, "initiator": initiator }))
+            .build(),
+    );
+}
+
+impl DeployLogSourceRequest {
+    fn from_body(body: &[u8]) -> Result<Self, ApiError> {
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice::<Self>(body)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid request body: {e}")))
+    }
+}
+
+impl PublishLogSourceRequest {
+    fn from_body(body: &[u8]) -> Result<Self, ApiError> {
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice::<Self>(body)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid request body: {e}")))
+    }
+}
+
 impl ExpectedRevision {
     /// The body is optional and existing clients POST nothing (sometimes with
     /// a JSON content type), so an empty or whitespace body means "no guard".
@@ -926,17 +1093,24 @@ impl ExpectedRevision {
 }
 
 /// Publish working copy as new version and deploy
+///
+/// NAN-5132: the publish (validation, version, deploy) is a background deploy
+/// job; `?wait=` as for deploy. A 409 for a stale `expected_updated_at` comes
+/// back from the job (`error_status: 409`) when `wait=false`.
 #[utoipa::path(
     post,
     path = "/api/log-sources/{id}/publish",
     tag = "log_sources",
     params(
-        ("id" = String, Path, description = "Log source ID")
+        ("id" = String, Path, description = "Log source ID"),
+        DeployWaitQuery,
     ),
-    request_body(content = Option<ExpectedRevision>, description = "Optional: refuse with 409 unless the working copy is still this revision"),
+    request_body(content = Option<PublishLogSourceRequest>, description = "Optional: revision guard, OCSF samples, unattested acknowledgement"),
     responses(
         (status = 409, description = "The working copy changed since expected_updated_at"),
-        (status = 200, description = "Publish and deploy result", body = DeploymentResult),
+        (status = 200, description = "Publish and deploy result (wait=true)", body = DeploymentResult),
+        (status = 202, description = "Publish job accepted (wait=false)", body = DeployJob),
+        (status = 422, description = "OCSF validation failed or no OCSF receipt for a changed parser (checked before any job is created)"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -947,29 +1121,47 @@ pub async fn publish_log_source(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
+    Query(wait): Query<DeployWaitQuery>,
     body: axum::body::Bytes,
-) -> Result<Json<DeploymentResult>, ApiError> {
+) -> Result<Response, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
-    let expected = ExpectedRevision::from_body(&body)?;
-    let result = state
+    let request = PublishLogSourceRequest::from_body(&body)?;
+    let id = *id;
+    // NAN-5079: the OCSF gate runs BEFORE the job is enqueued (422, no job, on
+    // both wait paths). The job then publishes AT the revision the gate
+    // checked, so an edit in between is a 409, never an unchecked publish.
+    // This also answers 404 before a job exists for a missing source.
+    let gate = nanosiem_core::log_sources::OcsfGateInput {
+        samples: request.ocsf_sample_logs,
+        acknowledge_unattested: request.acknowledge_unattested,
+    };
+    let checked = state
         .log_source_service
-        .publish(*id, Some(auth.user_id()), expected)
+        .ocsf_publish_precheck(id, request.expected_updated_at, &gate)
         .await?;
+    // Audited at the acknowledgement itself: once the job creates the version
+    // it is active even if its deploy then fails.
+    if checked.outcome == nanosiem_core::log_sources::OcsfGateOutcome::Unattested {
+        audit_unattested_go_live(&state, &auth, &client, id, "publish", false);
+    }
 
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_PUBLISHED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("log_source", Some(*id), None::<String>)
-            .client_context(&client)
-            .details(serde_json::json!({
-                "success": result.success,
-            }))
-            .build(),
-    );
-
-    Ok(Json(result))
+    let expected = Some(checked.revision);
+    let audit = DeployAudit {
+        action: LOG_SOURCE_PUBLISHED,
+        auth: auth.clone(),
+        client,
+        extra: Some(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) })),
+    };
+    let user_id = auth.user_id();
+    run_deploy_job(&state, audit, DeployJobKind::Publish, Some(id), wait.wait, move |state, progress| async move {
+        let result = state
+            .log_source_service
+            .publish_with_progress(id, Some(user_id), expected, progress.as_ref())
+            .await?;
+        Ok(DeployOk::Result(result))
+    })
+    .await
 }
 
 /// Revert to a previous version
@@ -1107,6 +1299,12 @@ pub async fn get_log_source_draft_status(
     ),
     components(schemas(
         ExpectedRevision,
+        PublishLogSourceRequest,
+        DeployLogSourceRequest,
+        nanosiem_core::log_sources::OcsfAttestationStatus,
+        nanosiem_core::log_sources::OcsfAttestationState,
+        nanosiem_core::parsers::OcsfValidationResult,
+        nanosiem_core::parsers::OcsfValidationDiagnostic,
         ToggleRequest,
         ValidateVrlRequest,
         ValidateNamespaceRequest,

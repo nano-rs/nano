@@ -30,7 +30,8 @@ import { useTestLogSourceVrl, useTestLogSourceVrlLive } from '@/hooks/use-api';
 import { runParserTests } from '@/lib/parser-test-pool';
 import { useToast } from '@/hooks/use-toast';
 import { extractFields } from './TestResultRow';
-import type { LiveTestResult } from '@/lib/api/types';
+import type { LiveTestResult, OcsfValidationResult } from '@/lib/api/types';
+import { OcsfValidationErrors } from '@/components/log-sources/OcsfGate';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { readSchemaFieldEntry, type SemanticField } from '@/lib/schema-fields';
 
@@ -44,6 +45,12 @@ interface ParserTestLabProps {
    * pending chain-aware comparison support on the backend.
    */
   extensionVrl?: string;
+  /**
+   * NAN-5079: the source under test. A passing OCSF test of its STORED parser
+   * generation becomes the source's OCSF receipt (the server ignores an
+   * unsaved buffer).
+   */
+  logSourceId?: string;
 }
 
 /** Key fields to preview in collapsed row — shown as badges */
@@ -221,9 +228,10 @@ interface PasteResult {
   success: boolean;
   output?: Record<string, unknown>;
   error?: string;
+  schemaValidation?: OcsfValidationResult;
 }
 
-export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensionVrl }: ParserTestLabProps) {
+export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensionVrl, logSourceId }: ParserTestLabProps) {
   const { toast } = useToast();
   const { mutate: testVrl, loading: testLoading } = useTestLogSourceVrl();
   const { mutate: testVrlLive, loading: liveLoading } = useTestLogSourceVrlLive();
@@ -261,12 +269,13 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
       // Bounded concurrency with 429 retry: the server admits a bounded number
       // of concurrent parser tests per user and answers 429 + Retry-After.
       const results: PasteResult[] = await runParserTests(capped, async (line) => {
-        const r = await testVrl({ vrlCode, sampleLog: line, extensionVrl });
+        const r = await testVrl({ vrlCode, sampleLog: line, extensionVrl, logSourceId });
         return {
           input: line,
           success: r.success,
           output: r.output as Record<string, unknown> | undefined,
           error: r.error ?? undefined,
+          schemaValidation: r.schema_validation,
         };
       });
       setPasteResults(results);
@@ -449,7 +458,12 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
                       {r.input}
                     </p>
                   </div>
-                  {r.error ? (
+                  {r.schemaValidation && !r.schemaValidation.valid ? (
+                    <>
+                      <OcsfValidationErrors validation={r.schemaValidation} />
+                      <FieldGrid newFields={fields} />
+                    </>
+                  ) : r.error ? (
                     <p className="text-red-400 text-[11px] px-3 py-2">{r.error}</p>
                   ) : (
                     <FieldGrid newFields={fields} />

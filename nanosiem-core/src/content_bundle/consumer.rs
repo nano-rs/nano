@@ -343,25 +343,62 @@ pub struct CurrentRelease {
     pub bundle_url: String,
 }
 
+/// Most `alternates` entries considered in one metadata response.
+pub const MAX_ALTERNATES: usize = 4;
+
 /// Parse a metadata body: the descriptor verifies against `ring` and names
 /// `channel`, `bundle_sha256` equals its payload digest, and `bundle_url` is a
 /// plain https URL (http too only when `insecure_http`).
+///
+/// Key rotation (NAN-5283): the body may also carry `alternates`, each a
+/// `{descriptor, bundle_url, bundle_sha256}` for the same publication under
+/// another signing key. Releases before NAN-5283 ignore the field and read
+/// only the top-level entry. Entries are tried in order (top level first) and
+/// the first whose signer is in `ring` is used. Only an UNTRUSTED signer moves
+/// on to the next entry; any other failure (a bad signature by a trusted key,
+/// a wrong channel, a digest or URL mismatch) refuses the whole response, as
+/// before.
 pub fn parse_current(body: &[u8], ring: &KeyRing, channel: &str, insecure_http: bool) -> Result<CurrentRelease, ChannelError> {
     let response: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| ChannelError::Refused("content metadata is not JSON".into()))?;
-    let descriptor = serde_json::to_vec(&response["descriptor"])
+    let alternates = match &response["alternates"] {
+        serde_json::Value::Null => &[][..],
+        serde_json::Value::Array(entries) => &entries[..entries.len().min(MAX_ALTERNATES)],
+        _ => return Err(ChannelError::Refused("content metadata alternates must be a list".into())),
+    };
+    for entry in std::iter::once(&response).chain(alternates) {
+        if let Some(release) = parse_entry(entry, ring, channel, insecure_http)? {
+            return Ok(release);
+        }
+    }
+    Err(ContentError::UntrustedSigner.into())
+}
+
+/// One `{descriptor, bundle_url, bundle_sha256}` entry; `None` when its
+/// signer is not in `ring` (the caller tries the next entry).
+fn parse_entry(
+    entry: &serde_json::Value,
+    ring: &KeyRing,
+    channel: &str,
+    insecure_http: bool,
+) -> Result<Option<CurrentRelease>, ChannelError> {
+    let descriptor = serde_json::to_vec(&entry["descriptor"])
         .map_err(|_| ChannelError::Refused("content metadata descriptor".into()))?;
-    let signed = SignedContentDescriptor::from_json(&descriptor, ring)?;
+    let signed = match SignedContentDescriptor::from_json(&descriptor, ring) {
+        Ok(signed) => signed,
+        Err(ContentError::UntrustedSigner) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     if signed.descriptor.channel != channel {
         return Err(ChannelError::Refused(format!(
             "asked for channel {channel}, the signed descriptor is for {}",
             signed.descriptor.channel
         )));
     }
-    if response["bundle_sha256"].as_str() != Some(signed.descriptor.payload.sha256.as_str()) {
+    if entry["bundle_sha256"].as_str() != Some(signed.descriptor.payload.sha256.as_str()) {
         return Err(ChannelError::Refused("content metadata digest differs from its signed descriptor".into()));
     }
-    let url = response["bundle_url"]
+    let url = entry["bundle_url"]
         .as_str()
         .ok_or_else(|| ChannelError::Refused("content metadata download URL missing".into()))?;
     let parsed = url::Url::parse(url).map_err(|_| ChannelError::Refused("content download URL is not a URL".into()))?;
@@ -374,7 +411,7 @@ pub fn parse_current(body: &[u8], ring: &KeyRing, channel: &str, insecure_http: 
     {
         return Err(ChannelError::Refused("content download URL must be plain https".into()));
     }
-    Ok(CurrentRelease { signed, bundle_url: url.to_string() })
+    Ok(Some(CurrentRelease { signed, bundle_url: url.to_string() }))
 }
 
 /// Dev-only HTTP (no SSRF pinning, http allowed); never used by release

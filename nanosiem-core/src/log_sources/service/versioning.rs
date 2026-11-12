@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::LogSourceService;
 use super::LogSourceServiceError;
+use crate::log_sources::deploy_jobs::{DeployPhase, DeployProgress, NoProgress};
 use crate::log_sources::types::{
     DeploymentResult, LogSource, LogSourceVersion, LogSourceWithDraftStatus, UpdateLogSource,
 };
@@ -23,6 +24,19 @@ impl LogSourceService {
         user_id: Option<Uuid>,
         expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<DeploymentResult, LogSourceServiceError> {
+        self.publish_with_progress(id, user_id, expected_updated_at, &NoProgress)
+            .await
+    }
+
+    /// [`Self::publish`] with phase reports (NAN-5132).
+    pub async fn publish_with_progress(
+        &self,
+        id: Uuid,
+        user_id: Option<Uuid>,
+        expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+        progress: &dyn DeployProgress,
+    ) -> Result<DeploymentResult, LogSourceServiceError> {
+        progress.phase(DeployPhase::Validating);
         let ls = self.repository().find_by_id(id).await?;
         ensure_unchanged(id, ls.updated_at, expected_updated_at)?;
 
@@ -104,7 +118,7 @@ impl LogSourceService {
 
         // Deploy — renders the active version just created, via the canonical
         // effective-deployed query shared with publication (NAN-2304).
-        self.deploy(id).await
+        self.deploy_with_progress(id, progress).await
     }
 
     /// Revert to a previous version: creates a NEW version copying the target, then updates working copy.
@@ -236,11 +250,13 @@ impl LogSourceService {
             None => (unversioned_has_draft(&ls), None, None),
         };
 
+        let ocsf_attestation = self.ocsf_attestation_status(&ls).await?;
         Ok(LogSourceWithDraftStatus {
             log_source: ls,
             has_draft_changes,
             active_version_number,
             active_parser_vrl,
+            ocsf_attestation,
         })
     }
 }
@@ -276,7 +292,7 @@ pub(crate) fn unversioned_has_draft(ls: &LogSource) -> bool {
 }
 
 /// Refuse when a caller-observed `updated_at` no longer matches the row.
-fn ensure_unchanged(
+pub(super) fn ensure_unchanged(
     id: Uuid,
     actual: chrono::DateTime<chrono::Utc>,
     expected: Option<chrono::DateTime<chrono::Utc>>,

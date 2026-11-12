@@ -314,3 +314,67 @@ fn helm_vector_seeds_match_compose_seeds() {
     assert_eq!(otlp, OTLP, "Helm OTLP seed drifted");
     assert_eq!(enrich, ENRICH_SOURCE, "Helm enrichment source drifted");
 }
+
+/// NAN-5285: the durable-2xx contract depends on the Vector image (the
+/// fsync-before-ack disk buffer is nano-rs/vector 0.61.0-nano.10+). Every
+/// shipped pin must name the same image and digest, so a bump can't leave one
+/// install path (compose, open core, the image locks) on an older buffer.
+#[test]
+fn every_shipped_vector_pin_names_one_image() {
+    fn pins(text: &str) -> Vec<String> {
+        text.lines()
+            .filter_map(|line| {
+                let at = line.find("ghcr.io/nano-rs/vector:")?;
+                let rest = &line[at..];
+                // `image@sha256:…` (compose) or `image sha256:…` (locks).
+                let pin: String = rest
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .replace(" sha256:", "@sha256:");
+                Some(pin.split_whitespace().next().unwrap_or_default().to_string())
+            })
+            .collect()
+    }
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for path in [
+        "docker-compose.yml",
+        "docker-compose.opensource.yml",
+        "images.lock",
+        "deploy/release/images.enterprise.lock",
+        "deploy/k8s/vector/vector.yaml",
+        "deploy/k8s/rackspace/vector.yaml",
+        "deploy/templates/vector-s3-sync.docker-compose.yml",
+    ] {
+        let Some(text) = repo_file(path) else { continue };
+        for pin in pins(&text) {
+            seen.push((path.to_string(), pin));
+        }
+    }
+    // The Helm chart pins Vector in `nano.imagePins` as separate tag/digest
+    // lines (NAN-5280); `nano.shippedImagePins` (older refs) is skipped.
+    let helm_pins = "deploy/helm/nano/templates/_image_pins.tpl";
+    if let Some(text) = repo_file(helm_pins) {
+        let block = text
+            .split("{{- define \"nano.imagePins\" -}}")
+            .nth(1)
+            .and_then(|rest| rest.split("{{- end -}}").next())
+            .expect("nano.imagePins block");
+        let mut lines = block.lines().skip_while(|l| l.trim() != "vector:").skip(1);
+        let mut field = |name: &str| -> String {
+            lines
+                .next()
+                .and_then(|l| l.trim().strip_prefix(&format!("{name}: ")).map(str::to_string))
+                .unwrap_or_else(|| panic!("{helm_pins}: vector {name} line"))
+        };
+        let (repo, tag, digest) = (field("repository"), field("tag"), field("digest"));
+        seen.push((helm_pins.to_string(), format!("{repo}:{tag}@{digest}")));
+    }
+    assert!(!seen.is_empty(), "no Vector image pins found");
+    let first = &seen[0].1;
+    assert!(first.contains("@sha256:"), "{}: pin without a digest: {first}", seen[0].0);
+    for (path, pin) in &seen {
+        assert_eq!(pin, first, "{path} pins a different Vector image than {}", seen[0].0);
+    }
+}

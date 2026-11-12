@@ -9,7 +9,11 @@ as before. The authority is the **Multi-node Self-run** guide, section
 ## Recommend
 
 - **Three postgres hosts** (`roles: [postgres]`, they may also carry
-  `keeper` or `clickhouse`). etcd and Sentinel run on them.
+  `keeper` or `clickhouse`). etcd and Sentinel run on them. A NEW install
+  with three Keeper hosts that are not all postgres hosts may set
+  `cluster.postgres_ha.dcs_hosts: keeper` to run them on the Keeper hosts
+  instead (about 3-4 s faster failover). Never add it to an existing
+  install: it is a topology change (empty etcd) that the installer refuses.
 - Two postgres hosts only when the inventory already has **three Keeper
   hosts**: etcd and Sentinel then run on the Keeper hosts as witnesses.
 - Keep the default `cluster.postgres_ha.synchronous_mode: on`. Say why: a

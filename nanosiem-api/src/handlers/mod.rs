@@ -93,6 +93,7 @@ pub mod license;
 #[cfg(feature = "enterprise")]
 pub mod license_usage;
 pub mod log_source_connect;
+pub mod log_source_deploy_jobs;
 pub mod log_source_health_series;
 pub mod log_sources;
 pub mod pipeline_tap;

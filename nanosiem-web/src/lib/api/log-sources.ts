@@ -14,28 +14,132 @@ import type {
   IngestionHistoryPoint,
   EnhancedDeploymentResponse,
   GenerationDeliveryStatus,
+  DeployJob,
   NamespaceValidationResult,
+  OcsfGateRequest,
 } from './types';
+import { followDeployJob, type PollOptions } from '../deploy-job';
+
+/** NAN-5079: the OCSF gate fields of a publish / deploy body. */
+export function ocsfGateBody(ocsf?: OcsfGateRequest): Record<string, unknown> {
+  const samples = (ocsf?.ocsfSampleLogs ?? []).filter((s) => s.trim() !== '');
+  return {
+    ...(samples.length > 0 ? { ocsf_sample_logs: samples } : {}),
+    ...(ocsf?.acknowledgeUnattested ? { acknowledge_unattested: true } : {}),
+    ...(ocsf?.unattestedSystemInstall ? { unattested_system_install: true } : {}),
+  };
+}
 
 /**
- * NAN-5131: deploy/undeploy/publish render the Vector config synchronously and
- * take 90 s+ on a small host. The edge gives these routes 300 s; the client
- * waits a little longer so the edge's answer (not a client abort) is shown.
+ * NAN-5131: deploy/undeploy/publish rendered the Vector config synchronously
+ * and could take 90 s+ on a small host, so these routes got a 300 s edge
+ * budget and the client waited a little longer.
+ *
+ * NAN-5132: they now start a background job (`?wait=false` → 202) and the
+ * client polls it, so the request returns at once. The long timeout stays on
+ * the start request only for a server that predates deploy jobs and answers
+ * synchronously.
  */
 export const DEPLOY_REQUEST_TIMEOUT_MS = 310_000;
 /** A request with an explicit client timeout. */
 export type LongRequest = <T>(endpoint: string, options: RequestInit, timeoutMs: number) => Promise<T>;
+/** Builds the error a failed job throws (an ApiClientError in the app). */
+export type DeployErrorFactory = (message: string, code: string, status?: number) => Error;
+
+/** Options for a deploy call: progress callback and polling overrides. */
+/**
+ * Poll options for a deploy job, plus (NAN-5079) the OCSF gate fields sent in
+ * the start request's body. The server checks the gate BEFORE creating the
+ * job, so a refusal is a 422 on the start request itself.
+ */
+export type DeployCallOptions = PollOptions & { ocsf?: OcsfGateRequest };
+
+/** JSON `init` fields for a deploy-route body; omitted when empty. */
+function jsonBody(body: Record<string, unknown>): { body?: string } {
+  return Object.keys(body).length > 0 ? { body: JSON.stringify(body) } : {};
+}
+
+function isDeployJob(value: unknown): value is DeployJob {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as DeployJob).id === 'string' &&
+    typeof (value as DeployJob).state === 'string' &&
+    typeof (value as DeployJob).status_path === 'string'
+  );
+}
+
+const defaultErrorFactory: DeployErrorFactory = (message, code, status) =>
+  Object.assign(new Error(message), { code, status });
+
+function errorCode(status: number | null | undefined): string {
+  switch (status) {
+    case 400:
+      return 'BAD_REQUEST';
+    case 403:
+      return 'FORBIDDEN';
+    case 404:
+      return 'NOT_FOUND';
+    case 409:
+      return 'CONFLICT';
+    case 422:
+      return 'VALIDATION_ERROR';
+    case 429:
+      return 'TOO_MANY_REQUESTS';
+    default:
+      return 'DEPLOY_JOB_FAILED';
+  }
+}
 
 export class LogSourcesApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
     private longRequest?: LongRequest,
+    private makeError: DeployErrorFactory = defaultErrorFactory,
   ) {}
 
   private deployRequest<T>(endpoint: string, options: RequestInit): Promise<T> {
     return this.longRequest
       ? this.longRequest<T>(endpoint, options, DEPLOY_REQUEST_TIMEOUT_MS)
       : this.request<T>(endpoint, options);
+  }
+
+  /**
+   * Start a deploy job and follow it to the end. Resolves to the job's final
+   * body exactly as the synchronous call returned it (`legacy` for deploy-all,
+   * which has no per-source result); rejects with the status the synchronous
+   * call would have returned when the job failed with an error.
+   */
+  private async runDeployJob<T>(
+    endpoint: string,
+    init: RequestInit,
+    options: DeployCallOptions | undefined,
+    legacy?: T,
+  ): Promise<T> {
+    const separator = endpoint.includes('?') ? '&' : '?';
+    const started = await this.deployRequest<unknown>(`${endpoint}${separator}wait=false`, init);
+    // A server without deploy jobs ignores `wait` and answers with the result.
+    if (!isDeployJob(started)) return started as T;
+    const job = await followDeployJob(started, (id) => this.getDeployJob(id), options);
+    if (job.result) return job.result as T;
+    if (job.error_status != null || job.state !== 'succeeded') {
+      throw this.makeError(
+        job.message || 'The deploy did not complete.',
+        job.state === 'interrupted' ? 'DEPLOY_INTERRUPTED' : errorCode(job.error_status),
+        job.error_status ?? undefined,
+      );
+    }
+    return (legacy ?? ({ deployed: true } as T)) as T;
+  }
+
+  /** NAN-5132: one deploy job. */
+  async getDeployJob(id: string): Promise<DeployJob> {
+    return this.request(`/api/log-sources/deploy-jobs/${encodeURIComponent(id)}`);
+  }
+
+  /** NAN-5132: recent deploy jobs for a log source (newest first, includes deploy-all). */
+  async listLogSourceDeployJobs(id: string, limit = 5): Promise<DeployJob[]> {
+    return this.request(`/api/log-sources/${encodeURIComponent(id)}/deploy-jobs?limit=${limit}`);
   }
 
   async listLogSources(): Promise<LogSource[]> {
@@ -86,19 +190,28 @@ export class LogSourcesApi {
     });
   }
 
+  /**
+   * NAN-5079: `validate_ocsf` is always sent; the server applies the OCSF
+   * contract only on an OCSF deployment. With `logSourceId`, a passing test
+   * of that source's STORED generation becomes its OCSF receipt (needs
+   * log_sources:edit); an unsaved buffer is validated but never attested.
+   */
   async testLogSourceVrl(
     vrlCode: string,
     sampleLog: string,
     extensionVrl?: string,
+    logSourceId?: string,
   ): Promise<LogSourceTestResult> {
     return this.request('/api/log-sources/test-vrl', {
       method: 'POST',
       body: JSON.stringify({
         vrl_code: vrlCode,
         sample_log: sampleLog,
+        validate_ocsf: true,
         ...(extensionVrl && extensionVrl.trim() !== ''
           ? { extension_vrl: extensionVrl }
           : {}),
+        ...(logSourceId ? { log_source_id: logSourceId } : {}),
       }),
     });
   }
@@ -110,22 +223,20 @@ export class LogSourcesApi {
     });
   }
 
-  async deployLogSource(id: string): Promise<EnhancedDeploymentResponse> {
-    return this.deployRequest(`/api/log-sources/${id}/deploy`, {
-      method: 'POST',
-    });
+  async deployLogSource(id: string, options?: DeployCallOptions): Promise<EnhancedDeploymentResponse> {
+    return this.runDeployJob(
+      `/api/log-sources/${id}/deploy`,
+      { method: 'POST', ...jsonBody(ocsfGateBody(options?.ocsf)) },
+      options,
+    );
   }
 
-  async undeployLogSource(id: string): Promise<EnhancedDeploymentResponse> {
-    return this.deployRequest(`/api/log-sources/${id}/undeploy`, {
-      method: 'POST',
-    });
+  async undeployLogSource(id: string, options?: DeployCallOptions): Promise<EnhancedDeploymentResponse> {
+    return this.runDeployJob(`/api/log-sources/${id}/undeploy`, { method: 'POST' }, options);
   }
 
-  async deployAllLogSources(): Promise<{ deployed: boolean }> {
-    return this.deployRequest('/api/log-sources/deploy-all', {
-      method: 'POST',
-    });
+  async deployAllLogSources(options?: DeployCallOptions): Promise<{ deployed: boolean }> {
+    return this.runDeployJob('/api/log-sources/deploy-all', { method: 'POST' }, options, { deployed: true });
   }
 
   /** NAN-5279: re-check a deploy's generation on the ingest hosts (one poll, no wait). */
@@ -171,13 +282,22 @@ export class LogSourcesApi {
    * Publish the working copy. `expectedUpdatedAt` (NAN-4919) makes the server
    * refuse with 409 unless the working copy is still the reviewed revision.
    */
-  async publishLogSource(id: string, expectedUpdatedAt?: string): Promise<EnhancedDeploymentResponse> {
-    return this.deployRequest(`/api/log-sources/${id}/publish`, {
-      method: 'POST',
-      ...(expectedUpdatedAt
-        ? { body: JSON.stringify({ expected_updated_at: expectedUpdatedAt }) }
-        : {}),
-    });
+  async publishLogSource(
+    id: string,
+    expectedUpdatedAt?: string,
+    options?: DeployCallOptions,
+  ): Promise<EnhancedDeploymentResponse> {
+    return this.runDeployJob(
+      `/api/log-sources/${id}/publish`,
+      {
+        method: 'POST',
+        ...jsonBody({
+          ...(expectedUpdatedAt ? { expected_updated_at: expectedUpdatedAt } : {}),
+          ...ocsfGateBody(options?.ocsf),
+        }),
+      },
+      options,
+    );
   }
 
   async revertLogSourceVersion(id: string, versionId: number): Promise<LogSourceVersion> {

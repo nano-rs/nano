@@ -192,6 +192,10 @@ impl AppState {
         // open consumer's registry (an open build registers none).
         #[cfg(feature = "enterprise")]
         nanosiem_enterprise::content_channels::install(pg_pool.clone(), audit_emitter.clone());
+        // NAN-5097 review: `auto`'s runtime demotions land in the readiness
+        // table in every process that runs enrichments (API and jobs).
+        #[cfg(feature = "enterprise")]
+        nanosiem_enterprise::custom_enrichment::wasm_status::install_runtime_attention_store(pg_pool.clone());
         // NAN-5220: those channels (and the sovereign feed route) present this
         // install's license: the online token, else the installed C05 file,
         // looked up on every check (a partial online tuple presents only an
@@ -436,6 +440,11 @@ impl AppState {
             log_source_service: LogSourceService::with_dual_pool_and_vector_config(
                 &dual_pool,
                 shared_vector_config,
+            ),
+            log_source_deploy_jobs: Arc::new(
+                nanosiem_core::log_sources::deploy_jobs::DeployJobRunner::with_pool(
+                    dual_pool.postgres().clone(),
+                ),
             ),
             // ClickHouse-backed rollup of per-source_type events/bytes/last_event_at.
             // Reads through `table_names.read("logs_per_source_5m")` so it picks

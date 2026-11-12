@@ -74,6 +74,7 @@ fn issued_token_debug_is_redacted() {
         credential: token(),
         token: "nit_abcdefghSECRETSECRET".into(),
         replaced: Some(token()),
+        active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
     };
     assert!(!format!("{issued:?}").contains("SECRET"));
     let json = serde_json::to_value(&issued).unwrap();
@@ -83,8 +84,12 @@ fn issued_token_debug_is_redacted() {
         credential: token(),
         token: "x".into(),
         replaced: None,
+        active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
     };
-    assert!(serde_json::to_value(&fresh).unwrap().get("replaced").is_none());
+    let fresh = serde_json::to_value(&fresh).unwrap();
+    assert!(fresh.get("replaced").is_none());
+    // NAN-5285 (F7): the sender is told how long a new token takes to work.
+    assert_eq!(fresh["active_within_secs"], TOKEN_ACTIVE_WITHIN_SECS);
 }
 
 #[test]

@@ -9,6 +9,7 @@ use super::LogSourceService;
 use super::LogSourceServiceError;
 use crate::parsers::vector_config_remote_delivery::with_delivery;
 use crate::parsers::VrlValidator;
+use crate::log_sources::deploy_jobs::{DeployPhase, DeployProgress, NoProgress};
 use crate::log_sources::types::{
     DeploymentAction, DeploymentResult, DeploymentStatus, LogSourceDeployment, VrlValidationResult,
 };
@@ -16,6 +17,17 @@ use crate::log_sources::types::{
 impl LogSourceService {
     /// Deploy a log source to Vector
     pub async fn deploy(&self, id: Uuid) -> Result<DeploymentResult, LogSourceServiceError> {
+        self.deploy_with_progress(id, &NoProgress).await
+    }
+
+    /// [`Self::deploy`], reporting each phase to `progress` (NAN-5132: the
+    /// deploy job records them for the UI).
+    pub async fn deploy_with_progress(
+        &self,
+        id: Uuid,
+        progress: &dyn DeployProgress,
+    ) -> Result<DeploymentResult, LogSourceServiceError> {
+        progress.phase(DeployPhase::WaitingForLock);
         // NAN-2297: stage → validate → backup → promote → reload is ONE critical
         // section against a single on-disk staging directory. Held for the whole
         // sequence, not per-step, so a concurrent deploy cannot clean this one's
@@ -26,6 +38,7 @@ impl LogSourceService {
         // Everything below must stay on lock-free helpers or `*_locked`
         // variants — the mutex is not reentrant.
         let _deploy_guard = self.vector_config.lock_deploys().await;
+        progress.phase(DeployPhase::Validating);
 
         let log_source = self.repository().find_by_id(id).await?;
 
@@ -36,7 +49,7 @@ impl LogSourceService {
         // source renders it again and fails the same way, until someone
         // deletes it. That is the second half of the draft-deploy wedge.
         let was_enabled = log_source.enabled;
-        let result = self.deploy_locked(id, log_source).await;
+        let result = self.deploy_locked(id, log_source, progress).await;
         let live = matches!(&result, Ok(r) if r.success);
         if !live && !was_enabled {
             match self.repository().disable(id).await {
@@ -60,6 +73,7 @@ impl LogSourceService {
         &self,
         id: Uuid,
         log_source: crate::log_sources::types::LogSource,
+        progress: &dyn DeployProgress,
     ) -> Result<DeploymentResult, LogSourceServiceError> {
         tracing::info!(
             "Starting deployment for log source '{}' ({})",
@@ -142,6 +156,7 @@ impl LogSourceService {
 
         // Step 2: Get all enabled log sources and deploy them all
         // Enable this log source for deployment
+        progress.phase(DeployPhase::Rendering);
         self.repository().enable(id).await?;
 
         // NAN-928: the helper also resolves dispatch source-config route names
@@ -223,6 +238,7 @@ impl LogSourceService {
                 raw_output: String::new(),
             }
         } else {
+            progress.phase(DeployPhase::ValidatingConfig);
             match self.vector_config.validate_staged_config().await {
                 Ok(result) => result,
                 Err(e) => {
@@ -302,6 +318,7 @@ impl LogSourceService {
         // leftover backup describes a different starting state; restoring it is
         // an unrelated overwrite, and when the leftover is the empty
         // first-install backup it deletes a live config outright.
+        progress.phase(DeployPhase::Promoting);
         let backup = match self.vector_config.backup_current().await {
             Ok(generation) => Some(generation),
             Err(e) => {
@@ -327,6 +344,7 @@ impl LogSourceService {
             // restored since NAN-2300; this is the same sequence.
             match backup.as_ref() {
                 Some(generation) => {
+                    progress.phase(DeployPhase::RollingBack);
                     if let Err(restore_err) = self.vector_config.restore_backup(generation).await {
                         tracing::error!(
                             "Restore after failed promotion also failed: {}. Active config may be \
@@ -372,6 +390,7 @@ impl LogSourceService {
         // helper is the only thing that knows whether the restore actually ran.
         //
         // `_locked`: this method already holds the deploy guard (NAN-2297).
+        progress.phase(DeployPhase::Reloading);
         if let Err(failure) = self
             .vector_config
             .reload_and_verify_locked(backup.as_ref())
@@ -430,6 +449,9 @@ impl LogSourceService {
                 return Err(LogSourceServiceError::RollbackFailed(error_msg));
             }
 
+            if failure.rolled_back {
+                progress.phase(DeployPhase::RollingBack);
+            }
             let (action, status) = if failure.rolled_back {
                 (DeploymentAction::Rollback, DeploymentStatus::RolledBack)
             } else {
@@ -518,7 +540,24 @@ impl LogSourceService {
 
     /// Undeploy a log source from Vector
     pub async fn undeploy(&self, id: Uuid) -> Result<DeploymentResult, LogSourceServiceError> {
+        self.undeploy_with_progress(id, &NoProgress).await
+    }
+
+    /// [`Self::undeploy`] with phase reports (NAN-5132).
+    ///
+    /// The deploy lock is taken before the source is disabled, so the render
+    /// that drops it reads the database state this call wrote, and a queued
+    /// deploy job for the same target has not read anything yet.
+    pub async fn undeploy_with_progress(
+        &self,
+        id: Uuid,
+        progress: &dyn DeployProgress,
+    ) -> Result<DeploymentResult, LogSourceServiceError> {
         let log_source = self.repository().find_by_id(id).await?;
+
+        progress.phase(DeployPhase::WaitingForLock);
+        let _deploy_guard = self.vector_config.lock_deploys().await;
+        progress.phase(DeployPhase::Rendering);
 
         tracing::info!("Undeploying log source '{}' ({})", log_source.name, id);
 
@@ -529,7 +568,8 @@ impl LogSourceService {
         // Redeploy all remaining enabled log sources (using active versions)
         let parsers = self.effective_deployed_parsers().await?;
 
-        if let Err(e) = self.vector_config.deploy_and_reload(&parsers).await {
+        progress.phase(DeployPhase::Reloading);
+        if let Err(e) = self.vector_config.deploy_and_reload_locked(&parsers).await {
             let error_msg = format!("Failed to redeploy after undeploy: {}", e);
             tracing::error!("{}", error_msg);
 
@@ -610,9 +650,24 @@ impl LogSourceService {
 
     /// Deploy all enabled log sources (using active version VRL)
     pub async fn deploy_all(&self) -> Result<(), LogSourceServiceError> {
+        self.deploy_all_with_progress(&NoProgress).await
+    }
+
+    /// [`Self::deploy_all`] with phase reports (NAN-5132). The enabled set is
+    /// read under the deploy lock, so a deploy-all job that was queued renders
+    /// the state at the time it runs, not the time it was requested.
+    pub async fn deploy_all_with_progress(
+        &self,
+        progress: &dyn DeployProgress,
+    ) -> Result<(), LogSourceServiceError> {
+        progress.phase(DeployPhase::WaitingForLock);
+        let _deploy_guard = self.vector_config.lock_deploys().await;
+        progress.phase(DeployPhase::Rendering);
+
         let parsers = self.effective_deployed_parsers().await?;
 
-        self.vector_config.deploy_and_reload(&parsers).await?;
+        progress.phase(DeployPhase::Reloading);
+        self.vector_config.deploy_and_reload_locked(&parsers).await?;
 
         // Mark all as deployed
         for ls in self.repository().list_enabled().await? {

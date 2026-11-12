@@ -266,7 +266,7 @@ pub fn create_router(state: AppState) -> Router {
             detection_code_probe_rate_limit_middleware,
         ));
 
-    // NAN-2062: preview can decrypt saved provider credentials, execute Deno
+    // NAN-2062: preview can decrypt saved provider credentials, execute sandboxed code
     // code, and make outbound requests. Every call is rate-limited per
     // interactive user/API key and provider slug.
     #[cfg(feature = "enterprise")]
@@ -379,6 +379,13 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/internal/vector-config/ingest-tokens",
             get(handlers::vector_config_delivery::get_ingest_tokens_file),
+        )
+        // NAN-5285: one ingest host installs a generation at a time. Same
+        // bearer gate as the generation delivery.
+        .route(
+            "/api/internal/vector-config/install-lease",
+            post(handlers::vector_config_delivery::post_install_lease)
+                .delete(handlers::vector_config_delivery::delete_install_lease),
         )
         // NAN-4907: nginx auth_request for the OTLP edge. Exempt from
         // user-session auth (PUBLIC_ENDPOINTS): the handler authenticates the
@@ -1017,7 +1024,7 @@ pub fn create_router(state: AppState) -> Router {
     // configure / sync / auto-sync routes too: IPinfo comes only from
     // the signed platform feed bundle above.
 
-    // Agent enrichment lookup (Deno providers — VirusTotal, AbuseIPDB, etc.)
+    // Agent enrichment lookup (sandboxed-code providers — VirusTotal, AbuseIPDB, etc.)
     // — enterprise only, depends on the lifted agent_enrichment +
     // custom_enrichment::sandbox modules.
     #[cfg(feature = "enterprise")]
@@ -1116,6 +1123,15 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/log-sources/deploy-all",
             post(handlers::log_sources::deploy_all_log_sources),
+        )
+        // NAN-5132: background deploy jobs.
+        .route(
+            "/api/log-sources/deploy-jobs/{job_id}",
+            get(handlers::log_source_deploy_jobs::get_deploy_job),
+        )
+        .route(
+            "/api/log-sources/{id}/deploy-jobs",
+            get(handlers::log_source_deploy_jobs::list_log_source_deploy_jobs),
         )
         // NAN-5279: re-check a deploy's generation on the ingest hosts.
         .route(

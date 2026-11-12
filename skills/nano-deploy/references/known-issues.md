@@ -64,6 +64,26 @@ product's files.
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.
 
+## 2.0.13 (fixed in 2.0.14)
+
+- **The upgrade's backup fails on a postgres host without the
+  `--backup-output` folder**, after a passing dry run: `host vm-7 backup
+  failed: mkdir: cannot create directory '/mnt/nano-backups': Permission
+  denied` at `backup:consistent-set`. **Handling:** create the folder, owned
+  by the install user, on every postgres host (and every ClickHouse host with
+  `--include-clickhouse-data`) (see
+  [upgrade.md](upgrade.md) Path A step 3), then `scripts/nano upgrade
+  --resume`.
+- **The dry run prints nothing for 2.5 to 4.5 minutes** over plain ssh (the
+  preflight result table arrives at the end). The upgrade steps themselves
+  stream. **Handling:** wait, or follow the journal. From 2.0.14 every
+  preflight phase prints a `==> … preflight checks on <host>: started` /
+  `done in Ns (P/T PASS)` line as it happens.
+- **The upgrade moves `NANO_VERSION` to the end of `.env`** and drops an
+  operator's duplicate key line (keeping the value in effect) without saying
+  so. Nothing breaks. From 2.0.14 keys stay on their line and collapsed keys
+  are named.
+
 ## 2.0.12 (fixed in 2.0.13)
 
 - **`scripts/nano upgrade` keeps every host's old rendered configuration**

@@ -175,7 +175,7 @@ function IssueTokenDialog({
           </DialogTitle>
           <DialogDescription>
             {issued
-              ? 'Copy the token now. It is shown once and cannot be read again.'
+              ? 'Copy the token now. It is shown once and cannot be read again. Every ingest host accepts it within about 10 seconds; a 401 before then means retry.'
               : 'Name the sender and pick its source. Every event sent with the token lands in that source, whatever sourcetype it declares. The binding never changes.'}
           </DialogDescription>
         </DialogHeader>
@@ -916,8 +916,10 @@ export function IngestTokensPanel() {
           ) : (
             <>
               Senders using <span className="font-mono text-foreground">VECTOR_AUTH_TOKEN</span> are refused on the HEC
-              and HTTP ingest endpoints within a few seconds. Built-in collector integrations use their own platform
-              credential and keep delivering. Move every sender to a named token first.
+              and HTTP ingest endpoints within a few seconds, and can no longer download Vector config. Built-in
+              collector integrations use their own platform credential and keep delivering. Move every sender to a
+              named token first, and give every Vector config consumer{' '}
+              <span className="font-mono text-foreground">NANO_VECTOR_CONFIG_DELIVERY_TOKEN</span>.
             </>
           )
         }

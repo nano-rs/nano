@@ -121,5 +121,55 @@ mkdir -p "$t/scripts"
 printf 'export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-}"\n' > "$t/scripts/start-dev.sh"
 expect "docs RAG token read from env only -> clean" "$t" 0
 
+# NAN-5025: --mask, the filter release reports (git-tree-diff.sh) go through.
+# The docs RAG token sat in a mirrored dev script; a release diff spanning its
+# removal quoted it verbatim into docs-internal. Tokens generated at run time.
+tok="nsiem-docs-$(openssl rand -hex 16)"
+gh="ghp_$(openssl rand -hex 20)"
+masked="$(printf 'export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-%s}"\nauth %s\nrisk-score sk-abcd AKIAIOSFODNN7EXAMPLE\n' "$tok" "$gh" | bash "$SCAN" --mask)"
+if [[ "$masked" == *"$tok"* || "$masked" == *"${tok#nsiem-docs-}"* || "$masked" == *"${gh#ghp_}"* ]]; then
+    no "--mask leaves no credential value"
+else
+    ok "--mask leaves no credential value"
+fi
+if [[ "$masked" == *"risk-score sk-abcd AKIAIOSFODNN7EXAMPLE"* ]]; then
+    ok "--mask leaves ordinary text and ALLOW entries alone"
+else
+    no "--mask changed ordinary text: $masked"
+fi
+
+# A multi-line PEM key body (a removed fixture in a diff) is masked line by
+# line; prose after a stray BEGIN marker is left alone.
+body1="$(openssl rand -base64 48 | tr -d '\n')"
+body2="$(openssl rand -base64 48 | tr -d '\n')"
+pem="$(printf -- '------BEGIN RSA PRIVATE KEY-----\n-%s\n-%s\n------END RSA PRIVATE KEY-----\n -----BEGIN PRIVATE KEY-----\n some ordinary prose follows here\n ordinaryidentifierwithlongname\n' "$body1" "$body2" | bash "$SCAN" --mask)"
+if [[ "$pem" == *"${body1:0:24}"* || "$pem" == *"${body2:0:24}"* ]]; then
+    no "--mask leaves a multi-line PEM key body"
+elif [[ "$pem" != *"some ordinary prose follows here"* || "$pem" != *"ordinaryidentifierwithlongname"* ]]; then
+    no "--mask swallowed text after a stray BEGIN marker: $pem"
+else
+    ok "--mask masks a multi-line PEM body and nothing after it"
+fi
+
+# git-tree-diff.sh end to end: a commit that REMOVES a hardcoded token (the
+# NAN-5025 fix shape) must not re-publish it in the release report.
+repo="$WORK/diff-repo"
+mkdir -p "$repo/scripts"
+git -C "$repo" init -q
+git -C "$repo" config user.email t@example.invalid
+git -C "$repo" config user.name t
+printf 'export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-%s}"\n' "$tok" > "$repo/scripts/start-dev.sh"
+git -C "$repo" add -A && git -C "$repo" commit -qm leak
+printf 'export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-}"\n' > "$repo/scripts/start-dev.sh"
+git -C "$repo" commit -qam fix
+report="$(cd "$repo" && bash "$ROOT/scripts/release/git-tree-diff.sh" HEAD~1 HEAD)"
+if [[ "$report" == *"${tok#nsiem-docs-}"* ]]; then
+    no "git-tree-diff report re-publishes a removed token"
+elif [[ "$report" != *"nsiem-[REDACTED]"* ]]; then
+    no "git-tree-diff report lost the removed line entirely"
+else
+    ok "git-tree-diff report masks a removed token"
+fi
+
 echo "$pass passed, $failed failed"
 [[ "$failed" == 0 ]]

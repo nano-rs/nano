@@ -1030,7 +1030,7 @@ function CodeTab({ entry, handleExport, exporting }: CodeTabProps) {
     <div className="p-0">
       <div className="px-5 py-2 border-b border-border flex items-center gap-2 bg-muted/20">
         <span className="font-mono text-[11px] text-muted-foreground">
-          {entry.execution_backend === 'collector' ? 'collector.ts' : 'enrich.ts'}
+          {entry.execution_backend === 'collector' ? 'collector.ts' : 'code.ts'}
         </span>
         <div className="flex-1" />
         {entry.execution_backend === 'deno' && entry.custom_enrichment_id && (

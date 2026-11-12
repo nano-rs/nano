@@ -6,7 +6,7 @@
 //! - `types` — request/response types
 //! - `sources` — source listing, enable/disable, stats
 //! - `lookup` — IP lookup against the ingest-time IP dictionary
-//! - `agent` — generic agent enrichment lookup runtime (Deno providers)
+//! - `agent` — generic agent enrichment lookup runtime (sandboxed-code providers)
 //! - `platform_feeds` — nano's signed platform feed bundle (IPinfo Lite,
 //!   ThreatFox, Tor exit list): status, check now, offline import (NAN-4948).
 //!   IPinfo Lite comes only from this bundle: NAN-4959 removed main's native

@@ -118,3 +118,45 @@ fn ocsf_null_forms_keep_clickhouse_rules() {
         assert!(!sql.contains("JSONExtract"), "{npl}: {sql}");
     }
 }
+
+/// NAN-5285 (v2.0.13 retest F9): a piped `| search "kw"` on OCSF tokenizes
+/// `message` OR `raw_data` (NAN-1828), so the pruned base stage must project
+/// `raw_data`; it projected only `message` and ClickHouse answered "Field
+/// 'raw_data' does not exist" (400). A keyword in the base search runs on the
+/// table itself and must not widen the projection.
+#[test]
+fn piped_search_keyword_projects_raw_data_on_ocsf() {
+    use crate::query::clickhouse_sql_gen::QueryOptions;
+    let options = QueryOptions {
+        table_view: true,
+        ..QueryOptions::default()
+    };
+    let generate = |npl: &str| {
+        let q = parse_query(npl).unwrap_or_else(|e| panic!("{npl:?}: {e}"));
+        ClickHouseSqlGenerator::new()
+            .with_profile(Arc::new(OcsfProfile::new()))
+            .generate_with_options(&q, &time_range(), &options)
+            .unwrap_or_else(|e| panic!("{npl:?}: {e}"))
+    };
+    for npl in [
+        r#"action=blocked | search "blk2013""#,
+        r#"class_uid=4002 | search blk2013 | table src_endpoint.ip"#,
+    ] {
+        let sql = generate(npl);
+        let base = sql.split("WHERE").next().unwrap_or_default().to_string();
+        assert!(
+            sql.contains("hasAllTokens(lower(raw_data)"),
+            "{npl}: the keyword must also search raw_data: {sql}"
+        );
+        assert!(
+            base.contains("raw_data") || base.contains("SELECT *"),
+            "{npl}: the base stage must project raw_data for the piped keyword: {sql}"
+        );
+    }
+    let base_only = generate(r#""blk2013" | table src_endpoint.ip"#);
+    let select = base_only.split("FROM").next().unwrap_or_default();
+    assert!(
+        !select.contains("raw_data"),
+        "a base-search keyword must not add raw_data to the projection: {base_only}"
+    );
+}

@@ -5,6 +5,7 @@
 pub mod auto_sort;
 pub mod command_extraction;
 pub mod lookup_boundary;
+pub mod ocsf_action_note;
 pub mod query_manipulation;
 
 // Re-export commonly used items
@@ -27,6 +28,7 @@ pub use lookup_boundary::{
     extract_post_enrichment_commands, lookup_boundary_plan, strip_enrichment_and_after,
 };
 pub use auto_sort::{apply_auto_sort, auto_sort_warning, AutoSortDecision};
+pub use ocsf_action_note::ocsf_action_column_note;
 pub use query_manipulation::{
     enforce_non_audit_query, enforce_source_scope, enforce_source_type_exclusion,
     strip_ai_and_after, strip_inputlookup_and_after, strip_lateral_and_after,

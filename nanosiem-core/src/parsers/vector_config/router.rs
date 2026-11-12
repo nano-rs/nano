@@ -908,11 +908,8 @@ impl VectorConfigManager {
 
         let mut config = String::from(
             "# Auto-generated dynamic router for deployed parsers\n\
-             # DO NOT EDIT - changes will be overwritten by parser deployment\n\
-             # Generated at: ",
+             # DO NOT EDIT - changes will be overwritten by parser deployment\n\n",
         );
-        config.push_str(&chrono::Utc::now().to_rfc3339());
-        config.push_str("\n\n");
 
         // Generate the route section
         // Accepts input from HTTP pipeline (source_type_extract), Vector native
@@ -1023,8 +1020,7 @@ impl VectorConfigManager {
 
         config.push_str(&format!(
             "# Auto-generated dynamic router for deployed parsers\n\
-             # DO NOT EDIT - changes will be overwritten by parser deployment\n\
-             # Generated at: {}\n\n\
+             # DO NOT EDIT - changes will be overwritten by parser deployment\n\n\
              # =============================================================================\n\
              # Dynamic Source Type Router\n\
              # =============================================================================\n\
@@ -1033,7 +1029,6 @@ impl VectorConfigManager {
              type = \"route\"\n\
              inputs = [{}]\n\n\
              [transforms.source_router.route]\n",
-            chrono::Utc::now().to_rfc3339(),
             inputs_formatted
         ));
 

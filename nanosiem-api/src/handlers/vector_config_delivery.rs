@@ -14,7 +14,9 @@
 //! the new token is not provisioned yet), with a boot warning, a SIEM health
 //! finding and a per-caller warning carrying the caller's IP, so a role-split
 //! ingest host upgraded after its app host keeps receiving config; v2.1 (or
-//! `NANO_VECTOR_CONFIG_DELIVERY_STRICT=true`) removes that fallback.
+//! `NANO_VECTOR_CONFIG_DELIVERY_STRICT=true`) removes that fallback. The
+//! fallback is also refused while an admin has the install token DISABLED, so
+//! the ingest-token switch revokes config delivery too (NAN-5042).
 //! `NANO_VECTOR_CONFIG_DELIVERY=off` (single-host stacks, which deliver config
 //! on a shared volume) or no credential at all disables the endpoints (404),
 //! fail closed. Resolution lives in `nanosiem_core::deployment_posture`.
@@ -33,6 +35,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use nanosiem_core::parsers::vector_config_delivery::{self, VectorConfigDeliveryError};
+use nanosiem_core::parsers::vector_config_remote_delivery::install_lease;
 
 use crate::state::AppState;
 use axum::{extract::ConnectInfo, Extension};
@@ -73,26 +76,113 @@ pub(crate) fn authorize_delivery(
     }
 }
 
-fn authorize(headers: &HeaderMap, peer: Option<&SocketAddr>) -> Result<(), StatusCode> {
-    authorize_with(
+/// What a delivery request asks for. The install-token switch closes config
+/// delivery but must not strand the revocation itself (NAN-5042 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryResource {
+    /// Rendered Vector configs (manifest + generation files): may carry
+    /// connection secrets, so refused to a disabled install token.
+    Config,
+    /// Vector's hashed ingest-tokens file: hashes, ids and route keys only.
+    /// Still served to the install-token fallback while the token is DISABLED,
+    /// because the file it receives is what turns the disable into a refusal
+    /// on that host (`fallback_enabled: false`, install token unlisted).
+    /// Refusing it would leave the host on its cached file, which keeps
+    /// accepting the disabled install token, and every later revocation, for
+    /// ingest.
+    TokensFile,
+}
+
+/// Which credential a delivery request authenticated with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryAuth {
+    /// `NANO_VECTOR_CONFIG_DELIVERY_TOKEN`.
+    Dedicated,
+    /// The deprecated v2.0.x forwarder install-token fallback. Only admitted
+    /// while the install token is ENABLED (see [`admit_install_token_fallback`]).
+    InstallTokenFallback,
+}
+
+/// The full delivery gate for one request: the bearer check against the
+/// resolved credential, then — for the install-token fallback only — the
+/// install token's admin switch, read from the database per request (no
+/// cache, so a disable applies on the consumer's next poll).
+async fn authorize(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<&SocketAddr>,
+    resource: DeliveryResource,
+) -> Result<(), StatusCode> {
+    authorize_request(
+        &state.ingest_token_service,
         headers,
         peer,
         deployment_posture::vector_config_delivery_from_env(),
+        resource,
     )
+    .await
 }
 
-/// The full delivery decision for one request against a resolved credential.
-pub(crate) fn authorize_with(
+/// [`authorize`] against an explicit credential and ingest-token service.
+pub(crate) async fn authorize_request(
+    ingest_tokens: &nanosiem_core::ingest_tokens::IngestTokenService,
     headers: &HeaderMap,
     peer: Option<&SocketAddr>,
     credential: DeliveryCredential,
+    resource: DeliveryResource,
 ) -> Result<(), StatusCode> {
+    let auth = authorize_with(headers, peer, credential)?;
+    let install_enabled = match (auth, resource) {
+        (DeliveryAuth::Dedicated, _) => return Ok(()),
+        // The revocation list itself: see `DeliveryResource::TokensFile`.
+        (DeliveryAuth::InstallTokenFallback, DeliveryResource::TokensFile) => Ok(true),
+        (DeliveryAuth::InstallTokenFallback, DeliveryResource::Config) => ingest_tokens
+            .settings()
+            .await
+            .map(|settings| settings.install_token_enabled)
+            .map_err(|error| {
+                tracing::warn!(%error, "Vector config delivery: could not read the install-token switch");
+            }),
+    };
+    admit_install_token_fallback(install_enabled)?;
+    warn_legacy_install_token_caller(crate::utils::extract_client_ip(headers, peer));
+    Ok(())
+}
+
+/// Security review 2026-11-08 (NAN-5042): disabling the install token must
+/// also close config delivery to it. Before this, the switch only re-rendered
+/// Vector's tokens file, so a forwarder holding a disabled install token could
+/// still download rendered configs over the v2.0.x fallback.
+///
+/// - enabled → admitted (the upgrade-compatibility path keeps working);
+/// - disabled → 401, exactly as if the token were wrong;
+/// - switch unreadable → 503, fail closed; the consumer keeps its current
+///   generation and retries, and the dedicated token is unaffected.
+pub(crate) fn admit_install_token_fallback(
+    install_enabled: Result<bool, ()>,
+) -> Result<(), StatusCode> {
+    match install_enabled {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StatusCode::UNAUTHORIZED),
+        Err(()) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// The bearer decision for one request against a resolved credential. Says
+/// WHICH credential matched; [`authorize`] applies the install-token switch.
+pub(crate) fn authorize_with(
+    headers: &HeaderMap,
+    _peer: Option<&SocketAddr>,
+    credential: DeliveryCredential,
+) -> Result<DeliveryAuth, StatusCode> {
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     match credential {
         DeliveryCredential::Disabled(_) => Err(StatusCode::NOT_FOUND),
-        DeliveryCredential::Dedicated(token) => authorize_delivery(authorization, Some(&token)),
+        DeliveryCredential::Dedicated(token) => {
+            authorize_delivery(authorization, Some(&token)).map(|()| DeliveryAuth::Dedicated)
+        }
         DeliveryCredential::DedicatedOrInstallToken { dedicated, install } => {
             // v2.0.x: the dedicated token first; then the install token for a
             // consumer whose configuration predates the dedicated one (a
@@ -100,21 +190,13 @@ pub(crate) fn authorize_with(
             // would freeze parser publishes and ingest-token revocations on
             // that host. Removed in v2.1 / NANO_VECTOR_CONFIG_DELIVERY_STRICT.
             if authorize_delivery(authorization, Some(&dedicated)).is_ok() {
-                return Ok(());
+                return Ok(DeliveryAuth::Dedicated);
             }
-            let result = authorize_delivery(authorization, Some(&install));
-            if result.is_ok() {
-                warn_legacy_install_token_caller(crate::utils::extract_client_ip(headers, peer));
-            }
-            result
+            authorize_delivery(authorization, Some(&install))
+                .map(|()| DeliveryAuth::InstallTokenFallback)
         }
-        DeliveryCredential::LegacyInstallToken(token) => {
-            let result = authorize_delivery(authorization, Some(&token));
-            if result.is_ok() {
-                warn_legacy_install_token_caller(crate::utils::extract_client_ip(headers, peer));
-            }
-            result
-        }
+        DeliveryCredential::LegacyInstallToken(token) => authorize_delivery(authorization, Some(&token))
+            .map(|()| DeliveryAuth::InstallTokenFallback),
     }
 }
 
@@ -181,8 +263,9 @@ fn delivery_error_status(error: VectorConfigDeliveryError) -> StatusCode {
     tag = "vector-config-delivery",
     responses(
         (status = 200, description = "Manifest of the newest ready generation (verbatim _manifest.json)", body = String, content_type = "application/json"),
-        (status = 401, description = "Missing or invalid delivery bearer (NANO_VECTOR_CONFIG_DELIVERY_TOKEN)"),
+        (status = 401, description = "Missing or invalid delivery bearer (NANO_VECTOR_CONFIG_DELIVERY_TOKEN), or the install-token fallback while the install token is disabled"),
         (status = 404, description = "No ready generation published, or delivery disabled (NANO_VECTOR_CONFIG_DELIVERY=off, or no delivery credential)"),
+        (status = 503, description = "Install-token fallback only: the install-token switch could not be read"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -192,7 +275,13 @@ pub async fn get_current_manifest(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    authorize(&headers, peer.as_ref().map(|Extension(ConnectInfo(addr))| addr))?;
+    authorize(
+        &state,
+        &headers,
+        peer.as_ref().map(|Extension(ConnectInfo(addr))| addr),
+        DeliveryResource::Config,
+    )
+    .await?;
     let root = state.vector_config_publisher.publications_root();
     let Some(generation) = vector_config_delivery::latest_ready_generation(&root)
         .await
@@ -234,8 +323,9 @@ pub async fn get_current_manifest(
     responses(
         (status = 200, description = "File bytes", body = Vec<u8>, content_type = "application/octet-stream"),
         (status = 400, description = "Malformed generation or path (traversal attempts land here)"),
-        (status = 401, description = "Missing or invalid delivery bearer (NANO_VECTOR_CONFIG_DELIVERY_TOKEN)"),
+        (status = 401, description = "Missing or invalid delivery bearer (NANO_VECTOR_CONFIG_DELIVERY_TOKEN), or the install-token fallback while the install token is disabled"),
         (status = 404, description = "Unknown generation, generation not ready, file absent, or delivery disabled (NANO_VECTOR_CONFIG_DELIVERY=off, or no delivery credential)"),
+        (status = 503, description = "Install-token fallback only: the install-token switch could not be read"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -246,7 +336,13 @@ pub async fn get_generation_file(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    authorize(&headers, peer.as_ref().map(|Extension(ConnectInfo(addr))| addr))?;
+    authorize(
+        &state,
+        &headers,
+        peer.as_ref().map(|Extension(ConnectInfo(addr))| addr),
+        DeliveryResource::Config,
+    )
+    .await?;
     let root = state.vector_config_publisher.publications_root();
     let Some(bytes) = vector_config_delivery::read_generation_file(&root, generation, &path)
         .await
@@ -278,7 +374,7 @@ pub async fn get_generation_file(
     tag = "vector-config-delivery",
     responses(
         (status = 200, description = "Vector valid_tokens_file content (hashes only)", body = String, content_type = "application/json"),
-        (status = 401, description = "Missing or invalid delivery bearer (NANO_VECTOR_CONFIG_DELIVERY_TOKEN)"),
+        (status = 401, description = "Missing or invalid delivery bearer (NANO_VECTOR_CONFIG_DELIVERY_TOKEN). The install-token fallback is still served while the install token is disabled, so the file that revokes it reaches that host"),
         (status = 404, description = "Token delivery is not `http`, or delivery disabled (NANO_VECTOR_CONFIG_DELIVERY=off, or no delivery credential)"),
         (status = 503, description = "The database could not be read; the consumer keeps its current file"),
     ),
@@ -290,7 +386,13 @@ pub async fn get_ingest_tokens_file(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    authorize(&headers, peer.as_ref().map(|Extension(ConnectInfo(addr))| addr))?;
+    authorize(
+        &state,
+        &headers,
+        peer.as_ref().map(|Extension(ConnectInfo(addr))| addr),
+        DeliveryResource::TokensFile,
+    )
+    .await?;
     match state.ingest_token_service.render_current().await {
         Ok(content) => Ok((
             [(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
@@ -307,8 +409,121 @@ pub async fn get_ingest_tokens_file(
     }
 }
 
+/// A consumer's install-lease request (NAN-5285).
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct InstallLeaseRequest {
+    /// The consumer's host identity (Compose host id, k8s pod name).
+    pub holder: String,
+    /// The generation it is about to install.
+    pub generation: i64,
+    /// Requested lease length; clamped to 30..=600 s.
+    pub ttl_secs: Option<u64>,
+}
+
+/// Releasing the install lease (NAN-5285).
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct InstallLeaseRelease {
+    pub holder: String,
+}
+
+/// Take the ingest install lease before reloading Vector (NAN-5285, v2.0.13
+/// retest F3): one ingest host installs a generation at a time, drained from
+/// the load balancer when another host is ready to take its traffic.
+#[utoipa::path(
+    post,
+    path = "/api/internal/vector-config/install-lease",
+    tag = "vector-config-delivery",
+    request_body = InstallLeaseRequest,
+    responses(
+        (status = 200, description = "Granted (install now; `drain` says whether to withdraw readiness first) or busy (another host is installing; retry on the next poll)", body = install_lease::LeaseOutcome),
+        (status = 400, description = "Invalid holder or generation"),
+        (status = 401, description = "Missing or invalid delivery bearer"),
+        (status = 404, description = "Delivery disabled"),
+        (status = 503, description = "The lease store (PostgreSQL) is unavailable; do not install this poll"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn post_install_lease(
+    State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<InstallLeaseRequest>,
+) -> Result<axum::Json<install_lease::LeaseOutcome>, (StatusCode, String)> {
+    authorize(
+        &state,
+        &headers,
+        peer.as_ref().map(|Extension(ConnectInfo(addr))| addr),
+        DeliveryResource::Config,
+    )
+    .await
+    .map_err(|status| (status, String::new()))?;
+    install_lease::request(&state.pool, &request.holder, request.generation, request.ttl_secs)
+        .await
+        .map(axum::Json)
+        .map_err(lease_error_response)
+}
+
+/// Release the ingest install lease after the install and rejoin (NAN-5285).
+#[utoipa::path(
+    delete,
+    path = "/api/internal/vector-config/install-lease",
+    tag = "vector-config-delivery",
+    request_body = InstallLeaseRelease,
+    responses(
+        (status = 204, description = "Released, or not held by this holder"),
+        (status = 400, description = "Invalid holder"),
+        (status = 401, description = "Missing or invalid delivery bearer"),
+        (status = 404, description = "Delivery disabled"),
+        (status = 503, description = "The lease store (PostgreSQL) is unavailable; the lease expires on its own"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_install_lease(
+    State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<InstallLeaseRelease>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    authorize(
+        &state,
+        &headers,
+        peer.as_ref().map(|Extension(ConnectInfo(addr))| addr),
+        DeliveryResource::Config,
+    )
+    .await
+    .map_err(|status| (status, String::new()))?;
+    install_lease::validate_holder(&request.holder)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    install_lease::release(&state.pool, &request.holder)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| lease_error_response(install_lease::LeaseError::Database(e)))
+}
+
+fn lease_error_response(error: install_lease::LeaseError) -> (StatusCode, String) {
+    match error {
+        install_lease::LeaseError::Request(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+        install_lease::LeaseError::Database(e) => {
+            tracing::warn!(error = %e, "Vector config install lease store unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "install lease store unavailable".to_string(),
+            )
+        }
+    }
+}
+
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(get_current_manifest, get_generation_file, get_ingest_tokens_file))]
+#[openapi(
+    paths(
+        get_current_manifest,
+        get_generation_file,
+        get_ingest_tokens_file,
+        post_install_lease,
+        delete_install_lease
+    ),
+    components(schemas(InstallLeaseRequest, InstallLeaseRelease, install_lease::LeaseOutcome))
+)]
 pub struct VectorConfigDeliveryApiDoc;
 
 #[cfg(test)]

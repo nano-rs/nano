@@ -408,7 +408,7 @@ impl AppState {
         }
     }
 
-    /// Start the custom enrichment scheduler (Deno data enrichments on cron
+    /// Start the custom enrichment scheduler (code data enrichments on cron
     /// schedules) — enterprise only after Phase 3.3 of NAN-744.
     #[cfg(feature = "enterprise")]
     pub fn start_custom_enrichment_scheduler(&self) -> tokio::task::JoinHandle<()> {
@@ -423,6 +423,14 @@ impl AppState {
             .and_then(|v| v.parse().ok())
             .unwrap_or(60); // Check every 60 seconds
         scheduler.start_scheduler(poll_interval)
+    }
+
+    /// NAN-5097: record each custom enrichment's wasm-sandbox readiness
+    /// (`custom_enrichment_wasm_status`) at boot and every minute.
+    /// PostgreSQL-local plus a local compile, so it is not egress-gated.
+    #[cfg(feature = "enterprise")]
+    pub fn start_enrichment_wasm_reconciler(&self) -> tokio::task::JoinHandle<()> {
+        nanosiem_enterprise::custom_enrichment::wasm_status::start_reconciler(self.pool.clone())
     }
 
     /// Start the collector scheduler (NAN-2189) — pulls events from SaaS APIs

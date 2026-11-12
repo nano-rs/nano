@@ -213,6 +213,26 @@ pub async fn run_health_check_with_trigger(
         Err(e) => warn!("Failed to read license token rejection: {}", e),
     }
 
+    // NAN-5097: custom enrichments that cannot move to the wasm sandbox yet.
+    #[cfg(feature = "enterprise")]
+    match super::enrichment_wasm_findings::load_needs_attention(pool).await {
+        Ok(names) => {
+            super::enrichment_wasm_findings::ensure_enrichment_wasm_findings(&mut analysis, &names)
+        }
+        Err(e) => warn!("Failed to read custom enrichment wasm status: {}", e),
+    }
+    #[cfg(feature = "enterprise")]
+    match super::enrichment_wasm_findings::load_collectors_needing_attention(pool).await {
+        Ok(names) => {
+            if let Some(rec) = super::enrichment_wasm_findings::collector_recommendation(&names) {
+                if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+                    analysis.recommendations.push(rec);
+                }
+            }
+        }
+        Err(e) => warn!("Failed to read collector wasm failures: {}", e),
+    }
+
     let duration_ms = start.elapsed().as_millis() as i32;
     let status = HealthStatus::from_score(analysis.overall_score);
 

@@ -357,6 +357,15 @@ impl MarketplaceRepository {
                 allowed_domains = EXCLUDED.allowed_domains,
                 config = EXCLUDED.config,
                 changelog = EXCLUDED.changelog,
+                -- NAN-5284: a manifest moving to or from the official lookup
+                -- takes effect once the entry is not installed (an installed
+                -- row keeps the backend its install provisioned).
+                execution_backend = CASE
+                    WHEN NOT COALESCE(marketplace_catalog.installed, false)
+                         AND 'lookup' IN (EXCLUDED.execution_backend, marketplace_catalog.execution_backend)
+                    THEN EXCLUDED.execution_backend
+                    ELSE marketplace_catalog.execution_backend
+                END,
                 updated_at = NOW()
             -- NAN-4946: an existing slug is updated only by the repository
             -- that owns it; another repository or a system row never has its

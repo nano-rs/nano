@@ -9,7 +9,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
@@ -20,7 +20,7 @@ use nanosiem_core::prevalence::artifact_fields::{
 };
 use nanosiem_core::prevalence::coverage::{ArtifactKind, CoverageSource};
 use nanosiem_core::prevalence::{PrevalenceScatterData, PrevalenceSettings, TimeWindow};
-use nanosiem_core::query::{ClickHouseSqlGenerator, SearchExpr};
+use nanosiem_core::query::SearchExpr;
 
 use super::settings::prevalence_settings_error_to_response;
 use nanosiem_core::prevalence::{ArtifactDetailResponse, ArtifactExplorerResponse, ArtifactType};
@@ -601,21 +601,82 @@ struct SingleStringRow {
     value: String,
 }
 
-/// Run one candidate-extraction read. A failed read degrades to "no
-/// candidates" (the endpoint still answers with the other class), but is
-/// logged: it used to be swallowed silently.
+/// Run one candidate-extraction read.
+///
+/// NAN-5285: a failed read is an error, never "no candidates". It used to
+/// degrade to an empty list, so a filter the SQL generator got wrong (every
+/// OCSF field filter, built with the UDM generator) answered `200` with no
+/// artifacts, indistinguishable from a query that matched nothing. A query
+/// problem ClickHouse reports (unknown field, type mismatch) is the caller's
+/// 400; anything else is a 500. Neither echoes the SQL (NAN-5161: it carries
+/// the caller's source-scope deny list).
 async fn fetch_candidates(
     ch: &clickhouse::Client,
     sql: &str,
     class: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, (StatusCode, String)> {
     match ch.query(sql).fetch_all::<SingleStringRow>().await {
-        Ok(rows) => rows.into_iter().map(|r| r.value).collect(),
+        Ok(rows) => Ok(rows.into_iter().map(|r| r.value).collect()),
         Err(e) => {
-            warn!("query-artifacts: {class} candidate read failed: {e}");
-            Vec::new()
+            let raw = e.to_string();
+            error!("query-artifacts: {class} candidate read failed: {raw}");
+            Err(candidate_read_error(class, &raw))
         }
     }
+}
+
+/// Map a failed candidate read to the status and message the caller sees.
+pub(super) fn candidate_read_error(class: &str, raw: &str) -> (StatusCode, String) {
+    use nanosiem_core::search::SearchError;
+    match nanosiem_core::search::parse_clickhouse_error(raw) {
+        SearchError::FieldNotFound { message, .. } => (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid query: {message}"),
+        ),
+        SearchError::SqlValidationError(message) => (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid query: {message}"),
+        ),
+        SearchError::Timeout(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("The {class} artifact read timed out; narrow the time range or the query"),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("The {class} artifact read failed in ClickHouse; see the nano-api log"),
+        ),
+    }
+}
+
+/// The WHERE fragment for the caller's nPL: its root search expression, built
+/// by `sql_gen` (NAN-5285: the profile-aware generator search uses). `*` or
+/// an empty query matches everything; anything that does not yield a filter
+/// is a 400, never widened to all logs (NAN-2048).
+pub(super) fn query_artifacts_filter(
+    query: &str,
+    sql_gen: &nanosiem_core::query::ClickHouseSqlGenerator,
+) -> Result<String, (StatusCode, String)> {
+    let query = query.trim();
+    if query.is_empty() || query == "*" {
+        return Ok("1=1".to_string());
+    }
+    // Piped queries filter on their root search expression only.
+    let parsed = nanosiem_core::parse_query(query)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid query: {e}")))?;
+    let search_expr = extract_search_expr(&parsed).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid query: no search expression to filter on".to_string(),
+        )
+    })?;
+    let where_clause = sql_gen.generate_search_expr(search_expr).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid query: could not build filter: {e}"),
+        )
+    })?;
+    tracing::debug!("Generated query filter: {}", where_clause);
+    Ok(where_clause)
 }
 
 /// POST /api/prevalence/query-artifacts
@@ -629,10 +690,11 @@ async fn fetch_candidates(
     request_body = QueryArtifactsRequest,
     responses(
         (status = 200, description = "Artifacts extracted from query with prevalence data", body = QueryArtifactsResponse),
-        (status = 400, description = "Invalid query (parse/extract/SQL-gen failure — never widened to all logs)"),
+        (status = 400, description = "Invalid query (parse/extract/SQL-gen failure, or a field ClickHouse does not have — never widened to all logs or answered as an empty 200)"),
         (status = 403, description = "Forbidden - Missing permission: prevalence:view or search:execute"),
         (status = 503, description = "Service unavailable - Prevalence tracking requires ClickHouse"),
-        (status = 500, description = "Internal server error")
+        (status = 500, description = "Internal server error: the artifact read or prevalence lookup failed"),
+        (status = 504, description = "The artifact read timed out")
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -693,55 +755,14 @@ pub async fn get_query_artifacts(
         None => "timestamp >= now() - INTERVAL 24 HOUR".to_string(),
     };
 
-    // Parse the user's search query and generate WHERE clause
-    let query_filter = if request.query.trim().is_empty() || request.query.trim() == "*" {
-        // No query filter needed for wildcard or empty query
-        "1=1".to_string()
-    } else {
-        // Parse the query and generate SQL WHERE clause directly from the search expression
-        // This handles piped queries correctly by extracting just the search filter part
-        match nanosiem_core::parse_query(&request.query) {
-            Ok(parsed_query) => {
-                // Extract the root search expression (handles piped queries)
-                match extract_search_expr(&parsed_query) {
-                    Some(search_expr) => {
-                        // Generate WHERE clause directly from the search expression
-                        let logs_table = state
-                            .dual_pool()
-                            .table_names()
-                            .read(nanosiem_core::schema::active_logs_table());
-                        let sql_gen = ClickHouseSqlGenerator::with_table(&logs_table);
-                        match sql_gen.generate_search_expr(search_expr) {
-                            Ok(where_clause) => {
-                                tracing::debug!("Generated query filter: {}", where_clause);
-                                where_clause
-                            }
-                            Err(e) => {
-                                // NAN-2048: never widen an invalid caller filter to
-                                // all-logs (1=1) — reject with 400 instead.
-                                return Err((
-                                    StatusCode::BAD_REQUEST,
-                                    format!("Invalid query: could not build filter: {e}"),
-                                ));
-                            }
-                        }
-                    }
-                    None => {
-                        // NAN-2048: no filterable root search expression — reject
-                        // rather than silently scanning all logs in the window.
-                        return Err((
-                            StatusCode::BAD_REQUEST,
-                            "Invalid query: no search expression to filter on".to_string(),
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                // NAN-2048: a parse failure must 400, not fall open to all logs.
-                return Err((StatusCode::BAD_REQUEST, format!("Invalid query: {e}")));
-            }
-        }
-    };
+    // NAN-5285: build the filter with the generator search uses (active
+    // schema profile + its logs table), so OCSF fields resolve to their columns
+    // and a bare keyword also matches `raw_data`, as it does in search.
+    let sql_gen = nanosiem_core::search::SearchService::ch_generator_for_pool(
+        dual_pool,
+        state.config.schema_profile(),
+    );
+    let query_filter = query_artifacts_filter(&request.query, &sql_gen)?;
 
     // Combine time filter with query filter
     let combined_filter = format!("({}) AND ({})", time_filter, query_filter);
@@ -794,7 +815,7 @@ pub async fn get_query_artifacts(
         &combined_filter,
         distinct_cap,
     ) {
-        Some(hash_query) => fetch_candidates(ch, &hash_query, "hash").await,
+        Some(hash_query) => fetch_candidates(ch, &hash_query, "hash").await?,
         None => Vec::new(),
     };
 
@@ -810,7 +831,7 @@ pub async fn get_query_artifacts(
         &internal,
         distinct_cap,
     ) {
-        Some(domain_query) => fetch_candidates(ch, &domain_query, "domain").await,
+        Some(domain_query) => fetch_candidates(ch, &domain_query, "domain").await?,
         None => Vec::new(),
     };
     let domain_results: Vec<String> = domain_results
@@ -848,9 +869,17 @@ pub async fn get_query_artifacts(
     // Look up prevalence for hashes
     let mut hash_points = Vec::new();
     if !hash_results.is_empty() {
-        if let Ok(hash_data) = prevalence_service
+        // NAN-5285: a failed prevalence lookup is a 500, not an empty 200.
+        let hash_data = prevalence_service
             .get_bulk_prevalence(&hash_results, TimeWindow::ThirtyDays, &prevalence_scope)
             .await
+            .map_err(|e| {
+                error!("query-artifacts: hash prevalence lookup failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The hash prevalence lookup failed; see the nano-api log".to_string(),
+                )
+            })?;
         {
             for mut data in hash_data {
                 coverage.apply(&mut data);
@@ -870,9 +899,17 @@ pub async fn get_query_artifacts(
     // Look up prevalence for domains
     let mut domain_points = Vec::new();
     if !domain_results.is_empty() {
-        if let Ok(domain_data) = prevalence_service
+        // NAN-5285: a failed prevalence lookup is a 500, not an empty 200.
+        let domain_data = prevalence_service
             .get_bulk_prevalence(&domain_results, TimeWindow::ThirtyDays, &prevalence_scope)
             .await
+            .map_err(|e| {
+                error!("query-artifacts: domain prevalence lookup failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The domain prevalence lookup failed; see the nano-api log".to_string(),
+                )
+            })?;
         {
             for mut data in domain_data {
                 coverage.apply(&mut data);

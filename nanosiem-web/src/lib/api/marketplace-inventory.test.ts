@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Capabilities } from '@/hooks/use-capabilities';
 import type { EnrichmentMarketplaceRepo, MarketplaceCatalogEntry } from './marketplace';
-import { applyFeedBundle, buildInventory, bundleFeedForSlug, bundleProvisions, catalogItem, inventoryAction, inventoryReason, isFirstPartyRepo, platformFeedForEntry, syncPollInterval, SYNC_POLL_MAX_MS, SYNC_POLL_MS } from './marketplace-inventory';
+import { applyFeedBundle, buildInventory, bundleFeedForSlug, bundleProvisions, catalogItem, inventoryAction, inventoryReason, inventorySandboxLabel, isFirstPartyRepo, platformFeedForEntry, syncPollInterval, SYNC_POLL_MAX_MS, SYNC_POLL_MS } from './marketplace-inventory';
 import { executionStageLabel, humanizeEnum } from '../marketplace-labels';
 
 const OPEN = { customEnrichment: false, agentEnrichment: false } as Capabilities;
@@ -54,6 +54,13 @@ describe('marketplace inventory projection', () => {
     expect(catalogItem(entry({}), [official], ENT, 'enterprise').requirement).toBeNull();
   });
 
+  it('NAN-5284: an official lookup needs the agent capability and keeps its key on the provider', () => {
+    expect(catalogItem(entry({ slug: 'shodan', execution_backend: 'lookup' }), [official], OPEN, 'open').requirement?.capability).toBe('agentEnrichment');
+    const installed = catalogItem(entry({ slug: 'shodan', execution_backend: 'lookup', installed: true, enabled: true, has_credentials: false }), [official], ENT, 'enterprise');
+    expect(installed.requirement).toBeNull();
+    expect(installed.reason).toBeNull();
+  });
+
   it('NAN-5088: an enterprise build without an active license asks for a license, not the edition', () => {
     // Licensed flags are all false on an enterprise build whose license is not active.
     const agent = catalogItem(entry({}), [official], OPEN, 'enterprise');
@@ -96,6 +103,27 @@ describe('marketplace inventory projection', () => {
     );
     expect(items.map(i => i.id)).toEqual(['abuseipdb', 'custom:c2']);
     expect(items[1]).toMatchObject({ kind: 'custom', reason: 'not_deployed', can_edit: true });
+  });
+
+  it('NAN-5097: carries wasm readiness onto catalog-installed and authored items', () => {
+    const attention = { compile_status: 'needs_attention' as const, reason: 'line 19: a credential is put in a URL', checked_at: '', current: true };
+    const compiled = { compile_status: 'compiled' as const, reason: null, checked_at: '', current: true };
+    const items = buildInventory(
+      [entry({ slug: 'shodan', installed: true, enabled: true, custom_enrichment_id: 'c1' }), entry({ slug: 'otx' })],
+      [
+        { id: 'c1', namespace_id: 'n', name: 'Shodan', description: null, enrichment_type: 'agent', enabled: true, status: 'active', last_run_at: null, last_run_status: null, created_at: '', wasm_status: attention },
+        { id: 'c2', namespace_id: 'n', name: 'Asset CMDB', description: null, enrichment_type: 'data', enabled: true, status: 'active', last_run_at: null, last_run_status: null, created_at: '', wasm_status: compiled },
+        { id: 'c3', namespace_id: 'n', name: 'Unchecked', description: null, enrichment_type: 'data', enabled: true, status: 'active', last_run_at: null, last_run_status: null, created_at: '' },
+      ],
+      [official], ENT, 'enterprise',
+    );
+    const byId = Object.fromEntries(items.map(i => [i.id, i]));
+    expect(inventorySandboxLabel(byId.shodan)).toBe('needs attention · not running');
+    expect(byId.shodan.sandbox?.reason).toContain('in a URL');
+    expect(inventorySandboxLabel(byId['custom:c2'])).toBe('wasm ready');
+    // Not checked yet, or not a custom enrichment: no badge.
+    expect(inventorySandboxLabel(byId['custom:c3'])).toBeNull();
+    expect(inventorySandboxLabel(byId.otx)).toBeNull();
   });
 
   it('never renders a raw snake_case enum', () => {

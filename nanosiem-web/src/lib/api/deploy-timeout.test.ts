@@ -27,11 +27,13 @@ describe('deploy request timeout (NAN-5131)', () => {
     await sc.deployAllSourceConfigs();
     expect(request).not.toHaveBeenCalled();
     const endpoints = longRequest.mock.calls.map(([endpoint]) => endpoint);
+    // NAN-5132: log-source deploys start a job (`wait=false`); a server
+    // without jobs answers synchronously, so the start keeps the long budget.
     expect(endpoints).toEqual([
-      '/api/log-sources/a/deploy',
-      '/api/log-sources/a/undeploy',
-      '/api/log-sources/deploy-all',
-      '/api/log-sources/a/publish',
+      '/api/log-sources/a/deploy?wait=false',
+      '/api/log-sources/a/undeploy?wait=false',
+      '/api/log-sources/deploy-all?wait=false',
+      '/api/log-sources/a/publish?wait=false',
       '/api/source-configurations/b/deploy',
       '/api/source-configurations/b/undeploy',
       '/api/source-configurations/deploy-all',

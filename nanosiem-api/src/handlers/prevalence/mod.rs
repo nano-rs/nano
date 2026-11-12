@@ -13,6 +13,8 @@
 //! - `settings` — prevalence configuration management
 
 mod discovery;
+#[cfg(test)]
+mod query_artifacts_filter_tests;
 mod export;
 mod lookups;
 mod settings;

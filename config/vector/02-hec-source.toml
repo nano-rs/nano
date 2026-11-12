@@ -29,7 +29,8 @@ valid_tokens_file.reload_interval_secs = 2
 # nano-rs/vector 0.61.0-nano.5+) reports it true once every sink the event
 # reached has finalized it. Every ClickHouse event sink is disk-buffered
 # (`_pipeline.toml`, pinned by deploy/hec_ack_contract_tests.rs), so true means
-# "committed to the durable buffer in front of ClickHouse", not the INSERT:
+# "committed (and, from nano-rs/vector 0.61.0-nano.10, fsynced: NAN-5285) to
+# the durable buffer in front of ClickHouse", not the INSERT:
 # acks keep resolving through a ClickHouse outage and the buffer delivers
 # at-least-once after it. Acks live in this Vector process's memory, so a
 # sender must poll the replica that took the event (sticky by channel behind

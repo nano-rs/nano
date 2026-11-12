@@ -67,8 +67,9 @@ clickhouse/config.d/
 cursor_alignment_test.html
 test_syntax_highlighting.html
 scripts/
-# NAN-3485 / NAN-4908: the api and jobs stages install the pinned, checksummed Deno.
-!scripts/ci/install-deno.sh
+# NAN-5094: the enterprise builder installs the wasm sandbox compiler (pinned Node
+# + componentize-js worker) with this script.
+!scripts/ci/install-node-sandbox-compiler.sh
 # NAN-5002: the guarded, TEST-only upgrade rehearsal copies exactly this SQL
 # fixture into a non-release image. Keep every other test/script path excluded.
 !scripts/tests/fixtures/upgrade/clickhouse/999999999lab_upgrade_probe.sql

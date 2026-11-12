@@ -26,7 +26,7 @@ export interface MarketplaceCatalogEntry {
   repository_id?: string;
   repository_file_path?: string;
   manifest_version: number;
-  execution_backend: 'deno' | 'native' | 'identity' | 'collector';
+  execution_backend: 'deno' | 'native' | 'identity' | 'collector' | 'lookup';
   custom_enrichment_id?: string;
   native_source_id?: string;
   identity_provider_id?: string;

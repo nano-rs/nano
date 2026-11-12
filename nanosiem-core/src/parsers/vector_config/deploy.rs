@@ -1407,14 +1407,28 @@ impl VectorConfigManager {
     /// Pure variant of [`Self::ocsf_sink_inputs`] with the OCSF gate passed in
     /// explicitly, so it is testable without the env-racy `ocsf_mode` read.
     pub(super) fn ocsf_sink_inputs_for(ocsf: bool, parsers: &[Parser]) -> Vec<String> {
+        Self::ocsf_sink_inputs_with(ocsf, super::fanin_slots::enabled(), parsers)
+    }
+
+    /// [`Self::ocsf_sink_inputs_for`] with the fan-in slot switch passed in.
+    pub(super) fn ocsf_sink_inputs_with(ocsf: bool, slots: bool, parsers: &[Parser]) -> Vec<String> {
         if !ocsf {
             return Vec::new();
         }
-        let mut v: Vec<String> = parsers
-            .iter()
-            .filter(|p| p.enabled && p.kind != "enrichment")
-            .map(|p| format!("\"{}_ocsf_prepare\"", Self::safe_name(&p.name)))
-            .collect();
+        let mut v: Vec<String> = if slots {
+            // NAN-5132: the sink reads the fixed OCSF slots (defined in
+            // `_combiner.toml`, see `fanin_slots`), never the parsers directly,
+            // so adding or removing a source does not rebuild this
+            // disk-buffered sink.
+            let k = super::fanin_slots::assign(parsers).len();
+            super::fanin_slots::fanin_inputs(k, &[super::fanin_slots::Family::Ocsf])
+        } else {
+            parsers
+                .iter()
+                .filter(|p| p.enabled && p.kind != "enrichment")
+                .map(|p| format!("\"{}_ocsf_prepare\"", Self::safe_name(&p.name)))
+                .collect()
+        };
         // NAN-1325: the generic Base Event lane always feeds ocsf_logs under OCSF
         // — even with zero deployed parsers — so unconfigured/unknown source types
         // are searchable (parity with the UDM `logs` unknown bucket). The
@@ -1501,61 +1515,74 @@ impl VectorConfigManager {
     /// and native OCSF successes, before optional sampling can skew the health
     /// denominator.
     pub(super) fn combiner_config_content_for(parsers: &[Parser], ocsf: bool) -> String {
-        let enabled_parsers: Vec<_> = parsers.iter().filter(|p| p.enabled).collect();
+        Self::combiner_config_content_with(parsers, ocsf, super::fanin_slots::enabled())
+    }
+
+    /// [`Self::combiner_config_content_for`] with the fan-in slot switch
+    /// passed in (`VECTOR_FANIN_SLOTS`, see [`super::fanin_slots::enabled`]).
+    pub(super) fn combiner_config_content_with(parsers: &[Parser], ocsf: bool, slots: bool) -> String {
+        use super::fanin_slots::{assign, fanin_inputs, slots_toml, Family};
 
         let mut config = String::from(
             "# Auto-generated combiner for all DB parsers\n\
              # DO NOT EDIT - changes will be overwritten\n\n",
         );
 
-        if enabled_parsers.is_empty() {
-            // No parsers enabled — use a filter that drops everything so Vector
-            // has a valid input (empty inputs = [] is rejected by Vector).
-            config.push_str(
-                "# No enabled parsers\n\
-                 [transforms.db_parsers_combined]\n\
-                 type = \"filter\"\n\
-                 inputs = [\"prepare_output\"]\n\
-                 condition = \"false\"\n\
-                 \n\
-                 [transforms.db_parser_health]\n\
-                 type = \"filter\"\n\
-                 inputs = [\"prepare_output\"]\n\
-                 condition = \"false\"\n",
-            );
-        } else {
+        let (persisted_inputs, health_inputs) = if slots {
+            // NAN-5132: the fan-ins read fixed slot filters (see
+            // `fanin_slots`); with no parsers every slot is parked, so the
+            // shape is the same for zero and N sources and adding one never
+            // rebuilds a fan-in.
+            let table = assign(parsers);
+            let families: &[Family] = if ocsf {
+                &[Family::Out, Family::Kept, Family::Ocsf]
+            } else {
+                &[Family::Out, Family::Kept]
+            };
+            config.push_str(&slots_toml(&table, families));
+            let k = table.len();
             // The persisted stream honors each parser's optional sample step.
-            let persisted_inputs: Vec<String> = enabled_parsers
-                .iter()
-                .map(|p| {
-                    let safe = Self::safe_name(&p.name);
-                    let has_sampling = p
-                        .sampling_ratio
-                        .map(|r| r > 0.0 && r < 1.0)
-                        .unwrap_or(false);
-                    if has_sampling {
-                        format!("\"{}_sample\"", safe)
-                    } else {
-                        format!("\"{}_output\"", safe)
-                    }
-                })
-                .collect();
-
-            // Health consumes the unsampled UDM output. Under OCSF it also sees
-            // native successes, which bypass the UDM output after the split.
-            let mut health_inputs: Vec<String> = enabled_parsers
-                .iter()
-                .map(|p| format!("\"{}_output\"", Self::safe_name(&p.name)))
-                .collect();
-            if ocsf {
-                health_inputs.extend(
-                    enabled_parsers
-                        .iter()
-                        .filter(|p| p.kind != "enrichment")
-                        .map(|p| format!("\"{}_ocsf_prepare\"", Self::safe_name(&p.name))),
-                );
+            // Health consumes the unsampled UDM output. Under OCSF it also
+            // sees native successes, which bypass the UDM output after the
+            // split.
+            let health = if ocsf {
+                fanin_inputs(k, &[Family::Out, Family::Ocsf])
+            } else {
+                fanin_inputs(k, &[Family::Out])
+            };
+            (fanin_inputs(k, &[Family::Kept]), health)
+        } else {
+            // Slots off: the fan-ins list every parser (pre-NAN-5132 shape).
+            let enabled: Vec<&Parser> = parsers.iter().filter(|p| p.enabled).collect();
+            if enabled.is_empty() {
+                // Vector rejects `inputs = []`: read a never-matching filter.
+                config.push_str(&format!(
+                    "[transforms.{parked}]\ntype = \"filter\"\ninputs = [\"prepare_output\"]\ncondition = \"false\"\n\n",
+                    parked = super::fanin_slots::PARKED
+                ));
+                let parked = vec![format!("\"{}\"", super::fanin_slots::PARKED)];
+                (parked.clone(), parked)
+            } else {
+                let persisted = enabled
+                    .iter()
+                    .map(|p| format!("\"{}\"", Family::Kept.input_for(p)))
+                    .collect();
+                let mut health: Vec<String> = enabled
+                    .iter()
+                    .map(|p| format!("\"{}\"", Family::Out.input_for(p)))
+                    .collect();
+                if ocsf {
+                    health.extend(
+                        enabled
+                            .iter()
+                            .filter(|p| p.kind != "enrichment")
+                            .map(|p| format!("\"{}\"", Family::Ocsf.input_for(p))),
+                    );
+                }
+                (persisted, health)
             }
-
+        };
+        {
             config.push_str(&format!(
                 "[transforms.db_parsers_combined]\n\
                  type = \"remap\"\n\
@@ -3037,6 +3064,16 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// NAN-4953 re-render.
     pub async fn deploy_and_reload(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
         let _guard = self.lock_deploys().await;
+        self.deploy_and_reload_locked(parsers).await
+    }
+
+    /// [`Self::deploy_and_reload`] for a caller that already holds the guard
+    /// from [`Self::lock_deploys`] (NAN-5132: undeploy and deploy-all take the
+    /// lock before they read the enabled set). The mutex is not reentrant.
+    pub async fn deploy_and_reload_locked(
+        &self,
+        parsers: &[Parser],
+    ) -> Result<(), VectorConfigError> {
         let backup = match self.backup_current().await {
             Ok(generation) => Some(generation),
             Err(error) => {

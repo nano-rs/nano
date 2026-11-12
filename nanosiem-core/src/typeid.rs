@@ -329,6 +329,7 @@ typeid_prefix!(notebook_share, "nbshr");
 typeid_prefix!(notebook_ref, "nbref");
 typeid_prefix!(parser, "parser");
 typeid_prefix!(log_source, "lsrc");
+typeid_prefix!(deploy_job, "djob");
 typeid_prefix!(cloud_credential, "cred");
 typeid_prefix!(enrichment, "enrich");
 typeid_prefix!(enrichment_run, "erun");

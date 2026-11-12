@@ -191,7 +191,7 @@ export function ParserUpstreamDiffModal({
 
   const handleDeployNow = async () => {
     try {
-      const result = await deployLogSource(logSourceId);
+      const result = await deployLogSource({ id: logSourceId });
       queryClient.invalidateQueries({ queryKey: ['log-sources'] });
       queryClient.invalidateQueries({ queryKey: ['log-source-deployments', logSourceId] });
       toastDeployResult(toast, (generation) => api.getDeliveryStatus(generation), result, {

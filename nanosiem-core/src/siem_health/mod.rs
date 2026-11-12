@@ -13,6 +13,9 @@
 
 pub mod analyzer;
 pub mod collector;
+// NAN-5097: reads an enterprise table (migration 9000094).
+#[cfg(feature = "enterprise")]
+pub mod enrichment_wasm_findings;
 pub mod finding_signature;
 pub mod repository;
 pub mod scheduler;

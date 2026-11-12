@@ -15,7 +15,7 @@
 //! GitHub Repos ──→ SyncService ──→ marketplace_catalog (PostgreSQL)
 //!                                       │
 //!                                       ├── native backend → enrichment_sources / agent_enrichment_providers
-//!                                       ├── deno backend   → custom_enrichments (Deno sandbox)
+//!                                       ├── deno backend   → custom_enrichments (wasm sandbox)
 //!                                       └── identity backend → identity_providers
 //! ```
 

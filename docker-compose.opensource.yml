@@ -71,6 +71,16 @@ x-nano-egress-env: &nano-egress-env
   # Read by the shared AI base-URL validator in api, jobs and search.
   NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS: ${NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS:-false}
 
+# Vector config rendering, read by every nano-api and nano-jobs replica.
+# They must all render with the same values, so set them here (or in .env)
+# and nowhere else. VECTOR_FANIN_SLOTS (NAN-5132): off by default. Turn it on
+# for installs that add or remove log sources often: adding a source then no
+# longer rebuilds the shared fan-ins or the disk-buffered OCSF sink, so the
+# ingest stall on deploy drops (15.7 s to 2.2 s at 20 sources). It costs
+# Vector memory and CPU on every event; check the Vector memory limit first.
+x-nano-vector-render-env: &nano-vector-render-env
+  VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
+
 # Feed/content update and integration-egress settings read by nano-api and
 # nano-jobs. Empty keeps each built-in default (auto-update on, nano.rs URLs).
 x-nano-update-env: &nano-update-env
@@ -231,7 +241,7 @@ services:
     # in REDIS_URL and the service identity the upgrade rollouts select, so an
     # upgrade recreates this one container in place with the new image instead
     # of orphaning it. Pinned to a concrete version + digest (NAN-1258).
-    image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    image: valkey/valkey:9.1.3@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
     container_name: nano-valkey
     restart: unless-stopped
     logging: *default-logging
@@ -481,7 +491,7 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.8-debian@sha256:da4473df93316e11ede7417f521c734c42defe11134cfe591bf815a54b19355f
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.10-debian@sha256:5d71a7b2bb1a0fd4e56941cb0be0590d8d74eb0f23cadab33f18510f2664fee7
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
@@ -598,7 +608,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      <<: [*nano-egress-env, *nano-update-env]
+      <<: [*nano-egress-env, *nano-update-env, *nano-vector-render-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
@@ -759,7 +769,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      <<: [*nano-egress-env, *nano-update-env]
+      <<: [*nano-egress-env, *nano-update-env, *nano-vector-render-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
