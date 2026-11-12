@@ -72,6 +72,7 @@ import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { Alert as ApiAlert, AlertCounts, UserDetail } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
+import { alertAssigneeLabel } from '@/lib/alert-assignee';
 import { trailingWindowTitle } from '@/lib/time-range';
 
 type StatusFilter = 'all' | 'new' | 'acknowledged' | 'closed';
@@ -782,8 +783,11 @@ export function Alerts() {
                       </TableCell>
                       <TableCell>
                         {alert.assigned_to ? (
-                          <span className="font-mono text-[10.5px] text-foreground truncate inline-block max-w-[110px]">
-                            {alert.assigned_to}
+                          <span
+                            className="font-mono text-[10.5px] text-foreground truncate inline-block max-w-[110px]"
+                            title={alertAssigneeLabel(alert)}
+                          >
+                            {alertAssigneeLabel(alert)}
                           </span>
                         ) : (
                           <span className="font-mono text-[10.5px] text-muted-foreground/70">

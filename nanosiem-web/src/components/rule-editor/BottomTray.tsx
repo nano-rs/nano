@@ -438,12 +438,12 @@ function VersionsCard({
         </div>
         {versions && versions.length > 0 && (
           <span className="ml-auto text-[10.5px] font-mono text-muted-foreground">
-            {versions.length} versions
+            {versions.length} {versions.length === 1 ? 'version' : 'versions'}
           </span>
         )}
       </div>
       {slice.length === 0 ? (
-        <div className="text-[11px] text-muted-foreground">No version history yet. First save creates v1.</div>
+        <div className="text-[11px] text-muted-foreground">No version history yet.</div>
       ) : (
         <div className="space-y-1.5">
           {slice.map((v, i) => {

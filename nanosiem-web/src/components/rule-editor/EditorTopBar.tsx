@@ -651,7 +651,8 @@ export function EditorTopBar({
           className={cn('h-7 text-[11.5px] px-3 gap-1.5', !dirty && 'opacity-60')}
         >
           <Save className="w-3 h-3" strokeWidth={1.75} />
-          {saving ? 'Saving…' : dirty ? (isNewMode ? 'Create rule' : 'Save rule') : 'Saved'}
+          {/* NAN-5317: an unsaved new-rule draft is never "Saved". */}
+          {saving ? 'Saving…' : isNewMode ? 'Create rule' : dirty ? 'Save rule' : 'Saved'}
         </Button>
       </div>
 

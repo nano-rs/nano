@@ -3008,8 +3008,9 @@ pub(crate) fn detect_event_kind(event: &serde_json::Value) -> String {
             .map_or(false, |s| !s.is_empty())
     };
 
-    // Alert/Signal events
-    if source_type == "signal" || source_type.contains("alert") {
+    // Alert/finding events. Findings are logged as `source_type = "findings"`;
+    // `signal` is the legacy name (NAN-5312). Keep in sync with `p_alert!`.
+    if source_type == "findings" || source_type == "signal" || source_type.contains("alert") {
         return "ALERT".to_string();
     }
 

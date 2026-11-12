@@ -138,8 +138,8 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
-                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
+                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column_in_scope()),
+                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column_in_scope()),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest if timestamp_available => self.time_ordered_pick(&field_expr, false),
                     AggFunc::Latest if timestamp_available => self.time_ordered_pick(&field_expr, true),
@@ -158,7 +158,7 @@ impl ClickHouseSqlGenerator {
                         let span = sparkline_span_secs.unwrap_or(1800); // default 30min
                         format!(
                             "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
-                            self.time_column(),
+                            self.time_column_in_scope(),
                             span
                         )
                     }
@@ -172,7 +172,7 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Rate => format!(
                         "(max({0}) - min({0})) / greatest(dateDiff('second', min({1}), max({1})), 1)",
                         field_expr,
-                        self.time_column(),
+                        self.time_column_in_scope(),
                     ),
                     // NAN-1528 (OTLP metrics): histogram quantile. Pragmatic form
                     // — quantileTDigest over the per-data-point values (works for
@@ -352,14 +352,14 @@ impl ClickHouseSqlGenerator {
     /// comparison key.
     pub(super) fn time_ordered_pick(&self, field_expr: &str, latest: bool) -> String {
         // `earliest(time)` is simply the extreme time.
-        if field_expr == self.time_column() {
+        if field_expr == self.time_column_in_scope() {
             let extreme = if latest { "max" } else { "min" };
             return format!("{extreme}({field_expr})");
         }
         format!(
             "{}({field_expr}, ({}, toString({field_expr})))",
             if latest { "argMax" } else { "argMin" },
-            self.time_column(),
+            self.time_column_in_scope(),
         )
     }
 
@@ -452,7 +452,17 @@ impl ClickHouseSqlGenerator {
         cont: bool,
         timestamp_available: bool,
     ) -> Result<String, SqlGenError> {
-        let time_bucket_expr = self.generate_time_bucket(span);
+        // NAN-5306 review: after `table time, …` the event time is in scope as
+        // `time`, not the physical column the bucket expression names.
+        let time_bucket_expr = {
+            let bucket = self.generate_time_bucket(span);
+            let in_scope = self.time_column_in_scope();
+            if in_scope == self.time_column() {
+                bucket
+            } else {
+                bucket.replace(self.time_column(), &in_scope)
+            }
+        };
 
         // (aggregate expression, output column name) per aggregation. The name is
         // None only for field-less aggregations other than count/sparkline (no
@@ -484,8 +494,8 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
-                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
+                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column_in_scope()),
+                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column_in_scope()),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest if timestamp_available => self.time_ordered_pick(&field_expr, false),
                     AggFunc::Latest if timestamp_available => self.time_ordered_pick(&field_expr, true),
@@ -502,7 +512,7 @@ impl ClickHouseSqlGenerator {
                         let sub_span = (span.as_secs() / 10).max(60);
                         format!(
                             "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
-                            self.time_column(),
+                            self.time_column_in_scope(),
                             sub_span
                         )
                     }
@@ -514,7 +524,7 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Rate => format!(
                         "(max({0}) - min({0})) / greatest(dateDiff('second', min({1}), max({1})), 1)",
                         field_expr,
-                        self.time_column(),
+                        self.time_column_in_scope(),
                     ),
                     // NAN-1528 (OTLP metrics): histogram quantile (pragmatic
                     // quantileTDigest form — see the stats-path arm).

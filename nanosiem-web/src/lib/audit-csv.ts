@@ -18,6 +18,7 @@ export const AUDIT_CSV_HEADERS = [
   'Resource Name',
   'IP Address',
   'Success',
+  'Details',
 ] as const;
 
 /**
@@ -35,6 +36,8 @@ export function auditCsv(rows: AuditLogEntry[]): string {
     log.resource_name || '',
     log.ip_address || '',
     log.success ? 'Yes' : 'No',
+    // NAN-5324: scopes granted, old → new values, denial reasons.
+    log.details ? JSON.stringify(log.details) : '',
   ]);
   return [[...AUDIT_CSV_HEADERS], ...body].map((row) => row.map(auditCsvCell).join(',')).join('\n');
 }

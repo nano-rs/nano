@@ -77,3 +77,43 @@ pub(crate) fn row_to_log_source(row: &sqlx::postgres::PgRow) -> LogSource {
         updated_at: row.get("updated_at"),
     }
 }
+
+/// Which `deployed`-reset rules an update triggers (NAN-5321).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeployedResetFlags {
+    /// A column Vector renders straight from `log_sources` changed: always undeployed.
+    pub config_changed: bool,
+    /// A working-draft column changed (`parser_vrl`, `output_fields`,
+    /// `extension_*`). Vector renders the ACTIVE version of these
+    /// (`EFFECTIVE_DEPLOYED_PARSERS_SQL`), so this undeploys only a source
+    /// with no published version.
+    pub draft_changed: bool,
+    /// `output_fields` changed. The effective query falls back to the working
+    /// copy's `output_fields` when the active version has none.
+    pub output_fields_changed: bool,
+}
+
+pub(crate) fn deployed_reset_flags(
+    update: &super::super::types::UpdateLogSource,
+) -> DeployedResetFlags {
+    DeployedResetFlags {
+        config_changed: update.source_type.is_some()
+            || update.dispatch_source_config_id.is_some()
+            || update.match_field.is_some()
+            || update.match_pattern.is_some()
+            || update.match_values.is_some()
+            || update.sampling_ratio.is_some()
+            || update.sampling_exclude_condition.is_some()
+            // normalize_vrl is not versioned: it renders from log_sources.
+            || update.normalize_vrl.is_some(),
+        draft_changed: update.parser_vrl.is_some()
+            || update.output_fields.is_some()
+            || update.extension_vrl.is_some()
+            || update.extension_enabled.is_some(),
+        output_fields_changed: update.output_fields.is_some(),
+    }
+}
+
+#[cfg(test)]
+#[path = "deployed_reset_flags_tests.rs"]
+mod deployed_reset_flags_tests;

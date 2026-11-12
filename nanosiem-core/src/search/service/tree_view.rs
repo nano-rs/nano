@@ -28,6 +28,28 @@ fn tree_field<'a>(row: &'a serde_json::Value, path: &str) -> Option<&'a serde_js
         .or_else(|| path.split('.').try_fold(row, |value, part| value.get(part)))
 }
 
+/// Why a tree over a non-empty result set came back with no nodes: none of
+/// the events carry the id the tree links on (NAN-5313 — the Defender EDR
+/// parser sets `process.pid` but no `process.uid`). Shown in the empty state
+/// instead of generic "try a different root" advice. `None` when the result
+/// set was empty or some event did carry an id.
+pub(crate) fn empty_tree_note(
+    event_count: usize,
+    node_count: usize,
+    child_field: &str,
+    parent_field: &str,
+) -> Option<String> {
+    if event_count == 0 || node_count > 0 {
+        return None;
+    }
+    let (events, verb) = if event_count == 1 { ("event", "carries") } else { ("events", "carry") };
+    Some(format!(
+        "None of the {event_count} matching {events} {verb} {child_field}, so there is \
+         nothing to link: the tree joins {child_field} to {parent_field}. The source's parser \
+         does not populate this id for these events."
+    ))
+}
+
 impl SearchService {
     /// Build tree visualization from flat search results
     ///
@@ -486,6 +508,17 @@ impl SearchService {
             elapsed
         );
 
+        // NAN-5313: name the missing id (in the schema's own spelling) when
+        // events matched but none could become a node.
+        let profile = self.active_profile.as_ref();
+        let native = |f: &str| profile.display_field_name(f).unwrap_or_else(|| f.to_string());
+        let note = empty_tree_note(
+            result_count,
+            all_child_ids.len(),
+            &native(&tree_info.child_field),
+            &native(&tree_info.parent_field),
+        );
+
         // Return a single result with tree metadata
         Ok(vec![json!({
             "_display_type": "tree",
@@ -499,6 +532,7 @@ impl SearchService {
             },
             "_tree_nodes": tree_nodes,
             "_tree_truncated": result_count >= 10000,
+            "_tree_note": note,
         })])
     }
 }

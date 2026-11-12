@@ -24,12 +24,14 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useSystemConfig } from '@/hooks/use-api';
 import { useRecentAuditChanges } from '@/hooks/use-api';
+import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
 import { auditActorLabel } from '@/lib/audit-feed';
 import { LastBackupCard } from '@/components/settings/LastBackupCard';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
   GROUP_LABEL,
+  isSectionVisible,
   type SettingsSection,
   type SectionStatus,
 } from '@/components/layout/settings/sections';
@@ -324,24 +326,19 @@ function RecentChangesPreview() {
 export function SettingsLanding() {
   useDocumentTitle('Settings');
   const { hasPermission, hasAnyPermission, isDemoUser } = useAuth();
-  const { capabilities } = useCapabilities();
-  const { data: systemConfig } = useSystemConfig();
+  const { capabilities, edition } = useCapabilities();
+  const { data: systemConfig } = useSystemConfig({ skip: !hasPermission(SHELL_READ_PERMISSIONS.systemConfig) });
   const isAirGap = systemConfig?.air_gap === true;
 
   const visibleSections = useMemo(() => {
     return SETTINGS_SECTIONS
       .map(s => {
-        if (s.capability && !capabilities[s.capability]) return null;
-        if (s.demoHidden && isDemoUser) return null;
-        if (s.airgapOnly && !isAirGap) return null;
-        const ok = !s.permissions
-          || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
-        if (!ok) return null;
+        if (!isSectionVisible(s, { capabilities, edition, isDemoUser, isAirGap, hasPermission, hasAnyPermission })) return null;
         return s;
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, edition, isAirGap]);
 
   const attention = useAttentionItems(visibleSections);
 
@@ -371,7 +368,7 @@ export function SettingsLanding() {
           <div className="flex flex-col gap-6">
             {/* NAN-5204: open core, admins only (the endpoint needs settings:system). */}
             {hasPermission('settings:system') && <LastBackupCard />}
-            <RecentChangesPreview />
+            {hasPermission(SHELL_READ_PERMISSIONS.audit) && <RecentChangesPreview />}
           </div>
         </div>
 

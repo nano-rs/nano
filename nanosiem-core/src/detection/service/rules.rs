@@ -140,11 +140,23 @@ impl DetectionService {
                     archived: Some(true),
                     ..Default::default()
                 };
-                return Ok(self.rule_repo.update(created.id, &update).await?);
+                let archived = self.rule_repo.update(created.id, &update).await?;
+                self.record_created_version(&archived).await;
+                return Ok(archived);
             }
         }
 
+        self.record_created_version(&created).await;
         Ok(created)
+    }
+
+    /// NAN-5315: write v1 when a rule is created. Without it the created state
+    /// was never versioned — the first edit became v1, so that edit could not
+    /// be reverted. Best-effort like every other version write
+    /// (`create_version_entry` logs and continues on failure).
+    async fn record_created_version(&self, rule: &DetectionRule) {
+        let reason = crate::tuning::types::VersionChangeReason::InitialCreation.to_string();
+        self.create_version_entry(rule, None, &reason, None).await;
     }
 
     /// Create a new detection rule with mode-based routing
@@ -225,7 +237,9 @@ impl DetectionService {
                             materialized_view_name: Some(Some(view_name)),
                             ..Default::default()
                         };
-                        Ok(self.rule_repo.update(created_rule.id, &update).await?)
+                        let rule = self.rule_repo.update(created_rule.id, &update).await?;
+                        self.record_created_version(&rule).await;
+                        Ok(rule)
                     }
                     Err(e) => {
                         // If materialized view creation fails, delete the rule and return error
@@ -254,6 +268,7 @@ impl DetectionService {
             DetectionMode::Scheduled => {
                 // Scheduled rules — next_run_at is persisted by the API handler
                 let created_rule = self.rule_repo.create(&rule).await?;
+                self.record_created_version(&created_rule).await;
                 Ok(created_rule)
             }
         }

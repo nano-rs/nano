@@ -17,6 +17,9 @@ mod config;
 pub mod denied_source_audit;
 pub mod display_sql;
 mod evaluator;
+/// NAN-5304: the real-time OCSF matched event applies the same empty-value
+/// stripping the search executor applies to scheduled rows.
+pub(crate) use evaluator::helpers::strip_empty_values;
 mod execution;
 /// Shared with the generated-SQL tripwire (`crate::query::generated_sql_tripwire`).
 pub(crate) use execution::validation::DISALLOWED_FUNCTIONS;

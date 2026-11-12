@@ -753,19 +753,25 @@ impl AlertRepository {
         &self,
         id: Uuid,
         assignee: &str,
+        assigned_by: &str,
         deny: &BTreeSet<String>,
     ) -> Result<Alert, AlertRepositoryError> {
         // NAN-1800: deny-scope guard on the UPDATE — a denied alert reads as
         // NotFound and is never mutated.
-        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 3);
+        // NAN-5314: stamp the actor + time so the Triage card / Timeline can
+        // render the assignment like acknowledge/close.
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 4);
         let sql = format!(
             r#"
-            UPDATE alerts SET assigned_to = $2
+            UPDATE alerts SET assigned_to = $2, assigned_by = $3, assigned_at = NOW()
             WHERE id = $1{scope_sql}
             RETURNING *
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(id).bind(assignee);
+        let mut query = sqlx::query_as::<_, Alert>(&sql)
+            .bind(id)
+            .bind(assignee)
+            .bind(assigned_by);
         if let Some(denied) = &scope_bind {
             query = query.bind(denied);
         }

@@ -100,7 +100,7 @@ export function LicenseBanner() {
 
   // A hard stop removes licensed-only surfaces, not the open/core product.
   if (status.state === 'locked') {
-    return <LicenseHardStopBanner status={status} />;
+    return <LicenseHardStopBanner status={status} canManageLicense={isAdmin} />;
   }
 
   // Grace period warning (dismissable)
@@ -124,17 +124,18 @@ export function LicenseBanner() {
           </div>
           <span className="text-amber-700 dark:text-amber-300">
             {legacyUpgrade
-              ? status.notice || 'Import a C05 license before the legacy upgrade grace ends.'
-              : `Your subscription is expiring${graceEnd ? ` on ${graceEnd.toLocaleDateString()}` : ''}. Update your billing to avoid service interruption.`}
+              ? status.notice || 'Import a license before the legacy upgrade grace ends.'
+              : `Your subscription is expiring${graceEnd ? ` on ${graceEnd.toLocaleDateString()}` : ''}.${isAdmin ? ' Update your billing to avoid service interruption.' : ''}`}
+            {isAdmin ? '' : ` ${ASK_ADMIN}`}
           </span>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {status.mode === 'offline' ? (
+          {!isAdmin ? null : status.mode === 'offline' ? (
             <Link
               to="/settings/license"
               className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 transition-colors"
             >
-              {legacyUpgrade ? 'Import C05 license' : 'Upload renewal'}
+              {legacyUpgrade ? 'Import license' : 'Upload renewal'}
             </Link>
           ) : (
             <a
@@ -161,7 +162,10 @@ export function LicenseBanner() {
   return null;
 }
 
-function LicenseHardStopBanner({ status }: { status: LicenseStatusResponse }) {
+/** Shown instead of a license CTA to roles that cannot manage the license. */
+export const ASK_ADMIN = 'Ask your administrator to install or renew the license.';
+
+export function LicenseHardStopBanner({ status, canManageLicense }: { status: LicenseStatusResponse; canManageLicense: boolean }) {
   const offline = status.mode === 'offline' || status.airgap;
   return (
     <div className="mx-6 mt-3 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50/80 px-4 py-3 text-sm dark:border-red-500/30 dark:bg-red-500/10">
@@ -174,10 +178,12 @@ function LicenseHardStopBanner({ status }: { status: LicenseStatusResponse }) {
           <div className="text-red-700/90 dark:text-red-300/90">
             {status.locked_reason || 'This license reached its hard-stop boundary.'}{' '}
             Open/core features, ingest, search, and stored data remain available.
+            {/* NAN-5310: only roles that can manage the license get a CTA. */}
+            {!canManageLicense && <> {ASK_ADMIN}</>}
           </div>
         </div>
       </div>
-      {offline ? (
+      {!canManageLicense ? null : offline ? (
         <Link
           to="/settings/license"
           className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-700"

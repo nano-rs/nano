@@ -1259,6 +1259,11 @@ export interface Alert {
   matched_event_count?: number;
   risk_score?: number;
   assigned_to?: string;
+  /** NAN-5314: assignee display name, resolved server-side from `assigned_to`. */
+  assignee_name?: string;
+  /** NAN-5314: who made the current assignment, and when (absent pre-migration-382). */
+  assigned_by?: string;
+  assigned_at?: string;
   acknowledged_by?: string;
   acknowledged_at?: string;
   closed_by?: string;
@@ -1320,12 +1325,23 @@ export interface BulkUpdateRulesResponse {
   }>;
 }
 
+/**
+ * A saved search's window (NAN-5311). `start`/`end` is the resolved window at
+ * save time; `preset` is set when the user picked a preset ("Last 24 hours"),
+ * and then the search reopens relative to now instead of on that past window.
+ * Stored as free JSON (`saved_searches.time_range JSONB`), so older rows carry
+ * only `start`/`end`.
+ */
+export interface SavedSearchTimeRange extends TimeRange {
+  preset?: string;
+}
+
 export interface SavedSearch {
   id: string;
   name: string;
   query: string;
   query_mode: 'piped' | 'sql';
-  time_range?: TimeRange;
+  time_range?: SavedSearchTimeRange;
   created_at: string;
   updated_at: string;
   user_id?: string;
@@ -1348,7 +1364,7 @@ export interface CreateSavedSearchRequest {
   name: string;
   query: string;
   query_mode: 'piped' | 'sql';
-  time_range?: TimeRange;
+  time_range?: SavedSearchTimeRange;
   visibility?: 'private' | 'public' | 'group';
   group_ids?: string[];
 }
@@ -1356,7 +1372,7 @@ export interface CreateSavedSearchRequest {
 export interface UpdateSavedSearchRequest {
   name?: string;
   query?: string;
-  time_range?: TimeRange;
+  time_range?: SavedSearchTimeRange;
 }
 
 export interface ShareSavedSearchRequest {
@@ -3905,6 +3921,8 @@ export interface AuditLogQuery {
   start_time?: string;
   end_time?: string;
   success?: boolean;
+  /** Free-text search, applied server-side over every matching row (NAN-5308). */
+  q?: string;
   limit?: number;
   offset?: number;
 }

@@ -95,18 +95,22 @@ export function PagedTreeView({ marker, nodes, config, ...props }: Props) {
       }
     }
   };
-  if (!pending) return <TreeVisualization nodes={nodes} config={config} {...props} />;
+  const markerNote = typeof marker._tree_note === 'string' ? marker._tree_note : null;
+  if (!pending) return <TreeVisualization nodes={nodes} config={config} {...props} emptyNote={markerNote} />;
+  // NAN-5313: an empty tree's note is shown in the empty state, not twice.
+  const emptyPage = !!active?.page && active.page.total_nodes === 0;
   return <div className="flex flex-col min-h-0">
     <div role="status" className="px-3 py-2 font-mono text-[10.5px] text-muted-foreground border-b border-border">
-      {active?.page?.preview ? 'Bounded 200-row preview; ancestry and counts are provisional. ' : active?.page ? `${active.page.total_roots} roots / ${active.page.total_nodes} nodes in the materialized view. ` : 'Loading first roots… '}
+      {active?.page?.preview ? 'Bounded 200-row preview; ancestry and counts are provisional. ' : active?.page ? `${active.page.total_roots} roots / ${active.page.total_nodes} nodes. ` : 'Loading first roots… '}
       {active?.loading && 'Exact tree queued or loading… '}
       {active?.page?.source_truncated && !active.page.preview && 'Input or branches were truncated; ancestry beyond retrieved rows is unknown. '}
-      {active?.page?.note && `${active.page.note} `}
+      {active?.page?.note && !emptyPage && `${active.page.note} `}
       {active?.error && <span role="alert">{active.error}</span>}
       {active?.pageLoading && 'Loading tree page…'}
     </div>
     <TreeVisualization key={`${key}:${active?.page?.preview ? 'preview' : 'exact'}`} nodes={active?.nodes ?? []}
       config={(active?.page?.config as unknown as TreeConfig) ?? config} {...props} serverPaged
+      emptyNote={active?.page?.note ?? markerNote}
       onLoadChildren={(node, offset) => { void load(node._page_path ?? [], offset); }} />
     {!active?.page?.preview && active?.page?.next_offset != null && <button disabled={active.pageLoading} className="border-t border-border px-3 py-2 text-[11px] font-mono" onClick={() => void load([], active.page!.next_offset!)}>Load more roots</button>}
   </div>;

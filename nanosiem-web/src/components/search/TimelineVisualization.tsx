@@ -42,10 +42,10 @@ import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { isInternalName } from '@/lib/internal-domains';
 import { api } from '@/lib/api';
 import type { ArtifactOccurrence as ApiArtifactOccurrence } from '@/lib/api/types';
-import { formatInTimeZone } from 'date-fns-tz';
 import { CHART_AXIS_LINE, CHART_AXIS_TEXT } from '@/lib/chart-colors';
 import { artifactCandidates } from '@/lib/prevalence/artifactFields';
 import { buildTimelinePlotData, timelinePlotDomain, timelineSeriesData, resolveBucketStart, type TimelinePlotPoint } from './timeline-fill';
+import { formatTimelineAxisLabel, formatTimelineTooltipTime, timelineAxisTicks } from './timeline-axis';
 import {
   buildObservationQueries,
   mergeObservations,
@@ -736,102 +736,32 @@ export function TimelineVisualization({
     return ['dataMin', 'dataMax'];
   }, [effectiveRange, staticMode, chartType, pickerRange]);
 
-  // Check if time range spans multiple days (for showing dates in labels)
-  const spansDays = useMemo(() => {
-    // In static mode, derive from actual data range
+  // The window the axis labels describe: the data extent for a timechart
+  // (static mode), else the effective query window, else a 24h default.
+  const axisWindow = useMemo<[number, number]>(() => {
     if (staticMode && timelineData.length >= 2) {
       const start = timelineData[0].timestamp;
       const end = timelineData[timelineData.length - 1].timestamp;
-      return (end - start) > 24 * 60 * 60 * 1000;
+      return end > start ? [start, end] : [start, start + 24 * 60 * 60 * 1000];
     }
-    if (effectiveRange) {
-      return (effectiveRange[1] - effectiveRange[0]) > 24 * 60 * 60 * 1000; // > 24 hours
-    }
-    return false;
+    if (effectiveRange) return effectiveRange;
+    const now = Date.now();
+    return [now - 24 * 60 * 60 * 1000, now];
   }, [effectiveRange, staticMode, timelineData]);
 
-  // Check time range duration for formatting precision
-  const rangeDurationMs = useMemo(() => {
-    // In static mode, derive from actual data range
-    if (staticMode && timelineData.length >= 2) {
-      const start = timelineData[0].timestamp;
-      const end = timelineData[timelineData.length - 1].timestamp;
-      return end - start || 24 * 60 * 60 * 1000;
-    }
-    if (effectiveRange) {
-      return effectiveRange[1] - effectiveRange[0];
-    }
-    return 24 * 60 * 60 * 1000; // default 24h
-  }, [effectiveRange, staticMode, timelineData]);
-
-  // Generate evenly-spaced tick values for the X-axis
+  // Evenly spaced X-axis ticks; calendar-stepped on long windows (NAN-5320).
   const xAxisTicks = useMemo(() => {
     if (!Array.isArray(xDomain) || xDomain.length !== 2) return undefined;
     const [start, end] = xDomain;
     if (typeof start !== 'number' || typeof end !== 'number') return undefined;
-
-    const range = end - start;
-    const targetTickCount = 20; // Aim for ~20 ticks
-
-    // Find a nice interval (round to nice time boundaries)
-    const rawInterval = range / targetTickCount;
-
-    // Nice intervals in milliseconds: from 1sec up to 24hr
-    const niceIntervals = [
-      1000,                // 1 sec
-      2 * 1000,            // 2 sec
-      5 * 1000,            // 5 sec
-      10 * 1000,           // 10 sec
-      15 * 1000,           // 15 sec
-      30 * 1000,           // 30 sec
-      60 * 1000,           // 1 min
-      5 * 60 * 1000,       // 5 min
-      10 * 60 * 1000,      // 10 min
-      15 * 60 * 1000,      // 15 min
-      30 * 60 * 1000,      // 30 min
-      60 * 60 * 1000,      // 1 hr
-      2 * 60 * 60 * 1000,  // 2 hr
-      4 * 60 * 60 * 1000,  // 4 hr
-      6 * 60 * 60 * 1000,  // 6 hr
-      12 * 60 * 60 * 1000, // 12 hr
-      24 * 60 * 60 * 1000, // 24 hr
-    ];
-
-    // Find the smallest nice interval >= rawInterval
-    const interval = niceIntervals.find(i => i >= rawInterval) || niceIntervals[niceIntervals.length - 1];
-
-    // Align start to the interval boundary
-    const alignedStart = Math.ceil(start / interval) * interval;
-
-    const ticks: number[] = [];
-    for (let t = alignedStart; t <= end; t += interval) {
-      ticks.push(t);
-    }
-
+    const ticks = timelineAxisTicks(start, end);
     return ticks.length > 0 ? ticks : undefined;
   }, [xDomain]);
 
-  const formatAxisLabel = useCallback((timestamp: number): string => {
-    const date = new Date(timestamp);
-
-    // Very tight range (< 2 min): show seconds.milliseconds
-    if (rangeDurationMs < 2 * 60 * 1000) {
-      return formatInTimeZone(date, 'UTC', 'HH:mm:ss.SSS');
-    }
-
-    // Tight range (< 30 min): show seconds
-    if (rangeDurationMs < 30 * 60 * 1000) {
-      return formatInTimeZone(date, 'UTC', 'HH:mm:ss');
-    }
-
-    // Multi-day range: show date + time
-    if (spansDays) {
-      return formatInTimeZone(date, 'UTC', 'M/d HH:mm');
-    }
-
-    // Default: just time
-    return formatInTimeZone(date, 'UTC', 'HH:mm');
-  }, [spansDays, rangeDurationMs]);
+  const formatAxisLabel = useCallback(
+    (timestamp: number): string => formatTimelineAxisLabel(timestamp, axisWindow[0], axisWindow[1]),
+    [axisWindow],
+  );
 
   // Calculate bucket interval for tooltip display
   const bucketInterval = useMemo(() => calculateBucketInterval(timelineData), [timelineData]);
@@ -911,28 +841,11 @@ export function TimelineVisualization({
     [],
   );
 
-  // Format timestamp for tooltip (includes date if range spans days)
-  const formatTooltipTime = useCallback((timestamp: number): string => {
-    const date = new Date(timestamp);
-
-    // Very tight range (< 2 min): show seconds.milliseconds
-    if (rangeDurationMs < 2 * 60 * 1000) {
-      return formatInTimeZone(date, 'UTC', 'HH:mm:ss.SSS');
-    }
-
-    // Tight range (< 30 min): show seconds
-    if (rangeDurationMs < 30 * 60 * 1000) {
-      return formatInTimeZone(date, 'UTC', 'HH:mm:ss');
-    }
-
-    // Multi-day range: always show date + time for clarity
-    if (spansDays) {
-      return formatInTimeZone(date, 'UTC', 'MMM d, HH:mm');
-    }
-
-    // Default: just time with seconds for precision
-    return formatInTimeZone(date, 'UTC', 'HH:mm:ss');
-  }, [spansDays, rangeDurationMs]);
+  // Tooltip time: date once the window spans days, year once it crosses one.
+  const formatTooltipTime = useCallback(
+    (timestamp: number): string => formatTimelineTooltipTime(timestamp, axisWindow[0], axisWindow[1]),
+    [axisWindow],
+  );
 
   // Helper: build scatter points from per-event artifact occurrences.
   // One dot per event, positioned at the event's actual timestamp.

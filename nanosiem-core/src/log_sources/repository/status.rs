@@ -37,6 +37,16 @@ impl LogSourceRepository {
 
     /// Advance the sample-validation receipt for a parser generation after
     /// every supplied sample passed VRL execution and OCSF validation.
+    ///
+    /// Returns the row's new `updated_at`: the `log_sources_updated_at`
+    /// trigger bumps it on this write like on any other, so a caller that
+    /// pinned the revision it checked must continue at the returned one
+    /// (NAN-5297: publish used to CAS against the pre-receipt revision and
+    /// 409'd against its own write).
+    ///
+    /// With `expected_updated_at`, the write is a compare-and-swap against the
+    /// revision the caller validated: a concurrent edit in between is
+    /// `StaleVersion`, never a receipt stamped onto a generation nobody checked.
     pub async fn set_ocsf_validation_attestation(
         &self,
         id: Uuid,
@@ -44,27 +54,42 @@ impl LogSourceRepository {
         parser_sha256: &str,
         sample_sha256: &str,
         sample_count: i32,
-    ) -> Result<(), LogSourceRepositoryError> {
-        let result = sqlx::query(
+        expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<chrono::DateTime<chrono::Utc>, LogSourceRepositoryError> {
+        let updated_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
             "UPDATE log_sources SET \
                 ocsf_validation_schema_version = $2, \
                 ocsf_validation_parser_sha256 = $3, \
                 ocsf_validation_sample_sha256 = $4, \
                 ocsf_validation_sample_count = $5, \
                 ocsf_validated_at = NOW() \
-             WHERE id = $1",
+             WHERE id = $1 AND ($6::timestamptz IS NULL OR updated_at = $6) \
+             RETURNING updated_at",
         )
         .bind(id)
         .bind(schema_version)
         .bind(parser_sha256)
         .bind(sample_sha256)
         .bind(sample_count)
-        .execute(&self.pool)
+        .bind(expected_updated_at)
+        .fetch_optional(&self.pool)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(LogSourceRepositoryError::NotFound(id.to_string()));
+        match updated_at {
+            Some(updated_at) => Ok(updated_at),
+            None => {
+                // Classify the miss only; the CAS above already refused it.
+                let exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM log_sources WHERE id = $1)")
+                        .bind(id)
+                        .fetch_one(&self.pool)
+                        .await?;
+                if exists {
+                    Err(LogSourceRepositoryError::StaleVersion(id))
+                } else {
+                    Err(LogSourceRepositoryError::NotFound(id.to_string()))
+                }
+            }
         }
-        Ok(())
     }
 
     /// The stored OCSF receipt, if any: (schema version, parser fingerprint,

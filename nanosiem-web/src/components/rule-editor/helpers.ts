@@ -53,17 +53,36 @@ export const MODE_META: Record<DisplayModeKey, { label: string; dotVar: string; 
 };
 
 // Cron → human cadence. Covers the common patterns used by rule authors.
+// Accepts the 5-field form (`min hour dom mon dow`) and the 6/7-field form the
+// scheduler stores (`sec min hour dom mon dow [year]`) — NAN-5316: the API
+// writes `*/30 * * * * *` (every 30 s) for auto-switched rules, which the old
+// 5-field parse read as "every 30m".
 export function cronHuman(expr: string | undefined | null): string {
   if (!expr) return '—';
   const parts = expr.trim().split(/\s+/);
-  if (parts.length < 5) return expr;
-  const [m, h, dom, mo, dow] = parts;
-  const starOthers = [h, dom, mo, dow].every((p) => p === '*' || p === '?');
-  if (starOthers) {
-    const mm = m.match(/^\*\/(\d+)$/);
+  if (parts.length < 5 || parts.length > 7) return expr;
+  const [s, m, h, dom, mo, dow] = parts.length === 5 ? ['0', ...parts] : parts;
+  const wild = (p: string) => p === '*' || p === '?';
+  const year = parts.length === 7 ? parts[6] : '*';
+  if (![dom, mo, dow, year].every(wild)) return expr;
+
+  // Sub-minute cadences: seconds field drives, everything else wildcard.
+  if (wild(m) && wild(h)) {
+    const sm = s.match(/^(?:\*|0)\/(\d+)$/);
+    if (sm) return `every ${sm[1]}s`;
+    if (s === '*') return 'every second';
+  }
+  if (!/^\d+$/.test(s)) return expr;
+
+  if (wild(h)) {
+    const mm = m.match(/^(?:\*|0)\/(\d+)$/);
     if (mm) return `every ${mm[1]}m`;
     if (m === '*') return 'every minute';
-    if (/^\d+$/.test(m)) return `at :${m.padStart(2, '0')}`;
+    if (/^\d+$/.test(m)) return `hourly at :${m.padStart(2, '0')}`;
+  }
+  if (/^\d+$/.test(m)) {
+    const hh = h.match(/^(?:\*|0)\/(\d+)$/);
+    if (hh && m === '0') return `every ${hh[1]}h`;
   }
   return expr;
 }

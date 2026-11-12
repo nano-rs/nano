@@ -27,6 +27,10 @@ mod source_stamp_tests;
 mod tests;
 #[cfg(test)]
 mod eval_chain_guard_tests;
+#[cfg(test)]
+mod stepped_dedup_tests;
+#[cfg(test)]
+mod created_version_tests;
 
 // Audit D13: the real-time SignalProcessor shares the scheduled path's
 // finding-emission dedup (candidate type + store helpers in `helpers`).

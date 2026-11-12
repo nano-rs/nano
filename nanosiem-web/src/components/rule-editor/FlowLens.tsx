@@ -34,7 +34,7 @@ export function FlowLens({ query, schedule, lookback }: FlowLensProps) {
           <span className="inline-flex items-center gap-1.5 text-muted-foreground">
             {schedule && (
               <>
-                every <span className="text-foreground">{cronHuman(schedule)}</span>
+                <span className="text-foreground">{cronHuman(schedule)}</span>
               </>
             )}
             {lookback && (

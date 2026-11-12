@@ -33,6 +33,7 @@ import {
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { useAuth } from '@/contexts/AuthContext';
+import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { QuickPivotIntake } from '@/components/dashboard/QuickPivotIntake';
@@ -147,9 +148,11 @@ function PulseCard({ p }: { p: Pulse }) {
 const NO_COVERAGE_FILTERS = { severity: [], mode: [] };
 
 function PulseStrip() {
-  const { data: myCases } = useMyCases(20);
+  // NAN-5325: only read what this role may read (no 403 + audited denial).
+  const { hasPermission } = useAuth();
+  const { data: myCases } = useMyCases(20, { skip: !hasPermission(SHELL_READ_PERMISSIONS.myCases) });
   const { data: health } = useDetectionHealthSummary();
-  const { data: siemHealth } = useSiemHealthLatest();
+  const { data: siemHealth } = useSiemHealthLatest({ skip: !hasPermission(SHELL_READ_PERMISSIONS.siemHealth) });
   const { data: coverage } = useMitreCoverage(NO_COVERAGE_FILTERS);
 
   const forYouCount = (myCases?.length ?? 0) + (health?.needs_tuning ?? 0);
@@ -513,8 +516,8 @@ function MyWorkColumn() {
   const canViewCases = hasPermission('cases:view') && capabilities.cases;
   const canViewNotebooks = hasPermission('notebooks:view') && capabilities.notebooks;
 
-  const { data: myCases } = useMyCases(5);
-  const { data: unassigned } = useUnassignedCases(5);
+  const { data: myCases } = useMyCases(5, { skip: !canViewCases });
+  const { data: unassigned } = useUnassignedCases(5, { skip: !canViewCases });
   const { data: notebooks } = useRecentNotebooks(3);
 
   const myList = (myCases ?? []).filter((c) => c.status !== 'resolved' && c.status !== 'closed');
@@ -632,6 +635,7 @@ function NoisyRuleRow({ r }: { r: NoisyRule }) {
 }
 
 function FleetColumn() {
+  const canReadAudit = useAuth().hasPermission(SHELL_READ_PERMISSIONS.audit);
   // "Fleet — last 24h": audit log tail of system-level changes. We can't perfectly
   // filter to rule-only events here without a richer API; surface everything recent
   // and let the visual kind heuristic classify.
@@ -640,7 +644,7 @@ function FleetColumn() {
     d.setHours(d.getHours() - 24);
     return d.toISOString();
   }, []);
-  const { data: audit } = useRecentAuditChanges({ start_time: since, limit: 6 });
+  const { data: audit } = useRecentAuditChanges({ start_time: since, limit: 6 }, { skip: !canReadAudit });
   const { data: noisy } = useNoisyRules(5);
 
   const changes = audit?.logs ?? [];
@@ -648,6 +652,7 @@ function FleetColumn() {
 
   return (
     <div className="flex flex-col gap-4">
+      {canReadAudit && (
       <div>
         <SectionHead eyebrow="Fleet — last 24h" count={changes.length} action="activity log" href="/settings/audit" />
         {changes.length === 0 ? (
@@ -658,6 +663,7 @@ function FleetColumn() {
           </div>
         )}
       </div>
+      )}
 
       <div>
         <SectionHead eyebrow="Noisiest rules" count={rules.length} action="tuning queue" href="/rules/tuning" />
@@ -749,8 +755,11 @@ function ActivityRow({ a }: { a: AuditLogEntry }) {
 }
 
 function ActivityFeed() {
-  const { data: audit } = useRecentAuditChanges({ limit: 7 });
+  const canReadAudit = useAuth().hasPermission(SHELL_READ_PERMISSIONS.audit);
+  const { data: audit } = useRecentAuditChanges({ limit: 7 }, { skip: !canReadAudit });
   const rows = audit?.logs ?? [];
+  // A role that can't read the audit log gets no card, not "No recent activity".
+  if (!canReadAudit) return null;
 
   return (
     <div>
@@ -779,7 +788,7 @@ export function Dashboard() {
   // ("N things need your attention today. Catch me up"). In open-core builds
   // (no cases capability) the count is null → the hero falls back to its
   // generic copy.
-  const { data: myCases } = useMyCases(20);
+  const { data: myCases } = useMyCases(20, { skip: !hasPermission(SHELL_READ_PERMISSIONS.myCases) || !capabilities.cases });
   const attentionCount = capabilities.cases && myCases
     ? myCases.filter((c) => c.status !== 'resolved' && c.status !== 'closed').length
     : null;
@@ -787,6 +796,7 @@ export function Dashboard() {
   // MyWorkColumn renders null when neither cases nor notebooks is available;
   // collapse the two-column grid to single column so FleetColumn doesn't
   // float in column 1 with column 2 blank.
+  const canSeeIngest = hasPermission(SHELL_READ_PERMISSIONS.ingestionHistory);
   const showMyWork =
     (hasPermission('cases:view') && capabilities.cases) ||
     (hasPermission('notebooks:view') && capabilities.notebooks);
@@ -802,8 +812,8 @@ export function Dashboard() {
           {showMyWork && <MyWorkColumn />}
           <FleetColumn />
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-6 pt-2">
-          <IngestSpark />
+        <div className={cn('grid grid-cols-1 gap-6 pt-2', canSeeIngest && 'md:grid-cols-[280px_1fr]')}>
+          {canSeeIngest && <IngestSpark />}
           <ActivityFeed />
         </div>
         <HomeDemoHint />

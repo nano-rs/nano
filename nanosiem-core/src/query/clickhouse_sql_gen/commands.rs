@@ -42,7 +42,9 @@ impl ClickHouseSqlGenerator {
         let timestamp_available = !aggregated
             && match available_columns {
                 None => true,
-                Some(cols) => cols.contains(self.time_column()),
+                // NAN-5306 review: or under the name a `table` gave it.
+                Some(cols) => cols.contains(self.time_column())
+                    || cols.contains(&self.time_column_in_scope().to_lowercase()),
             };
         match cmd {
             Command::Stats {
@@ -153,8 +155,9 @@ impl ClickHouseSqlGenerator {
                     // presented oldest-first. NAN-4278: this took the NEWEST N. The
                     // pipeline generator inverts the actual current order instead
                     // (`generate_command_sql_with_ctx`); this is the context-free form.
-                    // O27 (NAN-1721): order on the dataset time column.
-                    let tc = self.time_column();
+                    // O27 (NAN-1721): order on the dataset time column (as in
+                    // scope: `time` after `table time, …`, NAN-5306 review).
+                    let tc = self.time_column_in_scope();
                     Ok(format!("  SELECT * FROM {}\n  ORDER BY {tc} ASC\n  LIMIT {}", source, count))
                 } else {
                     // Post-aggregation / timestamp pruned: there is no `timestamp` to order by
@@ -232,13 +235,19 @@ impl ClickHouseSqlGenerator {
 
                         match alias {
                             Some(a) => format!("{} AS {}", field_expr, escape_identifier(a)),
-                            None => {
-                                if needs_alias {
-                                    format!("{} AS {}", field_expr, escape_identifier(name))
-                                } else {
-                                    field_expr
-                                }
+                            // NAN-5306: every column comes back under the name
+                            // the user asked for. A field that resolves to a
+                            // differently named column (`time` → `timestamp`,
+                            // `metadata.log_source` → `source_type`) used to
+                            // project bare, so the row keyed it by the physical
+                            // name while `column_order` carried the requested
+                            // one, and the column silently vanished.
+                            None if needs_alias
+                                || table_field_renamed(&field_expr, name) =>
+                            {
+                                format!("{} AS {}", field_expr, escape_identifier(name))
                             }
+                            None => field_expr,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -386,7 +395,10 @@ impl ClickHouseSqlGenerator {
                 // O27 (NAN-1721): the time column is profile-relative — `timestamp`
                 // on logs, `start_time` on spans (a literal `timestamp` does not
                 // exist on `otel_spans`); the legacy ORDER BY below uses it too.
-                let time_col = self.time_column();
+                // NAN-5306 review: the event time as in scope (`time` after a
+                // `table time, …` re-aliased it).
+                let time_col_in_scope = self.time_column_in_scope();
+                let time_col = time_col_in_scope.as_str();
                 let base_is_physical_row_scan = self.row_identity_column().is_some();
                 let time_col_available = match available_columns {
                     None => true,
@@ -1286,7 +1298,7 @@ impl ClickHouseSqlGenerator {
                     Ok(format!(
                         "  SELECT * FROM {}\n  ORDER BY {} ASC",
                         source,
-                        self.time_column()
+                        self.time_column_in_scope()
                     ))
                 } else {
                     // Post-aggregation / timestamp pruned: reverse the CURRENT result order via

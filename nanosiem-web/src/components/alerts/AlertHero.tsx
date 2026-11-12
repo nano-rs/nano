@@ -47,6 +47,10 @@ interface AlertHeroAlert {
   timestamp: Date;
   acknowledgedAt?: Date;
   acknowledgedBy?: string;
+  /** NAN-5314: assignee display label (name, never the raw user typeid). */
+  assignee?: string;
+  assignedAt?: Date;
+  assignedBy?: string;
   closedAt?: Date;
   closedBy?: string;
   triageVerdict?: string;
@@ -328,6 +332,18 @@ export function AlertHero({
                   <span className="text-foreground truncate">{alert.acknowledgedBy}</span>
                 </div>
               )}
+              {alert.assignee && (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-muted-foreground">assigned</span>
+                  <span className="text-foreground truncate" title={alert.assignee}>{alert.assignee}</span>
+                </div>
+              )}
+              {alert.assignedBy && (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-muted-foreground">by</span>
+                  <span className="text-foreground truncate">{alert.assignedBy}</span>
+                </div>
+              )}
               {alert.closedAt && (
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-muted-foreground">closed</span>
@@ -350,7 +366,7 @@ export function AlertHero({
                   </span>
                 </div>
               )}
-              {!alert.acknowledgedAt && !alert.closedAt && (
+              {!alert.acknowledgedAt && !alert.closedAt && !alert.assignee && (
                 <div className="text-muted-foreground/60">No triage actions yet.</div>
               )}
             </div>

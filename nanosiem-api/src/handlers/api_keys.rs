@@ -415,6 +415,8 @@ pub async fn create_key(
     // failed record rolls the key back (explicit failure, not a silent drop).
     // Only the ClickHouse delivery is detached.
     let actor_name = state.audit_actor_name(auth.user_id()).await;
+    // NAN-5324: the record says what the key can do, not only that it exists.
+    let created_details = api_key_created_details(&request);
     let (api_key, event) = state
         .api_key_service
         .create_key_audited(request, created_by, |key_id, key_name| {
@@ -423,6 +425,7 @@ pub async fn create_key(
                 .api_key(auth.api_key_id, auth.api_key_name.clone())
                 .resource("api_key", Some(key_id), Some(key_name.to_string()))
                 .client_context(&client)
+                .details(created_details)
                 .build()
         })
         .await
@@ -568,10 +571,40 @@ pub async fn update_key(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("api_key", Some(*id), Some(key.name.clone()))
             .client_context(&client)
+            .details(nanosiem_core::audit::changes::field_changes(
+                &api_key_audit_snapshot(&current),
+                &api_key_audit_snapshot(&key),
+            ))
             .build(),
     ).await;
 
     Ok(Json(ApiKeySummary::from(key)))
+}
+
+/// NAN-5324: the audit-relevant state of a key — what it can do and for how
+/// long. Never includes the secret or its hash.
+pub(crate) fn api_key_audit_snapshot(key: &ApiKey) -> serde_json::Value {
+    let mut permissions = key.permissions.clone();
+    permissions.sort();
+    serde_json::json!({
+        "name": key.name,
+        "description": key.description,
+        "permissions": permissions,
+        "enabled": key.enabled,
+        "expires_at": key.expires_at,
+        "rate_limit": key.rate_limit,
+    })
+}
+
+/// NAN-5324: `apikey_created` details — the granted scopes and limits.
+pub(crate) fn api_key_created_details(request: &CreateApiKeyRequest) -> serde_json::Value {
+    let mut permissions = request.permissions.clone();
+    permissions.sort();
+    serde_json::json!({
+        "permissions": permissions,
+        "expires_at": request.expires_at,
+        "rate_limit": request.rate_limit,
+    })
 }
 
 /// NAN-5029: may a key's self-update be applied? Only changes that TIGHTEN it
@@ -705,12 +738,11 @@ pub async fn delete_key(
         .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
 
     // Get key name for audit before deleting
-    let key_name = state
-        .api_key_service
-        .get_key(*id)
-        .await
-        .map(|k| k.name)
-        .unwrap_or_else(|_| "unknown".to_string());
+    let existing = state.api_key_service.get_key(*id).await.ok();
+    let key_name = existing
+        .as_ref()
+        .map(|k| k.name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
     // NAN-4954: the delete and its `apikey_deleted` audit record commit in ONE
     // PostgreSQL transaction; only the ClickHouse delivery is detached.
@@ -719,6 +751,7 @@ pub async fn delete_key(
         .api_key(auth.api_key_id, auth.api_key_name.clone())
         .resource("api_key", Some(*id), Some(key_name))
         .client_context(&client)
+        .details(existing.as_ref().map(api_key_audit_snapshot).unwrap_or(serde_json::Value::Null))
         .build();
     state
         .api_key_service
@@ -926,6 +959,7 @@ pub async fn reset_key(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("api_key", Some(*id), Some(result.name.clone()))
             .client_context(&client)
+            .details(api_key_audit_snapshot(&current))
             .build(),
     ).await;
 
@@ -1021,6 +1055,10 @@ pub async fn update_owner_clamp(
 #[cfg(test)]
 #[path = "api_keys_self_update_tests.rs"]
 mod self_update_tests;
+
+#[cfg(test)]
+#[path = "api_keys_audit_details_tests.rs"]
+mod audit_details_tests;
 
 /// OpenAPI documentation for API key management endpoints
 #[derive(utoipa::OpenApi)]

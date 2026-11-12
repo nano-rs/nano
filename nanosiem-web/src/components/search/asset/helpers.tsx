@@ -3,6 +3,7 @@
 import { cn } from '@/lib/utils';
 import type { ReactNode } from 'react';
 import { nplExactEquals } from '@/lib/npl-quote';
+import { primaryIdentityKind } from '@/lib/asset-pivot';
 import {
 
   schemaFieldCandidates,
@@ -317,7 +318,13 @@ export function withAssetIdentity(
   profile: SchemaProfileId,
 ): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...filters };
-  const clause = buildIdentityClause(identities, profile);
+  // NAN-5312: the related identities can carry only the short hostname
+  // (`ir-wks-01`) while events carry the FQDN the asset was opened on, so the
+  // primary identifier always joins the clause.
+  const kind = primary?.field && primary.value ? primaryIdentityKind(primary.field) : null;
+  const withPrimary =
+    kind && primary ? [...(identities ?? []), { [kind]: primary.value }] : identities;
+  const clause = buildIdentityClause(withPrimary, profile);
   if (clause) {
     merged._identityClause = clause;
   } else if (primary?.field && primary.value) {

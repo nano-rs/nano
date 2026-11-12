@@ -210,6 +210,9 @@ export function AlertDetail() {
               timestamp: alert.timestamp,
               acknowledgedAt: alert.acknowledgedAt,
               acknowledgedBy: alert.acknowledgedBy,
+              assignee: alert.assignee,
+              assignedAt: alert.assignedAt,
+              assignedBy: alert.assignedBy,
               closedAt: alert.closedAt,
               closedBy: alert.closedBy,
               triageVerdict: alert.triageVerdict,
@@ -225,7 +228,7 @@ export function AlertDetail() {
             alertId={alert.id}
             ruleName={displayName ?? 'Alert'}
             status={alert.status as 'open' | 'acknowledged' | 'closed'}
-            currentAssignee={apiAlert?.assigned_to ?? null}
+            currentAssignee={alert.assignee ?? null}
             onActionComplete={refetchAlert}
             bypassCasesSuppression={isMonitor}
           />
@@ -571,6 +574,16 @@ function TimelineTab({ alert }: { alert: NonNullable<ReturnType<typeof fromApiAl
       detail: `${alert.matchedEventCount} matched event${alert.matchedEventCount === 1 ? '' : 's'}`,
     },
   ];
+  // NAN-5314: assignment is a triage action too. Pre-migration-382 rows carry
+  // no time/actor; still record who holds it.
+  if (alert.assignee) {
+    items.push({
+      label: `Assigned to ${alert.assignee}`,
+      at: alert.assignedAt,
+      by: alert.assignedBy,
+      tone: 'var(--primary)',
+    });
+  }
   if (alert.acknowledgedAt) {
     items.push({
       label: 'Acknowledged',

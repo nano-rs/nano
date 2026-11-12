@@ -135,7 +135,8 @@ function Labeled({ label, mono, children }: { label: string; mono?: boolean; chi
 
 interface RoleListItemProps {
   role: RoleDetail;
-  memberCount: number;
+  /** null when the viewer cannot read users (no users:view) — show no count. */
+  memberCount: number | null;
   selected: boolean;
   onSelect: (id: string) => void;
 }
@@ -171,8 +172,12 @@ function RoleListItem({ role, memberCount, selected, onSelect }: RoleListItemPro
           <div className="text-[11px] text-muted-foreground truncate mt-0.5">{role.description}</div>
         )}
         <div className="flex items-center gap-3 mt-1 font-mono text-[10.5px] text-muted-foreground tabular-nums">
-          <span>{memberCount} {memberCount === 1 ? 'member' : 'members'}</span>
-          <span>·</span>
+          {memberCount !== null && (
+            <>
+              <span>{memberCount} {memberCount === 1 ? 'member' : 'members'}</span>
+              <span>·</span>
+            </>
+          )}
           <span>{perms} perms</span>
         </div>
       </div>
@@ -423,10 +428,12 @@ export function RolesView() {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const canCreate = hasPermission('roles:create');
+  const canViewUsers = hasPermission('users:view');
 
   const [roles, setRoles] = useState<RoleDetail[]>([]);
   const [permissions, setPermissions] = useState<PermissionInfo[]>([]);
   const [users, setUsers] = useState<UserDetail[]>([]);
+  const [usersReadable, setUsersReadable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -440,14 +447,21 @@ export function RolesView() {
   const fetchAll = async () => {
     setLoading(true);
     try {
+      // NAN-5307: users are optional decoration (member counts). Load them
+      // independently and only with users:view, so a refused /api/users can
+      // never discard the role list.
+      const usersPromise = canViewUsers
+        ? api.listUsers().then(res => res.users, () => null)
+        : Promise.resolve(null);
       const [rolesRes, permsRes, usersRes] = await Promise.all([
         api.listRoles(),
         api.listPermissions(),
-        api.listUsers(),
+        usersPromise,
       ]);
       setRoles(rolesRes.roles);
       setPermissions(permsRes);
-      setUsers(usersRes.users);
+      setUsers(usersRes ?? []);
+      setUsersReadable(usersRes !== null);
       if (!selectedId && rolesRes.roles.length > 0) {
         const firstAssignable = rolesRes.roles.find(r => !r.is_system) || rolesRes.roles[0];
         setSelectedId(firstAssignable.id);
@@ -586,7 +600,7 @@ export function RolesView() {
                 <RoleListItem
                   key={r.id}
                   role={r}
-                  memberCount={memberCounts[r.id] || 0}
+                  memberCount={usersReadable ? (memberCounts[r.id] || 0) : null}
                   selected={selected?.id === r.id}
                   onSelect={setSelectedId}
                 />

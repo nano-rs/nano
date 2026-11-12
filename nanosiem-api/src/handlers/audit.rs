@@ -60,6 +60,10 @@ pub struct ListAuditLogsQuery {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub success: Option<bool>,
+    /// Case-insensitive free-text search over message, action, actor, IP and
+    /// event metadata (resource, API key, details). Applied server-side, so
+    /// `total` counts every matching row (NAN-5308).
+    pub q: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -180,6 +184,7 @@ pub async fn query_audit_logs(
         start_time: query.start_time,
         end_time: query.end_time,
         success: query.success,
+        search: query.q,
         limit: Some(limit),
         offset: Some(offset),
     };
@@ -264,6 +269,8 @@ pub struct ExportAuditLogsQuery {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub success: Option<bool>,
+    /// Same free-text search as `GET /api/audit?q=` (NAN-5308).
+    pub q: Option<String>,
     pub format: Option<ExportFormat>,
     pub limit: Option<i64>,
 }
@@ -312,6 +319,7 @@ pub async fn export_audit_logs(
         start_time: query.start_time,
         end_time: query.end_time,
         success: query.success,
+        search: query.q.clone(),
         limit: Some(limit),
         offset: Some(0),
     };
@@ -343,6 +351,7 @@ pub async fn export_audit_logs(
                 "exported": entries.len(),
                 "admin_cross_user": is_admin && query.user_id != Some(auth.user_id()),
                 "target_user_id": effective_user_id,
+                "search": query.q,
             }))
             .build(),
     );
@@ -398,11 +407,19 @@ fn generate_csv(entries: &[AuditLogEntry]) -> Result<String, String> {
     let mut csv = String::new();
 
     // Header row
-    csv.push_str("id,timestamp,user_id,user_name,api_key_id,api_key_name,action,source,resource_type,resource_id,resource_name,ip_address,success,message\n");
+    csv.push_str("id,timestamp,user_id,user_name,api_key_id,api_key_name,action,source,resource_type,resource_id,resource_name,ip_address,success,message,details\n");
 
     for entry in entries {
+        // NAN-5324: keep the event details (scopes granted, old → new values,
+        // denial reason) — without them the export loses what changed.
+        let details = entry
+            .details
+            .as_ref()
+            .filter(|d| !d.is_null())
+            .map(|d| d.to_string())
+            .unwrap_or_default();
         let row = format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             entry.id,
             entry.timestamp.to_rfc3339(),
             escape_csv_field(entry.user_id.as_deref().unwrap_or("")),
@@ -417,6 +434,7 @@ fn generate_csv(entries: &[AuditLogEntry]) -> Result<String, String> {
             escape_csv_field(entry.ip_address.as_deref().unwrap_or("")),
             entry.success,
             escape_csv_field(entry.message.as_deref().unwrap_or("")),
+            escape_csv_field(&details),
         );
         csv.push_str(&row);
     }
@@ -516,6 +534,10 @@ pub async fn get_resource_types(
     )
 )]
 pub struct AuditApiDoc;
+
+#[cfg(test)]
+#[path = "audit_csv_details_tests.rs"]
+mod csv_details_tests;
 
 #[cfg(test)]
 mod tests {

@@ -59,6 +59,34 @@ async fn resolve_actor_display(state: &AppState, user_id: Uuid) -> String {
         .unwrap_or_else(|_| user_id.to_string())
 }
 
+/// NAN-5314: the user id an `assigned_to` value names, if it is a user typeid
+/// (`user_…`) or a bare UUID. Any other prefix is not a user reference.
+fn assigned_user_id(assigned_to: &str) -> Option<Uuid> {
+    let (prefix, uid) = nanosiem_core::typeid::parse_any(assigned_to).ok()?;
+    (prefix.is_empty() || prefix == nanosiem_core::typeid::user::PREFIX).then_some(uid)
+}
+
+/// NAN-5314: fill `assignee_name` from the `assigned_to` user typeid so the UI
+/// shows a person, not `user_4ckt…`. One user lookup per DISTINCT assignee; an
+/// unresolvable value (deleted user, free-text legacy assignee) leaves it None
+/// and the UI falls back to the raw value.
+async fn resolve_assignee_names(state: &AppState, alerts: &mut [Alert]) {
+    let mut names: std::collections::HashMap<Uuid, Option<String>> =
+        std::collections::HashMap::new();
+    for alert in alerts.iter_mut() {
+        let Some(uid) = alert.assigned_to.as_deref().and_then(assigned_user_id) else {
+            continue;
+        };
+        if !names.contains_key(&uid) {
+            let name = state.user_repo.get_user_by_id(uid).await.ok().map(|u| {
+                if u.name.trim().is_empty() { u.email } else { u.name }
+            });
+            names.insert(uid, name);
+        }
+        alert.assignee_name = names.get(&uid).cloned().flatten();
+    }
+}
+
 /// Recursively remove null, empty strings, and empty arrays/objects from JSON
 fn strip_empty_values(value: serde_json::Value) -> serde_json::Value {
     match value {
@@ -293,6 +321,8 @@ pub async fn list_alerts(
     } else {
         alerts
     };
+    let mut alerts = alerts;
+    resolve_assignee_names(&state, &mut alerts).await;
 
     Ok(Json(alerts))
 }
@@ -437,6 +467,9 @@ pub async fn get_alert(
             return Err(ApiError::NotFound("Alert not found".to_string()));
         }
     }
+
+    let mut alert = alert;
+    resolve_assignee_names(&state, std::slice::from_mut(&mut alert)).await;
 
     Ok(Json(alert))
 }
@@ -607,22 +640,24 @@ pub async fn assign_alert(
         }
     }
 
-    let alert = state
+    // NAN-5314: record the assigner like acknowledge/close record their actor.
+    let actor = resolve_actor_display(&state, auth.user_id()).await;
+    let mut alert = state
         .detection_service
-        .assign_alert(*id, &request.assigned_to, scope.deny_set())
+        .assign_alert(*id, &request.assigned_to, &actor, scope.deny_set())
         .await?;
+    resolve_assignee_names(&state, std::slice::from_mut(&mut alert)).await;
 
     // Send notification to assignee if assigned to someone other than self.
     // A3 (NAN-1747): the FE sends a typeid (`user_<base32>`), which
     // `Uuid::parse_str` always rejects — so the `if let Ok` silently skipped and
     // the assignee never got notified. `parse_any` accepts both the typeid and
     // the raw-UUID forms.
-    if let Ok((prefix, assigned_user_id)) = nanosiem_core::typeid::parse_any(&request.assigned_to) {
-        // Only treat this as a user id when it's a `user_…` typeid or a bare
-        // UUID — a mismatched prefix (e.g. `case_…`) whose decoded UUID happens
-        // to match a real user must NOT trigger a notification to that user.
-        let is_user_id = prefix.is_empty() || prefix == nanosiem_core::typeid::user::PREFIX;
-        if is_user_id && assigned_user_id != auth.user_id() {
+    // Only treat this as a user id when it's a `user_…` typeid or a bare UUID —
+    // a mismatched prefix (e.g. `case_…`) whose decoded UUID happens to match a
+    // real user must NOT trigger a notification to that user.
+    if let Some(assigned_user_id) = assigned_user_id(&request.assigned_to) {
+        if assigned_user_id != auth.user_id() {
             let notification_repo = NotificationRepository::new(state.pool.clone());
             // Fetch user name from database (JWT no longer contains PII)
             let assigner_name = state
@@ -1051,6 +1086,11 @@ pub async fn alert_velocity(
 #[cfg(test)]
 #[path = "alerts_nan1747_tests.rs"]
 mod alerts_nan1747_tests;
+
+// NAN-5314: assignee typeid → user id resolution, in a sibling file.
+#[cfg(test)]
+#[path = "alerts_nan5314_tests.rs"]
+mod alerts_nan5314_tests;
 
 /// OpenAPI documentation for alerts endpoints
 pub struct AlertsApiDoc;

@@ -88,8 +88,10 @@ function FieldGrid({
     }
   }
 
-  const udmUnchanged = unchanged.filter(k => !k.startsWith('ext.'));
-  const extUnchanged = unchanged.filter(k => k.startsWith('ext.'));
+  // Unmapped / legacy-ext keys are grouped below the mapped fields.
+  const isExtra = (k: string) => k.startsWith('unmapped.') || k.startsWith('ext.');
+  const udmUnchanged = unchanged.filter(k => !isExtra(k));
+  const extUnchanged = unchanged.filter(isExtra);
 
   const renderFieldRow = (key: string) => {
     const curr = currentFields?.[key];
@@ -106,10 +108,10 @@ function FieldGrid({
 
     return (
       <div key={key} className={`flex items-baseline gap-2 px-3 py-1 rounded ${valueBg}`}>
-        <span className="text-muted-foreground text-[11px] font-mono shrink-0 w-[140px] truncate" title={key}>
+        <span className="text-muted-foreground text-[11px] font-mono shrink-0 w-[180px] break-all" title={key}>
           {key}
         </span>
-        <span className={`text-[11px] font-mono ${valueColor} truncate`} title={next || curr || ''}>
+        <span className={`text-[11px] font-mono ${valueColor} min-w-0 break-all whitespace-pre-wrap`} title={next || curr || ''}>
           {isRemoved ? (
             <span className="line-through">{curr}</span>
           ) : (
@@ -138,7 +140,7 @@ function FieldGrid({
           {changed.length > 0 && (
             <div className="border-t border-border/20 mx-3 my-1" />
           )}
-          <div className="grid grid-cols-2 gap-x-1">
+          <div>
             {udmUnchanged.map(renderFieldRow)}
           </div>
         </>
@@ -148,9 +150,9 @@ function FieldGrid({
       {extUnchanged.length > 0 && (
         <>
           <div className="px-3 pt-2 pb-1">
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground/60 font-medium">Extended Fields</span>
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground/60 font-medium">Unmapped Fields</span>
           </div>
-          <div className="grid grid-cols-2 gap-x-1">
+          <div>
             {extUnchanged.map(renderFieldRow)}
           </div>
         </>

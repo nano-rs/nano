@@ -57,6 +57,7 @@ import { ingestionNavigation } from './ingestion-navigation';
 import { LOG_SOURCES_PATH, ingestionHomeFor } from '@/lib/ingestion-paths';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
+import { INSTANCE_SETUP_PERMISSION } from '@/lib/onboarding-access';
 import { useOnboardingProgress } from '@/hooks/use-api';
 import { VersionBadge } from '@/components/VersionBadge';
 import { ScrollContainerProvider } from '@/contexts/ScrollContainerContext';
@@ -219,7 +220,8 @@ export interface NavItem {
  */
 const navigation: NavItem[] = [
   { name: 'Home', href: '/', icon: NavHome }, // Always visible
-  { name: 'Getting Started', href: '/getting-started', icon: NavPlusCross }, // Onboarding wizard
+  // Instance-setup wizard: only roles that can read setup status (NAN-5309).
+  { name: 'Getting Started', href: '/getting-started', icon: NavPlusCross, permissions: INSTANCE_SETUP_PERMISSION },
   { name: 'Search', href: '/search', icon: NavSearch, permissions: 'search:view' },
   { name: 'Dashboards', href: '/dashboards', icon: NavGrid, permissions: 'dashboards:view' },
   // NAN-1793: scheduled reports — cron a saved search / dashboard into

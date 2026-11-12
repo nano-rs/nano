@@ -75,6 +75,8 @@ import { VrlLine } from '@/components/editor/VrlHighlight';
 import { useVrlHighlight } from '@/components/editor/use-vrl-highlight';
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
 import { useDefaultLayout } from 'react-resizable-panels';
+import { deployDialogDescription } from '@/lib/log-source-deploy-copy';
+import { useVrlDraftGuard } from '@/hooks/use-vrl-draft-guard';
 import { computeDiff, type DiffLine, type VrlUpdateInfo } from '@/lib/parser-diff';
 import { ParserTestLab } from '@/components/parser/ParserTestLab';
 import {
@@ -230,6 +232,13 @@ export function LogSourceDetail() {
   // VRL editor state
   const [isEditingVrl, setIsEditingVrl] = useState(false);
   const [editedVrl, setEditedVrl] = useState('');
+  // NAN-5323: leave-page warning + local draft restore for the VRL editor.
+  const vrlDraft = useVrlDraftGuard({
+    id: logSource?.id,
+    baseVrl: logSource?.parser_vrl,
+    editing: isEditingVrl,
+    editedVrl,
+  });
   const [validationResult, setValidationResult] = useState<ValidationResult>(null);
   const [validatedJustNow, setValidatedJustNow] = useState(false);
 
@@ -518,6 +527,7 @@ export function LogSourceDetail() {
   };
 
   const handleCancelEditVrl = () => {
+    vrlDraft.clear();
     setIsEditingVrl(false);
     setEditedVrl('');
     setValidationResult(null);
@@ -593,7 +603,8 @@ export function LogSourceDetail() {
           expected_updated_at: logSource.updated_at,
         },
       });
-      toast({ title: 'VRL saved', description: 'Parser code updated. Deploy to apply changes.' });
+      vrlDraft.clear();
+      toast({ title: 'Draft saved', description: 'Publish to apply the change to live parsing.' });
       setIsEditingVrl(false);
       setSaveVrlDialogOpen(false);
       setValidatedJustNow(false);
@@ -634,6 +645,7 @@ export function LogSourceDetail() {
           expected_updated_at: logSource.updated_at,
         },
       });
+      vrlDraft.clear();
       setCurrentDiff(null);
       setAcceptDiffDialogOpen(false);
       setIsEditingVrl(false);
@@ -685,6 +697,36 @@ export function LogSourceDetail() {
           onPublish={() => setPublishDialogOpen(true)}
           onDiscard={() => setDiscardDraftDialogOpen(true)}
         />
+        {vrlDraft.restorable !== null && (
+          <div
+            className="shrink-0 flex items-center justify-between gap-3 px-5 py-2 border-b border-border bg-muted/40"
+            data-testid="vrl-draft-restore"
+          >
+            <span className="text-[11.5px] text-foreground">
+              <span className="font-medium">Unsaved VRL edits</span>
+              <span className="text-muted-foreground ml-2">from earlier in this tab were kept.</span>
+            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button variant="outline" size="sm" className="h-7 text-[11.5px]" onClick={vrlDraft.clear}>
+                Discard
+              </Button>
+              <Button
+                size="sm"
+                className="h-7 text-[11.5px]"
+                onClick={() => {
+                  setEditedVrl(vrlDraft.restorable ?? '');
+                  setIsEditingVrl(true);
+                  setValidationResult(null);
+                  setValidatedJustNow(false);
+                  vrlDraft.dismissRestorable();
+                  setActiveTab('vrl');
+                }}
+              >
+                Restore edits
+              </Button>
+            </div>
+          </div>
+        )}
         <TabNav active={activeTab} onChange={setActiveTab} />
 
         <div className="flex-1 min-h-0 overflow-auto">
@@ -777,7 +819,7 @@ export function LogSourceDetail() {
           open={deployDialogOpen}
           onOpenChange={setDeployDialogOpen}
           title="Deploy log source"
-          description={`Deploy "${logSource.name}" to Vector. Incoming logs matching this source type will be parsed using the current VRL.`}
+          description={deployDialogDescription(logSource.name, draftStatus?.active_version_number, hasDraft)}
           confirmLabel={deploying ? 'Deploying…' : 'Deploy'}
           confirmIcon={deploying ? <LoadingIcon className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
           onConfirm={handleDeploy}

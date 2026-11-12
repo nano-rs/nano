@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { meaningfulAuditEntries, RECENT_CHANGES_FETCH_LIMIT } from '@/lib/audit-feed';
+import { alertAssigneeLabel } from '@/lib/alert-assignee';
 import { 
   api, 
   DetectionRule, 
@@ -585,6 +586,10 @@ export function fromApiAlert(alert: Alert) {
     timestamp: parseUTCTimestamp(alert.created_at),
     acknowledgedAt: alert.acknowledged_at ? parseUTCTimestamp(alert.acknowledged_at) : undefined,
     acknowledgedBy: alert.acknowledged_by,
+    // NAN-5314: show the assignee's name, never the raw user typeid.
+    assignee: alertAssigneeLabel(alert),
+    assignedAt: alert.assigned_at ? parseUTCTimestamp(alert.assigned_at) : undefined,
+    assignedBy: alert.assigned_by,
     closedAt: alert.closed_at ? parseUTCTimestamp(alert.closed_at) : undefined,
     closedBy: alert.closed_by,
     // AI Triage status
@@ -709,10 +714,12 @@ export function useLogSourceHealth(id: string | undefined) {
   );
 }
 
-export function useIngestionHistory(hours?: number) {
+/** Needs log_sources:view server-side — pass `skip` for roles without it. */
+export function useIngestionHistory(hours?: number, options?: UseQueryOptions) {
   return useQuery(
     () => api.getIngestionHistory(hours),
-    [hours]
+    [hours],
+    options
   );
 }
 
@@ -883,10 +890,12 @@ export function useSystemOverview(hours?: number) {
   );
 }
 
-export function useSystemConfig() {
+/** Needs settings:view server-side — pass `skip` for roles without it. */
+export function useSystemConfig(options?: UseQueryOptions) {
   return useQuery(
     () => api.getSystemConfig(),
-    []
+    [],
+    options
   );
 }
 
@@ -1439,14 +1448,14 @@ export function useNoisyRules(limit: number = 5) {
 }
 
 /** Current user's open cases for the Home "My work" column. */
-export function useMyCases(limit: number = 10) {
-  return useQuery(() => api.getMyCases(limit), [limit]);
+export function useMyCases(limit: number = 10, options?: UseQueryOptions) {
+  return useQuery(() => api.getMyCases(limit), [limit], options);
 }
 
 /** Unassigned triage queue for the Home "Unassigned" list.
  *  Backend `assigned_to` filter expects a user ID, so we fetch open/in-progress/pending
  *  cases and filter client-side (matches the prior Dashboard implementation). */
-export function useUnassignedCases(limit: number = 10) {
+export function useUnassignedCases(limit: number = 10, options?: UseQueryOptions) {
   return useQuery(
     async () => {
       const { cases } = await api.listCases({
@@ -1455,7 +1464,8 @@ export function useUnassignedCases(limit: number = 10) {
       });
       return cases.filter((c) => !c.assigned_to).slice(0, limit);
     },
-    [limit]
+    [limit],
+    options
   );
 }
 
@@ -1473,8 +1483,9 @@ export function useRecentNotebooks(limit: number = 5) {
 }
 
 /** Latest SIEM health report — feeds the Home "Ingest" and "Detection health" pulses. */
-export function useSiemHealthLatest() {
-  return useQuery(() => api.getSiemHealthLatest(), []);
+/** Needs settings:system server-side — pass `skip` for roles without it. */
+export function useSiemHealthLatest(options?: UseQueryOptions) {
+  return useQuery(() => api.getSiemHealthLatest(), [], options);
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,7 +1581,10 @@ export function useAuditLog(query: {
  * and token refreshes; see `lib/audit-feed.ts`). Over-fetches so a burst of
  * routine rows cannot push every change out of the window (NAN-3031).
  */
-export function useRecentAuditChanges(query: { start_time?: string; limit: number }) {
+export function useRecentAuditChanges(
+  query: { start_time?: string; limit: number },
+  options?: UseQueryOptions,
+) {
   return useQuery(
     async () => {
       const page = await api.queryAuditLogs({
@@ -1579,7 +1593,8 @@ export function useRecentAuditChanges(query: { start_time?: string; limit: numbe
       });
       return { ...page, logs: meaningfulAuditEntries(page.logs ?? [], query.limit) };
     },
-    [query.start_time, query.limit]
+    [query.start_time, query.limit],
+    options
   );
 }
 

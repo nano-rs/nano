@@ -41,6 +41,7 @@ use crate::detection::findings::FindingLogger;
 use crate::detection::risk::{score_rule_match, RiskModifier, RiskResult, ScoreCalculator};
 use crate::detection::service::helpers::{
     realtime_finding_candidate, record_finding_emissions_with_pool, retain_unemitted_with_pool,
+    store_detection_match_with_pool,
 };
 use crate::detection::service::ClaimedFinding;
 use crate::extensions::{
@@ -116,6 +117,56 @@ enum SignalOutcome {
     /// is a genuine match (counted in stats) but its alert/finding is
     /// suppressed by the per-window dedup (audit D13).
     WindowDeduped,
+}
+
+/// Per-poll-cycle buffer of real-time `detection_matches` review rows
+/// (NAN-5303).
+///
+/// A noisy real-time rule can produce thousands of signals a minute. One
+/// INSERT per signal would add a PG round-trip to every signal on the serial
+/// drain loop and grow `detection_matches` by one row per event, where a
+/// scheduled Grouped rule writes one row per run. The buffer mirrors the
+/// scheduled shape: per poll cycle, a Grouped rule gets ONE row carrying all
+/// of its matched events, and a PerEvent rule one row per event (as the
+/// scheduled PerEvent path stores them). Rules keep first-seen order.
+#[derive(Default)]
+pub(crate) struct MatchReviewBuffer {
+    rules: Vec<(DetectionRule, Vec<serde_json::Value>)>,
+}
+
+impl MatchReviewBuffer {
+    pub(crate) fn push(&mut self, rule: DetectionRule, event: serde_json::Value) {
+        match self.rules.iter_mut().find(|(r, _)| r.id == rule.id) {
+            Some((_, events)) => events.push(event),
+            None => self.rules.push((rule, vec![event])),
+        }
+    }
+
+    /// The `(rule, events)` rows to write, one entry per INSERT.
+    pub(crate) fn into_rows(self) -> Vec<(DetectionRule, Vec<serde_json::Value>)> {
+        let mut rows = Vec::new();
+        for (rule, events) in self.rules {
+            match rule.alert_mode {
+                AlertMode::Grouped => rows.push((rule, events)),
+                AlertMode::PerEvent => {
+                    for event in events {
+                        rows.push((rule.clone(), vec![event]));
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// Best-effort: a failed review write is logged and never drops the
+    /// alert or stalls the watermark.
+    async fn flush(self, pool: &sqlx::PgPool) {
+        for (rule, events) in self.into_rows() {
+            if let Err(e) = store_detection_match_with_pool(pool, &rule, &events).await {
+                warn!(rule_id = %rule.id, "Real-time: store_detection_match failed: {}", e);
+            }
+        }
+    }
 }
 
 /// Watermark for tracking processed signals
@@ -607,8 +658,13 @@ impl SignalProcessor {
         let mut mode_skipped_count: u64 = 0;
         let mut window_deduped_count: u64 = 0;
         let mut missing_log_sample: Option<(Uuid, Uuid, DateTime<Utc>)> = None;
+        // NAN-5303: `detection_matches` review rows for this poll cycle,
+        // written once per (rule, cycle) after the loop instead of one INSERT
+        // per signal (see `MatchReviewBuffer`).
+        let mut review_buffer = MatchReviewBuffer::default();
 
         for signal in signals {
+            let mut review_match: Option<(DetectionRule, serde_json::Value)> = None;
             match Self::process_signal(
                 dual_pool,
                 rule_repo,
@@ -620,11 +676,17 @@ impl SignalProcessor {
                 &score_calculator,
                 global_weight,
                 webhook_service,
+                &mut review_match,
             )
             .await
             {
                 Ok(outcome) => {
                     processed += 1;
+                    // Only a signal that processed successfully is recorded: a
+                    // failed one is retried next poll and recorded then.
+                    if let Some((rule, event)) = review_match.take() {
+                        review_buffer.push(rule, event);
+                    }
                     match outcome {
                         SignalOutcome::MatchedLogMissing => {
                             missing_log_count += 1;
@@ -693,6 +755,11 @@ impl SignalProcessor {
                 "Suppressed signals whose (rule, entity, window) was already alerted (audit D13)"
             );
         }
+
+        // NAN-5303: write this cycle's review rows BEFORE the watermark commits,
+        // so a crash in between replays the same signals and the
+        // (rule_id, event_hash) conflict guard turns the rewrite into a no-op.
+        review_buffer.flush(dual_pool.postgres()).await;
 
         // Update watermark after processing and commit the transaction
         // (releasing the FOR UPDATE row lock)
@@ -856,6 +923,9 @@ impl SignalProcessor {
         score_calculator: &ScoreCalculator,
         global_weight: f64,
         webhook_service: Option<&WebhookService>,
+        // NAN-5303: set to the (rule, matched event) this signal contributes to
+        // `detection_matches`; the batch loop buffers it on success.
+        review_match: &mut Option<(DetectionRule, serde_json::Value)>,
     ) -> anyhow::Result<SignalOutcome> {
         // Fetch the rule FIRST — its `risk_modifiers` decide which extra columns
         // the matched-log fetch must project so the real-time score sees the same
@@ -920,6 +990,14 @@ impl SignalProcessor {
             &mut events_vec,
             chrono::Utc::now(),
         );
+
+        // NAN-5303: record the match for review (Matches page, /api/rules/stats,
+        // tune-from-match) exactly like the scheduled path does in both Live and
+        // Alerting modes. Every signal that reaches here is a genuine match of an
+        // active rule, including ones whose alert/finding is window-deduped
+        // below. Handed to the batch loop, which writes one row per rule per
+        // poll cycle (`MatchReviewBuffer`).
+        *review_match = Some((rule.clone(), events_vec[0].clone()));
 
         // Score the match through the SAME engine the scheduled path uses (audit
         // R1 / NAN-1663): apply the rule's base score, its `risk_modifiers`, and
@@ -1361,8 +1439,30 @@ impl SignalProcessor {
             }
         };
 
-        // UDM carries the full original log in its `metadata` String column;
-        // OCSF reads the JSON tail column (`unmapped` spill, NAN-1443).
+        let modifier_expr = Self::modifier_fields_expr(modifier_cols);
+
+        // NAN-5304: OCSF returns the WHOLE matched row as one JSON object keyed
+        // by the physical (flat, dotted) column names — the same `SELECT *`
+        // shape the scheduled path's search emits — instead of a fixed
+        // UDM-semantic entity projection (`src_user`, `src_host`, …) that hid
+        // every OCSF field (`process.*`, `actor.*`, …) from the alert, finding
+        // and observables.
+        if profile.id() == crate::schema::SchemaId::Ocsf {
+            return format!(
+                r#"
+            SELECT
+                toString(id) as log_id,
+                toUnixTimestamp64Micro(timestamp) as ts,
+                formatRowNoNewline('JSONEachRow', *) AS row_json,
+                {modifier_expr}
+            FROM {logs_table}
+            WHERE timestamp BETWEEN '{ts_lower}' AND '{ts_upper}' AND id = '{log_id}'
+            LIMIT 1
+            "#
+            );
+        }
+
+        // UDM carries the full original log in its `metadata` String column.
         let metadata_expr = match profile.id() {
             // Spans/metrics/risk are never a tenant detection schema
             // (NAN-1555 / NAN-1798); UDM default.
@@ -1373,30 +1473,6 @@ impl SignalProcessor {
             crate::schema::SchemaId::Ocsf => {
                 format!("toString({}) AS metadata", profile.json_tail_column())
             }
-        };
-
-        // The rule's modifier-referenced columns as a JSON object under one
-        // `modifier_fields` alias (NAN-1663). `toString` each so the Map is
-        // homogeneous and the values decode as strings — RiskModifier parses
-        // strings to numbers for `>`/`<` and compares strings for `=`/`contains`,
-        // so string values evaluate correctly for every operator. The field name
-        // (the Map key) is a `is_known_field`-gated schema field, so it is a safe
-        // identifier; escape it defensively anyway.
-        let modifier_expr = if modifier_cols.is_empty() {
-            "'{}' AS modifier_fields".to_string()
-        } else {
-            let pairs = modifier_cols
-                .iter()
-                .map(|(name, col_sql)| {
-                    format!(
-                        "'{}', toString({})",
-                        crate::sql_hygiene::escape_sql_string(name),
-                        col_sql
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("toJSONString(map({pairs})) AS modifier_fields")
         };
 
         // Only fetch key fields for alert context - metadata contains the full original log
@@ -1431,6 +1507,75 @@ impl SignalProcessor {
             risk_entity = entity_col("risk_entity"),
             modifier_expr = modifier_expr,
         )
+    }
+
+    /// The rule's modifier-referenced columns as a JSON object under one
+    /// `modifier_fields` alias (NAN-1663). `toString` each so the Map is
+    /// homogeneous and the values decode as strings — RiskModifier parses
+    /// strings to numbers for `>`/`<` and compares strings for `=`/`contains`,
+    /// so string values evaluate correctly for every operator. The field name
+    /// (the Map key) is a `is_known_field`-gated schema field, so it is a safe
+    /// identifier; escape it defensively anyway.
+    fn modifier_fields_expr(modifier_cols: &[(String, String)]) -> String {
+        if modifier_cols.is_empty() {
+            return "'{}' AS modifier_fields".to_string();
+        }
+        let pairs = modifier_cols
+            .iter()
+            .map(|(name, col_sql)| {
+                format!(
+                    "'{}', toString({})",
+                    crate::sql_hygiene::escape_sql_string(name),
+                    col_sql
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("toJSONString(map({pairs})) AS modifier_fields")
+    }
+
+    /// Merge the rule's modifier columns into the event as flat keys, never
+    /// overwriting a key the row already carries, so a risk_modifier resolves
+    /// exactly as it does on the scheduled path (NAN-1663).
+    fn merge_modifier_fields(json: &mut serde_json::Value, modifier_fields: &str) {
+        if let (serde_json::Value::Object(obj), Ok(serde_json::Value::Object(extra))) = (
+            json,
+            serde_json::from_str::<serde_json::Value>(modifier_fields),
+        ) {
+            for (k, v) in extra {
+                obj.entry(k).or_insert(v);
+            }
+        }
+    }
+
+    /// NAN-5304: build the OCSF matched event from the whole-row JSON. Keys are
+    /// the physical OCSF columns (flat, dotted), exactly as the scheduled path
+    /// stores them. `id`/`timestamp` are normalised to the same forms the UDM
+    /// payload uses (canonical UUID, RFC 3339) so time extraction and event
+    /// hashing behave identically. Empty/default values are stripped exactly as
+    /// the search executor strips scheduled rows, so the stored event carries
+    /// the same keys (not ~150 empty OCSF columns). An unparseable row yields an
+    /// event carrying only `id`/`timestamp` rather than dropping the alert.
+    fn ocsf_event_from_row(
+        log_id: String,
+        ts: i64,
+        row_json: &str,
+        modifier_fields: &str,
+    ) -> serde_json::Value {
+        let mut json = match serde_json::from_str::<serde_json::Value>(row_json) {
+            Ok(v @ serde_json::Value::Object(_)) => v,
+            _ => serde_json::json!({}),
+        };
+        let timestamp = DateTime::from_timestamp_micros(ts)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+        if let serde_json::Value::Object(obj) = &mut json {
+            obj.insert("id".to_string(), serde_json::Value::String(log_id));
+            obj.insert("timestamp".to_string(), serde_json::Value::String(timestamp));
+            crate::search::strip_empty_values(obj);
+        }
+        Self::merge_modifier_fields(&mut json, modifier_fields);
+        json
     }
 
     /// Half-width of the timestamp window used to bound the matched-log fetch.
@@ -1502,6 +1647,22 @@ impl SignalProcessor {
 
         let ch_client = dual_pool.clickhouse();
 
+        // NAN-5304: OCSF fetches the whole row as JSON (see
+        // `build_fetch_matched_log_query`).
+        if profile.id() == crate::schema::SchemaId::Ocsf {
+            #[derive(Row, Deserialize)]
+            struct OcsfRow {
+                log_id: String,
+                ts: i64,
+                row_json: String,
+                modifier_fields: String,
+            }
+            let rows: Vec<OcsfRow> = ch_client.query(&query).fetch_all().await?;
+            return Ok(rows.into_iter().next().map(|row| {
+                Self::ocsf_event_from_row(row.log_id, row.ts, &row.row_json, &row.modifier_fields)
+            }));
+        }
+
         #[derive(Row, Deserialize)]
         struct LogRow {
             log_id: String,
@@ -1551,14 +1712,7 @@ impl SignalProcessor {
             // Merge the modifier columns as flat keys (never overwriting a base
             // field), so a risk_modifier on e.g. `auth_result` resolves exactly as
             // it does on the scheduled path (NAN-1663).
-            if let (serde_json::Value::Object(obj), Ok(serde_json::Value::Object(extra))) = (
-                &mut json,
-                serde_json::from_str::<serde_json::Value>(&row.modifier_fields),
-            ) {
-                for (k, v) in extra {
-                    obj.entry(k).or_insert(v);
-                }
-            }
+            Self::merge_modifier_fields(&mut json, &row.modifier_fields);
 
             Ok(Some(json))
         } else {
@@ -1588,7 +1742,7 @@ impl SignalProcessor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1781,7 +1935,7 @@ mod tests {
     // Audit D13: per-(rule, entity, window) dedup candidate dispatch
     // ------------------------------------------------------------------------
 
-    fn d13_test_rule(mode: RuleMode, alert_mode: AlertMode) -> DetectionRule {
+    pub(crate) fn d13_test_rule(mode: RuleMode, alert_mode: AlertMode) -> DetectionRule {
         use crate::models::detection_rule::{AiTriageHints, DetectionMode, Severity};
         DetectionRule {
             id: Uuid::parse_str("00000000-0000-0000-0000-0000000000d1").unwrap(),
@@ -1930,17 +2084,15 @@ mod tests {
             &[],
         );
 
-        // The full-context blob comes from the OCSF JSON tail column — the
-        // `unmapped` spill (NAN-1443; was `event`, now EPHEMERAL) — never the
-        // bare `metadata` identifier, which does not exist on ocsf_logs.
+        // NAN-5304: the whole OCSF row as one JSON object keyed by the
+        // physical columns — no UDM-semantic entity projection.
         assert!(
-            query.contains("toString(unmapped) AS metadata"),
-            "OCSF metadata must read the unmapped spill column: {query}"
+            query.contains("formatRowNoNewline('JSONEachRow', *) AS row_json"),
+            "OCSF must fetch the whole row: {query}"
         );
-        assert!(
-            !query.contains("\n                metadata,"),
-            "OCSF query must not select the bare `metadata` column: {query}"
-        );
+        for udm in ["AS src_ip", "AS src_user", "AS src_host", "AS dest_ip", "AS risk_entity", "AS metadata"] {
+            assert!(!query.contains(udm), "OCSF query must not alias UDM `{udm}`: {query}");
+        }
         // Precision-independent µs decode (DateTime64(3) on ocsf_logs).
         assert!(
             query.contains("toUnixTimestamp64Micro(timestamp) as ts"),
@@ -1950,12 +2102,63 @@ mod tests {
             !query.contains("reinterpretAsInt64"),
             "raw reinterpret reads DateTime64(3) as ms ticks: {query}"
         );
-        // Entity concepts resolve to promoted OCSF columns, aliased back to the
-        // UDM-semantic names the typed row deserializes by.
-        assert!(query.contains(r#""src_endpoint.ip" AS src_ip"#), "{query}");
-        assert!(query.contains(r#""dst_endpoint.ip" AS dest_ip"#), "{query}");
-        // Concepts OCSF does not carry keep the row shape via '' fallbacks.
-        assert!(query.contains("'' AS risk_entity"), "{query}");
+        assert!(query.contains("'{}' AS modifier_fields"), "{query}");
         assert!(query.contains("FROM nanosiem.ocsf_logs"), "{query}");
+        // R5 / NAN-1412: single timestamp-bounded WHERE, no PREWHERE.
+        assert!(
+            query.contains(
+                "WHERE timestamp BETWEEN '2026-07-02 20:25:55.774000' AND '2026-07-02 22:25:55.774000' AND id = '019ea2f0-9453-7db5-aec0-12fb99f7b373'"
+            ),
+            "{query}"
+        );
+        assert!(!query.contains("PREWHERE"), "{query}");
+    }
+
+    /// NAN-5304: a real-time OCSF alert's matched event carries the OCSF
+    /// columns (flat, dotted) — not `src_user` / `src_host` / `source_type`-only.
+    #[test]
+    fn ocsf_matched_event_keeps_ocsf_paths() {
+        // Shape verified against ClickHouse 26.10 `formatRowNoNewline('JSONEachRow', *)`.
+        let row_json = r#"{"id":"019ea2f0-9453-7db5-aec0-12fb99f7b373","timestamp":"2026-11-12 11:49:35.680","process.name":"powershell.exe","process.cmd_line":"powershell -enc AAAA","actor.user.name":"eve","device.hostname":"ws-042","dst_endpoint.ip":"10.9.8.7","traffic.bytes_in":12,"process.pid":0,"src_endpoint.ip":"","file.hashes.value":[],"message_blank":"","unmapped":{"x":"y"}}"#;
+        let ts = 1_794_484_175_680_000_i64;
+        let event = SignalProcessor::ocsf_event_from_row(
+            "019ea2f0-9453-7db5-aec0-12fb99f7b373".to_string(),
+            ts,
+            row_json,
+            r#"{"auth_result":"failure","process.name":"ignored"}"#,
+        );
+        assert_eq!(event["process.name"], "powershell.exe", "row value wins over modifier merge");
+        assert_eq!(event["actor.user.name"], "eve");
+        assert_eq!(event["device.hostname"], "ws-042");
+        assert_eq!(event["dst_endpoint.ip"], "10.9.8.7");
+        assert_eq!(event["unmapped"]["x"], "y");
+        // Empty OCSF columns are stripped like the scheduled search rows.
+        for empty in ["src_endpoint.ip", "file.hashes.value", "message_blank"] {
+            assert!(event.get(empty).is_none(), "empty `{empty}` must be stripped: {event}");
+        }
+        assert_eq!(event["process.pid"], 0, "numeric zero is kept, as on the scheduled path");
+        assert_eq!(event["auth_result"], "failure", "modifier columns still merge for scoring");
+        for udm in ["src_user", "src_host", "src_ip", "dest_ip", "dest_user", "dest_host", "risk_entity"] {
+            assert!(event.get(udm).is_none(), "UDM key `{udm}` leaked into OCSF event: {event}");
+        }
+        // id/timestamp normalised like the UDM payload.
+        assert_eq!(event["id"], "019ea2f0-9453-7db5-aec0-12fb99f7b373");
+        let expected_ts = DateTime::from_timestamp_micros(ts).unwrap().to_rfc3339();
+        assert_eq!(event["timestamp"], expected_ts.as_str());
+
+        // The scorer auto-detects an OCSF entity from this row.
+        let calc = crate::detection::risk::ScoreCalculator::new()
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
+        let (entity, field) = calc.extract_entity(None, std::slice::from_ref(&event));
+        assert_ne!(entity, "unknown");
+        let field = field.expect("an OCSF entity field");
+        assert!(field.contains('.'), "entity field must be an OCSF path, got `{field}`");
+    }
+
+    #[test]
+    fn ocsf_matched_event_survives_garbage_row() {
+        let event = SignalProcessor::ocsf_event_from_row("abc".to_string(), 0, "not json", "{}");
+        assert_eq!(event["id"], "abc");
+        assert!(event.get("timestamp").is_some());
     }
 }

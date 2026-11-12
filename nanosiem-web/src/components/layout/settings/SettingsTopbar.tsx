@@ -25,6 +25,8 @@ import { NotificationBell } from '@/components/NotificationBell';
 import { HelpMenu } from '@/components/support/HelpMenu';
 import { GROUP_LABEL, SECTION_BY_ID, resolveActiveSection } from './sections';
 import { useRecentAuditChanges } from '@/hooks/use-api';
+import { useAuth } from '@/contexts/AuthContext';
+import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
 
 interface SettingsTopbarProps {
   onOpenAudit: () => void;
@@ -45,7 +47,9 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
   const groupLabel = section ? GROUP_LABEL[section.group] : null;
 
   // Pull a count for the "Recent changes" button. Cheap query — last 24h, 50 entries.
-  const { data: auditData } = useRecentAuditChanges({ limit: 50 });
+  // NAN-5325: only for roles that can read the audit log.
+  const canReadAudit = useAuth().hasPermission(SHELL_READ_PERMISSIONS.audit);
+  const { data: auditData } = useRecentAuditChanges({ limit: 50 }, { skip: !canReadAudit });
   const auditCount = auditData?.logs?.length ?? 0;
 
   return (
@@ -79,6 +83,7 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
       <div className="flex-1" />
 
       {/* Recent changes trigger */}
+      {canReadAudit && (
       <button
         onClick={onOpenAudit}
         className={cn(
@@ -95,6 +100,7 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
           <span className="font-mono text-[10px] text-muted-foreground/60 tabular-nums">{auditCount}</span>
         )}
       </button>
+      )}
 
       <Separator orientation="vertical" className="h-5 mx-1" />
 

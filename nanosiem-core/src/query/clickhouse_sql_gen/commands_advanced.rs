@@ -396,8 +396,9 @@ impl ClickHouseSqlGenerator {
         // O27 (NAN-1721): order the streamstats windows on the active dataset's
         // time column (`start_time` for spans) — a bare `dataset=spans …
         // | streamstats …` otherwise references a nonexistent `timestamp`
-        // column. Logs keep `timestamp` byte-identical.
-        let tc = self.time_column();
+        // column. Logs keep `timestamp` byte-identical. NAN-5306 review: the
+        // time column as in scope (`time` after `table time, …`).
+        let tc = self.time_column_in_scope();
 
         // Build window function expressions for each aggregation
         let window_exprs: Vec<String> = aggregations.iter()

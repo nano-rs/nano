@@ -15,7 +15,7 @@
  */
 
 import type { ComponentType, SVGProps } from 'react';
-import type { Capabilities } from '@/hooks/use-capabilities';
+import type { BuildEdition, Capabilities } from '@/hooks/use-capabilities';
 import {
   Briefcase,
   Bell,
@@ -91,7 +91,32 @@ export interface SettingsSection {
   demoHidden?: boolean;
   /** Only show when the deployment runs in air-gapped mode (`system_config.air_gap`). */
   airgapOnly?: boolean;
+  /**
+   * Only show in the enterprise build, whatever the license admits. Unlike
+   * `capability` (which a missing license switches off), this keeps entries
+   * that fix the license itself reachable when nothing is licensed.
+   */
+  enterpriseOnly?: boolean;
   children?: SettingsSectionChild[];
+}
+
+export interface SectionVisibilityContext {
+  capabilities: Capabilities;
+  edition: BuildEdition;
+  isDemoUser: boolean;
+  isAirGap: boolean;
+  hasPermission: (p: string) => boolean;
+  hasAnyPermission: (p: string[]) => boolean;
+}
+
+/** Build, deployment and permission gates for one Settings section. */
+export function isSectionVisible(s: SettingsSection, ctx: SectionVisibilityContext): boolean {
+  if (s.capability && !ctx.capabilities[s.capability]) return false;
+  if (s.enterpriseOnly && ctx.edition !== 'enterprise') return false;
+  if (s.demoHidden && ctx.isDemoUser) return false;
+  if (s.airgapOnly && !ctx.isAirGap) return false;
+  return !s.permissions
+    || (Array.isArray(s.permissions) ? ctx.hasAnyPermission(s.permissions) : ctx.hasPermission(s.permissions));
 }
 
 export const SETTINGS_GROUPS: Array<{ id: SettingsGroupId; label: string; desc: string }> = [
@@ -416,13 +441,15 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   },
   {
     id: 'license',
-    label: 'Offline License',
+    label: 'License',
     group: 'admin',
     icon: KeyRound,
-    desc: 'Install, renew, inspect, and recover the C05 offline entitlement.',
+    desc: 'Install, renew, inspect, and recover the license.',
     href: '/settings/license',
     permissions: 'settings:system',
-    airgapOnly: true,
+    // NAN-5310: the license page is how an unlicensed enterprise install gets
+    // licensed, so it can't hide behind air-gap mode or a license capability.
+    enterpriseOnly: true,
     status: 'ok',
   },
   {

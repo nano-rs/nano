@@ -629,7 +629,8 @@ function classifyEventType(fields: Record<string, unknown>): string {
   const destPort = Number(readSchemaField(fields, 'destPort') ?? 0);
   const destIp = readSchemaFieldString(fields, 'destIp');
 
-  if (sourceType === 'signal' || sourceType.includes('alert')) return 'ALERT';
+  // Findings are logged as `findings`; `signal` is the legacy name (NAN-5312).
+  if (sourceType === 'findings' || sourceType === 'signal' || sourceType.includes('alert')) return 'ALERT';
 
   if (
     sourceType.includes('dhcp') ||

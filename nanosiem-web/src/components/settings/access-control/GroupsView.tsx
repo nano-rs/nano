@@ -115,6 +115,8 @@ interface GroupDetailViewProps {
   scim: ScimGroupSource[];
   members: UserDetail[];
   membersLoading: boolean;
+  /** Why the member list cannot be shown (e.g. the viewer lacks users:view). */
+  membersUnavailable?: string | null;
   onEdit: () => void;
   onDelete: () => void;
 }
@@ -128,7 +130,7 @@ function Labeled({ label, mono, children }: { label: string; mono?: boolean; chi
   );
 }
 
-function GroupDetailView({ group, scim, members, membersLoading, onEdit, onDelete }: GroupDetailViewProps) {
+function GroupDetailView({ group, scim, members, membersLoading, membersUnavailable, onEdit, onDelete }: GroupDetailViewProps) {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission('groups:edit');
   const canDelete = hasPermission('groups:delete');
@@ -220,6 +222,8 @@ function GroupDetailView({ group, scim, members, membersLoading, onEdit, onDelet
               <div className="px-4 py-6 text-center">
                 <LoadingIcon className="w-4 h-4 text-muted-foreground inline" />
               </div>
+            ) : membersUnavailable ? (
+              <div className="px-4 py-6 text-center text-[11.5px] text-muted-foreground">{membersUnavailable}</div>
             ) : members.length === 0 ? (
               <div className="px-4 py-6 text-center text-[11.5px] text-muted-foreground">No members yet.</div>
             ) : (
@@ -259,6 +263,12 @@ function GroupDetailView({ group, scim, members, membersLoading, onEdit, onDelet
   );
 }
 
+export const MEMBERS_NEED_USERS_VIEW = 'Viewing members needs the users:view permission.';
+
+function isForbidden(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { status?: number }).status === 403;
+}
+
 export function GroupsView() {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
@@ -271,7 +281,13 @@ export function GroupsView() {
   const [users, setUsers] = useState<UserDetail[]>([]);
   const [roles, setRoles] = useState<RoleSummary[]>([]);
   const [loading, setLoading] = useState(true);
-  const [usersLoading, setUsersLoading] = useState(true);
+  const canViewUsers = hasPermission('users:view');
+  const [usersLoading, setUsersLoading] = useState(canViewUsers);
+  // NAN-5307: never show "No members yet" when the member list simply could
+  // not be read — say why instead.
+  const [usersUnavailable, setUsersUnavailable] = useState<string | null>(
+    canViewUsers ? null : MEMBERS_NEED_USERS_VIEW,
+  );
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -310,18 +326,31 @@ export function GroupsView() {
   // Users are needed both for the member table on the right AND for the
   // CreateGroupDialog. Fetch once for both.
   useEffect(() => {
+    // Without users:view the request is refused (and audited as a denial),
+    // so don't send it.
+    if (!canViewUsers) {
+      setUsersUnavailable(MEMBERS_NEED_USERS_VIEW);
+      setUsersLoading(false);
+      return;
+    }
     let cancelled = false;
     setUsersLoading(true);
     api.listUsers().then(res => {
       if (cancelled) return;
       setUsers(res.users);
-    }).catch(() => {
-      // Non-blocking — empty users is OK; the member section just shows "No members yet".
+      setUsersUnavailable(null);
+    }).catch(err => {
+      if (cancelled) return;
+      setUsersUnavailable(
+        isForbidden(err)
+          ? MEMBERS_NEED_USERS_VIEW
+          : `Could not load members: ${err instanceof Error ? err.message : 'unknown error'}`,
+      );
     }).finally(() => {
       if (!cancelled) setUsersLoading(false);
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [canViewUsers]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -421,6 +450,7 @@ export function GroupsView() {
             scim={scimSources.get(selected.id) ?? []}
             members={selectedMembers}
             membersLoading={usersLoading}
+            membersUnavailable={usersUnavailable}
             onEdit={() => setEditing(selected)}
             onDelete={() => setPendingDelete(selected)}
           />

@@ -667,9 +667,15 @@ docker_images() {
     case "$APP_MODE" in
         image:*)
             tag="${APP_MODE#image:}"
-            put E2E_IMAGE_API "ghcr.io/nano-rs/nano-api:$tag"
-            put E2E_IMAGE_SEARCH "ghcr.io/nano-rs/nano-search:$tag"
-            put E2E_IMAGE_JOBS "ghcr.io/nano-rs/nano-jobs:$tag"
+            # ghcr.io/nano-rs/nano-* are the OPEN-CORE builds (no enterprise
+            # routes); an enterprise run needs the enterprise release images.
+            local prefix="ghcr.io/nano-rs/nano"
+            if [[ "$EDITION" == enterprise ]]; then
+                prefix="${E2E_ENTERPRISE_IMAGE_PREFIX:-us-central1-docker.pkg.dev/nano-rs/nanosiem-customer/nanosiem}"
+            fi
+            put E2E_IMAGE_API "$prefix-api:$tag"
+            put E2E_IMAGE_SEARCH "$prefix-search:$tag"
+            put E2E_IMAGE_JOBS "$prefix-jobs:$tag"
             ;;
         docker)
             tag="e2e-$(git -C "$ROOT" rev-parse --short=12 HEAD)-$EDITION"

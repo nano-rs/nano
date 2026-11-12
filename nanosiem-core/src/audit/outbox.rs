@@ -426,6 +426,7 @@ impl SecurityAuditOutbox {
         let end = query.end_time.unwrap_or_else(Utc::now);
         let limit = query.limit.unwrap_or(50).clamp(1, 1000);
         let offset = query.offset.unwrap_or(0).max(0);
+        let search = super::query::normalize_audit_search(query.search.as_deref());
 
         // Optional filters bound as NULL-able parameters ($n IS NULL OR col = $n)
         // so the statement text is fixed and fully parameterized.
@@ -437,10 +438,14 @@ impl SecurityAuditOutbox {
               AND ($5::text IS NULL OR source = $5)
               AND ($6::text IS NULL OR resource_type = $6)
               AND ($7::boolean IS NULL OR success = $7)
+              -- Free-text search; JSON object keys stripped so they never match.
+              AND ($8::text IS NULL OR strpos(
+                    lower(regexp_replace(event::text, '"([^"\\]|\\.)*"\s*:', ' ', 'g')),
+                    lower($8)) > 0)
         "#;
 
         let rows: Vec<EventRow> = sqlx::query_as(&format!(
-            "SELECT event_id, occurred_at, event {FILTER} ORDER BY occurred_at DESC LIMIT $8 OFFSET $9"
+            "SELECT event_id, occurred_at, event {FILTER} ORDER BY occurred_at DESC LIMIT $9 OFFSET $10"
         ))
         .bind(start)
         .bind(end)
@@ -449,6 +454,7 @@ impl SecurityAuditOutbox {
         .bind(&query.source)
         .bind(&query.resource_type)
         .bind(query.success)
+        .bind(&search)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -462,6 +468,7 @@ impl SecurityAuditOutbox {
             .bind(&query.source)
             .bind(&query.resource_type)
             .bind(query.success)
+            .bind(&search)
             .fetch_one(&self.pool)
             .await?;
 

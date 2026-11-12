@@ -18,25 +18,32 @@ interface TestResultRowProps {
   onToggle: () => void;
 }
 
-/** Extract flat field key-value pairs from parser output, flattening .udm and .ext */
+/**
+ * Flatten parser output into dotted-path → string pairs.
+ *
+ * OCSF output is nested (`src_endpoint.ip`, `http_request.url.hostname`,
+ * `metadata.product.name`, `unmapped.*`), so every nested object is walked
+ * and emitted under its dotted path — the same names search exposes. Arrays
+ * are rendered as JSON (they are leaf values in the OCSF columns). Legacy
+ * `ext` output flattens naturally to `ext.*`. (NAN-5305)
+ */
 export function extractFields(output: Record<string, unknown> | undefined): Record<string, string> {
-  if (!output) return {};
   const fields: Record<string, string> = {};
-  const udm = output.udm as Record<string, unknown> | undefined;
-  const ext = output.ext as Record<string, unknown> | undefined;
-  const source = udm || output;
-  for (const [k, v] of Object.entries(source)) {
-    if (v != null && typeof v !== 'object') {
-      fields[k] = String(v);
-    }
-  }
-  if (ext) {
-    for (const [k, v] of Object.entries(ext)) {
-      if (v != null && typeof v !== 'object') {
-        fields[`ext.${k}`] = String(v);
+  if (!output) return fields;
+  const walk = (obj: Record<string, unknown>, prefix: string) => {
+    for (const [k, v] of Object.entries(obj)) {
+      if (v == null) continue;
+      const path = prefix ? `${prefix}.${k}` : k;
+      if (Array.isArray(v)) {
+        if (v.length > 0) fields[path] = JSON.stringify(v);
+      } else if (typeof v === 'object') {
+        walk(v as Record<string, unknown>, path);
+      } else {
+        fields[path] = String(v);
       }
     }
-  }
+  };
+  walk(output, '');
   return fields;
 }
 

@@ -129,6 +129,9 @@ fn asset_concept_drilldowns_compile_to_the_concept_predicates() {
         ("class_uid=3002 AND activity_id=1 AND logon_type_id IN (3, 8)", &["class_uid = 3002", "activity_id = 1", "logon_type_id IN (3, 8)"]),
         ("class_uid=1001", &["class_uid = 1001"]),
         ("class_uid IN (1001, 201001, 201002)", &["class_uid IN (1001, 201001, 201002)"]),
+        // NAN-5312: `alerts` (Open sequence / ALERT lane) = the Findings
+        // category, which is what the OCSF classifiers bucket as ALERT.
+        ("category_uid=2", &["category_uid = 2"]),
     ];
     for (where_body, terms) in cases {
         let sql = ocsf_sql(&format!("* | where {where_body}"));
@@ -136,6 +139,10 @@ fn asset_concept_drilldowns_compile_to_the_concept_predicates() {
             assert!(sql.contains(t), "`{where_body}` → {sql}");
         }
     }
+    assert!(
+        crate::search::classification::OCSF_LANE_SQL.contains("WHEN category_uid = 2 THEN 4"),
+        "ALERT lane must stay the Findings category"
+    );
     // The copied strings stay in lockstep with the Rust concepts.
     for (concept, terms) in [
         (p::AUTH_SUCCESS, cases[2].1),

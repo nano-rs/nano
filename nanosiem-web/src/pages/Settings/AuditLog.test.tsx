@@ -8,6 +8,7 @@ import { auditFiltersFromSearch, auditFiltersToSearch } from '@/lib/audit-filter
 const mock = vi.hoisted(() => ({
   queryAuditLogs: vi.fn().mockResolvedValue({ logs: [], total: 0 }),
   exportAuditLogs: vi.fn(),
+  getAuditActions: vi.fn().mockResolvedValue([]),
 }));
 vi.mock('@/lib/api', () => ({ api: mock }));
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => false }));
@@ -128,26 +129,4 @@ test('Export all calls the bounded server export and shows progress', async () =
   expect(createObjectURL).toHaveBeenCalledOnce();
   expect(click).toHaveBeenCalledOnce();
   expect(revokeObjectURL).toHaveBeenCalledWith('blob:audit');
-});
-
-test('Export all is disabled while the local free-text search narrows the table', async () => {
-  render(
-    <MemoryRouter initialEntries={['/settings/audit?action=rule_created']}>
-      <AuditLogContent />
-    </MemoryRouter>,
-  );
-
-  const search = await screen.findByPlaceholderText('Search logs…');
-  const button = await screen.findByRole('button', { name: 'Export all' }) as HTMLButtonElement;
-  fireEvent.change(search, { target: { value: 'alice via key' } });
-
-  expect(button.disabled).toBe(true);
-  expect(screen.getByTestId('audit-export-all-search-reason').textContent)
-    .toBe('Clear the search to export all rows matching the filters');
-  fireEvent.click(button);
-  expect(mock.exportAuditLogs).not.toHaveBeenCalled();
-
-  fireEvent.change(search, { target: { value: '   ' } });
-  expect(button.disabled).toBe(false);
-  expect(screen.queryByTestId('audit-export-all-search-reason')).toBeNull();
 });

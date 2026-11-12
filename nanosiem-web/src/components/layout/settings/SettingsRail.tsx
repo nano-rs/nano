@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useSystemConfig } from '@/hooks/use-api';
+import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
@@ -22,6 +23,7 @@ import {
   type SettingsSectionChild,
   type SectionStatus,
   resolveActiveSection,
+  isSectionVisible,
 } from './sections';
 
 const STATUS_DOT: Record<NonNullable<SectionStatus>, string> = {
@@ -119,8 +121,8 @@ interface SettingsRailProps {
 export function SettingsRail({ onBackToApp }: SettingsRailProps) {
   const location = useLocation();
   const { hasPermission, hasAnyPermission, isDemoUser, user } = useAuth();
-  const { capabilities } = useCapabilities();
-  const { data: systemConfig } = useSystemConfig();
+  const { capabilities, edition } = useCapabilities();
+  const { data: systemConfig } = useSystemConfig({ skip: !hasPermission(SHELL_READ_PERMISSIONS.systemConfig) });
   const isAirGap = systemConfig?.air_gap === true;
   const [query, setQuery] = useState('');
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ access: true });
@@ -145,12 +147,7 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
   const visibleSections = useMemo(() => {
     return SETTINGS_SECTIONS
       .map((s): SettingsSection | null => {
-        if (s.capability && !capabilities[s.capability]) return null;
-        if (s.demoHidden && isDemoUser) return null;
-        if (s.airgapOnly && !isAirGap) return null;
-        const sectionVisible = !s.permissions
-          || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
-        if (!sectionVisible) return null;
+        if (!isSectionVisible(s, { capabilities, edition, isDemoUser, isAirGap, hasPermission, hasAnyPermission })) return null;
         const children = (s.children || []).filter(c => {
           if (c.capability && !capabilities[c.capability]) return false;
           return hasAny(c.permissions, checkPerm);
@@ -159,7 +156,7 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, edition, isAirGap]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();

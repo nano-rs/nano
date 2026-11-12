@@ -335,16 +335,24 @@ impl LogSourceService {
             return Ok(false);
         }
         check_sample_limits(std::slice::from_ref(&sample.to_string()))?;
-        self.repository()
+        match self
+            .repository()
             .set_ocsf_validation_attestation(
                 id,
                 crate::parsers::ocsf_validation_version(),
                 &source_parser_sha256(&log_source),
                 &ocsf_samples_sha256(&[sample.to_string()]),
                 1,
+                Some(log_source.updated_at),
             )
-            .await?;
-        Ok(true)
+            .await
+        {
+            Ok(_) => Ok(true),
+            // Edited since it was read: the tested VRL may no longer be the
+            // stored generation, so no receipt (the test result still stands).
+            Err(crate::log_sources::LogSourceRepositoryError::StaleVersion(_)) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The receipt state of `log_source`'s working-copy generation, for the
@@ -448,8 +456,11 @@ impl LogSourceService {
                 version.extension_vrl.as_deref(),
             )
         });
-        let outcome = self.enforce_ocsf_gate(&log_source, live, input).await?;
-        Ok(OcsfPrecheck { outcome, ..checked })
+        let (outcome, revision) = self.enforce_ocsf_gate(&log_source, live, input).await?;
+        // NAN-5297: a new receipt bumped `updated_at`; publish continues at the
+        // revision the receipt was written at (the receipt write was itself a
+        // CAS against the revision checked above, so nothing slipped in).
+        Ok(OcsfPrecheck { outcome, revision, ..checked })
     }
 
     /// Deploy's OCSF gate, run by the API before a deploy job is enqueued.
@@ -472,7 +483,9 @@ impl LogSourceService {
         if !log_source.deployed
             && self.version_repository().get_active_version(id).await?.is_none()
         {
-            checked.outcome = self.enforce_ocsf_gate(&log_source, None, input).await?;
+            let (outcome, revision) = self.enforce_ocsf_gate(&log_source, None, input).await?;
+            checked.outcome = outcome;
+            checked.revision = revision;
         }
         Ok(checked)
     }
@@ -506,27 +519,31 @@ impl LogSourceService {
     /// (D1). Otherwise: supplied samples win; with none, a matching receipt
     /// passes, then the library parser's bundled samples are tried; a first
     /// publish may be acknowledged as unattested (D2); else it is refused.
+    ///
+    /// Returns the outcome and the source's revision after the gate: unchanged
+    /// unless a new receipt was written, which bumps `updated_at` (NAN-5297).
     pub(crate) async fn enforce_ocsf_gate(
         &self,
         log_source: &LogSource,
         live: Option<(&str, bool, Option<&str>)>,
         input: &OcsfGateInput,
-    ) -> Result<OcsfGateOutcome, LogSourceServiceError> {
+    ) -> Result<(OcsfGateOutcome, chrono::DateTime<chrono::Utc>), LogSourceServiceError> {
+        let unchanged = log_source.updated_at;
         if !is_ocsf_deployment()? || log_source.kind != "log" {
-            return Ok(OcsfGateOutcome::NotRequired);
+            return Ok((OcsfGateOutcome::NotRequired, unchanged));
         }
         let version = crate::parsers::ocsf_validation_version();
         let parser_sha256 = source_parser_sha256(log_source);
         if let Some((parser_vrl, extension_enabled, extension_vrl)) = live {
             if ocsf_parser_sha256(version, parser_vrl, extension_enabled, extension_vrl) == parser_sha256 {
-                return Ok(OcsfGateOutcome::NotRequired);
+                return Ok((OcsfGateOutcome::NotRequired, unchanged));
             }
         }
         // A Nano Pipe plan routes/filters/masks events that a parser already
         // shaped; its output is not a parser's, so the parser gate does not
         // apply (and the plan is not VRL the sample runner can execute).
         if matches!(crate::parsers::pipe::stored_plan(&log_source.parser_vrl), Ok(Some(_))) {
-            return Ok(OcsfGateOutcome::NotRequired);
+            return Ok((OcsfGateOutcome::NotRequired, unchanged));
         }
         // D1 for rollback: a generation that was published before (a revert)
         // already went live once; never block going back to it.
@@ -543,7 +560,7 @@ impl LogSourceService {
                     v.extension_vrl.as_deref(),
                 ) == parser_sha256
             }) {
-                return Ok(OcsfGateOutcome::NotRequired);
+                return Ok((OcsfGateOutcome::NotRequired, unchanged));
             }
         }
 
@@ -554,12 +571,12 @@ impl LogSourceService {
                 .has_ocsf_validation_attestation(log_source.id, version, &parser_sha256)
                 .await?
             {
-                return Ok(OcsfGateOutcome::Reused);
+                return Ok((OcsfGateOutcome::Reused, unchanged));
             }
             bundled = self.library_parser_samples(log_source).await;
             if bundled.is_empty() {
                 if input.acknowledge_unattested && live.is_none() {
-                    return Ok(OcsfGateOutcome::Unattested);
+                    return Ok((OcsfGateOutcome::Unattested, unchanged));
                 }
                 return Err(LogSourceServiceError::OcsfValidationFailed(if live.is_none() {
                     "this parser has no OCSF sample-validation receipt; supply at least one representative raw event, or acknowledge an unattested first publish".to_string()
@@ -594,16 +611,18 @@ impl LogSourceService {
                 )));
             }
         }
-        self.repository()
+        let revision = self
+            .repository()
             .set_ocsf_validation_attestation(
                 log_source.id,
                 version,
                 &parser_sha256,
                 &ocsf_samples_sha256(samples),
                 samples.len() as i32,
+                Some(unchanged),
             )
             .await?;
-        Ok(OcsfGateOutcome::Attested { samples: samples.len() })
+        Ok((OcsfGateOutcome::Attested { samples: samples.len() }, revision))
     }
 }
 

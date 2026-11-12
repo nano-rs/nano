@@ -21,7 +21,7 @@ export function DeliveryAttentionBadge({ items }: { items: DeliveryAttention[] }
   const worst = worstAttention(items);
   if (!worst) return null;
   const kinds = new Set(items.map((i) => i.kind));
-  const what = kinds.size === 1 ? (kinds.has('pull') ? 'pull' : 'connector') : 'delivery';
+  const what = kinds.size === 1 ? [...kinds][0] : 'delivery';
   const lines = attentionSummary(items);
   return (
     <Tooltip>

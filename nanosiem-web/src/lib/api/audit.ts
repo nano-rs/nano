@@ -34,11 +34,17 @@ export class AuditApi {
     if (query.start_time) params.append('start_time', query.start_time);
     if (query.end_time) params.append('end_time', query.end_time);
     if (query.success !== undefined) params.append('success', String(query.success));
+    if (query.q) params.append('q', query.q);
     if (query.limit !== undefined) params.append('limit', String(query.limit));
     if (query.offset !== undefined) params.append('offset', String(query.offset));
 
     const queryString = params.toString();
     return this.request(`/api/audit${queryString ? `?${queryString}` : ''}`);
+  }
+
+  /** Distinct actions recorded in the last 90 days (for the Action filter). */
+  async getAuditActions(): Promise<string[]> {
+    return this.request('/api/audit/actions');
   }
 
   /** Download every matching audit row, bounded by the server at 100,000. */
@@ -51,6 +57,7 @@ export class AuditApi {
     if (query.start_time) params.append('start_time', query.start_time);
     if (query.end_time) params.append('end_time', query.end_time);
     if (query.success !== undefined) params.append('success', String(query.success));
+    if (query.q) params.append('q', query.q);
     params.append('format', query.format ?? 'csv');
     params.append('limit', String(Math.min(query.limit ?? 100_000, 100_000)));
 

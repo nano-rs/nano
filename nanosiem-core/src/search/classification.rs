@@ -33,10 +33,12 @@
 //! `&'static str` at compile time (required by `concat!`). Edit a predicate in
 //! exactly one place and both classifiers pick up the change.
 
-/// Predicate: alert / signal / finding event.
+/// Predicate: alert / signal / finding event. Detection findings are logged
+/// with `source_type = 'findings'` (`detection/findings.rs`); `signal` is the
+/// legacy name, kept so older rows still classify (NAN-5312).
 macro_rules! p_alert {
     () => {
-        "(lower(source_type) = 'signal' OR position(lower(source_type), 'alert') > 0)"
+        "(lower(source_type) IN ('findings', 'signal') OR position(lower(source_type), 'alert') > 0)"
     };
 }
 

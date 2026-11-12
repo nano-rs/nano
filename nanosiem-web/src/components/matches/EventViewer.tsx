@@ -8,7 +8,7 @@
 import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronLeft } from 'lucide-react';
 import { cn, isClickHouseDefault } from '@/lib/utils';
-import { extractEventTime, eventLatency } from './helpers';
+import { extractEventTime, eventLatency, resolveEventPath } from './helpers';
 import { LatencyPill } from './LatencyPill';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { schemaFieldCandidates, type SchemaProfileId, type SemanticField } from '@/lib/schema-fields';
@@ -112,12 +112,10 @@ function visibleFields(event: Record<string, unknown>): string[] {
 const FIELD_PREVIEW_MAX = 500;
 
 function getFieldValue(event: Record<string, unknown>, field: string): string {
-  const parts = field.split('.');
-  let v: unknown = event;
-  for (const p of parts) {
-    if (v === null || v === undefined || typeof v !== 'object') return '';
-    v = (v as Record<string, unknown>)[p];
-  }
+  // NAN-5300: matched events carry OCSF columns as FLAT dotted keys
+  // (`"process.name"`); a pure nested walk dropped every one of them.
+  const v = resolveEventPath(event, field);
+  if (v === undefined) return '';
   if (isClickHouseDefault(v, field)) return '';
   const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
   return s.length > FIELD_PREVIEW_MAX ? `${s.slice(0, FIELD_PREVIEW_MAX)}… (${s.length} chars)` : s;

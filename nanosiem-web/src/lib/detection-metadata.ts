@@ -218,7 +218,11 @@ export function createDetectionTemplate(author: string = ''): string {
     author: author || 'Your Name',
     severity: 'medium',
     mode: 'staging',
-    detection_mode: 'realtime',
+    // NAN-5317: the example query carries a `| risk` pipe, and piped rules
+    // can only run scheduled. A `realtime` default contradicted its own body
+    // (the validator then flagged it and the API silently switched it).
+    detection_mode: 'scheduled',
+    schedule: '*/5 * * * *',
     lookback: '15m',
     alert_mode: 'grouped',
     tags: 'tag1, tag2',
@@ -226,10 +230,11 @@ export function createDetectionTemplate(author: string = ''): string {
     mitre_techniques: 'T1078',
   };
 
-  // Template shows | risk command usage for dynamic risk scoring
-  const query = `// Write your detection query here
-source_type = "your_source"
-| risk score=50 entity=user factor="Detection match"`;
+  // OCSF field names (NAN-5317): parsers emit OCSF, not UDM, so the example
+  // filters on the routing key and attributes risk to the OCSF actor.
+  const query = `// Write your detection query here (OCSF field names)
+metadata.log_source = "your_source"
+| risk score=50 entity=actor.user.name factor="Detection match"`;
 
   return serializeDetectionMetadata(metadata, query);
 }

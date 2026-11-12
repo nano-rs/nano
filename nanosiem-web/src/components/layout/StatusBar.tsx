@@ -5,6 +5,8 @@ import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
 import { useSiemHealthLatest, useIngestionHistory } from '@/hooks/use-api';
 import { useCurrentPageTitle } from '@/components/layout/AppBreadcrumbs';
 import { useLayoutOptional } from '@/contexts/LayoutContext';
+import { useAuth } from '@/contexts/AuthContext';
+import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
 import { formatEventsPerMin, formatIngestScore, formatPlatformStatus } from './status-bar-format';
 
 /**
@@ -67,8 +69,11 @@ export function StatusBar() {
   // per-dimension Live-state commentary is AI-driven; the core fallback
   // fills it with the literal string "AI analysis unavailable", which
   // we filter out below so open builds don't render that placeholder.
-  const { data: siemHealth } = useSiemHealthLatest();
-  const { data: ingestHistory } = useIngestionHistory(1);
+  // NAN-5325: only ask for what this role may read; a refused read is a 403
+  // and an audited denial on every page load.
+  const { hasPermission } = useAuth();
+  const { data: siemHealth } = useSiemHealthLatest({ skip: !hasPermission(SHELL_READ_PERMISSIONS.siemHealth) });
+  const { data: ingestHistory } = useIngestionHistory(1, { skip: !hasPermission(SHELL_READ_PERMISSIONS.ingestionHistory) });
   const layout = useLayoutOptional();
 
   // Platform status: tint the leading dot + label by SIEM overall_status.

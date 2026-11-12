@@ -108,3 +108,27 @@ fn placeholder_ids_are_rejected_on_either_row_shape() {
         );
     }
 }
+
+/// NAN-5313: events matched but none carry the link id (Defender EDR sets
+/// `process.pid`, never `process.uid`) — the empty state must say so, in the
+/// schema's own field names, instead of "try a different root".
+#[test]
+fn empty_tree_note_names_the_missing_id() {
+    use super::empty_tree_note;
+    use crate::schema::{OcsfProfile, SchemaProfile};
+    let ocsf = OcsfProfile::new();
+    let child = ocsf.display_field_name("process_guid").unwrap();
+    let parent = ocsf.display_field_name("parent_process_guid").unwrap();
+    assert_eq!(child, "process.uid");
+    assert_eq!(parent, "actor.process.uid");
+
+    let note = empty_tree_note(29, 0, &child, &parent).expect("note");
+    assert!(note.contains("29 matching events carry process.uid"), "{note}");
+    assert!(note.contains("actor.process.uid"), "{note}");
+    assert!(!note.contains("materialized"), "{note}");
+
+    // No events at all, or a tree that built nodes: no note.
+    assert_eq!(empty_tree_note(0, 0, &child, &parent), None);
+    assert_eq!(empty_tree_note(29, 3, &child, &parent), None);
+    assert!(empty_tree_note(1, 0, "a", "b").unwrap().contains("1 matching event carries"));
+}

@@ -63,6 +63,11 @@ interface TreeVisualizationProps {
   fieldsCollapsed?: boolean;
   fieldsCount?: number;
   onExpandFields?: () => void;
+  /**
+   * Server explanation for an empty tree (`_tree_note`, NAN-5313), e.g. that no
+   * matching event carries `process.uid`. Replaces the generic advice.
+   */
+  emptyNote?: string | null;
 }
 
 // ─────────────────────────── helpers ───────────────────────────
@@ -933,6 +938,7 @@ export function TreeVisualization({
   onExpandFields,
   serverPaged,
   onLoadChildren,
+  emptyNote,
 }: TreeVisualizationProps) {
   const preset = useMemo(() => derivePreset(config), [config]);
   const presetLabel =
@@ -1085,7 +1091,9 @@ export function TreeVisualization({
         <div className="p-8 text-center text-muted-foreground text-sm">
           <GitBranch className="inline-block w-5 h-5 mb-2 text-muted-foreground/60" />
           <p className="text-sm text-foreground">No tree nodes returned</p>
-          <p className="text-xs mt-1">Try a different root, broaden the scope, or verify the tree command.</p>
+          <p className="text-xs mt-1">
+            {emptyNote || 'Try a different root, broaden the scope, or verify the tree command.'}
+          </p>
         </div>
       </div>
     );

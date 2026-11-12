@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useCallback, createContext, useContext } from 'react';
 import { api } from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 import type {
   TierStatus,
   OrganizationTier,
@@ -39,12 +40,25 @@ interface UseTierResult {
   aiCreditsLimit: number | null;
 }
 
+/** `GET /api/settings/tier` is gated on this permission server-side. */
+export const TIER_STATUS_PERMISSION = 'settings:system';
+
 export function useTier(): UseTierResult {
+  // NAN-5325: the shell mounts this for every role. Without settings:system
+  // the request is refused (and audited as a denial) on every page load, so
+  // don't send it; consumers get the defaults (all of them admin surfaces).
+  const { hasPermission } = useAuth();
+  const canRead = hasPermission(TIER_STATUS_PERMISSION);
   const [status, setStatus] = useState<TierStatus | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(canRead);
   const [error, setError] = useState<Error | null>(null);
 
   const fetchStatus = useCallback(async () => {
+    if (!canRead) {
+      setStatus(null);
+      setLoading(false);
+      return;
+    }
     try {
       setLoading(true);
       const result = await api.tier.getStatus();
@@ -55,7 +69,7 @@ export function useTier(): UseTierResult {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [canRead]);
 
   useEffect(() => {
     fetchStatus();

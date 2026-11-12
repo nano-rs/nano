@@ -46,7 +46,7 @@ async fn a_receipt_matches_only_its_version_and_parser_fingerprint() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());
     let id = source(&pool).await;
-    repo.set_ocsf_validation_attestation(id, "1.9.0", PARSER_A, SAMPLES, 3)
+    repo.set_ocsf_validation_attestation(id, "1.9.0", PARSER_A, SAMPLES, 3, None)
         .await
         .unwrap();
 
@@ -63,7 +63,7 @@ async fn a_receipt_matches_only_its_version_and_parser_fingerprint() {
     assert_eq!((version.as_str(), parser.as_str(), count), ("1.9.0", PARSER_A, 3));
 
     // Advancing the receipt replaces it.
-    repo.set_ocsf_validation_attestation(id, "1.9.0", PARSER_B, SAMPLES, 1)
+    repo.set_ocsf_validation_attestation(id, "1.9.0", PARSER_B, SAMPLES, 1, None)
         .await
         .unwrap();
     assert!(!repo.has_ocsf_validation_attestation(id, "1.9.0", PARSER_A).await.unwrap());
@@ -78,13 +78,13 @@ async fn the_constraint_refuses_a_partial_or_malformed_receipt() {
     let id = source(&pool).await;
 
     assert!(
-        repo.set_ocsf_validation_attestation(id, "1.9.0", "not-a-hash", SAMPLES, 1)
+        repo.set_ocsf_validation_attestation(id, "1.9.0", "not-a-hash", SAMPLES, 1, None)
             .await
             .is_err(),
         "a non-hex fingerprint is refused"
     );
     assert!(
-        repo.set_ocsf_validation_attestation(id, "1.9.0", PARSER_A, SAMPLES, 0)
+        repo.set_ocsf_validation_attestation(id, "1.9.0", PARSER_A, SAMPLES, 0, None)
             .await
             .is_err(),
         "a receipt with no samples is refused"
@@ -106,7 +106,60 @@ async fn setting_a_receipt_on_a_missing_source_is_not_found() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());
     assert!(repo
-        .set_ocsf_validation_attestation(Uuid::now_v7(), "1.9.0", PARSER_A, SAMPLES, 1)
+        .set_ocsf_validation_attestation(Uuid::now_v7(), "1.9.0", PARSER_A, SAMPLES, 1, None)
         .await
         .is_err());
+}
+
+async fn updated_at(pool: &sqlx::PgPool, id: Uuid) -> chrono::DateTime<chrono::Utc> {
+    sqlx::query_scalar("SELECT updated_at FROM log_sources WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read updated_at")
+}
+
+/// NAN-5297: the receipt write bumps `updated_at` (trigger), and returns the
+/// new revision so a publish pinned to the checked revision can continue at it
+/// instead of 409ing against its own write.
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+async fn a_receipt_written_at_the_checked_revision_returns_the_new_revision() {
+    let pool = common::migrated_pool().await;
+    let repo = LogSourceRepository::new(pool.clone());
+    let id = source(&pool).await;
+    let checked = updated_at(&pool, id).await;
+
+    let revision = repo
+        .set_ocsf_validation_attestation(id, "1.9.0", PARSER_A, SAMPLES, 3, Some(checked))
+        .await
+        .expect("CAS at the checked revision succeeds");
+    assert_eq!(revision, updated_at(&pool, id).await, "returns the row's new revision");
+    assert!(revision >= checked);
+}
+
+/// A concurrent edit between the gate's read and its receipt write is a
+/// conflict, never a receipt stamped onto an unchecked generation.
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+async fn a_receipt_at_a_stale_revision_is_a_conflict_and_writes_nothing() {
+    let pool = common::migrated_pool().await;
+    let repo = LogSourceRepository::new(pool.clone());
+    let id = source(&pool).await;
+    let checked = updated_at(&pool, id).await;
+    sqlx::query("UPDATE log_sources SET parser_vrl = '. = {\"edited\": true}' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("concurrent edit");
+
+    let err = repo
+        .set_ocsf_validation_attestation(id, "1.9.0", PARSER_A, SAMPLES, 3, Some(checked))
+        .await
+        .expect_err("stale revision");
+    assert!(
+        matches!(err, nanosiem_core::log_sources::LogSourceRepositoryError::StaleVersion(_)),
+        "got {err:?}"
+    );
+    assert!(repo.ocsf_validation_attestation(id).await.unwrap().is_none());
 }

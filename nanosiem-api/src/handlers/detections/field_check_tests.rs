@@ -188,3 +188,32 @@ fn quoted_values_are_not_read_as_field_comparisons() {
         vec!["class_uid".to_string()],
     );
 }
+
+// --- NAN-5317: the editor's new-rule template --------------------------------
+
+/// The query body `createDetectionTemplate` (nanosiem-web
+/// `lib/detection-metadata.ts`) seeds a new rule with. It must parse, pass the
+/// OCSF field check with no errors or warnings, and be scheduled-only (the
+/// template declares `detection_mode: scheduled`).
+const NEW_RULE_TEMPLATE: &str = "// Write your detection query here (OCSF field names)
+metadata.log_source = \"your_source\"
+| risk score=50 entity=actor.user.name factor=\"Detection match\"";
+
+#[test]
+fn new_rule_template_is_valid_ocsf_npl() {
+    let clean = crate::handlers::detections::strip_comments(NEW_RULE_TEMPLATE);
+    let parsed = nanosiem_core::parse_query(&clean).expect("template parses");
+    let derived = nanosiem_core::collect_derived_fields(&parsed);
+    let check = check_fields(
+        &referenced_fields(&clean),
+        &derived,
+        Dataset::Logs,
+        &profile(SchemaId::Ocsf),
+    );
+    assert!(check.errors.is_empty(), "{:?}", check.errors);
+    assert!(check.warnings.is_empty(), "{:?}", check.warnings);
+    assert!(
+        nanosiem_core::detection::materialized_view::MaterializedViewGenerator::check_query_realtime_eligible(&parsed).is_err(),
+        "a `| risk` pipe is scheduled-only, matching the template's detection_mode"
+    );
+}

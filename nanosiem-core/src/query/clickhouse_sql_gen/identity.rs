@@ -156,7 +156,15 @@ impl ClickHouseSqlGenerator {
         // Resolve the lookup key through the active profile so OCSF reads its
         // promoted column; for UDM `field_access_expr` returns the escaped column
         // name verbatim (byte-identical to the prior `escape_identifier`).
-        let field_escaped = self.field_access_expr(field, "String");
+        //
+        // A key an upstream stage created under this name (`table src_ip` →
+        // `"src_endpoint.ip" AS src_ip`, NAN-5306; an eval/rex output) is the
+        // column in scope: reference it, not the schema column it shadows.
+        let field_escaped = if self.is_upstream_computed_field(field) {
+            crate::query::escape_identifier(field)
+        } else {
+            self.field_access_expr(field, "String")
+        };
 
         // Determine lookup type from field name
         let (join_col, is_reverse) = resolve_identity_join_col(field, self.profile.as_ref());
@@ -259,6 +267,14 @@ impl ClickHouseSqlGenerator {
             crate::schema::FieldResolution::ExplicitColumn(c) => crate::query::escape_identifier(&c),
             _ => "\"user\"".to_string(),
         };
+        // NAN-5306 review: after a projection (`table time, src_ip, user`) the
+        // physical OCSF `"user.name"` is gone; the event's user is in scope as
+        // `user`, or not at all. Base-scan scope (`None`) is byte-identical.
+        let main_user_ref = match available_columns {
+            Some(set) if set.contains("user") => "main.\"user\"".to_string(),
+            Some(set) if !set.contains(main_user_col.trim_matches('"')) => "NULL".to_string(),
+            _ => format!("main.{}", main_user_col),
+        };
         // `field_access_expr` returns a plain (possibly quoted) column for
         // promoted fields, but a JSONExtract EXPRESSION for unpromoted OCSF
         // tail fields — prefixing that with `main.` produces
@@ -277,7 +293,7 @@ impl ClickHouseSqlGenerator {
             format!("lower({})", main_field)
         } else {
             // IP fields: the resolved user comes from identity_observations JOIN
-            format!("lower(COALESCE(i.user, main.{}))", main_user_col)
+            format!("lower(COALESCE(i.user, {}))", main_user_ref)
         };
 
         let mut dict_lookup_parts: Vec<String> = Vec::new();
@@ -449,15 +465,23 @@ impl ClickHouseSqlGenerator {
                 None => identity_obs_table.clone(),
             });
 
+        // NAN-5306 review: after `table time, …` the event time is in scope
+        // as `main.time`; the physical `timestamp` column is gone. Literal
+        // `timestamp` otherwise (byte-identical).
+        let main_ts = if self.time_column_in_scope() == self.time_column() {
+            "timestamp".to_string()
+        } else {
+            self.time_column_in_scope()
+        };
         Ok(format!(
             r#"  SELECT
     {select_main},
     {fill_clause},
     CASE
         WHEN i.observed_at IS NULL THEN 'none'
-        WHEN i.observed_at > main.timestamp - INTERVAL 1 HOUR THEN 'high'
-        WHEN i.observed_at > main.timestamp - INTERVAL 4 HOUR THEN 'medium'
-        WHEN i.observed_at > main.timestamp - INTERVAL 24 HOUR THEN 'low'
+        WHEN i.observed_at > main.{main_ts} - INTERVAL 1 HOUR THEN 'high'
+        WHEN i.observed_at > main.{main_ts} - INTERVAL 4 HOUR THEN 'medium'
+        WHEN i.observed_at > main.{main_ts} - INTERVAL 24 HOUR THEN 'low'
         ELSE 'stale'
     END AS identity_confidence,
     i.observed_at AS identity_observed_at,
@@ -467,9 +491,9 @@ impl ClickHouseSqlGenerator {
   FROM {source} AS main
   ASOF LEFT JOIN {build_side} AS i
     ON {asof_equi}
-    AND main.timestamp >= i.observed_at
+    AND main.{main_ts} >= i.observed_at
   WHERE i.observed_at IS NULL
-     OR i.observed_at > main.timestamp - INTERVAL {max_age_secs} SECOND
+     OR i.observed_at > main.{main_ts} - INTERVAL {max_age_secs} SECOND
   SETTINGS join_use_nulls = 1"#,
             select_main = select_main,
             fill_clause = fill_clause,
@@ -477,7 +501,8 @@ impl ClickHouseSqlGenerator {
             asof_equi = asof_equi,
             source = source,
             build_side = build_side,
-            max_age_secs = max_age_secs
+            max_age_secs = max_age_secs,
+            main_ts = main_ts
         ))
     }
 }

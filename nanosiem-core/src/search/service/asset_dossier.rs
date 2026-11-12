@@ -1366,6 +1366,24 @@ async fn query_files(
     })
 }
 
+/// NX-detection predicate for the DNS card.
+///
+/// UDM `answer` is a scalar String: NX is an empty answer or the literal
+/// `NXDOMAIN`. OCSF maps the concept to `answers.rdata`, an `Array(String)`,
+/// so the scalar form (`lower(<Array>)`) is a ClickHouse Code 43 that failed
+/// the whole dossier for every entity (NAN-5301). Array columns use
+/// element-wise membership instead. No `answer` column → nothing is NX.
+pub(crate) fn dns_nx_expr(profile: &dyn SchemaProfile) -> String {
+    let Some(a) = profile.udm_column_sql("answer") else {
+        return "0".to_string();
+    };
+    if profile.is_array_field("answer") {
+        format!("(empty({a}) OR has(arrayMap(x -> lower(x), {a}), 'nxdomain'))")
+    } else {
+        format!("({a} = '' OR lower({a}) = 'nxdomain')")
+    }
+}
+
 async fn query_dns(
     ch: &clickhouse::Client,
     profile: &dyn SchemaProfile,
@@ -1381,12 +1399,7 @@ async fn query_dns(
         Some(c) => c,
         None => return Ok(AssetDnsSummary::default()),
     };
-    let answer = profile.udm_column_sql("answer");
-    // NX detection needs an `answer` column; without it nothing is NX.
-    let nx_expr = match &answer {
-        Some(a) => format!("({a} = '' OR lower({a}) = 'nxdomain')"),
-        None => "0".to_string(),
-    };
+    let nx_expr = dns_nx_expr(profile);
     let scalar_sql = format!(
         r#"SELECT
             countIf({query} != '') AS queries,

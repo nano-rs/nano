@@ -10,7 +10,7 @@
  * agree on what "Last 24 hours" or "Previous week" means.
  */
 
-import type { TimeRange } from '@/lib/api/types';
+import type { SavedSearchTimeRange, TimeRange } from '@/lib/api/types';
 
 /**
  * Preset labels are load-bearing: saved searches persist them as strings, and
@@ -264,4 +264,41 @@ export function trailingWindowTitle(durationMs: number | null, now: Date = new D
     timeZone,
     now,
   );
+}
+
+/** Whether `preset` is one of the picker's preset labels. */
+export function isTimeRangePreset(preset: string | undefined | null): preset is string {
+  return !!preset && TIME_RANGE_PRESETS.some((c) => c.presets.some((p) => p.value === preset));
+}
+
+/**
+ * The `time_range` a saved search stores (NAN-5311): the resolved window, plus
+ * the preset when one is selected so the search reopens relative to now.
+ */
+export function savedSearchTimeRange(range: TimeRangeValue): SavedSearchTimeRange {
+  const window = toApiTimeRange(range);
+  return range.type === 'preset' && isTimeRangePreset(range.preset)
+    ? { ...window, preset: range.preset }
+    : window;
+}
+
+/**
+ * The picker value a saved search reopens with (NAN-5311). A search saved on a
+ * preset ("Last 24 hours") reopens on that preset, resolved against now; one
+ * saved on a fixed window (or an older row that stored only `start`/`end`)
+ * reopens on that window. `null` when the row carries nothing usable: the
+ * caller keeps the current picker value.
+ */
+export function savedSearchTimeRangeValue(
+  range: SavedSearchTimeRange | null | undefined,
+  now: number = Date.now(),
+): TimeRangeValue | null {
+  if (isTimeRangePreset(range?.preset)) {
+    return { type: 'preset', preset: range.preset, refreshedAt: now };
+  }
+  if (!range?.start || !range?.end) return null;
+  const start = new Date(range.start);
+  const end = new Date(range.end);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) return null;
+  return { type: 'custom', start, end };
 }

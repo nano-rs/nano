@@ -974,10 +974,11 @@ impl DetectionService {
         &self,
         id: Uuid,
         assignee: &str,
+        assigned_by: &str,
         deny: &std::collections::BTreeSet<String>,
     ) -> Result<Alert, DetectionError> {
-        info!("Assigning alert {} to {}", id, assignee);
-        let alert = self.alert_repo.assign(id, assignee, deny).await?;
+        info!("Assigning alert {} to {} by {}", id, assignee, assigned_by);
+        let alert = self.alert_repo.assign(id, assignee, assigned_by, deny).await?;
         Ok(alert)
     }
 

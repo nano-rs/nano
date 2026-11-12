@@ -768,6 +768,10 @@ pub async fn update_search_admission_settings(
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let settings = nanosiem_core::settings::SearchAdmissionSettings::new(state.pool.clone());
+    // NAN-5324: record which fields changed, old → new. A failed read of the
+    // previous config must not block the update; the record then carries the
+    // new values only.
+    let before = settings.get_config().await.ok();
     let updated = settings.update_config(config).await.map_err(|e| match e {
         nanosiem_core::settings::SearchAdmissionSettingsError::Validation(msg) => {
             ApiError::ValidationError(msg)
@@ -781,6 +785,10 @@ pub async fn update_search_admission_settings(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("settings", None, Some("search_admission".to_string()))
             .client_context(&client)
+            .details(match &before {
+                Some(before) => nanosiem_core::audit::changes::changes_between(before, &updated),
+                None => nanosiem_core::audit::changes::new_values(&updated),
+            })
             .build(),
     );
 
@@ -844,6 +852,10 @@ pub async fn update_search_query_limits(
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let settings = nanosiem_core::settings::SearchQueryLimitsSettings::new(state.pool.clone());
+    // NAN-5324: record which fields changed, old → new. A failed read of the
+    // previous config must not block the update; the record then carries the
+    // new values only.
+    let before = settings.get_config().await.ok();
     let updated = settings.update_config(config).await.map_err(|e| match e {
         nanosiem_core::settings::SearchQueryLimitsError::Validation(msg) => {
             ApiError::ValidationError(msg)
@@ -857,6 +869,10 @@ pub async fn update_search_query_limits(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("settings", None, Some("search_query_limits".to_string()))
             .client_context(&client)
+            .details(match &before {
+                Some(before) => nanosiem_core::audit::changes::changes_between(before, &updated),
+                None => nanosiem_core::audit::changes::new_values(&updated),
+            })
             .build(),
     );
 

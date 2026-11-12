@@ -10,6 +10,7 @@ on:
       - "scripts/tests/helm-chart-package.test.sh"
       - "scripts/tests/lock-provenance.test.sh"
       - "scripts/tests/release-notes-preflight.test.sh"
+      - "scripts/tests/check-mirror-includes.test.sh"
       - "deploy/helm/nano/**"
       - "deploy/release/**"
       - ".github/workflows/build-and-push.yml"
@@ -25,6 +26,10 @@ on:
       - "scripts/lib/**"
       - "deploy/compose/**"
       - "tools/sync-to-nano-mirror.sh"
+      # NAN-5330: preflight runs the strip, the credential scan and the include guard.
+      - "tools/check-mirror-enterprise-strip.py"
+      - "tools/scan-mirror-secrets.sh"
+      - ".github/workflows/sync-mirror.yml"
 
 permissions:
   contents: read

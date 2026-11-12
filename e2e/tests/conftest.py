@@ -310,7 +310,12 @@ def ocsf_lane(stack: Stack) -> Iterator[OcsfLane]:
     cred, tok = nano.issue_token(src["id"], name=f"{rk}-tok")
     from nano_e2e.client import expect as api_expect
 
-    res = api_expect(nano.api.post(f"/api/log-sources/{src['id']}/publish"), 200)
+    # NAN-5079: a custom parser's first publish needs a passing OCSF sample or
+    # an audited unattested acknowledgement. This minimal auth parser is not a
+    # complete OCSF event (no metadata.version), so acknowledge.
+    res = api_expect(
+        nano.api.post(f"/api/log-sources/{src['id']}/publish", json={"acknowledge_unattested": True}), 200
+    )
     assert res.get("success") is True, f"publishing the OCSF lane parser failed: {res}"
     n = {"i": 0}
 

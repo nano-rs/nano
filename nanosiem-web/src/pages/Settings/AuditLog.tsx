@@ -12,7 +12,7 @@
  * bordered divs suffice.
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { auditFiltersFromSearch, auditFiltersToSearch, sameAuditUrlFilters } from '@/lib/audit-filters';
 import { auditActorLabel } from '@/lib/audit-feed';
@@ -50,40 +50,9 @@ import { api, AuditLogEntry, AuditLogQuery } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import { auditCsv } from '@/lib/audit-csv';
+import { ALL_FILTER, AUDIT_SEARCH_DEBOUNCE_MS, auditActionOptions } from '@/lib/audit-actions';
 
-// Radix Select refuses an empty-string item value (it throws and blanks the
-// page), so "all" is a sentinel that maps to an absent filter.
-const ALL_FILTER = '__all__';
 
-// Common audit actions for filtering (underscore convention)
-const AUDIT_ACTIONS = [
-  { value: ALL_FILTER, label: 'All Actions' },
-  { value: 'login_success', label: 'Login Success' },
-  { value: 'login_failed', label: 'Login Failed' },
-  { value: 'logout', label: 'Logout' },
-  { value: 'auth_denied', label: 'Authorization Denied' },
-  { value: 'sso_sign_in_denied', label: 'SSO Sign-in Denied' },
-  { value: 'sso_group_grants_synchronized', label: 'SSO Group Grants Synchronized' },
-  { value: 'token_refresh', label: 'Session Refreshed' },
-  { value: 'user_created', label: 'User Created' },
-  { value: 'user_updated', label: 'User Updated' },
-  { value: 'user_deleted', label: 'User Deleted' },
-  { value: 'rule_created', label: 'Rule Created' },
-  { value: 'rule_updated', label: 'Rule Updated' },
-  { value: 'rule_deleted', label: 'Rule Deleted' },
-  { value: 'dashboard_created', label: 'Dashboard Created' },
-  { value: 'dashboard_updated', label: 'Dashboard Updated' },
-  { value: 'dashboard_deleted', label: 'Dashboard Deleted' },
-  { value: 'alert_acknowledged', label: 'Alert Acknowledged' },
-  { value: 'alert_closed', label: 'Alert Closed' },
-  { value: 'apikey_created', label: 'API Key Created' },
-  { value: 'apikey_updated', label: 'API Key Updated' },
-  { value: 'apikey_enabled', label: 'API Key Enabled' },
-  { value: 'apikey_disabled', label: 'API Key Disabled' },
-  { value: 'apikey_deleted', label: 'API Key Deleted' },
-  { value: 'session_terminated', label: 'Session Terminated' },
-  { value: 'oidc_provider_created', label: 'OIDC Provider Created' },
-];
 
 // Audit source subsystems for filtering
 const AUDIT_SOURCES = [
@@ -145,6 +114,7 @@ function formatAction(action: string): string {
     .replace(/\b\w/g, c => c.toUpperCase());
 }
 
+
 // Content component for use in tabbed Access Control page
 export function AuditLogContent() {
   const { toast } = useToast();
@@ -155,6 +125,9 @@ export function AuditLogContent() {
   const [total, setTotal] = useState(0);
   const [degradedReason, setDegradedReason] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // Full-page spinner only before the first answer: afterwards a refetch
+  // (e.g. each search keystroke) must not unmount the search box.
+  const [loadedOnce, setLoadedOnce] = useState(false);
   const [serverExporting, setServerExporting] = useState(false);
 
   // Filter state
@@ -170,8 +143,34 @@ export function AuditLogContent() {
     setSearchParams((current) => auditFiltersToSearch(current, filters), { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters.action, filters.source, filters.resource_type]);
+  // NAN-5308: the search box is a server-side filter (`q`), so it covers every
+  // matching row and the pagination total, not just the loaded page.
   const [searchQuery, setSearchQuery] = useState('');
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const q = searchQuery.trim() || undefined;
+      setFilters(prev => {
+        if (prev.q === q) return prev;
+        const next: AuditLogQuery = { ...prev, offset: 0 };
+        if (q) next.q = q; else delete next.q;
+        return next;
+      });
+    }, AUDIT_SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
   const [filterOpen, setFilterOpen] = useState(false);
+  const [recordedActions, setRecordedActions] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.getAuditActions()
+      .then(actions => { if (!cancelled && Array.isArray(actions)) setRecordedActions(actions); })
+      .catch(() => { /* fall back to the labelled list */ });
+    return () => { cancelled = true; };
+  }, []);
+  const actionOptions = useMemo(
+    () => auditActionOptions(recordedActions, filters.action),
+    [recordedActions, filters.action],
+  );
 
   // Detail dialog state
   const [selectedLog, setSelectedLog] = useState<AuditLogEntry | null>(null);
@@ -192,6 +191,7 @@ export function AuditLogContent() {
       });
     } finally {
       setLoading(false);
+      setLoadedOnce(true);
     }
   };
 
@@ -199,22 +199,6 @@ export function AuditLogContent() {
     fetchData();
   }, [filters]);
 
-  const filteredLogs = logs.filter(log => {
-    if (!searchQuery) return true;
-    const query = searchQuery.toLowerCase();
-    return (
-      log.action?.toLowerCase().includes(query) ||
-      log.user_name?.toLowerCase().includes(query) ||
-      log.api_key_name?.toLowerCase().includes(query) ||
-      log.source?.toLowerCase().includes(query) ||
-      log.ip_address?.toLowerCase().includes(query) ||
-      log.resource_type?.toLowerCase().includes(query) ||
-      log.resource_name?.toLowerCase().includes(query) ||
-      log.message?.toLowerCase().includes(query)
-    );
-  });
-  const exportAllBlockedBySearch = searchQuery.trim().length > 0;
-  const exportAllSearchReason = 'Clear the search to export all rows matching the filters';
 
   const handleFilterChange = (key: keyof AuditLogQuery, value: string) => {
     setFilters(prev => ({
@@ -236,8 +220,8 @@ export function AuditLogContent() {
 
   const handleExport = async () => {
     try {
-      // Exactly the rows on screen (search box applied), formula-neutralized.
-      const csv = auditCsv(filteredLogs);
+      // Exactly the rows on screen, formula-neutralized.
+      const csv = auditCsv(logs);
       const blob = new Blob([csv], { type: 'text/csv' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -258,7 +242,6 @@ export function AuditLogContent() {
   };
 
   const handleExportAll = async () => {
-    if (exportAllBlockedBySearch) return;
     setServerExporting(true);
     try {
       const { offset: _offset, ...matchingFilters } = filters;
@@ -301,7 +284,7 @@ export function AuditLogContent() {
   const totalPages = Math.ceil(total / limit);
   const hasActiveFilters = !!(filters.action || filters.source || filters.resource_type || filters.start_time || filters.end_time);
 
-  if (loading && logs.length === 0) {
+  if (loading && !loadedOnce) {
     return (
       <div className="flex items-center justify-center py-12">
         <LoadingIcon className="w-6 h-6 text-muted-foreground" />
@@ -344,7 +327,7 @@ export function AuditLogContent() {
                     <SelectValue placeholder="All Actions" />
                   </SelectTrigger>
                   <SelectContent>
-                    {AUDIT_ACTIONS.map((action) => (
+                    {actionOptions.map((action) => (
                       <SelectItem key={action.value} value={action.value} className="text-[12px]">
                         {action.label}
                       </SelectItem>
@@ -393,7 +376,8 @@ export function AuditLogContent() {
                 size="sm"
                 className="w-full h-7 text-[11.5px] px-2.5 border-border"
                 onClick={() => {
-                  setFilters({ limit: 50, offset: 0 });
+                  // Keep the free-text search; it has its own box.
+                  setFilters(prev => (prev.q ? { limit: 50, offset: 0, q: prev.q } : { limit: 50, offset: 0 }));
                   setFilterOpen(false);
                 }}
               >
@@ -413,25 +397,15 @@ export function AuditLogContent() {
         </Button>
         <Button
           onClick={handleExportAll}
-          disabled={serverExporting || exportAllBlockedBySearch}
+          disabled={serverExporting}
           variant="outline"
           size="sm"
           className="h-7 text-[11.5px] px-2.5 gap-1.5 border-border"
-          title={exportAllBlockedBySearch
-            ? exportAllSearchReason
-            : 'Export all matching audit rows (up to 100,000)'}
+          title="Export all matching audit rows, search included (up to 100,000)"
         >
           {serverExporting ? <LoadingIcon className="w-3 h-3" /> : <Download className="w-3 h-3" />}
           {serverExporting ? 'Exporting…' : 'Export all'}
         </Button>
-        {exportAllBlockedBySearch && (
-          <span
-            data-testid="audit-export-all-search-reason"
-            className="font-mono text-[10.5px] text-muted-foreground"
-          >
-            {exportAllSearchReason}
-          </span>
-        )}
         {serverExporting && (
           <span role="status" className="font-mono text-[10.5px] text-muted-foreground">
             Exporting up to 100,000 matching rows…
@@ -462,14 +436,14 @@ export function AuditLogContent() {
             </tr>
           </thead>
           <tbody className="divide-y divide-border/60">
-            {filteredLogs.length === 0 ? (
+            {logs.length === 0 ? (
               <tr>
                 <td colSpan={7} className="text-center text-[12px] text-muted-foreground py-10">
                   No audit logs found
                 </td>
               </tr>
             ) : (
-              filteredLogs.map((log) => (
+              logs.map((log) => (
                 <tr
                   key={log.id}
                   className="hover:bg-foreground/[0.025] cursor-pointer transition-colors"

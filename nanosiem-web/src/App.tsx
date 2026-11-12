@@ -90,6 +90,8 @@ const queryClient = new QueryClient({
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { UserPreferencesProvider, useUserPreferences } from '@/contexts/UserPreferencesContext';
 import { useOnboardingProgress } from '@/hooks/use-api';
+import { INSTANCE_SETUP_PERMISSION, shouldRedirectToSetup } from '@/lib/onboarding-access';
+import { LicensedFeatureUnavailable } from '@/components/LicensedFeatureUnavailable';
 import { SsoRouteGate } from '@/pages/Settings/SsoRouteGate';
 import { useRegisterSchemaHighlightFields } from '@/hooks/useRegisterSchemaHighlightFields';
 import { NotebookProvider } from '@/enterprise/contexts/NotebookContext';
@@ -341,20 +343,9 @@ function CapabilityRoute({
 }) {
   const { capabilities } = useCapabilities();
   if (capabilities[capability]) return <>{children}</>;
-
-  return (
-    <div data-testid="licensed-feature-unavailable" className="flex h-full flex-col items-center justify-center px-8 text-center">
-      <h1 className="text-xl font-semibold text-foreground">Licensed feature unavailable</h1>
-      <p className="mt-2 max-w-lg text-sm text-muted-foreground">
-        This surface is not admitted by the current license. Open/core features,
-        ingest, search, and stored data remain available.
-      </p>
-      <Link className="mt-5 text-sm font-medium text-primary hover:underline" to="/">
-        Return to Home
-      </Link>
-    </div>
-  );
+  return <LicensedFeatureUnavailable capability={capability} />;
 }
+
 
 function NotFoundPage() {
   const location = useLocation();
@@ -458,7 +449,7 @@ function ExternalRedirect({ url }: { url: string }) {
 
 function LandingPageRedirect() {
   const { landingPage } = useUserPreferences();
-  const { isDemoUser } = useAuth();
+  const { isDemoUser, hasPermission } = useAuth();
   const { data: onboardingProgress, loading: onboardingLoading } = useOnboardingProgress();
 
   // While loading onboarding state, show nothing to avoid flash
@@ -468,12 +459,16 @@ function LandingPageRedirect() {
   // Only redirect on first visit (no progress record yet) and only once per session.
   // sessionStorage flag prevents redirect loops when the user navigates back from
   // getting-started without taking any action (which would leave progress null).
-  if (!isDemoUser && !onboardingProgress && !onboardingLoading) {
-    const seen = sessionStorage.getItem('onboarding_seen');
-    if (!seen) {
-      sessionStorage.setItem('onboarding_seen', '1');
-      return <Navigate to="/getting-started" replace />;
-    }
+  // NAN-5309: only roles that can run instance setup are sent there.
+  if (shouldRedirectToSetup({
+    isDemoUser,
+    canRunSetup: hasPermission(INSTANCE_SETUP_PERMISSION),
+    hasProgress: !!onboardingProgress,
+    progressLoading: onboardingLoading,
+    seenThisSession: !!sessionStorage.getItem('onboarding_seen'),
+  })) {
+    sessionStorage.setItem('onboarding_seen', '1');
+    return <Navigate to="/getting-started" replace />;
   }
 
   switch (landingPage) {

@@ -22,6 +22,11 @@
  * NAN-4941: push listener configurations (HTTP, Vector, OTLP, HEC routing
  * profiles) with a routing rule into this source are listed too, so a
  * user-editable listener is one click from the source it feeds.
+ *
+ * NAN-5318: a source dispatched from a listener config is a push path, never
+ * "Pull". The HEC listener is platform-managed and always on; a `splunk_hec`
+ * config is only a routing profile over it, so its row shows whether events
+ * are arriving, not the profile's enabled/deployed flags.
  */
 
 import { Link } from 'react-router-dom';
@@ -33,6 +38,7 @@ import { connectDetailQueryKey } from '@/lib/api/log-source-connect';
 import { INGEST_CREDENTIALS_PATH } from '@/lib/add-data-sources';
 import { CLOUD_PULL_PATH, PROVIDER_LABEL, pullState } from '@/lib/cloud-pull';
 import { isListenerConfigType, sourceConfigPath } from '@/lib/ingestion-paths';
+import { isPlatformHecProfile } from '@/lib/delivery-attention';
 import { useAuth } from '@/contexts/AuthContext';
 import { formatCompactNumber, formatRelativeCompact, formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
@@ -113,7 +119,12 @@ export function LogSourceDelivery({
     staleTime: 30_000,
     retry: 1,
   });
-  const listenerConfigs = listeners.data ?? [];
+  // A dispatching listener config is a push path: list it with the listeners.
+  const dispatchIsListener = !!config.data && isListenerConfigType(config.data.config_type);
+  const listenerConfigs = [
+    ...(dispatchIsListener && config.data ? [config.data] : []),
+    ...(listeners.data ?? []).filter((c) => c.id !== dispatchSourceConfigId),
+  ];
   const detail = connect.error instanceof ApiClientError && connect.error.status === 404 ? undefined : connect.data;
   const tokens = (detail?.tokens ?? []).filter((t) => t.state === 'active');
   // Token use is sampled from Vector's counters (seconds behind); the rollup's
@@ -123,6 +134,7 @@ export function LogSourceDelivery({
   const pushState = !detail?.push_capable ? null : tokens.length === 0 ? 'idle' : lastUsed ? 'receiving' : 'pending';
   const errors = health?.collector_errors ?? [];
   const errors24h = health?.collector_errors_24h ?? 0;
+  const arriving = !!lastUsed || (health?.events_last_24h ?? 0) > 0;
 
   return (
     <section className="rounded-md border border-border bg-card" data-testid="log-source-delivery" aria-label="Delivery">
@@ -157,7 +169,7 @@ export function LogSourceDelivery({
               </td>
             </tr>
           )}
-          {dispatchSourceConfigId && (
+          {dispatchSourceConfigId && !dispatchIsListener && (
             <tr className="border-t border-border h-7" data-testid="delivery-row-pull">
               <td className="px-4 py-1.5 text-foreground">
                 Pull · {config.data ? (PROVIDER_LABEL[config.data.config_type] ?? config.data.config_type) : 'source configuration'}
@@ -175,18 +187,30 @@ export function LogSourceDelivery({
               </td>
             </tr>
           )}
-          {listenerConfigs.map((c) => (
-            <tr key={c.id} className="border-t border-border h-7" data-testid="delivery-row-listener">
-              <td className="px-4 py-1.5 text-foreground">Push · {LISTENER_LABEL[c.config_type] ?? c.config_type}</td>
-              <td className="px-4 py-1.5"><StateBadge state={pullState(c)} /></td>
-              <td className="px-4 py-1.5"><When at={c.last_event_at ?? null} /></td>
-              <td className="px-4 py-1.5 text-muted-foreground">
-                <Link className="text-primary hover:underline" to={sourceConfigPath(c.id)}>{c.name}</Link>
-                {!c.deployed && <span className="ml-2 text-amber-500">not deployed</span>}
-                {' · routing rule into this source'}
-              </td>
-            </tr>
-          ))}
+          {listenerConfigs.map((c) => {
+            const hec = isPlatformHecProfile(c);
+            const profileOff = !c.enabled || !c.deployed;
+            return (
+              <tr key={c.id} className="border-t border-border h-7" data-testid="delivery-row-listener">
+                <td className="px-4 py-1.5 text-foreground">Push · {LISTENER_LABEL[c.config_type] ?? c.config_type}</td>
+                <td className="px-4 py-1.5">
+                  <StateBadge state={hec ? (arriving ? 'receiving' : 'idle') : pullState(c)} />
+                </td>
+                <td className="px-4 py-1.5">
+                  <When at={c.last_event_at ?? (hec ? lastUsed ?? health?.last_event_at ?? null : null)} />
+                </td>
+                <td className="px-4 py-1.5 text-muted-foreground">
+                  <Link className="text-primary hover:underline" to={sourceConfigPath(c.id)}>{c.name}</Link>
+                  {hec && profileOff ? (
+                    <span className="ml-2" data-testid="delivery-hec-profile-off">routing profile off · listener routes by sourcetype</span>
+                  ) : (
+                    !c.deployed && <span className="ml-2 text-amber-500">not deployed</span>
+                  )}
+                  {c.id === dispatchSourceConfigId ? ' · dispatches into this source' : ' · routing rule into this source'}
+                </td>
+              </tr>
+            );
+          })}
           {!pushState && !dispatchSourceConfigId && listenerConfigs.length === 0 && (
             <tr className="border-t border-border h-7">
               <td colSpan={4} className="px-4 py-1.5 text-muted-foreground">

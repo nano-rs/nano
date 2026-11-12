@@ -201,6 +201,75 @@ fn disk_buffer_component_count(content: &str) -> usize {
 /// succeeded — and the caller reacts to that by rolling back a good config.
 const DEFAULT_RELOAD_ACK_TIMEOUT_SECS: u64 = 45;
 
+/// NAN-5298: the hard ceiling on one acknowledgement wait
+/// (`VECTOR_RELOAD_ACK_MAX_SECS`). The window above is only the *quiet*
+/// window: it is stretched to fit how long this Vector's reloads have been
+/// taking ([`ReloadDurations`]), and extended while Vector is visibly working
+/// through earlier reloads (see [`ReloadAckProbe::await_marker`]). A reload of
+/// a large parser library takes ~40 s on 2 vCPUs, and a fixed 45 s rolled
+/// back configs Vector went on to accept. This cap is what still bounds a
+/// Vector that never reloads at all, so a deploy cannot hold the deploy lock
+/// forever.
+const DEFAULT_RELOAD_ACK_MAX_SECS: u64 = 600;
+
+/// The acknowledgement window is at least this multiple of the slowest
+/// recent reload this process has measured.
+const RELOAD_ACK_HEADROOM: u32 = 2;
+
+/// NAN-5298: how long this Vector's reloads actually take, as measured by
+/// this process (delivery to acknowledgement), so the next window is sized to
+/// the reload in front of it rather than to a constant.
+///
+/// A decaying maximum: a slower reload raises it at once, and every faster
+/// one lets it fall by a quarter, so one outlier does not pin every later
+/// window at its size. Reload cost is O(deployed parsers), so this tracks a
+/// growing library on its own. Process-local and best effort: a fresh
+/// process starts from the configured window.
+pub(super) struct ReloadDurations {
+    slowest_recent_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ReloadDurations {
+    pub(super) const fn new() -> Self {
+        Self {
+            slowest_recent_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn record(&self, took: std::time::Duration) {
+        let took = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        let _ = self.slowest_recent_ms.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |old| Some(took.max(old - old / 4)),
+        );
+    }
+
+    /// `base`, stretched to [`RELOAD_ACK_HEADROOM`] x the slowest recent
+    /// reload, never above `cap`.
+    pub(super) fn window(&self, base: std::time::Duration, cap: std::time::Duration) -> std::time::Duration {
+        let slowest = std::time::Duration::from_millis(
+            self.slowest_recent_ms.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        base.max(slowest.saturating_mul(RELOAD_ACK_HEADROOM)).min(cap.max(base))
+    }
+}
+
+static RELOAD_DURATIONS: ReloadDurations = ReloadDurations::new();
+
+/// Parse a seconds knob; `None` when unset or empty (compose passes an unset
+/// `${VAR:-}` through as ""), a warning plus `None` when garbage.
+fn env_secs(name: &str) -> Option<u64> {
+    let raw = std::env::var(name).ok().filter(|raw| !raw.trim().is_empty())?;
+    match raw.trim().parse::<u64>() {
+        Ok(secs) => Some(secs),
+        Err(_) => {
+            tracing::warn!(value = %raw, "{name} is not a number of seconds; using the default");
+            None
+        }
+    }
+}
+
 /// Vector's own answer to "did you accept the config I just published?".
 ///
 /// NAN-2305: nothing on the Rust deploy path used to ask. `reload_vector`
@@ -339,7 +408,13 @@ fn metrics_client() -> Option<&'static reqwest::Client> {
 pub(super) struct ReloadAckProbe {
     url: String,
     client: reqwest::Client,
+    /// The quiet window: how long to wait with no sign of progress.
     timeout: std::time::Duration,
+    /// NAN-5298: the hard ceiling, however much progress Vector shows.
+    max_wait: std::time::Duration,
+    /// NAN-5298: where measured reload durations are recorded (the process
+    /// global in production; a private instance in tests).
+    durations: &'static ReloadDurations,
     poll_interval: std::time::Duration,
 }
 
@@ -352,21 +427,16 @@ impl ReloadAckProbe {
     /// that is fixed, rather than having every deploy roll itself back. It is
     /// deliberately loud — see `reload_outcome`.
     pub(super) fn from_env() -> Option<Self> {
-        let timeout_secs = match std::env::var("VECTOR_RELOAD_ACK_TIMEOUT_SECS") {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(0) => return None,
-                Ok(secs) => secs,
-                Err(_) => {
-                    tracing::warn!(
-                        value = %raw,
-                        "VECTOR_RELOAD_ACK_TIMEOUT_SECS is not a number — using {}s",
-                        DEFAULT_RELOAD_ACK_TIMEOUT_SECS
-                    );
-                    DEFAULT_RELOAD_ACK_TIMEOUT_SECS
-                }
-            },
-            Err(_) => DEFAULT_RELOAD_ACK_TIMEOUT_SECS,
+        let timeout_secs = match env_secs("VECTOR_RELOAD_ACK_TIMEOUT_SECS") {
+            Some(0) => return None,
+            Some(secs) => secs,
+            None => DEFAULT_RELOAD_ACK_TIMEOUT_SECS,
         };
+        // The cap never undercuts an explicitly configured window.
+        let max_secs = env_secs("VECTOR_RELOAD_ACK_MAX_SECS")
+            .unwrap_or(DEFAULT_RELOAD_ACK_MAX_SECS)
+            .max(timeout_secs);
+        let max_wait = std::time::Duration::from_secs(max_secs);
 
         let url = std::env::var("VECTOR_METRICS_URL")
             .unwrap_or_else(|_| DEFAULT_VECTOR_METRICS_URL.to_string());
@@ -374,7 +444,9 @@ impl ReloadAckProbe {
         Some(Self {
             url,
             client: metrics_client()?.clone(),
-            timeout: std::time::Duration::from_secs(timeout_secs),
+            timeout: RELOAD_DURATIONS.window(std::time::Duration::from_secs(timeout_secs), max_wait),
+            max_wait,
+            durations: &RELOAD_DURATIONS,
             poll_interval: std::time::Duration::from_secs(1),
         })
     }
@@ -408,7 +480,8 @@ impl ReloadAckProbe {
 
     /// Poll until one of the counters passes the pre-reload snapshot.
     pub(super) async fn await_ack(&self, before: ReloadCounters) -> ReloadAck {
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.timeout;
         let mut saw_rejection = false;
 
         loop {
@@ -433,6 +506,7 @@ impl ReloadAckProbe {
                 if now.reloads > before.reloads
                     || (!saw_rejection && counter_advanced(before.reloads, now.reloads))
                 {
+                    self.durations.record(started.elapsed());
                     return ReloadAck::Accepted;
                 }
             }
@@ -454,20 +528,61 @@ impl ReloadAckProbe {
     /// Correlated acknowledgement (NAN-4936): wait for the named marker
     /// component to be running. A configuration failure seen in the window, with
     /// the marker never appearing, is a rejection of this change.
+    ///
+    /// NAN-5298: the window is a QUIET window, not a fixed one. Vector runs
+    /// reloads one after another, so ours can be queued behind others (the
+    /// watcher's reload of the promoted files, a duplicate SIGHUP, an earlier
+    /// deploy's rollback), each O(deployed parsers). Every reload Vector
+    /// completes without our marker is proof it is alive and working through
+    /// that queue, so it restarts the window, up to `max_wait` in total. Giving
+    /// up while Vector was still applying the queue rolled back configs it went
+    /// on to accept, and the rollback's own reload then queued in front of the
+    /// next deploy, which timed out in turn.
     pub(super) async fn await_marker(&self, before: ReloadCounters, component_id: &str) -> ReloadAck {
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let started = tokio::time::Instant::now();
+        let ceiling = started + self.max_wait.max(self.timeout);
+        let mut deadline = (started + self.timeout).min(ceiling);
+        let mut last_reloads = before.reloads;
+        // When the last reload that was NOT ours completed: what follows it is
+        // our own reload, the duration the quiet window has to cover.
+        let mut last_progress = started;
         let mut saw_rejection = false;
         let mut readable = false;
         loop {
             if let Some(body) = self.read_body().await {
                 readable = true;
                 if marker_is_live(&body, component_id) {
+                    // Record OUR reload's duration, not the whole wait: time
+                    // spent queued behind other reloads is already covered by
+                    // the progress extensions, and counting it would inflate
+                    // the next quiet window (a 145 s queued wait would make a
+                    // rejecting or dead Vector take 290 s to roll back).
+                    self.durations.record(last_progress.elapsed());
+                    if started.elapsed() > self.timeout {
+                        tracing::info!(
+                            waited_secs = started.elapsed().as_secs(),
+                            window_secs = self.timeout.as_secs(),
+                            "Vector applied the change after its quiet window was extended by \
+                             reloads it completed in the meantime"
+                        );
+                    }
                     return ReloadAck::Accepted;
                 }
                 let now = parse_reload_counters(&body);
                 if counter_advanced(before.config_failures, now.config_failures) {
                     saw_rejection = true;
                 }
+                if counter_advanced(last_reloads, now.reloads) {
+                    // A reload finished, but not one containing our change:
+                    // Vector is making progress. Give ours a fresh window.
+                    // (Also after a rejection: the watcher can reject a
+                    // half-written tree and then load the complete one; the
+                    // verdict at the deadline is still Rejected if the marker
+                    // never runs.)
+                    last_progress = tokio::time::Instant::now();
+                    deadline = (last_progress + self.timeout).min(ceiling);
+                }
+                last_reloads = now.reloads;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -518,8 +633,12 @@ pub(super) fn reload_outcome(
             "Vector never acknowledged the config reload: neither its reload-success nor its \
              config-failure counter moved within the acknowledgement window. The reload signal \
              did not reach it (delivery: {}), or its config watcher is not watching the directory \
-             this config was written to.",
+             this config was written to. If Vector is only slow to reload, raise \
+             VECTOR_RELOAD_ACK_TIMEOUT_SECS (quiet window, default {}s) or \
+             VECTOR_RELOAD_ACK_MAX_SECS (ceiling, default {}s).",
             delivered.unwrap_or("none — relied on Vector's config watcher"),
+            DEFAULT_RELOAD_ACK_TIMEOUT_SECS,
+            DEFAULT_RELOAD_ACK_MAX_SECS,
         ))),
         ReloadAck::Unverifiable => match delivered {
             // A delivered SIGHUP is real evidence that a reload was requested;
@@ -3546,6 +3665,8 @@ mod deletion_tests;
 mod future_timestamp_tests;
 #[cfg(test)]
 mod reload_tests;
+#[cfg(test)]
+mod reload_window_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

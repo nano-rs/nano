@@ -63,6 +63,20 @@ pub struct Alert {
     pub event_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_to: Option<String>,
+    /// NAN-5314: display name (email) of whoever made the current assignment
+    /// (migration 382). NULL for pre-382 assignments.
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_by: Option<String>,
+    /// NAN-5314: when the current assignment was made (migration 382).
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_at: Option<DateTime<Utc>>,
+    /// NAN-5314: the assignee's display name, resolved from the `assigned_to`
+    /// user typeid by the API on read. Not a column.
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acknowledged_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -123,6 +123,7 @@ import { nplQuotedBody, nplRegexBody } from '@/lib/npl-quote';
 import { getBaseSearch, buildGroupByQuery } from '@/lib/npl-pipeline';
 import { csvCell } from '@/lib/csv-safe';
 import { grantSearchAutoRun } from '@/lib/search-auto-run';
+import { assetPivotField } from '@/lib/asset-pivot';
 
 function formatCacheAge(timestamp: number): string {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
@@ -403,17 +404,10 @@ interface FieldValueMenuProps {
 // favor of redirecting into `<field>="<value>" | asset` on the Search page.
 const ASSET_VIEW_ENTITY_TYPES = new Set(['ip', 'host', 'user']);
 
-// `| asset` resolves its identifier only from canonical UDM fields
-// (ASSET_IDENTIFIER_FIELDS in nanosiem-core asset.rs) — never OCSF dotted names
-// like `actor.user.name`, which yield "no resolved identifier". Map the resolved
-// entity type to its canonical field and pass `field=<canonical>` so the backend
-// fast-path resolves identity via the profile-aware `udm_column_sql` (works in
-// OCSF). Matches `| lateral` and the retired EntityPage. NAN-1452.
-const ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
-  ip: 'src_ip',
-  host: 'src_host',
-  user: 'user',
-};
+// "Open asset view" field choice lives in `assetPivotField` (lib/asset-pivot):
+// UDM maps onto the canonical identifier (NAN-1452); OCSF keeps the clicked
+// path, which `| asset field=` resolves (NAN-5277), and drops fields it cannot
+// seed from such as `device.uid` (NAN-5312).
 
 // Fallback window for the asset-view drilldown when there's no event timestamp
 // to anchor to (aggregated stats cells). Largest relative preset (see
@@ -492,9 +486,12 @@ export function FieldValueMenu({
   const threatIntel = threatIntelCapability && enrichAllowed;
   const enrichType = threatIntel ? enrichTypeFor(fieldType === 'generic' ? null : fieldType, stringValue) : null;
   const entityType = resolveEntityType(fieldName);
+  const assetField =
+    entityType && ASSET_VIEW_ENTITY_TYPES.has(entityType)
+      ? assetPivotField(fieldName, entityType, schemaMap.profile)
+      : null;
   const canOpenAssetView =
-    !!entityType &&
-    ASSET_VIEW_ENTITY_TYPES.has(entityType) &&
+    !!assetField &&
     typeof value === 'string' &&
     value.trim().length > 0;
 
@@ -781,15 +778,12 @@ export function FieldValueMenu({
 
         {/* NAN-1450/1452: drill into the search-native asset view for entity
             fields (ip / host / user). The legacy EntityPage was retired — we run
-            `<canonical>="<value>" | asset field=<canonical>` on the Search page,
-            mapping the OCSF/UDM field to the canonical identifier `| asset`
-            understands, over a window centered on the clicked event (≤6h cap). */}
+            `<field>="<value>" | asset field=<field>` on the Search page (field
+            from `assetPivotField`: UDM canonical, or the clicked OCSF path),
+            over a window centered on the clicked event (≤6h cap). */}
         {canOpenAssetView && (
           <DropdownMenuItem
             onClick={() => {
-              // Filter on the canonical identifier field, not the clicked OCSF
-              // field, so `| asset` can resolve the identifier (NAN-1452).
-              const assetField = ENTITY_TYPE_TO_ASSET_FIELD[entityType ?? ''] ?? fieldName;
               const assetQuery = `${assetField}="${escapeValue(stringValue)}" | asset field=${assetField}`;
               const params = new URLSearchParams({
                 q: assetQuery,

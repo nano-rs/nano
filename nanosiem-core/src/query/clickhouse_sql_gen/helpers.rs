@@ -148,6 +148,69 @@ pub(crate) fn normalize_field_name(field: &str) -> &str {
     }
 }
 
+/// Whether `table` projecting `name` as the bare `field_expr` would surface the
+/// column under a name other than `name` (NAN-5306): `field_expr` is a
+/// different column (`timestamp` for `time`) or an expression, whose result
+/// ClickHouse names after the expression text.
+pub(crate) fn table_field_renamed(field_expr: &str, name: &str) -> bool {
+    field_expr != name && field_expr != escape_identifier(name)
+}
+
+/// The requested names `table` re-aliases on output because they resolve to a
+/// differently named column or an expression (NAN-5306). Computed against the generator's
+/// CURRENT scope, so call it for the stage being generated (before its own
+/// outputs are registered). Wildcards and explicit aliases are excluded:
+/// wildcard expansions project real column names, and an explicit alias is
+/// already registered as a created column.
+pub(crate) fn table_implicit_aliases(
+    fields: &[crate::query::ast::TableField],
+    gen: &ClickHouseSqlGenerator,
+) -> Vec<String> {
+    fields
+        .iter()
+        .filter(|f| f.alias.is_none() && !f.name.contains('*'))
+        .filter(|f| {
+            let (expr, needs_alias) = field_to_sql_expr(&f.name, gen);
+            needs_alias || table_field_renamed(&expr, &f.name)
+        })
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// The name `table` leaves the event time column in scope under, when it is
+/// not its own (NAN-5306 review): `table time, src_ip` projects
+/// `timestamp AS time`, so later stages that read the event time must read
+/// `time`. `None` when the time column is projected under its own name (or a
+/// field is re-aliased TO it), when nothing projects it, or for a wildcard
+/// list (wildcards expand to physical names). `current` is the name the time
+/// column is in scope under before this `table` (a second `table time`).
+pub(crate) fn table_time_alias(
+    fields: &[crate::query::ast::TableField],
+    current: Option<&str>,
+    gen: &ClickHouseSqlGenerator,
+) -> Option<String> {
+    let time_col = gen.time_column();
+    let in_scope = gen.time_column_in_scope();
+    let mut alias = None;
+    for f in fields {
+        if f.name.contains('*') {
+            return None;
+        }
+        let out = f.alias.as_deref().unwrap_or(&f.name);
+        if out.eq_ignore_ascii_case(time_col) {
+            return None;
+        }
+        let (expr, _) = field_to_sql_expr(&f.name, gen);
+        let reads_time = expr == time_col
+            || current.is_some_and(|c| f.name == c)
+            || expr == in_scope && current.is_some();
+        if reads_time && alias.is_none() {
+            alias = Some(out.to_string());
+        }
+    }
+    alias
+}
+
 /// Convert a field name to its SQL expression, handling metadata fields
 /// Returns (sql_expression, needs_alias) where needs_alias indicates if the field
 /// should be aliased to its original name for clean output

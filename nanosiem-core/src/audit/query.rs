@@ -38,6 +38,11 @@ pub struct ClickHouseAuditQuery {
     pub end_time: Option<DateTime<Utc>>,
     /// Filter by success/failure status
     pub success: Option<bool>,
+    /// Case-insensitive free-text match over the whole event: message, action,
+    /// actor, source IP and the metadata JSON (resource, API key, details).
+    /// NAN-5308: the audit page's search box filters server-side through this,
+    /// so it covers every matching row, not only the loaded page.
+    pub search: Option<String>,
     /// Result limit
     pub limit: Option<i64>,
     /// Result offset
@@ -117,7 +122,37 @@ struct ResolvedFilters {
     has_resource_type: bool,
     has_status: bool,
     status_filter: Option<&'static str>,
+    search: Option<String>,
 }
+
+/// Longest free-text needle accepted for audit search.
+pub const AUDIT_SEARCH_MAX_CHARS: usize = 256;
+
+/// Normalize a free-text audit search: trimmed, empty → `None`, capped at
+/// [`AUDIT_SEARCH_MAX_CHARS`] characters.
+pub fn normalize_audit_search(raw: Option<&str>) -> Option<String> {
+    // NUL can never match stored text, and PostgreSQL rejects it outright
+    // (the degraded path would answer 503).
+    let cleaned: String = raw?.chars().filter(|c| *c != '\0').collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(AUDIT_SEARCH_MAX_CHARS).collect())
+}
+
+/// ClickHouse predicate for [`ClickHouseAuditQuery::search`]. A substring
+/// position check (not LIKE), so `%` / `_` in the needle are literal. The
+/// needle is always a bound parameter.
+///
+/// The metadata JSON is searched with its object KEYS stripped
+/// (`"actor_id":`, `"resource_name":`, …): every audit row carries the same
+/// keys, so matching them made `q=actor`, `q=key`, `q=_` return every row.
+/// The pattern has no `?` (the clickhouse client reads `?` as a placeholder).
+pub(crate) const AUDIT_SEARCH_CONDITION: &str = concat!(
+    "positionCaseInsensitiveUTF8(concat(message, ' ', action, ' ', `user`, ' ', src_ip, ' ', ",
+    r#"replaceRegexpAll(metadata, '"([^"\\\\]|\\\\.)*"\\s*:', ' ')), ?) > 0"#,
+);
 
 /// Build shared WHERE clause and resolved time range from a query
 fn resolve_filters(query: &ClickHouseAuditQuery) -> ResolvedFilters {
@@ -149,6 +184,10 @@ fn resolve_filters(query: &ClickHouseAuditQuery) -> ResolvedFilters {
     if has_status {
         conditions.push("status = ?");
     }
+    let search = normalize_audit_search(query.search.as_deref());
+    if search.is_some() {
+        conditions.push(AUDIT_SEARCH_CONDITION);
+    }
 
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -166,6 +205,7 @@ fn resolve_filters(query: &ClickHouseAuditQuery) -> ResolvedFilters {
         has_resource_type,
         has_status,
         status_filter,
+        search,
     }
 }
 
@@ -189,6 +229,9 @@ fn bind_filters<'a>(
     }
     if filters.has_status {
         q = q.bind(filters.status_filter.unwrap_or(""));
+    }
+    if let Some(search) = &filters.search {
+        q = q.bind(search.as_str());
     }
     q
 }
@@ -453,6 +496,10 @@ impl AuditQueryService {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "query_search_tests.rs"]
+mod search_tests;
 
 #[cfg(test)]
 mod tests {

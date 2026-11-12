@@ -39,6 +39,31 @@ export interface MatchView {
   events: Record<string, unknown>[];
 }
 
+/**
+ * NAN-5300: resolve a dotted field path against an event that may carry it as
+ * a FLAT dotted key (`{ "process.name": "x" }`, how matched events arrive from
+ * the API), as nested objects (`{ process: { name: "x" } }`), or any mix of the
+ * two (`{ metadata: { "product.name": "x" } }`). At each level the longest
+ * matching key prefix wins, so the exact flat key is tried before the walk.
+ * Returns `undefined` when no shape resolves.
+ */
+export function resolveEventPath(e: unknown, path: string): unknown {
+  const walk = (cur: unknown, parts: string[]): unknown => {
+    if (parts.length === 0) return cur;
+    if (cur === null || cur === undefined || typeof cur !== 'object' || Array.isArray(cur)) return undefined;
+    const obj = cur as Record<string, unknown>;
+    for (let i = parts.length; i >= 1; i--) {
+      const key = parts.slice(0, i).join('.');
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        const v = walk(obj[key], parts.slice(i));
+        if (v !== undefined) return v;
+      }
+    }
+    return undefined;
+  };
+  return walk(e, path.split('.'));
+}
+
 function stringField(e: Record<string, unknown>, key: string): string | undefined {
   const v = e[key];
   return typeof v === 'string' && v.trim() ? v : undefined;

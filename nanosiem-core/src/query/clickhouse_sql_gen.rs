@@ -1296,6 +1296,17 @@ pub struct ClickHouseSqlGenerator {
     /// (`generate_subsearch_sql`) so a subsearch's projection never leaks into
     /// the outer pipeline. Reset by `generate_with_options`.
     upstream_projected: RwLock<bool>,
+    /// NAN-5306 review: the name the event time column is in scope under after
+    /// a `table` projected it under another name (`table time, …` →
+    /// `timestamp AS time`). Stages that read the event time (timechart
+    /// buckets, earliest/latest, dedup order, resolve_identity's ASOF key,
+    /// streamstats windows) reference it through
+    /// [`time_column_in_scope`](Self::time_column_in_scope), since the physical
+    /// column is no longer in scope. `None` when the time column is in scope
+    /// under its own name (or was dropped). Maintained by
+    /// `note_upstream_computed`; swapped with the subsearch scope; reset by
+    /// `generate_with_options`.
+    upstream_time_alias: RwLock<Option<String>>,
     /// NAN-4934: OCSF `event` tail fields the base scan (`stage_0`) projected as
     /// a scalar alias (`toString(<event access>) AS "<field>"`), with the access
     /// type it was projected with (`"String"` or `"Float"`). Filled once
@@ -1429,6 +1440,7 @@ impl Clone for ClickHouseSqlGenerator {
             generation_time_range: RwLock::new(None),
             upstream_timestamp_rewritten: RwLock::new(false),
             upstream_projected: RwLock::new(false),
+            upstream_time_alias: RwLock::new(None),
             stage_tail_aliases: RwLock::new(std::collections::HashMap::new()),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
@@ -1479,6 +1491,7 @@ impl ClickHouseSqlGenerator {
             generation_time_range: RwLock::new(None),
             upstream_timestamp_rewritten: RwLock::new(false),
             upstream_projected: RwLock::new(false),
+            upstream_time_alias: RwLock::new(None),
             stage_tail_aliases: RwLock::new(std::collections::HashMap::new()),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
@@ -1509,6 +1522,7 @@ impl ClickHouseSqlGenerator {
             generation_time_range: RwLock::new(None),
             upstream_timestamp_rewritten: RwLock::new(false),
             upstream_projected: RwLock::new(false),
+            upstream_time_alias: RwLock::new(None),
             stage_tail_aliases: RwLock::new(std::collections::HashMap::new()),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
@@ -1757,6 +1771,59 @@ impl ClickHouseSqlGenerator {
     /// default ORDER BY, and the `rate()` counter window (NAN-1534).
     pub(crate) fn time_column(&self) -> &str {
         &self.time_column
+    }
+
+    /// The event time column as the stage being generated can read it
+    /// (NAN-5306 review): the requested name when an upstream `table`
+    /// projected the time column under another name (`time`), else
+    /// [`time_column`](Self::time_column). Byte-identical to `time_column`
+    /// for every pipeline without such a `table`.
+    pub(crate) fn time_column_in_scope(&self) -> String {
+        match &*self
+            .upstream_time_alias
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            Some(alias) => crate::query::escape_identifier(alias),
+            None => self.time_column.clone(),
+        }
+    }
+
+    fn swap_upstream_time_alias(&self, new: Option<String>) -> Option<String> {
+        let mut guard = self
+            .upstream_time_alias
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *guard, new)
+    }
+
+    /// The name the event time column is in scope under after `cmd` (see
+    /// `upstream_time_alias`). Computed against the scope BEFORE `cmd`'s
+    /// outputs are registered. Row filters, limits, reorders, dedup and
+    /// resolve_identity pass the columns through; an `eval` keeps it unless
+    /// it reassigns that name; anything else (aggregations, other
+    /// projections, renames) falls back to the physical time column.
+    fn time_alias_after(&self, cmd: &Command) -> Option<String> {
+        let current = self
+            .upstream_time_alias
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match cmd {
+            Command::Table { fields } => {
+                helpers::table_time_alias(fields, current.as_deref(), self)
+            }
+            Command::Where { .. }
+            | Command::Head { .. }
+            | Command::Tail { .. }
+            | Command::Sort { .. }
+            | Command::Reverse
+            | Command::Dedup { .. }
+            | Command::ResolveIdentity { .. } => current,
+            Command::Eval { assignments } => current
+                .filter(|alias| assignments.iter().all(|a| !a.field.eq_ignore_ascii_case(alias))),
+            _ => None,
+        }
     }
 
     /// The base-scan time-bound predicate for the ACTIVE dataset (NAN-1798 P2).
@@ -2372,6 +2439,7 @@ impl ClickHouseSqlGenerator {
     fn note_upstream_computed(&self, cmd: &Command) {
         // NAN-4276: typed against the scope BEFORE this command's outputs.
         let strings = self.string_outputs_of_command(cmd);
+        let time_alias = self.time_alias_after(cmd);
         let mut added = {
             let guard = self
                 .upstream_computed_fields
@@ -2391,6 +2459,14 @@ impl ClickHouseSqlGenerator {
         // to a bare identifier there).
         if let Some(alias) = self.bin_output_alias(cmd) {
             added.insert(alias);
+        }
+        // NAN-5306: `table` projects a field that resolves to a differently
+        // named column under the REQUESTED name (`timestamp AS "time"`). That
+        // name is the column every later stage reads, so register it — a
+        // `| table src_ip | stats count by src_ip` must group on the projected
+        // `src_ip`, not re-resolve it to `"src_endpoint.ip"` the table dropped.
+        if let Command::Table { fields } = cmd {
+            added.extend(helpers::table_implicit_aliases(fields, self));
         }
         // NAN-4295: rows after `mvexpand f` are already one per element (the
         // element is `f_expanded`), so a later `stats … by f` must not split
@@ -2429,6 +2505,7 @@ impl ClickHouseSqlGenerator {
                 Err(poisoned) => *poisoned.into_inner() = true,
             }
         }
+        self.swap_upstream_time_alias(time_alias);
     }
 
     /// Whether `cmd` rewrites the `timestamp` column WITHOUT registering it in
@@ -2775,6 +2852,7 @@ impl ClickHouseSqlGenerator {
         ctx.ext_fields = field_analysis::analyze_ext_fields(query, self.profile.as_ref());
 
         // Fresh upstream-computed scope for this generation (NAN-1341).
+        self.swap_upstream_time_alias(None);
         self.swap_stage_tail_aliases(Default::default());
         self.swap_upstream_computed(HashSet::new());
         self.swap_upstream_strings(HashSet::new());
@@ -2801,6 +2879,7 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_strings(HashSet::new());
         self.swap_upstream_mvexpanded(HashSet::new());
         self.swap_stage_tail_aliases(Default::default());
+        self.swap_upstream_time_alias(None);
         result
     }
 
@@ -4240,12 +4319,14 @@ impl ClickHouseSqlGenerator {
         // NAN-4903: the base-column scope is per pipeline too — a projection
         // inside the subsearch must not mark the outer stages as projected.
         let outer_projected = self.swap_upstream_projected(false);
+        let outer_time_alias = self.swap_upstream_time_alias(None);
         // NAN-4934: the subsearch scans the base table again, where the outer
         // stage_0 aliases do not exist.
         let outer_tail_aliases = self.swap_stage_tail_aliases(Default::default());
         let result = self.generate_subsearch_sql_inner(subsearch, ctx, limit);
         self.swap_stage_tail_aliases(outer_tail_aliases);
         self.swap_upstream_projected(outer_projected);
+        self.swap_upstream_time_alias(outer_time_alias);
         self.swap_upstream_computed(outer_scope);
         self.swap_upstream_strings(outer_strings);
         self.swap_upstream_mvexpanded(outer_mvexpanded);
@@ -5212,6 +5293,8 @@ mod ocsf_concept_predicate_tests;
 
 #[cfg(test)]
 mod ocsf_search_command_tests;
+#[cfg(test)]
+mod table_alias_tests;
 
 #[cfg(test)]
 #[path = "clickhouse_sql_gen/ci_like_tests.rs"]

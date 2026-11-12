@@ -166,6 +166,67 @@ pub(crate) fn realtime_finding_candidate(
     }
 }
 
+/// Pool-parameterized [`DetectionService::store_detection_match`] so the
+/// real-time `SignalProcessor` writes `detection_matches` through the SAME
+/// insert (event-hash dedup, NAN-1808 source_types stamp) as the scheduled,
+/// alert and retro-hunt paths (NAN-5303).
+pub(crate) async fn store_detection_match_with_pool(
+    pool: &sqlx::PgPool,
+    rule: &DetectionRule,
+    events: &[serde_json::Value],
+) -> Result<(), DetectionError> {
+    let event_count = events.len() as i32;
+    let severity_str = format!("{:?}", rule.severity).to_lowercase();
+    let matched_events = serde_json::Value::Array(events.to_vec());
+
+    // NAN-1808: stamp the match with the distinct normalized source_type
+    // values of its events (per-event `source_type` plus the aggregate
+    // `_nano_source_types` annotation) so the read side can enforce
+    // per-source RBAC — detection_matches is a sibling of alerts and is
+    // NOT covered by alerts.source_types. Callers on the aggregate path
+    // run `annotate_source_types_for_scoping` BEFORE this, so aggregate
+    // rows never land here as '{}' while the restricted registry is
+    // non-empty. An empty stamp means non-source-derived events
+    // (retro-hunt indicator summaries) = visible to everyone.
+    let source_types =
+        crate::db::repository::alerts::distinct_source_types(&matched_events);
+
+    // Compute event hash for deduplication (`compute_event_hash` strips
+    // `_nano_*` keys, so annotated and pre-annotation payloads dedup
+    // against each other).
+    let event_hash = crate::db::repository::compute_event_hash(&matched_events);
+
+    // Try to insert, but ignore if duplicate (same rule_id + event_hash)
+    // This prevents storing the same match multiple times when a rule runs
+    // frequently with a long lookback window
+    let result = sqlx::query(
+        r#"
+        INSERT INTO detection_matches (rule_id, rule_name, severity, matched_events, event_count, event_hash, source_types)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (rule_id, event_hash) DO NOTHING
+        "#
+    )
+    .bind(rule.id)
+    .bind(&rule.name)
+    .bind(severity_str)
+    .bind(matched_events)
+    .bind(event_count)
+    .bind(&event_hash)
+    .bind(&source_types)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        tracing::debug!(
+            "Skipped duplicate detection match for rule {} with event_hash {}",
+            rule.name,
+            event_hash
+        );
+    }
+
+    Ok(())
+}
+
 /// Filter `candidates` down to the findings NOT yet emitted for this rule — a
 /// single batched `SELECT ... = ANY($hashes)` against the persistent dedup
 /// store (NAN-1305). Fails open: on a query error every candidate is treated as
@@ -393,56 +454,7 @@ impl DetectionService {
         rule: &DetectionRule,
         events: &[serde_json::Value],
     ) -> Result<(), DetectionError> {
-        let event_count = events.len() as i32;
-        let severity_str = format!("{:?}", rule.severity).to_lowercase();
-        let matched_events = serde_json::Value::Array(events.to_vec());
-
-        // NAN-1808: stamp the match with the distinct normalized source_type
-        // values of its events (per-event `source_type` plus the aggregate
-        // `_nano_source_types` annotation) so the read side can enforce
-        // per-source RBAC — detection_matches is a sibling of alerts and is
-        // NOT covered by alerts.source_types. Callers on the aggregate path
-        // run `annotate_source_types_for_scoping` BEFORE this, so aggregate
-        // rows never land here as '{}' while the restricted registry is
-        // non-empty. An empty stamp means non-source-derived events
-        // (retro-hunt indicator summaries) = visible to everyone.
-        let source_types =
-            crate::db::repository::alerts::distinct_source_types(&matched_events);
-
-        // Compute event hash for deduplication (`compute_event_hash` strips
-        // `_nano_*` keys, so annotated and pre-annotation payloads dedup
-        // against each other).
-        let event_hash = crate::db::repository::compute_event_hash(&matched_events);
-
-        // Try to insert, but ignore if duplicate (same rule_id + event_hash)
-        // This prevents storing the same match multiple times when a rule runs
-        // frequently with a long lookback window
-        let result = sqlx::query(
-            r#"
-            INSERT INTO detection_matches (rule_id, rule_name, severity, matched_events, event_count, event_hash, source_types)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (rule_id, event_hash) DO NOTHING
-            "#
-        )
-        .bind(rule.id)
-        .bind(&rule.name)
-        .bind(severity_str)
-        .bind(matched_events)
-        .bind(event_count)
-        .bind(&event_hash)
-        .bind(&source_types)
-        .execute(&self.pg_pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            tracing::debug!(
-                "Skipped duplicate detection match for rule {} with event_hash {}",
-                rule.name,
-                event_hash
-            );
-        }
-
-        Ok(())
+        store_detection_match_with_pool(&self.pg_pool, rule, events).await
     }
 
     /// Build one [`ClaimedFinding`] candidate per `(entity, field, events)`

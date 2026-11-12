@@ -5,7 +5,7 @@
 use uuid::Uuid;
 
 use super::super::types::{ListParams, LogSource, NewLogSource, UpdateLogSource};
-use super::helpers::row_to_log_source;
+use super::helpers::{deployed_reset_flags, row_to_log_source};
 use super::{LogSourceRepository, LogSourceRepositoryError};
 
 impl LogSourceRepository {
@@ -439,18 +439,8 @@ impl LogSourceRepository {
 
         // Reset deployed status if deployment-affecting fields are being changed
         // This ensures the UI shows "Deploy" instead of "Undeploy" after config changes
-        let config_changed = update.source_type.is_some()
-            || update.dispatch_source_config_id.is_some()
-            || update.parser_vrl.is_some()
-            || update.output_fields.is_some()
-            || update.match_field.is_some()
-            || update.match_pattern.is_some()
-            || update.match_values.is_some()
-            || update.sampling_ratio.is_some()
-            || update.sampling_exclude_condition.is_some()
-            || update.extension_vrl.is_some()
-            || update.extension_enabled.is_some()
-            || update.normalize_vrl.is_some();
+        let flags = deployed_reset_flags(update);
+        let config_changed = flags.config_changed;
 
         let row = sqlx::query(
             r#"
@@ -471,7 +461,21 @@ impl LogSourceRepository {
                 match_pattern = COALESCE($15, match_pattern),
                 match_values = COALESCE($16, match_values),
                 enabled = COALESCE($17, enabled),
-                deployed = CASE WHEN $18 THEN false ELSE deployed END,
+                -- NAN-5321: VRL / output_fields / extension edits are the
+                -- editor's working draft. Once a version is published, Vector
+                -- runs the ACTIVE version (EFFECTIVE_DEPLOYED_PARSERS_SQL), so
+                -- saving a draft does not undeploy anything; only a source
+                -- that has never been published deploys its working copy.
+                deployed = CASE
+                    WHEN $18 THEN false
+                    WHEN $28 AND NOT EXISTS (
+                        SELECT 1 FROM log_source_versions lsv
+                        WHERE lsv.log_source_id = log_sources.id
+                          AND lsv.is_active = TRUE
+                          AND (NOT $29 OR lsv.output_fields IS NOT NULL)
+                    ) THEN false
+                    ELSE deployed
+                END,
                 stale_alert_enabled = COALESCE($19, stale_alert_enabled),
                 stale_threshold_minutes = COALESCE($20, stale_threshold_minutes),
                 sampling_ratio = COALESCE($21, sampling_ratio),
@@ -534,6 +538,8 @@ impl LogSourceRepository {
         .bind(&update.dispatch_source_config_id)
         .bind(&update.normalize_vrl)
         .bind(update.expected_updated_at)
+        .bind(flags.draft_changed)
+        .bind(flags.output_fields_changed)
         .fetch_optional(&self.pool)
         .await?;
 

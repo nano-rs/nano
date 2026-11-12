@@ -262,7 +262,11 @@ impl DetectionService {
             .as_deref()
             .unwrap_or(DEFAULT_STEPPED_CRON);
 
-        let windows = enumerate_test_windows(&time_range, cron_expr, lookback)?;
+        let windows = with_trailing_window(
+            enumerate_test_windows(&time_range, cron_expr, lookback)?,
+            &time_range,
+            lookback,
+        );
         if windows.len() > MAX_STEPPED_WINDOWS {
             return Err(DetectionError::InvalidQuery(format!(
                 "Selected range produces {} evaluation windows for this rule's \
@@ -324,7 +328,11 @@ impl DetectionService {
             Duration::minutes(lookback_minutes.unwrap_or(DEFAULT_STEPPED_LOOKBACK_MINUTES));
         let cron_expr = schedule_cron.unwrap_or(DEFAULT_STEPPED_CRON);
 
-        let windows = enumerate_test_windows(&time_range, cron_expr, lookback)?;
+        let windows = with_trailing_window(
+            enumerate_test_windows(&time_range, cron_expr, lookback)?,
+            &time_range,
+            lookback,
+        );
         if windows.len() > MAX_STEPPED_WINDOWS {
             return Err(DetectionError::InvalidQuery(format!(
                 "Selected range produces {} evaluation windows for this rule's \
@@ -401,9 +409,12 @@ impl DetectionService {
             });
         }
 
-        let mut total_matches: u64 = 0;
-        let mut sample_events: Vec<serde_json::Value> = Vec::new();
-        let mut buckets: Vec<TimeBucket> = Vec::with_capacity(windows.len());
+        // NAN-5302: consecutive windows overlap whenever lookback > step, so
+        // the same event is returned by every window that covers it. Production
+        // dedups those via `detection_matched_events` (`matched_event_id`), so
+        // the tester does the same in memory: each distinct event counts ONCE,
+        // attributed to the earliest tick that would have matched it.
+        let mut acc = SteppedMatchAccumulator::new(max_samples);
         // Audit D3b: track window failures so the tester surfaces "N windows
         // errored" instead of silently reporting them as `count: 0` — which made
         // a rule that errors every cycle look like a healthy "0 matches" rule.
@@ -415,22 +426,8 @@ impl DetectionService {
             // is anchored at the moment the rule "fired" — not the start of
             // its lookback window, which can extend before the user-selected
             // range.
-            let bucket_start = window.end;
             match result {
-                Ok(rows) => {
-                    let count = rows.len() as u64;
-                    total_matches += count;
-                    buckets.push(TimeBucket {
-                        bucket_start,
-                        count,
-                    });
-                    for row in rows {
-                        if sample_events.len() >= max_samples {
-                            break;
-                        }
-                        sample_events.push(row);
-                    }
-                }
+                Ok(rows) => acc.add_window(window.end, rows),
                 Err(e) => {
                     warn!(
                         "Stepped tester: window {}..{} failed: {}",
@@ -440,21 +437,15 @@ impl DetectionService {
                     if error_sample.is_none() {
                         error_sample = Some(e.to_string());
                     }
-                    buckets.push(TimeBucket {
-                        bucket_start,
-                        count: 0,
-                    });
+                    acc.add_failed_window(window.end);
                 }
             }
         }
 
+        let (total_matches, mut sample_events, buckets) = acc.finish();
+
         // Normalize the capped sample as one batch: parse the risk declaration once.
         crate::detection::normalize_match_events_for_query(&mut sample_events, query);
-
-        // FuturesUnordered yields in completion order — sort chronologically
-        // so the sparkline renders in time order regardless of how queries
-        // raced to finish.
-        buckets.sort_by_key(|b| b.bucket_start);
 
         let matches_by_day = derive_daily_counts(&buckets);
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -943,17 +934,129 @@ pub fn enumerate_test_windows(
         if tick > range.end {
             break;
         }
-        // NOTE (audit D36, deferred): when `lookback > step` consecutive windows
-        // overlap, so an event in the overlap is counted in multiple windows —
-        // the stepped tester over-counts raw-event volume by ~lookback/step vs
-        // production, which dedups matched events across cycles. De-duplicating
-        // here means threading per-event ids through the concurrent evaluator
-        // (memory-bound for high-volume rules); tracked on NAN-1716 as a
-        // follow-up so the tester's per-window semantics aren't changed under a
-        // rushed pass.
+        // When `lookback > step` consecutive windows overlap; the interactive
+        // tester de-duplicates events across them in `SteppedMatchAccumulator`
+        // (NAN-5302), the same way production dedups across cycles.
         windows.push(TimeRangeInput::new(tick - lookback, tick));
     }
     Ok(windows)
+}
+
+/// Distinct-event accumulator for the stepped rule tester (NAN-5302).
+///
+/// Overlapping lookback windows return the same event once per window that
+/// covers it. Production suppresses those repeats through
+/// `detection_matched_events`, keyed by [`super::helpers::matched_event_id`];
+/// this mirrors that in memory so `total_matches` is the number of DISTINCT
+/// events the rule would have matched, each bucket counts the events first
+/// matched at that tick, and the sample holds no duplicates. Windows complete
+/// in arbitrary order, so attribution keeps the EARLIEST tick per event,
+/// which makes the result independent of query completion order.
+pub(crate) struct SteppedMatchAccumulator {
+    max_samples: usize,
+    /// event-id digest → earliest tick (window end) whose window returned it.
+    /// Keyed by a 64-bit digest of the id, not the id string: a broad rule
+    /// over the full 14-day range can return millions of distinct events, and
+    /// the digest keeps each entry at ~24 bytes instead of ~100 (a collision
+    /// would merely under-count by one in a tester estimate).
+    first_seen: std::collections::HashMap<u64, DateTime<Utc>>,
+    /// Every evaluated tick, so empty and failed windows still get a bucket.
+    ticks: Vec<DateTime<Utc>>,
+    /// Up to `max_samples` distinct events, keyed by event-id digest.
+    samples: std::collections::HashMap<u64, serde_json::Value>,
+}
+
+/// Stable 64-bit digest of a matched-event id (same input as production's
+/// `detection_matched_events.event_id`).
+fn event_id_digest(row: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    super::helpers::matched_event_id(row).hash(&mut h);
+    h.finish()
+}
+
+impl SteppedMatchAccumulator {
+    pub(crate) fn new(max_samples: usize) -> Self {
+        Self {
+            max_samples,
+            first_seen: std::collections::HashMap::new(),
+            ticks: Vec::new(),
+            samples: std::collections::HashMap::new(),
+        }
+    }
+
+    pub(crate) fn add_window(&mut self, tick: DateTime<Utc>, rows: Vec<serde_json::Value>) {
+        self.ticks.push(tick);
+        for row in rows {
+            let id = event_id_digest(&row);
+            let first = self.first_seen.entry(id).or_insert(tick);
+            if tick < *first {
+                *first = tick;
+            }
+            if self.samples.len() < self.max_samples {
+                self.samples.entry(id).or_insert(row);
+            }
+        }
+    }
+
+    pub(crate) fn add_failed_window(&mut self, tick: DateTime<Utc>) {
+        self.ticks.push(tick);
+    }
+
+    /// Returns `(distinct_total, samples, chronological buckets)`. Samples are
+    /// ordered by first-matching tick so the drawer reads oldest-first.
+    pub(crate) fn finish(self) -> (u64, Vec<serde_json::Value>, Vec<TimeBucket>) {
+        let mut per_tick: BTreeMap<DateTime<Utc>, u64> = BTreeMap::new();
+        for tick in &self.ticks {
+            per_tick.entry(*tick).or_insert(0);
+        }
+        for tick in self.first_seen.values() {
+            *per_tick.entry(*tick).or_insert(0) += 1;
+        }
+        let buckets = per_tick
+            .into_iter()
+            .map(|(bucket_start, count)| TimeBucket {
+                bucket_start,
+                count,
+            })
+            .collect();
+
+        let mut samples: Vec<(DateTime<Utc>, u64, serde_json::Value)> = self
+            .samples
+            .into_iter()
+            .map(|(id, row)| {
+                let tick = self.first_seen.get(&id).copied().unwrap_or_else(Utc::now);
+                (tick, id, row)
+            })
+            .collect();
+        samples.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        (
+            self.first_seen.len() as u64,
+            samples.into_iter().map(|(_, _, row)| row).collect(),
+            buckets,
+        )
+    }
+}
+
+/// Append a final window ending at `range.end` when the last cron tick falls
+/// short of it (NAN-5302). Without it, an event younger than one tick was
+/// invisible to the tester (test said 0 while search said 1), because the
+/// production scheduler would only see it at the NEXT tick, after the range.
+/// Interactive tester only — autonomous tuning keeps exact production ticks.
+pub(crate) fn with_trailing_window(
+    mut windows: Vec<TimeRangeInput>,
+    range: &TimeRangeInput,
+    lookback: Duration,
+) -> Vec<TimeRangeInput> {
+    let needs_tail = match windows.last() {
+        Some(last) => last.end < range.end,
+        None => range.end > range.start,
+    };
+    if needs_tail {
+        windows.push(TimeRangeInput::new(range.end - lookback, range.end));
+    }
+    windows
 }
 
 /// Build the exact production cadence/lookback windows used by autonomous

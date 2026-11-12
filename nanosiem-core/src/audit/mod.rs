@@ -23,6 +23,9 @@
 //! - `source_type=audit | stats count by source, action` - Activity breakdown
 
 pub mod actions;
+pub mod changes;
+#[cfg(test)]
+mod changes_tests;
 mod context;
 mod emitter;
 pub mod outbox;

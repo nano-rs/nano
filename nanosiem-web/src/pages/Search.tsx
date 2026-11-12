@@ -68,7 +68,6 @@ import {
   useCreateSavedSearch,
   useDeleteSavedSearch,
   useShareSavedSearch,
-  useGroups,
   useCreateSharedSearch,
   useGetSharedSearch,
   useMelodStatus,
@@ -83,7 +82,7 @@ import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useAuth } from '@/contexts/AuthContext';
 import { useSearchHistory } from '@/hooks/useSearchHistory';
 import { resolveRunTimeRange, urlTimeRange, type SearchRunScope } from './search-run-scope';
-import { formatTimeWindowLabel, readTimeRangeParams, writeTimeRangeParams } from '@/lib/time-range';
+import { formatTimeWindow, formatTimeWindowLabel, isTimeRangePreset, readTimeRangeParams, savedSearchTimeRange, savedSearchTimeRangeValue, writeTimeRangeParams } from '@/lib/time-range';
 import { parseTimestampAsUTC } from '@/lib/parse-timestamp-utc';
 import { useScrollContainer } from '@/contexts/ScrollContainerContext';
 import { buildSearchTimeline } from './search-timeline';
@@ -1069,7 +1068,6 @@ export function Search() {
   const { mutate: createSavedSearch, loading: saving } = useCreateSavedSearch();
   const { mutate: _deleteSavedSearch } = useDeleteSavedSearch();
   const { mutate: _shareSavedSearch } = useShareSavedSearch();
-  const { data: _groups } = useGroups();
   const { mutate: createSharedSearch } = useCreateSharedSearch();
   const { mutate: getSharedSearch } = useGetSharedSearch();
   const buildQueryJob = useMelodJob<MelodApiResponse>();
@@ -3047,7 +3045,8 @@ export function Search() {
         name: saveSearchName,
         query,
         query_mode: queryMode,
-        time_range: toApiTimeRange(timeRange),
+        // NAN-5311: a preset is stored with the window so it reopens relative.
+        time_range: savedSearchTimeRange(timeRange),
         visibility: saveSearchShared ? 'public' : 'private',
       });
       setSaveDialogOpen(false);
@@ -4666,10 +4665,17 @@ export function Search() {
             savedSearches={savedSearches || []}
             sharedSearches={sharedSearches || []}
             currentUserId={user?.id}
-            onSelectQuery={(q, mode) => {
+            onSelectQuery={(q, mode, savedRange) => {
               setQuery(q);
               if (mode) setQueryMode(mode);
-              handleSearch(1, false, q, mode ?? queryMode, timeRange);
+              // NAN-5311: reopen with the window the query was saved with.
+              // The ref update keeps the timeRange effect from running it twice.
+              const reopenRange = savedSearchTimeRangeValue(savedRange) ?? timeRange;
+              if (reopenRange !== timeRange) {
+                prevTimeRangeRef.current = reopenRange;
+                setTimeRange(reopenRange);
+              }
+              handleSearch(1, false, q, mode ?? queryMode, reopenRange);
             }}
             onScheduleQuery={(q) => {
               setSavedQueriesOpen(false);
@@ -4763,8 +4769,17 @@ export function Search() {
                       className="w-full px-3 py-2 bg-background border border-border-2 rounded-md text-[13px] outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/25 resize-none"
                     />
                   </div>
-                  <div className="flex items-center justify-end">
-                    <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <div className="flex items-center justify-between gap-3">
+                    {/* NAN-5311: the window this query reopens on — a preset stays relative to now. */}
+                    <span className="min-w-0 truncate text-[11px] text-muted-foreground">
+                      Time range{' '}
+                      <span className="font-mono text-[10.5px] text-foreground/80" data-testid="save-query-time-range">
+                        {timeRange.type === 'preset' && isTimeRangePreset(timeRange.preset)
+                          ? timeRange.preset
+                          : formatTimeWindow(toApiTimeRange(timeRange))}
+                      </span>
+                    </span>
+                    <label className="inline-flex shrink-0 items-center gap-2 cursor-pointer">
                       <Checkbox
                         checked={saveSearchShared}
                         onCheckedChange={(checked) => setSaveSearchShared(checked === true)}

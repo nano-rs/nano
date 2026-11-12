@@ -11,6 +11,8 @@ import { useNavigate } from 'react-router-dom';
 import { Clock, X, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRecentAuditChanges } from '@/hooks/use-api';
+import { useAuth } from '@/contexts/AuthContext';
+import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
 import { auditActorLabel } from '@/lib/audit-feed';
 import type { AuditLogEntry } from '@/lib/api/types';
 
@@ -78,7 +80,9 @@ function relativeAge(ts: string): string {
 export function RecentChangesDrawer({ open, onClose }: RecentChangesDrawerProps) {
   const navigate = useNavigate();
   const query = useMemo(() => ({ limit: 50 }), []);
-  const { data, loading, error } = useRecentAuditChanges(query);
+  // Fetch only while open, and only for roles that can read audit (NAN-5325).
+  const canReadAudit = useAuth().hasPermission(SHELL_READ_PERMISSIONS.audit);
+  const { data, loading, error } = useRecentAuditChanges(query, { skip: !open || !canReadAudit });
   const entries = data?.logs ?? [];
 
   if (!open) return null;

@@ -304,7 +304,7 @@ const OPS = {
     // beforeunload guards and native confirms (e.g. "leave without copying the
     // token?") are accepted; each is recorded in the console log.
     page.on('dialog', async (d) => {
-      s.console.push({ type: 'dialog', text: `${d.type()}: ${d.message()}` });
+      s.console.push({ t: Date.now(), type: 'dialog', text: `${d.type()}: ${d.message()}` });
       await d.accept().catch(() => {});
     });
     // API response bodies (JSON, bounded), to assert a secret never comes back
@@ -329,8 +329,8 @@ const OPS = {
       s.responseBodies.add(pending);
       void pending.finally(() => s.responseBodies.delete(pending));
     });
-    page.on('console', (m) => s.console.push({ type: m.type(), text: m.text().slice(0, 4000) }));
-    page.on('pageerror', (e) => s.console.push({ type: 'pageerror', text: String(e).slice(0, 4000) }));
+    page.on('console', (m) => s.console.push({ t: Date.now(), type: m.type(), text: m.text().slice(0, 4000) }));
+    page.on('pageerror', (e) => s.console.push({ t: Date.now(), type: 'pageerror', text: String(e).slice(0, 4000) }));
     page.on('requestfinished', (r) => {
       const resp = r.response();
       s.network.push({ t: Date.now(), method: r.method(), url: r.url(), status: resp ? resp.status() : 0 });
@@ -558,6 +558,78 @@ const OPS = {
     return true;
   },
   async now() { return Date.now(); },
+
+  // ---------------------------------------------------------------- exploration (NAN-5291)
+  // Console errors and failed network requests (status >= 400 or no
+  // response) since `since` (ms epoch), scrubbed: what a step broke.
+  async events_since({ sid, since = 0 }) {
+    const s = sess(sid);
+    const bad = new Set(['error', 'pageerror', 'assert']);
+    return {
+      console: s.console.filter((c) => (c.t || 0) >= since && bad.has(c.type))
+        .map((c) => ({ t: c.t, type: c.type, text: scrub(c.text).slice(0, 1000) })),
+      network: s.network.filter((n) => n.t >= since && (n.failed || (n.status || 0) >= 400))
+        .map((n) => ({ t: n.t, method: n.method, url: scrub(n.url), status: n.status || 0, failed: n.failed || null })),
+    };
+  },
+  // Real keystrokes into an element (fill() uses the value setter instead).
+  async type_text({ sid, find: f, text, clear = false }) {
+    const { page } = sess(sid);
+    const el = await find(page, f);
+    await el.click();
+    if (clear) {
+      const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+      await page.keyboard.down(modifier); await page.keyboard.press('KeyA'); await page.keyboard.up(modifier);
+      await page.keyboard.press('Backspace');
+    }
+    await page.keyboard.type(String(text));
+    return true;
+  },
+  // Replace a CodeMirror document with `text`, open completion (Ctrl-Space)
+  // and return the offered options {label, detail}. [] when none open.
+  async autocomplete({ sid, find: f, text, timeout = 5000 }) {
+    const { page } = sess(sid);
+    await OPS.editor_fill({ sid, find: f, value: text });
+    await page.keyboard.down('Control'); await page.keyboard.press('Space'); await page.keyboard.up('Control');
+    const sel = '.cm-tooltip-autocomplete li';
+    try { await page.waitForSelector(sel, { timeout }); } catch { return []; }
+    await sleep(300); // async sources (schema / usage) fill in after the first paint
+    return page.$$eval(sel, (lis) => lis.map((li) => ({
+      label: (li.querySelector('.cm-completionLabel')?.textContent || li.textContent || '').trim(),
+      detail: (li.querySelector('.cm-completionDetail')?.textContent || '').trim(),
+    })));
+  },
+  // Every field name listed in the search results sidebar (collapsed groups
+  // such as Extended / Unmapped are opened first).
+  async sidebar_fields({ sid }) {
+    const { page } = sess(sid);
+    await page.evaluate(() => {
+      for (const b of document.querySelectorAll('button[aria-expanded="false"]')) {
+        if (/^(extended|unmapped)\b/i.test((b.textContent || '').trim())) b.click();
+      }
+    });
+    await sleep(500);
+    return page.evaluate(() => {
+      const out = [];
+      for (const row of document.querySelectorAll('div.cursor-pointer')) {
+        const spans = row.querySelectorAll(':scope > span');
+        if (spans.length >= 2 && (spans[0].textContent || '').trim() === '›') {
+          const name = (spans[1].textContent || '').trim();
+          if (name && !out.includes(name)) out.push(name);
+        }
+      }
+      return out;
+    });
+  },
+  // Field-name hints rendered as placeholders ("e.g., process.name") on
+  // visible inputs: hints a user copies verbatim.
+  async field_hints({ sid }) {
+    const { page } = sess(sid);
+    return page.evaluate(() => [...document.querySelectorAll('input[placeholder],textarea[placeholder]')]
+      .filter((e) => e.offsetWidth || e.offsetHeight)
+      .map((e) => /^e\.g\.,?\s*([A-Za-z_][\w.]*)\s*$/.exec(e.getAttribute('placeholder') || ''))
+      .filter(Boolean).map((m) => m[1]));
+  },
 
   // A table row (the first containing `contains`) as {lowercased header: cell}.
   async row_cells({ sid, within, contains, timeout }) {

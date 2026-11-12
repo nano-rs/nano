@@ -64,6 +64,7 @@ import type { LucideIcon } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
+import { INSTANCE_SETUP_PERMISSION } from '@/lib/onboarding-access';
 import {
   useUserPreferences,
   QueryMode,
@@ -363,6 +364,7 @@ export function UserSettings() {
     }
   }, [resetOnboarding, navigate, toast]);
   const canSql = hasPermission('search:sql');
+  const canRunSetup = hasPermission(INSTANCE_SETUP_PERMISSION);
   const {
     queryMode,
     setQueryMode,
@@ -746,7 +748,7 @@ export function UserSettings() {
             />
           </Row>
 
-          <Row label="Theme" desc="Choose a theme, or follow your system setting.">
+          <Row label="Theme" desc="Choose a theme, or follow your system setting." last={!canRunSetup}>
             <div className="flex w-[200px] flex-col items-end gap-3">
             <Select
               value={theme || 'system'}
@@ -802,21 +804,23 @@ export function UserSettings() {
             </div>
           </Row>
 
-          <Row
-            label="Getting Started"
-            desc="Reopen the setup wizard from the top — useful after dismissing or finishing it."
-            last
-          >
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleReopenSetup}
-              className="h-8 text-[12.5px] gap-1.5"
+          {canRunSetup && (
+            <Row
+              label="Getting Started"
+              desc="Reopen the setup wizard from the top — useful after dismissing or finishing it."
+              last
             >
-              <RotateCcw className="w-3 h-3" />
-              Reopen Getting Started
-            </Button>
-          </Row>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleReopenSetup}
+                className="h-8 text-[12.5px] gap-1.5"
+              >
+                <RotateCcw className="w-3 h-3" />
+                Reopen Getting Started
+              </Button>
+            </Row>
+          )}
         </SectionCard>
 
         {/* QUERY MODE */}

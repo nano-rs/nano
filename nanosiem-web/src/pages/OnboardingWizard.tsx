@@ -46,6 +46,8 @@ import { useCapabilities } from '@/hooks/use-capabilities';
 import type { Capabilities } from '@/hooks/use-capabilities';
 import type { OnboardingStep, OnboardingStatus } from '@/lib/api/onboarding';
 import { cn } from '@/lib/utils';
+import { useAuth } from '@/contexts/AuthContext';
+import { INSTANCE_SETUP_PERMISSION } from '@/lib/onboarding-access';
 
 interface SetupStep {
   key: OnboardingStep;
@@ -122,7 +124,7 @@ const STEPS: SetupStep[] = [
     key: 'create_parser',
     label: 'Log Parser',
     icon: Code,
-    description: 'Create a parser to normalize raw logs into the Unified Data Model for searching and detection.',
+    description: 'Create a parser to map raw logs to OCSF for searching and detection.',
     href: '/ingestion/log-sources/new',
     doneHref: '/ingestion/log-sources/repositories',
     statusKey: 'has_parsers',
@@ -147,10 +149,20 @@ const Eyebrow = ({ children }: { children: React.ReactNode }) => (
   </span>
 );
 
+/**
+ * NAN-5309: instance setup is for roles that can read its status. Anyone else
+ * goes to their landing page instead of a checklist built from 403 fallbacks.
+ */
 export function OnboardingWizard() {
+  const { hasPermission } = useAuth();
+  if (!hasPermission(INSTANCE_SETUP_PERMISSION)) return <Navigate to="/" replace />;
+  return <InstanceSetupWizard />;
+}
+
+function InstanceSetupWizard() {
   const navigate = useNavigate();
   const { data: progress, loading: progressLoading, refetch: refetchProgress } = useOnboardingProgress();
-  const { data: status, refetch: refetchStatus } = useOnboardingStatus();
+  const { data: status, error: statusError, refetch: refetchStatus } = useOnboardingStatus();
   // NAN-4779: steps are completed on other pages and often in another tab
   // (Add data, Ingest tokens, Settings); re-probe whenever the user comes back.
   useRefetchOnFocus(() => {
@@ -387,7 +399,7 @@ export function OnboardingWizard() {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="text-[13.5px] font-semibold text-foreground">{step.label}</span>
-                  <StatusPill isDone={isDone} isSkipped={isSkipped} isLocked={isLocked} step={step} />
+                  <StatusPill isDone={isDone} isSkipped={isSkipped} isLocked={isLocked} unknown={!status && !!statusError} step={step} />
                 </div>
                 <p
                   className="mt-1 text-[11.5px] leading-[1.5] text-muted-foreground/80"
@@ -494,10 +506,12 @@ interface StatusPillProps {
   isDone: boolean;
   isSkipped: boolean;
   isLocked: boolean;
+  /** The status probe failed: never claim "nothing set up" (NAN-5309). */
+  unknown?: boolean;
   step: SetupStep;
 }
 
-function StatusPill({ isDone, isSkipped, isLocked, step }: StatusPillProps) {
+function StatusPill({ isDone, isSkipped, isLocked, unknown, step }: StatusPillProps) {
   const tone = isLocked
     ? 'bg-amber-500/10 border-amber-500/30 text-amber-500'
     : isDone
@@ -512,6 +526,8 @@ function StatusPill({ isDone, isSkipped, isLocked, step }: StatusPillProps) {
     ? step.doneLabel
     : isSkipped
     ? 'Skipped'
+    : unknown
+    ? 'Status unavailable'
     : step.todoLabel;
 
   return (

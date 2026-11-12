@@ -2738,6 +2738,10 @@ class ApiClient {
     return this._audit.queryAuditLogs(query);
   }
 
+  async getAuditActions(): Promise<string[]> {
+    return this._audit.getAuditActions();
+  }
+
   async exportAuditLogs(query: import('./types').AuditExportQuery): Promise<{ blob: Blob; filename: string }> {
     return this._audit.exportAuditLogs(query);
   }

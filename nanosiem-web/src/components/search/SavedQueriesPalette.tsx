@@ -18,7 +18,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { X, Search, Bookmark, User, Users, Clock, Play, Edit3, Share2, CalendarClock } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import type { SavedSearch } from '@/lib/api';
+import type { SavedSearch, SavedSearchTimeRange } from '@/lib/api';
 
 interface SavedQueriesPaletteProps {
   open: boolean;
@@ -26,7 +26,8 @@ interface SavedQueriesPaletteProps {
   savedSearches: SavedSearch[];
   sharedSearches?: SavedSearch[];
   currentUserId?: string;
-  onSelectQuery: (query: string, mode?: 'piped' | 'sql') => void;
+  /** NAN-5311: `timeRange` is the window the query was saved with, when it has one. */
+  onSelectQuery: (query: string, mode?: 'piped' | 'sql', timeRange?: SavedSearchTimeRange) => void;
   onEditQuery?: (id: string) => void;
   onShareQuery?: (id: string) => void;
   onDeleteQuery?: (id: string) => void;
@@ -79,6 +80,7 @@ interface EnrichedQuery {
   name: string;
   query: string;
   queryMode: 'piped' | 'sql';
+  timeRange?: SavedSearchTimeRange;
   sourcetype: string;
   updatedAt: string;
   last: string;
@@ -97,6 +99,7 @@ function enrich(
     name: s.name,
     query: s.query,
     queryMode: s.query_mode,
+    timeRange: s.time_range,
     sourcetype: extractSourcetype(s.query),
     updatedAt: s.updated_at,
     last: formatRelative(s.updated_at),
@@ -359,7 +362,7 @@ export function SavedQueriesPalette({
   };
 
   const runSelected = (q: EnrichedQuery) => {
-    onSelectQuery(q.query, q.queryMode);
+    onSelectQuery(q.query, q.queryMode, q.timeRange);
     onOpenChange(false);
   };
 

@@ -27,10 +27,18 @@ describe('audit CSV', () => {
     ] as AuditLogEntry[];
     const lines = auditCsv(rows).split('\n');
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toBe('"Timestamp","Actor","API Key","Source","Action","Resource Type","Resource Name","IP Address","Success"');
+    expect(lines[0]).toBe('"Timestamp","Actor","API Key","Source","Action","Resource Type","Resource Name","IP Address","Success","Details"');
     expect(lines[1]).toBe(
-      '"2026-11-03T10:00:00Z","alice via key =HYPERLINK(""x"")","\'=HYPERLINK(""x"")","detection","rule_created","rule","\'@evil","10.0.0.1","Yes"',
+      '"2026-11-03T10:00:00Z","alice via key =HYPERLINK(""x"")","\'=HYPERLINK(""x"")","detection","rule_created","rule","\'@evil","10.0.0.1","Yes",""',
     );
-    expect(lines[2]).toBe('"2026-11-03T09:00:00Z","system","","","logout","","","","No"');
+    expect(lines[2]).toBe('"2026-11-03T09:00:00Z","system","","","logout","","","","No",""');
+  });
+
+  it('NAN-5324: keeps the event details as one JSON cell', () => {
+    const rows = [
+      { id: '1', timestamp: 't', action: 'apikey_created', success: true, details: { permissions: ['alerts:view', 'rules:view'] } },
+    ] as AuditLogEntry[];
+    const line = auditCsv(rows).split('\n')[1];
+    expect(line.endsWith(',"{""permissions"":[""alerts:view"",""rules:view""]}"')).toBe(true);
   });
 });

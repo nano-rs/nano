@@ -41,7 +41,11 @@ Anything after `--` goes to pytest.
      `nanosiem-jobs` and `nanosiem-api` as host processes on free ports.
    - **docker** (the Linux default): `docker build --target api|search|jobs`
      from this tree.
-   - **image:\<tag\>**: published `ghcr.io/nano-rs/nano-*` images.
+   - **image:\<tag\>**: published release images. `--edition open` pulls the
+     open-core `ghcr.io/nano-rs/nano-*`; `--edition enterprise` pulls the
+     enterprise build (`E2E_ENTERPRISE_IMAGE_PREFIX`, default
+     `us-central1-docker.pkg.dev/nano-rs/nanosiem-customer/nanosiem`; needs a
+     registry login). A released enterprise image starts license-locked.
 3. It creates the local admin through `/api/setup/initialize` and mints an
    admin API key.
 4. It writes `target/e2e/<runid>/stack.env` (mode 0600). This one file holds
@@ -185,6 +189,42 @@ dashboards register strict cleanup as soon as their concrete identity is
 known; cleanup runs every action and accepts only HTTP 200, 204, or 404.
 Suite-wide AI provider/model/agent bindings and mutable case/SOAR settings are
 snapshotted and restored from fixture finalizers, including on failures.
+
+### Exploratory persona runs (NAN-5291)
+
+Scripted journeys prove what we thought of; exploratory agents look for the
+rest. Each agent follows a charter in `e2e/personas-explore/` against a kept
+stack, using three tools (all read the kept stack's `stack.env`; `--run <id>`
+picks one):
+
+```bash
+# VECTOR_MEM_LIMIT: all 67 first-party OCSF parsers OOM the 512M compose default
+VECTOR_MEM_LIMIT=3G scripts/e2e.sh run personas --fresh --keep --edition enterprise --app image:<tag>
+PY=e2e/.venv/bin/python
+$PY -m nano_e2e.corpus                    # parsers-ocsf samples -> every OCSF class has data
+$PY -m nano_e2e.field_invariants --ui --json /tmp/fi.json   # OCSF field-name invariants
+$PY -m nano_e2e.explore start --persona soc_analyst         # step-by-step browser
+$PY -m nano_e2e.explore search '*' --start 2000-01-01T00:00:00Z
+$PY -m nano_e2e.explore screenshot /tmp/shot.png ; $PY -m nano_e2e.explore stop
+```
+
+- `nano_e2e.corpus` imports every `parsers-ocsf/*` parser LINKED from the
+  stack's synced nano-rs/parsers copy, publishes it (the OCSF gate runs) and
+  posts its bundled samples (the ~787 the gate checks) to Vector HEC with the
+  platform token and `sourcetype=<lane>`. Samples keep native timestamps:
+  search wide.
+- `nano_e2e.field_invariants` collects every field name the API (schema,
+  ext/unmapped keys, field stats, field usage, rule-validate suggestions,
+  rule-repo coverage) and, with `--ui`, the browser (search autocomplete,
+  results sidebar, rule editor, dashboard editor) shows, and checks it against
+  `system.columns`, the JSON paths present in `event`/`unmapped` and the
+  embedded OCSF contract: no doubled segment (`unmapped.unmapped`), no `ext.`,
+  no absent `unmapped.<k>`, no UDM alias shown as a field. Also a scenario:
+  `scripts/e2e.sh run field_invariants --run <id>`.
+- `nano_e2e.explore` keeps one browser per `--session` in a background daemon
+  (logged in as a throwaway persona user, deleted on `stop`). Every command
+  prints JSON with the console errors and failed requests (>= 400) since the
+  previous command. `idle N --reload` checks the return-after-idle page.
 
 ### The browser layer
 

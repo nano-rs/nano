@@ -358,7 +358,9 @@ export type AssetEventConcept =
   | 'interactiveLogon'
   | 'networkLogon'
   | 'fileEvents'
-  | 'fileLane';
+  | 'fileLane'
+  /** Detection findings / alerts: Open sequence + the timeline ALERT lane. */
+  | 'alerts';
 
 /**
  * OCSF `| where` bodies for each concept. These MUST stay the nPL spelling of
@@ -378,6 +380,10 @@ export const OCSF_ASSET_CONCEPT_WHERE: Record<AssetEventConcept, string> = {
   networkLogon: 'class_uid=3002 AND activity_id=1 AND logon_type_id IN (3, 8)',
   fileEvents: 'class_uid=1001',
   fileLane: 'class_uid IN (1001, 201001, 201002)',
+  // NAN-5312: findings are written as Detection Finding (2004), category 2 —
+  // the same rows the OCSF classifiers bucket as ALERT. Never `source_type`:
+  // findings are stored as `findings`, and `signal` has no rows at all.
+  alerts: 'category_uid=2',
 };
 
 /** The legacy UDM drilldowns, unchanged. */
@@ -395,6 +401,8 @@ const UDM_ASSET_CONCEPT_DRILL: Record<AssetEventConcept, Record<string, unknown>
   },
   fileEvents: { _tableCommand: '| where file_action!=""' },
   fileLane: { _tableCommand: '| where file_action!=""' },
+  // Findings are logged as source_type="findings"; `signal` is the legacy name.
+  alerts: { _tableCommand: '| where source_type="findings" OR source_type="signal"' },
 };
 
 /** Drilldown filters (field=value pairs and/or `_tableCommand`) for a concept. */

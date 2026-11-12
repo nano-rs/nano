@@ -1292,6 +1292,14 @@ mod time_bounds_override_tests;
 mod cloud_resource_column_tests;
 
 #[cfg(test)]
+#[path = "asset_dossier_ocsf_dns_tests.rs"]
+mod asset_dossier_ocsf_dns_tests;
+
+#[cfg(test)]
+#[path = "asset_findings_classification_tests.rs"]
+mod asset_findings_classification_tests;
+
+#[cfg(test)]
 #[path = "npl_golden_corpus_tests.rs"]
 pub(crate) mod npl_golden_corpus_tests;
 #[cfg(test)]

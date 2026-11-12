@@ -25,6 +25,7 @@ import { AssetPrevalenceCard } from './AssetPrevalenceCard';
 import { AssetStream } from './AssetStream';
 import { computeBucketWindow, formatTimestampHMS, withAssetIdentity } from './helpers';
 import { nplExactEquals } from '@/lib/npl-quote';
+import { profileEntityFilter } from '@/lib/asset-pivot';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import {
   assetConceptDrill,
@@ -54,7 +55,7 @@ function assetNpl(m: SchemaFieldMap) {
     TOP_DESTINATIONS_BY_COUNT: `| where ${destIp}!="" | stats count by ${destIp}, ${destHost} | sort -count`,
     PROCESS_TREE: `| where ${m.field('processName')}!="" | tree process`,
     // Timeline lane → drilldown command. AUTH/PROC/NET/FILE use `| where`; ALERT
-    // uses a base-search filter on source_type.
+    // is the `alerts` concept (assetConceptDrill).
     LANE_PROC: `| where ${m.field('processName')}!=""`,
     LANE_NET: `| where ${destIp}!=""`,
   };
@@ -284,14 +285,18 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
   // Investigate pivot — the plain entity filter, scoped to the asset view's
   // window (NAN-1458). Kept separate from handleAssetDrilldown so it doesn't
   // OR-expand across related identities.
+  // NAN-5312: the header passes the primary identifier by its UDM canonical
+  // name (`src_host`); translate it to the active profile's columns.
   const handleInvestigate = useCallback(
     (filters: Record<string, unknown>) => {
       if (!onDrilldown) return;
+      if (!schemaMap.ready) return schemaMap.guard(() => {})();
+      const native = profileEntityFilter(filters, schemaMap.profile);
       onDrilldown(
-        effectiveTimeRange ? { ...filters, _timeRangeOverride: effectiveTimeRange } : filters,
+        effectiveTimeRange ? { ...native, _timeRangeOverride: effectiveTimeRange } : native,
       );
     },
-    [onDrilldown, effectiveTimeRange],
+    [onDrilldown, effectiveTimeRange, schemaMap],
   );
 
   const navigate = useNavigate();
@@ -331,7 +336,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
           handleAssetDrilldown({ ...extras, ...assetConceptDrill(schemaMap.profile, 'fileLane') });
           return;
         case 'alert':
-          handleAssetDrilldown({ ...extras, source_type: 'signal' });
+          handleAssetDrilldown({ ...extras, ...assetConceptDrill(schemaMap.profile, 'alerts') });
           return;
         default:
           handleAssetDrilldown(extras);
@@ -450,7 +455,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
                   alerts={entityContext?.alerts ?? []}
                   total={entityContext?.alert_count}
                   onAlertClick={handleAlertClick}
-                  onOpenSequence={onDrilldown ? () => handleAssetDrilldown({ source_type: 'signal' }) : undefined}
+                  onOpenSequence={onDrilldown ? () => handleAssetDrilldown(assetConceptDrill(schemaMap.profile, 'alerts')) : undefined}
                 />
                 {dossier && (
                   <ProcessesCard

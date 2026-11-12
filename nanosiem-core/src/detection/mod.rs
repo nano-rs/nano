@@ -30,6 +30,8 @@ pub mod schedule_lag;
 pub mod scheduler;
 pub mod service;
 pub mod signal_processor;
+#[cfg(test)]
+mod signal_processor_match_record_tests;
 pub mod test_admission;
 
 pub use event_envelope::{normalize_match_event, normalize_match_events_for_query};

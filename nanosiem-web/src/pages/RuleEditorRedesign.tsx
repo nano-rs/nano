@@ -198,6 +198,10 @@ export function RuleEditorRedesign() {
   // Inspector drawer + Docs tab in PR 3/4 — for this PR we render summaries
   // and link out to the legacy editor for the revert action.
   const [versions, setVersions] = useState<RuleVersionSummary[]>([]);
+  // NAN-5315: bumped after a successful save so the version panel refetches
+  // (the save writes a new version; keying the fetch on `id` alone left the
+  // panel stale until a reload).
+  const [versionsNonce, setVersionsNonce] = useState(0);
   // NAN-622 — when a BottomTray version chip is clicked we hand the id to
   // InspectorDrawer; the Versions tab consumes it and clears it via
   // `onPendingVersionConsumed` so the next click re-fires the effect even
@@ -222,6 +226,8 @@ export function RuleEditorRedesign() {
           created_at?: string;
           modified_by?: string;
           change_description?: string;
+          // NAN-5315: the API's RuleVersion carries `change_reason`.
+          change_reason?: string;
         };
         const raw = (await resp.json()) as ApiVersion[];
         if (cancelled || !Array.isArray(raw)) return;
@@ -231,7 +237,7 @@ export function RuleEditorRedesign() {
             label: v.version_number != null ? `v${v.version_number}` : `#${v.id}`,
             when: v.created_at ? relativeTime(v.created_at) : undefined,
             by: v.modified_by,
-            msg: v.change_description,
+            msg: v.change_reason ?? v.change_description,
           })),
         );
       } catch {
@@ -241,7 +247,7 @@ export function RuleEditorRedesign() {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, versionsNonce]);
 
   // Populate MITRE autocomplete when the directory loads.
   useEffect(() => {
@@ -615,6 +621,7 @@ export function RuleEditorRedesign() {
       setTriageHintsChanged(false);
       setCaseChanged(false);
       setShowSaveConfirm(false);
+      setVersionsNonce((n) => n + 1);
       refetchRules();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Failed to update rule.';

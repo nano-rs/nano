@@ -11,6 +11,11 @@
  *
  * - pull: the dispatching config is gone (failed), enabled but not deployed
  *   (blocked: events wait in the queue), or disabled (paused);
+ * - push: the same, when the dispatching config is a push listener (HTTP,
+ *   Vector, OTLP). A `splunk_hec` config is only a routing profile over the
+ *   platform-managed HEC listener (always on, routes by sourcetype), so its
+ *   enabled/deployed flags never stop delivery and raise no attention
+ *   (NAN-5318);
  * - connector: a feed on the lane whose last run did not succeed (failed), or
  *   that is paused.
  *
@@ -19,26 +24,41 @@
 
 import type { LogSource, SourceConfiguration } from '@/lib/api/types';
 import type { ConnectorFeed } from '@/lib/api/connector-feeds';
+import { isListenerConfigType } from '@/lib/ingestion-paths';
 
 export type DeliveryAttentionLevel = 'failed' | 'blocked' | 'paused';
 
 export interface DeliveryAttention {
-  kind: 'pull' | 'connector';
+  kind: 'pull' | 'push' | 'connector';
   id: string;
   name: string;
   level: DeliveryAttentionLevel;
   reason: string;
 }
 
-/** The dispatching pull config's attention, else null. `undefined` config = not loaded yet. */
+type DispatchConfig = Pick<SourceConfiguration, 'id' | 'name' | 'enabled' | 'deployed'> &
+  Partial<Pick<SourceConfiguration, 'config_type'>>;
+
+/**
+ * The shared HEC listener is platform-managed and always on; a `splunk_hec`
+ * source configuration only adds routing on top of it, so disabling or not
+ * deploying it never stops HEC delivery (NAN-5318).
+ */
+export function isPlatformHecProfile(config: { config_type?: string }): boolean {
+  return config.config_type === 'splunk_hec';
+}
+
+/** The dispatching config's attention, else null. `undefined` config = not loaded yet. */
 export function pullAttention(
   configId: string,
-  config: Pick<SourceConfiguration, 'id' | 'name' | 'enabled' | 'deployed'> | null | undefined,
+  config: DispatchConfig | null | undefined,
 ): DeliveryAttention | null {
   if (config === undefined) return null;
   if (config === null) return { kind: 'pull', id: configId, name: configId, level: 'failed', reason: 'source configuration missing' };
-  if (!config.enabled) return { kind: 'pull', id: config.id, name: config.name, level: 'paused', reason: 'disabled' };
-  if (!config.deployed) return { kind: 'pull', id: config.id, name: config.name, level: 'blocked', reason: 'not deployed' };
+  if (isPlatformHecProfile(config)) return null;
+  const kind = config.config_type && isListenerConfigType(config.config_type) ? 'push' : 'pull';
+  if (!config.enabled) return { kind, id: config.id, name: config.name, level: 'paused', reason: 'disabled' };
+  if (!config.deployed) return { kind, id: config.id, name: config.name, level: 'blocked', reason: 'not deployed' };
   return null;
 }
 
@@ -56,7 +76,7 @@ export function connectorAttention(
 /** Attention per log source id, from the sources, the configs list (when readable) and the feeds (when readable). */
 export function deliveryAttentionBySource(
   sources: Pick<LogSource, 'id' | 'source_type' | 'match_values' | 'dispatch_source_config_id'>[],
-  configs: Pick<SourceConfiguration, 'id' | 'name' | 'enabled' | 'deployed'>[] | undefined,
+  configs: DispatchConfig[] | undefined,
   feeds: Pick<ConnectorFeed, 'id' | 'name' | 'enabled' | 'last_status' | 'source_type'>[] | undefined,
 ): Map<string, DeliveryAttention[]> {
   const configById = configs ? new Map(configs.map((c) => [c.id, c])) : null;
