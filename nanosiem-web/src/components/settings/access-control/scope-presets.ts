@@ -94,3 +94,22 @@ export function derivePreset(permissions: ScopeCandidate[], scopes: string[]): s
   }
   return 'custom';
 }
+
+/**
+ * NAN-5329: the preset an edit opens on. `derivePreset` matches the FULL preset,
+ * but the picker resolves presets to what the editor can grant — so a key whose
+ * scopes equal a preset the editor only partly holds would open on that preset,
+ * resolve to the editor's subset, and silently drop the rest on save. Open such
+ * a key on `custom` so its exact scope set is what gets saved.
+ */
+export function initialPresetId(
+  permissions: ScopeCandidate[],
+  initialScopes: string[],
+  defaultPresetId: string,
+  canGrant: (permissionId: string) => boolean,
+): string {
+  if (initialScopes.length === 0) return defaultPresetId;
+  const derived = derivePreset(permissions, initialScopes);
+  if (derived === 'custom') return derived;
+  return presetScopeIds(permissions, derived).every(canGrant) ? derived : 'custom';
+}

@@ -331,5 +331,7 @@ fn udm_render_has_no_stamp() {
     assert!(!config.contains(OCSF_LANE_STAMP_SUFFIX), "{config}");
     assert!(!config.contains("%source_type"), "{config}");
     let t = transforms(&config);
-    assert_eq!(inputs(&t, "okta_ocsf_parse"), vec!["okta_ocsf_filter".to_string()]);
+    // NAN-5340: a JSON-input parser reads its lane through the HEC payload step.
+    assert_eq!(inputs(&t, "okta_ocsf_parse"), vec!["okta_ocsf_hec_payload".to_string()]);
+    assert_eq!(inputs(&t, "okta_ocsf_hec_payload"), vec!["okta_ocsf_filter".to_string()]);
 }

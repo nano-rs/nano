@@ -78,6 +78,7 @@ import { useDefaultLayout } from 'react-resizable-panels';
 import { deployDialogDescription } from '@/lib/log-source-deploy-copy';
 import { useVrlDraftGuard } from '@/hooks/use-vrl-draft-guard';
 import { computeDiff, type DiffLine, type VrlUpdateInfo } from '@/lib/parser-diff';
+import { showInitialLoader } from '@/lib/detail-initial-loader';
 import { ParserTestLab } from '@/components/parser/ParserTestLab';
 import {
   EMPTY_OCSF_GATE,
@@ -124,6 +125,7 @@ import {
   isRawPassThroughVrl,
 } from '@/lib/log-source-pivt-context';
 import { useQuery } from '@tanstack/react-query';
+import { descriptionSummary } from '@/lib/description-summary';
 
 const CONFIG_TYPE_TO_SOURCE_TYPE: Record<string, string> = {
   http: 'routed',
@@ -278,7 +280,9 @@ export function LogSourceDetail() {
 
   // ----- early return: loading / 404 -----
 
-  if (loading) {
+  // NAN-5329: a refetch (Validate, Save VRL) must not unmount the page — that
+  // wiped the test lab's pasted samples and results.
+  if (showInitialLoader(loading, logSource, id)) {
     return (
       <div className="flex items-center justify-center h-full">
         <LoadingIcon className="w-6 h-6 text-muted-foreground" />
@@ -955,8 +959,11 @@ function LogSourceHero({
             </span>
           </div>
           {source.description && (
-            <div className="text-[11.5px] text-muted-foreground mt-1 leading-relaxed max-w-[820px]">
-              {source.description}
+            <div
+              className="text-[11.5px] text-muted-foreground mt-1 leading-relaxed max-w-[820px] line-clamp-2"
+              title={descriptionSummary(source.description)}
+            >
+              {descriptionSummary(source.description)}
             </div>
           )}
           <div className="flex items-center gap-1.5 mt-2 flex-wrap">
@@ -1325,7 +1332,7 @@ function OverviewTab({
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <LSCard eyebrow="About" title="Feed details">
           <LSRow label="Description">
-            <div className="text-foreground/80 leading-relaxed">{source.description || '—'}</div>
+            <div className="text-foreground/80 leading-relaxed whitespace-pre-line">{source.description || '—'}</div>
           </LSRow>
           <LSRow label="Category" mono>
             <span className="text-foreground">{source.category || '—'}</span>
@@ -1759,7 +1766,7 @@ function ConfigurationTab({
               rows={2}
             />
           ) : (
-            <div className="text-foreground/80 leading-relaxed">{source.description || '—'}</div>
+            <div className="text-foreground/80 leading-relaxed whitespace-pre-line">{source.description || '—'}</div>
           )}
         </LSRow>
         <LSRow label="Category" mono>

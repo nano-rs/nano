@@ -4,6 +4,7 @@ import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { isClickHouseDefault } from '@/lib/utils';
 import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
 import { isGeoEnrichmentField, isIocField } from '@/lib/enrichment-fields';
+import { isInternalHelperColumn, isOcsfInapplicableDefault, ocsfDisplayKey } from './event-row-line';
 import { FIELD_BUCKET_LABELS, FIELD_BUCKET_TOOLTIPS, extendedTooltip } from './field-buckets';
 
 // OCSF `event` JSON expansion (NAN-1241 follow-up).
@@ -204,7 +205,11 @@ export function flattenEventFields(
     // NAN-1446: `*_unified` entity columns are an internal query accelerator and
     // `event_bytes` is a sizing metric — neither is an OCSF spec field. Keep them
     // out of the record view so an OCSF row renders as pure spec.
-    if (key.endsWith('_unified') || key === 'event_bytes') continue;
+    if (isInternalHelperColumn(key)) continue;
+    // NAN-5326: Bool defaults on fields that don't apply to the class
+    // (`is_mfa false` on a process event) and the legacy `source_type` key —
+    // same rules as the results row line so both surfaces agree.
+    if (prefix === '' && isOcsf && isOcsfInapplicableDefault(key, value, fields)) continue;
 
     const isPrevalence = key === 'host_count' || key === 'is_rare' || key === 'prevalence_score' ||
                          key === 'prevalence_type' || key === 'total_occurrences' ||
@@ -249,6 +254,10 @@ export function flattenEventFields(
       } else if (value) {
         result.push([fullKey, value]);
       }
+    } else if (prefix === '') {
+      const displayKey = ocsfDisplayKey(key, isOcsf);
+      if (displayKey !== key && topLevelKeys.has(displayKey)) continue;
+      result.push([displayKey, value]);
     } else {
       result.push([fullKey, value]);
     }
@@ -275,7 +284,14 @@ export function flattenEventFields(
     return 0;
   };
 
-  return result.sort((a, b) => {
+  // A renamed alias (`source_type` → `metadata.log_source`) can collide with
+  // the same leaf expanded from the OCSF `event` record — keep one.
+  const seen = new Set<string>();
+  const deduped = prefix === ''
+    ? result.filter(([k]) => (seen.has(k) ? false : (seen.add(k), true)))
+    : result;
+
+  return deduped.sort((a, b) => {
     const catA = getFieldCategory(a[0]);
     const catB = getFieldCategory(b[0]);
     if (catA !== catB) return catA - catB;

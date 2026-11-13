@@ -86,6 +86,67 @@ Each run writes to `target/e2e/<runid>/artifacts/`:
 behaves the same way in native and docker mode. Scenarios call it through
 `Stack.svc()`, for example to restart Vector in the middle of a pull.
 
+### Licensing enterprise stacks (offline C05 trial)
+
+Enterprise stacks start license-locked. An offline C05 license is bound to the
+installation identity (`installation_id`, `organization_id`). The enterprise
+migration generates a random identity, so without a pin every `--fresh` stack
+would need its own license. Pin the identity once and one trial license serves
+every run:
+
+1. Get an identity to license. Pick two ids matching
+   `^[a-z0-9][a-z0-9_-]{0,63}$` (for example `e2e-dan-inst` and `e2e-dan-org`).
+   Or bring up a stack and read its generated ids:
+   `scripts/e2e.sh up --edition enterprise`, then
+   `scripts/e2e.sh license-ids [--run <id>]`. That prints `installation_id=`,
+   `organization_id=` and whether a license is installed.
+2. Issue the trial. In app.nano.rs go to admin → Licenses, issue a
+   **Self-run trial** for those two ids, and download the offline license
+   file.
+3. Store the file outside the repository, readable only by you:
+
+   ```bash
+   mkdir -p ~/.nano-e2e && mv ~/Downloads/<license>.json ~/.nano-e2e/c05-trial.json
+   chmod 600 ~/.nano-e2e/c05-trial.json
+   ```
+
+4. Set the env vars (for example in your shell profile):
+
+   ```bash
+   export NANO_E2E_INSTALLATION_ID=e2e-dan-inst
+   export NANO_E2E_INSTALLATION_ORG_ID=e2e-dan-org
+   export NANO_E2E_C05_LICENSE_FILE=~/.nano-e2e/c05-trial.json
+   ```
+
+What the harness does with them (enterprise edition only; `--edition open`
+ignores them with a warning):
+
+- `up` validates them before it creates anything. The two ids must be set
+  together and match the pattern. The file must be an absolute path to a
+  regular file you own (not a symlink), mode 0600, 1 byte to 256 KiB, and
+  outside this checkout. `scripts/e2e.sh doctor` runs the same checks.
+- After the migrator runs and **before any app process starts**, `up`
+  replaces the identity the migration generated with the pinned one. Nothing
+  else depends on the identity yet: the fingerprint is derived from the two
+  ids, and license state, the license ledger and the ClickHouse clock witness
+  only exist after an import. The update runs in one locked transaction. It
+  refuses (and `up` fails) if any license state or ledger row exists, and it
+  is a no-op when the identity already matches. There is no product-side way
+  to set the identity; only the harness does this, directly in its throwaway
+  PostgreSQL.
+- Once the stack is healthy and the admin exists, `up` imports the file with
+  `POST /api/license/import` and fails loudly unless `GET /api/license` then
+  reports `state=active`, `valid=true` and the pinned identity. With
+  `--defer-admin` (the `ui` and `personas` suites), the deferred first-run
+  setup imports it right after it mints the admin key.
+- The file's contents are never printed, logged, journaled or copied. Errors
+  name the file and the API status, never its bytes. The artifact guard
+  scrubs the contents by reading the file where it lives
+  (`--secret-file`); they are never written into the run dir.
+
+A trial expires. When it does, imports fail with "license NOT active"; issue a
+new trial for the same two ids and replace the file.
+
 ## Harness conventions
 
 - **Run markers.** Every event carries `nano-e2e-<runid>-<hash(test)>`, and
@@ -734,7 +795,10 @@ the harness's own safety properties:
 - a suite that runs nothing, or a skipped explicit legacy lane, fails;
 - Azure creates a consumer group and checkpoint container per run;
 - a timed-out legacy lane's whole process group is killed;
-- the stripped open-core tree defaults to `EDITION=open`.
+- the stripped open-core tree defaults to `EDITION=open`;
+- the C05 license env is validated, the identity seeding SQL is guarded and
+  parameterized, a refused seed or an inactive license fails `up`, and the
+  license file's contents never reach output or artifacts.
 
 ## Development
 

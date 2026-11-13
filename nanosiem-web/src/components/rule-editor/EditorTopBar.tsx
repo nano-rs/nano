@@ -115,14 +115,7 @@ function ModePill({ mode }: { mode: string }) {
         'inline-flex items-center gap-1.5 px-2 h-5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em]',
         meta.tone,
       )}
-      style={{
-        background:
-          display === 'live'
-            ? 'color-mix(in srgb, var(--success) 15%, transparent)'
-            : display === 'staging'
-              ? 'color-mix(in srgb, var(--primary) 15%, transparent)'
-              : 'color-mix(in srgb, var(--foreground) 10%, transparent)',
-      }}
+      style={{ background: meta.bg }}
     >
       <span className="w-1.5 h-1.5 rounded-full" style={{ background: meta.dotVar }} />
       {meta.label}

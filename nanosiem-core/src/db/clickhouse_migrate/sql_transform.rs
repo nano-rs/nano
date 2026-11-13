@@ -82,6 +82,15 @@ impl ClickHouseMigrator {
         message.contains("UNKNOWN_TABLE")
     }
 
+    /// NAN-5338: a GRANT / REVOKE whose grantee is defined in users.d XML
+    /// fails with `Code: 495 ... ACCESS_STORAGE_READONLY`. That is the
+    /// expected outcome on Compose and Helm installs, not a missing privilege:
+    /// the XML carries the same change, pinned by
+    /// `nanosiem-core/tests/migration_grants_users_xml_guard.rs`.
+    pub(super) fn is_readonly_access_storage_error(message: &str) -> bool {
+        message.contains("ACCESS_STORAGE_READONLY")
+    }
+
     /// NAN-1407: detect the `nano:keep-local-engine` block-comment marker.
     ///
     /// The dictionary staging tables (`*_dict_staging`) must stay PLAIN

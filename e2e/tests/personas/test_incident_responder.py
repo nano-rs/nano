@@ -65,18 +65,21 @@ def _start_flow(page: uilib.UiPage, flow_id: str) -> str:
     return page.wait_url(r"/automation/runs/[^/?#]+$").rstrip("/").rsplit("/", 1)[-1]
 
 
-def _approval_card(page: uilib.UiPage, flow_name: str) -> dict[str, Any]:
+def _approval_card(page: uilib.UiPage, requester: str) -> dict[str, Any]:
+    """The pending card for THIS run: a user-requested card names its requester
+    ("you" to the requester). Never fall back to whichever card is first: on a
+    kept stack another scenario's approval may still be pending (NAN-5333)."""
     page.goto("/automation/approvals")
     drawer = {"testid": "approvals-drawer"}
+    named = {"testid": "approval-card", "has": requester, "within": drawer}
     eventually(
-        lambda: page.count({"testid": "approval-card", "within": drawer}),
+        lambda: page.count(named),
         timeout=60,
         interval=2,
-        desc="pending responder playbook approval",
-        ok=lambda count: count >= 1,
+        desc=f"pending responder playbook approval requested by {requester}",
+        ok=lambda count: count == 1,
     )
-    named = {"testid": "approval-card", "has": flow_name, "within": drawer}
-    return named if page.count(named) else {"testid": "approval-card", "within": drawer}
+    return named
 
 
 def _typeid_uuid(value: str) -> str:
@@ -344,10 +347,10 @@ def test_incident_responder_journey(
         run = expect(nano.api.get(f"/api/soar/runs/{run_id}"), 200)
         assert run["status"] == "suspended", run
         assert run["requested_by_name"] == responder_me["name"], run
-        requester_card = _approval_card(page, flow_name)
+        requester_card = _approval_card(page, "you")
         assert page.count({"role": "button", "name": "Approve", "exact": True, "within": requester_card}) == 0
 
-        card = _approval_card(approver.page, flow_name)
+        card = _approval_card(approver.page, responder_me["name"])
         approver.page.click({"role": "radio", "name": "yes", "exact": True, "within": card})
         approver.page.click({"role": "button", "name": "Approve", "exact": True, "within": card})
         finished = eventually(

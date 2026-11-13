@@ -140,6 +140,9 @@ pub(crate) mod config_lock;
 #[path = "claim_metadata_tests.rs"]
 mod claim_metadata_tests;
 #[cfg(test)]
+#[path = "hec_payload_tests.rs"]
+mod hec_payload_tests;
+#[cfg(test)]
 #[path = "hec_route_tests.rs"]
 mod hec_route_tests;
 #[cfg(test)]
@@ -161,6 +164,7 @@ mod credentials;
 pub mod delivery;
 mod deploy;
 mod fanin_slots;
+mod hec_payload;
 pub mod hec_route;
 mod parser_config;
 mod publication;

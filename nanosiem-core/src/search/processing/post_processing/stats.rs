@@ -294,10 +294,14 @@ pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> se
             .unwrap_or(serde_json::Value::Null),
         // estdc() is approximate at the SQL layer only; client-side
         // post-processing over already-fetched rows counts exactly.
+        // NAN-5339: a missing value (absent key, JSON null, or the empty
+        // string a missing field reads as) is not a distinct value — same
+        // rule as the SQL path (`distinct_count_sql`) and values()/list().
         AggFunc::Dc | AggFunc::EstDc => {
             let unique: std::collections::HashSet<String> = rows
                 .iter()
                 .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+                .filter(|v| !v.is_null() && !json_value_to_raw_string(v).is_empty())
                 .map(|v| v.to_string())
                 .collect();
             serde_json::Value::Number(serde_json::Number::from(unique.len()))

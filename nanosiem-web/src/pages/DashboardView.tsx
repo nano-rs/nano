@@ -8,6 +8,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
+import { dashboardHasVariables } from '@/lib/dashboard-first-run-hint';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { ScheduleReportDialog } from '@/components/reports/ScheduleReportDialog';
@@ -967,7 +968,8 @@ export function DashboardView() {
               <div className="mb-3 px-3 py-2.5 rounded-md border border-border bg-foreground/[0.02] flex items-center gap-2.5">
                 <RefreshCw className="w-[12px] h-[12px] text-muted-foreground" />
                 <span className="text-[12px] text-muted-foreground">
-                  Set your variables and click{' '}
+                  {/* NAN-5328: only mention variables when the dashboard has some. */}
+                  {dashboardHasVariables(dashboard.layout?.variables) ? 'Set your variables and click ' : 'Click '}
                   <span className="font-mono text-foreground">Run</span> to load
                   panel data.
                 </span>

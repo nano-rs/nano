@@ -90,7 +90,7 @@ def test_parser_then_source_config_delete_keeps_every_reload_accepted(
             201,
         )
         parser_id = src["id"]
-        published = expect(nano.api.post(f"/api/log-sources/{parser_id}/publish"), 200)
+        published = expect(nano.api.post(f"/api/log-sources/{parser_id}/publish", json={"acknowledge_unattested": True}), 200)
         assert published.get("success") is True, f"bound pull parser publish failed: {published}"
         timeline.step("bound pull parser published")
         vector_reloads_quiet(stack.project, quiet=5, timeout=90)
@@ -112,7 +112,7 @@ def test_parser_then_source_config_delete_keeps_every_reload_accepted(
         # A later publish goes live.
         later = token_source("later")
         expect(nano.api.put(f"/api/log-sources/{later.source_id}", json={"parser_vrl": PARSER}), 200)
-        res = expect(nano.api.post(f"/api/log-sources/{later.source_id}/publish"), 200)
+        res = expect(nano.api.post(f"/api/log-sources/{later.source_id}/publish", json={"acknowledge_unattested": True}), 200)
         assert res.get("success") is True, f"publish after the deletes failed: {res}"
         n = {"i": 0}
 

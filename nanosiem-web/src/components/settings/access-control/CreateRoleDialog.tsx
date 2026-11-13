@@ -11,7 +11,10 @@ import { useEffect, useMemo, useState } from 'react';
 import { Shield, Check } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
+import { categoryDisplayName } from '@/lib/permissions';
 import { useToast } from '@/hooks/use-toast';
+import { useAuth } from '@/contexts/AuthContext';
+import { UNGRANTABLE_HINT, canToggleGrant, grantableOnly } from '@/lib/grantable-permissions';
 import {
   api,
   type RoleDetail,
@@ -47,6 +50,9 @@ export function CreateRoleDialog({
   onCreated,
 }: CreateRoleDialogProps) {
   const { toast } = useToast();
+  // NAN-5329: the server refuses permissions the creator does not hold; keep
+  // them unselectable here instead of failing on submit.
+  const { hasPermission } = useAuth();
   const isEditing = !!editing;
   const isDuplicating = !!duplicating;
   const [name, setName] = useState('');
@@ -87,6 +93,7 @@ export function CreateRoleDialog({
 
   const togglePerm = (id: string) => {
     setPermIds(prev => {
+      if (!canToggleGrant(id, prev.has(id), hasPermission)) return prev;
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -98,8 +105,9 @@ export function CreateRoleDialog({
     setPermIds(prev => {
       const next = new Set(prev);
       for (const p of groupedPermissions[cat] || []) {
-        if (on) next.add(p.id);
-        else next.delete(p.id);
+        if (on) {
+          if (hasPermission(p.id)) next.add(p.id);
+        } else next.delete(p.id);
       }
       return next;
     });
@@ -195,7 +203,7 @@ export function CreateRoleDialog({
               <div className="flex-1" />
               <button
                 type="button"
-                onClick={() => setPermIds(new Set(permissions.map(p => p.id)))}
+                onClick={() => setPermIds(prev => new Set([...prev, ...grantableOnly(permissions.map(p => p.id), hasPermission)]))}
                 className="text-[10.5px] text-muted-foreground hover:text-foreground"
               >
                 Select all
@@ -217,12 +225,12 @@ export function CreateRoleDialog({
             ) : (
               <div className="rounded-md border border-border overflow-hidden divide-y divide-border/60">
                 {Object.entries(groupedPermissions).map(([cat, perms]) => {
-                  const allOn = perms.every(p => permIds.has(p.id));
+                  const allOn = perms.every(p => permIds.has(p.id) || !hasPermission(p.id));
                   const someOn = perms.some(p => permIds.has(p.id));
                   return (
                     <div key={cat}>
                       <div className="flex items-center gap-2 px-3 py-1.5 bg-card/50">
-                        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">{cat}</div>
+                        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">{categoryDisplayName(cat)}</div>
                         <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums">
                           {perms.filter(p => permIds.has(p.id)).length}/{perms.length}
                         </span>
@@ -238,17 +246,20 @@ export function CreateRoleDialog({
                       <div className="grid grid-cols-2 gap-x-4">
                         {perms.map(p => {
                           const on = permIds.has(p.id);
+                          const blocked = !canToggleGrant(p.id, on, hasPermission);
                           return (
                             <button
                               key={p.id}
                               type="button"
                               role="checkbox"
                               aria-checked={on}
+                              disabled={blocked}
+                              title={blocked ? UNGRANTABLE_HINT : undefined}
                               aria-label={`${p.id}${p.description ? ` — ${p.description}` : ''}`}
                               onClick={() => togglePerm(p.id)}
                               className={cn(
                                 'flex items-center gap-2 px-3 h-8 transition-colors text-left',
-                                on ? 'bg-primary/8' : 'hover:bg-foreground/[0.025]',
+                                on ? 'bg-primary/8' : blocked ? 'opacity-45 cursor-not-allowed' : 'hover:bg-foreground/[0.025]',
                               )}
                             >
                               <div className={cn(

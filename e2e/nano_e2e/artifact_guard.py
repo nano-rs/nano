@@ -94,8 +94,24 @@ def expand(values: Iterable[str]) -> list[str]:
     return sorted(out, key=len, reverse=True)
 
 
-def load(registry: Path | None, env_files: Iterable[Path] = ()) -> list[str]:
+def file_secrets(paths: Iterable[Path]) -> list[str]:
+    """Secret FILES (the C05 license, NAN-5331): read at scrub time from where
+    the operator keeps them, so their contents are never copied into the run
+    dir's registry. A missing/unreadable/binary file contributes nothing."""
     vals: list[str] = []
+    for p in paths:
+        try:
+            text = p.read_bytes().decode()
+        except (OSError, UnicodeDecodeError):
+            continue
+        vals.extend(v for v in (text, text.strip()) if len(v) >= MIN_LEN)
+    return vals
+
+
+def load(
+    registry: Path | None, env_files: Iterable[Path] = (), secret_files: Iterable[Path] = ()
+) -> list[str]:
+    vals: list[str] = file_secrets(secret_files)
     if registry and registry.is_file():
         for line in registry.read_text().splitlines():
             if line.strip():
@@ -194,11 +210,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("artifacts", type=Path)
     s.add_argument("--run-dir", type=Path, required=True)
     s.add_argument("--env-file", type=Path, action="append", default=[])
+    s.add_argument("--secret-file", type=Path, action="append", default=[])
     a = ap.parse_args(argv)
     if a.cmd == "redact-rendered":
         print(f"redacted {redact_rendered(a.src, a.dst)} rendered config file(s)")
         return 0
-    secrets = load(a.run_dir / REGISTRY, a.env_file)
+    secrets = load(a.run_dir / REGISTRY, a.env_file, a.secret_file)
     left = scrub(a.artifacts, secrets)
     if left:
         print("E2E-SECURITY: secret value(s) remain in artifacts after scrubbing:", file=sys.stderr)

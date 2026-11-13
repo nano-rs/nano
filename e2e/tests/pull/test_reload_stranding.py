@@ -76,7 +76,7 @@ class _Churn:
             i += 1
             vrl = feeds.LANE_PARSER.format(lane=self.lane) + f"\n# churn {i}\n"
             self.nano.api.put(f"/api/log-sources/{self.src}", json={"parser_vrl": vrl})
-            if self.nano.api.post(f"/api/log-sources/{self.src}/publish").status_code == 200:
+            if self.nano.api.post(f"/api/log-sources/{self.src}/publish", json={"acknowledge_unattested": True}).status_code == 200:
                 with self.published:
                     self.publishes += 1
                     self.published.notify_all()

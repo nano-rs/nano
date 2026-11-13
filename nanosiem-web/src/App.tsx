@@ -246,7 +246,6 @@ const SoarSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Setting
 const OidcProvidersPage = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/OidcProviders'), 'OidcProvidersPage');
 const AuditLogPage = lazyWithRetryNamed(() => import('@/pages/Settings/AuditLog'), 'AuditLogPage');
 const AccessControlPage = lazyWithRetryNamed(() => import('@/pages/Settings/AccessControl'), 'AccessControlPage');
-const ApiKeyForm = lazyWithRetryNamed(() => import('@/pages/Settings/ApiKeyForm'), 'ApiKeyForm');
 const PrevalenceSettings = lazyWithRetryNamed(() => import('@/pages/Settings/PrevalenceSettings'), 'PrevalenceSettings');
 const CaseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/CaseSettings'), 'CaseSettings');
 const QueueSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/QueueSettings'), 'QueueSettings');
@@ -390,6 +389,11 @@ function RuleRedirect() {
 }
 
 // Legacy form route → right-side flyout on the SSO list (NAN-557).
+function ApiKeyEditRedirect() {
+  const { id } = useParams();
+  return <Navigate to={`/settings/access-control?tab=api-keys&key=${encodeURIComponent(id ?? '')}`} replace />;
+}
+
 function SsoEditRedirect() {
   const { id } = useParams();
   return <Navigate to={`/settings/access-control?tab=sso&provider=${encodeURIComponent(id ?? '')}`} replace />;
@@ -920,6 +924,8 @@ function ProtectedAppRoutes() {
           } />
 
           {/* Log Sources */}
+          {/* NAN-5329: the Ingestion rail group has no page of its own. */}
+          <Route path="/ingestion" element={<Navigate to="/ingestion/log-sources" replace />} />
           <Route path="/ingestion/log-sources" element={
             <PermissionRoute permission="log_sources:view" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
@@ -1160,19 +1166,15 @@ function ProtectedAppRoutes() {
           <Route path="/settings/access-control/sso/:id" element={
             <SsoEditRedirect />
           } />
+          {/* NAN-5329: the standalone API key form (old bubbly style, its own
+              reveal modal) is retired; create / edit live in the dense
+              Access Control > API keys tab, with one reveal-once card for
+              create and rotate. */}
           <Route path="/settings/access-control/api-keys/new" element={
-            <PermissionRoute permission="apikeys:create" element={
-              <Suspense fallback={<SettingsLoadingFallback />}>
-                <ApiKeyForm key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=api-keys&new=1" replace />
           } />
           <Route path="/settings/access-control/api-keys/:id" element={
-            <PermissionRoute permission="apikeys:create" element={
-              <Suspense fallback={<SettingsLoadingFallback />}>
-                <ApiKeyForm key={resetKey} />
-              </Suspense>
-            } />
+            <ApiKeyEditRedirect />
           } />
 
           {/* NAN-1192: legacy standalone list pages retired in favour of the

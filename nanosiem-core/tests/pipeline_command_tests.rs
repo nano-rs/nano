@@ -1119,11 +1119,11 @@ fn timechart_limit_avg_carries_sum_and_count() {
 fn timechart_limit_dc_single_scan_merges_uniq_exact_states() {
     let sql = npl("* | timechart span=1h dc(src_ip) by source_type limit=3");
     assert!(
-        sql.contains("uniqExactState(src_ip) AS __rank_state"),
+        sql.contains("uniqExactIfState(src_ip, toString(src_ip) != '') AS __rank_state"),
         "dc rank must carry the per-bucket uniqExact state; got: {sql}"
     );
     assert!(
-        sql.contains("uniqExactMerge(__rank_state) OVER (PARTITION BY __rank_key)"),
+        sql.contains("uniqExactIfMerge(__rank_state) OVER (PARTITION BY __rank_key)"),
         "dc rank total must merge the carried states; got: {sql}"
     );
     assert!(
@@ -1143,11 +1143,11 @@ fn timechart_limit_dc_single_scan_merges_uniq_exact_states() {
 fn timechart_limit_estdc_single_scan_merges_uniq_combined_states() {
     let sql = npl("* | timechart span=1h estdc(src_ip) by source_type limit=3");
     assert!(
-        sql.contains("uniqCombined64State(src_ip) AS __rank_state"),
+        sql.contains("uniqCombined64IfState(src_ip, toString(src_ip) != '') AS __rank_state"),
         "estdc rank must carry the per-bucket uniqCombined64 state; got: {sql}"
     );
     assert!(
-        sql.contains("uniqCombined64Merge(__rank_state) OVER (PARTITION BY __rank_key)"),
+        sql.contains("uniqCombined64IfMerge(__rank_state) OVER (PARTITION BY __rank_key)"),
         "estdc rank total must merge the carried states; got: {sql}"
     );
     assert!(!sql.contains("IN (SELECT"), "got: {sql}");
@@ -1204,7 +1204,7 @@ fn timechart_split_without_limit_unchanged() {
 fn stats_estdc_uses_uniq_combined64() {
     let sql = npl("* | stats estdc(src_ip) by source_type");
     assert!(
-        sql.contains("uniqCombined64(src_ip) AS estdc"),
+        sql.contains("uniqCombined64If(src_ip, toString(src_ip) != '') AS estdc"),
         "estdc should map to uniqCombined64; got: {sql}"
     );
 }
@@ -1212,7 +1212,7 @@ fn stats_estdc_uses_uniq_combined64() {
 #[test]
 fn timechart_estdc_uses_uniq_combined64() {
     let sql = npl("* | timechart span=1h estdc(src_ip)");
-    assert!(sql.contains("uniqCombined64(src_ip)"), "got: {sql}");
+    assert!(sql.contains("uniqCombined64If(src_ip, toString(src_ip) != '')"), "got: {sql}");
 }
 
 #[test]
@@ -1225,7 +1225,7 @@ fn eventstats_estdc_uses_uniq_combined64() {
     // absence of the window — since checking only the former would pass on a
     // reverted implementation.
     assert!(
-        sql.contains("uniqCombined64(src_ip)") && sql.contains("groupArray(__nano_k)"),
+        sql.contains("uniqCombined64If(src_ip, toString(src_ip) != '')") && sql.contains("groupArray(__nano_k)"),
         "eventstats estdc should be a uniqCombined64 map attach (NAN-1642); got: {sql}"
     );
     assert!(
@@ -1238,7 +1238,7 @@ fn eventstats_estdc_uses_uniq_combined64() {
     // subquery and the aggregate rather than an exact `(SELECT <agg> FROM`.
     let sql2 = npl("* | eventstats estdc(src_ip)");
     assert!(
-        sql2.contains("(SELECT toFloat64(uniqCombined64(src_ip)) FROM"),
+        sql2.contains("(SELECT toFloat64(uniqCombined64If(src_ip, toString(src_ip) != '')) FROM"),
         "whole-set eventstats estdc should use a scalar subquery; got: {sql2}"
     );
     assert!(
@@ -1251,7 +1251,7 @@ fn eventstats_estdc_uses_uniq_combined64() {
 fn streamstats_estdc_uses_uniq_combined64() {
     let sql = npl("* | streamstats estdc(src_ip) by source_type");
     assert!(
-        sql.contains("uniqCombined64(src_ip) OVER ("),
+        sql.contains("uniqCombined64If(src_ip, toString(src_ip) != '') OVER ("),
         "streamstats estdc should be a uniqCombined64 window; got: {sql}"
     );
 }
@@ -1260,17 +1260,17 @@ fn streamstats_estdc_uses_uniq_combined64() {
 fn estdc_distinct_count_alias_unaffected() {
     // distinct_count remains an alias for exact dc(), not estdc().
     let sql = npl("* | stats distinct_count(src_ip) by source_type");
-    assert!(sql.contains("uniqExact(src_ip)"), "got: {sql}");
+    assert!(sql.contains("uniqExactIf(src_ip, toString(src_ip) != '')"), "got: {sql}");
 }
 
 /// dc() emission pins: byte-identical uniqExact forms in every surface.
 #[test]
 fn dc_emission_stays_uniq_exact_everywhere() {
     let stats = npl("* | stats dc(src_ip) by source_type");
-    assert!(stats.contains("uniqExact(src_ip) AS dc"), "got: {stats}");
+    assert!(stats.contains("uniqExactIf(src_ip, toString(src_ip) != '') AS dc"), "got: {stats}");
 
     let timechart = npl("* | timechart span=1h dc(src_ip)");
-    assert!(timechart.contains("uniqExact(src_ip)"), "got: {timechart}");
+    assert!(timechart.contains("uniqExactIf(src_ip, toString(src_ip) != '')"), "got: {timechart}");
     assert!(!timechart.contains("uniqCombined64"), "got: {timechart}");
 
     // NAN-1642: grouped eventstats is a map attach, not a window (see
@@ -1278,7 +1278,7 @@ fn dc_emission_stays_uniq_exact_everywhere() {
     // this test is about, so assert the aggregate and let the shape be pinned
     // there rather than duplicating a brittle window expectation here.
     let eventstats = npl("* | eventstats dc(src_ip) by source_type");
-    assert!(eventstats.contains("uniqExact(src_ip)"), "got: {eventstats}");
+    assert!(eventstats.contains("uniqExactIf(src_ip, toString(src_ip) != '')"), "got: {eventstats}");
     assert!(!eventstats.contains("uniqCombined64"), "dc must stay exact; got: {eventstats}");
     // The dc arm is emitted separately from estdc, so the estdc test cannot
     // protect it: a dc-only regression to `uniqExact(src_ip) OVER (PARTITION
@@ -1294,7 +1294,7 @@ fn dc_emission_stays_uniq_exact_everywhere() {
     );
 
     let streamstats = npl("* | streamstats dc(src_ip) by source_type");
-    assert!(streamstats.contains("uniqExact(src_ip) OVER ("), "got: {streamstats}");
+    assert!(streamstats.contains("uniqExactIf(src_ip, toString(src_ip) != '') OVER ("), "got: {streamstats}");
 }
 
 // ============================================================================
@@ -1411,7 +1411,7 @@ fn eventstats_snapshot_carries_every_aggregate_slot() {
     );
     for fragment in [
         "toFloat64(count())",
-        "toFloat64(uniqExact(src_ip))",
+        "toFloat64(uniqExactIf(src_ip, toString(src_ip) != ''))",
         "toFloat64(avg(bytes_out))",
         "argMin(\"user\", (timestamp, toString(\"user\")))",
     ] {
@@ -1528,8 +1528,8 @@ fn eventstats_window_fallback_keeps_every_aggregate_and_alias() {
     );
     for fragment in [
         "toFloat64(count() OVER (PARTITION BY dest_ip)) AS c",
-        "toFloat64(uniqExact(src_ip) OVER (PARTITION BY dest_ip)) AS d",
-        "toFloat64(uniqCombined64(src_ip) OVER (PARTITION BY dest_ip)) AS e",
+        "toFloat64(uniqExactIf(src_ip, toString(src_ip) != '') OVER (PARTITION BY dest_ip)) AS d",
+        "toFloat64(uniqCombined64If(src_ip, toString(src_ip) != '') OVER (PARTITION BY dest_ip)) AS e",
         "toFloat64(sum(bytes_out) OVER (PARTITION BY dest_ip)) AS s",
         "toFloat64(stddevPop(bytes_out) OVER (PARTITION BY dest_ip)) AS sd",
         "toFloat64(max(bytes_out) OVER (PARTITION BY dest_ip) - \

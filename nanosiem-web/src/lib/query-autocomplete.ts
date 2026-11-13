@@ -72,6 +72,8 @@ export interface AutocompleteDataSource {
   getLegacyUdmFields(): Promise<UdmFieldInfo[]>;
   /** `/api/me/field-usage` — the caller's recent + workspace-popular fields. Optional. */
   getFieldUsage?(): Promise<FieldUsage | null>;
+  /** Bare spill keys seen in recent data (the OCSF `unmapped` column). Optional. */
+  getSpillFieldNames?(): Promise<string[]>;
 }
 
 const defaultDataSource: AutocompleteDataSource = {
@@ -89,7 +91,39 @@ const defaultDataSource: AutocompleteDataSource = {
       .then((data) => (data ? normalizeFieldUsage(data) : null))
       .catch(() => null);
   },
+  getSpillFieldNames: () => api.getExtFieldNames().catch(() => [] as string[]),
 };
+
+/**
+ * NAN-5326: category labels arrive lowercase from `/api/schema/fields`
+ * (`network`) and capitalised from the curated/UDM lists (`Network`), so the
+ * dropdown showed both spellings. Display one form.
+ */
+function displayCategory(category: string | undefined): string | undefined {
+  if (!category) return category;
+  return category.charAt(0).toUpperCase() + category.slice(1);
+}
+
+/** Namespaced `unmapped.<key>` entries for the OCSF spill (bare keys from the API). */
+async function fetchUnmappedFields(): Promise<UdmFieldInfo[]> {
+  if (!dataSource.getSpillFieldNames) return [];
+  let names: string[] = [];
+  try {
+    names = await dataSource.getSpillFieldNames();
+  } catch {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: UdmFieldInfo[] = [];
+  for (const raw of names) {
+    if (typeof raw !== 'string' || !raw) continue;
+    const name = raw.startsWith('unmapped.') ? raw : `unmapped.${raw}`;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push({ name, column_name: name, data_type: 'String', category: 'Unmapped', description: '' });
+  }
+  return out;
+}
 
 function normalizeFieldUsage(data: unknown): FieldUsage | null {
   if (!data || typeof data !== 'object') return null;
@@ -258,6 +292,15 @@ async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
           description: 'Log source (routing key)',
         });
       }
+      // NAN-5326: `unmapped.` completed to nothing although the fields panel
+      // lists the spill keys. The spill inventory is a data scan, so it never
+      // blocks suggestions: it is merged into the cached universe when it lands.
+      void fetchUnmappedFields().then((extra) => {
+        const known = new Set(fields.map((f) => f.name));
+        for (const f of extra) {
+          if (!known.has(f.name)) fields.push(f);
+        }
+      });
       return fields;
     })
     .catch(() => fetchLegacyUdmFields())
@@ -285,7 +328,7 @@ async function rankedFieldOptions(
 ): Promise<AutocompleteOption[]> {
   const universe = new Map<string, RankableField>();
   for (const f of udmFields) {
-    universe.set(f.name, { value: f.name, description: f.description || undefined, category: f.category });
+    universe.set(f.name, { value: f.name, description: f.description || undefined, category: displayCategory(f.category) });
   }
   for (const name of availableFields) {
     if (!universe.has(name)) universe.set(name, { value: name });

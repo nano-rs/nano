@@ -39,6 +39,7 @@ import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
 import { QueryEditor } from '@/components/editor';
 import { isClickHouseDefault } from '@/lib/utils';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { eventDetailEntries } from '@/components/search/event-row-line';
 import { SEMANTIC_FIELDS, type SemanticField } from '@/lib/schema-fields';
 // Reuse the Matches extractors so rows + detail pane pick the same canonical
 // fields (action / entity / src_ip / region / timestamp) as `/rules/:id/matches`.
@@ -924,16 +925,26 @@ function EventDetail({ event }: { event: Record<string, unknown> }) {
   const entity = extractEntity([event]);
   const ip = extractIp(event);
   const region = extractRegion(event);
+  // NAN-5326: label each summary value with the active profile's column, not
+  // the UDM names (`event_type`, `user`) that read as fields under OCSF.
+  const entityLabel = (() => {
+    if (entity.type === 'user') return fieldMap.field('user');
+    if (entity.type === 'host') return fieldMap.field('host');
+    if (entity.type === 'ip') return fieldMap.field('srcIp');
+    return entity.type === 'other' ? 'entity' : entity.type;
+  })();
   const canonical: Array<[string, string | undefined]> = [
     ['timestamp', time?.toISOString()],
-    ['event_type', action],
-    [entity.type === 'other' ? 'entity' : entity.type, entity.label !== 'unknown' ? entity.label : undefined],
+    [fieldMap.isOcsf ? 'activity_name' : 'event_type', action],
+    [entityLabel, entity.label !== 'unknown' ? entity.label : undefined],
     [fieldMap.field('srcIp'), ip],
     ['region', region],
   ].filter((pair): pair is [string, string] => typeof pair[1] === 'string' && pair[1].length > 0);
 
-  // Split keys into "top" vs "nested" for a readable layout.
-  const entries = Object.entries(event).sort(([a], [b]) => a.localeCompare(b));
+  // Split keys into "top" vs "nested" for a readable layout. Drop ClickHouse
+  // defaults (zero ports, prevalence sentinels) and internal helper columns
+  // (`*_unified`) with the same rules as the search Event Inspector.
+  const entries = eventDetailEntries(event, fieldMap.isOcsf);
   const flat = entries.filter(([, v]) => typeof v !== 'object' || v === null);
   const nested = entries.filter(([, v]) => typeof v === 'object' && v !== null);
 
@@ -944,7 +955,7 @@ function EventDetail({ event }: { event: Record<string, unknown> }) {
           <div className="flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-[0.12em] text-[var(--primary)]">
             <Check className="w-3 h-3" strokeWidth={1.75} />
             Match fields
-            <span className="ml-auto normal-case tracking-normal text-muted-foreground/70">canonical</span>
+            <span className="ml-auto normal-case tracking-normal text-muted-foreground/70">summary</span>
           </div>
           <dl
             className="space-y-1 font-mono text-[11px] p-2 rounded border"

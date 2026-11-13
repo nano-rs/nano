@@ -52,6 +52,7 @@ import {
   folderKind,
   normalizeSeverity,
   type FolderKind,
+  type DisplayModeKey,
 } from './helpers';
 import { FolderIconPicker } from './FolderIconPicker';
 import { DEFAULT_FOLDER_ICON_SLUG, iconForSlug } from './folder-icons';
@@ -126,7 +127,7 @@ function FolderIcon({ kind, slug }: { kind: FolderKind; slug?: string }) {
 type RuleRowProps = {
   name: string;
   severity: string;
-  modeKey: 'live' | 'staging' | 'paused' | 'unsaved';
+  modeKey: DisplayModeKey | 'unsaved';
   focused: boolean;
   onClick: () => void;
   onDragStart?: (e: React.DragEvent<HTMLButtonElement>) => void;

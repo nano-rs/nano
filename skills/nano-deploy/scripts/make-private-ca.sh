@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Create a private CA and ONE server certificate for nano role-split private
-# transport (ClickHouse, Keeper, app-internal). Use only when the operator has
-# no PKI of their own. Run it on the operator's workstation.
+# Create a private CA and ONE server certificate. Use only when the operator has
+# no PKI of their own. Run it on the operator's workstation. Two uses:
 #
+# 1. Role-split private transport (ClickHouse, Keeper, app-internal):
 #   make-private-ca.sh --out ./nano-pki --server-name nano-private.example.com \
 #       --ip 10.20.0.11 --ip 10.20.0.12 --ip 10.20.0.13 [--dns extra.name] [--days 825]
 #
+# 2. Evaluation without public DNS (Helm on GKE/EKS, or a single node): one
+#    certificate for the app and ingest host names, uploaded to Certificate
+#    Manager / imported into ACM, or used as the TLS secret:
+#   make-private-ca.sh --out ./nano-eval-pki --server-name nano.example.com \
+#       --dns ingest.nano.example.com
+#
+# At least one --ip or --dns is required (the server name is always a SAN).
 # The certificate is used as both server and client certificate (Keeper requires
 # a private-CA client certificate), so it carries serverAuth + clientAuth and a
 # SAN for the server name and every inventory address.
 #
 # Output (directory mode 0700): ca.key (0600, keep OFFLINE, never copy to hosts),
 # ca.crt, server.key (0600), server.crt. Copy only ca.crt, server.crt and
-# server.key to each host (see references/multi-node-ha.md). Prints no key material.
+# server.key to each host (see references/multi-node-ha.md), or upload only
+# server.crt and server.key (plus ca.crt as the chain for ACM) to the cloud
+# (cloud-gcp.md, cloud-aws.md). Prints no key material.
 set -euo pipefail
 umask 077
 out="" name="" days=825 sans=()
@@ -27,7 +36,7 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-[[ -n "$out" && -n "$name" && ${#sans[@]} -gt 0 ]] || { sed -n '2,18p' "$0"; exit 2; }
+[[ -n "$out" && -n "$name" && ${#sans[@]} -gt 0 ]] || { sed -n '2,25p' "$0"; exit 2; }
 if [[ -e "$out/server.key" || -e "$out/ca.key" ]]; then
     echo "$out already holds keys; refusing to overwrite (move it aside deliberately to re-issue)" >&2
     exit 3

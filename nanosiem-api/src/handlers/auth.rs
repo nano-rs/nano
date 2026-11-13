@@ -871,6 +871,16 @@ pub struct CurrentUserResponse {
     pub is_api_key: bool,
     pub preferred_query_mode: Option<String>,
     pub landing_page: Option<String>,
+    /// NAN-5328: true when the caller's data scope hides some sources from
+    /// live data (per-source RBAC, or the `audit` source without
+    /// `audit:view`). Lets an empty search say rows may be hidden by scope.
+    /// Only a boolean: the denied source names are not disclosed.
+    pub data_scope_restricted: bool,
+}
+
+/// NAN-5328: whether the caller's effective live-data scope denies any source.
+pub(crate) fn data_scope_restricted(auth: &AuthContext) -> bool {
+    auth.effective_viewer_scope().is_restricted()
 }
 
 /// Get current authenticated user
@@ -908,6 +918,7 @@ pub async fn get_current_user(
             is_api_key: true,
             preferred_query_mode: None,
             landing_page: None,
+            data_scope_restricted: data_scope_restricted(&auth),
         }));
     }
 
@@ -938,6 +949,7 @@ pub async fn get_current_user(
         is_api_key: false,
         preferred_query_mode,
         landing_page,
+        data_scope_restricted: data_scope_restricted(&auth),
     }))
 }
 
@@ -1056,6 +1068,11 @@ pub struct AuthApiDoc;
 #[cfg(test)]
 #[path = "auth_refresh_audit_tests.rs"]
 mod refresh_audit_tests;
+
+// NAN-5328: `/api/auth/me` data-scope flag.
+#[cfg(test)]
+#[path = "auth_me_scope_tests.rs"]
+mod me_scope_tests;
 
 #[cfg(test)]
 mod tests {

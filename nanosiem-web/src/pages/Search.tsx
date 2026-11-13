@@ -4936,6 +4936,11 @@ export function Search() {
                   );
                 })()}
               </>
+            ) : !showLimitWarning ? (
+              // NAN-5327: the drawer stays mounted (collapsed) when idle, so
+              // don't render limit copy like "1+ hits — consider narrowing"
+              // into the DOM / accessibility tree unless the limit was hit.
+              null
             ) : isAggregateQuery ? (
               <span className="text-sm text-muted-foreground">
                 <span className="text-amber-400 font-medium">{peakRowsScanned.toLocaleString()}+ rows scanned</span>
@@ -5053,6 +5058,7 @@ export function Search() {
           assetContext={assetContext}
           timeWindow="24h"
           resultCount={displayTotalCount}
+          isAggregate={isAggregateQuery}
           query={executedQuery}
           timeRange={apiTimeRange}
           plotRange={timelinePlotRange}
@@ -5160,6 +5166,7 @@ export function Search() {
                     isAggregateQuery={isAggregateQuery}
                     displayType={displayType}
                     histogramHasData={histogramData?.some((b) => b.count > 0) ?? false}
+                    dataScopeRestricted={user?.data_scope_restricted === true}
                     query={query}
                     executedQuery={executedQuery}
                     onAddToQuery={addToQuery}

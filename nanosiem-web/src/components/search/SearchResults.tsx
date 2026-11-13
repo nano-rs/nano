@@ -106,7 +106,7 @@ function getDetailViewMode(): DetailViewMode {
 // can't drift (the inline copy previously never expanded the OCSF `unmapped`
 // spill — that's exactly what sharing prevents).
 
-import { extractKeywordsFromQuery, highlightText } from './keyword-highlight';
+import { extractHighlightTerms, highlightEventRowLine, highlightText, keywordsForField, EMPTY_HIGHLIGHT_TERMS, type HighlightTerms } from './keyword-highlight';
 import { buildEventRowLine } from './event-row-line';
 
 interface SearchResult {
@@ -141,6 +141,8 @@ interface SearchResultsProps {
   /** Display type from backend for visualization routing */
   displayType?: DisplayType;
   histogramHasData?: boolean;
+  /** NAN-5328: the viewer's data scope hides some sources (empty-state note). */
+  dataScopeRestricted?: boolean;
   query?: string;
   executedQuery?: string; // The query that was actually executed (for highlighting)
   onAddToQuery: (field: string, value: string, exclude: boolean) => void;
@@ -891,6 +893,7 @@ export function SearchResults({
   isAggregateQuery,
   displayType,
   histogramHasData,
+  dataScopeRestricted = false,
   query,
   executedQuery,
   onAddToQuery,
@@ -925,6 +928,8 @@ export function SearchResults({
   fieldsCount,
   onExpandFields,
 }: SearchResultsProps) {
+  // NAN-5328: free-text terms vs field-scoped terms, parsed once per query.
+  const highlightTerms = React.useMemo(() => extractHighlightTerms(executedQuery), [executedQuery]);
   // Determine effective display type - prefer backend hint, fall back to isAggregateQuery
   const effectiveDisplayType: DisplayType = displayType ?? (isAggregateQuery ? 'table' : 'events');
 
@@ -1421,6 +1426,7 @@ export function SearchResults({
               isAggregateQuery={isAggregateQuery}
               histogramHasData={histogramHasData}
               query={query}
+              scopeRestricted={dataScopeRestricted}
             />
           ) : (
             <Suspense fallback={<div className="flex items-center justify-center py-12"><LoadingIcon className="w-5 h-5 text-muted-foreground" /></div>}>
@@ -1650,7 +1656,7 @@ export function SearchResults({
               onSetQuery={onSetQuery}
               query={query}
               hiddenEnrichments={hiddenEnrichments}
-              highlightKeywords={extractKeywordsFromQuery(executedQuery)}
+              highlightTerms={highlightTerms}
               notebookActive={notebookActive}
               onAddToNotebook={onAddToNotebook}
               totalCount={totalCount}
@@ -1682,7 +1688,7 @@ export function SearchResults({
         onAddToQuery={onAddToQuery}
         onSetQuery={onSetQuery}
         query={query}
-        highlightKeywords={extractKeywordsFromQuery(executedQuery)}
+        highlightTerms={highlightTerms}
         notebookActive={notebookActive}
         onAddToNotebook={onAddToNotebook}
         hiddenEnrichments={hiddenEnrichments}
@@ -1700,9 +1706,14 @@ interface EmptyStateProps {
   isAggregateQuery?: boolean;
   histogramHasData?: boolean;
   query?: string;
+  scopeRestricted?: boolean;
 }
 
-function EmptyState({ hasSearched, isAggregateQuery, histogramHasData, query }: EmptyStateProps) {
+// NAN-5328: a role whose data scope hides sources (per-source RBAC, or the
+// audit source without audit:view) gets an empty result for events it cannot
+// see. `scopeRestricted` makes the empty state say so instead of only
+// suggesting a wider time range.
+export function EmptyState({ hasSearched, isAggregateQuery, histogramHasData, query, scopeRestricted }: EmptyStateProps) {
   // Detect if query has a threshold (where clause with comparison)
   const hasThreshold = query?.toLowerCase().includes('| where') &&
     (query.includes('>') || query.includes('<') || query.includes('>=') || query.includes('<='));
@@ -1743,6 +1754,11 @@ function EmptyState({ hasSearched, isAggregateQuery, histogramHasData, query }: 
             <SearchIcon className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
             <p className="text-foreground text-base font-medium">No results found</p>
             <p className="text-muted-foreground text-sm mt-2">Try adjusting your query or expanding the time range</p>
+            {scopeRestricted && (
+              <p className="text-muted-foreground text-xs mt-1" data-testid="empty-scope-note">
+                Your role&apos;s data scope hides some sources, so matching events may not be visible to you.
+              </p>
+            )}
           </>
         )
       ) : (
@@ -1793,7 +1809,7 @@ function RawView({
   onSetQuery,
   query,
   hiddenEnrichments: _hiddenEnrichments = new Set(),
-  highlightKeywords = [],
+  highlightTerms = EMPTY_HIGHLIGHT_TERMS,
   notebookActive,
   onAddToNotebook,
   totalCount,
@@ -1811,7 +1827,7 @@ function RawView({
   onAddToQuery: (field: string, value: string, exclude: boolean) => void;
   onSetQuery?: (query: string) => void;
   query?: string;
-  highlightKeywords?: string[];
+  highlightTerms?: HighlightTerms;
   hiddenEnrichments?: Set<string>;
   notebookActive?: boolean;
   onAddToNotebook?: (entityType: string, value: string) => void;
@@ -2118,7 +2134,7 @@ function RawView({
                 {(() => {
                   // Every source renders the same JSON line; `message` is a
                   // normal key inside it, never promoted to the row (NAN-3010).
-                  const displayValue = buildEventRowLine(displayFields);
+                  const displayValue = buildEventRowLine(displayFields, false, schemaFields?.schema === 'ocsf');
                   if (!displayValue) return null;
                   const isMessageExpanded = expandedMessages.has(result.id);
                   const isLongMessage = displayValue.length > 500;
@@ -2126,10 +2142,12 @@ function RawView({
                   const messageDisplayValue = shouldTruncate
                     ? displayValue.substring(0, 500)
                     : displayValue;
+                  const hasTerms = highlightTerms.free.length > 0 || highlightTerms.scoped.length > 0;
                   return (
                     <div data-row-text className="text-foreground font-mono text-[12px] leading-[1.55] break-words whitespace-pre-wrap cursor-text select-text">
-                      {highlightKeywords.length > 0
-                        ? highlightText(messageDisplayValue, highlightKeywords)
+                      {/* NAN-5328: keys are never marked; a field=value term marks only its own field's value. */}
+                      {hasTerms
+                        ? highlightEventRowLine(displayFields, highlightTerms, shouldTruncate ? 500 : Infinity, schemaFields?.schema === 'ocsf')
                         : messageDisplayValue}
                       {isLongMessage && (
                         <button
@@ -2202,6 +2220,7 @@ function RawView({
                   }
                   // Same grouped categories / colors / tooltips as the Event Inspector.
                   const categories = buildFieldCategories(flattenedFields, knownSchemaFields, isOcsf);
+                  const presentKeys = new Set(flattenedFields.map(([fk]) => fk));
                   return (
                     <div data-row-text className="mt-3 pt-3 border-t border-border/30 -mx-3 px-3 md:mx-0 md:px-0 cursor-auto">
                       {isLoadingFullData && !fullData ? (
@@ -2281,7 +2300,7 @@ function RawView({
                                           onAddToQuery={onAddToQuery}
                                           onSetQuery={onSetQuery}
                                           query={query}
-                                          highlightKeywords={highlightKeywords}
+                                          highlightKeywords={keywordsForField(highlightTerms, k, presentKeys)}
                                           className="text-str"
                                           notebookActive={notebookActive}
                                           onAddToNotebook={onAddToNotebook}

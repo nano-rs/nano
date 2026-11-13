@@ -5,12 +5,13 @@
  *
  * Net-new UI that replaces the old Search Hub drawer. Mirrors
  * `design-ref/shadcn/saved-queries.jsx` — a command-palette-style modal
- * with a left sidebar of smart groups + sourcetypes and a main area for
+ * with a left sidebar of smart groups + log sources and a main area for
  * the query list. Keyboard-navigable (↑↓/↵/esc).
  *
  * Data model note: mockup's `folder`, `pinned`, and `freq` fields don't
  * exist on our `SavedSearch` yet. We:
- *   - infer `sourcetype` by regex-scanning the query (fallback "other")
+ *   - infer the log source (`metadata.log_source`) by regex-scanning the
+ *     query (fallback "other")
  *   - track `pinned` in localStorage per-user (lightweight until backend
  *     gets a real pinned flag)
  *   - skip `folder` and `freq` in the UI for now
@@ -19,6 +20,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { X, Search, Bookmark, User, Users, Clock, Play, Edit3, Share2, CalendarClock } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { SavedSearch, SavedSearchTimeRange } from '@/lib/api';
+import { extractLogSource } from './saved-query-log-source';
 
 interface SavedQueriesPaletteProps {
   open: boolean;
@@ -54,10 +56,6 @@ function savePinned(set: Set<string>) {
   } catch { /* ignore */ }
 }
 
-function extractSourcetype(query: string): string {
-  const m = query.match(/\b(?:sourcetype|source_type)\s*=\s*["']?([a-zA-Z0-9_.-]+)/i);
-  return m ? m[1] : 'other';
-}
 
 function formatRelative(iso: string): string {
   const then = new Date(iso).getTime();
@@ -81,7 +79,7 @@ interface EnrichedQuery {
   query: string;
   queryMode: 'piped' | 'sql';
   timeRange?: SavedSearchTimeRange;
-  sourcetype: string;
+  logSource: string;
   updatedAt: string;
   last: string;
   isMine: boolean;
@@ -100,7 +98,7 @@ function enrich(
     query: s.query,
     queryMode: s.query_mode,
     timeRange: s.time_range,
-    sourcetype: extractSourcetype(s.query),
+    logSource: extractLogSource(s.query),
     updatedAt: s.updated_at,
     last: formatRelative(s.updated_at),
     isMine: currentUserId ? s.user_id === currentUserId : true,
@@ -249,7 +247,7 @@ function QueryRow({
           {item.last}
         </span>
         <span className="w-0.5 h-0.5 rounded-full bg-muted-foreground/40" />
-        <span className="text-muted-foreground/80">{item.sourcetype}</span>
+        <span className="text-muted-foreground/80">{item.logSource}</span>
         {item.shared && (
           <>
             <span className="w-0.5 h-0.5 rounded-full bg-muted-foreground/40" />
@@ -291,15 +289,15 @@ export function SavedQueriesPalette({
 
   // Compute counts for sidebar badges
   const counts = useMemo(() => {
-    const sourcetypeMap = new Map<string, number>();
-    for (const q of all) sourcetypeMap.set(q.sourcetype, (sourcetypeMap.get(q.sourcetype) ?? 0) + 1);
+    const logSourceMap = new Map<string, number>();
+    for (const q of all) logSourceMap.set(q.logSource, (logSourceMap.get(q.logSource) ?? 0) + 1);
     return {
       all: all.length,
       pinned: all.filter(q => q.pinned).length,
       mine: all.filter(q => q.isMine).length,
       shared: all.filter(q => q.shared).length,
       recent: Math.min(5, all.length),
-      sourcetype: Array.from(sourcetypeMap.entries())
+      logSource: Array.from(logSourceMap.entries())
         .sort((a, b) => b[1] - a[1])
         .slice(0, 12)
         .map(([label, count]) => ({ id: label, label, count })),
@@ -316,14 +314,14 @@ export function SavedQueriesPalette({
       items = [...items].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()).slice(0, 5);
     } else if (scope.startsWith('type:')) {
       const st = scope.slice(5);
-      items = items.filter(q => q.sourcetype === st);
+      items = items.filter(q => q.logSource === st);
     }
     const f = filter.trim().toLowerCase();
     if (f) {
       items = items.filter(q =>
         q.name.toLowerCase().includes(f) ||
         q.query.toLowerCase().includes(f) ||
-        q.sourcetype.toLowerCase().includes(f)
+        q.logSource.toLowerCase().includes(f)
       );
     }
     return items;
@@ -407,10 +405,10 @@ export function SavedQueriesPalette({
             <SidebarItem active={scope === 'mine'} label="Mine" count={counts.mine} icon={<User className="w-3 h-3" />} onClick={() => setScope('mine')} />
             <SidebarItem active={scope === 'shared'} label="Shared with team" count={counts.shared} icon={<Users className="w-3 h-3" />} onClick={() => setScope('shared')} />
             <SidebarItem active={scope === 'recent'} label="Recently run" count={counts.recent} icon={<Clock className="w-3 h-3" />} onClick={() => setScope('recent')} />
-            {counts.sourcetype.length > 0 && (
+            {counts.logSource.length > 0 && (
               <>
-                <SectionLabel>Sourcetype</SectionLabel>
-                {counts.sourcetype.map(t => (
+                <SectionLabel>Log source</SectionLabel>
+                {counts.logSource.map(t => (
                   <SidebarItem
                     key={t.id}
                     active={scope === `type:${t.id}`}
@@ -434,7 +432,7 @@ export function SavedQueriesPalette({
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               onKeyDown={onInputKey}
-              placeholder="Search saved queries by name, syntax, or sourcetype…"
+              placeholder="Search saved queries by name, syntax, or log source…"
               className="w-full h-12 pl-10 pr-20 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground/70"
             />
             <div className="absolute right-3.5 top-1/2 -translate-y-1/2 font-mono text-[10px] text-muted-foreground flex items-center gap-1.5">
@@ -497,7 +495,7 @@ export function SavedQueriesPalette({
             </div>
             {selected && (
               <span className="text-muted-foreground/70">
-                {selected.sourcetype} · {selected.queryMode}
+                {selected.logSource} · {selected.queryMode}
               </span>
             )}
           </div>

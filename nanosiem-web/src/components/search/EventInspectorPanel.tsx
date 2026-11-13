@@ -19,6 +19,7 @@ import {
   splitFieldKey,
 } from './event-flatten';
 import { resolveRawView } from './event-raw-text';
+import { keywordsForField, type HighlightTerms } from './keyword-highlight';
 
 // ============================================================================
 // Types
@@ -54,6 +55,8 @@ export interface EventInspectorPanelProps {
   onSetQuery?: (query: string) => void;
   query?: string;
   highlightKeywords?: string[];
+  /** NAN-5328: field-scoped terms; when set, a `field=value` term highlights only in its field. */
+  highlightTerms?: HighlightTerms;
   notebookActive?: boolean;
   onAddToNotebook?: (entityType: string, value: string) => void;
   hiddenEnrichments?: Set<string>;
@@ -122,6 +125,7 @@ export function EventInspectorPanel({
   onSetQuery,
   query,
   highlightKeywords = [],
+  highlightTerms,
   notebookActive,
   onAddToNotebook,
   hiddenEnrichments = new Set(),
@@ -200,6 +204,9 @@ export function EventInspectorPanel({
   if (hiddenEnrichments.size > 0) {
     flattenedFields = flattenedFields.filter(([k]) => !isFieldHidden(k, hiddenEnrichments));
   }
+  const presentKeys = new Set(flattenedFields.map(([k]) => k));
+  const fieldKeywords = (k: string): string[] =>
+    highlightTerms ? keywordsForField(highlightTerms, k, presentKeys) : highlightKeywords;
 
   // Reset expanded values when event changes
   useEffect(() => {
@@ -528,7 +535,7 @@ export function EventInspectorPanel({
                               onAddToQuery={onAddToQuery}
                               onSetQuery={onSetQuery}
                               query={query}
-                              highlightKeywords={highlightKeywords}
+                              highlightKeywords={fieldKeywords(k)}
                               className="text-str"
                               notebookActive={notebookActive}
                               onAddToNotebook={onAddToNotebook}

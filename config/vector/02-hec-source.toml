@@ -147,6 +147,8 @@ if nano_credential_id != "" {
 # forwarder can clobber routing-critical fields (.source_type, .namespace,
 # .auth_status, etc.) and bypass per-parser HEC filters that fire on
 # source_type. NAN-938.
+# NAN-5340: set when `.message` below already carries the whole event as JSON.
+hec_message_is_payload = false
 if exists(.event) {
     if is_object(.event) {
         reserved = ["source_type", "namespace", "auth_status", "timestamp",
@@ -166,11 +168,13 @@ if exists(.event) {
             .message = to_string!(.event.message)
         } else {
             .message = encode_json(.event)
+            hec_message_is_payload = true
         }
     } else if is_string(.event) {
         .message = to_string!(.event)
     } else {
         .message = encode_json(.event)
+        hec_message_is_payload = true
     }
     del(.event)
 }
@@ -181,25 +185,39 @@ if exists(.event) {
 # `.message`, so rebuild the payload from the root minus the HEC envelope and
 # pipeline fields. VRL objects are key-sorted, so the JSON is deterministic. A
 # non-string `.message` (an object or number) is serialized the same way.
-if !exists(.message) || .message == null || .message == "" {
-    hec_envelope_keys = ["message", "auth_status", "source_type", "claimed_source_type",
-                         "sourcetype", "splunk_sourcetype", "splunk_source", "splunk_index",
-                         "splunk_channel", "host",
-                         "timestamp", "metadata", "content_format", "routing_timestamp",
-                         "ingest_time", "_inserted_at"]
-    hec_payload = {}
-    for_each(object!(.)) -> |key, value| {
-        if !includes(hec_envelope_keys, key) && value != null {
-            hec_payload = set!(hec_payload, [key], value)
-        }
+hec_envelope_keys = ["message", "auth_status", "source_type", "claimed_source_type",
+                     "sourcetype", "splunk_sourcetype", "splunk_source", "splunk_index",
+                     "splunk_channel", "host",
+                     "timestamp", "metadata", "content_format", "routing_timestamp",
+                     "ingest_time", "_inserted_at"]
+hec_payload = {}
+for_each(object!(.)) -> |key, value| {
+    if !includes(hec_envelope_keys, key) && value != null {
+        hec_payload = set!(hec_payload, [key], value)
     }
+}
+# NAN-5340: an object event WITH a `message` keeps `.message` (a text parser
+# reads its log line there) and its other keys sit beside it on the root,
+# where a root-replacing parser loses them. Keep the whole object in event
+# METADATA (a sender cannot set it): a JSON-input parser's generated
+# `_hec_payload` step hands it the object as its payload (as HTTP /ingest
+# does); for a text parser, `_ocsf_prepare` / `_output` merge the other keys
+# into `unmapped` / `ext` without replacing what the parser set.
+del(%nano_hec_event)
+if !exists(.message) || .message == null || .message == "" {
     if length(hec_payload) > 0 {
         .message = encode_json(hec_payload)
     } else {
         .message = ""
     }
-} else if !is_string(.message) {
-    .message = encode_json(.message)
+} else {
+    if length(hec_payload) > 0 && !hec_message_is_payload {
+        hec_payload.message = .message
+        %nano_hec_event = hec_payload
+    }
+    if !is_string(.message) {
+        .message = encode_json(.message)
+    }
 }
 
 .content_format = "splunk_hec"

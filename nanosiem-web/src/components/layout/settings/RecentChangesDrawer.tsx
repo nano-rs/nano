@@ -151,7 +151,7 @@ export function RecentChangesDrawer({ open, onClose }: RecentChangesDrawerProps)
                     {relativeAge(ev.timestamp)}
                   </span>
                   <span className="font-mono text-[10.5px] text-foreground/80 truncate">
-                    {ev.api_key_name || ev.api_key_id ? auditActorLabel(ev) : ev.user_name || (ev.user_id ? ev.user_id.slice(0, 8) : 'system')}
+                    {ev.api_key_name || ev.api_key_id ? auditActorLabel(ev) : ev.user_name || (ev.user_id ? ev.user_id.replace(/^user_/, '').slice(0, 8) : 'system')}
                   </span>
                   <span className="text-[10.5px] text-muted-foreground shrink-0">
                     {ev.action || ''}

@@ -30,6 +30,8 @@
 #                          --all-local also removes other worktrees' local stacks
 #   scripts/e2e.sh svc     <restart|stop|start|kill> <api|search|jobs|vector> [--run <id>]
 #   scripts/e2e.sh status  [--run <id>]
+#   scripts/e2e.sh license-ids [--run <id>]      installation_id + organization_id of a
+#                                                kept enterprise stack (to issue a C05 trial)
 #   scripts/e2e.sh selftest                      harness safety selftests (no stack, no cloud)
 #
 # Suites are the files/dirs under e2e/tests: `base` = e2e/tests/test_base.py,
@@ -40,6 +42,13 @@
 # credentials come from `doppler run -p nano-e2e -c dev` when available, else
 # ~/.nan2361-secrets/e2e.env (must be 0600), and are only ever placed in the
 # environment of the pytest process.
+#
+# Offline C05 license (enterprise, NAN-5331; see e2e/README.md):
+#   NANO_E2E_INSTALLATION_ID + NANO_E2E_INSTALLATION_ORG_ID  pin the installation
+#       identity every new stack gets (seeded after the migrator, before the app)
+#   NANO_E2E_C05_LICENSE_FILE  a 0600 license file outside the repo, imported as
+#       admin once the stack is healthy; `up` fails unless the license is active.
+#       Its contents are never printed, logged or copied.
 set -euo pipefail
 if (( BASH_VERSINFO[0] < 4 )); then
     echo "e2e.sh needs bash >= 4 (macOS: brew install bash, then put it first in PATH)" >&2
@@ -701,6 +710,63 @@ docker_build() {
     done
 }
 
+# ---------------------------------------------------------------- C05 license (NAN-5331)
+# The logic lives in e2e/nano_e2e/c05_license.py (stdlib only, system python3).
+license_py() { (cd "$PY_DIR" && python3 -m nano_e2e.c05_license "$@"); }
+
+# Validate the NANO_E2E_* license env before anything is created.
+license_env_check() {
+    if [[ -z "${NANO_E2E_INSTALLATION_ID:-}${NANO_E2E_INSTALLATION_ORG_ID:-}${NANO_E2E_C05_LICENSE_FILE:-}" ]]; then
+        return 0
+    fi
+    license_py check-env --repo-root "$ROOT" || die "invalid C05 license environment (see e2e/README.md)"
+    if [[ "$EDITION" != enterprise ]]; then
+        warn "NANO_E2E_INSTALLATION_*/NANO_E2E_C05_LICENSE_FILE ignored: --edition $EDITION has no C05 license"
+    fi
+}
+
+# Replace the identity the enterprise overlay migration generated with the
+# pinned one. Runs after the migrator and before any app process starts, so
+# no license, ledger row or ClickHouse witness exists yet; the SQL refuses
+# anyway once license state exists, and is a no-op for the same identity.
+seed_installation_identity() {
+    [[ -n "${NANO_E2E_INSTALLATION_ID:-}" ]] || return 0
+    [[ "$EDITION" == enterprise ]] || return 0
+    local out
+    out="$(license_py seed-sql | dc exec -T postgres psql -X -qAt -U nanosiem -d nanosiem \
+        -v "iid=$NANO_E2E_INSTALLATION_ID" -v "oid=$NANO_E2E_INSTALLATION_ORG_ID")" \
+        || die "seeding the installation identity failed"
+    license_py check-seeded <<<"$out" || die "installation identity not pinned"
+    ok "installation identity pinned: $NANO_E2E_INSTALLATION_ID (org $NANO_E2E_INSTALLATION_ORG_ID)"
+}
+
+# Import NANO_E2E_C05_LICENSE_FILE as the bootstrapped admin; fail unless the
+# license is then active. Never prints the file.
+import_c05_license() {
+    [[ -n "${NANO_E2E_C05_LICENSE_FILE:-}" ]] || return 0
+    [[ "$EDITION" == enterprise ]] || return 0
+    if (( DEFER_ADMIN )); then
+        # No admin yet: the deferred first-run setup (nano_e2e.firstrun)
+        # imports it once the scenarios have created the admin.
+        ok "C05 license import deferred to first-run setup (--defer-admin)"
+        return 0
+    fi
+    E2E_API_URL="http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_API_PORT)" \
+    E2E_ADMIN_ENV="$RUN_DIR/admin.env" \
+        license_py import --repo-root "$ROOT" || die "C05 license import failed (file contents not shown)"
+    ok "C05 license imported and active"
+}
+
+cmd_license_ids() {
+    resolve_run
+    [[ "$(env_get "$RUN_DIR/run.env" E2E_EDITION)" == enterprise ]] \
+        || die "run $RUN_ID is not an enterprise stack (no installation identity)"
+    local out
+    out="$(license_py ids-sql | dc exec -T postgres psql -X -qAt -U nanosiem -d nanosiem)" \
+        || die "could not read the installation identity (is run $RUN_ID up?)"
+    license_py parse-ids <<<"$out" || die "could not read the installation identity"
+}
+
 # ---------------------------------------------------------------- up
 cmd_up() {
     command -v docker >/dev/null || die "docker not found"
@@ -710,6 +776,7 @@ cmd_up() {
     RUN_DIR="$E2E_HOME/$RUN_ID"; PROJECT="nanoe2e-$RUN_ID"
     [[ "$PROJECT" != nanoch* ]] || die "refusing project name $PROJECT"
     [[ ! -e "$RUN_DIR" ]] || die "run dir $RUN_DIR already exists"
+    license_env_check
     mkdir -p "$RUN_DIR"/{artifacts,pids,data,clickhouse} \
         "$RUN_DIR"/vector-dynamic/{sources/parsers,sources/configs,ingest-tokens} "$RUN_DIR"/vector-validation
     chmod 700 "$RUN_DIR"
@@ -788,6 +855,7 @@ cmd_up() {
     if [[ "$APP_MODE" == native ]]; then
         write_app_env
         native_migrate
+        seed_installation_identity
         # Vector after the migrator, so its sinks start against the schema.
         dc up -d vector >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/compose-up.log" >&2; die "compose up vector failed"; }
@@ -805,6 +873,7 @@ cmd_up() {
         log "running migrator container"
         dc run --rm clickhouse-migrate > "$RUN_DIR/artifacts/migrator.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/migrator.log" >&2; die "migrator failed"; }
+        seed_installation_identity
         dc up -d vector nano-search nano-jobs nano-api >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/compose-up.log" >&2; die "compose up (app) failed"; }
         local p
@@ -821,6 +890,7 @@ cmd_up() {
     else
         bootstrap_admin
     fi
+    import_c05_license
     write_stack_env
     UP_DONE=1; trap - EXIT
     ok "stack up: $RUN_ID"
@@ -1208,7 +1278,9 @@ cmd_run() {
     fi
     # The web build and browser come first: a failure here must not leave a
     # stack behind (cmd_up has already disarmed its own cleanup when it returns).
-    if selects_suite ui connectors otlp personas || content_acceptance_selected; then
+    # enterprise carries browser scenarios (tests/enterprise/ui, content_acceptance)
+    # that need the edition's web build too (NAN-5333).
+    if selects_suite ui connectors otlp personas enterprise || content_acceptance_selected; then
         venv_ensure
         # E2E_WEB_DIST: drive a prebuilt UI instead (e.g. another branch's
         # build against this stack); it must contain index.html.
@@ -1420,8 +1492,12 @@ scrub_artifacts() {
     # pytest recorded in the run's 0600 registry, tokens scenarios learned) is
     # replaced in every artifact; any value left anywhere (text or binary)
     # fails with 3. Cleanup succeeding is never the boundary.
+    # The C05 license is scrubbed by reading the operator's file in place
+    # (never copied into the run dir).
+    local extra=()
+    [[ -n "${NANO_E2E_C05_LICENSE_FILE:-}" ]] && extra+=(--secret-file "$NANO_E2E_C05_LICENSE_FILE")
     guard scrub "$RUN_DIR/artifacts" --run-dir "$RUN_DIR" \
-        --env-file "$RUN_DIR/compose.env" --env-file "$RUN_DIR/admin.env"
+        --env-file "$RUN_DIR/compose.env" --env-file "$RUN_DIR/admin.env" "${extra[@]}"
 }
 
 ch_admin() {
@@ -1565,6 +1641,16 @@ for name, keys in groups.items():
 PY
     else
         warn "no cloud credentials: cloud pull scenarios will SKIP (see e2e/README.md)"
+    fi
+    # C05 license env (NAN-5331): presence + validity, never contents.
+    if [[ -n "${NANO_E2E_INSTALLATION_ID:-}${NANO_E2E_INSTALLATION_ORG_ID:-}${NANO_E2E_C05_LICENSE_FILE:-}" ]]; then
+        if license_py check-env --repo-root "$ROOT"; then
+            ok "C05 license env: identity ${NANO_E2E_INSTALLATION_ID:-unpinned}, license file ${NANO_E2E_C05_LICENSE_FILE:+present}"
+        else
+            bad=1
+        fi
+    else
+        ok "C05 license env: unset (enterprise stacks start license-locked)"
     fi
     if (( bad == 0 )); then ok "doctor: ready"; else warn "doctor: fix the items above"; fi
     return "$bad"
@@ -1715,6 +1801,7 @@ case "$CMD" in
     legacy) cmd_legacy ;;
     gc) cmd_gc ;;
     svc) cmd_svc ;;
+    license-ids) cmd_license_ids ;;
     selftest)
         # Harness safety properties; no stack and no cloud credentials needed.
         venv_ensure

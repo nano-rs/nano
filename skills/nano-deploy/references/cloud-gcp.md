@@ -11,12 +11,38 @@ export CLOUDSDK_CORE_PROJECT=$PROJECT  # this shell only; never `gcloud config s
 ```
 
 `gcloud config set project` changes the operator's global default for every
-other terminal; the environment variable scopes it to this session.
+other terminal; the environment variable scopes it to this session. Every
+command below ALSO passes `--project "$PROJECT"`: an agent's shell state
+(exported variables) may not survive from one tool call to the next, and a
+command that falls back to the default project can create billable resources
+in the operator's production project (seen in a v2.0.18 GKE run). Keep the
+flag on every `gcloud` command you add, and re-export the variables in each
+call if your shell does not keep them.
+
+Turn on the APIs the commands use (a new project often has `sqladmin` off):
+
+```bash
+gcloud --project "$PROJECT" services enable compute.googleapis.com container.googleapis.com \
+  sqladmin.googleapis.com servicenetworking.googleapis.com certificatemanager.googleapis.com
+```
+
+`compute`: VPC, firewall, VMs, quotas, addresses, load balancers; `container`:
+GKE; `sqladmin` and `servicenetworking`: Cloud SQL with a private IP;
+`certificatemanager`: the GKE Gateways' certificate map. Cloud Storage and IAM
+(cold tier, service accounts) are on by default.
 
 Label every resource `--labels nano-deployment=$NAME` where the command takes
 it. `gcloud sql instances create` and `gcloud compute addresses create` have
 no label flag in GA gcloud (checked on 564): label those through the REST API
-(below).
+(below; addresses with the Compute API's `setLabels`). Some things cannot be
+labelled at all, so tell the operator a label-based asset search will miss
+them: the VPC, subnets, router/NAT and the PSA peering; on GKE, the load
+balancer parts the Gateway controller creates (forwarding rules, target
+proxies, URL maps, backend services, health checks, NEGs: names start with
+`gkegw`) and GKE's own firewall rules (`gke-<cluster>-...`). GKE cluster
+labels reach the node VMs and boot disks; nano's PVC disks get labels only
+from a StorageClass with the PD CSI parameter `labels: nano-deployment=$NAME`
+(set it as `global.storageClass` and `clickhouse.storage.storageClass`).
 
 ## Instance and disk choices
 
@@ -43,11 +69,11 @@ GCP subnets are regional, so one subnet holds every VM; the plan's addresses
 (`10.40.1.x`, `10.40.2.x`, `10.40.3.x`) still map to zones a/b/c.
 
 ```bash
-gcloud compute networks create $NAME-vpc --subnet-mode=custom
-gcloud compute networks subnets create $NAME-private --network $NAME-vpc --region $REGION \
+gcloud --project "$PROJECT" compute networks create $NAME-vpc --subnet-mode=custom
+gcloud --project "$PROJECT" compute networks subnets create $NAME-private --network $NAME-vpc --region $REGION \
   --range 10.40.0.0/21 --enable-private-ip-google-access
-gcloud compute routers create $NAME-router --network $NAME-vpc --region $REGION
-gcloud compute routers nats create $NAME-nat --router $NAME-router --region $REGION \
+gcloud --project "$PROJECT" compute routers create $NAME-router --network $NAME-vpc --region $REGION
+gcloud --project "$PROJECT" compute routers nats create $NAME-nat --router $NAME-router --region $REGION \
   --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges
 ```
 
@@ -115,7 +141,7 @@ python3 scripts/plan.py --firewall-tsv | tail -n +2 | while IFS=$'\t' read -r po
     *) src="--source-tags nano-$source" ;;
   esac
   # GCP rule names allow only lowercase letters, digits and hyphens
-  gcloud compute firewall-rules create "$NAME-$port-$source-$target" --network $NAME-vpc \
+  gcloud --project "$PROJECT" compute firewall-rules create "$NAME-$port-$source-$target" --network $NAME-vpc \
     --direction INGRESS --action ALLOW --rules tcp:$port $src --target-tags nano-$target
 done
 ```
@@ -130,7 +156,7 @@ access prevention enforced:
 
 ```bash
 for b in cold backup; do
-  gcloud storage buckets create gs://$NAME-$b --location $REGION --uniform-bucket-level-access \
+  gcloud --project "$PROJECT" storage buckets create gs://$NAME-$b --location $REGION --uniform-bucket-level-access \
     --public-access-prevention --default-storage-class STANDARD
 done
 ```
@@ -143,10 +169,10 @@ only**, and have the operator create its HMAC key and enter it in nano
 for backups):
 
 ```bash
-gcloud iam service-accounts create $NAME-cold --display-name "nano cold tier"
-gcloud storage buckets add-iam-policy-binding gs://$NAME-cold \
+gcloud --project "$PROJECT" iam service-accounts create $NAME-cold --display-name "nano cold tier"
+gcloud --project "$PROJECT" storage buckets add-iam-policy-binding gs://$NAME-cold \
   --member serviceAccount:$NAME-cold@$PROJECT.iam.gserviceaccount.com --role roles/storage.objectAdmin
-# operator, not the agent: gcloud storage hmac create $NAME-cold@$PROJECT.iam.gserviceaccount.com
+# operator, not the agent: gcloud --project "$PROJECT" storage hmac create $NAME-cold@$PROJECT.iam.gserviceaccount.com
 ```
 
 The HMAC secret is shown once; it goes straight into nano, never into chat.
@@ -170,7 +196,7 @@ python3 scripts/plan.py <plan flags> --nodes-tsv | tail -n +2 | \
 while IFS=$'\t' read -r name kind zone addr type data_gib data_type iops mbps extra; do
   disk=""
   [ "$data_gib" != 0 ] && disk="--create-disk name=$name-data,size=${data_gib}GB,type=$data_type,auto-delete=no,device-name=data"
-  echo gcloud compute instances create $name --zone $zone --machine-type $type \
+  echo gcloud --project "$PROJECT" compute instances create $name --zone $zone --machine-type $type \
     --subnet $NAME-private --private-network-ip $addr --no-address \
     --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud \
     --boot-disk-size 100GB --boot-disk-type pd-balanced $disk \
@@ -194,21 +220,21 @@ instance group per zone and role:
 
 ```bash
 for z in a b c; do
-  gcloud compute instance-groups unmanaged create $NAME-app-$z --zone $REGION-$z
-  gcloud compute instance-groups set-named-ports $NAME-app-$z --zone $REGION-$z --named-ports http:80
+  gcloud --project "$PROJECT" compute instance-groups unmanaged create $NAME-app-$z --zone $REGION-$z
+  gcloud --project "$PROJECT" compute instance-groups set-named-ports $NAME-app-$z --zone $REGION-$z --named-ports http:80
   # add the app VMs of that zone:
-  # gcloud compute instance-groups unmanaged add-instances $NAME-app-$z --zone $REGION-$z --instances nano-app-N
+  # gcloud --project "$PROJECT" compute instance-groups unmanaged add-instances $NAME-app-$z --zone $REGION-$z --instances nano-app-N
 done
-gcloud compute health-checks create http $NAME-app-ready --port 80 --request-path /readyz \
+gcloud --project "$PROJECT" compute health-checks create http $NAME-app-ready --port 80 --request-path /readyz \
   --check-interval 10s --timeout 5s --healthy-threshold 2 --unhealthy-threshold 2
-gcloud compute backend-services create $NAME-app --global --load-balancing-scheme EXTERNAL_MANAGED \
+gcloud --project "$PROJECT" compute backend-services create $NAME-app --global --load-balancing-scheme EXTERNAL_MANAGED \
   --protocol HTTP --port-name http --health-checks $NAME-app-ready
-# gcloud compute backend-services add-backend $NAME-app --global --instance-group $NAME-app-a --instance-group-zone $REGION-a  (each zone)
-gcloud compute url-maps create $NAME-app --default-service $NAME-app
-gcloud compute ssl-certificates create $NAME-app --domains <app hostname> --global
-gcloud compute target-https-proxies create $NAME-app --url-map $NAME-app --ssl-certificates $NAME-app
-gcloud compute addresses create $NAME-app-ip --global
-gcloud compute forwarding-rules create $NAME-app --global --load-balancing-scheme EXTERNAL_MANAGED \
+# gcloud --project "$PROJECT" compute backend-services add-backend $NAME-app --global --instance-group $NAME-app-a --instance-group-zone $REGION-a  (each zone)
+gcloud --project "$PROJECT" compute url-maps create $NAME-app --default-service $NAME-app
+gcloud --project "$PROJECT" compute ssl-certificates create $NAME-app --domains <app hostname> --global
+gcloud --project "$PROJECT" compute target-https-proxies create $NAME-app --url-map $NAME-app --ssl-certificates $NAME-app
+gcloud --project "$PROJECT" compute addresses create $NAME-app-ip --global
+gcloud --project "$PROJECT" compute forwarding-rules create $NAME-app --global --load-balancing-scheme EXTERNAL_MANAGED \
   --address $NAME-app-ip --target-https-proxy $NAME-app --ports 443
 # the ingest LB the same way, with health check path /healthz and the ingest hostname
 ```
@@ -279,31 +305,43 @@ anything; run `scripts/pg-preflight.py` first so a gap shows before `helm instal
 
 | Item | Requirement |
 |---|---|
-| Version | PostgreSQL 16 or newer (16, 17, 18 tested). Cloud SQL may default to 16, depending on when and how the instance was created (check with `gcloud sql instances describe $NAME-pg --format='value(databaseVersion)'`). 16 works from nano 2.0.11; 2.0.10 and earlier fail in the migrator with `unrecognized configuration parameter "transaction_timeout"`, so use `POSTGRES_17` there |
-| Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`. All supported, no database flags needed. Users created through Cloud SQL (`gcloud sql users create`) are in `cloudsqlsuperuser` and can create them |
+| Version | PostgreSQL 16 or newer (16, 17, 18 tested). Cloud SQL may default to 16, depending on when and how the instance was created (check with `gcloud --project "$PROJECT" sql instances describe $NAME-pg --format='value(databaseVersion)'`). 16 works from nano 2.0.11; 2.0.10 and earlier fail in the migrator with `unrecognized configuration parameter "transaction_timeout"`, so use `POSTGRES_17` there |
+| Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`. All supported, no database flags needed. Users created through Cloud SQL (`gcloud --project "$PROJECT" sql users create`) are in `cloudsqlsuperuser` and can create them |
 | Parameters | No flags required. Allow at least 200 connections (about 20 per nano pod): the default depends on the tier's memory, so use 8 GB or more or set the `max_connections` flag |
-| Schema | The nano user needs `CREATE` on schema `public` in the `nanosiem` database (PostgreSQL 15+ no longer grants it to every role). A database made with `gcloud sql databases create` and a user made through Cloud SQL have it (the user is in `cloudsqlsuperuser`, which owns the database). `pg-preflight.py` checks it; on `FAIL schema`, run `GRANT ALL ON SCHEMA public TO nanosiem;` as the `postgres` user, connected to `nanosiem` |
+| Schema | The nano user needs `CREATE` on schema `public` in the `nanosiem` database (PostgreSQL 15+ no longer grants it to every role). A database made with `gcloud --project "$PROJECT" sql databases create` and a user made through Cloud SQL have it (the user is in `cloudsqlsuperuser`, which owns the database). `pg-preflight.py` checks it; on `FAIL schema`, run `GRANT ALL ON SCHEMA public TO nanosiem;` as the `postgres` user, connected to `nanosiem` |
 | Network | Private IP only (`--no-assign-ip`) through private services access on the GKE cluster's VPC (VPC-native cluster); require SSL |
 | HA | Regional availability (`--availability-type=REGIONAL`): a standby in another zone of the region, automatic failover. Zonal is a single point of failure |
 
 ```bash
 # once per VPC: private services access
-gcloud compute addresses create google-managed-services-$NAME --global \
-  --purpose=VPC_PEERING --prefix-length=16 --network=$NAME-vpc
-gcloud services vpc-peerings connect --service=servicenetworking.googleapis.com \
+gcloud --project "$PROJECT" compute addresses create google-managed-services-$NAME --global \
+  --purpose=VPC_PEERING --prefix-length=20 --network=$NAME-vpc   # /20: see below
+gcloud --project "$PROJECT" services vpc-peerings connect --service=servicenetworking.googleapis.com \
   --ranges=google-managed-services-$NAME --network=$NAME-vpc
-gcloud services vpc-peerings list --network=$NAME-vpc   # must list servicenetworking; don't pipe the connect into tail
-gcloud sql instances create $NAME-pg --database-version=POSTGRES_17 --edition=ENTERPRISE \
-  --region=$REGION --tier=db-custom-2-8192 --availability-type=REGIONAL \
+gcloud --project "$PROJECT" services vpc-peerings list --network=$NAME-vpc   # must list servicenetworking; don't pipe the connect into tail
+gcloud --project "$PROJECT" sql instances create $NAME-pg --database-version=POSTGRES_17 --edition=ENTERPRISE \
+  --region=$REGION --zone=$REGION-b --secondary-zone=$REGION-c \
+  --tier=db-custom-2-8192 --availability-type=REGIONAL \
   --network=projects/$PROJECT/global/networks/$NAME-vpc --no-assign-ip \
   --ssl-mode=ENCRYPTED_ONLY --storage-type=SSD --storage-size=50 --storage-auto-increase \
   --backup-start-time=03:00 --enable-point-in-time-recovery
-gcloud sql databases create nanosiem --instance=$NAME-pg
+gcloud --project "$PROJECT" sql databases create nanosiem --instance=$NAME-pg
 ```
+
+Private services access range: `/20` (4,096 addresses), the same as the
+product guide. It leaves room for Cloud SQL in several regions and other
+Google-managed services; a `/16` reserves 65,536 addresses of the operator's
+private space that may later overlap peered or VPN-connected networks. Both
+GKE test runs used `/20`.
+
+`--zone`/`--secondary-zone`: put the primary and standby in two of the GKE
+node zones (`--node-locations`). Without them Cloud SQL picks, and in a v2.0.18
+test it put the primary in `$REGION-f`, a zone with no nodes (cross-zone
+latency and egress on every query).
 
 Labels and the database user go through the Cloud SQL Admin REST API, with
 the access token in a header file and the password read from a file, so
-neither is ever on a command line. (`gcloud sql users create` takes the
+neither is ever on a command line. (`gcloud --project "$PROJECT" sql users create` takes the
 password only as `--password=...`, which shows in `ps` and the shell history;
 it has no `--prompt-for-password`.) The operator writes the password to
 `pg-password.txt` themselves (mode 0600):
@@ -317,7 +355,7 @@ curl -fsS -X POST -H @gcp-auth-header.txt -H 'Content-Type: application/json' --
 curl -fsS -X PATCH -H @gcp-auth-header.txt -H 'Content-Type: application/json' \
   --data "{\"settings\": {\"userLabels\": {\"nano-deployment\": \"$NAME\"}}}" "$API"
 rm -f pg-user.json gcp-auth-header.txt
-gcloud sql users list --instance=$NAME-pg --format='table(name,type)'   # nanosiem, BUILT_IN
+gcloud --project "$PROJECT" sql users list --instance=$NAME-pg --format='table(name,type)'   # nanosiem, BUILT_IN
 ```
 
 Create the user this way, not with `CREATE ROLE` in SQL: users created
@@ -325,7 +363,7 @@ through Cloud SQL (gcloud or the API) belong to `cloudsqlsuperuser` and can
 create the extensions; roles created in SQL cannot, and the migrator then
 stops on `pg_trgm`. Use a URL-safe password (it is interpolated into
 `DATABASE_URL`). The host is the
-instance's private IP (`gcloud sql instances describe $NAME-pg --format='value(ipAddresses[0].ipAddress)'`).
+instance's private IP (`gcloud --project "$PROJECT" sql instances describe $NAME-pg --format='value(ipAddresses[0].ipAddress)'`).
 Then check with `scripts/pg-preflight.py` ([helm.md](helm.md#step-0-preflight-read-only)).
 
 ## GKE for the Helm chart
@@ -342,23 +380,27 @@ supported there: the chart needs the ingest node pool label and taint
 for `large`/`xlarge`, and a fixed number of nodes per zone for the zonal
 ClickHouse and Keeper disks. Say so if the operator asks for Autopilot.
 
-**Quota first** (read-only; show the operator the numbers). A default
+**Quota first** (read-only; show the operator the numbers; needs the
+`compute` API on). A default
 project often cannot hold the HA layout: 6 x `n2-standard-8` is 48 vCPUs
 (`CPUS_ALL_REGIONS` is often 32), and `SSD_TOTAL_GB` (often 500) counts every
 pd-balanced disk, node boot disks (100 GB each by default) included. Two
 1500Gi ClickHouse volumes plus six boot disks need about 3,900 GB, and even
 90 days hot (`clickhouse.storage.size: 500Gi`) with two replicas is 1,000 GB
-before the boot disks: more than the default 500 GB. Request increases, or
-plan 90 days hot plus the GCS cold tier. Node boot disks on `pd-standard`
+before the boot disks: more than the default 500 GB. In short, the documented
+HA layout needs about 48 vCPU and 3.9 TB of SSD quota. Request increases
+(they can take a day), or plan 90 days hot plus the GCS cold tier. On a
+32-vCPU quota, 6 x `n2-highmem-4` (24 vCPU) ran the HA values at about
+12.5 GB/day in two tests. Node boot disks on `pd-standard`
 (`--disk-type pd-standard` on the cluster) move 600 GB off the SSD quota. For a
 lab or test only, `clickhouse.storage.size: 150Gi` fits the default quota (a
 GKE test ran on it); it is not a production size.
 
 ```bash
 # `describe` has no --filter: flatten, then filter the output.
-gcloud compute project-info describe --flatten=quotas \
+gcloud --project "$PROJECT" compute project-info describe --flatten=quotas \
   --format='csv[no-heading](quotas.metric,quotas.limit,quotas.usage)' | grep -E '^CPUS_ALL_REGIONS,'
-gcloud compute regions describe $REGION --flatten=quotas \
+gcloud --project "$PROJECT" compute regions describe $REGION --flatten=quotas \
   --format='csv[no-heading](quotas.metric,quotas.limit,quotas.usage)' | grep -E '^(CPUS|N2_CPUS|SSD_TOTAL_GB),'
 ```
 
@@ -378,7 +420,7 @@ the operator's `~/.kube/config` (and its production contexts) stays as it was:
 ```bash
 export KUBECONFIG=$PWD/nano-deploy-work/kubeconfig
 # about 5-10 minutes
-gcloud container clusters create $NAME --region $REGION \
+gcloud --project "$PROJECT" container clusters create $NAME --region $REGION \
   --node-locations $REGION-a,$REGION-b,$REGION-c --num-nodes 2 \
   --machine-type n2-standard-8 \
   --network $NAME-vpc --subnetwork $NAME-private --enable-ip-alias \
@@ -393,7 +435,7 @@ gcloud container clusters create $NAME --region $REGION \
   AVX2.
 - `--gateway-api=standard`: without it there is no
   `gke-l7-global-external-managed` GatewayClass and the Gateways never get an
-  address. Existing cluster: `gcloud container clusters update $NAME
+  address. Existing cluster: `gcloud --project "$PROJECT" container clusters update $NAME
   --region $REGION --gateway-api=standard`. The class appears a few minutes
   **after** the cluster reports RUNNING (about 3 minutes in a test), so a
   Step 0 preflight straight after creation reads "no Gateway implementation".
@@ -410,7 +452,7 @@ gcloud container clusters create $NAME --region $REGION \
   the policy admits them only from the nano namespace (add a scraper elsewhere
   with `vector.metrics.networkPolicyFrom`). Dataplane V2 is
   creation-time only; on an existing cluster check
-  `gcloud container clusters describe $NAME --region $REGION --format='value(networkConfig.datapathProvider,networkPolicy.enabled)'`
+  `gcloud --project "$PROJECT" container clusters describe $NAME --region $REGION --format='value(networkConfig.datapathProvider,networkPolicy.enabled)'`
   (`ADVANCED_DATAPATH` or `True` = enforced); otherwise the network policy
   add-on (`--update-addons=NetworkPolicy=ENABLED`, then
   `--enable-network-policy`) recreates the nodes, so ask first.
@@ -420,7 +462,7 @@ gcloud container clusters create $NAME --region $REGION \
   turn on authorized networks, which can start empty so `kubectl` times out.
   Add `--enable-master-authorized-networks --master-authorized-networks
   <operator CIDR>`, or `--enable-dns-access` and
-  `gcloud container clusters get-credentials $NAME --region $REGION --dns-endpoint`.
+  `gcloud --project "$PROJECT" container clusters get-credentials $NAME --region $REGION --dns-endpoint`.
 
 Then, in order (each is a hard stop for the chart):
 
@@ -444,31 +486,43 @@ Then, in order (each is a hard stop for the chart):
    credentials:
 
    ```bash
-   gcloud certificate-manager dns-authorizations create $NAME-app --domain=<app host>
-   gcloud certificate-manager dns-authorizations create $NAME-ingest --domain=<ingest host>
+   gcloud --project "$PROJECT" certificate-manager dns-authorizations create $NAME-app --domain=<app host>
+   gcloud --project "$PROJECT" certificate-manager dns-authorizations create $NAME-ingest --domain=<ingest host>
    for h in app ingest; do   # the CNAME record the operator adds for each
-     gcloud certificate-manager dns-authorizations describe $NAME-$h --format='value(dnsResourceRecord)'
+     gcloud --project "$PROJECT" certificate-manager dns-authorizations describe $NAME-$h --format='value(dnsResourceRecord)'
    done
    # operator adds each CNAME, then:
-   gcloud certificate-manager certificates create $NAME-app --domains=<app host> --dns-authorizations=$NAME-app
-   gcloud certificate-manager certificates create $NAME-ingest --domains=<ingest host> --dns-authorizations=$NAME-ingest
-   gcloud certificate-manager maps create $NAME-map
-   gcloud certificate-manager maps entries create $NAME-app --map=$NAME-map --certificates=$NAME-app --hostname=<app host>
-   gcloud certificate-manager maps entries create $NAME-ingest --map=$NAME-map --certificates=$NAME-ingest --hostname=<ingest host>
-   gcloud certificate-manager certificates describe $NAME-app --format='value(managed.state)'   # ACTIVE
+   gcloud --project "$PROJECT" certificate-manager certificates create $NAME-app --domains=<app host> --dns-authorizations=$NAME-app
+   gcloud --project "$PROJECT" certificate-manager certificates create $NAME-ingest --domains=<ingest host> --dns-authorizations=$NAME-ingest
+   gcloud --project "$PROJECT" certificate-manager maps create $NAME-map
+   gcloud --project "$PROJECT" certificate-manager maps entries create $NAME-app --map=$NAME-map --certificates=$NAME-app --hostname=<app host>
+   gcloud --project "$PROJECT" certificate-manager maps entries create $NAME-ingest --map=$NAME-map --certificates=$NAME-ingest --hostname=<ingest host>
+   gcloud --project "$PROJECT" certificate-manager certificates describe $NAME-app --format='value(managed.state)'   # ACTIVE
    ```
 
-   No public DNS (evaluation only): upload a private-CA certificate for both
-   names (`make-private-ca.sh`, then `gcloud certificate-manager certificates
-   create <name> --certificate-file ... --private-key-file ...`), add the two
-   map entries for it, and test with `curl --resolve`.
+   No public DNS (evaluation only): one private-CA certificate for both names,
+   uploaded instead of the DNS authorizations and managed certificates (worked
+   in a v2.0.18 run; a browser needs hosts-file entries and the CA trusted):
+
+   ```bash
+   bash scripts/make-private-ca.sh --out ./nano-deploy-work/eval-pki --server-name <app host> --dns <ingest host>
+   gcloud --project "$PROJECT" certificate-manager certificates create $NAME-eval \
+     --certificate-file=./nano-deploy-work/eval-pki/server.crt \
+     --private-key-file=./nano-deploy-work/eval-pki/server.key --labels nano-deployment=$NAME
+   gcloud --project "$PROJECT" certificate-manager maps create $NAME-map
+   gcloud --project "$PROJECT" certificate-manager maps entries create $NAME-app --map=$NAME-map --certificates=$NAME-eval --hostname=<app host>
+   gcloud --project "$PROJECT" certificate-manager maps entries create $NAME-ingest --map=$NAME-map --certificates=$NAME-eval --hostname=<ingest host>
+   ```
+
+   Test with `smoke-test.py --ca-file ./nano-deploy-work/eval-pki/ca.crt
+   --resolve <app host>:<app IP> --resolve <ingest host>:<ingest IP>`.
 
 4. **Static IPs.** Reserve a global address per Gateway so DNS survives a
    reinstall; the operator creates A records for them:
 
    ```bash
-   gcloud compute addresses create $NAME-app-ip $NAME-ingest-ip --global --ip-version=IPV4
-   gcloud compute addresses list --global --filter="name~^$NAME-"
+   gcloud --project "$PROJECT" compute addresses create $NAME-app-ip $NAME-ingest-ip --global --ip-version=IPV4
+   gcloud --project "$PROJECT" compute addresses list --global --filter="name~^$NAME-"
    ```
 
    Values (`values-gke-site.yaml`, after `values-gke.yaml`):
@@ -494,12 +548,15 @@ Then, in order (each is a hard stop for the chart):
    would refuse nano). See [Managed PostgreSQL (Cloud SQL)](#managed-postgresql-cloud-sql).
    The first `vpc-peerings connect` in a project can fail with an
    authentication error while the Service Networking agent is provisioned;
-   retry it. A database created with `gcloud sql databases create` is owned by
+   retry it. A database created with `gcloud --project "$PROJECT" sql databases create` is owned by
    `cloudsqlsuperuser`; that is fine. Tell the operator what a failover looks
-   like: about 10-14 s of stalled API, sign-in and OTLP requests (no errors,
-   HEC unaffected, nothing lost), and an OTLP request that timed out at the
-   client may or may not have been stored (a 2.0.11 GKE test found it was
-   not), so a retrying sender at worst duplicates it.
+   like (v2.0.18 GKE test): API reads and sign-ins stall for about 23 s (some
+   exceed a 15 s client timeout), OTLP writes get HTTP 503 for about 16 s (the
+   same as on AKS from 2.0.12; 2.0.11 stalled instead of answering), HEC is up
+   to about 3 s slower and never fails, and no accepted event is lost. Clients
+   must retry on 503 and timeouts. An OTLP request that timed out at the
+   client may or may not have been stored, so a retrying sender at worst
+   duplicates it.
 
 6. **Registry credential.** The chart's `registryCredentialRefresh` CronJob
    keeps `nano-registry` fresh (see [helm.md](helm.md)). After the pull, run
@@ -510,8 +567,8 @@ Teardown (only on request, and show the list first): `helm uninstall nano -n
 nano` (it removes the `ClickHouseCluster`/`KeeperCluster` itself), then
 `kubectl delete namespace nano` (PVCs, secret, leftover hook Jobs; the disks
 go with the PVCs); the load balancers go with the Gateways. Then
-`gcloud container clusters delete $NAME --region $REGION`, the Cloud SQL
+`gcloud --project "$PROJECT" container clusters delete $NAME --region $REGION`, the Cloud SQL
 instance, the two global addresses, the map entries, map, certificates and DNS
-authorizations. If `gcloud services vpc-peerings delete` refuses ("producer
-services still using this connection"), use `gcloud compute networks peerings
+authorizations. If `gcloud --project "$PROJECT" services vpc-peerings delete` refuses ("producer
+services still using this connection"), use `gcloud --project "$PROJECT" compute networks peerings
 delete servicenetworking-googleapis-com --network $NAME-vpc`.

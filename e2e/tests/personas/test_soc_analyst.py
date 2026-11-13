@@ -94,6 +94,10 @@ def test_soc_analyst_journey(
         dash_items = dashboards if isinstance(dashboards, list) else dashboards.get("dashboards", dashboards.get("items", []))
         dashboard = next(item for item in dash_items if item.get("name") == dashboard_name)
         edited_description = f"Edited persona ground truth {mark[-8:]}"
+        # NAN-5328: a new blank dashboard opens in edit mode (?edit=true); the
+        # settings menu lives in the view-mode header, so open it plainly.
+        page.wait_text("Editing", exact=False)
+        page.goto(f"/dashboards/{dashboard['id']}")
         page.click({"role": "button", "name": "More actions", "exact": True})
         page.click({"role": "menuitem", "name": "Settings", "exact": True})
         page.wait_text("Dashboard settings", exact=True)

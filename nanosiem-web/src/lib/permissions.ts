@@ -3,7 +3,8 @@
 /**
  * Shared permission display utilities
  *
- * Used by ApiKeyForm and RoleForm to render human-readable category names.
+ * Used by the role and API key pickers and the permission matrix to render
+ * human-readable category / resource names.
  * The backend returns raw category strings (e.g. "rule_repositories") —
  * this map provides friendly labels for the UI.
  */

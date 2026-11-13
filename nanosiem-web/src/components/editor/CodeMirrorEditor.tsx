@@ -351,7 +351,7 @@ export function CodeMirrorEditor({
         }
 
         // Check validation state after lint updates (debounced)
-        const validationState = getValidationState();
+        const validationState = getValidationState(update.state.doc);
         updateValidationState(validationState);
       });
     }, [updateValidationState]);

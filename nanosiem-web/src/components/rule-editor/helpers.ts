@@ -8,7 +8,7 @@ import type { DetectionRule } from '@/lib/api/types';
 
 export type SeverityKey = 'critical' | 'high' | 'medium' | 'low' | 'informational';
 export type ModeKey = 'staging' | 'live' | 'alerting' | 'paused';
-export type DisplayModeKey = 'live' | 'staging' | 'paused';
+export type DisplayModeKey = 'alerting' | 'live' | 'staging' | 'paused';
 
 // Severity → token color. Matches the oklch palette used by the /rules list.
 export const SEV_COLOR: Record<SeverityKey, string> = {
@@ -37,19 +37,45 @@ export function normalizeSeverity(raw: DetectionRule['severity'] | string | unde
   return 'medium';
 }
 
-// The design uses live/staging/paused; the API uses staging/live/alerting/paused.
-// Map:   staging → staging,   alerting → live,   live → live,   paused → paused.
+// Map the API mode onto a display key. NAN-5327: `alerting` used to collapse
+// to `live`, so the header badge and tree pill read "LIVE" after "Enable
+// alerting" while the YAML / meta row said alerting. Live (count only) and
+// Alerting (emits alerts) are operationally different and must not share a
+// badge.
 export function displayMode(mode: string | undefined | null): DisplayModeKey {
   if (mode === 'paused') return 'paused';
-  if (mode === 'staging') return 'staging';
-  if (mode === 'alerting' || mode === 'live') return 'live';
+  if (mode === 'alerting') return 'alerting';
+  if (mode === 'live') return 'live';
   return 'staging';
 }
 
-export const MODE_META: Record<DisplayModeKey, { label: string; dotVar: string; tone: string }> = {
-  live: { label: 'LIVE', dotVar: 'var(--success)', tone: 'text-[var(--success)]' },
-  staging: { label: 'STAGING', dotVar: 'var(--primary)', tone: 'text-[var(--primary)]' },
-  paused: { label: 'PAUSED', dotVar: 'var(--muted-foreground)', tone: 'text-muted-foreground' },
+export const MODE_META: Record<DisplayModeKey, { label: string; dotVar: string; tone: string; bg: string }> = {
+  // Alerting is the normal production state, not an error: it takes the
+  // success tone and Live takes cyan, matching `getModeColor` (lib/ui-colors).
+  alerting: {
+    label: 'ALERTING',
+    dotVar: 'var(--success)',
+    tone: 'text-[var(--success)]',
+    bg: 'color-mix(in srgb, var(--success) 15%, transparent)',
+  },
+  live: {
+    label: 'LIVE',
+    dotVar: 'var(--accent-cyan)',
+    tone: 'text-[var(--accent-cyan)]',
+    bg: 'color-mix(in srgb, var(--accent-cyan) 15%, transparent)',
+  },
+  staging: {
+    label: 'STAGING',
+    dotVar: 'var(--primary)',
+    tone: 'text-[var(--primary)]',
+    bg: 'color-mix(in srgb, var(--primary) 15%, transparent)',
+  },
+  paused: {
+    label: 'PAUSED',
+    dotVar: 'var(--muted-foreground)',
+    tone: 'text-muted-foreground',
+    bg: 'color-mix(in srgb, var(--foreground) 10%, transparent)',
+  },
 };
 
 // Cron → human cadence. Covers the common patterns used by rule authors.
@@ -87,18 +113,13 @@ export function cronHuman(expr: string | undefined | null): string {
   return expr;
 }
 
-// Categorize a rule into a folder. Uses the explicit `folder` field first, then
-// falls back to its primary MITRE tactic, then to 'Uncategorized'.
-export function folderOf(rule: DetectionRule): string {
+// Categorize a rule into a folder. Uses the explicit `folder` field, else
+// 'Uncategorized'. NAN-5327: this used to fall back to a MITRE-tactic guess
+// (Execution → "Identity"), so the tree disagreed with the meta row / API,
+// which both show `folder: null` as Uncategorized.
+export function folderOf(rule: Pick<DetectionRule, 'folder'>): string {
   const explicit = (rule.folder || '').trim();
-  if (explicit) return explicit;
-  const tactics = rule.mitre_tactics || [];
-  if (tactics.length === 0) return 'Uncategorized';
-  const first = tactics[0];
-  if (/TA00(01|02|04|06)/.test(first)) return 'Identity';
-  if (/TA000[35]/.test(first)) return 'Endpoint';
-  if (/TA00(07|08|09|10|11)/.test(first)) return 'Network';
-  return 'Cloud';
+  return explicit || 'Uncategorized';
 }
 
 // Folder display icon kind — drives the icon in RuleRail.

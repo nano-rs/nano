@@ -79,6 +79,20 @@ if time_ms > 0 && time_ms <= max_future_ms {
 src_type = downcase(to_string(%source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
 if is_object(ocsf_event) && (to_string(ocsf_event.metadata.log_source) ?? "") == "" { ocsf_event.metadata.log_source = src_type }
+# NAN-5340: an HEC object event's sibling keys (stashed in metadata by
+# hec_normalize) for a text parser that read only its `message`. They land
+# under `unmapped` and never replace a key the parser set. A JSON-input parser
+# received them in its payload; its `_hec_payload` step cleared the stash.
+nano_hec_event = %nano_hec_event
+if is_object(nano_hec_event) && is_object(ocsf_event) && (is_object(ocsf_event.unmapped) || ocsf_event.unmapped == null) {
+    nano_unmapped = object(ocsf_event.unmapped) ?? {}
+    for_each(object!(nano_hec_event)) -> |nano_key, nano_value| {
+        if !includes(["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type", "client_ip", "ingest_client_ip", "ingest_peer"], nano_key) && (get(nano_unmapped, [nano_key]) ?? null) == null {
+            nano_unmapped = set!(nano_unmapped, [nano_key], nano_value)
+        }
+    }
+    if length(nano_unmapped) > 0 { ocsf_event.unmapped = nano_unmapped }
+}
 # NAN-4912: a token-bound sender's differing claim (stashed in metadata by the
 # ingest lanes) survives the parser's root replacement under `unmapped`.
 claimed = to_string(%nano_claimed_source_type) ?? ""
@@ -238,6 +252,18 @@ impl VectorConfigManager {
         } else {
             source_name
         };
+
+        // NAN-5340: a JSON-input parser receives an HEC object event whole
+        // (see `hec_payload`); a text parser keeps `.message` = the log line.
+        let source_name =
+            if super::hec_payload::parser_reads_json_object(parser, &runtime_vrl(&parser.parser_vrl).0) {
+                let (payload, name) =
+                    super::hec_payload::hec_payload_transform(&safe_name, &source_name);
+                source_config.push_str(&payload);
+                name
+            } else {
+                source_name
+            };
 
         // NAN-4919: a processing plan with native steps renders as a chain of
         // generated transforms in the parser slot (after the source router,
@@ -632,6 +658,22 @@ impl VectorConfigManager {
              ext_val = .ext\n\
              if ext_val == null {{\n\
                  ext_val = {{}}\n\
+             }}\n\
+             \n\
+             # NAN-5340: an HEC object event's sibling keys (metadata stash\n\
+             # from hec_normalize) for a text parser that read only its\n\
+             # `message`. They land under `ext`, never replacing a key the\n\
+             # parser set in `ext` or `udm`.\n\
+             nano_hec_event = %nano_hec_event\n\
+             if is_object(nano_hec_event) && is_object(ext_val) {{\n\
+                 nano_ext = object!(ext_val)\n\
+                 nano_udm = object(.udm) ?? {{}}\n\
+                 for_each(object!(nano_hec_event)) -> |nano_key, nano_value| {{\n\
+                     if !includes([\"message\", \"parse_error\", \"parse_fallback\", \"parse_failure\", \"claimed_source_type\", \"client_ip\", \"ingest_client_ip\", \"ingest_peer\"], nano_key) && (get(nano_ext, [nano_key]) ?? null) == null && (get(nano_udm, [nano_key]) ?? null) == null {{\n\
+                         nano_ext = set!(nano_ext, [nano_key], nano_value)\n\
+                     }}\n\
+                 }}\n\
+                 ext_val = nano_ext\n\
              }}\n\
              \n\
              # Handle source_type - use .source_type if set, otherwise default\n\

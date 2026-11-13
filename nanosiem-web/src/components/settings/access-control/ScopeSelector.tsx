@@ -16,7 +16,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Search as SearchIcon, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { type PermissionInfo } from '@/lib/api';
-import { SCOPE_PRESETS, derivePreset, presetScopeIds } from './scope-presets';
+import { SCOPE_PRESETS, initialPresetId, presetScopeIds } from './scope-presets';
+import { GRANT_ALL, UNGRANTABLE_HINT, canToggleGrant, grantableOnly, type CanGrant } from '@/lib/grantable-permissions';
 
 interface ScopeSelectorProps {
   permissions: PermissionInfo[];
@@ -25,11 +26,13 @@ interface ScopeSelectorProps {
   /** Preset to start on when `initialScopes` is empty (create starts read-only). */
   defaultPresetId?: string;
   onChange: (scopes: string[]) => void;
+  /** NAN-5329: permissions the creator may grant; others are not tickable and presets skip them. */
+  canGrant?: CanGrant;
 }
 
-export function ScopeSelector({ permissions, initialScopes, defaultPresetId = 'custom', onChange }: ScopeSelectorProps) {
+export function ScopeSelector({ permissions, initialScopes, defaultPresetId = 'custom', onChange, canGrant = GRANT_ALL }: ScopeSelectorProps) {
   const [presetId, setPresetId] = useState<string>(() =>
-    initialScopes.length > 0 ? derivePreset(permissions, initialScopes) : defaultPresetId,
+    initialPresetId(permissions, initialScopes, defaultPresetId, canGrant),
   );
   const [customScopes, setCustomScopes] = useState<Set<string>>(() => new Set(initialScopes));
   const [scopeQuery, setScopeQuery] = useState('');
@@ -37,10 +40,10 @@ export function ScopeSelector({ permissions, initialScopes, defaultPresetId = 'c
   const presetScopes = useMemo(() => {
     const out: Record<string, string[]> = {};
     for (const p of SCOPE_PRESETS) {
-      out[p.id] = presetScopeIds(permissions, p.id);
+      out[p.id] = grantableOnly(presetScopeIds(permissions, p.id), canGrant);
     }
     return out;
-  }, [permissions]);
+  }, [permissions, canGrant]);
 
   const activeScopes = presetId === 'custom' ? [...customScopes] : presetScopes[presetId] || [];
 
@@ -61,6 +64,7 @@ export function ScopeSelector({ permissions, initialScopes, defaultPresetId = 'c
   }, [scopeQuery, permissions]);
 
   const toggleScope = (id: string) => {
+    if (!canToggleGrant(id, customScopes.has(id), canGrant)) return;
     const next = new Set(customScopes);
     if (next.has(id)) next.delete(id);
     else next.add(id);
@@ -110,17 +114,21 @@ export function ScopeSelector({ permissions, initialScopes, defaultPresetId = 'c
           <div className="max-h-[200px] overflow-y-auto scrollbar-thin">
             {filteredScopes.slice(0, 100).map(p => {
               const on = customScopes.has(p.id);
+              const blocked = !canToggleGrant(p.id, on, canGrant);
               return (
                 <button
                   key={p.id}
                   type="button"
                   role="checkbox"
                   aria-checked={on}
+                  aria-disabled={blocked || undefined}
+                  disabled={blocked}
+                  title={blocked ? UNGRANTABLE_HINT : undefined}
                   aria-label={`${p.id} — ${p.description}`}
                   onClick={() => toggleScope(p.id)}
                   className={cn(
                     'w-full flex items-center gap-2 px-2.5 h-8 border-b border-border/50 last:border-b-0 transition-colors text-left',
-                    on ? 'bg-primary/8' : 'hover:bg-foreground/[0.025]',
+                    on ? 'bg-primary/8' : blocked ? 'opacity-45 cursor-not-allowed' : 'hover:bg-foreground/[0.025]',
                   )}
                 >
                   <div className={cn(

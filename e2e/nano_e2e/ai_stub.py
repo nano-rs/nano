@@ -128,16 +128,24 @@ def deterministic_content(body: dict[str, Any]) -> tuple[str, str]:
                 ".activity_id = 1",
                 ".type_uid = 300201",
                 ".severity_id = 1",
-                ".actor.user.name = string!(parsed.user)",
+                # A complete OCSF 1.9.0 Authentication event: the parser editor
+                # validates generated drafts against the contract (NAN-5333).
+                '.time = to_unix_timestamp(now(), unit: "milliseconds")',
+                '.metadata.version = "1.9.0"',
+                '.metadata.product.name = "nano-e2e"',
+                '.metadata.product.vendor_name = "nano"',
+                ".user.name = string!(parsed.user)",
+                ".actor.user.name = .user.name",
                 ".src_endpoint.ip = string!(parsed.src_ip)",
-                ".device.hostname = string!(parsed.host)",
+                ".src_endpoint.hostname = string!(parsed.host)",
+                '.service.name = "persona-auth"',
                 ".message = string!(parsed.message)",
             ]
         )
         return "parser", (
             "Deterministic persona JSON authentication parser.\n"
             f"```vrl\n{vrl}\n```\n"
-            "Output fields: actor.user.name, src_endpoint.ip, device.hostname, message"
+            "Output fields: user.name, actor.user.name, src_endpoint.ip, src_endpoint.hostname, service.name, message"
         )
 
     if "provider" in lower and ("connection" in lower or "respond" in lower):

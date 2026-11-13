@@ -244,9 +244,14 @@ export function AuditLogContent() {
   const handleExportAll = async () => {
     setServerExporting(true);
     try {
-      const { offset: _offset, ...matchingFilters } = filters;
+      // The search box is debounced into `filters.q`; export what the box says
+      // NOW, or a click inside the debounce window exports every row instead of
+      // the searched ones (NAN-5333).
+      const { offset: _offset, q: _q, ...matchingFilters } = filters;
+      const q = searchQuery.trim();
       const download = await api.exportAuditLogs({
         ...matchingFilters,
+        ...(q ? { q } : {}),
         limit: 100_000,
         format: 'csv',
       });
@@ -426,8 +431,9 @@ export function AuditLogContent() {
         <table className="w-full">
           <thead>
             <tr className="border-b border-border bg-card/50">
-              <th className="text-left px-3 py-2 text-[11px] text-muted-foreground w-36">Timestamp</th>
-              <th className="text-left px-3 py-2 text-[11px] text-muted-foreground w-28">Actor</th>
+              {/* NAN-5329: one-line rows — timestamp never wraps, actor gets the width. */}
+              <th className="text-left px-3 py-2 text-[11px] text-muted-foreground w-48 whitespace-nowrap">Timestamp</th>
+              <th className="text-left px-3 py-2 text-[11px] text-muted-foreground w-56">Actor</th>
               <th className="text-left px-3 py-2 text-[11px] text-muted-foreground w-24">Source</th>
               <th className="text-left px-3 py-2 text-[11px] text-muted-foreground">Action</th>
               <th className="text-left px-3 py-2 text-[11px] text-muted-foreground">Resource</th>
@@ -449,34 +455,34 @@ export function AuditLogContent() {
                   className="hover:bg-foreground/[0.025] cursor-pointer transition-colors"
                   onClick={() => handleViewDetails(log)}
                 >
-                  <td className="px-3 py-1.5">
+                  <td className="px-3 py-1 whitespace-nowrap">
                     <span className="font-mono text-[10.5px] text-muted-foreground tabular-nums">
                       {formatUTC(log.timestamp)}
                     </span>
                   </td>
-                  <td className="px-3 py-1.5">
-                    <div className="flex items-center gap-1.5">
+                  <td className="px-3 py-1">
+                    <div className="flex items-center gap-1.5 min-w-0">
                       <User className="w-3 h-3 text-muted-foreground shrink-0" />
-                      <span className="font-mono text-[10.5px] text-foreground truncate max-w-[90px]" title={auditActorLabel(log)}>
+                      <span className="font-mono text-[10.5px] text-foreground truncate max-w-[200px]" title={auditActorLabel(log)}>
                         {auditActorLabel(log)}
                       </span>
                     </div>
                   </td>
-                  <td className="px-3 py-1.5">
+                  <td className="px-3 py-1 whitespace-nowrap">
                     {log.source && (
                       <span className="font-mono text-[10px] text-muted-foreground uppercase tracking-wide">
                         {log.source}
                       </span>
                     )}
                   </td>
-                  <td className="px-3 py-1.5">
+                  <td className="px-3 py-1 whitespace-nowrap">
                     {log.action && (
                       <span className={cn('font-mono text-[10px] font-semibold tracking-[0.08em] uppercase px-1.5 py-0.5 rounded border', getActionTone(log.action))}>
                         {formatAction(log.action)}
                       </span>
                     )}
                   </td>
-                  <td className="px-3 py-1.5 max-w-[200px]">
+                  <td className="px-3 py-1 max-w-[320px] truncate whitespace-nowrap" title={[log.resource_type, log.resource_name ?? log.resource_id].filter(Boolean).join(' ')}>
                     {log.resource_type && (
                       <span className="text-[11px] text-muted-foreground">
                         {log.resource_type}
@@ -490,7 +496,7 @@ export function AuditLogContent() {
                       </span>
                     )}
                   </td>
-                  <td className="px-3 py-1.5">
+                  <td className="px-3 py-1 whitespace-nowrap">
                     {log.ip_address && (
                       <div className="flex items-center gap-1">
                         <Globe className="w-3 h-3 text-muted-foreground shrink-0" />
@@ -498,7 +504,7 @@ export function AuditLogContent() {
                       </div>
                     )}
                   </td>
-                  <td className="px-3 py-1.5">
+                  <td className="px-3 py-1 whitespace-nowrap">
                     {log.success ? (
                       <CircleCheck className="w-3.5 h-3.5 text-emerald-400" />
                     ) : (

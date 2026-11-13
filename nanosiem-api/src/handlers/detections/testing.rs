@@ -544,6 +544,11 @@ pub async fn validate_detection(
         prevalence_pushdown_reason,
         warning,
         errors,
-        referenced_fields,
+        // NAN-5326: the returned list drops command params (`| risk score=…`)
+        // and adds group-by fields; the check above used the raw list.
+        referenced_fields: super::field_check::display_referenced_fields(
+            &clean_query,
+            &derived_fields,
+        ),
     }))
 }

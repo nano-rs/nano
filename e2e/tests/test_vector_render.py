@@ -102,7 +102,7 @@ def test_draft_then_normal_then_publish_all_go_live(
             ),
             200,
         )
-        res = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish"), 200)
+        res = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish", json={"acknowledge_unattested": True}), 200)
         assert res.get("success") is True, f"publish after the draft failed: {res}"
         _parsed_live(stack, nano, src.token, mark, "publish", "published-parsed")
         timeline.step("published parser is live")
@@ -187,7 +187,7 @@ def test_interpolation_syntax_is_refused_and_dollar_vrl_runs_as_written(
         '.message = replace(m, r\'^(\\S+)$\', "cap-$1") + " lit-" + "$" + "{HOME}"'
     )
     expect(nano.api.put(f"/api/log-sources/{src.source_id}", json={"parser_vrl": vrl}), 200)
-    res = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish"), 200)
+    res = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish", json={"acknowledge_unattested": True}), 200)
     assert res.get("success") is True, f"publish failed: {res}"
     n = {"i": 0}
 

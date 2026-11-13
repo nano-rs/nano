@@ -213,7 +213,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   })}
                 </div>
               </FormField>
-              <FormField label="Mode" required yamlKey="mode" hint="Live fires alerts. Staging evaluates silently.">
+              <FormField label="Mode" required yamlKey="mode" hint="Alerting emits alerts. Live counts matches without alerting. Staging evaluates silently.">
                 <div className="space-y-1.5">
                   {([
                     { k: 'staging', d: 'Evaluates but suppresses output (bake-in)' },

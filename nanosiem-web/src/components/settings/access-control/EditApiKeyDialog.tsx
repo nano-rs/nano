@@ -31,6 +31,7 @@ import {
   SheetFooter,
 } from '@/components/ui/sheet';
 import { ScopeSelector } from './ScopeSelector';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface EditApiKeyDialogProps {
   open: boolean;
@@ -42,6 +43,8 @@ interface EditApiKeyDialogProps {
 
 export function EditApiKeyDialog({ open, apiKey, permissions, onClose, onSaved }: EditApiKeyDialogProps) {
   const { toast } = useToast();
+  // NAN-5329: only permissions the creator holds are grantable.
+  const { hasPermission } = useAuth();
   const [name, setName] = useState(apiKey.name);
   const [description, setDescription] = useState(apiKey.description ?? '');
   const [scopes, setScopes] = useState<string[]>(apiKey.permissions);
@@ -125,6 +128,7 @@ export function EditApiKeyDialog({ open, apiKey, permissions, onClose, onSaved }
             <ScopeSelector
               key={open ? apiKey.id : 'closed'}
               permissions={permissions}
+              canGrant={hasPermission}
               initialScopes={apiKey.permissions}
               onChange={setScopes}
             />

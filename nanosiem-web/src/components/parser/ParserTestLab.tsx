@@ -11,6 +11,7 @@
  */
 
 import { useState } from 'react';
+import { VrlErrorText } from './VrlErrorText';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -409,9 +410,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
                         </p>
                       </div>
                       {result.new_parse.error ? (
-                        <pre className="font-mono text-red-400 text-[11px] leading-relaxed whitespace-pre-wrap break-words px-3 py-2">
-                          {result.new_parse.error}
-                        </pre>
+                        <VrlErrorText error={result.new_parse.error} />
                       ) : (
                         <FieldGrid newFields={newFields} currentFields={currentFields} />
                       )}
@@ -466,7 +465,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
                       <FieldGrid newFields={fields} />
                     </>
                   ) : r.error ? (
-                    <p className="text-red-400 text-[11px] px-3 py-2">{r.error}</p>
+                    <VrlErrorText error={r.error} />
                   ) : (
                     <FieldGrid newFields={fields} />
                   )}

@@ -32,7 +32,8 @@ export interface BlankDashboardDraft {
 export const EMPTY_BLANK_DASHBOARD_DRAFT: BlankDashboardDraft = {
   name: '',
   description: '',
-  visibility: 'public',
+  // NAN-5328: a new dashboard starts private; the author shares it explicitly.
+  visibility: 'private',
 };
 
 export interface BlankDashboardFormProps {

@@ -38,6 +38,7 @@ import { Button } from '@/components/ui/button';
 import { PrevalenceScatterPlot, type PrevalenceScatterData } from '@/components/prevalence/PrevalenceScatterPlot';
 import { usePrevalenceScatterData } from '@/hooks/use-api';
 import { useInternalDomains } from '@/hooks/use-internal-domains';
+import { shouldWarnRowShortfall } from '@/lib/timeline-row-shortfall';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { isInternalName } from '@/lib/internal-domains';
 import { api } from '@/lib/api';
@@ -443,6 +444,8 @@ interface TimelineVisualizationProps {
    */
   plotRange?: { start: string; end: string };
   resultCount?: number;
+  /** NAN-5328: aggregate pipelines return fewer rows than events by design; suppresses the row-shortfall warning. */
+  isAggregate?: boolean;
   /** Static mode: hides zoom controls, prevalence toggle, and drag-to-select. Used for timechart results. */
   staticMode?: boolean;
   /** Title override for the card header */
@@ -486,6 +489,7 @@ export function TimelineVisualization({
   timeRange,
   plotRange,
   resultCount,
+  isAggregate = false,
   staticMode = false,
   title,
   urlRarityView,
@@ -1333,7 +1337,7 @@ export function TimelineVisualization({
           <div className="mt-4">
             {mode === 'timeline' ? (
               <div className="select-none" style={{ userSelect: 'none' }} tabIndex={-1}>
-                {eventCount > 0 && resultCount !== undefined && resultCount < eventCount && (
+                {resultCount !== undefined && shouldWarnRowShortfall({ eventCount, resultCount, isAggregate }) && (
                   <p className="text-xs font-mono text-muted-foreground mb-2 flex items-center gap-1">
                     <AlertTriangle className="w-3 h-3" />Stream sees {eventCount.toLocaleString()} hits; table returned {resultCount.toLocaleString()} rows
                   </p>

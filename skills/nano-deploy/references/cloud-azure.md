@@ -526,8 +526,8 @@ Then, in order (each is a hard stop for the chart):
    **Evaluation without a domain:** use the AGC frontends' own host names
    (`az network alb frontend show ... --query fqdn`) as the app and ingest
    host names, with a private CA issued by cert-manager itself
-   (`make-private-ca.sh` is not this: it makes a server certificate for
-   role-split private transport). Senders and browsers must trust
+   (on AKS cert-manager issues it in the cluster, so `make-private-ca.sh`,
+   used for this on GKE and EKS, is not needed). Senders and browsers must trust
    `nano-private-ca`'s `ca.crt`:
 
    ```yaml

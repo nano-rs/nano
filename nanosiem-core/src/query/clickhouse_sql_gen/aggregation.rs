@@ -130,8 +130,8 @@ impl ClickHouseSqlGenerator {
                     // (`where dc > N`) and Splunk parity depend on exact counts.
                     // Memory grows linearly with cardinality (~190 B/distinct string);
                     // estdc() is the bounded-memory alternative (~0.9% error).
-                    AggFunc::Dc => format!("uniqExact({})", field_expr),
-                    AggFunc::EstDc => format!("uniqCombined64({})", field_expr),
+                    AggFunc::Dc => distinct_count_sql("uniqExact", &field_expr),
+                    AggFunc::EstDc => distinct_count_sql("uniqCombined64", &field_expr),
                     AggFunc::Sum => format!("sum({})", field_expr),
                     AggFunc::Avg => format!("avg({})", field_expr),
                     AggFunc::Min => format!("min({})", field_expr),
@@ -486,8 +486,8 @@ impl ClickHouseSqlGenerator {
                             format!("count({})", field_expr)
                         }
                     }
-                    AggFunc::Dc => format!("uniqExact({})", field_expr),
-                    AggFunc::EstDc => format!("uniqCombined64({})", field_expr),
+                    AggFunc::Dc => distinct_count_sql("uniqExact", &field_expr),
+                    AggFunc::EstDc => distinct_count_sql("uniqCombined64", &field_expr),
                     AggFunc::Sum => format!("sum({})", field_expr),
                     AggFunc::Avg => format!("avg({})", field_expr),
                     AggFunc::Min => format!("min({})", field_expr),
@@ -651,8 +651,8 @@ impl ClickHouseSqlGenerator {
                         }
                         Some(AggFunc::Sum) => format!("sum({})", agg_field),
                         Some(AggFunc::Avg) => format!("avg({})", agg_field),
-                        Some(AggFunc::Dc) => format!("uniqExact({})", agg_field),
-                        Some(AggFunc::EstDc) => format!("uniqCombined64({})", agg_field),
+                        Some(AggFunc::Dc) => distinct_count_sql("uniqExact", &agg_field),
+                        Some(AggFunc::EstDc) => distinct_count_sql("uniqCombined64", &agg_field),
                         _ => "count()".to_string(),
                     };
                     write!(
@@ -692,13 +692,13 @@ impl ClickHouseSqlGenerator {
                         // APPROXIMATE state is not result-identical to the exact
                         // two-pass form it replaces.
                         (Some(AggFunc::Dc), Some(f)) => (
-                            format!("uniqExactState({}) AS __rank_state", f),
-                            "uniqExactMerge(__rank_state) OVER (PARTITION BY __rank_key)"
+                            format!("{} AS __rank_state", distinct_count_state_sql("uniqExact", f)),
+                            "uniqExactIfMerge(__rank_state) OVER (PARTITION BY __rank_key)"
                                 .to_string(),
                         ),
                         (Some(AggFunc::EstDc), Some(f)) => (
-                            format!("uniqCombined64State({}) AS __rank_state", f),
-                            "uniqCombined64Merge(__rank_state) OVER (PARTITION BY __rank_key)"
+                            format!("{} AS __rank_state", distinct_count_state_sql("uniqCombined64", f)),
+                            "uniqCombined64IfMerge(__rank_state) OVER (PARTITION BY __rank_key)"
                                 .to_string(),
                         ),
                         (Some(AggFunc::Count), Some(f)) => (
@@ -873,6 +873,33 @@ fn null_when_no_rows(func: &AggFunc, agg_expr: String, ungrouped: bool) -> Strin
         return agg_expr;
     }
     format!("if(count() = 0, NULL, {agg_expr})")
+}
+
+/// NAN-5339: dc() / estdc() never count the empty string as a value.
+///
+/// A field missing from a row reads as `''`, not NULL: unknown and `ext.*`
+/// fields compile to `toString(ext.x)`, OCSF `unmapped.*` reads default to
+/// `''`, and non-Nullable String columns default to `''`. A plain
+/// `uniqExact(x)` counted that `''` as one distinct value, so dc() of a field
+/// absent from every row returned 1 and every dc() over partially-populated
+/// data was inflated by one. `values()` / `list()` already drop `''`.
+///
+/// The `-If` combinator keeps the column's own type (no `nullIf` on numerics);
+/// numeric 0 still counts (`toString(0)` is `'0'`) and NULL is still ignored
+/// (`toString(NULL) != ''` is NULL, i.e. false). `func` is `uniqExact` (dc)
+/// or `uniqCombined64` (estdc).
+pub(super) fn distinct_count_sql(func: &str, expr: &str) -> String {
+    format!("{func}If({expr}, {})", distinct_value_present(expr))
+}
+
+/// The `-IfState` form of [`distinct_count_sql`]. Its state must be merged
+/// with `<func>IfMerge` — an `-If` state is not a plain `<func>` state.
+fn distinct_count_state_sql(func: &str, expr: &str) -> String {
+    format!("{func}IfState({expr}, {})", distinct_value_present(expr))
+}
+
+fn distinct_value_present(expr: &str) -> String {
+    format!("toString({expr}) != ''")
 }
 
 /// NAN-4295: the private alias of a per-element (`arrayJoin`) by-field.

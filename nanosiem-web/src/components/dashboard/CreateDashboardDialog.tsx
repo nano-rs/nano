@@ -15,7 +15,7 @@
 import { useEffect, useState } from 'react';
 import { Grid as GridIcon } from 'lucide-react';
 
-import { Sheet, SheetContent } from '@/components/ui/sheet';
+import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 
 import {
   BlankDashboardForm,
@@ -76,12 +76,14 @@ export function CreateDashboardDialog({
         <div className="px-4 py-3 pr-12 border-b border-border flex items-center gap-2">
           <GridIcon className="w-[13px] h-[13px] text-primary" />
           <div className="flex-1 min-w-0">
-            <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground font-semibold">
+            {/* NAN-5328: Radix Dialog needs a Title/Description for a11y (and
+                logs a console error without them). */}
+            <SheetTitle className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground font-semibold">
               Dashboard Builder
-            </div>
-            <div className="text-[11px] text-muted-foreground mt-0.5">
+            </SheetTitle>
+            <SheetDescription className="text-[11px] text-muted-foreground mt-0.5">
               Name it, then add panels from the library.
-            </div>
+            </SheetDescription>
           </div>
         </div>
 

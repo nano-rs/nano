@@ -9,7 +9,9 @@ use std::sync::Arc;
 use nanosiem_core::query::Dataset;
 use nanosiem_core::schema::{profile_for_id, SchemaId, SchemaProfile};
 
-use super::{check_fields, parse_dataset, referenced_fields, unknown_field_errors};
+use super::{
+    check_fields, display_referenced_fields, parse_dataset, referenced_fields, unknown_field_errors,
+};
 
 /// The seeded `accumulated_risk_threshold_exceeded` rule's query (enterprise
 /// migration 9000033, `RiskNotableConfig::default_rule_query`).
@@ -216,4 +218,30 @@ fn new_rule_template_is_valid_ocsf_npl() {
         nanosiem_core::detection::materialized_view::MaterializedViewGenerator::check_query_realtime_eligible(&parsed).is_err(),
         "a `| risk` pipe is scheduled-only, matching the template's detection_mode"
     );
+}
+
+// --- NAN-5326: the referenced_fields list the validate endpoint returns ------
+
+#[test]
+fn display_referenced_fields_drops_command_params_and_adds_group_by() {
+    let q = r#"metadata.log_source = "edr" | stats count by actor.user.name, device.hostname | risk score=50 entity=actor.user.name factor="Detection match""#;
+    let derived: HashSet<String> = nanosiem_core::parse_query(q)
+        .map(|p| nanosiem_core::collect_derived_fields(&p))
+        .unwrap_or_default();
+    let fields = display_referenced_fields(q, &derived);
+    assert_eq!(
+        fields,
+        vec![
+            "metadata.log_source".to_string(),
+            "actor.user.name".to_string(),
+            "device.hostname".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn display_referenced_fields_skips_timechart_params_and_quoted_by() {
+    let q = r#"process.cmd_line CONTAINS "x by y" | timechart span=1h count by process.name"#;
+    let fields = display_referenced_fields(q, &HashSet::new());
+    assert_eq!(fields, vec!["process.name".to_string()]);
 }

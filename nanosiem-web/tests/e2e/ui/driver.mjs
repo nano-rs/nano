@@ -91,6 +91,18 @@ async function ensureBrowser() {
   return browser;
 }
 
+// Wait for captured API bodies (secret learning happens there), bounded: a body
+// still pending after 10 s is a stream the capture filter did not recognise,
+// and waiting on it would wedge the driver for the rest of the run (NAN-5333).
+async function settleBodies(s, ms = 10_000) {
+  let timer;
+  await Promise.race([
+    Promise.allSettled([...s.responseBodies]),
+    new Promise((resolve) => { timer = setTimeout(resolve, ms); }),
+  ]);
+  clearTimeout(timer);
+}
+
 function sess(sid) {
   const s = sessions.get(sid);
   if (!s) throw new Error(`unknown session ${sid}`);
@@ -314,7 +326,10 @@ const OPS = {
         try {
           const u = new URL(r.url());
           if (!u.pathname.startsWith('/api/')) return;
-          if (!(r.headers()['content-type'] || '').includes('json')) return;
+          const ctype = r.headers()['content-type'] || '';
+          // Streams (NDJSON search/tail, SSE) never end while the page is open:
+          // awaiting their body would hang every later op (NAN-5333).
+          if (!ctype.includes('json') || ctype.includes('ndjson') || ctype.includes('event-stream')) return;
           const body = await r.text();
           const method = r.request().method();
           // API keys are reveal-once values rendered by the page, not typed by
@@ -342,7 +357,7 @@ const OPS = {
 
   async close({ sid, failed }) {
     const s = sess(sid);
-    await Promise.allSettled([...s.responseBodies]);
+    await settleBodies(s);
     fs.mkdirSync(s.out, { recursive: true });
     const lines = s.console.map((c) => JSON.stringify(c));
     fs.writeFileSync(path.join(s.out, 'console.log'), scrub(lines.join('\n') + (lines.length ? '\n' : '')));
@@ -452,7 +467,7 @@ const OPS = {
     if (typeof name !== 'string' || !/^[a-z0-9][a-z0-9._-]*\.png$/i.test(name) || path.basename(name) !== name) {
       throw new Error(`invalid screenshot name ${JSON.stringify(name)}`);
     }
-    await Promise.allSettled([...s.responseBodies]);
+    await settleBodies(s);
     await inject(s.page);
     const left = await maskSecrets(s.page);
     if (left !== 0) throw new Error(`screenshot blocked: ${left} rendered secret(s) could not be masked`);
@@ -546,7 +561,7 @@ const OPS = {
   // failure screenshot); returns how many remain.
   async mask_secrets({ sid }) {
     const s = sess(sid);
-    await Promise.allSettled([...s.responseBodies]);
+    await settleBodies(s);
     await inject(s.page);
     return maskSecrets(s.page);
   },
@@ -694,7 +709,20 @@ const OPS = {
   async search({ sid, query, extra = '' }) {
     const { page } = sess(sid);
     await page.goto(`${BASE}/search?q=${encodeURIComponent(query)}&run=true${extra}`, { waitUntil: 'domcontentloaded' });
-    await waitText(page, 'Query complete', { exact: false, timeout: 60_000 });
+    // NAN-5235: a search link from outside the app loads its query and waits
+    // for an explicit Run, unless this tab already ran the same query (then it
+    // runs). Handle both: click Run when the prompt shows (NAN-5333).
+    const prompt = { testid: 'linked-query-run-prompt' };
+    const done = { text: 'Query complete', exact: false };
+    const first = await until(async () => {
+      if ((await count(page, done)) > 0) return 'done';
+      if ((await count(page, prompt)) > 0) return 'prompt';
+      return null;
+    }, { timeout: 60_000, desc: 'the linked-query Run prompt or a completed query' });
+    if (first === 'prompt') {
+      await click(page, { role: 'button', name: 'Run', exact: true, within: prompt }, { timeout: 15_000 });
+      await waitText(page, 'Query complete', { exact: false, timeout: 60_000 });
+    }
     return page.url();
   },
   async results_count({ sid }) {

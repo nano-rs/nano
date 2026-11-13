@@ -8,6 +8,7 @@
  * color-coded diff (green = added, red = removed, yellow = changed).
  */
 
+import { VrlErrorText } from './VrlErrorText';
 import { CircleCheck, XCircle, ChevronRight, ChevronDown } from 'lucide-react';
 
 interface TestResultRowProps {
@@ -76,7 +77,7 @@ export function TestResultRow({ input, newParse, currentParse, expanded, onToggl
       {expanded && (
         <div className="border-t border-border/50">
           {newParse.error && (
-            <p className="text-red-400 text-[11px] px-3 py-2">{newParse.error}</p>
+            <VrlErrorText error={newParse.error} />
           )}
           {allKeys.length > 0 && (
             <div className="overflow-auto max-h-80">

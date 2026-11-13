@@ -7,7 +7,8 @@
  * marks over the same terms — a second copy would drift from this one.
  */
 
-import type { ReactNode } from 'react';
+import { Fragment, type ReactNode } from 'react';
+import { eventRowLineObject } from './event-row-line';
 
 /**
  * Extract keywords from a search query for highlighting.
@@ -19,23 +20,60 @@ import type { ReactNode } from 'react';
  * - "malware src_ip=10.0.0.1" → ["malware"]
  * - '"exact phrase"' → ["exact phrase"]
  */
+/**
+ * Highlight terms split by scope (NAN-5328).
+ *  • `free` — bare and quoted free-text terms; they match anywhere.
+ *  • `scoped` — `field=value` / `field IN (...)` values; they highlight only in
+ *    the field they were scoped to (an OCSF dotted path such as
+ *    `actor.user.name` is one field name, not a free-text `actor.user.`).
+ */
+export interface ScopedHighlightTerm {
+  field: string;
+  value: string;
+}
+export interface HighlightTerms {
+  free: string[];
+  scoped: ScopedHighlightTerm[];
+}
+
+export const EMPTY_HIGHLIGHT_TERMS: HighlightTerms = { free: [], scoped: [] };
+
+/**
+ * Extract keywords from a search query for highlighting.
+ * Flat union of free-text and field-scoped terms (see `extractHighlightTerms`
+ * for the scoped form the result views use).
+ *
+ * Examples:
+ * - "c2 beacon" → ["c2", "beacon"]
+ * - "src_ip=192.168.1.1" → ["192.168.1.1"]
+ * - "malware src_ip=10.0.0.1" → ["10.0.0.1", "malware"]
+ * - '"exact phrase"' → ["exact phrase"]
+ */
 export function extractKeywordsFromQuery(query: string | undefined): string[] {
-  if (!query || !query.trim()) return [];
+  const { free, scoped } = extractHighlightTerms(query);
+  return [...new Set([...scoped.map((t) => t.value), ...free])];
+}
+
+export function extractHighlightTerms(query: string | undefined): HighlightTerms {
+  if (!query || !query.trim()) return { free: [], scoped: [] };
 
   // Only extract highlight terms from the search portion (before first pipe).
   // Everything after a pipe is a transformation command (stats, where, table, etc.)
   // and should not generate highlights — those tokens are commands, not search text.
   const searchPortion = query.split('|')[0];
-  if (!searchPortion.trim()) return [];
+  if (!searchPortion.trim()) return { free: [], scoped: [] };
 
-  // Two tiers of highlight terms:
-  //  • strong — explicit field=value, IN-list, and quoted values. Always
-  //    highlighted, INCLUDING numeric values like status=500 / dest_port=443.
-  //  • weak — bare free-text tokens. Short pure numbers are dropped from this
-  //    tier because they produce noisy false-positive highlights everywhere.
+  // Tiers of highlight terms:
+  //  • scoped — explicit field=value and IN-list values. Always highlighted
+  //    (numeric values like status=500 included), but only in their field.
+  //  • strong free — quoted phrases. Always highlighted, anywhere.
+  //  • weak free — bare free-text tokens. Short pure numbers are dropped from
+  //    this tier because they produce noisy false-positive highlights.
+  const scoped: ScopedHighlightTerm[] = [];
   const strongKeywords: string[] = [];
   const weakKeywords: string[] = [];
-  const fieldValueRegex = /(\w+)\s*(?:!=|=|<=|>=|<|>)\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|\/((?:\\.|[^/\\])*)\/|(\S+))/g;
+  // Field names are OCSF dotted paths (`actor.user.name`) or UDM names.
+  const fieldValueRegex = /([\w.]+)\s*(?:!=|=|<=|>=|<|>)\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|\/((?:\\.|[^/\\])*)\/|(\S+))/g;
   const unescapeQuoted = (value: string): string =>
     value.replace(/\\(["'\\])/g, '$1');
 
@@ -56,7 +94,7 @@ export function extractKeywordsFromQuery(query: string | undefined): string[] {
       // Strip leading/trailing wildcards for highlighting (e.g., *powershell* -> powershell)
       value = value.trim().replace(/^\*+|\*+$/g, '');
       if (value) {
-        strongKeywords.push(value);
+        scoped.push({ field: match[1], value });
       }
     }
   }
@@ -66,15 +104,15 @@ export function extractKeywordsFromQuery(query: string | undefined): string[] {
   fieldValueRegex.lastIndex = 0;
   const withoutFieldValues = searchPortion.replace(fieldValueRegex, ' ');
 
-  // Remove field IN (...) patterns — extract quoted values as keywords first
-  const inRegex = /\w+\s+IN\s*\(\s*((?:"[^"]*"|'[^']*'|[^)]*?))\s*\)/gi;
+  // Remove field IN (...) patterns — extract quoted values as scoped terms first
+  const inRegex = /([\w.]+)\s+IN\s*\(\s*((?:"[^"]*"|'[^']*'|[^)]*?))\s*\)/gi;
   let inMatch;
-  const withoutIn = withoutFieldValues.replace(inRegex, (_fullMatch, valueList: string) => {
+  const withoutIn = withoutFieldValues.replace(inRegex, (_fullMatch, field: string, valueList: string) => {
     // Extract quoted values from the IN list
     const quotedInRegex = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'/g;
     while ((inMatch = quotedInRegex.exec(valueList)) !== null) {
       const val = inMatch[1] || inMatch[2];
-      if (val && val.trim()) strongKeywords.push(unescapeQuoted(val.trim()));
+      if (val && val.trim()) scoped.push({ field, value: unescapeQuoted(val.trim()) });
     }
     return ' ';
   });
@@ -111,7 +149,50 @@ export function extractKeywordsFromQuery(query: string | undefined): string[] {
   const strong = strongKeywords.filter(k => !isNoise(k));
   const weak = weakKeywords.filter(k => !isNoise(k) && !/^\d{1,4}$/.test(k));
 
-  return [...new Set([...strong, ...weak])];
+  const seen = new Set<string>();
+  const scopedUnique = scoped.filter((t) => {
+    if (isNoise(t.value)) return false;
+    const key = `${t.field.toLowerCase()}\u0000${t.value}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return { free: [...new Set([...strong, ...weak])], scoped: scopedUnique };
+}
+
+/**
+ * NAN-5328: the terms to highlight inside one field's value — free-text terms
+ * plus the terms scoped to THIS field. A scoped term whose field is not a key
+ * of the event (`presentKeys`) — e.g. a UDM alias the server resolved to an
+ * OCSF column — cannot be placed, so it highlights in every value instead of
+ * disappearing.
+ */
+export function keywordsForField(
+  terms: HighlightTerms,
+  field: string,
+  presentKeys: ReadonlySet<string>,
+): string[] {
+  const f = field.toLowerCase();
+  const out = [...terms.free];
+  for (const t of terms.scoped) {
+    const tf = t.field.toLowerCase();
+    if (tf === f || !hasKeyCaseInsensitive(presentKeys, tf)) out.push(t.value);
+  }
+  return [...new Set(out)];
+}
+
+// Lower-cased key sets, computed once per event key set (callers pass the
+// same Set for every field of an event).
+const loweredKeyCache = new WeakMap<ReadonlySet<string>, Set<string>>();
+
+function hasKeyCaseInsensitive(keys: ReadonlySet<string>, lowered: string): boolean {
+  if (keys.has(lowered)) return true;
+  let low = loweredKeyCache.get(keys);
+  if (!low) {
+    low = new Set([...keys].map((k) => k.toLowerCase()));
+    loweredKeyCache.set(keys, low);
+  }
+  return low.has(lowered);
 }
 
 /**
@@ -121,10 +202,13 @@ export function extractKeywordsFromQuery(query: string | undefined): string[] {
 export function highlightText(text: string, keywords: string[]): ReactNode {
   if (!keywords.length || !text) return text;
 
-  // Escape special regex characters in keywords
-  const escapedKeywords = keywords.map(k =>
-    k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  );
+  // Escape special regex characters in keywords. NAN-5328: a numeric term
+  // (`class_uid=1007`) matches a whole number only — not the `1007` inside
+  // `100701`.
+  const escapedKeywords = keywords.map(k => {
+    const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return /^\d+$/.test(k) ? `(?<!\\d)${escaped}(?!\\d)` : escaped;
+  });
 
   // Build regex that matches any keyword (case-insensitive)
   const regex = new RegExp(`(${escapedKeywords.join('|')})`, 'gi');
@@ -142,4 +226,42 @@ export function highlightText(text: string, keywords: string[]): ReactNode {
       part
     );
   });
+}
+
+/**
+ * NAN-5328: highlight the compact JSON event line (`buildEventRowLine`) with
+ * field scoping. Keys are never highlighted; each value gets the free-text
+ * terms plus the terms scoped to its own key, so `actor.user.name="mallory"`
+ * marks `mallory` in `actor.user.name`, not inside `process.cmd_line`.
+ * The text is identical to `buildEventRowLine(fields, false, isOcsf)`, cut to `maxLen`.
+ */
+export function highlightEventRowLine(
+  fields: Record<string, unknown> | undefined,
+  terms: HighlightTerms,
+  maxLen = Infinity,
+  isOcsf = false,
+): ReactNode {
+  const obj = eventRowLineObject(fields, isOcsf);
+  if (!obj) return null;
+  const keys = new Set(Object.keys(obj));
+  const segments: Array<{ text: string; keywords: string[] }> = [];
+  const entries = Object.entries(obj);
+  segments.push({ text: '{', keywords: [] });
+  entries.forEach(([k, v], i) => {
+    segments.push({ text: `${i > 0 ? ',' : ''}${JSON.stringify(k)}:`, keywords: [] });
+    segments.push({ text: JSON.stringify(v), keywords: keywordsForField(terms, k, keys) });
+  });
+  segments.push({ text: '}', keywords: [] });
+
+  let remaining = maxLen;
+  const out: ReactNode[] = [];
+  for (let i = 0; i < segments.length && remaining > 0; i++) {
+    const seg = segments[i];
+    const text = seg.text.length > remaining ? seg.text.substring(0, remaining) : seg.text;
+    remaining -= text.length;
+    out.push(
+      <Fragment key={i}>{seg.keywords.length > 0 ? highlightText(text, seg.keywords) : text}</Fragment>,
+    );
+  }
+  return out;
 }

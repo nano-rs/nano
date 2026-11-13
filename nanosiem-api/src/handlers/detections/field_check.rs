@@ -243,6 +243,69 @@ pub(crate) fn referenced_fields(clean_query: &str) -> Vec<String> {
     out
 }
 
+/// The `referenced_fields` list the validate endpoint returns: the compared
+/// fields minus command parameters / keywords / derived names (`| risk
+/// score=50 entity=… factor=…` listed `score`, `entity`, `factor` as fields —
+/// NAN-5326), plus the group-by fields of aggregation commands (`| stats count
+/// by actor.user.name`), which the comparison regex never sees. Display only:
+/// the field CHECK still runs on [`referenced_fields`].
+pub(crate) fn display_referenced_fields(
+    clean_query: &str,
+    derived_fields: &HashSet<String>,
+) -> Vec<String> {
+    let skip = |name: &str| {
+        let lower = name.to_lowercase();
+        KEYWORDS.contains(&lower.as_str())
+            || COMMAND_PARAMS.contains(&lower.as_str())
+            || derived_fields.contains(&lower)
+    };
+    let mut out: Vec<String> = referenced_fields(clean_query)
+        .into_iter()
+        .filter(|f| !skip(f))
+        .collect();
+    // Group-by names are not filtered by `derived_fields`: the aggregation's
+    // own output columns include them, but they are read from the input.
+    for f in group_by_fields(clean_query) {
+        let lower = f.to_lowercase();
+        let param = KEYWORDS.contains(&lower.as_str()) || COMMAND_PARAMS.contains(&lower.as_str());
+        if !param && !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// Field names after `by` in aggregation pipe segments.
+fn group_by_fields(clean_query: &str) -> Vec<String> {
+    static BY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static IDENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let by_re = BY_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^\s*(?:stats|timechart|eventstats|streamstats|chart|top|rare)\b.*?\bby\s+(.+)$",
+        )
+        .unwrap()
+    });
+    let ident_re = IDENT_RE.get_or_init(|| {
+        regex::Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*$").unwrap()
+    });
+    let masked = mask_string_literals(clean_query);
+    let mut out: Vec<String> = Vec::new();
+    for segment in masked.split('|').skip(1) {
+        let Some(cap) = by_re.captures(segment.trim()) else { continue };
+        let Some(list) = cap.get(1) else { continue };
+        for tok in list.as_str().split(|c: char| c == ',' || c.is_whitespace()) {
+            // `span=1h` style params after the by-list are not fields.
+            if tok.is_empty() || tok.contains('=') {
+                continue;
+            }
+            if ident_re.is_match(tok) && !out.iter().any(|o| o == tok) {
+                out.push(tok.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Blank out the contents of quoted string literals (`"…"`, `'…'`, with
 /// backslash escapes) so a value such as `"/LogFile="` or `"key=clear"` is not
 /// mistaken for a field comparison. Byte length is preserved.

@@ -239,10 +239,12 @@ def _send_with(stack: Stack, transport: str, token: str, endpoint: dict[str, Any
             timeout=10,
         )
     else:
+        # The edge accepts OTLP/HTTP protobuf only (anything else is a 415
+        # before auth); an empty body is a valid empty ExportLogsServiceRequest.
         r = httpx.post(
             endpoint["otlp_logs_url"],
-            json={"resourceLogs": []},
-            headers={"Authorization": f"Bearer {token}"},
+            content=b"",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/x-protobuf"},
             timeout=10,
         )
     return r.status_code

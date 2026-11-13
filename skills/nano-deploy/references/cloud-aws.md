@@ -408,12 +408,30 @@ Then, in order (each is a hard stop for the chart):
 2. **Gateway API.** The standard CRDs (`kubectl apply -f
    https://github.com/kubernetes-sigs/gateway-api/releases/download/<v>/standard-install.yaml`),
    then the AWS Load Balancer Controller v2.13+ with IRSA (its IAM policy from
-   the controller release), its gateway CRDs (`config/crd/gateway/gateway-crds.yaml`
+   the SAME controller release; recipe below), its gateway CRDs (`config/crd/gateway/gateway-crds.yaml`
    of the same controller release) and the Gateway API feature gate
    (`--set controllerConfig.featureGates.ALBGatewayAPI=true` on the controller
    chart). Pin the controller chart (`--version`) and tag what it creates
    (`--set defaultTags.nano-deployment=nano`: the ALBs, target groups and
-   security groups). Create the GatewayClass `values-aws.yaml` expects:
+   security groups). The IAM policy and service account (a v2.0.18 run had to
+   work these out; the product guide now has them):
+
+   ```bash
+   LBC_VERSION=v3.6.2   # the controller version you install
+   ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+   curl -fsSLo ./nano-deploy-work/lbc-iam-policy.json \
+     "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/$LBC_VERSION/docs/install/iam_policy.json"
+   aws iam create-policy --policy-name $NAME-AWSLoadBalancerControllerIAMPolicy \
+     --policy-document file://nano-deploy-work/lbc-iam-policy.json --tags $TAG
+   eksctl create iamserviceaccount --cluster $NAME --region $AWS_REGION \
+     --namespace kube-system --name aws-load-balancer-controller \
+     --attach-policy-arn "arn:aws:iam::$ACCOUNT:policy/$NAME-AWSLoadBalancerControllerIAMPolicy" --approve
+   helm search repo eks/aws-load-balancer-controller --versions | head   # chart version whose APP VERSION = $LBC_VERSION
+   ```
+
+   Then install the chart with `--set serviceAccount.create=false --set
+   serviceAccount.name=aws-load-balancer-controller`. Create the GatewayClass
+   `values-aws.yaml` expects:
 
    ```bash
    kubectl apply -f - <<'YAML'
@@ -439,6 +457,19 @@ Then, in order (each is a hard stop for the chart):
    `tls.aws.ingestCertificateArn`. The operator needs a domain they control;
    after install, CNAME both hostnames to the ALB names
    (`kubectl -n nano get gateway`).
+
+   No public DNS (evaluation only): one private-CA certificate for both names,
+   imported into ACM, its ARN as both `appCertificateArn` and
+   `ingestCertificateArn`; test with `smoke-test.py --ca-file ... --resolve`:
+
+   ```bash
+   bash scripts/make-private-ca.sh --out ./nano-deploy-work/eval-pki --server-name <app host> --dns <ingest host>
+   aws acm import-certificate --region $AWS_REGION \
+     --certificate fileb://nano-deploy-work/eval-pki/server.crt \
+     --private-key fileb://nano-deploy-work/eval-pki/server.key \
+     --certificate-chain fileb://nano-deploy-work/eval-pki/ca.crt \
+     --tags $TAG --query CertificateArn --output text
+   ```
 
    **Restrict exposure** (ask; matches the docs' "Restrict exposure"): both
    ALBs are internet-facing and open to 0.0.0.0/0 by default. Set
@@ -489,7 +520,7 @@ run `scripts/pg-preflight.py` first so a gap shows before `helm install`.
 | Version | PostgreSQL 16 or newer (16, 17, 18 tested). RDS PostgreSQL 16 works from nano 2.0.11; 2.0.10 and earlier need 17+ |
 | Extensions | `pg_trgm`, `pgcrypto`, `uuid-ossp`. All are on RDS's supported list and trusted, so the database owner creates them. Nothing to do unless the parameter group sets `rds.allowed_extensions`: then add the three (the default `*` allows them) |
 | Parameters | None required. Default `rds.force_ssl=1` is fine (`sslmode: require`). Allow at least 200 connections (about 20 per nano pod); every class from `db.m7g.large` up does by default |
-| Network | Private subnets of the EKS VPC, `--no-publicly-accessible`, security group allowing 5432 from the node security group only |
+| Network | Private subnets of the EKS VPC, `--no-publicly-accessible`, security group allowing 5432 from the node security group only. With eksctl managed node groups that is the EKS **cluster security group** (`aws eks describe-cluster --name $NAME --query cluster.resourcesVpcConfig.clusterSecurityGroupId`, named `eks-cluster-sg-...`), not the stack's `ClusterSharedNodeSecurityGroup` |
 | HA | Multi-AZ DB instance (`--multi-az`, synchronous standby in another AZ, about 60-120 s failover), or a Multi-AZ DB cluster. Single-AZ is a single point of failure |
 
 ```bash

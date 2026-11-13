@@ -370,7 +370,7 @@ def _published_source(stack: Stack, nano: Nano, token_source) -> object:
     src = token_source()
     vrl = feeds.LANE_PARSER.format(lane=src.route_key)
     expect(nano.api.put(f"/api/log-sources/{src.source_id}", json={"parser_vrl": vrl}), 200)
-    res = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish"), 200)
+    res = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish", json={"acknowledge_unattested": True}), 200)
     assert res.get("success") is True, f"publish failed: {res}"
     n = {"i": 0}
 

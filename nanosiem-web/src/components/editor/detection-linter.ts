@@ -533,9 +533,24 @@ export function markValidationStale(): void {
 /**
  * Get current validation state from last backend result
  */
-export function getValidationState(): ValidationState | null {
+export function getValidationState(doc?: Text): ValidationState | null {
   // Return null if validation is stale (document changed since last validation)
   if (isValidationStale || !lastBackendResult) return null;
+  return buildValidationState(lastBackendResult, doc);
+}
+
+/**
+ * Combine a backend validation result with the client-side frontmatter lint
+ * for the same document. Exported for tests.
+ *
+ * NAN-5327: the panel/pill used to reflect the backend query check only, so a
+ * blocking frontmatter error ("Title must use snake_case") sat in the gutter
+ * next to a "VALID" pill and Create then failed on a toast. Client-side
+ * `error`-severity diagnostics now make the state invalid and are listed. It
+ * also used to show only `errors[0]`; every backend error is listed now.
+ */
+export function buildValidationState(result: ValidateDetectionResult, doc?: Text): ValidationState {
+  const lastBackendResult = result;
 
   // Determine info message (mode auto-correction or MV info)
   // Shorten verbose backend messages for display
@@ -563,11 +578,28 @@ export function getValidationState(): ValidationState | null {
   }
 
   // Handle errors being undefined (backend sometimes returns undefined instead of [])
-  const errors = lastBackendResult.errors || [];
+  const backendErrors = Array.isArray(lastBackendResult.errors)
+    ? lastBackendResult.errors
+    : lastBackendResult.errors
+      ? [String(lastBackendResult.errors)]
+      : [];
+  // Only frontmatter diagnostics: query-body checks (unbalanced quotes/parens)
+  // overlap with the backend parse error and would be listed twice.
+  let frontmatterErrors: string[] = [];
+  if (doc) {
+    const text = doc.toString();
+    const yamlEnd = text.startsWith('---') ? text.indexOf('---', 3) : -1;
+    if (yamlEnd !== -1) {
+      frontmatterErrors = clientSideValidation(doc)
+        .filter((d) => d.severity === 'error' && d.from < yamlEnd)
+        .map((d) => d.message);
+    }
+  }
+  const errors = [...frontmatterErrors, ...backendErrors];
 
   return {
-    valid: lastBackendResult.valid,
-    error: errors.length > 0 ? errors[0] : undefined,
+    valid: lastBackendResult.valid && frontmatterErrors.length === 0,
+    error: errors.length > 0 ? errors.join('\n') : undefined,
     info,
     detectionMode,
     createsMaterializedView: lastBackendResult.creates_materialized_view,

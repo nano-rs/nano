@@ -679,3 +679,5 @@ mod deep_expression_stack_tests;
 mod cidr_membership_tests;
 #[cfg(test)]
 mod string_plus_tests;
+#[cfg(test)]
+mod dc_missing_value_tests;

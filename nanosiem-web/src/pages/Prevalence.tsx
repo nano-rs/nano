@@ -522,8 +522,10 @@ export function Prevalence() {
           loading={loading && !data}
           approximate={countsApproximate}
         />
+        {/* NAN-5326: `high_risk_asset_count` counts ARTIFACTS (rare + seen in
+            24h), not hosts — 4 artifacts on 1 host read "4 assets". */}
         <KpiTile
-          label="High-risk assets"
+          label="High-risk artifacts"
           value={highRiskCount}
           sub="Rare + active in last 24h"
           icon={ShieldAlert}
@@ -1042,7 +1044,7 @@ function ExpandedArtifactDetail({
       <FacetCard
         key="sources"
         icon={Tag}
-        title="Source types"
+        title="Log sources"
         rows={detail.source_types.map((s) => ({ name: s.source_type, value: s.count }))}
         mono
       />,

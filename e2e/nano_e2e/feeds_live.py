@@ -91,7 +91,7 @@ def ensure_vendor_parser(nano: Nano, parser: VendorParser) -> str:
     missing = [lane for lane in parser.lanes if lane not in (src.get("match_values") or [])]
     assert not missing, f"imported {parser.name} does not claim lanes {missing}: {src.get('match_values')}"
     if not (src.get("deployed") and src.get("enabled")):
-        res = expect(nano.api.post(f"/api/log-sources/{source_id}/publish"), 200)
+        res = expect(nano.api.post(f"/api/log-sources/{source_id}/publish", json={"acknowledge_unattested": True}), 200)
         assert res.get("success") is True, f"publishing {parser.name} failed: {res}"
     eventually(
         lambda: expect(nano.api.get(f"/api/log-sources/{source_id}"), 200),

@@ -13,7 +13,9 @@ session's `stack` fixture calls `ensure_admin()`:
 
 Then the admin API key is minted, written to the run's admin.env (0600, read
 by the runner's secret scrubber) and into stack.env, so a later `run --run
-<id>` reuses the stack like any other.
+<id>` reuses the stack like any other. On an enterprise stack with
+NANO_E2E_C05_LICENSE_FILE set, the offline C05 license is then imported
+(NAN-5331), exactly as `up` does when it creates the admin itself.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from pathlib import Path
 
 import httpx
 
-from nano_e2e import bootstrap
+from nano_e2e import bootstrap, c05_license
 
 
 @dataclass
@@ -91,6 +93,9 @@ def ensure_admin() -> FirstRun:
         _rewrite_stack_env(stack_env, key)
     os.environ["NANOSIEM_API_KEY"] = key
     os.environ["E2E_ADMIN_DEFERRED"] = "done"
+    # NAN-5331: `up --defer-admin` leaves the C05 import to us (it needs the
+    # admin). Same contract as the runner: active license, or fail loudly.
+    c05_license.import_from_env(api, key, os.environ.get("E2E_EDITION", ""))
     return RESULT
 
 

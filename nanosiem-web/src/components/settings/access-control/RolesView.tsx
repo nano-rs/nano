@@ -37,58 +37,21 @@ import {
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { CreateRoleDialog } from './CreateRoleDialog';
-
-const CANONICAL_ACTIONS = ['view', 'create', 'edit', 'delete'] as const;
-type CanonicalAction = (typeof CANONICAL_ACTIONS)[number];
-
-interface MatrixRow {
-  resource: string;
-  /** Display label — e.g. "Detection rules" if available, else the resource id. */
-  label: string;
-  category: string;
-  actions: Map<string, PermissionInfo>;
-  specialAction?: { id: string; label: string; permission: PermissionInfo };
-}
-
-function buildMatrix(permissions: PermissionInfo[]): MatrixRow[] {
-  const byResource = new Map<string, MatrixRow>();
-  for (const p of permissions) {
-    const [resource, action] = p.id.split(':');
-    if (!resource || !action) continue;
-    let row = byResource.get(resource);
-    if (!row) {
-      row = {
-        resource,
-        label: p.name.split(' ').slice(0, -1).join(' ') || resource,
-        category: p.category || 'other',
-        actions: new Map(),
-      };
-      byResource.set(resource, row);
-    }
-    row.actions.set(action, p);
-    if (!CANONICAL_ACTIONS.includes(action as CanonicalAction) && !row.specialAction) {
-      row.specialAction = {
-        id: action,
-        label: action.charAt(0).toUpperCase() + action.slice(1),
-        permission: p,
-      };
-    }
-  }
-  return Array.from(byResource.values()).sort((a, b) => {
-    const cat = a.category.localeCompare(b.category);
-    return cat !== 0 ? cat : a.resource.localeCompare(b.resource);
-  });
-}
+import { CANONICAL_ACTIONS, buildMatrix, type MatrixRow } from './role-matrix';
+import { categoryDisplayName } from '@/lib/permissions';
+import { UNGRANTABLE_HINT } from '@/lib/grantable-permissions';
 
 function rolePermCount(role: RoleDetail): number {
   return role.permissions.length;
 }
 
-function PermCell({ allowed, locked, onToggle, label }: {
+function PermCell({ allowed, locked, onToggle, label, ungrantable = false }: {
   allowed: boolean;
   locked: boolean;
   onToggle?: () => void;
   label: string;
+  /** NAN-5329: the viewer does not hold this permission, so cannot grant it. */
+  ungrantable?: boolean;
 }) {
   if (allowed) {
     return (
@@ -108,16 +71,18 @@ function PermCell({ allowed, locked, onToggle, label }: {
       </button>
     );
   }
+  const blocked = locked || ungrantable;
   return (
     <button
       type="button"
-      disabled={locked}
+      disabled={blocked}
       onClick={onToggle}
       className={cn(
         'h-7 flex items-center justify-center rounded-sm border border-border bg-card/40 text-muted-foreground/70 transition-colors w-full',
-        locked ? 'cursor-default' : 'hover:bg-foreground/[0.04]',
+        blocked ? 'cursor-default' : 'hover:bg-foreground/[0.04]',
+        !locked && ungrantable && 'opacity-45',
       )}
-      title={locked ? 'System role — cannot be modified' : `${label} not allowed (click to grant)`}
+      title={locked ? 'System role — cannot be modified' : ungrantable ? UNGRANTABLE_HINT : `${label} not allowed (click to grant)`}
     >
       <span className="w-[4px] h-[4px] rounded-full bg-muted-foreground/40" />
     </button>
@@ -357,7 +322,7 @@ function RoleDetailView({
               {Object.entries(matrixByCategory).map(([cat, rows]) => (
                 <div key={cat}>
                   <div className="px-3 py-1.5 bg-card/30 border-b border-border/60 text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">
-                    {cat}
+                    {categoryDisplayName(cat)}
                   </div>
                   {rows.map(r => (
                     <div
@@ -382,6 +347,7 @@ function RoleDetailView({
                             key={action}
                             allowed={allowedSet.has(perm.id)}
                             locked={locked || !canEdit}
+                            ungrantable={!hasPermission(perm.id)}
                             label={action}
                             onToggle={() => onPermissionToggle(perm.id)}
                           />
@@ -393,6 +359,7 @@ function RoleDetailView({
                           key="special"
                           allowed={allowedSet.has(r.specialAction.permission.id)}
                           locked={locked || !canEdit}
+                          ungrantable={!hasPermission(r.specialAction.permission.id)}
                           label={r.specialAction.label}
                           onToggle={() => onPermissionToggle(r.specialAction!.permission.id)}
                         />

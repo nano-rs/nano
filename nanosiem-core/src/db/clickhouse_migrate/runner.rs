@@ -196,6 +196,9 @@ impl ClickHouseMigrator {
 
         // Collect SET key=value pairs to append as SETTINGS clause to DDL queries
         let mut settings: Vec<(String, String)> = Vec::new();
+        // NAN-5338: statements skipped because their profile-gated target
+        // table is absent, summarized once per migration (see below).
+        let mut absent_table_skips = 0usize;
 
         for statement in migration_sql.split(';') {
             let sql = statement.trim();
@@ -289,11 +292,28 @@ impl ClickHouseMigrator {
             match self.execute_with_busy_retry(&full_sql).await {
                 Ok(_) => {}
                 Err(e) if skip_if_unknown_table && Self::is_unknown_table_error(&e.to_string()) => {
-                    tracing::warn!(
+                    // NAN-5338: expected on UDM-only deployments and on every
+                    // fresh OCSF install (the overlay creates the current shape
+                    // after the numbered migrations), so not a warning.
+                    tracing::debug!(
                         "Migration statement skipped (target table absent on this \
                          deployment profile): {} - {}",
                         migration.filename,
                         e
+                    );
+                    absent_table_skips += 1;
+                    continue;
+                }
+                Err(e) if is_soft_fail && Self::is_readonly_access_storage_error(&e.to_string()) => {
+                    // NAN-5338: the grantee is a users.d XML user (Compose,
+                    // Helm). Its privileges come from that file, which already
+                    // carries this change (migration_grants_users_xml_guard).
+                    tracing::info!(
+                        "Migration GRANT/REVOKE not applied: grantee is defined in \
+                         users.d XML (read-only access storage), which carries this \
+                         privilege change: {} - {}",
+                        migration.filename,
+                        sql
                     );
                     continue;
                 }
@@ -316,6 +336,16 @@ impl ClickHouseMigrator {
                         .await);
                 }
             }
+        }
+
+        if absent_table_skips > 0 {
+            tracing::info!(
+                "{}: skipped {} statement(s) whose target table does not exist yet \
+                 (profile-gated: UDM-only deployment, or a fresh OCSF install whose \
+                 overlay creates the current shape after the numbered migrations)",
+                migration.filename,
+                absent_table_skips
+            );
         }
 
         Ok(())

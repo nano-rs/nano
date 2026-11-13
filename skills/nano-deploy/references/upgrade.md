@@ -21,6 +21,9 @@ python3 -I scripts/upgrade-plan.py compose --inventory ./nano-deploy-work/invent
 python3 -I scripts/upgrade-plan.py compose --host <user>@<host>
 # Helm
 python3 -I scripts/upgrade-plan.py helm --namespace nano [--release nano] [--context <ctx>]
+# Helm with an external PostgreSQL (RDS, Cloud SQL, Azure): the license comes from the API
+python3 -I scripts/upgrade-plan.py helm --namespace nano --creds ./admin-creds.env \
+  [--app-url https://<app host>] [--ca-file <ca.crt> --resolve <app host>:<IP>]
 ```
 
 It changes nothing and prints no secret (only `NANO_VERSION` and a digest of
@@ -33,7 +36,9 @@ each host's `.env`). It reads:
   another release;
 - the upgrade policy of the target package (`--policy`): the minimum source
   version and any required stops;
-- the license state from PostgreSQL, including the "upgrade required" lock;
+- the license state from PostgreSQL, including the "upgrade required" lock
+  (Helm with an external PostgreSQL: `GET /api/license` as the admin from
+  `--creds`, at `--app-url` or the app HTTPRoute's hostname);
 - health (Docker up, no restarting, failed or unhealthy containers; Helm:
   every workload ready) and free disk on Docker's data root;
 - whether `.env` is byte-identical on every host;

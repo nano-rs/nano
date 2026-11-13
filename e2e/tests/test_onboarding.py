@@ -60,7 +60,7 @@ def test_data_before_parser_publish(stack: Stack, nano: Nano, token_source, mark
     timeline.step("connect status", state=status.get("state"), events_24h=status.get("events_24h"))
 
     expect(nano.api.put(f"/api/log-sources/{src.source_id}", json={"parser_vrl": PARSER}), 200)
-    published = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish"), 200)
+    published = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish", json={"acknowledge_unattested": True}), 200)
     assert published.get("success") is True, f"publish failed: {published}"
     timeline.step("parser published", message=published.get("message"))
 

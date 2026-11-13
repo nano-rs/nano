@@ -32,6 +32,7 @@ import {
   SheetFooter,
 } from '@/components/ui/sheet';
 import { ScopeSelector } from './ScopeSelector';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface CreateApiKeyDialogProps {
   open: boolean;
@@ -49,6 +50,8 @@ const EXPIRES_OPTIONS = [
 
 export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: CreateApiKeyDialogProps) {
   const { toast } = useToast();
+  // NAN-5329: only permissions the creator holds are grantable.
+  const { hasPermission } = useAuth();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [scopes, setScopes] = useState<string[]>([]);
@@ -141,6 +144,7 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
             <ScopeSelector
               key={open ? 'open' : 'closed'}
               permissions={permissions}
+              canGrant={hasPermission}
               initialScopes={[]}
               defaultPresetId="readonly"
               onChange={setScopes}

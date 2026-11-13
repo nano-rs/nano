@@ -179,7 +179,7 @@ def install(nano: Nano, parsers: list[CorpusParser], deploy_timeout: float = 180
             c.source_id = str(source_id)
             src = expect(nano.api.get(f"/api/log-sources/{c.source_id}"), 200)
             if not (src.get("deployed") and src.get("enabled")):
-                res = expect(nano.api.post(f"/api/log-sources/{c.source_id}/publish", timeout=600), 200)
+                res = expect(nano.api.post(f"/api/log-sources/{c.source_id}/publish", json={"acknowledge_unattested": True}, timeout=600), 200)
                 if res.get("success") is not True:
                     raise RuntimeError(f"publish refused: {str(res)[:300]}")
             log(f"  published {c.name} ({len(c.samples)} samples, lanes {','.join(c.lanes)})")

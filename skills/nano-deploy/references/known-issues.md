@@ -13,6 +13,11 @@ product's files.
   Synthetic sign-in monitors and failover probes must stay below it (one
   sign-in every 10 s is fine), or authenticate with an API key instead.
 
+- **OTLP/HTTP is binary protobuf only.** `/otlp/v1/{logs,traces,metrics}`
+  answers `415` ("protobuf only") to OTLP/JSON. Senders must use
+  `http/protobuf` (the OpenTelemetry SDK and Collector default); a sender set
+  to `http/json` needs changing, not a nano fix.
+
 - **TLS overlay during first install.** With `docker-compose.tls.yml` active,
   plain-HTTP `localhost` calls get a 301 redirect, and the installer's health
   and admin-creation calls can treat it as success. Install first without the

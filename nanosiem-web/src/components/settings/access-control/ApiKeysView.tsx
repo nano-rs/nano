@@ -16,6 +16,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Search as SearchIcon,
   Plus,
@@ -440,6 +441,21 @@ export function ApiKeysView() {
   const [pendingDelete, setPendingDelete] = useState<ApiKeySummary | null>(null);
   const [pendingRotate, setPendingRotate] = useState<ApiKeySummary | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  // NAN-5329: deep links from the retired standalone form —
+  // `?new=1` opens the create sheet, `?key=<id>` selects a key.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    const wantsNew = searchParams.get('new') === '1';
+    const keyId = searchParams.get('key');
+    if (!wantsNew && !keyId) return;
+    if (wantsNew && canCreate) setShowCreate(true);
+    if (keyId) setSelectedId(keyId);
+    const next = new URLSearchParams(searchParams);
+    next.delete('new');
+    next.delete('key');
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   const fetchAll = async () => {
     setLoading(true);
@@ -450,8 +466,8 @@ export function ApiKeysView() {
       ]);
       setKeys(keysRes.api_keys);
       setPermissions(permsRes);
-      if (!selectedId && keysRes.api_keys.length > 0) {
-        setSelectedId(keysRes.api_keys[0].id);
+      if (keysRes.api_keys.length > 0) {
+        setSelectedId((prev) => prev ?? keysRes.api_keys[0].id);
       }
     } catch (err) {
       toast({

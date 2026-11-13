@@ -13,7 +13,8 @@ and never prints a secret: it reads NANO_VERSION and a sha256 of each host's
   # Compose, single node:
   python3 -I scripts/upgrade-plan.py compose --host ubuntu@nano.example.com
   # Helm:
-  python3 -I scripts/upgrade-plan.py helm --namespace nano [--release nano] [--context CTX]
+  python3 -I scripts/upgrade-plan.py helm --namespace nano [--release nano] [--context CTX] \\
+      [--app-url https://APP_FQDN] [--creds ./admin-creds.env] [--ca-file CA] [--resolve HOST:IP]
 
 Common options:
   --target X.Y.Z    plan for this release (default: the latest, from
@@ -26,7 +27,13 @@ Common options:
 
 It detects the install type (single node, multi-node HA, Helm), the version on
 every host or workload, the license state (including the "upgrade required"
-lock), health and free disk, then prints the path for this install:
+lock), health and free disk, then prints the path for this install. On Helm
+the license comes from the bundled PostgreSQL pod; with an external
+PostgreSQL (RDS, Cloud SQL, Azure) it is read through the API instead:
+GET /api/license as the admin from --creds (default ./admin-creds.env, then
+~/.nano-admin-credentials) at --app-url (default: https:// + the hostname of
+the release's app HTTPRoute). The password is read from the file and sent
+only in the sign-in request body; nothing is printed. It prints the path:
   - from v2.0.10 or later: `scripts/nano upgrade` (Compose) with the package;
   - from v2.0.9 or earlier: re-run the installer host by host (HA: ClickHouse
     hosts, PostgreSQL replicas, then the leader's host after moving the
@@ -40,11 +47,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
+import socket
+import ssl
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 
@@ -301,6 +312,98 @@ def probe_helm(base: list[str], release: str) -> list[Unit]:
 
 
 # --- analysis --------------------------------------------------------------------------
+def app_url_from_routes(base: list[str], release: str) -> str:
+    """https:// + the hostname of the release's app HTTPRoute (component app-gateway), or ""."""
+    code, out, _ = kubectl(base, "get", "httproute", "-l",
+                           f"app.kubernetes.io/instance={release},app.kubernetes.io/component=app-gateway",
+                           "-o", "jsonpath={.items[0].spec.hostnames[0]}")
+    host = out.strip() if code == 0 else ""
+    return f"https://{host}" if host and re.fullmatch(r"[A-Za-z0-9.-]+", host) else ""
+
+
+def read_creds(path: str) -> dict:
+    """KEY=VALUE lines (admin-credentials.sh format); quotes stripped. Never logged."""
+    out: dict = {}
+    with open(os.path.expanduser(path), encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            out[key.strip()] = value
+    return out
+
+
+def pin_resolve(pairs: list[str]) -> None:
+    """--resolve HOST:IP (or curl's HOST:PORT:IP): connect HOST to IP; TLS still verifies HOST."""
+    pins = {}
+    for pair in pairs:
+        host, _, rest = pair.partition(":")
+        port, colon, ip = rest.partition(":")
+        if not (colon and port.isdigit() and ip):
+            ip = rest
+        if not host or not ip:
+            raise ValueError(f"--resolve expects HOST:IP, got {pair!r}")
+        pins[host.lower()] = ip.strip("[]")
+    if pins:
+        real = socket.getaddrinfo
+        socket.getaddrinfo = lambda host, *a, **k: real(pins.get(str(host).lower(), host), *a, **k)
+
+
+def api_license(app_url: str, creds_path: str, ca_file: str | None = None, timeout: float = 15) -> tuple[dict | None, str]:
+    """Sign in as the admin and read GET /api/license. Returns (license, "") or (None, why)."""
+    try:
+        creds = read_creds(creds_path)
+    except OSError as err:
+        return None, f"no admin credentials ({err.strerror or err}: {creds_path})"
+    email, password = creds.get("NANO_ADMIN_EMAIL", ""), creds.get("NANO_ADMIN_PASSWORD", "")
+    if not email or not password:
+        return None, f"no NANO_ADMIN_EMAIL/NANO_ADMIN_PASSWORD in {creds_path}"
+    base = app_url.rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1")):
+        # The admin password goes in the sign-in body: never over plain HTTP to a remote host.
+        return None, f"refusing to send the admin password to {base}: use https:// (plain http only for localhost)"
+    ctx = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+
+    def call(method: str, path: str, body: bytes | None = None, token: str = "") -> tuple[int, object]:
+        headers = {"Accept": "application/json", "User-Agent": "nano-deploy-upgrade-plan"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        request = urllib.request.Request(base + path, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=ctx) as response:
+                status, raw = response.status, response.read()
+        except urllib.error.HTTPError as err:
+            status, raw = err.code, err.read()
+        try:
+            return status, json.loads(raw) if raw else None
+        except ValueError:
+            return status, None
+
+    try:
+        status, data = call("POST", "/api/auth/login", json.dumps({"email": email, "password": password}).encode())
+        password = ""
+        token = ((data or {}).get("tokens") or {}).get("access_token") if isinstance(data, dict) else None
+        if not token:
+            return None, f"admin sign-in at {base} answered {status}"
+        status, data = call("GET", "/api/license", token=token)
+    except (urllib.error.URLError, OSError, ValueError) as err:
+        return None, f"{base} not reachable ({getattr(err, 'reason', err)})"
+    if status != 200 or not isinstance(data, dict):
+        return None, f"GET {base}/api/license answered {status}"
+    return {"status": str(data.get("state") or ""), "valid": bool(data.get("valid")),
+            "locked_reason": str(data.get("locked_reason") or ""),
+            "last_checked_at": str(data.get("last_checked_at") or ""),
+            "mode": str(data.get("mode") or ""), "expires_at": str(data.get("expires_at") or ""),
+            "source": "api"}, ""
+
+
 def leader_of(units: list[Unit]) -> str:
     for unit in units:
         for member in unit.patroni or []:
@@ -309,7 +412,8 @@ def leader_of(units: list[Unit]) -> str:
     return ""
 
 
-def assess(kind: str, units: list[Unit], latest: dict | None, target: tuple | None, policy: dict | None) -> dict:
+def assess(kind: str, units: list[Unit], latest: dict | None, target: tuple | None, policy: dict | None,
+           license_note: str = "") -> dict:
     findings: list[Finding] = []
     reachable = [u for u in units if not u.error]
     for unit in units:
@@ -362,7 +466,8 @@ def assess(kind: str, units: list[Unit], latest: dict | None, target: tuple | No
     license_state = next((u.license for u in reachable if u.license), None)
     upgrade_required = False
     if license_state is None:
-        findings.append(Finding("WARN", "license", "not read (no PostgreSQL reachable here): check Settings → License"))
+        findings.append(Finding("WARN", "license", license_note or "not read (no PostgreSQL reachable here): "
+                                "check Settings → License"))
     else:
         reason = license_state.get("locked_reason") or ""
         upgrade_required = "upgrade" in reason.lower()
@@ -377,8 +482,10 @@ def assess(kind: str, units: list[Unit], latest: dict | None, target: tuple | No
                                     f"valid={license_state.get('valid')} reason={reason or '-'}: fix the license; "
                                     "the upgrade dry run checks it"))
         else:
+            via = " (via GET /api/license)" if license_state.get("source") == "api" else ""
+            expires = f" expires {license_state['expires_at']}" if license_state.get("expires_at") else ""
             findings.append(Finding("PASS", "license", f"status={license_state.get('status')} last check-in "
-                                    f"{license_state.get('last_checked_at') or 'unknown'}"))
+                                    f"{license_state.get('last_checked_at') or 'unknown'}{expires}{via}"))
 
     latest_version = parse_version((latest or {}).get("version"))
     target = target or latest_version
@@ -399,8 +506,10 @@ def assess(kind: str, units: list[Unit], latest: dict | None, target: tuple | No
                                 + (f"required stop(s) {', '.join(stops)}: upgrade to each in turn" if stops
                                    else "no required stops")))
     elif target and current:
+        enforced = ("Helm has no `scripts/nano upgrade` dry run, so check the release notes' upgrade path"
+                    if kind == "helm" else "`scripts/nano upgrade --dry-run` enforces it")
         findings.append(Finding("WARN", "policy", "not checked here (pass --policy <target package>/deploy/release/"
-                                "upgrade-policy.json); `scripts/nano upgrade --dry-run` enforces it"))
+                                f"upgrade-policy.json); {enforced}"))
 
     if kind == "helm":
         path = "helm"
@@ -613,6 +722,29 @@ def render(result: dict, steps: list[str]) -> str:
     return "\n".join(out) + "\n"
 
 
+def helm_license_via_api(a: argparse.Namespace, base: list[str], units: list[Unit]) -> str:
+    """No bundled PostgreSQL pod: read the license through the API. Sets it on the
+    first unit and returns "", or returns the WARN detail saying why it was not read."""
+    app_url = a.app_url or app_url_from_routes(base, a.release)
+    if not app_url:
+        return ("not read: external PostgreSQL and no app HTTPRoute found; pass --app-url https://<app host> "
+                "and --creds <admin credential file>")
+    creds = a.creds
+    if not creds:
+        creds = next((p for p in ("./admin-creds.env", "~/.nano-admin-credentials")
+                      if os.path.isfile(os.path.expanduser(p))), "./admin-creds.env")
+    try:
+        pin_resolve(a.resolve)
+    except ValueError as err:
+        return f"not read: {err}"
+    license_state, why = api_license(app_url, creds, a.ca_file)
+    if license_state is None:
+        return (f"not read via the API: {why}. Pass --app-url, --creds (and --ca-file/--resolve for a "
+                "private-CA install), or check Settings → License")
+    units[0].license = license_state
+    return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="kind", required=True)
@@ -630,6 +762,13 @@ def main(argv: list[str] | None = None) -> int:
     helm.add_argument("--namespace", required=True)
     helm.add_argument("--release", default="nano")
     helm.add_argument("--context")
+    helm.add_argument("--app-url", help="app URL for the license via GET /api/license when PostgreSQL is external "
+                      "(default: https:// + the app HTTPRoute hostname)")
+    helm.add_argument("--creds", help="admin credential file, NANO_ADMIN_EMAIL/NANO_ADMIN_PASSWORD "
+                      "(default: ./admin-creds.env, then ~/.nano-admin-credentials)")
+    helm.add_argument("--ca-file", help="CA bundle for the app URL (a private-CA evaluation install)")
+    helm.add_argument("--resolve", action="append", default=[], metavar="HOST:IP",
+                      help="connect HOST to IP, like curl --resolve (no public DNS); repeatable")
     for p in (compose, helm):
         p.add_argument("--target", help="plan for this release (default: the latest)")
         p.add_argument("--latest-url", default=LATEST_URL)
@@ -697,7 +836,10 @@ def main(argv: list[str] | None = None) -> int:
         if not units:
             print(f"upgrade-plan: no workloads of release {a.release} in namespace {a.namespace}", file=sys.stderr)
             return 2
-        result = assess("helm", units, latest, target, policy)
+        license_note = ""
+        if not any(u.license for u in units):
+            license_note = helm_license_via_api(a, base, units)
+        result = assess("helm", units, latest, target, policy, license_note)
         result["install_type"] = "helm"
         steps = helm_steps(result, a.namespace, a.release)
     result["steps"] = [] if result["up_to_date"] else steps

@@ -114,6 +114,7 @@ def test_audit_api_key_actor_filter_url_and_csv(nano: Nano, page: uilib.UiPage, 
             "Resource Name",
             "IP Address",
             "Success",
+            "Details",  # NAN-5324: scopes granted, old -> new values, denial reasons
         ]
         assert len(rows) - 1 == len(ui_rows), (len(rows) - 1, len(ui_rows))
         assert all(line.startswith('"') for line in text.splitlines()), "a cell is not quoted"
@@ -124,22 +125,14 @@ def test_audit_api_key_actor_filter_url_and_csv(nano: Nano, page: uilib.UiPage, 
         for r in rows[1:]:
             assert not any(FORMULA_PREFIX.match(c) for c in r), f"an exported cell evaluates: {r}"
 
-        # The server has no equivalent for the table's local free-text search.
-        # Do not let "Export all" silently broaden the visible result set.
+        # NAN-5308: the search runs server-side, so "Export all" exports the
+        # rows matching the filters AND the search box (never broader than the
+        # visible result set) via POST /api/audit/export, bounded and formula-safe.
         search = {"placeholder": "Search logs…"}
         export_all = {"role": "button", "name": "Export all"}
-        page.fill(uilib.field(search, name.lstrip("=")))
-        reason = "Clear the search to export all rows matching the filters"
-        page.wait_text(reason)
-        assert page.attr(export_all, "disabled") is not None
-
-        page.fill(uilib.field(search, ""))
-        page.wait_text(reason, gone=True)
+        term = name.lstrip("=")
+        page.fill(uilib.field(search, term))
         assert page.attr(export_all, "disabled") is None
-
-        # Server export: after the local search is clear, the button calls POST
-        # /api/audit/export with the page filter, downloads the bounded export,
-        # and preserves formula safety.
         since = page.now_ms()
         all_name, all_text = page.download(export_all, timeout_ms=60_000)
         all_rows = list(csv.reader(io.StringIO(all_text)))
@@ -161,7 +154,9 @@ def test_audit_api_key_actor_filter_url_and_csv(nano: Nano, page: uilib.UiPage, 
             "ip_address",
             "success",
             "message",
+            "details",  # NAN-5324
         ]
+        assert all(any(term.lower() in c.lower() for c in r) for r in all_rows[1:]), "export ignored the search"
         all_mine = next(r for r in all_rows[1:] if name.lstrip("=") in r[10])
         assert all_mine[6] == action
         if FORMULA_PREFIX.match(name):

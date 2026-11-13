@@ -143,8 +143,6 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/settings/access-control/groups/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Edit Group' }] },
   { path: '/settings/access-control/roles/new', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'New Role' }] },
   { path: '/settings/access-control/roles/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Edit Role' }] },
-  { path: '/settings/access-control/api-keys/new', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'New API Key' }] },
-  { path: '/settings/access-control/api-keys/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Edit API Key' }] },
 
   // Legacy settings sub-pages
   { path: '/settings/users', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Users' }] },

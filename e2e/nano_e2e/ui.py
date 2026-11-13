@@ -94,7 +94,14 @@ class Driver:
             self.close()
             raise
 
-    def call(self, op: str, timeout: float = OP_TIMEOUT, **args: Any) -> Any:
+    def call(self, op: str, **args: Any) -> Any:
+        # `timeout` (ms) belongs to the op and goes to the driver. It used to be
+        # swallowed as this method's own read timeout, so every wait ran at the
+        # driver's 20 s default (NAN-5335). Bound the read by the op's own wait.
+        if args.get("timeout") is None:
+            args.pop("timeout", None)  # JSON null would defeat the driver's default
+        op_ms = args.get("timeout")
+        read_timeout = max(OP_TIMEOUT, op_ms / 1000 + 30) if isinstance(op_ms, (int, float)) else OP_TIMEOUT
         with self._lock:
             rid = next(self._ids)
             assert self._proc.stdin and self._proc.stdout
@@ -103,7 +110,7 @@ class Driver:
                 self._proc.stdin.flush()
             except BrokenPipeError as exc:
                 raise RuntimeError("E2E-INFRA: UI driver is gone; see artifacts/ui-driver.log") from exc
-            line = _readline(self._proc.stdout, timeout)
+            line = _readline(self._proc.stdout, read_timeout)
             if not line:
                 raise RuntimeError(f"E2E-INFRA: UI driver exited during {op}; see artifacts/ui-driver.log")
             resp = json.loads(line)

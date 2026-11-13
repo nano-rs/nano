@@ -47,6 +47,8 @@ export interface User {
   default_time_range?: TimeRangePreset;
   landing_page?: LandingPage;
   isApiKey?: boolean;
+  /** NAN-5328: the role's data scope hides some sources from live data. */
+  data_scope_restricted?: boolean;
 }
 
 /**

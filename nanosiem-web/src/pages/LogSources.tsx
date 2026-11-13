@@ -74,6 +74,7 @@ import {
 } from '@/lib/api/log-source-connect';
 import { logSourceTransportLabel } from '@/lib/log-source-transports';
 import { cn } from '@/lib/utils';
+import { descriptionSummary } from '@/lib/description-summary';
 
 type DerivedStatus = 'deployed' | 'ready' | 'paused' | 'draft';
 type FilterId = 'all' | 'deployed' | 'ready' | 'warn' | 'draft';
@@ -764,7 +765,7 @@ function LogSourceRow({
             </div>
             {source.description && (
               <div className="text-[11px] text-muted-foreground truncate mt-0.5 leading-relaxed max-w-[620px]">
-                {source.description}
+                {descriptionSummary(source.description)}
               </div>
             )}
             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">

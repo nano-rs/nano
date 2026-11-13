@@ -425,7 +425,8 @@ export function Dashboards() {
       toast({ title: 'Dashboard created', description: `Dashboard "${data.name}" has been created.` });
       setCreateDialogOpen(false);
       refetch();
-      navigate(`/dashboards/${created.id}`);
+      // NAN-5328: the create sheet promises edit mode with the panel library.
+      navigate(`/dashboards/${created.id}?edit=true`);
     } catch (err) {
       toast({
         title: 'Error',

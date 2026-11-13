@@ -91,7 +91,7 @@ def test_rejected_pull_credential_does_not_block_other_deploys(
         # An unrelated change: publish a parser on a fresh source; it must go live.
         src = token_source()
         expect(nano.api.put(f"/api/log-sources/{src.source_id}", json={"parser_vrl": PARSER}), 200)
-        published = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish"), 200)
+        published = expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish", json={"acknowledge_unattested": True}), 200)
         assert published.get("success") is True, published
         n = {"i": 0}
 
@@ -246,7 +246,7 @@ def test_events_accepted_during_a_vector_reload_all_land(
 
     src = token_source()
     expect(nano.api.put(f"/api/log-sources/{src.source_id}", json={"parser_vrl": PARSER}), 200)
-    assert expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish"), 200).get("success") is True
+    assert expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish", json={"acknowledge_unattested": True}), 200).get("success") is True
 
     for round_no in range(ROUNDS):
         sent: list[str] = []
@@ -274,7 +274,7 @@ def test_events_accepted_during_a_vector_reload_all_land(
             # transforms (the "feed starts right after its lane is published" case).
             vrl = PARSER + f"\n# round {round_no}"
             expect(nano.api.put(f"/api/log-sources/{src.source_id}", json={"parser_vrl": vrl}), 200)
-            expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish"), 200)
+            expect(nano.api.post(f"/api/log-sources/{src.source_id}/publish", json={"acknowledge_unattested": True}), 200)
         t.join()
         assert len(sent) >= EVENTS_PER_ROUND - 1, f"round {round_no}: too few accepted: {sent}"
 

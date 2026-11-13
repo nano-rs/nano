@@ -3838,7 +3838,7 @@ fn ip_field_cidr_validation_is_strict_and_non_ip_slashes_are_unchanged() {
             )
             .unwrap();
         assert!(
-            grouped.contains("toFloat64(uniqExact(src_ip))"),
+            grouped.contains("toFloat64(uniqExactIf(src_ip, toString(src_ip) != ''))"),
             "grouped dc() must stay uniqExact, got:\n{grouped}"
         );
         let global = ClickHouseSqlGenerator::new()
@@ -3848,8 +3848,8 @@ fn ip_field_cidr_validation_is_strict_and_non_ip_slashes_are_unchanged() {
             )
             .unwrap();
         assert!(
-            global.contains("toFloat64(count(DISTINCT src_ip))"),
-            "ungrouped dc() must stay count(DISTINCT), got:\n{global}"
+            global.contains("toFloat64(uniqExactIf(src_ip, toString(src_ip) != ''))"),
+            "ungrouped dc() must stay exact (uniqExactIf, NAN-5339), got:\n{global}"
         );
     }
 

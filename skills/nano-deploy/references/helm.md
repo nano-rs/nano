@@ -194,16 +194,19 @@ not fit, is a hard stop. Fix the value; never edit chart templates.
 ## Step 5: install (mutating)
 
 ```bash
-helm upgrade --install nano ./nano -n nano --wait --timeout 20m \
+helm upgrade --install nano ./nano -n nano --wait --timeout 30m \
   -f nano/values-customer-images.yaml -f nano/values-standard.yaml -f nano/values-sovereign.yaml \
   -f ./nano-deploy-work/helm/values-site.yaml -f ./nano-deploy-work/helm/values-licence.yaml
 kubectl -n nano get pods -w
 kubectl -n nano logs -f job/nano-migrate-r1
 ```
 
-The first migration can take 10+ minutes against a remote managed PostgreSQL.
-Keep `--timeout` at or below `migrations.dependentProgressDeadlineSeconds`
-(1800 s from 2.0.11): use `--wait --timeout 30m` there. If the install still
+Install with `--wait --timeout 30m`, the same as the product guide: it equals
+`migrations.dependentProgressDeadlineSeconds` (1800 s from 2.0.11), so a
+longer timeout never helps, and `--wait` returns as soon as the pods are
+ready (about 8 minutes in the v2.0.18 GKE and EKS runs, the migration Job
+about 6 of them). The first migration can take 10+ minutes against a remote
+managed PostgreSQL. Upgrades keep `--timeout 20m`. If the install still
 fails, read the migration Job's log first, fix the cause, and run the same
 `helm upgrade --install` again ([known-issues.md](known-issues.md)).
 

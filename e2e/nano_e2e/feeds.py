@@ -302,7 +302,7 @@ def ensure_lane_source(
         )
     elif src.get("parser_vrl") != vrl:
         expect(nano.api.put(f"/api/log-sources/{src['id']}", json={"parser_vrl": vrl}), 200)
-    res = expect(nano.api.post(f"/api/log-sources/{src['id']}/publish"), 200)
+    res = expect(nano.api.post(f"/api/log-sources/{src['id']}/publish", json={"acknowledge_unattested": True}), 200)
     assert res.get("success") is True, f"publishing lane parser {lane} failed: {res}"
     return src["id"]
 

@@ -95,6 +95,7 @@ pub struct AuditLogListResponse {
 pub struct AuditLogEntry {
     pub id: String,
     pub timestamp: DateTime<Utc>,
+    /// Acting user (`user_…` typeid, same form as `/api/auth/me`); non-user actors pass through.
     pub user_id: Option<String>,
     pub user_name: Option<String>,
     pub action: Option<String>,
@@ -107,7 +108,7 @@ pub struct AuditLogEntry {
     pub success: bool,
     pub message: Option<String>,
     pub details: Option<serde_json::Value>,
-    /// API key ID when the action was authenticated via an API key
+    /// API key ID (`key_…` typeid) when the action was authenticated via an API key
     pub api_key_id: Option<String>,
     /// API key display name when the action was authenticated via an API key
     pub api_key_name: Option<String>,
@@ -119,7 +120,7 @@ impl From<ClickHouseAuditEntry> for AuditLogEntry {
         Self {
             id: e.event_id,
             timestamp: e.timestamp,
-            user_id: e.actor_id,
+            user_id: as_typeid(nanosiem_core::typeid::user::PREFIX, e.actor_id),
             user_name: e.user,
             action: e.action,
             source: e.source,
@@ -131,10 +132,22 @@ impl From<ClickHouseAuditEntry> for AuditLogEntry {
             success,
             message: Some(e.message),
             details: e.metadata.get("details").cloned(),
-            api_key_id: e.api_key_id,
+            api_key_id: as_typeid(nanosiem_core::typeid::api_key::PREFIX, e.api_key_id),
             api_key_name: e.api_key_name,
         }
     }
+}
+
+/// NAN-5329: the audit store keeps actor / API-key ids as raw UUID strings,
+/// while every other API (`/api/auth/me`, `/api/users`, `/api/api-keys`)
+/// speaks typeids. Emit the typeid so audit rows and CSV exports join to those
+/// APIs. Values that are not a UUID (`system`, an already-encoded typeid) pass
+/// through unchanged.
+pub(crate) fn as_typeid(prefix: &str, raw: Option<String>) -> Option<String> {
+    raw.map(|s| match Uuid::parse_str(&s) {
+        Ok(id) => nanosiem_core::typeid::encode(prefix, &id),
+        Err(_) => s,
+    })
 }
 
 /// Query audit logs with filtering
@@ -539,6 +552,11 @@ pub struct AuditApiDoc;
 #[path = "audit_csv_details_tests.rs"]
 mod csv_details_tests;
 
+// NAN-5329: audit ids are typeids, like the rest of the API.
+#[cfg(test)]
+#[path = "audit_typeid_tests.rs"]
+mod typeid_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,9 +595,10 @@ mod tests {
 
     #[test]
     fn from_ch_entry_propagates_api_key_actor() {
-        let key_id = uuid::Uuid::now_v7().to_string();
+        let key_uuid = uuid::Uuid::now_v7();
+        let key_id = nanosiem_core::typeid::encode(nanosiem_core::typeid::api_key::PREFIX, &key_uuid);
         let entry = ch_entry_with_metadata(json!({
-            "api_key_id": key_id,
+            "api_key_id": key_uuid.to_string(),
             "api_key_name": "ci-bot",
         }));
 

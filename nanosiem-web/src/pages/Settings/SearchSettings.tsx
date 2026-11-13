@@ -4,6 +4,7 @@ import { useState, useEffect, useId } from 'react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
 import { NumberInput } from '@/components/ui/number-input';
+import { numberInputWidth } from '@/lib/number-input-width';
 import { Switch } from '@/components/ui/switch';
 import { AlertTriangle, Save } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
@@ -275,7 +276,8 @@ export function SearchSettings() {
                     min={row.min}
                     max={row.max}
                     aria-describedby={descId}
-                    className="h-8 w-[80px] text-center font-mono text-[12px]"
+                    className="h-8 text-center font-mono text-[12px]"
+                    style={{ width: numberInputWidth(row.max) }}
                   />
                   {row.suffix && (
                     <span className="font-mono text-[10.5px] text-muted-foreground">{row.suffix}</span>
@@ -446,7 +448,8 @@ export function SearchSettings() {
                     min={row.min}
                     max={row.max}
                     aria-describedby={descId}
-                    className="h-8 w-[80px] text-center font-mono text-[12px]"
+                    className="h-8 text-center font-mono text-[12px]"
+                    style={{ width: numberInputWidth(row.max) }}
                   />
                   <span className="font-mono text-[10.5px] text-muted-foreground">{row.suffix}</span>
                 </div>

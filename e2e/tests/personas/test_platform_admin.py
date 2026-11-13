@@ -28,6 +28,28 @@ def _oidc_providers(client: Nano) -> list[dict]:
     return body if isinstance(body, list) else body.get("providers", body.get("items", []))
 
 
+# NAN-5238 refusal copy (nanosiem-api-lib grant_authz `admin_required` with
+# nanosiem-enterprise oidc/admin.rs `SSO_TRUST_CHANGE_REASON`), surfaced
+# verbatim in the provider sheet's error toast.
+SSO_TRUST_REFUSAL = "Changing SSO trust settings requires administrator authority"
+
+
+def _submit_oidc_provider(page: uilib.UiPage, name: str, client_id: str, client_secret: str) -> None:
+    page.goto("/settings/oidc")
+    page.wait_text("Add provider", exact=True, timeout_ms=60_000)
+    page.click({"role": "button", "name": "Add provider", "exact": True})
+    page.fill(
+        uilib.field({"css": 'input[placeholder="Azure AD"]'}, name),
+        uilib.field(
+            {"css": 'input[placeholder="https://login.microsoftonline.com/{tenant}/v2.0"]'},
+            "https://accounts.google.com",
+        ),
+        uilib.field({"css": 'input[placeholder="Application (client) ID"]'}, client_id),
+        uilib.field({"css": 'input[placeholder="Client secret value"]'}, client_secret, secret=True),
+    )
+    page.click({"role": "button", "name": "Create provider", "exact": True})
+
+
 def test_platform_admin_journey(
     stack: Stack,
     nano: Nano,
@@ -141,27 +163,40 @@ def test_platform_admin_journey(
             keyed_api.close()
 
         if edition == "enterprise":
-            # Create an enabled SSO provider in the browser. The dummy secret is
-            # scrubbed from all artifacts; cleanup is registered by concrete id.
+            # NAN-5238: creating (enabling) an SSO provider is a trust change and
+            # needs administrator authority -- every catalog permission -- not
+            # just settings:system. The subset platform-admin persona must see
+            # the server's refusal in the browser and leave nothing behind.
             oidc_secret = "e2e-oidc-" + secrets.token_hex(16)
             page.driver.register_secret(oidc_secret)
-            page.goto("/settings/oidc")
-            page.wait_text("Add provider", exact=True, timeout_ms=60_000)
-            page.click({"role": "button", "name": "Add provider", "exact": True})
-            page.fill(
-                uilib.field({"css": 'input[placeholder="Azure AD"]'}, provider_name),
-                uilib.field(
-                    {"css": 'input[placeholder="https://login.microsoftonline.com/{tenant}/v2.0"]'},
-                    "https://accounts.google.com",
-                ),
-                uilib.field({"css": 'input[placeholder="Application (client) ID"]'}, f"client-{mark[-8:]}"),
-                uilib.field({"css": 'input[placeholder="Client secret value"]'}, oidc_secret, secret=True),
+            _submit_oidc_provider(page, provider_name, f"client-{mark[-8:]}", oidc_secret)
+            page.wait_text(SSO_TRUST_REFUSAL, exact=False, timeout_ms=30_000)
+            assert not any(item.get("name") == provider_name for item in _oidc_providers(nano)), (
+                "subset platform-admin created an SSO provider"
             )
-            page.click({"role": "button", "name": "Create provider", "exact": True})
-            page.wait_text(provider_name, exact=True, timeout_ms=60_000)
+            timeline.step("SSO trust boundary", persona="platform-admin", ui="refused")
+
+            # A full administrator creates the enabled provider through the same
+            # browser flow. The dummy secret is scrubbed from all artifacts;
+            # cleanup is registered by concrete id.
+            admin_page = uilib.UiPage.open(ui, artifact_dir / "ui-admin-sso", name="admin:sso")
+            admin_failed = True
+            try:
+                uilib.login(admin_page, stack.admin_email, stack.admin_password)
+                _submit_oidc_provider(admin_page, provider_name, f"client-{mark[-8:]}", oidc_secret)
+                admin_page.wait_text(provider_name, exact=True, timeout_ms=60_000)
+                admin_failed = False
+            finally:
+                admin_page.finish(admin_failed)
+                if admin_failed:
+                    # The POST may have landed before the UI wait failed; never
+                    # leak an enabled provider onto the stack.
+                    for item in _oidc_providers(nano):
+                        if item.get("name") == provider_name:
+                            nano.api.delete(f"/api/settings/oidc/{item['id']}")
             provider = eventually(
                 lambda: next(
-                    (item for item in _oidc_providers(platform.client) if item.get("name") == provider_name),
+                    (item for item in _oidc_providers(nano) if item.get("name") == provider_name),
                     None,
                 ),
                 timeout=30,
@@ -171,11 +206,11 @@ def test_platform_admin_journey(
             assert provider is not None
             platform.cleanup.register_http(
                 f"OIDC provider {provider['id']}",
-                lambda: platform.client.api.delete(f"/api/settings/oidc/{provider['id']}"),
+                lambda: nano.api.delete(f"/api/settings/oidc/{provider['id']}"),
             )
             assert provider["enabled"] is True
             assert provider["issuer"] == "https://accounts.google.com"
-            timeline.step("SSO provider configured", provider=provider["id"], enabled=True)
+            timeline.step("SSO provider configured", provider=provider["id"], enabled=True, actor="admin")
         else:
             capabilities = expect(nano.api.get("/api/capabilities"), 200)["capabilities"]
             assert capabilities["sso"] is False

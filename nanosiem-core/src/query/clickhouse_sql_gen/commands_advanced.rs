@@ -5,6 +5,7 @@
 //! Helper methods for complex command match arms: StreamStats, EventStats,
 //! Sequence, Funnel, Anomaly, Tree, Asset, Cloud.
 
+use super::aggregation::distinct_count_sql;
 use super::helpers::*;
 use super::{extract_fields_from_search_expr, ClickHouseSqlGenerator, SourceStability};
 use crate::query::ast::*;
@@ -449,10 +450,10 @@ impl ClickHouseSqlGenerator {
                                 field_expr, partition_clause, frame_spec)
                         }
                     }
-                    AggFunc::Dc => format!("uniqExact({}) OVER ({}ORDER BY {tc} {})",
-                        field_expr, partition_clause, frame_spec),
-                    AggFunc::EstDc => format!("uniqCombined64({}) OVER ({}ORDER BY {tc} {})",
-                        field_expr, partition_clause, frame_spec),
+                    AggFunc::Dc => format!("{} OVER ({}ORDER BY {tc} {})",
+                        distinct_count_sql("uniqExact", &field_expr), partition_clause, frame_spec),
+                    AggFunc::EstDc => format!("{} OVER ({}ORDER BY {tc} {})",
+                        distinct_count_sql("uniqCombined64", &field_expr), partition_clause, frame_spec),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArrayDistinct({})(toString({})) OVER ({}ORDER BY {tc} {})), ', ')",
                         self.max_group_array_size, field_expr, partition_clause, frame_spec),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({})) OVER ({}ORDER BY {tc} {})), ', ')",
@@ -615,22 +616,21 @@ impl ClickHouseSqlGenerator {
             let value_expr = match agg.func {
                 AggFunc::Count => format!("toFloat64({})", windowed("count()".to_string())),
                 AggFunc::Dc => {
-                    // Same aggregates the window emission used: exact
-                    // count(DISTINCT) over the whole set, uniqExact per group.
-                    // ClickHouse has no DISTINCT window function, so the
-                    // single-scan whole-set form uses uniqExact — also exact.
-                    if grouped || over.is_some() {
-                        format!("toFloat64({})", windowed(format!("uniqExact({})", field_expr)))
-                    } else {
-                        format!("toFloat64(count(DISTINCT {}))", field_expr)
-                    }
+                    // Exact distinct count (uniqExact) in every shape — grouped,
+                    // whole-set, and the single-scan window form. NAN-5339: the
+                    // whole-set form was `count(DISTINCT x)`, which (like plain
+                    // uniqExact) counted the missing-field `''` as a value.
+                    format!(
+                        "toFloat64({})",
+                        windowed(distinct_count_sql("uniqExact", &field_expr))
+                    )
                 }
                 AggFunc::EstDc => {
                     // Approximate distinct count: bounded memory via
                     // uniqCombined64 (~0.9% measured error).
                     format!(
                         "toFloat64({})",
-                        windowed(format!("uniqCombined64({})", field_expr))
+                        windowed(distinct_count_sql("uniqCombined64", &field_expr))
                     )
                 }
                 AggFunc::Sum => format!("toFloat64({})", windowed(format!("sum({})", field_expr))),

@@ -3563,6 +3563,8 @@ export interface CurrentUser {
   roles: string[];
   permissions: string[];
   is_api_key?: boolean;
+  /** NAN-5328: the role's data scope hides some sources from live data. */
+  data_scope_restricted?: boolean;
 }
 
 export interface OidcProviderInfo {

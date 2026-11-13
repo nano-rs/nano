@@ -54,3 +54,15 @@ fn migration_185_dictionaries_are_fatal() {
         assert!(!M::migration_statement_soft_fails(&body, true), "{body}");
     }
 }
+
+/// NAN-5338: the users.d read-only storage error is recognized (logged at
+/// INFO, the XML carries the grant); any other GRANT failure is not.
+#[test]
+fn readonly_access_storage_error_is_recognized() {
+    let e = "Code: 495. DB::Exception: Cannot update user `nanosiem_ingest` in users_xml \
+             because this storage is readonly. (ACCESS_STORAGE_READONLY)";
+    assert!(M::is_readonly_access_storage_error(e));
+    assert!(!M::is_readonly_access_storage_error(
+        "Code: 497. DB::Exception: nanosiem_admin: Not enough privileges. (ACCESS_DENIED)"
+    ));
+}
