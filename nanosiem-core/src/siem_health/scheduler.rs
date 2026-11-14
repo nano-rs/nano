@@ -188,6 +188,17 @@ pub async fn run_health_check_with_trigger(
         Ok(users) => analyzer::ensure_clickhouse_network_findings(&mut analysis, &users),
         Err(e) => warn!("Failed to read ClickHouse user networks: {}", e),
     }
+    // NAN-5390: ClickHouse refusing nano's logins or writes (wrong user
+    // networks, password or grants). A refused probe login is itself evidence.
+    let refusals = match super::clickhouse_refusals::clickhouse_refusals(system_probe_client).await {
+        Ok(lines) => lines,
+        Err(e) => {
+            let msg = e.to_string();
+            warn!("Failed to read ClickHouse refusals: {}", msg);
+            super::clickhouse_refusals::refusal_from_error(&msg).into_iter().collect()
+        }
+    };
+    super::clickhouse_refusals::ensure_clickhouse_refusal_findings(&mut analysis, &refusals);
     // NAN-5204: automatic backups enabled but none succeeded in 36 hours.
     match crate::backup_status::BackupStatusRepository::new(pool.clone()).get().await {
         Ok(status) => {

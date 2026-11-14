@@ -41,8 +41,12 @@ fn probe_at(url: String) -> ReloadAckProbe {
             .build()
             .expect("client"),
         timeout: std::time::Duration::from_millis(300),
+        base: std::time::Duration::from_millis(300),
+        unreadable_grace: std::time::Duration::from_secs(60),
         max_wait: std::time::Duration::from_millis(300),
         durations: Box::leak(Box::new(ReloadDurations::new())),
+        loaded_bytes: 0,
+        expect_outcome: false,
         poll_interval: std::time::Duration::from_millis(25),
     }
 }

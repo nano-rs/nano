@@ -84,7 +84,7 @@ impl LogSourceService {
         // reverted rows instead of waiting for the 5 s reconciler.
         if two_phase.published && !live && VectorConfigManager::generation_delivery_active() {
             progress.phase(DeployPhase::RollingBack);
-            if let Err(e) = self.vector_config.reload_vector().await {
+            if let Err(e) = self.vector_config.reload_vector_after_rollback().await {
                 tracing::warn!(
                     log_source_id = %id,
                     error = %e,
@@ -651,7 +651,7 @@ impl LogSourceService {
             match backup {
                 Some(backup) => match self.vector_config.restore_backup(backup).await {
                     Ok(()) => {
-                        if let Err(e) = self.vector_config.reload_vector().await {
+                        if let Err(e) = self.vector_config.reload_vector_after_rollback().await {
                             tracing::error!(error = %e, "reload after withdrawing a two-phase deploy failed");
                         }
                     }
@@ -912,7 +912,7 @@ impl LogSourceService {
         // Local: `deploy_and_reload_locked` already restored its snapshot on a
         // rejection. Role split: republish the routed state from the database.
         if role_split {
-            if let Err(e) = self.vector_config.reload_vector().await {
+            if let Err(e) = self.vector_config.reload_vector_after_rollback().await {
                 tracing::warn!(error = %e, "could not republish after a withdrawn undeploy; the reconciler retries");
             }
         } else if let Ok(parsers) = self.effective_deployed_parsers().await {

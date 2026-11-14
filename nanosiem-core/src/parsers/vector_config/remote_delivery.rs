@@ -51,6 +51,11 @@ pub const CONSUMER_SYNC_INTERVAL_ENV: &str = "NANO_VECTOR_CONFIG_SYNC_INTERVAL_S
 /// The ingest consumers' per-install Vector acknowledgement wait (their
 /// `ACK_TIMEOUT_SECS`).
 pub const CONSUMER_ACK_TIMEOUT_ENV: &str = "NANO_VECTOR_CONFIG_CONSUMER_ACK_TIMEOUT_SECS";
+/// NAN-5298: the consumers' size-stretched install wait ceiling (their
+/// `ACK_MAX_SECS`); a slow host may take this long to apply a large generation.
+pub const CONSUMER_ACK_MAX_ENV: &str = "NANO_VECTOR_CONFIG_CONSUMER_ACK_MAX_SECS";
+/// `vector-config-consumer.sh`'s `ACK_MAX_SECS` default.
+pub const DEFAULT_CONSUMER_ACK_MAX_SECS: u64 = 180;
 /// `vector-config-consumer.sh` defaults (`SYNC_INTERVAL`, `ACK_TIMEOUT_SECS`).
 pub const DEFAULT_CONSUMER_SYNC_INTERVAL_SECS: u64 = 5;
 pub const DEFAULT_CONSUMER_ACK_TIMEOUT_SECS: u64 = 60;
@@ -412,16 +417,30 @@ pub fn derived_ack_timeout(sync_interval_secs: u64, consumer_ack_secs: u64) -> D
     )
 }
 
+/// The longest one consumer install may wait for Vector: the larger of its
+/// `ACK_TIMEOUT_SECS` floor and its `ACK_MAX_SECS` ceiling.
+pub fn consumer_install_wait_secs() -> u64 {
+    install_wait_secs(env_secs(CONSUMER_ACK_TIMEOUT_ENV), env_secs(CONSUMER_ACK_MAX_ENV))
+}
+
+pub(crate) fn install_wait_secs(floor: Option<u64>, ceiling: Option<u64>) -> u64 {
+    let floor = floor.filter(|secs| *secs > 0).unwrap_or(DEFAULT_CONSUMER_ACK_TIMEOUT_SECS);
+    let ceiling = ceiling.filter(|secs| *secs > 0).unwrap_or(DEFAULT_CONSUMER_ACK_MAX_SECS);
+    floor.max(ceiling)
+}
+
 /// How long a deploy waits for the ingest hosts: [`DELIVERY_ACK_TIMEOUT_ENV`]
 /// when set to a number, otherwise [`derived_ack_timeout`].
 pub fn ack_timeout() -> Duration {
     match env_secs(DELIVERY_ACK_TIMEOUT_ENV) {
         Some(secs) => Duration::from_secs(secs),
+        // NAN-5298: size the wait to the consumers' longest install (their
+        // size-stretched ceiling), not their quiet floor; the edge clamp in
+        // `derived_ack_timeout` still bounds it. Past it the deploy reports
+        // the generation PENDING (never a rollback): the hosts keep applying.
         None => derived_ack_timeout(
             consumer_sync_interval().as_secs(),
-            env_secs(CONSUMER_ACK_TIMEOUT_ENV)
-                .filter(|secs| *secs > 0)
-                .unwrap_or(DEFAULT_CONSUMER_ACK_TIMEOUT_SECS),
+            consumer_install_wait_secs(),
         ),
     }
 }

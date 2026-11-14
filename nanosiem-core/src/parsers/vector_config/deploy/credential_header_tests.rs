@@ -66,6 +66,32 @@ pub(super) fn transform_in(config: &str, name: &str) -> String {
         .to_string()
 }
 
+/// The type Vector gives the event root (`.`) in remap `name` of `config`.
+/// Vector types `.` from the input's schema: `trace_to_log` and
+/// `metric_to_log` declare none, so `.` is `any` there and the OTLP trace /
+/// metric preps must open with `. = object(.) ?? {}`. A bare `vrl::compile`
+/// assumes an object and rejects that line as E651, which Vector
+/// 0.61.0-nano.11 accepts (`vector validate`); every other input is an object.
+pub(super) fn vector_root_kind(config: &toml::Value, name: &str) -> vrl::value::Kind {
+    use vrl::value::{Kind, kind::Collection};
+    let transforms = &config["transforms"];
+    let inputs = transforms[name]["inputs"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let untyped = |input: &toml::Value| {
+        let kind = input.as_str().and_then(|i| transforms.get(i)).and_then(|t| t.get("type")).and_then(|t| t.as_str());
+        matches!(kind, Some("trace_to_log" | "metric_to_log"))
+    };
+    if !inputs.is_empty() && inputs.iter().all(untyped) { Kind::any() } else { Kind::object(Collection::any()) }
+}
+
+/// `vrl::compile` with the event root typed as Vector types it (see
+/// [`vector_root_kind`]).
+pub(super) fn compile_with_root(src: &str, root: vrl::value::Kind) -> vrl::compiler::Result {
+    use vrl::compiler::{CompileConfig, compile_with_external, state::ExternalEnv};
+    use vrl::value::{Kind, kind::Collection};
+    let external = ExternalEnv::new_with_kind(root, Kind::object(Collection::any()));
+    compile_with_external(src, &vrl::stdlib::all(), &external, CompileConfig::default())
+}
+
 /// The pipeline config is not valid TOML until Vector interpolates its
 /// `${VAR:-default}` sink settings, so slice the block out textually.
 pub(super) fn pipeline(name: &str) -> String {

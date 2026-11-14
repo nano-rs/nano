@@ -168,24 +168,34 @@
     /// diagnostic here would take OTLP ingestion down on the next Vector reload.
     #[test]
     fn otlp_source_vrl_blocks_compile() {
-        use vrl::compiler::compile;
+        use super::credential_header_tests::{compile_with_root, vector_root_kind};
         use vrl::diagnostic::Formatter;
 
         let content = include_str!("../../../../../config/vector/03-otlp-source.toml");
-        let blocks = extract_vrl_blocks(content);
-        assert!(
-            !blocks.is_empty(),
-            "expected ≥1 VRL block in 03-otlp-source.toml"
+        let config: toml::Value = toml::from_str(&crate::vector_env::substitute_like_vector(content))
+            .expect("03-otlp-source.toml parses");
+        // Each remap compiles against the root type Vector gives it: `any`
+        // behind trace_to_log / metric_to_log, an object elsewhere.
+        let remaps: Vec<(&str, &str)> = config["transforms"]
+            .as_table()
+            .expect("[transforms]")
+            .iter()
+            .filter(|(_, t)| t.get("type").and_then(|v| v.as_str()) == Some("remap"))
+            .map(|(name, t)| (name.as_str(), t["source"].as_str().expect("remap source")))
+            .collect();
+        assert!(!remaps.is_empty(), "expected ≥1 remap in 03-otlp-source.toml");
+        assert_eq!(
+            remaps.len(),
+            extract_vrl_blocks(content).len(),
+            "every VRL block in 03-otlp-source.toml is a remap source"
         );
 
-        let fns = vrl::stdlib::all();
-        let failures: Vec<String> = blocks
+        let failures: Vec<String> = remaps
             .iter()
-            .enumerate()
-            .filter_map(|(idx, block)| {
-                compile(block, &fns).err().map(|diagnostics| {
+            .filter_map(|(name, block)| {
+                compile_with_root(block, vector_root_kind(&config, name)).err().map(|diagnostics| {
                     let formatted = Formatter::new(block, diagnostics).to_string();
-                    format!("block #{idx}:\n{formatted}")
+                    format!("{name}:\n{formatted}")
                 })
             })
             .collect();

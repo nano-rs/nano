@@ -23,7 +23,14 @@ Checks:
             hosts a second time), no read-only replicated tables, replication
             delay <= 30 s, Keeper session alive, no distributed DDL older than
             10 min still pending (an entry older than one its host already
-            finished is stale, not stuck: it only warns).
+            finished is stale, not stuck: it only warns). NAN-5390: no
+            refused logins for nano's users (codes 192-195, 516; latest within
+            10 min), which catches a wrong clickhouse.allowedNetworks because
+            pods log in from the pod network; and a zero-row INSERT as
+            nanosiem_vector succeeds. That probe runs over loopback inside the
+            ClickHouse pod (always allowed), so it checks Vector's password and
+            INSERT grant, NOT its networks; `helm test` writes from the pod
+            network.
   registry  the registry credential refresh CronJob (when present) succeeded
             within the last hour.
 Exit 0 = healthy, 1 = a check failed, 2 = usage error / kubectl unavailable.
@@ -154,7 +161,29 @@ CH_SQL = {
     "delay": "SELECT max(absolute_delay) FROM clusterAllReplicas('default', system.replicas) SETTINGS skip_unavailable_shards=1",
     "keeper": "SELECT count() FROM system.zookeeper_connection WHERE NOT is_expired",
     "ddl": DDL_SQL,
+    # NAN-5390: refused logins (UNKNOWN_USER, WRONG_PASSWORD, REQUIRED_PASSWORD,
+    # IP_ADDRESS_NOT_ALLOWED, AUTHENTICATION_FAILED) whose latest message, within
+    # the last 10 minutes on this replica, names a nano user. system.errors
+    # counts are cumulative since server start; the sum is reported as such.
+    # Two TSV columns: refusals, last message.
+    "refusals": "SELECT sum(value), any(last_error_message) FROM system.errors "
+                "WHERE code IN (192, 193, 194, 195, 516) AND remote = 0 "
+                "AND last_error_time > now() - 600 "
+                "AND match(last_error_message, '^nanosiem[a-z_]*: ')",
 }
+
+# NAN-5390: Vector's write identity, checked with a zero-row INSERT over HTTP
+# from inside the ClickHouse pod (clickhouse-client refuses an empty INSERT
+# client-side, before any grant check). Stores nothing; logs in, checks the
+# INSERT grant. ocsf_logs_raw on OCSF installs, logs_ingest on UDM. ClickHouse's
+# answer goes to stderr, which exec_sh returns on failure.
+WRITE_PROBE = (
+    'for t in ocsf_logs_raw logs_ingest; do '
+    'wget -qO- --content-on-error --post-data= '
+    '--header "X-ClickHouse-User: nanosiem_vector" --header "X-ClickHouse-Key: $CLICKHOUSE_VECTOR_PASSWORD" '
+    '"http://127.0.0.1:8123/?query=INSERT%20INTO%20nanosiem.$t%20FORMAT%20JSONEachRow" 1>&2 '
+    '&& { echo "ok $t"; exit 0; }; done; exit 1'
+)
 
 
 def check_clickhouse(kube: Kube, pods: list[dict]) -> None:
@@ -172,7 +201,7 @@ def check_clickhouse(kube: Kube, pods: list[dict]) -> None:
         if rc != 0:
             row("ch", False, f"{key} query failed on {pod}: {out[:200]}")
             return
-        results[key] = out.split()
+        results[key] = out.split() if key != "refusals" else out.split("\t", 1)
     configured, answering = (int(x) for x in results["replicas"][:2])
     row("ch", configured > 0 and answering == configured, f"replicas answering {answering}/{configured} (cluster 'default')")
     row("ch", int(results["readonly"][0]) == 0, f"{results['readonly'][0]} read-only / expired-session replicated tables")
@@ -186,6 +215,18 @@ def check_clickhouse(kube: Kube, pods: list[dict]) -> None:
     if stale:
         row("ch", None, f"{stale} stale distributed DDL entries: never run on a host that has finished later ones; "
             "harmless, ClickHouse drops them after distributed_ddl.task_max_lifetime (7 days)")
+    refused = int((results["refusals"] + ["0"])[0] or 0)
+    last = (results["refusals"] + ["", ""])[1].strip()[:200]
+    row("ch", refused == 0, "no refused logins for nano's ClickHouse users in the last 10 min" if not refused
+        else f"refused logins for nano's ClickHouse users: {refused} since ClickHouse started, latest within "
+             f"10 min (last: {last}); check clickhouse.allowedNetworks and the ClickHouse passwords")
+    # The password is expanded inside the pod; it never reaches this process.
+    rc, out = kube.exec_sh(pod, None, WRITE_PROBE)
+    if rc == 127 or "not found" in out:
+        row("ch", None, f"write probe skipped: no wget in {pod}")
+    else:
+        row("ch", rc == 0, f"nanosiem_vector can write ({out.split()[-1]}; password + grant, over loopback)" if rc == 0
+            else f"nanosiem_vector cannot write: {out[:200]}")
 
 
 def check_registry(kube: Kube, release_prefix: str) -> None:

@@ -12,6 +12,8 @@
 //! scores, and prioritized recommendations.
 
 pub mod analyzer;
+// NAN-5390: ClickHouse refusing nano's logins or writes.
+pub mod clickhouse_refusals;
 pub mod collector;
 // NAN-5097: reads an enterprise table (migration 9000094).
 #[cfg(feature = "enterprise")]

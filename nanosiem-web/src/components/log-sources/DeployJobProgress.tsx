@@ -82,6 +82,17 @@ export function DeployJobProgress({ job, className }: { job: DeployJob | undefin
           <span className="text-muted-foreground truncate" data-testid="deploy-job-phase">
             {phaseLabel(job.phase)}
           </span>
+          {job.message && (
+            // NAN-5298: what the reload wait is doing (a large config can
+            // take minutes to compile on a small host).
+            <span
+              className="text-muted-foreground truncate min-w-0"
+              title={job.message}
+              data-testid="deploy-job-substatus"
+            >
+              {job.message}
+            </span>
+          )}
           <span className="flex items-center gap-0.5 shrink-0" aria-hidden>
             {PHASE_STEPS.map((phase, index) => (
               <span

@@ -21,10 +21,12 @@ use std::collections::HashMap;
 
 use vrl::compiler::runtime::Runtime;
 use vrl::compiler::state::RuntimeState;
-use vrl::compiler::{compile, Program, TargetValue, TimeZone};
-use vrl::value::{Secrets, Value};
+use vrl::compiler::{Program, TargetValue, TimeZone};
+use vrl::value::{kind::Collection, Kind, Secrets, Value};
 
-use super::credential_header_tests::{json, pipeline, transform_in, transform_source};
+use super::credential_header_tests::{
+    compile_with_root, json, pipeline, transform_in, transform_source, vector_root_kind,
+};
 use super::VectorConfigManager;
 use crate::parsers::vector_config::parser_config::{OCSF_PARSE_FAILURE_RECORD_VRL, OCSF_PREPARE_VRL};
 
@@ -249,12 +251,18 @@ struct Chain(HashMap<String, Program>);
 
 impl Chain {
     fn run(&mut self, event: Value, metadata: Value, programs: &[(&str, String)]) -> Value {
+        self.run_rooted(event, metadata, programs, Kind::object(Collection::any()))
+    }
+
+    /// `run`, with every program compiled against `root` as the event-root
+    /// type (see `credential_header_tests::vector_root_kind`).
+    fn run_rooted(&mut self, event: Value, metadata: Value, programs: &[(&str, String)], root: Kind) -> Value {
         let mut target = TargetValue { value: event, metadata, secrets: Secrets::new() };
         for (name, src) in programs {
             let src = src
                 .replace(r#"get_env_var("VECTOR_AUTH_TOKEN") ?? """#, &format!("{TOKEN:?}"))
                 .replace(r#"get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? """#, r#""true""#);
-            let program = self.0.entry(src.clone()).or_insert_with(|| match compile(&src, &vrl::stdlib::all()) {
+            let program = self.0.entry(format!("{root:?}\n{src}")).or_insert_with(|| match compile_with_root(&src, root.clone()) {
                 Ok(c) => c.program,
                 Err(d) => panic!("{name} failed to compile:\n{}", vrl::diagnostic::Formatter::new(&src, d)),
             });
@@ -394,7 +402,8 @@ fn otlp_traces_and_metrics_store_no_credential() {
         ("otlp_traces_prep", span, ["http.method", "attempt", "follows", "service.name"].as_slice()),
         ("otlp_metrics_prep", metric, ["http.method", "http.url"].as_slice()),
     ] {
-        let row = runner.run(event, json(serde_json::json!({})), &[(name, transform_in(&otlp, name))]);
+        let root = vector_root_kind(&toml::from_str(&otlp).expect("OTLP config parses"), name);
+        let row = runner.run_rooted(event, json(serde_json::json!({})), &[(name, transform_in(&otlp, name))], root);
         let stored = row.get(vrl::path!("event")).and_then(|v| v.as_str()).expect("event is a JSON string").into_owned();
         for secret in SECRETS {
             assert!(!stored.contains(secret), "{name}: `{secret}` reached storage: {stored}");

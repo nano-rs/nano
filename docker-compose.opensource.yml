@@ -682,6 +682,7 @@ services:
       # the check) and hard ceiling (default 600) in seconds; empty = default.
       VECTOR_RELOAD_ACK_TIMEOUT_SECS: ${VECTOR_RELOAD_ACK_TIMEOUT_SECS:-}
       VECTOR_RELOAD_ACK_MAX_SECS: ${VECTOR_RELOAD_ACK_MAX_SECS:-}
+      VECTOR_RELOAD_ACK_UNREADABLE_SECS: ${VECTOR_RELOAD_ACK_UNREADABLE_SECS:-}
       # NAN-1913: must be the sources ROOT as Vector sees it. The api writes
       # parser credential files (GCP service-account JSON, Kafka CA, TLS certs)
       # to <VECTOR_CONFIG_DIR>/sources/parsers__*, which this volume exposes at
@@ -830,6 +831,7 @@ services:
       VECTOR_CONFIG_DIR: /app/config/vector
       VECTOR_RELOAD_ACK_TIMEOUT_SECS: ${VECTOR_RELOAD_ACK_TIMEOUT_SECS:-}
       VECTOR_RELOAD_ACK_MAX_SECS: ${VECTOR_RELOAD_ACK_MAX_SECS:-}
+      VECTOR_RELOAD_ACK_UNREADABLE_SECS: ${VECTOR_RELOAD_ACK_UNREADABLE_SECS:-}
       # NAN-1913: see nano-api — sources root as Vector sees it, not the
       # dynamic-config root.
       VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic/sources

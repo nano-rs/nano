@@ -357,7 +357,10 @@ pub use publication::{
 };
 pub use redaction::redact_config_snapshot;
 pub use backup::BackupGeneration;
-pub use deploy::{ActivationOutcome, ReloadWatch, VerifyFailure};
+pub use deploy::{
+    current_reload_wait, ActivationOutcome, ReloadWaitStatus, ReloadWatch, VerifyFailure,
+    DEFAULT_RELOAD_ACK_MAX_SECS,
+};
 
 /// NAN-4936: hooks for tests elsewhere in the crate (the entrypoint tests).
 #[cfg(test)]

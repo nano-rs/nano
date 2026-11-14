@@ -45,7 +45,7 @@ pub use validator::{CompiledNormalizer, VrlValidator, VrlValidatorError};
 #[cfg(test)]
 pub(crate) use validator::validate_enrichment_encoding_contract;
 pub use vector_config::{
-    ActivationOutcome, ReloadWatch,
+    current_reload_wait, ActivationOutcome, ReloadWaitStatus, ReloadWatch, DEFAULT_RELOAD_ACK_MAX_SECS,
     base_router_inputs, hec_normalize_present, redact_config_snapshot, PublicationOutcome,
     SnapshotBundle, VectorConfigError, VectorConfigManager, VectorConfigPublicationError,
     VectorConfigPublisher,

@@ -44,6 +44,21 @@ describe('DeployJobProgress', () => {
     expect(strip.textContent).toMatch(/1[12]s/);
   });
 
+  it('shows the reload sub-status while Vector compiles a large config (NAN-5298)', () => {
+    render(
+      <DeployJobProgress
+        job={job({ message: 'Vector is compiling the new config (340 KiB); waited 52s of up to 180s for its verdict' })}
+      />,
+    );
+    expect(screen.getByTestId('deploy-job-phase').textContent).toBe('Reloading Vector');
+    expect(screen.getByTestId('deploy-job-substatus').textContent).toContain('waited 52s of up to 180s');
+  });
+
+  it('shows no sub-status without a message', () => {
+    render(<DeployJobProgress job={job({})} />);
+    expect(screen.queryByTestId('deploy-job-substatus')).toBeNull();
+  });
+
   it('shows the final state and message', () => {
     render(
       <DeployJobProgress

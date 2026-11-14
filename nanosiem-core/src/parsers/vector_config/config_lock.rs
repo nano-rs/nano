@@ -33,7 +33,11 @@ pub const CONFIG_LOCK_FILE: &str = ".nano-config.lock";
 
 /// Longest a deploy waits for the entrypoint (its cold-start guard validates
 /// each pull source with a 90s bound).
-const MAX_WAIT: Duration = Duration::from_secs(300);
+///
+/// NAN-5298: a deploy holds the lock through its reload wait, at most
+/// `DEFAULT_RELOAD_ACK_MAX_SECS` (180) for the forward reload plus the base
+/// window (45) for a rollback's, inside this bound (`reload_compile_budget_tests`).
+pub(super) const MAX_WAIT: Duration = Duration::from_secs(300);
 
 /// Held while a deploy writes the shared config; released on drop.
 pub struct ConfigDirLock {

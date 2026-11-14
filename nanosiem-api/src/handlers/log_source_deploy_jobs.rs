@@ -55,6 +55,27 @@ fn default_wait() -> bool {
     true
 }
 
+/// NAN-5298 follow-up (review): the longest a `wait=true` request holds its
+/// connection. The edge's `proxy_read_timeout` is 300 s and the web gives up at
+/// 310 s; a deploy still running past this answers 202 with the job (and its
+/// `status_path`) instead of a 504 without one, which invited duplicate
+/// deploys. The deploy itself keeps running either way.
+pub(crate) const SYNC_DEPLOY_WAIT: std::time::Duration = std::time::Duration::from_secs(270);
+
+/// A running job in the reload phase carries what the reload wait is doing
+/// (NAN-5298 follow-up: a large config can take minutes to compile, and an
+/// unexplained "Reloading Vector" for that long reads as a hang).
+pub(crate) fn with_reload_status(mut job: DeployJob) -> DeployJob {
+    if job.state == DeployJobState::Running
+        && matches!(job.phase, DeployPhase::Reloading | DeployPhase::Activating)
+    {
+        if let Some(status) = nanosiem_core::parsers::current_reload_wait() {
+            job.message = Some(status.describe());
+        }
+    }
+    job
+}
+
 /// What a deploy job's work produced.
 pub(crate) enum DeployOk {
     /// A per-source deploy result (deploy, undeploy, publish).
@@ -174,7 +195,20 @@ where
     if !wait {
         return Ok((StatusCode::ACCEPTED, Json(submitted.job)).into_response());
     }
-    match rx.await {
+    let Ok(received) = tokio::time::timeout(SYNC_DEPLOY_WAIT, rx).await else {
+        // Still running: hand back the job to poll rather than letting the
+        // edge cut the connection with no job id.
+        let job = state
+            .log_source_deploy_jobs
+            .get(submitted.job.id)
+            .await
+            .ok()
+            .flatten()
+            .map(with_reload_status)
+            .unwrap_or(submitted.job);
+        return Ok((StatusCode::ACCEPTED, Json(job)).into_response());
+    };
+    match received {
         Ok(Ok(DeployOk::Result(result))) => Ok(Json(result).into_response()),
         Ok(Ok(DeployOk::Done(body, _))) => Ok(Json(body).into_response()),
         Ok(Err(error)) => Err(error),
@@ -215,7 +249,7 @@ pub async fn get_deploy_job(
         .await
         .map_err(|e| ApiError::InternalError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Deploy job not found: {job_id}")))?;
-    Ok(Json(job))
+    Ok(Json(with_reload_status(job)))
 }
 
 /// Query for [`list_log_source_deploy_jobs`].
@@ -253,7 +287,7 @@ pub async fn list_log_source_deploy_jobs(
         .list_for_source(*id, query.limit.unwrap_or(10))
         .await
         .map_err(|e| ApiError::InternalError(e.to_string()))?;
-    Ok(Json(jobs))
+    Ok(Json(jobs.into_iter().map(with_reload_status).collect()))
 }
 
 #[derive(utoipa::OpenApi)]
@@ -262,3 +296,7 @@ pub async fn list_log_source_deploy_jobs(
     components(schemas(DeployJob, DeployJobKind, DeployJobState, DeployPhase))
 )]
 pub struct LogSourceDeployJobsApiDoc;
+
+#[cfg(test)]
+#[path = "log_source_deploy_jobs_budget_tests.rs"]
+mod budget_tests;

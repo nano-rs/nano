@@ -282,3 +282,21 @@ fn delivery_state_serializes_snake_case() {
         r#""not_applicable""#
     );
 }
+
+/// NAN-5298 (review): the API's host wait follows the consumers' longest
+/// install (their size-stretched ACK_MAX_SECS), not their 45-60 s floor, so a
+/// host that needs 60+ s to compile is waited for as long as the edge allows.
+#[test]
+fn the_host_wait_follows_the_consumers_install_ceiling() {
+    // Defaults and the enterprise compose (floor 45, ceiling 180).
+    assert_eq!(install_wait_secs(None, None), DEFAULT_CONSUMER_ACK_MAX_SECS);
+    assert_eq!(install_wait_secs(Some(45), Some(180)), 180);
+    // A floor above the ceiling wins.
+    assert_eq!(install_wait_secs(Some(240), Some(180)), 240);
+    let wait = derived_ack_timeout(DEFAULT_CONSUMER_SYNC_INTERVAL_SECS, install_wait_secs(Some(45), None));
+    // One 67 s install (the Sysmon compile) plus a poll fits; the edge clamp holds.
+    assert!(wait >= Duration::from_secs(67 + DEFAULT_CONSUMER_SYNC_INTERVAL_SECS), "{wait:?}");
+    assert!(wait <= Duration::from_secs(180), "{wait:?}");
+    // Before: derived from the 45 s floor alone.
+    assert!(wait > derived_ack_timeout(DEFAULT_CONSUMER_SYNC_INTERVAL_SECS, 45));
+}

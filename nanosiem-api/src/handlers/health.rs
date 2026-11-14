@@ -68,6 +68,30 @@ async fn cluster_all_shard_ch_probe(
         })
 }
 
+/// NAN-5390: `/health` query. `strict=1` (or `true`) maps "error" to HTTP 503.
+#[derive(Debug, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct HealthQuery {
+    /// `1` / `true`: answer 503 instead of 200 when the status is "error".
+    pub strict: Option<String>,
+}
+
+impl HealthQuery {
+    pub fn from_raw(raw: Option<&str>) -> Self {
+        let strict = raw
+            .unwrap_or("")
+            .split('&')
+            .filter_map(|kv| kv.split_once('=').or(Some((kv, ""))))
+            .find(|(k, _)| *k == "strict")
+            .map(|(_, v)| v.to_string());
+        Self { strict }
+    }
+
+    pub fn is_strict(&self) -> bool {
+        matches!(self.strict.as_deref(), Some("1") | Some("true"))
+    }
+}
+
 /// Minimal public health check response (prevents information disclosure)
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PublicHealthResponse {
@@ -203,17 +227,33 @@ async fn check_service_health(url: &str, request_id: Option<&str>) -> ServiceHea
 /// to prevent information disclosure about system architecture.
 /// Use /health/detailed (authenticated) for full diagnostics.
 ///
+/// NAN-5390: `?strict=1` serves "error" with HTTP 503, for checks that only
+/// read the status code (`helm test`, external monitors) and must see a
+/// ClickHouse that refuses nano's login. Plain `/health` keeps its 200 +
+/// body contract: Compose healthchecks, edge routing checks, the upgrader and
+/// legacy k8s probes consume it, and a 503 there would unroute or restart the
+/// API on every transient ClickHouse/shard blip (one replica down in HA fails
+/// the all-shard probe). Kubernetes probes target `/livez`.
+///
 /// GET /health
 #[utoipa::path(
     get,
     path = "/health",
     tag = "health",
+    params(HealthQuery),
     responses(
-        (status = 200, description = "Health status", body = PublicHealthResponse),
+        (status = 200, description = "Health status (always 200 without `strict`; read `status`)", body = PublicHealthResponse),
+        (status = 503, description = "With `strict=1`: PostgreSQL or ClickHouse is down or refuses nano's login", body = PublicHealthResponse),
     ),
     security(())
 )]
-pub async fn health_check(State(state): State<AppState>) -> Json<PublicHealthResponse> {
+pub async fn health_check(
+    State(state): State<AppState>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> (axum::http::StatusCode, Json<PublicHealthResponse>) {
+    // Parsed by hand so a malformed query string can never turn a health
+    // check into a 400 (the typed `Query` extractor rejects it).
+    let query = HealthQuery::from_raw(raw.as_deref());
     let mut is_healthy = state.dual_pool().health_check().await.is_healthy();
 
     // NAN-1728 (L-1): the DualPool `SELECT 1` only touches the LB-connected node,
@@ -227,13 +267,17 @@ pub async fn health_check(State(state): State<AppState>) -> Json<PublicHealthRes
         }
     }
 
-    Json(PublicHealthResponse {
-        status: if is_healthy {
-            "ok".to_string()
-        } else {
-            "error".to_string()
-        },
-    })
+    let code = if is_healthy || !query.is_strict() {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(PublicHealthResponse {
+            status: if is_healthy { "ok" } else { "error" }.to_string(),
+        }),
+    )
 }
 
 #[utoipa::path(
@@ -414,3 +458,7 @@ pub async fn health_check_detailed(
     ))
 )]
 pub struct HealthApiDoc;
+
+#[cfg(test)]
+#[path = "health_tests.rs"]
+mod tests;

@@ -210,11 +210,56 @@ const DEFAULT_RELOAD_ACK_TIMEOUT_SECS: u64 = 45;
 /// back configs Vector went on to accept. This cap is what still bounds a
 /// Vector that never reloads at all, so a deploy cannot hold the deploy lock
 /// forever.
-const DEFAULT_RELOAD_ACK_MAX_SECS: u64 = 600;
+///
+/// NAN-5298 follow-up: 180 s, not 600. Every wait here runs under the deploy
+/// lock and, for the synchronous routes (source-configuration deploys, a
+/// log-source deploy with `wait=true`), inside the edge's 300 s
+/// `proxy_read_timeout` and the web's 310 s give-up, after up to 90 s of
+/// isolation `vector validate`. It also keeps one forward wait plus a rollback
+/// (which only gets the base window, [`ReloadAckProbe::for_rollback`]) far
+/// inside the web's 15-minute deploy-job poll and `config_lock.rs`'s 300 s
+/// give-up. The slowest reload measured (Vector held to 0.15 CPU, 5 OCSF
+/// sources) acknowledged in about 100 s.
+pub const DEFAULT_RELOAD_ACK_MAX_SECS: u64 = 180;
+
+/// NAN-5298 follow-up: how long the metrics endpoint may stay unreadable
+/// during a wait (`VECTOR_RELOAD_ACK_UNREADABLE_SECS`) before the wait ends.
+/// A baseline was read just before the reload, so continuous silence this
+/// long means Vector exited, restarted or lost its exporter, not that it is
+/// compiling: a busy Vector still answers its metrics listener. Ends a
+/// delivered (open-ended) wait on a dead Vector, which would otherwise hold
+/// the deploy lock to the ceiling.
+const DEFAULT_RELOAD_ACK_UNREADABLE_SECS: u64 = 60;
+
+/// NAN-5298 follow-up: the smallest tree size a measured reload rate is
+/// computed over. A reload's fixed overhead (the watcher's debounce, the 1 s
+/// metrics scrape) divided by a tiny tree reads as a huge per-MiB rate that
+/// would stretch every later window to the ceiling.
+const RATE_MEASUREMENT_FLOOR_BYTES: u64 = 256 * 1024;
 
 /// The acknowledgement window is at least this multiple of the slowest
 /// recent reload this process has measured.
 const RELOAD_ACK_HEADROOM: u32 = 2;
+
+/// NAN-5298 follow-up: how long Vector is assumed to need per MiB of the config
+/// tree it loads, until this process has measured a reload of its own.
+///
+/// A reload compiles EVERY remap program in the tree, not only the changed
+/// one, so its cost is O(loaded VRL), and a fixed window cannot hold for a
+/// large tree on a small host: the v2.0.20 Compose upgrade lane (6 cores,
+/// 5 OCSF sources, about 340 KiB of rendered parsers) took 67 s from publish
+/// to "Vector has reloaded" for Microsoft Sysmon, and the 45 s window rolled
+/// back the config Vector was about to accept. 512 s per MiB (2 KiB/s) is
+/// deliberately pessimistic, about 2.5x that measurement (a Vector held to a
+/// quarter core needed more than 130 s for the same tree): until a reload has
+/// been timed on this host, a late acknowledgement costs a rollback while a
+/// long wait only delays the verdict on a dead Vector. This only governs a
+/// reload whose signal could not be confirmed delivered; a delivered one waits
+/// for Vector's outcome ([`ReloadAckProbe::expect_outcome`]).
+const DEFAULT_RELOAD_MS_PER_MIB: u64 = 512_000;
+
+/// Bytes in one MiB, for the per-size reload rate.
+const MIB: u128 = 1024 * 1024;
 
 /// NAN-5298: how long this Vector's reloads actually take, as measured by
 /// this process (delivery to acknowledgement), so the next window is sized to
@@ -225,34 +270,137 @@ const RELOAD_ACK_HEADROOM: u32 = 2;
 /// window at its size. Reload cost is O(deployed parsers), so this tracks a
 /// growing library on its own. Process-local and best effort: a fresh
 /// process starts from the configured window.
+///
+/// NAN-5298 follow-up: it also keeps the slowest recent reload RATE (ms per
+/// MiB of loaded config), the same decaying way, so a deploy that grows the
+/// tree gets a window sized to the tree it is about to load instead of to the
+/// smaller tree the last reload compiled. Before the first measurement the
+/// rate is [`DEFAULT_RELOAD_MS_PER_MIB`].
 pub(super) struct ReloadDurations {
     slowest_recent_ms: std::sync::atomic::AtomicU64,
+    /// 0 = not measured yet.
+    slowest_recent_ms_per_mib: std::sync::atomic::AtomicU64,
+    /// NAN-5298 follow-up circuit breaker: a delivered (open-ended) wait ran to
+    /// the ceiling with Vector answering and producing no outcome at all. Until
+    /// Vector shows any reload outcome again, delivered waits use the quiet
+    /// window, so a wedged Vector does not hold the deploy lock for the full
+    /// ceiling on every queued deploy.
+    outcome_wait_tripped: std::sync::atomic::AtomicBool,
+}
+
+/// Raise `cell` to `sample` at once, or let it fall by a quarter.
+fn decaying_max(cell: &std::sync::atomic::AtomicU64, sample: u64) {
+    let _ = cell.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |old| Some(sample.max(old - old / 4)),
+    );
 }
 
 impl ReloadDurations {
     pub(super) const fn new() -> Self {
         Self {
             slowest_recent_ms: std::sync::atomic::AtomicU64::new(0),
+            slowest_recent_ms_per_mib: std::sync::atomic::AtomicU64::new(0),
+            outcome_wait_tripped: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn outcome_wait_tripped(&self) -> bool {
+        self.outcome_wait_tripped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_outcome_wait_tripped(&self, tripped: bool) {
+        let was = self
+            .outcome_wait_tripped
+            .swap(tripped, std::sync::atomic::Ordering::Relaxed);
+        if tripped && !was {
+            tracing::warn!(
+                "Vector produced no reload outcome before the acknowledgement ceiling although the \
+                 reload signal was delivered; later deploys wait only the quiet window until \
+                 Vector reports a reload outcome again"
+            );
+        } else if !tripped && was {
+            tracing::info!("Vector reported a reload outcome again; delivered reloads wait for their outcome");
         }
     }
 
     pub(super) fn record(&self, took: std::time::Duration) {
-        let took = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
-        let _ = self.slowest_recent_ms.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |old| Some(took.max(old - old / 4)),
-        );
+        self.record_reload(took, 0);
+    }
+
+    /// Record one reload that took `took` to compile a tree of `loaded_bytes`
+    /// (0 = size unknown: only the duration is recorded).
+    pub(super) fn record_reload(&self, took: std::time::Duration, loaded_bytes: u64) {
+        let took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        decaying_max(&self.slowest_recent_ms, took_ms);
+        if loaded_bytes > 0 {
+            let per_mib = u128::from(took_ms) * MIB
+                / u128::from(loaded_bytes.max(RATE_MEASUREMENT_FLOOR_BYTES));
+            decaying_max(
+                &self.slowest_recent_ms_per_mib,
+                u64::try_from(per_mib).unwrap_or(u64::MAX).max(1),
+            );
+        }
     }
 
     /// `base`, stretched to [`RELOAD_ACK_HEADROOM`] x the slowest recent
     /// reload, never above `cap`.
     pub(super) fn window(&self, base: std::time::Duration, cap: std::time::Duration) -> std::time::Duration {
+        self.window_for(base, cap, 0)
+    }
+
+    /// [`Self::window`], also stretched to the estimated compile cost of a
+    /// `loaded_bytes` tree: [`RELOAD_ACK_HEADROOM`] x the slowest measured
+    /// rate, or [`DEFAULT_RELOAD_MS_PER_MIB`] before any measurement. Never
+    /// above `cap` (which never undercuts `base`).
+    pub(super) fn window_for(
+        &self,
+        base: std::time::Duration,
+        cap: std::time::Duration,
+        loaded_bytes: u64,
+    ) -> std::time::Duration {
         let slowest = std::time::Duration::from_millis(
             self.slowest_recent_ms.load(std::sync::atomic::Ordering::Relaxed),
         );
-        base.max(slowest.saturating_mul(RELOAD_ACK_HEADROOM)).min(cap.max(base))
+        let measured = self.slowest_recent_ms_per_mib.load(std::sync::atomic::Ordering::Relaxed);
+        let per_mib = if measured == 0 {
+            u128::from(DEFAULT_RELOAD_MS_PER_MIB)
+        } else {
+            u128::from(measured) * u128::from(RELOAD_ACK_HEADROOM)
+        };
+        let by_size = std::time::Duration::from_millis(
+            u64::try_from(per_mib * u128::from(loaded_bytes) / MIB).unwrap_or(u64::MAX),
+        );
+        base.max(slowest.saturating_mul(RELOAD_ACK_HEADROOM))
+            .max(by_size)
+            .min(cap.max(base))
     }
+}
+
+/// NAN-5298 follow-up: bytes of config Vector compiles on a reload of the tree
+/// at `config_dir`: the root plus every directory it is launched with
+/// ([`super::staging::STAGED_CONFIG_SUBDIRS`]), top level only, as Vector
+/// loads them. Dotfiles (in-flight temp files) are skipped. Unreadable
+/// entries count as 0: the estimate only ever widens the window.
+pub(super) fn loaded_config_bytes(config_dir: &Path) -> u64 {
+    let dirs = std::iter::once(config_dir.to_path_buf()).chain(
+        super::staging::STAGED_CONFIG_SUBDIRS
+            .iter()
+            .map(|subdir| config_dir.join(subdir)),
+    );
+    dirs.filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            !name.starts_with('.')
+                && (name.ends_with(".toml") || name.ends_with(".yaml") || name.ends_with(".json"))
+        })
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 static RELOAD_DURATIONS: ReloadDurations = ReloadDurations::new();
@@ -362,6 +510,14 @@ fn counter_advanced(before: f64, now: f64) -> bool {
     now > before || (now > 0.0 && now < before)
 }
 
+/// NAN-5298 follow-up (review): a forward reload may wait for a delivered
+/// signal's outcome; a rollback's reload only gets the base window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReloadMode {
+    Forward,
+    Rollback,
+}
+
 /// What Vector said about the reload we just triggered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReloadAck {
@@ -408,6 +564,10 @@ fn metrics_client() -> Option<&'static reqwest::Client> {
 pub(super) struct ReloadAckProbe {
     url: String,
     client: reqwest::Client,
+    /// The configured quiet window (`VECTOR_RELOAD_ACK_TIMEOUT_SECS`), before
+    /// any stretching. What a wait gets after Vector refuses a config, and all
+    /// a rollback's reload gets.
+    base: std::time::Duration,
     /// The quiet window: how long to wait with no sign of progress.
     timeout: std::time::Duration,
     /// NAN-5298: the hard ceiling, however much progress Vector shows.
@@ -415,7 +575,131 @@ pub(super) struct ReloadAckProbe {
     /// NAN-5298: where measured reload durations are recorded (the process
     /// global in production; a private instance in tests).
     durations: &'static ReloadDurations,
+    /// NAN-5298 follow-up: size of the config tree this reload compiles
+    /// (0 = unknown), so the window covers its compile cost and the measured
+    /// duration becomes a per-size rate for the next deploy.
+    loaded_bytes: u64,
+    /// NAN-5298 follow-up: the reload signal was DELIVERED (SIGHUP to the
+    /// Vector process, or the validation-volume responder's HUP), so Vector
+    /// will produce an outcome; see [`Self::expect_outcome`].
+    expect_outcome: bool,
+    /// How long the metrics endpoint may stay unreadable before the wait
+    /// ends ([`DEFAULT_RELOAD_ACK_UNREADABLE_SECS`]).
+    unreadable_grace: std::time::Duration,
     poll_interval: std::time::Duration,
+}
+
+/// NAN-5298 follow-up: what a wait is doing right now, for the deploy job's
+/// sub-status ([`current_reload_wait`]). One deploy runs at a time (the
+/// deploy lock), so one process-wide slot is enough.
+#[derive(Debug, Clone)]
+pub struct ReloadWaitStatus {
+    pub started: std::time::Instant,
+    /// Waiting for a delivered reload's outcome (up to the ceiling) rather
+    /// than a quiet window.
+    pub awaiting_outcome: bool,
+    pub limit: std::time::Duration,
+    pub loaded_bytes: u64,
+}
+
+impl ReloadWaitStatus {
+    /// One line for an operator.
+    pub fn describe(&self) -> String {
+        let waited = self.started.elapsed().as_secs();
+        let kib = self.loaded_bytes / 1024;
+        if self.awaiting_outcome {
+            format!(
+                "Vector is compiling the new config ({kib} KiB); waited {waited}s of up to {}s for its verdict",
+                self.limit.as_secs()
+            )
+        } else {
+            format!(
+                "Waiting for Vector to acknowledge the reload ({kib} KiB config); {waited}s of {}s",
+                self.limit.as_secs()
+            )
+        }
+    }
+}
+
+static RELOAD_WAIT: std::sync::Mutex<Option<ReloadWaitStatus>> = std::sync::Mutex::new(None);
+
+/// The reload wait in progress in this process, if any.
+pub fn current_reload_wait() -> Option<ReloadWaitStatus> {
+    RELOAD_WAIT.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// Clears [`RELOAD_WAIT`] when a wait ends, however it ends.
+struct ReloadWaitSlot;
+
+impl ReloadWaitSlot {
+    fn set(status: ReloadWaitStatus) -> Self {
+        *RELOAD_WAIT.lock().unwrap_or_else(|p| p.into_inner()) = Some(status);
+        Self
+    }
+}
+
+impl Drop for ReloadWaitSlot {
+    fn drop(&mut self) {
+        *RELOAD_WAIT.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// Per-series `configuration_failed` counters (the full series text, labels
+/// included, to its value).
+pub(super) fn failure_series(body: &str) -> std::collections::BTreeMap<String, f64> {
+    let mut series = std::collections::BTreeMap::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(name_labels), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let name = name_labels.split('{').next().unwrap_or(name_labels);
+        if name.ends_with("component_errors_total")
+            && name_labels.contains(r#"error_type="configuration_failed""#)
+        {
+            if let Ok(value) = value.parse::<f64>() {
+                *series.entry(name_labels.to_string()).or_insert(0.0) += value;
+            }
+        }
+    }
+    series
+}
+
+/// NAN-5298 follow-up: did Vector refuse a config since the baseline?
+///
+/// Never on a DECREASE. `configuration_failed` series are one-shot counters
+/// that Vector's registry expires, so the summed total can fall mid-wait
+/// without any new refusal; reading that as a rejection collapsed a delivered
+/// wait and rolled back a config Vector went on to accept. A refusal is the
+/// sum rising above the baseline, or any single series rising (or appearing)
+/// between two scrapes in the wait, which also catches a refusal whose series
+/// restarted from 1 below an expired baseline.
+pub(super) struct RejectionWatch {
+    baseline_sum: f64,
+    previous: Option<std::collections::BTreeMap<String, f64>>,
+}
+
+impl RejectionWatch {
+    pub(super) fn new(before: ReloadCounters) -> Self {
+        Self {
+            baseline_sum: before.config_failures,
+            previous: None,
+        }
+    }
+
+    pub(super) fn observe(&mut self, body: &str) -> bool {
+        let now = failure_series(body);
+        let sum: f64 = now.values().sum();
+        let rose = self.previous.as_ref().is_some_and(|previous| {
+            now.iter()
+                .any(|(series, value)| *value > previous.get(series).copied().unwrap_or(0.0))
+        });
+        self.previous = Some(now);
+        sum > self.baseline_sum || rose
+    }
 }
 
 impl ReloadAckProbe {
@@ -427,6 +711,17 @@ impl ReloadAckProbe {
     /// that is fixed, rather than having every deploy roll itself back. It is
     /// deliberately loud — see `reload_outcome`.
     pub(super) fn from_env() -> Option<Self> {
+        Self::with_loaded_bytes(0)
+    }
+
+    /// [`Self::from_env`] for a reload of the tree at `config_dir`: the quiet
+    /// window also covers the estimated compile cost of that tree
+    /// ([`ReloadDurations::window_for`]).
+    pub(super) fn from_env_for(config_dir: &Path) -> Option<Self> {
+        Self::with_loaded_bytes(loaded_config_bytes(config_dir))
+    }
+
+    fn with_loaded_bytes(loaded_bytes: u64) -> Option<Self> {
         let timeout_secs = match env_secs("VECTOR_RELOAD_ACK_TIMEOUT_SECS") {
             Some(0) => return None,
             Some(secs) => secs,
@@ -441,14 +736,108 @@ impl ReloadAckProbe {
         let url = std::env::var("VECTOR_METRICS_URL")
             .unwrap_or_else(|_| DEFAULT_VECTOR_METRICS_URL.to_string());
 
+        let base = std::time::Duration::from_secs(timeout_secs);
+        let unreadable_grace = std::time::Duration::from_secs(
+            env_secs("VECTOR_RELOAD_ACK_UNREADABLE_SECS")
+                .filter(|secs| *secs > 0)
+                .unwrap_or(DEFAULT_RELOAD_ACK_UNREADABLE_SECS),
+        );
         Some(Self {
             url,
             client: metrics_client()?.clone(),
-            timeout: RELOAD_DURATIONS.window(std::time::Duration::from_secs(timeout_secs), max_wait),
+            base,
+            unreadable_grace,
+            timeout: RELOAD_DURATIONS.window_for(
+                std::time::Duration::from_secs(timeout_secs),
+                max_wait,
+                loaded_bytes,
+            ),
             max_wait,
             durations: &RELOAD_DURATIONS,
+            loaded_bytes,
+            expect_outcome: false,
             poll_interval: std::time::Duration::from_secs(1),
         })
+    }
+
+    /// NAN-5298 follow-up: the reload signal was delivered, so Vector WILL
+    /// either apply the change or refuse it; the only open question is when.
+    /// Silence then means "still compiling", not "never asked", so the wait
+    /// runs to the ceiling (`VECTOR_RELOAD_ACK_MAX_SECS`) instead of the quiet
+    /// window. A refusal seen in the wait shrinks it back to one quiet window,
+    /// so a rejected config still rolls back promptly (a half-written tree can
+    /// be refused before the complete one is applied).
+    ///
+    /// Circuit breaker: after a delivered wait ran to the ceiling with no
+    /// outcome, this is ignored (quiet window) until Vector reports any
+    /// reload outcome again ([`ReloadDurations::outcome_wait_tripped`]).
+    pub(super) fn expect_outcome(&mut self) {
+        if self.durations.outcome_wait_tripped() {
+            tracing::warn!(
+                "reload signal delivered, but the last delivered wait got no outcome from Vector; \
+                 waiting only the quiet window"
+            );
+            return;
+        }
+        self.expect_outcome = true;
+    }
+
+    /// Arm the outcome wait only for a FORWARD reload whose signal was
+    /// confirmed delivered (NAN-5298 review).
+    pub(super) fn arm_for_delivery(&mut self, delivered: bool, mode: ReloadMode) {
+        if delivered && mode == ReloadMode::Forward {
+            self.expect_outcome();
+        }
+    }
+
+    /// NAN-5298 follow-up (review): the probe for a ROLLBACK's reload. It waits
+    /// only the configured base window and never for an outcome: the deploy
+    /// already spent its budget on the forward reload, and a wedged Vector must
+    /// not hold the deploy lock for a second ceiling.
+    pub(super) fn for_rollback() -> Option<Self> {
+        let mut probe = Self::from_env()?;
+        probe.timeout = probe.base;
+        probe.max_wait = probe.base;
+        Some(probe)
+    }
+
+    /// Re-size the quiet window for the tree at `config_dir` as it is NOW
+    /// (after every file of the change was written).
+    pub(super) fn resize_for(&mut self, config_dir: &Path) {
+        self.loaded_bytes = loaded_config_bytes(config_dir);
+        self.timeout = self.durations.window_for(self.base, self.max_wait, self.loaded_bytes);
+    }
+
+    fn wait_status(&self, limit: std::time::Duration) -> ReloadWaitSlot {
+        ReloadWaitSlot::set(ReloadWaitStatus {
+            started: std::time::Instant::now(),
+            awaiting_outcome: self.expect_outcome,
+            limit,
+            loaded_bytes: self.loaded_bytes,
+        })
+    }
+
+    /// Marker mode without a counter baseline (the pre-reload scrape failed):
+    /// a marker that goes live is still proof of acceptance. The first
+    /// readable scrape becomes the baseline for the rest of the wait.
+    pub(super) async fn await_marker_unbaselined(&self, component_id: &str) -> ReloadAck {
+        let started = tokio::time::Instant::now();
+        // The quiet window only (a rollback's is the base window), so a dead
+        // Vector releases the deploy lock inside the entrypoint's flock wait.
+        let deadline = started + self.timeout;
+        loop {
+            if let Some(body) = self.read_body().await {
+                if marker_is_live(&body, component_id) {
+                    return ReloadAck::Accepted;
+                }
+                return self.await_marker(parse_reload_counters(&body), component_id).await;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return ReloadAck::Unverifiable;
+            }
+            tokio::time::sleep(remaining.min(self.poll_interval)).await;
+        }
     }
 
     /// Read the counters once. `None` means the endpoint is unreadable, which is
@@ -481,11 +870,21 @@ impl ReloadAckProbe {
     /// Poll until one of the counters passes the pre-reload snapshot.
     pub(super) async fn await_ack(&self, before: ReloadCounters) -> ReloadAck {
         let started = tokio::time::Instant::now();
-        let deadline = started + self.timeout;
+        let ceiling = started + self.max_wait.max(self.timeout);
+        let mut deadline = if self.expect_outcome {
+            ceiling
+        } else {
+            (started + self.timeout).min(ceiling)
+        };
+        let _status = self.wait_status(deadline - started);
         let mut saw_rejection = false;
+        let mut rejections = RejectionWatch::new(before);
+        let mut unreadable_since: Option<tokio::time::Instant> = None;
 
         loop {
-            if let Some(now) = self.read().await {
+            if let Some(body) = self.read_body().await {
+                unreadable_since = None;
+                let now = parse_reload_counters(&body);
                 // A success anywhere in the window outranks a failure seen
                 // earlier in it. One deploy writes many files, and a
                 // `--watch-config` Vector can fire on a half-written tree and
@@ -493,8 +892,11 @@ impl ReloadAckProbe {
                 // Vector did LAST is what it is running now, so bailing at the
                 // first rejection would roll back a config it went on to
                 // accept.
-                if counter_advanced(before.config_failures, now.config_failures) {
+                if rejections.observe(&body) && !saw_rejection {
                     saw_rejection = true;
+                    // Vector answered: one BASE window for a reload already in
+                    // flight, however large the tree's estimate.
+                    deadline = deadline.min(tokio::time::Instant::now() + self.base);
                 }
                 // NAN-4936: a reload counter that came back LOWER than the
                 // snapshot is only presumed to be a restarted series when
@@ -506,9 +908,21 @@ impl ReloadAckProbe {
                 if now.reloads > before.reloads
                     || (!saw_rejection && counter_advanced(before.reloads, now.reloads))
                 {
-                    self.durations.record(started.elapsed());
+                    self.durations.record_reload(started.elapsed(), self.loaded_bytes);
+                    self.durations.set_outcome_wait_tripped(false);
                     return ReloadAck::Accepted;
                 }
+            } else if unreadable_since
+                .get_or_insert_with(tokio::time::Instant::now)
+                .elapsed()
+                >= self.unreadable_grace
+            {
+                tracing::warn!(
+                    unreadable_secs = self.unreadable_grace.as_secs(),
+                    "Vector's metrics endpoint stopped answering during the reload wait; treating \
+                     the reload as not acknowledged"
+                );
+                break;
             }
 
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -519,8 +933,12 @@ impl ReloadAckProbe {
         }
 
         if saw_rejection {
+            self.durations.set_outcome_wait_tripped(false);
             ReloadAck::Rejected
         } else {
+            if self.expect_outcome && unreadable_since.is_none() && tokio::time::Instant::now() >= ceiling {
+                self.durations.set_outcome_wait_tripped(true);
+            }
             ReloadAck::NotAcknowledged
         }
     }
@@ -541,36 +959,51 @@ impl ReloadAckProbe {
     pub(super) async fn await_marker(&self, before: ReloadCounters, component_id: &str) -> ReloadAck {
         let started = tokio::time::Instant::now();
         let ceiling = started + self.max_wait.max(self.timeout);
-        let mut deadline = (started + self.timeout).min(ceiling);
+        let mut deadline = if self.expect_outcome {
+            ceiling
+        } else {
+            (started + self.timeout).min(ceiling)
+        };
+        let _status = self.wait_status(deadline - started);
         let mut last_reloads = before.reloads;
         // When the last reload that was NOT ours completed: what follows it is
         // our own reload, the duration the quiet window has to cover.
         let mut last_progress = started;
         let mut saw_rejection = false;
+        let mut saw_progress = false;
+        let mut rejections = RejectionWatch::new(before);
         let mut readable = false;
+        let mut unreadable_since: Option<tokio::time::Instant> = None;
         loop {
             if let Some(body) = self.read_body().await {
                 readable = true;
+                unreadable_since = None;
                 if marker_is_live(&body, component_id) {
                     // Record OUR reload's duration, not the whole wait: time
                     // spent queued behind other reloads is already covered by
                     // the progress extensions, and counting it would inflate
                     // the next quiet window (a 145 s queued wait would make a
                     // rejecting or dead Vector take 290 s to roll back).
-                    self.durations.record(last_progress.elapsed());
+                    self.durations.record_reload(last_progress.elapsed(), self.loaded_bytes);
+                    self.durations.set_outcome_wait_tripped(false);
                     if started.elapsed() > self.timeout {
                         tracing::info!(
                             waited_secs = started.elapsed().as_secs(),
                             window_secs = self.timeout.as_secs(),
-                            "Vector applied the change after its quiet window was extended by \
-                             reloads it completed in the meantime"
+                            awaiting_outcome = self.expect_outcome,
+                            "Vector applied the change after its quiet window"
                         );
                     }
                     return ReloadAck::Accepted;
                 }
                 let now = parse_reload_counters(&body);
-                if counter_advanced(before.config_failures, now.config_failures) {
+                if rejections.observe(&body) && !saw_rejection {
                     saw_rejection = true;
+                    // A delivered signal's open-ended wait ends here: Vector
+                    // answered, so only a reload already in flight (the
+                    // complete tree after a half-written one) gets one BASE
+                    // window, however large the tree's estimate.
+                    deadline = deadline.min(tokio::time::Instant::now() + self.base);
                 }
                 if counter_advanced(last_reloads, now.reloads) {
                     // A reload finished, but not one containing our change:
@@ -579,16 +1012,47 @@ impl ReloadAckProbe {
                     // half-written tree and then load the complete one; the
                     // verdict at the deadline is still Rejected if the marker
                     // never runs.)
+                    saw_progress = true;
                     last_progress = tokio::time::Instant::now();
-                    deadline = (last_progress + self.timeout).min(ceiling);
+                    deadline = if self.expect_outcome && !saw_rejection {
+                        ceiling
+                    } else if saw_rejection {
+                        (last_progress + self.base).min(ceiling)
+                    } else {
+                        (last_progress + self.timeout).min(ceiling)
+                    };
                 }
                 last_reloads = now.reloads;
+            } else if unreadable_since
+                .get_or_insert_with(tokio::time::Instant::now)
+                .elapsed()
+                >= self.unreadable_grace
+            {
+                // The baseline was read just before the reload: continuous
+                // silence this long is a dead or restarted Vector.
+                tracing::warn!(
+                    unreadable_secs = self.unreadable_grace.as_secs(),
+                    "Vector's metrics endpoint stopped answering during the reload wait; treating \
+                     the reload as not acknowledged"
+                );
+                return if saw_rejection {
+                    ReloadAck::Rejected
+                } else {
+                    ReloadAck::NotAcknowledged
+                };
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             tokio::time::sleep(remaining.min(self.poll_interval)).await;
+        }
+        if saw_rejection || saw_progress {
+            // Vector reported an outcome of SOME reload: it is not wedged.
+            self.durations.set_outcome_wait_tripped(false);
+        } else if self.expect_outcome && readable && unreadable_since.is_none() {
+            // Delivered, answering, and silent to the ceiling: a wedge.
+            self.durations.set_outcome_wait_tripped(true);
         }
         match (saw_rejection, readable) {
             (true, _) => ReloadAck::Rejected,
@@ -720,6 +1184,8 @@ pub struct ReloadWatch {
     probe: Option<ReloadAckProbe>,
     before: Option<ReloadCounters>,
     marker: Option<ActivationMarker>,
+    /// Re-measured at [`Self::outcome`]: the change is written AFTER `begin`.
+    config_dir: std::path::PathBuf,
 }
 
 /// The per-change marker of [`ReloadWatch`]'s correlated mode.
@@ -789,7 +1255,7 @@ impl ReloadWatch {
     /// `config_dir` is the api's VECTOR_CONFIG_DIR (the marker goes in its
     /// `sources/configs`).
     pub async fn begin(config_dir: &std::path::Path) -> Self {
-        let probe = ReloadAckProbe::from_env();
+        let probe = ReloadAckProbe::from_env_for(config_dir);
         let before = match probe.as_ref() {
             Some(probe) => probe.read().await,
             None => None,
@@ -801,7 +1267,12 @@ impl ReloadWatch {
                 .join("configs")
                 .join(ACTIVATION_MARKER_FILE),
         });
-        Self { probe, before, marker }
+        Self {
+            probe,
+            before,
+            marker,
+            config_dir: config_dir.to_path_buf(),
+        }
     }
 
     pub async fn outcome(self) -> ActivationOutcome {
@@ -833,12 +1304,23 @@ impl ReloadWatch {
         // explicitly; the watcher alone is not reliable on every mount.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let delivery = deliver_reload_signal().await;
-        let ack = match (self.probe.as_ref(), self.before, self.marker.as_ref()) {
+        let mut probe = self.probe;
+        if let Some(probe) = probe.as_mut() {
+            // Sized for the tree as written now, not as it was at `begin`.
+            probe.resize_for(&self.config_dir);
+            probe.arm_for_delivery(delivery.is_ok(), ReloadMode::Forward);
+        }
+        let ack = match (probe.as_ref(), self.before, self.marker.as_ref()) {
             (Some(probe), Some(before), Some(marker)) => {
                 probe.await_marker(before, &marker.component_id()).await
             }
+            // No baseline (a transient scrape failure at `begin`): the marker
+            // going live is still proof.
+            (Some(probe), None, Some(marker)) => {
+                probe.await_marker_unbaselined(&marker.component_id()).await
+            }
             (Some(probe), Some(before), None) => probe.await_ack(before).await,
-            (Some(_), None, _) => ReloadAck::Unverifiable,
+            (Some(_), None, None) => ReloadAck::Unverifiable,
             (None, _, _) => ReloadAck::VerificationDisabled,
         };
         match ack {
@@ -3176,6 +3658,14 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         self.reload_vector_graded().await.1
     }
 
+    /// NAN-5298 follow-up (review): the reload after RESTORING a previous
+    /// config (a rollback). It waits only the configured base window and
+    /// never for a delivered reload's outcome, so a wedged Vector cannot hold
+    /// the deploy lock for a second ceiling on top of the forward wait.
+    pub async fn reload_vector_after_rollback(&self) -> Result<(), VectorConfigError> {
+        self.reload_vector_graded_as(ReloadMode::Rollback).await.1
+    }
+
     /// [`Self::reload_vector`] plus the raw acknowledgement, so a caller can
     /// tell a definitive refusal ([`ReloadAck::Rejected`]: roll back) from an
     /// unconfirmed reload (Vector down or slow: keep what was written).
@@ -3190,6 +3680,10 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// the baseline is taken, so a reload the watcher already attempted on the
     /// promoted files does not count either way: only the marker's reload does.
     async fn reload_vector_graded(&self) -> (ReloadAck, Result<(), VectorConfigError>) {
+        self.reload_vector_graded_as(ReloadMode::Forward).await
+    }
+
+    async fn reload_vector_graded_as(&self, mode: ReloadMode) -> (ReloadAck, Result<(), VectorConfigError>) {
         // NAN-5133: role split grades by the ingest hosts, never by a local
         // signal (there is no local Vector to signal or scrape).
         if let Some(publisher) = super::remote_delivery::active_publisher() {
@@ -3213,7 +3707,10 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             tracing::info!("Vector config {PULL_DELIVERY_NOTE}");
             return (ReloadAck::VerificationDisabled, Ok(()));
         }
-        let probe = ReloadAckProbe::from_env();
+        let probe = match mode {
+            ReloadMode::Forward => ReloadAckProbe::from_env_for(&self.config_dir),
+            ReloadMode::Rollback => ReloadAckProbe::for_rollback(),
+        };
         let marker = activation_marker_enabled().then(|| ActivationMarker {
             id: uuid::Uuid::new_v4().simple().to_string(),
             path: self
@@ -3237,8 +3734,10 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             None => None,
         };
 
-        // The marker goes in only once a baseline exists to compare against.
-        let marker = match (marker, before) {
+        // The marker goes in whenever acknowledgement is checked: even with
+        // no counter baseline (a transient scrape failure), the marker going
+        // live is proof of acceptance (NAN-5298 review).
+        let marker = match (marker, probe.as_ref()) {
             (Some(marker), Some(_)) => match write_marker(&marker).await {
                 Ok(()) => Some(marker),
                 Err(error) => {
@@ -3253,15 +3752,22 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let delivery = self.deliver_reload_signal().await;
+        let mut probe = probe;
+        if let Some(probe) = probe.as_mut() {
+            probe.arm_for_delivery(delivery.is_ok(), mode);
+        }
 
         let ack = match (probe.as_ref(), before, marker.as_ref()) {
             (Some(probe), Some(before), Some(marker)) => {
                 probe.await_marker(before, &marker.component_id()).await
             }
+            (Some(probe), None, Some(marker)) => {
+                probe.await_marker_unbaselined(&marker.component_id()).await
+            }
             (Some(probe), Some(before), None) => probe.await_ack(before).await,
             // Configured but unreadable: no baseline means no comparison, and a
             // missing baseline must not be read as a missing reload.
-            (Some(_), None, _) => ReloadAck::Unverifiable,
+            (Some(_), None, None) => ReloadAck::Unverifiable,
             (None, _, _) => ReloadAck::VerificationDisabled,
         };
 
@@ -3341,7 +3847,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             Ok(()) => {
                 tracing::warn!("deploy failed; restored the previous Vector config");
                 if reload {
-                    if let Err(error) = self.reload_vector().await {
+                    if let Err(error) = self.reload_vector_after_rollback().await {
                         tracing::error!(%error, "reload after restoring the previous Vector config failed");
                     }
                 }
@@ -3582,7 +4088,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             };
             let rolled_back = match self.restore_backup(backup).await {
                 Ok(()) => {
-                    let _ = self.reload_vector().await;
+                    let _ = self.reload_vector_after_rollback().await;
                     true
                 }
                 Err(restore_err) => {
@@ -3658,7 +4164,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             }
 
             // Reload with restored config
-            if let Err(reload_err) = self.reload_vector().await {
+            if let Err(reload_err) = self.reload_vector_after_rollback().await {
                 tracing::error!("Reload after rollback failed: {}", reload_err);
             }
 
@@ -3698,6 +4204,8 @@ mod future_timestamp_tests;
 mod reload_tests;
 #[cfg(test)]
 mod reload_window_tests;
+#[cfg(test)]
+mod reload_compile_budget_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

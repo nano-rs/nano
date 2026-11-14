@@ -371,7 +371,7 @@ pub async fn validate_log_source(
     request_body(content = Option<DeployLogSourceRequest>, description = "Optional: OCSF samples or the unattested acknowledgement for a source's first go-live"),
     responses(
         (status = 200, description = "Deployment result (wait=true)", body = DeploymentResult),
-        (status = 202, description = "Deploy job accepted (wait=false)", body = DeployJob),
+        (status = 202, description = "Deploy job accepted (wait=false, or wait=true still running after 270 s)", body = DeployJob),
         (status = 422, description = "OCSF validation failed, or no OCSF receipt for a first go-live (checked before any job is created)"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
@@ -445,7 +445,7 @@ pub async fn deploy_log_source(
     ),
     responses(
         (status = 200, description = "Undeployment result (wait=true)", body = DeploymentResult),
-        (status = 202, description = "Undeploy job accepted (wait=false)", body = DeployJob),
+        (status = 202, description = "Undeploy job accepted (wait=false, or wait=true still running after 270 s)", body = DeployJob),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -897,7 +897,7 @@ fn check_test_sample(sample: &str) -> Result<(), ApiError> {
     params(DeployWaitQuery),
     responses(
         (status = 200, description = "All enabled log sources deployed (wait=true)"),
-        (status = 202, description = "Deploy-all job accepted (wait=false)", body = DeployJob),
+        (status = 202, description = "Deploy-all job accepted (wait=false, or wait=true still running after 270 s)", body = DeployJob),
         (status = 403, description = "Forbidden"),
     ),
     security(("api_key" = []))
@@ -1109,7 +1109,7 @@ impl ExpectedRevision {
     responses(
         (status = 409, description = "The working copy changed since expected_updated_at"),
         (status = 200, description = "Publish and deploy result (wait=true)", body = DeploymentResult),
-        (status = 202, description = "Publish job accepted (wait=false)", body = DeployJob),
+        (status = 202, description = "Publish job accepted (wait=false, or wait=true still running after 270 s)", body = DeployJob),
         (status = 422, description = "OCSF validation failed or no OCSF receipt for a changed parser (checked before any job is created)"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),

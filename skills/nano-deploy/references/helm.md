@@ -161,6 +161,20 @@ upgrade that leaves the token out keeps the one already installed (the chart
 reuses every key of the existing `nano-secrets`), so the guide's upgrade
 command omits it safely. Pass a new token only to replace it.
 
+**ClickHouse networks (`clickhouse.allowedNetworks`, NAN-5367/NAN-5390).** Set
+it in `values-site.yaml` to the cluster's real pod CIDR (and node CIDR when an
+external LoadBalancer reaches ClickHouse), read from the cloud, never guessed:
+GKE `gcloud container clusters describe <c> --format='value(clusterIpv4Cidr)'`,
+EKS the VPC/subnet CIDRs (VPC CNI) or `100.64.0.0/10` (custom networking), AKS
+`az aks show --query networkProfile.podCidr` (overlay) or the node subnet (Azure
+CNI). Chart 2.0.21+ adds loopback itself; on 2.0.20 add `127.0.0.1` and `::1`
+or the first migration fails with 516. Left unset, every nano ClickHouse user
+accepts any address (NOTES warning, SIEM Health high finding). A wrong value
+locks every nano user out (search 500, migration 516/195); fix it with a
+corrected `helm upgrade` (2.0.21+), or follow the guide's
+`#allowed-networks-recovery` patch on 2.0.20. `k8s-health.py` reports refused
+logins and a refused Vector write.
+
 For about 10–15 GB/day, the Kubernetes guide's "Example: about 12.5 GB/day"
 layers `values-small.yaml` with larger ClickHouse resources and 1500Gi of
 storage, plus an HA file (`clickhouse.replicas: 2`, Keeper 3, two replicas of

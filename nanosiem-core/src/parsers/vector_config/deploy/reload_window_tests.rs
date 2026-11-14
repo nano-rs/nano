@@ -105,8 +105,12 @@ fn probe(server: &MockServer, quiet: Duration, max_wait: Duration) -> ReloadAckP
             .build()
             .expect("client"),
         timeout: quiet,
+        base: quiet,
+        unreadable_grace: std::time::Duration::from_secs(60),
         max_wait,
         durations: Box::leak(Box::new(ReloadDurations::new())),
+        loaded_bytes: 0,
+        expect_outcome: false,
         poll_interval: Duration::from_millis(10),
     }
 }

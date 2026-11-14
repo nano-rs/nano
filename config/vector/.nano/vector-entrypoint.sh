@@ -67,7 +67,9 @@ nano_validate() {
 
 # --- cross-process lock -----------------------------------------------------------------
 # Best effort: a lock file that cannot be opened (read-only, missing) or a holder that does
-# not let go within 120s does not keep Vector down.
+# not let go within 120s does not keep Vector down. NAN-5298: a deploy waiting on a Vector that
+# died (this restart) gives up after VECTOR_RELOAD_ACK_UNREADABLE_SECS (60) of unreadable
+# metrics, and its rollback reload waits only the base window (45), so it lets go inside 120s.
 # (`touch` and `-r` first: a failed redirection on `exec` would end this shell.)
 [ -e "$LOCK_FILE" ] || touch "$LOCK_FILE" 2>/dev/null
 if [ -r "$LOCK_FILE" ]; then
