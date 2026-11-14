@@ -337,9 +337,11 @@ pub fn grade(generation: i64, hosts: &[(String, Option<HostGeneration>)]) -> Opt
     if !rejected.is_empty() {
         return Some(DeliveryVerdict::Rejected { hosts: rejected });
     }
-    if hosts
-        .iter()
-        .all(|(_, status)| status.as_ref().is_some_and(|s| s.installed >= target))
+    // An empty poll is no evidence (NAN-5399: a peer Service with no pods).
+    if !hosts.is_empty()
+        && hosts
+            .iter()
+            .all(|(_, status)| status.as_ref().is_some_and(|s| s.installed >= target))
     {
         return Some(DeliveryVerdict::Acknowledged);
     }
@@ -459,31 +461,120 @@ async fn poll_host(client: &reqwest::Client, url: &str, token: &str) -> Option<H
     response.json::<HostGeneration>().await.ok()
 }
 
+async fn poll_relays(
+    client: &reqwest::Client,
+    urls: &[String],
+    token: &str,
+) -> Vec<(String, Option<HostGeneration>)> {
+    futures::future::join_all(urls.iter().map(|url| async move {
+        (url.clone(), poll_host(client, url, token).await)
+    }))
+    .await
+}
+
 /// Wait for every ingest host to report on `generation`.
 pub async fn await_hosts(generation: i64, urls: &[String], token: &str, timeout: Duration) -> DeliveryReport {
     let client = reqwest::Client::new();
+    await_polls(generation, timeout, POLL_INTERVAL, Duration::ZERO, || {
+        poll_relays(&client, urls, token)
+    })
+    .await
+}
+
+/// NAN-5399: wait for every Vector pod behind the metrics peer Service
+/// ([`metrics_peers`]) to run `generation`. The Service is re-resolved on every
+/// poll (padded to the expected pod count), and an acknowledgement must hold
+/// over an unchanged pod set for [`metrics_peers::MEMBERSHIP_STABLE_FOR`].
+pub async fn await_metrics_peers(generation: i64, target: &str, timeout: Duration) -> DeliveryReport {
+    let client = reqwest::Client::new();
+    await_polls(
+        generation,
+        timeout,
+        POLL_INTERVAL,
+        metrics_peers::MEMBERSHIP_STABLE_FOR,
+        || metrics_peers::poll_peers(&client, target),
+    )
+    .await
+}
+
+/// Poll until [`grade`] settles or the wait ends; the host count is the last
+/// poll's. Shared by both acknowledgement sources.
+///
+/// NAN-5399 review: `timeout` is a hard bound. Every poll runs under the
+/// deadline, so a stalled resolver or scrape cannot hold a deploy past it; a
+/// poll cut off there grades the previous poll (or, with none, one unanswered
+/// entry, never an acknowledgement). An acknowledgement is returned only once
+/// it has held over the same host set for `stable_for` (zero: at once).
+pub(super) async fn await_polls<F, Fut>(
+    generation: i64,
+    timeout: Duration,
+    interval: Duration,
+    stable_for: Duration,
+    mut poll: F,
+) -> DeliveryReport
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Vec<(String, Option<HostGeneration>)>>,
+{
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut last: Option<Vec<(String, Option<HostGeneration>)>> = None;
+    // When the current run of acknowledged polls over this host set began.
+    let mut acked_since: Option<(tokio::time::Instant, Vec<String>)> = None;
     loop {
-        let statuses = futures::future::join_all(urls.iter().map(|url| {
-            let client = &client;
-            async move { (url.clone(), poll_host(client, url, token).await) }
-        }))
-        .await;
-        if let Some(verdict) = grade(generation, &statuses) {
-            return DeliveryReport {
-                generation,
-                host_count: urls.len(),
-                verdict,
-            };
+        let Ok(statuses) = tokio::time::timeout_at(deadline, poll()).await else {
+            let statuses = last.unwrap_or_else(|| vec![("poll timed out".to_string(), None)]);
+            return final_report(generation, &statuses);
+        };
+        let verdict = grade(generation, &statuses);
+        match verdict {
+            Some(DeliveryVerdict::Acknowledged) => {
+                let now = tokio::time::Instant::now();
+                let members: Vec<String> = statuses.iter().map(|(host, _)| host.clone()).collect();
+                let since = match &acked_since {
+                    Some((since, previous)) if *previous == members => *since,
+                    _ => now,
+                };
+                if now.duration_since(since) >= stable_for {
+                    return DeliveryReport {
+                        generation,
+                        host_count: statuses.len(),
+                        verdict: DeliveryVerdict::Acknowledged,
+                    };
+                }
+                acked_since = Some((since, members));
+            }
+            Some(verdict) => {
+                return DeliveryReport {
+                    generation,
+                    host_count: statuses.len(),
+                    verdict,
+                };
+            }
+            None => acked_since = None,
         }
-        if tokio::time::Instant::now() + POLL_INTERVAL > deadline {
-            return DeliveryReport {
-                generation,
-                host_count: urls.len(),
-                verdict: verdict_now(generation, &statuses),
-            };
+        if tokio::time::Instant::now() + interval > deadline {
+            return final_report(generation, &statuses);
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        last = Some(statuses);
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// The report for a wait that ran out. An acknowledgement that had not yet
+/// held for its stability window is reported as pending on every host it
+/// covered, never as acknowledged.
+fn final_report(generation: i64, statuses: &[(String, Option<HostGeneration>)]) -> DeliveryReport {
+    let verdict = match grade(generation, statuses) {
+        Some(DeliveryVerdict::Acknowledged) | None => DeliveryVerdict::Pending {
+            hosts: pending_hosts(generation, statuses),
+            unanswered: unanswered_hosts(statuses),
+        },
+        Some(verdict) => verdict,
+    };
+    DeliveryReport {
+        generation,
+        host_count: statuses.len(),
+        verdict,
     }
 }
 
@@ -498,9 +589,14 @@ pub(super) async fn deliver(publisher: &dyn GenerationPublisher) -> Result<Deliv
         .map_err(|error| DeliveryFailure::Publication(format!(
             "Could not publish the Vector configuration generation for the ingest hosts: {error}"
         )))?;
-    let urls = relay_urls();
-    let token = std::env::var(RELAY_TOKEN_ENV).unwrap_or_default();
-    let result = grade_published(generation, &urls, &token, ack_timeout()).await;
+    let result = match metrics_peers::configured_target() {
+        Some(target) => grade_published_peers(generation, &target, ack_timeout()).await,
+        None => {
+            let urls = relay_urls();
+            let token = std::env::var(RELAY_TOKEN_ENV).unwrap_or_default();
+            grade_published(generation, &urls, &token, ack_timeout()).await
+        }
+    };
     if let Ok(delivered) = &result {
         set_note(Some((delivered.note.clone(), delivered.delivery.clone())));
     }
@@ -523,6 +619,48 @@ pub(super) async fn grade_published(
         return Err(DeliveryFailure::Unconfirmed(note));
     }
     let report = await_hosts(generation, urls, token, timeout).await;
+    conclude(&report, timeout)
+}
+
+/// NAN-5399: [`deliver`] after publication on Kubernetes, graded by every
+/// Vector pod's own metrics ([`metrics_peers`]).
+pub(super) async fn grade_published_peers(
+    generation: i64,
+    target: &str,
+    timeout: Duration,
+) -> Result<Delivered, DeliveryFailure> {
+    let report = await_metrics_peers(generation, target, timeout).await;
+    peers_outcome(conclude(&report, timeout), &report)
+}
+
+/// NAN-5399 review: the pods' metrics cannot show every failure (a generation
+/// the escaping gate refused never reloads Vector), so a wait that ends with
+/// NO pod running the generation is never a success here, even when every pod
+/// answered. Some pods confirmed and the rest still installing stays pending.
+pub(super) fn peers_outcome(
+    result: Result<Delivered, DeliveryFailure>,
+    report: &DeliveryReport,
+) -> Result<Delivered, DeliveryFailure> {
+    let none_confirmed = matches!(
+        &report.verdict,
+        DeliveryVerdict::Pending { hosts, .. } if hosts.len() >= report.host_count
+    );
+    match result {
+        Ok(delivered) if none_confirmed => {
+            tracing::warn!(generation = report.generation, "{}", delivered.note);
+            Err(DeliveryFailure::Unconfirmed(format!(
+                "Published generation {}, but no Vector pod is running it yet ({} pod(s) checked); \
+                 it is NOT known to be live. {}",
+                report.generation, report.host_count, delivered.note
+            )))
+        }
+        other => other,
+    }
+}
+
+/// The deploy outcome for a finished wait, whichever source answered it.
+pub(super) fn conclude(report: &DeliveryReport, timeout: Duration) -> Result<Delivered, DeliveryFailure> {
+    let generation = report.generation;
     let sync_interval = consumer_sync_interval();
     let note = report.note(timeout, sync_interval);
     let delivery = report.delivery(sync_interval);
@@ -575,6 +713,16 @@ pub async fn delivery_status(generation: i64) -> GenerationDeliveryStatus {
                       is final and there are no ingest hosts to re-check."
                 .to_string(),
         };
+    }
+    if let Some(target) = metrics_peers::configured_target() {
+        let client = reqwest::Client::new();
+        let statuses = tokio::time::timeout(
+            Duration::from_secs(10),
+            metrics_peers::poll_peers(&client, &target),
+        )
+        .await
+        .unwrap_or_else(|_| vec![(target.clone(), None)]);
+        return grade_status(generation, &statuses);
     }
     let urls = relay_urls();
     let token = std::env::var(RELAY_TOKEN_ENV).unwrap_or_default();
@@ -703,3 +851,4 @@ pub(super) fn grade_delivery(result: &Result<Delivered, DeliveryFailure>) -> Gra
 mod tests;
 
 pub mod install_lease;
+pub mod metrics_peers;

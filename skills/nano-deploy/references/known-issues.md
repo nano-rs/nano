@@ -69,6 +69,23 @@ product's files.
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.
 
+## 2.0.23 and earlier, single node (fixed after 2.0.23)
+
+- **`scripts/nano upgrade` always fails preflight on a single-node install**
+  (open or enterprise), dry run and real run alike: `FAIL single
+  runtime-config command failed (exit 78): docker compose exec`, then
+  `nano: preflight failed; no installation state was changed`. The check
+  validated Vector's config without the interpolation flag the running
+  Vector uses, so the shipped `${VAR:-default}` values read as a TOML error.
+  Nothing is wrong with the install or the new config. Role splits are not
+  affected. The upgrader that runs is the one in the extracted target
+  bundle, so a target release with the fix upgrades normally with Path A.
+  **Handling** for a target of 2.0.23 or earlier: take a backup
+  (`scripts/nano backup --key-file ... --output ...`), then upgrade with the
+  installer rerun from the extracted bundle (Path B, single node:
+  `cd ~/nano && NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh`;
+  open installs drop `NANO_IMAGES_LOCK`). Do not skip or edit the check.
+
 ## 2.0.13 (fixed in 2.0.14)
 
 - **The upgrade's backup fails on a postgres host without the

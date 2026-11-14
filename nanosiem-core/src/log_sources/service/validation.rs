@@ -199,47 +199,80 @@ fn diagnostic_from_warning(message: &str) -> VrlDiagnostic {
     }
 }
 
-impl LogSourceService {
-    /// Validate VRL code without saving
-    pub async fn validate_vrl(&self, vrl_code: &str) -> VrlValidationResult {
-        // NAN-4953: the explicit validate endpoint and publish refuse Vector
-        // env-interpolation syntax, like a save does (crud.rs).
-        if let Err(msg) = crate::vector_env::reject_vrl_interpolation("parser_vrl", vrl_code) {
-            return VrlValidationResult {
+/// The checks before any compile: Vector env-interpolation syntax is refused
+/// like a save refuses it (NAN-4953), and validation sees the text the
+/// renderer writes (NAN-5057: a lone `\r` becomes a line break there, ending a
+/// VRL comment early). `Err` is the refusal, already a result.
+fn prepare_for_validation(vrl_code: &str) -> Result<String, VrlValidationResult> {
+    if let Err(msg) = crate::vector_env::reject_vrl_interpolation("parser_vrl", vrl_code) {
+        return Err(VrlValidationResult {
+            valid: false,
+            errors: vec![msg.clone()],
+            diagnostics: vec![diagnostic_from_error(&msg)],
+        });
+    }
+    Ok(crate::parsers::vrl_safety::as_rendered(vrl_code).into_owned())
+}
+
+/// The endpoint's shape for a validator verdict: the error, then every
+/// warning as `Warning: ...`, each with a diagnostic.
+fn validation_result(
+    result: Result<crate::parsers::VrlValidationResult, VrlValidatorError>,
+) -> VrlValidationResult {
+    match result {
+        Ok(result) => {
+            let mut errors = Vec::new();
+            let mut diagnostics = Vec::new();
+            if let Some(ref err) = result.error {
+                errors.push(err.clone());
+                diagnostics.push(diagnostic_from_error(err));
+            }
+            for warning in &result.warnings {
+                errors.push(format!("Warning: {}", warning));
+                diagnostics.push(diagnostic_from_warning(warning));
+            }
+            VrlValidationResult {
+                valid: result.valid,
+                errors,
+                diagnostics,
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            VrlValidationResult {
                 valid: false,
                 errors: vec![msg.clone()],
                 diagnostics: vec![diagnostic_from_error(&msg)],
-            };
+            }
         }
-        // NAN-5057: validate the text the renderer writes (a lone `\r`
-        // becomes a line break there, ending a VRL comment early).
-        let rendered = crate::parsers::vrl_safety::as_rendered(vrl_code);
-        match self.vrl_validator.validate_vrl(&rendered).await {
-            Ok(result) => {
-                let mut errors = Vec::new();
-                let mut diagnostics = Vec::new();
-                if let Some(ref err) = result.error {
-                    errors.push(err.clone());
-                    diagnostics.push(diagnostic_from_error(err));
-                }
-                for warning in &result.warnings {
-                    errors.push(format!("Warning: {}", warning));
-                    diagnostics.push(diagnostic_from_warning(warning));
-                }
-                VrlValidationResult {
-                    valid: result.valid,
-                    errors,
-                    diagnostics,
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                VrlValidationResult {
-                    valid: false,
-                    errors: vec![msg.clone()],
-                    diagnostics: vec![diagnostic_from_error(&msg)],
-                }
-            }
+    }
+}
+
+impl LogSourceService {
+    /// Validate VRL code without saving
+    pub async fn validate_vrl(&self, vrl_code: &str) -> VrlValidationResult {
+        let rendered = match prepare_for_validation(vrl_code) {
+            Ok(rendered) => rendered,
+            Err(refused) => return refused,
+        };
+        validation_result(self.vrl_validator.validate_vrl(&rendered).await)
+    }
+
+    /// [`Self::validate_vrl`] for `POST /api/log-sources/validate-vrl`
+    /// (NAN-5400): the same result, but the tenant program compiles only in
+    /// the bounded parser-test worker, never in this process. `Err` only when
+    /// no worker is free ([`LogSourceServiceError::ParserTestBusy`], a 429).
+    pub async fn validate_vrl_isolated(
+        &self,
+        vrl_code: &str,
+    ) -> Result<VrlValidationResult, LogSourceServiceError> {
+        let rendered = match prepare_for_validation(vrl_code) {
+            Ok(rendered) => rendered,
+            Err(refused) => return Ok(refused),
+        };
+        match self.vrl_validator.validate_vrl_isolated(&rendered).await {
+            Err(VrlValidatorError::Busy(message)) => Err(LogSourceServiceError::ParserTestBusy(message)),
+            other => Ok(validation_result(other)),
         }
     }
 

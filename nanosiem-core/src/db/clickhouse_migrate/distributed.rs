@@ -4,17 +4,88 @@
 
 use super::{ClickHouseMigrateError, ClickHouseMigrator};
 
-/// NAN-5367: the `HOST` clause for ClickHouse users the migrator creates with
-/// SQL. Loopback plus private address space (RFC 1918, carrier-grade NAT for
-/// pod networks such as EKS custom networking, IPv6 ULA); never any address.
-/// `system.users` predicate for a user that admits any address: `HOST ANY`
-/// shows as `host_ip = ['::/0']` (verified on 26.10), and a user with no
-/// host entries at all is equally unrestricted.
-pub(crate) const SQL_USER_OPEN_HOST_PREDICATE: &str = "(has(host_ip, '::/0') \
-     OR has(host_ip, '0.0.0.0/0') OR length(host_names_regexp) > 0 AND has(host_names_regexp, '.*'))";
-
+/// NAN-5367: the fallback `HOST` clause for ClickHouse users the migrator
+/// creates with SQL (see [`APP_CH_USER`]). Loopback plus private address space
+/// (RFC 1918, carrier-grade NAT for pod networks such as EKS custom
+/// networking, IPv6 ULA); never any address. `HOST ANY` shows in
+/// `system.users` as `host_ip = ['::/0']` (verified on 26.10).
 pub(crate) const SQL_USER_HOST_CLAUSE: &str = "IP '127.0.0.1', IP '::1', IP '10.0.0.0/8', \
      IP '172.16.0.0/12', IP '192.168.0.0/16', IP '100.64.0.0/10', IP 'fc00::/7'";
+
+/// NAN-5404: SQL users the migrator creates accept exactly the networks of the
+/// app user, which every deployment narrows to the networks it runs on.
+/// [`SQL_USER_HOST_CLAUSE`] is only the fallback while the app user still
+/// accepts any address (an install before NAN-5367) or cannot be read: an
+/// Agent Lane agent on a private LAN would otherwise overlap these users.
+pub(crate) const APP_CH_USER: &str = "nanosiem";
+
+/// One `system.users` row's host columns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, clickhouse::Row, serde::Deserialize)]
+pub(crate) struct UserHosts {
+    pub name: String,
+    pub storage: String,
+    pub host_ip: Vec<String>,
+    pub host_names: Vec<String>,
+    pub host_names_regexp: Vec<String>,
+    pub host_names_like: Vec<String>,
+}
+
+impl UserHosts {
+    fn sets(&self) -> (std::collections::BTreeSet<&str>, std::collections::BTreeSet<&str>) {
+        (
+            self.host_ip.iter().map(String::as_str).collect(),
+            self.host_names.iter().map(String::as_str).collect(),
+        )
+    }
+}
+
+/// NAN-5404: the HOST clause copying `app`'s networks, or `None` when it is
+/// unusable as a template: any address, reverse-DNS matching, no entry at
+/// all, or a value that is not a plain address / name.
+pub(crate) fn host_clause_from_app(app: &UserHosts) -> Option<String> {
+    let plain = |v: &String| {
+        !v.is_empty()
+            && v.len() <= 253
+            && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'/' | b'_' | b'-'))
+    };
+    if !app.host_names_regexp.is_empty()
+        || !app.host_names_like.is_empty()
+        || (app.host_ip.is_empty() && app.host_names.is_empty())
+        || app.host_ip.iter().any(|v| v.ends_with("/0") || !plain(v))
+        || !app.host_names.iter().all(plain)
+    {
+        return None;
+    }
+    let (ips, names) = app.sets();
+    let mut parts: Vec<String> = ips.iter().map(|ip| format!("IP '{ip}'")).collect();
+    parts.extend(names.iter().map(|n| if *n == "localhost" { "LOCAL".to_string() } else { format!("NAME '{n}'") }));
+    Some(parts.join(", "))
+}
+
+/// NAN-5404: the `ALTER USER .. HOST` clause `user` needs, if any: the app
+/// user's list when `user` admits anything outside it, else (legacy fallback) the private
+/// ranges only while `user` admits any address.
+pub(crate) fn sql_user_host_fix(user: &UserHosts, app: Option<&UserHosts>) -> Option<String> {
+    if user.storage == "users_xml" {
+        return None;
+    }
+    let open = user.host_ip.iter().any(|v| v == "::/0" || v == "0.0.0.0/0")
+        || user.host_names_regexp.iter().any(|v| v == ".*");
+    match app.and_then(|a| host_clause_from_app(a).map(|c| (a, c))) {
+        Some((a, clause)) => {
+            // Narrow only: a list already inside the app user's is left
+            // alone, so nodes whose app-user lists differ slightly never flap.
+            let ((ui, un), (ai, an)) = (user.sets(), a.sets());
+            let inside = !(ui.is_empty() && un.is_empty())
+                && ui.is_subset(&ai)
+                && un.is_subset(&an)
+                && user.host_names_regexp.is_empty()
+                && user.host_names_like.is_empty();
+            (!inside).then_some(clause)
+        }
+        None => open.then(|| SQL_USER_HOST_CLAUSE.to_string()),
+    }
+}
 
 impl ClickHouseMigrator {
     /// Tables that need Distributed wrappers for cross-shard queries.
@@ -453,15 +524,20 @@ impl ClickHouseMigrator {
                 profile_ensured = true;
             }
 
-            // NAN-5367: never an any-address user. Private address space only
-            // (pod / Compose / inventory networks); the deployment's own user
-            // config narrows XML users further.
+            // NAN-5367 / NAN-5404: never an any-address user: the app user's
+            // networks, or private address space while those are unusable.
+            let hosts = self
+                .read_user_hosts(APP_CH_USER)
+                .await?
+                .as_ref()
+                .and_then(host_clause_from_app)
+                .unwrap_or_else(|| SQL_USER_HOST_CLAUSE.to_string());
             let create_sql = format!(
                 "CREATE USER IF NOT EXISTS {user}{oc} IDENTIFIED BY ? \
                  HOST {hosts} SETTINGS PROFILE 'rawsql'",
                 user = user,
                 oc = on_cluster,
-                hosts = SQL_USER_HOST_CLAUSE,
+                hosts = hosts,
             );
             self.client
                 .query(&create_sql)
@@ -519,51 +595,52 @@ impl ClickHouseMigrator {
         Ok(created)
     }
 
-    /// NAN-5367: `ALTER USER .. HOST` a SQL-storage user that still accepts
-    /// connections from any address. Returns whether it altered the user.
-    /// A users.xml user (`storage = 'users_xml'`, read-only) or a user that
-    /// already has a host list is left untouched, so this is a no-op on every
-    /// later migrate.
+    /// One user's host columns (`None`: no such user).
+    pub(crate) async fn read_user_hosts(&self, user: &str) -> Result<Option<UserHosts>, ClickHouseMigrateError> {
+        let rows: Vec<UserHosts> = self
+            .client
+            .query(
+                "SELECT name, storage, host_ip, host_names, host_names_regexp, host_names_like \
+                 FROM system.users WHERE name = ?",
+            )
+            .bind(user)
+            .fetch_all()
+            .await
+            .map_err(|e| {
+                ClickHouseMigrateError::ClickHouse(format!("reading the host list of ClickHouse user '{}': {}", user, e))
+            })?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// NAN-5367 / NAN-5404: `ALTER USER .. HOST` a SQL-storage user the
+    /// migrator owns so it accepts exactly the app user's networks (see
+    /// [`sql_user_host_fix`]). A users.xml user (read-only) or one already in
+    /// line is left untouched, so this is a no-op on every later migrate.
+    /// Returns whether it altered the user.
     pub async fn tighten_sql_user_hosts(
         &mut self,
         user: &str,
         on_cluster: &str,
     ) -> Result<bool, ClickHouseMigrateError> {
-        let open: u64 = self
-            .client
-            .query(&format!(
-                "SELECT count() FROM system.users WHERE name = '{}' \
-                 AND storage != 'users_xml' AND {}",
-                crate::sql_hygiene::escape_sql_string(user),
-                SQL_USER_OPEN_HOST_PREDICATE,
-            ))
-            .fetch_one()
-            .await
-            .map_err(|e| {
-                ClickHouseMigrateError::ClickHouse(format!(
-                    "reading the host list of ClickHouse user '{}': {}",
-                    user, e
-                ))
-            })?;
-        if open == 0 {
+        let Some(current) = self.read_user_hosts(user).await? else {
             return Ok(false);
-        }
-        let sql = format!(
-            "ALTER USER {user}{oc} HOST {hosts}",
-            user = user,
-            oc = on_cluster,
-            hosts = SQL_USER_HOST_CLAUSE,
-        );
+        };
+        let app = self.read_user_hosts(APP_CH_USER).await?;
+        let Some(hosts) = sql_user_host_fix(&current, app.as_ref()) else {
+            return Ok(false);
+        };
+        let sql = format!("ALTER USER {user}{oc} HOST {hosts}", user = user, oc = on_cluster, hosts = hosts);
         self.client.query(&sql).execute().await.map_err(|e| {
             ClickHouseMigrateError::ClickHouse(format!(
-                "restricting ClickHouse user '{}' to private networks: {}",
+                "restricting ClickHouse user '{}' to the app user's networks: {}",
                 user, e
             ))
         })?;
         tracing::info!(
-            "NAN-5367: ClickHouse user '{}' accepted connections from any address; \
-             restricted it to loopback + private networks",
-            user
+            "NAN-5404: ClickHouse user '{}' now accepts the same networks as '{}' ({})",
+            user,
+            APP_CH_USER,
+            hosts
         );
         Ok(true)
     }

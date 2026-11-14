@@ -2,7 +2,6 @@
 //! Parser-test admission (security review 2026-11-08, NAN-5040 follow-up).
 
 use super::*;
-use crate::handlers::log_sources::parser_test_gate_sizing;
 use nanosiem_core::principal_gate::PrincipalGate;
 use std::time::Duration;
 
@@ -48,26 +47,4 @@ async fn admitted_work_returns_and_releases() {
     let permit = gate.try_acquire("user:a").unwrap();
     assert_eq!(run_admitted(permit, async { 7 }).await.ok(), Some(7));
     assert!(gate.try_acquire("user:a").is_ok());
-}
-
-/// One principal can never take the whole server-wide ceiling, on any replica
-/// size (a 2-CPU compose replica included), and the Lab's 4-way fan-out fits.
-#[test]
-fn gate_sizing_leaves_room_for_other_principals() {
-    for cpus in [1, 2, 4, 8, 16, 64] {
-        let (per, global) = parser_test_gate_sizing(cpus);
-        assert!(global >= 16, "cpus={cpus}");
-        assert!(per * 4 <= global, "cpus={cpus}: per={per} global={global}");
-        assert!(per >= 2, "cpus={cpus}");
-        assert!(per >= 4 || cpus < 8, "cpus={cpus}");
-    }
-    assert_eq!(parser_test_gate_sizing(2), (4, 16));
-    // N principals behind one address each get their own allowance.
-    let (per, global) = parser_test_gate_sizing(2);
-    let gate = PrincipalGate::new("Parser test", per, global, 1);
-    let permits: Vec<_> = (0..4)
-        .flat_map(|u| (0..per).map(move |_| u))
-        .map(|u| gate.try_acquire(&format!("user:{u}")).expect("admitted"))
-        .collect();
-    assert_eq!(permits.len(), global);
 }

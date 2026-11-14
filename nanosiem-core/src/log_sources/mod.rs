@@ -31,6 +31,7 @@ pub use service::pipe::{pipe_route_key, pipe_tap_component, MAX_PIPE_SAMPLES};
 pub use service::{
     LogSourceService, LogSourceServiceError, OcsfGateInput, OcsfGateOutcome, OcsfPrecheck,
 };
+pub use service::ocsf_attestation::run_ocsf_samples;
 pub use tier_guard::{data_source_cap, enforce_data_source_limit, DataSourceCap};
 pub use types::*;
 pub use version_repository::{DiscardOutcome, LogSourceVersionError, LogSourceVersionRepository};

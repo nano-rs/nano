@@ -43,7 +43,6 @@ use nanosiem_core::parsers::vector_config_remote_delivery::{
     self as remote_delivery, DeliveryState, GenerationDelivery, GenerationDeliveryStatus,
     IngestHostDelivery,
 };
-use nanosiem_core::principal_gate::PrincipalGate;
 use nanosiem_core::typeid::TypeIdParam;
 use super::principal_admission::{principal_key, refused, run_admitted, too_many_requests};
 use axum::response::{IntoResponse, Response};
@@ -386,6 +385,7 @@ pub async fn deploy_log_source(
     Query(wait): Query<DeployWaitQuery>,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
+    let request_started = std::time::Instant::now();
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
     let request = DeployLogSourceRequest::from_body(&body)?;
 
@@ -417,7 +417,7 @@ pub async fn deploy_log_source(
         client,
         extra: Some(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) })),
     };
-    run_deploy_job(&state, audit, DeployJobKind::Deploy, Some(id), wait.wait, move |state, progress| async move {
+    run_deploy_job(&state, audit, DeployJobKind::Deploy, Some(id), wait.wait, request_started, move |state, progress| async move {
         // A save between the check and the job must not go live unchecked.
         state
             .log_source_service
@@ -458,6 +458,7 @@ pub async fn undeploy_log_source(
     Path(id): Path<TypeIdParam>,
     Query(wait): Query<DeployWaitQuery>,
 ) -> Result<Response, ApiError> {
+    let request_started = std::time::Instant::now();
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     // 404 before a job exists for a source that does not.
@@ -465,7 +466,7 @@ pub async fn undeploy_log_source(
 
     let id = *id;
     let audit = DeployAudit { action: LOG_SOURCE_UNDEPLOYED, auth: auth.clone(), client, extra: None };
-    run_deploy_job(&state, audit, DeployJobKind::Undeploy, Some(id), wait.wait, move |state, progress| async move {
+    run_deploy_job(&state, audit, DeployJobKind::Undeploy, Some(id), wait.wait, request_started, move |state, progress| async move {
         let result = state
             .log_source_service
             .undeploy_with_progress(id, progress.as_ref())
@@ -640,6 +641,7 @@ pub struct ValidateVrlRequest {
     responses(
         (status = 200, description = "VRL validation result", body = VrlValidationResult),
         (status = 403, description = "Forbidden"),
+        (status = 429, description = "Too many parser tests or validations running for this caller or server; retry after Retry-After"),
     ),
     security(("api_key" = []))
 )]
@@ -647,13 +649,23 @@ pub async fn validate_vrl(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<ValidateVrlRequest>,
-) -> Result<Json<VrlValidationResult>, ApiError> {
-    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
-
-    let result = state
-        .log_source_service
-        .validate_vrl(&request.vrl_code)
-        .await;
+) -> Result<Json<VrlValidationResult>, Response> {
+    ensure_permission(&auth, LOG_SOURCES_VIEW).map_err(IntoResponse::into_response)?;
+    // NAN-5400: a view-only caller's draft compiles only in the bounded
+    // parser-test worker, under the same per-principal admission as tests.
+    let permit = nanosiem_core::parsers::test_sandbox::admit(Some(&principal_key(&auth)))
+        .await
+        .map_err(refused)?;
+    let service = state.log_source_service.clone();
+    let vrl_code = request.vrl_code;
+    let result = run_admitted(
+        permit,
+        nanosiem_core::parsers::test_sandbox::admitted(async move {
+            service.validate_vrl_isolated(&vrl_code).await
+        }),
+    )
+    .await?
+    .map_err(parser_test_error)?;
     Ok(Json(result))
 }
 
@@ -709,8 +721,10 @@ pub async fn test_vrl(
         .filter(|_| auth.has_permission(LOG_SOURCES_EDIT))
         .map(|id| **id);
     check_test_sample(&request.sample_log).map_err(IntoResponse::into_response)?;
-    let permit = parser_test_gate()
-        .try_acquire(&principal_key(&auth))
+    // NAN-5396: the replica's one parser-test admission, per principal,
+    // before any validation, compile or query work.
+    let permit = nanosiem_core::parsers::test_sandbox::admit(Some(&principal_key(&auth)))
+        .await
         .map_err(refused)?;
 
     let service = state.log_source_service.clone();
@@ -718,7 +732,7 @@ pub async fn test_vrl(
     let vrl_code = request.vrl_code.clone();
     let extension_vrl = request.extension_vrl.clone();
     let sample_log = request.sample_log.clone();
-    let result = run_admitted(permit, async move {
+    let result = run_admitted(permit, nanosiem_core::parsers::test_sandbox::admitted(async move {
         if validate_ocsf {
             service
                 .test_vrl_chain_ocsf(&vrl_code, extension_vrl.as_deref(), &sample_log)
@@ -728,7 +742,7 @@ pub async fn test_vrl(
                 .test_vrl_chain(&vrl_code, extension_vrl.as_deref(), &sample_log)
                 .await
         }
-    })
+    }))
     .await?
     .map_err(parser_test_error)?;
 
@@ -815,14 +829,16 @@ async fn test_vrl_live_inner(
     // line, and ReadOnly analysts legitimately use the test lab. The disclosure
     // is now exactly what `/api/search` would give the same caller.
     ensure_permission(&auth, nanosiem_core::auth::permissions::SEARCH_EXECUTE).map_err(api)?;
-    let permit = parser_test_gate()
-        .try_acquire(&principal_key(&auth))
+    // NAN-5396: the replica's one parser-test admission, per principal,
+    // before any validation, compile or query work.
+    let permit = nanosiem_core::parsers::test_sandbox::admit(Some(&principal_key(&auth)))
+        .await
         .map_err(refused)?;
 
     let limit = request.limit.unwrap_or(10);
     let service = state.log_source_service.clone();
     let scope = auth.effective_viewer_scope();
-    let results = run_admitted(permit, async move {
+    let results = run_admitted(permit, nanosiem_core::parsers::test_sandbox::admitted(async move {
         service
             .test_vrl_live(
                 &request.vrl_code,
@@ -832,46 +848,14 @@ async fn test_vrl_live_inner(
                 &scope,
             )
             .await
-    })
+    }))
     .await?
     .map_err(parser_test_error)?;
     Ok(Json(results))
 }
 
-/// Retry-After for a refused parser test. Each test is bounded to a few
-/// seconds (`exec_bounds::TEST_EXECUTION_BUDGET`) and runs in a worker process
-/// (`parsers::test_sandbox`).
-const PARSER_TEST_RETRY_AFTER_SECS: u64 = 1;
-
-/// Parser-test admission sizing: `(per_principal, global)`.
-///
-/// The global ceiling is at least 16 and twice the CPU count, and one
-/// principal may hold at most a quarter of it (at least 2), so a single caller
-/// can never lock everyone else out, even on a 2-CPU compose replica
-/// (16 global / 4 per principal). The Parser Test Lab runs 4 at a time and
-/// retries a 429 after `Retry-After`.
-pub fn parser_test_gate_sizing(cpus: usize) -> (usize, usize) {
-    let global = (cpus.saturating_mul(2)).max(16);
-    ((global / 4).max(2), global)
-}
-
-/// Security review 2026-11-08 (NAN-5040): parser tests execute tenant VRL.
-/// Execution is time-bounded and off the tokio workers; this gate also caps
-/// how many run at once, per principal (never per source address) and per
-/// replica.
-fn parser_test_gate() -> &'static PrincipalGate {
-    static GATE: std::sync::OnceLock<PrincipalGate> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| {
-        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let (per_principal, global) = parser_test_gate_sizing(cpus);
-        PrincipalGate::new(
-            "Parser test",
-            per_principal,
-            global,
-            PARSER_TEST_RETRY_AFTER_SECS,
-        )
-    })
-}
+/// Retry-After for a refused parser test.
+const PARSER_TEST_RETRY_AFTER_SECS: u64 = nanosiem_core::parsers::test_sandbox::RETRY_AFTER_SECONDS;
 
 /// Largest raw `sample_log` accepted by test-vrl. Real events are tens of KiB.
 pub const MAX_TEST_SAMPLE_BYTES: usize = 1024 * 1024;
@@ -908,10 +892,11 @@ pub async fn deploy_all_log_sources(
     Extension(client): Extension<ClientContext>,
     Query(wait): Query<DeployWaitQuery>,
 ) -> Result<Response, ApiError> {
+    let request_started = std::time::Instant::now();
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     let audit = DeployAudit { action: LOG_SOURCE_DEPLOY_ALL, auth: auth.clone(), client, extra: None };
-    run_deploy_job(&state, audit, DeployJobKind::DeployAll, None, wait.wait, move |state, progress| async move {
+    run_deploy_job(&state, audit, DeployJobKind::DeployAll, None, wait.wait, request_started, move |state, progress| async move {
         state
             .log_source_service
             .deploy_all_with_progress(progress.as_ref())
@@ -1124,6 +1109,7 @@ pub async fn publish_log_source(
     Query(wait): Query<DeployWaitQuery>,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
+    let request_started = std::time::Instant::now();
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     let request = PublishLogSourceRequest::from_body(&body)?;
@@ -1154,7 +1140,7 @@ pub async fn publish_log_source(
         extra: Some(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) })),
     };
     let user_id = auth.user_id();
-    run_deploy_job(&state, audit, DeployJobKind::Publish, Some(id), wait.wait, move |state, progress| async move {
+    run_deploy_job(&state, audit, DeployJobKind::Publish, Some(id), wait.wait, request_started, move |state, progress| async move {
         let result = state
             .log_source_service
             .publish_with_progress(id, Some(user_id), expected, progress.as_ref())

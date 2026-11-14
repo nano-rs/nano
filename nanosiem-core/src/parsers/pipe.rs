@@ -53,6 +53,18 @@ pub struct Plan {
 }
 
 pub fn stored_plan(source: &str) -> Result<Option<Plan>, String> {
+    let plan = stored_plan_shape(source)?;
+    if let Some(plan) = &plan {
+        plan.validate()?;
+    }
+    Ok(plan)
+}
+
+/// [`stored_plan`] without [`Plan::validate`]: the marker, size, body and
+/// JSON shape only. It never invokes the VRL compiler, so the API can route
+/// a stored plan (native or stateless) and leave every compiler-backed check
+/// to the bounded parser-test worker (NAN-5400).
+pub fn stored_plan_shape(source: &str) -> Result<Option<Plan>, String> {
     let Some(rest) = source.strip_prefix(HEADER) else {
         return Ok(None);
     };
@@ -69,7 +81,6 @@ pub fn stored_plan(source: &str) -> Result<Option<Plan>, String> {
     }
     let plan: Plan =
         serde_json::from_str(document).map_err(|e| format!("Invalid processing plan: {e}"))?;
-    plan.validate()?;
     Ok(Some(plan))
 }
 

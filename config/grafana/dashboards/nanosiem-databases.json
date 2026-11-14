@@ -791,7 +791,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (component_id) (rate(nanosiem_vector_component_received_events_total{job=\"nano-vector\", host=~\"$host\", component_kind=\"source\", component_type!~\"internal_.*\"}[$__rate_interval]))",
+          "expr": "sum by (component_id) (rate(nanosiem_vector_component_received_events_total{job=\"nano-vector\", host=~\"$host\", component_kind=\"source\", component_type!~\"internal_.*|demo_logs\"}[$__rate_interval]))",
           "legendFormat": "{{component_id}}"
         }
       ],
@@ -820,7 +820,7 @@
     {
       "type": "timeseries",
       "title": "Sent by sink",
-      "description": "",
+      "description": "Blackhole sinks (discarded data and nano's reload markers) are excluded.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -838,7 +838,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (component_id) (rate(nanosiem_vector_component_sent_events_total{job=\"nano-vector\", host=~\"$host\", component_kind=\"sink\"}[$__rate_interval]))",
+          "expr": "sum by (component_id) (rate(nanosiem_vector_component_sent_events_total{job=\"nano-vector\", host=~\"$host\", component_kind=\"sink\", component_type!=\"blackhole\"}[$__rate_interval]))",
           "legendFormat": "{{component_id}}"
         }
       ],

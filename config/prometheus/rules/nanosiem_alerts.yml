@@ -96,10 +96,15 @@ groups:
     rules:
       # Events still arrive at Vector's sources but none reach a ClickHouse
       # sink: the pipeline is stalled (ClickHouse down, read-only, or a
-      # wedged sink). Internal sources (Vector's own metrics/logs) are ignored.
+      # wedged sink). Internal sources (Vector's own metrics/logs) are ignored,
+      # and so are demo_logs sources (NAN-5407): nano's reload markers
+      # (nano_activation_<id> on Compose, __nano_ack_/__nano_failed_ sentinels
+      # on Helm) emit one synthetic event per second into a blackhole on every
+      # install, so counting them fired this alert whenever a healthy install
+      # went idle. Unit tests: scripts/tests/fixtures/monitoring/nanosiem_alerts.test.yml.
       - alert: NanoIngestStalled
         expr: |
-          sum(rate(nanosiem_vector_component_received_events_total{job="nano-vector", component_kind="source", component_type!~"internal_.*"}[10m])) > 0
+          sum(rate(nanosiem_vector_component_received_events_total{job="nano-vector", component_kind="source", component_type!~"internal_.*|demo_logs"}[10m])) > 0
             and on()
           (sum(rate(nanosiem_vector_component_sent_events_total{job="nano-vector", component_type="clickhouse"}[10m])) or on() vector(0)) == 0
         for: 10m

@@ -1,0 +1,1108 @@
+name: windows_sysmon_ocsf
+display_name: Microsoft Sysmon (OCSF)
+version: "1.6.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
+  into complete OCSF 1.9.0 records, routed by Sysmon EventID:
+    1  Process Create    -> Process Activity 1007 (Launch)
+    5  Process Terminate -> Process Activity 1007 (Terminate)
+    10 Process Access    -> Process Activity 1007 (Open)
+    7  Image Loaded      -> Module Activity 1005 (Load; module = the loaded image)
+    12 Registry Key      -> Registry Key Activity 201001 (Win ext; Create/Delete)
+    13 Registry Value    -> Registry Value Activity 201002 (Win ext; Set)
+    3  Network Connect   -> Network Activity 4001 (Open)
+    11 File Create       -> File System Activity 1001 (Create)
+    23 File Delete       -> File System Activity 1001 (Delete)
+    22 DNS Query         -> DNS Activity 4003 (Query)
+  Preserves unconsumed EventData in unmapped, including unknown EventIDs, and
+  maps process/session, executable metadata, network direction and file clocks.
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize. Carries metadata.profiles ["host"] because the
+  `device` object is profile-bound in OCSF 1.9. The OCSF counterpart of
+  parsers/windows_sysmon — deploy one or the other, never both.
+ocsf_version: "1.9.0"
+match_values:
+  - windows_sysmon
+category: endpoint
+vendor: "Microsoft"
+product: "Sysmon"
+parser_vrl: |
+  # Sysmon JSON -> OCSF 1.9.0. Emits the COMPLETE OCSF record on the root.
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  __reference_consumed = []
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "category_uid": 1,
+          "activity_id": 99,
+          "type_uid": 100799,
+          "severity_id": 1,
+          "status_id": 0,
+          "time": 0,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": "", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": sha2("windows_sysmon|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      p = object!(parsed)
+      ed = object(p.event_data) ?? {}
+      eid = to_int(p.event_id) ?? 0
+
+      computer = downcase(string(p.computer) ?? string(p.host) ?? "")
+
+      # ---- event time (common Sysmon JSON shapes) -> epoch ms ----------
+      consumed = []
+      time_ms = 0
+      ts_str = string(p.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      if time_ms == 0 {
+          ts_str = string(p.time_created) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+      }
+      if time_ms == 0 {
+          ts_str = string(ed.UtcTime) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds"); consumed = push(consumed, "UtcTime") }
+              if terr != null {
+                  # EventData.UtcTime omits an explicit zone but is UTC by
+                  # contract. Add it before parsing so host timezone cannot
+                  # shift the event clock.
+                  utc_ts = replace(ts_str, " ", "T") + "Z"
+                  t2, terr2 = parse_timestamp(utc_ts, "%+")
+                  if terr2 == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds"); consumed = push(consumed, "UtcTime") }
+              }
+          }
+      }
+
+      # ---- shared helpers (inlined) ------------------------------------
+      # actor user "DOMAIN\\user" -> name (strip domain)
+      actor_user = ""
+      au_raw = string(ed.User) ?? ""
+      if au_raw != "" {
+          aup = split(au_raw, "\\")
+          actor_user = if length(aup) >= 2 { string(aup[1]) ?? "" } else { string(aup[0]) ?? "" }
+      }
+      # actor process basename from Image path (VRL has no dynamic array index,
+      # so take the trailing path segment via regex)
+      img = string(ed.Image) ?? ""
+      actor_proc_name = ""
+      anm, anmerr = parse_regex(img, r'(?P<b>[^\\/]+)$')
+      if anmerr == null { actor_proc_name = string(anm.b) ?? "" }
+      # parent basename
+      pimg = string(ed.ParentImage) ?? ""
+      parent_proc_name = ""
+      pnm, pnmerr = parse_regex(pimg, r'(?P<b>[^\\/]+)$')
+      if pnmerr == null { parent_proc_name = string(pnm.b) ?? "" }
+      # SHA-256 out of the "SHA256=..,MD5=.." Hashes string
+      sha = ""
+      hs = string(ed.Hashes) ?? ""
+      if hs != "" {
+          hm, hmerr = parse_regex(hs, r'SHA256=(?P<h>[0-9A-Fa-f]+)')
+          if hmerr == null { sha = downcase(string(hm.h) ?? "") }
+      }
+
+      # The Image-based (acting/subject) process, assembled once. For 1007
+      # process-family events this is the OCSF top-level `process` (the SUBJECT);
+      # for the network/file/dns classes it is the initiator (actor.process).
+      subject_process = {
+          "name": actor_proc_name,
+          "cmd_line": string(ed.CommandLine) ?? "",
+          "pid": to_int(ed.ProcessId) ?? 0,
+          "uid": string(ed.ProcessGuid) ?? "",
+          "file": { "name": actor_proc_name, "path": img, "type_id": 1 }
+      }
+      if sha != "" && eid != 7 && eid != 11 && eid != 23 { subject_process.file = { "name": actor_proc_name, "path": img, "type_id": 1, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
+
+      # The PARENT process (initiator), present on Process Create (EID 1).
+      parent_process = {
+          "name": parent_proc_name,
+          "cmd_line": string(ed.ParentCommandLine) ?? "",
+          "pid": to_int(ed.ParentProcessId) ?? 0
+      }
+      if is_string(ed.ParentImage) { parent_process.file = { "path": pimg, "name": parent_proc_name, "type_id": 1 } }
+      if is_string(ed.ParentProcessGuid) { parent_process.uid = ed.ParentProcessGuid }
+      if is_string(ed.ParentUser) { parent_process.user = { "name": ed.ParentUser } }
+      has_parent = exists(ed.ParentImage) || exists(ed.ParentCommandLine) || exists(ed.ParentProcessId) || exists(ed.ParentProcessGuid) || exists(ed.ParentUser)
+
+      # actor.process for the non-1007 classes (network/file/dns): the initiator
+      # is the Image-based process, with its parent nested.
+      actor_process = subject_process
+      if has_parent { actor_process.parent_process = parent_process }
+
+      # ---- defaults; overridden per class below ----
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+
+      ocsf = {}
+
+      if eid == 1 || eid == 5 {
+          # process-family -> Process Activity 1007
+          class_uid = 1007; class_name = "Process Activity"; category_uid = 1; category_name = "System Activity"
+          if eid == 1 { activity_id = 1; activity_name = "Launch" }
+          if eid == 5 { activity_id = 2; activity_name = "Terminate" }
+          # OCSF 1007: top-level `process` (REQUIRED) = the SUBJECT process.
+          ocsf.process = subject_process
+          # EID 1 (Create) carries a parent/initiator -> actor.process. Terminate
+          # has no separate initiator, so actor is the user only.
+          if eid == 1 {
+              ocsf.actor = { "process": parent_process, "user": { "name": actor_user } }
+          } else {
+              ocsf.actor = { "user": { "name": actor_user } }
+          }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 12 {
+          # Registry Key Create/Delete -> Registry Key Activity 201001 (Windows
+          # extension). actor.process makes the change; reg_key is the subject.
+          class_uid = 201001; class_name = "Registry Key Activity"; category_uid = 1; category_name = "System Activity"
+          reg_event = string(ed.EventType) ?? ""
+          activity_id = 99; activity_name = "Other"
+          if reg_event == "CreateKey" { activity_id = 1; activity_name = "Create" }
+          if reg_event == "DeleteKey" { activity_id = 4; activity_name = "Delete" }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.reg_key = { "path": string(ed.TargetObject) ?? "" }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 13 {
+          # Registry Value Set -> Registry Value Activity 201002 (Windows
+          # extension), activity 2 (Set). reg_value carries the value + data.
+          class_uid = 201002; class_name = "Registry Value Activity"; category_uid = 1; category_name = "System Activity"
+          activity_id = 2; activity_name = "Set"
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          # Sysmon TargetObject is the full key\value; split on the LAST backslash:
+          # tail -> reg_value.name (required), head -> reg_value.path (required).
+          tgt = string(ed.TargetObject) ?? ""
+          rv_name = ""
+          rvm, rvmerr = parse_regex(tgt, r'(?P<n>[^\\]+)$')
+          if rvmerr == null { rv_name = string(rvm.n) ?? "" }
+          rv_path = tgt
+          rpm, rpmerr = parse_regex(tgt, r'^(?P<p>.*)\\[^\\]+$')
+          if rpmerr == null { rv_path = string(rpm.p) ?? "" }
+          ocsf.reg_value = { "name": rv_name, "path": rv_path, "data": string(ed.Details) ?? "" }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 7 {
+          # Image Loaded -> Module Activity 1005 (Load). OCSF models this as a
+          # module load: the loading process is the ACTOR (actor.process), the
+          # loaded image is the `module` (its own subject), NOT Process Activity.
+          class_uid = 1005; class_name = "Module Activity"; category_uid = 1; category_name = "System Activity"
+          activity_id = 1; activity_name = "Load"
+          loaded = string(ed.ImageLoaded) ?? ""
+          mod_name = ""
+          mnm, mnmerr = parse_regex(loaded, r'(?P<b>[^\\/]+)$')
+          if mnmerr == null { mod_name = string(mnm.b) ?? "" }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          signed_raw = downcase(string(ed.Signed) ?? "")
+          signature_state = string(ed.SignatureStatus) ?? ""
+          signature_state_id = 99
+          if downcase(signature_state) == "valid" { signature_state_id = 1; signature_state = "Valid" }
+          if downcase(signature_state) == "expired" { signature_state_id = 2; signature_state = "Expired" }
+          if downcase(signature_state) == "revoked" { signature_state_id = 3; signature_state = "Revoked" }
+          if downcase(signature_state) == "untrusted" { signature_state_id = 6; signature_state = "Untrusted" }
+          module_file = {
+              "path": loaded,
+              "name": mod_name,
+              "type_id": 1
+          }
+          if signed_raw == "true" {
+              module_file.signatures = [{
+                  "algorithm_id": 4,
+                  "algorithm": "Authenticode",
+                  "serialization_id": 6,
+                  "serialization": "Authenticode",
+                  "developer_uid": string(ed.Signature) ?? "",
+                  "state_id": signature_state_id,
+                  "state": signature_state
+              }]
+          }
+          if sha != "" { module_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
+          ocsf.module = { "load_type_id": 1, "file": module_file }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 10 {
+          # Process Access -> Process Activity 1007 (Open). Source = actor, Target = process.
+          class_uid = 1007; class_name = "Process Activity"; category_uid = 1; category_name = "System Activity"
+          activity_id = 3; activity_name = "Open"
+          simg = string(ed.SourceImage) ?? ""
+          src_proc_name = ""
+          snm, snmerr = parse_regex(simg, r'(?P<b>[^\\/]+)$')
+          if snmerr == null { src_proc_name = string(snm.b) ?? "" }
+          timg = string(ed.TargetImage) ?? ""
+          tgt_proc_name = ""
+          tnm, tnmerr = parse_regex(timg, r'(?P<b>[^\\/]+)$')
+          if tnmerr == null { tgt_proc_name = string(tnm.b) ?? "" }
+          ocsf.actor = {
+              "process": { "name": src_proc_name, "uid": string(ed.SourceProcessGUID) ?? "", "pid": to_int(ed.SourceProcessId) ?? 0, "file": { "name": src_proc_name, "path": simg, "type_id": 1 } },
+              "user": { "name": actor_user }
+          }
+          ocsf.process = { "name": tgt_proc_name, "uid": string(ed.TargetProcessGUID) ?? "", "pid": to_int(ed.TargetProcessId) ?? 0, "file": { "name": tgt_proc_name, "path": timg, "type_id": 1 } }
+          ocsf.device = { "hostname": computer }
+          # OCSF actual_permissions is integer_t. Sysmon emits a hexadecimal
+          # access mask such as 0x1fffff, so preserve the mask losslessly as an
+          # integer instead of leaking its source string into the typed field.
+          granted_access_raw = downcase(string(ed.GrantedAccess) ?? "")
+          if granted_access_raw != "" {
+              granted_access_hex = replace(granted_access_raw, "0x", "")
+              granted_access, granted_access_err = parse_int(granted_access_hex, base: 16)
+              if granted_access_err == null { ocsf.actual_permissions = granted_access }
+          }
+      } else if eid == 3 {
+          # Network Connection -> Network Activity 4001 (Open)
+          class_uid = 4001; class_name = "Network Activity"; category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Open"
+          proto = downcase(string(ed.Protocol) ?? "")
+          ocsf.src_endpoint = { "ip": downcase(string(ed.SourceIp) ?? ""), "port": to_int(ed.SourcePort) ?? 0, "hostname": downcase(string(ed.SourceHostname) ?? "") }
+          ocsf.dst_endpoint = { "ip": downcase(string(ed.DestinationIp) ?? ""), "port": to_int(ed.DestinationPort) ?? 0, "hostname": downcase(string(ed.DestinationHostname) ?? "") }
+          # protocol_num is an IANA number; only emit it when known (no -1 sentinel).
+          if proto == "tcp" { ocsf.connection_info = { "direction_id": 0, "protocol_num": 6 } }
+          if proto == "udp" { ocsf.connection_info = { "direction_id": 0, "protocol_num": 17 } }
+          if !is_object(ocsf.connection_info) { ocsf.connection_info = { "direction_id": 0 } }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 11 || eid == 23 {
+          # File Create / Delete -> File System Activity 1001
+          class_uid = 1001; class_name = "File System Activity"; category_uid = 1; category_name = "System Activity"
+          if eid == 11 { activity_id = 1; activity_name = "Create" }
+          if eid == 23 { activity_id = 4; activity_name = "Delete" }
+          tf = string(ed.TargetFilename) ?? ""
+          file_name = ""
+          fnm, fnmerr = parse_regex(tf, r'(?P<b>[^\\/]+)$')
+          if fnmerr == null { file_name = string(fnm.b) ?? "" }
+          file_obj = { "name": file_name, "path": tf, "type_id": 1 }
+          if sha != "" { file_obj.hashes = [{ "algorithm_id": 3, "value": sha }] }
+          ocsf.file = file_obj
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 22 {
+          # DNS Query -> DNS Activity 4003 (Query)
+          class_uid = 4003; class_name = "DNS Activity"; category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Query"
+          # OCSF 1.9 DNS Activity requires at least one network endpoint. Sysmon
+          # observes the query on this host, so the device is also the source
+          # endpoint even though Event ID 22 does not carry a remote DNS server.
+          if computer != "" { ocsf.src_endpoint = { "hostname": computer } }
+          ocsf.query = { "hostname": downcase(string(ed.QueryName) ?? "") }
+          qr = string(ed.QueryResults) ?? ""
+          if qr != "" { ocsf.answers = [{ "rdata": qr }] }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+      } else {
+          # unknown EventID -> Process Activity / Other, carry context.
+          # 1007 requires `process`; the only process this record describes is the
+          # Image-based one, so it is both subject and (with its parent) actor.
+          ocsf.process = subject_process
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+      }
+
+      # ---- consumed source keys, specific to the branch that emitted them ----
+      # Only successfully represented scalar values are removed below. Merely
+      # reading a helper is not consumption (e.g. Image on Process Access).
+      process_keys = ["Image", "CommandLine", "ProcessId", "ProcessGuid", "User"]
+      parent_keys = ["ParentImage", "ParentCommandLine", "ParentProcessId", "ParentProcessGuid", "ParentUser"]
+      branch_keys = []
+      if eid == 1 { branch_keys = append(process_keys, parent_keys) }
+      if eid == 5 { branch_keys = process_keys }
+      if eid == 3 { branch_keys = append(append(process_keys, parent_keys), ["SourceIp", "SourcePort", "SourceHostname", "DestinationIp", "DestinationPort", "DestinationHostname"]) }
+      if eid == 7 { branch_keys = append(append(process_keys, parent_keys), ["ImageLoaded"]) }
+      if eid == 10 { branch_keys = ["SourceImage", "SourceProcessGUID", "SourceProcessId", "TargetImage", "TargetProcessGUID", "TargetProcessId", "User"] }
+      if eid == 11 || eid == 23 { branch_keys = append(append(process_keys, parent_keys), ["TargetFilename"]) }
+      if eid == 12 { branch_keys = append(append(process_keys, parent_keys), ["TargetObject"]) }
+      if eid == 13 { branch_keys = append(append(process_keys, parent_keys), ["TargetObject", "Details"]) }
+      if eid == 22 { branch_keys = append(append(process_keys, parent_keys), ["QueryName", "QueryResults"]) }
+      if !includes([1, 3, 5, 7, 10, 11, 12, 13, 22, 23], eid) { branch_keys = append(process_keys, parent_keys) }
+      for_each(branch_keys) -> |_index, key| {
+          value = get!(ed, [key])
+          if is_string(value) { consumed = push(consumed, key) }
+          if includes(["ProcessId", "ParentProcessId", "SourceProcessId", "TargetProcessId", "SourcePort", "DestinationPort"], key) {
+              number, number_err = to_int(value)
+              consumed = filter(consumed) -> |_i, k| { k != key }
+              if number_err == null && (is_string(value) || is_integer(value)) { consumed = push(consumed, key) }
+          }
+      }
+      if eid == 22 && (string(ed.QueryResults) ?? "") == "" { consumed = filter(consumed) -> |_i, key| { key != "QueryResults" } }
+      if eid == 12 && includes(["CreateKey", "DeleteKey"], ed.EventType) { consumed = push(consumed, "EventType") }
+      if eid == 13 && ed.EventType == "SetValue" { consumed = push(consumed, "EventType") }
+      if eid == 10 && exists(ocsf.actual_permissions) { consumed = push(consumed, "GrantedAccess") }
+      if eid == 7 && downcase(string(ed.Signed) ?? "") == "true" && is_string(ed.Signed) {
+          consumed = append(consumed, ["Signed"])
+          if is_string(ed.Signature) { consumed = push(consumed, "Signature") }
+          if is_string(ed.SignatureStatus) { consumed = push(consumed, "SignatureStatus") }
+      }
+      # A SHA256 extraction alone does not consume a multi-hash source string.
+      if sha != "" && eid != 10 && match(hs, r'^SHA256=[0-9A-Fa-f]+$') { consumed = push(consumed, "Hashes") }
+
+      # Image-based process context. EID 10 uses separate Source/Target fields.
+      if eid != 10 {
+          process_path = if class_uid == 1007 { ["process"] } else { ["actor", "process"] }
+          string_fields = { "IntegrityLevel": ["integrity"], "CurrentDirectory": ["working_directory"] }
+          for_each(string_fields) -> |key, path| {
+              value = get!(ed, [key])
+              if is_string(value) {
+                  ocsf = set!(ocsf, append(process_path, array!(path)), value)
+                  consumed = push(consumed, key)
+              }
+          }
+          if is_string(ed.IntegrityLevel) {
+              levels = { "untrusted": 1, "low": 2, "medium": 3, "high": 4, "system": 5, "protected": 6, "unknown": 0 }
+              level = int(get!(levels, [downcase(string!(ed.IntegrityLevel))])) ?? 99
+              ocsf = set!(ocsf, append(process_path, ["integrity_id"]), level)
+          }
+          # On module loads these attributes describe the DLL, not its loader.
+          file_path = if eid == 7 { ["module", "file"] } else { append(process_path, ["file"]) }
+          file_fields = { "OriginalFileName": ["internal_name"], "Company": ["company_name"], "Product": ["product", "name"], "Description": ["desc"], "FileVersion": ["version"] }
+          for_each(file_fields) -> |key, path| {
+              value = get!(ed, [key])
+              if is_string(value) {
+                  ocsf = set!(ocsf, append(file_path, array!(path)), value)
+                  consumed = push(consumed, key)
+              }
+          }
+      }
+      for_each({ "LogonId": "uid", "LogonGuid": "uuid" }) -> |key, attribute| {
+          value = get!(ed, [key])
+          if is_string(value) {
+              ocsf = set!(ocsf, ["actor", "session", attribute], value)
+              consumed = push(consumed, key)
+          }
+      }
+      # Windows TerminalSessionId is not OCSF's pseudo-terminal (tty/pts).
+      if eid == 10 {
+          thread_id, thread_err = to_int(ed.SourceThreadId)
+          if thread_err == null && (is_string(ed.SourceThreadId) || is_integer(ed.SourceThreadId)) {
+              ocsf.actor.process.ptid = thread_id
+              consumed = push(consumed, "SourceThreadId")
+          }
+          if is_string(ed.SourceUser) { ocsf.actor.process.user = { "name": ed.SourceUser }; consumed = push(consumed, "SourceUser") }
+          # NAN-2986: Process Access carries no `User`; the accessing
+          # principal is SourceUser. Without this actor.user.name was "".
+          if actor_user == "" && is_string(ed.SourceUser) {
+              su_parts = split(string!(ed.SourceUser), "\\")
+              if length(su_parts) >= 2 {
+                  ocsf.actor.user = { "name": string(su_parts[1]) ?? "", "domain": string(su_parts[0]) ?? "" }
+              } else {
+                  ocsf.actor.user = { "name": string!(ed.SourceUser) }
+              }
+          }
+          if is_string(ed.TargetUser) { ocsf.process.user = { "name": ed.TargetUser }; consumed = push(consumed, "TargetUser") }
+      }
+      if eid == 3 {
+          if includes(["tcp", "udp"], downcase(string(ed.Protocol) ?? "")) { consumed = push(consumed, "Protocol") }
+          initiated = downcase(to_string(ed.Initiated) ?? "")
+          if initiated == "true" { ocsf.connection_info.direction_id = 2; consumed = push(consumed, "Initiated") }
+          if initiated == "false" { ocsf.connection_info.direction_id = 1; consumed = push(consumed, "Initiated") }
+          # NAN-2986: Sysmon writes "-" when it could not resolve a hostname or
+          # service name. "-" is not a hostname; emitting it made
+          # dst_endpoint.hostname="-" the most common destination on the
+          # blaster mix. Leave it unconsumed so it stays visible in unmapped.
+          if is_string(ed.SourcePortName) && ed.SourcePortName != "-" { ocsf.src_endpoint.svc_name = ed.SourcePortName; consumed = push(consumed, "SourcePortName") }
+          if is_string(ed.DestinationPortName) && ed.DestinationPortName != "-" { ocsf.dst_endpoint.svc_name = ed.DestinationPortName; consumed = push(consumed, "DestinationPortName") }
+          if ed.SourceHostname == "-" {
+              ocsf.src_endpoint = remove!(object!(ocsf.src_endpoint), ["hostname"])
+              consumed = filter(consumed) -> |_i, k| { k != "SourceHostname" }
+          }
+          if ed.DestinationHostname == "-" {
+              ocsf.dst_endpoint = remove!(object!(ocsf.dst_endpoint), ["hostname"])
+              consumed = filter(consumed) -> |_i, k| { k != "DestinationHostname" }
+          }
+      }
+      if eid == 11 {
+          created_raw = string(ed.CreationUtcTime) ?? ""
+          created, created_err = parse_timestamp(created_raw, "%+")
+          if created_err != null { created, created_err = parse_timestamp(replace(created_raw, " ", "T") + "Z", "%+") }
+          if created_err == null {
+              ocsf.file.created_time = to_unix_timestamp(created, unit: "milliseconds")
+              consumed = push(consumed, "CreationUtcTime")
+          }
+      }
+      # QueryStatus is Win32 DNS_STATUS. Only success and DNS_ERROR_RCODE_*
+      # translate to RFC response codes; other Windows errors remain residual.
+      if eid == 22 {
+          query_status, query_status_err = to_int(ed.QueryStatus)
+          rcodes = { "0": "NoError", "1": "FormError", "2": "ServError", "3": "NXDomain", "4": "NotImp", "5": "Refused", "6": "YXDomain", "7": "YXRRSet", "8": "NXRRSet", "9": "NotAuth", "10": "NotZone", "17": "BADKEY", "18": "BADTIME" }
+          code = if query_status == 0 { 0 } else { query_status - 9000 }
+          caption = get!(rcodes, [to_string(code)])
+          if query_status_err == null && query_status != 9000 && caption != null && (is_string(ed.QueryStatus) || is_integer(ed.QueryStatus)) {
+              ocsf.rcode_id = code
+              ocsf.rcode = caption
+              consumed = push(consumed, "QueryStatus")
+          }
+      }
+
+      # Merge residuals with branch-specific unmapped evidence. Scalars retain
+      # their source type; arrays/objects become JSON strings for spill storage.
+      residual = object(ocsf.unmapped) ?? {}
+      for_each(ed) -> |key, value| {
+          if !includes(consumed, key) {
+              spill_key = snakecase(key)
+              spill_value = if is_array(value) || is_object(value) { encode_json(value) } else { value }
+              # Snake-case collisions must not overwrite earlier source values.
+              if includes(keys(residual), spill_key) {
+                  base_key = spill_key
+                  suffix = 2
+                  for_each(ed) -> |_other_key, _other_value| {
+                      if includes(keys(residual), spill_key) {
+                          spill_key = base_key + "_" + to_string(suffix)
+                          suffix = suffix + 1
+                      }
+                  }
+              }
+              residual = set!(residual, [spill_key], spill_value)
+          }
+      }
+      if !is_empty(residual) { ocsf.unmapped = residual }
+
+      # NAN-2986: never emit an empty actor.user.name ("" matched every
+      # `actor.user.name=*` hunt). Drop the empty user when the actor still
+      # carries its process; a class that requires `actor` keeps the object.
+      if is_object(ocsf.actor) && (string(ocsf.actor.user.name) ?? "") == "" && is_object(ocsf.actor.process) {
+          ocsf.actor = remove!(object!(ocsf.actor), ["user"])
+      }
+
+      # Reuse the reference implementation's branch-specific consumption rules.
+      __reference_consumed = map_values(consumed) -> |key| { "event_data." + string!(key) }
+
+      # ---- common envelope ----
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = 1
+      ocsf.severity = "Informational"
+      ocsf.status_id = 1
+      ocsf.status = "Success"
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+      # Windows record_id is only unique within a host/channel stream and can be
+      # reused after a log reset. Include the source event time so replaying the
+      # same event stays idempotent while a later reused RecordID cannot collide.
+      record_id = to_string(p.record_id) ?? ""
+      log_name = downcase(string(p.channel) ?? "Microsoft-Windows-Sysmon/Operational")
+      log_provider = downcase(string(p.provider_name) ?? "Microsoft-Windows-Sysmon")
+      record_uid = ""
+      if record_id != "" && computer != "" && ts_str != "" {
+          record_uid = join!(["windows_sysmon", computer, log_name, log_provider, record_id, ts_str], "|")
+      }
+      if record_uid == "" { record_uid = sha2("windows_sysmon|raw|" + raw_log, variant: "SHA-256") }
+      if is_object(ocsf.device) { ocsf.device.type_id = 0 }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": ["host"],
+          "uid": record_uid,
+          "event_code": to_string(eid),
+          "log_name": string(p.channel) ?? "Microsoft-Windows-Sysmon/Operational",
+          "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Sysmon",
+          "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
+      }
+
+      # NAN-3713: original_event_uid carries the vendor's bare record number
+      # (the per-host, per-channel sequence), not the composite uid above, so
+      # it stays searchable as the number Windows shows. Omitted when absent.
+      if record_id != "" {
+          ocsf.metadata.original_event_uid = record_id
+          # Record ID is represented in original_event_uid (and the composite UID).
+          __reference_consumed = push(__reference_consumed, "record_id")
+      }
+      # NAN-3342: publish the canonical lowercase name beside known IANA ids.
+      # Unknown numbers retain their id without inventing a name.
+      protocol_names = { "1": "icmp", "2": "igmp", "6": "tcp", "17": "udp", "41": "ipv6", "47": "gre", "50": "esp", "51": "ah", "58": "icmpv6", "89": "ospf", "132": "sctp" }
+      protocol_name = get(protocol_names, [to_string(ocsf.connection_info.protocol_num) ?? ""]) ?? null
+      if is_string(protocol_name) { ocsf.connection_info.protocol_name = protocol_name }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # computer: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.Signed: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.GrantedAccess: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.Protocol: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.SourceIp: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.SourceHostname: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.DestinationIp: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.DestinationHostname: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.QueryName: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.Initiated: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # channel: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # provider_name: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # time_created: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event_data.UtcTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event_data.CreationUtcTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # host: Case normalization already performed by the parser; observed at device.hostname, and checked against the emitted branch.
+  # event_data.Protocol: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # event_data.GrantedAccess: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        computer
+      | event_data\.Signed
+      | event_data\.GrantedAccess
+      | event_data\.Protocol
+      | event_data\.SourceIp
+      | event_data\.SourceHostname
+      | event_data\.DestinationIp
+      | event_data\.DestinationHostname
+      | event_data\.QueryName
+      | event_data\.Initiated
+      | channel
+      | provider_name
+      | host
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      | time_created
+      | event_data\.UtcTime
+      | event_data\.CreationUtcTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event_data\.Protocol
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event_data\.GrantedAccess
+      )\z') {
+          __value = value
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          if is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null {
+              __expected = __integer
+              if ."actual_permissions" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Reuse v1.2 branch consumed-key lists; the independent Sysmon mappings checker verifies transformed destinations, including hashes, users, enums and hexadecimal masks.
+  for_each(array!(__reference_consumed)) -> |_index, key| {
+      __consumed = __consumed + ("," + encode_json(key))
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    channel
+  | computer
+  | event_data
+  | event_data\.CommandLine
+  | event_data\.CreationUtcTime
+  | event_data\.DestinationHostname
+  | event_data\.DestinationIp
+  | event_data\.DestinationPort
+  | event_data\.DestinationPortName
+  | event_data\.Details
+  | event_data\.EventType
+  | event_data\.GrantedAccess
+  | event_data\.Hashes
+  | event_data\.Image
+  | event_data\.ImageLoaded
+  | event_data\.Initiated
+  | event_data\.IntegrityLevel
+  | event_data\.ParentCommandLine
+  | event_data\.ParentImage
+  | event_data\.ParentProcessGuid
+  | event_data\.ParentProcessId
+  | event_data\.ParentUser
+  | event_data\.ProcessGuid
+  | event_data\.ProcessId
+  | event_data\.Protocol
+  | event_data\.QueryName
+  | event_data\.QueryResults
+  | event_data\.QueryStatus
+  | event_data\.Signature
+  | event_data\.SignatureStatus
+  | event_data\.Signed
+  | event_data\.SourceHostname
+  | event_data\.SourceImage
+  | event_data\.SourceIp
+  | event_data\.SourcePort
+  | event_data\.SourcePortName
+  | event_data\.SourceProcessGUID
+  | event_data\.SourceProcessId
+  | event_data\.SourceThreadId
+  | event_data\.SourceUser
+  | event_data\.TargetFilename
+  | event_data\.TargetImage
+  | event_data\.TargetObject
+  | event_data\.TargetProcessGUID
+  | event_data\.TargetProcessId
+  | event_data\.TargetUser
+  | event_data\.User
+  | event_data\.UtcTime
+  | event_id
+  | host
+  | provider_name
+  | record_id
+  | time_created
+  | timestamp
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: "{\"event_id\":1,\"record_id\":91234,\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":10,\"record_id\":91236,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:17:00Z\",\"event_data\":{\"SourceImage\":\"C:\\\\tools\\\\mimikatz.exe\",\"SourceProcessId\":\"777\",\"SourceProcessGUID\":\"{bbbb}\",\"TargetImage\":\"C:\\\\Windows\\\\System32\\\\lsass.exe\",\"TargetProcessId\":\"640\",\"TargetProcessGUID\":\"{cccc}\",\"GrantedAccess\":\"0x1fffff\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":11,\"record_id\":91242,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:22:00Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\notepad.exe\",\"TargetFilename\":\"C:\\\\Users\\\\alice\\\\notes.txt\",\"ProcessId\":\"1010\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":12,\"record_id\":91239,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:19:00Z\",\"event_data\":{\"EventType\":\"CreateKey\",\"TargetObject\":\"HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\",\"Image\":\"C:\\\\Windows\\\\regedit.exe\",\"ProcessId\":\"555\",\"User\":\"CORP\\\\bob\"}}"
+    expect:
+      "class_uid": 201001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":13,\"record_id\":91240,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:20:00Z\",\"event_data\":{\"EventType\":\"SetValue\",\"TargetObject\":\"HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\\\\Updater\",\"Details\":\"C:\\\\tmp\\\\bad.exe\",\"Image\":\"C:\\\\Windows\\\\regedit.exe\",\"ProcessId\":\"555\",\"User\":\"CORP\\\\bob\"}}"
+    expect:
+      "class_uid": 201002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":22,\"record_id\":91244,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:24:00Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\svchost.exe\",\"QueryName\":\"evil.example.com\",\"QueryResults\":\"type:  5 evil.cdn.net;::ffff:1.2.3.4;\",\"ProcessId\":\"1012\"}}"
+    expect:
+      "class_uid": 4003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":23,\"record_id\":91243,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:23:00Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"TargetFilename\":\"C:\\\\Users\\\\alice\\\\secret.docx\",\"Hashes\":\"SHA256=FFEE0011\",\"ProcessId\":\"1011\"}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":3,\"record_id\":91241,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:21:00Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\curl.exe\",\"ProcessId\":\"888\",\"Protocol\":\"tcp\",\"SourceIp\":\"10.1.2.3\",\"SourcePort\":\"51234\",\"SourceHostname\":\"WKS-01\",\"DestinationIp\":\"93.184.216.34\",\"DestinationPort\":\"443\",\"DestinationHostname\":\"example.com\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":5,\"record_id\":91235,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:16:00Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":7,\"record_id\":91237,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:18:00Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\svchost.exe\",\"ImageLoaded\":\"C:\\\\Windows\\\\System32\\\\ntdll.dll\",\"Signed\":\"true\",\"Signature\":\"Microsoft Windows\",\"SignatureStatus\":\"Valid\",\"ProcessId\":\"900\",\"User\":\"NT AUTHORITY\\\\SYSTEM\"}}"
+    expect:
+      "class_uid": 1005
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":7,\"record_id\":91238,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:18:30Z\",\"event_data\":{\"Image\":\"C:\\\\tmp\\\\bad.exe\",\"ImageLoaded\":\"C:\\\\tmp\\\\eeevil.dll\",\"Signed\":\"false\",\"SignatureStatus\":\"Unavailable\",\"ProcessId\":\"901\"}}"
+    expect:
+      "class_uid": 1005
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":255,\"record_id\":91245,\"computer\":\"WKS-01\",\"timestamp\":\"2026-08-18T10:25:00Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\Sysmon.exe\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91246,\"computer\":\"WKS-01\",\"time_created\":\"2026-08-18T10:26:00.123Z\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:20:00.000\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4322\",\"ProcessGuid\":\"{aaaa-2222}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048760123
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91247,\"computer\":\"WKS-01\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:27:00.456\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4323\",\"ProcessGuid\":\"{aaaa-3333}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048820456
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91248,\"computer\":\"WKS-01\",\"timestamp\":\"not-a-time\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:28:00.789\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4324\",\"ProcessGuid\":\"{aaaa-4444}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048880789
+      "metadata.version": "1.9.0"
+  - raw: "not json at all"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # NAN-2986: log-blaster EID 3 with Sysmon's "-" for an unresolved
+  # destination hostname and service names. "-" is not a hostname; it must
+  # not land in the promoted dst_endpoint.hostname column (it stays in
+  # unmapped as event_data.destination_hostname).
+  - raw: "{\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"computer\":\"WS-SALES-016.corp.local\",\"event_data\":{\"DestinationHostname\":\"-\",\"DestinationIp\":\"105.240.28.169\",\"DestinationIsIpv6\":\"false\",\"DestinationPort\":\"53\",\"DestinationPortName\":\"-\",\"Image\":\"C:\\\\ProgramData\\\\Microsoft\\\\Windows Defender\\\\Platform\\\\4.18.26020.6-0\\\\MpCmdRun.exe\",\"Initiated\":\"true\",\"ProcessGuid\":\"{01a0e965-f15a-7ca2-ac47-7fea08422567}\",\"ProcessId\":\"4699\",\"Protocol\":\"tcp\",\"RuleName\":\"NetworkConnect\",\"SourceHostname\":\"WS-SALES-016.corp.local\",\"SourceIp\":\"10.1.1.152\",\"SourceIsIpv6\":\"false\",\"SourcePort\":\"57028\",\"SourcePortName\":\"-\",\"User\":\"CORP.LOCAL\\\\mbrown\",\"UtcTime\":\"2026-09-28 17:00:00.000\"},\"event_id\":3,\"host\":\"WS-SALES-016.corp.local\",\"keywords\":\"0x8000000000000000\",\"level\":\"Information\",\"level_value\":4,\"process_id\":5999,\"provider_guid\":\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"record_id\":1790622167378291,\"task\":3,\"task_name\":\"Network connection detected\",\"thread_id\":5639,\"timestamp\":\"2026-09-28T17:00:00.000220Z\",\"user_id\":\"S-1-5-18\",\"user_name\":\"NT AUTHORITY\\\\SYSTEM\",\"version\":3}"
+    expect:
+      "class_uid": 4001
+      "connection_info.direction_id": 2
+      "dst_endpoint.hostname": "<missing>"
+      "dst_endpoint.svc_name": "<missing>"
+      "src_endpoint.svc_name": "<missing>"
+  # NAN-2986: log-blaster EID 10. Process Access has no User; the actor is
+  # SourceUser, split into name + domain (was actor.user.name = "").
+  - raw: "{\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"computer\":\"WS-ENG-086.corp.local\",\"event_data\":{\"CallTrace\":\"C:\\\\Windows\\\\SYSTEM32\\\\ntdll.dll+9d4c4\",\"GrantedAccess\":\"0x1000\",\"RuleName\":\"ProcessAccess\",\"SourceImage\":\"C:\\\\Windows\\\\System32\\\\dsregcmd.exe\",\"SourceProcessGUID\":\"{01a0e965-f152-7f11-a56f-417d659b45b2}\",\"SourceProcessId\":\"5734\",\"SourceThreadId\":\"7787\",\"SourceUser\":\"CORP.LOCAL\\\\jmoore\",\"TargetImage\":\"C:\\\\Windows\\\\System32\\\\svchost.exe\",\"TargetProcessGUID\":\"{01a0e965-f152-7f11-a56f-418161bd201a}\",\"TargetProcessId\":\"26677\",\"TargetUser\":\"NT AUTHORITY\\\\SYSTEM\",\"UtcTime\":\"2026-09-28 17:00:00.000\"},\"event_id\":10,\"host\":\"WS-ENG-086.corp.local\",\"keywords\":\"0x8000000000000000\",\"level\":\"Information\",\"level_value\":4,\"process_id\":1036,\"provider_guid\":\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"record_id\":1790622167378092,\"task\":10,\"task_name\":\"Process accessed\",\"thread_id\":9444,\"timestamp\":\"2026-09-28T17:00:00.000021Z\",\"user_id\":\"S-1-5-18\",\"user_name\":\"NT AUTHORITY\\\\SYSTEM\",\"version\":3}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 3
+      "actor.user.name": "jmoore"
+      "actor.user.domain": "CORP.LOCAL"
+      "actor.process.user.name": "CORP.LOCAL\\jmoore"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("windows_sysmon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "not json at all"
+    expect:
+      "metadata.uid": "8dd389bdb82e1de5d776ad51758db5e01fbc919f03546210ab1634702ec6be48"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("windows_sysmon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"event_id\":1,\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
+    expect:
+      "metadata.uid": "ab7de99dd3553cc8057ad59973186d7a60b2f12ac6d28e3ffb73dab992061d5a"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3713: original_event_uid is the bare record number; metadata.uid stays the composite
+  - raw: "{\"event_id\":1,\"record_id\":91234,\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
+    expect:
+      "metadata.uid": "windows_sysmon|wks-01.corp.local|microsoft-windows-sysmon/operational|microsoft-windows-sysmon|91234|2026-08-18T10:15:00.123Z"
+      "metadata.original_event_uid": "91234"
+
+  # NAN-3342: live network query protocol=tcp must find this event.
+  - raw: "{\"event_id\":3,\"computer\":\"WKS-01\",\"timestamp\":\"2026-10-17T21:00:00Z\",\"event_data\":{\"Protocol\":\"TCP\",\"Image\":\"C:\\\\Windows\\\\cmd.exe\",\"SourceIp\":\"10.0.0.1\",\"DestinationIp\":\"10.0.0.2\",\"SourcePort\":\"4321\",\"DestinationPort\":\"443\",\"Initiated\":\"true\"}}"
+    expect:
+      "class_uid": 4001
+      "connection_info.protocol_num": 6
+      "connection_info.protocol_name": "tcp"
+
+  # NAN-3342: live network query protocol=udp must find this event.
+  - raw: "{\"event_id\":3,\"computer\":\"WKS-01\",\"timestamp\":\"2026-10-17T21:00:00Z\",\"event_data\":{\"Protocol\":\"udp\",\"Image\":\"C:\\\\Windows\\\\cmd.exe\",\"SourceIp\":\"10.0.0.1\",\"DestinationIp\":\"10.0.0.2\",\"SourcePort\":\"4321\",\"DestinationPort\":\"443\",\"Initiated\":\"true\"}}"
+    expect:
+      "class_uid": 4001
+      "connection_info.protocol_num": 17
+      "connection_info.protocol_name": "udp"

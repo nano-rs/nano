@@ -497,7 +497,7 @@
     {
       "type": "timeseries",
       "title": "Events received by Vector",
-      "description": "Events per second arriving at Vector's sources (internal sources excluded).",
+      "description": "Events per second arriving at Vector's sources (internal sources and nano's demo_logs reload markers excluded).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -515,7 +515,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (host) (rate(nanosiem_vector_component_received_events_total{job=\"nano-vector\", component_kind=\"source\", component_type!~\"internal_.*\", host=~\"$host\"}[$__rate_interval]))",
+          "expr": "sum by (host) (rate(nanosiem_vector_component_received_events_total{job=\"nano-vector\", component_kind=\"source\", component_type!~\"internal_.*|demo_logs\", host=~\"$host\"}[$__rate_interval]))",
           "legendFormat": "{{host}}"
         }
       ],

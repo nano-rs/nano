@@ -113,3 +113,51 @@ fn policies_reissue_without_blocking_only_when_a_replica_is_down() {
         ]
     );
 }
+
+// ---- NAN-5404: SQL users follow the app user's networks ----
+
+fn hosts(name: &str, storage: &str, ips: &[&str], names: &[&str]) -> UserHosts {
+    UserHosts {
+        name: name.into(),
+        storage: storage.into(),
+        host_ip: ips.iter().map(|s| s.to_string()).collect(),
+        host_names: names.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn nan5404_sql_users_copy_the_app_users_networks() {
+    let app = hosts(APP_CH_USER, "users_xml", &["172.16.0.0/12", "192.168.0.0/16"], &["localhost"]);
+    assert_eq!(
+        host_clause_from_app(&app).as_deref(),
+        Some("IP '172.16.0.0/12', IP '192.168.0.0/16', LOCAL")
+    );
+    // An older private-range user is narrowed to the app's list ...
+    let wide = hosts("nanosiem_rawsql", "local_directory", &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"], &["localhost"]);
+    assert_eq!(sql_user_host_fix(&wide, Some(&app)).as_deref(), Some("IP '172.16.0.0/12', IP '192.168.0.0/16', LOCAL"));
+    // ... one already in line is left alone, and so is a users.xml user.
+    let same = hosts("nanosiem_rawsql", "local_directory", &["192.168.0.0/16", "172.16.0.0/12"], &["localhost"]);
+    assert_eq!(sql_user_host_fix(&same, Some(&app)), None);
+    // Narrow only: already inside the app's list (another node's) is kept.
+    let narrower = hosts("nanosiem_rawsql", "local_directory", &["172.16.0.0/12"], &["localhost"]);
+    assert_eq!(sql_user_host_fix(&narrower, Some(&app)), None);
+    assert_eq!(sql_user_host_fix(&hosts("x", "users_xml", &["::/0"], &[]), Some(&app)), None);
+}
+
+#[test]
+fn nan5404_legacy_app_user_falls_back_to_private_ranges_for_open_users_only() {
+    let legacy = hosts(APP_CH_USER, "users_xml", &["::/0"], &[]);
+    assert_eq!(host_clause_from_app(&legacy), None);
+    let open = hosts("nanosiem_rawsql", "local_directory", &["::/0"], &[]);
+    assert_eq!(sql_user_host_fix(&open, Some(&legacy)).as_deref(), Some(SQL_USER_HOST_CLAUSE));
+    assert_eq!(sql_user_host_fix(&open, None).as_deref(), Some(SQL_USER_HOST_CLAUSE));
+    let private = hosts("nanosiem_rawsql", "local_directory", &["10.0.0.0/8"], &["localhost"]);
+    assert_eq!(sql_user_host_fix(&private, Some(&legacy)), None);
+    // A value that is not a plain address is never spliced into SQL.
+    let odd = hosts(APP_CH_USER, "users_xml", &["10.0.0.0/8' OR 1"], &[]);
+    assert_eq!(host_clause_from_app(&odd), None);
+    let mut rx = hosts(APP_CH_USER, "users_xml", &["10.0.0.0/8"], &[]);
+    rx.host_names_regexp = vec![".*".into()];
+    assert_eq!(host_clause_from_app(&rx), None);
+}

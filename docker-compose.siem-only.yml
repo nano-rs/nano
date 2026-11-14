@@ -50,6 +50,18 @@ x-logging-verbose: &verbose-logging
     max-size: "100m"
     max-file: "3"
 
+# Agent Lane (enterprise; the open edition ignores it), read by nano-api AND
+# nano-jobs (the leader's Agent Lane reconciler keeps each token's ClickHouse
+# user), so one definition for both (NAN-5402). The listener state follows
+# .env (unset = off). Off is deliberate: the reconciler drops every token user.
+# The generated docker-compose.agentlane.yml sets it on and adds the URL and
+# allow-list; a listener that is on without them (an overlay from before this
+# fix) keeps existing users and raises a SIEM Health finding instead.
+x-agentlane-base-env: &agentlane-base-env
+  NANO_AGENTLANE_LISTENER: ${NANO_AGENTLANE_LISTENER:-off}
+  NANO_AGENTLANE_NODE_URLS: ${NANO_AGENTLANE_NODE_URLS:-}
+  NANO_AGENTLANE_MAX_ACTIVE_TOKENS_OVERRIDE: ${NANO_AGENTLANE_MAX_ACTIVE_TOKENS_OVERRIDE:-}
+
 services:
   postgres:
     # Pinned by digest (NAN-1258): a tag alone (`postgres:17`) can be silently
@@ -308,6 +320,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
+      <<: *agentlane-base-env
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
@@ -407,6 +420,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
+      <<: *agentlane-base-env
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}

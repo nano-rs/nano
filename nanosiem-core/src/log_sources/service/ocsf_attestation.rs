@@ -203,12 +203,18 @@ fn is_ocsf_deployment() -> Result<bool, LogSourceServiceError> {
 /// per-sample compiles made a 38-sample bundled set take minutes): the
 /// parser runs as one batch, then the extension runs as one batch over
 /// the parser outputs, which is the order Vector applies them in.
-pub(crate) async fn run_ocsf_samples(
+///
+/// This is the publish/deploy gate, so its worker jobs run under the deploy
+/// gate budget (NAN-5406): more compile CPU and wall clock than an
+/// interactive test, and they wait for a worker slot rather than answering
+/// 429 while someone is testing a parser.
+pub async fn run_ocsf_samples(
     validator: &crate::parsers::VrlValidator,
     parser_vrl: &str,
     extension_vrl: Option<&str>,
     samples: &[String],
 ) -> Result<Vec<ParserTestResult>, LogSourceServiceError> {
+    let validator = &validator.clone().for_deploy_gate();
     let inputs: Vec<String> = samples
         .iter()
         .map(|sample| serde_json::json!({ "message": sample }).to_string())

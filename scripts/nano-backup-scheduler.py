@@ -157,6 +157,35 @@ BACKUP_ROLE = "nano_backup"
 # and pod networks the scheduler runs on).
 BACKUP_CH_HOSTS = ("IP '127.0.0.1', IP '::1', IP '10.0.0.0/8', IP '172.16.0.0/12', "
                    "IP '192.168.0.0/16', IP '100.64.0.0/10', IP 'fc00::/7'")
+# NAN-5404: nano_backup accepts exactly the networks of the app user
+# `nanosiem`, which the deployment narrows to the networks it really runs on
+# (Docker pools, inventory hosts, clickhouse.allowedNetworks). The private
+# ranges above are only the fallback while `nanosiem` still accepts any address
+# (an install that predates NAN-5367) or cannot be read: on those, an Agent
+# Lane agent on a private LAN would otherwise overlap nano_backup.
+APP_CH_USER = "nanosiem"
+_HOST_TOKEN_RE = re.compile(r"^[0-9A-Za-z.:/_-]{1,253}$")
+
+
+def app_user_hosts(rows: list[dict[str, Any]]) -> tuple[frozenset[str], frozenset[str]] | None:
+    """`(host_ip, host_names)` of APP_CH_USER from system.users rows, or None
+    when it is missing, accepts any address, matches by reverse DNS, has no
+    entry at all, or carries a value that is not a plain address or name."""
+    app = next((r for r in rows if r.get("name") == APP_CH_USER), None)
+    if app is None or app.get("host_names_regexp") or app.get("host_names_like"):
+        return None
+    ips = [str(v) for v in app.get("host_ip") or []]
+    names = [str(v) for v in app.get("host_names") or []]
+    if not (ips or names) or any(v.endswith("/0") or not _HOST_TOKEN_RE.fullmatch(v) for v in ips + names):
+        return None
+    return frozenset(ips), frozenset(names)
+
+
+def host_clause(ips: Iterable[str], names: Iterable[str]) -> str:
+    """A CREATE/ALTER USER HOST clause; `localhost` is ClickHouse's LOCAL."""
+    parts = [f"IP '{ip}'" for ip in sorted(ips)]
+    parts += ["LOCAL" if n == "localhost" else f"NAME '{n}'" for n in sorted(names)]
+    return ", ".join(parts)
 # NAN-1728: on a multi-shard cluster each shard holds the lookup rows that
 # were written through it; reads go through the `_distributed` wrapper (the
 # argMax dedup collapses cross-shard copies). Single node: the local table.
@@ -802,6 +831,50 @@ class Database:
         finally:
             conn.close()
 
+    def _user_rows(self) -> list[dict[str, Any]]:
+        raw = self.ch(f"SELECT name, host_ip, host_names, host_names_regexp, host_names_like FROM system.users "
+                      f"WHERE name IN ('{APP_CH_USER}', '{BACKUP_ROLE}') FORMAT JSONEachRow", admin=True)
+        rows = []
+        for line in raw.decode(errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        return rows
+
+    def backup_hosts(self, rows: list[dict[str, Any]] | None = None) -> tuple[str, tuple[frozenset[str], frozenset[str]] | None]:
+        """NAN-5404: (HOST clause, wanted (ips, names)) for nano_backup: the app
+        user's networks, else (legacy / unreadable) BACKUP_CH_HOSTS and None."""
+        app = app_user_hosts(self._user_rows() if rows is None else rows)
+        if app is None:
+            return BACKUP_CH_HOSTS, None
+        return host_clause(*app), app
+
+    def align_backup_hosts(self, cluster: str) -> bool:
+        """ALTER nano_backup's HOST list only when it admits anything outside
+        the wanted one (see backup_hosts). Legacy fallback: only an any-address user is
+        tightened, to BACKUP_CH_HOSTS. Returns whether it altered the user."""
+        rows = self._user_rows()
+        backup = next((r for r in rows if r.get("name") == BACKUP_ROLE), None)
+        if backup is None:
+            return False
+        hosts, wanted = self.backup_hosts(rows)
+        current = (frozenset(str(v) for v in backup.get("host_ip") or []),
+                   frozenset(str(v) for v in backup.get("host_names") or []))
+        if wanted is not None:
+            # Narrow only: a list already inside the app user's is left alone,
+            # so nodes whose app-user lists differ slightly (role split: Docker
+            # pools only on hosts that also run bridge services) never flap.
+            inside = current[0] <= wanted[0] and current[1] <= wanted[1] and (current[0] or current[1])
+            if inside and not backup.get("host_names_regexp") and not backup.get("host_names_like"):
+                return False
+        elif not any(str(v).endswith("/0") for v in current[0]):
+            return False
+        self.ch(f"ALTER USER {BACKUP_ROLE}{cluster} HOST {hosts}", admin=True)
+        return True
+
     def provision_clickhouse(self) -> None:
         """Review M4: touch the cluster only when the `nano_backup`
         credential does not work. A working user is left alone, so a routine
@@ -812,21 +885,19 @@ class Database:
         cluster = f" ON CLUSTER '{self.ch_cluster}'" if self.ch_cluster else ""
         try:
             self.ch("SELECT 1 FROM nanosiem.lookup_rows LIMIT 0")
-            # NAN-5367: a user an earlier release created accepts connections
-            # from any address. Tighten it once; a local read, so a routine
-            # run on an already-restricted user still issues no cluster DDL.
-            open_any = self.ch(f"SELECT count() FROM system.users WHERE name = '{BACKUP_ROLE}' "
-                               "AND has(host_ip, '::/0') FORMAT TSVRaw", admin=True)
-            if open_any.decode(errors="replace").strip() not in ("", "0"):
-                self.ch(f"ALTER USER {BACKUP_ROLE}{cluster} HOST {BACKUP_CH_HOSTS}", admin=True)
+            # NAN-5367 / NAN-5404: keep the host list in line with the app
+            # user's. A local read; a routine run on a user already in line
+            # issues no cluster DDL.
+            self.align_backup_hosts(cluster)
             return
         except BackupError as error:
             if "unreachable" in str(error):
                 raise
+        hosts, _ = self.backup_hosts()
         self.ch(f"CREATE USER IF NOT EXISTS {BACKUP_ROLE}{cluster} IDENTIFIED WITH sha256_password BY "
-                f"'{self.backup_ch_password}' HOST {BACKUP_CH_HOSTS}", admin=True)
+                f"'{self.backup_ch_password}' HOST {hosts}", admin=True)
         self.ch(f"ALTER USER {BACKUP_ROLE}{cluster} IDENTIFIED WITH sha256_password BY "
-                f"'{self.backup_ch_password}' HOST {BACKUP_CH_HOSTS}", admin=True)
+                f"'{self.backup_ch_password}' HOST {hosts}", admin=True)
         for table in ("lookup_rows", "lookup_rows_distributed"):
             self.ch(f"GRANT{cluster} SELECT ON nanosiem.{table} TO {BACKUP_ROLE}", admin=True)
 

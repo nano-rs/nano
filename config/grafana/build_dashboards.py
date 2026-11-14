@@ -25,6 +25,11 @@ from pathlib import Path
 OUT = Path(__file__).resolve().parent / "dashboards"
 DS = {"type": "prometheus", "uid": "${datasource}"}
 H = 'host=~"$host"'
+# Vector sources that carry real ingest: not Vector's own internal_* sources,
+# and not demo_logs, which on every install is only nano's synthetic reload
+# markers (nano_activation_<id>, __nano_ack_*/__nano_failed_*), 1 event/s each
+# into a blackhole (NAN-5407). Same filter as the NanoIngestStalled rule.
+REAL_SOURCES = 'component_kind="source", component_type!~"internal_.*|demo_logs"'
 
 
 class Board:
@@ -144,8 +149,8 @@ def overview() -> Board:
         (f'sum by (host) (rate(nanosiem_vector_component_sent_events_total{{job="nano-vector", component_type="clickhouse", {H}}}[$__rate_interval]))', "{{host}}")],
         unit="eps", description="Events per second Vector's ClickHouse sinks sent, per ingest host.")
     b.ts("Events received by Vector", [
-        (f'sum by (host) (rate(nanosiem_vector_component_received_events_total{{job="nano-vector", component_kind="source", component_type!~"internal_.*", {H}}}[$__rate_interval]))', "{{host}}")],
-        unit="eps", description="Events per second arriving at Vector's sources (internal sources excluded).")
+        (f'sum by (host) (rate(nanosiem_vector_component_received_events_total{{job="nano-vector", {REAL_SOURCES}, {H}}}[$__rate_interval]))', "{{host}}")],
+        unit="eps", description="Events per second arriving at Vector's sources (internal sources and nano's demo_logs reload markers excluded).")
     b.row("API")
     b.ts("API requests", [
         (f'sum by (status) (rate(axum_http_requests_total{{job="nano-api", {H}}}[$__rate_interval]))', "{{status}}")],
@@ -256,10 +261,10 @@ def clickhouse_ingest() -> Board:
          unit="bytes")
     v = f'job="nano-vector", {H}'
     b.row("Vector")
-    b.ts("Received by source", [(f'sum by (component_id) (rate(nanosiem_vector_component_received_events_total{{{v}, component_kind="source", component_type!~"internal_.*"}}[$__rate_interval]))', "{{component_id}}")],
+    b.ts("Received by source", [(f'sum by (component_id) (rate(nanosiem_vector_component_received_events_total{{{v}, {REAL_SOURCES}}}[$__rate_interval]))', "{{component_id}}")],
          unit="eps")
-    b.ts("Sent by sink", [(f'sum by (component_id) (rate(nanosiem_vector_component_sent_events_total{{{v}, component_kind="sink"}}[$__rate_interval]))', "{{component_id}}")],
-         unit="eps")
+    b.ts("Sent by sink", [(f'sum by (component_id) (rate(nanosiem_vector_component_sent_events_total{{{v}, component_kind="sink", component_type!="blackhole"}}[$__rate_interval]))', "{{component_id}}")],
+         unit="eps", description="Blackhole sinks (discarded data and nano's reload markers) are excluded.")
     b.ts("Buffer fill", [(f'max by (host, component_id) (nanosiem_vector_buffer_size_bytes{{{v}}}) / max by (host, component_id) (nanosiem_vector_buffer_max_size_bytes{{{v}}} > 0)', "{{host}} {{component_id}}")],
          unit="percentunit", description="Disk buffers fill when ClickHouse cannot keep up.")
     b.ts("Buffered events", [(f'sum by (host, component_id) (nanosiem_vector_buffer_size_events{{{v}}})', "{{host}} {{component_id}}")])

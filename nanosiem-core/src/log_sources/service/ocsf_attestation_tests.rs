@@ -124,3 +124,28 @@ if .parsed == "ext-bad" { .b = to_int!(.parsed) } else { .b = 2 }
     let chained = run_ocsf_samples(&validator, parser, None, &samples).await.unwrap();
     assert!(chained[0].output.as_ref().unwrap().get("b").is_none());
 }
+
+/// NAN-5406: the publish/deploy gate compiles each stage ONCE for the whole
+/// sample set, never once per sample: N samples cost one parser compile and
+/// one extension compile.
+#[tokio::test]
+async fn the_gate_compiles_each_stage_once_whatever_the_sample_count() {
+    use crate::parsers::test_sandbox::compile_counter;
+    let validator = crate::parsers::VrlValidator::new();
+    // Unique sources: the counter is keyed by program text and shared by
+    // every test in this process.
+    let parser = "# nan5406-parser-compile-once\n.parsed = string!(.message)";
+    let extension = "# nan5406-extension-compile-once\n.ext = 1";
+    let samples: Vec<String> = (0..25).map(|i| format!("sample {i}")).collect();
+    let results = run_ocsf_samples(&validator, parser, Some(extension), &samples)
+        .await
+        .expect("gate run");
+    assert_eq!(results.len(), samples.len());
+    assert!(results.iter().all(|r| r.output.as_ref().is_some_and(|o| o["ext"] == 1)));
+    assert_eq!(compile_counter::count(parser), 1, "one parser compile for {} samples", samples.len());
+    assert_eq!(compile_counter::count(extension), 1, "one extension compile");
+
+    let parser_only = "# nan5406-parser-only-compile-once\n.parsed = string!(.message)";
+    run_ocsf_samples(&validator, parser_only, None, &samples).await.expect("gate run");
+    assert_eq!(compile_counter::count(parser_only), 1);
+}

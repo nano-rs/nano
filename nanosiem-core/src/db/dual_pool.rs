@@ -448,6 +448,10 @@ pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     "logs_per_source_5m_v2",
     // NAN-5170: arrival-time hourly ingest volume (Self-run usage metering).
     "ingest_volume_1h",
+    // Long-retention hourly per-source rollup. Only some builds create it;
+    // where the table is absent the reconciler skips it (no wrapper, no
+    // error), so readers must check the table exists before reading.
+    "logs_per_source_1h",
     "parser_health_5m",
     // Observability / OTLP native-storage tables (NAN-1721 O1). Their READ SQL
     // (traces, RED charts, metrics, synthetics) routes to the `_distributed`

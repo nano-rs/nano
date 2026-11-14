@@ -87,6 +87,11 @@ rebuild, and offer to ask support to retire the old ID.
 > Path B for that one upgrade, or go straight to 2.0.12 with Path A
 > ([known-issues.md](known-issues.md#2011-fixed-in-2012)).
 
+> **Single node, target 2.0.23 or earlier:** the dry run fails
+> `runtime-config` (exit 78) on every single-node install, a false failure in
+> the upgrader. Use Path B for that upgrade
+> ([known-issues.md](known-issues.md#2023-and-earlier-single-node-fixed-after-2023)).
+
 > **Upgrading to 2.0.12 with Path A on a role split:** the 2.0.12 upgrader
 > keeps every host's old rendered configuration (`~/nano/.nano-generated/`),
 > so template-only fixes (the ingest edge's OTLP 503 during a PostgreSQL

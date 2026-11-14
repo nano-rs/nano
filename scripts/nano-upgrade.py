@@ -1308,25 +1308,58 @@ def embedded_test_root_key_id(install_dir: pathlib.Path) -> str:
     return expected_key_id
 
 
+VECTOR_ENV_INTERPOLATION_FLAG = "--dangerously-allow-env-var-interpolation"
+
+
 def vector_validation_arguments(
     current_layout: bool, *, managed_legacy_layout: bool = False,
+    allow_env_var_interpolation: bool = False,
 ) -> list[str]:
-    """Keep the v2 and v0.1.703 Vector CLI contracts independently testable."""
+    """Keep the v2 and v0.1.703 Vector CLI contracts independently testable.
+
+    `current_layout` is the role-split runtime (`/etc/vector/runtime/reload.toml`),
+    which always runs a nano Vector with interpolation on. Every other layout
+    shares the `/etc/vector` + `dynamic/sources/{parsers,configs}` directories,
+    but two Vector CLI contracts run there: v2 single-host Compose passes
+    `--dangerously-allow-env-var-interpolation` (Vector 0.57+ needs it for the
+    shipped `${VAR:-default}` values), and the v0.1.703 upstream Vector 0.56
+    predates the flag. NAN-5403: the caller must say which one the running
+    container uses (`allow_env_var_interpolation`); the layout alone cannot.
+    """
     if current_layout:
         return [
             "exec", "-T", "vector", "vector",
-            "--dangerously-allow-env-var-interpolation", "validate", "--no-environment",
+            VECTOR_ENV_INTERPOLATION_FLAG, "validate", "--no-environment",
             "--config-dir", "/etc/vector/config",
             "--config-dir", "/etc/vector/runtime/current/parsers",
             "--config-dir", "/etc/vector/runtime/current/configs",
             "/etc/vector/runtime/reload.toml",
         ]
     return [
-        "exec", "-T", "vector", "vector", "validate", "--no-environment",
+        "exec", "-T", "vector", "vector",
+        *([VECTOR_ENV_INTERPOLATION_FLAG] if allow_env_var_interpolation else []),
+        "validate", "--no-environment",
         "--config-dir", "/etc/vector/config" if managed_legacy_layout else "/etc/vector",
         "--config-dir", "/etc/vector/dynamic/sources/parsers",
         "--config-dir", "/etc/vector/dynamic/sources/configs",
     ]
+
+
+def running_vector_allows_env_var_interpolation(container_args_json: str) -> bool:
+    """Whether a running Vector container was started with interpolation on.
+
+    `container_args_json` is `docker inspect --format '{{json .Args}}'`: the
+    argv after the executable, i.e. any entrypoint wrapper arguments followed
+    by the Compose `command`. The flag is a standalone token there in every
+    shipped layout (nano entrypoint `exec`s Vector with "$@").
+    """
+    try:
+        arguments = json.loads(container_args_json)
+    except ValueError as error:
+        raise UpgradeError("cannot read the running Vector command line") from error
+    if not isinstance(arguments, list) or not all(isinstance(value, str) for value in arguments):
+        raise UpgradeError("cannot read the running Vector command line")
+    return VECTOR_ENV_INTERPOLATION_FLAG in arguments
 
 
 def secure_append_line(path: pathlib.Path, encoded: str, label: str) -> None:
@@ -3305,6 +3338,18 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             return []
         return ["--force-recreate"] if any(self._config_mounts_stale(s) for s in services) else []
 
+    def _running_vector_allows_env_var_interpolation(self) -> bool:
+        containers = self.compose(["ps", "-q", "vector"], timeout=30).stdout.split()
+        if len(containers) != 1:
+            raise UpgradeError(
+                f"expected one running Vector container, found {len(containers)}"
+            )
+        inspected = self.runner.run(
+            ["docker", "inspect", "--format", "{{json .Args}}", containers[0]],
+            timeout=30,
+        )
+        return running_vector_allows_env_var_interpolation(inspected.stdout)
+
     def _check_runtime_config(self) -> str:
         validated: list[str] = []
         if "ingest" in self.roles and self._service_exists("vector"):
@@ -3316,11 +3361,25 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             # Pre-2.0 used an upstream Vector whose interpolation opt-in flag
             # did not exist. Keep both exact CLI contracts in the standalone
             # helper so a layout adapter cannot accidentally merge them.
+            # NAN-5403: outside the role-split runtime layout, validate with
+            # exactly the interpolation contract the running container uses
+            # (v2 single-host passes the flag; v0.1.703 cannot). Guessing
+            # "no flag" from the layout failed every single-host upgrade
+            # with exit 78 on the shipped `${VAR:-default}` values.
+            is_current = current_layout.returncode == 0
             arguments = vector_validation_arguments(
-                current_layout.returncode == 0,
+                is_current,
                 managed_legacy_layout=getattr(self, "legacy_layout", None) is not None,
+                allow_env_var_interpolation=(
+                    not is_current and self._running_vector_allows_env_var_interpolation()
+                ),
             )
-            self.compose(arguments, timeout=120)
+            result = self.compose(arguments, timeout=120, check=False)
+            if result.returncode != 0:
+                raise UpgradeError(
+                    f"Vector configuration does not validate (exit {result.returncode}): "
+                    f"{self._safe_service_failure(result)}"
+                )
             validated.append("Vector")
         edge = "nginx" if "app" in self.roles else "ingest-edge" if "ingest" in self.roles else ""
         if edge and self._service_exists(edge):

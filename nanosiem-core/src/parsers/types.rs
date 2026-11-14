@@ -549,7 +549,7 @@ pub struct UpdateParser {
 }
 
 /// VRL validation result
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct VrlValidationResult {
     pub valid: bool,
     pub error: Option<String>,

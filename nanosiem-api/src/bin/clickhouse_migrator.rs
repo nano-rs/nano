@@ -38,9 +38,11 @@
 //!   than apply the OCSF default to it (NAN-5271).
 //! - `CLICKHOUSE_ENTERPRISE_MIGRATIONS_DIR` — defaults to
 //!   `./clickhouse-enterprise`. Only consulted when this binary is built
-//!   with `--features enterprise`. Today the directory is empty and the
-//!   migrator is a no-op there; future enterprise-only ClickHouse
-//!   overlays land in this directory (NAN-747 Phase 6).
+//!   with `--features enterprise`. Holds the enterprise-only ClickHouse
+//!   overlays (NAN-747 Phase 6), applied after the shared and OCSF
+//!   migrations and before the distributed-wrapper pass, so overlay tables
+//!   listed in `DISTRIBUTED_TABLES` get their `_distributed` wrapper in the
+//!   same run.
 //!
 //! Operator subcommand (never run by a deploy):
 //!

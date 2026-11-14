@@ -394,3 +394,32 @@ async fn cross_step_and_two_target_metadata_writes_are_refused_everywhere() {
     let rows = batch::run(&plan, &[json!({"spoof":"6f1c0c1e-2b8f-4d7e-9a51-0c5e6c1d2a10"})], None).unwrap();
     assert!(rows[0].error.is_some(), "preview must not run a metadata write: {:?}", rows[0]);
 }
+
+/// NAN-5400: the validate endpoint's isolated validation (compile in the
+/// parser-test worker; in-process under this test harness) returns exactly
+/// what validate_vrl returns for stored plans, warnings included.
+#[tokio::test]
+async fn isolated_validation_matches_validate_vrl_for_stored_plans() {
+    let validator = VrlValidator::new();
+    let ok = plan(vec![step("set", json!({"field":"note","value":"'''"}))]);
+    let bad = plan(vec![step("vrl", json!({"code":"log(.message)"}))]);
+    let route = plan(vec![step(
+        "route",
+        json!({"routes":[{"label":"a","predicate":"get_hostname!() == \"x\""}]}),
+    )]);
+    let combine = plan(vec![step("combine", json!({"keys":["host"]}))]);
+    let edited = ok.stored().unwrap().replace(BODY, ".");
+    for source in [
+        ok.stored().unwrap(),
+        bad.stored().unwrap(),
+        route.stored().unwrap(),
+        combine.stored().unwrap(),
+        edited,
+    ] {
+        assert_eq!(
+            validator.validate_vrl_isolated(&source).await.unwrap(),
+            validator.validate_vrl(&source).await.unwrap(),
+            "{source}"
+        );
+    }
+}

@@ -56,6 +56,7 @@ pub const LIMITS: WorkerLimits = WorkerLimits {
     private_memory_bytes: WORKER_PRIVATE_MEMORY_BYTES,
     address_space_bytes: WORKER_ADDRESS_SPACE_BYTES,
     cpu_seconds: WORKER_CPU_SECONDS,
+    cpu_ceiling_seconds: WORKER_CPU_SECONDS + 1,
     wall: Duration::from_secs(WORKER_WALL_SECONDS),
     max_output_bytes: MAX_RESPONSE_BYTES,
 };

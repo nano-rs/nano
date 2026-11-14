@@ -77,6 +77,7 @@ impl AppState {
         if remote::install_generation_publisher(publisher) {
             tracing::info!(
                 relays = remote::relay_urls().len(),
+                metrics_peers = remote::metrics_peers::configured_target().as_deref().unwrap_or("none"),
                 "Vector config generation delivery active: deploys are graded by ingest-host acknowledgement"
             );
         }

@@ -62,6 +62,15 @@ fn default_wait() -> bool {
 /// deploys. The deploy itself keeps running either way.
 pub(crate) const SYNC_DEPLOY_WAIT: std::time::Duration = std::time::Duration::from_secs(270);
 
+/// How long a `wait=true` request still waits for its job after spending
+/// `elapsed` before it (NAN-5406: the OCSF gate runs before the job is
+/// enqueued and can take a minute or more per stage on a slow host). The whole
+/// request stays inside [`SYNC_DEPLOY_WAIT`], so it still answers before the
+/// edge gives up; a job left running answers 202 with its `status_path`.
+pub(crate) fn remaining_sync_wait(elapsed: std::time::Duration) -> std::time::Duration {
+    SYNC_DEPLOY_WAIT.saturating_sub(elapsed)
+}
+
 /// A running job in the reload phase carries what the reload wait is doing
 /// (NAN-5298 follow-up: a large config can take minutes to compile, and an
 /// unexplained "Reloading Vector" for that long reads as a hang).
@@ -120,6 +129,9 @@ impl DeployAudit {
 
 /// Run `work` as a deploy job; see the module docs for `wait`.
 ///
+/// `request_started` is when the handler began: work it did before the job
+/// (the OCSF gate) counts against the synchronous wait.
+///
 /// `work` receives a clone of the state and the job's progress sink. The
 /// audit event is emitted when the work finishes successfully, as the
 /// synchronous handlers always did; a request that joined a queued job is
@@ -130,6 +142,7 @@ pub(crate) async fn run_deploy_job<W, Fut>(
     kind: DeployJobKind,
     log_source_id: Option<Uuid>,
     wait: bool,
+    request_started: std::time::Instant,
     work: W,
 ) -> Result<Response, ApiError>
 where
@@ -195,7 +208,7 @@ where
     if !wait {
         return Ok((StatusCode::ACCEPTED, Json(submitted.job)).into_response());
     }
-    let Ok(received) = tokio::time::timeout(SYNC_DEPLOY_WAIT, rx).await else {
+    let Ok(received) = tokio::time::timeout(remaining_sync_wait(request_started.elapsed()), rx).await else {
         // Still running: hand back the job to poll rather than letting the
         // edge cut the connection with no job id.
         let job = state

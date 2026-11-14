@@ -47,12 +47,28 @@ pub struct WorkerLimits {
     /// `RLIMIT_AS` (Linux): the whole address space, binary image and thread
     /// stacks included.
     pub address_space_bytes: u64,
-    /// `RLIMIT_CPU` soft limit (SIGXCPU); the hard limit is one second later.
+    /// `RLIMIT_CPU` soft limit (SIGXCPU) at spawn.
     pub cpu_seconds: u64,
+    /// `RLIMIT_CPU` hard limit (SIGKILL): the ceiling no phase of the worker
+    /// can pass, raised to at least `cpu_seconds + 1`. A worker with phases
+    /// moves its soft limit inside this ceiling with
+    /// [`extend_cpu_soft_limit`]; one without gets `cpu_seconds + 1`.
+    pub cpu_ceiling_seconds: u64,
     /// Wall clock from spawn to reaped exit.
     pub wall: Duration,
     /// Largest stdout the parent reads.
     pub max_output_bytes: usize,
+}
+
+impl WorkerLimits {
+    /// The effective `RLIMIT_CPU` hard limit.
+    pub const fn cpu_hard_seconds(&self) -> u64 {
+        if self.cpu_ceiling_seconds > self.cpu_seconds {
+            self.cpu_ceiling_seconds
+        } else {
+            self.cpu_seconds + 1
+        }
+    }
 }
 
 /// Why a worker produced no usable reply. Callers map these to their own
@@ -242,7 +258,7 @@ pub fn apply_limits(limits: &WorkerLimits) -> io::Result<()> {
         limits.address_space_bytes,
         limits.address_space_bytes,
     )?;
-    cap(libc::RLIMIT_CPU as _, limits.cpu_seconds, limits.cpu_seconds + 1)?;
+    cap(libc::RLIMIT_CPU as _, limits.cpu_seconds, limits.cpu_hard_seconds())?;
     cap(libc::RLIMIT_CORE as _, 0, 0)?;
     // SAFETY: integer arguments only; the child cannot gain privileges
     // through exec and cannot relax this.
@@ -256,12 +272,81 @@ pub fn apply_limits(limits: &WorkerLimits) -> io::Result<()> {
 /// data/address-space limit). The wall clock still bounds the worker.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub fn apply_limits(limits: &WorkerLimits) -> io::Result<()> {
-    cap(libc::RLIMIT_CPU as _, limits.cpu_seconds, limits.cpu_seconds + 1)?;
+    cap(libc::RLIMIT_CPU as _, limits.cpu_seconds, limits.cpu_hard_seconds())?;
     cap(libc::RLIMIT_CORE as _, 0, 0)
 }
 
 #[cfg(not(unix))]
 pub fn apply_limits(_limits: &WorkerLimits) -> io::Result<()> {
+    Ok(())
+}
+
+/// CPU time (user + system) this process has used, all threads.
+#[cfg(unix)]
+pub fn self_cpu_time() -> Option<Duration> {
+    rusage_cpu_time(libc::RUSAGE_SELF)
+}
+
+/// CPU time (user + system) of this process's reaped children.
+#[cfg(unix)]
+pub fn children_cpu_time() -> Option<Duration> {
+    rusage_cpu_time(libc::RUSAGE_CHILDREN)
+}
+
+#[cfg(unix)]
+fn rusage_cpu_time(who: libc::c_int) -> Option<Duration> {
+    // SAFETY: getrusage only writes into the zeroed struct this frame owns.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+        return None;
+    }
+    let time = |t: libc::timeval| {
+        Duration::from_secs(t.tv_sec.max(0) as u64) + Duration::from_micros(t.tv_usec.max(0) as u64)
+    };
+    Some(time(usage.ru_utime) + time(usage.ru_stime))
+}
+
+/// Inside a worker, once, between phases: allow `seconds` more CPU on top of
+/// what the process has already used, by moving the `RLIMIT_CPU` soft limit
+/// (raising it, or lowering it when the first phase finished early). Never
+/// above the hard limit, which a process cannot raise, so neither can the
+/// tenant program that runs after this call: the worker's ceiling
+/// ([`WorkerLimits::cpu_ceiling_seconds`]) holds.
+///
+/// A stricter soft limit inherited from the parent (an operator's
+/// `ulimit -t` below [`WorkerLimits::cpu_seconds`]) is never raised: the
+/// soft limit found here below the configured first-phase limit can only be
+/// that inherited one, since [`apply_limits`] never raises it.
+#[cfg(unix)]
+pub fn extend_cpu_soft_limit(limits: &WorkerLimits, seconds: u64) -> io::Result<()> {
+    let used = self_cpu_time().ok_or_else(io::Error::last_os_error)?;
+    // Whole seconds, rounded up: the kernel counts the partial one.
+    let used = used.as_secs() + u64::from(used.subsec_nanos() > 0);
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: the pointer refers to an initialized rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CPU as _, &mut current) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut soft = (used.saturating_add(seconds) as libc::rlim_t).min(current.rlim_max);
+    if current.rlim_cur < limits.cpu_seconds as libc::rlim_t {
+        soft = soft.min(current.rlim_cur);
+    }
+    let value = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: current.rlim_max,
+    };
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CPU as _, &value) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn extend_cpu_soft_limit(_limits: &WorkerLimits, _seconds: u64) -> io::Result<()> {
     Ok(())
 }
 

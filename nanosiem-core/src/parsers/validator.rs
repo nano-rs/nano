@@ -160,6 +160,9 @@ pub struct VrlValidator {
     /// Where sample tests execute (NAN-5234): a resource-limited worker
     /// process unless this validator is itself running inside one.
     isolation: Isolation,
+    /// The worker's bounds (NAN-5406): interactive unless this validator runs
+    /// the OCSF gate before a publish or deploy.
+    budget: super::test_sandbox::Budget,
 }
 
 /// Where a [`VrlValidator`] executes test programs.
@@ -178,6 +181,17 @@ impl VrlValidator {
         Self {
             registry: VrlRegistry::Parser,
             isolation: Isolation::WorkerProcess,
+            budget: super::test_sandbox::Budget::Interactive,
+        }
+    }
+
+    /// A validator for `registry` (the parser-test worker rebuilds the
+    /// caller's validator from a job).
+    pub(crate) fn for_registry(registry: VrlRegistry) -> Self {
+        Self {
+            registry,
+            isolation: Isolation::WorkerProcess,
+            budget: super::test_sandbox::Budget::Interactive,
         }
     }
 
@@ -186,6 +200,14 @@ impl VrlValidator {
     /// previews, NAN-4919).
     pub(crate) fn inside_worker(mut self) -> Self {
         self.isolation = Isolation::InProcess;
+        self
+    }
+
+    /// This validator, running its worker jobs under the deploy gate budget
+    /// (NAN-5406, [`super::test_sandbox::Budget::DeployGate`]). Only for the
+    /// OCSF sample gate before a publish or deploy goes live.
+    pub fn for_deploy_gate(mut self) -> Self {
+        self.budget = super::test_sandbox::Budget::DeployGate;
         self
     }
 
@@ -203,7 +225,7 @@ impl VrlValidator {
             work,
         };
         let executed = match self.isolation {
-            Isolation::WorkerProcess => test_sandbox::run(&job).await,
+            Isolation::WorkerProcess => test_sandbox::run_under(&job, self.budget).await,
             Isolation::InProcess => test_sandbox::run_in_process(job).await,
         };
         match executed {
@@ -219,6 +241,7 @@ impl VrlValidator {
         Self {
             registry: VrlRegistry::Enrichment,
             isolation: Isolation::WorkerProcess,
+            budget: super::test_sandbox::Budget::Interactive,
         }
     }
 
@@ -265,16 +288,101 @@ impl VrlValidator {
         &self,
         vrl_code: &str,
     ) -> Result<VrlValidationResult, VrlValidatorError> {
+        self.validate_stored(vrl_code, Compile::InThisProcess).await
+    }
+
+    /// [`Self::validate_vrl`] with the compile in the bounded parser-test
+    /// worker (NAN-5400): the same verdict, warnings and error text, but the
+    /// tenant program never compiles in this process. The text gates run here
+    /// first, so a refused program never costs a worker. `Err` only when no
+    /// worker is available ([`VrlValidatorError::Busy`] is a 429); a program
+    /// that exhausts the worker's bounds is an invalid result saying so.
+    pub async fn validate_vrl_isolated(
+        &self,
+        vrl_code: &str,
+    ) -> Result<VrlValidationResult, VrlValidatorError> {
+        let gates = self.validate_before_test(vrl_code).await?;
+        if !gates.valid {
+            return Ok(gates);
+        }
+        match self
+            .execute_job(super::test_sandbox::Work::Validate {
+                code: vrl_code.to_string(),
+            })
+            .await?
+        {
+            Ok(super::test_sandbox::Outcome::Validate(result)) => Ok(result),
+            Ok(_) => Err(VrlValidatorError::ExecutionError(
+                "Invalid parser test worker response".into(),
+            )),
+            Err(bound) => Ok(VrlValidationResult {
+                valid: false,
+                error: Some(format!("VRL validation stopped: {bound}")),
+                warnings: gates.warnings,
+            }),
+        }
+    }
+
+    /// The parser-test path's validation (NAN-5396): every gate of
+    /// [`Self::validate_vrl`] except the compile. Tenant VRL on the test path
+    /// compiles only inside the CPU- and memory-bounded parser-test worker,
+    /// which reports compile errors exactly as validation would.
+    async fn validate_before_test(
+        &self,
+        vrl_code: &str,
+    ) -> Result<VrlValidationResult, VrlValidatorError> {
+        // NAN-5400: resolving a stored Nano Pipe plan validates it, and that
+        // compiles its advanced VRL steps. The worker validates a stored plan
+        // in full instead; nothing about it is checked here.
+        if is_stored_plan(vrl_code) {
+            return Ok(VrlValidationResult {
+                valid: true,
+                error: None,
+                warnings: Vec::new(),
+            });
+        }
+        self.validate_stored(vrl_code, Compile::InTestWorker).await
+    }
+
+    /// Full validation of a native plan and its extension, inside the
+    /// parser-test worker before it runs them (NAN-5400): the API only parses
+    /// a native plan's shape.
+    pub(crate) async fn validate_native_test(
+        &self,
+        plan: &crate::parsers::pipe::Plan,
+        extension: Option<&str>,
+    ) -> Result<(), String> {
+        let verdict = self
+            .validate_native_plan(plan, Compile::InThisProcess)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !verdict.valid {
+            return Err(verdict.error.unwrap_or_else(|| "Invalid processing plan".into()));
+        }
+        if let Some(extension) = extension {
+            let verdict = self.validate_vrl(extension).await.map_err(|error| error.to_string())?;
+            if !verdict.valid {
+                return Err(verdict.error.unwrap_or_default());
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_stored(
+        &self,
+        vrl_code: &str,
+        compile: Compile,
+    ) -> Result<VrlValidationResult, VrlValidatorError> {
         // NAN-4919: a stored Nano Pipe plan is validated as what it deploys.
         match resolve_plan(vrl_code) {
-            PlanSource::Plain => self.validate_source(vrl_code, false).await,
+            PlanSource::Plain => self.validate_source(vrl_code, false, compile).await,
             PlanSource::Invalid(message) => Ok(VrlValidationResult {
                 valid: false,
                 error: Some(message),
                 warnings: Vec::new(),
             }),
-            PlanSource::Program(program) => self.validate_source(&program, true).await,
-            PlanSource::Native(plan) => self.validate_native_plan(&plan).await,
+            PlanSource::Program(program) => self.validate_source(&program, true, compile).await,
+            PlanSource::Native(plan) => self.validate_native_plan(&plan, compile).await,
         }
     }
 
@@ -288,6 +396,7 @@ impl VrlValidator {
         &self,
         vrl_code: &str,
         compiled_plan: bool,
+        compile: Compile,
     ) -> Result<VrlValidationResult, VrlValidatorError> {
         let mut warnings = Vec::new();
 
@@ -357,7 +466,15 @@ impl VrlValidator {
         warnings.extend(self.generate_helpful_warnings(vrl_code));
 
         // Step 9: Native VRL compilation check (a compiled plan with event
-        // metadata read-only, NAN-4919)
+        // metadata read-only, NAN-4919). On the test path the worker compiles
+        // (NAN-5396).
+        if compile == Compile::InTestWorker {
+            return Ok(VrlValidationResult {
+                valid: true,
+                error: None,
+                warnings,
+            });
+        }
         match self.compile_vrl_as(vrl_code, compiled_plan) {
             Ok(compile_warnings) => {
                 warnings.extend(compile_warnings);
@@ -405,7 +522,7 @@ impl VrlValidator {
             PlanSource::Plain => (vrl_code, false),
             PlanSource::Invalid(message) => return Ok(single_error_result(message, Vec::new())),
             PlanSource::Native(plan) => {
-                let result = self.validate_native_plan(&plan).await?;
+                let result = self.validate_native_plan(&plan, Compile::InThisProcess).await?;
                 let errors = result.error.clone().into_iter().collect();
                 return Ok((result, errors));
             }
@@ -487,6 +604,7 @@ impl VrlValidator {
     async fn validate_native_plan(
         &self,
         plan: &crate::parsers::pipe::Plan,
+        compile: Compile,
     ) -> Result<VrlValidationResult, VrlValidatorError> {
         use crate::parsers::pipe::{native, Plan, Step};
         let mut segments = plan.segments();
@@ -510,6 +628,9 @@ impl VrlValidator {
                     // The inline lookup remap is compiler-owned but still has
                     // to compile against the allowlist like everything else.
                     let program = lookup.program().map_err(VrlValidatorError::InvalidInput)?;
+                    if compile == Compile::InTestWorker {
+                        continue;
+                    }
                     if let Err(errors) = super::vrl_guard::compile_formatted(
                         &program,
                         &self.registry.functions(),
@@ -565,7 +686,7 @@ impl VrlValidator {
                     })
                 }
             };
-            let result = self.validate_source(&program, true).await?;
+            let result = self.validate_source(&program, true, compile).await?;
             warnings.extend(result.warnings);
             if !result.valid {
                 return Ok(VrlValidationResult {
@@ -597,27 +718,8 @@ impl VrlValidator {
                 "Batch tests accept at most 100 inputs of 64 KiB each".into(),
             ));
         }
-        let validation = self.validate_native_plan(&plan).await?;
-        if !validation.valid {
-            return Ok(sample_inputs
-                .iter()
-                .map(|input| ParserTestResult {
-                    success: false,
-                    input: input.clone(),
-                    output: None,
-                    error: validation.error.clone(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                })
-                .collect());
-        }
-        if let Some(extension) = extension {
-            let validation = self.validate_vrl(extension).await?;
-            if !validation.valid {
-                return Err(VrlValidatorError::InvalidInput(
-                    validation.error.unwrap_or_default(),
-                ));
-            }
-        }
+        // NAN-5400: the plan and its extension are validated in the worker
+        // (the plan's checks compile VRL); an invalid one fails every sample.
         let mut indices = Vec::new();
         let mut inputs = Vec::new();
         let mut results: Vec<_> = sample_inputs
@@ -653,9 +755,14 @@ impl VrlValidator {
                 })
                 .await?
             {
-                Ok(super::test_sandbox::Outcome::Native(rows)) => {
-                    rows.map_err(VrlValidatorError::ExecutionError)?
-                }
+                Ok(super::test_sandbox::Outcome::Native(Ok(rows))) => rows,
+                Ok(super::test_sandbox::Outcome::Native(Err(error))) => vec![
+                    super::test_sandbox::NativeRow {
+                        outputs: vec![],
+                        error: Some(error),
+                    };
+                    indices.len()
+                ],
                 Ok(_) => {
                     return Err(VrlValidatorError::ExecutionError(
                         "Invalid parser test worker response".into(),
@@ -889,7 +996,7 @@ impl VrlValidator {
         vrl_code: &str,
         sample_input: &str,
     ) -> Result<ParserTestResult, VrlValidatorError> {
-        if let PlanSource::Native(plan) = resolve_plan(vrl_code) {
+        if let Some(plan) = native_plan_shape(vrl_code) {
             let mut rows = self
                 .test_native_pipe(plan, None, &[sample_input.to_string()])
                 .await?;
@@ -900,9 +1007,9 @@ impl VrlValidator {
         exec_bounds::check_samples(&[sample_input])?;
         let start = Instant::now();
 
-        // First validate the VRL code (the stored form: plan-aware gates)
-        let validation = self.validate_vrl(vrl_code).await?;
-        let vrl_code = &resolved_program(vrl_code);
+        // First validate the VRL code (the stored form: plan-aware gates). The
+        // compile runs in the worker, which resolves the stored form itself.
+        let validation = self.validate_before_test(vrl_code).await?;
         if !validation.valid {
             return Ok(ParserTestResult {
                 success: false,
@@ -931,7 +1038,7 @@ impl VrlValidator {
         // (NAN-5040, NAN-5234).
         let executed = match self
             .execute_job(super::test_sandbox::Work::Each {
-                code: vrl_code.clone(),
+                code: vrl_code.to_string(),
                 inputs: vec![input_json],
             })
             .await?
@@ -939,7 +1046,16 @@ impl VrlValidator {
             Ok(super::test_sandbox::Outcome::Each(Ok(mut rows))) => rows
                 .pop()
                 .unwrap_or_else(|| Err("no result".to_string())),
-            Ok(super::test_sandbox::Outcome::Each(Err(compile_error))) => Err(compile_error),
+            // A compile error reads as the validation error it replaces.
+            Ok(super::test_sandbox::Outcome::Each(Err(compile_error))) => {
+                return Ok(ParserTestResult {
+                    success: false,
+                    input: sample_input.to_string(),
+                    output: None,
+                    error: Some(compile_error),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                })
+            }
             Ok(_) => Err("Invalid parser test worker response".to_string()),
             Err(bound) => Err(bound),
         };
@@ -972,15 +1088,15 @@ impl VrlValidator {
         vrl_code: &str,
         sample_inputs: &[String],
     ) -> Result<Vec<ParserTestResult>, VrlValidatorError> {
-        if let PlanSource::Native(plan) = resolve_plan(vrl_code) {
+        if let Some(plan) = native_plan_shape(vrl_code) {
             return self.test_native_pipe(plan, None, sample_inputs).await;
         }
         exec_bounds::check_samples(sample_inputs)?;
-        // Validation below still sees the stored form (plan-aware gates);
-        // execution runs the compiled program.
+        // Validation below sees the stored form (plan-aware gates); the
+        // worker resolves it and compiles (NAN-5396).
         let start = Instant::now();
 
-        let validation = self.validate_vrl(vrl_code).await?;
+        let validation = self.validate_before_test(vrl_code).await?;
         if !validation.valid {
             return Ok(sample_inputs
                 .iter()
@@ -998,7 +1114,6 @@ impl VrlValidator {
         // worker under ONE request budget, so a slow program cannot multiply
         // its cost by the sample count. Invalid JSON samples never leave this
         // process.
-        let vrl_code = resolved_program(vrl_code);
         let mut results: Vec<ParserTestResult> = Vec::with_capacity(sample_inputs.len());
         let mut indices = Vec::new();
         let mut inputs = Vec::new();
@@ -1022,14 +1137,25 @@ impl VrlValidator {
         if !inputs.is_empty() {
             let rows = match self
                 .execute_job(super::test_sandbox::Work::Each {
-                    code: vrl_code,
+                    code: vrl_code.to_string(),
                     inputs,
                 })
                 .await?
             {
                 Ok(super::test_sandbox::Outcome::Each(Ok(rows))) => rows,
+                // A compile error fails every sample, as the validation error
+                // it replaces did.
                 Ok(super::test_sandbox::Outcome::Each(Err(compile_error))) => {
-                    return Err(VrlValidatorError::ExecutionError(compile_error))
+                    return Ok(sample_inputs
+                        .iter()
+                        .map(|sample_input| ParserTestResult {
+                            success: false,
+                            input: sample_input.clone(),
+                            output: None,
+                            error: Some(compile_error.clone()),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        })
+                        .collect())
                 }
                 Ok(_) => {
                     return Err(VrlValidatorError::ExecutionError(
@@ -1080,7 +1206,7 @@ impl VrlValidator {
             .copied()
             .filter(|stage| !stage.trim().is_empty())
             .collect();
-        if let Some(PlanSource::Native(plan)) = nonblank.first().map(|s| resolve_plan(s)) {
+        if let Some(plan) = nonblank.first().and_then(|s| native_plan_shape(s)) {
             if nonblank.len() > 2 {
                 return Err(VrlValidatorError::InvalidInput(
                     "A processing plan accepts one separate source extension".into(),
@@ -1099,7 +1225,6 @@ impl VrlValidator {
                 .ok_or_else(|| VrlValidatorError::ExecutionError("no result".into()));
         }
         exec_bounds::check_samples(&[sample_input])?;
-        let resolved: Vec<String> = vrl_stages.iter().map(|s| resolved_program(s)).collect();
         let start = Instant::now();
 
         // Filter out blank stages — they're no-ops in the chain.
@@ -1126,7 +1251,7 @@ impl VrlValidator {
         // Validate every stage upfront — we don't want to leak partial state on a
         // downstream syntax error.
         for (idx, vrl) in &stages {
-            let validation = self.validate_vrl(vrl).await?;
+            let validation = self.validate_before_test(vrl).await?;
             if !validation.valid {
                 return Ok(ParserTestResult {
                     success: false,
@@ -1154,7 +1279,7 @@ impl VrlValidator {
         let work = super::test_sandbox::Work::Chain {
             stages: stages
                 .iter()
-                .map(|(idx, _)| (*idx, resolved[*idx].clone()))
+                .map(|(idx, vrl)| (*idx, vrl.to_string()))
                 .collect(),
             input: current,
         };
@@ -1593,8 +1718,18 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FirstLoggedMessage
 /// Build a `(VrlValidationResult, Vec<String>)` for the single-error
 /// pre-compile failure case. Used by [`VrlValidator::validate_vrl_collect_errors`]
 /// so each early-return branch is a one-liner.
+/// Where validation's compile step runs (NAN-5396).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compile {
+    /// Here: save, deploy and the explicit validate endpoint.
+    InThisProcess,
+    /// Skipped here: the parser-test worker compiles under its CPU and memory
+    /// bounds and reports compile errors itself.
+    InTestWorker,
+}
+
 /// How [`VrlValidator`] treats one parser source (NAN-4919).
-enum PlanSource {
+pub(crate) enum PlanSource {
     /// Ordinary parser VRL.
     Plain,
     /// A stored plan that is malformed or refused.
@@ -1605,7 +1740,24 @@ enum PlanSource {
     Native(crate::parsers::pipe::Plan),
 }
 
-fn resolve_plan(source: &str) -> PlanSource {
+/// A stored Nano Pipe plan (validated in the parser-test worker on the test
+/// and isolated-validation paths, NAN-5400).
+fn is_stored_plan(source: &str) -> bool {
+    source.starts_with(crate::parsers::pipe::HEADER)
+}
+
+/// A well-formed stored plan with native steps, by SHAPE only (no compile):
+/// it runs as a native batch test, validated in the worker. Anything else,
+/// including a malformed plan, takes the program path, whose worker
+/// validation reports the error.
+fn native_plan_shape(source: &str) -> Option<crate::parsers::pipe::Plan> {
+    match crate::parsers::pipe::stored_plan_shape(source) {
+        Ok(Some(plan)) if plan.has_native() => Some(plan),
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_plan(source: &str) -> PlanSource {
     if !source.starts_with(crate::parsers::pipe::HEADER) {
         return PlanSource::Plain;
     }
@@ -1617,15 +1769,6 @@ fn resolve_plan(source: &str) -> PlanSource {
             Ok(program) => PlanSource::Program(program),
             Err(message) => PlanSource::Invalid(message),
         },
-    }
-}
-
-/// The program a stored source executes: compiled plan VRL, or the source.
-/// Invalid plans fall back to the marker body, which never compiles.
-fn resolved_program(source: &str) -> String {
-    match resolve_plan(source) {
-        PlanSource::Program(program) => program,
-        _ => source.to_string(),
     }
 }
 

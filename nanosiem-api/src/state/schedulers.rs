@@ -413,6 +413,8 @@ impl AppState {
     #[cfg(feature = "enterprise")]
     pub fn start_custom_enrichment_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let encryption = Some(Arc::new(EncryptionService::from_env()));
+        // NAN-5104: reload the ingest dictionaries after each run.
+        nanosiem_enterprise::custom_enrichment::dict_reload::install_from_dual_pool(&self.dual_pool);
         let scheduler = Arc::new(CustomEnrichmentScheduler::new(
             self.pool.clone(),
             self.dual_pool.clickhouse().clone(),

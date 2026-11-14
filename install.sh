@@ -3021,6 +3021,81 @@ recreate_stale_mount_services() {
 }
 recreate_stale_mount_services
 
+# NAN-5404: ClickHouse cannot confine a user to a listener, so with the Agent
+# Lane port published EVERY ClickHouse user other than a token user must
+# refuse the agent networks. The renders above lock the users nano defines;
+# this reads every user ClickHouse actually has (system.users: users.d, the
+# built-in `default`, SQL-created ones such as nano_backup or one added by
+# hand) and withdraws the listener if any of them admits an agent source.
+# Role-split hosts: the app's Agent Lane control plane runs the same check on
+# every ClickHouse node before it provisions a token.
+agentlane_read_users() {
+    local out=$1 query
+    query=$(python3 -I deploy/compose/agentlane.py users-query </dev/null)
+    # ClickHouse may have just been recreated onto new config: up to ~2 min.
+    for _ in $(seq 1 40); do
+        # The admin password is already in the ClickHouse container's
+        # environment; it never appears on this host's command line.
+        # shellcheck disable=SC2016
+        docker compose "${COMPOSE_ARGS[@]}" exec -T clickhouse sh -c \
+            'clickhouse-client --user nanosiem_admin --password "$CLICKHOUSE_ADMIN_PASSWORD" --query "$1"' \
+            sh "$query" </dev/null >"$out" 2>/dev/null && [[ -s "$out" ]] && return 0
+        : >"$out"
+        sleep 3
+    done
+    return 1
+}
+AGENTLANE_DEFERRED_FAILURE=""
+agentlane_check_live_users() {
+    local rows statement statements
+    [[ -n "$AGENTLANE_OVERLAY" ]] || return 0
+    rows=$(mktemp .nano-agentlane-users.XXXXXX)
+    # Users nano created with SQL (nano_backup, legacy raw-SQL users) get the
+    # app user's networks first, so the check below only fires on users nano
+    # did not create. Older releases created them on the private ranges,
+    # which overlap an agent on a private LAN.
+    if agentlane_read_users "$rows"; then
+        statements=$(python3 -I deploy/compose/agentlane.py align-sql --users-json "$rows" </dev/null) || statements=""
+        while IFS= read -r statement; do
+            [[ -n "$statement" ]] || continue
+            # shellcheck disable=SC2016
+            if docker compose "${COMPOSE_ARGS[@]}" exec -T clickhouse sh -c \
+                'clickhouse-client --user nanosiem_admin --password "$CLICKHOUSE_ADMIN_PASSWORD" --query "$1"' \
+                sh "$statement" </dev/null >/dev/null; then
+                log "Agent Lane: ${statement%% HOST *} now accepts the same networks as nanosiem"
+            else
+                warn "Agent Lane: could not run: $statement"
+            fi
+        done <<<"$statements"
+        [[ -z "$statements" ]] || agentlane_read_users "$rows" || :
+    fi
+    if python3 -I deploy/compose/agentlane.py check-users --env-file .env --users-json "$rows" </dev/null; then
+        rm -f "$rows"
+        ok "Agent Lane: no ClickHouse user other than token users accepts the allow-listed networks"
+        return 0
+    fi
+    rm -f "$rows"
+    # Withdraw the listener: drop the overlay and recreate ClickHouse without
+    # it. The rest of the install (nginx reload, PostgreSQL HA identity, API
+    # health, admin init) still runs; install.sh exits non-zero at the end.
+    local args=() skip=0 item
+    for item in "${COMPOSE_ARGS[@]}"; do
+        if (( skip )); then skip=0; [[ "$item" == "$AGENTLANE_OVERLAY" ]] && continue; args+=(-f "$item"); continue; fi
+        if [[ "$item" == -f ]]; then skip=1; continue; fi
+        args+=("$item")
+    done
+    agentlane_unpublish
+    if docker compose "${args[@]}" up -d --no-deps --force-recreate clickhouse </dev/null; then
+        COMPOSE_ARGS=("${args[@]}")
+        AGENTLANE_OVERLAY=""
+    else
+        warn "Could not recreate ClickHouse without the Agent Lane listener; stop it now: docker compose ${args[*]} up -d --no-deps --force-recreate clickhouse"
+    fi
+    AGENTLANE_DEFERRED_FAILURE="Agent Lane was withdrawn (see the users named above): the listener is closed and the rest of the stack is running. Restrict or drop those users, then re-run install.sh."
+    warn "$AGENTLANE_DEFERRED_FAILURE"
+}
+agentlane_check_live_users
+
 # On a re-run/upgrade, `up -d` recreates the app containers (new IPs) but leaves
 # nginx as-is. Reload nginx so it re-reads its config (through the directory
 # mount, NAN-5397) and re-resolves upstream IPs, otherwise
@@ -3355,6 +3430,8 @@ echo "  Logs:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} logs
 echo "  Stop:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down"
 echo "  Reset:    cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down -v   (DELETES ALL DATA)"
 echo
+# NAN-5404: reported last, after every other step ran.
+[[ -z "$AGENTLANE_DEFERRED_FAILURE" ]] || fail "$AGENTLANE_DEFERRED_FAILURE"
 }
 
 # Keep this invocation as the final parsed command. When install.sh arrives via
