@@ -258,24 +258,27 @@ async fn security_event_survives_clickhouse_241_and_drains_after_recovery() {
 
     let row = outbox_row(&dp, event.event_id).await;
     assert!(row.delivered_at.is_some() && row.udm_delivered_at.is_some() && row.ocsf_delivered_at.is_some(), "{row:?}");
-    assert_eq!(udm_rows(&dp, &marker).await, 1);
+    // NAN-5354: an OCSF install writes the audit event once, to ocsf_logs.
+    assert_eq!(udm_rows(&dp, &marker).await, 0);
     assert_eq!(ocsf_rows(&dp, &marker).await, 1);
     assert!(active_health_event(&dp).await.is_none(), "backlog condition must resolve");
 
     // The delivered row keeps the event's real time, not the drain time.
+    // NAN-5354: on OCSF that row is the ocsf_logs one (no UDM row).
     let skew: i64 = dp
         .clickhouse()
         .query(
             "SELECT toInt64(dateDiff('millisecond', timestamp, \
-                 fromUnixTimestamp64Milli(toInt64(?), 'UTC'))) FROM logs \
-             WHERE source_type = 'audit' AND JSONExtractString(metadata, 'resource_name') = ?",
+                 fromUnixTimestamp64Milli(toInt64(?), 'UTC'))) FROM ocsf_logs \
+             WHERE source_type = 'audit' \
+               AND JSONExtractString(toString(unmapped), 'resource_name') = ?",
         )
         .bind(event.occurred_at.timestamp_millis())
         .bind(&marker)
         .fetch_one()
         .await
         .unwrap();
-    assert!(skew.abs() <= 1, "UDM row must be dated at occurred_at (skew {skew} ms)");
+    assert!(skew.abs() <= 1, "OCSF row must be dated at occurred_at (skew {skew} ms)");
 
     // After recovery the medium "failed in the last 24h" finding remains.
     let recs = audit_durability_recommendations(Some(&stats));
@@ -300,7 +303,8 @@ async fn healthy_emit_is_recorded_and_redrain_never_duplicates() {
     let row = outbox_row(&dp, event.event_id).await;
     assert!(row.delivered_at.is_some(), "{row:?}");
     assert_eq!(row.attempts, 0);
-    assert_eq!(udm_rows(&dp, &marker).await, 1);
+    // NAN-5354: an OCSF install writes the audit event once, to ocsf_logs.
+    assert_eq!(udm_rows(&dp, &marker).await, 0);
 
     // Simulate a lost delivery stamp (process died between the ClickHouse ack
     // and the PG update): the drainer must notice the rows already exist.
@@ -315,10 +319,11 @@ async fn healthy_emit_is_recorded_and_redrain_never_duplicates() {
     let drainer = AuditOutboxDrainer::new(emitter.clone(), dp.postgres().clone());
     let outcome = drainer.drain_once().await.expect("drain");
     assert_eq!(outcome.claimed, 1);
-    assert_eq!(outcome.already_present, 1, "{outcome:?}");
+    assert_eq!(outcome.already_present, 0, "no UDM half under OCSF: {outcome:?}");
     assert_eq!(outcome.already_present_ocsf, 1, "{outcome:?}");
     assert_eq!(outcome.delivered, 1, "{outcome:?}");
-    assert_eq!(udm_rows(&dp, &marker).await, 1, "UDM row must not be duplicated");
+    // NAN-5354: an OCSF install writes the audit event once, to ocsf_logs.
+    assert_eq!(udm_rows(&dp, &marker).await, 0, "no UDM row under OCSF");
     assert_eq!(ocsf_rows(&dp, &marker).await, 1, "OCSF mirror must not be duplicated");
 
     // The mirror row's id IS the event id (what the duplicate check keys on).
@@ -358,7 +363,8 @@ async fn recorded_event_survives_a_crash_before_clickhouse_delivery() {
         .await
         .expect("drain");
     assert_eq!(stats.pending, 0, "{stats:?}");
-    assert_eq!(udm_rows(&dp, &marker).await, 1);
+    // NAN-5354: an OCSF install writes the audit event once, to ocsf_logs.
+    assert_eq!(udm_rows(&dp, &marker).await, 0);
     assert_eq!(ocsf_rows(&dp, &marker).await, 1);
 }
 
@@ -453,4 +459,37 @@ async fn event_is_lost_only_when_both_stores_fail() {
         .expect_err("both stores failing must be an explicit error");
     let msg = err.to_string();
     assert!(msg.contains("PostgreSQL") && msg.contains("ClickHouse"), "{msg}");
+}
+
+/// NAN-5354: on OCSF, a routine audit event and an OCSF-only write (the case
+/// lifecycle path) each land once, in ocsf_logs, and never in logs. The
+/// OCSF-only write is synchronous, so its row is visible right after it returns.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL + ClickHouse; run with --ignored"]
+async fn ocsf_install_writes_audit_only_to_ocsf_logs() {
+    let dp = healthy_pool().await;
+    let emitter = AuditEmitter::new(dp.clone());
+
+    let marker = format!("nan5354-case-{}", Uuid::new_v4().simple());
+    let case_event = AuditEvent::builder(AuditSource::Case, "resolved")
+        .resource("case", Some(Uuid::now_v7()), Some(marker.clone()))
+        .build();
+    emitter.emit_ocsf_durable(&[case_event]).await.expect("ocsf-only write");
+    assert_eq!(ocsf_rows(&dp, &marker).await, 1, "case audit row in ocsf_logs");
+    assert_eq!(udm_rows(&dp, &marker).await, 0, "no case audit row in logs");
+
+    let marker = format!("nan5354-routine-{}", Uuid::new_v4().simple());
+    let routine = critical_event(LOGIN_SUCCESS, &marker);
+    emitter.emit(&routine).await.expect("routine emit");
+    let mut landed = 0;
+    for _ in 0..50 {
+        // Routine events use async inserts: wait for the buffer flush.
+        landed = ocsf_rows(&dp, &marker).await;
+        if landed > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(landed, 1, "routine audit row in ocsf_logs");
+    assert_eq!(udm_rows(&dp, &marker).await, 0, "no routine audit row in logs");
 }

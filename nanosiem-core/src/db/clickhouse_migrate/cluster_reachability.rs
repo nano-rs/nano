@@ -98,7 +98,7 @@ impl Reachability {
 /// Prefer the remote_servers rows (`database_replica_name = ''`); a name that
 /// exists ONLY as a Replicated database keeps its rows so that topology is not
 /// reported as empty. `cluster` must already be a quoted SQL literal.
-pub(crate) fn server_cluster_rows_predicate(cluster_literal: &str) -> String {
+pub fn server_cluster_rows_predicate(cluster_literal: &str) -> String {
     format!(
         "cluster = {cluster_literal} AND (database_replica_name = '' OR \
          (SELECT countIf(database_replica_name = '') FROM system.clusters \

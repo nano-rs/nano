@@ -88,3 +88,7 @@ config/vector/dynamic/ingest-tokens/
 
 # Per-checkout development secrets (scripts/start-microservices-dev.sh)
 .nano-dev-secrets
+
+# NAN-5361: Agent Lane listener render (single host, enterprise installer)
+/docker-compose.agentlane.yml
+/.nano-agentlane/

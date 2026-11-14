@@ -1891,6 +1891,35 @@ if [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]]; th
 fi
 ok "Edition $NANO_EDITION (from $EDITION_FROM), release $NANO_VERSION ($NANO_IMAGE_PREFIX-*)"
 
+# NAN-5354: a re-run on an existing install is an upgrade from the release in
+# .env (PRE_RUN_NANO_VERSION) to $NANO_VERSION, and must not skip a release the
+# upgrade policy marks as a required stop (v2.0.20 before v2.0.23: its audit
+# readers must be live before writers stop dual-writing). Same rule as
+# `scripts/nano upgrade` (the path union over every release up to the target),
+# from the same code: scripts/lib/nano_bundle.py upgrade-path. Covers
+# single-node and every role-split (--role) host of a release bundle (which
+# ships the policy), before anything is written. An open-core git checkout has
+# no deploy/release/ (the mirror strips it), so the check is skipped there with
+# a note.
+check_required_stops() {
+    local policy=deploy/release/upgrade-policy.json out
+    [[ "$PRE_RUN_NANO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$PRE_RUN_NANO_VERSION" != "$NANO_VERSION" ]] || return 0
+    if [[ ! -f "$policy" ]]; then
+        warn "No upgrade policy in this tree ($policy; open-core git checkouts do not ship it): skipping the required-stop check for $PRE_RUN_NANO_VERSION -> $NANO_VERSION. Follow the release notes' upgrade path (required stops are listed there)."
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        if tr -d '[:space:]' < "$policy" | grep -q '"required_stops":\["'; then
+            fail "This release's upgrade policy has required stops, and python3 is needed to check the path from $PRE_RUN_NANO_VERSION to $NANO_VERSION. Install Python 3, then re-run."
+        fi
+        return 0
+    fi
+    out=$(python3 -I scripts/lib/nano_bundle.py upgrade-path --policy "$policy" \
+        --from "$PRE_RUN_NANO_VERSION" --to "$NANO_VERSION" </dev/null 2>&1) \
+        || fail "Refusing to upgrade: ${out#nano bundle: } (install each required release with its own bundle or checkout, then re-run this one)."
+}
+check_required_stops
+
 if [[ -n "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" && -z "$(normalize_bool "$NANO_ALLOW_PRIVATE_AI_ENDPOINTS")" ]]; then
     fail "NANO_ALLOW_PRIVATE_AI_ENDPOINTS must be true or false (got '$NANO_ALLOW_PRIVATE_AI_ENDPOINTS')."
 fi
@@ -2216,11 +2245,121 @@ configure_ingest_ack_durability
 configure_automatic_backups
 configure_planned_volume
 
+# ----------------------------------------------------------------------------
+# NAN-5361: Agent Lane listener (enterprise). A dedicated HTTPS ClickHouse
+# listener for AI agents, off unless .env (single host) or the inventory (role
+# split) turns it on with an allow-list. The port is published only after
+# deploy/compose/agentlane/nano-agentlane-host (root) has loaded the matching
+# firewall and staged the certificate; otherwise nothing is published.
+# ----------------------------------------------------------------------------
+AGENTLANE_OVERLAY=""
+AGENTLANE_HELPER=deploy/compose/agentlane/nano-agentlane-host
+agentlane_flag_on() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+# Add (add) or drop (remove) docker-compose.agentlane.yml in .env's
+# NANO_COMPOSE_OVERLAYS, which scripts/nano and nano upgrade read; every other
+# overlay the operator listed is kept as it was.
+agentlane_record_overlay() {
+    local action="$1" current updated="" item
+    current=$(env_value NANO_COMPOSE_OVERLAYS)
+    for item in $current; do
+        [[ "$item" == docker-compose.agentlane.yml ]] || updated="${updated:+$updated }$item"
+    done
+    [[ "$action" == add ]] && updated="${updated:+$updated }docker-compose.agentlane.yml"
+    [[ "$updated" == "$current" ]] && return 0
+    nano_env_set_keys .env "NANO_COMPOSE_OVERLAYS=$updated" \
+        || fail "Could not record NANO_COMPOSE_OVERLAYS in .env."
+}
+# Withdraw a render the firewall does not match, so no later `docker compose
+# up` (scripts/nano, nano upgrade, a manual restart) publishes a port or starts
+# a listener this host's firewall does not guard: single host drops the
+# overlay (and its NANO_COMPOSE_OVERLAYS entry), role split the listener file
+# the renderer already wrote into the published config.d.
+agentlane_unpublish() {
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        rm -f .nano-generated/clickhouse/config.d/zz-agentlane-listener.xml
+    else
+        agentlane_record_overlay remove
+        rm -f docker-compose.agentlane.yml
+    fi
+}
+# Fail closed unless the root helper applied exactly this render's firewall
+# and certificate. Root runs it directly; anyone else gets the command.
+agentlane_require_applied() {
+    local state
+    state=$(bash "$AGENTLANE_HELPER" status "$NANO_INSTALL_DIR" 2>/dev/null) || true
+    [[ "$state" == applied ]] && return 0
+    if [[ "$(id -u)" == 0 ]]; then
+        log "Applying the Agent Lane firewall and certificate (${state:-not-applied})"
+        if ! bash "$AGENTLANE_HELPER" apply "$NANO_INSTALL_DIR"; then
+            agentlane_unpublish
+            fail "Agent Lane: nano-agentlane-host apply failed. The listener was not published."
+        fi
+        return 0
+    fi
+    agentlane_unpublish
+    fail "Agent Lane is on, but this host's listener firewall is ${state:-not applied} (not-applied/stale: first run, or the allow-list, port or certificate paths changed; live-*: the live nftables table is missing or nano-agentlane-check.timer has not verified it in the last 2 minutes). Nothing was published. Run: sudo bash $NANO_INSTALL_DIR/$AGENTLANE_HELPER apply $NANO_INSTALL_DIR, then re-run install.sh (no root needed)."
+}
+agentlane_warn_leftover() {
+    [[ -f /etc/nano/agentlane/applied.json ]] || return 0
+    warn "Agent Lane is off, but this host still has its listener firewall and certificate. Remove them with: sudo bash $NANO_INSTALL_DIR/$AGENTLANE_HELPER remove"
+}
+configure_agentlane_single() {
+    local summary enabled port bind public_url
+    [[ "$MULTI_NODE" == "1" ]] && return 0
+    if ! agentlane_flag_on "$(env_value NANO_AGENTLANE_LISTENER)"; then
+        # Off (every install before v2.0.23): drop a previous render, if any.
+        if [[ -f deploy/compose/agentlane.py || -f docker-compose.agentlane.yml ]]; then
+            agentlane_record_overlay remove
+            rm -f docker-compose.agentlane.yml
+            rm -rf .nano-agentlane
+            agentlane_warn_leftover
+        fi
+        return 0
+    fi
+    [[ "$NANO_EDITION" == enterprise ]] \
+        || fail "NANO_AGENTLANE_LISTENER=true in .env, but Agent Lane is an enterprise feature and this install is the $NANO_EDITION edition. Remove it from .env."
+    [[ -f deploy/compose/agentlane.py && -f "$AGENTLANE_HELPER" ]] \
+        || fail "NANO_AGENTLANE_LISTENER=true, but this bundle has no Agent Lane listener files (deploy/compose/agentlane*). Use the enterprise bundle for v2.0.23 or later."
+    command -v python3 >/dev/null 2>&1 || fail "The Agent Lane listener needs python3 on this host."
+    summary=$(python3 -I deploy/compose/agentlane.py render-single --install-dir "$NANO_INSTALL_DIR" --env-file .env </dev/null) \
+        || fail "Agent Lane listener settings in .env are invalid (above). Nothing was published."
+    IFS=$'\t' read -r enabled port bind public_url < <(
+        python3 -I -c 'import json,sys; v=json.loads(sys.argv[1]); print(v["enabled"], v.get("port",""), v.get("bind_address",""), v.get("public_url",""), sep="\t")' "$summary"
+    )
+    [[ "$enabled" == True ]] || fail "Agent Lane render did not enable the listener."
+    agentlane_require_applied
+    agentlane_record_overlay add
+    AGENTLANE_OVERLAY=docker-compose.agentlane.yml
+    ok "Agent Lane listener: https on ${bind}:${port}, allow-listed sources only (shown in Settings as $public_url)"
+}
+configure_agentlane_single
+
 # Resolve overlays before sizing as well as startup: an overlay can replace the
 # Vector data volume with a host bind/external driver, whose capacity cannot be
 # inferred from DockerRootDir. Keeping one validated list prevents the sizing
 # and runtime Compose graphs from disagreeing.
 read -r -a NANO_OVERLAY_LIST <<< "${NANO_COMPOSE_OVERLAYS:-}"
+# NAN-5397: a host converted from the pre-v2 layout keeps
+# docker-compose.legacy-preserved.yml, whose canonical config binds point at
+# .nano-v2-control/<bundle sha>/ (frozen at the transition bundle; an old one
+# also pins nginx.conf as a file). Drop those pins once the transition has
+# settled so this release's config files reach the services.
+if [[ "$MULTI_NODE" != "1" && " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.legacy-preserved.yml "* \
+    && -f scripts/lib/compose_stale_mounts.py ]]; then
+    python3 -I scripts/lib/compose_stale_mounts.py --root "$NANO_INSTALL_DIR" \
+        --prune-overlay docker-compose.legacy-preserved.yml </dev/null \
+        || warn "Could not check docker-compose.legacy-preserved.yml for pinned config mounts."
+fi
+if [[ -n "$AGENTLANE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " != *" $AGENTLANE_OVERLAY "* ]]; then
+    NANO_OVERLAY_LIST+=("$AGENTLANE_OVERLAY")
+elif [[ -z "$AGENTLANE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.agentlane.yml "* ]]; then
+    fail "NANO_COMPOSE_OVERLAYS names docker-compose.agentlane.yml, but Agent Lane is off. install.sh manages that overlay: remove it from NANO_COMPOSE_OVERLAYS."
+fi
 for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
     if [[ ! "$overlay" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]]; then
         fail "NANO_COMPOSE_OVERLAYS: '$overlay' is not a compose file name in the install directory"
@@ -2452,6 +2591,15 @@ PY
     log "Rendered host-local sizing for ${NANO_DETECTED_CPU_CORES} CPU / ${NANO_DETECTED_MEMORY_MIB} MiB RAM"
     if [[ ",${ROLE_ARG}," == *,clickhouse,* ]]; then
         log "Using host-local ClickHouse memory limit $CLICKHOUSE_MEM_LIMIT"
+    fi
+    # NAN-5361: a host the inventory gives the Agent Lane listener binds it
+    # (host network) as soon as ClickHouse restarts with the rendered config,
+    # so its firewall and certificate must be in place first.
+    if [[ "${NANO_AGENTLANE_HOST:-}" == "true" ]]; then
+        agentlane_require_applied
+        ok "Agent Lane listener on this host: port ${NANO_AGENTLANE_PORT}, allow-listed sources only"
+    elif [[ ",${ROLE_ARG}," == *,clickhouse,* ]]; then
+        agentlane_warn_leftover
     fi
     if [[ "$NANO_PRIVATE_TLS" == "true" ]]; then
         for tls_path in "$NANO_TLS_CERT" "$NANO_TLS_KEY" "$NANO_TLS_CA"; do
@@ -2778,6 +2926,14 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
         || nano_env_set_keys .env "NANO_CLICKHOUSE_NETWORKS_FILE=./.nano-generated/clickhouse/networks.xml" \
         || fail "Could not record NANO_CLICKHOUSE_NETWORKS_FILE in .env."
     log "ClickHouse users accept connections from loopback and the Docker networks only${ch_ingest_networks:+ (nanosiem_ingest also from $ch_ingest_networks)}"
+    # NAN-5361: that lock is what refuses nano's own users on the Agent Lane
+    # port, so an Agent Lane allow-list must not overlap it.
+    if [[ -n "$AGENTLANE_OVERLAY" ]] \
+        && ! python3 -I deploy/compose/agentlane.py check-networks --env-file .env \
+            --networks-xml .nano-generated/clickhouse/networks.xml </dev/null; then
+        agentlane_unpublish
+        fail "Agent Lane was not published (above). Nothing was started."
+    fi
 fi
 
 log "Starting services"
@@ -2833,9 +2989,41 @@ if (( compose_up_rc != 0 )); then
     fail "Starting services failed (see the docker compose output and the last log lines above). Fix the cause, then rerun install.sh on this host; reruns are safe."
 fi
 
+# NAN-5397: a single-file bind mount pins the file's inode. The update above
+# (`git reset --hard`, a bundle unpack) and the sizing/network renders replace
+# those files with new ones, but `up -d` recreates a container only when its
+# definition changed, so nginx, Prometheus, ClickHouse and the rest kept
+# reading the old file after an upgrade. Recreate every running service whose
+# mounted file differs from the file now in the install directory.
+recreate_stale_mount_services() {
+    local container service configured
+    local containers=() services=()
+    [[ -f scripts/lib/compose_stale_mounts.py ]] || return 0
+    # `ps` also lists orphans (services no longer in the Compose files); `up`
+    # cannot recreate those, so only configured services are considered.
+    configured=$(docker compose "${COMPOSE_ARGS[@]}" config --services </dev/null 2>/dev/null) || return 0
+    while IFS= read -r container; do
+        if [[ -n "$container" ]]; then containers+=("$container"); fi
+    done < <(docker compose "${COMPOSE_ARGS[@]}" ps -q </dev/null 2>/dev/null || true)
+    (( ${#containers[@]} > 0 )) || return 0
+    while IFS= read -r service; do
+        if [[ "$service" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && grep -qxF -- "$service" <<<"$configured"; then
+            services+=("$service")
+        fi
+    done < <(python3 -I scripts/lib/compose_stale_mounts.py --root "$NANO_INSTALL_DIR" \
+        "${containers[@]}" </dev/null || true)
+    (( ${#services[@]} > 0 )) || return 0
+    log "Recreating ${services[*]} to load the updated configuration files"
+    # The stack is already up: a failed recreate leaves these services on
+    # their previous configuration, which is no reason to abort the install.
+    docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate "${services[@]}" </dev/null \
+        || warn "Could not recreate ${services[*]} onto the updated configuration; they keep running their previous configuration files. Run: docker compose ${COMPOSE_ARGS[*]} up -d --no-deps --force-recreate ${services[*]}"
+}
+recreate_stale_mount_services
+
 # On a re-run/upgrade, `up -d` recreates the app containers (new IPs) but leaves
-# nginx as-is — and it won't have loaded an updated nginx.conf either. Reload
-# nginx so it picks up any config change and re-resolves upstream IPs, otherwise
+# nginx as-is. Reload nginx so it re-reads its config (through the directory
+# mount, NAN-5397) and re-resolves upstream IPs, otherwise
 # it proxies dead old IPs and 502s until restarted (NAN-1237). Best-effort.
 docker compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload </dev/null >/dev/null 2>&1 || true
 

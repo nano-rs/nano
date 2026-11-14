@@ -79,6 +79,7 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/automation/capabilities', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Capabilities' }], capability: 'soar' },
   { path: '/risk/watchlists', segments: [{ label: 'Home', href: '/' }, { label: 'Risk', href: '/risk' }, { label: 'Watchlists' }], capability: 'risk' },
   { path: '/settings/risk', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Risk Scoring' }], capability: 'risk' },
+  { path: '/settings/agentlane', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Agent Lane' }], capability: 'agentLane' },
   { path: '/platform/health', segments: [{ label: 'Home', href: '/' }, { label: 'SIEM Health' }], capability: 'siemHealth' },
 
   // Observability (NAN-1536 console; NAN-3280: these were missing, so the

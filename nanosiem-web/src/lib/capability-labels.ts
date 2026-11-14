@@ -22,4 +22,5 @@ export const CAPABILITY_LABELS: Record<keyof Capabilities, string> = {
   iocLists: 'IOC lists',
   soar: 'SOAR automation',
   threatIntel: 'Threat intel',
+  agentLane: 'Agent Lane',
 };

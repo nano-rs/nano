@@ -61,6 +61,14 @@ if _LEGACY_BRIDGE_SPEC is None or _LEGACY_BRIDGE_SPEC.loader is None:
 nano_legacy_bridge = importlib.util.module_from_spec(_LEGACY_BRIDGE_SPEC)
 sys.modules[_LEGACY_BRIDGE_SPEC.name] = nano_legacy_bridge
 _LEGACY_BRIDGE_SPEC.loader.exec_module(nano_legacy_bridge)
+_STALE_MOUNTS_SPEC = importlib.util.spec_from_file_location(
+    "compose_stale_mounts", SCRIPT_DIR / "lib/compose_stale_mounts.py"
+)
+if _STALE_MOUNTS_SPEC is None or _STALE_MOUNTS_SPEC.loader is None:
+    raise RuntimeError("cannot load the stale bind-mount check")
+compose_stale_mounts = importlib.util.module_from_spec(_STALE_MOUNTS_SPEC)
+sys.modules[_STALE_MOUNTS_SPEC.name] = compose_stale_mounts
+_STALE_MOUNTS_SPEC.loader.exec_module(compose_stale_mounts)
 ROLE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "keeper": (),
     "clickhouse": ("keeper",),
@@ -3239,7 +3247,19 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 and str(other.get("Destination", "")).startswith(destination.rstrip("/") + "/")
             )
             host = self._host_digest(resolved, nested)
-            seen = self._mounted_digest(container, destination, nested)
+            if resolved.is_file():
+                # NAN-5397: `docker cp` re-binds the mount's Source path, so it
+                # returns the NEW file while the container still reads the old
+                # inode. Read a single-file mount from inside the container.
+                state, content = compose_stale_mounts.read_container_file(container, destination)
+                if state == "missing":
+                    eprint(f"note: {self.host_name}: {service} no longer sees {destination}; recreating it")
+                    return True
+                seen = (
+                    hashlib.sha256(b"\0" + content).hexdigest() if state == "ok" else None
+                )
+            else:
+                seen = self._mounted_digest(container, destination, nested)
             if host is not None and seen is not None and host != seen:
                 eprint(f"note: {self.host_name}: {service} reads an outdated {destination}; recreating it")
                 return True
@@ -4412,6 +4432,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 target, run_id, expected_bundle_sha256,
             )
             current = self.version
+        pruned_control_pins = self._prune_legacy_control_pins()
         # NAN-5013: single-node only (preflight refuses a public token on a
         # role-split host, whose cluster must share one generated value).
         rotated_install_token = False
@@ -4459,7 +4480,24 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             "rotated_public_install_token": rotated_install_token,
             "pinned_compatible_delivery_mode": pinned_delivery_mode,
             "pinned_schema_profile": pinned_schema_profile,
+            "pruned_control_pins": pruned_control_pins,
         }
+
+    def _prune_legacy_control_pins(self) -> list[str]:
+        """NAN-5397: a settled legacy transition's overlay pins every canonical
+        config bind to .nano-v2-control/<sha>/, so later upgrades never reach
+        those services (and an old pinned nginx.conf file mount blocks the
+        directory-mounted nginx). Drop the pins; the base file's mounts apply.
+        Not on the run that performs the transition (its rollout uses them)."""
+        if getattr(self, "role_env", None) or getattr(self, "_legacy_transition_rollout", False):
+            return []
+        overlay = "docker-compose.legacy-preserved.yml"
+        if overlay not in self.env.get("NANO_COMPOSE_OVERLAYS", "").split():
+            return []
+        dropped = compose_stale_mounts.prune_control_pins(self.install_dir, self.install_dir / overlay)
+        for entry in dropped:
+            eprint(f"note: {overlay}: dropped the pinned config mount {entry}")
+        return dropped
 
     def _up_existing(
         self, services: Iterable[str], timeout: int, *, exact: bool = False,
@@ -6641,6 +6679,10 @@ def check_version_path(
     if semver(installed) < semver(minimum):
         checks.append(Check("version-path", False, f"target requires at least {minimum}; installed {installed}", "coordinator"))
         return checks
+    # NAN-5354: the signer puts the PATH UNION in the manifest (every stop any
+    # release up to the target requires, nano_bundle._required_stops_on_path),
+    # so this check covers every release between the installed version and the
+    # target, not only the target's own policy entry.
     stops = manifest.get("required_stops", [])
     if not isinstance(stops, list) or not all(isinstance(stop, str) for stop in stops):
         checks.append(Check("version-path", False, "manifest required_stops is invalid", "coordinator"))

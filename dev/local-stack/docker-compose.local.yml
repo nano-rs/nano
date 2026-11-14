@@ -104,6 +104,10 @@ services:
   nginx:
     profiles: !reset []
     container_name: ${NANOCH_PROJECT:-nanoch}-nginx
+    # The image's own entrypoint: the shipped service's directory-mount
+    # wrapper (NAN-5397) expects config/nginx at /etc/nano/nginx.
+    entrypoint: !reset null
+    environment: !reset {}
     command: ["nginx", "-c", "/etc/nginx/nano/nginx.conf", "-g", "daemon off;"]
     extra_hosts:
       - "host.docker.internal:host-gateway"

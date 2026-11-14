@@ -630,6 +630,33 @@ pub const SSO_SIGN_IN_DENIED: &str = "sso_sign_in_denied";
 pub const SSO_GROUP_GRANTS_SYNCHRONIZED: &str = "sso_group_grants_synchronized";
 
 // =============================================================================
+// Agent Lane Actions (NAN-5360, enterprise)
+// =============================================================================
+
+/// An administrator switched Agent Lane on (agentlane tokens may connect)
+pub const AGENTLANE_ENABLED: &str = "agentlane_enabled";
+/// An administrator switched Agent Lane off (every agentlane ClickHouse user dropped)
+pub const AGENTLANE_DISABLED: &str = "agentlane_disabled";
+/// An agentlane token (and its ClickHouse user) was created
+pub const AGENTLANE_TOKEN_CREATED: &str = "agentlane_token_created";
+/// An agentlane token was revoked (its ClickHouse user dropped, queries killed)
+pub const AGENTLANE_TOKEN_REVOKED: &str = "agentlane_token_revoked";
+/// An agentlane token reached its expiry (its ClickHouse user dropped)
+pub const AGENTLANE_TOKEN_EXPIRED: &str = "agentlane_token_expired";
+/// NAN-5362: one SQL query an agentlane token ran (harvested from ClickHouse
+/// `system.query_log`). `success` is false when ClickHouse raised an error;
+/// the query text and resource use are in `details`. Routine (not durable):
+/// an agent can run many, and `system.query_log` is the record of truth the
+/// harvester re-reads until the event is in the audit store.
+pub const AGENTLANE_QUERY: &str = "agentlane_query";
+/// NAN-5362: ClickHouse refused an agentlane query on its token's quota
+/// (code 201) or concurrency cap (code 202).
+pub const AGENTLANE_QUERY_REFUSED: &str = "agentlane_query_refused";
+/// NAN-5362: a failed ClickHouse login with an agentlane user name (from
+/// `system.session_log`, when the install enables it).
+pub const AGENTLANE_LOGIN_FAILED: &str = "agentlane_login_failed";
+
+// =============================================================================
 // SCIM provisioning Actions (NAN-5274, enterprise)
 // =============================================================================
 
@@ -1114,6 +1141,13 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     INGESTION_RESUMED,
     // Federated identity — JIT provisioning of a new user on first OIDC login.
     OIDC_USER_PROVISIONED,
+    // Agent Lane (NAN-5360) — who may run SQL directly against the event
+    // store. Admin-gated, low-volume; expiry fires once per token.
+    AGENTLANE_ENABLED,
+    AGENTLANE_DISABLED,
+    AGENTLANE_TOKEN_CREATED,
+    AGENTLANE_TOKEN_REVOKED,
+    AGENTLANE_TOKEN_EXPIRED,
     // SCIM provisioning (NAN-5274) — IdP-pushed account and access changes,
     // plus the token that authorizes them. Authenticated, low-volume (the
     // floodable `scim_request_denied` is deliberately excluded).
@@ -1187,6 +1221,12 @@ mod durable_classifier_tests {
             "source_scope_unrestricted",
             "source_scope_granted",
             "source_scope_revoked",
+            // NAN-5360: Agent Lane switch and token lifecycle.
+            "agentlane_enabled",
+            "agentlane_disabled",
+            "agentlane_token_created",
+            "agentlane_token_revoked",
+            "agentlane_token_expired",
             // bb506d7c5 (#9259): SCIM provisioning. Token-authenticated, rate
             // limited per provider; the floodable scim_request_denied stays out.
             "scim_token_issued",

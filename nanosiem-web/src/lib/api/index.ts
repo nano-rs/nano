@@ -37,6 +37,7 @@ import { RiskApi } from '@/enterprise/api/risk';
 import { IocListsApi } from '@/enterprise/api/ioc-lists';
 import { ThreatIntelApi } from '@/enterprise/api/threat-intel';
 import { ScimApi } from '@/enterprise/api/scim';
+import { AgentLaneApi } from '@/enterprise/api/agentlane';
 import { SoarApi } from '@/enterprise/api/soar';
 import { InternalDomainsApi } from './internal-domains';
 import { RiskWatchlistsApi } from '@/enterprise/api/risk-watchlists';
@@ -284,6 +285,7 @@ class ApiClient {
   private _iocLists: IocListsApi;
   private _threatIntel: ThreatIntelApi;
   private _scim: ScimApi;
+  private _agentLane: AgentLaneApi;
   private _soar: SoarApi;
   private _internalDomains: InternalDomainsApi;
   private _riskWatchlists: RiskWatchlistsApi;
@@ -374,6 +376,7 @@ class ApiClient {
     this._iocLists = new IocListsApi(this.request.bind(this));
     this._threatIntel = new ThreatIntelApi(this.request.bind(this));
     this._scim = new ScimApi(this.request.bind(this));
+    this._agentLane = new AgentLaneApi(this.request.bind(this));
     this._soar = new SoarApi(this.request.bind(this));
     this._internalDomains = new InternalDomainsApi(this.request.bind(this));
     this._riskWatchlists = new RiskWatchlistsApi(this.request.bind(this));
@@ -451,6 +454,11 @@ class ApiClient {
   /** SCIM provisioning settings (enterprise; NAN-5274). */
   get scim(): ScimApi {
     return this._scim;
+  }
+
+  /** Agent Lane switch and tokens (enterprise; NAN-5360). */
+  get agentLane(): AgentLaneApi {
+    return this._agentLane;
   }
 
   /** SOAR automation (enterprise; the open build carries a rejecting stub). */

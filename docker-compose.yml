@@ -75,6 +75,20 @@ services:
       # literals exactly — override in .env on a memory-tight box.
       NANO_PREVALENCE_CACHE_CELLS: ${NANO_PREVALENCE_CACHE_CELLS:-1000000}
       NANO_PREVALENCE_CACHE_CELLS_IP: ${NANO_PREVALENCE_CACHE_CELLS_IP:-5000000}
+      # NAN-5359: Agent Lane profile read caps (empty = defaults).
+      NANO_AGENTLANE_MAX_ROWS_TO_READ: ${NANO_AGENTLANE_MAX_ROWS_TO_READ:-}
+      NANO_AGENTLANE_MAX_BYTES_TO_READ: ${NANO_AGENTLANE_MAX_BYTES_TO_READ:-}
+      # NAN-5359: Agent Lane workload CPU-slot cap per node, 1-256 (empty = 2).
+      # Raise for hunt-heavy installs (trades detection/analyst latency for
+      # agent throughput).
+      NANO_AGENTLANE_MAX_CONCURRENT_THREADS: ${NANO_AGENTLANE_MAX_CONCURRENT_THREADS:-}
+      # NAN-5359: Agent Lane workload memory cap per node in bytes (empty = a
+      # quarter of ClickHouse's memory limit). All Agent Lane limits are per
+      # node.
+      NANO_AGENTLANE_WORKLOAD_MAX_MEMORY: ${NANO_AGENTLANE_WORKLOAD_MAX_MEMORY:-}
+      # NAN-5359: memory budget per token per node in bytes (empty = 4 GiB,
+      # or a quarter of ClickHouse's memory limit if smaller).
+      NANO_AGENTLANE_MAX_MEMORY_PER_TOKEN: ${NANO_AGENTLANE_MAX_MEMORY_PER_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -461,7 +475,7 @@ services:
     #            the token. Silent.
     # So never drop the flag, and after any Vector bump confirm env-driven values
     # resolve at runtime (send HEC with the real token and with the literal).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.11-debian@sha256:27e8dc155770379cef504fe647d7611cad527143120a17e2e1bfae8ab4bc54c2
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.12-debian@sha256:f0b6ee0a0dd16b5e26e5f4d01134b3e66b6a4d09fc8b4a97a11d786a22ac8670
     container_name: nanosiem-vector
     network_mode: "service:vector-netns"
     security_opt:

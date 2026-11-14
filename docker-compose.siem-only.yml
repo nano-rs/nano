@@ -111,6 +111,10 @@ services:
     image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
     container_name: nano-clickhouse
     restart: unless-stopped
+    # NAN-5397: an upgrade recreates ClickHouse when its mounted config
+    # changed. Let a busy server flush and stop cleanly instead of the 10 s
+    # default followed by SIGKILL.
+    stop_grace_period: 60s
     depends_on:
       clickhouse-preflight:
         condition: service_completed_successfully
@@ -555,8 +559,30 @@ services:
     # (absent) Vector via a runtime-resolved variable, so nginx still starts
     # cleanly — a request to /ingest would 502, but BYO-aggregator deployments
     # don't use it (your aggregator writes straight to ClickHouse :8123).
+    # NAN-5397: directory mount + link, as in docker-compose.opensource.yml, so
+    # an upgraded config file is what a reload or restart reads.
+    environment:
+      NANO_NGINX_CONF: nginx.opensource.conf
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Another Compose layer (an operator overlay, or a legacy-preserved
+        # overlay from a pre-v2 transition) can still bind-mount a file at
+        # nginx.conf. A mountpoint cannot be replaced: use that file as is.
+        if awk '$$5 == "/etc/nginx/nginx.conf" { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+          echo "nano: /etc/nginx/nginx.conf is bind-mounted by a Compose overlay; using it (NANO_NGINX_CONF ignored)" >&2
+        else
+          case "$${NANO_NGINX_CONF}" in
+            ""|*/*|.*) echo "nano: NANO_NGINX_CONF must be a file name in config/nginx" >&2; exit 1 ;;
+          esac
+          [ -f "/etc/nano/nginx/$${NANO_NGINX_CONF}" ] \
+            || { echo "nano: config/nginx/$${NANO_NGINX_CONF} not found" >&2; exit 1; }
+          ln -sf "/etc/nano/nginx/$${NANO_NGINX_CONF}" /etc/nginx/nginx.conf
+        fi
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
     volumes:
-      - ./config/nginx/nginx.opensource.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx:/etc/nano/nginx:ro
       # NAN-5015: edge client-IP mode (none = strip CDN headers; cdn = forward them).
       - ./config/nginx/client-ip/${NANO_EDGE_CDN_CLIENT_IP:-none}.conf:/etc/nginx/nano-client-ip.d/edge.conf:ro
     ports:

@@ -80,6 +80,11 @@ on:
       - scripts/tests/compose-published-ports.sh
       - scripts/tests/fixtures/compose-published-ports.allow
       - scripts/tests/nginx-internal-404.sh
+      - scripts/tests/nginx-edge-health.test.sh
+      - scripts/tests/compose-config-refresh.test.sh
+      - scripts/tests/compose-legacy-overlay-nginx.test.sh
+      - scripts/tests/test_compose_stale_mounts.py
+      - scripts/lib/compose_stale_mounts.py
       # Open-core relation inventory (relation-inventory job): any Rust or
       # schema change can make open code name a relation the open schema lacks.
       - "**/*.rs"
@@ -269,6 +274,20 @@ jobs:
             bash scripts/tests/nginx-internal-404.sh
           else
             echo "nginx /api/internal test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5397: the edge routes /health, /health/detailed, /ready and /livez
+      # to nano-api with the query string (plain and TLS), and an upgrade's
+      # nginx config is live after the installer sequence.
+      - name: nginx edge health routes and upgraded config
+        run: |
+          if [ -f scripts/tests/nginx-edge-health.test.sh ]; then
+            bash scripts/tests/nginx-edge-health.test.sh
+            bash scripts/tests/compose-config-refresh.test.sh
+            bash scripts/tests/compose-legacy-overlay-nginx.test.sh
+            python3 -I scripts/tests/test_compose_stale_mounts.py
+          else
+            echo "edge health/config refresh tests not in this tree (public mirror); skipping"
           fi
 
       - name: Mirror credential scan tests

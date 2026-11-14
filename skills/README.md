@@ -6,6 +6,7 @@ agents such as Claude Code and Codex.
 | Skill | What it does |
 |---|---|
 | [`nano-deploy`](nano-deploy/SKILL.md) | Sizes, deploys, verifies and operates nano Self-run (enterprise, licensed) on your own hosts: single node, 3-node HA (Compose role split), a fully highly available cluster of N VMs (yours, or new ones on AWS, Azure or GCP) laid out from your data volume, or Kubernetes (Helm). It runs a read-only preflight first, asks before every change (and before creating any cloud resource) and never prints secrets. |
+| [`nano-agentlane`](nano-agentlane/SKILL.md) | Hunts and investigates on nano's event data through Agent Lane, the read-only fast lane for AI agents: connects over HTTPS with an Agent Lane token, follows the lane's limits, and runs tested native ClickHouse SQL recipes (free-text hunts, top-N, timecharts, IOC sweeps, prevalence, identity as-of joins, detections by rule). Needs a token from Settings → Agent Lane (nano Self-run). |
 
 ## Install
 
@@ -21,6 +22,9 @@ Any agent with Agent Skills support, through the open `skills` installer:
 ```bash
 npx skills add nano-rs/nano --skill nano-deploy
 ```
+
+The same commands install `nano-agentlane`: replace `nano-deploy` with
+`nano-agentlane`.
 
 For an agent without skill support, copy the folder anywhere and tell the
 agent: *"Read `nano-deploy/SKILL.md` and follow it."*

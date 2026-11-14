@@ -208,6 +208,8 @@ pub async fn run_health_check_with_trigger(
     }
     // NAN-5077: IP allowlist rule loads that failed (fail-closed enforcement),
     // as published to the system-health bus by nanosiem-api / nanosiem-search.
+    #[cfg(feature = "enterprise")]
+    let mut service_events: Vec<crate::system_health::SystemHealthEvent> = Vec::new();
     match crate::system_health::SystemHealthRepository::new(pool.clone())
         .list(None, Some(crate::system_health::HealthCategory::Service.as_str()), None, 200, 0)
         .await
@@ -216,6 +218,10 @@ pub async fn run_health_check_with_trigger(
             analyzer::ensure_ip_allowlist_findings(&mut analysis, &events);
             // NAN-5149: repeated failed sign-ins for one email.
             analyzer::ensure_login_guessing_findings(&mut analysis, &events);
+            #[cfg(feature = "enterprise")]
+            {
+                service_events = events;
+            }
         }
         Err(e) => warn!("Failed to read service health events: {}", e),
     }
@@ -252,6 +258,12 @@ pub async fn run_health_check_with_trigger(
         }
         Err(e) => warn!("Failed to read collector wasm failures: {}", e),
     }
+
+    // NAN-5360 + NAN-5362: Agent Lane over its active-token cap or blind to
+    // its budgets; query audit lag, refusal spikes, failed logins from
+    // unknown addresses. One registration for both.
+    #[cfg(feature = "enterprise")]
+    super::agentlane_findings::ensure_all(pool, &mut analysis, &service_events).await;
 
     let duration_ms = start.elapsed().as_millis() as i32;
     let status = HealthStatus::from_score(analysis.overall_score);

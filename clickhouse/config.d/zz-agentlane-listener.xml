@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<!--
+  Empty target for the Agent Lane listener bind mount (enterprise, NAN-5361).
+  Docker must find this file inside the read-only config.d parent bind before
+  it can overlay the rendered listener config. Keep it inert: Agent Lane is off
+  unless the enterprise installer renders the listener and mounts it here.
+-->
+<clickhouse/>

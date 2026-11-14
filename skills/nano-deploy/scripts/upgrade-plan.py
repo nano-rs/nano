@@ -498,8 +498,15 @@ def assess(kind: str, units: list[Unit], latest: dict | None, target: tuple | No
         if min_from and current < min_from:
             findings.append(Finding("FAIL", "policy", f"{vstr(target)} upgrades only from {vstr(min_from)} or later; "
                                     f"upgrade to {entry.get('previous_supported_version') or vstr(min_from)} first"))
-        stops = [s for s in entry.get("required_stops") or []
-                 if (sv := parse_version(s)) and current < sv < target]
+        # NAN-5354: the path union, the rule nano_bundle signs into the
+        # manifest: a stop any release up to the target requires counts, so a
+        # later entry that forgot to repeat it cannot reopen the skip.
+        on_path = [entry] + [e for k, e in (policy.get("releases") or {}).items()
+                             if (kv := parse_version(k)) and kv <= target and isinstance(e, dict)]
+        stops = sorted({s for e in on_path for s in e.get("required_stops") or []
+                        if (sv := parse_version(s)) and current < sv < target
+                        and not (min_from and sv <= min_from)},
+                       key=lambda s: parse_version(s) or (0, 0, 0))
         findings.append(Finding("PASS" if not stops else "WARN", "policy",
                                 f"from {vstr(current)} to {vstr(target)}: minimum source "
                                 f"{entry.get('min_from_version') or 'any'}, "

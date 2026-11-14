@@ -3320,6 +3320,20 @@ pub fn create_router(state: AppState) -> Router {
         ));
         app = app.merge(licensed_app);
     }
+    // Session-authenticated enterprise routes that enforce the hard stop
+    // themselves (narrowing operations stay available at it). One generic
+    // seam; the routes are named in the enterprise crate.
+    #[cfg(feature = "enterprise")]
+    {
+        app = app.merge(
+            nanosiem_enterprise::handlers::extension_self_licensed_routes::<AppState>().route_layer(
+                axum_middleware::from_fn_with_state(
+                    state.license_status.clone(),
+                    crate::middleware::license_state_extension,
+                ),
+            ),
+        );
+    }
     // Per-source RBAC scope administration (NAN-1799) — restricted source_type
     // registry + per-group grants. Core surface (not enterprise-gated); the
     // handlers gate on the source_scopes:view / source_scopes:manage

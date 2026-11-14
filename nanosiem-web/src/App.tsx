@@ -242,6 +242,7 @@ const SettingsLandingPage = lazyWithRetryNamed(() => import('@/pages/Settings/Se
 const MelodSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/MelodSettings'), 'MelodSettings');
 const RetentionSettings = lazyWithRetryNamed(() => import('@/pages/Settings/RetentionSettings'), 'RetentionSettings');
 const RiskSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/RiskSettings'), 'RiskSettings');
+const AgentLaneSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/AgentLaneSettings'), 'AgentLaneSettings');
 const SoarSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/SoarSettings'), 'SoarSettings');
 const OidcProvidersPage = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/OidcProviders'), 'OidcProvidersPage');
 const AuditLogPage = lazyWithRetryNamed(() => import('@/pages/Settings/AuditLog'), 'AuditLogPage');
@@ -735,6 +736,14 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="risk:configure" capability="risk" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <RiskSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-5360: Agent Lane switch and agentlane tokens (enterprise) */}
+          <Route path="/settings/agentlane" element={
+            <PermissionRoute permission="agentlane:manage" capability="agentLane" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <AgentLaneSettings key={resetKey} />
               </Suspense>
             } />
           } />

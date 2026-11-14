@@ -900,8 +900,14 @@ mod tests {
         // NAN-5132 adds the two deploy-job GETs to both editions: 685 / 423.
         // NAN-5285 adds /api/internal/vector-config/install-lease (POST +
         // DELETE, one template) to both editions: 686 / 424.
+        // NAN-5360 adds 3 ENTERPRISE Agent Lane templates through the extension
+        // seam (/api/settings/agentlane, /api/settings/agentlane/tokens,
+        // /api/settings/agentlane/tokens/{id}/revoke): 689; open unchanged.
+        // The active-token cap adds PUT /api/settings/agentlane/limits: 690.
+        // NAN-5362 adds the ENTERPRISE /api/settings/agentlane/usage: 691.
+        // NAN-5363 adds the ENTERPRISE /api/settings/agentlane/schema: 692.
         #[cfg(feature = "enterprise")]
-        let min_paths = 686;
+        let min_paths = 692;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's

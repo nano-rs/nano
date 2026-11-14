@@ -8,6 +8,8 @@
 //! drainer checks ClickHouse for the UDM row's content-derived id and for the
 //! OCSF mirror row's id (= `event_id`), so a write that landed but whose
 //! delivery stamp was lost is never duplicated in either table.
+//! NAN-5354: on an OCSF install only the OCSF row is written, so the UDM half
+//! is stamped without an insert.
 //!
 //! The drainer also owns the operator signal: while any event is past its
 //! inline window and still undelivered, it keeps a `system_health_events`
@@ -115,10 +117,15 @@ impl AuditOutboxDrainer {
         let all_ids: Vec<Uuid> = claimed.iter().map(|p| p.event_id).collect();
         let ocsf_required = self.emitter.mirrors_ocsf();
 
-        // UDM half.
+        // UDM half. NAN-5354: an OCSF install writes no UDM audit row, so the
+        // half is stamped without an insert (rows recorded before the upgrade
+        // included).
         let need_udm: Vec<&super::outbox::PendingAuditEvent> =
             claimed.iter().filter(|p| !p.udm_delivered).collect();
-        if !need_udm.is_empty() {
+        if !need_udm.is_empty() && ocsf_required {
+            let ids: Vec<Uuid> = need_udm.iter().map(|p| p.event_id).collect();
+            SecurityAuditOutbox::mark_udm_delivered(&mut tx, &ids).await?;
+        } else if !need_udm.is_empty() {
             let events: Vec<AuditEvent> = need_udm.iter().map(|p| p.event.clone()).collect();
             let present = match self.emitter.existing_udm_ids(&events).await {
                 Ok(present) => present,

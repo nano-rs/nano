@@ -420,6 +420,18 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     capability: 'sso',
   },
   {
+    id: 'agentlane',
+    label: 'Agent Lane',
+    group: 'admin',
+    icon: Route,
+    desc: 'Direct ClickHouse SQL for AI agents: switch, tokens, revocation.',
+    href: '/settings/agentlane',
+    matchPrefixes: ['/settings/agentlane'],
+    permissions: 'agentlane:manage',
+    status: 'ok',
+    capability: 'agentLane',
+  },
+  {
     id: 'audit',
     label: 'Audit Log',
     group: 'admin',

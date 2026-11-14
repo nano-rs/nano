@@ -11,6 +11,10 @@
 //! reports in PostgreSQL. Reports include AI-generated narrative summaries,
 //! scores, and prioritized recommendations.
 
+// NAN-5360 + NAN-5362: Agent Lane findings (active-token cap from enterprise
+// migration 9000096; query-audit conditions from the enterprise harvester).
+#[cfg(feature = "enterprise")]
+pub mod agentlane_findings;
 pub mod analyzer;
 // NAN-5390: ClickHouse refusing nano's logins or writes.
 pub mod clickhouse_refusals;

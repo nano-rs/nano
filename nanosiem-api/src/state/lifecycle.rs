@@ -387,6 +387,17 @@ impl AppState {
             |state| vec![state.start_enrichment_wasm_reconciler()],
         ));
 
+        // Leader-only enterprise extension workers that need no egress (so
+        // they run air-gapped too). One generic seam; the workers are named in
+        // the enterprise crate. Not under the licensed-worker supervisor: they
+        // receive the live license status and enforce the hard stop themselves.
+        #[cfg(feature = "enterprise")]
+        handles.extend(nanosiem_enterprise::handlers::extension_leader_jobs(
+            self,
+            self.leader_fence.clone(),
+            self.license_status.clone(),
+        ));
+
         // === Egress schedulers — skipped in air-gap mode ===
         // Air-gapped installs have no outbound internet, so any job that fetches
         // from the internet (GitHub repo sync, model/MITRE catalogs)

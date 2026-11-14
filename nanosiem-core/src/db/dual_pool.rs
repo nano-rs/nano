@@ -1360,6 +1360,30 @@ impl DualPool {
         }
     }
 
+    /// Test-only pool whose ClickHouse clients all point at `url` (a mock
+    /// HTTP server in emitter tests); PostgreSQL is lazy and never dialled.
+    #[cfg(test)]
+    pub(crate) fn for_mock_clickhouse_tests(url: &str) -> Self {
+        let mut pool = Self::for_sql_generation_tests(false);
+        let client = ClickHouseClient::default().with_url(url).with_database("nanosiem");
+        pool.clickhouse = client.clone();
+        pool.clickhouse_admin = client.clone();
+        pool.clickhouse_rawsql = client.clone();
+        pool.clickhouse_rawsql_noaudit = client;
+        pool
+    }
+
+    /// Like [`Self::for_mock_clickhouse_tests`], with uncompressed responses,
+    /// for mocks that answer SELECTs with hand-built RowBinary (NAN-5362).
+    #[cfg(test)]
+    pub(crate) fn for_mock_clickhouse_select_tests(url: &str) -> Self {
+        let mut pool = Self::for_mock_clickhouse_tests(url);
+        let client = pool.clickhouse.clone().with_compression(clickhouse::Compression::None);
+        pool.clickhouse = client.clone();
+        pool.clickhouse_admin = client;
+        pool
+    }
+
     /// Re-detect cluster state after migrations create distributed tables.
     /// Call this after `ensure_distributed_tables()` to pick up newly created tables.
     pub async fn refresh_cluster_state(&mut self, database: &str) {

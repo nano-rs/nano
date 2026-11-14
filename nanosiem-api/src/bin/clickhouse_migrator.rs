@@ -61,6 +61,12 @@
 //! - `clickhouse_migrator activate-migration-refreshes [--retry-exhausted]` runs one durable
 //!   post-migration refresh pass. The API jobs leader normally owns this; the
 //!   command exists for upgrade validation and operator diagnostics (NAN-4977).
+//! - `clickhouse_migrator ensure-agentlane` converges only the Agent Lane
+//!   profile, workload, role, grants and audit row policies (NAN-5359), using
+//!   `NANO_AGENTLANE_MAX_ROWS_TO_READ` / `NANO_AGENTLANE_MAX_BYTES_TO_READ` /
+//!   `NANO_AGENTLANE_MAX_CONCURRENT_THREADS` / `NANO_AGENTLANE_MAX_MEMORY_PER_TOKEN` /
+//!   `NANO_AGENTLANE_WORKLOAD_MAX_MEMORY` (all per server).
+//!   ClickHouse only; a full migrate runs the same step.
 
 use anyhow::{Context, Result};
 use nanosiem_core::db::{ClickHouseMigrator, Database, DualPoolConfig};
@@ -84,8 +90,9 @@ async fn main() -> ExitCode {
         Some("activate-migration-refreshes") => {
             return activate_migration_refreshes(&args[1..]).await;
         }
+        Some("ensure-agentlane") => return ensure_agentlane(&args[1..]).await,
         Some(other) => {
-            eprintln!("unknown argument {other:?}; usage: clickhouse_migrator [drop-ocsf-legacy [--confirm] | repair-future-timestamps [--skew-seconds N] [--confirm] | purge-future-timestamp-repair --repair-id UUID [--confirm] | activate-migration-refreshes [--retry-exhausted]]");
+            eprintln!("unknown argument {other:?}; usage: clickhouse_migrator [drop-ocsf-legacy [--confirm] | repair-future-timestamps [--skew-seconds N] [--confirm] | purge-future-timestamp-repair --repair-id UUID [--confirm] | activate-migration-refreshes [--retry-exhausted] | ensure-agentlane]");
             return ExitCode::from(2);
         }
     }
@@ -179,6 +186,88 @@ impl Drop for MigrationLock {
         // Dropping the connection closes the session, which releases the
         // advisory lock; the process exits right after `run` in any case.
         drop(self.connection.take());
+    }
+}
+
+/// NAN-5359: the Agent Lane settings from the environment (every limit is
+/// per server; see `AgentlaneSettings`).
+fn agentlane_settings() -> Result<nanosiem_core::db::clickhouse_migrate::AgentlaneSettings> {
+    use nanosiem_core::db::clickhouse_migrate::{
+        agentlane_settings_from_env, AgentlaneEnv, MAX_BYTES_TO_READ_ENV,
+        MAX_CONCURRENT_THREADS_ENV, MAX_MEMORY_PER_TOKEN_ENV, MAX_ROWS_TO_READ_ENV,
+        WORKLOAD_MAX_MEMORY_ENV,
+    };
+    let var = |name: &str| std::env::var(name).ok();
+    let (rows, bytes, threads, per_token, memory) = (
+        var(MAX_ROWS_TO_READ_ENV),
+        var(MAX_BYTES_TO_READ_ENV),
+        var(MAX_CONCURRENT_THREADS_ENV),
+        var(MAX_MEMORY_PER_TOKEN_ENV),
+        var(WORKLOAD_MAX_MEMORY_ENV),
+    );
+    agentlane_settings_from_env(AgentlaneEnv {
+        max_rows_to_read: rows.as_deref(),
+        max_bytes_to_read: bytes.as_deref(),
+        max_concurrent_threads: threads.as_deref(),
+        max_memory_per_token: per_token.as_deref(),
+        workload_max_memory: memory.as_deref(),
+    })
+    .context("reading the Agent Lane settings (NAN-5359)")
+}
+
+/// The admin user and password the migrator connects with, when both are set
+/// (`CLICKHOUSE_ADMIN_USER` / `CLICKHOUSE_ADMIN_PASSWORD`). Used to read
+/// Agent Lane grant drift on every replica.
+fn admin_credentials_from_env() -> Option<(String, String)> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    Some((var("CLICKHOUSE_ADMIN_USER")?, var("CLICKHOUSE_ADMIN_PASSWORD")?))
+}
+
+/// `ensure-agentlane` (NAN-5359): converge only the Agent Lane profile,
+/// workload, role, grants and audit row policies against an already-migrated
+/// ClickHouse. A full migrate runs the same step; this re-applies changed read
+/// caps or workload thread cap without the PostgreSQL work, and drives the
+/// agentlane e2e lane.
+async fn ensure_agentlane(args: &[String]) -> ExitCode {
+    if !args.is_empty() {
+        eprintln!("usage: clickhouse_migrator ensure-agentlane");
+        return ExitCode::from(2);
+    }
+    let result = async {
+        let caps = agentlane_settings()?;
+        let (client, database) = clickhouse_admin_from_env()?;
+        let admin = admin_credentials_from_env();
+        let mut migrator = ClickHouseMigrator::new(client, database);
+        migrator
+            .ensure_agentlane_objects(
+                &caps,
+                admin.as_ref().map(|(user, password)| {
+                    nanosiem_core::db::clickhouse_migrate::NodeCredentials { user, password }
+                }),
+            )
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+    .await;
+    match result {
+        Ok(outcome) => {
+            println!(
+                "Agent Lane objects ensured: {} granted table(s), {} audit-policy table(s), {} revoked grant(s), \
+                 {} node(s) checked for drift, {} unchecked, {} unresolved, workload max_memory {} bytes",
+                outcome.granted_tables,
+                outcome.policy_tables,
+                outcome.revoked,
+                outcome.nodes_checked,
+                outcome.nodes_unchecked,
+                outcome.unresolved_memberships,
+                outcome.workload_max_memory
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ensure-agentlane failed: {error:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -578,6 +667,9 @@ async fn run() -> Result<()> {
 
     let config =
         DualPoolConfig::from_env().context("loading DualPool configuration from environment")?;
+    // NAN-5359: validate the Agent Lane settings before any DDL, so a bad
+    // value fails in the first second instead of after the schema work.
+    let agentlane_caps = agentlane_settings()?;
 
     // NAN-5213: a role-split cluster with several app hosts starts one
     // migrator per host. Serialize the whole run behind a cluster-wide
@@ -844,6 +936,33 @@ async fn run() -> Result<()> {
     tracing::info!(
         "NAN-2001: ensured raw-SQL audit row policies on {} table(s)",
         policy_count
+    );
+
+    // NAN-5359: the Agent Lane profile, workload, role, grants and audit row
+    // policies. After the tables, the `_local` split and migration 189's
+    // `nano` workload root exist. Inert config: no user is created here (the
+    // enterprise token control plane creates one per token). Fails closed so
+    // the role can never hold grants without its audit-hiding policy.
+    let agentlane = migrator
+        .ensure_agentlane_objects(
+            &agentlane_caps,
+            match (&config.clickhouse_admin_user, &config.clickhouse_admin_password) {
+                (Some(user), Some(password)) if !user.is_empty() && !password.is_empty() => {
+                    Some(nanosiem_core::db::clickhouse_migrate::NodeCredentials { user, password })
+                }
+                _ => None,
+            },
+        )
+        .await
+        .context("ensuring the Agent Lane profile, role and workload (NAN-5359)")?;
+    tracing::info!(
+        "NAN-5359: Agent Lane objects ensured ({} granted table(s), {} audit-policy table(s), {} revoked grant(s), {} node(s) checked for drift, {} unchecked, {} unresolved)",
+        agentlane.granted_tables,
+        agentlane.policy_tables,
+        agentlane.revoked,
+        agentlane.nodes_checked,
+        agentlane.nodes_unchecked,
+        agentlane.unresolved_memberships
     );
 
     // NAN-1728 (C2/P0): now that the reference-table `_distributed` wrappers

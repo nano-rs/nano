@@ -77,6 +77,10 @@ pub struct Capabilities {
     /// NAN-4931): external providers through the connector engine plus the
     /// install's own IOC feeds and lists. Enterprise.
     pub threat_intel: bool,
+    /// Agent Lane (`/api/settings/agentlane*`, NAN-5360): direct ClickHouse SQL
+    /// for AI agents with agentlane tokens. Enterprise; an admin still switches
+    /// it on in Settings.
+    pub agent_lane: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -155,6 +159,7 @@ pub(crate) fn capabilities_response(licensed: bool) -> CapabilitiesResponse {
             ioc_lists: licensed,
             soar: licensed,
             threat_intel: licensed,
+            agent_lane: licensed,
         },
     }
 }
@@ -206,6 +211,7 @@ mod tests {
             body.capabilities.ioc_lists,
             body.capabilities.soar,
             body.capabilities.threat_intel,
+            body.capabilities.agent_lane,
         ];
         assert!(licensed_flags.into_iter().all(|available| !available));
         assert!(body.capabilities.siem_health);

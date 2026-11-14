@@ -59,6 +59,13 @@ export interface Capabilities {
    * feeds and lists.
    */
   threatIntel: boolean;
+  /**
+   * Agent Lane: direct ClickHouse SQL for AI agents with agentlane tokens
+   * (`/api/settings/agentlane*`, enterprise; NAN-5360). Build-level only: an
+   * admin still switches it on in Settings > Agent Lane. Optional because older
+   * APIs do not publish it; absent means off.
+   */
+  agentLane?: boolean;
 }
 
 export interface CapabilitiesContextValue {

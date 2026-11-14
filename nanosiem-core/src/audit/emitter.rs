@@ -18,13 +18,18 @@ use crate::ingestion::ClickHouseLogRow;
 /// This writes audit events directly to ClickHouse as searchable logs
 /// with source_type='audit'.
 ///
-/// The UDM row always goes to the shard-local UDM logs table. Clustered reads
-/// still use the distributed wrapper, so the audit page sees the complete
-/// canonical audit store without re-fanning an already shard-routed write.
-/// Under the OCSF profile an OCSF API Activity (6003) mirror row is
-/// additionally written to the profile's `ocsf_logs` table so AUDIT_VIEW
-/// principals can find audit events from the search bar, which reads
-/// `ocsf_logs` under OCSF (NAN-1390 / G16).
+/// Each event is written once, to the active profile's store:
+///
+/// - **UDM:** a row in the shard-local UDM `logs` table. Clustered reads
+///   still use the distributed wrapper, so the audit page sees the complete
+///   canonical audit store without re-fanning an already shard-routed write.
+/// - **OCSF:** an OCSF API Activity (6003) row in `ocsf_logs` (NAN-1390 /
+///   G16), which the search bar and the Audit page both read. NAN-5354
+///   (v2.0.23): no UDM `logs` row is written any more. v2.0.20 to v2.0.22 dual-write so
+///   N-1 pods that read only `logs` kept working during the rolling upgrade;
+///   v2.0.20 is a required upgrade stop (`deploy/release/upgrade-policy.json`),
+///   so every reader is already on the union path
+///   (`audit::query`, which still reads historical `logs` rows).
 ///
 /// Security-critical events ([`Self::emit_durable`]) are first recorded in the
 /// PostgreSQL `security_audit_events` table (NAN-4954), so a ClickHouse
@@ -32,8 +37,8 @@ use crate::ingestion::ClickHouseLogRow;
 pub struct AuditEmitter {
     dual_pool: DualPool,
     /// Whether the active schema profile is OCSF (resolved once at
-    /// construction; the profile is boot-fixed env config). Drives the
-    /// `ocsf_logs` mirror write.
+    /// construction; the profile is boot-fixed env config). When set, events
+    /// are written to `ocsf_logs` only (NAN-5354).
     mirror_to_ocsf: bool,
     /// PostgreSQL record of truth + delivery outbox for security-critical
     /// events (NAN-4954).
@@ -99,11 +104,31 @@ impl std::fmt::Display for InsertFailure {
 /// path; it is the ceiling that also covers the low-volume direct callers.
 static AUDIT_INSERT_BOUND: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
 
+/// A permit from `bound`, waiting at most `wait`. Unlike `try_acquire`, a
+/// saturated bound delays the caller instead of failing it: NAN-5362 callers
+/// retry on their own and prefer a short wait to an immediate refusal, and the
+/// NAN-5354 OCSF-only write is the event's only copy, so a burst must queue.
+/// Still saturated after `wait` is [`InsertFailure::Saturated`].
+async fn acquire_within(
+    bound: &tokio::sync::Semaphore,
+    wait: std::time::Duration,
+) -> Result<tokio::sync::SemaphorePermit<'_>, InsertFailure> {
+    match tokio::time::timeout(wait, bound.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(InsertFailure::Saturated),
+    }
+}
+
 /// Backstop timeout for a single audit insert at the emitter level. Generous on
 /// purpose — API callers wrap their own tighter 4s/5s bounds on top of this; the
 /// backstop only exists so a slow/unresponsive ClickHouse can never hold a permit
 /// (or block a direct caller's background loop) indefinitely.
 const AUDIT_INSERT_BACKSTOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long an OCSF-only write ([`AuditEmitter::emit_ocsf_durable`]) waits for
+/// an [`AUDIT_INSERT_BOUND`] permit before failing (NAN-5354). It is the only
+/// copy of the event, so a momentary burst must queue, not drop it.
+const OCSF_ONLY_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Record an audit event (or batch) dropped by the emitter-level backstop —
 /// loud + observable + log-recoverable, consistent with the API-layer drop
@@ -141,15 +166,22 @@ impl AuditEmitter {
             // fail-fast); defaulting UDM here just keeps audit emission alive
             // no matter what.
             .unwrap_or(false);
+        Self::with_profile(dual_pool, mirror_to_ocsf)
+    }
+
+    /// An emitter for an explicit profile (`ocsf = true` for OCSF), instead of
+    /// the boot env. Tests use it to exercise both profiles in one process.
+    pub(crate) fn with_profile(dual_pool: DualPool, ocsf: bool) -> Self {
         let outbox = SecurityAuditOutbox::new(dual_pool.postgres().clone());
         Self {
             dual_pool,
-            mirror_to_ocsf,
+            mirror_to_ocsf: ocsf,
             outbox,
         }
     }
 
-    /// Whether this emitter writes the OCSF `ocsf_logs` mirror row.
+    /// Whether this emitter writes audit events to OCSF `ocsf_logs` (and, since
+    /// NAN-5354, ONLY there: no UDM `logs` row).
     pub fn mirrors_ocsf(&self) -> bool {
         self.mirror_to_ocsf
     }
@@ -298,6 +330,91 @@ impl AuditEmitter {
         self.emit_batch_inner(events, false).await
     }
 
+    /// Whether this emitter writes the UDM `logs` row: only on UDM installs
+    /// (NAN-5354; an OCSF install writes `ocsf_logs` only). Must match
+    /// [`Self::perform_insert`] (pinned by `checked_path_writes_the_same_stores_as_emit`).
+    fn writes_udm(&self) -> bool {
+        !self.mirror_to_ocsf
+    }
+
+    /// Write a batch synchronously (`async_insert=0`, `wait_end_of_query=1`)
+    /// and report every failure instead of dropping the batch (NAN-5362).
+    ///
+    /// For callers that keep their own record of truth and retry until the
+    /// write lands (the Agent Lane query-audit harvester re-reads
+    /// `system.query_log`). Waits up to `wait` for the process-wide insert
+    /// bound instead of failing at once when it is momentarily full.
+    ///
+    /// Writes the same single store as [`Self::emit`] (NAN-5354): UDM `logs`
+    /// on a UDM install, `ocsf_logs` on an OCSF install. With `verify`, that
+    /// store is checked first and only events it does not yet hold are
+    /// written, so a retry after a write that landed (but whose ack was lost)
+    /// never duplicates it. Without it (events known to be new) every event is
+    /// written.
+    pub async fn emit_batch_checked(
+        &self,
+        events: &[AuditEvent],
+        verify: bool,
+        wait: std::time::Duration,
+    ) -> Result<(), AuditEmitError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let _permit = acquire_within(&AUDIT_INSERT_BOUND, wait)
+            .await
+            .map_err(|failure| AuditEmitError::Storage(failure.to_string()))?;
+        let work = async {
+            let (udm, ocsf): (Vec<AuditEvent>, Vec<AuditEvent>) = if verify {
+                let udm_present = if self.writes_udm() { self.existing_udm_ids(events).await? } else { HashSet::new() };
+                let ocsf_present = self.existing_ocsf_ids(events).await?;
+                (
+                    events.iter().filter(|e| self.writes_udm() && !udm_present.contains(&udm_row_id(e))).cloned().collect(),
+                    events.iter().filter(|e| self.mirror_to_ocsf && !ocsf_present.contains(&e.event_id)).cloned().collect(),
+                )
+            } else {
+                (
+                    if self.writes_udm() { events.to_vec() } else { Vec::new() },
+                    if self.mirror_to_ocsf { events.to_vec() } else { Vec::new() },
+                )
+            };
+            let client = self.write_client(true);
+            if !udm.is_empty() {
+                self.insert_udm(&client, &udm).await?;
+            }
+            if !ocsf.is_empty() {
+                self.insert_ocsf_mirror(&client, &ocsf).await?;
+            }
+            Ok::<(), AuditEmitError>(())
+        };
+        match tokio::time::timeout(AUDIT_INSERT_BACKSTOP_TIMEOUT, work).await {
+            Ok(r) => r,
+            Err(_) => Err(AuditEmitError::Storage(InsertFailure::Timeout.to_string())),
+        }
+    }
+
+    /// `event_id`s of `events` that the store this emitter writes already
+    /// holds (NAN-5362): the content-derived UDM `logs` row on a UDM install,
+    /// the `ocsf_logs` row (whose `id` is the `event_id`) on an OCSF install
+    /// (NAN-5354: one store per profile). Events must keep their
+    /// `occurred_at` between the write and this check.
+    pub async fn delivered_event_ids(
+        &self,
+        events: &[AuditEvent],
+    ) -> Result<HashSet<uuid::Uuid>, AuditEmitError> {
+        let mut delivered: HashSet<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
+        if self.writes_udm() {
+            let present = self.existing_udm_ids(events).await?;
+            let with_udm: HashSet<uuid::Uuid> =
+                events.iter().filter(|e| present.contains(&udm_row_id(e))).map(|e| e.event_id).collect();
+            delivered.retain(|id| with_udm.contains(id));
+        }
+        if self.mirror_to_ocsf {
+            let present = self.existing_ocsf_ids(events).await?;
+            delivered.retain(|id| present.contains(id));
+        }
+        Ok(delivered)
+    }
+
     /// Shared batch-insert entry point for the routine (non-outbox) paths —
     /// applies the emitter-level backstop via [`Self::bounded_insert`]. On
     /// saturation or backstop timeout the batch is DROPPED (full event logged +
@@ -355,17 +472,42 @@ impl AuditEmitter {
             .await
     }
 
-    /// Write ONLY the OCSF `ocsf_logs` mirror rows for `events`, through the same
-    /// bounded, fire-and-forget path as routine audit events (NAN-5271). For
-    /// callers that already write their own UDM `logs` row (case lifecycle
-    /// audit) but whose events must also be searchable on an OCSF tenant. A
-    /// no-op under UDM.
-    pub async fn emit_ocsf_mirror(&self, events: &[AuditEvent]) -> Result<(), AuditEmitError> {
+    /// Write ONLY the OCSF `ocsf_logs` rows for `events` (NAN-5271). For
+    /// callers that write their own UDM `logs` row under UDM (case lifecycle
+    /// audit) and need this store under OCSF. A no-op under UDM.
+    ///
+    /// NAN-5354: on OCSF this is the event's ONLY copy, so the write is
+    /// durable: a synchronous insert (`async_insert=0`, `wait_end_of_query=1`,
+    /// so a flush error is returned instead of lost after an ack on receipt),
+    /// and a saturated [`AUDIT_INSERT_BOUND`] is waited on for up to
+    /// [`OCSF_ONLY_PERMIT_WAIT`] instead of failing at once. Bounded by the
+    /// backstop timeout; any failure is returned.
+    pub async fn emit_ocsf_durable(&self, events: &[AuditEvent]) -> Result<(), AuditEmitError> {
+        self.emit_ocsf_durable_within(events, OCSF_ONLY_PERMIT_WAIT).await
+    }
+
+    pub(crate) async fn emit_ocsf_durable_within(
+        &self,
+        events: &[AuditEvent],
+        permit_wait: std::time::Duration,
+    ) -> Result<(), AuditEmitError> {
         if events.is_empty() || !self.mirror_to_ocsf {
             return Ok(());
         }
-        self.bounded_call(self.insert_ocsf_mirror(&self.write_client(false), events))
+        let _permit = acquire_within(&AUDIT_INSERT_BOUND, permit_wait)
             .await
+            .map_err(|failure| {
+                AuditEmitError::Storage(format!("{failure} for {}ms", permit_wait.as_millis()))
+            })?;
+        match tokio::time::timeout(
+            AUDIT_INSERT_BACKSTOP_TIMEOUT,
+            self.insert_ocsf_mirror(&self.write_client(true), events),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(AuditEmitError::Storage(InsertFailure::Timeout.to_string())),
+        }
     }
 
     /// Outbox-drainer delivery of the OCSF mirror half (synchronous, bounded).
@@ -475,8 +617,10 @@ impl AuditEmitter {
         }
     }
 
-    /// Perform the actual ClickHouse insert(s) for a batch: the UDM row, then
-    /// (under the OCSF profile) the `ocsf_logs` mirror row.
+    /// Perform the actual ClickHouse insert for a batch: the UDM `logs` row
+    /// under UDM, the `ocsf_logs` row under OCSF. NAN-5354: an OCSF install
+    /// writes the audit event once; its Audit page reads the OCSF row through
+    /// the union reader (`audit::query`).
     ///
     /// Callers reach this only via [`Self::bounded_insert`], which holds the
     /// [`AUDIT_INSERT_BOUND`] permit and applies the backstop timeout.
@@ -486,9 +630,10 @@ impl AuditEmitter {
         durable: bool,
     ) -> Result<(), AuditEmitError> {
         let client = self.write_client(durable);
-        self.insert_udm(&client, events).await?;
         if self.mirror_to_ocsf {
             self.insert_ocsf_mirror(&client, events).await?;
+        } else {
+            self.insert_udm(&client, events).await?;
         }
         tracing::debug!(count = events.len(), "Emitted batch of audit events");
         Ok(())
@@ -595,6 +740,18 @@ fn ocsf_mirror_insert_sql(table: &str, rows: usize) -> String {
 #[cfg(test)]
 #[path = "emitter_future_timestamp_tests.rs"]
 mod future_timestamp_tests;
+
+#[cfg(test)]
+#[path = "emitter_single_write_tests.rs"]
+mod single_write_tests;
+
+#[cfg(test)]
+#[path = "emitter_ocsf_durable_tests.rs"]
+mod ocsf_durable_tests;
+
+#[cfg(test)]
+#[path = "emitter_checked_tests.rs"]
+mod checked_tests;
 
 /// Errors that can occur when emitting audit events
 #[derive(Debug, thiserror::Error)]

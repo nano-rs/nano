@@ -1460,6 +1460,75 @@ def load_policy(
     )
 
 
+def _entry_stops(entry: Any, label: str) -> list[tuple[tuple[int, int, int], str]]:
+    if not isinstance(entry, dict) or not isinstance(entry.get("required_stops"), list):
+        raise BundleError(f"upgrade policy {label} required_stops must be an array")
+    return [
+        (_release_core(item, f"upgrade policy {label} required_stops[]", stable=True), item)
+        for item in entry["required_stops"]
+    ]
+
+
+def _check_stop_inheritance(releases: dict[str, Any]) -> None:
+    """NAN-5354: a stop one release requires must be repeated by every LATER
+    release that can still be reached from below it (its `min_from_version` is
+    under the stop). The signed manifest already carries the path union
+    ([`_required_stops_on_path`]), so this is the lint that keeps the policy
+    file honest: a copied entry with `[]` fails at signing and in preflight
+    instead of silently relying on the union."""
+    entries = []
+    for key, entry in releases.items():
+        if not isinstance(entry, dict):
+            raise BundleError("upgrade policy release entry must be an object")
+        minimum = _release_core(
+            entry.get("min_from_version"), f"upgrade policy releases[{key}].min_from_version"
+        )
+        entries.append(
+            (_release_core(key, "upgrade policy release key"), key, minimum,
+             _entry_stops(entry, f"releases[{key}]"))
+        )
+    for core, key, _, stops in entries:
+        for stop_core, stop in stops:
+            for later_core, later_key, later_min, later_stops in entries:
+                if later_core <= core or later_min >= stop_core:
+                    continue
+                if stop_core not in {item for item, _ in later_stops}:
+                    raise BundleError(
+                        f"upgrade policy releases[{later_key}] must repeat required stop {stop} "
+                        f"from releases[{key}] (its min_from_version is below {stop})"
+                    )
+
+
+def _required_stops_on_path(
+    value: dict[str, Any], target: tuple[int, int, int], minimum: tuple[int, int, int]
+) -> list[str]:
+    """NAN-5354: every stop any release up to the target requires, inside the
+    target's supported range (minimum, target). An upgrade to the target must
+    pass each one above the installed version, whichever release added it, so
+    a later entry that forgot an inherited stop cannot reopen the skip."""
+    found: dict[tuple[int, int, int], str] = {}
+    candidates = [("default", value["default"])] + [
+        (key, entry) for key, entry in value["releases"].items()
+        if _release_core(key, "upgrade policy release key") <= target
+    ]
+    for key, entry in candidates:
+        for core, stop in _entry_stops(entry, key):
+            if minimum < core < target:
+                found.setdefault(core, stop)
+    return [found[core] for core in sorted(found)]
+
+
+def skipped_required_stops(policy_bytes: bytes, label: str, installed: str, target: str) -> list[str]:
+    """The required stops an upgrade from `installed` straight to `target`
+    would skip (strictly between them), by the path-union rule. Shared by
+    install.sh re-runs (`nano_bundle.py upgrade-path`) and the tests; the
+    coordinator applies the same rule to the signed manifest's stops."""
+    _, stops, _ = _policy_from_bytes(policy_bytes, label, target)
+    low = _release_core(installed, "installed version")
+    high = _release_core(target, "target version")
+    return [stop for stop in stops if low < _release_core(stop, "required stop") < high]
+
+
 def _policy_from_bytes(
     data: bytes, label: str, version: str, *, require_exact_release: bool = False
 ) -> tuple[str, list[str], dict[str, Any]]:
@@ -1519,6 +1588,11 @@ def _policy_from_bytes(
             raise BundleError(
                 "upgrade policy previous_supported_version must be in the supported range"
             )
+    _check_stop_inheritance(releases)
+    # NAN-5354: the manifest carries the path union, not only this entry's own
+    # stops, so the coordinator's version-path check covers every release on
+    # the way to the target.
+    checked_stops = _required_stops_on_path(value, target_key, minimum_key)
     requires = value["requires"]
     # Reuse the manifest validator for the nested requirements object.
     probe = {
@@ -1865,6 +1939,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     load.add_argument("file")
     load.add_argument("--image-prefix")
+    path = commands.add_parser(
+        "upgrade-path",
+        help="refuse an upgrade that would skip a required stop (install.sh re-runs)",
+    )
+    path.add_argument("--policy", required=True)
+    path.add_argument("--from", dest="installed", required=True)
+    path.add_argument("--to", dest="target", required=True)
     return parser
 
 
@@ -1886,6 +1967,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"verified nano {verified.manifest['version']} {verified.manifest['edition']} "
                     f"{kind} ({len(verified.manifest['images'])} images)"
                 )
+        elif args.command == "upgrade-path":
+            try:
+                data = Path(args.policy).read_bytes()
+            except OSError as exc:
+                raise BundleError(f"cannot read upgrade policy {args.policy}") from exc
+            skipped = skipped_required_stops(data, args.policy, args.installed, args.target)
+            if skipped:
+                raise BundleError(
+                    f"upgrading {args.installed} straight to {args.target} would skip required "
+                    f"stop(s) {', '.join(skipped)}: upgrade to "
+                    + " then ".join(skipped)
+                    + f" first, then to {args.target}"
+                )
+            print(f"upgrade path {args.installed} -> {args.target}: no required stop skipped")
         elif args.command == "load":
             loaded = load_bundle(args.file, image_prefix=args.image_prefix or None)
             role_text = _role_file() or "all"

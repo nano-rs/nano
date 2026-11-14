@@ -163,6 +163,10 @@ services:
     image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
     container_name: nano-clickhouse
     restart: unless-stopped
+    # NAN-5397: an upgrade recreates ClickHouse when its mounted config
+    # changed. Let a busy server flush and stop cleanly instead of the 10 s
+    # default followed by SIGKILL.
+    stop_grace_period: 60s
     depends_on:
       clickhouse-preflight:
         condition: service_completed_successfully
@@ -342,6 +346,29 @@ services:
       # it for a declared planned volume; empty means the shipped 10 minutes
       # (a no-op on untouched views, a reset after a larger tier).
       NANO_PREVALENCE_REFRESH_MINUTES: ${NANO_PREVALENCE_REFRESH_MINUTES:-}
+      # NAN-5359: per-server read caps of the Agent Lane `agentlane` profile.
+      # Empty means the defaults (500M rows / 50 GiB); 0 is refused.
+      NANO_AGENTLANE_MAX_ROWS_TO_READ: ${NANO_AGENTLANE_MAX_ROWS_TO_READ:-}
+      NANO_AGENTLANE_MAX_BYTES_TO_READ: ${NANO_AGENTLANE_MAX_BYTES_TO_READ:-}
+      # NAN-5359: CPU-slot cap of the `agentlane` workload per node, 1-256
+      # (empty = 2). Raise for hunt-heavy installs. P6 at the default of
+      # 2 (2 shards, 6 CPU, 16 agents): nano unaffected (ingest flush p95 -8.9%,
+      # detection lag p95 +9.4%, analyst p50/p95 within 3%), but agents total
+      # 0.62 queries/s (19.7 on plain ClickHouse) and 27% of hunts time out at
+      # 60 s. Raising it trades detection/analyst latency for agent throughput.
+      NANO_AGENTLANE_MAX_CONCURRENT_THREADS: ${NANO_AGENTLANE_MAX_CONCURRENT_THREADS:-}
+      # NAN-5359: memory cap of the whole `agentlane` workload per node, in
+      # bytes (256 MiB-1 TiB). Empty = a quarter of ClickHouse's effective
+      # memory limit; when full, the largest Agent Lane query is killed, never
+      # ingest or detections (and on the server limit, Agent Lane queries are
+      # the first overcommit victims, so ingest waits instead of failing).
+      # Every Agent Lane limit is per node: N nodes behind a load balancer
+      # allow N times as much in total.
+      NANO_AGENTLANE_WORKLOAD_MAX_MEMORY: ${NANO_AGENTLANE_WORKLOAD_MAX_MEMORY:-}
+      # NAN-5359: memory budget per token per node, shared by its concurrent
+      # queries, in bytes (256 MiB-1 TiB; empty = 4 GiB, the per-query cap, or
+      # a quarter of ClickHouse's memory limit if that is smaller).
+      NANO_AGENTLANE_MAX_MEMORY_PER_TOKEN: ${NANO_AGENTLANE_MAX_MEMORY_PER_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -506,7 +533,7 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.11-debian@sha256:27e8dc155770379cef504fe647d7611cad527143120a17e2e1bfae8ab4bc54c2
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.12-debian@sha256:f0b6ee0a0dd16b5e26e5f4d01134b3e66b6a4d09fc8b4a97a11d786a22ac8670
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
@@ -990,8 +1017,34 @@ services:
     logging: *default-logging
     security_opt:
       - no-new-privileges:true
+    # NAN-5397: mount the config DIRECTORY and link nginx.conf into it at start.
+    # A single-file bind mount pins the file's inode: an upgrade's `git reset`
+    # (or a bundle unpack) writes a new file, the running container keeps the
+    # old one, and `nginx -s reload` re-reads the old config. Through the
+    # directory, a reload or restart reads the current file. NANO_NGINX_CONF
+    # picks the file (docker-compose.tls.yml selects the TLS variant).
+    environment:
+      NANO_NGINX_CONF: nginx.opensource.conf
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Another Compose layer (an operator overlay, or a legacy-preserved
+        # overlay from a pre-v2 transition) can still bind-mount a file at
+        # nginx.conf. A mountpoint cannot be replaced: use that file as is.
+        if awk '$$5 == "/etc/nginx/nginx.conf" { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+          echo "nano: /etc/nginx/nginx.conf is bind-mounted by a Compose overlay; using it (NANO_NGINX_CONF ignored)" >&2
+        else
+          case "$${NANO_NGINX_CONF}" in
+            ""|*/*|.*) echo "nano: NANO_NGINX_CONF must be a file name in config/nginx" >&2; exit 1 ;;
+          esac
+          [ -f "/etc/nano/nginx/$${NANO_NGINX_CONF}" ] \
+            || { echo "nano: config/nginx/$${NANO_NGINX_CONF} not found" >&2; exit 1; }
+          ln -sf "/etc/nano/nginx/$${NANO_NGINX_CONF}" /etc/nginx/nginx.conf
+        fi
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
     volumes:
-      - ./config/nginx/nginx.opensource.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx:/etc/nano/nginx:ro
       # NAN-5015: edge client-IP mode (none = strip CDN headers; cdn = forward them).
       - ./config/nginx/client-ip/${NANO_EDGE_CDN_CLIENT_IP:-none}.conf:/etc/nginx/nano-client-ip.d/edge.conf:ro
     ports:
