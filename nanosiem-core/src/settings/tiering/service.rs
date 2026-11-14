@@ -29,25 +29,19 @@ fn clickhouse_cluster_name() -> Option<String> {
     })
 }
 
-/// `system.parts` source that dedupes replicas to one per shard on a cluster
-/// (`cluster(...)`), so per-disk byte/row sums count each shard exactly once.
-/// Plain `system.parts` on single-node.
-fn parts_source_dedup() -> String {
+/// `system.parts` source and database predicate. On a cluster with a fan-out
+/// client, `cluster(...)` dedupes replicas to one per shard so per-disk
+/// byte/row sums count each shard exactly once, and the DB is pinned literally
+/// (`currentDatabase()` is unsafe on remote shards). Without one (single-node,
+/// or no admin identity to hold REMOTE) the local `system.parts`, byte-identical
+/// to the single-node form.
+fn parts_source(fan_out: bool) -> (String, &'static str) {
     match clickhouse_cluster_name() {
-        Some(cl) => format!("cluster('{}', system.parts)", cl),
-        None => "system.parts".to_string(),
-    }
-}
-
-/// Database predicate for `system.parts` reads. `currentDatabase()` is unsafe
-/// inside `cluster(...)` (evaluated on remote shards, where the default DB may
-/// not be `nanosiem`), so on a cluster pin the literal DB the app owns; keep
-/// `currentDatabase()` on single-node so the query is byte-identical.
-fn cluster_db_filter() -> &'static str {
-    if clickhouse_cluster_name().is_some() {
-        "database = 'nanosiem'"
-    } else {
-        "database = currentDatabase()"
+        Some(cl) if fan_out => (
+            format!("cluster('{}', system.parts)", cl),
+            "database = 'nanosiem'",
+        ),
+        _ => ("system.parts".to_string(), "database = currentDatabase()"),
     }
 }
 
@@ -55,6 +49,9 @@ fn cluster_db_filter() -> &'static str {
 pub struct TieringService {
     pg_pool: PgPool,
     ch_client: ClickHouseClient,
+    /// NAN-5367: the identity that may fan out with `cluster(...)` (REMOTE):
+    /// the admin client. The runtime user has no REMOTE by design.
+    fanout_client: Option<ClickHouseClient>,
     crypto: EncryptionService,
     config_dir: PathBuf,
 }
@@ -65,9 +62,16 @@ impl TieringService {
         Self {
             pg_pool,
             ch_client,
+            fanout_client: None,
             crypto: EncryptionService::from_env(),
             config_dir,
         }
+    }
+
+    /// NAN-5367: client for cross-shard `system.parts` reads (needs REMOTE).
+    pub fn with_fanout_client(mut self, client: Option<ClickHouseClient>) -> Self {
+        self.fanout_client = client;
+        self
     }
 
     /// Get current tiering configuration
@@ -798,10 +802,12 @@ impl TieringService {
         // Plain `system.parts` on single-node. Parts belong to the LOCAL
         // MergeTree, so the table filter uses the bare local name.
         let logs_table = crate::schema::active_logs_table();
-        let parts_source = parts_source_dedup();
-        let db_filter = cluster_db_filter();
+        let (parts_source, db_filter) = parts_source(self.fanout_client.is_some());
         let stats: Vec<VolumeStats> = self
-            .ch_client
+            .fanout_client
+            .as_ref()
+            .filter(|_| clickhouse_cluster_name().is_some())
+            .unwrap_or(&self.ch_client)
             .query(&format!(
                 r#"
                 SELECT

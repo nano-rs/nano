@@ -368,36 +368,6 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
-impl From<nanosiem_core::FeedServiceError> for ApiError {
-    fn from(err: nanosiem_core::FeedServiceError) -> Self {
-        match &err {
-            nanosiem_core::FeedServiceError::RepositoryError(repo_err) => {
-                match repo_err {
-                    nanosiem_core::feeds::FeedRepositoryError::NotFound(id) => {
-                        ApiError::NotFound(format!("Feed not found: {}", id))
-                    }
-                    nanosiem_core::feeds::FeedRepositoryError::DuplicateName(name) => {
-                        ApiError::ValidationError(format!("Feed name already exists: {}", name))
-                    }
-                    nanosiem_core::feeds::FeedRepositoryError::DatabaseError(e) => {
-                        tracing::error!(error = %e, "Feed repository database error");
-                        ApiError::DatabaseError("A database error occurred".to_string())
-                    }
-                    nanosiem_core::feeds::FeedRepositoryError::ClickHouseError(e) => {
-                        ApiError::DatabaseError(format!("ClickHouse error: {}", e))
-                    }
-                }
-            }
-            nanosiem_core::FeedServiceError::InvalidPattern(msg) => {
-                ApiError::ValidationError(format!("Invalid regex pattern: {}", msg))
-            }
-            nanosiem_core::FeedServiceError::NoMatchingCriteria => {
-                ApiError::ValidationError("Feed must have at least one matching criteria (match_field with match_pattern or match_values)".to_string())
-            }
-        }
-    }
-}
-
 impl From<nanosiem_core::ParserServiceError> for ApiError {
     fn from(err: nanosiem_core::ParserServiceError) -> Self {
         match &err {

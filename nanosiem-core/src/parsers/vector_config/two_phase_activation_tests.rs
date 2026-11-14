@@ -164,7 +164,11 @@ async fn staging_changes_no_routing_and_activation_touches_only_router_and_entry
         assert_eq!(outside, &vec![PARKED.to_string()], "{id} is not parked");
     }
     // The slots already carry the chain, so B never rebuilds a fan-in.
-    assert!(slots.iter().any(|s| inputs(&a[s]).iter().any(|i| i.starts_with("added_source_"))));
+    // (Only the families of the active profile exist: NAN-5346, OCSF has no
+    // UDM `out` / `kept` slots.)
+    assert!(slots
+        .iter()
+        .any(|s| a.get(s).is_some_and(|d| inputs(d).iter().any(|i| i.starts_with("added_source_")))));
 
     // A → B: the router and the chain's entry only.
     let mut active = staged.clone();

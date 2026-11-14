@@ -127,6 +127,7 @@ fn ingest_lanes_stash_the_claim_in_metadata() {
 
 #[test]
 fn udm_output_restores_the_claim_after_a_root_replacing_parser() {
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let config = VectorConfigManager::new("/tmp/nanosiem-test")
         .generate_parser_config_string(&parser(r#". = { "message": .message, "ext": { "rebuilt": true } }"#));
     let parse_vrl = transform_source(&config, "acme_vpn_parse");

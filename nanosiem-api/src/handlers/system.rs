@@ -256,13 +256,13 @@ async fn get_event_count(
         .map_err(|e| ApiError::InternalError(e.to_string()));
     }
 
-    get_event_count_clickhouse(
-        state.dual_pool.clickhouse(),
-        state.dual_pool.is_clustered(),
-        start,
-        end,
-    )
-    .await
+    // NAN-5367: the cross-shard `cluster(system.parts)` read needs REMOTE,
+    // which only the admin identity holds; without it count the local node.
+    let (client, fan_out) = match state.dual_pool.clickhouse_fanout() {
+        Some(admin) => (admin, state.dual_pool.is_clustered()),
+        None => (state.dual_pool.clickhouse(), false),
+    };
+    get_event_count_clickhouse(client, fan_out, start, end).await
 }
 
 /// Get event count from ClickHouse using system.parts for fast approximate counts

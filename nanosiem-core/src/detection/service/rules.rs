@@ -90,8 +90,8 @@ impl DetectionService {
         &self,
         rule: NewDetectionRule,
     ) -> Result<DetectionRule, DetectionError> {
-        // Validate the query syntax
-        self.validate_query(&rule.query)?;
+        // Validate the query syntax and its fields (NAN-5348)
+        self.validate_rule_query(&rule.query, rule.dataset.as_deref())?;
 
         // Validate cron expression if provided
         if let Some(ref cron) = rule.schedule_cron {
@@ -176,8 +176,8 @@ impl DetectionService {
     ) -> Result<DetectionRule, DetectionError> {
         use crate::models::detection_rule::DetectionMode;
 
-        // Validate the query syntax
-        self.validate_query(&rule.query)?;
+        // Validate the query syntax and its fields (NAN-5348)
+        self.validate_rule_query(&rule.query, rule.dataset.as_deref())?;
 
         // Validate cron expression if provided
         if let Some(ref cron) = rule.schedule_cron {
@@ -364,9 +364,11 @@ impl DetectionService {
             }
         }
 
-        // Validate the query if it's being updated
+        // Validate the query (syntax + fields, NAN-5348) if it's being
+        // updated, under the post-patch dataset.
         if let Some(ref query) = update.query {
-            self.validate_query(query)?;
+            let dataset = update.dataset.as_deref().or(existing_rule.dataset.as_deref());
+            self.validate_rule_query(query, dataset)?;
         }
 
         // Validate cron expression if it's being updated
@@ -432,11 +434,6 @@ impl DetectionService {
 
         let _runtime_lock = self.acquire_rule_runtime_lock(id).await?;
 
-        // Validate the query if it's being updated
-        if let Some(ref query) = update.query {
-            self.validate_query(query)?;
-        }
-
         // Validate cron expression if it's being updated
         if let Some(ref cron) = update.schedule_cron {
             self.validate_cron(cron)?;
@@ -444,6 +441,13 @@ impl DetectionService {
 
         // Get the existing rule to check for mode changes
         let existing_rule = self.get_rule(id).await?;
+
+        // Validate the query (syntax + fields, NAN-5348) if it's being updated,
+        // under the post-patch dataset.
+        if let Some(ref query) = update.query {
+            let dataset = update.dataset.as_deref().or(existing_rule.dataset.as_deref());
+            self.validate_rule_query(query, dataset)?;
+        }
         let old_mode = existing_rule.detection_mode;
         let new_mode = update.detection_mode.unwrap_or(old_mode);
 

@@ -382,7 +382,7 @@ const PANIC_RETRY_BACKOFF_SECS: i64 = 300;
 const DETERMINISTIC_FAILURE_BACKOFF_SECS: i64 = 3600;
 
 /// A failure that retrying the same window cannot fix (NAN-4031).
-fn is_deterministic_failure<T>(result: &Result<T, crate::detection::DetectionError>) -> bool {
+pub(crate) fn is_deterministic_failure<T>(result: &Result<T, crate::detection::DetectionError>) -> bool {
     matches!(
         result,
         Err(crate::detection::DetectionError::InvalidQuery(_)

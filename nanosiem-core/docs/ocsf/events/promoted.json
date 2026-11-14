@@ -698,7 +698,24 @@
   "udm_fields": [
    "protocol"
   ],
-  "prewhere": false
+  "prewhere": false,
+  "enum_values": {
+   "hopopt": 0,
+   "icmp": 1,
+   "igmp": 2,
+   "ipv4": 4,
+   "tcp": 6,
+   "udp": 17,
+   "ipv6": 41,
+   "gre": 47,
+   "esp": 50,
+   "ah": 51,
+   "ipv6-icmp": 58,
+   "ospf": 89,
+   "pim": 103,
+   "vrrp": 112,
+   "sctp": 132
+  }
  },
  {
   "ocsf_path": "traffic.bytes_in",

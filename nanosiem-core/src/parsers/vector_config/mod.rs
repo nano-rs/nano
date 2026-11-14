@@ -30,28 +30,177 @@
 /// object-valued `Authorization` goes too. Arrays are not descended into
 /// (`flatten` keeps them whole). A macro, not a `const`, so it can be
 /// `concat!`-ed into the static config literals.
+///
+/// NAN-5180: the path walk (`flatten` + a split and a downcase per segment)
+/// cost 35-60 us per event on the OCSF lane, and almost no event carries a
+/// credential key. It now runs only when [`credential_key_precheck_vrl!`]
+/// finds one in the event's JSON text, which it always does when the walk
+/// would remove something (see that macro), so the output is unchanged.
 macro_rules! credential_field_redaction_vrl {
     () => {
-        r#"# NAN-4038: credential-named fields never reach storage (any depth,
+        concat!(
+            r#"# NAN-4038: credential-named fields never reach storage (any depth,
 # case-insensitive). See credential_field_redaction_vrl! in vector_config/mod.rs.
 nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
 nano_cred_paths = []
-for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
-    nano_segments = split(nano_flat_key, "\u{1f}")
-    nano_hit = -1
-    for_each(nano_segments) -> |nano_i, nano_seg| {
-        if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
-            nano_hit = nano_i
+# NAN-5352: one gate for both forms. It also matches a credential name written
+# INSIDE a string (`raw_data`, `message`, any other text), which is a superset
+# of the key precheck below, so an event without either pays one scan.
+nano_cred_text = encode_json(.)
+if match(nano_cred_text, "#,
+            credential_text_gate_vrl!(),
+            r#") || match(nano_cred_text, "#,
+            credential_escape_gate_vrl!(),
+            r#") {
+    if match(encode_json(.), "#,
+            credential_key_precheck_vrl!(),
+            r#") {
+        for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
+            nano_segments = split(nano_flat_key, "\u{1f}")
+            nano_hit = -1
+            for_each(nano_segments) -> |nano_i, nano_seg| {
+                if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+                    nano_hit = nano_i
+                }
+            }
+            if nano_hit >= 0 {
+                nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+            }
         }
     }
-    if nano_hit >= 0 {
-        nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+    for_each(nano_cred_paths) -> |_idx, nano_path| {
+        . = object!(remove!(., array!(nano_path)))
     }
-}
-for_each(nano_cred_paths) -> |_idx, nano_path| {
-    . = object!(remove!(., array!(nano_path)))
-}
+"#,
+            credential_text_redaction_vrl!(),
+            r#"}
 "#
+        )
+    };
+}
+
+/// NAN-5352: the text half of the storage boundary. Runs inside the
+/// [`credential_text_gate_vrl!`] branch of [`credential_field_redaction_vrl!`],
+/// after the key walk, over every value of the event:
+///
+/// * an object nested anywhere, including inside an array (which the key walk
+///   does not descend into), loses its credential-named keys, and so does a
+///   dotted attribute name ending in one (`http.request.header.authorization`);
+/// * a string that names a credential has the VALUE replaced by `[REDACTED]`
+///   in place, so `raw_data` / `message` keep the rest of the original text.
+///   Forms: a JSON key (`"Cookie": "..."`, also a flat array/object or a
+///   scalar), the same JSON escaped once inside a string (`\"Cookie\":\"...\"`),
+///   a header line (`Authorization: Bearer ...` to the end of the line,
+///   including folded continuation lines, real or escaped CR/LF), a cookie
+///   header (each cookie VALUE, `Cookie: a=[REDACTED]; b=[REDACTED]`) and
+///   `key=value` (`x-api-key=...`, quoted or not, with an auth scheme word,
+///   ending at whitespace, `;`, `|`, `,` or `&`);
+/// * letters written as JSON `\u00XX` escapes (and the Kelvin sign) are
+///   decoded first in a string that names a credential that way, so an
+///   escaped key is still a key;
+/// * A name counts where it starts the text or follows a non-alphanumeric
+///   character or an escaped `\n` / `\r` / `\t` (a header line inside a
+///   JSON string).
+/// * Fail closed: when a credential name followed by `:` / `=` is still left
+///   with a value that is not `[REDACTED]` (deeper escaping, a nested object
+///   value, a name glued to a preceding letter), the whole string becomes
+///   `[REDACTED: credential-bearing text]`.
+///
+/// The replacements are `replace_with` closures, not `replace(.., "$1...")`:
+/// the pipeline file this lands in is environment-interpolated unescaped, and
+/// Vector reads `$1` there as a reference to an environment variable named
+/// `1` and refuses the whole config. The text has no `$` (a test checks it).
+macro_rules! credential_text_redaction_vrl {
+    () => {
+        concat!(
+            r#"    # NAN-5352: credential values inside text, and credential keys inside
+    # arrays and dotted attribute names; see credential_text_redaction_vrl! in
+    # vector_config/mod.rs.
+    . = map_values(., recursive: true) -> |nano_value| {
+        if is_object(nano_value) {
+            filter(object!(nano_value)) -> |nano_key, _nano_v| {
+                nano_lk = downcase(nano_key)
+                !includes(nano_cred_names, nano_lk) && !match(nano_lk, r'\.(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\z')
+            }
+        } else if is_string(nano_value) && (match(string!(nano_value), "#,
+            credential_text_gate_vrl!(),
+            r#") || match(string!(nano_value), "#,
+            credential_escape_gate_vrl!(),
+            r#")) {
+            nano_text = string!(nano_value)
+            # JSON lets any letter be written as \u00XX; decode those (and the
+            # Kelvin sign) so an escaped name is still a name.
+            nano_norm = nano_text
+            if match(nano_text, r'\\+u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])') {
+                nano_norm = replace(nano_norm, r'\\+u212[Aa]', "K")
+                nano_norm = replace_with(nano_norm, r'\\+u00(?P<nano_h>4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])') -> |nano_e| { decode_base16(to_string(nano_e.nano_h)) ?? "" }
+            }
+            if match(nano_norm, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') {
+                nano_text = nano_norm
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|\[(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\]|\{(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\}|-?[0-9][0-9.eE+-]*|true|false|null)') -> |nano_m| { to_string(nano_m.nano_k) + "\"[REDACTED]\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\"\s*:\s*)(?:\\"(?:[^"\\]|\\\\\\"|\\\\\\\\|\\\\[^"\\])*\\"|-?[0-9][0-9.eE+-]*|true|false|null)') -> |nano_m| { to_string(nano_m.nano_k) + "\\\"[REDACTED]\\\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*[:=][ \t]*)(?:"(?:[^"\\]|\\.)*"|\x27[^\x27]*\x27)') -> |nano_m| { to_string(nano_m.nano_k) + "\"[REDACTED]\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:set-cookie|cookie)[ \t]*:)(?P<nano_v>(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*[^\s"\\\x27|](?:[^\r\n"\\|]|\\[^rn"\\])*(?:(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+(?:[^\r\n"\\|]|\\[^rn"\\])*)*)') -> |nano_m| {
+                    nano_cv = to_string(nano_m.nano_v)
+                    if contains(nano_cv, "=") { to_string(nano_m.nano_k) + replace(nano_cv, r'=[^;\r\n"\\|]*', "=[REDACTED]") } else { to_string(nano_m.nano_k) + " [REDACTED]" }
+                }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key)[ \t]*:)(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*[^\s"\\\x27|](?:[^\r\n"\\|]|\\[^rn"\\])*(?:(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+(?:[^\r\n"\\|]|\\[^rn"\\])*)*') -> |nano_m| { to_string(nano_m.nano_k) + " [REDACTED]" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*=[ \t]*)(?:(?:bearer|basic|digest|negotiate|ntlm|token)[ \t]+)?[^\s"\\\x27&,;|][^\s"\\&,;|]*') -> |nano_m| { to_string(nano_m.nano_k) + "[REDACTED]" }
+                nano_left = replace(nano_text, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=](?:\s*\\*"\[REDACTED\]\\*"|(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*(?:\[REDACTED\]|[^=;\s"\\]+=\[REDACTED\]|[&,;|}\]]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[^ \t\\\r\n]|\\[^trn]|\z)|\z))', "")
+                if match(nano_left, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') {
+                    nano_text = "[REDACTED: credential-bearing text]"
+                }
+            }
+            nano_text
+        } else {
+            nano_value
+        }
+    }
+"#
+        )
+    };
+}
+
+/// NAN-5352: the outer gate of [`credential_field_redaction_vrl!`], matched
+/// against `encode_json(.)`. A credential name followed (after an optional,
+/// possibly escaped, closing quote and whitespace) by `:` or `=`. It matches
+/// every `"<name>":` the key precheck matches, plus the same name written in
+/// a string value at any escaping depth (`\"Cookie\":`, `Cookie: ...`,
+/// `x-api-key=...`). Keep the alternation equal to `nano_cred_names`.
+macro_rules! credential_text_gate_vrl {
+    () => {
+        r#"r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]'"#
+    };
+}
+
+/// NAN-5352: any JSON `\u00XX` escape of a letter or `-` (or of the Kelvin
+/// sign). No encoder needs one, so it only appears in a deliberately spelled
+/// name such as `\u0041uthorization`; a string carrying one is decoded and
+/// checked again. A separate match from [`credential_text_gate_vrl!`] so
+/// each keeps its literal prefilter: one regex with both alternations made
+/// the no-credential path twice as slow.
+macro_rules! credential_escape_gate_vrl {
+    () => {
+        r#"r'\\u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])'"#
+    };
+}
+
+/// NAN-5180: a cheap gate in front of the credential path walk
+/// ([`credential_field_redaction_vrl!`] and the three copies in
+/// `config/vector/00-base.toml`). Matched against `encode_json(<value>)`.
+///
+/// It never misses a key the walk would remove. `encode_json` writes every
+/// object key, at any depth, as `"<key>":` with no whitespace and escapes only
+/// `"`, `\` and control characters, none of which a credential name contains.
+/// The walk compares `downcase(segment)`, and `(?i)` covers every key that
+/// downcases to a name: ASCII case, and U+212A KELVIN SIGN, which downcases to
+/// `k` and which Unicode case folding also maps to `k`. Extra matches (a key
+/// inside an array, `ſ` folding to `s`, ...) only run the walk, which then
+/// decides exactly as before. Keep the alternation equal to
+/// `nano_cred_names` (a test checks it).
+macro_rules! credential_key_precheck_vrl {
+    () => {
+        r#"r'(?i)"(?:authorization|proxy-authorization|x-api-key|x-webhook-secret|cookie|set-cookie)":'"#
     };
 }
 
@@ -134,17 +283,42 @@ pub(crate) const INGEST_TRANSPORT_STRIP_VRL: &str = ingest_transport_strip_vrl!(
 #[cfg(test)]
 pub(crate) const CREDENTIAL_FIELD_REDACTION_VRL: &str = credential_field_redaction_vrl!();
 
+/// NAN-5180: the gate regex literal (VRL raw string), for the sync tests.
+#[cfg(test)]
+pub(crate) const CREDENTIAL_KEY_PRECHECK_VRL: &str = credential_key_precheck_vrl!();
+
+/// NAN-5352: the outer text gate literal (VRL raw string), for the tests.
+#[cfg(test)]
+pub(crate) const CREDENTIAL_TEXT_GATE_VRL: &str = credential_text_gate_vrl!();
+
+/// NAN-5352: the escaped-letter gate literal (VRL raw string), for the tests.
+#[cfg(test)]
+pub(crate) const CREDENTIAL_ESCAPE_GATE_VRL: &str = credential_escape_gate_vrl!();
+
+/// NAN-5352: the text pass spliced into the redaction macro, for the tests.
+#[cfg(test)]
+pub(crate) const CREDENTIAL_TEXT_REDACTION_VRL: &str = credential_text_redaction_vrl!();
+
 mod backup;
 pub(crate) mod config_lock;
 #[cfg(test)]
 #[path = "claim_metadata_tests.rs"]
 mod claim_metadata_tests;
 #[cfg(test)]
+#[path = "credential_precheck_tests.rs"]
+mod credential_precheck_tests;
+#[cfg(test)]
+#[path = "raw_text_redaction_tests.rs"]
+mod raw_text_redaction_tests;
+#[cfg(test)]
 #[path = "hec_payload_tests.rs"]
 mod hec_payload_tests;
 #[cfg(test)]
 #[path = "hec_route_tests.rs"]
 mod hec_route_tests;
+#[cfg(test)]
+#[path = "stage_profile_tests.rs"]
+mod stage_profile_tests;
 #[cfg(test)]
 #[path = "reserved_source_type_guard_tests.rs"]
 mod reserved_source_type_guard_tests;
@@ -154,6 +328,9 @@ mod ocsf_lane_stamp_tests;
 #[cfg(test)]
 #[path = "ocsf_parser_health_tests.rs"]
 mod ocsf_parser_health_tests;
+#[cfg(test)]
+#[path = "ocsf_parse_failure_tests.rs"]
+mod ocsf_parse_failure_tests;
 #[cfg(test)]
 #[path = "token_bound_route_tests.rs"]
 mod token_bound_route_tests;

@@ -34,21 +34,30 @@ async fn cluster_all_shard_ch_probe(
     else {
         return Ok(());
     };
-    let sql = format!("SELECT count() FROM clusterAllReplicas('{cluster}', system.one)");
+    // NAN-5367: run the fan-out as the admin identity, which holds REMOTE
+    // (users.d admin = ALL; k8s/BYOC admin is granted REMOTE, CLUSTER). The
+    // runtime user deliberately has no REMOTE (NAN-2001 SSRF posture), so
+    // issuing this as the runtime user was denied (Code 497) on every call and
+    // the probe never ran. Remote shards answer as the remote_servers user,
+    // which can read system.one. Without admin credentials there is no
+    // identity allowed to fan out: skip without querying, as before.
+    if !dual_pool.has_clickhouse_admin() {
+        tracing::debug!("all-shard health probe skipped: no ClickHouse admin identity configured");
+        return Ok(());
+    }
+    let sql = format!(
+        "SELECT count() FROM clusterAllReplicas('{}', system.one)",
+        nanosiem_core::sql_hygiene::escape_sql_string(&cluster)
+    );
     dual_pool
-        .clickhouse()
+        .clickhouse_admin()
         .query(&sql)
         .fetch_one::<u64>()
         .await
         .map(|_| ())
         .or_else(|e| {
-            // NAN-2025: the runtime `nanosiem` CH user intentionally lacks the
-            // REMOTE grant (`clusterAllReplicas`/`remote` are denied per the
-            // NAN-2001 SSRF posture), and on a single-shard cluster this all-shard
-            // probe has no diagnostic value anyway (the LB `SELECT 1` already
-            // proved the sole shard reachable). Treat a privilege denial as a skip
-            // rather than flipping the whole health check to a false CH-down
-            // verdict and flooding WARN on every /health call.
+            // Defense in depth: an admin identity without REMOTE (a custom
+            // BYOC role) is a skip, not a false ClickHouse-down verdict.
             let msg = e.to_string();
             if msg.contains("ACCESS_DENIED") || msg.contains("Code: 497") {
                 tracing::debug!("all-shard health probe skipped (probe not permitted): {msg}");

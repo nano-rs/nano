@@ -59,6 +59,23 @@ fn runtime_vrl(source: &str) -> (String, bool) {
 /// `%source_type` is the upstream-stashed routing key (the parser's
 /// `. = {OCSF object}` wiped the root); `time` is OCSF epoch-ms.
 pub(super) const OCSF_PREPARE_VRL: &str = concat!(
+    r#"# NAN-5340: an HEC object event's sibling keys (stashed in metadata by
+# hec_normalize) for a text parser that read only its `message`. They land
+# under `unmapped` and never replace a key the parser set. A JSON-input parser
+# received them in its payload; its `_hec_payload` step cleared the stash.
+# NAN-5352: merged BEFORE the credential redaction below, so a sibling such as
+# `Authorization` is removed like any other credential field.
+nano_hec_event = %nano_hec_event
+if is_object(nano_hec_event) && (is_object(.unmapped) || .unmapped == null) {
+    nano_unmapped = object(.unmapped) ?? {}
+    for_each(object!(nano_hec_event)) -> |nano_key, nano_value| {
+        if !includes(["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type", "client_ip", "ingest_client_ip", "ingest_peer"], nano_key) && (get(nano_unmapped, [nano_key]) ?? null) == null {
+            nano_unmapped = set!(nano_unmapped, [nano_key], nano_value)
+        }
+    }
+    if length(nano_unmapped) > 0 { .unmapped = nano_unmapped }
+}
+"#,
     credential_field_redaction_vrl!(),
     ingest_transport_strip_vrl!(),
     r#"ocsf_event = .
@@ -79,20 +96,6 @@ if time_ms > 0 && time_ms <= max_future_ms {
 src_type = downcase(to_string(%source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
 if is_object(ocsf_event) && (to_string(ocsf_event.metadata.log_source) ?? "") == "" { ocsf_event.metadata.log_source = src_type }
-# NAN-5340: an HEC object event's sibling keys (stashed in metadata by
-# hec_normalize) for a text parser that read only its `message`. They land
-# under `unmapped` and never replace a key the parser set. A JSON-input parser
-# received them in its payload; its `_hec_payload` step cleared the stash.
-nano_hec_event = %nano_hec_event
-if is_object(nano_hec_event) && is_object(ocsf_event) && (is_object(ocsf_event.unmapped) || ocsf_event.unmapped == null) {
-    nano_unmapped = object(ocsf_event.unmapped) ?? {}
-    for_each(object!(nano_hec_event)) -> |nano_key, nano_value| {
-        if !includes(["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type", "client_ip", "ingest_client_ip", "ingest_peer"], nano_key) && (get(nano_unmapped, [nano_key]) ?? null) == null {
-            nano_unmapped = set!(nano_unmapped, [nano_key], nano_value)
-        }
-    }
-    if length(nano_unmapped) > 0 { ocsf_event.unmapped = nano_unmapped }
-}
 # NAN-4912: a token-bound sender's differing claim (stashed in metadata by the
 # ingest lanes) survives the parser's root replacement under `unmapped`.
 claimed = to_string(%nano_claimed_source_type) ?? ""
@@ -122,13 +125,75 @@ if is_object(ocsf_event) {
 /// NAN-5070: OCSF parsers report a failed parse in `unmapped.parse_error` (the
 /// OCSF home for vendor data that has no schema field) and still emit a
 /// `class_uid` (0) so the raw record lands in `ocsf_logs`. Root `.parse_error`
-/// / `.metadata.parse_error` never reach this lane (the split sends them to
-/// the UDM recovery path), so this is the only failure signal on the OCSF
-/// lane. Each event takes exactly one of `_ocsf_prepare` / `_output`, so the
-/// health branch counts it once. Runs after [`OCSF_PREPARE_VRL`], which nests
-/// the OCSF object under `.event`.
+/// / `.metadata.parse_error`, runtime failures and output without a
+/// `class_uid` reach this lane as the `_ocsf_failure` record (NAN-5346),
+/// which always sets `unmapped.parse_error`, so this is the only failure
+/// signal on the OCSF lane and each event is counted once. Runs after
+/// [`OCSF_PREPARE_VRL`], which nests the OCSF object under `.event`.
 pub(super) const OCSF_PARSER_FAILURE_VRL: &str =
     "._nano_parser_failure = !is_nullish(.event.unmapped.parse_error)";
+
+/// NAN-5346: suffix of the per-parser OCSF parse-error record remap.
+pub(super) const OCSF_FAILURE_SUFFIX: &str = "_ocsf_failure";
+
+/// NAN-5346: the OCSF parse-error record. Under OCSF a parser runtime failure
+/// (an event Vector rerouted to a parser remap's `.dropped` port, annotated
+/// with `.metadata.dropped`) and any parser output without a `class_uid` (or
+/// with a root `.parse_error` / `.metadata.parse_error`) used to take the UDM
+/// `_output` path into `logs`, which OCSF search never reads. This shapes them
+/// into a Base Event (class 0) that keeps the raw text in `raw_data` and the
+/// error, the failing stage and the parser identity under `unmapped`, like the
+/// record a first-party OCSF parser emits for input it cannot parse (NAN-5340).
+/// The record then takes `_ocsf_prepare`, where [`OCSF_PARSER_FAILURE_VRL`]
+/// counts it as a parse failure. Output the parser did produce is kept whole
+/// under `unmapped.parser_output`. Expects `nano_parser_id` and
+/// `nano_parser_name` to be set first.
+///
+/// Credential-named fields are removed from the event FIRST (the same
+/// key-level redaction [`OCSF_PREPARE_VRL`] runs), because both `raw_data`
+/// (the serialized event when it has no `message`) and `parser_output`
+/// snapshot it here, before `_ocsf_prepare` could redact the copy.
+pub(super) const OCSF_PARSE_FAILURE_RECORD_VRL: &str = concat!(
+    credential_field_redaction_vrl!(),
+    r#"nano_error = ""
+nano_stage = "parser"
+nano_output = null
+if exists(.metadata.dropped.message) {
+    nano_error = to_string(.metadata.dropped.message) ?? "Parser runtime error"
+    nano_stage = to_string(.metadata.dropped.component_id) ?? "parser"
+} else {
+    nano_output = .
+    if exists(.parse_error) {
+        nano_error = to_string(.parse_error) ?? "Unknown parse error"
+    } else if exists(.metadata.parse_error) {
+        nano_error = to_string(.metadata.parse_error) ?? "Unknown parse error"
+    }
+    if nano_error == "" {
+        nano_error = "parser output has no OCSF class_uid"
+        nano_stage = "ocsf_mapping"
+    }
+}
+nano_raw = to_string(.message) ?? ""
+if nano_raw == "" { nano_raw = encode_json(.) }
+nano_time = 0
+nano_ts = .timestamp
+if is_string(nano_ts) { nano_ts = parse_timestamp(to_string(nano_ts) ?? "", "%+") ?? null }
+if is_timestamp(nano_ts) { nano_time = to_unix_timestamp(timestamp!(nano_ts), unit: "milliseconds") }
+nano_unmapped = { "parse_error": nano_error, "parse_stage": nano_stage, "parser_id": nano_parser_id, "parser_name": nano_parser_name }
+if nano_output != null { nano_unmapped = merge(nano_unmapped, { "parser_output": nano_output }) }
+. = {
+    "class_uid": 0,
+    "category_uid": 0,
+    "activity_id": 0,
+    "type_uid": 0,
+    "severity_id": 0,
+    "time": nano_time,
+    "message": "Parse failure (" + nano_parser_name + "): " + nano_error,
+    "raw_data": nano_raw,
+    "metadata": { "product": { "name": nano_parser_name } },
+    "unmapped": nano_unmapped
+}"#
+);
 
 /// NAN-5264: an OCSF record the parser could not really parse, but did not
 /// report as a failure either. First-party OCSF parsers handle input they do
@@ -346,19 +411,32 @@ impl VectorConfigManager {
         };
 
         // NAN-1246: under the OCSF profile, fork OCSF events (the VRL emitted a
-        // root `.class_uid`) off to `ocsf_logs` and send everything else down the
-        // normal UDM `_output` → logs path. Generated per parser — mirrors how the
-        // UDM router/transforms are generated from onboarded sources — and gated on
-        // NANO_SCHEMA_PROFILE=ocsf so UDM deployments stay byte-identical (no lane).
+        // root `.class_uid`) off to `ocsf_logs`. Generated per parser and gated
+        // on NANO_SCHEMA_PROFILE=ocsf so UDM deployments stay byte-identical.
         // The shared `clickhouse_ocsf_logs` sink is emitted once by the deploy
         // orchestration (inputs = every parser's `_ocsf_prepare`).
-        let (ocsf_lane_config, successful_output_input) = if ocsf {
-            let split_name = format!("{}_ocsf_split", safe_name);
-            let lane = self.generate_ocsf_lane(&safe_name, &successful_output_input, parser.id);
-            (lane, format!("{}._unmatched", split_name))
-        } else {
-            (String::new(), successful_output_input)
-        };
+        //
+        // NAN-5346: under OCSF nothing takes the UDM `_output` → `logs` path any
+        // more (no `_output`, no `_sample`). Runtime failures and output without
+        // a `class_uid` become a class-0 parse-error record (`_ocsf_failure`)
+        // on the same `_ocsf_prepare` → `ocsf_logs` path, so they are
+        // searchable and parser health counts them through
+        // `unmapped.parse_error` (NAN-5070).
+        if ocsf {
+            let lane = self.generate_ocsf_lane(
+                parser,
+                &safe_name,
+                &successful_output_input,
+                &failure_inputs,
+            );
+            for block in [&source_config, &transform_config, &extension_config, &lane] {
+                if !block.is_empty() {
+                    config.push_str(block);
+                    config.push_str("\n");
+                }
+            }
+            return config;
+        }
 
         let mut output_inputs = vec![successful_output_input];
         output_inputs.extend(failure_inputs);
@@ -372,10 +450,6 @@ impl VectorConfigManager {
         }
         if !extension_config.is_empty() {
             config.push_str(&extension_config);
-            config.push_str("\n");
-        }
-        if !ocsf_lane_config.is_empty() {
-            config.push_str(&ocsf_lane_config);
             config.push_str("\n");
         }
         config.push_str(&output_config);
@@ -399,40 +473,64 @@ impl VectorConfigManager {
 
     /// NAN-1246: per-parser OCSF fork. Routes events whose VRL emitted a root
     /// `.class_uid` into `{name}_ocsf_prepare` (which shapes the `ocsf_logs` row:
-    /// `{event, timestamp, source_type}`) → the shared `clickhouse_ocsf_logs` sink;
-    /// non-OCSF events fall to `{name}_ocsf_split._unmatched` and continue down the
-    /// UDM `_output` → logs path. `source_type` is recovered from the event
-    /// metadata stashed upstream (the parser's `. = {OCSF object}` wipes the root).
+    /// `{event, timestamp, source_type}`) → the shared `clickhouse_ocsf_logs` sink.
+    /// `source_type` is recovered from the event metadata stashed upstream (the
+    /// parser's `. = {OCSF object}` wipes the root).
+    ///
+    /// NAN-5346: everything else (`{name}_ocsf_split._unmatched`, plus every
+    /// parser-authored remap's `.dropped` port in `failure_inputs`) goes to
+    /// `{name}_ocsf_failure`, which shapes a class-0 parse-error record
+    /// ([`OCSF_PARSE_FAILURE_RECORD_VRL`]) and feeds the same `_ocsf_prepare`.
     fn generate_ocsf_lane(
         &self,
+        parser: &Parser,
         safe_name: &str,
         input_name: &str,
-        parser_id: uuid::Uuid,
+        failure_inputs: &[String],
     ) -> String {
         let split = format!("{}_ocsf_split", safe_name);
         let prepare = format!("{}_ocsf_prepare", safe_name);
+        let failure = format!("{}{OCSF_FAILURE_SUFFIX}", safe_name);
+        let failure_input_list = std::iter::once(format!("{split}._unmatched"))
+            .chain(failure_inputs.iter().cloned())
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "[transforms.{split}]\n\
              type = \"route\"\n\
              inputs = [\"{input_name}\"]\n\
              [transforms.{split}.route]\n\
-             # Explicit parser failures must stay on the UDM recovery path so\n\
-             # metadata.parse_error remains searchable and countable.\n\
+             # Explicit parser failures take the parse-error record path so the\n\
+             # raw event and the error stay searchable and countable.\n\
              ocsf = 'exists(.class_uid) && !exists(.parse_error) && !exists(.metadata.parse_error)'\n\
+             \n\
+             # NAN-5346: runtime failures and output without a class_uid.\n\
+             [transforms.{failure}]\n\
+             type = \"remap\"\n\
+             inputs = [{failure_input_list}]\n\
+             source = '''\n\
+             nano_parser_id = \"{parser_id}\"\n\
+             nano_parser_name = \"{parser_name}\"\n\
+             {failure_record}\n\
+             '''\n\
              \n\
              [transforms.{prepare}]\n\
              type = \"remap\"\n\
-             inputs = [\"{split}.ocsf\"]\n\
+             inputs = [\"{split}.ocsf\", \"{failure}\"]\n\
              source = '''\n\
              {vrl}\n\
              # Protected identity for the pre-sampling parser-health branch.\n\
              # The OCSF ClickHouse sink ignores this internal field.\n\
              ._nano_parser_id = \"{parser_id}\"\n\
-             {failure}\n\
+             {failure_flag}\n\
              {fallback}\n\
              '''\n",
+            parser_id = parser.id,
+            parser_name = escape_vrl_string(&parser.name),
+            failure_record = OCSF_PARSE_FAILURE_RECORD_VRL,
             vrl = OCSF_PREPARE_VRL,
-            failure = OCSF_PARSER_FAILURE_VRL,
+            failure_flag = OCSF_PARSER_FAILURE_VRL,
             fallback = OCSF_PARSER_FALLBACK_VRL
         )
     }
@@ -948,6 +1046,7 @@ mod tests {
 
     #[test]
     fn sampling_never_discards_durable_protocols_or_parse_failures() {
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let m = manager();
         let mut p = make_parser(".message = string!(.message)", None, false);
         p.sampling_ratio = Some(0.1);
@@ -1084,6 +1183,8 @@ mod tests {
     /// escaped string, which is benign).
     #[test]
     fn parser_metadata_vrl_injection_blocked() {
+        // The vendor/product/sample literals live in the UDM `_output` / `_sample`.
+        let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
         let m = manager();
         let mut p = make_parser(".x = 1", None, false);
         p.vendor = Some("evil\"; .pwned = true; //".to_string());
@@ -1161,38 +1262,84 @@ mod tests {
     }
 
     // NAN-1246: the per-parser OCSF lane forks `class_uid` events to `_ocsf_prepare`
-    // and its embedded VRL compiles. (Tests `generate_ocsf_lane` directly to avoid
-    // the env-racy `ocsf_mode` gate.)
+    // and its embedded VRL compiles. NAN-5346: everything else (the unmatched
+    // port and each `.dropped` port) goes to `_ocsf_failure`, which feeds the
+    // same `_ocsf_prepare`. (Tests `generate_ocsf_lane` directly to avoid the
+    // env-racy `ocsf_mode` gate.)
     #[test]
     fn ocsf_lane_routes_class_uid_and_wires_prepare() {
         use vrl::compiler::compile;
         let m = manager();
-        let parser_id = uuid::Uuid::new_v4();
-        let lane = m.generate_ocsf_lane("apache", "apache_parse", parser_id);
-        assert!(lane.contains("[transforms.apache_ocsf_split]"), "{lane}");
-        assert!(lane.contains("inputs = [\"apache_parse\"]"), "{lane}");
+        let mut parser = make_parser(". = .", None, false);
+        parser.name = "apache".into();
+        let lane = m.generate_ocsf_lane(
+            &parser,
+            "apache",
+            "apache_parse",
+            &["apache_parse.dropped".to_string()],
+        );
+        let doc: toml::Table = lane.parse().expect("lane is valid TOML");
+        let t = doc["transforms"].as_table().unwrap();
+        let inputs = |name: &str| -> Vec<String> {
+            t[name]["inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(inputs("apache_ocsf_split"), ["apache_parse"]);
+        assert_eq!(
+            t["apache_ocsf_split"]["route"]["ocsf"].as_str().unwrap(),
+            "exists(.class_uid) && !exists(.parse_error) && !exists(.metadata.parse_error)"
+        );
+        assert_eq!(
+            inputs("apache_ocsf_failure"),
+            ["apache_ocsf_split._unmatched", "apache_parse.dropped"]
+        );
+        assert_eq!(
+            inputs("apache_ocsf_prepare"),
+            ["apache_ocsf_split.ocsf", "apache_ocsf_failure"]
+        );
         assert!(
-            lane.contains(
-                "ocsf = 'exists(.class_uid) && !exists(.parse_error) && \
-                 !exists(.metadata.parse_error)'"
-            ),
+            lane.contains(&format!("._nano_parser_id = \"{}\"", parser.id)),
             "{lane}"
         );
-        assert!(lane.contains("[transforms.apache_ocsf_prepare]"), "{lane}");
-        assert!(
-            lane.contains("inputs = [\"apache_ocsf_split.ocsf\"]"),
-            "{lane}"
+        for name in ["apache_ocsf_failure", "apache_ocsf_prepare"] {
+            let vrl = t[name]["source"].as_str().unwrap();
+            assert!(
+                compile(vrl, &vrl::stdlib::all()).is_ok(),
+                "{name} VRL failed to compile:\n{vrl}"
+            );
+        }
+    }
+
+    /// NAN-5346: the OCSF render has no UDM `_output` / `_sample`, so nothing a
+    /// parser emits can reach `db_parsers_combined` → `logs`; the UDM render is
+    /// unchanged (no OCSF components).
+    #[test]
+    fn ocsf_render_has_no_udm_output_and_udm_render_has_no_ocsf_lane() {
+        let m = manager();
+        let mut parser = make_parser(". = .", Some(".x = 1"), true);
+        parser.sampling_ratio = Some(0.5);
+        let ocsf = m.generate_parser_config_for(&parser, true);
+        let doc: toml::Table = ocsf.parse().expect("valid TOML");
+        let names: Vec<&String> = doc["transforms"].as_table().unwrap().keys().collect();
+        assert!(!names.iter().any(|n| n.ends_with("_output") || n.ends_with("_sample")), "{names:?}");
+        let failure = doc["transforms"]["test_apache_ocsf_failure"]["inputs"].as_array().unwrap();
+        let failure: Vec<&str> = failure.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(
+            failure,
+            [
+                "test_apache_ocsf_split._unmatched",
+                "test_apache_parse.dropped",
+                "test_apache_extension.dropped"
+            ]
         );
-        assert!(
-            lane.contains(&format!("._nano_parser_id = \"{parser_id}\"")),
-            "{lane}"
-        );
-        let opener = "source = '''";
-        let body = &lane[lane.find(opener).unwrap() + opener.len()..];
-        let vrl = &body[..body.find("'''").unwrap()];
-        assert!(
-            compile(vrl, &vrl::stdlib::all()).is_ok(),
-            "generated lane VRL failed to compile:\n{vrl}"
-        );
+
+        let udm = m.generate_parser_config_for(&parser, false);
+        assert!(udm.contains("[transforms.test_apache_output]"), "{udm}");
+        assert!(udm.contains("[transforms.test_apache_sample]"), "{udm}");
+        assert!(!udm.contains("_ocsf_"), "{udm}");
     }
 }

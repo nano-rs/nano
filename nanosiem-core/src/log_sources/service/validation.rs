@@ -37,21 +37,65 @@ const LIVE_SAMPLE_MAX_EXECUTION_TIME_SECS: u32 = 10;
 /// only thing standing between a `log_sources:view` caller and the raw contents
 /// of a restricted feed (or the `audit` trail). An unrestricted caller appends
 /// nothing and the SQL is byte-identical to the pre-scoping form.
+///
+/// NAN-5347: profile-aware. `logs_table` is the active profile's events table
+/// ([`live_sample_table`]). UDM stays byte-identical. On OCSF two things
+/// differ:
+/// - the sample is the ORIGINAL event: `raw_data` when set, else `message`.
+///   OCSF producers keep the original in `raw_data` and often leave `message`
+///   empty or set it to a summary, so reading `message` alone reported "no
+///   events" or re-ran a parser against a summary. The expression is aliased
+///   `sample`, never `message`: a ClickHouse alias shadows the same-named
+///   column everywhere in the statement.
+/// - `source_type` is not lowercased at ingest (direct writers can send mixed
+///   case, NAN-1384), so it compares `lower(source_type)` against the lowered
+///   key, exactly as search does.
 fn build_live_sample_sql(
+    schema: crate::schema::SchemaId,
     logs_table: &str,
     source_type: &str,
     limit: usize,
     scope: &crate::auth::ScopeSet,
 ) -> String {
-    let safe_source_type = crate::sql_hygiene::escape_sql_string(source_type);
+    let ocsf = schema == crate::schema::SchemaId::Ocsf;
+    let (projection, source_filter, present) = if ocsf {
+        (
+            OCSF_SAMPLE_PROJECTION,
+            format!(
+                "lower(source_type) = '{}'",
+                crate::sql_hygiene::escape_sql_string(&source_type.to_lowercase())
+            ),
+            "(raw_data != '' OR message != '')",
+        )
+    } else {
+        (
+            "message",
+            format!(
+                "source_type = '{}'",
+                crate::sql_hygiene::escape_sql_string(source_type)
+            ),
+            "message != ''",
+        )
+    };
     let scope_and =
         crate::search::service::source_scope_sql_predicate("source_type", scope.deny_set())
             .map(|p| format!(" AND {p}"))
             .unwrap_or_default();
     format!(
-        "SELECT message FROM {} WHERE source_type = '{}' AND timestamp >= now() - INTERVAL {} HOUR AND message != ''{} ORDER BY timestamp DESC LIMIT {}",
-        logs_table, safe_source_type, LIVE_SAMPLE_LOOKBACK_HOURS, scope_and, limit
+        "SELECT {} FROM {} WHERE {} AND timestamp >= now() - INTERVAL {} HOUR AND {}{} ORDER BY timestamp DESC LIMIT {}",
+        projection, logs_table, source_filter, LIVE_SAMPLE_LOOKBACK_HOURS, present, scope_and, limit
     )
+}
+
+/// The OCSF sample: the original event (`raw_data`) when the producer kept
+/// it, else `message`.
+const OCSF_SAMPLE_PROJECTION: &str = "if(raw_data != '', raw_data, message) AS sample";
+
+/// The events table the live sample read targets: the profile's store
+/// (`logs` / `ocsf_logs`), routed through the `_distributed` wrapper on a
+/// cluster so every shard's recent events are candidates (NAN-5347).
+fn live_sample_table(schema: crate::schema::SchemaId, tables: &crate::db::TableNames) -> String {
+    tables.read_bare(crate::schema::logs_table_for(schema))
 }
 
 /// Count top-level keys in a JSON object output. Returns 0 if `output` is None
@@ -348,27 +392,39 @@ impl LogSourceService {
         })?;
 
         let limit = limit.min(100);
-        let sql = build_live_sample_sql(self.logs_table, source_type, limit, scope);
+        let table = live_sample_table(self.schema, &self.table_names);
+        let sql = build_live_sample_sql(self.schema, &table, source_type, limit, scope);
 
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct MessageRow {
             message: String,
         }
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct SampleRow {
+            sample: String,
+        }
 
-        let rows: Vec<MessageRow> = ch_client
-            .query(&sql)
-            .with_option(
-                "max_execution_time",
-                LIVE_SAMPLE_MAX_EXECUTION_TIME_SECS.to_string(),
-            )
-            .fetch_all()
-            .await
-            .map_err(|e| {
-                LogSourceServiceError::InvalidVrl(format!(
-                    "Failed to fetch recent sample events: {}",
-                    e
-                ))
-            })?;
+        let query = ch_client.query(&sql).with_option(
+            "max_execution_time",
+            LIVE_SAMPLE_MAX_EXECUTION_TIME_SECS.to_string(),
+        );
+        let fetched = if self.schema == crate::schema::SchemaId::Ocsf {
+            query
+                .fetch_all::<SampleRow>()
+                .await
+                .map(|rows| rows.into_iter().map(|r| r.sample).collect::<Vec<_>>())
+        } else {
+            query
+                .fetch_all::<MessageRow>()
+                .await
+                .map(|rows| rows.into_iter().map(|r| r.message).collect::<Vec<_>>())
+        };
+        let rows = fetched.map_err(|e| {
+            LogSourceServiceError::InvalidVrl(format!(
+                "Failed to fetch recent sample events: {}",
+                e
+            ))
+        })?;
 
         if rows.is_empty() {
             return Err(LogSourceServiceError::InvalidSourceType(format!(
@@ -377,7 +433,7 @@ impl LogSourceService {
             )));
         }
 
-        Ok(rows.into_iter().map(|row| row.message).collect())
+        Ok(rows)
     }
 
     /// Validate a log source's VRL and update its validation status
@@ -404,8 +460,10 @@ impl LogSourceService {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_live_sample_sql, distinct_current_vrl};
+    use super::{build_live_sample_sql, distinct_current_vrl, live_sample_table};
     use crate::auth::ScopeSet;
+    use crate::db::TableNames;
+    use crate::schema::SchemaId::{Ocsf, Udm};
     use std::collections::BTreeSet;
 
     fn deny(items: &[&str]) -> ScopeSet {
@@ -415,6 +473,7 @@ mod tests {
     #[test]
     fn unrestricted_caller_gets_bounded_recent_query() {
         let sql = build_live_sample_sql(
+            Udm,
             "nanosiem.logs",
             "windows_sysmon",
             10,
@@ -430,7 +489,7 @@ mod tests {
 
     #[test]
     fn live_sample_query_always_has_a_timestamp_bound() {
-        let sql = build_live_sample_sql("nanosiem.logs", "windows_sysmon", 10, &deny(&["audit"]));
+        let sql = build_live_sample_sql(Udm, "nanosiem.logs", "windows_sysmon", 10, &deny(&["audit"]));
         let where_at = sql.find(" WHERE ").expect("WHERE clause present");
         assert_eq!(sql.matches(" WHERE ").count(), 1, "got: {sql}");
         assert!(
@@ -446,7 +505,7 @@ mod tests {
         // that request match zero rows — which the handler then reports as the
         // ordinary "no events found for this source" error, indistinguishable
         // from an allowed-but-idle source (no existence oracle).
-        let sql = build_live_sample_sql("nanosiem.logs", "audit", 10, &deny(&["audit"]));
+        let sql = build_live_sample_sql(Udm, "nanosiem.logs", "audit", 10, &deny(&["audit"]));
         assert!(sql.contains("lower(source_type) != 'audit'"), "got: {sql}");
         // The requested source is still bound literally — the deny predicate is
         // ANDed on top rather than replacing the caller's filter.
@@ -458,6 +517,7 @@ mod tests {
         // A predicate appended AFTER `ORDER BY ... LIMIT` would be a syntax
         // error; one appended after `LIMIT` silently truncated. Pin the order.
         let sql = build_live_sample_sql(
+            Udm,
             "nanosiem.logs",
             "windows_sysmon",
             5,
@@ -472,8 +532,127 @@ mod tests {
     #[test]
     fn source_type_stays_escaped_under_scoping() {
         // The scope work must not disturb the existing quote-breakout defense.
-        let sql = build_live_sample_sql("nanosiem.logs", "a'b", 1, &deny(&["audit"]));
+        let sql = build_live_sample_sql(Udm, "nanosiem.logs", "a'b", 1, &deny(&["audit"]));
         assert!(!sql.contains("'a'b'"), "got: {sql}");
+    }
+
+    #[test]
+    fn ocsf_samples_read_the_ocsf_store() {
+        // NAN-5347: the live test lab and Nano Pipe samples read `logs` on every
+        // profile, so an OCSF install (which writes `ocsf_logs`) never found a
+        // sample. The table follows the profile, cluster-routed like search.
+        assert_eq!(live_sample_table(Ocsf, &TableNames::new(false)), "ocsf_logs");
+        assert_eq!(
+            live_sample_table(Ocsf, &TableNames::new(true)),
+            "ocsf_logs_distributed"
+        );
+        // UDM unchanged: the same names `DualPool::logs_table()` returned.
+        assert_eq!(live_sample_table(Udm, &TableNames::new(false)), "logs");
+        assert_eq!(live_sample_table(Udm, &TableNames::new(true)), "logs_distributed");
+    }
+
+    #[test]
+    fn ocsf_sample_query_folds_source_type_and_keeps_its_bounds() {
+        // `source_type` is not lowercased at ingest on OCSF (direct writers),
+        // so the key compares through `lower()`, as search does.
+        let sql = build_live_sample_sql(
+            Ocsf,
+            "ocsf_logs",
+            "Windows_Sysmon",
+            10,
+            &deny(&["audit"]),
+        );
+        assert_eq!(
+            sql,
+            "SELECT if(raw_data != '', raw_data, message) AS sample FROM ocsf_logs \
+             WHERE lower(source_type) = 'windows_sysmon' \
+             AND timestamp >= now() - INTERVAL 24 HOUR AND (raw_data != '' OR message != '') \
+             AND lower(source_type) != 'audit' ORDER BY timestamp DESC LIMIT 10"
+        );
+        assert!(!sql.to_uppercase().contains("PREWHERE"), "{sql}");
+        let evil = build_live_sample_sql(Ocsf, "ocsf_logs", "a'b", 1, &ScopeSet::unrestricted());
+        assert!(!evil.contains("'a'b'"), "got: {evil}");
+    }
+
+    /// Live: the OCSF sample read returns the raw messages an OCSF install
+    /// stores, where the UDM read finds no `logs` table at all. Point
+    /// `NANO_OCSF_TEST_CH_URL` at a throwaway ClickHouse whose
+    /// `nanosiem.ocsf_logs` was created from `clickhouse/ocsf/init.sql`.
+    #[tokio::test]
+    #[ignore = "requires NANO_OCSF_TEST_CH_URL (a ClickHouse with nanosiem.ocsf_logs)"]
+    async fn ocsf_live_samples_come_from_ocsf_logs() {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct MessageRow {
+            message: String,
+        }
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct SampleRow {
+            sample: String,
+        }
+        let client = clickhouse::Client::default()
+            .with_url(std::env::var("NANO_OCSF_TEST_CH_URL").expect("NANO_OCSF_TEST_CH_URL"))
+            .with_database("nanosiem")
+            // Plain HTTP: a stock server image's LZ4 reply did not decompress.
+            .with_compression(clickhouse::Compression::None);
+        let tag = uuid::Uuid::now_v7().simple().to_string();
+        let source = format!("nan5347_live_{tag}");
+        client
+            .query(&format!(
+                "INSERT INTO nanosiem.ocsf_logs (timestamp, source_type, class_uid, message, raw_data) VALUES \
+                 (now64(3) - INTERVAL 5 MINUTE, '{source}', 1007, '<Event>{tag}</Event>', ''), \
+                 (now64(3) - INTERVAL 4 MINUTE, '{source}', 1007, '', '<Raw>{tag}</Raw>'), \
+                 (now64(3) - INTERVAL 3 MINUTE, '{source}', 1007, 'Process launched', '<Original>{tag}</Original>'), \
+                 (now64(3) - INTERVAL 2 MINUTE, '{source}', 1007, '', ''), \
+                 (now64(3) - INTERVAL 2 DAY, '{source}', 1007, 'too old', '')"
+            ))
+            .execute()
+            .await
+            .expect("fixture insert");
+        let tables = TableNames::new(false);
+
+        let before = build_live_sample_sql(
+            Udm,
+            &live_sample_table(Udm, &tables),
+            &source,
+            10,
+            &ScopeSet::unrestricted(),
+        );
+        assert!(
+            client.query(&before).fetch_all::<MessageRow>().await.is_err(),
+            "the UDM sample read should find no `logs` table on an OCSF store"
+        );
+
+        let sql = build_live_sample_sql(
+            Ocsf,
+            &live_sample_table(Ocsf, &tables),
+            // Mixed case: the lane key folds like search does.
+            &source.to_uppercase(),
+            10,
+            &ScopeSet::unrestricted(),
+        );
+        let rows: Vec<SampleRow> = client.query(&sql).fetch_all().await.expect("OCSF sample read");
+        let samples: Vec<String> = rows.into_iter().map(|r| r.sample).collect();
+        // Newest first. The original (`raw_data`) wins over a summary
+        // `message`; a raw_data-only row is a sample; a message-only row
+        // still is; an empty row and the out-of-window row are not.
+        assert_eq!(
+            samples,
+            vec![
+                format!("<Original>{tag}</Original>"),
+                format!("<Raw>{tag}</Raw>"),
+                format!("<Event>{tag}</Event>"),
+            ]
+        );
+
+        let denied = build_live_sample_sql(
+            Ocsf,
+            &live_sample_table(Ocsf, &tables),
+            &source,
+            10,
+            &deny(&[&source]),
+        );
+        let rows: Vec<SampleRow> = client.query(&denied).fetch_all().await.expect("scoped read");
+        assert!(rows.is_empty(), "a denied source returned raw samples");
     }
 
     #[test]

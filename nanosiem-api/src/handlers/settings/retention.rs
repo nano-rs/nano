@@ -323,7 +323,8 @@ pub async fn get_storage_overview(
 
     let dual_pool = state.dual_pool();
     let settings =
-        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
+        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone())
+            .with_fanout_client(dual_pool.clickhouse_fanout().cloned());
 
     let postgres_stats = match settings.get_pg_storage_stats().await {
         Ok(stats) => Some(StorageStatsResponse::from(stats)),
@@ -407,7 +408,8 @@ pub async fn get_clickhouse_storage_stats(
 
     let dual_pool = state.dual_pool();
     let settings =
-        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
+        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone())
+            .with_fanout_client(dual_pool.clickhouse_fanout().cloned());
 
     let stats = settings.get_clickhouse_storage_stats().await?;
     Ok(Json(ClickHouseStorageStatsResponse::from(stats)))
@@ -448,7 +450,8 @@ pub async fn update_clickhouse_retention(
     }
 
     let settings =
-        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
+        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone())
+            .with_fanout_client(dual_pool.clickhouse_fanout().cloned());
 
     settings
         .update_clickhouse_retention(request.retention_days)
@@ -502,7 +505,8 @@ pub async fn run_clickhouse_retention_now(
     let dual_pool = state.dual_pool();
 
     let settings =
-        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
+        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone())
+            .with_fanout_client(dual_pool.clickhouse_fanout().cloned());
 
     // OPTIMIZE TABLE FINAL + MATERIALIZE TTL can take minutes on large tables.
     // Run with a timeout to return a proper error instead of a GKE 502.

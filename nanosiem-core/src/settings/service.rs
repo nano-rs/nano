@@ -59,6 +59,12 @@ impl DualSystemSettings {
         }
     }
 
+    /// NAN-5367: admin client for cross-shard storage stats (REMOTE).
+    pub fn with_fanout_client(mut self, client: Option<ClickHouseClient>) -> Self {
+        self.clickhouse_storage = self.clickhouse_storage.with_fanout_client(client);
+        self
+    }
+
     // PostgreSQL retention settings (for metadata tables)
     pub async fn get_pg_retention_config(&self) -> Result<RetentionConfig, RetentionError> {
         self.retention.get_config().await

@@ -84,6 +84,8 @@ import type {
 import { cn } from '@/lib/utils';
 import { SourceConfigForm } from '@/components/log-sources/SourceConfigForm';
 import { SourceTypeCombobox } from '@/components/log-sources/SourceTypeCombobox';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { sourceConfigSearchUrl } from '@/lib/source-config-search';
 
 // ============================================================================
 // Constants & helpers
@@ -264,6 +266,8 @@ export default function SourceConfigurationDetail() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const { hasPermission } = useAuth();
+  // NAN-5348: View logs filters on the profile's routing-key field.
+  const schemaMap = useSchemaFieldMap();
 
   const canEdit = hasPermission('source_configs:edit');
   const canDeploy = hasPermission('source_configs:deploy');
@@ -646,9 +650,14 @@ export default function SourceConfigurationDetail() {
           onDeploy={() => setDeployTargetOpen(true)}
           onUndeploy={() => setUndeployTargetOpen(true)}
           onOpenConnection={() => setEditConnectionOpen(true)}
-          onViewLogs={() =>
-            navigate(`/search#source_type=${encodeURIComponent(config.config_type)}`)
-          }
+          onViewLogs={schemaMap.guard(() =>
+            navigate(
+              sourceConfigSearchUrl(
+                schemaMap.field('logSource'),
+                config.routing_rules.map((r) => r.target_source_type),
+              ),
+            ),
+          )}
           telemetry={config as AccessTelemetry}
         />
 

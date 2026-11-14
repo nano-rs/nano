@@ -34,8 +34,24 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{ArtifactType, PrevalenceData};
 
-/// How often the `*_prevalence_final_refresh` views run (ClickHouse 160).
+/// How often the `*_prevalence_final_refresh` views run by default (ClickHouse
+/// 160). A planned-volume tier lengthens it (NAN-5345: 30 min at ~1 TB/day,
+/// 60 at >=10 TB/day); the probe reads the live cadence into
+/// [`CoverageProbe::refresh_interval`], and this is the floor and fallback.
 pub const FINAL_REFRESH_INTERVAL: Duration = Duration::minutes(10);
+
+/// The longest live `*_prevalence_final_refresh` cadence in the connection's
+/// database, in seconds (0 when unknown). ClickHouse normalizes the unit (`EVERY 60 MINUTE` reads back as
+/// `EVERY 1 HOUR`), so every unit is converted.
+pub const PREVALENCE_REFRESH_SECONDS_SQL: &str = "SELECT toUInt32(max(multiIf(\
+    unit = 'SECOND', n, unit = 'MINUTE', n * 60, unit = 'HOUR', n * 3600, \
+    unit = 'DAY', n * 86400, unit = 'WEEK', n * 604800, 0))) \
+    FROM (SELECT toUInt32OrZero(extract(create_table_query, 'REFRESH EVERY (\\d+) [A-Z]+')) AS n, \
+                 extract(create_table_query, 'REFRESH EVERY \\d+ ([A-Z]+)') AS unit \
+          FROM system.tables \
+          WHERE database = currentDatabase() \
+            AND name IN ('hash_prevalence_final_refresh', 'domain_prevalence_final_refresh', \
+                         'ip_prevalence_final_refresh'))";
 
 /// `time_bucket` is hourly (`toStartOfHour`): coverage that starts within one
 /// bucket of the window start covers the window.
@@ -135,7 +151,9 @@ impl PrevalenceProductState {
         } else {
             PrevalenceCoverageState::Ready
         };
-        let retry_after_s = (warming || stale).then(|| FINAL_REFRESH_INTERVAL.num_seconds() as u64);
+        // `base.retry_after_s` carries the live refresh interval from classify.
+        let retry_after_s = (warming || stale)
+            .then(|| base.retry_after_s.unwrap_or(FINAL_REFRESH_INTERVAL.num_seconds() as u64));
         PrevalenceProductState { state, warming, stale, partial, retry_after_s, ..base }
     }
 }
@@ -151,6 +169,18 @@ pub struct CoverageProbe {
     pub ingest_head: Option<DateTime<Utc>>,
     /// Oldest last successful `*_prevalence_final_refresh` run.
     pub refreshed_at: Option<DateTime<Utc>>,
+    /// Longest live `*_prevalence_final_refresh` cadence (`None`: unknown).
+    pub refresh_interval: Option<Duration>,
+}
+
+impl CoverageProbe {
+    /// The cadence staleness is judged against: the live one, never below the
+    /// shipped default.
+    pub fn effective_refresh_interval(&self) -> Duration {
+        self.refresh_interval
+            .filter(|interval| *interval > FINAL_REFRESH_INTERVAL)
+            .unwrap_or(FINAL_REFRESH_INTERVAL)
+    }
 }
 
 impl CoverageProbe {
@@ -213,8 +243,9 @@ pub fn classify(
         Some(_) => (false, false),
     };
 
+    let interval = probe.effective_refresh_interval();
     let stale = match (refreshed_at, ingest_head) {
-        (Some(refreshed), Some(head)) => head - refreshed > FINAL_REFRESH_INTERVAL * 2,
+        (Some(refreshed), Some(head)) => head - refreshed > interval * 2,
         _ => false,
     };
 
@@ -231,7 +262,7 @@ pub fn classify(
             refreshed_at,
             ingest_head,
             window_start,
-            retry_after_s: None,
+            retry_after_s: Some(interval.num_seconds() as u64),
             age_s: refreshed_at.map(|refreshed| (now - refreshed).num_seconds().max(0) as u64),
         },
     )
@@ -286,6 +317,7 @@ impl CoverageReport {
         let base = PrevalenceProductState {
             covered_since,
             age_s: states.iter().filter_map(|s| s.age_s).max(),
+            retry_after_s: states.iter().filter_map(|s| s.retry_after_s).max(),
             ..first
         };
         PrevalenceProductState::from_flags(warming, stale, partial, base)

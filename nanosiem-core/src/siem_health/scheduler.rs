@@ -174,11 +174,20 @@ pub async fn run_health_check_with_trigger(
     analyzer::ensure_audit_durability_findings(&mut analysis, &metrics);
     // NAN-5032: sources stored under a platform-owned source type.
     analyzer::ensure_reserved_source_name_findings(&mut analysis, &metrics);
+    // NAN-5342: one shard taking more writes / parts / merges than the rest.
+    analyzer::ensure_shard_skew_findings(&mut analysis, &metrics);
     // Security review 2026-11-08: insecure-but-accepted deployment settings.
     analyzer::ensure_deployment_posture_findings(
         &mut analysis,
         &crate::deployment_posture::PostureInputs::from_env(),
     );
+    // NAN-5367: nano ClickHouse users that still accept any address (Helm
+    // with clickhouse.allowedNetworks unset, or SQL users an older release
+    // created without HOST).
+    match analyzer::open_clickhouse_users(system_probe_client).await {
+        Ok(users) => analyzer::ensure_clickhouse_network_findings(&mut analysis, &users),
+        Err(e) => warn!("Failed to read ClickHouse user networks: {}", e),
+    }
     // NAN-5204: automatic backups enabled but none succeeded in 36 hours.
     match crate::backup_status::BackupStatusRepository::new(pool.clone()).get().await {
         Ok(status) => {

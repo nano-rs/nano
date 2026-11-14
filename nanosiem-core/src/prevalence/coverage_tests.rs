@@ -17,6 +17,7 @@ fn probe(covered_days: Option<i64>, ingest_days: Option<i64>, head_min: i64, ref
         ingest_since: ingest_days.map(|d| now() - Duration::days(d)),
         ingest_head: Some(now() - Duration::minutes(head_min)),
         refreshed_at: refreshed_min.map(|m| now() - Duration::minutes(m)),
+        refresh_interval: None,
     }
 }
 
@@ -53,7 +54,7 @@ fn young_install_shorter_than_the_window_is_warming() {
 fn coverage_within_one_bucket_of_the_window_start_counts_as_covered() {
     let window_start = now() - Duration::hours(24);
     let since = Some(window_start + Duration::minutes(40));
-    let p = CoverageProbe { covered_since: [since; 3], ingest_since: since, ingest_head: Some(now()), refreshed_at: None };
+    let p = CoverageProbe { covered_since: [since; 3], ingest_since: since, ingest_head: Some(now()), refreshed_at: None, refresh_interval: None };
     assert_eq!(hash(&p, CoverageSource::Live, window_start).state, PrevalenceCoverageState::Ready);
 }
 
@@ -147,4 +148,29 @@ fn serializes_snake_case_and_skips_empty_hints() {
     assert_eq!(json["state"], "ready");
     assert!(json.get("retry_after_s").is_none());
     assert!(json["refreshed_at"].is_null());
+}
+
+#[test]
+fn a_longer_planned_volume_cadence_is_not_stale_inside_two_intervals() {
+    // NAN-5345: at ~1 TB/day the views refresh every 30 min. A 45-min-old
+    // snapshot is current there, stale at the shipped 10 min.
+    let mut p = probe(Some(60), Some(60), 1, Some(45));
+    assert_eq!(hash(&p, CoverageSource::Refreshed, now() - Duration::days(7)).state, PrevalenceCoverageState::Stale);
+    p.refresh_interval = Some(Duration::minutes(30));
+    let s = hash(&p, CoverageSource::Refreshed, now() - Duration::days(7));
+    assert_eq!(s.state, PrevalenceCoverageState::Ready);
+    assert_eq!(s.retry_after_s, None);
+    // Past two intervals it is stale, and the retry hint is the live cadence.
+    p.refreshed_at = Some(now() - Duration::minutes(70));
+    let s = hash(&p, CoverageSource::Refreshed, now() - Duration::days(7));
+    assert_eq!(s.state, PrevalenceCoverageState::Stale);
+    assert_eq!(s.retry_after_s, Some(1800));
+}
+
+#[test]
+fn a_cadence_below_the_default_never_tightens_staleness() {
+    let mut p = probe(Some(60), Some(60), 1, Some(15));
+    p.refresh_interval = Some(Duration::minutes(5));
+    assert_eq!(p.effective_refresh_interval(), FINAL_REFRESH_INTERVAL);
+    assert_eq!(hash(&p, CoverageSource::Refreshed, now() - Duration::days(7)).state, PrevalenceCoverageState::Ready);
 }

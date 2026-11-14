@@ -143,7 +143,8 @@ fn get_tiering_service(state: &AppState) -> Result<TieringService, ApiError> {
         dual_pool.postgres().clone(),
         dual_pool.clickhouse().clone(),
         config_dir,
-    ))
+    )
+    .with_fanout_client(dual_pool.clickhouse_fanout().cloned()))
 }
 
 // ============================================================================

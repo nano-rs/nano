@@ -615,6 +615,11 @@ fn eval_expression_to_sql_inner_unguarded(
             })? {
                 return Ok(sql);
             }
+            if let Some(sql) = enum_label_comparison(gen, left, *op, right, |side| {
+                eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             if let Some(sql) = string_literal_comparison(left, *op, right, |side| {
                 eval_expression_to_sql_inner(gen, side, false, field_override)
             })? {
@@ -676,9 +681,15 @@ fn array_subject<'e>(
     let EvalExpression::Field(name) = expr else {
         return None;
     };
-    if field_override.is_some_and(|resolve| resolve(name, false).is_some())
-        || gen.is_upstream_computed_field(name)
-    {
+    if field_override.is_some_and(|resolve| resolve(name, false).is_some()) {
+        return None;
+    }
+    // NAN-5350: a column an upstream `table`/`rename` projected an array into
+    // is a real `Array(T)` stage column, whatever it was read from.
+    if gen.upstream_array(name).is_some() {
+        return Some(name.as_str());
+    }
+    if gen.is_upstream_computed_field(name) {
         return None;
     }
     // Same test as a `stats … by` array field (NAN-4295): a physical
@@ -874,6 +885,46 @@ fn regex_literal_comparison(
     } else {
         format!("({matched})")
     }))
+}
+
+/// `f = "label"` in eval where `f` resolves to a fixed-table enum-int column
+/// (NAN-5348: `if(protocol="udp", …)`, `status_id="failure"`): compare the
+/// int, as the search term and `| where` do. The case-insensitive string fold
+/// below would emit `lower(toString(<int>)) = 'udp'`, which never matches.
+/// Numeric strings and pipeline-computed names keep the generic paths.
+fn enum_label_comparison(
+    gen: &ClickHouseSqlGenerator,
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    lower_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
+) -> Result<Option<String>, SqlGenError> {
+    if !matches!(op, BinaryOperator::Eq | BinaryOperator::Ne) {
+        return Ok(None);
+    }
+    let (subject, field, label) = match (left, right) {
+        (subject @ EvalExpression::Field(f), EvalExpression::Literal(Value::String(l)))
+        | (EvalExpression::Literal(Value::String(l)), subject @ EvalExpression::Field(f)) => {
+            (subject, f, l)
+        }
+        _ => return Ok(None),
+    };
+    if label.parse::<f64>().is_ok()
+        || gen.is_computed_field(field)
+        || gen.is_upstream_computed_field(field)
+    {
+        return Ok(None);
+    }
+    let Some(crate::schema::EnumIntMapping::Values(labels)) = gen.profile.enum_int_mapping(field)
+    else {
+        return Ok(None);
+    };
+    let id = super::enum_values_literal_sql(field, labels, label)?;
+    let subject_sql = lower_side(subject)?;
+    Ok(Some(format!(
+        "({subject_sql} {} {id})",
+        if op == BinaryOperator::Eq { "=" } else { "!=" }
+    )))
 }
 
 /// `f = "x"` / `f != "x"` in eval (NAN-3041): case-insensitive against a

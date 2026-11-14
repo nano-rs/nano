@@ -587,6 +587,10 @@ impl RuleRepositoryService {
                 true, // imported updates never write risk_modifiers
             )
             .map_err(|e| RuleRepositoryError::ConversionFailed(e.to_string()))?;
+            // NAN-5348: the same save-time field check the API save paths run.
+            detection_service
+                .validate_rule_query(&new_rule.query, existing_dataset.as_deref())
+                .map_err(|e| RuleRepositoryError::ConversionFailed(e.to_string()))?;
 
             // Update the existing rule's query, severity, and metadata
             sqlx::query(

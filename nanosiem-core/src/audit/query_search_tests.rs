@@ -14,14 +14,13 @@ fn search_adds_one_bound_condition() {
     };
     let f = resolve_filters(&q);
     assert_eq!(f.search.as_deref(), Some("pa-probe-key"));
-    assert!(f.where_clause.contains(AUDIT_SEARCH_CONDITION));
-    assert!(!f.where_clause.contains("pa-probe-key"));
+    assert_eq!(f.conditions, vec![AUDIT_SEARCH_CONDITION]);
 
     let blank = ClickHouseAuditQuery {
         search: Some("   ".into()),
         ..Default::default()
     };
-    assert!(resolve_filters(&blank).where_clause.is_empty());
+    assert!(resolve_filters(&blank).conditions.is_empty());
 }
 
 #[test]
@@ -32,10 +31,7 @@ fn search_combines_with_other_filters() {
         ..Default::default()
     };
     let f = resolve_filters(&q);
-    assert_eq!(
-        f.where_clause,
-        format!("WHERE action = ? AND {AUDIT_SEARCH_CONDITION}")
-    );
+    assert_eq!(f.conditions, vec!["action = ?", AUDIT_SEARCH_CONDITION]);
 }
 
 #[test]

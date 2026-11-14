@@ -688,6 +688,57 @@ pub fn ensure_audit_durability_findings(analysis: &mut AnalysisResult, metrics: 
     }
 }
 
+/// NAN-5367: the nano ClickHouse users (`nanosiem*`) whose network list
+/// admits any address. Reads `system.users`, which only the admin identity may
+/// read: when the probe client is the runtime-user fallback (no admin
+/// credentials) it returns no users instead of issuing a query that would be
+/// denied.
+pub async fn open_clickhouse_users(
+    system_probe_client: &clickhouse::Client,
+) -> Result<Vec<String>, clickhouse::error::Error> {
+    let current: String = system_probe_client.query("SELECT currentUser()").fetch_one().await?;
+    let runtime = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "nanosiem".into());
+    if current == runtime {
+        return Ok(Vec::new());
+    }
+    system_probe_client
+        .query(
+            "SELECT name FROM system.users WHERE startsWith(name, 'nanosiem') \
+             AND (has(host_ip, '::/0') OR has(host_ip, '0.0.0.0/0')) ORDER BY name",
+        )
+        .fetch_all::<String>()
+        .await
+}
+
+/// NAN-5367: title of the any-address ClickHouse users finding.
+pub const OPEN_CLICKHOUSE_USERS_TITLE: &str = "ClickHouse users accept connections from any address";
+
+/// NAN-5367: a high finding when nano ClickHouse users admit any address.
+pub fn ensure_clickhouse_network_findings(analysis: &mut AnalysisResult, open_users: &[String]) {
+    if open_users.is_empty() {
+        return;
+    }
+    analysis.overall_score = analysis.overall_score.min(79);
+    if analysis.recommendations.iter().any(|r| r.title == OPEN_CLICKHOUSE_USERS_TITLE) {
+        return;
+    }
+    analysis.recommendations.insert(
+        0,
+        Recommendation {
+            title: OPEN_CLICKHOUSE_USERS_TITLE.to_string(),
+            description: format!(
+                "{} accept ClickHouse connections from any address. Set \
+                 clickhouse.allowedNetworks to your pod/node CIDRs (Helm), or re-run install.sh \
+                 (Compose), so only the deployment's own networks can log in. Reachability is \
+                 still limited by the ClusterIP Services and NetworkPolicy, but one exposed port \
+                 or LoadBalancer would open every nano user.",
+                open_users.join(", ")
+            ),
+            priority: "high".to_string(),
+        },
+    );
+}
+
 /// Security review 2026-11-08 (group B): insecure deployment settings that
 /// are still accepted in v2.0.x (a public install token, config delivery on
 /// the install token, development keys on a public deployment). Deterministic
@@ -813,6 +864,20 @@ pub fn ensure_reserved_source_name_findings(
     metrics: &CollectedMetrics,
 ) {
     for rec in reserved_source_name_recommendations(&metrics.reserved_source_names) {
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.push(rec);
+        }
+    }
+}
+
+/// NAN-5342: shards diverging in write rate, parts or merge load (warning
+/// level, `medium`, no score cap), plus a `low` notice when the check could
+/// not run. Deterministic on every report path.
+pub fn ensure_shard_skew_findings(analysis: &mut AnalysisResult, metrics: &CollectedMetrics) {
+    let Some(skew) = metrics.shard_skew.as_ref() else {
+        return;
+    };
+    for rec in super::shard_skew::shard_skew_recommendations(skew) {
         if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
             analysis.recommendations.push(rec);
         }
@@ -1224,7 +1289,7 @@ mod login_guessing_findings_tests;
 mod ingest_watchdog_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// NAN-617: a fresh install with no operator setup and no events yet
@@ -1322,7 +1387,7 @@ mod tests {
 
     /// Base fixture with everything at zero — tests above tweak fields to
     /// exercise specific deployment_state branches.
-    pub(super) fn base_zero_metrics_fixture() -> CollectedMetrics {
+    pub(crate) fn base_zero_metrics_fixture() -> CollectedMetrics {
         CollectedMetrics {
             ingestion: IngestionMetrics {
                 source_volumes: vec![],
@@ -1358,6 +1423,7 @@ mod tests {
             },
             audit_durability: None,
             reserved_source_names: Default::default(),
+            shard_skew: None,
             alerting: AlertingMetrics {
                 total_alerts_24h: 0,
                 total_alerts_prior_24h: 0,

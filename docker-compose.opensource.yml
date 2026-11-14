@@ -212,6 +212,11 @@ services:
       # fallback files are empty, preserving manual compose on older installs.
       - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-config.xml:/etc/clickhouse-server/config.d/zzzz-nano-sizing.xml:ro
       - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-users.xml:/etc/clickhouse-server/users.d/zzzz-nano-sizing.xml:ro
+      # NAN-5367: per-user <networks> rendered by install.sh (Docker address
+      # pools + the NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS allow-list for
+      # nanosiem_ingest). The checked-in fallback is empty, leaving the
+      # loopback + private-range lists in users.d/nanosiem-users.xml.
+      - ${NANO_CLICKHOUSE_NETWORKS_FILE:-./config/sizing-defaults/clickhouse-networks.xml}:/etc/clickhouse-server/users.d/zzzz-nano-networks.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -333,6 +338,10 @@ services:
       # literals exactly — override in .env on a memory-tight box.
       NANO_PREVALENCE_CACHE_CELLS: ${NANO_PREVALENCE_CACHE_CELLS:-1000000}
       NANO_PREVALENCE_CACHE_CELLS_IP: ${NANO_PREVALENCE_CACHE_CELLS_IP:-5000000}
+      # NAN-5345: prevalence *_final_refresh cadence in minutes. install.sh sets
+      # it for a declared planned volume; empty means the shipped 10 minutes
+      # (a no-op on untouched views, a reset after a larger tier).
+      NANO_PREVALENCE_REFRESH_MINUTES: ${NANO_PREVALENCE_REFRESH_MINUTES:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -554,6 +563,9 @@ services:
       VECTOR_DISK_BUFFER_COUNT: ${VECTOR_DISK_BUFFER_COUNT:-8}
       VECTOR_BATCH_MAX_BYTES: ${VECTOR_BATCH_MAX_BYTES:-52428800}
       VECTOR_BATCH_MAX_EVENTS: ${VECTOR_BATCH_MAX_EVENTS:-50000}
+      # NAN-5345: the installer emits 5 only for a planned volume of ~1 TB/day
+      # or more (Helm parity); every other install keeps the 10 s default.
+      VECTOR_BATCH_TIMEOUT_SECS: ${VECTOR_BATCH_TIMEOUT_SECS:-10}
       VECTOR_MEMORY_BUFFER_MAX_EVENTS: ${VECTOR_MEMORY_BUFFER_MAX_EVENTS:-100000}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem
@@ -575,7 +587,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${VECTOR_MEM_LIMIT:-512M}
+          # NAN-5193: ~1 GiB at 16 deployed sources; 512M OOMs.
+          memory: ${VECTOR_MEM_LIMIT:-1G}
           cpus: ${VECTOR_CPU_LIMIT:-2}
 
   # NAN-4919: Nano Pipe live tap relay. Shares Vector's stable network
@@ -1021,6 +1034,10 @@ services:
     environment:
       # nanosiem_ingest password — same source as the clickhouse service.
       CLICKHOUSE_INGEST_PASSWORD: ${CLICKHOUSE_INGEST_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+      # NAN-5345: on more than one shard the pipeline writes the
+      # ocsf_logs_raw_distributed wrapper. The single-node stack has one shard;
+      # the role-split renderer writes the real count into every role env.
+      NANO_CH_SHARDS: ${NANO_CH_SHARDS:-1}
     volumes:
       - ./tenzir/pipeline.tql:/pipeline.tql:ro
     ports:

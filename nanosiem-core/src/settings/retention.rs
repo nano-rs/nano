@@ -47,6 +47,25 @@ fn parts_source_dedup() -> String {
     }
 }
 
+/// NAN-5346: the event tables a retention change applies to. The active
+/// table first; under OCSF also the UDM `logs` table, which an OCSF install
+/// still creates and which keeps its historical rows. Without it `logs` kept
+/// the init.sql TTL whatever the operator set. UDM: `["logs"]` only.
+pub(crate) fn retention_tables_for(active: &'static str) -> Vec<&'static str> {
+    if active == "logs" {
+        vec!["logs"]
+    } else {
+        vec![active, "logs"]
+    }
+}
+
+/// The DELETE TTL a retention change applies to `table`. A metadata ALTER;
+/// the server re-evaluates existing parts in a background mutation
+/// (`materialize_ttl_after_modify`), so the request never waits on a rewrite.
+pub(crate) fn retention_ttl_sql(table: &str, on_cluster: &str, days: u32) -> String {
+    format!("ALTER TABLE {table}{on_cluster} MODIFY TTL timestamp + INTERVAL {days} DAY DELETE")
+}
+
 /// Database predicate for `system.parts` reads. `currentDatabase()` is unsafe
 /// inside `cluster(...)` (evaluated on remote shards, where the default DB may
 /// not be `nanosiem`), so on a cluster pin the literal DB the app owns; keep
@@ -333,11 +352,20 @@ impl RetentionService {
 /// Service for managing ClickHouse storage
 pub struct ClickHouseStorageService {
     client: ClickHouseClient,
+    /// NAN-5367: the identity that may fan out with `cluster(...)` (REMOTE):
+    /// the admin client. The runtime user has no REMOTE by design.
+    fanout_client: Option<ClickHouseClient>,
 }
 
 impl ClickHouseStorageService {
     pub fn new(client: ClickHouseClient) -> Self {
-        Self { client }
+        Self { client, fanout_client: None }
+    }
+
+    /// NAN-5367: client for cross-shard `system.parts` reads (needs REMOTE).
+    pub fn with_fanout_client(mut self, client: Option<ClickHouseClient>) -> Self {
+        self.fanout_client = client;
+        self
     }
 
     /// Get ClickHouse storage statistics for the logs table
@@ -397,14 +425,21 @@ impl ClickHouseStorageService {
         // belong to the LOCAL MergeTree, so the table filter uses the bare local
         // name (not the `_distributed` wrapper).
         let stats_logs_table = crate::schema::active_logs_table();
-        let parts_source = parts_source_dedup();
+        // NAN-5367: fan out only through the admin identity (REMOTE); without
+        // one, read the local shard instead of a query the runtime user is
+        // denied.
+        let fan_out = self.fanout_client.is_some() && clickhouse_cluster_name().is_some();
+        let parts_source = if fan_out { parts_source_dedup() } else { "system.parts".to_string() };
         // Inside `cluster(...)` the WHERE runs on remote shards, where
         // `currentDatabase()` may resolve to the cluster connection's default
         // (not `nanosiem`) and drop every remote row — so on a cluster filter by
         // the literal DB. Single-node keeps `currentDatabase()` (byte-identical).
-        let db_filter = cluster_db_filter();
+        let db_filter = if fan_out { cluster_db_filter() } else { "database = currentDatabase()" };
         let stats: Option<TableStats> = match self
-            .client
+            .fanout_client
+            .as_ref()
+            .filter(|_| fan_out)
+            .unwrap_or(&self.client)
             .query(&format!(
                 r#"
                 SELECT
@@ -538,18 +573,15 @@ impl ClickHouseStorageService {
         // NAN-1728 H1: TTL runs on the LOCAL MergeTree; `ON CLUSTER` fans the
         // ALTER out to every shard (empty clause → byte-identical on single-node)
         // so all shards keep the same retention window.
-        let logs_table = crate::schema::active_logs_table();
+        // NAN-5346: also the UDM `logs` table under OCSF (retention_tables_for).
         let on_cluster = on_cluster_clause();
-        let query = format!(
-            "ALTER TABLE {logs_table}{on_cluster} MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
-            days
-        );
-
-        self.client
-            .query(&query)
-            .execute()
-            .await
-            .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
+        for table in retention_tables_for(crate::schema::active_logs_table()) {
+            self.client
+                .query(&retention_ttl_sql(table, &on_cluster, days))
+                .execute()
+                .await
+                .map_err(|e| RetentionError::ClickHouse(format!("{table}: {e}")))?;
+        }
 
         Ok(())
     }
@@ -604,6 +636,18 @@ impl ClickHouseStorageService {
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
 
+        // NAN-5346: under OCSF also expire the UDM `logs` table's historical
+        // rows. MATERIALIZE TTL only: a background mutation that drops
+        // expired parts, never a blocking OPTIMIZE FINAL of a table that no
+        // longer takes writes. Its rows are not part of the returned count.
+        for table in retention_tables_for(local_logs_table).into_iter().skip(1) {
+            self.client
+                .query(&format!("ALTER TABLE {table}{on_cluster} MATERIALIZE TTL"))
+                .execute()
+                .await
+                .map_err(|e| RetentionError::ClickHouse(format!("{table}: {e}")))?;
+        }
+
         Ok(before.count.saturating_sub(after.count))
     }
 }
@@ -627,3 +671,7 @@ fn format_bytes(bytes: u64) -> String {
         format!("{} bytes", bytes)
     }
 }
+
+#[cfg(test)]
+#[path = "retention_tables_tests.rs"]
+mod retention_tables_tests;

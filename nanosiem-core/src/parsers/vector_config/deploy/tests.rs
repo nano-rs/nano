@@ -554,11 +554,19 @@
         assert!(!udm.contains("disabled_src_output"), "{udm}");
 
         let ocsf = VectorConfigManager::combiner_config_content_for(&[sampled, disabled], true);
+        // NAN-5346: under OCSF every parser record (parse failures included)
+        // leaves through `_ocsf_prepare`; nothing feeds the UDM `logs` stream.
         assert_eq!(
             resolved_inputs(&[&ocsf], "db_parser_health"),
-            vec!["limacharlie_output".to_string(), "limacharlie_ocsf_prepare".to_string()],
-            "OCSF health must combine UDM fallback/failures with native successes: {ocsf}"
+            vec!["limacharlie_ocsf_prepare".to_string()],
+            "OCSF health reads the OCSF lane only: {ocsf}"
         );
+        assert_eq!(
+            resolved_inputs(&[&ocsf], "db_parsers_combined"),
+            vec!["prepare_output".to_string()],
+            "only the never-matching parked filter; no parser output reaches logs under OCSF: {ocsf}"
+        );
+        assert!(!ocsf.contains("limacharlie_output") && !ocsf.contains("limacharlie_sample"), "{ocsf}");
 
         let vrl_blocks = extract_vrl_blocks(&ocsf);
         let health_vrl = vrl_blocks.last().expect("health mapper VRL");

@@ -46,6 +46,12 @@
 #   HTTP and OTLP acknowledge: after the disk buffer fsyncs, or once the record
 #   is in the page cache (faster; a host failure loses acknowledged events).
 #   Recorded in .env; one value for every ingest host.
+#   NANO_PLANNED_GB_PER_DAY (whole GB/day, 0 = not declared) and NANO_INGEST_PATH
+#   (raw | preshaped) — NAN-5345 planned-volume sizing. Unset keeps host-only
+#   sizing; ~300 GB/day and up select the large-deployment ClickHouse and
+#   Vector settings. Asked once on a fresh interactive install, kept in .env.
+#   NANO_AVG_EVENT_BYTES (default 1000; ~300 firewall/flow, ~2000 EDR) turns
+#   the planned volume into events/s for the Vector CPU estimate (NAN-5372).
 #
 # Override defaults: NANO_INSTALL_DIR, NANO_REPO_URL, NANO_BRANCH, NANO_VERSION.
 # NANO_VERSION defaults to the release recorded in the edition's images lock
@@ -536,6 +542,125 @@ configure_ingest_ack_durability() {
     fi
     # Compose gives the shell environment precedence over .env.
     export NANO_INGEST_ACK_DURABILITY="$effective"
+}
+
+# NAN-5345: planned daily volume and ingest path. Large-deployment ClickHouse
+# and Vector settings apply only when the operator declares a planned volume
+# that needs them; host size still caps every number. An existing install
+# never gains a planned volume (or a prompt) on upgrade: it is asked only on
+# a fresh interactive install, or set with NANO_PLANNED_GB_PER_DAY.
+valid_planned_gb_per_day() {
+    [[ "${1:-}" =~ ^[0-9]{1,7}$ ]]
+}
+
+valid_avg_event_bytes() {
+    [[ "${1:-}" =~ ^[0-9]{2,6}$ ]] && (( 10#$1 >= 50 ))
+}
+
+validate_planned_volume_input() {
+    local input="${NANO_PLANNED_GB_PER_DAY:-}" path="${NANO_INGEST_PATH:-}"
+    if [[ -n "$input" ]] && ! valid_planned_gb_per_day "$input"; then
+        fail "NANO_PLANNED_GB_PER_DAY must be a whole number of GB per day, 0 for none (got '$input')."
+    fi
+    if [[ -n "$path" && "$path" != raw && "$path" != preshaped ]]; then
+        fail "NANO_INGEST_PATH must be raw or preshaped (got '$path')."
+    fi
+    if [[ -n "${NANO_AVG_EVENT_BYTES:-}" ]] && ! valid_avg_event_bytes "$NANO_AVG_EVENT_BYTES"; then
+        fail "NANO_AVG_EVENT_BYTES must be a whole number of bytes, 50-999999 (got '$NANO_AVG_EVENT_BYTES')."
+    fi
+    return 0
+}
+
+configure_planned_volume() {
+    local input="${NANO_PLANNED_GB_PER_DAY:-}" path_input="${NANO_INGEST_PATH:-}"
+    local bytes_input="${NANO_AVG_EVENT_BYTES:-}"
+    local recorded recorded_path recorded_bytes answer default_path=raw
+    validate_planned_volume_input
+    [[ "${BUNDLE_TENZIR:-0}" == "1" ]] && default_path=preshaped
+    recorded=$(env_value NANO_PLANNED_GB_PER_DAY)
+    recorded_path=$(env_value NANO_INGEST_PATH)
+    recorded_bytes=$(env_value NANO_AVG_EVENT_BYTES)
+    if [[ -n "$recorded" ]] && ! valid_planned_gb_per_day "$recorded"; then
+        fail "NANO_PLANNED_GB_PER_DAY in .env must be a whole number of GB per day (got '$recorded'). Fix .env and re-run."
+    fi
+    if [[ -n "$recorded_path" && "$recorded_path" != raw && "$recorded_path" != preshaped ]]; then
+        fail "NANO_INGEST_PATH in .env must be raw or preshaped (got '$recorded_path'). Fix .env and re-run."
+    fi
+    if [[ -n "$recorded_bytes" ]] && ! valid_avg_event_bytes "$recorded_bytes"; then
+        fail "NANO_AVG_EVENT_BYTES in .env must be a whole number of bytes, 50-999999 (got '$recorded_bytes'). Fix .env and re-run."
+    fi
+    if [[ -z "$input" && -z "$recorded" && "${REUSE_ENV:-0}" != "1" && "${MULTI_NODE:-0}" != "1" ]] \
+        && have_controlling_tty; then
+        while :; do
+            answer=$(prompt_tty "Planned log volume in GB per day (Enter to skip: settings then follow this host's size only)")
+            answer=$(printf '%s' "$answer" | tr -d '[:space:]')
+            [[ -z "$answer" ]] && break
+            valid_planned_gb_per_day "$answer" && { input=$answer; break; }
+            warn "Enter a whole number of GB per day, or press Enter to skip."
+        done
+        if [[ -n "$input" && "$input" != 0 && -z "$path_input" && -z "$recorded_path" ]]; then
+            while :; do
+                answer=$(prompt_tty "Do events arrive as raw logs that nano parses, or pre-shaped OCSF (Tenzir/Cribl)? raw/preshaped" "$default_path")
+                [[ "$answer" == raw || "$answer" == preshaped ]] && { path_input=$answer; break; }
+                warn "Enter raw or preshaped."
+            done
+        fi
+    fi
+    [[ -n "$input" ]] && input=$(( 10#$input ))
+    [[ -n "$bytes_input" ]] && bytes_input=$(( 10#$bytes_input ))
+    # Role-split: the shared .env is the one source, edited on the app host
+    # and copied to every host (same rule as NANO_INGEST_ACK_DURABILITY).
+    if [[ "${MULTI_NODE:-0}" == "1" && ",${ROLE_ARG:-}," != *,app,* ]] \
+        && { [[ -n "$input" && "$input" != "$recorded" ]] \
+            || [[ -n "$path_input" && "$path_input" != "$recorded_path" ]] \
+            || [[ -n "$bytes_input" && "$bytes_input" != "$recorded_bytes" ]]; }; then
+        fail "NANO_PLANNED_GB_PER_DAY / NANO_INGEST_PATH / NANO_AVG_EVENT_BYTES differ from this host's .env. Every host must size from the same planned volume: set them in the app host's .env, copy that .env to every host, then re-run install.sh here."
+    fi
+    if [[ -n "$input" && "$input" != "$recorded" ]]; then
+        nano_env_set_keys .env "NANO_PLANNED_GB_PER_DAY=$input" \
+            || fail "Could not record NANO_PLANNED_GB_PER_DAY in .env."
+        recorded=$input
+        log "Recorded NANO_PLANNED_GB_PER_DAY=$input in .env"
+    fi
+    if [[ -n "$path_input" && "$path_input" != "$recorded_path" ]]; then
+        nano_env_set_keys .env "NANO_INGEST_PATH=$path_input" \
+            || fail "Could not record NANO_INGEST_PATH in .env."
+        recorded_path=$path_input
+        log "Recorded NANO_INGEST_PATH=$path_input in .env"
+    fi
+    if [[ -n "$bytes_input" && "$bytes_input" != "$recorded_bytes" ]]; then
+        nano_env_set_keys .env "NANO_AVG_EVENT_BYTES=$bytes_input" \
+            || fail "Could not record NANO_AVG_EVENT_BYTES in .env."
+        recorded_bytes=$bytes_input
+        log "Recorded NANO_AVG_EVENT_BYTES=$bytes_input in .env"
+    fi
+    PLANNED_GB_PER_DAY="${recorded:-0}"
+    PLANNED_INGEST_PATH="${recorded_path:-$default_path}"
+    PLANNED_AVG_EVENT_BYTES="${recorded_bytes:-1000}"
+}
+
+# One KEY's value from a generated KEY=VALUE file; empty when absent.
+sizing_file_value() {
+    awk -F= -v k="$2" '$1 == k { v = substr($0, length(k) + 2) } END { print v }' "$1"
+}
+
+# Prints the warning when this host's Vector cannot carry the planned volume.
+report_planned_ingest_capacity() {
+    local env_file="$1" needed hosts per_host path planned tier bytes
+    [[ -f "$env_file" ]] || return 0
+    planned=$(sizing_file_value "$env_file" NANO_SIZING_PLANNED_GB_PER_DAY)
+    [[ -n "$planned" ]] || return 0
+    needed=$(sizing_file_value "$env_file" NANO_SIZING_VECTOR_VCPU_NEEDED)
+    hosts=$(sizing_file_value "$env_file" NANO_SIZING_INGEST_HOSTS_NEEDED)
+    per_host=$(sizing_file_value "$env_file" NANO_SIZING_VECTOR_VCPU_PER_HOST)
+    path=$(sizing_file_value "$env_file" NANO_SIZING_INGEST_PATH)
+    tier=$(sizing_file_value "$env_file" NANO_SIZING_TIER)
+    bytes=$(sizing_file_value "$env_file" NANO_SIZING_AVG_EVENT_BYTES)
+    log "Planned volume: ${planned} GB/day (${path} ingest, sizing tier ${tier})"
+    if [[ "$hosts" =~ ^[0-9]+$ ]] && (( hosts > 1 )); then
+        warn "One host cannot carry ${planned} GB/day of ${path} ingest: Vector needs about ${needed} vCPU (at ~${bytes:-1000} B/event) and this host gives it ${per_host}. Plan ${hosts} ingest hosts of this size (about ${needed} vCPU of Vector in total) with a role-split install; see docs/getting-started/self-hosting-multi-node.md. nano will still install and run here."
+    fi
+    return 0
 }
 
 # Automatic backups (NAN-5204). Asked once on a TTY, only while .env records
@@ -1789,6 +1914,7 @@ fi
 
 validate_license_inputs
 validate_ingest_ack_durability_input
+validate_planned_volume_input
 
 if [[ "${NANO_CHECK_ONLY:-0}" == "1" ]]; then
     printf 'edition=%s\nversion=%s\nimage_prefix=%s\nlock=%s\n' "$NANO_EDITION" "$NANO_VERSION" "$NANO_IMAGE_PREFIX" "$IMAGES_LOCK"
@@ -1811,6 +1937,13 @@ if [[ -f .env ]]; then
     if [[ -z "${NANO_BASE_URL:-}" && -n "$(env_value BASE_URL)" ]]; then
         BASE_URL=$(env_value BASE_URL)
     fi
+fi
+
+# NAN-5367: the role-split renderer admits this host's Docker address pools to
+# ClickHouse when bridge-network services here reach it on the host address.
+if [[ "$MULTI_NODE" == "1" ]]; then
+    NANO_DOCKER_ADDRESS_POOLS_JSON=$(docker info --format '{{json .DefaultAddressPools}}' </dev/null 2>/dev/null || true)
+    export NANO_DOCKER_ADDRESS_POOLS_JSON
 fi
 
 # NAN-5213: with several app hosts only the FIRST app host in inventory order
@@ -2081,6 +2214,7 @@ configure_outbound_proxy
 configure_private_ai_endpoints
 configure_ingest_ack_durability
 configure_automatic_backups
+configure_planned_volume
 
 # Resolve overlays before sizing as well as startup: an overlay can replace the
 # Vector data volume with a host bind/external driver, whose capacity cannot be
@@ -2121,6 +2255,9 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         --topology single \
         --roles "$sizing_roles" \
         --shards 1 \
+        --planned-gb-per-day "$PLANNED_GB_PER_DAY" \
+        --ingest-path "$PLANNED_INGEST_PATH" \
+        --avg-event-bytes "$PLANNED_AVG_EVENT_BYTES" \
         --format env </dev/null > "$sizing_defaults"
 
     old_sizing_env="" old_sizing_server="" old_sizing_users=""
@@ -2143,6 +2280,9 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         --topology single \
         --roles "$sizing_roles" \
         --shards 1 \
+        --planned-gb-per-day "$PLANNED_GB_PER_DAY" \
+        --ingest-path "$PLANNED_INGEST_PATH" \
+        --avg-event-bytes "$PLANNED_AVG_EVENT_BYTES" \
         --override-env .env \
         --server-output .nano-generated/sizing/clickhouse-config.xml \
         --users-output .nano-generated/sizing/clickhouse-users.xml \
@@ -2159,6 +2299,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     sized_memory=$(env_value NANO_DETECTED_MEMORY_MIB)
     sized_ch=$(env_value CLICKHOUSE_MEM_LIMIT)
     log "Rendered shared-host sizing for ${sized_cpu} CPU / ${sized_memory} MiB RAM (ClickHouse limit $sized_ch)"
+    report_planned_ingest_capacity .nano-generated/sizing/host.env
 fi
 
 # NAN-3322 / NAN-4909: the unauthenticated ingest ports (Vector native :6000,
@@ -2581,6 +2722,62 @@ if [[ "$MULTI_NODE" == "1" && "${NANO_POSTGRES_HA:-false}" == "true" && ",${ROLE
         *)
             warn "Could not read the Patroni member list on this host; if its member is the leader, recreating it costs a failover (about 20-25 s of failed writes). Check 'patronictl list' and switch over first if needed." ;;
     esac
+fi
+
+# NAN-5367: ClickHouse users accept connections only from the networks the
+# Compose stack runs on. Render the per-user <networks> override from the
+# Docker address pools the Compose network is allocated from (stable across
+# `docker compose down && up`, unlike the network's current subnet), plus the
+# current subnet when a custom IPAM config placed it elsewhere. An external
+# direct-OCSF writer (Tenzir/Cribl on another host) is admitted as
+# nanosiem_ingest only, through NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS.
+# Role-split hosts get theirs from render-inventory.py instead.
+if [[ "$MULTI_NODE" != "1" ]]; then
+    ch_network_args=()
+    ch_pools_json=$(docker info --format '{{json .DefaultAddressPools}}' </dev/null 2>/dev/null || true)
+    ch_net_ids=$(docker inspect nano-clickhouse \
+        --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' </dev/null 2>/dev/null || true)
+    # Subnets the effective Compose config pins with IPAM (an overlay in
+    # NANO_COMPOSE_OVERLAYS, e.g. 198.18.0.0/24): read from the config, so a
+    # fresh install and a down/up after a subnet change are covered, not only
+    # a running container's current network.
+    ch_compose_json=$(mktemp .nano-compose-config.XXXXXX)
+    docker compose "${COMPOSE_ARGS[@]}" config --format json </dev/null >"$ch_compose_json" 2>/dev/null || :
+    ch_network_args+=(--compose-config "$ch_compose_json")
+    for ch_net_id in $ch_net_ids; do
+        for ch_subnet in $(docker network inspect "$ch_net_id" \
+            --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' </dev/null 2>/dev/null || true); do
+            [[ "$ch_subnet" =~ ^[0-9A-Fa-f:.]+/[0-9]+$ ]] && ch_network_args+=(--network "$ch_subnet")
+        done
+    done
+    ch_ingest_networks=${NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS:-$(env_value NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS)}
+fi
+if [[ "$MULTI_NODE" != "1" ]] \
+    && { [[ ! -r scripts/lib/clickhouse_networks.py || ! -r clickhouse/users.d/nanosiem-users.xml ]]; }; then
+    # A partial tree (tests, a hand-copied install): the checked-in
+    # loopback + private-range lists apply. Never an any-address fallback.
+    [[ -z "$ch_ingest_networks" ]] \
+        || fail "NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS is set but scripts/lib/clickhouse_networks.py or clickhouse/users.d/nanosiem-users.xml is missing from $NANO_INSTALL_DIR."
+    warn "scripts/lib/clickhouse_networks.py or clickhouse/users.d is missing; ClickHouse users keep the built-in loopback + private-network lists."
+    rm -f "$ch_compose_json"
+elif [[ "$MULTI_NODE" != "1" ]]; then
+    mkdir -p .nano-generated/clickhouse
+    python3 -I scripts/lib/clickhouse_networks.py \
+        --users-xml clickhouse/users.d/nanosiem-users.xml \
+        --output .nano-generated/clickhouse/networks.xml \
+        --docker-pools-json "$ch_pools_json" \
+        --ingest-networks "$ch_ingest_networks" \
+        ${ch_network_args[@]+"${ch_network_args[@]}"} </dev/null >/dev/null \
+        || fail "Could not render the ClickHouse network allow-list (NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS='$ch_ingest_networks')."
+    rm -f "$ch_compose_json"
+    if [[ -n "${NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS:-}" ]]; then
+        nano_env_set_keys .env "NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS=$NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS" \
+            || fail "Could not record NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS in .env."
+    fi
+    [[ "$(env_value NANO_CLICKHOUSE_NETWORKS_FILE)" == "./.nano-generated/clickhouse/networks.xml" ]] \
+        || nano_env_set_keys .env "NANO_CLICKHOUSE_NETWORKS_FILE=./.nano-generated/clickhouse/networks.xml" \
+        || fail "Could not record NANO_CLICKHOUSE_NETWORKS_FILE in .env."
+    log "ClickHouse users accept connections from loopback and the Docker networks only${ch_ingest_networks:+ (nanosiem_ingest also from $ch_ingest_networks)}"
 fi
 
 log "Starting services"

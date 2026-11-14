@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!--
+  NAN-5367: system.* and information_schema.* are readable only with an
+  explicit grant.
+
+  The official image's config.xml already sets both to true, but nano must not
+  depend on the base image for a security boundary (ClickHouse's built-in
+  default is false). With these on, a user reads a system table only through
+  GRANT SELECT ON system.<table> (each nano user's least-privilege list is in
+  users.d/nanosiem-users.xml); system.tables / columns / databases and the
+  constant tables (one, settings, functions, ...) stay readable but are
+  filtered to what the user can SHOW. Raw-SQL users hold no system grant, so
+  system.query_log (other users' SQL) and system.users are refused to them.
+
+  Shipped on every path: Compose mounts config.d, render-inventory.py copies
+  it, the Helm chart folds it into files/clickhouse/server.json
+  (scripts/sync-files.sh), and the legacy k8s manifests carry a copy.
+-->
+<clickhouse>
+    <access_control_improvements>
+        <select_from_system_db_requires_grant>true</select_from_system_db_requires_grant>
+        <select_from_information_schema_requires_grant>true</select_from_information_schema_requires_grant>
+    </access_control_improvements>
+</clickhouse>

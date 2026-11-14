@@ -152,15 +152,21 @@ services:
     # (or, better, as a container on this compose network, which reaches
     # `clickhouse:8123` internally and needs no published port at all).
     #
-    # SECURITY: the nanosiem_ingest (INSERT-only), nanosiem (app r/w), and
-    # nanosiem_admin (DDL) users all accept connections from any network
-    # (users.d/nanosiem-users.xml, <ip>::/0</ip>). `default` has no password and
-    # accepts connections from inside the ClickHouse container only
-    # (users.d/default-user.xml), so it is never reachable through this port,
-    # not even from this host. If your aggregator is on ANOTHER host and you must widen
-    # this bind (e.g. "8123:8123"), you are exposing the admin + app users too,
-    # not just the ingest user. Widen ONLY behind a firewall / IP-allowlist; never
-    # leave :8123 open to the internet.
+    # SECURITY (NAN-5367): every ClickHouse user accepts connections only from
+    # loopback and private address space (users.d/nanosiem-users.xml), never any
+    # address. `default` has no password and accepts connections from inside the
+    # ClickHouse container only (users.d/default-user.xml), so it is never
+    # reachable through this port, not even from this host. If your aggregator
+    # is on ANOTHER host and you must widen this bind (e.g. "8123:8123"), the
+    # app and admin users stay limited to private networks, but admit the
+    # aggregator explicitly and as nanosiem_ingest only: render the override
+    #   python3 -I scripts/lib/clickhouse_networks.py \
+    #     --users-xml clickhouse/users.d/nanosiem-users.xml \
+    #     --output .nano-generated/clickhouse/networks.xml \
+    #     --ingest-networks "<aggregator IP or CIDR>"
+    # and set NANO_CLICKHOUSE_NETWORKS_FILE=./.nano-generated/clickhouse/networks.xml
+    # in .env. Widen ONLY behind a firewall / IP-allowlist; never leave :8123
+    # open to the internet.
     ports:
       - "127.0.0.1:8123:8123"
     volumes:
@@ -170,6 +176,11 @@ services:
       - ./clickhouse/users.d:/etc/clickhouse-server/users.d:ro
       - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-config.xml:/etc/clickhouse-server/config.d/zzzz-nano-sizing.xml:ro
       - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-users.xml:/etc/clickhouse-server/users.d/zzzz-nano-sizing.xml:ro
+      # NAN-5367: per-user <networks> rendered by install.sh (Docker address
+      # pools + the NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS allow-list for
+      # nanosiem_ingest). The checked-in fallback is empty, leaving the
+      # loopback + private-range lists in users.d/nanosiem-users.xml.
+      - ${NANO_CLICKHOUSE_NETWORKS_FILE:-./config/sizing-defaults/clickhouse-networks.xml}:/etc/clickhouse-server/users.d/zzzz-nano-networks.xml:ro
     ulimits:
       nofile:
         soft: 262144

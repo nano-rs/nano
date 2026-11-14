@@ -333,6 +333,11 @@ impl ClickHouseSqlGenerator {
     /// same-named column an upstream stage already produced and not an
     /// array read out of the JSON tail (cast to text for grouping).
     pub(super) fn stats_by_field_is_array(&self, field: &str) -> bool {
+        // NAN-5350: a column an upstream `table`/`rename` projected an array
+        // into splits as the field it was read from does.
+        if let Some(array) = self.upstream_array(field) {
+            return array.split_by && !self.is_upstream_mvexpanded(field);
+        }
         // `is_computed_field` is no guard here: it holds every stats by-field
         // of the whole query (field_analysis), including this one.
         if self.is_upstream_computed_field(field) || self.is_upstream_mvexpanded(field) {

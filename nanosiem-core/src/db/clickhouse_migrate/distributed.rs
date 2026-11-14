@@ -4,6 +4,18 @@
 
 use super::{ClickHouseMigrateError, ClickHouseMigrator};
 
+/// NAN-5367: the `HOST` clause for ClickHouse users the migrator creates with
+/// SQL. Loopback plus private address space (RFC 1918, carrier-grade NAT for
+/// pod networks such as EKS custom networking, IPv6 ULA); never any address.
+/// `system.users` predicate for a user that admits any address: `HOST ANY`
+/// shows as `host_ip = ['::/0']` (verified on 26.10), and a user with no
+/// host entries at all is equally unrestricted.
+pub(crate) const SQL_USER_OPEN_HOST_PREDICATE: &str = "(has(host_ip, '::/0') \
+     OR has(host_ip, '0.0.0.0/0') OR length(host_names_regexp) > 0 AND has(host_names_regexp, '.*'))";
+
+pub(crate) const SQL_USER_HOST_CLAUSE: &str = "IP '127.0.0.1', IP '::1', IP '10.0.0.0/8', \
+     IP '172.16.0.0/12', IP '192.168.0.0/16', IP '100.64.0.0/10', IP 'fc00::/7'";
+
 impl ClickHouseMigrator {
     /// Tables that need Distributed wrappers for cross-shard queries.
     ///
@@ -378,6 +390,10 @@ impl ClickHouseMigrator {
                      declaratively-managed grants untouched",
                     user
                 );
+                // NAN-5367: a SQL-created user from an older release has no
+                // HOST clause (any address). Tighten it; users.xml users are
+                // read-only and get their networks from users.d.
+                self.tighten_sql_user_hosts(user, &on_cluster).await?;
                 continue;
             }
 
@@ -437,11 +453,15 @@ impl ClickHouseMigrator {
                 profile_ensured = true;
             }
 
+            // NAN-5367: never an any-address user. Private address space only
+            // (pod / Compose / inventory networks); the deployment's own user
+            // config narrows XML users further.
             let create_sql = format!(
                 "CREATE USER IF NOT EXISTS {user}{oc} IDENTIFIED BY ? \
-                 SETTINGS PROFILE 'rawsql'",
+                 HOST {hosts} SETTINGS PROFILE 'rawsql'",
                 user = user,
                 oc = on_cluster,
+                hosts = SQL_USER_HOST_CLAUSE,
             );
             self.client
                 .query(&create_sql)
@@ -497,6 +517,55 @@ impl ClickHouseMigrator {
         }
 
         Ok(created)
+    }
+
+    /// NAN-5367: `ALTER USER .. HOST` a SQL-storage user that still accepts
+    /// connections from any address. Returns whether it altered the user.
+    /// A users.xml user (`storage = 'users_xml'`, read-only) or a user that
+    /// already has a host list is left untouched, so this is a no-op on every
+    /// later migrate.
+    pub async fn tighten_sql_user_hosts(
+        &mut self,
+        user: &str,
+        on_cluster: &str,
+    ) -> Result<bool, ClickHouseMigrateError> {
+        let open: u64 = self
+            .client
+            .query(&format!(
+                "SELECT count() FROM system.users WHERE name = '{}' \
+                 AND storage != 'users_xml' AND {}",
+                crate::sql_hygiene::escape_sql_string(user),
+                SQL_USER_OPEN_HOST_PREDICATE,
+            ))
+            .fetch_one()
+            .await
+            .map_err(|e| {
+                ClickHouseMigrateError::ClickHouse(format!(
+                    "reading the host list of ClickHouse user '{}': {}",
+                    user, e
+                ))
+            })?;
+        if open == 0 {
+            return Ok(false);
+        }
+        let sql = format!(
+            "ALTER USER {user}{oc} HOST {hosts}",
+            user = user,
+            oc = on_cluster,
+            hosts = SQL_USER_HOST_CLAUSE,
+        );
+        self.client.query(&sql).execute().await.map_err(|e| {
+            ClickHouseMigrateError::ClickHouse(format!(
+                "restricting ClickHouse user '{}' to private networks: {}",
+                user, e
+            ))
+        })?;
+        tracing::info!(
+            "NAN-5367: ClickHouse user '{}' accepted connections from any address; \
+             restricted it to loopback + private networks",
+            user
+        );
+        Ok(true)
     }
 
     /// Create Distributed table wrappers for cross-shard queries.

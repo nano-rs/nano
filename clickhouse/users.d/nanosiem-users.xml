@@ -5,13 +5,34 @@
     container (CLICKHOUSE_NANOSIEM_PASSWORD / CLICKHOUSE_ADMIN_PASSWORD) so
     each deployment gets per-install random secrets without baking creds
     into version-controlled XML.
+
+    Networks (NAN-5367): no user accepts connections from any address. The
+    lists below are the fallback for a plain `docker compose up`: loopback
+    plus private address space. Every supported deployment path narrows them
+    with a later file that replaces each user's <networks>:
+      * single-host Compose: install.sh renders the Docker address pools the
+        Compose network is allocated from (scripts/lib/clickhouse_networks.py,
+        mounted as users.d/zzzz-nano-networks.xml);
+      * role-split: render-inventory.py renders the inventory host addresses
+        (users.d/zz-sovereign-networks.xml);
+      * Helm: clickhouse.allowedNetworks (templates/clickhouse/_settings.tpl).
+    External direct-OCSF writers get nanosiem_ingest access only, through the
+    explicit NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS /
+    cluster.clickhouse_ingest_allowed_networks / clickhouse.ingestAllowedNetworks
+    allow-lists. Guard: nanosiem-core/tests/clickhouse_networks_guard.rs.
   -->
   <users>
     <!-- Admin user for migrations (DDL enabled) -->
     <nanosiem_admin>
       <profile>admin</profile>
       <networks>
-        <ip>::/0</ip>
+        <!-- NAN-5367: see "Networks" at the top of this file. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_ADMIN_PASSWORD"/>
       <quota>default</quota>
@@ -23,7 +44,13 @@
     <nanosiem>
       <profile>default</profile>
       <networks>
-        <ip>::/0</ip>
+        <!-- NAN-5367: see "Networks" at the top of this file. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_NANOSIEM_PASSWORD"/>
       <quota>default</quota>
@@ -62,6 +89,18 @@
         <query>GRANT SELECT(type, query_kind, event_time, tables) ON system.query_log</query>
         <query>GRANT SELECT(event_type, event_time, database, table) ON system.part_log</query>
         <query>GRANT SELECT(name, value, last_error_time) ON system.errors</query>
+        <!-- NAN-5342: siem-health shard-skew probe (migration 199). The admin
+             client fans out with cluster(...); remote shards answer as this
+             remote_servers user, so it reads these node-local system logs.
+             Column-scoped; no event tables. metric_log (CH 26.x) keeps its
+             values in the `metrics` Map behind ALIAS columns, and the
+             initiator rewrites the aliases to metrics['...'] before the
+             query reaches a remote shard, so `metrics` must be granted too
+             (server counters only). -->
+        <query>GRANT SELECT(event_date, rows, part_name) ON system.part_log</query>
+        <query>GRANT SELECT(event_date, event_time, metrics, CurrentMetric_BackgroundMergesAndMutationsPoolTask, CurrentMetric_BackgroundMergesAndMutationsPoolSize) ON system.metric_log</query>
+        <query>GRANT SELECT(event_date, event_time, metric, value) ON system.asynchronous_metric_log</query>
+        <query>GRANT SELECT(database, type) ON system.replication_queue</query>
         <!-- NAN-4957: + type, element_count, bytes_allocated for the SIEM Health
              dictionary-memory probe (resident dictionaries vs the server limit). -->
         <query>GRANT SELECT(database, name, status, last_exception, type, element_count, bytes_allocated) ON system.dictionaries</query>
@@ -96,6 +135,31 @@
         <!-- NAN-2330: clustered process visibility without granting REMOTE to
              the runtime user. Migration 172 owns this narrow DEFINER view. -->
         <query>GRANT SELECT ON nanosiem.cluster_processes</query>
+        <!-- NAN-5367: select_from_system_db_requires_grant is on (config.d/
+             access_control.xml), so these are the remaining system reads this
+             identity makes, directly or as the remote half of an admin
+             cluster()/clusterAllReplicas() probe (remote_servers authenticate
+             as this user). Each was failing with ACCESS_DENIED. Column-scoped.
+             Kept in lockstep with clickhouse/200_system_read_grants.sql and the
+             map in nanosiem-core/tests/clickhouse_system_grants_guard.rs.
+             * disks.name + storage_policies: tiering detection in disk
+               pressure (a failed read counted as untiered).
+             * parts.disk_name: per-tier storage stats (tiering settings).
+             * distribution_queue: SIEM Health async-forward backlog probe.
+             * settings_profiles.name: ingest-pause guard state on replicas.
+             * row_policies: raw-SQL audit row-policy convergence on replicas.
+             * clusters: cluster-name convergence at boot and the ingest
+               watchdog's replica discovery.
+             * macros: getMacro('replica') in the clustered refresh-activation
+               probe (getMacro needs this grant with the setting on). -->
+        <query>GRANT SELECT(name) ON system.disks</query>
+        <query>GRANT SELECT(policy_name, volume_priority, disks) ON system.storage_policies</query>
+        <query>GRANT SELECT(disk_name) ON system.parts</query>
+        <query>GRANT SELECT(database, table, data_files, error_count, last_exception) ON system.distribution_queue</query>
+        <query>GRANT SELECT(name) ON system.settings_profiles</query>
+        <query>GRANT SELECT(short_name, database, table, select_filter, is_restrictive, apply_to_all, apply_to_list, apply_to_except) ON system.row_policies</query>
+        <query>GRANT SELECT(cluster, shard_num, replica_num, host_name, database_replica_name) ON system.clusters</query>
+        <query>GRANT SELECT(macro, substitution) ON system.macros</query>
       </grants>
     </nanosiem>
 
@@ -107,7 +171,13 @@
     <nanosiem_vector>
       <profile>ingestion</profile>
       <networks>
-        <ip>::/0</ip>
+        <!-- NAN-5367: see "Networks" at the top of this file. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_VECTOR_PASSWORD"/>
       <quota>default</quota>
@@ -181,7 +251,13 @@
     <nanosiem_ingest>
       <profile>ingestion</profile>
       <networks>
-        <ip>::/0</ip>
+        <!-- NAN-5367: see "Networks" at the top of this file. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_INGEST_PASSWORD"/>
       <quota>default</quota>
@@ -295,7 +371,13 @@
     <nanosiem_rawsql>
       <profile>rawsql</profile>
       <networks>
-        <ip>::/0</ip>
+        <!-- NAN-5367: see "Networks" at the top of this file. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_RAWSQL_PASSWORD"/>
       <quota>default</quota>
@@ -356,7 +438,13 @@
     <nanosiem_rawsql_noaudit>
       <profile>rawsql</profile>
       <networks>
-        <ip>::/0</ip>
+        <!-- NAN-5367: see "Networks" at the top of this file. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD"/>
       <quota>default</quota>

@@ -38,6 +38,7 @@ pub(crate) mod identity;
 // search/api layer to target the `otel_spans`/`otel_metrics` tables (NAN-1528).
 pub mod otel;
 pub(crate) mod search_expr;
+mod upstream_arrays;
 
 /// The `ioc in <feed>("…")` indicator subquery (version-collapsed, committed
 /// rows only). Public so the real-ClickHouse suites execute the production SQL.
@@ -1345,6 +1346,17 @@ pub struct ClickHouseSqlGenerator {
     /// NAN-4295: fields an upstream `mvexpand` already expanded (one row per
     /// element). Same scope rules as `upstream_computed_fields`.
     upstream_mvexpanded: RwLock<HashSet<String>>,
+    /// NAN-5350: stage columns holding an array field under a projected or
+    /// renamed name (see `upstream_arrays`). Same scope rules as
+    /// `upstream_computed_fields`.
+    upstream_arrays: RwLock<upstream_arrays::UpstreamArrays>,
+    /// NAN-5350: the arrays the last generated subsearch ended with, for the
+    /// `join`/`append` embedding it (taken by `record_join_arrays` /
+    /// `record_append_arrays`).
+    subsearch_arrays: RwLock<upstream_arrays::UpstreamArrays>,
+    /// NAN-5350: the array scope after the `join`/`append` just generated,
+    /// taken by its `note_upstream_computed`.
+    pending_subsearch_arrays: RwLock<Option<upstream_arrays::UpstreamArrays>>,
     /// Reference-side aliases for UN-aliased aggregations (NAN-1339): an
     /// un-aliased `avg(bytes_in)` outputs a column literally named `avg`
     /// (`Aggregation::output_alias` fallback), but users following the
@@ -1446,6 +1458,9 @@ impl Clone for ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             upstream_string_fields: RwLock::new(HashSet::new()),
             upstream_mvexpanded: RwLock::new(HashSet::new()),
+            upstream_arrays: RwLock::new(Default::default()),
+            subsearch_arrays: RwLock::new(Default::default()),
+            pending_subsearch_arrays: RwLock::new(None),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::clone(&self.profile),
             base_profile: self.base_profile.clone(),
@@ -1497,6 +1512,9 @@ impl ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             upstream_string_fields: RwLock::new(HashSet::new()),
             upstream_mvexpanded: RwLock::new(HashSet::new()),
+            upstream_arrays: RwLock::new(Default::default()),
+            subsearch_arrays: RwLock::new(Default::default()),
+            pending_subsearch_arrays: RwLock::new(None),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
             base_profile: None,
@@ -1528,6 +1546,9 @@ impl ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             upstream_string_fields: RwLock::new(HashSet::new()),
             upstream_mvexpanded: RwLock::new(HashSet::new()),
+            upstream_arrays: RwLock::new(Default::default()),
+            subsearch_arrays: RwLock::new(Default::default()),
+            pending_subsearch_arrays: RwLock::new(None),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
             base_profile: None,
@@ -2477,6 +2498,8 @@ impl ClickHouseSqlGenerator {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(field.clone());
         }
+        // NAN-5350: typed against the scope BEFORE this command's outputs.
+        let arrays = self.upstream_arrays_after(cmd, &added);
         {
             let mut guard = self
                 .upstream_string_fields
@@ -2506,6 +2529,7 @@ impl ClickHouseSqlGenerator {
             }
         }
         self.swap_upstream_time_alias(time_alias);
+        self.swap_upstream_arrays(arrays);
     }
 
     /// Whether `cmd` rewrites the `timestamp` column WITHOUT registering it in
@@ -2857,6 +2881,8 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_computed(HashSet::new());
         self.swap_upstream_strings(HashSet::new());
         self.swap_upstream_mvexpanded(HashSet::new());
+        self.swap_upstream_arrays(Default::default());
+        self.reset_subsearch_array_slots();
 
         let result = self.generate_query(query, &mut ctx);
         match self.generation_time_range.write() {
@@ -2880,6 +2906,8 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_mvexpanded(HashSet::new());
         self.swap_stage_tail_aliases(Default::default());
         self.swap_upstream_time_alias(None);
+        self.swap_upstream_arrays(Default::default());
+        self.reset_subsearch_array_slots();
         result
     }
 
@@ -3678,6 +3706,7 @@ impl ClickHouseSqlGenerator {
                 } else {
                     format!("({})", trimmed)
                 };
+                self.record_append_arrays(Some((&union_cols, &main_cols, &sub_cols)));
                 Ok(format!(
                     "  SELECT {} FROM {}\n  UNION ALL\n  SELECT {} FROM {} AS _append_sub",
                     project(&main_cols),
@@ -3691,6 +3720,7 @@ impl ClickHouseSqlGenerator {
             {
                 // Both sides are passthroughs over the same base select clause
                 // (plus identical eval/rename extras) — positionally aligned.
+                self.record_append_arrays(None);
                 Ok(format!(
                     "  SELECT * FROM {}\n  UNION ALL\n{}",
                     source_cte, subsearch_sql
@@ -4218,8 +4248,11 @@ impl ClickHouseSqlGenerator {
         // `sub.k` to the prior stage's "sub.k" column instead of the new sub
         // table (Code 403 INVALID_JOIN_ON_EXPRESSION), and downstream stages
         // can't reference the bare name. Join keys are already in `main.*`.
+        // NAN-5350: the columns this join takes from the subsearch.
+        let mut taken_from_sub: Option<Vec<String>> = None;
         let select_clause = match &sub_shape {
             OutputShape::Columns(cols) => {
+                let taken = taken_from_sub.get_or_insert_with(Vec::new);
                 // NAN-1562: the sub-side Columns shape is computed by `sub_gen`,
                 // so canonicalize the key names through the SAME profile to match
                 // (spans/metrics keep `service_name`; logs map through the free
@@ -4254,9 +4287,11 @@ impl ClickHouseSqlGenerator {
                                 "coalesce({sub_alias}.{escaped}, main.{escaped}) AS {escaped}"
                             ));
                             clashing.push(escaped);
+                            taken.push(c.clone());
                         }
                     } else {
                         sub_cols.push(format!("{}.{} AS {}", sub_alias, escaped, escaped));
+                        taken.push(c.clone());
                     }
                 }
                 let main_cols = if clashing.is_empty() {
@@ -4277,6 +4312,7 @@ impl ClickHouseSqlGenerator {
         // peak memory; `partial_merge` measured ~36% less peak memory than the
         // default hash algorithm for that shape. Logs subsearches keep CH's
         // default (hash) → byte-identical. Emitted on the JOIN CTE.
+        self.record_join_arrays(sub_gen, taken_from_sub.as_deref());
         let join_settings = match subsearch_dataset {
             Some(otel::Dataset::Spans) | Some(otel::Dataset::Metrics) if cross_dataset => {
                 "\n  SETTINGS join_algorithm = 'partial_merge'"
@@ -4316,6 +4352,7 @@ impl ClickHouseSqlGenerator {
         let outer_scope = self.swap_upstream_computed(HashSet::new());
         let outer_strings = self.swap_upstream_strings(HashSet::new());
         let outer_mvexpanded = self.swap_upstream_mvexpanded(HashSet::new());
+        let outer_arrays = self.swap_upstream_arrays(Default::default());
         // NAN-4903: the base-column scope is per pipeline too — a projection
         // inside the subsearch must not mark the outer stages as projected.
         let outer_projected = self.swap_upstream_projected(false);
@@ -4330,6 +4367,8 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_computed(outer_scope);
         self.swap_upstream_strings(outer_strings);
         self.swap_upstream_mvexpanded(outer_mvexpanded);
+        let sub_arrays = self.swap_upstream_arrays(outer_arrays);
+        self.set_subsearch_arrays(sub_arrays);
         result
     }
 
@@ -5287,6 +5326,9 @@ mod npl_eval_parity_tests;
 
 #[cfg(test)]
 mod npl_batch_b_tests;
+
+#[cfg(test)]
+mod ocsf_alias_gap_tests;
 
 #[cfg(test)]
 mod ocsf_concept_predicate_tests;

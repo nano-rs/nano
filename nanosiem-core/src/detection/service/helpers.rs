@@ -894,6 +894,64 @@ impl DetectionService {
         Ok(())
     }
 
+    /// Save-time check of a rule query (NAN-5348): it parses, and every field
+    /// it names passes the search path's field validator for the profile the
+    /// rule runs under. A rule naming a refused field (`hostname` on OCSF) is
+    /// rejected with the validator's "did you mean" message instead of being
+    /// stored and backing off at every scheduled run.
+    ///
+    /// Only save paths call this; stored rules load unchanged.
+    pub fn validate_rule_query(
+        &self,
+        query: &str,
+        dataset: Option<&str>,
+    ) -> Result<(), DetectionError> {
+        Self::validate_rule_query_with_profile(self.active_profile.as_ref(), query, dataset)
+    }
+
+    /// [`validate_rule_query`](Self::validate_rule_query) against an explicit
+    /// logs profile. The profile is picked the way the search service picks it
+    /// (`SearchService::dataset_profile`): the rule's dataset, the active logs
+    /// profile for `logs`. A query that selects its dataset inline
+    /// (`dataset=…`) is only parsed: the search service resolves that profile
+    /// from the query text.
+    pub fn validate_rule_query_with_profile(
+        logs_profile: &dyn crate::schema::SchemaProfile,
+        query: &str,
+        dataset: Option<&str>,
+    ) -> Result<(), DetectionError> {
+        let parsed =
+            parse_query(query).map_err(|e| DetectionError::QueryParseError(e.to_string()))?;
+        if query.to_ascii_lowercase().contains("dataset=") {
+            return Ok(());
+        }
+        let dataset_profile;
+        let profile: &dyn crate::schema::SchemaProfile =
+            match crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) {
+                crate::query::Dataset::Logs => logs_profile,
+                crate::query::Dataset::Spans => {
+                    dataset_profile = crate::schema::profile_for_id(crate::schema::SchemaId::Spans);
+                    dataset_profile.as_ref()
+                }
+                crate::query::Dataset::Metrics => {
+                    dataset_profile =
+                        crate::schema::profile_for_id(crate::schema::SchemaId::Metrics);
+                    dataset_profile.as_ref()
+                }
+                crate::query::Dataset::Risk => {
+                    dataset_profile = crate::schema::profile_for_id(crate::schema::SchemaId::Risk);
+                    dataset_profile.as_ref()
+                }
+            };
+        match crate::query::validation::validate_query_fields_with_profile(&parsed, Some(profile))
+            .into_iter()
+            .next()
+        {
+            Some(e) => Err(DetectionError::InvalidQuery(e.to_string())),
+            None => Ok(()),
+        }
+    }
+
     /// Validate that a rule is compatible with real-time execution
     ///
     /// Real-time rules are implemented using ClickHouse materialized views,

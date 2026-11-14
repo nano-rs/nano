@@ -34,6 +34,14 @@ COMPRESSION = 5.0           # conservative ratio the Self-run guide plans with (
 MERGE_FILL = 0.75           # keep the data disk under ~75% full for merges
 OS_DISK_GB = 100            # OS + Docker images, separate disk
 EXTRA_DATA_GB = 100         # PostgreSQL, findings, small tables, Vector disk buffers
+# Vector CPU from events/s (NAN-5372): vCPU = peak factor x events/s / events per core.
+# Same constants as scripts/lib/resource-sizing.sh and the Helm chart's sizing.* (a test
+# keeps them equal). Raw: nano-measured 1,950-6,500 events/s per core over the 16 shipped
+# OCSF parsers; 1,900 sits under the slowest. Pre-shaped: half the measured ship-only 90k.
+VECTOR_PEAK_FACTOR = 2
+VECTOR_RAW_EVENTS_PER_CORE = 1900
+VECTOR_PRESHAPED_EVENTS_PER_CORE = 45000
+DEFAULT_AVG_EVENT_BYTES = 1000  # mixed feeds; ~300 firewall/flow, ~2000 EDR
 
 
 def ceil_to(value: float, step: int) -> int:
@@ -81,7 +89,9 @@ def plan(args: argparse.Namespace) -> dict:
     data_disk_gib = ceil_to(hot_gib / MERGE_FILL + EXTRA_DATA_GB, 250)
     t = tier(gb_sized)
     ch_vcpu_needed = max(2.0, 5.0 * gb_sized / 1000)       # 5 vCPU per TB/day
-    vector_vcpu_needed = max(1.0, 12.0 * gb_sized / 1000)   # heavy-parse worst case
+    events_per_core = VECTOR_PRESHAPED_EVENTS_PER_CORE if args.ingest_path == "preshaped" else VECTOR_RAW_EVENTS_PER_CORE
+    eps_sized = gb_sized * 1e9 / 86400 / args.avg_event_bytes
+    vector_vcpu_needed = max(1.0, VECTOR_PEAK_FACTOR * eps_sized / events_per_core)
     out: dict = {
         "input": {"eps": round(eps, 1), "gb_per_day": round(gb, 2), "avg_event_bytes": args.avg_event_bytes,
                   "retention_days": args.retention_days, "growth_factor": args.growth,
@@ -138,7 +148,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--eps", type=float)
     p.add_argument("--gb-per-day", type=float)
-    p.add_argument("--avg-event-bytes", type=int, default=1000)
+    p.add_argument("--avg-event-bytes", type=int, default=DEFAULT_AVG_EVENT_BYTES,
+                   help="average event size: ~300 firewall/flow, ~1000 mixed/identity, ~2000 EDR")
+    p.add_argument("--ingest-path", choices=["raw", "preshaped"], default="raw",
+                   help="raw logs parsed by nano's Vector, or pre-shaped OCSF (Tenzir/Cribl)")
     p.add_argument("--retention-days", type=int, default=365)
     p.add_argument("--compression", type=float, default=COMPRESSION, help="ClickHouse ratio; plan 5 until measured")
     p.add_argument("--growth", type=float, default=1.0, help="multiplier for 12-month growth, e.g. 1.5")

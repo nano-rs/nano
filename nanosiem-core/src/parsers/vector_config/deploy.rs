@@ -1732,23 +1732,35 @@ impl VectorConfigManager {
             // shape is the same for zero and N sources and adding one never
             // rebuilds a fan-in.
             let table = assign(parsers);
-            let families: &[Family] = if ocsf {
-                &[Family::Out, Family::Kept, Family::Ocsf]
-            } else {
-                &[Family::Out, Family::Kept]
-            };
+            let families: &[Family] = if ocsf { &[Family::Ocsf] } else { &[Family::Out, Family::Kept] };
             config.push_str(&slots_toml(&table, families));
             let k = table.len();
-            // The persisted stream honors each parser's optional sample step.
-            // Health consumes the unsampled UDM output. Under OCSF it also
-            // sees native successes, which bypass the UDM output after the
-            // split.
-            let health = if ocsf {
-                fanin_inputs(k, &[Family::Out, Family::Ocsf])
+            if ocsf {
+                // NAN-5346: an OCSF parser has no UDM `_output`; every record,
+                // parse failures included, leaves through `_ocsf_prepare`.
+                // Nothing a parser emits feeds the UDM `logs` stream.
+                let parked = vec![format!("\"{}\"", super::fanin_slots::PARKED)];
+                (parked, fanin_inputs(k, &[Family::Ocsf]))
             } else {
-                fanin_inputs(k, &[Family::Out])
-            };
-            (fanin_inputs(k, &[Family::Kept]), health)
+                // The persisted stream honors each parser's optional sample
+                // step. Health consumes the unsampled UDM output.
+                (fanin_inputs(k, &[Family::Kept]), fanin_inputs(k, &[Family::Out]))
+            }
+        } else if ocsf {
+            // NAN-5346: see the slot branch. `db_parsers_combined` reads the
+            // never-matching filter (Vector rejects `inputs = []`).
+            config.push_str(&format!(
+                "[transforms.{parked}]\ntype = \"filter\"\ninputs = [\"prepare_output\"]\ncondition = \"false\"\n\n",
+                parked = super::fanin_slots::PARKED
+            ));
+            let parked = vec![format!("\"{}\"", super::fanin_slots::PARKED)];
+            let health: Vec<String> = parsers
+                .iter()
+                .filter(|p| p.enabled && p.kind != "enrichment")
+                .map(|p| format!("\"{}\"", Family::Ocsf.input_for(p)))
+                .collect();
+            let health = if health.is_empty() { parked.clone() } else { health };
+            (parked, health)
         } else {
             // Slots off: the fan-ins list every parser (pre-NAN-5132 shape).
             let enabled: Vec<&Parser> = parsers.iter().filter(|p| p.enabled).collect();
@@ -1765,18 +1777,10 @@ impl VectorConfigManager {
                     .iter()
                     .map(|p| format!("\"{}\"", Family::Kept.input_for(p)))
                     .collect();
-                let mut health: Vec<String> = enabled
+                let health: Vec<String> = enabled
                     .iter()
                     .map(|p| format!("\"{}\"", Family::Out.input_for(p)))
                     .collect();
-                if ocsf {
-                    health.extend(
-                        enabled
-                            .iter()
-                            .filter(|p| p.kind != "enrichment")
-                            .map(|p| format!("\"{}\"", Family::Ocsf.input_for(p))),
-                    );
-                }
                 (persisted, health)
             }
         };
@@ -2498,6 +2502,10 @@ if nano_ingest_client_ip != "" {
     ocsf_event.unmapped.ingest_client_ip = nano_ingest_client_ip
 }
 if nano_ingest_peer != "" { ocsf_event.unmapped.ingest_peer = nano_ingest_peer }
+# NAN-5346: a source-flagged parse failure (generic_parser set
+# metadata.parse_error) is findable as `unmapped.parse_error`, like a parser's.
+nano_generic_error = to_string(.metadata.parse_error) ?? ""
+if nano_generic_error != "" { ocsf_event.unmapped.parse_error = nano_generic_error }
 
 # NAN-1556: OTLP LogRecords (source_type=otlp_log) reach this generic lane with
 # canonical fields already set by otlp_logs_prep (.severity, .metadata.src_host
@@ -2543,13 +2551,36 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// route and one sink per shard; retries remain pinned to the same shard.
     /// With zero/one endpoint the single-node config is byte-identical.
     pub(super) fn full_pipeline_config_content() -> String {
+        Self::pipeline_config_content_for(Self::ocsf_mode())
+    }
+
+    /// [`Self::full_pipeline_config_content`] for an explicit schema profile,
+    /// so both renders are testable without the env-racy `ocsf_mode` gate.
+    pub(super) fn pipeline_config_content_for(ocsf: bool) -> String {
         let mut content = with_ack_durability(Self::pipeline_config_content(), ack_durability());
-        if Self::ocsf_mode() {
+        if ocsf {
+            // NAN-5346: an unparsed event is written once, to `ocsf_logs`.
+            // `generic_parser` feeds only `generic_ocsf_prepare`; the UDM
+            // `normalize` → `logs` chain keeps its (empty) placeholder input
+            // so the static topology, and the disk-buffered `clickhouse_logs`
+            // sink, stay unchanged.
+            debug_assert!(
+                content.contains(Self::UDM_NORMALIZE_INPUTS),
+                "pipeline_config_content: normalize inputs moved"
+            );
+            content = content.replacen(Self::UDM_NORMALIZE_INPUTS, Self::OCSF_NORMALIZE_INPUTS, 1);
             content.push_str(Self::GENERIC_OCSF_PREPARE_BLOCK);
         }
         let endpoints = Self::clickhouse_shard_endpoints();
         Self::shard_route_clickhouse_sinks(content, &endpoints)
     }
+
+    /// The UDM `normalize` inputs in [`Self::pipeline_config_content`].
+    const UDM_NORMALIZE_INPUTS: &'static str =
+        "[transforms.normalize]\ntype = \"remap\"\ninputs = [\"placeholder_combiner\", \"generic_parser\"]\n";
+    /// NAN-5346: the OCSF `normalize` inputs (no `generic_parser`).
+    const OCSF_NORMALIZE_INPUTS: &'static str =
+        "[transforms.normalize]\ntype = \"remap\"\ninputs = [\"placeholder_combiner\"]\n";
 
     pub(super) fn clickhouse_shard_endpoints() -> Vec<String> {
         std::env::var("VECTOR_CLICKHOUSE_SHARD_ENDPOINTS")
@@ -3671,6 +3702,8 @@ mod reload_window_tests;
 mod tests;
 #[cfg(test)]
 mod credential_header_tests;
+#[cfg(test)]
+mod raw_data_credential_tests;
 #[cfg(test)]
 mod transport_header_tests;
 #[cfg(test)]

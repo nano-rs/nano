@@ -96,11 +96,12 @@ pub enum LogSourceServiceError {
 pub struct LogSourceService {
     pool: PgPool,
     ch_client: Option<ClickHouseClient>,
-    /// Used by VRL live-test to fetch sample messages from the raw `logs`
-    /// table (`validation.rs::live_test`). Distinct from `table_names` —
-    /// `logs_table` is a static name, `table_names` resolves the per-call
-    /// cluster-aware variant for rollup reads.
-    logs_table: &'static str,
+    /// Schema profile the live test lab and Nano Pipe samples read raw
+    /// messages under (`validation.rs::fetch_recent_messages`). NAN-5347: the
+    /// sample read used the pool's UDM `logs` table unconditionally, so on an
+    /// OCSF install "test against live data" never found a sample. Resolved
+    /// once at construction, like every other env-derived profile read.
+    schema: crate::schema::SchemaId,
     /// Carried through to LogSourceRepository so rollup-backed reads pick
     /// the `_distributed` wrapper in cluster mode (NAN-734).
     table_names: crate::db::TableNames,
@@ -127,7 +128,9 @@ impl LogSourceService {
         Self {
             pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
-            logs_table: dual_pool.logs_table(),
+            schema: crate::schema::active_profile_from_env()
+                .map(|p| p.id())
+                .unwrap_or(crate::schema::SchemaId::Udm),
             table_names: dual_pool.table_names(),
             vector_config,
             vrl_validator: Arc::new(VrlValidator::new()),

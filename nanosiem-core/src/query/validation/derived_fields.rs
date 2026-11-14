@@ -292,13 +292,22 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 let n = i + 1;
                 fields.insert(format!("step{}_time", n));
                 fields.insert(format!("step{}_event_id", n));
+                // NAN-5348: the codegen names the column with the field's dots
+                // as underscores (`fields(process.name)` → `step1_process_name`,
+                // `commands_advanced.rs`); register that spelling too, or a
+                // `| table step1_process_name` after an OCSF sequence is
+                // rejected as an unknown field.
+                let mut add = |field: &str| {
+                    let field = field.to_lowercase();
+                    fields.insert(format!("step{}_{}", n, field.replace('.', "_")));
+                    fields.insert(format!("step{}_{}", n, field));
+                };
                 for field in capture_fields {
-                    fields.insert(format!("step{}_{}", n, field.to_lowercase()));
+                    add(field);
                 }
                 // Auto-captured fields from condition expressions
-                let cond_fields = collect_fields_from_expr(cond);
-                for field in &cond_fields {
-                    fields.insert(format!("step{}_{}", n, field.to_lowercase()));
+                for field in &collect_fields_from_expr(cond) {
+                    add(field);
                 }
             }
             fields.insert("sequence_duration_seconds".to_string());

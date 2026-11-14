@@ -19,6 +19,7 @@ pub mod enrichment_wasm_findings;
 pub mod finding_signature;
 pub mod repository;
 pub mod scheduler;
+pub mod shard_skew;
 pub mod suppressions_repository;
 pub mod types;
 

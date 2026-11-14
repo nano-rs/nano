@@ -31,9 +31,16 @@
         <min_bytes_for_wide_part>10485760</min_bytes_for_wide_part>
         <min_rows_for_wide_part>0</min_rows_for_wide_part>
 
-        <!-- Compression block sizes -->
-        <min_compress_block_size>65536</min_compress_block_size>
-        <max_compress_block_size>1048576</max_compress_block_size>
+        <!-- Compression block sizes. NAN-5345 / NAN-4957: every column, mark
+             and skip-index stream of a part being written holds one
+             max_compress_block_size buffer plus its compressed twin, so the
+             write cost is per STREAM (191 columns + 113 skip indexes on
+             nanosiem.logs). 64 KiB cut a 20k-row insert from 1.23 GiB to
+             176 MiB with an unchanged compression ratio. The compose
+             zzz-dev-override.xml carried this alone; Helm and role-split
+             ClickHouse read this file. -->
+        <min_compress_block_size>16384</min_compress_block_size>
+        <max_compress_block_size>65536</max_compress_block_size>
 
         <!-- Index granularity -->
         <index_granularity>8192</index_granularity>

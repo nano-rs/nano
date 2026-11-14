@@ -691,8 +691,23 @@ fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
-/// Map a manifest ClickHouse type to the schema-agnostic [`FieldType`]. Collapses
-/// `LowCardinality(...)` / `DateTime64(...)` like the manifest⟷DDL gate does.
+/// NAN-5348 (NAN-3893 direction): bare legacy names with no single correct
+/// OCSF target, and the OCSF paths to suggest. Each one used to fall through
+/// to the `unmapped` spill (`app`: the whole OCSF `app` object) and silently
+/// return nothing, so the validator refuses it with "did you mean". A name
+/// with ONE correct target stays aliased instead: the manifest `udm_fields`,
+/// `process` → the command line (`command_line_unified`), and `protocol` →
+/// `connection_info.protocol_num` with the IANA name table in `enum_values`.
+const OCSF_RETIRED_FIELDS: &[(&str, &[&str])] = &[
+    ("host", &["device.hostname", "src_endpoint.hostname", "dst_endpoint.hostname"]),
+    ("hostname", &["device.hostname", "src_endpoint.hostname", "dst_endpoint.hostname"]),
+    ("src", &["src_endpoint.ip", "src_endpoint.hostname"]),
+    ("dest", &["dst_endpoint.ip", "dst_endpoint.hostname"]),
+    ("dest_domain", &["query.hostname", "http_request.url.hostname", "dst_endpoint.hostname"]),
+    ("app", &["app_name", "metadata.product.name", "api.service.name"]),
+    ("signature", &["finding_info.title", "finding_info.uid", "metadata.event_code"]),
+];
+
 /// nPL names owned by risk-based alerting (risk entity scoring). They resolve to
 /// the `unmapped` spill the finding writer populates, ahead of the OCSF
 /// registry, so a bare `risk_score` never reads a source-reported value.
@@ -746,6 +761,8 @@ fn ocsf_leaf_field_type(info: &ocsf_registry::OcsfPathInfo) -> FieldType {
     }
 }
 
+/// Map a manifest ClickHouse type to the schema-agnostic [`FieldType`]. Collapses
+/// `LowCardinality(...)` / `DateTime64(...)` like the manifest⟷DDL gate does.
 fn map_ch_type(ch_type: &str) -> FieldType {
     let base = {
         let t = ch_type.trim();
@@ -1130,6 +1147,11 @@ impl SchemaProfile for OcsfProfile {
         // NAN-5275: the field universe plus every name `resolve_canonical`
         // gives a real meaning to, so the editor accepts what codegen reads and
         // flags what would fall through to an empty `unmapped` lookup.
+        // NAN-5348: a retired bare name (`host`, `src`, `app`, …) is refused even
+        // where it names a whole OCSF object.
+        if self.retired_field_suggestions(name).is_some() {
+            return false;
+        }
         if self.is_known_field(name) {
             return true;
         }
@@ -1162,6 +1184,13 @@ impl SchemaProfile for OcsfProfile {
         // UDM-name alias layer: the manifest correspondence plus the
         // class-split surfaces (`user`, `src_host`, `process_name`, …).
         self.udm_column_sql(name).is_some()
+    }
+
+    fn retired_field_suggestions(&self, name: &str) -> Option<&'static [&'static str]> {
+        OCSF_RETIRED_FIELDS
+            .iter()
+            .find(|(retired, _)| retired.eq_ignore_ascii_case(name))
+            .map(|(_, paths)| *paths)
     }
 
     fn field_type(&self, field: &str) -> Option<FieldType> {

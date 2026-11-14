@@ -62,6 +62,18 @@ pub trait SchemaProfile: Send + Sync {
         self.is_known_field(name)
     }
 
+    /// NAN-5348 (the NAN-3893 direction): a bare legacy field name this schema
+    /// refuses because no single field of it carries that meaning, with the
+    /// paths to suggest instead. Without the refusal such a name falls through
+    /// to the JSON spill and silently matches nothing. The query validator
+    /// rejects it with "did you mean"; a name an earlier pipeline stage
+    /// produced (`eval host=…`) is a derived field and is never refused.
+    ///
+    /// Default: `None` (UDM keeps its own names).
+    fn retired_field_suggestions(&self, _name: &str) -> Option<&'static [&'static str]> {
+        None
+    }
+
     // --- Typing & query optimization hints ---
 
     /// Value type of a field, if known.

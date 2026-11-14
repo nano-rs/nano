@@ -864,6 +864,21 @@ async fn run() -> Result<()> {
         );
     }
 
+    // NAN-5345: the prevalence `*_final_refresh` cadence follows the planned-volume
+    // tier (30 min at ~1 TB/day, 60 at >=10 TB/day). Unset means the shipped
+    // 10 min: a no-op on views already there, a reset for an install that
+    // dropped back from a large tier. Runs after the repoint above so the
+    // window rewrite keeps the distributed FROM.
+    let prevalence_refresh_minutes =
+        nanosiem_core::db::clickhouse_migrate::prevalence_refresh_minutes_from_env(
+            std::env::var("NANO_PREVALENCE_REFRESH_MINUTES").ok().as_deref(),
+        )
+        .context("reading NANO_PREVALENCE_REFRESH_MINUTES (NAN-5345)")?;
+    migrator
+        .apply_prevalence_refresh_cadence(prevalence_refresh_minutes)
+        .await
+        .context("applying the planned-volume prevalence refresh cadence (NAN-5345)")?;
+
     // NAN-1116: surface any FAILED dictionaries in the deploy log. A FAILED
     // dict referenced by a dictGet()-backed MATERIALIZED column silently drops
     // 100% of ingestion at runtime; this makes it loud at every migrate instead

@@ -13,6 +13,7 @@ mod cluster_reachability;
 mod detection;
 mod distributed;
 mod ocsf_legacy_drop;
+mod prevalence_cadence;
 mod runner;
 mod schema_profile_guard;
 mod sql_transform;
@@ -21,6 +22,8 @@ mod types;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod prevalence_cadence_tests;
 #[cfg(test)]
 mod soft_fail_tests;
 #[cfg(test)]
@@ -34,4 +37,9 @@ pub use ocsf_legacy_drop::{
 pub use schema_profile_guard::{
     check_unset_profile_against_install, classify_installed_logs_schema, InstalledLogsSchema,
 };
+pub use prevalence_cadence::prevalence_refresh_minutes_from_env;
 pub use types::{ClickHouseMigrateError, ClickHouseMigrator, Migration};
+
+#[cfg(test)]
+#[path = "legacy_self_source_tests.rs"]
+mod legacy_self_source_tests;

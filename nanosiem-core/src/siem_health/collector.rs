@@ -69,6 +69,15 @@ pub async fn collect_metrics(
     let alerting = collect_alerting_metrics(pool).await;
     let audit_durability = collect_audit_durability(pool).await;
     let reserved_source_names = collect_reserved_source_names(pool).await;
+    // NAN-5342: system tables only, via the admin probe client. Single-node
+    // installs (no cluster) run no query.
+    let shard_skew = super::shard_skew::collect_shard_skew(
+        &super::shard_skew::ClickHouseShardSkewSource(system_probe_client),
+        super::shard_skew::cluster_from_env(is_clustered).as_deref(),
+        &std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "nanosiem".into()),
+        Utc::now().timestamp(),
+    )
+    .await;
 
     CollectedMetrics {
         ingestion,
@@ -78,6 +87,7 @@ pub async fn collect_metrics(
         alerting,
         audit_durability,
         reserved_source_names,
+        shard_skew,
         collected_at: Utc::now(),
     }
 }

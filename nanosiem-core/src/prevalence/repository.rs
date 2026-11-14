@@ -336,6 +336,17 @@ impl PrevalenceRepository {
             Err(error) => debug!(%error, "prevalence coverage: refresh probe failed"),
         }
 
+        // NAN-5345: the live cadence (a planned-volume tier lengthens it), so a
+        // 30- or 60-minute refresh is not reported stale between runs.
+        let query = super::coverage::PREVALENCE_REFRESH_SECONDS_SQL;
+        match self.client.query(query).fetch_one::<u32>().await {
+            Ok(seconds) if seconds > 0 => {
+                probe.refresh_interval = Some(chrono::Duration::seconds(i64::from(seconds)));
+            }
+            Ok(_) => {}
+            Err(error) => debug!(%error, "prevalence coverage: refresh cadence probe failed"),
+        }
+
         probe
     }
 

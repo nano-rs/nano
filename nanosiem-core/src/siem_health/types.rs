@@ -201,6 +201,11 @@ pub struct CollectedMetrics {
     /// source type. Empty on reports written before this field existed.
     #[serde(default)]
     pub reserved_source_names: ReservedSourceNames,
+    /// NAN-5342: per-shard write rate, part count and merge-pool history.
+    /// `None` on single-shard installs, when the probes could not run, and
+    /// on reports written before this field existed.
+    #[serde(default)]
+    pub shard_skew: Option<super::shard_skew::ShardSkewMetrics>,
     pub collected_at: DateTime<Utc>,
 }
 

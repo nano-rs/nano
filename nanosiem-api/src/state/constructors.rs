@@ -19,7 +19,7 @@ use nanosiem_core::prevalence::PrevalenceService;
 #[cfg(feature = "enterprise")]
 use nanosiem_core::tuning::{NotificationService, TuningRepository};
 use nanosiem_core::{
-    generate_node_id, DetectionService, DiskPressureConfig, DiskPressureService, FeedService,
+    generate_node_id, DetectionService, DiskPressureConfig, DiskPressureService,
     IpAllowlistService, LogSourceService, LogTelemetryService, ParserService,
     QueryLibraryRepository, SearchService, SourceConfigService,
 };
@@ -424,7 +424,6 @@ impl AppState {
             // NAN-1581: flag-aware lookup service shared with the management
             // handlers so create/upload/row ops follow LOOKUP_STORAGE_BACKEND.
             lookup_service: lookup_service_for_state,
-            feed_service: FeedService::with_dual_pool(&dual_pool),
 
             // Services using PostgreSQL only (or with optional ClickHouse for stats)
             distributed_scheduler: Arc::new(RwLock::new(None)),

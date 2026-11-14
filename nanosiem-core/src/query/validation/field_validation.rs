@@ -338,6 +338,15 @@ fn is_valid_field(
     // output-name note in `validate_command_fields`).
     validate_field_name_format(field_name)?;
     reject_doubled_spill_namespace(field_name)?;
+    // NAN-5348: after `| inputlookup` the rows are lookup-table rows: any
+    // well-formed name may be one of its columns (`host`, `app`), so neither
+    // the retired-name refusal nor the log-schema typo gate applies.
+    if derived.contains(LOOKUP_ROWS_MARKER) {
+        return Ok(());
+    }
+    if let Some(p) = profile {
+        reject_retired_field(field_name, p)?;
+    }
 
     match validate_field_name(field_name) {
         Ok(_) => Ok(()),
@@ -392,6 +401,34 @@ fn is_valid_field(
     }
 }
 
+/// Marker in the derived-field set: the pipeline's rows come from
+/// `| inputlookup` (a lookup table), not the log table, so a bare legacy name
+/// is a lookup column, never a refused log field (NAN-5348). Not a valid field
+/// name, so it can never collide with a real one.
+const LOOKUP_ROWS_MARKER: &str = "\u{0}inputlookup-rows";
+
+/// Refuse a bare legacy name the active schema has no single target for
+/// (NAN-5348, the NAN-3893 direction): `host`, `src`, `app`, … under OCSF
+/// would read the `unmapped` spill (or a whole OCSF object) and match nothing.
+/// A 400 with the OCSF paths replaces that silent empty result.
+fn reject_retired_field(
+    field_name: &str,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> Result<(), FieldValidationError> {
+    let Some(paths) = profile.retired_field_suggestions(field_name) else {
+        return Ok(());
+    };
+    Err(FieldValidationError {
+        field_name: field_name.to_string(),
+        message: format!(
+            "Field '{field_name}' is not an OCSF field and would match nothing: no single \
+             OCSF path carries it. Use the OCSF path for what you mean, or \
+             'unmapped.{field_name}' for a producer's own key"
+        ),
+        suggestions: paths.iter().map(|p| (*p).to_string()).collect(),
+    })
+}
+
 /// The JSON-spill namespaces a field may be written under (`ext.foo` under UDM;
 /// `unmapped.foo` — or the UDM-muscle-memory `ext.foo` — under OCSF).
 const SPILL_NAMESPACES: [&str; 2] = ["ext", "unmapped"];
@@ -440,6 +477,9 @@ fn validate_query_fields_recursive(
             validate_query_fields_recursive(source, errors, derived, profile);
             validate_command_fields(command, errors, derived, profile);
             collect_command_output_fields(command, derived);
+            if matches!(command, Command::InputLookup { .. }) {
+                derived.insert(LOOKUP_ROWS_MARKER.to_string());
+            }
         }
     }
 }
@@ -1688,13 +1728,17 @@ mod tests {
         // now lands on `user.name` through the manifest `udm_fields`, and no
         // alias with an unmapped target sits inside the typo gate any more, so
         // this pins parity rather than a rejection.
+        // NAN-5348: `hostname` itself is now REFUSED under OCSF with the
+        // OCSF host paths as suggestions (it read the `unmapped` spill and
+        // silently matched nothing); without a profile it still passes.
         use crate::schema::SchemaProfile;
         let ocsf = crate::schema::OcsfProfile::new();
         assert!(!ocsf.is_known_field("hostname"));
         let query = parse_query(r#"hostname="admin""#).unwrap();
         let with_ocsf = validate_query_fields_with_profile(&query, Some(&ocsf));
-        let without = validate_query_fields_with_profile(&query, None);
-        assert_eq!(with_ocsf.len(), without.len(), "{with_ocsf:?} vs {without:?}");
+        assert_eq!(with_ocsf.len(), 1, "{with_ocsf:?}");
+        assert!(with_ocsf[0].suggestions.contains(&"device.hostname".to_string()));
+        assert!(validate_query_fields_with_profile(&query, None).is_empty());
         let query = parse_query(r#"username="admin""#).unwrap();
         assert!(validate_query_fields_with_profile(&query, Some(&ocsf)).is_empty());
     }

@@ -152,6 +152,11 @@ RECIPIENT_CERT = f"{KEYS_DIR}/recipient.crt"
 SIGNING_KEY = f"{KEYS_DIR}/signing.pem"
 RECOVERY_KEY = f"{KEYS_DIR}/recovery-key.pem"
 BACKUP_ROLE = "nano_backup"
+# NAN-5367: the SELECT-only ClickHouse backup user never accepts connections
+# from any address: loopback and private address space (the Compose, inventory
+# and pod networks the scheduler runs on).
+BACKUP_CH_HOSTS = ("IP '127.0.0.1', IP '::1', IP '10.0.0.0/8', IP '172.16.0.0/12', "
+                   "IP '192.168.0.0/16', IP '100.64.0.0/10', IP 'fc00::/7'")
 # NAN-1728: on a multi-shard cluster each shard holds the lookup rows that
 # were written through it; reads go through the `_distributed` wrapper (the
 # argMax dedup collapses cross-shard copies). Single node: the local table.
@@ -804,17 +809,24 @@ class Database:
         never leaves the user dropped on part of the cluster. A repair creates
         the user if it is missing, resets its password and grants SELECT on
         the two lookup tables only; nothing is ever dropped."""
+        cluster = f" ON CLUSTER '{self.ch_cluster}'" if self.ch_cluster else ""
         try:
             self.ch("SELECT 1 FROM nanosiem.lookup_rows LIMIT 0")
+            # NAN-5367: a user an earlier release created accepts connections
+            # from any address. Tighten it once; a local read, so a routine
+            # run on an already-restricted user still issues no cluster DDL.
+            open_any = self.ch(f"SELECT count() FROM system.users WHERE name = '{BACKUP_ROLE}' "
+                               "AND has(host_ip, '::/0') FORMAT TSVRaw", admin=True)
+            if open_any.decode(errors="replace").strip() not in ("", "0"):
+                self.ch(f"ALTER USER {BACKUP_ROLE}{cluster} HOST {BACKUP_CH_HOSTS}", admin=True)
             return
         except BackupError as error:
             if "unreachable" in str(error):
                 raise
-        cluster = f" ON CLUSTER '{self.ch_cluster}'" if self.ch_cluster else ""
         self.ch(f"CREATE USER IF NOT EXISTS {BACKUP_ROLE}{cluster} IDENTIFIED WITH sha256_password BY "
-                f"'{self.backup_ch_password}'", admin=True)
+                f"'{self.backup_ch_password}' HOST {BACKUP_CH_HOSTS}", admin=True)
         self.ch(f"ALTER USER {BACKUP_ROLE}{cluster} IDENTIFIED WITH sha256_password BY "
-                f"'{self.backup_ch_password}'", admin=True)
+                f"'{self.backup_ch_password}' HOST {BACKUP_CH_HOSTS}", admin=True)
         for table in ("lookup_rows", "lookup_rows_distributed"):
             self.ch(f"GRANT{cluster} SELECT ON nanosiem.{table} TO {BACKUP_ROLE}", admin=True)
 

@@ -150,6 +150,18 @@ fn allowed(source: &Parser, slot: usize) -> impl Fn(&str) -> bool {
 
 #[tokio::test]
 async fn adding_or_removing_a_source_rebuilds_no_fanin() {
+    // NAN-5346: the persisted family differs by profile (UDM `Kept`, OCSF
+    // `Ocsf`); both must keep the fan-ins constant.
+    for (schema, family) in [
+        (crate::schema::SchemaId::Udm, Family::Kept),
+        (crate::schema::SchemaId::Ocsf, Family::Ocsf),
+    ] {
+        let _pin = crate::schema::pin_active_schema_for_test(schema);
+        adding_or_removing_one_source_rebuilds_no_fanin(family).await;
+    }
+}
+
+async fn adding_or_removing_one_source_rebuilds_no_fanin(family: Family) {
     super::force_for_test(Some(true));
     let tmp = TempDir::new().unwrap();
     let manager = VectorConfigManager::new(tmp.path());
@@ -171,7 +183,7 @@ async fn adding_or_removing_a_source_rebuilds_no_fanin() {
         assert!(after.contains_key(fanin));
     }
     assert!(diff.contains("transforms.source_router"));
-    assert!(diff.contains(&format!("transforms.{}", slot_id(Family::Kept, slot))));
+    assert!(diff.contains(&format!("transforms.{}", slot_id(family, slot))));
 
     // Removing it again is just as narrow, and restores the previous tree.
     let restored = deploy(&manager, &base).await;
@@ -212,22 +224,22 @@ fn resolved_inputs_reach_every_parser_through_its_slots() {
     let combiner = VectorConfigManager::combiner_config_content_for(&set, true);
     let sink = VectorConfigManager::ocsf_sink_content(&VectorConfigManager::ocsf_sink_inputs_for(true, &set));
 
-    let mut kept = resolved_inputs(&[&combiner], "db_parsers_combined");
+    // NAN-5346: under OCSF the persisted UDM stream reads only the parked
+    // (never-matching) filter, and health reads the OCSF lane.
+    assert_eq!(resolved_inputs(&[&combiner], "db_parsers_combined"), vec!["prepare_output"]);
+    let udm = VectorConfigManager::combiner_config_content_for(&set, false);
+    let mut kept = resolved_inputs(&[&udm], "db_parsers_combined");
     kept.sort();
     assert_eq!(kept, vec!["source_00_sample", "source_01_output", "source_02_output"]);
 
+    let mut health = resolved_inputs(&[&udm], "db_parser_health");
+    health.sort();
+    assert_eq!(health, vec!["source_00_output", "source_01_output", "source_02_output"]);
     let mut health = resolved_inputs(&[&combiner], "db_parser_health");
     health.sort();
     assert_eq!(
         health,
-        vec![
-            "source_00_ocsf_prepare",
-            "source_00_output",
-            "source_01_ocsf_prepare",
-            "source_01_output",
-            "source_02_ocsf_prepare",
-            "source_02_output",
-        ]
+        vec!["source_00_ocsf_prepare", "source_01_ocsf_prepare", "source_02_ocsf_prepare"]
     );
 
     let mut ocsf = resolved_inputs(&[&combiner, &sink], "clickhouse_ocsf_logs");
@@ -257,7 +269,9 @@ fn slots_off_wires_the_same_components_directly() {
     for ocsf in [false, true] {
         let on = VectorConfigManager::combiner_config_content_with(&set, ocsf, true);
         let off = VectorConfigManager::combiner_config_content_with(&set, ocsf, false);
-        assert!(!off.contains("nano-slot-"), "{off}");
+        // No slot filters; only the parked filter (OCSF's persisted input,
+        // NAN-5346) may exist.
+        assert!(!off.replace(PARKED, "").contains("nano-slot-"), "{off}");
         for fanin in ["db_parsers_combined", "db_parser_health"] {
             let mut a = resolved_inputs(&[&on], fanin);
             let mut b = resolved_inputs(&[&off], fanin);

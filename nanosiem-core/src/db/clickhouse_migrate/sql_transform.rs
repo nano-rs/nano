@@ -157,6 +157,33 @@ impl ClickHouseMigrator {
     /// Substitute `{clickhouse_self_*}` placeholders in dictionary SOURCE blocks
     /// that reference the local CH instance.
     ///
+    /// NAN-5367: migrations 110, 112 and 114 predate the NAN-707 placeholders
+    /// and hard-code `HOST 'localhost' PORT 9000 USER 'nanosiem' PASSWORD
+    /// 'nanosiem'` in their ClickHouse-sourced prevalence dictionaries. Later
+    /// migrations (115, 121, 130+) re-issue them with placeholders, so an
+    /// installed system ends correct, but on every fresh install the ALTERs
+    /// that run in between load those dictionaries with the default password:
+    /// 5-9 `AUTHENTICATION_FAILED` per install (and connection refusals on a
+    /// custom native port). Applied migration files are immutable (their
+    /// checksum is recorded), so rewrite the legacy literal to the placeholder
+    /// form at apply time; the checksum is of the file and is unaffected.
+    /// Only that exact self-source shape is touched.
+    pub(super) fn rewrite_legacy_self_source_credentials(sql: &str) -> String {
+        static LEGACY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = LEGACY.get_or_init(|| {
+            regex::Regex::new(
+                r"SOURCE\(CLICKHOUSE\((\s*)HOST 'localhost'(\s+)PORT 9000(\s+)USER 'nanosiem'(\s+)PASSWORD 'nanosiem'",
+            )
+            .expect("legacy self-source regex")
+        });
+        re.replace_all(
+            sql,
+            "SOURCE(CLICKHOUSE(${1}HOST '{clickhouse_self_host}'${2}PORT {clickhouse_self_port}${3}\
+             USER '{clickhouse_self_user}'${4}PASSWORD '{clickhouse_self_password}'",
+        )
+        .into_owned()
+    }
+
     /// NAN-707: Historically only `init.sql` ran this substitution (see the
     /// inline `replace(...)` chain in `runner::run_init_sql`). Numbered migrations
     /// got the placeholder text verbatim, so any migration referencing the local

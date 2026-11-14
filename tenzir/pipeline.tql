@@ -22,11 +22,21 @@
 //   NANO_CH_NATIVE_PORT         ClickHouse native TCP port. Default 9000
 //   NANO_CH_INGEST_USER         INSERT-only user.           Default nanosiem_ingest
 //   NANO_TENZIR_LISTEN          Listener address.           Default 0.0.0.0:9095
+//   NANO_CH_SHARDS              ClickHouse shard count.     Default 1
+//   NANO_CH_TABLE               Landing table override.     Default below
+//
+// On more than one shard (NANO_CH_SHARDS > 1) the sink writes the write-only
+// `nanosiem.ocsf_logs_raw_distributed` wrapper, which splits each batch across
+// the shards (NAN-5203 / NAN-5345). `ocsf_logs_raw` would keep every row on the
+// one server NANO_CH_HOST names.
 
 let $ch_host = env("NANO_CH_HOST").otherwise("clickhouse")
 let $ch_port = int(env("NANO_CH_NATIVE_PORT").otherwise("9000"))
 let $ch_user = env("NANO_CH_INGEST_USER").otherwise("nanosiem_ingest")
 let $listen  = env("NANO_TENZIR_LISTEN").otherwise("0.0.0.0:9095")
+let $ch_shards = int(env("NANO_CH_SHARDS").otherwise("1"))
+let $ch_table = env("NANO_CH_TABLE").otherwise(
+  "nanosiem.ocsf_logs_raw_distributed" if $ch_shards > 1 else "nanosiem.ocsf_logs_raw")
 
 // ── SOURCE ────────────────────────────────────────────────────────────────
 // Receive newline-delimited JSON over HTTP. Point your shipper at
@@ -64,6 +74,51 @@ this = { event: this, source_type: "tenzir" }
 source_type = source_type.otherwise("unknown")
 // ───────────────────────────────────────────────────────────────────────────
 
+// ── CREDENTIAL REDACTION (NAN-5352 — keep this) ───────────────────────────
+// This lane writes straight to ClickHouse, past the Vector storage boundary
+// that redacts credentials, so it redacts here: a credential-named key
+// (authorization, proxy-authorization, x-api-key, x-webhook-secret, cookie,
+// set-cookie) anywhere in the event, or written inside `raw_data`, `message`
+// or any other string (JSON, escaped JSON, header lines including folded
+// ones, key=value), keeps the rest of the text but its VALUE becomes
+// [REDACTED]. Anything these rules cannot bound (a nested object value,
+// deeper escaping, a name spelled with \u escapes) fails closed: the event
+// lands with only its class/time fields and a [REDACTED: ...] marker in
+// `message` and `raw_data`. Events that name no credential skip this block.
+// Same rules as nano's Vector redaction (credential_text_redaction_vrl! in
+// nanosiem-core vector_config/mod.rs); tenzir/tests/credential_redaction.sh
+// runs them.
+let $nano_cred_gate = r#"(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]"#
+let $nano_cred_escgate = r#"\\u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])"#
+let $nano_cred_json = r#"(?i)((?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|\[(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\]|\{(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\}|-?[0-9][0-9.eE+-]*|true|false|null)"#
+let $nano_cred_esc = r#"(?i)((?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\"\s*:\s*)(?:\\"(?:[^"\\]|\\\\\\"|\\\\\\\\|\\\\[^"\\])*\\"|-?[0-9][0-9.eE+-]*|true|false|null)"#
+let $nano_cred_qval = r#"(?i)((?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*[:=][ \t]*)(?:"(?:[^"\\]|\\.)*"|\x27[^\x27]*\x27)"#
+let $nano_cred_hdr = r#"(?i)((?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*:)(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*[^\s"\\\x27|](?:[^\r\n"\\|]|\\[^rn"\\])*(?:(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+(?:[^\r\n"\\|]|\\[^rn"\\])*)*"#
+let $nano_cred_kv = r#"(?i)((?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*=[ \t]*)(?:(?:bearer|basic|digest|negotiate|ntlm|token)[ \t]+)?[^\s"\\\x27&,;|][^\s"\\&,;|]*"#
+let $nano_cred_done = r#"(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=](?:\s*\\*"\[REDACTED\]\\*"|(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*(?:\[REDACTED\]|[^=;\s"\\]+=\[REDACTED\]|[&,;|}\]]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[^ \t\\\r\n]|\\[^trn]|\z)|\z))"#
+let $nano_cred_left = r#"(?i)(?:(?:p|\\+u00(?:50|70))(?:r|\\+u00(?:52|72))(?:o|\\+u00(?:4F|6F))(?:x|\\+u00(?:58|78))(?:y|\\+u00(?:59|79))(?:-|\\+u002[dD])(?:a|\\+u00(?:41|61))(?:u|\\+u00(?:55|75))(?:t|\\+u00(?:54|74))(?:h|\\+u00(?:48|68))(?:o|\\+u00(?:4F|6F))(?:r|\\+u00(?:52|72))(?:i|\\+u00(?:49|69))(?:z|\\+u00(?:5A|7A))(?:a|\\+u00(?:41|61))(?:t|\\+u00(?:54|74))(?:i|\\+u00(?:49|69))(?:o|\\+u00(?:4F|6F))(?:n|\\+u00(?:4E|6E))|(?:a|\\+u00(?:41|61))(?:u|\\+u00(?:55|75))(?:t|\\+u00(?:54|74))(?:h|\\+u00(?:48|68))(?:o|\\+u00(?:4F|6F))(?:r|\\+u00(?:52|72))(?:i|\\+u00(?:49|69))(?:z|\\+u00(?:5A|7A))(?:a|\\+u00(?:41|61))(?:t|\\+u00(?:54|74))(?:i|\\+u00(?:49|69))(?:o|\\+u00(?:4F|6F))(?:n|\\+u00(?:4E|6E))|(?:x|\\+u00(?:58|78))(?:-|\\+u002[dD])(?:w|\\+u00(?:57|77))(?:e|\\+u00(?:45|65))(?:b|\\+u00(?:42|62))(?:h|\\+u00(?:48|68))(?:o|\\+u00(?:4F|6F))(?:o|\\+u00(?:4F|6F))(?:k|\\+u00(?:4B|6B)|\\+u212[aA])(?:-|\\+u002[dD])(?:s|\\+u00(?:53|73))(?:e|\\+u00(?:45|65))(?:c|\\+u00(?:43|63))(?:r|\\+u00(?:52|72))(?:e|\\+u00(?:45|65))(?:t|\\+u00(?:54|74))|(?:x|\\+u00(?:58|78))(?:-|\\+u002[dD])(?:a|\\+u00(?:41|61))(?:p|\\+u00(?:50|70))(?:i|\\+u00(?:49|69))(?:-|\\+u002[dD])(?:k|\\+u00(?:4B|6B)|\\+u212[aA])(?:e|\\+u00(?:45|65))(?:y|\\+u00(?:59|79))|(?:s|\\+u00(?:53|73))(?:e|\\+u00(?:45|65))(?:t|\\+u00(?:54|74))(?:-|\\+u002[dD])(?:c|\\+u00(?:43|63))(?:o|\\+u00(?:4F|6F))(?:o|\\+u00(?:4F|6F))(?:k|\\+u00(?:4B|6B)|\\+u212[aA])(?:i|\\+u00(?:49|69))(?:e|\\+u00(?:45|65))|(?:c|\\+u00(?:43|63))(?:o|\\+u00(?:4F|6F))(?:o|\\+u00(?:4F|6F))(?:k|\\+u00(?:4B|6B)|\\+u212[aA])(?:i|\\+u00(?:49|69))(?:e|\\+u00(?:45|65)))\\*"?\s*[:=]"#
+_nano_j = event.print_ndjson()
+if _nano_j.match_regex($nano_cred_gate) or _nano_j.match_regex($nano_cred_escgate) {
+  _nano_j = _nano_j.replace_regex($nano_cred_json, r#"\1"[REDACTED]""#)
+  _nano_j = _nano_j.replace_regex($nano_cred_esc, r#"\1\\"[REDACTED]\\""#)
+  _nano_j = _nano_j.replace_regex($nano_cred_qval, r#"\1"[REDACTED]""#)
+  _nano_j = _nano_j.replace_regex($nano_cred_hdr, r#"\1 [REDACTED]"#)
+  _nano_j = _nano_j.replace_regex($nano_cred_kv, r#"\1[REDACTED]"#)
+  if _nano_j.replace_regex($nano_cred_done, "").match_regex($nano_cred_left) {
+    event = {
+      class_uid: event.class_uid?, category_uid: event.category_uid?,
+      activity_id: event.activity_id?, type_uid: event.type_uid?,
+      severity_id: event.severity_id?, time: event.time?,
+      message: "[REDACTED: credential-bearing event]",
+      raw_data: "[REDACTED: credential-bearing event]",
+    }
+  } else {
+    event = _nano_j.parse_json()
+  }
+}
+drop _nano_j
+// ───────────────────────────────────────────────────────────────────────────
+
 // ── BATCH (coalesce before the sink — keep this) ───────────────────────────
 // ClickHouse wants big inserts, not a storm of 1-row parts. A mapping that
 // produces HETEROGENEOUS events (real OCSF: each class / field-set is a distinct
@@ -78,7 +133,8 @@ source_type = source_type.otherwise("unknown")
 unordered { batch 65536, timeout=2s }
 
 // ── SINK (pre-wired — keep the table) ──────────────────────────────────────
-// Native to_clickhouse straight into nano's OCSF landing table. nano's
+// Native to_clickhouse straight into nano's OCSF landing table ($ch_table:
+// ocsf_logs_raw on one shard, its _distributed wrapper on more). nano's
 // materialized-view chain derives every promoted / enriched / prevalence column
 // into `nanosiem.ocsf_logs`; you send only {event, source_type} and the server
 // fills the timestamp (from event.time) and the row id.
@@ -90,7 +146,7 @@ unordered { batch 65536, timeout=2s }
 // `nanosiem.ocsf_logs_native_raw` entrypoint instead (a thin JSON/String shim
 // that forwards into ocsf_logs_raw) — see tenzir/AGENTS.md.
 // `tls=false` — the native port is plaintext on the internal docker network.
-to_clickhouse table="nanosiem.ocsf_logs_raw",
+to_clickhouse table=$ch_table,
   host=$ch_host, port=$ch_port,
   user=$ch_user, password=env("CLICKHOUSE_INGEST_PASSWORD"),
   tls=false, mode="append"

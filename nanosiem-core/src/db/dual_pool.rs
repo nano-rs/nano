@@ -669,6 +669,9 @@ pub struct DualPool {
     /// Admin client for DDL operations (CREATE/DROP views, etc.)
     /// Falls back to regular client if admin credentials not configured
     clickhouse_admin: ClickHouseClient,
+    /// NAN-5367: `clickhouse_admin` is a distinct admin identity (admin
+    /// credentials configured), not the runtime-user fallback.
+    has_clickhouse_admin: bool,
     /// NAN-2001: raw-SQL feature clients. `clickhouse_rawsql` is audit-capable;
     /// `clickhouse_rawsql_noaudit` carries the RESTRICTIVE audit row policy. The
     /// raw-SQL handler picks by the caller's `audit:view`. Both are REQUIRED —
@@ -1010,6 +1013,7 @@ impl DualPool {
             postgres,
             clickhouse,
             clickhouse_admin,
+            has_clickhouse_admin: using_admin,
             clickhouse_rawsql,
             clickhouse_rawsql_noaudit,
             is_clustered,
@@ -1282,6 +1286,23 @@ impl DualPool {
         &self.clickhouse_admin
     }
 
+    /// NAN-5367: whether [`Self::clickhouse_admin`] authenticates as the admin
+    /// identity (`CLICKHOUSE_ADMIN_USER`/`PASSWORD` set) rather than falling
+    /// back to the runtime user. Callers that need an admin-only privilege
+    /// (REMOTE for `clusterAllReplicas`) skip instead of issuing a query the
+    /// runtime user is denied.
+    pub fn has_clickhouse_admin(&self) -> bool {
+        self.has_clickhouse_admin
+    }
+
+    /// NAN-5367: the client for `cluster()` / `clusterAllReplicas()` reads of
+    /// `system.*` metadata: the admin identity, which holds REMOTE. `None`
+    /// without admin credentials; callers then read the local node instead of
+    /// issuing a fan-out the runtime user is denied (Code 497).
+    pub fn clickhouse_fanout(&self) -> Option<&ClickHouseClient> {
+        self.has_clickhouse_admin.then_some(&self.clickhouse_admin)
+    }
+
     /// NAN-2001: audit-capable raw-SQL client (`nanosiem_rawsql`). Read-only,
     /// SELECT only on the raw-SQL allowlist. Used for `POST /api/search/sql`
     /// (and dashboards SQL / meloD advanced validation) when the caller HAS
@@ -1329,6 +1350,7 @@ impl DualPool {
             postgres,
             clickhouse: ClickHouseClient::default(),
             clickhouse_admin: ClickHouseClient::default(),
+            has_clickhouse_admin: false,
             clickhouse_rawsql: ClickHouseClient::default(),
             clickhouse_rawsql_noaudit: ClickHouseClient::default(),
             is_clustered,

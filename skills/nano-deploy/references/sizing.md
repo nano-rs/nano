@@ -3,7 +3,7 @@
 Run the calculator and show its output to the operator:
 
 ```bash
-python3 scripts/size.py --eps <EPS> --retention-days <DAYS> --topology single|ha3|helm [--growth 1.5]
+python3 scripts/size.py --eps <EPS> --retention-days <DAYS> --topology single|ha3|helm [--growth 1.5] [--avg-event-bytes 300|1000|2000] [--ingest-path raw|preshaped]
 ```
 
 ## The source of truth
@@ -126,7 +126,10 @@ expected for 20 TB/day. Replicas add availability, not capacity: the plan shows 
 | Disk buffer | the installer's budget: 2 × Vector memory, 2-32 GiB, over 2 + 6 × shards buffers | nano-measured (`resource-sizing.sh`, `disk-buffer-budget.env`) |
 | Buffer floor at volume | ≥ 1 GiB per sink | MEASURED-external (500-790 MB used of 1 GiB at 10-25 s flush latency) |
 | Vector memory at ≥ 1 TB/day | ≥ 8 GiB | MEASURED-external (2 GB OOM-looped 581 times) |
-| Memory per deployed source | ~10 MiB | nano-measured (470-512 MiB at 50 sources) |
+| Memory per deployed source | ~1 GiB at 16 sources; the installer floors Vector at 1 GiB plus 64 MiB per source beyond 16 | nano-measured 2026-11-13 (NAN-5193) |
+| Vector CPU model | vCPU = 2 (peak) × events/s ÷ events per core; events/s = GB/day × 1e9 ÷ 86,400 ÷ average event bytes (`NANO_AVG_EVENT_BYTES` / `sizing.avgEventBytes` / `size.py --avg-event-bytes`, default 1000) | nano-measured (NAN-5372); `resource-sizing.sh`, Helm `sizing.*` and `size.py` share the constants (a test keeps them equal) |
+| Vector events per core, raw logs parsed by nano | 1,900 (measured 1,950-6,500 across 16 shipped OCSF parsers: EDR 3,600-4,600, Okta 1,950, Palo Alto 2,527, Zeek 2,509). Per TB/day: ~41 vCPU at 300 B (firewall/flow), ~13 at 1,000 B (mixed/identity), ~7 at 2,000 B (EDR) | nano-measured 2026-11-13, 0.61.0-nano.11, after parsers#67 |
+| Vector events per core, pre-shaped OCSF (Tenzir/Cribl) | 45,000 (ship-only measured 90-120k; half for bursts): ~0.5 vCPU per TB/day at 1,000 B | nano-measured 2026-11-13 |
 | Request concurrency | keep 6 | nano-measured default; MEASURED-external (16 wedged production) |
 | Co-locate on ClickHouse hosts | up to 100 GB/day | nano-measured guidance |
 
@@ -156,8 +159,11 @@ from the inventory yet". Each row carries a plain-words topic:
 | `CLICKHOUSE_INGEST_MAX_MEMORY_USAGE` ≥ 16 GiB | ≥ 1 TB/day | inventory override (MEASURED-external) | async-insert flushes |
 | ingest workload threads ≥ 2 × cores | above ~5,300 EPS | not settable (fixed at 4) | ingest workload threads |
 | per-user insert caps | ≥ 1 TB/day | not settable | insert concurrency |
-| flush 5 s / 256 MiB, 64 KiB blocks | ≥ 1 TB/day | not settable | async-insert flushes |
-| merge memory soft limit, per-table merge cap | ≥ 1 TB/day per shard | not settable | merge capacity |
+| adaptive flush 1-5 s (1-10 s at ≥ 10 TB/day) / 256 MiB | ≥ 1 TB/day | `NANO_PLANNED_GB_PER_DAY` in the shared `.env` (NAN-5345) | async-insert flushes |
+| 64 KiB compress blocks | always | shipped in `mergetree.xml` (NAN-5345) | async-insert flushes |
+| part limits 2,000/4,000 (5,000/10,000), merge memory 50% of RAM | ≥ 1 TB/day | `NANO_PLANNED_GB_PER_DAY` in the shared `.env` (NAN-5345) | merge capacity |
+| per-table merge cap | ≥ 1 TB/day per shard | not settable | merge capacity |
+| prevalence `*_final_refresh` every 30 min (60 at ≥ 10 TB/day; 10 default) | ≥ 1 TB/day | `NANO_PLANNED_GB_PER_DAY` in the shared `.env`; Helm `migrations.prevalenceRefreshMinutes` (NAN-5345) | refresh CPU |
 | sink acks, DLQ, `delete_failed_message=false` | always | not settable | Vector delivery |
 | Vector role split | more than 4 ingest hosts | not available | Vector role split |
 | TTL-driven tiering | when part of retention is cold | free-space tiering only | TTL tiering |

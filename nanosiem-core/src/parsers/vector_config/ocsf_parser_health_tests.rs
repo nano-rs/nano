@@ -9,7 +9,8 @@
 //! record as a success and a failing parser showed a 0% failure rate.
 //!
 //! The scenario runs the generated per-parser chain (`_source_lane` stamp,
-//! `_parse`, the `_ocsf_split` route condition, `_ocsf_prepare` or `_output`)
+//! `_parse`, the `_ocsf_split` route condition, `_ocsf_failure` for anything
+//! the split does not take, then `_ocsf_prepare`)
 //! and the generated `db_parser_health` reducer on the VRL runtime, so the row
 //! that would reach `parser_health_ingest` is asserted directly.
 
@@ -156,8 +157,14 @@ fn through_named(
     let (_, parsed, meta) = run(&source(&t, &format!("{name}_parse")), event, meta).unwrap();
 
     let ocsf_lane = takes_ocsf_lane(&t, name, &parsed);
-    let step = if ocsf_lane { format!("{name}_ocsf_prepare") } else { format!("{name}_output") };
-    let (_, row, meta) = run(&source(&t, &step), parsed, meta).unwrap();
+    // NAN-5346: the unmatched port feeds `_ocsf_failure`, then `_ocsf_prepare`.
+    let (parsed, meta) = if ocsf_lane {
+        (parsed, meta)
+    } else {
+        let (_, record, meta) = run(&source(&t, &format!("{name}_ocsf_failure")), parsed, meta).unwrap();
+        (record, meta)
+    };
+    let (_, row, meta) = run(&source(&t, &format!("{name}_ocsf_prepare")), parsed, meta).unwrap();
     let (_, health, _) = run(&source(&c, "db_parser_health"), row, meta)
         .expect("the health reducer keeps every attributed parser row");
     Outcome { ocsf_lane, health }
@@ -189,10 +196,10 @@ fn a_failed_ocsf_parse_counts_as_a_parse_error() {
     assert_eq!(bad.health["parse_failure"], 0, "pre-fix render undercounts");
 }
 
-/// A root `.parse_error` still takes the UDM recovery path, where `_output`
-/// counts it. It never also reaches `_ocsf_prepare`, so it counts once.
+/// A root `.parse_error` leaves the OCSF split and becomes the parse-error
+/// record (NAN-5346), which `_ocsf_prepare` counts once.
 #[test]
-fn a_root_parse_error_counts_once_on_the_udm_recovery_path() {
+fn a_root_parse_error_counts_once_on_the_parse_error_record_path() {
     let vrl = format!("{JSON_GENERIC_LIKE_VRL}\nif exists(.unmapped.parse_error) {{ .parse_error = .unmapped.parse_error }}");
     let p = parser(Uuid::new_v4(), &vrl);
     let m = VectorConfigManager::new("/tmp/nanosiem-test");

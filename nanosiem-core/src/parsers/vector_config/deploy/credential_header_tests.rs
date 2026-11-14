@@ -68,7 +68,7 @@ pub(super) fn transform_in(config: &str, name: &str) -> String {
 
 /// The pipeline config is not valid TOML until Vector interpolates its
 /// `${VAR:-default}` sink settings, so slice the block out textually.
-fn pipeline(name: &str) -> String {
+pub(super) fn pipeline(name: &str) -> String {
     let content = VectorConfigManager::pipeline_config_content();
     let header = format!("[transforms.{name}]\n");
     let at = content

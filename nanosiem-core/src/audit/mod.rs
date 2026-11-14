@@ -274,8 +274,13 @@ impl AuditEvent {
     /// The audit-specific metadata JSON stored on the UDM row (and read back by
     /// the audit page). Shared with the PostgreSQL fallback read path
     /// (`outbox::SecurityAuditOutbox::query`) so both render identically.
+    ///
+    /// NAN-5346: `event_id` is the stable audit event id. The OCSF copy's row
+    /// `id` is the same value, so an OCSF reader that also reads `logs`
+    /// keeps one row per event.
     pub fn metadata_json(&self) -> serde_json::Value {
         json!({
+            "event_id": self.event_id.to_string(),
             "actor_id": self.actor_id.map(|id| id.to_string()),
             "actor_name": self.actor_name,
             "api_key_id": self.api_key_id.map(|id| id.to_string()),
@@ -451,6 +456,8 @@ impl AuditEvent {
             // nano vendor extension — byte-parity with the UDM row's metadata
             // JSON (plus source/action, which UDM stores as top-level columns).
             "unmapped": {
+                // NAN-5346: also the row `id`; parity with the UDM metadata.
+                "event_id": self.event_id.to_string(),
                 "source": self.source.to_string(),
                 "action": self.action,
                 "actor_id": self.actor_id.map(|id| id.to_string()),

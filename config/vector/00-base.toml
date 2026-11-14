@@ -395,16 +395,20 @@ if exists(%nano_json_record) {
     parser_record = del(%nano_json_record)
     nano_message_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
     nano_message_cred_paths = []
-    for_each(keys(flatten(object!(parser_record), "\u{1f}"))) -> |_idx, nano_flat_key| {
-        nano_segments = split(nano_flat_key, "\u{1f}")
-        nano_hit = -1
-        for_each(nano_segments) -> |nano_i, nano_seg| {
-            if nano_hit < 0 && includes(nano_message_cred_names, downcase(nano_seg)) {
-                nano_hit = nano_i
+    # NAN-5180: walk only when a credential key can be present; see
+    # credential_key_precheck_vrl! in nanosiem-core vector_config/mod.rs.
+    if match(encode_json(object!(parser_record)), r'(?i)"(?:authorization|proxy-authorization|x-api-key|x-webhook-secret|cookie|set-cookie)":') {
+        for_each(keys(flatten(object!(parser_record), "\u{1f}"))) -> |_idx, nano_flat_key| {
+            nano_segments = split(nano_flat_key, "\u{1f}")
+            nano_hit = -1
+            for_each(nano_segments) -> |nano_i, nano_seg| {
+                if nano_hit < 0 && includes(nano_message_cred_names, downcase(nano_seg)) {
+                    nano_hit = nano_i
+                }
             }
-        }
-        if nano_hit >= 0 {
-            nano_message_cred_paths = push(nano_message_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+            if nano_hit >= 0 {
+                nano_message_cred_paths = push(nano_message_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+            }
         }
     }
     for_each(nano_message_cred_paths) -> |_idx, nano_path| {
@@ -419,16 +423,20 @@ if exists(%nano_json_record) {
 # The storage-boundary redactor remains defense in depth for every transport.
 nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
 nano_cred_paths = []
-for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
-    nano_segments = split(nano_flat_key, "\u{1f}")
-    nano_hit = -1
-    for_each(nano_segments) -> |nano_i, nano_seg| {
-        if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
-            nano_hit = nano_i
+# NAN-5180: walk only when a credential key can be present; see
+# credential_key_precheck_vrl! in nanosiem-core vector_config/mod.rs.
+if match(encode_json(.), r'(?i)"(?:authorization|proxy-authorization|x-api-key|x-webhook-secret|cookie|set-cookie)":') {
+    for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
+        nano_segments = split(nano_flat_key, "\u{1f}")
+        nano_hit = -1
+        for_each(nano_segments) -> |nano_i, nano_seg| {
+            if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+                nano_hit = nano_i
+            }
         }
-    }
-    if nano_hit >= 0 {
-        nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+        if nano_hit >= 0 {
+            nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+        }
     }
 }
 for_each(nano_cred_paths) -> |_idx, nano_path| {
@@ -486,16 +494,20 @@ if to_bool(%nano_json_batch_member) ?? false {
         # JSON before the member becomes either `.message` or merged fields.
         nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
         nano_cred_paths = []
-        for_each(keys(flatten(object!(parsed), "\u{1f}"))) -> |_idx, nano_flat_key| {
-            nano_segments = split(nano_flat_key, "\u{1f}")
-            nano_hit = -1
-            for_each(nano_segments) -> |nano_i, nano_seg| {
-                if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
-                    nano_hit = nano_i
+        # NAN-5180: walk only when a credential key can be present; see
+        # credential_key_precheck_vrl! in nanosiem-core vector_config/mod.rs.
+        if match(encode_json(object!(parsed)), r'(?i)"(?:authorization|proxy-authorization|x-api-key|x-webhook-secret|cookie|set-cookie)":') {
+            for_each(keys(flatten(object!(parsed), "\u{1f}"))) -> |_idx, nano_flat_key| {
+                nano_segments = split(nano_flat_key, "\u{1f}")
+                nano_hit = -1
+                for_each(nano_segments) -> |nano_i, nano_seg| {
+                    if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+                        nano_hit = nano_i
+                    }
                 }
-            }
-            if nano_hit >= 0 {
-                nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+                if nano_hit >= 0 {
+                    nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+                }
             }
         }
         for_each(nano_cred_paths) -> |_idx, nano_path| {

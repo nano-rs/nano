@@ -298,6 +298,14 @@ initialize_e2e_clickhouse_config() {
     mkdir -p "$target"
     cp -R "$ROOT/clickhouse/config.d" "$target/config.d"
     cp -R "$ROOT/clickhouse/users.d" "$target/users.d"
+    # NAN-5367: the same per-user <networks> install.sh renders (loopback +
+    # this Docker daemon's address pools), so every run proves the shipped
+    # restriction rather than the private-range fallback.
+    python3 -I "$ROOT/scripts/lib/clickhouse_networks.py" \
+        --users-xml "$target/users.d/nanosiem-users.xml" \
+        --output "$target/users.d/zzzz-nano-networks.xml" \
+        --docker-pools-json "$(docker info --format '{{json .DefaultAddressPools}}' 2>/dev/null || true)" \
+        >/dev/null || die "could not render the ClickHouse network allow-list"
 }
 
 # Optional NAN-4997 capacity emulation. The normal e2e defaults stay unchanged;

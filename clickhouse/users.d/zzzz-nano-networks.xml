@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<!--
+  Empty target for the NAN-5367 generated <networks> bind mount. Docker must
+  find this file inside the read-only users.d parent bind before it can overlay
+  the generated file. Keep this placeholder inert: install.sh supplies the
+  active contents (Docker address pools + the nanosiem_ingest allow-list).
+-->
+<clickhouse/>

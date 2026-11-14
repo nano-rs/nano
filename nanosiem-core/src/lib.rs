@@ -228,10 +228,7 @@ pub use detection::{
 pub use enrichment::{
     EnrichmentError, EnrichmentRepository, EnrichmentService, IpEnrichmentResult, LogEnrichment,
 };
-pub use feeds::{
-    Feed, FeedHealthMetrics, FeedHistoryPoint, FeedRepositoryError, FeedService, FeedServiceError,
-    FeedStats, NewFeed, UpdateFeed,
-};
+pub use feeds::Feed;
 pub use gdpr::{
     AnonymizationError, AnonymizationPreview, AnonymizationRequest, AnonymizationService,
     AnonymizationStatus, IdentifierType,

@@ -275,7 +275,9 @@ impl AppState {
                 // dictionaries` probe, byte-identical on single-node.
                 // NAN-5215: `skip_unavailable_shards = 1` so one hard-down
                 // replica does not fail the probe for every live node.
-                let cluster = if dual_pool.is_clustered() {
+                // NAN-5367: the fan-out needs REMOTE, held only by the
+                // admin identity; without it probe the local node.
+                let cluster = if dual_pool.is_clustered() && dual_pool.clickhouse_fanout().is_some() {
                     std::env::var("CLICKHOUSE_CLUSTER")
                         .ok()
                         .filter(|c| !c.trim().is_empty())
@@ -297,7 +299,9 @@ impl AppState {
                 };
 
                 match dual_pool
-                    .clickhouse()
+                    .clickhouse_fanout()
+                    .filter(|_| cluster.is_some())
+                    .unwrap_or(dual_pool.clickhouse())
                     .query(&sql)
                     .fetch_all::<(String, String, String)>()
                     .await

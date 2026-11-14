@@ -73,6 +73,8 @@ fn remap_source<'a>(doc: &'a toml::Table, transform: &str) -> &'a str {
 
 #[test]
 fn hostile_scalars_render_as_inert_literals() {
+    // `_output` / `_sample` are the UDM render (NAN-5346: none under OCSF).
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let mgr = VectorConfigManager::new(std::path::PathBuf::from("/tmp/nanosiem-render-safety"));
     let mut p = parser("acme");
     p.source_type = SOURCE_TYPE_BREAKOUT.to_string();
@@ -101,6 +103,8 @@ fn hostile_scalars_render_as_inert_literals() {
 
 #[tokio::test]
 async fn stored_hostile_rows_degrade_per_source_and_never_fail_the_render() {
+    // `_output` / `_sample` are the UDM render (NAN-5346: none under OCSF).
+    let _udm = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Udm);
     let dir = TempDir::new().unwrap();
     let mgr = VectorConfigManager::new(dir.path());
 

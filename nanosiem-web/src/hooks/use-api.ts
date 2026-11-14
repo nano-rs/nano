@@ -540,43 +540,14 @@ export function fromApiDetection(rule: DetectionRule) {
 }
 
 // Convert API alert to frontend format
-// Extract key entities from matched events for display
-function extractEntities(events: Record<string, unknown>[]): string[] {
-  if (!events || events.length === 0) return [];
-  
-  const entities: string[] = [];
-  const firstEvent = events[0];
-  
-  // Priority order for entity extraction
-  const entityFields = ['user', 'src_ip', 'dest_ip', 'dest_host', 'hostname', 'file_hash', 'url_domain'];
-  
-  for (const field of entityFields) {
-    const value = firstEvent[field];
-    if (value && typeof value === 'string' && value.trim()) {
-      entities.push(value);
-      if (entities.length >= 2) break; // Max 2 entities
-    }
-  }
-  
-  return entities;
-}
-
 export function fromApiAlert(alert: Alert) {
   const ruleName = alert.rule_name || 'Unknown Rule';
   const eventCount = alert.matched_event_count || alert.matched_events?.length || 0;
-  const entities = extractEntities(alert.matched_events || []);
-  
-  // Build descriptive message with entities
-  let alertMessage = `${ruleName}`;
-  if (entities.length > 0) {
-    alertMessage += ` (${entities.join(', ')})`;
-  }
-  
+
   return {
     id: alert.id,
     ruleId: alert.rule_id,
     ruleName: ruleName,
-    alertMessage: alertMessage,
     severity: alert.severity === 'informational' ? 'info' : alert.severity,
     status: alert.status === 'new' ? 'open' : alert.status,
     disposition: alert.disposition,

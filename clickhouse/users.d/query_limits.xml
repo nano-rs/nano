@@ -469,9 +469,8 @@
         <nanosiem>
             <profile>default</profile>
             <quota>default</quota>
-            <networks>
-                <ip>::/0</ip>
-            </networks>
+            <!-- NAN-5367: <networks> live with the user in nanosiem-users.xml.
+                 Users.d files MERGE, so an any-address entry here would re-open it. -->
         </nanosiem>
     </users>
 

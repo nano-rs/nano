@@ -150,6 +150,9 @@ impl ClickHouseMigrator {
         // and a migration with hardcoded creds breaks any tenant whose
         // password is rotated off the default. init.sql has always done this
         // — now numbered migrations do too.
+        // NAN-5367: 110/112/114 hard-code the default self credentials; give
+        // them the placeholders first (the file and its checksum stay as-is).
+        let migration_sql = Self::rewrite_legacy_self_source_credentials(&migration_sql);
         let migration_sql = Self::substitute_clickhouse_self_vars(&migration_sql);
 
         // NAN-1728: resolve the `{dist_suffix}` placeholder to `_distributed` on

@@ -24,7 +24,12 @@ Ground truth for field mappings is the parser set in the **parsers repo**
    `future_timestamp_skew_seconds`, so each shard mints `id` and `timestamp`
    itself and an identical retried batch deduplicates exactly as a direct
    insert does. The wrapper exists only on clustered installs, and
-   `nanosiem_ingest` is granted INSERT on it.
+   `nanosiem_ingest` is granted INSERT on it. The shipped `pipeline.tql`
+   picks it for you when `NANO_CH_SHARDS` is greater than 1 (NAN-5345); keep
+   that `$ch_table` logic if you rewrite the sink. The role-split renderer
+   writes `NANO_CH_SHARDS` into every role env, the bundled compose service
+   passes it through, and Helm publishes it (with `NANO_CH_TABLE`) in the
+   `<release>-direct-ocsf` ConfigMap.
 2. **Requires Tenzir ≥ 6.6.0.** The first release whose `to_clickhouse` accepts
    `ocsf_logs_raw`'s column types AND omits server-derived columns it doesn't
    send. On Tenzir 6.4.0–6.5.x, target the legacy `nanosiem.ocsf_logs_native_raw`
@@ -43,6 +48,12 @@ Ground truth for field mappings is the parser set in the **parsers repo**
    `to_clickhouse` — real OCSF is schema-heterogeneous, and without it every event
    becomes a 1-row native INSERT that OOM-kills the node under load. See
    [Batch before the sink](#batch-before-the-sink).
+8. **Keep the CREDENTIAL REDACTION block** (NAN-5352), after your mapping and
+   before `batch`. This lane skips nano's Vector redaction, so the block is
+   what keeps `Authorization` / `Cookie` / `X-Api-Key`-style values out of
+   `raw_data`, `message` and every other field. Events that name no
+   credential skip it. After editing the pipeline, run
+   `tenzir/tests/credential_redaction.sh`.
 
 ---
 

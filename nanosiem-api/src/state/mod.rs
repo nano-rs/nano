@@ -34,7 +34,7 @@ use nanosiem_core::settings::local_auth::LocalAuthSettings;
 #[cfg(feature = "enterprise")]
 use nanosiem_core::tuning::{NotificationService, TuningRepository};
 use nanosiem_core::{
-    DetectionService, DiskPressureService, DistributedDetectionScheduler, FeedService,
+    DetectionService, DiskPressureService, DistributedDetectionScheduler,
     IpAllowlistService, LogSourceService, LogTelemetryService, ParserService,
     QueryLibraryRepository, SearchService, SourceConfigService,
 };
@@ -204,8 +204,6 @@ pub struct AppState {
     pub leader_fence: nanosiem_core::leader::LeaderFence,
     /// Enrichment service
     pub enrichment: Arc<RwLock<EnrichmentService>>,
-    /// Feed service
-    pub feed_service: FeedService,
     /// Parser service
     pub parser_service: ParserService,
     /// Log source service

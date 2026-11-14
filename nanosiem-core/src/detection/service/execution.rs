@@ -182,6 +182,34 @@ pub(super) fn fail_closed_stamp(
     serde_json::Value::Array(values.into_iter().map(serde_json::Value::String).collect())
 }
 
+/// Map a search failure onto the detection error the scheduler acts on.
+///
+/// NAN-4031: a deterministic query failure is not an outage; the scheduler
+/// backs it off (`is_deterministic_failure`) instead of retrying every tick.
+/// NAN-5348: that covers a refused / unknown field (`FieldNotFound`, e.g.
+/// `hostname` on OCSF) and a user-facing generation guardrail (`SqlGenError`
+/// "Invalid query: …", e.g. an unknown protocol name), mirroring the
+/// background-job mapping (`search/background/types.rs`).
+pub(crate) fn detection_error_from_search(e: crate::search::SearchError) -> DetectionError {
+    use crate::search::SearchError;
+    match e {
+        SearchError::SqlValidationError(message) => DetectionError::InvalidQuery(message),
+        ref field @ SearchError::FieldNotFound { .. } => {
+            DetectionError::InvalidQuery(crate::search::client_error_message(field))
+        }
+        SearchError::SqlGenError(message)
+            if message.starts_with("Invalid query:")
+                || message.starts_with("Unsupported operation:") =>
+        {
+            DetectionError::InvalidQuery(message)
+        }
+        ref parse @ (SearchError::ParseError(_) | SearchError::StructuredParseError { .. }) => {
+            DetectionError::QueryParseError(parse.to_string())
+        }
+        other => DetectionError::SearchError(other.to_string()),
+    }
+}
+
 impl DetectionService {
     // ========================================================================
     // Rule Execution
@@ -305,14 +333,7 @@ impl DetectionService {
             .search(request, scope)
             .await
             .map(|r| r.results)
-            .map_err(|e| match e {
-                // NAN-4031: a deterministic validation failure is not an outage;
-                // the scheduler backs it off instead of retrying every tick.
-                crate::search::SearchError::SqlValidationError(message) => {
-                    DetectionError::InvalidQuery(message)
-                }
-                other => DetectionError::SearchError(other.to_string()),
-            })
+            .map_err(detection_error_from_search)
     }
 
     /// NAN-1800: derive the companion query that lists the DISTINCT

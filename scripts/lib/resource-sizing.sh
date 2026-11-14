@@ -19,6 +19,43 @@ override_env=""
 server_output=""
 users_output=""
 cli_overrides=""
+planned_gb_per_day=""
+ingest_path=""
+avg_event_bytes=""
+vector_sources=""
+
+# NAN-5345: planned-volume tiers. Large-deployment settings apply only when
+# the operator declares a planned daily volume that needs them; an install
+# without one keeps the host-only sizing below. Host size still caps every
+# number. Boundaries sit between the Helm presets' nominal volumes (100 GB,
+# 1 TB, 10 TB/day): at or above LARGE the ~1 TB/day tier applies, at or above
+# XLARGE the >=10 TB/day tier.
+PLANNED_TIER_LARGE_MIN_GB_PER_DAY=300
+PLANNED_TIER_XLARGE_MIN_GB_PER_DAY=3000
+# Vector CPU from the planned event rate (NAN-5372): parse cost is mostly per
+# event, so vCPU = peak factor x events/s / events per core, with events/s =
+# GB/day x 1e9 / 86400 / average event size. Raw: re-measured 2026-11-13 on
+# nano Vector 0.61.0-nano.11 with the 16 shipped OCSF parsers (after the
+# credential precheck, raw-text redaction and parsers#67): 1,950-6,500
+# events/s per core; 1,900 is just under the slowest realistic parsers (Okta
+# 1,950 at ~1.1 KB, Palo Alto 2,527 at ~280 B). Pre-shaped OCSF (Tenzir/Cribl
+# door): ship-only Vector does 90-120k events/s per core; planned at half of
+# that for bursts. The average event size defaults to 1,000 B (mixed feeds);
+# ~300 B for firewall/flow, ~2,000 B for EDR. At the default that is ~13 vCPU
+# per TB/day raw. The Helm chart (sizing.*) and the nano-deploy skill's size.py
+# carry the same constants; a test keeps them equal.
+VECTOR_PEAK_FACTOR=2
+VECTOR_RAW_EVENTS_PER_CORE=1900
+VECTOR_PRESHAPED_EVENTS_PER_CORE=45000
+DEFAULT_AVG_EVENT_BYTES=1000
+# NAN-5193: Vector holds about 1 GiB at 16 deployed sources. Every size gets
+# at least that (when the host has room above the other roles' floors), plus
+# an allowance per source beyond 16 when the operator declares more.
+VECTOR_BASE_MEMORY_MIB=1024
+VECTOR_BASE_SOURCES=16
+VECTOR_MIB_PER_EXTRA_SOURCE=64
+# Raw parsing at >=1 TB/day: readers run 8-12 GiB (2 GiB OOM-looped).
+VECTOR_LARGE_TIER_MEMORY_MIB=8192
 
 fail() {
     printf 'resource sizing error: %s\n' "$*" >&2
@@ -40,6 +77,16 @@ Usage: resource-sizing.sh [options]
   --server-output PATH         Write the ClickHouse server override XML
   --users-output PATH          Write the ClickHouse profile override XML
   --format env                 Emit stable KEY=VALUE lines (default)
+  --planned-gb-per-day GB      Planned daily volume (NANO_PLANNED_GB_PER_DAY);
+                               unset or 0 keeps host-only sizing (NAN-5345)
+  --ingest-path raw|preshaped  How events arrive (NANO_INGEST_PATH): raw logs
+                               parsed by nano's Vector (default) or pre-shaped
+                               OCSF (Tenzir/Cribl; default with --roles tenzir)
+  --avg-event-bytes BYTES      Average event size (NANO_AVG_EVENT_BYTES, default
+                               1000): ~300 firewall/flow, ~2000 EDR. Turns the
+                               planned volume into events/s for Vector CPU
+  --vector-sources COUNT       Planned deployed log sources (NANO_VECTOR_SOURCES,
+                               default 16) for Vector's memory allowance
 EOF
 }
 
@@ -63,6 +110,14 @@ while [[ $# -gt 0 ]]; do
         --server-output) [[ $# -ge 2 ]] || fail "--server-output needs a path"; server_output="$2"; shift 2 ;;
         --users-output) [[ $# -ge 2 ]] || fail "--users-output needs a path"; users_output="$2"; shift 2 ;;
         --format) [[ $# -ge 2 ]] || fail "--format needs a value"; format="$2"; shift 2 ;;
+        --planned-gb-per-day)
+            [[ $# -ge 2 ]] || fail "--planned-gb-per-day needs a value"
+            planned_gb_per_day="$2"; shift 2 ;;
+        --ingest-path) [[ $# -ge 2 ]] || fail "--ingest-path needs a value"; ingest_path="$2"; shift 2 ;;
+        --avg-event-bytes)
+            [[ $# -ge 2 ]] || fail "--avg-event-bytes needs a value"
+            avg_event_bytes="$2"; shift 2 ;;
+        --vector-sources) [[ $# -ge 2 ]] || fail "--vector-sources needs a value"; vector_sources="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown option $1" ;;
     esac
@@ -214,6 +269,38 @@ for role in ${roles//,/ }; do
     esac
 done
 
+[[ -n "$planned_gb_per_day" ]] || planned_gb_per_day="${NANO_PLANNED_GB_PER_DAY:-}"
+[[ -n "$planned_gb_per_day" ]] || planned_gb_per_day=0
+[[ "$planned_gb_per_day" =~ ^[0-9]{1,7}$ ]] \
+    || fail "planned volume must be a whole number of GB per day (0 or unset = not declared)"
+planned_gb_per_day=$(( 10#$planned_gb_per_day ))
+[[ -n "$ingest_path" ]] || ingest_path="${NANO_INGEST_PATH:-}"
+if [[ -z "$ingest_path" ]]; then
+    # The bundled Tenzir node is the pre-shaped OCSF door.
+    if has_role tenzir; then ingest_path=preshaped; else ingest_path=raw; fi
+fi
+[[ "$ingest_path" == raw || "$ingest_path" == preshaped ]] \
+    || fail "ingest path must be raw or preshaped"
+[[ -n "$avg_event_bytes" ]] || avg_event_bytes="${NANO_AVG_EVENT_BYTES:-}"
+[[ -n "$avg_event_bytes" ]] || avg_event_bytes=$DEFAULT_AVG_EVENT_BYTES
+[[ "$avg_event_bytes" =~ ^[0-9]{2,6}$ ]] && (( 10#$avg_event_bytes >= 50 )) \
+    || fail "average event size must be a whole number of bytes, 50-999999"
+avg_event_bytes=$(( 10#$avg_event_bytes ))
+[[ -n "$vector_sources" ]] || vector_sources="${NANO_VECTOR_SOURCES:-}"
+[[ -n "$vector_sources" ]] || vector_sources=$VECTOR_BASE_SOURCES
+[[ "$vector_sources" =~ ^[1-9][0-9]{0,4}$ ]] || fail "Vector source count must be a positive integer"
+if (( planned_gb_per_day >= PLANNED_TIER_XLARGE_MIN_GB_PER_DAY )); then
+    sizing_tier=xlarge
+elif (( planned_gb_per_day >= PLANNED_TIER_LARGE_MIN_GB_PER_DAY )); then
+    sizing_tier=large
+elif (( planned_gb_per_day > 0 )); then
+    sizing_tier=base
+else
+    sizing_tier=none
+fi
+tiered=0
+[[ "$sizing_tier" == large || "$sizing_tier" == xlarge ]] && tiered=1
+
 [[ -n "$vector_data_capacity_bytes" ]] \
     || vector_data_capacity_bytes="${NANO_VECTOR_DATA_CAPACITY_BYTES:-}"
 vector_data_storage_mode="${NANO_VECTOR_DATA_STORAGE_MODE:-named}"
@@ -259,6 +346,15 @@ cpu_string() {
 }
 
 bytes_from_mib() { printf '%s\n' "$(( $1 * 1048576 ))"; }
+
+# "2.550" -> 2550 (millicores); inverse of cpu_string for validated values.
+mcpu_from_cpu_string() {
+    local whole="${1%%.*}" fraction=""
+    [[ "$1" == *.* ]] && fraction="${1#*.}"
+    fraction="${fraction}000"
+    fraction="${fraction:0:3}"
+    printf '%s\n' "$(( 10#$whole * 1000 + 10#$fraction ))"
+}
 
 # Leave the OS 10%, at least 384 MiB and at most 8 GiB. The remainder is one
 # shared budget on a co-located install; a dedicated role receives the whole
@@ -346,6 +442,27 @@ if [[ "$topology" == "single" ]] && has_role clickhouse \
     reduce_memory_budget tenzir_mib 512
     (( memory_excess == 0 )) || fail "host RAM cannot satisfy the 6 GiB ClickHouse platform-feed floor"
     ch_mib=$(( ch_mib + enrichment_shortfall ))
+fi
+
+# NAN-5193 / NAN-5345: Vector's memory target. The ingest role's 85% Vector
+# share must reach the target; the shortfall comes only from co-located
+# PostgreSQL above 512 MiB, then the app share down to its floor, never from
+# ClickHouse. A host with nothing to give keeps its proportional share.
+vector_target_mib=$VECTOR_BASE_MEMORY_MIB
+(( vector_sources > VECTOR_BASE_SOURCES )) && vector_target_mib=$(( vector_target_mib + (vector_sources - VECTOR_BASE_SOURCES) * VECTOR_MIB_PER_EXTRA_SOURCE ))
+if (( tiered )) && [[ "$ingest_path" == raw ]] && (( vector_target_mib < VECTOR_LARGE_TIER_MEMORY_MIB )); then
+    vector_target_mib=$VECTOR_LARGE_TIER_MEMORY_MIB
+fi
+if has_role ingest; then
+    ingest_target_mib=$(( (vector_target_mib * 100 + 84) / 85 ))
+    if (( ingest_mib < ingest_target_mib )); then
+        vector_shortfall=$(( ingest_target_mib - ingest_mib ))
+        memory_excess=$vector_shortfall
+        reduce_memory_budget pg_mib 512
+        reduce_memory_budget app_mib 800
+        ingest_mib=$(( ingest_mib + vector_shortfall - memory_excess ))
+        memory_excess=0
+    fi
 fi
 
 total_mcpu=$(( cpu_cores * 1000 ))
@@ -483,6 +600,13 @@ vector_mcpu=$(( ingest_mcpu * 85 / 100 ))
 (( vector_mcpu < 200 )) && vector_mcpu=200
 vector_cores=$(ceil_div "$vector_mcpu" 1000)
 vector_concurrency=$(clamp "$vector_cores" 2 6)
+# NAN-5345: sink concurrency 6 at ~1 TB/day and 12 at >=10 TB/day, capped at
+# two in-flight requests per Vector core on this host.
+vector_concurrency_cap=$(max 2 "$(( vector_cores * 2 ))")
+case "$sizing_tier" in
+    large) vector_concurrency=$(min 6 "$vector_concurrency_cap") ;;
+    xlarge) vector_concurrency=$(min 12 "$vector_concurrency_cap") ;;
+esac
 vector_buffer_mib=$(clamp "$(( vector_mib * 2 ))" 2048 32768)
 vector_desired_buffer_bytes=$(bytes_from_mib "$vector_buffer_mib")
 
@@ -850,6 +974,35 @@ ch_optimize_threshold=$(( (ch_merge_slots * 25 + 31) / 32 ))
 (( ch_optimize_threshold > 25 )) && ch_optimize_threshold=25
 (( ch_optimize_threshold > ch_merge_threshold_max )) && ch_optimize_threshold=$ch_merge_threshold_max
 
+# NAN-5345: ClickHouse tier settings. Each block is empty below the ~1 TB/day
+# tier, so an install without a planned volume renders exactly as before.
+tier_server_lines=""
+tier_merge_tree_lines=""
+tier_ingestion_lines=""
+if (( tiered )); then
+    if [[ "$sizing_tier" == xlarge ]]; then
+        ch_parts_to_delay=5000; ch_parts_to_throw=10000; ch_flush_max_ms=10000
+    else
+        ch_parts_to_delay=2000; ch_parts_to_throw=4000; ch_flush_max_ms=5000
+    fi
+    # Merges stop taking new work above half of the server's memory, so a
+    # merge backlog at volume cannot crowd out inserts and queries.
+    tier_server_lines="  <merges_mutations_memory_usage_to_ram_ratio>0.5</merges_mutations_memory_usage_to_ram_ratio>
+"
+    # Server merge_tree defaults: they apply to every table, so a table
+    # rebuilt by a migration keeps them (table-level ALTERs do not).
+    tier_merge_tree_lines="    <parts_to_delay_insert>$ch_parts_to_delay</parts_to_delay_insert>
+    <parts_to_throw_insert>$ch_parts_to_throw</parts_to_throw_insert>
+"
+    # Adaptive flush between 1 s and the tier ceiling, with larger buffers.
+    # async_insert_busy_timeout_ms is the ceiling's alias the base profile sets.
+    tier_ingestion_lines="      <async_insert_use_adaptive_busy_timeout>1</async_insert_use_adaptive_busy_timeout>
+      <async_insert_busy_timeout_min_ms>1000</async_insert_busy_timeout_min_ms>
+      <async_insert_busy_timeout_ms>$ch_flush_max_ms</async_insert_busy_timeout_ms>
+      <async_insert_max_data_size>268435456</async_insert_max_data_size>
+"
+fi
+
 if [[ -n "$server_output" ]]; then
     mkdir -p "$(dirname "$server_output")"
     cat > "$server_output" <<EOF
@@ -867,11 +1020,11 @@ if [[ -n "$server_output" ]]; then
   <background_fetches_pool_size>$CLICKHOUSE_BACKGROUND_FETCHES_POOL_SIZE</background_fetches_pool_size>
   <background_move_pool_size>$CLICKHOUSE_BACKGROUND_MOVE_POOL_SIZE</background_move_pool_size>
   <background_common_pool_size>$CLICKHOUSE_BACKGROUND_COMMON_POOL_SIZE</background_common_pool_size>
-  <merge_tree>
+${tier_server_lines}  <merge_tree>
     <number_of_free_entries_in_pool_to_lower_max_size_of_merge>$ch_lower_merge_threshold</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
     <number_of_free_entries_in_pool_to_execute_mutation>$ch_mutation_threshold</number_of_free_entries_in_pool_to_execute_mutation>
     <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>$ch_optimize_threshold</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
-  </merge_tree>
+${tier_merge_tree_lines}  </merge_tree>
   <max_concurrent_queries>$CLICKHOUSE_MAX_CONCURRENT_QUERIES</max_concurrent_queries>
   <max_concurrent_insert_queries>$CLICKHOUSE_MAX_CONCURRENT_INSERT_QUERIES</max_concurrent_insert_queries>
   <max_concurrent_select_queries>$CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES</max_concurrent_select_queries>
@@ -910,7 +1063,7 @@ if [[ -n "$users_output" ]]; then
       <max_memory_usage_for_user>$CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
       <max_threads>$CLICKHOUSE_INGEST_MAX_THREADS</max_threads>
       <max_insert_threads>$CLICKHOUSE_INGEST_MAX_THREADS</max_insert_threads>
-    </ingestion>
+${tier_ingestion_lines}    </ingestion>
     <admin>
       <max_memory_usage>$CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE</max_memory_usage>
       <max_memory_usage_for_user>$CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
@@ -931,3 +1084,41 @@ fi
 for key in $SIZING_KEYS; do
     printf '%s=%s\n' "$key" "${!key}"
 done
+
+# NAN-5345: planning keys exist only when the operator declared a volume, so
+# an install without one emits exactly the keys it always did.
+if (( planned_gb_per_day > 0 )); then
+    printf 'NANO_SIZING_PLANNED_GB_PER_DAY=%s\n' "$planned_gb_per_day"
+    printf 'NANO_SIZING_INGEST_PATH=%s\n' "$ingest_path"
+    printf 'NANO_SIZING_TIER=%s\n' "$sizing_tier"
+    # Prevalence *_final_refresh cadence (clickhouse_migrator, NAN-5345): each
+    # run scans the recent working set, so it runs less often at volume.
+    # Without this key the migrator converges on the shipped 10 minutes, so
+    # clearing the volume resets a cadence a large tier lengthened.
+    case "$sizing_tier" in
+        xlarge) printf 'NANO_PREVALENCE_REFRESH_MINUTES=60\n' ;;
+        large) printf 'NANO_PREVALENCE_REFRESH_MINUTES=30\n' ;;
+        *) printf 'NANO_PREVALENCE_REFRESH_MINUTES=10\n' ;;
+    esac
+    if has_role ingest; then
+        if [[ "$ingest_path" == raw ]]; then
+            events_per_core=$VECTOR_RAW_EVENTS_PER_CORE
+        else
+            events_per_core=$VECTOR_PRESHAPED_EVENTS_PER_CORE
+        fi
+        # Average events/s first, so the products stay well inside 64 bits.
+        planned_eps=$(ceil_div "$(( planned_gb_per_day * 1000000000 ))" "$(( 86400 * avg_event_bytes ))")
+        needed_vector_mcpu=$(ceil_div "$(( VECTOR_PEAK_FACTOR * planned_eps * 1000 ))" "$events_per_core")
+        printf 'NANO_SIZING_AVG_EVENT_BYTES=%s\n' "$avg_event_bytes"
+        printf 'NANO_SIZING_EVENTS_PER_SEC=%s\n' "$planned_eps"
+        # Capacity is what this host's Vector may use after any override.
+        host_vector_mcpu=$(mcpu_from_cpu_string "$VECTOR_CPU_LIMIT")
+        printf 'NANO_SIZING_VECTOR_VCPU_NEEDED=%s\n' "$(ceil_div "$needed_vector_mcpu" 1000)"
+        printf 'NANO_SIZING_VECTOR_VCPU_PER_HOST=%s\n' "$VECTOR_CPU_LIMIT"
+        printf 'NANO_SIZING_INGEST_HOSTS_NEEDED=%s\n' "$(max 1 "$(ceil_div "$needed_vector_mcpu" "$host_vector_mcpu")")"
+    fi
+    if (( tiered )); then
+        # Compose parity with the Helm presets' 5 s Vector batch timeout.
+        printf 'VECTOR_BATCH_TIMEOUT_SECS=5\n'
+    fi
+fi

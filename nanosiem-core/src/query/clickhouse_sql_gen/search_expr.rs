@@ -2671,6 +2671,7 @@ impl ClickHouseSqlGenerator {
                 ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
+                let raw_field = field.as_str();
                 // Normalize field name (apply aliases like command_line -> process).
                 // NAN-1555: profile-aware (spans keep `service_name`); logs identical.
                 let field = self.canonicalize_field(field);
@@ -2762,6 +2763,18 @@ impl ClickHouseSqlGenerator {
                     let stage_col = self.is_upstream_projected().then(|| escape_identifier(field));
                     return self.generate_array_field_filter_on(field, stage_col.as_deref(), op, value);
                 }
+                // NAN-5350: a column an upstream `table`/`rename` projected an
+                // array into under a name the schema no longer resolves (the
+                // requested name NAN-5306 registers, or a new name) keeps the
+                // membership semantics of the field it was read from.
+                if let Some((name, array)) = self.upstream_array_operand(raw_field, field) {
+                    return self.generate_array_field_filter_on(
+                        &array.source,
+                        Some(&escape_identifier(name)),
+                        op,
+                        value,
+                    );
+                }
 
                 // NAN-2361: `field=*` is an EXISTENCE test here too. The
                 // pipeline path had the inverse of the search-term bug: rather
@@ -2838,6 +2851,29 @@ impl ClickHouseSqlGenerator {
                                 ));
                             }
                             _ => {}
+                        }
+                    }
+                }
+
+                // NAN-5348: a label on a fixed-table enum-int column
+                // (`protocol="tcp"`, `status_id="failure"`) compares the int, as
+                // the search-term path does — `lower(toString(<int>)) = 'tcp'`
+                // matched nothing. Unknown labels fail loudly; numeric strings
+                // and pipeline-computed names keep the generic path below.
+                if let (Comparator::Eq | Comparator::Ne, Value::String(s)) = (op, value) {
+                    if s.parse::<f64>().is_err()
+                        && !self.is_computed_field(field)
+                        && !self.is_upstream_computed_field(field)
+                    {
+                        if let Some(crate::schema::EnumIntMapping::Values(labels)) =
+                            self.profile.enum_int_mapping(field)
+                        {
+                            return Ok(format!(
+                                "{} {} {}",
+                                column_ref,
+                                comparator_to_sql(op),
+                                enum_values_literal_sql(field, labels, s)?
+                            ));
                         }
                     }
                 }
@@ -3060,6 +3096,14 @@ impl ClickHouseSqlGenerator {
                     // a projection the stage column already holds the array.
                     let stage_col = self.is_upstream_projected().then(|| escape_identifier(field));
                     return self.generate_array_in_list_filter(field, stage_col.as_deref(), values, *negated);
+                } else if let Some((name, array)) = self.upstream_array_operand(field, field) {
+                    // NAN-5350: see the FieldFilter arm.
+                    return self.generate_array_in_list_filter(
+                        &array.source,
+                        Some(&escape_identifier(name)),
+                        values,
+                        *negated,
+                    );
                 } else if !self.is_computed_field(field)
                     && !self.is_upstream_computed_field(field)
                     && self.needs_resolved_stage_access(field)

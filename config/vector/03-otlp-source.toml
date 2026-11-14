@@ -90,6 +90,78 @@ inputs = ["otlp_ingest.traces"]
 type = "remap"
 inputs = ["otlp_traces_to_log"]
 source = '''
+# NAN-5352: span / metric attributes go to ClickHouse as OTLP {key, value}
+# pairs with no later redaction step, so redact here, before the pair
+# conversion. Verbatim copy of credential_field_redaction_vrl! (nanosiem-core
+# vector_config/mod.rs); a test keeps the two equal. metric_to_log /
+# trace_to_log do not type the root as an object, so say it is one first.
+. = object(.) ?? {}
+# NAN-4038: credential-named fields never reach storage (any depth,
+# case-insensitive). See credential_field_redaction_vrl! in vector_config/mod.rs.
+nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
+nano_cred_paths = []
+# NAN-5352: one gate for both forms. It also matches a credential name written
+# INSIDE a string (`raw_data`, `message`, any other text), which is a superset
+# of the key precheck below, so an event without either pays one scan.
+nano_cred_text = encode_json(.)
+if match(nano_cred_text, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') || match(nano_cred_text, r'\\u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])') {
+    if match(encode_json(.), r'(?i)"(?:authorization|proxy-authorization|x-api-key|x-webhook-secret|cookie|set-cookie)":') {
+        for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
+            nano_segments = split(nano_flat_key, "\u{1f}")
+            nano_hit = -1
+            for_each(nano_segments) -> |nano_i, nano_seg| {
+                if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+                    nano_hit = nano_i
+                }
+            }
+            if nano_hit >= 0 {
+                nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+            }
+        }
+    }
+    for_each(nano_cred_paths) -> |_idx, nano_path| {
+        . = object!(remove!(., array!(nano_path)))
+    }
+    # NAN-5352: credential values inside text, and credential keys inside
+    # arrays and dotted attribute names; see credential_text_redaction_vrl! in
+    # vector_config/mod.rs.
+    . = map_values(., recursive: true) -> |nano_value| {
+        if is_object(nano_value) {
+            filter(object!(nano_value)) -> |nano_key, _nano_v| {
+                nano_lk = downcase(nano_key)
+                !includes(nano_cred_names, nano_lk) && !match(nano_lk, r'\.(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\z')
+            }
+        } else if is_string(nano_value) && (match(string!(nano_value), r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') || match(string!(nano_value), r'\\u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])')) {
+            nano_text = string!(nano_value)
+            # JSON lets any letter be written as \u00XX; decode those (and the
+            # Kelvin sign) so an escaped name is still a name.
+            nano_norm = nano_text
+            if match(nano_text, r'\\+u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])') {
+                nano_norm = replace(nano_norm, r'\\+u212[Aa]', "K")
+                nano_norm = replace_with(nano_norm, r'\\+u00(?P<nano_h>4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])') -> |nano_e| { decode_base16(to_string(nano_e.nano_h)) ?? "" }
+            }
+            if match(nano_norm, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') {
+                nano_text = nano_norm
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|\[(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\]|\{(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\}|-?[0-9][0-9.eE+-]*|true|false|null)') -> |nano_m| { to_string(nano_m.nano_k) + "\"[REDACTED]\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\"\s*:\s*)(?:\\"(?:[^"\\]|\\\\\\"|\\\\\\\\|\\\\[^"\\])*\\"|-?[0-9][0-9.eE+-]*|true|false|null)') -> |nano_m| { to_string(nano_m.nano_k) + "\\\"[REDACTED]\\\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*[:=][ \t]*)(?:"(?:[^"\\]|\\.)*"|\x27[^\x27]*\x27)') -> |nano_m| { to_string(nano_m.nano_k) + "\"[REDACTED]\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:set-cookie|cookie)[ \t]*:)(?P<nano_v>(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*[^\s"\\\x27|](?:[^\r\n"\\|]|\\[^rn"\\])*(?:(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+(?:[^\r\n"\\|]|\\[^rn"\\])*)*)') -> |nano_m| {
+                    nano_cv = to_string(nano_m.nano_v)
+                    if contains(nano_cv, "=") { to_string(nano_m.nano_k) + replace(nano_cv, r'=[^;\r\n"\\|]*', "=[REDACTED]") } else { to_string(nano_m.nano_k) + " [REDACTED]" }
+                }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key)[ \t]*:)(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*[^\s"\\\x27|](?:[^\r\n"\\|]|\\[^rn"\\])*(?:(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+(?:[^\r\n"\\|]|\\[^rn"\\])*)*') -> |nano_m| { to_string(nano_m.nano_k) + " [REDACTED]" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*=[ \t]*)(?:(?:bearer|basic|digest|negotiate|ntlm|token)[ \t]+)?[^\s"\\\x27&,;|][^\s"\\&,;|]*') -> |nano_m| { to_string(nano_m.nano_k) + "[REDACTED]" }
+                nano_left = replace(nano_text, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=](?:\s*\\*"\[REDACTED\]\\*"|(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*(?:\[REDACTED\]|[^=;\s"\\]+=\[REDACTED\]|[&,;|}\]]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[^ \t\\\r\n]|\\[^trn]|\z)|\z))', "")
+                if match(nano_left, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') {
+                    nano_text = "[REDACTED: credential-bearing text]"
+                }
+            }
+            nano_text
+        } else {
+            nano_value
+        }
+    }
+}
 ts = .timestamp
 if !is_timestamp(ts) { ts = .start_time_unix_nano }
 if !is_timestamp(ts) { ts = now() }
@@ -225,6 +297,78 @@ inputs = ["otlp_ingest.metrics"]
 type = "remap"
 inputs = ["otlp_metrics_to_log"]
 source = '''
+# NAN-5352: span / metric attributes go to ClickHouse as OTLP {key, value}
+# pairs with no later redaction step, so redact here, before the pair
+# conversion. Verbatim copy of credential_field_redaction_vrl! (nanosiem-core
+# vector_config/mod.rs); a test keeps the two equal. metric_to_log /
+# trace_to_log do not type the root as an object, so say it is one first.
+. = object(.) ?? {}
+# NAN-4038: credential-named fields never reach storage (any depth,
+# case-insensitive). See credential_field_redaction_vrl! in vector_config/mod.rs.
+nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
+nano_cred_paths = []
+# NAN-5352: one gate for both forms. It also matches a credential name written
+# INSIDE a string (`raw_data`, `message`, any other text), which is a superset
+# of the key precheck below, so an event without either pays one scan.
+nano_cred_text = encode_json(.)
+if match(nano_cred_text, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') || match(nano_cred_text, r'\\u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])') {
+    if match(encode_json(.), r'(?i)"(?:authorization|proxy-authorization|x-api-key|x-webhook-secret|cookie|set-cookie)":') {
+        for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
+            nano_segments = split(nano_flat_key, "\u{1f}")
+            nano_hit = -1
+            for_each(nano_segments) -> |nano_i, nano_seg| {
+                if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+                    nano_hit = nano_i
+                }
+            }
+            if nano_hit >= 0 {
+                nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+            }
+        }
+    }
+    for_each(nano_cred_paths) -> |_idx, nano_path| {
+        . = object!(remove!(., array!(nano_path)))
+    }
+    # NAN-5352: credential values inside text, and credential keys inside
+    # arrays and dotted attribute names; see credential_text_redaction_vrl! in
+    # vector_config/mod.rs.
+    . = map_values(., recursive: true) -> |nano_value| {
+        if is_object(nano_value) {
+            filter(object!(nano_value)) -> |nano_key, _nano_v| {
+                nano_lk = downcase(nano_key)
+                !includes(nano_cred_names, nano_lk) && !match(nano_lk, r'\.(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\z')
+            }
+        } else if is_string(nano_value) && (match(string!(nano_value), r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') || match(string!(nano_value), r'\\u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])')) {
+            nano_text = string!(nano_value)
+            # JSON lets any letter be written as \u00XX; decode those (and the
+            # Kelvin sign) so an escaped name is still a name.
+            nano_norm = nano_text
+            if match(nano_text, r'\\+u(?:00(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])|212[Aa])') {
+                nano_norm = replace(nano_norm, r'\\+u212[Aa]', "K")
+                nano_norm = replace_with(nano_norm, r'\\+u00(?P<nano_h>4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|2[Dd])') -> |nano_e| { decode_base16(to_string(nano_e.nano_h)) ?? "" }
+            }
+            if match(nano_norm, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') {
+                nano_text = nano_norm
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|\[(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\]|\{(?:[^\[\]{}"]|"(?:[^"\\]|\\.)*")*\}|-?[0-9][0-9.eE+-]*|true|false|null)') -> |nano_m| { to_string(nano_m.nano_k) + "\"[REDACTED]\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\"\s*:\s*)(?:\\"(?:[^"\\]|\\\\\\"|\\\\\\\\|\\\\[^"\\])*\\"|-?[0-9][0-9.eE+-]*|true|false|null)') -> |nano_m| { to_string(nano_m.nano_k) + "\\\"[REDACTED]\\\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*[:=][ \t]*)(?:"(?:[^"\\]|\\.)*"|\x27[^\x27]*\x27)') -> |nano_m| { to_string(nano_m.nano_k) + "\"[REDACTED]\"" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:set-cookie|cookie)[ \t]*:)(?P<nano_v>(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*[^\s"\\\x27|](?:[^\r\n"\\|]|\\[^rn"\\])*(?:(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+(?:[^\r\n"\\|]|\\[^rn"\\])*)*)') -> |nano_m| {
+                    nano_cv = to_string(nano_m.nano_v)
+                    if contains(nano_cv, "=") { to_string(nano_m.nano_k) + replace(nano_cv, r'=[^;\r\n"\\|]*', "=[REDACTED]") } else { to_string(nano_m.nano_k) + " [REDACTED]" }
+                }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key)[ \t]*:)(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*[^\s"\\\x27|](?:[^\r\n"\\|]|\\[^rn"\\])*(?:(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+(?:[^\r\n"\\|]|\\[^rn"\\])*)*') -> |nano_m| { to_string(nano_m.nano_k) + " [REDACTED]" }
+                nano_text = replace_with(nano_text, r'(?i)(?P<nano_k>(?:\A|[^A-Za-z0-9]|\\[nrt])(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)[ \t]*=[ \t]*)(?:(?:bearer|basic|digest|negotiate|ntlm|token)[ \t]+)?[^\s"\\\x27&,;|][^\s"\\&,;|]*') -> |nano_m| { to_string(nano_m.nano_k) + "[REDACTED]" }
+                nano_left = replace(nano_text, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=](?:\s*\\*"\[REDACTED\]\\*"|(?:[ \t]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[ \t]|\\t)+)*(?:\[REDACTED\]|[^=;\s"\\]+=\[REDACTED\]|[&,;|}\]]|(?:\r\n|\r|\n|\\r\\n|\\r|\\n)(?:[^ \t\\\r\n]|\\[^trn]|\z)|\z))', "")
+                if match(nano_left, r'(?i)(?:proxy-authorization|authorization|x-webhook-secret|x-api-key|set-cookie|cookie)\\*"?\s*[:=]') {
+                    nano_text = "[REDACTED: credential-bearing text]"
+                }
+            }
+            nano_text
+        } else {
+            nano_value
+        }
+    }
+}
 ts = .timestamp
 if !is_timestamp(ts) { ts = now() }
 nanos = to_string(to_unix_timestamp(ts, unit: "nanoseconds") ?? 0)

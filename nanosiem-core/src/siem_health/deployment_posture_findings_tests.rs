@@ -40,3 +40,20 @@ fn provisioned_deployment_adds_nothing() {
     assert!(analysis.recommendations.is_empty());
     assert_eq!(analysis.overall_score, before);
 }
+
+#[test]
+fn open_clickhouse_users_surface_once_and_cap_the_score() {
+    let metrics = base_zero_metrics_fixture();
+    let mut analysis = fallback_report(&metrics);
+    ensure_clickhouse_network_findings(&mut analysis, &[]);
+    assert!(analysis.recommendations.is_empty(), "no open users, no finding");
+    let users = vec!["nanosiem".to_string(), "nanosiem_ingest".to_string()];
+    ensure_clickhouse_network_findings(&mut analysis, &users);
+    ensure_clickhouse_network_findings(&mut analysis, &users);
+    assert_eq!(analysis.recommendations.len(), 1);
+    let r = &analysis.recommendations[0];
+    assert_eq!(r.title, OPEN_CLICKHOUSE_USERS_TITLE);
+    assert_eq!(r.priority, "high");
+    assert!(r.description.contains("clickhouse.allowedNetworks") && r.description.contains("nanosiem_ingest"));
+    assert!(analysis.overall_score <= 79);
+}
