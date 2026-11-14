@@ -7,7 +7,6 @@
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::entity::{Entity, Process};
 use crate::event::Event;
@@ -66,7 +65,7 @@ impl SysmonGenerator {
             "CommandLine": child.cmdline,
             "CurrentDirectory": r"C:\Windows\system32\",
             "User": format!("{}\\{}", entity.domain.to_uppercase(), entity.user.split('\\').last().unwrap_or(&entity.user)),
-            "LogonGuid": format!("{{{}}}", Uuid::now_v7()),
+            "LogonGuid": format!("{{{}}}", crate::rng::uuid()),
             "LogonId": format!("0x{:X}", rng.random_range(0x10000u32..0xFFFFF)),
             "TerminalSessionId": "1",
             "IntegrityLevel": "Medium",
@@ -135,7 +134,7 @@ impl SysmonGenerator {
         parent: &Process,
         process_hash: Option<&str>,
     ) -> Event {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let event_data = serde_json::json!({
             "RuleName": "ProcessCreate",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
@@ -150,7 +149,7 @@ impl SysmonGenerator {
             "CommandLine": child.cmdline,
             "CurrentDirectory": r"C:\Windows\system32\",
             "User": format!("{}\\{}", entity.domain.to_uppercase(), entity.user.split('\\').last().unwrap_or(&entity.user)),
-            "LogonGuid": format!("{{{}}}", Uuid::now_v7()),
+            "LogonGuid": format!("{{{}}}", crate::rng::uuid()),
             "LogonId": format!("0x{:X}", rng.random_range(0x10000u32..0xFFFFF)),
             "TerminalSessionId": "1",
             "IntegrityLevel": "Medium",
@@ -223,7 +222,7 @@ impl SysmonGenerator {
         destination_ip: &str,
         destination_port: u16,
     ) -> Event {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let event_data = serde_json::json!({
             "RuleName": "NetworkConnect",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
@@ -280,7 +279,7 @@ impl SysmonGenerator {
         let event_data = serde_json::json!({
             "RuleName": "NetworkConnect",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
             "User": format!("{}\\{}", entity.domain.to_uppercase(), entity.user.split('\\').last().unwrap_or(&entity.user)),
@@ -315,7 +314,7 @@ impl SysmonGenerator {
         let event_data = serde_json::json!({
             "RuleName": "-",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
             "User": format!("{}\\{}", entity.domain.to_uppercase(), entity.user.split('\\').last().unwrap_or(&entity.user)),
@@ -346,7 +345,7 @@ impl SysmonGenerator {
         let event_data = serde_json::json!({
             "RuleName": "ImageLoad",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
             "ImageLoaded": if file.file_path.is_empty() { r"C:\Windows\System32\kernel32.dll".to_string() } else { file.file_path.clone() },
@@ -386,11 +385,11 @@ impl SysmonGenerator {
         let event_data = serde_json::json!({
             "RuleName": "ProcessAccess",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "SourceProcessGUID": format!("{{{}}}", Uuid::now_v7()),
+            "SourceProcessGUID": format!("{{{}}}", crate::rng::uuid()),
             "SourceProcessId": rng.random_range(1000u32..30000).to_string(),
             "SourceThreadId": rng.random_range(1000u32..10000).to_string(),
             "SourceImage": source.process_path,
-            "TargetProcessGUID": format!("{{{}}}", Uuid::now_v7()),
+            "TargetProcessGUID": format!("{{{}}}", crate::rng::uuid()),
             "TargetProcessId": rng.random_range(1000u32..30000).to_string(),
             "TargetImage": target.process_path,
             "GrantedAccess": "0x1000",
@@ -422,7 +421,7 @@ impl SysmonGenerator {
         let event_data = serde_json::json!({
             "RuleName": "-",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
             "TargetFilename": format!(r"C:\Users\{}\AppData\Local\Temp\tmp{:08x}.tmp", entity.user.split('\\').last().unwrap_or("user"), rng.random::<u32>()),
@@ -461,7 +460,7 @@ impl SysmonGenerator {
             "RuleName": if event_id == "12" { "RegistryEvent (Object create and delete)" } else { "RegistryEvent (Value Set)" },
             "EventType": if event_id == "12" { "CreateKey" } else { "SetValue" },
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
             "TargetObject": format!("{}\\{}", hive, chain.process_name.replace(".exe", "")),
@@ -506,7 +505,7 @@ impl SysmonGenerator {
         let event_data = serde_json::json!({
             "RuleName": "-",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "QueryName": domain,
             "QueryStatus": "0",
@@ -532,7 +531,7 @@ impl SysmonGenerator {
         let event_data = serde_json::json!({
             "RuleName": "-",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
             "TargetFilename": if file.file_path.is_empty() { format!(r"C:\Users\{}\AppData\Local\Temp\tmp{:08x}.tmp", entity.user.split('\\').last().unwrap_or("user"), rng.random::<u32>()) } else { file.file_path.clone() },
@@ -576,7 +575,7 @@ impl SysmonGenerator {
         event_data: serde_json::Value,
         label: &str,
     ) -> Event {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let message = serde_json::json!({
             "channel": "Microsoft-Windows-Sysmon/Operational",
             "computer": entity.fqdn(),

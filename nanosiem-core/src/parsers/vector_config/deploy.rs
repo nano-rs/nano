@@ -1414,6 +1414,23 @@ pub(super) const PULL_DELIVERY_NOTE: &str =
     "published as a Vector config generation; each Vector pod's config consumer installs it";
 
 async fn deliver_reload_signal() -> Result<&'static str, String> {
+    // NAN-5387: open-core Compose ships no docker CLI in the api image, so
+    // trying `docker kill` first logged "could not signal the Vector container
+    // (docker unavailable)" on every deploy before the responder delivered the
+    // reload. When the responder is alive (fresh heartbeat on the shared
+    // validation volume) it is the configured path: use it first.
+    if let Some(root) = validation_dir() {
+        if responder_heartbeat_fresh(&root, std::time::SystemTime::now()).await {
+            match request_reload_in(&root, RESPONDER_RELOAD_TIMEOUT).await {
+                Ok(method) => return Ok(method),
+                Err(responder) => {
+                    return deliver_via_docker()
+                        .await
+                        .map_err(|docker| format!("{responder}; {docker}"));
+                }
+            }
+        }
+    }
     let docker = deliver_via_docker().await;
     if docker.is_ok() {
         return docker;
@@ -1435,16 +1452,45 @@ async fn deliver_reload_signal() -> Result<&'static str, String> {
 /// every second).
 const RESPONDER_RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The shared validation volume (`VECTOR_VALIDATION_DIR`), when configured.
+fn validation_dir() -> Option<std::path::PathBuf> {
+    std::env::var("VECTOR_VALIDATION_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The responder rewrites `<validation dir>/.responder` (epoch seconds) about
+/// every 30 s; a validation it runs can delay that by up to 90 s.
+pub(super) const RESPONDER_HEARTBEAT_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(150);
+
+/// NAN-5387: is the Vector container's responder alive? Reads the heartbeat
+/// it writes (config/vector/.nano/vector-entrypoint.sh).
+pub(super) async fn responder_heartbeat_fresh(
+    root: &std::path::Path,
+    now: std::time::SystemTime,
+) -> bool {
+    let Ok(text) = tokio::fs::read_to_string(root.join(".responder")).await else {
+        return false;
+    };
+    let Ok(beat) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    let Ok(now) = now.duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    // A heartbeat slightly in the future (clock granularity) counts as fresh.
+    now.as_secs().saturating_sub(beat) <= RESPONDER_HEARTBEAT_MAX_AGE.as_secs()
+}
+
 /// Ask the Vector container's responder to SIGHUP Vector. `Err` when no
 /// validation volume is configured or nothing answered.
 pub(super) async fn request_reload_via_responder() -> Result<&'static str, String> {
-    let Some(root) = std::env::var("VECTOR_VALIDATION_DIR")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    else {
+    let Some(root) = validation_dir() else {
         return Err("no validation volume (VECTOR_VALIDATION_DIR) to carry a reload request".to_string());
     };
-    request_reload_in(std::path::Path::new(&root), RESPONDER_RELOAD_TIMEOUT).await
+    request_reload_in(&root, RESPONDER_RELOAD_TIMEOUT).await
 }
 
 pub(crate) async fn request_reload_in(
@@ -4202,6 +4248,8 @@ mod deletion_tests;
 mod future_timestamp_tests;
 #[cfg(test)]
 mod reload_tests;
+#[cfg(test)]
+mod responder_signal_tests;
 #[cfg(test)]
 mod reload_window_tests;
 #[cfg(test)]

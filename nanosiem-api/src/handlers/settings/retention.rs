@@ -468,6 +468,9 @@ pub async fn update_clickhouse_retention(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("settings", None, Some("clickhouse_retention".to_string()))
             .client_context(&client)
+            // The day count, so the history of retention changes can be
+            // reported from the audit log.
+            .details(serde_json::json!({ "ttl_days": request.retention_days }))
             .build(),
     );
 

@@ -1,0 +1,18 @@
+{
+  "description": "Dry run: proves install, load, metrics and JSON output in about 10 minutes per scenario.",
+  "SEED": 20261114,
+  "ASSETS": 5000,
+  "GB_PER_DAY": 50,
+  "BLAST_PROCS": 1,
+  "BLAST_THREADS": 4,
+  "BLAST_BATCH": 500,
+  "ANALYSTS": 3,
+  "DASHBOARD_VIEWERS": 2,
+  "DURATION": "10m",
+  "START_EPS": 1000,
+  "STEP_EPS": 1500,
+  "STEP_SECS": 150,
+  "DRAIN_SECS": 45,
+  "MAX_EPS": 4000,
+  "CEILING_ANALYSTS": 1
+}

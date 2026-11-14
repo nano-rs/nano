@@ -4,21 +4,26 @@ Optional and off by default. Offer it once the install is verified. It adds
 Prometheus, Grafana with five dashboards, and alert rules. It is metrics only:
 if it stops, dashboards stop; ingest and search do not.
 
-The full operator guide ships in the bundle at
-`docs/administration/monitor-self-run.md` and on nano.rs
-(https://nano.rs/docs/getting-started/monitor-self-run). Follow it; this page is
-the agent's checklist.
+The full operator guide is on nano.rs
+(https://nano.rs/docs/getting-started/monitor-self-run). A release bundle also
+has it at `docs/administration/monitor-self-run.md`; a `get.nano.rs` git
+checkout has no `docs/administration/`, so use nano.rs there. Follow it; this
+page is the agent's checklist.
+
+**Installer reruns:** on a git checkout, `./install.sh` first updates to the
+latest release (an upgrade). Use `NANO_SKIP_GIT_UPDATE=1 ./install.sh` unless
+the operator wants to upgrade too.
 
 ## Decide
 
 Ask the operator:
 
 1. Do they already run Prometheus and Grafana? Then use "Your own Prometheus"
-   in the guide: scrape table, job names, the `host` label, dashboards and
-   rules from the bundle.
+   in the guide: job names, the `host` label, the token file, dashboards and
+   rules from `config/`. See "Your own Prometheus" below for the steps.
 2. Otherwise, which shape:
    - **Single node:** add `monitoring` to `COMPOSE_PROFILES` in `.env`, rerun
-     `./install.sh`.
+     `NANO_SKIP_GIT_UPDATE=1 ./install.sh`.
    - **Role split:** one host gets the `monitoring` role. A small dedicated VM
      (2 vCPU, 4 GB, 50 GB), or an existing PostgreSQL/Keeper host. Only one,
      even on full HA. `plan.py --monitoring dedicated|colocate` places it.
@@ -53,6 +58,39 @@ Ask the operator:
 Report the targets and the dashboard check as a table, like any other verify
 step. Never print the Grafana password or the service token in the report.
 
+## Your own Prometheus
+
+- **Single node:** nothing is published by default. Ask for the host's
+  private IPv4 that their Prometheus reaches (10/8, 172.16/12, 192.168/16,
+  100.64/10 or 127/8, and on this host; a public address also needs
+  `NANO_METRICS_ALLOW_PUBLIC=1`, only behind a network firewall). Put
+  `NANO_METRICS_BIND_ADDRESS=<that address>` in `.env` and rerun
+  `NANO_SKIP_GIT_UPDATE=1 ./install.sh` (needs Docker Compose 2.24.4+). The
+  installer starts `nano-metrics-edge` (GET/HEAD `/metrics` only) on that
+  address: api 3000, search 3002, jobs 3003, Vector 9598, ClickHouse 9363,
+  node-exporter 9100 (`NANO_METRICS_NODE_PORT` to move it). It also runs
+  node-exporter and sets `NANO_JOBS_BIND_ADDR=0.0.0.0`; `nano upgrade` keeps
+  and updates the edge. Removing the setting and rerunning undoes all of it.
+  Docker publishes in front of UFW, so the operator must limit these ports
+  to the Prometheus host with the cloud firewall (or the guide's
+  `DOCKER-USER` rules, which match `--ctorigdstport` host ports with `--ctdir ORIGINAL`). There are
+  no Valkey metrics on this path. On role split the setting is ignored (the
+  installer warns).
+- **Role split:** needs a monitoring host in the inventory (exporter ports and
+  firewall). Start from that host's `.nano-generated/monitoring/prometheus.yml`,
+  and change the token and CA paths.
+- **Token:** `NANO_SERVICE_TOKEN` in the install's `.env` (shared `.env` on
+  role split). Copy it over ssh straight into a `root:<prometheus group>`
+  0440 file (for `prom/prometheus`, a dedicated group added with
+  `--group-add`, never `nobody`), and reference it with
+  `authorization.credentials_file`. Never print it.
+- **Labels:** every target gets `host=<host name>` (and `nano_role`, as in
+  the guide's example). Job names must match the
+  guide (`nano-api`, `nano-search`, `nano-jobs`, `nano-vector`, `clickhouse`,
+  `node`).
+- **Verify:** their Prometheus shows every target UP (Status > Targets), and
+  "nano Overview" shows every service up after the dashboards are imported.
+
 ## Self-ingest
 
 1. In the UI: create a log source, issue an ingest token for it.
@@ -70,3 +108,4 @@ step. Never print the Grafana password or the service token in the report.
 | api/search/jobs targets DOWN with 401 | `.env` copies differ | Copy the first app host's `.env` again; rerun the app hosts and the monitoring host |
 | Grafana does not start | `NANO_GRAFANA_ADMIN_PASSWORD` missing | Rerun the first app host's role, copy `.env` again |
 | Single node: nano-jobs DOWN | jobs on loopback | The installer sets `NANO_JOBS_BIND_ADDR=0.0.0.0`; rerun it |
+| Single node, own Prometheus: connection refused | `NANO_METRICS_BIND_ADDRESS` unset or not the address Prometheus uses | Set it in `.env`, rerun; check `docker ps --filter name=nano-metrics-edge` |

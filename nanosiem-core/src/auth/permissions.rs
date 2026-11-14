@@ -465,6 +465,50 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     GDPR_ANONYMIZE,
 ];
 
+/// Extra permission ids registered at startup by builds that add surfaces of
+/// their own (an extension crate calls [`register_permissions`]). Open builds
+/// register none. The PostgreSQL `permissions` catalog (which the role and API
+/// key editors list) is seeded by that build's own migrations; this registry
+/// only makes the in-process validators agree with it.
+static PERMISSION_EXTENSIONS: std::sync::OnceLock<std::sync::Mutex<Vec<&'static str>>> =
+    std::sync::OnceLock::new();
+
+/// Register extra permission ids (`category:action`). Idempotent; ids that are
+/// already static or registered are ignored, and malformed ids (no `:`, empty
+/// category or action) are rejected.
+pub fn register_permissions(extra: &[&'static str]) {
+    let lock = PERMISSION_EXTENSIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut list = lock.lock().unwrap_or_else(|e| e.into_inner());
+    for p in extra {
+        let well_formed = matches!(p.split_once(':'), Some((c, a)) if !c.is_empty() && !a.is_empty());
+        if well_formed && !ALL_PERMISSIONS.contains(p) && !list.contains(p) {
+            list.push(p);
+        }
+    }
+}
+
+/// [`ALL_PERMISSIONS`] plus any registered extensions.
+pub fn all_permissions() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = ALL_PERMISSIONS.to_vec();
+    if let Some(lock) = PERMISSION_EXTENSIONS.get() {
+        out.extend(lock.lock().unwrap_or_else(|e| e.into_inner()).iter().copied());
+    }
+    out
+}
+
+/// [`CATEGORIES`] plus the category of every registered extension permission.
+pub fn categories() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = CATEGORIES.to_vec();
+    for p in all_permissions() {
+        if let Some((category, _)) = p.split_once(':') {
+            if !out.contains(&category) {
+                out.push(category);
+            }
+        }
+    }
+    out
+}
+
 /// Extra demo permissions registered at startup by builds that add surfaces
 /// of their own (an enterprise extension calls
 /// [`register_demo_permissions`]). Open builds register none.
@@ -610,17 +654,16 @@ pub const CATEGORIES: &[&str] = &[
     "gdpr",
 ];
 
-/// Check if a permission ID is valid
+/// Check if a permission ID is valid (static or registered at startup)
 pub fn is_valid_permission(permission: &str) -> bool {
-    ALL_PERMISSIONS.contains(&permission)
+    all_permissions().contains(&permission)
 }
 
-/// Get all permissions for a category
+/// Get all permissions for a category (static or registered at startup)
 pub fn permissions_for_category(category: &str) -> Vec<&'static str> {
-    ALL_PERMISSIONS
-        .iter()
+    all_permissions()
+        .into_iter()
         .filter(|p| p.starts_with(&format!("{}:", category)))
-        .copied()
         .collect()
 }
 
@@ -657,6 +700,20 @@ mod tests {
         assert!(is_valid_permission(USERS_CREATE));
         assert!(!is_valid_permission("invalid:permission"));
         assert!(!is_valid_permission(""));
+    }
+
+    #[test]
+    fn registered_permissions_extend_the_validators() {
+        // A test-only id: nothing in the product registers it.
+        const EXTRA: &str = "zz_registry_test:export";
+        assert!(!is_valid_permission(EXTRA));
+        register_permissions(&[EXTRA, EXTRA, "malformed", ":x", "y:", SEARCH_VIEW]);
+        assert!(is_valid_permission(EXTRA));
+        assert!(!is_valid_permission("malformed"));
+        assert_eq!(permissions_for_category("zz_registry_test"), vec![EXTRA]);
+        assert!(categories().contains(&"zz_registry_test"));
+        assert_eq!(all_permissions().iter().filter(|p| **p == EXTRA).count(), 1);
+        assert_eq!(all_permissions().iter().filter(|p| **p == SEARCH_VIEW).count(), 1);
     }
 
     #[test]

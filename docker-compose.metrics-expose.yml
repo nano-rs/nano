@@ -1,0 +1,59 @@
+# NAN-5408: publish nano's metrics to your own Prometheus on a single-node
+# install. install.sh manages this overlay: set NANO_METRICS_BIND_ADDRESS in
+# .env to one of the host's own private addresses and rerun ./install.sh. It
+# checks the address (scripts/lib/metrics-bind.sh: private unless
+# NANO_METRICS_ALLOW_PUBLIC=1, never 0.0.0.0, on this host) and Docker Compose
+# 2.24.4+ (`!reset` below), adds the overlay to NANO_COMPOSE_OVERLAYS (so
+# `nano` and `nano upgrade` keep it, and check the address again), sets
+# NANO_JOBS_BIND_ADDR=0.0.0.0, and undoes all of it when the setting is gone.
+# Do not list it in NANO_COMPOSE_OVERLAYS yourself.
+#
+# What it adds:
+#   - metrics-edge: a small nginx that publishes one port per scrape target on
+#     NANO_METRICS_BIND_ADDRESS only (never every interface). Each port answers
+#     GET/HEAD /metrics only; see config/monitoring/metrics-edge.conf.
+#       3000 nano-api      3002 nano-search   3003 nano-jobs   (bearer token)
+#       9598 Vector        9363 ClickHouse    9100 node-exporter
+#   - node-exporter, which otherwise runs only with the monitoring profile.
+#
+# Docker publishes these ports in front of the host firewall (UFW does not
+# see them). Restrict who reaches NANO_METRICS_BIND_ADDRESS with your cloud or
+# network firewall: only your Prometheus needs it.
+# docs/administration/monitor-self-run.md, "Your own Prometheus".
+services:
+  metrics-edge:
+    # Same pinned image as vector-netns in docker-compose.opensource.yml.
+    image: nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
+    container_name: nano-metrics-edge
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    user: "101:101"
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,uid=101,gid=101
+    volumes:
+      - ./config/monitoring/metrics-edge.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "${NANO_METRICS_BIND_ADDRESS:?set NANO_METRICS_BIND_ADDRESS in .env and rerun install.sh}:3000:3000"
+      - "${NANO_METRICS_BIND_ADDRESS:?}:3002:3002"
+      - "${NANO_METRICS_BIND_ADDRESS:?}:3003:3003"
+      - "${NANO_METRICS_BIND_ADDRESS:?}:9598:9598"
+      - "${NANO_METRICS_BIND_ADDRESS:?}:9363:9363"
+      - "${NANO_METRICS_BIND_ADDRESS:?}:${NANO_METRICS_NODE_PORT:-9100}:9100"
+    deploy:
+      resources:
+        limits:
+          memory: 32M
+          cpus: "0.1"
+
+  node-exporter:
+    # Run it without the monitoring profile too.
+    profiles: !reset []

@@ -1,0 +1,535 @@
+{
+  "schema": "nano-benchmark/result@1",
+  "run_id": "dry1",
+  "scenario": "ceiling",
+  "generated_at": "2026-11-14T16:44:32.518998+00:00",
+  "nano_version": "2.0.23",
+  "schema_profile": "ocsf",
+  "topology": {
+    "name": "bench-dryrun",
+    "provider": "Rackspace Spot",
+    "region": "us-central-dfw-2",
+    "hosts": [
+      {
+        "name": "app1",
+        "role": "app",
+        "server_class": "gp.vs2.large-dfw2",
+        "vcpu": 4,
+        "mem_gb": 16,
+        "market_usd_per_hour": 0.04,
+        "bid_usd_per_hour": 0.08,
+        "on_demand_usd_per_hour": 0.09
+      },
+      {
+        "name": "ch1",
+        "role": "clickhouse",
+        "server_class": "gp.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 32,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.15,
+        "on_demand_usd_per_hour": 0.17
+      },
+      {
+        "name": "ing1",
+        "role": "ingest",
+        "server_class": "ch.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 16,
+        "market_usd_per_hour": 0.06,
+        "bid_usd_per_hour": 0.12,
+        "on_demand_usd_per_hour": 0.13
+      },
+      {
+        "name": "blaster1",
+        "role": "load-generator",
+        "server_class": "ch.vs2.large-dfw2",
+        "vcpu": 4,
+        "mem_gb": 8,
+        "market_usd_per_hour": 0.04,
+        "bid_usd_per_hour": 0.06,
+        "on_demand_usd_per_hour": 0.06
+      }
+    ],
+    "nano_usd_per_hour_market": 0.18,
+    "nano_usd_per_hour_bid_ceiling": 0.35,
+    "clickhouse_layout": "shards"
+  },
+  "dataset": {
+    "generator": "tools/log-blaster",
+    "seed_base": 20261114,
+    "assets": 5000,
+    "lateral_chains": false,
+    "source_mix": {
+      "windows_sysmon": 0.6,
+      "windows_event": 0.1,
+      "conduit_proxy": 0.12,
+      "apache_access": 0.1,
+      "aws_cloudtrail": 0.08
+    }
+  },
+  "phases": [
+    {
+      "label": "ceil01-1000",
+      "window": {
+        "start": "2026-11-14T16:33:48.002378+00:00",
+        "end": "2026-11-14T16:36:18.549917+00:00",
+        "seconds": 150.5
+      },
+      "target_eps": 1000,
+      "sender": {
+        "processes": 1,
+        "events_sent": 150000,
+        "events_failed": 0,
+        "achieved_eps": 996.4,
+        "seed": [
+          20261114
+        ]
+      },
+      "stored": {
+        "events": 150000,
+        "raw_bytes": 147171546,
+        "avg_event_bytes": 981.1,
+        "by_source": {
+          "apache_access": 15011,
+          "aws_cloudtrail": 11856,
+          "conduit_proxy": 18041,
+          "windows_event": 15168,
+          "windows_sysmon": 89924
+        }
+      },
+      "throughput": {
+        "eps": 996.4,
+        "gb_per_day": 84.46
+      },
+      "ingest_lag_ms": {
+        "p50": 6018,
+        "p95": 10962,
+        "p99": 11110,
+        "max": 11474
+      },
+      "markers": {
+        "sent": 600,
+        "stored_rows": 600,
+        "stored_unique": 600,
+        "exactly_once": true
+      },
+      "slo": {
+        "lag_p99_ok": true,
+        "zero_loss": true,
+        "errors_ok": true,
+        "pass": true
+      },
+      "storage": {
+        "rows_on_ch1": 1494609,
+        "compressed_bytes": 330780510,
+        "uncompressed_bytes": 3859583532,
+        "compression_ratio": 11.67
+      },
+      "queries_at_load": {
+        "search_by_tier": {
+          "triage": {
+            "server": {
+              "count": 6,
+              "p50_ms": 48.5,
+              "p95_ms": 318.75,
+              "p99_ms": 378.15000000000003,
+              "max_ms": 393,
+              "avg_ms": 108.5
+            },
+            "round_trip": {
+              "count": 6,
+              "p50_ms": 82.5,
+              "p95_ms": 330.75,
+              "p99_ms": 385.35,
+              "max_ms": 399,
+              "avg_ms": 129.33333333333334
+            }
+          },
+          "hunt": {
+            "server": {
+              "count": 4,
+              "p50_ms": 46,
+              "p95_ms": 235.54999999999993,
+              "p99_ms": 259.90999999999997,
+              "max_ms": 266,
+              "avg_ms": 96.5
+            },
+            "round_trip": {
+              "count": 4,
+              "p50_ms": 53.5,
+              "p95_ms": 242.84999999999994,
+              "p99_ms": 266.9699999999999,
+              "max_ms": 273,
+              "avg_ms": 103.5
+            }
+          },
+          "ir": {
+            "server": {
+              "count": 1,
+              "p50_ms": 94,
+              "p95_ms": 94,
+              "p99_ms": 94,
+              "max_ms": 94,
+              "avg_ms": 94
+            },
+            "round_trip": {
+              "count": 1,
+              "p50_ms": 100,
+              "p95_ms": 100,
+              "p99_ms": 100,
+              "max_ms": 100,
+              "avg_ms": 100
+            }
+          }
+        },
+        "error_rates": {
+          "analysts": 0,
+          "dashboards": null,
+          "agents": null
+        }
+      }
+    },
+    {
+      "label": "ceil02-2500",
+      "window": {
+        "start": "2026-11-14T16:37:18.693489+00:00",
+        "end": "2026-11-14T16:39:49.420848+00:00",
+        "seconds": 150.7
+      },
+      "target_eps": 2500,
+      "sender": {
+        "processes": 1,
+        "events_sent": 374000,
+        "events_failed": 0,
+        "achieved_eps": 2481.3,
+        "seed": [
+          20261114
+        ]
+      },
+      "stored": {
+        "events": 374000,
+        "raw_bytes": 367189552,
+        "avg_event_bytes": 981.8,
+        "by_source": {
+          "apache_access": 37244,
+          "aws_cloudtrail": 30014,
+          "conduit_proxy": 44860,
+          "windows_event": 37746,
+          "windows_sysmon": 224136
+        }
+      },
+      "throughput": {
+        "eps": 2481.3,
+        "gb_per_day": 210.48
+      },
+      "ingest_lag_ms": {
+        "p50": 3777,
+        "p95": 6290.149999999999,
+        "p99": 9452.45,
+        "max": 11447
+      },
+      "markers": {
+        "sent": 748,
+        "stored_rows": 748,
+        "stored_unique": 748,
+        "exactly_once": true
+      },
+      "slo": {
+        "lag_p99_ok": true,
+        "zero_loss": true,
+        "errors_ok": true,
+        "pass": true
+      },
+      "storage": {
+        "rows_on_ch1": 1494616,
+        "compressed_bytes": 330807859,
+        "uncompressed_bytes": 3859600263,
+        "compression_ratio": 11.67
+      },
+      "queries_at_load": {
+        "search_by_tier": {
+          "triage": {
+            "server": {
+              "count": 4,
+              "p50_ms": 43.5,
+              "p95_ms": 53.099999999999994,
+              "p99_ms": 53.82,
+              "max_ms": 54,
+              "avg_ms": 44.75
+            },
+            "round_trip": {
+              "count": 4,
+              "p50_ms": 50,
+              "p95_ms": 59.8,
+              "p99_ms": 60.76,
+              "max_ms": 61,
+              "avg_ms": 51.25
+            }
+          },
+          "hunt": {
+            "server": {
+              "count": 5,
+              "p50_ms": 111,
+              "p95_ms": 202.79999999999998,
+              "p99_ms": 209.36,
+              "max_ms": 211,
+              "avg_ms": 120.8
+            },
+            "round_trip": {
+              "count": 5,
+              "p50_ms": 123,
+              "p95_ms": 212.39999999999998,
+              "p99_ms": 219.28,
+              "max_ms": 221,
+              "avg_ms": 129.6
+            }
+          },
+          "ir": {
+            "server": {
+              "count": 4,
+              "p50_ms": 45.5,
+              "p95_ms": 79.39999999999999,
+              "p99_ms": 82.28,
+              "max_ms": 83,
+              "avg_ms": 51.5
+            },
+            "round_trip": {
+              "count": 4,
+              "p50_ms": 50.5,
+              "p95_ms": 86.1,
+              "p99_ms": 89.22,
+              "max_ms": 90,
+              "avg_ms": 56.75
+            }
+          }
+        },
+        "error_rates": {
+          "analysts": 0,
+          "dashboards": null,
+          "agents": null
+        }
+      }
+    },
+    {
+      "label": "ceil03-4000",
+      "window": {
+        "start": "2026-11-14T16:40:50.254992+00:00",
+        "end": "2026-11-14T16:43:20.523816+00:00",
+        "seconds": 150.3
+      },
+      "target_eps": 4000,
+      "sender": {
+        "processes": 1,
+        "events_sent": 594000,
+        "events_failed": 0,
+        "achieved_eps": 3952.9,
+        "seed": [
+          20261114
+        ]
+      },
+      "stored": {
+        "events": 594000,
+        "raw_bytes": 583160906,
+        "avg_event_bytes": 981.8,
+        "by_source": {
+          "apache_access": 59346,
+          "aws_cloudtrail": 47758,
+          "conduit_proxy": 71058,
+          "windows_event": 59683,
+          "windows_sysmon": 356155
+        }
+      },
+      "throughput": {
+        "eps": 3952.9,
+        "gb_per_day": 335.3
+      },
+      "ingest_lag_ms": {
+        "p50": 2907,
+        "p95": 4455,
+        "p99": 5183,
+        "max": 11131
+      },
+      "markers": {
+        "sent": 1188,
+        "stored_rows": 1188,
+        "stored_unique": 1188,
+        "exactly_once": true
+      },
+      "slo": {
+        "lag_p99_ok": true,
+        "zero_loss": true,
+        "errors_ok": true,
+        "pass": true
+      },
+      "storage": {
+        "rows_on_ch1": 1494642,
+        "compressed_bytes": 330793384,
+        "uncompressed_bytes": 3859689778,
+        "compression_ratio": 11.67
+      },
+      "queries_at_load": {
+        "search_by_tier": {
+          "triage": {
+            "server": {
+              "count": 2,
+              "p50_ms": 167,
+              "p95_ms": 284.9,
+              "p99_ms": 295.38,
+              "max_ms": 298,
+              "avg_ms": 167
+            },
+            "round_trip": {
+              "count": 2,
+              "p50_ms": 172.5,
+              "p95_ms": 290.85,
+              "p99_ms": 301.37,
+              "max_ms": 304,
+              "avg_ms": 172.5
+            }
+          },
+          "hunt": {
+            "server": {
+              "count": 7,
+              "p50_ms": 46,
+              "p95_ms": 124.1,
+              "p99_ms": 127.22,
+              "max_ms": 128,
+              "avg_ms": 65.28571428571429
+            },
+            "round_trip": {
+              "count": 7,
+              "p50_ms": 52,
+              "p95_ms": 130.1,
+              "p99_ms": 133.22,
+              "max_ms": 134,
+              "avg_ms": 71.42857142857143
+            }
+          },
+          "ir": {
+            "server": {
+              "count": 2,
+              "p50_ms": 135.5,
+              "p95_ms": 197.15,
+              "p99_ms": 202.63,
+              "max_ms": 204,
+              "avg_ms": 135.5
+            },
+            "round_trip": {
+              "count": 2,
+              "p50_ms": 144,
+              "p95_ms": 206.1,
+              "p99_ms": 211.62,
+              "max_ms": 213,
+              "avg_ms": 144
+            }
+          }
+        },
+        "error_rates": {
+          "analysts": 0.08333333333333333,
+          "dashboards": null,
+          "agents": null
+        }
+      }
+    }
+  ],
+  "hosts": {
+    "app1": {
+      "samples": 114,
+      "cpu_busy_pct": {
+        "p50": 4.4,
+        "p95": 6.4,
+        "max": 9.0
+      },
+      "mem_used_pct": {
+        "p50": 10.1,
+        "max": 11.3
+      },
+      "disk_used_pct_end": 10.0,
+      "net_rx_mbps": 1.1,
+      "net_tx_mbps": 1.8,
+      "headroom": {
+        "cpu_pct": 93.6,
+        "mem_pct": 88.7,
+        "disk_pct": 90.0
+      }
+    },
+    "ch1": {
+      "samples": 114,
+      "cpu_busy_pct": {
+        "p50": 40.4,
+        "p95": 59.3,
+        "max": 65.8
+      },
+      "mem_used_pct": {
+        "p50": 10.2,
+        "max": 12.7
+      },
+      "disk_used_pct_end": 6.0,
+      "net_rx_mbps": 5.8,
+      "net_tx_mbps": 1.2,
+      "headroom": {
+        "cpu_pct": 40.7,
+        "mem_pct": 87.3,
+        "disk_pct": 94.0
+      }
+    },
+    "ing1": {
+      "samples": 114,
+      "cpu_busy_pct": {
+        "p50": 21.0,
+        "p95": 35.9,
+        "max": 36.5
+      },
+      "mem_used_pct": {
+        "p50": 8.1,
+        "max": 8.8
+      },
+      "disk_used_pct_end": 3.0,
+      "net_rx_mbps": 15.6,
+      "net_tx_mbps": 4.2,
+      "headroom": {
+        "cpu_pct": 64.1,
+        "mem_pct": 91.2,
+        "disk_pct": 97.0
+      }
+    },
+    "blaster1": {
+      "samples": 114,
+      "cpu_busy_pct": {
+        "p50": 0.9,
+        "p95": 1.6,
+        "max": 2.3
+      },
+      "mem_used_pct": {
+        "p50": 8.3,
+        "max": 8.5
+      },
+      "disk_used_pct_end": 8.0,
+      "net_rx_mbps": 0.1,
+      "net_tx_mbps": 15.5,
+      "headroom": {
+        "cpu_pct": 98.4,
+        "mem_pct": 91.5,
+        "disk_pct": 92.0
+      }
+    }
+  },
+  "ceiling": {
+    "sustained_eps": 3952.9,
+    "sustained_gb_per_day": 335.3,
+    "lag_ms_at_ceiling": {
+      "p50": 2907,
+      "p95": 4455,
+      "p99": 5183,
+      "max": 11131
+    },
+    "broke_at": null
+  },
+  "cost": {
+    "usd_per_hour": 0.18,
+    "usd_per_day": 4.32,
+    "usd_per_gb_ingested": 0.01288,
+    "basis": "Spot market price at provisioning; nano hosts only (load generators excluded)"
+  }
+}

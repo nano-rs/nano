@@ -1,0 +1,412 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nano.rs/schemas/benchmark/result-1.json",
+  "title": "nano benchmark result",
+  "description": "One benchmark run (ceiling or SOC day), as written by benchmarks/public/lib/collect.py. Host addresses and secrets are never included.",
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "scenario",
+    "nano_version",
+    "topology",
+    "dataset",
+    "phases"
+  ],
+  "properties": {
+    "schema": {
+      "const": "nano-benchmark/result@1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "scenario": {
+      "enum": [
+        "ceiling",
+        "socday",
+        "adhoc"
+      ]
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nano_version": {
+      "type": "string"
+    },
+    "schema_profile": {
+      "enum": [
+        "ocsf",
+        "udm"
+      ]
+    },
+    "target_gb_per_day": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "topology": {
+      "type": "object",
+      "required": [
+        "hosts"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clickhouse_layout": {
+          "enum": [
+            "shards",
+            "replicas"
+          ]
+        },
+        "nano_usd_per_hour_market": {
+          "type": "number",
+          "description": "Sum of Spot market prices of the nano hosts (load generators excluded)."
+        },
+        "nano_usd_per_hour_bid_ceiling": {
+          "type": "number"
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "role"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "role": {
+                "enum": [
+                  "app",
+                  "clickhouse",
+                  "ingest",
+                  "load-generator"
+                ]
+              },
+              "server_class": {
+                "type": "string"
+              },
+              "vcpu": {
+                "type": "integer"
+              },
+              "mem_gb": {
+                "type": "number"
+              },
+              "disk_gb": {
+                "type": "number"
+              },
+              "market_usd_per_hour": {
+                "type": "number"
+              },
+              "bid_usd_per_hour": {
+                "type": "number"
+              },
+              "on_demand_usd_per_hour": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "properties": {
+        "generator": {
+          "type": "string"
+        },
+        "seed_base": {
+          "type": "integer",
+          "description": "Blaster process N uses seed_base + N."
+        },
+        "assets": {
+          "type": "integer"
+        },
+        "lateral_chains": {
+          "type": "boolean"
+        },
+        "source_mix": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "window": {
+            "type": "object",
+            "properties": {
+              "start": {
+                "type": "string"
+              },
+              "end": {
+                "type": "string"
+              },
+              "seconds": {
+                "type": "number"
+              }
+            }
+          },
+          "target_eps": {
+            "type": "number"
+          },
+          "sender": {
+            "type": "object",
+            "properties": {
+              "processes": {
+                "type": "integer"
+              },
+              "events_sent": {
+                "type": "integer"
+              },
+              "events_failed": {
+                "type": "integer"
+              },
+              "achieved_eps": {
+                "type": "number"
+              },
+              "seed": {
+                "type": "array"
+              }
+            }
+          },
+          "stored": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "integer"
+              },
+              "raw_bytes": {
+                "type": "integer"
+              },
+              "avg_event_bytes": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "by_source": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "throughput": {
+            "type": "object",
+            "properties": {
+              "eps": {
+                "type": "number"
+              },
+              "gb_per_day": {
+                "type": "number"
+              }
+            }
+          },
+          "ingest_lag_ms": {
+            "$ref": "#/$defs/quantiles"
+          },
+          "markers": {
+            "type": "object",
+            "properties": {
+              "sent": {
+                "type": "integer"
+              },
+              "stored_rows": {
+                "type": "integer"
+              },
+              "stored_unique": {
+                "type": "integer"
+              },
+              "exactly_once": {
+                "type": "boolean"
+              }
+            }
+          },
+          "slo": {
+            "type": "object",
+            "properties": {
+              "lag_p99_ok": {
+                "type": "boolean"
+              },
+              "zero_loss": {
+                "type": "boolean"
+              },
+              "errors_ok": {
+                "type": "boolean"
+              },
+              "pass": {
+                "type": "boolean"
+              }
+            }
+          },
+          "storage": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "ceiling": {
+      "type": "object",
+      "properties": {
+        "sustained_eps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sustained_gb_per_day": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "lag_ms_at_ceiling": {
+          "$ref": "#/$defs/quantiles"
+        },
+        "broke_at": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      }
+    },
+    "queries": {
+      "type": "object",
+      "description": "k6 SOC mix summary (nano-benchmark/soc-mix@1): search p50/p95/p99 by tier, dashboard refresh, Agent Lane queries, error rates."
+    },
+    "detections": {
+      "type": "object",
+      "properties": {
+        "rules_fired": {
+          "type": "integer"
+        },
+        "event_to_alert_ms": {
+          "type": "object",
+          "properties": {
+            "scheduled": {
+              "$ref": "#/$defs/quantiles"
+            },
+            "realtime": {
+              "$ref": "#/$defs/quantiles"
+            }
+          }
+        },
+        "rule_set": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "findings": {
+          "type": "integer",
+          "description": "Detection findings (OCSF 2004) written by bench- rules during the run window."
+        },
+        "realtime_findings": {
+          "type": "integer"
+        }
+      }
+    },
+    "hosts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "cpu_busy_pct": {
+            "type": "object"
+          },
+          "mem_used_pct": {
+            "type": "object"
+          },
+          "disk_used_pct_end": {
+            "type": "number"
+          },
+          "headroom": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "properties": {
+        "usd_per_hour": {
+          "type": "number"
+        },
+        "usd_per_day": {
+          "type": "number"
+        },
+        "usd_per_gb_ingested": {
+          "type": "number"
+        },
+        "basis": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "quantiles": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "p50": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p95": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p99": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

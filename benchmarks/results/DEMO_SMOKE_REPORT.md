@@ -2,7 +2,7 @@
 
 **Target:** `nano-demo` (GKE, ns `nanosiem`), ClickHouse Cloud backend, ~22M rows/24h of data.
 **Measured under live production conditions:** ~200 EPS continuous ingestion + **26 live detection rules** running concurrently. Search load applied via k6 over `kubectl port-forward` to a **single** `nanosiem-search` replica (of 4) — i.e. no load-balancer help, one pod absorbing everything.
-**Method:** JWT auth (`/api/auth/login`), read-only. Query corpus: `benchmarks/results/soc_ir_corpus.json`; replayed by `benchmarks/k6/search_realistic.js`.
+**Method:** JWT auth (`/api/auth/login`), read-only. Query corpus: `benchmarks/results/soc_ir_corpus_udm.json` (this run was on the UDM profile; the OCSF corpus is `soc_ir_corpus.json`); replayed by `benchmarks/k6/search_realistic.js` with `SCHEMA_PROFILE=udm`.
 
 ## TL;DR
 
@@ -92,7 +92,7 @@ By domain (p50 / p95): Web 57 / 313ms · Network-proxy 97 / 373ms · Cloud-AWS 1
 Window-bound, not token-bound: `error | stats count` is a flat ~3s over 24h regardless of match count (even `timeout` with **0 matches** = 3.06s) and drops to **0.21s at 1h**. The bare-fetch form is ~2× the count-only cost due to the count(\*) companion (#2). Takeaway: narrower default windows + source-scoping (which real queries already do) keep the engine fast; the 24h bare-keyword path is the only thing that full-scans.
 
 ## Artifacts
-- `soc_ir_corpus.json` — 94 validated IR/SOC queries (14 domains, 46 MITRE techniques) with measured latencies
+- `soc_ir_corpus_udm.json` — 94 validated IR/SOC queries (14 domains, 46 MITRE techniques) with measured latencies
 - `search_realistic.json` — load-test results under live conditions (this report's §2)
 - `search.json` / `search_24h.json` — stress reference (6h / 24h)
 - `benchmarks/k6/search_realistic.js` — replays the corpus at per-query analyst windows

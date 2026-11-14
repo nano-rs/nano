@@ -1,0 +1,9 @@
+{
+  "description": "The published sample day: one simulated day at the 50 GB/day tier rate, byte-reproducible.",
+  "command": "log-blaster --seed 20261114 --assets 5000 --eps 590 --events 50976000 --start-time 2026-01-01T00:00:00Z --output nano-sample-day.ndjson",
+  "SEED": 20261114,
+  "ASSETS": 5000,
+  "EPS": 590,
+  "EVENTS": 50976000,
+  "START_TIME": "2026-01-01T00:00:00Z"
+}

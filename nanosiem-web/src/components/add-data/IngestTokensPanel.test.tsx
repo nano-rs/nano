@@ -234,6 +234,34 @@ it('issues a token bound to a source and shows its value once', async () => {
   expect(document.body.textContent).not.toContain('nit_TESTVALUE');
 });
 
+async function issueWith(ingest_ready: object) {
+  calls.create.mockResolvedValueOnce({
+    credential: { ...ACTIVE, credential_id: '0b8f6a52-6f1e-4c55-9a3e-2f1d7c9b1a03', name: 'fw-edge-01' },
+    token: 'nit_TESTVALUEtestvalueTESTVALUEtestvalue12',
+    ingest_ready,
+  });
+  renderPage();
+  fireEvent.click(await screen.findByRole('button', { name: /New token/ }));
+  const dialog = await screen.findByTestId('issue-ingest-token-dialog');
+  fireEvent.change(within(dialog).getByLabelText('Name'), { target: { value: 'fw-edge-01' } });
+  await pick(dialog, 'Source', /pan_traffic/);
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Issue token' }));
+  await screen.findByTestId('issued-ingest-token');
+  return screen.getByTestId('issue-ingest-token-dialog');
+}
+
+it('says the issued token is live only when the API confirms it (NAN-5395)', async () => {
+  const dialog = await issueWith({ ready: true, delivery: 'shared_volume', waited_ms: 2100 });
+  expect(dialog.textContent).toContain('Ingest already accepts it.');
+  expect(dialog.textContent).not.toContain('may answer 401');
+});
+
+it('tells the sender to retry a 401 when the token is not confirmed (NAN-5395)', async () => {
+  const dialog = await issueWith({ ready: false, delivery: 'http', waited_ms: 0, retry_after_secs: 5 });
+  expect(dialog.textContent).toContain('HEC/HTTP may answer 401 for about 5 s; retry.');
+  expect(dialog.textContent).not.toContain('already accepts');
+});
+
 it('revokes after confirmation', async () => {
   renderPage();
   const rows = await screen.findAllByTestId('ingest-token-row');

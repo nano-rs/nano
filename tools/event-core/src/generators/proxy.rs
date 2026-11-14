@@ -7,7 +7,6 @@
 use chrono::{DateTime, Utc};
 use rand::seq::IndexedRandom;
 use rand::Rng;
-use uuid::Uuid;
 
 use crate::entity::Entity;
 use crate::event::Event;
@@ -385,7 +384,7 @@ impl ProxyGenerator {
         let request_bytes = if spec.method == "GET" { 0 } else { 768 };
 
         let log_entry = serde_json::json!({
-            "id": Uuid::now_v7().to_string(),
+            "id": crate::rng::uuid().to_string(),
             "timestamp": ts.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string(),
             "client_ip": entity.ip,
             "username": entity.user,
@@ -590,7 +589,7 @@ impl ProxyGenerator {
         }
 
         let log_entry = serde_json::json!({
-            "id": Uuid::now_v7().to_string(),
+            "id": crate::rng::uuid().to_string(),
             "timestamp": ts.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string(),
             "client_ip": entity.ip,
             "username": serde_json::Value::Null,

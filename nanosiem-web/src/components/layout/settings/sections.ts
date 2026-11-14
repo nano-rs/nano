@@ -28,6 +28,7 @@ import {
   Database,
   Shield,
   ShieldCheck,
+  FileCheck2,
   EyeOff,
   KeyRound,
   Users as UsersIcon,
@@ -450,6 +451,22 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     href: '/settings/gdpr',
     permissions: 'gdpr:anonymize',
     status: 'ok',
+  },
+  {
+    // NAN-5382: Evidence Pack sits with GDPR & Compliance. A sibling rather than
+    // a child, so `compliance:export` alone reaches it without `gdpr:anonymize`.
+    // Licensed only (`complianceExport`): open builds and unlicensed enterprise
+    // installs get no route target, nav entry or landing card for it.
+    id: 'evidence-pack',
+    label: 'Evidence Pack',
+    group: 'admin',
+    icon: FileCheck2,
+    desc: 'Metadata-only compliance evidence export for an audit period (JSON, CSV, PDF).',
+    href: '/settings/compliance/evidence-pack',
+    matchPrefixes: ['/settings/compliance'],
+    permissions: 'compliance:export',
+    status: 'ok',
+    capability: 'complianceExport',
   },
   {
     id: 'license',

@@ -502,6 +502,26 @@ PY
                 || die "NANO_COMPOSE_OVERLAYS file is missing or symbolic: $overlay"
             COMPOSE_ARGS+=(-f "$INSTALL_DIR/$overlay")
         done
+        # NAN-5408: never publish metrics on an address install.sh would
+        # refuse (a hand-edited 0.0.0.0 or public address in .env).
+        if [[ " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.metrics-expose.yml "* ]]; then
+            local metrics_bind_lib="$SCRIPT_DIR/lib/metrics-bind.sh" metrics_reason
+            [[ -f "$metrics_bind_lib" ]] || die "metrics address helper is missing: $metrics_bind_lib"
+            # shellcheck source=scripts/lib/metrics-bind.sh
+            source "$metrics_bind_lib"
+            metrics_reason=$(nano_metrics_bind_error \
+                "$(env_value "$INSTALL_DIR/.env" NANO_METRICS_BIND_ADDRESS)" \
+                "$(env_value "$INSTALL_DIR/.env" NANO_METRICS_ALLOW_PUBLIC)") \
+                || die "NANO_METRICS_BIND_ADDRESS in .env: $metrics_reason. Fix it (or remove it) and rerun install.sh."
+        fi
+        # NAN-5387: a restore restarts the stack; recreate nano's pinned
+        # network on NANO_COMPOSE_SUBNET first if it has gone missing.
+        local pin_subnet
+        pin_subnet="$(env_value "$INSTALL_DIR/.env" NANO_COMPOSE_SUBNET)"
+        if [[ -n "$pin_subnet" && -f "$INSTALL_DIR/scripts/lib/network-pin.sh" ]]; then
+            bash "$INSTALL_DIR/scripts/lib/network-pin.sh" ensure "$pin_subnet" \
+                --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" || true
+        fi
     else
         [[ -f "$LEGACY_LAYOUT_RESOLVER" && ! -L "$LEGACY_LAYOUT_RESOLVER" ]] \
             || die "legacy layout resolver is missing"

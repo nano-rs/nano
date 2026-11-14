@@ -12,7 +12,8 @@
 //! and rotate responses wait out that request-path cache interval after the
 //! atomic file update, so a returned destructive operation cannot be followed
 //! by a request authenticated from the pre-update snapshot. No Vector reload
-//! or listener restart is required.
+//! or listener restart is required. Issue and rotate responses report whether
+//! the new token is confirmed live on ingest (`readiness`, NAN-5395).
 //!
 //! **The token decides the source.** A file entry's `name`, which the fork
 //! stamps as `%nano_credential_name`, is the bound source's route key
@@ -49,6 +50,7 @@
 //! file holds hashes only and is written 0600; nothing here logs its content.
 
 mod file;
+mod readiness;
 mod repository;
 mod service;
 mod usage;
@@ -63,6 +65,10 @@ mod enrichment_lane_auth_tests;
 
 pub use file::{
     render_tokens_file, write_tokens_file, TokenFileEntry, DEFAULT_TOKENS_FILE, MULTIPLEX_ROUTE,
+};
+pub use readiness::{
+    ready_wait_from, wait_for_ingest, IngestReadiness, DEFAULT_READY_WAIT, MAX_READY_WAIT,
+    NOT_READY_RETRY_AFTER_SECS, READY_WAIT_ENV,
 };
 pub use repository::{BindableSourceCredential, IngestTokenRepository, IngestTokenRepositoryError};
 pub use service::{file_extra_entries, IngestTokenService, IngestTokenServiceError, ROTATION_PENDING_TTL};

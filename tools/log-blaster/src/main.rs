@@ -10,6 +10,9 @@
 //! Usage:
 //!   log-blaster --vector http://localhost:8080 --rate 30                       # Normal mode
 //!   log-blaster --vector http://localhost:8080 --blast --eps 50000             # Blast mode
+//!   log-blaster --vector http://ingest/ingest/ --blast --eps 20000 --seed 20261114 \
+//!     --tokens-file tokens.json --run-id r1 --summary-json r1.json             # Public benchmark (benchmarks/public)
+//!   log-blaster --seed 20261114 --output day.ndjson --events 1000000           # Byte-reproducible offline sample
 //!   log-blaster --vector http://localhost:8080 --spike \
 //!     --spike-profile tools/log-blaster/profiles/spike_corporate.json          # Spike mode
 //!   log-blaster --hec --rate 30                                                # Splunk HEC (default :8088)
@@ -21,6 +24,7 @@
 //!   log-blaster --combo-join --combo-join-fraction 0.3 --rate 600 --duration 1 \
 //!     --clickhouse-url http://localhost:8123                                   # Spans→otel_spans + correlated auth-failure logs→nanosiem.logs (validate spans↔logs join)
 
+mod bench;
 mod spike;
 
 use anyhow::Result;
@@ -225,6 +229,48 @@ struct Args {
     /// rollout's stall and every rejected batch be read off a timeline.
     #[arg(long)]
     request_log: Option<std::path::PathBuf>,
+
+    // --- Public benchmark (benchmarks/public) -------------------------------
+    /// Fixed RNG seed. The same seed gives the same fleet (hosts, users, IPs)
+    /// and, per worker, the same event content; with `--output` the file is
+    /// byte-for-byte reproducible. Unset = OS randomness (previous behavior).
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// JSON object mapping `source_type` to an ingest token. nano v2 binds each
+    /// ingest token to one log source, so a mixed-source blast needs one token
+    /// per source type (`windows_sysmon`, `windows_event`, `conduit_proxy`,
+    /// `apache_access`, `aws_cloudtrail`, plus `bench_marker` for markers).
+    /// Blast mode only. Token values are never logged.
+    #[arg(long)]
+    tokens_file: Option<std::path::PathBuf>,
+
+    /// Benchmark run id. With a `bench_marker` token in --tokens-file, each
+    /// batch also carries one sequenced marker record for exactly-once counting.
+    #[arg(long)]
+    run_id: Option<String>,
+
+    /// Write a JSON summary of what the sender saw (blast and --output modes).
+    #[arg(long)]
+    summary_json: Option<std::path::PathBuf>,
+
+    /// Blast mode: run for this many seconds (overrides --duration minutes).
+    #[arg(long)]
+    duration_secs: Option<u64>,
+
+    /// Offline mode: write NDJSON envelopes (`message`, `timestamp`,
+    /// `source_type`) to this file instead of sending. Single-threaded on a
+    /// simulated clock (--start-time, spaced 1/--eps apart); reproducible with --seed.
+    #[arg(long, conflicts_with_all = ["hec", "tenzir", "spike", "seed_identities", "otlp", "combo_join", "blast"])]
+    output: Option<std::path::PathBuf>,
+
+    /// Number of generated records for --output (lateral chains are extra).
+    #[arg(long, default_value = "1000000")]
+    events: u64,
+
+    /// Simulated start time for --output (RFC 3339).
+    #[arg(long, default_value = "2026-01-01T00:00:00Z")]
+    start_time: String,
 }
 
 #[tokio::main]
@@ -237,6 +283,12 @@ async fn main() -> Result<()> {
         .init();
 
     let mut args = Args::parse();
+
+    // Seed before anything draws randomness (the fleet is built below).
+    if let Some(seed) = args.seed {
+        event_core::rng::set_seed(seed);
+        info!("RNG seed: {seed}");
+    }
 
     // HEC and Vector use different default ports / path suffixes. When
     // `--hec` is set and `--vector` was left at its default, switch the
@@ -304,7 +356,13 @@ async fn main() -> Result<()> {
     // The token field is shared across the Vector and HEC transports — the
     // OOTB HEC listener also reads `VECTOR_AUTH_TOKEN` (one token to
     // rotate). The Tenzir listener has no auth, so skip resolution there.
-    if args.token.is_none() && args.tenzir.is_none() {
+    // --output never sends; with --tokens-file every source carries its own
+    // token, so the shared one is optional there.
+    let token_optional = args.output.is_some() || args.tokens_file.is_some();
+    if args.token.is_none() && args.tenzir.is_none() && token_optional {
+        args.token = std::env::var("VECTOR_AUTH_TOKEN").ok();
+    }
+    if args.token.is_none() && args.tenzir.is_none() && !token_optional {
         let resolved = std::env::var("VECTOR_AUTH_TOKEN")
             .unwrap_or_else(|_| {
                 eprintln!("set --token or VECTOR_AUTH_TOKEN (an ingest token or the install token)");
@@ -364,6 +422,44 @@ async fn main() -> Result<()> {
             "  Source types:  windows_sysmon, windows_event, conduit_proxy, aws_cloudtrail"
         );
         println!("--------------------------------------\n");
+    }
+
+    // Public benchmark: offline, byte-reproducible NDJSON (no network).
+    if let Some(path) = args.output.clone() {
+        let start = chrono::DateTime::parse_from_rfc3339(&args.start_time)
+            .map_err(|e| anyhow::anyhow!("--start-time: {e}"))?
+            .with_timezone(&Utc);
+        let started = Utc::now();
+        let t0 = Instant::now();
+        let written = bench::run_output_mode(
+            &world.read(),
+            &path,
+            args.events,
+            args.eps,
+            start,
+            args.chain_interval_secs,
+            args.chain_max_hops,
+        )?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        info!("Wrote {} records to {} in {:.1}s", written, path.display(), elapsed);
+        bench::RunSummary {
+            tool: "log-blaster",
+            version: env!("CARGO_PKG_VERSION"),
+            run_id: args.run_id.clone(),
+            seed: args.seed,
+            mode: "output",
+            target_eps: args.eps,
+            threads: 1,
+            assets: args.assets,
+            started_at: started.to_rfc3339(),
+            ended_at: Utc::now().to_rfc3339(),
+            elapsed_secs: elapsed,
+            events_sent: written,
+            achieved_eps: written as f64 / elapsed.max(1e-9),
+            ..Default::default()
+        }
+        .write(args.summary_json.as_deref())?;
+        return Ok(());
     }
 
     // NAN-1154: seed user_registry with identities matching the fleet's users,
@@ -451,7 +547,7 @@ async fn run_chain_emitter(
         }
     };
     let gen = LateralChainGenerator::new();
-    let mut rng = rand::rngs::StdRng::from_os_rng();
+    let mut rng = event_core::rng::stream_rng(1_000);
     let mut seed_cursor: usize = 0;
 
     info!(
@@ -730,6 +826,30 @@ async fn run_blast_mode(
         args.eps, args.threads, effective_batch_size, args.batch_size
     );
 
+    // Public benchmark: one ingest token per source type, plus sequenced
+    // markers when a run id and a marker token are given.
+    let router = Arc::new(bench::Router::new(
+        &args.vector,
+        transport,
+        args.tokens_file.as_deref(),
+    )?);
+    let marker_run = match (&args.run_id, router.has_marker_lane()) {
+        (Some(run), true) => Some(Arc::new(run.clone())),
+        (Some(_), false) => {
+            warn!(
+                "--run-id given but no `{}` token in --tokens-file: no markers",
+                bench::MARKER_SOURCE
+            );
+            None
+        }
+        _ => None,
+    };
+    let marker_seq = Arc::new(AtomicU64::new(0));
+    let markers_sent = Arc::new(AtomicU64::new(0));
+    let markers_failed = Arc::new(AtomicU64::new(0));
+    let run_started_at = Utc::now();
+    let run_t0 = Instant::now();
+
     let events_sent = Arc::new(AtomicU64::new(0));
     // NAN-5004: source acknowledgements move response completion to the disk
     // buffer commit point. Keep request-level latency samples so the 3k EPS
@@ -754,7 +874,11 @@ async fn run_blast_mode(
     };
     let mut handles = Vec::new();
     for thread_id in 0..args.threads {
-        let transport = transport.clone();
+        let router = router.clone();
+        let marker_run = marker_run.clone();
+        let marker_seq = marker_seq.clone();
+        let markers_sent = markers_sent.clone();
+        let markers_failed = markers_failed.clone();
         let events_sent = events_sent.clone();
         let response_latencies_us = response_latencies_us.clone();
         let running = running.clone();
@@ -778,7 +902,8 @@ async fn run_blast_mode(
             let proxy_gen = ProxyGenerator::new();
             let apache_gen = ApacheGenerator::new();
             let cloudtrail_gen = CloudTrailGenerator::new();
-            let mut rng = rand::rngs::StdRng::from_os_rng();
+            // Seeded per worker when --seed is set (OS-seeded otherwise).
+            let mut rng = event_core::rng::stream_rng(thread_id as u64 + 1);
 
             let sem = Arc::new(tokio::sync::Semaphore::new(max_inflight));
 
@@ -809,10 +934,17 @@ async fn run_blast_mode(
                         batch.push(event);
                     }
                 }
+                if let Some(run) = marker_run.as_ref() {
+                    let seq = marker_seq.fetch_add(1, Ordering::Relaxed);
+                    batch.push(bench::marker_event(run, thread_id, seq, sim_time));
+                }
 
-                let batch_len = batch.len() as u64;
+                // Markers are counted separately; batch_len is data events only.
+                let batch_len = batch_size as u64;
                 let client = client.clone();
-                let transport = transport.clone();
+                let router = router.clone();
+                let markers_sent = markers_sent.clone();
+                let markers_failed = markers_failed.clone();
                 let events_sent = events_sent.clone();
                 let response_latencies_us = response_latencies_us.clone();
                 let failed_batches = failed_batches.clone();
@@ -821,8 +953,18 @@ async fn run_blast_mode(
                 tokio::spawn(async move {
                     let request_started = Instant::now();
                     let started_unix_ms = Utc::now().timestamp_millis();
-                    let outcome =
-                        send_batch_with_retry(&client, &transport, &batch, max_retries).await;
+                    let sent = router.send(&client, batch, max_retries).await;
+                    markers_sent.fetch_add(sent.markers_ok, Ordering::Relaxed);
+                    markers_failed.fetch_add(sent.markers_failed, Ordering::Relaxed);
+                    let outcome: Result<()> = if sent.events_failed == 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "{} of {} events failed",
+                            sent.events_failed,
+                            batch_len
+                        ))
+                    };
                     if let Some(log) = request_log.as_ref() {
                         use std::io::Write as _;
                         let error = outcome
@@ -842,11 +984,12 @@ async fn run_blast_mode(
                     }
                     if outcome.is_err() {
                         failed_batches.fetch_add(1, Ordering::Relaxed);
-                        failed_events.fetch_add(batch_len, Ordering::Relaxed);
                     }
+                    // Per source group: a failed group does not void the others.
+                    failed_events.fetch_add(sent.events_failed, Ordering::Relaxed);
+                    events_sent.fetch_add(sent.events_ok, Ordering::Relaxed);
                     match outcome {
                         Ok(()) => {
-                            events_sent.fetch_add(batch_len, Ordering::Relaxed);
                             let mut latencies = response_latencies_us.lock();
                             if latencies.len() == MAX_LATENCY_SAMPLES {
                                 latencies.pop_front();
@@ -896,8 +1039,14 @@ async fn run_blast_mode(
         }
     });
 
-    if args.duration > 0 {
-        tokio::time::sleep(TokioDuration::from_secs(args.duration * 60)).await;
+    let run_secs = args
+        .duration_secs
+        .unwrap_or(args.duration.saturating_mul(60));
+    if run_secs > 0 {
+        tokio::select! {
+            _ = tokio::time::sleep(TokioDuration::from_secs(run_secs)) => {}
+            _ = tokio::signal::ctrl_c() => info!("Interrupted; draining in-flight batches..."),
+        }
         running.store(false, Ordering::Relaxed);
     } else {
         tokio::signal::ctrl_c().await?;
@@ -911,6 +1060,27 @@ async fn run_blast_mode(
     stats_handle.abort();
 
     let total = events_sent.load(Ordering::Relaxed);
+    let elapsed = run_t0.elapsed().as_secs_f64();
+    bench::RunSummary {
+        tool: "log-blaster",
+        version: env!("CARGO_PKG_VERSION"),
+        run_id: args.run_id.clone(),
+        seed: args.seed,
+        mode: "blast",
+        target_eps: args.eps,
+        threads: args.threads,
+        batch_size: effective_batch_size,
+        assets: args.assets,
+        started_at: run_started_at.to_rfc3339(),
+        ended_at: Utc::now().to_rfc3339(),
+        elapsed_secs: elapsed,
+        events_sent: total,
+        events_failed: failed_events.load(Ordering::Relaxed),
+        markers_sent: markers_sent.load(Ordering::Relaxed),
+        markers_failed: markers_failed.load(Ordering::Relaxed),
+        achieved_eps: total as f64 / elapsed.max(1e-9),
+    }
+    .write(args.summary_json.as_deref())?;
     info!("Total events sent: {}", total);
     info!(
         "Failed batches: {} ({} events) after {} retr(ies) each",

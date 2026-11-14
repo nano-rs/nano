@@ -175,7 +175,9 @@ function IssueTokenDialog({
           </DialogTitle>
           <DialogDescription>
             {issued
-              ? 'Copy the token now. It is shown once and cannot be read again. Every ingest host accepts it within about 10 seconds; a 401 before then means retry.'
+              ? issued.ingest_ready?.ready
+                ? 'Copy the token now. It is shown once and cannot be read again. Ingest already accepts it.'
+                : `Copy the token now. It is shown once and cannot be read again. HEC/HTTP may answer 401 for about ${issued.ingest_ready?.retry_after_secs ?? issued.active_within_secs ?? 10} s; retry.`
               : 'Name the sender and pick its source. Every event sent with the token lands in that source, whatever sourcetype it declares. The binding never changes.'}
           </DialogDescription>
         </DialogHeader>

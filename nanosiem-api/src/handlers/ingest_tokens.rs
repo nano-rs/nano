@@ -32,8 +32,8 @@ use nanosiem_core::audit::{
 };
 use nanosiem_core::auth::permissions;
 use nanosiem_core::ingest_tokens::{
-    BindableSource, IngestToken, IngestTokenService, IngestTokenServiceError, IngestTokenSettings,
-    InstallTokenMode, TokenDelivery,
+    ready_wait_from, BindableSource, IngestReadiness, IngestToken, IngestTokenService,
+    IngestTokenServiceError, IngestTokenSettings, InstallTokenMode, TokenDelivery, READY_WAIT_ENV,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -184,6 +184,28 @@ pub struct IssuedIngestToken {
     /// (each host pulls the token list every 2 s; Vector re-reads it every
     /// 2 s). A sender that gets 401 inside this window should retry.
     pub active_within_secs: u64,
+    /// NAN-5395: whether the token is confirmed live on HEC and HTTP ingest.
+    /// `ready` = true only on single-host Compose, after nano-api wrote the
+    /// tokens file Vector reads and one re-read interval passed (the call
+    /// waits that, bounded by `NANO_INGEST_TOKEN_READY_WAIT_SECS`). On Helm and
+    /// role-split installs it is never confirmed: retry a 401 for up to
+    /// `retry_after_secs`. OTLP accepts the token at once.
+    pub ingest_ready: IngestReadiness,
+}
+
+/// NAN-5395: what the response says about the new token on ingest.
+async fn ingest_readiness(state: &AppState, credential_id: Uuid) -> IngestReadiness {
+    let budget = ready_wait_from(std::env::var(READY_WAIT_ENV).ok().as_deref());
+    let readiness = state.ingest_token_service.ingest_readiness(budget).await;
+    if !readiness.ready {
+        tracing::debug!(
+            %credential_id,
+            delivery = ?readiness.delivery,
+            retry_after_secs = ?readiness.retry_after_secs,
+            "new ingest token not confirmed live on ingest; senders should retry a 401"
+        );
+    }
+    readiness
 }
 
 /// Upper bound on a new token's propagation to every ingest host.
@@ -352,7 +374,7 @@ pub async fn list_ingest_tokens(
 
 #[utoipa::path(post, path = "/api/ingest-tokens", tag = "ingest_tokens",
     request_body = CreateIngestTokenRequest,
-    responses((status = 201, body = IssuedIngestToken, description = "Issued; `token` is shown once"),
+    responses((status = 201, body = IssuedIngestToken, description = "Issued; `token` is shown once. `ingest_ready` says whether HEC/HTTP ingest is confirmed to accept it (single-host Compose: after one 2 s re-read, which the call waits); otherwise retry a 401 for up to `ingest_ready.retry_after_secs`"),
         (status = 400, description = "Invalid name, or the source does not exist / cannot receive pushed events"),
         (status = 403, description = "Forbidden (admins only)"),
         (status = 409, description = "An active token has this name"),
@@ -383,6 +405,7 @@ pub async fn create_ingest_token(
             "route_key": credential.route_key,
         }),
     ).await;
+    let ingest_ready = ingest_readiness(&state, credential.credential_id).await;
     let mut response = (
         StatusCode::CREATED,
         Json(IssuedIngestToken {
@@ -390,6 +413,7 @@ pub async fn create_ingest_token(
             token,
             replaced: None,
             active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
+            ingest_ready,
         }),
     )
         .into_response();
@@ -442,7 +466,7 @@ pub async fn bind_ingest_token(
 
 #[utoipa::path(post, path = "/api/ingest-tokens/{credential_id}/rotate", tag = "ingest_tokens",
     params(("credential_id" = Uuid, Path, description = "Credential id")),
-    responses((status = 201, body = IssuedIngestToken, description = "Rotated; the new `token` is shown once and the old value is revoked"),
+    responses((status = 201, body = IssuedIngestToken, description = "Rotated; the new `token` is shown once and the old value is revoked. `ingest_ready` says whether HEC/HTTP ingest is confirmed to accept it; otherwise retry a 401 for up to `ingest_ready.retry_after_secs`"),
         (status = 403, description = "Forbidden (admins only)"), (status = 404, description = "Not found"),
         (status = 409, description = "Revoked or unbound (bind it first)"),
         (status = 503, description = "Not rotated: the replacement could not be published (the old token keeps working), or token delivery is not configured")),
@@ -476,6 +500,7 @@ pub async fn rotate_ingest_token(
             "route_key": new.route_key,
         }),
     ).await;
+    let ingest_ready = ingest_readiness(&state, new.credential_id).await;
     let mut response = (
         StatusCode::CREATED,
         Json(IssuedIngestToken {
@@ -483,6 +508,7 @@ pub async fn rotate_ingest_token(
             token,
             replaced: Some(old),
             active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
+            ingest_ready,
         }),
     )
         .into_response();
@@ -635,6 +661,7 @@ pub async fn update_install_token(
         CreateIngestTokenRequest,
         BindIngestTokenRequest,
         IssuedIngestToken,
+        IngestReadiness,
         UpdateInstallTokenRequest,
         InstallTokenMode,
         TokenDelivery

@@ -66,11 +66,7 @@ fn lock_blocking(path: &PathBuf) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)?;
+    let file = open_lock_file(path)?;
     let deadline = std::time::Instant::now() + MAX_WAIT;
     loop {
         match file.try_lock() {
@@ -87,6 +83,23 @@ fn lock_blocking(path: &PathBuf) -> std::io::Result<std::fs::File> {
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
+    }
+}
+
+/// NAN-5387: `flock(2)` needs only a readable descriptor (the entrypoint
+/// locks `exec 9<file`). The Vector entrypoint runs as root and creates the
+/// file first on open-core Compose, so it is root-owned 0644 and nano-api
+/// (uid 999) gets "permission denied" asking for write access. Open it
+/// read-only; create it (which does need write) only when it is missing.
+pub(super) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path),
+        Err(error) => Err(error),
     }
 }
 

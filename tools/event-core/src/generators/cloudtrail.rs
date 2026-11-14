@@ -8,7 +8,6 @@
 
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
-use uuid::Uuid;
 
 use crate::entity::Entity;
 use crate::event::Event;
@@ -530,8 +529,8 @@ impl CloudTrailGenerator {
             None
         };
 
-        let event_id = Uuid::now_v7().to_string();
-        let request_id = Uuid::now_v7().to_string();
+        let event_id = crate::rng::uuid().to_string();
+        let request_id = crate::rng::uuid().to_string();
 
         // AWS resource type string
         let service_upper = op

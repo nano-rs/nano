@@ -1,5 +1,7 @@
 *.json
 *.log
 !.gitignore
-# soc_ir_corpus.json is a committed benchmark input (consumed by search_realistic.js), not a run output
+# The IR/SOC corpora are committed benchmark inputs, not run outputs:
+# soc_ir_corpus.json (OCSF profile, the default) and soc_ir_corpus_udm.json (UDM).
 !soc_ir_corpus.json
+!soc_ir_corpus_udm.json

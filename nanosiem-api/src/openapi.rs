@@ -906,8 +906,10 @@ mod tests {
         // The active-token cap adds PUT /api/settings/agentlane/limits: 690.
         // NAN-5362 adds the ENTERPRISE /api/settings/agentlane/usage: 691.
         // NAN-5363 adds the ENTERPRISE /api/settings/agentlane/schema: 692.
+        // NAN-5379 adds 4 ENTERPRISE Evidence Pack templates (registered via
+        // `extension_api_docs`): 696; open is unchanged.
         #[cfg(feature = "enterprise")]
-        let min_paths = 692;
+        let min_paths = 696;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's

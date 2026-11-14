@@ -270,12 +270,15 @@ pub(crate) fn ioc_feed_indicator_subquery(feed: &IocFeed, is_clustered: bool) ->
 /// 6. Fallback: plain match(field, pattern)
 ///
 /// `field_expr`: the SQL expression for the field (e.g., `"command_line"`, `toString(ext.foo)`)
-/// `skip_tostring`: true when `field_expr` is a plain String column, so the
-///   case-insensitive substring guard uses `lower(field_expr)` — which matches
-///   the `lower(<col>)` text skip index (NAN-1247). false keeps
-///   `lower(toString(field_expr))` for ext/JSON/numeric fields (NULL-safety /
-///   coercion). Computed by the caller via `search_lowered`/
-///   `is_plain_string_search_column`.
+/// `skip_tostring`: true when `field_expr` is a plain String column, so every
+///   arm reads the raw column and the case-insensitive substring guard uses
+///   `lower(field_expr)` — which matches the `lower(<col>)` text skip index
+///   (NAN-1247). false reads `toString(field_expr)` in EVERY arm (`match`,
+///   `startsWith`, `endsWith` and the guards) for ext/JSON/numeric fields:
+///   NULL-safety for an absent JSON key, and coercion for a numeric column —
+///   `match()` / `lower()` on an Int/UInt column is a ClickHouse type error
+///   (Code 43) that failed the whole search as a 500 (NAN-5416). Computed by
+///   the caller via `search_lowered`/`is_plain_string_search_column`.
 /// `negated`: true for NotRegex (inverts the result)
 fn build_optimized_regex_sql(
     field_expr: &str,
@@ -283,6 +286,8 @@ fn build_optimized_regex_sql(
     skip_tostring: bool,
     negated: bool,
 ) -> String {
+    let subject = regex_subject(field_expr, skip_tostring);
+    let field_expr = subject.as_str();
     let escaped = escape_regex_pattern(pattern);
     let ci_pattern = if escaped.starts_with("(?i)") {
         format!("'{}'", escaped)
@@ -348,11 +353,7 @@ fn build_optimized_regex_sql(
                     .map(|lit| {
                         let escaped_lit = escape_string(&ch_lower(lit));
                         let pattern = escape_like_pattern(&escaped_lit);
-                        let lhs = if skip_tostring {
-                            format!("lower({})", field_expr)
-                        } else {
-                            format!("lower(toString({}))", field_expr)
-                        };
+                        let lhs = format!("lower({})", field_expr);
                         ci_like(&lhs, &format!("%{pattern}%"), false)
                     })
                     .collect();
@@ -372,11 +373,7 @@ fn build_optimized_regex_sql(
                 // verifies the full regex on survivors.
                 let escaped_token = escape_string(&ch_lower(&token));
                 let pattern = escape_like_pattern(&escaped_token);
-                let lhs = if skip_tostring {
-                    format!("lower({})", field_expr)
-                } else {
-                    format!("lower(toString({}))", field_expr)
-                };
+                let lhs = format!("lower({})", field_expr);
                 let guard = ci_like(&lhs, &format!("%{pattern}%"), false);
                 // For negated: NOT (guard AND match) → can't short-circuit, just negate match.
                 if negated {
@@ -393,6 +390,51 @@ fn build_optimized_regex_sql(
     } else {
         format!("match({}, {})", field_expr, ci_pattern)
     }
+}
+
+/// NAN-5416: the subject a regex / pattern arm reads. A plain String column is
+/// read raw, so the `lower(<col>)` text index keeps matching by expression;
+/// anything else (numeric or UUID column, ext / OCSF JSON tail, CTE column) is
+/// read through `toString()`, which coerces a number to its decimal text and
+/// maps an absent JSON key to `''` rather than NULL. A subject that is already
+/// a bare `toString(...)` call is not wrapped twice.
+pub(crate) fn regex_subject(field_expr: &str, plain_string: bool) -> String {
+    if plain_string || is_tostring_call(field_expr) {
+        field_expr.to_string()
+    } else {
+        format!("toString({field_expr})")
+    }
+}
+
+/// Whether `expr` is exactly one `toString( ... )` call (its opening paren
+/// closes at the last character), so wrapping it again would be a no-op.
+fn is_tostring_call(expr: &str) -> bool {
+    let Some(inner) = expr.strip_prefix("toString(") else { return false };
+    let mut depth = 1usize;
+    let mut in_str: Option<char> = None;
+    let mut chars = inner.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = in_str {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => in_str = Some(c),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == inner.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// NAN-4943: an nPL regex predicate over a string-valued SQL expression that
@@ -627,12 +669,23 @@ impl ClickHouseSqlGenerator {
     /// wrapper orphans the `lower(<col>)` index → full scan (NAN-1247). For a real
     /// String column `toString(col)` is a semantic no-op, so dropping it changes
     /// only the SQL form (and turns the index back on), never the result.
+    ///
+    /// NAN-5416: judged on the RESOLVED column as well as the nPL token. Under
+    /// OCSF a UDM-era name resolves to a differently named column, and
+    /// `is_numeric_field("src_port")` is false even though it resolves to the
+    /// Int32 `src_endpoint.port`; reading that as a String column emitted
+    /// `lower(<int col>)` / `match(<int col>)` (CH Code 43). UDM resolves a
+    /// column to itself, so it is byte-identical there.
     fn is_plain_string_search_column(&self, field: &str) -> bool {
-        matches!(
-            self.profile.resolve(field),
-            crate::schema::FieldResolution::ExplicitColumn(_)
-        ) && !self.profile.is_numeric_field(field)
-            && !self.profile.is_uuid_field(field)
+        match self.profile.resolve(field) {
+            crate::schema::FieldResolution::ExplicitColumn(col) => {
+                !self.profile.is_numeric_field(field)
+                    && !self.profile.is_uuid_field(field)
+                    && !self.profile.is_numeric_field(&col)
+                    && !self.profile.is_uuid_field(&col)
+            }
+            _ => false,
+        }
     }
 
     /// True when a field on the spill/JSON path resolves to a plain non-null
@@ -1861,7 +1914,11 @@ impl ClickHouseSqlGenerator {
                         false,
                     ));
                 }
-                Ok(format!("match({}, {})", field_expr, value_sql))
+                Ok(format!(
+                    "match({}, {})",
+                    regex_subject(&field_expr, self.is_plain_string_search_column(field)),
+                    value_sql
+                ))
             }
             Comparator::NotRegex => {
                 // NAN-1026 Phase 2: NOT iLike instead of NOT hasToken — substring-correct.
@@ -1885,7 +1942,11 @@ impl ClickHouseSqlGenerator {
                 }
                 // Use match() = 0 instead of NOT match() — ClickHouse optimizer
                 // mishandles NOT match() when PREWHERE contains OR conditions.
-                Ok(format!("match({}, {}) = 0", field_expr, value_sql))
+                Ok(format!(
+                    "match({}, {}) = 0",
+                    regex_subject(&field_expr, self.is_plain_string_search_column(field)),
+                    value_sql
+                ))
             }
             Comparator::Like | Comparator::NotLike => {
                 // Case-insensitive. NAN-1381: lowered form so the `lower(col)` text

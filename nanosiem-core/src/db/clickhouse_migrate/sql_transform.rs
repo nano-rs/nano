@@ -91,6 +91,84 @@ impl ClickHouseMigrator {
         message.contains("ACCESS_STORAGE_READONLY")
     }
 
+    /// NAN-5387: the grantees of a `GRANT ... TO a, b` or `REVOKE ... FROM a, b`
+    /// statement, unquoted. `None` when the statement is not one of those or
+    /// names a grantee this cannot read exactly (`ALL`, `CURRENT_USER`,
+    /// `EXCEPT`, an unusual identifier): the caller then executes it as before.
+    pub(super) fn access_statement_grantees(sql: &str) -> Option<Vec<String>> {
+        let trimmed = sql.trim();
+        // ASCII-only uppercasing keeps byte offsets identical to `trimmed`.
+        let upper = trimmed.to_ascii_uppercase();
+        let keyword = if upper.starts_with("GRANT") {
+            "TO"
+        } else if upper.starts_with("REVOKE") {
+            "FROM"
+        } else {
+            return None;
+        };
+        // The LAST top-level ` TO ` / ` FROM `: privilege column lists sit in
+        // parentheses, and an `ON CLUSTER` clause comes before it.
+        let bytes = upper.as_bytes();
+        let mut depth = 0i32;
+        let mut split_at = None;
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0
+                && b.is_ascii_whitespace()
+                && upper[i + 1..].starts_with(keyword)
+                && upper[i + 1 + keyword.len()..]
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
+                split_at = Some(i + 1 + keyword.len());
+            }
+        }
+        let mut list = trimmed[split_at?..].trim();
+        for suffix in ["WITH GRANT OPTION", "WITH ADMIN OPTION", "WITH REPLACE OPTION"] {
+            if list.to_ascii_uppercase().ends_with(suffix) {
+                list = list[..list.len() - suffix.len()].trim_end();
+            }
+        }
+        static IDENT: once_cell::sync::Lazy<Regex> =
+            once_cell::sync::Lazy::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid regex"));
+        let mut out = Vec::new();
+        for raw in list.split(',') {
+            let raw = raw.trim();
+            let name = raw
+                .strip_prefix('`')
+                .and_then(|r| r.strip_suffix('`'))
+                .or_else(|| raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')))
+                .unwrap_or(raw);
+            let quoted = name.len() != raw.len();
+            if !IDENT.is_match(name) {
+                return None;
+            }
+            let reserved = ["ALL", "CURRENT_USER", "EXCEPT", "NONE", "DEFAULT"];
+            if !quoted && reserved.contains(&name.to_ascii_uppercase().as_str()) {
+                return None;
+            }
+            out.push(name.to_string());
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// NAN-5387: skip a GRANT / REVOKE whose every grantee is a users.d XML
+    /// user. ClickHouse refuses it with Code 495 (read-only access storage);
+    /// the XML already carries the change (`migration_grants_users_xml_guard`).
+    pub(super) fn grants_only_xml_users(
+        sql: &str,
+        xml_users: &std::collections::HashSet<String>,
+    ) -> bool {
+        !xml_users.is_empty()
+            && Self::access_statement_grantees(sql)
+                .is_some_and(|grantees| grantees.iter().all(|g| xml_users.contains(g)))
+    }
+
     /// NAN-1407: detect the `nano:keep-local-engine` block-comment marker.
     ///
     /// The dictionary staging tables (`*_dict_staging`) must stay PLAIN

@@ -16,7 +16,13 @@
 # -----------------------------------------------------------------------------
 FROM rust:1.95-bookworm AS chef
 
+# NAN-5409: cargo-auditable embeds each binary's exact crate list (name, version,
+# source; feature-resolved for that build) in a section of the binary, so syft,
+# grype, trivy and the BuildKit SBOM attestation see the Rust dependencies of the
+# shipped images. Pinned version, --locked. It wraps only workspace crates
+# (RUSTC_WORKSPACE_WRAPPER), so the cooked dependency layer below stays cached.
 RUN cargo install cargo-chef --locked \
+    && cargo install cargo-auditable --locked --version 0.7.7 \
     && apt-get update && apt-get install -y \
         pkg-config \
         mold \
@@ -104,16 +110,18 @@ RUN mkdir -p /app/clickhouse-enterprise
 #
 # nanosiem-jobs and clickhouse_migrator are [[bin]] targets of nanosiem-api
 # (nanosiem-api/Cargo.toml:13-23), hence `-p nanosiem-api` for all three.
+#
+# `cargo auditable build` (NAN-5409): same build, plus the embedded crate list.
 RUN if [ "$EDITION" = "enterprise" ]; then \
-        cargo build --release --features enterprise -p nanosiem-api --bin nanosiem-api \
-        && cargo build --release --features enterprise -p nanosiem-search --bin nanosiem-search \
-        && cargo build --release --features enterprise -p nanosiem-api --bin nanosiem-jobs \
-        && cargo build --release --features enterprise -p nanosiem-api --bin clickhouse_migrator; \
+        cargo auditable build --release --features enterprise -p nanosiem-api --bin nanosiem-api \
+        && cargo auditable build --release --features enterprise -p nanosiem-search --bin nanosiem-search \
+        && cargo auditable build --release --features enterprise -p nanosiem-api --bin nanosiem-jobs \
+        && cargo auditable build --release --features enterprise -p nanosiem-api --bin clickhouse_migrator; \
     else \
-        cargo build --release -p nanosiem-api --bin nanosiem-api \
-        && cargo build --release -p nanosiem-search --bin nanosiem-search \
-        && cargo build --release -p nanosiem-api --bin nanosiem-jobs \
-        && cargo build --release -p nanosiem-api --bin clickhouse_migrator; \
+        cargo auditable build --release -p nanosiem-api --bin nanosiem-api \
+        && cargo auditable build --release -p nanosiem-search --bin nanosiem-search \
+        && cargo auditable build --release -p nanosiem-api --bin nanosiem-jobs \
+        && cargo auditable build --release -p nanosiem-api --bin clickhouse_migrator; \
     fi
 
 # NAN-5094: the wasm sandbox's save-time compiler (enterprise only). Pinned
@@ -351,7 +359,7 @@ COPY . .
 # already cooked above, and `-w` never bumps a dependency version), then keep
 # --locked so any other drift still fails the build. A no-op for the source tree.
 RUN cargo update --workspace --offline \
-    && cargo build --release --locked -p nano-connector --bin nano-connector-runner
+    && cargo auditable build --release --locked -p nano-connector --bin nano-connector-runner
 
 FROM debian:bookworm-slim AS connector-runner
 
@@ -382,7 +390,7 @@ ENTRYPOINT ["/usr/local/bin/nano-connector-runner"]
 # dedicated read-only `nano_backup` role, reads the lookup-table rows through
 # ClickHouse SQL as the least-privilege `nano_backup` ClickHouse user, and
 # reads .env / certificates from a read-only mount of the install directory.
-FROM postgres:17@sha256:0027bef26712baaee437a4ea48fdf3d2d2e2bc5f0d81615374408ca320f3c7e3 AS backup
+FROM postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07 AS backup
 
 LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
       org.opencontainers.image.description="nano scheduled backups: PostgreSQL + configuration + lookup tables to a path or S3-compatible bucket"

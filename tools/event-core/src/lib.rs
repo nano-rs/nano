@@ -9,3 +9,4 @@ pub mod generators;
 pub mod http;
 pub mod otlp;
 pub mod profiles;
+pub mod rng;

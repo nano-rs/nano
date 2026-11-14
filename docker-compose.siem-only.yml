@@ -68,7 +68,7 @@ services:
     # re-pushed with different content; the @sha256 makes `docker pull` refuse
     # anything but this exact manifest. Keep in sync with images.lock — bump the
     # tag AND the digest together (resolve with `docker buildx imagetools inspect`).
-    image: postgres:17@sha256:0027bef26712baaee437a4ea48fdf3d2d2e2bc5f0d81615374408ca320f3c7e3
+    image: postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07
     container_name: nano-postgres
     restart: unless-stopped
     logging: *default-logging
@@ -105,7 +105,7 @@ services:
   # start with from a persisted tiering storage.xml. ClickHouse only starts
   # after it exits 0. Same image as the server, so nothing extra to pull.
   clickhouse-preflight:
-    image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
+    image: clickhouse/clickhouse-server:26.10.4.207@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035
     container_name: nano-clickhouse-preflight
     entrypoint: ["/bin/sh", "/preflight/clickhouse-preflight.sh", "/config.d"]
     logging: *verbose-logging
@@ -120,7 +120,7 @@ services:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
     # Rollback: the ONLY supported downgrade target from 26.10 is
     # 26.8.36.3@sha256:d426d2f6… (see docs/dev/CLICKHOUSE-UPGRADE-NOTES.md).
-    image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
+    image: clickhouse/clickhouse-server:26.10.4.207@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035
     container_name: nano-clickhouse
     restart: unless-stopped
     # NAN-5397: an upgrade recreates ClickHouse when its mounted config
@@ -563,7 +563,7 @@ services:
   nginx:
     # Was `:alpine` (NAN-1258) — floating tag pinned to its digest. The tag is
     # kept for human readability; the @sha256 is what `docker pull` enforces.
-    image: nginx:alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    image: nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
     container_name: nano-nginx
     restart: unless-stopped
     logging: *default-logging

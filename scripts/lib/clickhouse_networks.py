@@ -7,10 +7,14 @@ XML carries a safe fallback (loopback + private address space); each Compose
 deployment path renders a later-loading users.d file that REPLACES every
 user's <networks> with the addresses that deployment actually uses:
 
-  * single-host Compose (install.sh): loopback + the Docker address pools the
-    Compose network is allocated from. The pools, not the network's current
-    subnet, because `docker compose down && up` may allocate a different
-    subnet from the same pools, and a stale subnet would lock the app out.
+  * single-host Compose (install.sh): loopback + the subnet install.sh pins
+    nano's Compose network to (NAN-5387, scripts/lib/compose_network_pin.py:
+    `--compose-subnet`), plus the network's live subnets. Where the operator's
+    Compose files manage the network themselves (nothing pinned), the Docker
+    address pools the network is allocated from instead: the pools, not the
+    network's current subnet, because `docker compose down && up` may allocate
+    a different subnet from the same pools, and a stale subnet would lock the
+    app out.
   * role-split (render-inventory.py): loopback + every inventory host address,
     plus the local Docker pools on a host that also runs bridge-network
     services which reach ClickHouse through the host address.
@@ -23,7 +27,7 @@ refused everywhere.
 CLI (install.sh):
     clickhouse_networks.py --users-xml clickhouse/users.d/nanosiem-users.xml \
         --output .nano-generated/clickhouse/networks.xml \
-        --docker-pools-json "$(docker info --format '{{json .DefaultAddressPools}}')" \
+        (--compose-subnet CIDR | --docker-pools-json "$(docker info --format '{{json .DefaultAddressPools}}')") \
         [--network CIDR ...] [--ingest-networks "cidr,cidr"]
 """
 
@@ -206,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--docker-pools-json", default=None,
                         help="`docker info --format '{{json .DefaultAddressPools}}'` output")
+    parser.add_argument("--compose-subnet", default="",
+                        help="the subnet nano's Compose network is pinned to; replaces the Docker pools")
     parser.add_argument("--network", action="append", default=[],
                         help="extra network for every user (e.g. a custom Compose subnet)")
     parser.add_argument("--compose-config", type=Path, default=None,
@@ -215,8 +221,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         users = users_with_networks(args.users_xml)
+        # NAN-5387: a pinned network cannot move, so its subnet replaces the
+        # Docker pools (which, unconfigured, include all of 192.168.0.0/16).
+        pinned = args.compose_subnet.strip()
         networks = (
-            docker_pools(args.docker_pools_json)
+            ([pinned] if pinned else docker_pools(args.docker_pools_json))
             + compose_ipam_subnets(args.compose_config)
             + list(args.network)
         )

@@ -232,7 +232,7 @@ only where it is enforced. Check from another namespace (prints `000` when
 enforced, `401` when not; the pod ends normally either way):
 
 ```bash
-kubectl run np-test -n default --rm -i --image=curlimages/curl:8.12.1 --restart=Never --command -- \
+kubectl run np-test -n default --rm -i --image=curlimages/curl:8.23.0 --restart=Never --command -- \
   sh -c 'curl -s -m 5 -o /dev/null -w "%{http_code}\n" http://nano-vector-internal.nano.svc.cluster.local:4318/v1/logs; true'
 ```
 

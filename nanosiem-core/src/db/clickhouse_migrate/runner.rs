@@ -202,6 +202,11 @@ impl ClickHouseMigrator {
         // NAN-5338: statements skipped because their profile-gated target
         // table is absent, summarized once per migration (see below).
         let mut absent_table_skips = 0usize;
+        // NAN-5387: GRANT / REVOKE statements addressed only to users.d XML
+        // users, skipped before they reach ClickHouse (see below).
+        // Read once per run by `run_migrations_with_prefix`.
+        let xml_users = self.xml_users.clone().unwrap_or_default();
+        let mut xml_grant_skips = 0usize;
 
         for statement in migration_sql.split(';') {
             let sql = statement.trim();
@@ -292,6 +297,21 @@ impl ClickHouseMigrator {
             // statement still aborts (the marker only tolerates absence).
             let skip_if_unknown_table = Self::has_skip_if_unknown_table_marker(&sql);
 
+            // NAN-5387: a grant to a users.d XML user can only fail with Code
+            // 495 (read-only access storage), which ClickHouse also records in
+            // `system.errors` and so trips "zero access errors" checks. The XML
+            // already carries the change (migration_grants_users_xml_guard), so
+            // the statement is not sent at all.
+            if is_soft_fail && Self::grants_only_xml_users(&sql, &xml_users) {
+                tracing::debug!(
+                    "Migration GRANT/REVOKE skipped: every grantee is a users.d XML user: {} - {}",
+                    migration.filename,
+                    sql
+                );
+                xml_grant_skips += 1;
+                continue;
+            }
+
             match self.execute_with_busy_retry(&full_sql).await {
                 Ok(_) => {}
                 Err(e) if skip_if_unknown_table && Self::is_unknown_table_error(&e.to_string()) => {
@@ -341,6 +361,14 @@ impl ClickHouseMigrator {
             }
         }
 
+        if xml_grant_skips > 0 {
+            tracing::info!(
+                "{}: skipped {} GRANT/REVOKE statement(s) addressed only to users.d XML users \
+                 (their privileges come from that file)",
+                migration.filename,
+                xml_grant_skips
+            );
+        }
         if absent_table_skips > 0 {
             tracing::info!(
                 "{}: skipped {} statement(s) whose target table does not exist yet \
@@ -874,6 +902,7 @@ impl ClickHouseMigrator {
         // Detect if we're on ClickHouse Cloud (affects SQL sanitization)
         let is_cloud = self.detect_cloud().await?;
         self.detect_server_version().await;
+        self.detect_xml_users().await;
 
         // Detect if we're on a cluster (affects DDL transformation)
         let cluster_name = self.detect_cluster().await?;

@@ -5336,6 +5336,8 @@ mod ocsf_concept_predicate_tests;
 #[cfg(test)]
 mod ocsf_search_command_tests;
 #[cfg(test)]
+mod regex_numeric_field_tests;
+#[cfg(test)]
 mod dc_missing_value_tests;
 #[cfg(test)]
 mod table_alias_tests;

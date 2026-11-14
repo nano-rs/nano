@@ -141,6 +141,43 @@ INGEST_SERVICES = (
     "app-api-proxy", "vector", "vector-config-consumer", "vector-tap", "ingest-edge", "clickhouse-proxy",
 )
 APP_EDGE_SERVICES = ("nginx", "app-internal-edge")
+# NAN-5419: a (re)started Vector compiles its whole parser tree before its
+# sources listen (about 44 s for five OCSF sources on a 6-vCPU host), so
+# "container running" is not "accepting events". The wait for its API health
+# is sized like the deploy path's reload-ack window (NAN-5298, #9490 in
+# nanosiem-core/src/parsers/vector_config/deploy.rs): a 45 s base, stretched
+# to the estimated compile cost of the loaded tree at 512 s per MiB, never
+# above 180 s. That estimate bounds a Vector whose container is down; one that
+# is running and still compiling may take the whole 180 s. Either way the wait
+# ends as soon as Vector reports healthy.
+VECTOR_READY_BASE_SECONDS = 45
+VECTOR_READY_MAX_SECONDS = 180
+VECTOR_COMPILE_SECONDS_PER_MIB = 512
+# Every directory a Compose Vector is launched with (single host: /etc/vector
+# plus the api-delivered dynamic dirs; role-split and dev: the static subdirs).
+VECTOR_CONFIG_DIRS = (
+    "/etc/vector",
+    "/etc/vector/sources/parsers",
+    "/etc/vector/sources/configs",
+    "/etc/vector/sinks",
+    "/etc/vector/dynamic/sources/parsers",
+    "/etc/vector/dynamic/sources/configs",
+)
+# The same probe as the Vector Compose healthcheck (docker-compose.yml and
+# deploy/compose/docker-compose.enterprise.yml): the Debian image has no
+# curl/wget, so ask the loopback-only API over bash's /dev/tcp. Vector starts
+# its API only after the topology (every source) is built.
+VECTOR_HEALTH_PROBE = (
+    "exec 3<>/dev/tcp/127.0.0.1/8686 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 "
+    "&& grep -q ' 200 ' <&3"
+)
+# A smoke failure that means "the route's upstream is not listening yet", not
+# a rejected event: curl 7 (connect refused), 52 (empty reply), 56 (reset), or
+# an edge 502/503/504 from any of the three HTTP clients in the smoke script.
+SMOKE_RETRYABLE_RE = re.compile(
+    r"\b(?:502|503|504)\b|connection refused|connection reset|empty reply", re.I,
+)
+SMOKE_RETRYABLE_CURL_EXITS = frozenset({7, 52, 56})
 LEGACY_MANAGED_OTLP_CONFIG_SHA256 = (
     "1a14ffd1d41df60fa7e414593ae430c1bf6e0a3b0ecab0905e322b943b9521a7"
 )
@@ -226,6 +263,33 @@ BUNDLE_IMAGE_ROLES: dict[str, frozenset[str]] = {
     "alertmanager": frozenset({"monitoring"}),
 }
 INSTALL_OPERATION_RESERVE_BYTES = 256 * 1024**2
+METRICS_EXPOSE_OVERLAY = "docker-compose.metrics-expose.yml"
+_METRICS_OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])"
+_METRICS_ADDRESS = re.compile(rf"{_METRICS_OCTET}\.{_METRICS_OCTET}\.{_METRICS_OCTET}\.{_METRICS_OCTET}")
+
+
+def metrics_bind_error(address: str, allow_public: str = "") -> str | None:
+    """NAN-5408: why NANO_METRICS_BIND_ADDRESS may not be published on, or None.
+
+    The same rule as scripts/lib/metrics-bind.sh (install.sh, scripts/nano):
+    plain dotted-quad IPv4 without leading zeros, never 0/8, and private
+    (10/8, 172.16/12, 192.168/16, 100.64/10, 127/8) unless
+    NANO_METRICS_ALLOW_PUBLIC is on.
+    """
+    match = _METRICS_ADDRESS.fullmatch(address)
+    if match is None:
+        return f"{address!r} is not a plain IPv4 address (four decimal numbers 0-255, no leading zeros)"
+    a, b = int(match.group(1)), int(match.group(2))
+    if a == 0:
+        return f"{address!r} is not a host address (0.0.0.0 would publish on every interface)"
+    if a in (10, 127) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127):
+        return None
+    if allow_public.strip().lower() in {"1", "true", "yes", "on"}:
+        return None
+    return (
+        f"{address!r} is a public address; use the host's private address, or set "
+        "NANO_METRICS_ALLOW_PUBLIC=1 if a network firewall already limits the metrics ports"
+    )
 DOCKER_OPERATION_RESERVE_BYTES = 1024**3
 ENRICHMENT_CONTROL_TREE_GUIDE = "docs/administration/upgrade-v2.md"
 
@@ -1934,6 +1998,16 @@ class LocalOps:
             path = self.install_dir / overlay
             if path.is_symlink() or not path.is_file():
                 raise UpgradeError(f"NANO_COMPOSE_OVERLAYS file is missing or symbolic: {overlay}")
+            if overlay == METRICS_EXPOSE_OVERLAY:
+                # NAN-5408: never publish metrics on an address install.sh refuses.
+                reason = metrics_bind_error(
+                    self.env.get("NANO_METRICS_BIND_ADDRESS", ""),
+                    self.env.get("NANO_METRICS_ALLOW_PUBLIC", ""),
+                )
+                if reason is not None:
+                    raise UpgradeError(
+                        f"NANO_METRICS_BIND_ADDRESS in .env: {reason}. Fix it (or remove it) and rerun install.sh"
+                    )
             arguments.extend(("-f", str(path)))
         return arguments
 
@@ -1968,11 +2042,30 @@ class LocalOps:
         arguments.extend(test_compose_override_arguments(self.install_dir))
         return arguments
 
+    def _ensure_network_pin(self) -> None:
+        """NAN-5387: before the first `up`, recreate nano's pinned Compose
+        network on NANO_COMPOSE_SUBNET if it has gone missing, so Compose does
+        not create an unpinned one that ClickHouse's allow-list refuses.
+        Never removes or replaces a network (install.sh owns that)."""
+        if getattr(self, "_network_pin_checked", False):
+            return
+        self._network_pin_checked = True
+        subnet = self.env.get("NANO_COMPOSE_SUBNET", "")
+        helper = self.install_dir / "scripts/lib/network-pin.sh"
+        if not subnet or self.role_env or self.legacy_layout is not None or not helper.is_file():
+            return
+        self.runner.run(
+            ["bash", str(helper), "ensure", subnet, *self.compose_args[2:]],
+            timeout=120, check=False,
+        )
+
     def compose(
         self, arguments: Sequence[str], *, timeout: int = 120,
         input_text: str | None = None, check: bool = True,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        if arguments and arguments[0] == "up":
+            self._ensure_network_pin()
         return self.runner.run(
             [*self.compose_args, *arguments], timeout=timeout,
             input_text=input_text, check=check, env=env,
@@ -5088,6 +5181,100 @@ printf 'consumer generation %s ready\n' "$generation"
             f"config/token convergence; load-balancer rejoin was not attempted (last probe: {last})"
         )
 
+    def _vector_ready_budget(self) -> int:
+        """NAN-5419: seconds a (re)started Vector may take to report healthy.
+
+        Compile-aware like the reload-ack window: the bytes of config Vector
+        loads, at VECTOR_COMPILE_SECONDS_PER_MIB, between the base and the
+        ceiling. An unreadable tree gets the ceiling; the wait ends as soon as
+        Vector is healthy, so a wide bound only delays the verdict on a
+        Vector that never comes up.
+        """
+        sizer = (
+            'total=0\n'
+            'for dir in "$@"; do\n'
+            '  [ -d "$dir" ] || continue\n'
+            '  for file in "$dir"/*.toml "$dir"/*.yaml "$dir"/*.json; do\n'
+            '    [ -f "$file" ] || continue\n'
+            '    size=$(wc -c <"$file" 2>/dev/null) || continue\n'
+            '    total=$((total + size))\n'
+            '  done\n'
+            'done\n'
+            'echo "$total"\n'
+        )
+        try:
+            result = self.compose(
+                ["exec", "-T", "vector", "sh", "-c", sizer, "nano-upgrade", *VECTOR_CONFIG_DIRS],
+                timeout=20, check=False,
+            )
+            loaded = int(str(result.stdout).strip().splitlines()[-1]) if result.returncode == 0 else -1
+        except (UpgradeError, OSError, ValueError, IndexError, AttributeError, TypeError):
+            loaded = -1
+        if loaded < 0:
+            return VECTOR_READY_MAX_SECONDS
+        estimate = (loaded * VECTOR_COMPILE_SECONDS_PER_MIB + (1 << 20) - 1) >> 20
+        return min(max(VECTOR_READY_BASE_SECONDS, estimate), VECTOR_READY_MAX_SECONDS)
+
+    def _probe_vector_health(self) -> str:
+        """Vector's state through its API: healthy, starting, down or unprobeable.
+
+        "starting" means the probe ran inside a running container and the API
+        is not answering 200 yet (Vector is still compiling); "down" means the
+        container itself is not running or is restarting.
+        """
+        result = self.compose(
+            ["exec", "-T", "vector", "bash", "-c", VECTOR_HEALTH_PROBE],
+            timeout=15, check=False,
+        )
+        if result.returncode == 0:
+            return "healthy"
+        detail = f"{result.stdout or ''} {result.stderr or ''}"
+        if re.search(r"is not running|is restarting|no such container|not uniquely running", detail, re.I):
+            return "down"
+        if result.returncode in {126, 127} and re.search(r"not found|no such file", detail, re.I):
+            return "unprobeable"
+        return "starting"
+
+    def _wait_vector_ready(self, timeout: int) -> None:
+        """NAN-5419: wait until a (re)started Vector reports healthy on its API.
+
+        Without this, a single-host rollout's wait ends as soon as the
+        container runs, while Vector is still compiling and nginx answers the
+        ingest route with 502. The compile-aware estimate bounds a Vector
+        whose container is down; one that is visibly alive and compiling gets
+        up to the ceiling, as a delivered reload does on the deploy path: a
+        late verdict costs seconds, a premature one fails the upgrade.
+        """
+        ceiling = VECTOR_READY_MAX_SECONDS if timeout <= 0 else min(VECTOR_READY_MAX_SECONDS, timeout)
+        estimate = min(self._vector_ready_budget(), ceiling)
+        started = time.monotonic()
+        last = "probe was not attempted"
+        while True:
+            try:
+                state = self._probe_vector_health()
+            except (UpgradeError, OSError) as error:
+                state, last = "down", " ".join(str(error).split())[:200]
+            else:
+                last = {
+                    "starting": "running, API not healthy yet",
+                    "down": "container is not running",
+                }.get(state, state)
+            if state == "unprobeable":
+                eprint("note: this Vector image has no bash for the health probe; the ingest smoke retries instead")
+                return
+            if state == "healthy":
+                return
+            elapsed = time.monotonic() - started
+            if elapsed >= ceiling or (state == "down" and elapsed >= estimate):
+                break
+            time.sleep(2)
+        raise UpgradeError(
+            f"vector did not report healthy on its API (127.0.0.1:8686/health) within "
+            f"{int(time.monotonic() - started)}s (expected about {estimate}s for its config tree, "
+            f"limit {ceiling}s; last state: {last}). It compiles every parser before its sources "
+            "listen. Check 'docker compose logs vector'"
+        )
+
     def _wait_ingest_readiness(self, services: Iterable[str], timeout: int) -> None:
         selected = list(dict.fromkeys(services))
         prerequisites = [
@@ -5095,6 +5282,10 @@ printf 'consumer generation %s ready\n' "$generation"
             if service not in {"vector-config-consumer", "ingest-edge"}
         ]
         self._wait_services(prerequisites, timeout)
+        if "vector" in selected and "vector-config-consumer" not in selected:
+            # NAN-5419: single host has no consumer (whose probe already
+            # checks Vector's :8686/health) and its Vector no healthcheck.
+            self._wait_vector_ready(timeout)
         if "vector-config-consumer" in selected:
             self._wait_ingest_consumer_ready(timeout)
         if "ingest-edge" in selected:
@@ -5633,6 +5824,22 @@ printf 'consumer generation %s ready\n' "$generation"
                 timeout=timeout,
             )
             services = [*services, "node-exporter"]
+        # NAN-5408: a single node's metrics edge (docker-compose.metrics-expose.yml)
+        # belongs to no role; bring it, and the node-exporter it runs, to the
+        # target definition with the app role, as install.sh would.
+        if (
+            role == "app"
+            and not getattr(self, "role_env", None)
+            and METRICS_EXPOSE_OVERLAY in (getattr(self, "env", None) or {}).get("NANO_COMPOSE_OVERLAYS", "").split()
+            and self._service_exists("metrics-edge")
+        ):
+            edge = ["node-exporter", "metrics-edge"]
+            self.compose(
+                ["up", "-d", "--no-deps", "--pull", "never", *self._recreate_args(edge), *edge],
+                timeout=timeout,
+            )
+            self._wait_services(edge, timeout)
+            services = [*services, *[s for s in edge if s not in services]]
         result = {"services": services}
         if role == "app" and any(service in APP_EDGE_SERVICES for service in services):
             result["dependency_probe"] = dependency_probe
@@ -5792,12 +5999,42 @@ fi
             if getattr(self, "_legacy_bridge_rollout", False)
             else "http://127.0.0.1:80/ingest"
         )
-        self.compose(
-            ["exec", "-T", edge_service, "sh", "-ec", script, "nano-upgrade", payload,
-             ingest_url],
-            timeout=30, input_text=token + "\n",
+        # NAN-5419: a single host has no consumer/edge readiness gate, and a
+        # resumed run may get here while a just-recreated Vector is still
+        # compiling: wait for it, then retry "not listening yet" answers.
+        # Bounded by NodeExecutor.smoke_ingest's remote timeout.
+        started = time.monotonic()
+        if self._service_exists("vector-config-consumer"):
+            deadline = started + VECTOR_READY_MAX_SECONDS
+        else:
+            self._wait_vector_ready(VECTOR_READY_MAX_SECONDS)
+            # Vector is up: anything still 502 clears within the base window.
+            deadline = time.monotonic() + VECTOR_READY_BASE_SECONDS
+        attempts = 0
+        while True:
+            attempts += 1
+            result = self.compose(
+                ["exec", "-T", edge_service, "sh", "-ec", script, "nano-upgrade", payload,
+                 ingest_url],
+                timeout=30, input_text=token + "\n", check=False,
+            )
+            if result.returncode == 0:
+                return {"marker": marker, "accepted": True, "attempts": attempts}
+            raw = f"{result.stdout or ''}\n{result.stderr or ''}".replace(token, "[REDACTED]")
+            lines = [line.strip() for line in raw.splitlines() if line.strip()]
+            detail = lines[-1][:300] if lines else f"process exited {result.returncode}"
+            retryable = (
+                result.returncode in SMOKE_RETRYABLE_CURL_EXITS
+                or bool(SMOKE_RETRYABLE_RE.search(raw))
+            )
+            if not retryable or time.monotonic() >= deadline:
+                break
+            time.sleep(3)
+        waited = int(time.monotonic() - started)
+        raise UpgradeError(
+            f"ingest smoke through {edge_service} failed after {attempts} attempt(s) "
+            f"in {waited}s (exit {result.returncode}): {detail}"
         )
-        return {"marker": marker, "accepted": True}
 
     def smoke_search(self, marker: str, timeout: int) -> dict[str, Any]:
         if "clickhouse" not in self.roles:
@@ -6439,7 +6676,16 @@ class NodeExecutor:
     def smoke_ingest(self, marker: str) -> dict[str, Any]:
         if self.local:
             return self.local_ops.smoke_ingest(marker)
-        return json_object(self._remote("smoke-ingest", ["--marker", marker], 120), "remote smoke ingest")
+        # NAN-5419: the worker may wait up to VECTOR_READY_MAX_SECONDS for
+        # Vector, then retry for VECTOR_READY_BASE_SECONDS; leave room for
+        # the last probe and the last 30 s attempt.
+        return json_object(
+            self._remote(
+                "smoke-ingest", ["--marker", marker],
+                VECTOR_READY_MAX_SECONDS + VECTOR_READY_BASE_SECONDS + 75,
+            ),
+            "remote smoke ingest",
+        )
 
     def smoke_search(self, marker: str, timeout: int) -> dict[str, Any]:
         if self.local:

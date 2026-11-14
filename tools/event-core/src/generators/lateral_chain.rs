@@ -25,7 +25,6 @@
 
 use chrono::{DateTime, Utc};
 use rand::Rng;
-use uuid::Uuid;
 
 use crate::entity::{Entity, WorldState};
 use crate::event::Event;
@@ -172,7 +171,7 @@ impl LateralChainGenerator {
         let event_data = serde_json::json!({
             "RuleName": "NetworkConnect",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": image,
             "User": format!(
@@ -228,7 +227,7 @@ impl LateralChainGenerator {
             "IpPort": rng.random_range(49152u16..65535).to_string(),
             "KeyLength": "0",
             "LmPackageName": "-",
-            "LogonGuid": format!("{{{}}}", Uuid::now_v7()),
+            "LogonGuid": format!("{{{}}}", crate::rng::uuid()),
             "LogonProcessName": protocol,
             "LogonType": logon_type,
             "ProcessId": "0x0",
@@ -321,7 +320,7 @@ impl LateralChainGenerator {
         let event_data = serde_json::json!({
             "RuleName": "ProcessCreate",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-            "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": tool_path,
             "FileVersion": "-",
@@ -336,12 +335,12 @@ impl LateralChainGenerator {
                 dest.domain.to_uppercase(),
                 user.split('\\').last().unwrap_or(user)
             ),
-            "LogonGuid": format!("{{{}}}", Uuid::now_v7()),
+            "LogonGuid": format!("{{{}}}", crate::rng::uuid()),
             "LogonId": format!("0x{:X}", rng.random_range(0x10000u32..0xFFFFF)),
             "TerminalSessionId": "0",
             "IntegrityLevel": "High",
             "Hashes": format!("SHA256={}", process_hash),
-            "ParentProcessGuid": format!("{{{}}}", Uuid::now_v7()),
+            "ParentProcessGuid": format!("{{{}}}", crate::rng::uuid()),
             "ParentProcessId": rng.random_range(500u32..900).to_string(),
             "ParentImage": parent_path,
             "ParentCommandLine": parent_path,
@@ -379,7 +378,7 @@ fn sysmon_event(
     label: &str,
     source_type: &str,
 ) -> Event {
-    let mut rng = rand::rng();
+    let mut rng = crate::rng::rng();
     let message = serde_json::json!({
         "channel": "Microsoft-Windows-Sysmon/Operational",
         "computer": entity.fqdn(),
@@ -416,7 +415,7 @@ fn winevt_event(
     keywords: &[&str],
     label: &str,
 ) -> Event {
-    let mut rng = rand::rng();
+    let mut rng = crate::rng::rng();
     let message = serde_json::json!({
         "channel": "Security",
         "computer": entity.fqdn(),

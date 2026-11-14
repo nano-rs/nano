@@ -20,12 +20,14 @@ use super::{
     IngestToken, IngestTokenRepository, IngestTokenRepositoryError, IngestTokenSettings,
     InstallTokenMode, TokenFileEntry, DEFAULT_TOKENS_FILE, INSTALL_CREDENTIAL_ID,
     MULTIPLEX_ROUTE, PLATFORM_PULL_CREDENTIAL_ID,
+    wait_for_ingest, IngestReadiness,
 };
 
 /// How often the background task re-publishes the file (a no-op when it is
 /// current) and samples Vector's per-credential counter.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_VECTOR_METRICS_URL: &str = "http://vector:9598/metrics";
+
 /// The shipped Vector sources check their hashed-token file at most once every
 /// two seconds. After removing a credential from a shared-volume file, wait a
 /// full interval (plus a small scheduling margin) before reporting success so
@@ -482,6 +484,14 @@ impl IngestTokenService {
             return Err(IngestTokenServiceError::DeliveryNotConfigured);
         }
         Ok(self.render_state().await?.0)
+    }
+
+    /// Whether a just-issued token is confirmed live on HEC and HTTP ingest,
+    /// reported within `budget` (NAN-5395). Never fails. Waits only for the
+    /// shared-volume delivery, where this process wrote the file Vector reads;
+    /// holds no lock or database connection while it does.
+    pub async fn ingest_readiness(&self, budget: Duration) -> IngestReadiness {
+        wait_for_ingest(self.delivery, budget, SHARED_VOLUME_REMOVAL_SETTLE).await
     }
 
     /// Renders the file content plus what `publish` logs about it.

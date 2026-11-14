@@ -476,7 +476,7 @@ Then, in order (each is a hard stop for the chart):
    `000`):
 
    ```bash
-   kubectl run np-test -n default --rm -it --image=curlimages/curl:8.12.1 --restart=Never -- \
+   kubectl run np-test -n default --rm -it --image=curlimages/curl:8.23.0 --restart=Never -- \
      curl -s -m 5 -o /dev/null -w '%{http_code}\n' http://nano-vector-internal.nano.svc.cluster.local:4318/v1/logs
    ```
 

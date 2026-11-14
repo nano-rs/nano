@@ -7,6 +7,7 @@
  * /24h queries are a deliberate worst-case stress probe.
  *
  * The query corpus is the source of truth: benchmarks/results/soc_ir_corpus.json
+ * for an OCSF install (the default), soc_ir_corpus_udm.json for a UDM one
  * (each entry: {use_case, tier, mitre, query, window, catches}). Edit that file
  * to change what runs — this script picks it up automatically.
  *
@@ -14,7 +15,8 @@
  *   SEARCH_URL=http://localhost:13002 JWT_TOKEN=$(/tmp/nano_login.sh) \
  *     k6 run benchmarks/k6/search_realistic.js
  *
- * Env: SEARCH_URL (default http://localhost:3002), API_KEY or JWT_TOKEN, VUS (default 3), DURATION (default 3m)
+ * Env: SEARCH_URL (default http://localhost:3002), API_KEY or JWT_TOKEN, VUS (default 3), DURATION (default 3m),
+ *      SCHEMA_PROFILE (ocsf | udm, default ocsf: picks the corpus file)
  */
 
 import http from "k6/http";
@@ -28,7 +30,8 @@ const VUS = parseInt(__ENV.VUS || "3", 10);
 const DURATION = __ENV.DURATION || "3m";
 
 // --- Corpus (read at init) ---
-const CORPUS = JSON.parse(open("../results/soc_ir_corpus.json"));
+const CORPUS_FILE = (__ENV.SCHEMA_PROFILE || "ocsf") === "udm" ? "soc_ir_corpus_udm.json" : "soc_ir_corpus.json";
+const CORPUS = JSON.parse(open(`../results/${CORPUS_FILE}`));
 const QUERIES = CORPUS.domains.flatMap((d) =>
   d.queries.map((q) => ({ ...q, domain: d.domain }))
 );

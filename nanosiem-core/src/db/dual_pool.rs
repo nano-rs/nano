@@ -1277,6 +1277,21 @@ impl DualPool {
         pool
     }
 
+    /// A copy of this pool whose application client ([`Self::clickhouse`])
+    /// and admin / fan-out client ([`Self::clickhouse_fanout`]) send each
+    /// `name=value` as a query setting on every request. For a bounded
+    /// background job that reads through both clients and needs per-query
+    /// limits (execution time, result size) without a dedicated profile. The
+    /// raw-SQL clients are unchanged.
+    pub fn with_clickhouse_read_settings(&self, settings: &[(&str, &str)]) -> Self {
+        let mut pool = self.clone();
+        for (name, value) in settings {
+            pool.clickhouse = pool.clickhouse.with_option(*name, *value);
+            pool.clickhouse_admin = pool.clickhouse_admin.with_option(*name, *value);
+        }
+        pool
+    }
+
     /// Get a reference to the ClickHouse client
     pub fn clickhouse(&self) -> &ClickHouseClient {
         &self.clickhouse

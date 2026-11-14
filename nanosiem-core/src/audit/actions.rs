@@ -1176,7 +1176,31 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
 /// the exact set and the DoS-amplification rationale behind the exclusions.
 #[inline]
 pub fn is_security_critical(action: &str) -> bool {
-    SECURITY_CRITICAL_ACTIONS.contains(&action)
+    SECURITY_CRITICAL_ACTIONS.contains(&action) || registered_security_critical(action)
+}
+
+/// Security-critical actions registered at startup by builds that add
+/// surfaces of their own (an extension crate calls
+/// [`register_security_critical_actions`]). Open builds register none. The
+/// same durability rule applies: authenticated, committed, low-volume.
+static SECURITY_CRITICAL_EXTENSIONS: std::sync::OnceLock<std::sync::Mutex<Vec<&'static str>>> =
+    std::sync::OnceLock::new();
+
+/// Register extra security-critical audit actions. Idempotent.
+pub fn register_security_critical_actions(extra: &[&'static str]) {
+    let lock = SECURITY_CRITICAL_EXTENSIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut list = lock.lock().unwrap_or_else(|e| e.into_inner());
+    for a in extra {
+        if !a.is_empty() && !SECURITY_CRITICAL_ACTIONS.contains(a) && !list.contains(a) {
+            list.push(a);
+        }
+    }
+}
+
+fn registered_security_critical(action: &str) -> bool {
+    SECURITY_CRITICAL_EXTENSIONS
+        .get()
+        .is_some_and(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()).contains(&action))
 }
 
 #[cfg(test)]
@@ -1281,5 +1305,17 @@ mod durable_classifier_tests {
         assert!(!is_security_critical(SEARCH_HISTORY_CLEARED));
         assert!(!is_security_critical(TOKEN_REFRESH));
         assert!(!is_security_critical("nonexistent_action"));
+    }
+
+    #[test]
+    fn registered_actions_are_security_critical() {
+        // A test-only action: nothing in the product registers it.
+        const EXTRA: &str = "zz_registry_test_exported";
+        assert!(!is_security_critical(EXTRA));
+        register_security_critical_actions(&[EXTRA, EXTRA, ""]);
+        assert!(is_security_critical(EXTRA));
+        assert!(!is_security_critical(""));
+        // The static set is unchanged (the pinned list above still holds).
+        assert!(!SECURITY_CRITICAL_ACTIONS.contains(&EXTRA));
     }
 }

@@ -81,6 +81,9 @@ pub struct Capabilities {
     /// for AI agents with agentlane tokens. Enterprise; an admin still switches
     /// it on in Settings.
     pub agent_lane: bool,
+    /// Licensed compliance-export surface (`/api/compliance/*`): metadata-only
+    /// audit-period exports. Enterprise; access still needs `compliance:export`.
+    pub compliance_export: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -160,6 +163,7 @@ pub(crate) fn capabilities_response(licensed: bool) -> CapabilitiesResponse {
             soar: licensed,
             threat_intel: licensed,
             agent_lane: licensed,
+            compliance_export: licensed,
         },
     }
 }
@@ -212,6 +216,7 @@ mod tests {
             body.capabilities.soar,
             body.capabilities.threat_intel,
             body.capabilities.agent_lane,
+            body.capabilities.compliance_export,
         ];
         assert!(licensed_flags.into_iter().all(|available| !available));
         assert!(body.capabilities.siem_health);

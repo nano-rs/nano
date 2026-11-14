@@ -57,6 +57,11 @@ pub struct ClickHouseMigrator {
     /// Server `(major, minor)` from `version()`, detected on first run. The
     /// inner `None` means the probe failed (treated as a current server).
     pub(super) server_version: Option<Option<(u32, u32)>>,
+    /// NAN-5387: names of users defined in users.d XML (`system.users` rows
+    /// with `storage = 'users_xml'`), read once per run. A GRANT / REVOKE
+    /// whose grantees are all XML users is skipped instead of executed: it
+    /// can only fail with Code 495 and leave a `system.errors` entry.
+    pub(super) xml_users: Option<std::collections::HashSet<String>>,
 }
 
 /// NAN-1029: default distributed DDL coordination timeout for every query the
@@ -104,6 +109,7 @@ impl ClickHouseMigrator {
             is_cloud: None,
             cluster: None,
             server_version: None,
+            xml_users: None,
         }
     }
 }

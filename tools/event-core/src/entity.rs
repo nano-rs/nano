@@ -9,8 +9,7 @@ use parking_lot::Mutex;
 use rand::seq::IndexedRandom;
 use rand::Rng;
 use serde::Serialize;
-use std::collections::HashMap;
-use uuid::Uuid;
+use std::collections::BTreeMap;
 
 // =============================================================================
 // Constants
@@ -159,7 +158,7 @@ pub struct Process {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct ProcessTree {
-    processes: HashMap<u32, Process>,
+    processes: BTreeMap<u32, Process>,
     active_user_pids: Vec<u32>,
     pid_counter: u32,
 }
@@ -168,7 +167,7 @@ pub struct ProcessTree {
 impl ProcessTree {
     pub fn new(user: &str) -> Self {
         let mut tree = Self {
-            processes: HashMap::new(),
+            processes: BTreeMap::new(),
             active_user_pids: Vec::new(),
             pid_counter: 1000,
         };
@@ -177,7 +176,7 @@ impl ProcessTree {
     }
 
     fn init_system_processes(&mut self, default_user: &str) {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
 
         let system_procs = [
             (4, "System", "System", r"NT AUTHORITY\SYSTEM", 0, ""),
@@ -246,7 +245,7 @@ impl ProcessTree {
                     } else {
                         format!("\"{}\"", path)
                     },
-                    guid: Uuid::now_v7().to_string(),
+                    guid: crate::rng::uuid().to_string(),
                 },
             );
         }
@@ -273,7 +272,7 @@ impl ProcessTree {
                     parent_pid: services_pid,
                     parent_name: "services.exe".to_string(),
                     cmdline: format!(r#""C:\Windows\System32\svchost.exe" {}"#, svc_group),
-                    guid: Uuid::now_v7().to_string(),
+                    guid: crate::rng::uuid().to_string(),
                 },
             );
         }
@@ -293,7 +292,7 @@ impl ProcessTree {
                 parent_pid: winlogon_pid,
                 parent_name: "winlogon.exe".to_string(),
                 cmdline: r#""C:\Windows\explorer.exe""#.to_string(),
-                guid: Uuid::now_v7().to_string(),
+                guid: crate::rng::uuid().to_string(),
             },
         );
         self.active_user_pids.push(explorer_pid);
@@ -301,7 +300,7 @@ impl ProcessTree {
     }
 
     fn get_next_pid(&mut self) -> u32 {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         self.pid_counter += rng.random_range(4..=40);
         self.pid_counter
     }
@@ -311,7 +310,7 @@ impl ProcessTree {
     }
 
     pub fn random_active_parent(&self) -> Option<&Process> {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         self.active_user_pids
             .choose(&mut rng)
             .and_then(|pid| self.processes.get(pid))
@@ -322,7 +321,7 @@ impl ProcessTree {
     }
 
     pub fn random_svchost(&self) -> Option<&Process> {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let svchosts: Vec<_> = self
             .processes
             .values()
@@ -355,7 +354,7 @@ impl ProcessTree {
             parent_pid: parent.pid,
             parent_name: parent.name.clone(),
             cmdline: cmdline.to_string(),
-            guid: Uuid::now_v7().to_string(),
+            guid: crate::rng::uuid().to_string(),
         };
 
         self.processes.insert(pid, proc.clone());
@@ -397,7 +396,7 @@ impl ProcessTree {
         cmdline: &str,
         user: &str,
     ) -> (Process, Process) {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
 
         let parent = if user.contains("AUTHORITY") {
             self.random_svchost()
@@ -557,7 +556,7 @@ pub struct BrowsingSession {
 
 impl BrowsingSession {
     pub fn new() -> Self {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         Self {
             current_url: ENTRY_POINTS[rng.random_range(0..ENTRY_POINTS.len())].to_string(),
             referrer: String::new(),
@@ -567,7 +566,7 @@ impl BrowsingSession {
     }
 
     pub fn next_request(&mut self) -> (String, String, String) {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let action: f64 = rng.random();
 
         if action < 0.10 && !self.history.is_empty() {
@@ -648,14 +647,14 @@ impl std::fmt::Debug for Entity {
 #[allow(dead_code)]
 impl Entity {
     pub fn new(hostname: &str, user: &str, ip: &str, mac: &str, domain: &str) -> Self {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         Self {
             hostname: hostname.to_string(),
             user: user.to_string(),
             ip: ip.to_string(),
             mac: mac.to_string(),
             interface: INTERFACES.choose(&mut rng).unwrap().to_string(),
-            device_id: Uuid::now_v7().to_string(),
+            device_id: crate::rng::uuid().to_string(),
             domain: domain.to_string(),
             process_tree: Mutex::new(ProcessTree::new(user)),
             browsing_session: Mutex::new(BrowsingSession::new()),
@@ -915,7 +914,7 @@ impl WorldState {
     }
 
     pub fn random_entity(&self) -> &Entity {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         self.entities.choose(&mut rng).unwrap()
     }
 

@@ -1,0 +1,14 @@
+{
+  "description": "Ceiling ramp: 20,000-host seeded fleet, 10-minute steps of +10,000 events/s from 10,000 until an SLO breaks.",
+  "SEED": 20261114,
+  "ASSETS": 20000,
+  "BLAST_PROCS": 4,
+  "BLAST_THREADS": 8,
+  "BLAST_BATCH": 1000,
+  "START_EPS": 10000,
+  "STEP_EPS": 10000,
+  "STEP_SECS": 600,
+  "DRAIN_SECS": 90,
+  "MAX_EPS": 400000,
+  "CEILING_ANALYSTS": 2
+}

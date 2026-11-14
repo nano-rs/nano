@@ -144,7 +144,8 @@ pub struct DatabaseHealth {
 /// Health status for downstream services
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DownstreamServicesHealth {
-    /// Ingest Service health (port 3001)
+    /// Ingest (Vector) health: its metrics endpoint, or the ingest proxy on a
+    /// role-split app host
     pub ingest: ServiceHealth,
     /// Search Service health (port 3002)
     pub search: ServiceHealth,
@@ -159,6 +160,44 @@ pub struct ServiceHealth {
     pub latency_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// NAN-5387: where `/health/detailed` probes ingest and search.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DownstreamProbeUrls {
+    pub ingest: String,
+    pub search: String,
+}
+
+/// Compose service names shared by the open-core and enterprise single-host
+/// stacks (docker-compose.opensource.yml). Helm and role-split set the
+/// variables below to their own addresses.
+const DEFAULT_INGEST_PROBE_URL: &str = "http://vector:9598/metrics";
+const DEFAULT_SEARCH_PROBE_URL: &str = "http://nano-search:3002/health";
+
+/// NAN-5387: the probes used to default to `http://ingest:3001/health` and
+/// `http://search:3002/health`, services no shipped topology has (there is no
+/// separate ingest service: Vector is ingest), so open-core Compose and Helm
+/// always reported both "unavailable".
+///
+/// * ingest: `INGEST_SERVICE_URL` (role-split app hosts: the ingest proxy's
+///   end-to-end `/healthz`), else `VECTOR_METRICS_URL` (Vector's
+///   internal-metrics exporter, which the deploy path already reads; Helm
+///   points it at the vector-metrics Service), else the Compose default.
+/// * search: `SEARCH_SERVICE_URL`, else `NANO_HEALTH_SEARCH_URL` (the
+///   variable the health exporter reads), else the Compose default.
+pub(crate) fn downstream_probe_urls(get: impl Fn(&str) -> Option<String>) -> DownstreamProbeUrls {
+    let first = |keys: &[&str], default: &str| {
+        keys.iter()
+            .filter_map(|key| get(key))
+            .map(|value| value.trim().to_string())
+            .find(|value| !value.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+    DownstreamProbeUrls {
+        ingest: first(&["INGEST_SERVICE_URL", "VECTOR_METRICS_URL"], DEFAULT_INGEST_PROBE_URL),
+        search: first(&["SEARCH_SERVICE_URL", "NANO_HEALTH_SEARCH_URL"], DEFAULT_SEARCH_PROBE_URL),
+    }
 }
 
 /// Check health of a downstream service
@@ -322,7 +361,7 @@ pub async fn livez() -> Json<PublicHealthResponse> {
 ///
 /// Returns health status for all configured databases and downstream services.
 /// In dual mode, checks both PostgreSQL and ClickHouse.
-/// Also checks Ingest Service (port 3001) and Search Service (port 3002) health.
+/// Also checks ingest (Vector) and the Search Service (port 3002).
 /// Propagates X-Request-ID header to downstream services for distributed tracing.
 ///
 /// SECURITY: This endpoint requires authentication to prevent information disclosure.
@@ -353,11 +392,9 @@ pub async fn health_check_detailed(
     // `settings:system` capability, not the broad read-only `settings:view`.
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
-    // Get service URLs from environment or use defaults
-    let ingest_url = std::env::var("INGEST_SERVICE_URL")
-        .unwrap_or_else(|_| "http://ingest:3001/health".to_string());
-    let search_url = std::env::var("SEARCH_SERVICE_URL")
-        .unwrap_or_else(|_| "http://search:3002/health".to_string());
+    // NAN-5387: probe the services each topology actually runs.
+    let DownstreamProbeUrls { ingest: ingest_url, search: search_url } =
+        downstream_probe_urls(|key| std::env::var(key).ok());
 
     // Extract request ID for propagation
     let rid = request_id.as_ref().map(|r| r.0.as_str());

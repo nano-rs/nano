@@ -1,0 +1,14 @@
+{
+  "name": "nano benchmark: SOC overview",
+  "description": "The panels a SOC wall display refreshes all day. The k6 SOC-day scenario runs every panel on each refresh with the panel cache bypassed.",
+  "panels": [
+    {"id": "events_by_class", "window": "24h", "query": "* | stats count by class_name | sort -count"},
+    {"id": "events_timechart", "window": "24h", "query": "* | timechart span=15m count by class_name"},
+    {"id": "failed_logons_by_user", "window": "24h", "query": "class_uid=3002 status_id=2 | stats count by user.name | sort -count | head 20"},
+    {"id": "top_processes", "window": "1h", "query": "class_uid=1007 | stats count by process.name | sort -count | head 20"},
+    {"id": "egress_by_host", "window": "1h", "query": "class_uid=4002 | stats count by http_request.url.hostname | sort -count | head 20"},
+    {"id": "network_by_port", "window": "1h", "query": "class_uid=4001 | stats count by dst_endpoint.port | sort -count | head 20"},
+    {"id": "cloud_api_ops", "window": "24h", "query": "class_uid=6003 | stats count by api.operation | sort -count | head 20"},
+    {"id": "rare_processes", "window": "24h", "query": "class_uid=1007 | stats dc(device.hostname) as hosts, count by process.name | where hosts < 3 | sort count | head 25"}
+  ]
+}

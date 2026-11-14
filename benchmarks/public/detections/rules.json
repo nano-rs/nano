@@ -1,0 +1,3899 @@
+{
+ "version": 1,
+ "count": 200,
+ "realtime": 20,
+ "rules": [
+  {
+   "name": "bench-001 endpoint: rundll32.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"rundll32.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1218.011"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-002 endpoint: regsvr32.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"regsvr32.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1218.010"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-003 endpoint: mshta.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"mshta.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1218.005"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-004 endpoint: certutil.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"certutil.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1105"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-005 endpoint: bitsadmin.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"bitsadmin.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1197"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-006 endpoint: wmic.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"wmic.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1047"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-007 endpoint: cscript.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"cscript.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-008 endpoint: wscript.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"wscript.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-009 endpoint: installutil.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"installutil.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-010 endpoint: msbuild.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"msbuild.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-011 endpoint: regasm.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"regasm.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-012 endpoint: regsvcs.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"regsvcs.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-013 endpoint: odbcconf.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"odbcconf.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-014 endpoint: cmstp.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"cmstp.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-015 endpoint: forfiles.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"forfiles.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-016 endpoint: pcalua.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"pcalua.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-017 endpoint: msiexec.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"msiexec.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-018 endpoint: schtasks.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"schtasks.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1053.005"
+   ],
+   "mitre_tactics": [
+    "TA0003"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-019 endpoint: at.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"at.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-020 endpoint: sc.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"sc.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-021 endpoint: reg.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"reg.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-022 endpoint: vssadmin.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"vssadmin.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1490"
+   ],
+   "mitre_tactics": [
+    "TA0040"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-023 endpoint: wevtutil.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"wevtutil.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1070.001"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-024 endpoint: bcdedit.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"bcdedit.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-025 endpoint: fsutil.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"fsutil.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-026 endpoint: nltest.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"nltest.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-027 endpoint: dsquery.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"dsquery.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-028 endpoint: adfind.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"adfind.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-029 endpoint: net1.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"net1.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-030 endpoint: whoami.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"whoami.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-031 endpoint: quser.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"quser.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-032 endpoint: qwinsta.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"qwinsta.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-033 endpoint: psexec.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"psexec.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1569.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-034 endpoint: psexesvc.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"psexesvc.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-035 endpoint: procdump.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"procdump.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1003.001"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-036 endpoint: ntdsutil.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"ntdsutil.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1003.003"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-037 endpoint: esentutl.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"esentutl.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-038 endpoint: expand.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"expand.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-039 endpoint: makecab.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"makecab.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-040 endpoint: hh.exe execution",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.name=\"hh.exe\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-041 endpoint: encoded powershell",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/-enc(odedcommand)?\\s/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1059.001"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-042 endpoint: powershell download cradle",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/downloadstring|downloadfile|invoke-webrequest|iwr\\s/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1105"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-043 endpoint: powershell hidden window",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/-w(indowstyle)?\\s+hidden/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1564.003"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-044 endpoint: powershell bypass policy",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/-ep\\s+bypass|-executionpolicy\\s+bypass/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1059.001"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-045 endpoint: invoke-expression",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/\\biex\\b|invoke-expression/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1059.001"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-046 endpoint: mimikatz keywords",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/sekurlsa|kerberos::|lsadump::/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1003.001"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-047 endpoint: shadow copy delete",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/shadowcopy\\s+delete|delete\\s+shadows/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1490"
+   ],
+   "mitre_tactics": [
+    "TA0040"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-048 endpoint: event log clear",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/cl\\s+(security|system|application)|clear-eventlog/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1070.001"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-049 endpoint: user add",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/net1?\\s+user\\s+\\S+\\s+\\S+\\s+.add/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1136.001"
+   ],
+   "mitre_tactics": [
+    "TA0003"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-050 endpoint: local admin add",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/net1?\\s+localgroup\\s+administrators\\s+\\S+\\s+.add/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1098"
+   ],
+   "mitre_tactics": [
+    "TA0003"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-051 endpoint: domain admins enum",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/net1?\\s+group\\s+\\\"?domain admins/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1069.002"
+   ],
+   "mitre_tactics": [
+    "TA0007"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-052 endpoint: scheduled task create",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/schtasks(\\.exe)?\\s+.create/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1053.005"
+   ],
+   "mitre_tactics": [
+    "TA0003"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-053 endpoint: service create",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/sc(\\.exe)?\\s+create/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1543.003"
+   ],
+   "mitre_tactics": [
+    "TA0003"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-054 endpoint: run key persistence",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/currentversion\\\\\\\\run/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1547.001"
+   ],
+   "mitre_tactics": [
+    "TA0003"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-055 endpoint: certutil decode",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/certutil.*-decode/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1140"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-056 endpoint: certutil urlcache",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/certutil.*-urlcache/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1105"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-057 endpoint: regsvr32 scrobj",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/regsvr32.*scrobj/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1218.010"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-058 endpoint: rundll32 javascript",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/rundll32.*javascript:/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1218.011"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-059 endpoint: mshta http",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/mshta.*https?:../i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1218.005"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-060 endpoint: wmic process call create",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/wmic.*process\\s+call\\s+create/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1047"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-061 endpoint: wmic shadowcopy",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/wmic.*shadowcopy/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1490"
+   ],
+   "mitre_tactics": [
+    "TA0040"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-062 endpoint: bcdedit recovery off",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/bcdedit.*recoveryenabled\\s+no/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1490"
+   ],
+   "mitre_tactics": [
+    "TA0040"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-063 endpoint: defender exclusion",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/add-mppreference.*exclusion/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1562.001"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-064 endpoint: defender disable",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/set-mppreference.*disable/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1562.001"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-065 endpoint: firewall disable",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/netsh.*advfirewall.*state\\s+off/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1562.004"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-066 endpoint: rdp enable",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/fdenytsconnections.*0/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1021.001"
+   ],
+   "mitre_tactics": [
+    "TA0008"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-067 endpoint: lsass access via comsvcs",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/comsvcs.*minidump/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1003.001"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-068 endpoint: ntds copy",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/ntds\\.dit/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1003.003"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-069 endpoint: sam hive save",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/reg(\\.exe)?\\s+save\\s+hklm\\\\\\\\sam/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1003.002"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-070 endpoint: whoami all",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/whoami\\s+.all/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1033"
+   ],
+   "mitre_tactics": [
+    "TA0007"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-071 endpoint: nltest trusts",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/nltest.*domain_trusts/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1482"
+   ],
+   "mitre_tactics": [
+    "TA0007"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-072 endpoint: ping sweep",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/for\\s+.l.*ping/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1018"
+   ],
+   "mitre_tactics": [
+    "TA0007"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-073 endpoint: base64 in cmdline",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/frombase64string/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1027"
+   ],
+   "mitre_tactics": [
+    "TA0005"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-074 endpoint: curl to raw ip",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/curl(\\.exe)?\\s+.*https?:..\\d+\\.\\d+\\.\\d+\\.\\d+/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1105"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-075 endpoint: archive staging",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.cmd_line=/(7z|rar|zip)(\\.exe)?\\s+a\\s+.*-p/i",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1560.001"
+   ],
+   "mitre_tactics": [
+    "TA0009"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-076 endpoint: winword.exe spawns powershell.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"winword.exe\" process.name=\"powershell.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-077 endpoint: winword.exe spawns cmd.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"winword.exe\" process.name=\"cmd.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-078 endpoint: winword.exe spawns wscript.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"winword.exe\" process.name=\"wscript.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-079 endpoint: winword.exe spawns mshta.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"winword.exe\" process.name=\"mshta.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-080 endpoint: winword.exe spawns rundll32.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"winword.exe\" process.name=\"rundll32.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-081 endpoint: excel.exe spawns powershell.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"excel.exe\" process.name=\"powershell.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-082 endpoint: excel.exe spawns cmd.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"excel.exe\" process.name=\"cmd.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-083 endpoint: excel.exe spawns wscript.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"excel.exe\" process.name=\"wscript.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-084 endpoint: excel.exe spawns mshta.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"excel.exe\" process.name=\"mshta.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-085 endpoint: excel.exe spawns rundll32.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"excel.exe\" process.name=\"rundll32.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-086 endpoint: powerpnt.exe spawns powershell.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"powerpnt.exe\" process.name=\"powershell.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-087 endpoint: powerpnt.exe spawns cmd.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"powerpnt.exe\" process.name=\"cmd.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-088 endpoint: powerpnt.exe spawns wscript.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"powerpnt.exe\" process.name=\"wscript.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-089 endpoint: powerpnt.exe spawns mshta.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"powerpnt.exe\" process.name=\"mshta.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-090 endpoint: powerpnt.exe spawns rundll32.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"powerpnt.exe\" process.name=\"rundll32.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-091 endpoint: outlook.exe spawns powershell.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"outlook.exe\" process.name=\"powershell.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-092 endpoint: outlook.exe spawns cmd.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"outlook.exe\" process.name=\"cmd.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-093 endpoint: outlook.exe spawns wscript.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"outlook.exe\" process.name=\"wscript.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-094 endpoint: outlook.exe spawns mshta.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"outlook.exe\" process.name=\"mshta.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-095 endpoint: outlook.exe spawns rundll32.exe",
+   "description": "nano public benchmark detection (endpoint).",
+   "query": "class_uid=1007 process.parent_process.name=\"outlook.exe\" process.name=\"rundll32.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "endpoint"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1204.002"
+   ],
+   "mitre_tactics": [
+    "TA0002"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-096 network: outbound to port 4444",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=4444 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-097 network: outbound to port 5555",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=5555 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-098 network: outbound to port 1337",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=1337 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-099 network: outbound to port 31337",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=31337 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-100 network: outbound to port 6666",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=6666 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-101 network: outbound to port 6667",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=6667 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-102 network: outbound to port 6697",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=6697 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-103 network: outbound to port 8081",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=8081 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-104 network: outbound to port 8888",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=8888 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-105 network: outbound to port 9001",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=9001 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-106 network: outbound to port 9050",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=9050 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-107 network: outbound to port 1080",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=1080 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-108 network: outbound to port 3128",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=3128 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-109 network: outbound to port 2222",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=2222 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-110 network: outbound to port 4433",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=4433 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-111 network: outbound to port 50050",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=50050 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-112 network: outbound to port 7777",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=7777 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-113 network: outbound to port 12345",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=12345 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-114 network: outbound to port 54321",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=54321 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-115 network: outbound to port 1234",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=1234 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-116 network: outbound to port 10000",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=10000 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-117 network: outbound to port 20000",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=20000 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-118 network: outbound to port 65535",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=65535 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-119 network: outbound to port 23",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=23 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-120 network: outbound to port 69",
+   "description": "nano public benchmark detection (network).",
+   "query": "class_uid=4001 dst_endpoint.port=69 | stats count as conns, dc(dst_endpoint.ip) as dsts by src_endpoint.ip",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "network"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1571"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-121 identity: 10+ failed logons by user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by user.name | where failures > 10",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-122 identity: 10+ failed logons by src_endpoint.ip",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by src_endpoint.ip | where failures > 10",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-123 identity: 10+ failed logons by dst_endpoint.hostname",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by dst_endpoint.hostname | where failures > 10",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-124 identity: 10+ failed logons by actor.user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by actor.user.name | where failures > 10",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-125 identity: 20+ failed logons by user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by user.name | where failures > 20",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-126 identity: 20+ failed logons by src_endpoint.ip",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by src_endpoint.ip | where failures > 20",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-127 identity: 20+ failed logons by dst_endpoint.hostname",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by dst_endpoint.hostname | where failures > 20",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-128 identity: 20+ failed logons by actor.user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by actor.user.name | where failures > 20",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-129 identity: 50+ failed logons by user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by user.name | where failures > 50",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-130 identity: 50+ failed logons by src_endpoint.ip",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by src_endpoint.ip | where failures > 50",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-131 identity: 50+ failed logons by dst_endpoint.hostname",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by dst_endpoint.hostname | where failures > 50",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-132 identity: 50+ failed logons by actor.user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by actor.user.name | where failures > 50",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-133 identity: 100+ failed logons by user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by user.name | where failures > 100",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-134 identity: 100+ failed logons by src_endpoint.ip",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by src_endpoint.ip | where failures > 100",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-135 identity: 100+ failed logons by dst_endpoint.hostname",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by dst_endpoint.hostname | where failures > 100",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-136 identity: 100+ failed logons by actor.user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by actor.user.name | where failures > 100",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-137 identity: 200+ failed logons by user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by user.name | where failures > 200",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-138 identity: 200+ failed logons by src_endpoint.ip",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by src_endpoint.ip | where failures > 200",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-139 identity: 200+ failed logons by dst_endpoint.hostname",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by dst_endpoint.hostname | where failures > 200",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-140 identity: 200+ failed logons by actor.user.name",
+   "description": "nano public benchmark detection (identity).",
+   "query": "class_uid=3002 status_id=2 | stats count as failures by actor.user.name | where failures > 200",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "identity"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1110"
+   ],
+   "mitre_tactics": [
+    "TA0006"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-141 proxy: egress to pastebin",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/pastebin\\.com/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-142 proxy: egress to raw github",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/raw\\.githubusercontent\\.com/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-143 proxy: egress to ngrok",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/ngrok\\.(io|app)/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-144 proxy: egress to dynamic dns",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/duckdns\\.org|no-ip\\.|dyndns/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-145 proxy: egress to file sharing",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/transfer\\.sh|file\\.io|mega\\.nz/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-146 proxy: egress to tor gateway",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/\\.onion\\.|tor2web/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-147 proxy: egress to discord cdn",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/cdn\\.discordapp\\.com/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-148 proxy: egress to telegram api",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/api\\.telegram\\.org/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-149 proxy: egress to ip literal host",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/^\\d+\\.\\d+\\.\\d+\\.\\d+$/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-150 proxy: egress to long subdomain",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/^[a-z0-9]{30,}\\./i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-151 proxy: egress to punycode",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/xn--/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-152 proxy: egress to free tld",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/\\.(tk|ml|ga|cf|gq)$/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-153 proxy: egress to crypto mining pool",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/pool\\.|mining|xmr/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-154 proxy: egress to anonymizer",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/proxy|anonym|hide/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-155 proxy: egress to cloud storage exfil",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_request.url.hostname=/dropbox|drive\\.google|onedrive/i",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-156 proxy: 50+ HTTP 403 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=403 | stats count as hits by src_endpoint.ip | where hits > 50",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-157 proxy: 200+ HTTP 403 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=403 | stats count as hits by src_endpoint.ip | where hits > 200",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-158 proxy: 50+ HTTP 404 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=404 | stats count as hits by src_endpoint.ip | where hits > 50",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-159 proxy: 200+ HTTP 404 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=404 | stats count as hits by src_endpoint.ip | where hits > 200",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-160 proxy: 50+ HTTP 407 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=407 | stats count as hits by src_endpoint.ip | where hits > 50",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-161 proxy: 200+ HTTP 407 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=407 | stats count as hits by src_endpoint.ip | where hits > 200",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-162 proxy: 50+ HTTP 500 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=500 | stats count as hits by src_endpoint.ip | where hits > 50",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-163 proxy: 200+ HTTP 500 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=500 | stats count as hits by src_endpoint.ip | where hits > 200",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-164 proxy: 50+ HTTP 502 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=502 | stats count as hits by src_endpoint.ip | where hits > 50",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-165 proxy: 200+ HTTP 502 by source",
+   "description": "nano public benchmark detection (proxy).",
+   "query": "class_uid=4002 http_response.code=502 | stats count as hits by src_endpoint.ip | where hits > 200",
+   "severity": "low",
+   "tags": [
+    "nano-benchmark",
+    "proxy"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1071.001"
+   ],
+   "mitre_tactics": [
+    "TA0011"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-166 cloud: CloudTrail ConsoleLogin",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"ConsoleLogin\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-167 cloud: CloudTrail CreateUser",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"CreateUser\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-168 cloud: CloudTrail CreateAccessKey",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"CreateAccessKey\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-169 cloud: CloudTrail AttachUserPolicy",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"AttachUserPolicy\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-170 cloud: CloudTrail PutBucketPolicy",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"PutBucketPolicy\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-171 cloud: CloudTrail PutBucketAcl",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"PutBucketAcl\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-172 cloud: CloudTrail DeleteTrail",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"DeleteTrail\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-173 cloud: CloudTrail StopLogging",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"StopLogging\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-174 cloud: CloudTrail UpdateTrail",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"UpdateTrail\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-175 cloud: CloudTrail AuthorizeSecurityGroupIngress",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"AuthorizeSecurityGroupIngress\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-176 cloud: CloudTrail CreateLoginProfile",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"CreateLoginProfile\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-177 cloud: CloudTrail UpdateAssumeRolePolicy",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"UpdateAssumeRolePolicy\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-178 cloud: CloudTrail DisableKey",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"DisableKey\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-179 cloud: CloudTrail ScheduleKeyDeletion",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"ScheduleKeyDeletion\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "*/5 * * * *",
+   "lookback_minutes": 5
+  },
+  {
+   "name": "bench-180 cloud: CloudTrail GetSecretValue",
+   "description": "nano public benchmark detection (cloud).",
+   "query": "class_uid=6003 api.operation=\"GetSecretValue\"",
+   "severity": "medium",
+   "tags": [
+    "nano-benchmark",
+    "cloud"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "mitre_techniques": [
+    "T1078.004"
+   ],
+   "mitre_tactics": [
+    "TA0001"
+   ],
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
+  },
+  {
+   "name": "bench-181 realtime: rundll32.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"rundll32.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-182 realtime: sc.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"sc.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-183 realtime: wmic.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"wmic.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-184 realtime: reg.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"reg.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-185 realtime: schtasks.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"schtasks.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-186 realtime: mimikatz.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"mimikatz.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-187 realtime: psexesvc.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"psexesvc.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-188 realtime: procdump.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"procdump.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-189 realtime: ntdsutil.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"ntdsutil.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-190 realtime: adfind.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"adfind.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-191 realtime: rclone.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"rclone.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-192 realtime: anydesk.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"anydesk.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-193 realtime: ngrok.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"ngrok.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-194 realtime: plink.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"plink.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-195 realtime: nc.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"nc.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-196 realtime: socat.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"socat.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-197 realtime: chisel.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"chisel.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-198 realtime: sharphound.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"sharphound.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-199 realtime: rubeus.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"rubeus.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  },
+  {
+   "name": "bench-200 realtime: seatbelt.exe launched (real-time)",
+   "description": "nano public benchmark detection (realtime).",
+   "query": "class_uid=1007 process.name=\"seatbelt.exe\"",
+   "severity": "high",
+   "tags": [
+    "nano-benchmark",
+    "realtime"
+   ],
+   "author": "nano benchmark",
+   "alert_cooldown_minutes": 30,
+   "detection_mode": "real-time",
+   "realtime_enabled": true
+  }
+ ]
+}

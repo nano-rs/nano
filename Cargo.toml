@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.24"
+version = "2.0.25"
 edition = "2021"
 authors = ["NanoSIEM Team"]
 license = "AGPL-3.0-or-later"
@@ -64,9 +64,6 @@ proptest = "1.9"
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-
-# RSS/Atom feed parsing
-feed-rs = "2.3"
 
 # OpenAPI / Swagger documentation
 utoipa = { version = "5", features = ["chrono", "uuid", "axum_extras"] }

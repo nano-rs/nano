@@ -2,7 +2,8 @@
  * NanoSIEM Search Concurrency Ramp (k6)
  *
  * Steps concurrent virtual users 5 → 10 → 25 → 50 → 100 (discrete stages),
- * driving the realistic IR/SOC corpus (soc_ir_corpus.json) at each query's
+ * driving the realistic IR/SOC corpus (soc_ir_corpus.json; soc_ir_corpus_udm.json
+ * with SCHEMA_PROFILE=udm) at each query's
  * own analyst window. Finds the concurrency "knee" — the analyst count where
  * p95 blows up, throughput plateaus, or errors climb.
  *
@@ -32,7 +33,8 @@ const API_KEY = __ENV.API_KEY || "";
 const JWT_TOKEN = __ENV.JWT_TOKEN || "";
 const STAGE_SECONDS = parseInt(__ENV.STAGE_SECONDS || "45", 10);
 
-const CORPUS = JSON.parse(open("../results/soc_ir_corpus.json"));
+const CORPUS_FILE = (__ENV.SCHEMA_PROFILE || "ocsf") === "udm" ? "soc_ir_corpus_udm.json" : "soc_ir_corpus.json";
+const CORPUS = JSON.parse(open(`../results/${CORPUS_FILE}`));
 const QUERIES = CORPUS.domains.flatMap((d) => d.queries);
 
 const WINDOW_MS = { "15m": 900000, "1h": 3600000, "6h": 21600000, "24h": 86400000, "7d": 604800000 };

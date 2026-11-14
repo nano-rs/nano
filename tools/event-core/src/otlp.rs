@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn trace_ids_are_lowercase_hex_and_linked() {
         let world = one_entity();
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let spans = gen_trace(world.random_entity(), &mut rng);
         assert!(spans.len() >= 2, "expected a root + children");
 
@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn metrics_have_three_shapes_per_service() {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let points = gen_metrics(&mut rng);
         assert_eq!(points.len(), SERVICES.len() * 3);
 
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn host_metrics_cover_the_fleet_with_four_gauges_each() {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let points = gen_host_metrics(&mut rng);
         // Four gauges per host.
         assert_eq!(points.len(), HOST_FLEET.len() * 4);
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn rum_metrics_are_three_web_vitals_with_page_and_browser() {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let points = gen_rum_metrics(&mut rng);
         assert_eq!(points.len(), 3);
 
@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn rum_spans_are_pageviews_with_some_errors() {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         // Run several ticks so the ~12% error fraction is exercised.
         let mut total = 0usize;
         let mut errors = 0usize;
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn log_carries_trace_context_and_severity() {
         let world = one_entity();
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let log = gen_log(world.random_entity(), Some(("abc123", "def456")), &mut rng);
         assert_eq!(log["traceId"], "abc123");
         assert_eq!(log["spanId"], "def456");

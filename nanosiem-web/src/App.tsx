@@ -257,6 +257,7 @@ const SourceScopes = lazyWithRetryNamed(() => import('@/pages/Settings/SourceSco
 const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
 const AirgapImportPage = lazyWithRetryNamed(() => import('@/enterprise/airgap/AirgapImportPage'), 'AirgapImportPage');
 const LicenseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/License'), 'LicenseSettings');
+const EvidencePack = lazyWithRetryNamed(() => import('@/enterprise/pages/EvidencePack'), 'EvidencePack');
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -1113,6 +1114,15 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="settings:system" capability="customEnrichment" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <AirgapImportPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-5382: Evidence Pack (licensed `complianceExport`); the open
+              build stubs the page and hides its Settings entry. */}
+          <Route path="/settings/compliance/evidence-pack" element={
+            <PermissionRoute permission="compliance:export" capability="complianceExport" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <EvidencePack key={resetKey} />
               </Suspense>
             } />
           } />

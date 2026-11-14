@@ -95,6 +95,16 @@ struct CountRow {
     count: u64,
 }
 
+/// Per-action totals for a query's window and filters
+/// ([`AuditQueryService::count_by_action`]).
+#[derive(Debug, Clone, PartialEq, Eq, clickhouse::Row, Serialize, Deserialize)]
+pub struct AuditActionCount {
+    pub action: String,
+    pub count: u64,
+    /// Rows with a non-empty status other than `success`.
+    pub failures: u64,
+}
+
 /// Row for distinct values
 #[derive(Debug, clickhouse::Row, Deserialize)]
 struct StringRow {
@@ -664,6 +674,21 @@ pub(crate) fn count_sql(segments: &[AuditSegment], conditions: &[&str]) -> (Stri
     (format!("SELECT count() as count {from}"), binds)
 }
 
+/// Per-action count and failure count for [`count_sql`]'s rows. Binds: the
+/// time binds, the filters.
+pub(crate) fn action_counts_sql(segments: &[AuditSegment], conditions: &[&str]) -> (String, Vec<String>) {
+    let (from, binds) = audit_from(segments, conditions);
+    (
+        format!(
+            "SELECT action, count() AS count, countIf(status != '' AND status != 'success') AS failures \
+             {from} \
+             GROUP BY action \
+             ORDER BY action"
+        ),
+        binds,
+    )
+}
+
 /// Distinct non-empty `action` or `source` values (the filter dropdowns).
 /// Binds: the time binds.
 pub(crate) fn distinct_sql(segments: &[AuditSegment], column: AuditColumn) -> (String, Vec<String>) {
@@ -781,6 +806,29 @@ impl AuditQueryService {
             .map_err(|e| AuditQueryError::QueryError(e.to_string()))?;
 
         Ok(row.count)
+    }
+
+    /// Exact per-action totals (count and failures) for the rows matching
+    /// `query`'s window and filters; `limit` and `offset` are ignored.
+    pub async fn count_by_action(
+        &self,
+        query: &ClickHouseAuditQuery,
+    ) -> Result<Vec<AuditActionCount>, AuditQueryError> {
+        let client = self.dual_pool.clickhouse();
+        let filters = resolve_filters(query);
+
+        let segments = self.sources(filters.start, Some(filters.end));
+        let (sql, time_binds) = action_counts_sql(&segments, &filters.conditions);
+
+        let mut q = client.query(&sql);
+        for b in &time_binds {
+            q = q.bind(b.as_str());
+        }
+        q = bind_filters(q, query, &filters);
+
+        q.fetch_all()
+            .await
+            .map_err(|e| AuditQueryError::QueryError(e.to_string()))
     }
 
     /// Get distinct action values from audit events

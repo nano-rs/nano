@@ -1303,6 +1303,9 @@ mod asset_findings_classification_tests;
 #[path = "npl_golden_corpus_tests.rs"]
 pub(crate) mod npl_golden_corpus_tests;
 #[cfg(test)]
+#[path = "soc_ir_corpus_tests.rs"]
+mod soc_ir_corpus_tests;
+#[cfg(test)]
 #[path = "prevalence_canonical_keys_tests.rs"]
 mod prevalence_canonical_keys_tests;
 

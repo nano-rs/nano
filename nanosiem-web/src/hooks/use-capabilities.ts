@@ -66,6 +66,12 @@ export interface Capabilities {
    * APIs do not publish it; absent means off.
    */
   agentLane?: boolean;
+  /**
+   * Licensed compliance-export surface (`/api/compliance/*`, enterprise). Access
+   * still needs `compliance:export`. Optional because older APIs do not publish
+   * it; absent means off.
+   */
+  complianceExport?: boolean;
 }
 
 export interface CapabilitiesContextValue {

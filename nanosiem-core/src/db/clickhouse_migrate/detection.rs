@@ -87,6 +87,29 @@ impl ClickHouseMigrator {
         v
     }
 
+    /// NAN-5387: users defined in users.d XML, cached for the run. A failed
+    /// read yields an empty set: every GRANT then executes, and a 495 is
+    /// still tolerated as before.
+    pub(super) async fn detect_xml_users(&mut self) -> std::collections::HashSet<String> {
+        if let Some(users) = &self.xml_users {
+            return users.clone();
+        }
+        let users = match self
+            .client
+            .query("SELECT name FROM system.users WHERE storage = 'users_xml'")
+            .fetch_all::<String>()
+            .await
+        {
+            Ok(names) => names.into_iter().collect(),
+            Err(e) => {
+                tracing::debug!("Could not list users.d XML users: {e}; migration grants run unfiltered");
+                std::collections::HashSet::new()
+            }
+        };
+        self.xml_users = Some(users.clone());
+        users
+    }
+
     /// Parse `"26.10.3.7"` (or `"26.4.5.143 (official build)"`) into `(26, 10)`.
     pub(super) fn parse_server_version(raw: &str) -> Option<(u32, u32)> {
         let mut parts = raw.trim().split(|c: char| c == '.' || c.is_whitespace());

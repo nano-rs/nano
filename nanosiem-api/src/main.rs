@@ -377,6 +377,19 @@ async fn async_main() -> Result<()> {
         state.add_task_handle(supervisor).await;
     }
 
+    // Per-instance enterprise extension workers (generic seam; nothing named
+    // here): started in the background under the live license, after the
+    // pools are ready and without blocking boot.
+    #[cfg(feature = "enterprise")]
+    {
+        let supervisor = state.start_component_worker_supervisor(
+            nanosiem_api::license_admission::WorkerCapability::Extensions,
+            "api_extensions",
+            |state| nanosiem_enterprise::handlers::extension_api_workers(state),
+        );
+        state.add_task_handle(supervisor).await;
+    }
+
     // Initialize metrics
     tracing::info!("Initializing Prometheus metrics...");
     let (app_metrics, prometheus_layer) = AppMetrics::new();

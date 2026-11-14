@@ -25,6 +25,9 @@ on:
       - "**/Cargo.toml"
       - "Cargo.lock"
       - "migrations/**"
+      # The IR/SOC benchmark corpora are checked by soc_ir_corpus_tests.rs
+      # (nanosiem-core lib tests): a corpus-only edit must run that gate too.
+      - "benchmarks/results/soc_ir_corpus*.json"
       - ".github/workflows/pg-integration-tests.yml"
   workflow_dispatch:
 

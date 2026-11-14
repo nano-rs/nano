@@ -45,6 +45,7 @@ fn readers(segments: &[AuditSegment]) -> Vec<(&'static str, (String, Vec<String>
         ("rows", rows_sql(segments, &f.conditions), n + 2),
         ("rows/unfiltered", rows_sql(segments, &[]), 2),
         ("count", count_sql(segments, &f.conditions), n),
+        ("count by action", action_counts_sql(segments, &f.conditions), n),
         ("distinct action", distinct_sql(segments, AuditColumn::Action), 0),
         ("distinct source", distinct_sql(segments, AuditColumn::Source), 0),
         ("api key usage", api_key_daily_usage_sql(segments), 1),

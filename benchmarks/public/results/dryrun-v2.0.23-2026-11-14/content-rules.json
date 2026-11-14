@@ -1,0 +1,15 @@
+{
+  "profile": "ocsf",
+  "nano_version": "2.0.23",
+  "loaded_at": "2026-11-14T16:33:21.335854+00:00",
+  "sources": null,
+  "rules": {
+    "requested": 200,
+    "created": 39,
+    "skipped_existing": 161,
+    "failed": 0,
+    "errors": [],
+    "mode": "alerting",
+    "realtime": 20
+  }
+}

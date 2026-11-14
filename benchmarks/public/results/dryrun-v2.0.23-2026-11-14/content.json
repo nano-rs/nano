@@ -1,0 +1,165 @@
+{
+  "profile": "ocsf",
+  "nano_version": "2.0.23",
+  "loaded_at": "2026-11-14T16:09:26.021309+00:00",
+  "sources": [
+    {
+      "source_type": "windows_sysmon",
+      "parser_path": "parsers-ocsf/windows_sysmon/parser.yaml",
+      "log_source_id": "lsrc_5hjqcfx0f683xane99p62vpwpt",
+      "deploy_ok": true,
+      "deploy_attempts": 2,
+      "deploy_secs": 85.4
+    },
+    {
+      "source_type": "windows_event",
+      "parser_path": "parsers-ocsf/windows_event/parser.yaml",
+      "log_source_id": "lsrc_5v3pyw0qmg9xg98y0jaadpvjq9",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 55.9
+    },
+    {
+      "source_type": "conduit_proxy",
+      "parser_path": "parsers-ocsf/conduit_proxy/parser.yaml",
+      "log_source_id": "lsrc_4nk8kr7axj815s580xze6c50nt",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 54.4
+    },
+    {
+      "source_type": "apache_access",
+      "parser_path": "parsers-ocsf/apache/parser.yaml",
+      "log_source_id": "lsrc_38pffce0219499870w69tyecrk",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 35.3
+    },
+    {
+      "source_type": "aws_cloudtrail",
+      "parser_path": "parsers-ocsf/aws_cloudtrail/parser.yaml",
+      "log_source_id": "lsrc_4975y9rwtp9gst417mn7j73bz3",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 57.0
+    },
+    {
+      "source_type": "bench_marker",
+      "parser_path": "parsers-ocsf/json_generic/parser.yaml",
+      "log_source_id": "lsrc_7yvc0c9q929jpan5gy60g3c39z",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 65.9
+    }
+  ],
+  "rules": {
+    "requested": 200,
+    "created": 48,
+    "skipped_existing": 0,
+    "failed": 152,
+    "errors": [
+      {
+        "name": "bench-001 endpoint: rundll32.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-002 endpoint: regsvr32.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-003 endpoint: mshta.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-004 endpoint: certutil.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-005 endpoint: bitsadmin.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-006 endpoint: wmic.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-018 endpoint: schtasks.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-022 endpoint: vssadmin.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-023 endpoint: wevtutil.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-033 endpoint: psexec.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-035 endpoint: procdump.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-036 endpoint: ntdsutil.exe execution",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-041 endpoint: encoded powershell",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-042 endpoint: powershell download cradle",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-043 endpoint: powershell hidden window",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-044 endpoint: powershell bypass policy",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-045 endpoint: invoke-expression",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-046 endpoint: mimikatz keywords",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-047 endpoint: shadow copy delete",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      },
+      {
+        "name": "bench-048 endpoint: event log clear",
+        "status": 422,
+        "error": "{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation error: MITRE tactics and techniques must either both be empty or both be provided\"}}"
+      }
+    ],
+    "mode": "alerting",
+    "realtime": 20
+  }
+}

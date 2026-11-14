@@ -82,6 +82,23 @@ export interface IssuedIngestToken {
   replaced?: IngestToken | null;
   /** Seconds until every ingest host accepts the token (NAN-5285). */
   active_within_secs?: number;
+  /** Whether HEC/HTTP ingest is confirmed to accept the token (NAN-5395). */
+  ingest_ready?: IngestReadiness;
+}
+
+/** What the issue/rotate call can confirm about the new token on ingest (NAN-5395). */
+export interface IngestReadiness {
+  /**
+   * Confirmed live on HEC and HTTP ingest. Only single-host Compose confirms it
+   * (nano-api wrote the file Vector reads and one re-read passed); Helm and
+   * role-split installs never do. OTLP accepts a new token at once either way.
+   */
+  ready: boolean;
+  /** How the token reaches ingest. */
+  delivery?: 'http' | 'shared_volume' | 'none';
+  waited_ms: number;
+  /** Set when not ready: retry a HEC/HTTP 401 for up to this many seconds. */
+  retry_after_secs?: number;
 }
 
 export const INGEST_TOKENS_QUERY_KEY = ['ingest-tokens'] as const;

@@ -1313,14 +1313,22 @@ if ! docker compose version </dev/null >/dev/null 2>&1; then
     fail "docker compose v2 is required. Update Docker or install the compose plugin."
 fi
 
+# Docker Compose 2.24.4 or later: role-split renders and the NAN-5408 metrics
+# overlay use `!reset`/`!override`, which older Compose rejects or misreads.
+compose_version=""
+compose_at_least_2_24_4() {
+    local major minor patch
+    compose_version=$(docker compose version --short </dev/null 2>/dev/null | sed 's/^v//' | cut -d- -f1)
+    IFS=. read -r major minor patch <<< "$compose_version"
+    [[ "$major" =~ ^[0-9]+$ ]] || major=0
+    [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
+    [[ "$patch" =~ ^[0-9]+$ ]] || patch=0
+    ! (( major < 2 || (major == 2 && minor < 24) || (major == 2 && minor == 24 && patch < 4) ))
+}
+
 if [[ -n "$INVENTORY_ARG" ]]; then
     require_cmd python3 "Install Python 3 (used only to validate and render the sovereign host inventory)."
-    compose_version=$(docker compose version --short </dev/null 2>/dev/null | sed 's/^v//' | cut -d- -f1)
-    IFS=. read -r compose_major compose_minor compose_patch <<< "$compose_version"
-    compose_major=${compose_major:-0}; compose_minor=${compose_minor:-0}; compose_patch=${compose_patch:-0}
-    if (( compose_major < 2 || (compose_major == 2 && compose_minor < 24) || (compose_major == 2 && compose_minor == 24 && compose_patch < 4) )); then
-        fail "Role-split installs require Docker Compose 2.24.4+ (found $compose_version)."
-    fi
+    compose_at_least_2_24_4 || fail "Role-split installs require Docker Compose 2.24.4+ (found $compose_version)."
     [[ -f "$INVENTORY_ARG" ]] || fail "Inventory not found: $INVENTORY_ARG"
     INVENTORY_PATH="$(cd "$(dirname "$INVENTORY_ARG")" && pwd -P)/$(basename "$INVENTORY_ARG")"
 fi
@@ -2260,20 +2268,21 @@ agentlane_flag_on() {
         *) return 1 ;;
     esac
 }
-# Add (add) or drop (remove) docker-compose.agentlane.yml in .env's
+# Add (add) or drop (remove) an installer-managed overlay in .env's
 # NANO_COMPOSE_OVERLAYS, which scripts/nano and nano upgrade read; every other
 # overlay the operator listed is kept as it was.
-agentlane_record_overlay() {
-    local action="$1" current updated="" item
+record_managed_overlay() {
+    local overlay="$1" action="$2" current updated="" item
     current=$(env_value NANO_COMPOSE_OVERLAYS)
     for item in $current; do
-        [[ "$item" == docker-compose.agentlane.yml ]] || updated="${updated:+$updated }$item"
+        [[ "$item" == "$overlay" ]] || updated="${updated:+$updated }$item"
     done
-    [[ "$action" == add ]] && updated="${updated:+$updated }docker-compose.agentlane.yml"
+    [[ "$action" == add ]] && updated="${updated:+$updated }$overlay"
     [[ "$updated" == "$current" ]] && return 0
     nano_env_set_keys .env "NANO_COMPOSE_OVERLAYS=$updated" \
         || fail "Could not record NANO_COMPOSE_OVERLAYS in .env."
 }
+agentlane_record_overlay() { record_managed_overlay docker-compose.agentlane.yml "$1"; }
 # Withdraw a render the firewall does not match, so no later `docker compose
 # up` (scripts/nano, nano upgrade, a manual restart) publishes a port or starts
 # a listener this host's firewall does not guard: single host drops the
@@ -2339,11 +2348,93 @@ configure_agentlane_single() {
 }
 configure_agentlane_single
 
+# NAN-5408: "your own Prometheus" on a single node. NANO_METRICS_BIND_ADDRESS
+# (one of this host's own private IPv4 addresses; scripts/lib/metrics-bind.sh)
+# turns on docker-compose.metrics-expose.yml: a /metrics-only edge publishing
+# api, search, jobs, Vector, ClickHouse and node-exporter on that address. The
+# overlay is recorded in NANO_COMPOSE_OVERLAYS so `nano` and `nano upgrade`
+# keep it, and dropped again when the setting is removed. Everything is
+# checked before anything is written to .env.
+METRICS_EXPOSE_OVERLAY=""
+configure_metrics_expose_single() {
+    local overlay=docker-compose.metrics-expose.yml addr allow_public reason on_host
+    addr=${NANO_METRICS_BIND_ADDRESS:-$(env_value NANO_METRICS_BIND_ADDRESS)}
+    allow_public=${NANO_METRICS_ALLOW_PUBLIC:-$(env_value NANO_METRICS_ALLOW_PUBLIC)}
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        [[ -z "$addr" ]] || warn "NANO_METRICS_BIND_ADDRESS is ignored on a role-split install: give a host the monitoring role instead (docs/administration/monitor-self-run.md, \"Your own Prometheus: several hosts\")."
+        return 0
+    fi
+    if [[ -z "$addr" ]]; then
+        if [[ " $(env_value NANO_COMPOSE_OVERLAYS) " == *" $overlay "* ]]; then
+            record_managed_overlay "$overlay" remove
+            # Undo the jobs widening this setting made, unless the monitoring
+            # profile still scrapes jobs.
+            if [[ "$(env_value NANO_JOBS_BIND_ADDR)" == 0.0.0.0 && ",$(env_value COMPOSE_PROFILES)," != *,monitoring,* ]]; then
+                nano_env_set_keys .env "NANO_JOBS_BIND_ADDR=" \
+                    || fail "Could not reset NANO_JOBS_BIND_ADDR in .env."
+                log "Reset NANO_JOBS_BIND_ADDR (nano-jobs listens on loopback again)"
+            fi
+            log "NANO_METRICS_BIND_ADDRESS is not set: metrics are no longer published for an external Prometheus"
+        fi
+        return 0
+    fi
+    reason=$(nano_metrics_bind_error "$addr" "$allow_public") \
+        || fail "NANO_METRICS_BIND_ADDRESS: $reason."
+    on_host=0
+    nano_metrics_bind_on_host "$addr" || on_host=$?
+    case "$on_host" in
+        0) ;;
+        2) warn "Cannot list this host's addresses (no \`ip\` command); make sure NANO_METRICS_BIND_ADDRESS=$addr is one of them." ;;
+        *) fail "NANO_METRICS_BIND_ADDRESS=$addr is not an address of this host (ip -4 -o addr show). Use the private address your Prometheus connects to." ;;
+    esac
+    if [[ -n "$(env_value NANO_METRICS_NODE_PORT)" ]]; then
+        [[ "$(env_value NANO_METRICS_NODE_PORT)" =~ ^[1-9][0-9]{0,4}$ ]] && (( $(env_value NANO_METRICS_NODE_PORT) <= 65535 )) \
+            || fail "NANO_METRICS_NODE_PORT must be a port number (1-65535)."
+    fi
+    compose_at_least_2_24_4 \
+        || fail "NANO_METRICS_BIND_ADDRESS needs Docker Compose 2.24.4 or later (found ${compose_version:-unknown}). Update Docker Compose, or remove the setting."
+    [[ -f "$overlay" && -f config/monitoring/metrics-edge.conf ]] \
+        || fail "NANO_METRICS_BIND_ADDRESS is set, but this bundle has no $overlay. Use v2.0.25 or later."
+    [[ -n "$(env_value NANO_SERVICE_TOKEN)" ]] \
+        || fail "NANO_METRICS_BIND_ADDRESS is set, but NANO_SERVICE_TOKEN is missing from .env (the /metrics bearer token)."
+    # Checked: persist what the installer was given, so a later plain `docker
+    # compose up` (scripts/nano), which reads only .env, sees the same values.
+    if [[ "$addr" != "$(env_value NANO_METRICS_BIND_ADDRESS)" ]]; then
+        nano_env_set_keys .env "NANO_METRICS_BIND_ADDRESS=$addr" \
+            || fail "Could not record NANO_METRICS_BIND_ADDRESS in .env."
+    fi
+    if [[ -n "${NANO_METRICS_ALLOW_PUBLIC:-}" && "$NANO_METRICS_ALLOW_PUBLIC" != "$(env_value NANO_METRICS_ALLOW_PUBLIC)" ]]; then
+        nano_env_set_keys .env "NANO_METRICS_ALLOW_PUBLIC=$NANO_METRICS_ALLOW_PUBLIC" \
+            || fail "Could not record NANO_METRICS_ALLOW_PUBLIC in .env."
+    fi
+    if [[ -z "$(env_value NANO_JOBS_BIND_ADDR)" ]]; then
+        nano_env_set_keys .env "NANO_JOBS_BIND_ADDR=0.0.0.0" \
+            || fail "Could not record NANO_JOBS_BIND_ADDR in .env."
+        log "Persisted NANO_JOBS_BIND_ADDR=0.0.0.0 to .env (the metrics edge scrapes nano-jobs on the private Compose network)"
+    fi
+    record_managed_overlay "$overlay" add
+    METRICS_EXPOSE_OVERLAY="$overlay"
+    ok "Metrics for your own Prometheus: GET /metrics only, on ${addr} ports 3000 3002 3003 9598 9363 $(env_value NANO_METRICS_NODE_PORT | grep . || echo 9100). Limit them to your Prometheus with your firewall."
+}
+[[ -f scripts/lib/metrics-bind.sh ]] \
+    || fail "scripts/lib/metrics-bind.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+# shellcheck source=scripts/lib/metrics-bind.sh
+. scripts/lib/metrics-bind.sh
+configure_metrics_expose_single
+
 # Resolve overlays before sizing as well as startup: an overlay can replace the
 # Vector data volume with a host bind/external driver, whose capacity cannot be
 # inferred from DockerRootDir. Keeping one validated list prevents the sizing
 # and runtime Compose graphs from disagreeing.
-read -r -a NANO_OVERLAY_LIST <<< "${NANO_COMPOSE_OVERLAYS:-}"
+# NAN-5387 review: the overlays recorded in .env apply to a plain ./install.sh
+# rerun too (scripts/nano and nano upgrade already read them), so the graph
+# install.sh plans and starts is the customer's whole graph. The invoking
+# environment still wins when it sets NANO_COMPOSE_OVERLAYS (even to "").
+if [[ -n "${NANO_COMPOSE_OVERLAYS+set}" ]]; then
+    read -r -a NANO_OVERLAY_LIST <<< "$NANO_COMPOSE_OVERLAYS"
+else
+    read -r -a NANO_OVERLAY_LIST <<< "$(env_value NANO_COMPOSE_OVERLAYS)"
+fi
 # NAN-5397: a host converted from the pre-v2 layout keeps
 # docker-compose.legacy-preserved.yml, whose canonical config binds point at
 # .nano-v2-control/<bundle sha>/ (frozen at the transition bundle; an old one
@@ -2359,6 +2450,11 @@ if [[ -n "$AGENTLANE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " != *" $AGENTLANE_O
     NANO_OVERLAY_LIST+=("$AGENTLANE_OVERLAY")
 elif [[ -z "$AGENTLANE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.agentlane.yml "* ]]; then
     fail "NANO_COMPOSE_OVERLAYS names docker-compose.agentlane.yml, but Agent Lane is off. install.sh manages that overlay: remove it from NANO_COMPOSE_OVERLAYS."
+fi
+if [[ -n "$METRICS_EXPOSE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " != *" $METRICS_EXPOSE_OVERLAY "* ]]; then
+    NANO_OVERLAY_LIST+=("$METRICS_EXPOSE_OVERLAY")
+elif [[ -z "$METRICS_EXPOSE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.metrics-expose.yml "* ]]; then
+    fail "NANO_COMPOSE_OVERLAYS names docker-compose.metrics-expose.yml, but NANO_METRICS_BIND_ADDRESS is not set. install.sh manages that overlay: set NANO_METRICS_BIND_ADDRESS in .env instead."
 fi
 for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
     if [[ ! "$overlay" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]]; then
@@ -2679,6 +2775,34 @@ for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
     fi
 done
 
+# NAN-5387: nano's Compose network is pinned to one subnet, so ClickHouse's
+# user network check admits that subnet instead of Docker's whole address pools
+# (unconfigured, 172.16.0.0/12 AND 192.168.0.0/16: every host on a 192.168.x
+# LAN). install.sh creates the network itself (scripts/lib/network-pin.sh): an
+# existing install keeps the subnet it runs on, a fresh one takes the subnet
+# Docker allocates next, recorded as NANO_COMPOSE_SUBNET. Every Compose command
+# then reuses that network unchanged. Compose files that manage the network
+# themselves (an IPAM subnet, an external or extra network) are left alone; the
+# allow-list then stays the Docker pools plus their subnets, as before. Moving
+# onto (or off) the pinned network happens right before the stack starts
+# (nano_network_pin_apply below), never in a prepare-only run.
+COMPOSE_SUBNET=""
+NETWORK_PIN_ACTION=none
+if [[ "$MULTI_NODE" != "1" && -r scripts/lib/network-pin.sh && -r scripts/lib/compose_network_pin.py ]]; then
+    # shellcheck source=scripts/lib/network-pin.sh
+    . scripts/lib/network-pin.sh
+    nano_network_pin_plan "$(env_value NANO_COMPOSE_SUBNET)"
+    if [[ -n "$NETWORK_PIN_SUBNET" ]]; then
+        COMPOSE_SUBNET=$NETWORK_PIN_SUBNET
+        [[ "$(env_value NANO_COMPOSE_SUBNET)" == "$COMPOSE_SUBNET" ]] \
+            || nano_env_set_keys .env "NANO_COMPOSE_SUBNET=$COMPOSE_SUBNET" \
+            || fail "Could not record NANO_COMPOSE_SUBNET in .env."
+        log "nano's Compose network $NETWORK_PIN_NAME is pinned to $COMPOSE_SUBNET"
+    else
+        warn "nano's Compose network is not pinned (${NETWORK_PIN_REASON:-unknown reason}); ClickHouse keeps admitting Docker's address pools."
+    fi
+fi
+
 # ----------------------------------------------------------------------------
 # 4. Pull images + bring stack up
 # ----------------------------------------------------------------------------
@@ -2874,9 +2998,10 @@ fi
 
 # NAN-5367: ClickHouse users accept connections only from the networks the
 # Compose stack runs on. Render the per-user <networks> override from the
-# Docker address pools the Compose network is allocated from (stable across
-# `docker compose down && up`, unlike the network's current subnet), plus the
-# current subnet when a custom IPAM config placed it elsewhere. An external
+# subnet nano's network is pinned to (NAN-5387, above) or, when nothing is
+# pinned, the Docker address pools the Compose network is allocated from
+# (stable across `docker compose down && up`, unlike the network's current
+# subnet); plus the current subnet when a custom IPAM config placed it elsewhere. An external
 # direct-OCSF writer (Tenzir/Cribl on another host) is admitted as
 # nanosiem_ingest only, through NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS.
 # Role-split hosts get theirs from render-inventory.py instead.
@@ -2914,6 +3039,7 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
         --users-xml clickhouse/users.d/nanosiem-users.xml \
         --output .nano-generated/clickhouse/networks.xml \
         --docker-pools-json "$ch_pools_json" \
+        --compose-subnet "${COMPOSE_SUBNET:-}" \
         --ingest-networks "$ch_ingest_networks" \
         ${ch_network_args[@]+"${ch_network_args[@]}"} </dev/null >/dev/null \
         || fail "Could not render the ClickHouse network allow-list (NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS='$ch_ingest_networks')."
@@ -2925,7 +3051,7 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
     [[ "$(env_value NANO_CLICKHOUSE_NETWORKS_FILE)" == "./.nano-generated/clickhouse/networks.xml" ]] \
         || nano_env_set_keys .env "NANO_CLICKHOUSE_NETWORKS_FILE=./.nano-generated/clickhouse/networks.xml" \
         || fail "Could not record NANO_CLICKHOUSE_NETWORKS_FILE in .env."
-    log "ClickHouse users accept connections from loopback and the Docker networks only${ch_ingest_networks:+ (nanosiem_ingest also from $ch_ingest_networks)}"
+    log "ClickHouse users accept connections from loopback and ${COMPOSE_SUBNET:-the Docker networks} only${ch_ingest_networks:+ (nanosiem_ingest also from $ch_ingest_networks)}"
     # NAN-5361: that lock is what refuses nano's own users on the Agent Lane
     # port, so an Agent Lane allow-list must not overlap it.
     if [[ -n "$AGENTLANE_OVERLAY" ]] \
@@ -2934,6 +3060,22 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
         agentlane_unpublish
         fail "Agent Lane was not published (above). Nothing was started."
     fi
+fi
+
+# NAN-5408: `up` leaves a service that left the Compose graph running, with its
+# ports still published. With NANO_METRICS_BIND_ADDRESS gone, remove the
+# metrics edge, and the node-exporter it started unless the monitoring
+# profile runs one.
+if [[ "$MULTI_NODE" != "1" && -z "$METRICS_EXPOSE_OVERLAY" ]]; then
+    stale_metrics=(nano-metrics-edge)
+    [[ ",${COMPOSE_PROFILES:-}," == *,monitoring,* ]] || stale_metrics+=(nano-node-exporter)
+    for container in "${stale_metrics[@]}"; do
+        if docker container inspect "$container" >/dev/null 2>&1; then
+            docker rm -f "$container" >/dev/null </dev/null \
+                || fail "Could not remove $container. Its metrics ports may still be published: docker rm -f $container"
+            log "Removed $container (metrics are no longer published for an external Prometheus)"
+        fi
+    done
 fi
 
 log "Starting services"
@@ -2946,6 +3088,18 @@ if [[ "$MULTI_NODE" == "1" && "${ROLE_CONFIG_WAS_PUBLISHED:-0}" == "1" ]]; then
     # after publication so all mounts bind the newly published tree.
     compose_up_args+=(--force-recreate)
     log "Recreating selected role services to attach the newly published configuration"
+fi
+# NAN-5387: move the stack onto (or off) nano's pinned network. `down` first,
+# so every container is recreated by the `up` below: Compose reconnects the
+# containers it keeps WITHOUT their service DNS aliases when a network is
+# replaced under them.
+if declare -F nano_network_pin_apply >/dev/null; then
+    case "$NETWORK_PIN_ACTION" in
+        replace) log "Moving every service onto nano's pinned network $NETWORK_PIN_NAME ($COMPOSE_SUBNET): stopping the stack first" ;;
+        release) log "Your Compose files manage nano's network now: stopping the stack to retire the pinned $NETWORK_PIN_NAME" ;;
+    esac
+    nano_network_pin_apply \
+        || fail "Could not move nano onto its network $NETWORK_PIN_NAME (above). The stack may be stopped; fix the cause and rerun install.sh (reruns are safe)."
 fi
 # NAN-5269: `up -d` waits for clickhouse-migrate to complete, and a v2.0.11
 # install sat there for ten minutes with nothing to show for it. The migrator

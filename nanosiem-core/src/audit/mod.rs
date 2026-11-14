@@ -39,7 +39,9 @@ pub use context::ClientContext;
 pub use emitter::{AuditEmitError, AuditEmitter, DurableOutcome};
 pub use outbox::{AuditOutboxStats, SecurityAuditOutbox};
 pub use outbox_drain::{AuditOutboxDrainer, DrainOutcome};
-pub use query::{AuditQueryError, AuditQueryService, ClickHouseAuditEntry, ClickHouseAuditQuery};
+pub use query::{
+    AuditActionCount, AuditQueryError, AuditQueryService, ClickHouseAuditEntry, ClickHouseAuditQuery,
+};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

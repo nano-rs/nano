@@ -26,6 +26,17 @@ COPY . .
 # Build
 RUN npm run build
 
+# NAN-5409: the nginx image holds only bundled JS, so a scanner of the final
+# image sees no npm packages. This stage is the production npm tree (dev
+# dependencies pruned) and BUILDKIT_SBOM_SCAN_STAGE makes the BuildKit SBOM
+# attestation include it. Only npm's hidden lockfile reaches the final image.
+FROM builder AS sbom-npm-deps
+RUN npm prune --omit=dev --ignore-scripts --no-audit --no-fund
+
+FROM scratch AS sbom-npm
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
+COPY --from=sbom-npm-deps /app/node_modules /node_modules
+
 # Production stage - serve with nginx
 FROM nginx:alpine
 
@@ -38,6 +49,8 @@ LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
 
 # Copy built assets
 COPY --from=builder /app/dist /usr/share/nginx/html
+# NAN-5409: the production npm lockfile, which also pulls the sbom-npm stage into the build.
+COPY --from=sbom-npm /node_modules/.package-lock.json /usr/share/nano/sbom/nanosiem-web.package-lock.json
 
 # Copy nginx config for SPA routing (use port 5173 to match dev server)
 # NAN-5235: Cross-Origin-Opener-Policy same-origin on documents, so a page on

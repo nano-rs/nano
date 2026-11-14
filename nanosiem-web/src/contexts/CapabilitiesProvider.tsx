@@ -38,6 +38,7 @@ const FALLBACK_CAPABILITIES: CapabilitiesContextValue = {
     soar: false,
     threatIntel: false,
     agentLane: false,
+    complianceExport: false,
   },
 };
 

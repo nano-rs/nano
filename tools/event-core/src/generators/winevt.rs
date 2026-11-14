@@ -5,7 +5,6 @@
 
 use chrono::{DateTime, Utc};
 use rand::Rng;
-use uuid::Uuid;
 
 use crate::entity::Entity;
 use crate::event::Event;
@@ -59,7 +58,7 @@ impl WindowsEventGenerator {
             "IpPort": rng.random_range(49152u16..65535).to_string(),
             "KeyLength": "0",
             "LmPackageName": "-",
-            "LogonGuid": format!("{{{}}}", Uuid::now_v7()),
+            "LogonGuid": format!("{{{}}}", crate::rng::uuid()),
             "LogonProcessName": protocol,
             "LogonType": logon_type.to_string(),
             "ProcessId": "0x0",
@@ -265,7 +264,7 @@ impl WindowsEventGenerator {
         keywords: &[&str],
         label: &str,
     ) -> Event {
-        let mut rng = rand::rng();
+        let mut rng = crate::rng::rng();
         let message = serde_json::json!({
             "channel": "Security",
             "computer": entity.fqdn(),

@@ -131,6 +131,8 @@ services:
       # directly. Token must match the Vector service's VECTOR_AUTH_TOKEN.
       VECTOR_INGEST_URL: http://vector:8080/
       VECTOR_ENRICH_URL: http://vector:8090/
+      # NAN-5387: /health/detailed search probe (dev service name).
+      SEARCH_SERVICE_URL: http://nanosiem-search:3002/health
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-}
       # Vector reads its config from the shared directory: no HTTP delivery.
       NANO_VECTOR_CONFIG_DELIVERY: "off"
@@ -432,7 +434,7 @@ services:
   # Stable network namespace: replacing only Vector must not strand the tap
   # relay in a retired container namespace (NAN-5004).
   vector-netns:
-    image: nginx:alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    image: nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
     container_name: nanosiem-vector-netns
     entrypoint: ["/bin/sh", "-ec"]
     command: ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $$!; done"]
@@ -551,7 +553,7 @@ services:
   # start with from a persisted tiering storage.xml. ClickHouse only starts
   # after it exits 0. Same image as the server, so nothing extra to pull.
   clickhouse-preflight:
-    image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
+    image: clickhouse/clickhouse-server:26.10.4.207@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035
     container_name: nanosiem-clickhouse-preflight
     entrypoint: ["/bin/sh", "/preflight/clickhouse-preflight.sh", "/config.d"]
     security_opt:
@@ -565,7 +567,7 @@ services:
     # Rollback: the ONLY supported downgrade target from 26.10 is
     # 26.8.36.3@sha256:d426d2f6… (see docs/dev/CLICKHOUSE-UPGRADE-NOTES.md).
     # 26.4/26.5 cannot read 26.10 text indexes and are CVE-2026-116366 exposed.
-    image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
+    image: clickhouse/clickhouse-server:26.10.4.207@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035
     container_name: nanosiem-clickhouse
     depends_on:
       clickhouse-preflight:

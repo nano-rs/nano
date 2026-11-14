@@ -30,6 +30,13 @@ on:
       - "tools/check-mirror-enterprise-strip.py"
       - "tools/scan-mirror-secrets.sh"
       - ".github/workflows/sync-mirror.yml"
+      # NAN-5409: preflight generates both editions' SBOMs and checks every shipped
+      # dependency's license, so a dependency change is checked here too.
+      - ".github/workflows/release-sbom.yml"
+      - "scripts/tests/sbom.test.sh"
+      - "Cargo.lock"
+      - "nanosiem-web/package-lock.json"
+      - "nanosiem-enterprise/sandbox-compiler/package-lock.json"
 
 permissions:
   contents: read
@@ -37,9 +44,17 @@ permissions:
 jobs:
   preflight:
     runs-on: [self-hosted, Linux, X64, nano-pr]
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # NAN-5409: preflight check 13 (scripts/release/check-sbom.sh) runs cargo tree
+      # and the pinned SBOM tools.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95
+
+      - name: Install pinned SBOM tools
+        run: bash scripts/release/install-sbom-tools.sh "$RUNNER_TEMP/sbom-tools" >> "$GITHUB_PATH"
+
       # NAN-5172: preflight packages the Helm chart (scripts/release/package-chart.sh).
       - name: Set up Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1

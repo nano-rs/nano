@@ -39,6 +39,7 @@ import { ThreatIntelApi } from '@/enterprise/api/threat-intel';
 import { ScimApi } from '@/enterprise/api/scim';
 import { AgentLaneApi } from '@/enterprise/api/agentlane';
 import { SoarApi } from '@/enterprise/api/soar';
+import { EvidencePackApi } from '@/enterprise/api/evidence-pack';
 import { InternalDomainsApi } from './internal-domains';
 import { RiskWatchlistsApi } from '@/enterprise/api/risk-watchlists';
 import { NotificationsApi } from './notifications';
@@ -287,6 +288,7 @@ class ApiClient {
   private _scim: ScimApi;
   private _agentLane: AgentLaneApi;
   private _soar: SoarApi;
+  private _evidencePack: EvidencePackApi;
   private _internalDomains: InternalDomainsApi;
   private _riskWatchlists: RiskWatchlistsApi;
   private _notifications: NotificationsApi;
@@ -378,6 +380,7 @@ class ApiClient {
     this._scim = new ScimApi(this.request.bind(this));
     this._agentLane = new AgentLaneApi(this.request.bind(this));
     this._soar = new SoarApi(this.request.bind(this));
+    this._evidencePack = new EvidencePackApi(this.request.bind(this), this.requestRaw.bind(this));
     this._internalDomains = new InternalDomainsApi(this.request.bind(this));
     this._riskWatchlists = new RiskWatchlistsApi(this.request.bind(this));
     this._notifications = new NotificationsApi(this.request.bind(this));
@@ -464,6 +467,11 @@ class ApiClient {
   /** SOAR automation (enterprise; the open build carries a rejecting stub). */
   get soar(): SoarApi {
     return this._soar;
+  }
+
+  /** Evidence Pack compliance export (enterprise; the open build carries a rejecting stub). */
+  get evidencePack(): EvidencePackApi {
+    return this._evidencePack;
   }
 
   get dashboards(): DashboardsApi {

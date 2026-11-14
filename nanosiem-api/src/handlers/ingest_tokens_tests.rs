@@ -75,6 +75,7 @@ fn issued_token_debug_is_redacted() {
         token: "nit_abcdefghSECRETSECRET".into(),
         replaced: Some(token()),
         active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
+        ingest_ready: ready(true),
     };
     assert!(!format!("{issued:?}").contains("SECRET"));
     let json = serde_json::to_value(&issued).unwrap();
@@ -85,11 +86,26 @@ fn issued_token_debug_is_redacted() {
         token: "x".into(),
         replaced: None,
         active_within_secs: TOKEN_ACTIVE_WITHIN_SECS,
+        ingest_ready: ready(false),
     };
     let fresh = serde_json::to_value(&fresh).unwrap();
     assert!(fresh.get("replaced").is_none());
     // NAN-5285 (F7): the sender is told how long a new token takes to work.
     assert_eq!(fresh["active_within_secs"], TOKEN_ACTIVE_WITHIN_SECS);
+    // NAN-5395: and whether it already works on every ingest host.
+    assert_eq!(fresh["ingest_ready"]["ready"], false);
+    assert_eq!(fresh["ingest_ready"]["retry_after_secs"], 5);
+    assert_eq!(fresh["ingest_ready"]["delivery"], "http");
+    assert!(fresh["ingest_ready"].get("ingest_hosts").is_none());
+}
+
+fn ready(ready: bool) -> IngestReadiness {
+    IngestReadiness {
+        ready,
+        delivery: if ready { TokenDelivery::SharedVolume } else { TokenDelivery::Http },
+        waited_ms: if ready { 2_100 } else { 0 },
+        retry_after_secs: (!ready).then_some(5),
+    }
 }
 
 #[test]

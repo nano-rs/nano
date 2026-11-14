@@ -4,7 +4,7 @@
 //! private networks; a users.xml user is left untouched; a rerun is a no-op.
 //!
 //! ```text
-//! docker run -d --name ch -p 127.0.0.1:18123:8123 clickhouse/clickhouse-server:26.10.3.7
+//! docker run -d --name ch -p 127.0.0.1:18123:8123 clickhouse/clickhouse-server:26.10.4.207
 //! NANOSIEM_TEST_CLICKHOUSE_URL=http://127.0.0.1:18123 \
 //!   cargo test -p nanosiem-core --test clickhouse_sql_user_hosts -- --ignored
 //! ```

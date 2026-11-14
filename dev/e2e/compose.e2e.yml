@@ -217,7 +217,7 @@ services:
   # through it: /api, /api/search, /ingest (Vector HTTP), /otlp (auth_request
   # to nano-api, then Vector :4318).
   edge:
-    image: nginx:alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    image: nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
     container_name: ${E2E_PROJECT}-edge
     labels: *e2e-labels
     restart: "no"
