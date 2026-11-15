@@ -568,3 +568,46 @@ fn example_env_key_is_refused_as_active_but_its_ciphertext_survives_the_upgrade(
     assert!(EncryptionService::new(example.as_bytes()).decrypt(&rewrapped).is_err());
     assert!(ring.rewrap(&rewrapped).unwrap().is_none(), "already on the active key");
 }
+
+
+/// NAN-5412: v2 (`nck2:`) envelopes sealed by the PRE-upgrade crates
+/// (aes-gcm 0.10, hkdf 0.12, sha2 0.10) under every credential scope and both
+/// ring keys. They must keep opening, and the HKDF-derived context keys must
+/// stay byte-identical, across RustCrypto majors. Never regenerate this file
+/// with new crates: that would hide exactly the break it exists to catch.
+#[test]
+fn v2_envelopes_sealed_by_earlier_crates_still_open() {
+    let fixtures: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("v2-fixtures.json")).unwrap();
+    assert_eq!(fixtures.len(), 8);
+    for f in fixtures {
+        let s = |k: &str| f[k].as_str().unwrap().to_string();
+        let scope = match s("scope").as_str() {
+            "tenant" => CredentialScope::Tenant(s("scope_id").parse().unwrap()),
+            "account" => CredentialScope::Account(s("scope_id").parse().unwrap()),
+            "deployment" => CredentialScope::Deployment,
+            "platform" => CredentialScope::Platform,
+            other => panic!("unknown scope {other}"),
+        };
+        let purpose: &'static str = Box::leak(s("purpose").into_boxed_str());
+        let (row, active) = (s("row"), s("active"));
+        let sealed = EncryptedData {
+            ciphertext: s("ciphertext"),
+            nonce: s("nonce"),
+        };
+        let root = if active == "k1" { ROOT } else { OTHER };
+        let key = derive(root.as_bytes(), &CredentialContext::new(scope, purpose, &row)).unwrap();
+        assert_eq!(hex::encode(key.as_ref()), s("derived_key_hex"), "HKDF output moved: {f}");
+
+        // Opens under the ring whichever key is active now (the header names it).
+        for current in ["k1", "k2"] {
+            let svc = two_key_ring(current).with_context(scope, purpose, &row);
+            let (plain, id) = svc.decrypt_with_key_id(&sealed).unwrap();
+            assert_eq!(plain, s("plaintext").as_bytes(), "{f}");
+            assert_eq!(id, active);
+        }
+        // Still context-bound: another row must not open it.
+        let wrong = two_key_ring(&active).with_context(scope, purpose, "another-row");
+        assert!(wrong.decrypt(&sealed).is_err());
+    }
+}

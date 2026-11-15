@@ -144,8 +144,8 @@ fn validate_operator_provenance(
     path = "/api/settings/tier",
     tag = "settings",
     responses(
-        (status = 200, body = TierStatusResponse),
-        (status = 403, body = ErrorResponse),
+        (status = 200, description = "Current tier, limits and usage", body = TierStatusResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -223,9 +223,9 @@ pub async fn get_tier_status(
     tag = "settings",
     request_body = SetTierRequest,
     responses(
-        (status = 200, body = nanosiem_core::TierLimits),
-        (status = 403, body = ErrorResponse),
-        (status = 422, body = ErrorResponse),
+        (status = 200, description = "Updated tier limits", body = nanosiem_core::TierLimits),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 422, description = "Invalid tier or capacity", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -301,8 +301,8 @@ pub async fn set_tier(
     tag = "settings",
     request_body = nanosiem_core::UpdateTierLimits,
     responses(
-        (status = 200, body = nanosiem_core::TierLimits),
-        (status = 403, body = ErrorResponse),
+        (status = 200, description = "Updated tier limits", body = nanosiem_core::TierLimits),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -339,8 +339,8 @@ pub async fn update_tier_limits(
     tag = "settings",
     params(UsageRangeQuery),
     responses(
-        (status = 200, body = Vec<nanosiem_core::DailyUsage>),
-        (status = 403, body = ErrorResponse),
+        (status = 200, description = "Daily usage history", body = Vec<nanosiem_core::DailyUsage>),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -371,8 +371,8 @@ pub async fn get_usage_history(
     tag = "settings",
     params(AiUsageQuery),
     responses(
-        (status = 200, body = AiUsageDetailResponse),
-        (status = 403, body = ErrorResponse),
+        (status = 200, description = "AI usage detail", body = AiUsageDetailResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]

@@ -53,8 +53,10 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
             .with(env_filter)
             .init();
     } else {
+        // NAN-5432: plaintext keeps one event per line, whatever the fields
+        // carry (see `OneLineStdout`). JSON escapes on its own.
         tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_writer(OneLineStdout))
             .with(forwarding_layer)
             .with(env_filter)
             .init();
@@ -81,6 +83,72 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
     TracingGuard {
         _root_span_guard: guard,
     }
+}
+
+// ---------------------------------------------------------------------------
+// One event, one line (plaintext)
+// ---------------------------------------------------------------------------
+
+/// Stdout for the plaintext log format, one event per line (NAN-5432).
+///
+/// Field values can carry event bytes: ClickHouse error messages quote the
+/// value that failed to parse, byte for byte. A line break in a value would
+/// start a forged log line, and a NUL can truncate or confuse log shippers.
+/// tracing-subscriber already escapes ESC / BEL / BS / FF / DEL in field
+/// values, so the only raw ESC left is its own ANSI coloring; this writer
+/// escapes the remaining C0 controls (except tab) and every line break but
+/// the one that ends the event. The fmt layer writes each event with one
+/// `write_all` of the whole formatted line, which is what makes "the final
+/// byte" mean "the end of the event".
+#[derive(Debug, Clone, Copy, Default)]
+struct OneLineStdout;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for OneLineStdout {
+    type Writer = OneLineWriter<std::io::Stdout>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        OneLineWriter(std::io::stdout())
+    }
+}
+
+/// See [`OneLineStdout`].
+pub(crate) struct OneLineWriter<W>(pub(crate) W);
+
+impl<W: IoWrite> IoWrite for OneLineWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write_all(&escape_log_line(buf))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// `line` with every control byte that could break or forge a log line
+/// escaped (`\n`, `\r`, `\0`, `\xNN`). Tab and ESC (ANSI coloring) pass,
+/// and so does a final `\n`. Borrows when nothing needs escaping.
+pub(crate) fn escape_log_line(line: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let (body, end) = match line.split_last() {
+        Some((b'\n', body)) => (body, &b"\n"[..]),
+        _ => (line, &b""[..]),
+    };
+    let needs = |b: u8| (b < 0x20 && b != b'\t' && b != 0x1b) || b == 0x7f;
+    if !body.iter().copied().any(needs) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = Vec::with_capacity(line.len() + 16);
+    for &b in body {
+        match b {
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0 => out.extend_from_slice(b"\\0"),
+            b if needs(b) => out.extend_from_slice(format!("\\x{b:02x}").as_bytes()),
+            b => out.push(b),
+        }
+    }
+    out.extend_from_slice(end);
+    std::borrow::Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -314,10 +382,22 @@ async fn siem_flush_task(mut rx: tokio::sync::mpsc::Receiver<String>, url: Strin
     }
 }
 
-async fn flush_batch(client: &reqwest::Client, url: &str, token: &str, buffer: &mut Vec<String>) {
+pub(crate) async fn flush_batch(client: &reqwest::Client, url: &str, token: &str, buffer: &mut Vec<String>) {
     // Build NDJSON body
     let ndjson = buffer.join("\n");
     buffer.clear();
+
+    // NAN-5441: the forwarding client honors the env proxy. Under "proxy
+    // required" with none for the URL's scheme, drop the batch rather than
+    // send it direct. Reported once on stderr: a tracing event here would be
+    // forwarded back into this same layer.
+    if let Err(e) = crate::egress_proxy::require_env_proxy(url) {
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("SIEM forwarding disabled: {e}");
+        }
+        return;
+    }
 
     // Gzip compress
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -343,3 +423,7 @@ async fn flush_batch(client: &reqwest::Client, url: &str, token: &str, buffer: &
 
     let _ = req.send().await;
 }
+
+#[cfg(test)]
+#[path = "telemetry_one_line_tests.rs"]
+mod one_line_tests;

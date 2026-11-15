@@ -137,6 +137,11 @@ pub struct DualHealthResponse {
     /// must not tell an unauthenticated caller that detection is impaired.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detection: Option<nanosiem_core::detection::health::DetectionExecutionHealth>,
+    /// NAN-5450: usage of the ClickHouse disks, the PostgreSQL volume and the
+    /// Vector disk buffers (warning at 80 %, critical at 90 %). A critical
+    /// volume makes the overall `status` `degraded`. Cached for 30 seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<nanosiem_core::health::disk_monitor::DiskHealthReport>,
 }
 
 /// Health status for a single database
@@ -468,8 +473,13 @@ pub async fn health_check_detailed(
     };
     let detection_ok = detection.as_ref().is_none_or(|d| d.status == "ok");
 
+    // NAN-5450: disk usage. Each source is bounded (5 s) and the report is
+    // cached for 30 s, so this endpoint stays fast under polling.
+    let disk = nanosiem_core::health::disk_monitor::cached_disk_health(state.dual_pool()).await;
+    let disk_ok = disk.status < nanosiem_core::health::disk_monitor::DiskLevel::Critical;
+
     let overall_status = if is_healthy {
-        if !detection_ok {
+        if !detection_ok || !disk_ok {
             "degraded"
         } else if ingest_ok && search_ok {
             "ok"
@@ -504,12 +514,84 @@ pub async fn health_check_detailed(
         dual_mode_enabled: true,
         services: Some(services_health),
         detection,
+        disk: Some(disk),
+    }))
+}
+
+/// NAN-5450: what the admin disk banner shows.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct DiskAlertResponse {
+    /// Worst level over the data disks: `ok` / `unknown` show nothing,
+    /// `warning` (80 %) a notice on Settings -> Storage, `critical` (90 %, or
+    /// forecast to fill within 24 hours) a banner on every page, `imminent`
+    /// (95 %) a red banner that cannot be dismissed.
+    pub level: nanosiem_core::health::disk_monitor::DiskLevel,
+    /// Disks at warning or worse, each underlying disk once, worst first.
+    /// Each carries its free bytes, usage, growth rate and forecast.
+    pub disks: Vec<nanosiem_core::health::disk_monitor::DiskVolumeHealth>,
+    /// Whether ingestion is paused right now (by disk pressure or an admin).
+    pub ingestion_paused: bool,
+    /// `disk_pressure` or `manual` while paused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingestion_pause_source: Option<String>,
+    /// Usage fractions the levels start at.
+    pub warn_fraction: f64,
+    pub critical_fraction: f64,
+    pub imminent_fraction: f64,
+    /// The disk-full recovery runbook.
+    pub runbook: String,
+    pub checked_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Disk space alert for the admin banner
+///
+/// The data disks (ClickHouse, PostgreSQL, Vector disk buffers) at 80 % or
+/// more, with the growth forecast, and whether ingestion is paused. Polled by
+/// the web app for `settings:system` holders. Cached for 30 seconds.
+#[utoipa::path(
+    get,
+    path = "/api/system/disk-alert",
+    tag = "system",
+    responses(
+        (status = 200, description = "Disk space alert", body = DiskAlertResponse),
+        (status = 403, description = "Missing settings:system", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_disk_alert(
+    State(state): State<AppState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
+) -> Result<Json<DiskAlertResponse>, crate::error::ApiError> {
+    use nanosiem_core::health::disk_monitor::{self, DiskLevel};
+    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
+    let report = disk_monitor::cached_disk_health(state.dual_pool()).await;
+    let disks: Vec<_> = report.alarming_disks().into_iter().cloned().collect();
+    let level = disks.first().map(|d| d.level).unwrap_or(if report.status == DiskLevel::Unknown {
+        DiskLevel::Unknown
+    } else {
+        DiskLevel::Ok
+    });
+    let pause = state.ingestion_pause.state().await.ok();
+    Ok(Json(DiskAlertResponse {
+        level,
+        disks,
+        ingestion_paused: pause.as_ref().is_some_and(|p| p.paused),
+        ingestion_pause_source: pause
+            .as_ref()
+            .filter(|p| p.paused)
+            .and_then(|p| p.source)
+            .map(|s| serde_json::to_value(s).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()),
+        warn_fraction: report.warn_fraction,
+        critical_fraction: report.critical_fraction,
+        imminent_fraction: report.imminent_fraction,
+        runbook: disk_monitor::DISK_FULL_RUNBOOK.to_string(),
+        checked_at: report.checked_at,
     }))
 }
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health_check, ready_check, livez, health_check_detailed),
+    paths(health_check, ready_check, livez, health_check_detailed, get_disk_alert),
     components(schemas(
         PublicHealthResponse,
         HealthResponse,
@@ -517,7 +599,13 @@ pub async fn health_check_detailed(
         DatabaseHealth,
         DownstreamServicesHealth,
         ServiceHealth,
-        nanosiem_core::detection::health::DetectionExecutionHealth
+        nanosiem_core::detection::health::DetectionExecutionHealth,
+        nanosiem_core::health::disk_monitor::DiskHealthReport,
+        nanosiem_core::health::disk_monitor::DiskVolumeHealth,
+        nanosiem_core::health::disk_monitor::DiskLevel,
+        nanosiem_core::health::disk_monitor::DiskComponent,
+        nanosiem_core::health::disk_monitor::DiskForecast,
+        DiskAlertResponse
     ))
 )]
 pub struct HealthApiDoc;

@@ -7,13 +7,11 @@
 //! `nanosiem_core::search::denied_source_audit`. Delivery never touches the
 //! response.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use nanosiem_core::audit::ClientContext;
 use nanosiem_core::search::denied_source_audit::{
     with_scope, DeniedSourceAuditRecord, DeniedSourceAuditScope, DeniedSourceAuditSink,
 };
@@ -54,18 +52,7 @@ pub fn scope_for_request(
     }
     // The key owner when there is one, with the key itself named on the event.
     let actor = auth.ownership_user_id().unwrap_or(auth.claims.sub);
-    let connect_info = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|value| value.0);
-    let client = ClientContext::new(
-        crate::middleware::extract_ip_address(request, connect_info.as_ref()),
-        request
-            .headers()
-            .get(axum::http::header::USER_AGENT)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.chars().take(512).collect()),
-    );
+    let client = crate::middleware::client_context(request);
     DeniedSourceAuditScope::new(
         actor,
         auth.api_key_id,

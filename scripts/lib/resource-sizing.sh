@@ -15,6 +15,7 @@ cpu_cores=""
 memory_mib=""
 shards=1
 vector_data_capacity_bytes=""
+vector_data_free_bytes=""
 override_env=""
 server_output=""
 users_output=""
@@ -81,6 +82,9 @@ Usage: resource-sizing.sh [options]
   --shards COUNT               ClickHouse shard count (for per-shard buffers)
   --vector-data-capacity-bytes BYTES
                                Filesystem capacity backing VECTOR_DATA_DIR
+  --vector-data-free-bytes BYTES
+                               Free space on that filesystem now (NAN-5446;
+                               probed with the capacity when that is probed)
   --override-env PATH          Apply sizing keys from an operator .env
   --override KEY=VALUE         Apply an inventory override (repeatable)
   --server-output PATH         Write the ClickHouse server override XML
@@ -112,6 +116,10 @@ while [[ $# -gt 0 ]]; do
         --vector-data-capacity-bytes)
             [[ $# -ge 2 ]] || fail "--vector-data-capacity-bytes needs a value"
             vector_data_capacity_bytes="$2"
+            shift 2 ;;
+        --vector-data-free-bytes)
+            [[ $# -ge 2 ]] || fail "--vector-data-free-bytes needs a value"
+            vector_data_free_bytes="$2"
             shift 2 ;;
         --override-env) [[ $# -ge 2 ]] || fail "--override-env needs a path"; override_env="$2"; shift 2 ;;
         --override)
@@ -206,7 +214,7 @@ detect_memory_mib() {
 }
 
 detect_vector_data_capacity_bytes() {
-    local docker_root="" capacity_kib="" probe_image="" locked_probe_image=""
+    local docker_root="" capacity_kib="" free_kib="" probe_image="" locked_probe_image=""
     local compose_file="" images_lock=""
     command -v docker >/dev/null 2>&1 || return 1
     docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
@@ -254,9 +262,18 @@ detect_vector_data_capacity_bytes() {
         --mount type=volume,dst=/var/lib/vector \
         --entrypoint /bin/df \
         "$probe_image" -Pk /var/lib/vector 2>/dev/null \
-        | awk 'NR == 2 { print $2 }') || return 1
+        | awk 'NR == 2 { print $2, $4 }') || return 1
+    # NAN-5446: df's Available column is the free space right now; the Vector
+    # budget must fit what is free today, not only the install-time capacity.
+    free_kib=${capacity_kib#* }
+    capacity_kib=${capacity_kib%% *}
     [[ "$capacity_kib" =~ ^[1-9][0-9]*$ ]] || return 1
-    printf '%s\n' "$(( capacity_kib * 1024 ))"
+    [[ "$free_kib" =~ ^[0-9]+$ ]] || free_kib=""
+    if [[ -n "$free_kib" ]]; then
+        printf '%s %s\n' "$(( capacity_kib * 1024 ))" "$(( free_kib * 1024 ))"
+    else
+        printf '%s\n' "$(( capacity_kib * 1024 ))"
+    fi
 }
 
 [[ -n "$cpu_cores" ]] || cpu_cores="${NANO_SIZING_CPU_CORES:-}"
@@ -326,9 +343,14 @@ if has_role ingest; then
     if [[ -z "$vector_data_capacity_bytes" && "$vector_data_storage_mode" == bind ]]; then
         fail "Vector data uses bind/external storage whose capacity differs from DockerRootDir; set NANO_VECTOR_DATA_CAPACITY_BYTES or pass --vector-data-capacity-bytes"
     fi
-    [[ -n "$vector_data_capacity_bytes" ]] \
-        || vector_data_capacity_bytes=$(detect_vector_data_capacity_bytes) \
-        || fail "cannot query the Docker daemon for the filesystem capacity backing Vector; set NANO_VECTOR_DATA_CAPACITY_BYTES or pass --vector-data-capacity-bytes"
+    if [[ -z "$vector_data_capacity_bytes" ]]; then
+        detected_vector_data=$(detect_vector_data_capacity_bytes) \
+            || fail "cannot query the Docker daemon for the filesystem capacity backing Vector; set NANO_VECTOR_DATA_CAPACITY_BYTES or pass --vector-data-capacity-bytes"
+        vector_data_capacity_bytes=${detected_vector_data%% *}
+        if [[ -z "$vector_data_free_bytes" && "$detected_vector_data" == *" "* ]]; then
+            vector_data_free_bytes=${detected_vector_data#* }
+        fi
+    fi
 else
     # Inactive-profile values are emitted for stable compose interpolation but
     # no Vector process runs on this host. Keep them deterministic without
@@ -337,6 +359,28 @@ else
 fi
 [[ "$vector_data_capacity_bytes" =~ ^[1-9][0-9]*$ ]] \
     || fail "Vector data filesystem capacity must be a positive integer byte count"
+[[ -n "$vector_data_free_bytes" ]] || vector_data_free_bytes="${NANO_VECTOR_DATA_FREE_BYTES:-}"
+[[ -z "$vector_data_free_bytes" || "$vector_data_free_bytes" =~ ^[0-9]+$ ]] \
+    || fail "Vector data filesystem free space must be a non-negative integer byte count"
+
+# NAN-5446: the disk-pressure pause threshold (DISK_PRESSURE_PAUSE_THRESHOLD,
+# a fraction, default 0.92) in per-mille. The invoking environment wins over
+# the operator .env, matching Compose interpolation.
+disk_pressure_pause_value="${DISK_PRESSURE_PAUSE_THRESHOLD:-}"
+if [[ -z "$disk_pressure_pause_value" && -n "$override_env" && -f "$override_env" ]]; then
+    disk_pressure_pause_value=$(awk -F= '
+        { sub(/\r$/, "") }
+        $1 == "DISK_PRESSURE_PAUSE_THRESHOLD" { value = substr($0, 31) }
+        END { gsub(/^["\047]|["\047]$/, "", value); print value }
+    ' "$override_env")
+fi
+[[ -n "$disk_pressure_pause_value" ]] || disk_pressure_pause_value=0.92
+[[ "$disk_pressure_pause_value" =~ ^0?\.[0-9]+$ ]] \
+    || fail "DISK_PRESSURE_PAUSE_THRESHOLD must be a fraction such as 0.92 (got '$disk_pressure_pause_value')"
+disk_pressure_pause_digits="${disk_pressure_pause_value#*.}000"
+disk_pressure_pause_permille=$(( 10#${disk_pressure_pause_digits:0:3} ))
+(( disk_pressure_pause_permille > 0 && disk_pressure_pause_permille < 1000 )) \
+    || fail "DISK_PRESSURE_PAUSE_THRESHOLD must be between 0 and 1"
 
 min() { (( $1 < $2 )) && printf '%s\n' "$1" || printf '%s\n' "$2"; }
 max() { (( $1 > $2 )) && printf '%s\n' "$1" || printf '%s\n' "$2"; }
@@ -701,6 +745,40 @@ vector_allocatable_bytes=$(( vector_data_capacity_bytes - vector_reserved_bytes 
 vector_buffer_budget_bytes=$vector_desired_buffer_bytes
 (( vector_buffer_budget_bytes > vector_allocatable_bytes )) \
     && vector_buffer_budget_bytes=$vector_allocatable_bytes
+
+# NAN-5446: a full shared disk must never be reached by Vector's own buffers.
+# Vector only fills its buffers while ClickHouse refuses writes, and on a host
+# where ClickHouse shares the filesystem ingestion pauses at
+# DISK_PRESSURE_PAUSE_THRESHOLD. What Vector already accepted must still fit in
+# what is left above that point, less 1 GiB for PostgreSQL WAL and logs.
+# Otherwise Vector hits ENOSPC before its max_size, stops every source and
+# restart-loops. The capacity reserves above are an install-time snapshot that
+# ClickHouse growth eats into; this bound is not.
+vector_pause_headroom_bytes=0
+if has_role clickhouse; then
+    vector_pause_headroom_bytes=$(( vector_data_capacity_bytes * (1000 - disk_pressure_pause_permille) / 1000 - 1073741824 ))
+    (( vector_pause_headroom_bytes < 0 )) && vector_pause_headroom_bytes=0
+    if (( vector_buffer_budget_bytes > vector_pause_headroom_bytes )); then
+        vector_buffer_budget_bytes=$vector_pause_headroom_bytes
+    fi
+fi
+# NAN-5446: and it must fit in the space that is free now (less the safety
+# reserve), not only in the install-time capacity: an upgrade on a disk that
+# has since filled must not size a backlog the disk cannot hold.
+if [[ -n "$vector_data_free_bytes" ]]; then
+    vector_free_budget_bytes=$(( vector_data_free_bytes - vector_safety_reserve_bytes ))
+    (( vector_free_budget_bytes < 0 )) && vector_free_budget_bytes=0
+    (( vector_buffer_budget_bytes > vector_free_budget_bytes )) \
+        && vector_buffer_budget_bytes=$vector_free_budget_bytes
+fi
+if (( vector_buffer_budget_bytes < vector_minimum_total_bytes )); then
+    vector_free_note=""
+    [[ -n "$vector_data_free_bytes" ]] && vector_free_note=" (${vector_data_free_bytes} bytes free now)"
+    printf 'resource sizing warning: the Vector disk buffers need at least %s bytes, but only %s bytes fit below the %s disk-pressure pause threshold and in the free space%s. Using the minimum; grow the disk or free space so Vector cannot fill it while ClickHouse refuses writes.\n' \
+        "$vector_minimum_total_bytes" "$vector_buffer_budget_bytes" \
+        "$disk_pressure_pause_value" "$vector_free_note" >&2
+    vector_buffer_budget_bytes=$vector_minimum_total_bytes
+fi
 vector_buffer_component_bytes=$(( vector_buffer_budget_bytes / vector_buffer_count ))
 (( vector_buffer_component_bytes >= VECTOR_DISK_BUFFER_MIN_BYTES )) || fail \
     "Vector per-buffer allocation ${vector_buffer_component_bytes} is below its ${VECTOR_DISK_BUFFER_MIN_BYTES}-byte minimum"

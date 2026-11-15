@@ -187,7 +187,8 @@ impl ParserService {
                 warnings: vec![],
             };
         }
-        match self.vrl_validator.validate_vrl(vrl_code).await {
+        // NAN-5401: compiled in the bounded worker, waiting for a slot.
+        match self.vrl_validator.validate_vrl_bounded(vrl_code).await {
             Ok(result) => result,
             Err(e) => VrlValidationResult {
                 valid: false,

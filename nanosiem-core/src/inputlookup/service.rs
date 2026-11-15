@@ -117,6 +117,15 @@ impl InputLookupService {
         }
     }
 
+    /// Use the managed lookup URL allowlist (NAN-5443): the deployment list
+    /// merged with the admin list from Settings. The caller starts the
+    /// process-wide refresh ([`super::allowlist::start_refresh`]); until it
+    /// has read the admin list once, external fetches are refused.
+    pub fn with_managed_allowlist(mut self, deployment: super::allowlist::DeploymentAllowlist) -> Self {
+        self.fetcher = Arc::new(UrlFetcher::new(self.config.clone()).with_managed_allowlist(deployment));
+        self
+    }
+
     /// Attach the internal [`LookupService`] so `lookup://<name>` URLs resolve
     /// to a full read of the named internal lookup table.
     pub fn with_lookup_service(mut self, lookup_service: Arc<LookupService>) -> Self {

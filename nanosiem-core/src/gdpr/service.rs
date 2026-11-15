@@ -265,7 +265,8 @@ impl AnonymizationService {
                 self.get_request(request_id).await
             }
             Err(e) => {
-                let err_msg = e.to_string();
+                // ClickHouse mutation errors can quote the values they touched.
+                let err_msg = crate::db::pg_text::pg_safe_error_text(&e.to_string());
                 error!(request_id = %request_id, error = %err_msg, "GDPR anonymization failed");
 
                 sqlx::query(

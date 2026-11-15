@@ -93,16 +93,16 @@ impl ClickHouseMigrator {
     /// Create a new migrator with the given ClickHouse client
     pub fn new(client: clickhouse::Client, database: impl Into<String>) -> Self {
         let client = client
-            .with_option(
+            .with_setting(
                 "distributed_ddl_task_timeout",
                 MIGRATOR_DISTRIBUTED_DDL_TIMEOUT_SECS,
             )
-            .with_option("max_execution_time", MIGRATOR_MAX_EXECUTION_TIME_SECS)
+            .with_setting("max_execution_time", MIGRATOR_MAX_EXECUTION_TIME_SECS)
             // NAN-4906: CH 26.9+ answers `compress=1` with ZSTD unless told
             // otherwise; clickhouse-rs 0.14 decodes LZ4 only. Production
             // clients already carry this (`db::clickhouse_transport::client`);
             // repeating it covers callers that pass a bare client.
-            .with_option("network_compression_method", "LZ4");
+            .with_setting("network_compression_method", "LZ4");
         Self {
             client,
             database: database.into(),

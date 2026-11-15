@@ -635,11 +635,11 @@ async fn recreate_database(admin_url: &str, database: &str) -> PgPool {
         .await
         .expect("connect to isolated PostgreSQL admin database");
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)")))
         .await
         .expect("drop stale isolated inventory database");
     admin
-        .execute(format!("CREATE DATABASE {database}").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
         .await
         .expect("create isolated inventory database");
     admin.close().await;
@@ -703,7 +703,7 @@ async fn open_runtime_only_references_fresh_open_relations() {
         .await
         .expect("reconnect for isolated database cleanup");
     admin
-        .execute(format!("DROP DATABASE {database} WITH (FORCE)").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE {database} WITH (FORCE)")))
         .await
         .expect("drop isolated inventory database");
 

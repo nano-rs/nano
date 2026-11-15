@@ -331,3 +331,67 @@ async fn the_deploy_gate_waits_for_a_slot_instead_of_answering_busy() {
     assert!(started.elapsed() >= release_after, "it ran only once a slot freed");
     releaser.await.unwrap();
 }
+
+/// NAN-5401: saves, publishes, deploys and attestation compile in the
+/// worker under the deploy-gate budget (which waits for a slot, see
+/// `the_deploy_gate_waits_for_a_slot_instead_of_answering_busy`) whenever
+/// this process can run one; the AI loops route the same way but keep the
+/// interactive budget. In-process only inside a worker or in a process with
+/// no worker executable.
+#[test]
+fn bounded_validation_routes_to_the_waiting_worker_lane() {
+    use crate::parsers::VrlValidator;
+    for validator in [VrlValidator::new(), VrlValidator::for_enrichment()] {
+        for executor in [Executor::Worker(PathBuf::from("/usr/bin/nanosiem-api")), Executor::InProcessTestHarness] {
+            let routed = validator.bounded_route(executor.clone()).expect("routed to the worker");
+            assert_eq!(routed.budget(), Budget::DeployGate, "{executor:?}");
+            let ai = validator.interactive_route(executor.clone()).expect("AI loops routed to the worker");
+            assert_eq!(ai.budget(), Budget::Interactive, "{executor:?}");
+        }
+        assert!(validator.bounded_route(Executor::Unavailable).is_none());
+        assert!(validator.interactive_route(Executor::Unavailable).is_none());
+        let inside = validator.clone().inside_worker();
+        assert!(inside.bounded_route(Executor::Worker(PathBuf::from("/usr/bin/nanosiem-api"))).is_none());
+        assert!(inside.interactive_route(Executor::Worker(PathBuf::from("/usr/bin/nanosiem-api"))).is_none());
+    }
+    assert!(Budget::DeployGate.admission_wait() >= Duration::from_secs(30));
+}
+
+/// NAN-5401: the bounded entry points return exactly what in-process
+/// validation returns, one diagnostic per entry for the AI loops included.
+#[tokio::test]
+async fn bounded_validation_matches_in_process_validation() {
+    let validator = crate::parsers::VrlValidator::new();
+    for source in [
+        ".parsed = upcase!(.message)",
+        ".timestamp = now()\n.message = .message",
+        ".x = no_such_function_nan5401()\n.y = also_missing_nan5401()",
+        ".foo = { bar",
+        ".foo = exec('ls')",
+        "",
+    ] {
+        assert_eq!(
+            validator.validate_vrl_bounded(source).await.unwrap(),
+            validator.validate_vrl(source).await.unwrap(),
+            "{source}"
+        );
+        assert_eq!(
+            validator.validate_vrl_collect_errors_interactive(source).await.unwrap(),
+            validator.validate_vrl_collect_errors(source).await.unwrap(),
+            "{source}"
+        );
+    }
+    let job = ParserTestJob {
+        registry: VrlRegistry::Parser,
+        work: Work::ValidateCollect { code: ".x = no_such_function_nan5401()\n.y = also_missing_nan5401()".into() },
+    };
+    let Outcome::ValidateCollect(result, errors) = execute(&job) else { panic!("wrong outcome") };
+    assert!(!result.valid);
+    assert!(errors.len() >= 2, "one entry per diagnostic: {errors:?}");
+    assert!(job.matches(&Outcome::ValidateCollect(result, errors)));
+    assert!(!job.matches(&Outcome::Validate(crate::parsers::VrlValidationResult {
+        valid: true,
+        error: None,
+        warnings: Vec::new(),
+    })));
+}

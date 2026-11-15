@@ -117,3 +117,22 @@ async fn stored_plans_never_compile_in_the_api_process() {
         assert!(chain.is_err(), "compiled in the API process: {chain:?}");
     }
 }
+
+/// NAN-5401: the save-path validation is NOT fail-closed: a process with no
+/// worker executable (this harness, library callers, examples) is not the
+/// API, which always registers one, so it compiles in-process as before
+/// rather than refusing every save.
+#[tokio::test]
+async fn bounded_validation_compiles_in_process_without_a_worker() {
+    let validator = VrlValidator::new();
+    assert!(validator.validate_vrl_bounded(".x = 1").await.unwrap().valid);
+    let refused = validator.validate_vrl_bounded(".x = no_such_function_nan5401()").await.unwrap();
+    assert!(!refused.valid);
+    assert_eq!(refused, validator.validate_vrl(".x = no_such_function_nan5401()").await.unwrap());
+    let (collected, errors) = validator
+        .validate_vrl_collect_errors_interactive(".x = no_such_function_nan5401()")
+        .await
+        .unwrap();
+    assert!(!collected.valid);
+    assert!(!errors.is_empty());
+}

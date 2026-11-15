@@ -13,6 +13,7 @@ import {
   Activity,
   PauseCircle,
   PlayCircle,
+  Clock,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import {
@@ -27,7 +28,11 @@ import { Input } from '@/components/ui/input';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC } from '@/lib/date-utils';
 import { useToast } from '@/hooks/use-toast';
+import { useAuth } from '@/contexts/AuthContext';
 import { SettingsSubsectionShell, type SubsectionTab } from '@/components/settings/SettingsSubsectionShell';
+import { DiskUsageNotice } from '@/components/DiskSpaceBanner';
+import { StatGrid, type StatCell } from '@/components/settings/StatGrid';
+import { StorageTieringPanel } from '@/enterprise/components/settings/StorageTieringPanel';
 
 type StorageTabId = 'clickhouse' | 'postgres';
 const TAB_IDS: StorageTabId[] = ['clickhouse', 'postgres'];
@@ -41,7 +46,7 @@ const TABS: SubsectionTab<StorageTabId>[] = [
     id: 'clickhouse',
     label: 'ClickHouse · Logs',
     icon: Zap,
-    desc: 'Time-series log storage. Daily partitions; TTL retention managed via deployment config.',
+    desc: 'Time-series log storage. Daily partitions; retention set below or with NANO_RETENTION_DAYS; optional hot/cold tiering to object storage.',
   },
   {
     id: 'postgres',
@@ -104,6 +109,8 @@ export function RetentionSettings() {
         </div>
       ) : (
         <div className="px-6 py-5 space-y-5">
+          {/* NAN-5450: data disks at 80 % or more, with the forecast. */}
+          <DiskUsageNotice />
           {/* ClickHouse */}
           <div style={{ display: activeTab === 'clickhouse' ? 'block' : 'none' }} className="space-y-5">
             {overview?.ingestion && (
@@ -129,11 +136,23 @@ export function RetentionSettings() {
             {overview?.clickhouse ? (
               <>
                 <ClickHouseStats stats={overview.clickhouse} />
+                <RetentionPanel
+                  stats={overview.clickhouse}
+                  diskDays={overview.disk_pressure?.estimated_retention_days ?? null}
+                  onSaved={(days) =>
+                    setOverview((prev) =>
+                      prev?.clickhouse
+                        ? { ...prev, clickhouse: { ...prev.clickhouse, ttl_days: days, retention_source: 'ui' } }
+                        : prev,
+                    )
+                  }
+                />
+                <StorageTieringPanel />
                 <HelperNote
                   icon={Archive}
                   iconColor="text-cyan-400"
-                  title="Data retention"
-                  body="ClickHouse TTL retention and storage tiering are managed via deployment configuration. Data is automatically partitioned by day; expired partitions are dropped on the configured schedule."
+                  title="How retention works"
+                  body="Events are partitioned by day. ClickHouse deletes whole days once they are older than the retention above. The disk still caps it: when ClickHouse passes the high watermark and no cold tier is configured, the oldest days are dropped first, whatever the retention. With a cold tier, older parts move to object storage and the retention applies there too. A deployment can also set retention with NANO_RETENTION_DAYS (.env) or nano.retention.days (Helm); a new value there replaces the one set here on the next deploy."
                 />
               </>
             ) : overview?.clickhouse_enabled ? (
@@ -169,31 +188,6 @@ export function RetentionSettings() {
   );
 }
 
-interface StatCell {
-  label: string;
-  value: string;
-  sub?: string | null;
-}
-
-function StatGrid({ cells }: { cells: StatCell[] }) {
-  return (
-    <div className="grid grid-cols-2 lg:grid-cols-4 border-l border-t border-border">
-      {cells.map((c) => (
-        <div key={c.label} className="px-4 py-3 border-r border-b border-border min-w-0">
-          <p className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">
-            {c.label}
-          </p>
-          <p className="font-mono text-[16px] font-semibold tabular-nums text-foreground leading-none mt-1.5 truncate">
-            {c.value}
-          </p>
-          {c.sub && (
-            <p className="font-mono text-[10.5px] text-muted-foreground mt-1 truncate">{c.sub}</p>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
 
 function HelperNote({
   icon: Icon,
@@ -214,6 +208,136 @@ function HelperNote({
         <p className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed">{body}</p>
       </div>
     </div>
+  );
+}
+
+const MIN_RETENTION_DAYS = 1;
+const MAX_RETENTION_DAYS = 3650;
+/** Below this, the installer refuses a disk (NAN-5449); the UI warns. */
+const SHORT_RETENTION_DAYS = 7;
+
+/** NAN-5449: the event retention (ClickHouse TTL) and the control that sets it. */
+export function RetentionPanel({
+  stats,
+  diskDays,
+  onSaved,
+}: {
+  stats: ClickHouseStorageStats;
+  diskDays: number | null;
+  onSaved: (days: number) => void;
+}) {
+  const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canEdit = hasPermission('settings:retention');
+  const current = stats.ttl_days;
+  const [value, setValue] = useState(current != null ? String(current) : '');
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setValue(current != null ? String(current) : '');
+  }, [current]);
+
+  const parsed = /^\d+$/.test(value.trim()) ? Number(value.trim()) : NaN;
+  const valid = Number.isInteger(parsed) && parsed >= MIN_RETENTION_DAYS && parsed <= MAX_RETENTION_DAYS;
+  const changed = valid && parsed !== current;
+  // Unknown current TTL: the new value may be a reduction, so confirm too.
+  const reducing = changed && (current == null || parsed < current);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.updateClickHouseRetention(parsed);
+      onSaved(parsed);
+      toast({ title: 'Retention updated', description: `Events are kept for ${parsed} days.` });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Request failed';
+      toast({ title: 'Error', description: message, variant: 'destructive' });
+    } finally {
+      setBusy(false);
+      setConfirmOpen(false);
+    }
+  };
+
+  const sourceLabel =
+    stats.retention_source === 'deployment'
+      ? `set by deployment (NANO_RETENTION_DAYS=${stats.deployment_retention_days ?? current})`
+      : stats.retention_source === 'ui'
+        ? 'set in Settings'
+        : 'shipped default';
+
+  return (
+    <section className="space-y-2 pb-4 border-b border-border/60" aria-label="Event retention">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <Clock className="w-4 h-4 text-cyan-400 shrink-0" />
+          <div className="min-w-0">
+            <p className="text-[12.5px] font-medium text-foreground">
+              Event retention{' '}
+              <span className="font-mono" data-testid="retention-current">
+                {current != null ? `${current} days` : 'unknown'}
+              </span>
+            </p>
+            <p className="font-mono text-[10.5px] text-muted-foreground mt-0.5 truncate">
+              {sourceLabel}
+              {diskDays != null && current != null && diskDays < current
+                ? ` · disk holds ~${Math.floor(diskDays)} days at the current rate`
+                : ''}
+            </p>
+          </div>
+        </div>
+        {canEdit && (
+          <form
+            className="flex items-center gap-1.5 shrink-0"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!changed || busy) return;
+              if (reducing) setConfirmOpen(true);
+              else void save();
+            }}
+          >
+            <Input
+              aria-label="Retention in days"
+              inputMode="numeric"
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              className="h-7 w-20 font-mono text-[12px] tabular-nums"
+            />
+            <span className="text-[11.5px] text-muted-foreground">days</span>
+            <Button type="submit" size="sm" variant="outline" className="h-7 text-[11.5px]" disabled={!changed || busy}>
+              Save
+            </Button>
+          </form>
+        )}
+      </div>
+      {value.trim() !== '' && !valid && (
+        <p className="text-[11.5px] text-red-400">
+          Enter a whole number of days, {MIN_RETENTION_DAYS}-{MAX_RETENTION_DAYS}.
+        </p>
+      )}
+      {valid && parsed < SHORT_RETENTION_DAYS && (
+        <p className="text-[11.5px] text-yellow-400">
+          Under {SHORT_RETENTION_DAYS} days leaves little history for investigations and detection tuning.
+        </p>
+      )}
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={(open) => !open && setConfirmOpen(false)}
+        title={`Reduce retention to ${valid ? parsed : ''} days?`}
+        description={
+          <>
+            {current == null && 'The current retention could not be read, so this may shorten it. '}
+            Events older than{' '}
+            <span className="text-foreground font-medium font-mono">{valid ? parsed : ''} days</span> are deleted in
+            the background, including the audit trail stored in the event table. This cannot be undone.
+          </>
+        }
+        confirmLabel="Reduce retention"
+        variant="danger"
+        loading={busy}
+        onConfirm={() => void save()}
+      />
+    </section>
   );
 }
 

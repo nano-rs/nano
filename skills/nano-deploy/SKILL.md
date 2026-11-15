@@ -222,7 +222,8 @@ failed, with the evidence.
 ### 5. Operate
 
 For day-2 work, read [references/operate.md](references/operate.md):
-backup and restore drills, adding a node, certificate rotation, and support
+backup and restore drills, adding a node, certificate rotation, storage
+tiering to object storage (`scripts/nano tiering`), and support
 bundles (`scripts/nano support-bundle`, redacted; see
 [When something goes wrong](#when-something-goes-wrong)). Upgrades: see below.
 

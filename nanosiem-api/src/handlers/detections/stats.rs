@@ -275,7 +275,7 @@ pub async fn get_detection_matches(
             serde_json::Value,
             Option<chrono::DateTime<chrono::Utc>>,
         ),
-    >(&sql)
+    >(sqlx::AssertSqlSafe(sql.as_str()))
     .bind(*id);
 
     if let Some(start) = query.start_time {
@@ -316,7 +316,7 @@ pub async fn get_detection_matches(
         count_sql.push_str(&MatchScope::sql_predicate("source_types", count_param));
     }
 
-    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql).bind(*id);
+    let mut count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql.as_str())).bind(*id);
 
     if let Some(start) = query.start_time {
         count_query = count_query.bind(start);

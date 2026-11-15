@@ -38,6 +38,11 @@
 #       LICENSE_TOKEN=… NANO_DEPLOYMENT_ID=… ./install.sh
 #   NANO_ALLOW_PRIVATE_AI_ENDPOINTS (true | false, default false) — allow AI
 #   providers on private addresses (a local LLM); asked once, kept in .env.
+#   NANO_EGRESS_PROXY_REQUIRED (true | false) — refuse every direct public
+#   connection (NAN-5441); NANO_DESTINATION_PROXY_URL (http://host:port) and
+#   NANO_DESTINATION_PROXY_MODE (pinned_ip | hostname) — proxy for user-set
+#   destinations (webhooks, AI provider URLs, lookup url=, scheduled fetches,
+#   synthetic checks). Recorded in .env when given; never asked.
 #   NANO_SCHEMA_PROFILE (ocsf | udm | ocsf+tenzir, default ocsf) — chosen at
 #   first install and immutable afterward; see the prompt below. New installs
 #   are OCSF-first (NAN-4903); an existing install keeps the profile recorded in
@@ -52,6 +57,26 @@
 #   Vector settings. Asked once on a fresh interactive install, kept in .env.
 #   NANO_AVG_EVENT_BYTES (default 1000; ~300 firewall/flow, ~2000 EDR) turns
 #   the planned volume into events/s for the Vector CPU estimate (NAN-5372).
+#   NANO_RETENTION_DAYS (1-3650; unset keeps 365) — event retention, the
+#   ClickHouse TTL (NAN-5449). Asked once on a fresh interactive install, kept
+#   in .env, applied by the migrator. With a planned volume the installer
+#   checks the disk against it (plan.py's model, scripts/lib/retention-sizing.sh):
+#   it warns when the disk holds fewer days, and a fresh install refuses a
+#   disk that holds under 7 days unless NANO_ALLOW_UNDERSIZED_DISK=true.
+#   Enterprise: NANO_TIERING (on | off, default off; or --tiering) and NANO_TIERING_PROVIDER (s3 |
+#   s3-compatible | gcs | azure), NANO_TIERING_BUCKET, NANO_TIERING_REGION,
+#   NANO_TIERING_ENDPOINT, NANO_TIERING_PREFIX (default nano),
+#   NANO_TIERING_MOVE_FACTOR (default 0.3; 0 pauses), NANO_TIERING_CACHE_SIZE
+#   (default 10Gi), NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS, and the secrets
+#   NANO_TIERING_ACCESS_KEY_ID / NANO_TIERING_SECRET_ACCESS_KEY (or
+#   NANO_TIERING_AZURE_ACCOUNT_URL / _CONTAINER / _ACCOUNT_NAME /
+#   _ACCOUNT_KEY): NAN-5445 ClickHouse hot/cold storage tiering on a single
+#   host. Asked once on a TTY, kept in .env; a later run that passes any of
+#   them updates .env. Role-split clusters use the inventory `tiering:` block.
+#   Once on, a changed provider, bucket, prefix, region, endpoint, Azure
+#   account or container (or a role-split host rename) is refused unless
+#   NANO_TIERING_ALLOW_RELOCATE=1: cold parts point at the old location.
+#   See docs/administration/storage-tiering.md and `scripts/nano tiering`.
 #
 # Override defaults: NANO_INSTALL_DIR, NANO_REPO_URL, NANO_BRANCH, NANO_VERSION.
 # NANO_VERSION defaults to the release recorded in the edition's images lock
@@ -144,16 +169,51 @@ while [[ $# -gt 0 ]]; do
             TOPOLOGY_MIGRATION_SHA="$2"; shift 2 ;;
         --record-pg-ha-identity)
             RECORD_PG_HA_IDENTITY_ONLY=1; shift ;;
+        # NAN-5445 (enterprise): storage tiering, single host. Each flag sets
+        # the matching NANO_TIERING* key (kept in .env). Secrets are never
+        # flags: pass NANO_TIERING_ACCESS_KEY_ID / _SECRET_ACCESS_KEY (or
+        # _AZURE_ACCOUNT_KEY) in the environment, or answer the hidden prompt.
+        --tiering)
+            [[ $# -ge 2 ]] || { printf '%s
+' "--tiering requires off, s3, s3-compatible, gcs or azure" >&2; exit 2; }
+            case "$2" in
+                off) export NANO_TIERING=off ;;
+                s3|s3-compatible|gcs|azure) export NANO_TIERING=on NANO_TIERING_PROVIDER="$2" ;;
+                *) printf '%s
+' "--tiering requires off, s3, s3-compatible, gcs or azure (got $2)" >&2; exit 2 ;;
+            esac
+            shift 2 ;;
+        --tiering-bucket|--tiering-region|--tiering-endpoint|--tiering-prefix|--tiering-move-factor|--tiering-cache-size|--tiering-azure-account-url|--tiering-azure-container|--tiering-azure-account-name)
+            [[ $# -ge 2 ]] || { printf '%s
+' "$1 requires a value" >&2; exit 2; }
+            tiering_key="NANO_TIERING_$(printf '%s' "${1#--tiering-}" | tr 'a-z-' 'A-Z_')"
+            export "$tiering_key=$2"
+            shift 2 ;;
+        --tiering-use-environment-credentials)
+            export NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS=true; shift ;;
         -h|--help)
             cat <<'EOF'
 Usage: install.sh [--role app,ingest,clickhouse,keeper,postgres,monitoring --inventory inventory.yaml]
                   [--accept-topology-migration CURRENT_IDENTITY_SHA256]
+                  [--tiering off|s3|s3-compatible|gcs|azure [--tiering-bucket B] [--tiering-region R]
+                   [--tiering-endpoint URL] [--tiering-prefix P] [--tiering-move-factor F]
+                   [--tiering-cache-size 10Gi] [--tiering-use-environment-credentials]
+                   [--tiering-azure-account-url URL --tiering-azure-container C
+                    --tiering-azure-account-name A]]
        install.sh --record-pg-ha-identity
 
 Without role/inventory arguments, installs the unchanged single-node stack.
 Enterprise bundles may select one or more roles from a shared host inventory.
 The migration acknowledgement is valid only for a role-split install after its
 data-movement runbook has completed; the exact recorded identity is required.
+
+--tiering (enterprise, single host) turns on ClickHouse cold storage tiering to
+object storage; without it an interactive install asks once ("Enable cold
+storage tiering? [y/N]", default no). Secrets come from the environment
+(NANO_TIERING_ACCESS_KEY_ID, NANO_TIERING_SECRET_ACCESS_KEY, or
+NANO_TIERING_AZURE_ACCOUNT_KEY) or a hidden prompt, never from flags.
+Role-split clusters use the inventory `tiering:` block. See
+docs/administration/storage-tiering.md.
 
 --record-pg-ha-identity (first postgres host of a PostgreSQL HA cluster, after
 the other postgres hosts are installed) only records the cluster's identity
@@ -463,6 +523,48 @@ configure_outbound_proxy() {
         || fail "Could not record NANO_OUTBOUND_PROXY_ASKED in .env."
 }
 
+# Egress proxy policy (NAN-5441), unattended only: recorded in .env when the
+# installer is given the values, and left alone otherwise (a re-run without
+# them keeps what .env has). See docs/getting-started/docker-deployment.md.
+# Refuse invalid unattended egress input before anything is written.
+validate_egress_policy_input() {
+    if [[ -n "${NANO_EGRESS_PROXY_REQUIRED:-}" ]]; then
+        case "$NANO_EGRESS_PROXY_REQUIRED" in
+            true|false) ;;
+            *) fail "NANO_EGRESS_PROXY_REQUIRED must be true or false (got '$NANO_EGRESS_PROXY_REQUIRED')." ;;
+        esac
+    fi
+    if [[ -n "${NANO_DESTINATION_PROXY_URL:-}" ]]; then
+        [[ "$NANO_DESTINATION_PROXY_URL" =~ ^http://([^/@[:space:]]+@)?([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}/?$ ]] \
+            || fail "NANO_DESTINATION_PROXY_URL must look like http://[user:password@]host:port (got '$(redact_proxy_url "$NANO_DESTINATION_PROXY_URL")')."
+    fi
+    if [[ -n "${NANO_DESTINATION_PROXY_MODE:-}" ]]; then
+        case "$NANO_DESTINATION_PROXY_MODE" in
+            pinned_ip|hostname) ;;
+            *) fail "NANO_DESTINATION_PROXY_MODE must be pinned_ip or hostname (got '$NANO_DESTINATION_PROXY_MODE')." ;;
+        esac
+    fi
+}
+
+configure_egress_policy() {
+    validate_egress_policy_input
+    if [[ -n "${NANO_EGRESS_PROXY_REQUIRED:-}" ]]; then
+        nano_env_set_keys .env "NANO_EGRESS_PROXY_REQUIRED=$NANO_EGRESS_PROXY_REQUIRED" \
+            || fail "Could not record NANO_EGRESS_PROXY_REQUIRED in .env."
+    fi
+    if [[ -n "${NANO_DESTINATION_PROXY_URL:-}" ]]; then
+        nano_env_set_keys .env "DESTINATION_EGRESS_PROXY_URL=$NANO_DESTINATION_PROXY_URL" \
+            || fail "Could not record DESTINATION_EGRESS_PROXY_URL in .env."
+    fi
+    if [[ -n "${NANO_DESTINATION_PROXY_MODE:-}" ]]; then
+        nano_env_set_keys .env "DESTINATION_EGRESS_PROXY_MODE=$NANO_DESTINATION_PROXY_MODE" \
+            || fail "Could not record DESTINATION_EGRESS_PROXY_MODE in .env."
+    fi
+    if [[ "$(env_value NANO_EGRESS_PROXY_REQUIRED)" == "true" ]]; then
+        log "Egress proxy required: services refuse direct public connections; every path needs its proxy (HTTPS_PROXY, CONNECTOR_/SOAR_/ENRICHMENT_/DESTINATION_EGRESS_PROXY_URL)."
+    fi
+}
+
 # Private-address AI providers (a BYO local LLM on 10.x / 192.168.x). The AI
 # base-URL validator refuses private addresses unless
 # NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS is on (cloud-metadata stays blocked
@@ -663,6 +765,128 @@ report_planned_ingest_capacity() {
     return 0
 }
 
+# NAN-5449: event retention (the ClickHouse TTL), NANO_RETENTION_DAYS. Asked
+# once on a fresh interactive single-host install; otherwise taken from the
+# environment. Recorded in .env, where the migrator reads it. Unset keeps the
+# shipped 365 days (or what Settings -> Storage set).
+valid_retention_days() {
+    [[ "${1:-}" =~ ^[0-9]{1,4}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 3650 ))
+}
+
+validate_retention_input() {
+    local input="${NANO_RETENTION_DAYS:-}"
+    if [[ -n "$input" ]] && ! valid_retention_days "$input"; then
+        fail "NANO_RETENTION_DAYS must be a whole number of days, 1-3650 (got '$input')."
+    fi
+    case "$(normalize_bool "${NANO_ALLOW_UNDERSIZED_DISK:-false}")" in
+        true|false) ;;
+        *) fail "NANO_ALLOW_UNDERSIZED_DISK must be true or false (got '${NANO_ALLOW_UNDERSIZED_DISK}')." ;;
+    esac
+    return 0
+}
+
+configure_retention_days() {
+    local input="${NANO_RETENTION_DAYS:-}" recorded answer
+    validate_retention_input
+    recorded=$(env_value NANO_RETENTION_DAYS)
+    if [[ -n "$recorded" ]] && ! valid_retention_days "$recorded"; then
+        fail "NANO_RETENTION_DAYS in .env must be a whole number of days, 1-3650 (got '$recorded'). Fix .env and re-run."
+    fi
+    if [[ -z "$input" && -z "$recorded" && "${REUSE_ENV:-0}" != "1" && "${MULTI_NODE:-0}" != "1" ]] \
+        && have_controlling_tty; then
+        while :; do
+            answer=$(prompt_tty "Event retention in days (the disk still caps it; change later in Settings -> Storage)" "365")
+            answer=$(printf '%s' "$answer" | tr -d '[:space:]')
+            valid_retention_days "$answer" && { input=$answer; break; }
+            warn "Enter a whole number of days, 1-3650."
+        done
+    fi
+    [[ -n "$input" ]] && input=$(( 10#$input ))
+    # Role-split: one shared .env, edited on the app host (see above).
+    if [[ "${MULTI_NODE:-0}" == "1" && ",${ROLE_ARG:-}," != *,app,* \
+        && -n "$input" && "$input" != "$recorded" ]]; then
+        fail "NANO_RETENTION_DAYS differs from this host's .env. Set it in the app host's .env, copy that .env to every host, then re-run install.sh here."
+    fi
+    if [[ -n "$input" && "$input" != "$recorded" ]]; then
+        nano_env_set_keys .env "NANO_RETENTION_DAYS=$input" \
+            || fail "Could not record NANO_RETENTION_DAYS in .env."
+        recorded=$input
+        log "Recorded NANO_RETENTION_DAYS=$input in .env"
+    fi
+    RETENTION_DAYS="${recorded:-365}"
+}
+
+# NAN-5449: compare the planned volume x retention with this host's disk,
+# using the capacity the resource sizer already probed (the Docker volume
+# filesystem that holds ClickHouse, PostgreSQL and the Vector buffers).
+# Overhead beside ClickHouse: the Vector buffer budget, the sizer's Docker
+# reserve (10 %, at least 4 GiB) and 10 GiB for PostgreSQL and images.
+# Warns when the disk holds fewer days than the retention; refuses a fresh
+# install that holds under 7 days unless NANO_ALLOW_UNDERSIZED_DISK=true. An
+# existing install (retention_existing_install) is only warned, never blocked
+# on upgrade (a refused install started nothing, so a re-run is refused again).
+# NAN-5449: whether this host already runs (or ran) nano, so the 7-day disk
+# refusal must only warn: a ClickHouse container of this compose project, a
+# re-run that reuses the recorded .env (REUSE_ENV=1), or a ClickHouse data
+# volume left by an earlier install (`docker compose down` removes the
+# containers but keeps the volume and its data).
+retention_existing_install() {
+    [[ "${REUSE_ENV:-0}" == "1" ]] && return 0
+    [[ -n "$(docker compose "${sizing_compose_args[@]}" ps -a -q clickhouse </dev/null 2>/dev/null)" ]] && return 0
+    [[ -n "$(docker volume ls -q --filter label=com.docker.compose.volume=nano-clickhouse-data </dev/null 2>/dev/null)" ]] && return 0
+    return 1
+}
+
+report_retention_fit() {
+    local env_file="$1" planned capacity buffers docker_reserve overhead sizing
+    local supported needed verdict min_days need_gib cap_gib
+    [[ -f "$env_file" && -f scripts/lib/retention-sizing.sh ]] || return 0
+    planned="${PLANNED_GB_PER_DAY:-0}"
+    [[ "$planned" =~ ^[0-9]+$ ]] && (( planned > 0 )) || return 0
+    # Cold tier on (NAN-5445): object storage holds the older days, so the
+    # local disk does not cap retention (Helm skips the check the same way).
+    case "$(printf '%s' "${NANO_TIERING:-$(env_value NANO_TIERING 2>/dev/null)}" | tr 'A-Z' 'a-z')" in
+        on|true|yes|1) return 0 ;;
+    esac
+    # Bind/external Vector storage: the probed capacity is not ClickHouse's disk.
+    [[ "${NANO_VECTOR_DATA_STORAGE_MODE:-named}" == named ]] || return 0
+    capacity=$(sizing_file_value "$env_file" VECTOR_DATA_CAPACITY_BYTES)
+    buffers=$(sizing_file_value "$env_file" VECTOR_DISK_BUFFER_TOTAL_BUDGET_BYTES)
+    [[ "$capacity" =~ ^[1-9][0-9]*$ ]] || return 0
+    [[ "$buffers" =~ ^[0-9]+$ ]] || buffers=0
+    docker_reserve=$(( capacity / 10 ))
+    (( docker_reserve >= 4294967296 )) || docker_reserve=4294967296
+    overhead=$(( buffers + docker_reserve + 10737418240 ))
+    sizing=$(bash scripts/lib/retention-sizing.sh \
+        --gb-per-day "$planned" \
+        --retention-days "${RETENTION_DAYS:-365}" \
+        --disk-bytes "$capacity" \
+        --overhead-bytes "$overhead") || { warn "Could not check the disk against the planned volume and retention."; return 0; }
+    supported=$(printf '%s\n' "$sizing" | awk -F= '$1 == "NANO_RETENTION_SUPPORTED_DAYS" { print $2 }')
+    needed=$(printf '%s\n' "$sizing" | awk -F= '$1 == "NANO_RETENTION_NEEDED_BYTES" { print $2 }')
+    verdict=$(printf '%s\n' "$sizing" | awk -F= '$1 == "NANO_RETENTION_VERDICT" { print $2 }')
+    min_days=$(printf '%s\n' "$sizing" | awk -F= '$1 == "NANO_RETENTION_MIN_DAYS" { print $2 }')
+    need_gib=$(( (needed + 1073741823) / 1073741824 ))
+    cap_gib=$(( capacity / 1073741824 ))
+    case "$verdict" in
+        ok)
+            log "Disk: ${cap_gib} GiB holds about ${supported} days at ${planned} GB/day (retention ${RETENTION_DAYS:-365} days)"
+            ;;
+        warn)
+            warn "This host's disk (${cap_gib} GiB) holds about ${supported} days of events at ${planned} GB/day, less than the ${RETENTION_DAYS:-365}-day retention (that needs about ${need_gib} GiB at 5:1 compression). The estimate is conservative (measured compression is often 10x or more). When ClickHouse passes 80 % of the disk, nano drops the oldest days first. Grow the disk if it turns out short."
+            ;;
+        refuse)
+            if [[ "$(normalize_bool "${NANO_ALLOW_UNDERSIZED_DISK:-false}")" == "true" ]] \
+                || retention_existing_install; then
+                warn "This host's disk (${cap_gib} GiB) holds only about ${supported} days of events at ${planned} GB/day (under the ${min_days}-day minimum; the ${RETENTION_DAYS:-365}-day retention needs about ${need_gib} GiB). nano drops the oldest days whenever ClickHouse passes 80 % of the disk. Grow the disk."
+            else
+                fail "This host's disk (${cap_gib} GiB) holds only about ${supported} days of events at ${planned} GB/day, under the ${min_days}-day minimum (the ${RETENTION_DAYS:-365}-day retention needs about ${need_gib} GiB at 5:1 compression). Nothing was started. Grow the disk, lower NANO_PLANNED_GB_PER_DAY if it overstates the volume, or set NANO_ALLOW_UNDERSIZED_DISK=true to install anyway."
+            fi
+            ;;
+    esac
+    return 0
+}
+
 # Automatic backups (NAN-5204). Asked once on a TTY, only while .env records
 # no answer; a re-run or upgrade never asks again, and
 # `scripts/nano backup-schedule --configure` changes it later. Unattended
@@ -686,6 +910,30 @@ configure_automatic_backups() {
     fi
     python3 -I scripts/nano-backup-scheduler.py --install-dir "$PWD" configure --from-installer \
         || fail "Automatic backup setup failed (see above). Fix the destination, or set NANO_BACKUP_ENABLED=false, and re-run."
+}
+
+# NAN-5445: ClickHouse hot/cold storage tiering (single host). Asked once on
+# a TTY while .env has no NANO_TIERING; unattended installs pass the
+# NANO_TIERING* keys (a later run that passes any of them updates .env). The
+# answers and the object-store secrets are kept in the 0600 .env; the rendered
+# ClickHouse config holds only from_env references to them. Role-split
+# clusters take the settings from the inventory `tiering:` block instead.
+configure_storage_tiering() {
+    [[ "$MULTI_NODE" == "1" ]] && return 0
+    # Enterprise feature: the open bundle has no tiering tooling, and an open
+    # install that asks for tiering fails loudly instead of ignoring it.
+    if [[ "$NANO_EDITION" != enterprise || ! -f scripts/nano-tiering.py || ! -f scripts/lib/clickhouse_tiering.py ]]; then
+        case "$(printf '%s' "${NANO_TIERING:-$(env_value NANO_TIERING)}" | tr 'A-Z' 'a-z')" in
+            on|true|yes|1) fail "Storage tiering (NANO_TIERING / --tiering) is an enterprise feature and this install is the $NANO_EDITION edition. Remove it, or use the enterprise bundle." ;;
+        esac
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        [[ -z "${NANO_TIERING:-}" ]] || fail "Storage tiering needs python3 on this host."
+        return 0
+    fi
+    python3 -I scripts/nano-tiering.py --install-dir "$PWD" configure --from-installer \
+        || fail "Storage tiering settings are invalid (see above). Fix the NANO_TIERING* values, or set NANO_TIERING=off, and re-run."
 }
 
 # ----------------------------------------------------------------------------
@@ -1932,6 +2180,7 @@ check_required_stops() {
 }
 check_required_stops
 
+validate_egress_policy_input
 if [[ -n "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" && -z "$(normalize_bool "$NANO_ALLOW_PRIVATE_AI_ENDPOINTS")" ]]; then
     fail "NANO_ALLOW_PRIVATE_AI_ENDPOINTS must be true or false (got '$NANO_ALLOW_PRIVATE_AI_ENDPOINTS')."
 fi
@@ -1956,6 +2205,7 @@ fi
 validate_license_inputs
 validate_ingest_ack_durability_input
 validate_planned_volume_input
+validate_retention_input
 
 if [[ "${NANO_CHECK_ONLY:-0}" == "1" ]]; then
     printf 'edition=%s\nversion=%s\nimage_prefix=%s\nlock=%s\n' "$NANO_EDITION" "$NANO_VERSION" "$NANO_IMAGE_PREFIX" "$IMAGES_LOCK"
@@ -2252,10 +2502,13 @@ EOF
     ok "Wrote .env (mode 600)"
 fi
 configure_outbound_proxy
+configure_egress_policy
 configure_private_ai_endpoints
 configure_ingest_ack_durability
 configure_automatic_backups
 configure_planned_volume
+configure_retention_days
+configure_storage_tiering
 
 # ----------------------------------------------------------------------------
 # NAN-5361: Agent Lane listener (enterprise). A dedicated HTTPS ClickHouse
@@ -2541,6 +2794,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     sized_ch=$(env_value CLICKHOUSE_MEM_LIMIT)
     log "Rendered shared-host sizing for ${sized_cpu} CPU / ${sized_memory} MiB RAM (ClickHouse limit $sized_ch)"
     report_planned_ingest_capacity .nano-generated/sizing/host.env
+    report_retention_fit .nano-generated/sizing/host.env
 fi
 
 # NAN-3322 / NAN-4909: the unauthenticated ingest ports (Vector native :6000,
@@ -2854,6 +3108,21 @@ if [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+# NAN-5411: tenzir/pipeline.tql is meant to be edited (see the summary at the
+# end), and extracting a release package over the install directory replaces
+# it. The running Tenzir node still reads the operator's version until it is
+# recreated below (a new image, or the stale-mount recreate), so check now:
+# an edited pipeline the package replaced is saved to tenzir/pipeline.tql.bak
+# and the install stops once, before anything is pulled or restarted.
+if [[ -f scripts/lib/compose_stale_mounts.py ]]; then
+    tenzir_container=$(docker compose "${COMPOSE_ARGS[@]}" ps -q tenzir </dev/null 2>/dev/null || true)
+    if [[ -n "$tenzir_container" ]]; then
+        python3 -I scripts/lib/compose_stale_mounts.py --root "$NANO_INSTALL_DIR" \
+            --guard-tenzir-pipeline "$tenzir_container" </dev/null \
+            || fail "Stopped before replacing your edited Tenzir pipeline (see above). Nothing has been pulled or restarted."
+    fi
+fi
+
 ACTIVE_IMAGES=$(docker compose "${COMPOSE_ARGS[@]}" config --images </dev/null)
 
 # NAN-5197: every active image is pinned (third-party by @sha256 in the Compose
@@ -3012,23 +3281,6 @@ fi
 # nanosiem_ingest only, through NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS.
 # Role-split hosts get theirs from render-inventory.py instead.
 if [[ "$MULTI_NODE" != "1" ]]; then
-    ch_network_args=()
-    ch_pools_json=$(docker info --format '{{json .DefaultAddressPools}}' </dev/null 2>/dev/null || true)
-    ch_net_ids=$(docker inspect nano-clickhouse \
-        --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' </dev/null 2>/dev/null || true)
-    # Subnets the effective Compose config pins with IPAM (an overlay in
-    # NANO_COMPOSE_OVERLAYS, e.g. 198.18.0.0/24): read from the config, so a
-    # fresh install and a down/up after a subnet change are covered, not only
-    # a running container's current network.
-    ch_compose_json=$(mktemp .nano-compose-config.XXXXXX)
-    docker compose "${COMPOSE_ARGS[@]}" config --format json </dev/null >"$ch_compose_json" 2>/dev/null || :
-    ch_network_args+=(--compose-config "$ch_compose_json")
-    for ch_net_id in $ch_net_ids; do
-        for ch_subnet in $(docker network inspect "$ch_net_id" \
-            --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' </dev/null 2>/dev/null || true); do
-            [[ "$ch_subnet" =~ ^[0-9A-Fa-f:.]+/[0-9]+$ ]] && ch_network_args+=(--network "$ch_subnet")
-        done
-    done
     ch_ingest_networks=${NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS:-$(env_value NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS)}
 fi
 if [[ "$MULTI_NODE" != "1" ]] \
@@ -3038,18 +3290,17 @@ if [[ "$MULTI_NODE" != "1" ]] \
     [[ -z "$ch_ingest_networks" ]] \
         || fail "NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS is set but scripts/lib/clickhouse_networks.py or clickhouse/users.d/nanosiem-users.xml is missing from $NANO_INSTALL_DIR."
     warn "scripts/lib/clickhouse_networks.py or clickhouse/users.d is missing; ClickHouse users keep the built-in loopback + private-network lists."
-    rm -f "$ch_compose_json"
 elif [[ "$MULTI_NODE" != "1" ]]; then
-    mkdir -p .nano-generated/clickhouse
+    # The Docker inputs (address pools, ClickHouse's live subnets, the
+    # effective Compose config's IPAM subnets) are read by the renderer, the
+    # same way `scripts/nano upgrade` renders this list (NAN-5435).
     python3 -I scripts/lib/clickhouse_networks.py \
         --users-xml clickhouse/users.d/nanosiem-users.xml \
         --output .nano-generated/clickhouse/networks.xml \
-        --docker-pools-json "$ch_pools_json" \
         --compose-subnet "${COMPOSE_SUBNET:-}" \
         --ingest-networks "$ch_ingest_networks" \
-        ${ch_network_args[@]+"${ch_network_args[@]}"} </dev/null >/dev/null \
+        --from-docker -- "${COMPOSE_ARGS[@]}" </dev/null >/dev/null \
         || fail "Could not render the ClickHouse network allow-list (NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS='$ch_ingest_networks')."
-    rm -f "$ch_compose_json"
     if [[ -n "${NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS:-}" ]]; then
         nano_env_set_keys .env "NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS=$NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS" \
             || fail "Could not record NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS in .env."
@@ -3065,6 +3316,44 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
             --networks-xml .nano-generated/clickhouse/networks.xml </dev/null; then
         agentlane_unpublish
         fail "Agent Lane was not published (above). Nothing was started."
+    fi
+fi
+
+# NAN-5445: render ClickHouse storage tiering (config.d/zzz-nano-tiering.xml)
+# from the NANO_TIERING* keys. The file's digest goes into .env as
+# NANO_TIERING_CONFIG_SHA256, which the clickhouse service carries in its
+# environment: a changed tiering config changes the service definition, so the
+# `up` below recreates ClickHouse before clickhouse-migrate runs and switches
+# the event tables to the policy. Once a table uses nano_tiered the renderer
+# refuses to drop the policy (ClickHouse would not start); pause with
+# NANO_TIERING_MOVE_FACTOR=0 instead. Role-split hosts get theirs from
+# render-inventory.py.
+if [[ "$MULTI_NODE" != "1" && "$NANO_EDITION" == enterprise && -f scripts/lib/clickhouse_tiering.py ]]; then
+    mkdir -p .nano-generated/clickhouse
+    tiering_render=$(python3 -I scripts/lib/clickhouse_tiering.py render --env-file .env \
+        --output .nano-generated/clickhouse/tiering.xml </dev/null) \
+        || fail "Could not render the ClickHouse storage tiering config (above). Nothing was started."
+    tiering_state=$(sed -n 's/^state=//p' <<<"$tiering_render")
+    tiering_sha=$(sed -n 's/^sha256=//p' <<<"$tiering_render")
+    [[ "$(env_value NANO_CLICKHOUSE_TIERING_FILE)" == "./.nano-generated/clickhouse/tiering.xml" ]] \
+        || nano_env_set_keys .env "NANO_CLICKHOUSE_TIERING_FILE=./.nano-generated/clickhouse/tiering.xml" \
+        || fail "Could not record NANO_CLICKHOUSE_TIERING_FILE in .env."
+    [[ "$(env_value NANO_TIERING_CONFIG_SHA256)" == "$tiering_sha" ]] \
+        || nano_env_set_keys .env "NANO_TIERING_CONFIG_SHA256=$tiering_sha" \
+        || fail "Could not record NANO_TIERING_CONFIG_SHA256 in .env."
+    if [[ "$tiering_state" == "active" ]]; then
+        python3 -I scripts/lib/clickhouse_tiering.py check --env-file .env </dev/null 2>/dev/null \
+            | sed 's/^/    /' >&2 || true
+        if [[ "${NANO_TIERING_SKIP_PROBE:-}" != "1" ]]; then
+            # Host-side write/read/delete probe; a store only the Compose
+            # network can resolve (http://rustfs:9000) cannot be probed here.
+            if tiering_probe=$(python3 -I scripts/lib/clickhouse_tiering.py probe --env-file .env </dev/null 2>&1); then
+                ok "Object store check from this host: $tiering_probe"
+            else
+                warn "Object store check from this host failed: ${tiering_probe#tiering: }. ClickHouse still starts (cold parts wait for the store); check with: scripts/nano tiering test"
+            fi
+        fi
+        log "ClickHouse storage tiering on (policy nano_tiered); clickhouse-migrate switches the event tables. Status: scripts/nano tiering status"
     fi
 fi
 

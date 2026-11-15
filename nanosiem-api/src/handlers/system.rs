@@ -364,7 +364,7 @@ async fn get_alert_count(
     "#
     );
 
-    let mut query = sqlx::query(&sql).bind(start).bind(end);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(start).bind(end);
     if let Some(denied) = deny {
         query = query.bind(denied);
     }
@@ -399,7 +399,7 @@ async fn get_critical_alert_count(
     "#
     );
 
-    let mut query = sqlx::query(&sql).bind(start).bind(end);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(start).bind(end);
     if let Some(denied) = deny {
         query = query.bind(denied);
     }

@@ -24,11 +24,16 @@ ClickHouse from outside those networks add it to the ingest allow-list, which
 widens ONLY `nanosiem_ingest`. An any-address entry (prefix length 0) is
 refused everywhere.
 
-CLI (install.sh):
+CLI:
     clickhouse_networks.py --users-xml clickhouse/users.d/nanosiem-users.xml \
         --output .nano-generated/clickhouse/networks.xml \
         (--compose-subnet CIDR | --docker-pools-json "$(docker info --format '{{json .DefaultAddressPools}}')") \
         [--network CIDR ...] [--ingest-networks "cidr,cidr"]
+
+    install.sh and `scripts/nano upgrade` (NAN-5435) let it read Docker itself,
+    so both render the same list from the same inputs:
+    clickhouse_networks.py --users-xml ... --output ... [--compose-subnet CIDR] \
+        [--ingest-networks ...] --from-docker -- <docker compose args...>
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ import ipaddress
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -204,6 +210,50 @@ def write(root: ET.Element, path: Path) -> bool:
     return True
 
 
+CLICKHOUSE_CONTAINER = "nano-clickhouse"
+
+
+def _docker(arguments: list[str]) -> str:
+    """stdout of a docker command, "" when it fails (the caller's fallbacks apply)."""
+    try:
+        result = subprocess.run(
+            ["docker", *arguments], stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def discover_docker(compose_args: list[str], scratch_dir: Path) -> tuple[str, list[str], Path]:
+    """Read the Docker inputs of a single-host render (NAN-5435).
+
+    Returns the daemon's address pools (`docker info` JSON), the live subnets
+    of the networks nano's ClickHouse container runs on, and the effective
+    Compose config written to a file in `scratch_dir` (IPAM subnets an overlay
+    pins are admitted, so a fresh install and a down/up after a subnet change
+    are covered, not only a running container's current network). The config
+    is interpolated (it carries .env secrets), so `scratch_dir` is a private
+    temporary directory outside the install tree that the caller removes.
+    """
+    pools_json = _docker(["info", "--format", "{{json .DefaultAddressPools}}"]).strip()
+    live: list[str] = []
+    network_ids = _docker([
+        "inspect", CLICKHOUSE_CONTAINER, "--format",
+        "{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}",
+    ]).split()
+    for network_id in network_ids:
+        for subnet in _docker([
+            "network", "inspect", network_id, "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}",
+        ]).split():
+            if re.fullmatch(r"[0-9A-Fa-f:.]+/[0-9]+", subnet):
+                live.append(subnet)
+    fd, name = tempfile.mkstemp(prefix=".nano-compose-config.", dir=scratch_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(_docker(["compose", *compose_args, "config", "--format", "json"]))
+    return pools_json, live, Path(name)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--users-xml", required=True, type=Path)
@@ -218,7 +268,28 @@ def main(argv: list[str] | None = None) -> int:
                         help="`docker compose config --format json` output: IPAM subnets are admitted")
     parser.add_argument("--ingest-networks", default="",
                         help="comma/space separated allow-list for nanosiem_ingest only")
+    parser.add_argument("--from-docker", action="store_true",
+                        help="read the pools, ClickHouse's live subnets and the Compose config from "
+                        "Docker; the arguments after `--` are the `docker compose` arguments")
+    parser.add_argument("compose_args", nargs="*", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.compose_args and not args.from_docker:
+        parser.error("compose arguments are only accepted with --from-docker")
+    if not args.from_docker:
+        return render(args)
+    if args.docker_pools_json is not None or args.compose_config is not None:
+        parser.error("--from-docker reads the pools and the Compose config itself")
+    # mkdtemp is private (0700), outside the install tree, and always removed.
+    with tempfile.TemporaryDirectory(prefix="nano-compose-config.") as scratch:
+        args.docker_pools_json, live, args.compose_config = discover_docker(
+            args.compose_args, Path(scratch),
+        )
+        args.network = [*live, *args.network]
+        return render(args)
+
+
+def render(args: argparse.Namespace) -> int:
+    """Render and write the allow-list from parsed CLI arguments."""
     try:
         users = users_with_networks(args.users_xml)
         # NAN-5387: a pinned network cannot move, so its subnet replaces the
@@ -233,7 +304,8 @@ def main(argv: list[str] | None = None) -> int:
             users,
             networks,
             split_list(args.ingest_networks),
-            comment="Generated by install.sh (scripts/lib/clickhouse_networks.py, NAN-5367). Do not edit; "
+            comment="Generated by install.sh or scripts/nano upgrade (scripts/lib/clickhouse_networks.py, "
+            "NAN-5367). Do not edit; "
             "set NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS in .env and re-run install.sh.",
         )
         changed = write(root, args.output)

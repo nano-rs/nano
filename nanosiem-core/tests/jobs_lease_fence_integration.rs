@@ -116,7 +116,7 @@ async fn takeover_bumps_the_epoch_after_in_flight_guarded_writes_and_refuses_sta
     stop_b.cancel();
     handle_b.await.unwrap();
     for table in ["leader_lease_history", "leader_lease_epochs"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE lock_id = $1"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE lock_id = $1")))
             .bind(lock_id)
             .execute(&pool)
             .await
@@ -130,7 +130,12 @@ fn rand_suffix() -> u32 {
 
 // ---- NAN-4933 codex review: guarded side effects (disk pressure, synthetics).
 
-use nanosiem_core::settings::{fifo_drop_loop, DiskPressureError, DropLoopOutcome, PartitionDropper, PartitionSnapshot};
+use nanosiem_core::settings::{fifo_drop_loop, DiskPressureError, DropLoopOutcome, Evicted, PartitionDropper, PartitionSnapshot};
+
+/// NAN-5447: the loop takes a retention-floor cutoff. These tests exercise the
+/// fence, not the floor, so the cutoff is today (every fake partition is older).
+const TODAY: &str = "20261104";
+const CUTOFF: &str = TODAY;
 use std::sync::Mutex;
 
 async fn seed_epoch(pool: &sqlx::PgPool) -> i64 {
@@ -165,22 +170,22 @@ struct FakePartitions {
 
 #[async_trait::async_trait]
 impl PartitionDropper for FakePartitions {
-    async fn partition_snapshot(&self, _today: &str) -> Result<PartitionSnapshot, DiskPressureError> {
+    async fn partition_snapshot(&self, _cutoff: &str) -> Result<PartitionSnapshot, DiskPressureError> {
         Ok(PartitionSnapshot {
-            oldest_before_today: Some(format!("202610{:02}", self.dropped.lock().unwrap().len() + 1)),
-            newest: Some("20261104".to_string()),
+            oldest_before_cutoff: Some(format!("202610{:02}", self.dropped.lock().unwrap().len() + 1)),
+            newest: Some(TODAY.to_string()),
         })
     }
     async fn usage(&self) -> Result<f64, DiskPressureError> {
         let n = self.dropped.lock().unwrap().len();
         Ok(self.usage_after.lock().unwrap().get(n).copied().unwrap_or(0.95))
     }
-    async fn drop_partition(&self, date: &str) -> Result<Vec<String>, DiskPressureError> {
+    async fn drop_partition(&self, date: &str) -> Result<Evicted, DiskPressureError> {
         tokio::time::sleep(self.drop_delay).await;
         self.dropped.lock().unwrap().push(date.to_owned());
-        Ok(vec!["ocsf_logs".to_owned()])
+        Ok(Evicted { dropped: vec!["ocsf_logs".to_owned()], ..Default::default() })
     }
-    async fn dropped(&self, _date: &str, _tables: &[String]) {
+    async fn dropped(&self, _date: &str, _evicted: &Evicted) {
         if self.supersede_after_first && self.dropped.lock().unwrap().len() == 1 {
             bump_epoch(&self.pool, self.lock_id).await;
         }
@@ -205,7 +210,7 @@ async fn a_superseded_leader_resuming_mid_drop_loop_drops_nothing_more() {
     let lock_id = seed_epoch(&pool).await;
     let fence = LeaderFence::pinned(lock_id, 1);
     let parts = fake(&pool, lock_id, true, Duration::ZERO, vec![]);
-    let outcome = fifo_drop_loop(&parts, &fence, &pool, 0.70, 5, Duration::ZERO, "20261104").await;
+    let outcome = fifo_drop_loop(&parts, &fence, &pool, 0.70, 5, Duration::ZERO, TODAY, CUTOFF).await;
     assert_eq!(outcome, DropLoopOutcome::Superseded);
     assert_eq!(parts.dropped.lock().unwrap().len(), 1, "no extra partition after the takeover");
     sqlx::query("DELETE FROM leader_lease_epochs WHERE lock_id = $1").bind(lock_id).execute(&pool).await.ok();
@@ -219,7 +224,7 @@ async fn the_drop_loop_rechecks_pressure_before_every_drop() {
     let fence = LeaderFence::pinned(lock_id, 1);
     // High before the first drop, relieved before the second.
     let parts = fake(&pool, lock_id, false, Duration::ZERO, vec![0.92, 0.65]);
-    let outcome = fifo_drop_loop(&parts, &fence, &pool, 0.70, 5, Duration::ZERO, "20261104").await;
+    let outcome = fifo_drop_loop(&parts, &fence, &pool, 0.70, 5, Duration::ZERO, TODAY, CUTOFF).await;
     assert_eq!(outcome, DropLoopOutcome::Relieved);
     assert_eq!(parts.dropped.lock().unwrap().len(), 1);
     sqlx::query("DELETE FROM leader_lease_epochs WHERE lock_id = $1").bind(lock_id).execute(&pool).await.ok();
@@ -234,7 +239,7 @@ async fn a_takeover_waits_for_an_in_flight_guarded_side_effect() {
     let lock_id = seed_epoch(&pool).await;
     let fence = LeaderFence::pinned(lock_id, 1);
     let parts = fake(&pool, lock_id, false, Duration::from_secs(3), vec![0.95, 0.95]);
-    let drop_loop = async { fifo_drop_loop(&parts, &fence, &pool, 0.70, 1, Duration::ZERO, "20261104").await };
+    let drop_loop = async { fifo_drop_loop(&parts, &fence, &pool, 0.70, 1, Duration::ZERO, TODAY, CUTOFF).await };
     let takeover = async {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let started = std::time::Instant::now();

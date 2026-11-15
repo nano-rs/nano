@@ -270,7 +270,7 @@ impl ClickHouseMigrator {
             )
             .iter()
             .fold(self.client.clone(), |client, (name, value)| {
-                client.with_option(*name, *value)
+                client.with_setting(*name, *value)
             });
             for sql in [baseline, hide_audit] {
                 if let Err(e) = policy_client.query(&sql).execute().await {

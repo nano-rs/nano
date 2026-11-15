@@ -249,13 +249,22 @@ fn validation_result(
 }
 
 impl LogSourceService {
-    /// Validate VRL code without saving
-    pub async fn validate_vrl(&self, vrl_code: &str) -> VrlValidationResult {
+    /// Validate VRL code for a save, validate, publish or attestation
+    /// (NAN-5401): the compile runs in the bounded parser-test worker
+    /// ([`crate::parsers::VrlValidator::validate_vrl_bounded`]), waiting for
+    /// a slot behind interactive tests rather than answering busy. `Err` only
+    /// when it waited the full budget without one
+    /// ([`LogSourceServiceError::ValidationBusy`], a retryable 503): a busy
+    /// pool is never reported as invalid VRL.
+    pub async fn validate_vrl(&self, vrl_code: &str) -> Result<VrlValidationResult, LogSourceServiceError> {
         let rendered = match prepare_for_validation(vrl_code) {
             Ok(rendered) => rendered,
-            Err(refused) => return refused,
+            Err(refused) => return Ok(refused),
         };
-        validation_result(self.vrl_validator.validate_vrl(&rendered).await)
+        match self.vrl_validator.validate_vrl_bounded(&rendered).await {
+            Err(VrlValidatorError::Busy(message)) => Err(LogSourceServiceError::ValidationBusy(message)),
+            other => Ok(validation_result(other)),
+        }
     }
 
     /// [`Self::validate_vrl`] for `POST /api/log-sources/validate-vrl`
@@ -437,7 +446,7 @@ impl LogSourceService {
             sample: String,
         }
 
-        let query = ch_client.query(&sql).with_option(
+        let query = ch_client.query(&sql).with_setting(
             "max_execution_time",
             LIVE_SAMPLE_MAX_EXECUTION_TIME_SECS.to_string(),
         );
@@ -475,7 +484,7 @@ impl LogSourceService {
         id: Uuid,
     ) -> Result<VrlValidationResult, LogSourceServiceError> {
         let log_source = self.repository().find_by_id(id).await?;
-        let result = self.validate_vrl(&log_source.parser_vrl).await;
+        let result = self.validate_vrl(&log_source.parser_vrl).await?;
 
         let error_msg = if result.valid {
             None

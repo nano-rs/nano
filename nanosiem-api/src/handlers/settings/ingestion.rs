@@ -163,7 +163,7 @@ pub async fn pause_ingestion(
 /// Resume ingestion
 ///
 /// Lifts a manual or an automatic (disk-pressure) pause. If disk usage is
-/// still at the emergency level, the disk-pressure monitor pauses again on its
+/// still at or above the pause threshold, the disk-pressure monitor pauses again on its
 /// next check.
 #[utoipa::path(
     post,

@@ -119,8 +119,8 @@ async fn insert_events(
     ch.clone()
         // Synchronous insert so the MV fires before we start waiting
         // (async_insert buffering would add its own flush latency).
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .query(&sql)
         .execute()
         .await
@@ -139,7 +139,7 @@ async fn wait_at_least(
     let start = Instant::now();
     let mut last = -1;
     while start.elapsed() < PHASE_TIMEOUT {
-        last = sqlx::query_scalar::<_, i64>(sql)
+        last = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
             .bind(rule_id)
             .fetch_one(pool)
             .await
@@ -230,11 +230,11 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
     let admin = PgPool::connect(ADMIN_PG_URL)
         .await
         .expect("connect local Postgres (is the dev stack up?)");
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")))
         .execute(&admin)
         .await
         .expect("drop stale scratch db");
-    sqlx::query(&format!("CREATE DATABASE {SCRATCH_DB}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {SCRATCH_DB}")))
         .execute(&admin)
         .await
         .expect("create scratch db");
@@ -417,7 +417,7 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
     }
 
     pg.close().await;
-    if let Err(e) = sqlx::query(&format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)"))
+    if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")))
         .execute(&admin)
         .await
     {

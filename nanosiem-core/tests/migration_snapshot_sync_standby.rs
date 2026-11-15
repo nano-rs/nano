@@ -68,11 +68,11 @@ async fn snapshot_refuses_before_any_ddl_when_no_synchronous_standby_streams() {
         }
     };
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {TEST_DB_NAME} WITH (FORCE)").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {TEST_DB_NAME} WITH (FORCE)")))
         .await
         .expect("drop test db");
     admin
-        .execute(format!("CREATE DATABASE {TEST_DB_NAME}").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB_NAME}")))
         .await
         .expect("create test db");
     admin
@@ -155,11 +155,11 @@ async fn a_stuck_snapshot_ends_at_its_budget_and_rolls_back() {
     };
     let name = "nanosiem_nan5269_stuck_test";
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")))
         .await
         .expect("drop test db");
     admin
-        .execute(format!("CREATE DATABASE {name}").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .await
         .expect("create test db");
     let url = {

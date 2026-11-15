@@ -336,8 +336,8 @@ impl<'a> FutureTimestampRepair<'a> {
         let foreground = self
             .client
             .clone()
-            .with_option("async_insert", "0")
-            .with_option("wait_for_async_insert", "1");
+            .with_setting("async_insert", "0")
+            .with_setting("wait_for_async_insert", "1");
         foreground
             .query(&format!(
                 "INSERT INTO {table} VALUES (toUUID('{}'), {}, now64(6))",
@@ -578,9 +578,9 @@ impl<'a> FutureTimestampRepair<'a> {
         let foreground = self
             .client
             .clone()
-            .with_option("async_insert", "0")
-            .with_option("wait_for_async_insert", "1")
-            .with_option("insert_distributed_sync", "1");
+            .with_setting("async_insert", "0")
+            .with_setting("wait_for_async_insert", "1")
+            .with_setting("insert_distributed_sync", "1");
         foreground
             .query(&materialize_sql(
                 &repair_set,
@@ -776,9 +776,9 @@ impl<'a> FutureTimestampRepair<'a> {
         let foreground = self
             .client
             .clone()
-            .with_option("async_insert", "0")
-            .with_option("wait_for_async_insert", "1")
-            .with_option("insert_distributed_sync", "1");
+            .with_setting("async_insert", "0")
+            .with_setting("wait_for_async_insert", "1")
+            .with_setting("insert_distributed_sync", "1");
         let ip_buffer = format!("{}.{}", self.database, FUTURE_IP_REPAIR_ROWS_TABLE);
         let mut resumed_rows = 0;
         if shape == EpochMillisRepairShape::IpEnrichments {

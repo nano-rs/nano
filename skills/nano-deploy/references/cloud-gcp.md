@@ -164,9 +164,13 @@ done
 nano speaks the S3 API, which Cloud Storage serves at
 `https://storage.googleapis.com` with **HMAC keys**. Create one service
 account per bucket, grant it `roles/storage.objectAdmin` on **that bucket
-only**, and have the operator create its HMAC key and enter it in nano
-(Settings → Storage & Retention for the cold tier; the backup configuration
-for backups):
+only**. For backups the operator creates its HMAC key and enters it in the
+backup configuration. For the cold tier, either attach the service account to
+the ClickHouse VMs (scope `cloud-platform`) and use
+`plan.py --tiering-provider gcs --tiering-bucket $NAME-cold
+--tiering-use-environment-credentials` (no keys), or give the operator an HMAC
+key for `NANO_TIERING_ACCESS_KEY_ID` / `NANO_TIERING_SECRET_ACCESS_KEY` in the
+shared `.env`:
 
 ```bash
 gcloud --project "$PROJECT" iam service-accounts create $NAME-cold --display-name "nano cold tier"
@@ -175,9 +179,9 @@ gcloud --project "$PROJECT" storage buckets add-iam-policy-binding gs://$NAME-co
 # operator, not the agent: gcloud --project "$PROJECT" storage hmac create $NAME-cold@$PROJECT.iam.gserviceaccount.com
 ```
 
-The HMAC secret is shown once; it goes straight into nano, never into chat.
+The HMAC secret is shown once; it goes straight into `.env`, never into chat.
 RustFS is the self-hosted S3-compatible alternative. Tiering moves are
-free-space driven today (TTL-driven moves are planned).
+free-space driven (move_factor 0.3); see [operate.md](operate.md#storage-tiering).
 
 ## Identity for the VMs and the operator
 

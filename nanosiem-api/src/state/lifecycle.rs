@@ -642,6 +642,7 @@ impl AppState {
         handles.push(self.start_query_tracker_cleanup());
         handles.push(self.start_search_job_cleanup());
         handles.push(self.start_detection_dedup_cleanup());
+        handles.push(self.start_notification_cleanup());
         handles.push(self.start_lookup_generation_cleanup());
         handles.push(self.start_prevalence_dict_health_monitor());
         tracing::info!("Cleanup tasks started (leader-only)");

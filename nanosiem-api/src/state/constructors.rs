@@ -216,9 +216,14 @@ impl AppState {
         // Create inputlookup service for URL-based enrichment. The internal
         // lookup layer is wired so `| inputlookup <internal_table>` reads the
         // CH/PG-backed lookup table directly (NAN-1581 Phase 5).
-        // NAN-5436: `from_env` applies the INPUTLOOKUP_ALLOWED_DOMAINS host
-        // allowlist when set; unset keeps the default (public hosts allowed).
+        // NAN-5443: the host allowlist is INPUTLOOKUP_ALLOWED_DOMAINS merged
+        // with the admin list from Settings > Lookup URLs, re-read every 30 s
+        // (this process serves the api and jobs roles; see
+        // `nanosiem_core::inputlookup::allowlist` for precedence). An empty
+        // effective list keeps the default (public hosts allowed).
+        nanosiem_core::inputlookup::allowlist::start_refresh(dual_pool.postgres().clone()).await;
         let inputlookup_service = InputLookupService::new(InputLookupConfig::from_env())
+            .with_managed_allowlist(nanosiem_core::inputlookup::allowlist::DeploymentAllowlist::from_env())
             .with_lookup_service(Arc::new(lookup_service.clone()));
 
         // Create search service and add inputlookup. The active schema profile
@@ -236,11 +241,13 @@ impl AppState {
         // process; apply the admin's AI-search command allowlist here too and
         // audit refusals.
         search_service.spawn_query_limits_refresh(dual_pool.postgres().clone());
-        nanosiem_core::search::ai_command_policy::install_audit_sink(
-            nanosiem_core::search::ai_command_policy::EmitterAiCommandAuditSink::new(
-                audit_emitter.clone(),
-            ),
+        let search_audit_sink = nanosiem_core::search::ai_command_policy::EmitterAiCommandAuditSink::new(
+            audit_emitter.clone(),
+            nanosiem_core::auth::UserRepository::new(dual_pool.postgres().clone()),
         );
+        nanosiem_core::search::ai_command_policy::install_audit_sink(search_audit_sink.clone());
+        // NAN-5443: audit every external lookup fetch (host only) and refusal.
+        nanosiem_core::inputlookup::allowlist::install_fetch_audit_sink(search_audit_sink);
 
         // Wire the enterprise `CloudRiskProvider` impl onto the search service
         // so cloud overview / dossier surfaces render risk badges. Open-core

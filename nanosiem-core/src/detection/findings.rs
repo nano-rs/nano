@@ -809,8 +809,8 @@ impl FindingLogger {
         let client = dual_pool
             .clickhouse()
             .clone()
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "0");
+            .with_setting("async_insert", "1")
+            .with_setting("wait_for_async_insert", "0");
         let now = Utc::now();
 
         // Extract fields from metadata for direct column storage

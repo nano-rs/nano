@@ -335,12 +335,27 @@ pub(crate) enum AuditStore {
     Ocsf,
 }
 
+impl AuditStore {
+    /// The store of the active schema profile (`NANO_SCHEMA_PROFILE`).
+    pub(crate) fn for_active_profile() -> Self {
+        let ocsf = crate::schema::active_profile_from_env()
+            .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+            // Same fallback as `AuditEmitter::new`, so reader and writer agree.
+            .unwrap_or(false);
+        if ocsf {
+            Self::Ocsf
+        } else {
+            Self::Udm
+        }
+    }
+}
+
 /// The audit columns every reader uses, projected from an OCSF audit row.
 /// `metadata` is the `unmapped` object, which carries the same keys as the
 /// UDM row's metadata JSON (`AuditEvent::to_ocsf_event`). `status` comes from
 /// `status_id` (1 = Success) so it reads `success` / `failure` like UDM, and
 /// no alias refers to a column of its own name.
-const OCSF_AUDIT_PROJECTION: &str = "id, timestamp, \
+pub(crate) const OCSF_AUDIT_PROJECTION: &str = "id, timestamp, \
      `actor.user.name` AS `user`, `api.operation` AS action, `api.service.name` AS source, \
      `src_endpoint.ip` AS src_ip, `http_request.user_agent` AS user_agent, \
      if(status_id = 1, 'success', 'failure') AS status, message, toString(unmapped) AS metadata";
@@ -373,6 +388,10 @@ pub(crate) struct AuditSegment {
     /// originals of legacy case copies, which this read hides
     /// ([`LEGACY_CASE_ORIGINAL_LOOKBACK_SECS`]).
     pub(crate) legacy_originals_in: Option<String>,
+    /// NAN-5447: an [`super::archive`] read. `table` is the audit archive and
+    /// only rows archived from these origin tables are shown (the archive
+    /// holds rows already deduplicated, in the [`UDM_AUDIT_COLUMNS`] shape).
+    pub(crate) archive_origins: Option<&'static [&'static str]>,
 }
 
 /// NAN-5346: the dedupe key of a UDM audit row. Rows written since NAN-5346
@@ -533,7 +552,7 @@ impl AuditSegment {
     /// Binds in SQL order: the window, then the window of the subquery: the
     /// same window for the UDM copy-skipping read, the window widened by the
     /// lookback for the OCSF legacy-original read.
-    fn binds(&self) -> Vec<String> {
+    pub(crate) fn binds(&self) -> Vec<String> {
         let mut binds = self.time_binds();
         if self.skip_copies_in.is_some() {
             binds.extend(self.time_binds());
@@ -551,7 +570,11 @@ impl AuditSegment {
     /// * UDM: not an event whose OCSF copy is in the same window, except a
     ///   legacy case row, which is always kept (it is canonical).
     /// * OCSF: not a legacy case copy whose UDM original exists.
-    fn predicate(&self) -> String {
+    pub(crate) fn predicate(&self) -> String {
+        if let Some(origins) = self.archive_origins {
+            let list = origins.iter().map(|o| format!("'{o}'")).collect::<Vec<_>>().join(", ");
+            return format!("{} AND origin_table IN ({list})", self.time());
+        }
         let mut predicate = format!("{} AND source_type = 'audit'", self.time());
         if let Some(ocsf) = &self.skip_copies_in {
             predicate.push_str(&format!(
@@ -573,8 +596,9 @@ impl AuditSegment {
     }
 
     /// `SELECT <audit columns> FROM <table> WHERE <predicate>`.
-    fn select(&self) -> String {
+    pub(crate) fn select(&self) -> String {
         let columns = match self.store {
+            _ if self.archive_origins.is_some() => UDM_AUDIT_COLUMNS,
             AuditStore::Udm => UDM_AUDIT_COLUMNS,
             AuditStore::Ocsf => OCSF_AUDIT_PROJECTION,
         };
@@ -606,6 +630,7 @@ pub(crate) fn plan_sources(
         end: end.clone(),
         skip_copies_in,
         legacy_originals_in: None,
+        archive_origins: None,
     };
     match store {
         AuditStore::Udm => vec![udm(None)],
@@ -617,9 +642,31 @@ pub(crate) fn plan_sources(
                 end: end.clone(),
                 skip_copies_in: None,
                 legacy_originals_in: Some(logs_table.to_string()),
+                archive_origins: None,
             },
             udm(Some(ocsf_table.to_string())),
         ],
+    }
+}
+
+/// NAN-5447: the read of the eviction audit archive over `[start, end]`:
+/// the rows the disk-pressure evictor moved out of the event tables before it
+/// dropped their partitions, limited to the origin tables `store` reads (so a
+/// table this profile never showed stays hidden).
+pub(crate) fn archive_segment(
+    store: AuditStore,
+    archive_table: &str,
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
+) -> AuditSegment {
+    AuditSegment {
+        store,
+        table: archive_table.to_string(),
+        start,
+        end: end.map_or(UpperBound::Open, UpperBound::Inclusive),
+        skip_copies_in: None,
+        legacy_originals_in: None,
+        archive_origins: Some(super::archive::shown_origins(store)),
     }
 }
 
@@ -635,7 +682,7 @@ pub(crate) fn plan_sources(
 pub(crate) fn audit_from(segments: &[AuditSegment], conditions: &[&str]) -> (String, Vec<String>) {
     let binds: Vec<String> = segments.iter().flat_map(AuditSegment::binds).collect();
     if let [only] = segments {
-        if only.store == AuditStore::Udm {
+        if only.store == AuditStore::Udm && only.archive_origins.is_none() {
             let mut sql = format!("FROM {} WHERE {}", only.table, only.predicate());
             for c in conditions {
                 sql.push_str(" AND ");
@@ -738,23 +785,46 @@ pub struct AuditQueryService {
 impl AuditQueryService {
     /// Create a new audit query service for the active schema profile.
     pub fn new(dual_pool: DualPool) -> Self {
-        let ocsf = crate::schema::active_profile_from_env()
-            .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
-            // Same fallback as `AuditEmitter::new`, so reader and writer agree.
-            .unwrap_or(false);
-        let store = if ocsf { AuditStore::Ocsf } else { AuditStore::Udm };
-        Self { dual_pool, store }
+        Self { dual_pool, store: AuditStore::for_active_profile() }
     }
 
     /// The reads for `[start, end]` (`end = None`: open) in this profile.
-    fn sources(&self, start: DateTime<Utc>, end: Option<DateTime<Utc>>) -> Vec<AuditSegment> {
-        plan_sources(
+    ///
+    /// NAN-5447: plus the eviction audit archive when it holds rows in the
+    /// window. The probe is one count over a tiny table; when it finds
+    /// nothing (every install that never evicted audit-bearing data) the
+    /// reads are exactly the pre-archive ones.
+    async fn sources(&self, start: DateTime<Utc>, end: Option<DateTime<Utc>>) -> Vec<AuditSegment> {
+        let mut segments = plan_sources(
             self.store,
             self.dual_pool.logs_table(),
             &self.dual_pool.table_names().read("ocsf_logs"),
             start,
             end,
-        )
+        );
+        let archive = self.dual_pool.table_names().read(super::archive::AUDIT_ARCHIVE_TABLE);
+        let segment = archive_segment(self.store, &archive, start, end);
+        if self.archive_has_rows(&segment).await {
+            segments.push(segment);
+        }
+        segments
+    }
+
+    /// Whether the archive read `segment` would return any row. A failure
+    /// (the archive table not created yet) reads as "no rows".
+    async fn archive_has_rows(&self, segment: &AuditSegment) -> bool {
+        let sql = format!("SELECT toUInt8(count() > 0) FROM {} WHERE {}", segment.table, segment.predicate());
+        let mut q = self.dual_pool.clickhouse().query(&sql);
+        for b in segment.binds() {
+            q = q.bind(b);
+        }
+        match q.fetch_one::<u8>().await {
+            Ok(v) => v == 1,
+            Err(e) => {
+                tracing::debug!(error = %e, "audit archive probe failed; reading the event tables only");
+                false
+            }
+        }
     }
 
     /// Query audit logs from ClickHouse
@@ -767,7 +837,7 @@ impl AuditQueryService {
         let offset = query.offset.unwrap_or(0);
         let filters = resolve_filters(query);
 
-        let segments = self.sources(filters.start, Some(filters.end));
+        let segments = self.sources(filters.start, Some(filters.end)).await;
         let (sql, time_binds) = rows_sql(&segments, &filters.conditions);
 
         let mut q = client.query(&sql);
@@ -791,7 +861,7 @@ impl AuditQueryService {
         let client = self.dual_pool.clickhouse();
         let filters = resolve_filters(query);
 
-        let segments = self.sources(filters.start, Some(filters.end));
+        let segments = self.sources(filters.start, Some(filters.end)).await;
         let (sql, time_binds) = count_sql(&segments, &filters.conditions);
 
         let mut q = client.query(&sql);
@@ -817,7 +887,7 @@ impl AuditQueryService {
         let client = self.dual_pool.clickhouse();
         let filters = resolve_filters(query);
 
-        let segments = self.sources(filters.start, Some(filters.end));
+        let segments = self.sources(filters.start, Some(filters.end)).await;
         let (sql, time_binds) = action_counts_sql(&segments, &filters.conditions);
 
         let mut q = client.query(&sql);
@@ -846,7 +916,7 @@ impl AuditQueryService {
         let client = self.dual_pool.clickhouse();
         let since = Utc::now() - chrono::Duration::days(90);
 
-        let segments = self.sources(since, None);
+        let segments = self.sources(since, None).await;
         let (sql, time_binds) = distinct_sql(&segments, column);
         let mut q = client.query(&sql);
         for b in &time_binds {
@@ -889,7 +959,7 @@ impl AuditQueryService {
 
         // Bucket on the UTC calendar day explicitly so day boundaries match the
         // handler's UTC densification regardless of the column's timezone.
-        let segments = self.sources(start, None);
+        let segments = self.sources(start, None).await;
         let (sql, time_binds) = api_key_daily_usage_sql(&segments);
 
         let mut q = client.query(&sql);

@@ -206,6 +206,10 @@ pub struct CollectedMetrics {
     /// on reports written before this field existed.
     #[serde(default)]
     pub shard_skew: Option<super::shard_skew::ShardSkewMetrics>,
+    /// NAN-5450: ClickHouse, PostgreSQL and Vector buffer volume usage.
+    /// `None` on reports written before this field existed.
+    #[serde(default)]
+    pub disk: Option<crate::health::disk_monitor::DiskHealthReport>,
     pub collected_at: DateTime<Utc>,
 }
 

@@ -162,16 +162,16 @@ async fn restrict_reference_outside_the_predicate_is_in_use_on_every_postgres_ma
     let pool = common::migrated_pool().await;
     let table = format!("nan4980_restrict_{}", &Uuid::new_v4().simple().to_string()[..12]);
     let constraint = format!("{table}_credential_fkey");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {table} (credential_id UUID CONSTRAINT {constraint} \
          REFERENCES cloud_credentials(id) ON DELETE RESTRICT)"
-    ))
+    )))
     .execute(&pool)
     .await
     .unwrap();
     let repo = CredentialRepository::new(pool.clone());
     let cred = repo.create(&credential(&unique("nan4980-restrict")), None).await.unwrap();
-    sqlx::query(&format!("INSERT INTO {table} (credential_id) VALUES ($1)"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO {table} (credential_id) VALUES ($1)")))
         .bind(cred.id)
         .execute(&pool)
         .await
@@ -179,7 +179,7 @@ async fn restrict_reference_outside_the_predicate_is_in_use_on_every_postgres_ma
 
     let outcome = repo.delete(cred.id).await;
     let survived = repo.exists(cred.id).await.unwrap();
-    sqlx::query(&format!("DROP TABLE {table}")).execute(&pool).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}"))).execute(&pool).await.unwrap();
     match outcome {
         Err(err @ CredentialRepositoryError::InUse { .. }) => {
             let message = err.to_string();

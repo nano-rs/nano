@@ -6,11 +6,13 @@
 //! - AI provider connectivity
 //! - Data feed staleness
 //! - Stuck (unkillable) ClickHouse queries
+//! - Disk usage of the ClickHouse, PostgreSQL and Vector buffer volumes (NAN-5450)
 //!
 //! It runs as a background scheduler that periodically checks health
 //! and creates notifications for admin users when issues are detected.
 
 pub mod ai_monitor;
+pub mod disk_monitor;
 pub mod feed_monitor;
 pub mod repository;
 pub mod scheduler;

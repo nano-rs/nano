@@ -218,10 +218,15 @@ impl GitHubWriteClient {
         Ok((owner.to_string(), repo.to_string()))
     }
 
-    fn auth<'a>(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        rb.header("Authorization", format!("Bearer {}", self.token))
+    /// Authenticate a request. NAN-5441: under `NANO_EGRESS_PROXY_REQUIRED`
+    /// with no `HTTPS_PROXY`, refuse rather than reach GitHub directly.
+    fn auth(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, GitHubWriteError> {
+        crate::egress_proxy::require_env_proxy(GITHUB_API)
+            .map_err(|e| GitHubWriteError::BlockedEndpoint(e.to_string()))?;
+        Ok(rb
+            .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
+            .header("X-GitHub-Api-Version", API_VERSION))
     }
 
     /// Parse a JSON body on success, or map a non-2xx into an `Api` error whose
@@ -268,7 +273,7 @@ impl GitHubWriteClient {
             ],
         )
         .map_err(|error| GitHubWriteError::InvalidUrl(error.to_string()))?;
-        let response = self.auth(self.http.get(url)).send().await?;
+        let response = self.auth(self.http.get(url))?.send().await?;
         let pulls: Vec<PullResponse> = Self::parse(response).await?;
         let Some(pull) = pulls.into_iter().next() else {
             return Ok(None);
@@ -323,7 +328,7 @@ impl GitHubWriteClient {
                 )
             })?
             .push(&format!("{base_branch}...{head_branch}"));
-        let response = self.auth(self.http.get(url)).send().await?;
+        let response = self.auth(self.http.get(url))?.send().await?;
         let comparison: CompareResponse = Self::parse(response).await?;
         ensure_exact_operation_diff(&comparison.files, file_path, "operation branch")
     }
@@ -340,7 +345,7 @@ impl GitHubWriteClient {
             &[("per_page", "2")],
         )
         .map_err(|error| GitHubWriteError::InvalidUrl(error.to_string()))?;
-        let response = self.auth(self.http.get(url)).send().await?;
+        let response = self.auth(self.http.get(url))?.send().await?;
         let files: Vec<ChangedFile> = Self::parse(response).await?;
         ensure_exact_operation_diff(&files, file_path, "pull request")
     }
@@ -351,7 +356,7 @@ impl GitHubWriteClient {
         let (owner, repo) = Self::parse_github_repo(repo_url)?;
 
         let url = format!("{GITHUB_API}/repos/{owner}/{repo}");
-        let resp = self.auth(self.http.get(&url)).send().await?;
+        let resp = self.auth(self.http.get(&url))?.send().await?;
         let repo: RepoResponse = Self::parse(resp).await?;
         let (can_read, can_write) = match repo.permissions {
             Some(p) => (p.pull, p.push),
@@ -430,7 +435,7 @@ impl GitHubWriteClient {
             &[("q", q.as_str()), ("per_page", "1")],
         )
         .map_err(|e| GitHubWriteError::InvalidUrl(e.to_string()))?;
-        let resp = self.auth(self.http.get(url)).send().await?;
+        let resp = self.auth(self.http.get(url))?.send().await?;
         // 422 (repo not indexed yet) / 403 (search rate limit) are expected
         // transient misses — not push-blocking. Surface only as "not found".
         if !resp.status().is_success() {
@@ -457,7 +462,7 @@ impl GitHubWriteClient {
         let (owner, repo) = Self::parse_github_repo(repo_url)?;
         let url = format!("{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/labels");
         let body = json!({ "labels": labels });
-        let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let resp = self.auth(self.http.post(&url))?.json(&body).send().await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
@@ -477,7 +482,7 @@ impl GitHubWriteClient {
         branch: &str,
     ) -> Result<Option<String>, GitHubWriteError> {
         let url = format!("{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{branch}");
-        let response = self.auth(self.http.get(&url)).send().await?;
+        let response = self.auth(self.http.get(&url))?.send().await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -493,7 +498,7 @@ impl GitHubWriteClient {
         git_ref: &str,
     ) -> Result<Option<ContentsFile>, GitHubWriteError> {
         let url = format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}?ref={git_ref}");
-        let response = self.auth(self.http.get(&url)).send().await?;
+        let response = self.auth(self.http.get(&url))?.send().await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -546,7 +551,7 @@ impl GitHubWriteClient {
 
         let url = format!("{GITHUB_API}/repos/{owner}/{repo}/git/refs");
         let body = json!({ "ref": format!("refs/heads/{head_branch}"), "sha": base_sha });
-        let response = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let response = self.auth(self.http.post(&url))?.json(&body).send().await?;
         if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
             return self
                 .get_branch_ref(&owner, &repo, head_branch)
@@ -655,7 +660,7 @@ impl GitHubWriteClient {
         if let Some(blob_sha) = existing.map(|file| file.sha) {
             body["sha"] = json!(blob_sha);
         }
-        let response = self.auth(self.http.put(&url)).json(&body).send().await?;
+        let response = self.auth(self.http.put(&url))?.json(&body).send().await?;
         if matches!(
             response.status(),
             StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY
@@ -794,7 +799,7 @@ impl GitHubWriteClient {
             "base": base_branch,
             "body": pr_body,
         });
-        let response = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let response = self.auth(self.http.post(&url))?.json(&body).send().await?;
         if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
             if let Some(existing) = self
                 .find_pull_request(

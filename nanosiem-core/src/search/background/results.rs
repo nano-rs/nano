@@ -202,18 +202,18 @@ impl SearchJobResultStore {
             .client
             .clone()
             .with_validation(false)
-            .with_option("async_insert", "0")
-            .with_option("wait_end_of_query", "1");
+            .with_setting("async_insert", "0")
+            .with_setting("wait_end_of_query", "1");
         let quorum_writer = base
             .clone()
-            .with_option("insert_quorum", "auto")
-            .with_option("insert_quorum_parallel", "0");
+            .with_setting("insert_quorum", "auto")
+            .with_setting("insert_quorum_parallel", "0");
         // NAN-5215: with one replica of a two-replica shard down the majority
         // quorum cannot be met. Fall back to a quorum-less insert (the live
         // replica takes the part; the returning one fetches it) instead of
         // failing the job. Readers then see the rows via an eventual read
         // checked against the PostgreSQL row count (see `ReadConsistency`).
-        let degraded_writer = base.with_option("insert_quorum", "0");
+        let degraded_writer = base.with_setting("insert_quorum", "0");
         let mut degraded = false;
         let mut seq: u64 = 0;
         for chunk in rows.chunks(INSERT_BATCH_ROWS) {
@@ -256,9 +256,9 @@ impl SearchJobResultStore {
         first_seq: u64,
         chunk: &[serde_json::Value],
     ) -> Result<(), clickhouse::error::Error> {
-        let mut insert = writer
-            .insert::<ResultRow>(&self.table_names.local("search_job_results"))
-            .await?;
+        let mut insert =
+            crate::db::clickhouse_insert::insert::<ResultRow>(&writer, &self.table_names.local("search_job_results"))
+                .await?;
         for (offset, row) in chunk.iter().enumerate() {
             // Encoding cannot fail for an in-memory `Value`; keep the error
             // path anyway rather than panic.
@@ -313,7 +313,7 @@ impl SearchJobResultStore {
             .bind(offset.saturating_add(limit))
             // Read-your-quorum-writes on replicated tables (no-op otherwise);
             // `Eventual` only after a sequential read came back inconsistent.
-            .with_option(
+            .with_setting(
                 "select_sequential_consistency",
                 consistency.select_sequential_consistency(),
             )

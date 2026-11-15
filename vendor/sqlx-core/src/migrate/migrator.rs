@@ -23,25 +23,11 @@ pub struct Migrator {
     pub locking: bool,
     #[doc(hidden)]
     pub no_tx: bool,
-}
+    #[doc(hidden)]
+    pub table_name: Cow<'static, str>,
 
-fn validate_applied_migrations(
-    applied_migrations: &[AppliedMigration],
-    migrator: &Migrator,
-) -> Result<(), MigrateError> {
-    if migrator.ignore_missing {
-        return Ok(());
-    }
-
-    let migrations: HashSet<_> = migrator.iter().map(|m| m.version).collect();
-
-    for applied_migration in applied_migrations {
-        if !migrations.contains(&applied_migration.version) {
-            return Err(MigrateError::VersionMissing(applied_migration.version));
-        }
-    }
-
-    Ok(())
+    #[doc(hidden)]
+    pub create_schemas: Cow<'static, [Cow<'static, str>]>,
 }
 
 impl Migrator {
@@ -51,6 +37,8 @@ impl Migrator {
         ignore_missing: false,
         no_tx: false,
         locking: true,
+        table_name: Cow::Borrowed("_sqlx_migrations"),
+        create_schemas: Cow::Borrowed(&[]),
     };
 
     /// Creates a new instance with the given source.
@@ -81,8 +69,65 @@ impl Migrator {
         })
     }
 
+    /// Creates a new instance with the given migrations.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use sqlx::{ SqlSafeStr, migrate::{Migration, MigrationType::*, Migrator}};
+    ///
+    /// // Define your migrations.
+    /// // You can also use include_str!("./xxx.sql") instead of hard-coded SQL statements.
+    /// let migrations = vec![
+    ///     Migration::new(1, "user".into(), ReversibleUp, "create table users ( ... )".into_sql_str(), false),
+    ///     Migration::new(2, "post".into(), ReversibleUp, "create table posts ( ... )".into_sql_str(), false),
+    ///     // add more...
+    ///  ];
+    ///  let m = Migrator::with_migrations(migrations);
+    /// ```
+    pub fn with_migrations(mut migrations: Vec<Migration>) -> Self {
+        migrations.sort();
+        Self {
+            migrations: Cow::Owned(migrations),
+            ..Self::DEFAULT
+        }
+    }
+
+    /// Override the name of the table used to track executed migrations.
+    ///
+    /// May be schema-qualified and/or contain quotes. Defaults to `_sqlx_migrations`.
+    ///
+    /// Potentially useful for multi-tenant databases.
+    ///
+    /// ### Warning: Potential Data Loss or Corruption!
+    /// Changing this option for a production database will likely result in data loss or corruption
+    /// as the migration machinery will no longer be aware of what migrations have been applied
+    /// and will attempt to re-run them.
+    ///
+    /// You should create the new table as a copy of the existing migrations table (with contents!),
+    /// and be sure all instances of your application have been migrated to the new
+    /// table before deleting the old one.
+    pub fn dangerous_set_table_name(&mut self, table_name: impl Into<Cow<'static, str>>) -> &Self {
+        self.table_name = table_name.into();
+        self
+    }
+
+    /// Add a schema name to be created if it does not already exist.
+    ///
+    /// May be used with [`Self::dangerous_set_table_name()`] to place the migrations table
+    /// in a new schema without requiring it to exist first.
+    ///
+    /// ### Note: Support Depends on Database
+    /// SQLite cannot create new schemas without attaching them to a database file,
+    /// the path of which must be specified separately in an [`ATTACH DATABASE`](https://www.sqlite.org/lang_attach.html) command.
+    pub fn create_schema(&mut self, schema_name: impl Into<Cow<'static, str>>) -> &Self {
+        self.create_schemas.to_mut().push(schema_name.into());
+        self
+    }
+
     /// Specify whether applied migrations that are missing from the resolved migrations should be ignored.
-    pub fn set_ignore_missing(&mut self, ignore_missing: bool) -> &Self {
+    pub fn set_ignore_missing(&mut self, ignore_missing: bool) -> &mut Self {
         self.ignore_missing = ignore_missing;
         self
     }
@@ -95,7 +140,7 @@ impl Migrator {
     ///
     /// This should only be used if the database does not support locking, e.g. CockroachDB which talks the Postgres
     /// protocol but does not support advisory locks used by SQLx's migrations support for Postgres.
-    pub fn set_locking(&mut self, locking: bool) -> &Self {
+    pub fn set_locking(&mut self, locking: bool) -> &mut Self {
         self.locking = locking;
         self
     }
@@ -134,12 +179,57 @@ impl Migrator {
         <A::Connection as Deref>::Target: Migrate,
     {
         let mut conn = migrator.acquire().await?;
-        self.run_direct(&mut *conn).await
+        self.run_direct(None, &mut *conn, false).await
+    }
+
+    pub async fn run_to<'a, A>(&self, target: i64, migrator: A) -> Result<(), MigrateError>
+    where
+        A: Acquire<'a>,
+        <A::Connection as Deref>::Target: Migrate,
+    {
+        let mut conn = migrator.acquire().await?;
+        self.run_direct(Some(target), &mut *conn, false).await
+    }
+
+    /// Skip any pending migrations until a specific version against the database;
+    /// Additionally validate previously applied migrations against the current migration
+    /// source to detect accidental changes in previously-applied migrations.
+    ///
+    /// Skipping entails not executing the SQL of the migrations, but marking them as
+    /// applied in the [_migrations] table.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::migrate::MigrateError;
+    /// # fn main() -> Result<(), MigrateError> {
+    /// #     sqlx::__rt::test_block_on(async move {
+    /// use sqlx::migrate::Migrator;
+    /// use sqlx::sqlite::SqlitePoolOptions;
+    ///
+    /// let m = Migrator::new(std::path::Path::new("./migrations")).await?;
+    /// let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+    /// m.skip(&pool, Some(17)).await
+    /// #     })
+    /// # }
+    /// ```
+    pub async fn skip<'a, A>(&self, migrator: A, target: Option<i64>) -> Result<(), MigrateError>
+    where
+        A: Acquire<'a>,
+        <A::Connection as Deref>::Target: Migrate,
+    {
+        let mut conn = migrator.acquire().await?;
+        self.run_direct(target, &mut *conn, true).await
     }
 
     // Getting around the annoying "implementation of `Acquire` is not general enough" error
     #[doc(hidden)]
-    pub async fn run_direct<C>(&self, conn: &mut C) -> Result<(), MigrateError>
+    pub async fn run_direct<C>(
+        &self,
+        target: Option<i64>,
+        conn: &mut C,
+        skip: bool,
+    ) -> Result<(), MigrateError>
     where
         C: Migrate,
     {
@@ -148,16 +238,20 @@ impl Migrator {
             conn.lock().await?;
         }
 
+        for schema_name in self.create_schemas.iter() {
+            conn.create_schema_if_not_exists(schema_name).await?;
+        }
+
         // creates [_migrations] table only if needed
         // eventually this will likely migrate previous versions of the table
-        conn.ensure_migrations_table().await?;
+        conn.ensure_migrations_table(&self.table_name).await?;
 
-        let version = conn.dirty_version().await?;
+        let version = conn.dirty_version(&self.table_name).await?;
         if let Some(version) = version {
             return Err(MigrateError::Dirty(version));
         }
 
-        let applied_migrations = conn.list_applied_migrations().await?;
+        let applied_migrations = conn.list_applied_migrations(&self.table_name).await?;
         validate_applied_migrations(&applied_migrations, self)?;
 
         let applied_migrations: HashMap<_, _> = applied_migrations
@@ -166,6 +260,11 @@ impl Migrator {
             .collect();
 
         for migration in self.iter() {
+            if target.is_some_and(|target| target < migration.version) {
+                // Target version reached
+                break;
+            }
+
             if migration.migration_type.is_down_migration() {
                 continue;
             }
@@ -177,7 +276,11 @@ impl Migrator {
                     }
                 }
                 None => {
-                    conn.apply(migration).await?;
+                    if skip {
+                        conn.skip(&self.table_name, migration).await?;
+                    } else {
+                        conn.apply(&self.table_name, migration).await?;
+                    }
                 }
             }
         }
@@ -222,14 +325,14 @@ impl Migrator {
 
         // creates [_migrations] table only if needed
         // eventually this will likely migrate previous versions of the table
-        conn.ensure_migrations_table().await?;
+        conn.ensure_migrations_table(&self.table_name).await?;
 
-        let version = conn.dirty_version().await?;
+        let version = conn.dirty_version(&self.table_name).await?;
         if let Some(version) = version {
             return Err(MigrateError::Dirty(version));
         }
 
-        let applied_migrations = conn.list_applied_migrations().await?;
+        let applied_migrations = conn.list_applied_migrations(&self.table_name).await?;
         validate_applied_migrations(&applied_migrations, self)?;
 
         let applied_migrations: HashMap<_, _> = applied_migrations
@@ -244,7 +347,7 @@ impl Migrator {
             .filter(|m| applied_migrations.contains_key(&m.version))
             .filter(|m| m.version > target)
         {
-            conn.revert(migration).await?;
+            conn.revert(&self.table_name, migration).await?;
         }
 
         // unlock the migrator to allow other migrators to run
@@ -255,4 +358,23 @@ impl Migrator {
 
         Ok(())
     }
+}
+
+fn validate_applied_migrations(
+    applied_migrations: &[AppliedMigration],
+    migrator: &Migrator,
+) -> Result<(), MigrateError> {
+    if migrator.ignore_missing {
+        return Ok(());
+    }
+
+    let migrations: HashSet<_> = migrator.iter().map(|m| m.version).collect();
+
+    for applied_migration in applied_migrations {
+        if !migrations.contains(&applied_migration.version) {
+            return Err(MigrateError::VersionMissing(applied_migration.version));
+        }
+    }
+
+    Ok(())
 }

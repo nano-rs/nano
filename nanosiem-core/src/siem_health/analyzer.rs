@@ -1475,6 +1475,7 @@ pub(crate) mod tests {
             audit_durability: None,
             reserved_source_names: Default::default(),
             shard_skew: None,
+            disk: None,
             alerting: AlertingMetrics {
                 total_alerts_24h: 0,
                 total_alerts_prior_24h: 0,

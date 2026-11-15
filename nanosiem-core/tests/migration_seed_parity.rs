@@ -102,19 +102,18 @@ async fn recreate(db: &str) -> PgPool {
         .expect("connect admin db");
     let _ = admin
         .execute(
-            format!(
+            sqlx::AssertSqlSafe(format!(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
                  WHERE datname = '{db}' AND pid <> pg_backend_pid()"
-            )
-            .as_str(),
+            )),
         )
         .await;
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {db}").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db}")))
         .await
         .expect("drop test db");
     admin
-        .execute(format!("CREATE DATABASE {db}").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
         .await
         .expect("create test db");
     PgPoolOptions::new()
@@ -126,7 +125,7 @@ async fn recreate(db: &str) -> PgPool {
 
 /// `id` set of a single-column query, sorted.
 async fn scalars(pool: &PgPool, sql: &str) -> Vec<String> {
-    let rows = sqlx::query(sql).fetch_all(pool).await.expect("query");
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await.expect("query");
     let mut out: Vec<String> = rows.iter().map(|r| r.get::<String, _>(0)).collect();
     out.sort();
     out

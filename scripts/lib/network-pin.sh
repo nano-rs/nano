@@ -33,6 +33,21 @@
 #     recreates a pinned network that has gone missing (an interrupted
 #     install.sh, `docker network prune`), so Compose does not make an
 #     unpinned one in its place. Never removes or replaces anything.
+# Usage (single-node `scripts/nano upgrade`, NAN-5435: the same two steps
+# install.sh runs, as commands):
+#   bash scripts/lib/network-pin.sh plan <recorded subnet> <compose args...>
+#     nano_network_pin_plan; prints
+#     "<action>\t<subnet>\t<network>\t<reason>\t<status>" (status: pinnable,
+#     managed, or empty when the Compose config could not be read).
+#     The caller records <subnet> as NANO_COMPOSE_SUBNET and renders the
+#     ClickHouse allow-list from it before ClickHouse restarts.
+#   bash scripts/lib/network-pin.sh apply <recorded subnet> <compose args...>
+#     plans again from the recorded subnet, then nano_network_pin_apply (a
+#     replace or release stops the stack); prints the action it carried out.
+#     The caller then starts the whole stack (`up -d`), as install.sh does.
+#   bash scripts/lib/network-pin.sh preview <recorded subnet> <compose args...>
+#     plan without creating anything (a read-only preflight); a missing
+#     network with nothing recorded gives no subnet.
 
 NANO_NETWORK_PIN_HELPER=${NANO_NETWORK_PIN_HELPER:-$(dirname "${BASH_SOURCE[0]}")/compose_network_pin.py}
 NANO_NETWORK_PIN_LABEL=sh.nano.network-pin
@@ -103,6 +118,16 @@ nano_network_pin_plan() {
         return 0
     fi
     if [[ -z "$info" ]]; then
+        if [[ "${NETWORK_PIN_PREVIEW:-0}" == "1" ]]; then
+            # Read-only: never create the network.
+            if [[ -n "$recorded" ]]; then
+                NETWORK_PIN_SUBNET=$(nano_network_pin_choose --recorded "$recorded") || NETWORK_PIN_SUBNET=""
+            else
+                NETWORK_PIN_REASON="$NETWORK_PIN_NAME does not exist yet"
+            fi
+            [[ -n "$NETWORK_PIN_SUBNET" ]] && NETWORK_PIN_ACTION=keep
+            return 0
+        fi
         if [[ -n "$recorded" ]]; then
             NETWORK_PIN_SUBNET=$(nano_network_pin_choose --recorded "$recorded") || { NETWORK_PIN_SUBNET=""; return 0; }
             if ! nano_network_pin_create "$NETWORK_PIN_NAME" "$NETWORK_PIN_SUBNET"; then
@@ -189,10 +214,28 @@ nano_network_pin_ensure() {
         && nano_network_pin_say "Recreated nano's pinned network $NETWORK_PIN_NAME on $subnet"
 }
 
+# plan|preview|apply <recorded subnet> <compose args...> (see Usage above).
+nano_network_pin_command() {
+    local command="$1" recorded="$2" planned
+    shift 2
+    COMPOSE_ARGS=("$@")
+    [[ "$command" == preview ]] && NETWORK_PIN_PREVIEW=1
+    nano_network_pin_plan "$recorded"
+    planned=$NETWORK_PIN_ACTION
+    if [[ "$command" == apply ]]; then
+        nano_network_pin_apply || return 1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$planned" "$NETWORK_PIN_SUBNET" "$NETWORK_PIN_NAME" \
+        "${NETWORK_PIN_REASON:-}" "${NETWORK_PIN_STATUS:-}"
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -u
     case "${1:-}" in
         ensure) shift; nano_network_pin_ensure "$@" ;;
-        *) nano_network_pin_say "usage: network-pin.sh ensure <subnet> <compose args...>"; exit 2 ;;
+        plan|preview|apply)
+            [[ $# -ge 2 ]] || { nano_network_pin_say "usage: network-pin.sh $1 <recorded subnet> <compose args...>"; exit 2; }
+            nano_network_pin_command "$@" ;;
+        *) nano_network_pin_say "usage: network-pin.sh ensure|plan|preview|apply <subnet> <compose args...>"; exit 2 ;;
     esac
 fi

@@ -84,7 +84,7 @@ pub enum Error {
         source: BoxDynError,
     },
 
-    /// Error occured while encoding a value.
+    /// Error occurred while encoding a value.
     #[error("error occurred while encoding a value: {0}")]
     Encode(#[source] BoxDynError),
 
@@ -123,6 +123,12 @@ pub enum Error {
 
     #[error("got unexpected connection status after attempting to begin transaction")]
     BeginFailed,
+
+    // Not returned in normal operation.
+    /// Error occurred while reading configuration file
+    #[doc(hidden)]
+    #[error("error reading configuration file: {0}")]
+    ConfigFile(#[from] crate::config::ConfigError),
 }
 
 impl StdError for Box<dyn DatabaseError> {}
@@ -197,6 +203,8 @@ pub enum ErrorKind {
     NotNullViolation,
     /// Check constraint violation.
     CheckViolation,
+    /// Exclusion constraint violation.
+    ExclusionViolation,
     /// An unmapped error.
     Other,
 }

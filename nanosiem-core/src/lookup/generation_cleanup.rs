@@ -130,7 +130,10 @@ impl LookupGenerationReconciler {
                 Ok(ReconcileResult::Purged)
             }
             Err(error) => {
-                let message: String = error.to_string().chars().take(2_000).collect();
+                let message: String = crate::db::pg_text::pg_safe_error_text(&error.to_string())
+                    .chars()
+                    .take(2_000)
+                    .collect();
                 // Each pass is bounded, and exponential retry delay is capped at
                 // fifteen minutes so a transient failure is never abandoned.
                 sqlx::query(

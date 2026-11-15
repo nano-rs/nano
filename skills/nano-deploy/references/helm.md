@@ -141,7 +141,7 @@ helm show values "$CHART" --version $V > ./nano-deploy-work/helm/chart-values.ya
 python3 scripts/helm-values.py --chart-values ./nano-deploy-work/helm/chart-values.yaml \
   --enrollment "$ENROLLMENT_FILE" --base-url https://APP_FQDN \
   --app-host APP_FQDN --ingest-host INGEST_FQDN --pull-secret nano-registry \
-  --issuer letsencrypt --storage-gi <from size.py> --hot-days <retention> \
+  --issuer letsencrypt --storage-gi <from size.py> \
   --out ./nano-deploy-work/helm
 ```
 

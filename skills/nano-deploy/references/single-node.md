@@ -123,6 +123,34 @@ If the operator has no enrollment yet (the trial is still pending), say that
 the install will run unlicensed until the values are added. Ask whether to continue. To add them later, run this
 step, then Step 8 again.
 
+## Optional: storage tiering (mutating, secret)
+
+Enterprise edition only (the open edition refuses `NANO_TIERING=on`). Off by
+default. Only if the operator wants older data in object storage (intake
+question 9). An interactive install asks `Enable cold storage tiering? [y/N]`
+itself; for an unattended Step 8, generate the flags with `plan.py ...
+--tiering-provider <s3|s3-compatible|gcs|azure> --tiering-bucket ...` (its
+`tiering.install_flags` and `tiering.secret_env`) or write them by hand;
+[operate.md](operate.md#storage-tiering) lists the keys. If the operator
+declines, pass `--tiering off` so the prompt is not shown.
+The secrets never pass through the chat or the workstation: the operator types
+them into a host-side file, which Step 8 sources like the admin credentials.
+
+```bash
+# Operator, in their own terminal (values are typed, not echoed into chat):
+ssh $H 'umask 077 && cat > ~/.nano-tiering.env'
+#   NANO_TIERING_ACCESS_KEY_ID=...
+#   NANO_TIERING_SECRET_ACCESS_KEY=...      (azure: NANO_TIERING_AZURE_ACCOUNT_KEY=...)
+#   then Ctrl-D
+```
+
+Add `set -a && . ~/.nano-tiering.env && set +a &&` before the Step 8 command
+and append the flags (`./install.sh --tiering s3 --tiering-bucket ...
+--tiering-region ...`). The installer validates them, writes them to `.env`, checks the
+store from the host (a warning, not a stop) and renders the ClickHouse policy.
+Delete `~/.nano-tiering.env` after Step 8. Check with
+`$SSH $H 'cd ~/nano && scripts/nano tiering status && scripts/nano tiering test'`.
+
 ## Step 8: install and start (mutating)
 
 ```bash

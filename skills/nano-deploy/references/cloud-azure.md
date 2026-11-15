@@ -130,14 +130,15 @@ Do not put this NSG on the `agw` subnet.
 
 ## Object storage: cold tier and backups
 
-nano's tiering and backup clients speak the **S3 API**. Azure Blob Storage has
-no S3 API, so on Azure:
-
-- **Cold tier:** run RustFS (S3-compatible, self-hosted) on Azure VMs with
-  managed disks, or use an external S3-compatible store; or keep all retention
-  on local disk (`plan.py --hot-days <retention>`, more disk, no tier). The
-  plan's cold-tier line is priced at Blob Hot LRS as a placeholder and listed
-  as unverified.
+- **Cold tier:** ClickHouse tiers to Azure Blob natively with the storage
+  account key: `plan.py --tiering-provider azure --tiering-azure-account-url
+  https://<account>.blob.core.windows.net --tiering-azure-container <name>-cold
+  --tiering-azure-account-name <account>` writes the inventory `tiering:` block;
+  the operator puts `NANO_TIERING_AZURE_ACCOUNT_KEY` in the shared `.env`. The
+  container must exist. Single host: the same values as `NANO_TIERING_*` keys
+  (see [operate.md](operate.md#storage-tiering)). Or keep all retention on local
+  disk (`plan.py --hot-days <retention>`, more disk, no tier).
+- nano's backup client speaks the **S3 API**, which Azure Blob does not have.
 - **Backups:** an Azure Files share mounted on the backup hosts (NFS 4.1 on a
   premium file share behind a private endpoint), used as a directory
   destination (`NANO_BACKUP_DESTINATION=path`), or the same S3-compatible store.

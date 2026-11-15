@@ -193,6 +193,8 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::upload::UploadApiDoc::openapi(),
         handlers::gdpr::GdprApiDoc::openapi(),
         handlers::ip_allowlist::IpAllowlistApiDoc::openapi(),
+        // Lookup URL allowlist (NAN-5443) — open core.
+        handlers::inputlookup_allowlist::InputLookupAllowlistApiDoc::openapi(),
         handlers::ingest_tokens::IngestTokensApiDoc::openapi(),
         handlers::log_source_connect::LogSourceConnectApiDoc::openapi(),
         handlers::log_source_health_series::LogSourceHealthSeriesApiDoc::openapi(),
@@ -908,8 +910,13 @@ mod tests {
         // NAN-5363 adds the ENTERPRISE /api/settings/agentlane/schema: 692.
         // NAN-5379 adds 4 ENTERPRISE Evidence Pack templates (registered via
         // `extension_api_docs`): 696; open is unchanged.
+        // NAN-5438 adds 4 ENTERPRISE pivt case-action templates
+        // (/api/cases/{id}/ai-actions + approve/dismiss/undo): 700.
+        // NAN-5443 adds the shared /api/settings/inputlookup-allowed-domains
+        // (GET/PUT, one template) to both editions: 701 / 425.
+        // NAN-5450 adds GET /api/system/disk-alert to both editions: 702 / 421.
         #[cfg(feature = "enterprise")]
-        let min_paths = 696;
+        let min_paths = 702;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
@@ -917,8 +924,11 @@ mod tests {
         // paths: 416 + 2 = 418; NAN-5217's three ingestion-pause paths: 421;
         // NAN-5272 drops /api/sigma/convert: 420; NAN-5279 adds
         // /api/log-sources/delivery-status: 421. NAN-5132's two deploy-job
-        // GETs: 423. NAN-5285's install-lease template: 424.
-        let min_paths = 424;
+        // GETs: 423. NAN-5285's install-lease template: 424. NAN-5443's
+        // lookup URL allowlist template: 425. NAN-5445 moves the five
+        // storage-tiering paths to enterprise: 420.
+        // NAN-5450's disk-alert: 421.
+        let min_paths = 421;
 
         assert!(
             path_count >= min_paths,
@@ -957,6 +967,87 @@ mod tests {
         assert!(
             components.security_schemes.contains_key("api_key"),
             "Should have api_key scheme"
+        );
+    }
+
+    /// NAN-5412 — the Swagger UI router actually serves the page, its bundled
+    /// assets and the spec it points at. A utoipa-swagger-ui major can move
+    /// the embedded asset layout or the config route without a compile error.
+    #[tokio::test]
+    async fn verify_swagger_ui_serves_page_assets_and_spec() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::util::ServiceExt;
+
+        let app: axum::Router = axum::Router::new().merge(swagger_ui());
+        let fetch = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 64 * 1024 * 1024).await.unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let (status, page) = fetch("/swagger-ui/").await;
+        assert_eq!(status, StatusCode::OK, "/swagger-ui/ must render");
+        assert!(page.contains("swagger-ui"), "index page is not the Swagger UI");
+        let (status, bundle) = fetch("/swagger-ui/swagger-ui-bundle.js").await;
+        assert_eq!(status, StatusCode::OK, "embedded Swagger UI bundle missing");
+        assert!(bundle.len() > 100_000, "Swagger UI bundle is suspiciously small");
+        let (status, init) = fetch("/swagger-ui/swagger-initializer.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            init.contains("/api-docs/openapi.json"),
+            "the UI no longer points at the served spec"
+        );
+        let (status, spec) = fetch("/api-docs/openapi.json").await;
+        assert_eq!(status, StatusCode::OK, "spec route must serve");
+        let spec: serde_json::Value = serde_json::from_str(&spec).expect("served spec is JSON");
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert!(spec["paths"].as_object().is_some_and(|p| !p.is_empty()));
+    }
+
+    /// NAN-5412 — OpenAPI 3.1 makes `description` REQUIRED on every Response
+    /// Object. utoipa 5 emitted `"description": ""` for a response annotated
+    /// without one; utoipa 6 omits the key, so an undescribed
+    /// `(status = 200, body = T)` now yields an invalid spec that strict
+    /// generators and validators reject. Every response must say what it means.
+    #[test]
+    fn verify_every_response_has_a_description() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let mut missing = Vec::new();
+        for (path, item) in spec["paths"].as_object().expect("paths object") {
+            for (method, op) in item.as_object().expect("path item object") {
+                let Some(responses) = op.get("responses").and_then(|r| r.as_object()) else {
+                    continue;
+                };
+                for (status, response) in responses {
+                    // A `$ref` response inherits its description from the component.
+                    if response.get("$ref").is_some() {
+                        continue;
+                    }
+                    let described = response
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .is_some_and(|d| !d.trim().is_empty());
+                    if !described {
+                        missing.push(format!("{} {path} {status}", method.to_uppercase()));
+                    }
+                }
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "{} response(s) have no description, which OpenAPI 3.1 requires. Add \
+             `description = \"...\"` to each `(status = ..., ...)` entry:\n  {}",
+            missing.len(),
+            missing.join("\n  ")
         );
     }
 

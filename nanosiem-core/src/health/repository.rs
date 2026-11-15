@@ -9,6 +9,25 @@ use uuid::Uuid;
 use super::types::HealthIssue;
 use crate::models::notification::NotificationType;
 
+/// One in-app notification per active admin ($1 type, $2 title, $3 message,
+/// $4 link, $5 metadata).
+const NOTIFY_ADMINS_SQL: &str = r#"
+    INSERT INTO notifications (
+        user_id, notification_type, title, message, link, metadata
+    )
+    SELECT DISTINCT
+        u.id, $1, $2, $3, $4, $5
+    FROM users u
+    WHERE u.status = 'active'
+      AND EXISTS (
+          SELECT 1 FROM user_groups ug
+          JOIN group_roles gr ON gr.group_id = ug.group_id
+          JOIN roles r ON r.id = gr.role_id
+          WHERE ug.user_id = u.id AND r.name = 'Admin'
+      )
+"#;
+
+
 /// Notification payload inserted transactionally with a health-issue claim.
 pub struct HealthNotification {
     pub notification_type: NotificationType,
@@ -145,23 +164,7 @@ impl HealthRepository {
             return Ok(None);
         }
 
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO notifications (
-                user_id, notification_type, title, message, link, metadata
-            )
-            SELECT DISTINCT
-                u.id, $1, $2, $3, $4, $5
-            FROM users u
-            WHERE u.status = 'active'
-              AND EXISTS (
-                  SELECT 1 FROM user_groups ug
-                  JOIN group_roles gr ON gr.group_id = ug.group_id
-                  JOIN roles r ON r.id = gr.role_id
-                  WHERE ug.user_id = u.id AND r.name = 'Admin'
-              )
-            "#,
-        )
+        let inserted = sqlx::query(NOTIFY_ADMINS_SQL)
         .bind(notification.notification_type.to_string())
         .bind(&notification.title)
         .bind(&notification.message)
@@ -173,6 +176,21 @@ impl HealthRepository {
         tx.commit().await?;
 
         Ok(Some(inserted))
+    }
+
+    /// NAN-5450: one notification to every active admin, no issue tracking
+    /// (the caller rate-limits: the hourly imminent-disk reminder). Returns
+    /// the recipients.
+    pub async fn notify_admins(&self, notification: &HealthNotification) -> Result<u64, HealthRepositoryError> {
+        Ok(sqlx::query(NOTIFY_ADMINS_SQL)
+            .bind(notification.notification_type.to_string())
+            .bind(&notification.title)
+            .bind(&notification.message)
+            .bind(&notification.link)
+            .bind(&notification.metadata)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
     }
 
     /// Mark an issue as resolved

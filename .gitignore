@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 Cargo.lock
+# The desktop app is its own cargo workspace; its lockfile pins the shipped
+# installer's dependency set (the root Cargo.lock is force-added).
+!nano-desktop/src-tauri/Cargo.lock
 
 # Node.js
 node_modules/

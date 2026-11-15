@@ -78,6 +78,17 @@ pub async fn collect_metrics(
         Utc::now().timestamp(),
     )
     .await;
+    // NAN-5450: data volume usage. The admin probe client reads every
+    // ClickHouse node on a cluster; a refused fan-out falls back to the
+    // connected node.
+    let disk = Some(
+        crate::health::disk_monitor::collect_disk_health(
+            pool,
+            system_probe_client,
+            super::shard_skew::cluster_from_env(is_clustered).as_deref(),
+        )
+        .await,
+    );
 
     CollectedMetrics {
         ingestion,
@@ -88,6 +99,7 @@ pub async fn collect_metrics(
         audit_durability,
         reserved_source_names,
         shard_skew,
+        disk,
         collected_at: Utc::now(),
     }
 }
@@ -448,7 +460,7 @@ async fn collect_insert_integrity(
     let ch = match cluster_ref {
         Some(_) => {
             let (name, value) = PROBE_SKIP_UNAVAILABLE_REPLICAS;
-            skip_down_replicas.with_option(name, value)
+            skip_down_replicas.with_setting(name, value)
         }
         None => skip_down_replicas,
     };

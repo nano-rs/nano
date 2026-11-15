@@ -43,16 +43,26 @@
 //! There is no fallback to a direct connection, and an invalid proxy setting
 //! is an error for the caller to refuse to start on, never "direct".
 //!
+//! # Proxy required (`NANO_EGRESS_PROXY_REQUIRED`, NAN-5441)
+//!
+//! Off by default. When on, a path with no proxy URL gets
+//! [`ProxyRequiredDialer`] (every connection to a public address refuses
+//! with [`ProxyRefusal::Required`]), and [`crate::broker::DirectDialer`]
+//! itself refuses public addresses too, so a broker built without these
+//! helpers cannot go direct. Internal addresses stay direct.
+//!
 //! The hosted platform's HMAC-granted per-tenant egress proxy (NAN-4369)
 //! is not part of the ClickHouse product and is not implemented here.
 
 use std::sync::Arc;
 
-use base64::Engine as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::broker::{BrokerConfig, DialTarget, Dialer, DirectDialer};
+
+// The proxy settings types and the CONNECT handshake are shared with the
+// destination proxy for pinned user-set destinations (NAN-5441).
+pub use nanosiem_core::egress_proxy::{ProxyConfigError, ProxyEndpoint, ProxyMode, ProxyRefusal, EGRESS_PROXY_REQUIRED_ENV};
 
 /// Pull feeds and threat-intel lookups.
 pub const CONNECTOR_PROXY_ENV: &str = "CONNECTOR_EGRESS_PROXY_URL";
@@ -60,82 +70,15 @@ pub const CONNECTOR_PROXY_ENV: &str = "CONNECTOR_EGRESS_PROXY_URL";
 /// `hostname` (see the module docs).
 pub const CONNECTOR_PROXY_MODE_ENV: &str = "CONNECTOR_EGRESS_PROXY_MODE";
 
-/// What a CONNECT request names.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ProxyMode {
-    /// `CONNECT <pinned ip>:<port>`: the broker resolves, checks and pins.
-    #[default]
-    PinnedIp,
-    /// `CONNECT <host>:<port>`: the proxy resolves and enforces egress.
-    Hostname,
-}
-
-impl ProxyMode {
-    /// Parse a mode setting. Unset or empty is [`ProxyMode::PinnedIp`]; any
-    /// value other than `pinned_ip` / `hostname` is an error.
-    pub fn parse(value: Option<&str>) -> Result<Self, ProxyConfigError> {
-        match value.map(str::trim) {
-            None | Some("") | Some("pinned_ip") => Ok(Self::PinnedIp),
-            Some("hostname") => Ok(Self::Hostname),
-            Some(_) => Err(ProxyConfigError::Mode),
-        }
-    }
-}
-
-/// Longest CONNECT response header block read from the proxy.
-const MAX_PROXY_HEADER_BYTES: usize = 8192;
-
-/// Why a tunnel was not opened. Nothing reached the vendor in any case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ProxyRefusal {
-    #[error("egress proxy is unreachable")]
-    Unreachable,
-    #[error("egress proxy denied the destination")]
-    Denied,
-    #[error("egress proxy refused the tunnel")]
-    Refused,
-    /// The operator's proxy setting is invalid: every connection is refused
-    /// rather than sent direct.
-    #[error("egress proxy setting is invalid; the request was refused")]
-    Misconfigured,
-}
-
-impl ProxyRefusal {
-    fn into_io(self) -> std::io::Error {
-        std::io::Error::other(self)
-    }
-
-    /// The refusal a dialer returned, if the error is one.
-    pub fn from_io(error: &std::io::Error) -> Option<Self> {
-        error.get_ref().and_then(|e| e.downcast_ref::<Self>()).copied()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ProxyConfigError {
-    #[error("egress proxy URL must be http://[user:password@]host:port with no path, query or fragment")]
-    Url,
-    #[error("egress proxy mode must be `pinned_ip` or `hostname`")]
-    Mode,
-}
-
 /// Dials every new connection as a CONNECT tunnel through a forward proxy.
 pub struct ProxyDialer {
-    host: String,
-    port: u16,
+    endpoint: ProxyEndpoint,
     mode: ProxyMode,
-    /// `Proxy-Authorization` value, from the URL's userinfo.
-    authorization: Option<String>,
 }
 
 impl std::fmt::Debug for ProxyDialer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProxyDialer")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("mode", &self.mode)
-            .field("authenticated", &self.authorization.is_some())
-            .finish()
+        f.debug_struct("ProxyDialer").field("endpoint", &self.endpoint).field("mode", &self.mode).finish()
     }
 }
 
@@ -143,32 +86,7 @@ impl ProxyDialer {
     /// `proxy_url` is `http://[user:password@]host:port`. Credentials, when
     /// present, are sent as `Proxy-Authorization: Basic` on CONNECT only.
     pub fn new(proxy_url: &str) -> Result<Self, ProxyConfigError> {
-        if proxy_url.chars().any(char::is_control) || proxy_url.contains('\\') {
-            return Err(ProxyConfigError::Url);
-        }
-        let url = url::Url::parse(proxy_url).map_err(|_| ProxyConfigError::Url)?;
-        if url.scheme() != "http" || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-            return Err(ProxyConfigError::Url);
-        }
-        let host = match url.host() {
-            Some(url::Host::Domain(d)) if !d.is_empty() => d.to_string(),
-            Some(url::Host::Ipv4(ip)) => ip.to_string(),
-            Some(url::Host::Ipv6(ip)) => ip.to_string(),
-            _ => return Err(ProxyConfigError::Url),
-        };
-        let port = url.port_or_known_default().ok_or(ProxyConfigError::Url)?;
-        let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8().map(|c| c.into_owned()).map_err(|_| ProxyConfigError::Url);
-        let authorization = match (url.username(), url.password()) {
-            ("", None) => None,
-            (user, password) => {
-                let pair = format!("{}:{}", decode(user)?, decode(password.unwrap_or(""))?);
-                if pair.chars().any(char::is_control) {
-                    return Err(ProxyConfigError::Url);
-                }
-                Some(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair)))
-            }
-        };
-        Ok(Self { host, port, mode: ProxyMode::PinnedIp, authorization })
+        Ok(Self { endpoint: ProxyEndpoint::parse(proxy_url)?, mode: ProxyMode::PinnedIp })
     }
 
     /// [`ProxyDialer::new`] with an explicit [`ProxyMode`].
@@ -180,13 +98,13 @@ impl ProxyDialer {
         self.mode
     }
 
-    /// The CONNECT request: the pinned address in `pinned_ip` mode, the
+    /// The CONNECT authority: the pinned address in `pinned_ip` mode, the
     /// policy-checked host name in `hostname` mode. `None` refuses the dial
     /// (a hostname-mode target that is not a plain DNS name).
-    fn connect_request(&self, target: &DialTarget<'_>) -> Option<String> {
-        let authority = match self.mode {
+    fn connect_authority(&self, target: &DialTarget<'_>) -> Option<String> {
+        match self.mode {
             // `SocketAddr` renders IPv6 as `[addr]:port`: a valid authority form.
-            ProxyMode::PinnedIp => target.addr.to_string(),
+            ProxyMode::PinnedIp => Some(target.addr.to_string()),
             ProxyMode::Hostname => {
                 // The broker only passes allowlisted names; re-check so a
                 // literal IP or a header-splitting byte can never be sent.
@@ -195,50 +113,17 @@ impl ProxyDialer {
                 {
                     return None;
                 }
-                format!("{}:{}", target.host, target.addr.port())
+                Some(format!("{}:{}", target.host, target.addr.port()))
             }
-        };
-        let mut req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
-        if let Some(auth) = &self.authorization {
-            req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
         }
-        req.push_str("\r\n");
-        Some(req)
-    }
-}
-
-/// Read exactly through the header terminator: never consume tunnel bytes,
-/// trust a length, or allocate from proxy input.
-async fn read_connect_status(stream: &mut TcpStream) -> Result<u16, ProxyRefusal> {
-    let mut head = Vec::with_capacity(128);
-    while !head.ends_with(b"\r\n\r\n") {
-        if head.len() >= MAX_PROXY_HEADER_BYTES {
-            return Err(ProxyRefusal::Refused);
-        }
-        head.push(stream.read_u8().await.map_err(|_| ProxyRefusal::Unreachable)?);
-    }
-    let line = head.split(|b| *b == b'\n').next().unwrap_or_default();
-    let line = std::str::from_utf8(line).map_err(|_| ProxyRefusal::Refused)?.trim_end_matches('\r');
-    let mut parts = line.splitn(3, ' ');
-    match (parts.next(), parts.next()) {
-        (Some("HTTP/1.1" | "HTTP/1.0"), Some(code)) if code.len() == 3 => code.parse().map_err(|_| ProxyRefusal::Refused),
-        _ => Err(ProxyRefusal::Refused),
     }
 }
 
 #[async_trait::async_trait]
 impl Dialer for ProxyDialer {
     async fn dial(&self, target: DialTarget<'_>) -> std::io::Result<TcpStream> {
-        let request = self.connect_request(&target).ok_or_else(|| ProxyRefusal::Refused.into_io())?;
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .map_err(|_| ProxyRefusal::Unreachable.into_io())?;
-        stream.write_all(request.as_bytes()).await.map_err(|_| ProxyRefusal::Unreachable.into_io())?;
-        match read_connect_status(&mut stream).await.map_err(ProxyRefusal::into_io)? {
-            200..=299 => Ok(stream),
-            403 | 407 => Err(ProxyRefusal::Denied.into_io()),
-            _ => Err(ProxyRefusal::Refused.into_io()),
-        }
+        let authority = self.connect_authority(&target).ok_or_else(|| ProxyRefusal::Refused.into_io())?;
+        self.endpoint.connect_tunnel(&authority).await.map_err(ProxyRefusal::into_io)
     }
 
     fn resolves_remotely(&self, _host: &str) -> bool {
@@ -268,12 +153,41 @@ pub fn dialer_from_value(value: Option<&str>) -> Result<Arc<dyn Dialer>, ProxyCo
     dialer_from_values(value, None)
 }
 
-/// [`dialer_from_env_with_mode`] on already-read values.
+/// [`dialer_from_env_with_mode`] on already-read values. With no proxy URL
+/// and "proxy required" on ([`EGRESS_PROXY_REQUIRED_ENV`], NAN-5441) the
+/// dialer is [`ProxyRequiredDialer`]: every connection refuses with
+/// [`ProxyRefusal::Required`] instead of going direct.
 pub fn dialer_from_values(url: Option<&str>, mode: Option<&str>) -> Result<Arc<dyn Dialer>, ProxyConfigError> {
+    dialer_from_values_required(url, mode, nanosiem_core::egress_proxy::proxy_required())
+}
+
+/// [`dialer_from_values`] with "proxy required" passed in (tests, hosts with
+/// their own settings source).
+pub fn dialer_from_values_required(
+    url: Option<&str>,
+    mode: Option<&str>,
+    required: bool,
+) -> Result<Arc<dyn Dialer>, ProxyConfigError> {
     let mode = ProxyMode::parse(mode)?;
     match url.map(str::trim) {
+        None | Some("") if required => Ok(Arc::new(ProxyRequiredDialer)),
         None | Some("") => Ok(Arc::new(DirectDialer)),
         Some(url) => Ok(Arc::new(ProxyDialer::with_mode(url, mode)?)),
+    }
+}
+
+/// "Proxy required" is on and this path has no proxy URL (NAN-5441): a
+/// public address refuses with [`ProxyRefusal::Required`]; an internal one
+/// (already admitted by the broker's policy) is dialed directly.
+pub struct ProxyRequiredDialer;
+
+#[async_trait::async_trait]
+impl Dialer for ProxyRequiredDialer {
+    async fn dial(&self, target: DialTarget<'_>) -> std::io::Result<TcpStream> {
+        if nanosiem_core::egress_proxy::is_public_destination(target.addr.ip()) {
+            return Err(ProxyRefusal::Required.into_io());
+        }
+        TcpStream::connect(target.addr).await
     }
 }
 

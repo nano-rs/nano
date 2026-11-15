@@ -96,7 +96,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
 
       - name: Install deps
         working-directory: nanosiem-web
@@ -181,7 +181,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
 
       # Desktop imports shared TypeScript directly from nanosiem-web. Bare
       # imports inside those files resolve from nanosiem-web/node_modules, so a
@@ -237,19 +237,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.95
+        uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100
 
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
         with:
           workspaces: nano-desktop/src-tauri
 
-      # NOT `--locked`: `.gitignore` blanket-ignores `Cargo.lock` and the
-      # desktop lockfile was never force-added, unlike the root workspace's.
-      # So `src-tauri` resolves dependencies fresh on every build and this job
-      # cannot pin them. Worth fixing separately — a shipped installer built
-      # from a floating dependency set is not reproducible — but committing the
-      # lockfile is its own decision, so it does not belong in this workflow.
+      # `--locked`: nano-desktop/src-tauri/Cargo.lock is committed (NAN-5412),
+      # so tests run against the same dependency set the installer ships.
       - name: Run desktop tests
         working-directory: nano-desktop/src-tauri
-        run: cargo test
+        run: cargo test --locked

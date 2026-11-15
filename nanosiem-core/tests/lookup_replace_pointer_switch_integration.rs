@@ -110,18 +110,18 @@ async fn pg_failure_after_staging_keeps_old_generation_and_schema() {
     // Reject any registry UPDATE for this table: the publish step fails AFTER
     // the replacement rows are staged in ClickHouse.
     let trigger_fn = format!("nan2875_fail_{suffix}");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION {trigger_fn}() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN IF NEW.name = '{name}' THEN RAISE EXCEPTION 'forced registry failure'; END IF; \
          RETURN NEW; END $$"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("create trigger fn");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TRIGGER {trigger_fn} BEFORE UPDATE ON lookup_tables_registry \
          FOR EACH ROW EXECUTE FUNCTION {trigger_fn}()"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("create trigger");
@@ -136,13 +136,13 @@ async fn pg_failure_after_staging_keeps_old_generation_and_schema() {
         )
         .await;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP TRIGGER {trigger_fn} ON lookup_tables_registry"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("drop trigger");
-    sqlx::query(&format!("DROP FUNCTION {trigger_fn}()"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {trigger_fn}()")))
         .execute(&pool)
         .await
         .expect("drop trigger fn");

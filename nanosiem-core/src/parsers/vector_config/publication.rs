@@ -2103,6 +2103,37 @@ mod tests {
         assert_eq!(decoded.to_bytes(), original.to_bytes());
     }
 
+    /// NAN-5412: a signing key exactly as operators make one
+    /// (`openssl genpkey -algorithm ed25519 | openssl pkey -outform DER | base64`,
+    /// OpenSSL 4.1), with the public key and an RFC 8032 signature OpenSSL
+    /// produced over a fixed message. Independent of ed25519-dalek, so it pins
+    /// PKCS#8 decoding and signature bytes across dalek majors. Throwaway key,
+    /// never a production secret.
+    #[test]
+    fn openssl_pkcs8_key_decodes_and_signs_byte_identically() {
+        const OPENSSL_PKCS8_B64: &str =
+            "MC4CAQAwBQYDK2VwBCIEICrP5D8+Opm6Y0NzIRY3yINOfF4Ib0rApbNTCJvxUsTV";
+        const OPENSSL_PUBLIC_HEX: &str =
+            "bf7f097bd474d8e77dae89b5b0e245c069fb811ea8c4b941fdcf0b465bea2c9d";
+        const OPENSSL_SIGNATURE_HEX: &str = "a79bcd01bfaff54e7be6c0751b073d0a7e49bd866b6cf5a7aef2c3209965749615879315b78955f60b9d35f570bec7f0b4971ebf986eaccc8774b4f6775a3e00";
+        let message = b"nano NAN-5412 pkcs8 fixture";
+
+        let key = decode_signing_key(OPENSSL_PKCS8_B64).expect("OpenSSL PKCS#8 decodes");
+        assert_eq!(hex::encode(key.verifying_key().to_bytes()), OPENSSL_PUBLIC_HEX);
+        assert_eq!(hex::encode(key.sign(message).to_bytes()), OPENSSL_SIGNATURE_HEX);
+
+        let openssl_signature =
+            Signature::from_slice(&hex::decode(OPENSSL_SIGNATURE_HEX).unwrap()).unwrap();
+        assert!(key
+            .verifying_key()
+            .verify_strict(message, &openssl_signature)
+            .is_ok());
+        assert!(key
+            .verifying_key()
+            .verify_strict(b"nano NAN-5412 pkcs8 fixturE", &openssl_signature)
+            .is_err());
+    }
+
     #[test]
     fn malformed_signing_key_is_still_rejected() {
         assert!(matches!(

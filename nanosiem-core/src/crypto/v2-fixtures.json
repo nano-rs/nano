@@ -1,0 +1,98 @@
+[
+  {
+    "active": "k1",
+    "ciphertext": "TkNLAgECazFqUH3qmygqArH1BuxDA5WKETwv5ZL7hpzhEUgmywGXdb5Pofse90vLRQ==",
+    "derived_key_hex": "794dc851715fb322f2a2a87820dda037fff93623d316cb8c1195288d72af139c",
+    "kind": "tenant",
+    "nonce": "nck2:NAdQ5AfY5Ne/CqAq",
+    "plaintext": "{\"token\":\"fixture-token\"}",
+    "purpose": "connector.vendor",
+    "row": "feed-1",
+    "scope": "tenant",
+    "scope_id": "00000000-0000-0000-0000-000000000001"
+  },
+  {
+    "active": "k1",
+    "ciphertext": "TkNLAgECazEBn9xaumTQk30lqGaKwcDays1hN1IK160wBPo7lKFq7p2n+n67",
+    "derived_key_hex": "bb588b70901f33516dac9a250aadf602bdaf87c56e9f7d5b674be032d6f23b4b",
+    "kind": "account",
+    "nonce": "nck2:t0odxz4wKotAh/Ay",
+    "plaintext": "fixture-client-secret",
+    "purpose": "sso.client_secret",
+    "row": "00000000-0000-0000-0000-000000000007",
+    "scope": "account",
+    "scope_id": "00000000-0000-0000-0000-00000000002a"
+  },
+  {
+    "active": "k1",
+    "ciphertext": "TkNLAgECazFfhm3372HH5nvCSJaeQfPsNyDD5DzRsrxf4g4iCaAKkps=",
+    "derived_key_hex": "b95fffbd6afb8ca7cdfadb76fc2f95cf1c13c135a76cecc6a4456c6b33a33085",
+    "kind": "deployment",
+    "nonce": "nck2:sYlds70d8/1UNEv8",
+    "plaintext": "sk-fixture-ai-key",
+    "purpose": "ai.gateway_key",
+    "row": "default",
+    "scope": "deployment",
+    "scope_id": null
+  },
+  {
+    "active": "k1",
+    "ciphertext": "TkNLAgECazECftXoCRYYz+C6yzZYC8zX6ZBs5wFzBOXEh8Y0BktKNluoO4Ti",
+    "derived_key_hex": "be04d83ec730d8660defd8636b047c58d4aa7eb8b0301b0563b8b8237549369d",
+    "kind": "platform",
+    "nonce": "nck2:bIzL4TOjli7dHuDX",
+    "plaintext": "{\"api_key\":\"fixture\"}",
+    "purpose": "platform.feed",
+    "row": "feed/synthient",
+    "scope": "platform",
+    "scope_id": null
+  },
+  {
+    "active": "k2",
+    "ciphertext": "TkNLAgECazJcCRX+UpKFdCPGIY4JZzi8frxvolezNZRlSPsjFU9rByLQRBqnxoTB5w==",
+    "derived_key_hex": "f2cfb5b921e6a3ef8796d672a0ec54f71126d371f6a200d300c880a08fc52a59",
+    "kind": "tenant",
+    "nonce": "nck2:u73+XbqhmoVC9HJF",
+    "plaintext": "{\"token\":\"fixture-token\"}",
+    "purpose": "connector.vendor",
+    "row": "feed-1",
+    "scope": "tenant",
+    "scope_id": "00000000-0000-0000-0000-000000000001"
+  },
+  {
+    "active": "k2",
+    "ciphertext": "TkNLAgECazKreyB9UTUCQ+O1fvZ8c5P1M45ayhwwl9TTfulE5yncwAPbidZS",
+    "derived_key_hex": "805b825b87c92e5854ae585c5292766e6fe44a4bf4ea520a966853b4dafac95a",
+    "kind": "account",
+    "nonce": "nck2:rKZ096hnp5l7HoOM",
+    "plaintext": "fixture-client-secret",
+    "purpose": "sso.client_secret",
+    "row": "00000000-0000-0000-0000-000000000007",
+    "scope": "account",
+    "scope_id": "00000000-0000-0000-0000-00000000002a"
+  },
+  {
+    "active": "k2",
+    "ciphertext": "TkNLAgECazLXDmDmCp2fK8eyk7YvYC2nYFwXxoCSxZMk8SrFmTpLpEY=",
+    "derived_key_hex": "c4bc989b66d2a0dea7da1485040920724662c634f0a8a9f1985daa21a3848781",
+    "kind": "deployment",
+    "nonce": "nck2:ih8EmWDPklE7scfQ",
+    "plaintext": "sk-fixture-ai-key",
+    "purpose": "ai.gateway_key",
+    "row": "default",
+    "scope": "deployment",
+    "scope_id": null
+  },
+  {
+    "active": "k2",
+    "ciphertext": "TkNLAgECazLXKw2yLb980YdIpDeZ/4kgY+RSNktsYv1M1v5a0ka2ZwpGTrGP",
+    "derived_key_hex": "17911849d268541c6472d928ebb2b35dd13a0b67094d2d4ae6672f20208ce1e0",
+    "kind": "platform",
+    "nonce": "nck2:iv0qfQYvPagPkNGY",
+    "plaintext": "{\"api_key\":\"fixture\"}",
+    "purpose": "platform.feed",
+    "row": "feed/synthient",
+    "scope": "platform",
+    "scope_id": null
+  }
+]

@@ -432,6 +432,10 @@ impl From<nanosiem_core::ParserServiceError> for ApiError {
             nanosiem_core::ParserServiceError::VrlValidationFailed(msg) => {
                 ApiError::ValidationError(format!("VRL validation failed: {}", msg))
             }
+            // NAN-5401: the save/deploy waited its full budget for a worker.
+            nanosiem_core::ParserServiceError::ValidationBusy(msg) => {
+                ApiError::ServiceUnavailable(msg.clone())
+            }
             nanosiem_core::ParserServiceError::VectorValidationFailed(msg) => {
                 ApiError::ValidationError(format!("Vector validation failed: {}", msg))
             }
@@ -481,6 +485,11 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             // NAN-5234: every parser-test worker is busy.
             nanosiem_core::LogSourceServiceError::ParserTestBusy(msg) => {
                 ApiError::TooManyRequests(msg.clone())
+            }
+            // NAN-5401: a save/publish/deploy waited its full budget for a
+            // parser validation worker; retryable, never "invalid VRL".
+            nanosiem_core::LogSourceServiceError::ValidationBusy(msg) => {
+                ApiError::ServiceUnavailable(msg.clone())
             }
             nanosiem_core::LogSourceServiceError::InvalidSourceType(t) => {
                 ApiError::ValidationError(format!("Invalid source type: {}", t))
@@ -630,6 +639,12 @@ impl From<nanosiem_core::RetentionError> for ApiError {
         match &err {
             RetentionError::InvalidPeriod(msg) => ApiError::ValidationError(msg.clone()),
             RetentionError::Config(msg) => ApiError::InternalError(msg.clone()),
+            // NAN-5450: a full disk is an operator-actionable state, not an
+            // opaque storage error. The message names the recovery runbook.
+            RetentionError::DiskFull(msg) => {
+                tracing::warn!(error = %msg, "ClickHouse retention refused: disk full");
+                ApiError::ServiceUnavailable(msg.clone())
+            }
             RetentionError::ClickHouse(msg) => {
                 tracing::error!(error = %msg, "ClickHouse retention error");
                 ApiError::InternalError("A storage error occurred".to_string())
@@ -642,32 +657,16 @@ impl From<nanosiem_core::RetentionError> for ApiError {
     }
 }
 
+// NAN-5445: storage tiering is enterprise-only.
+#[cfg(feature = "enterprise")]
 impl From<nanosiem_core::settings::TieringError> for ApiError {
     fn from(err: nanosiem_core::settings::TieringError) -> Self {
         use nanosiem_core::settings::TieringError;
         match &err {
-            TieringError::Config(msg) => ApiError::ValidationError(msg.clone()),
-            TieringError::NotConfigured => {
-                ApiError::BadRequest("Tiering is not configured".to_string())
-            }
-            TieringError::S3Connection(msg) => {
-                ApiError::BadRequest(format!("S3 connection failed: {}", msg))
-            }
+            TieringError::ManagedByDeployment(msg) => ApiError::Conflict(msg.clone()),
             TieringError::ClickHouse(_) => {
                 tracing::error!(error = %err, "Tiering ClickHouse error");
                 ApiError::InternalError("A ClickHouse error occurred".to_string())
-            }
-            TieringError::Encryption(_) => {
-                tracing::error!(error = %err, "Tiering encryption error");
-                ApiError::InternalError("An encryption error occurred".to_string())
-            }
-            TieringError::Database(_) => {
-                tracing::error!(error = %err, "Tiering database error");
-                ApiError::InternalError("A database error occurred".to_string())
-            }
-            TieringError::Io(_) => {
-                tracing::error!(error = %err, "Tiering IO error");
-                ApiError::InternalError("A storage configuration error occurred".to_string())
             }
         }
     }

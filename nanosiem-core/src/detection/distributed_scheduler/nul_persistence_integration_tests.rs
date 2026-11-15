@@ -180,10 +180,10 @@ impl Harness {
     /// Reject inserts into `table` matching `when` with SQLSTATE 22P05.
     async fn reject_inserts(&mut self, table: &'static str, when: &str) {
         let name = format!("nan5424_reject_{}_{}_{}", table, self.tag, self.triggers.len());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TRIGGER {name} BEFORE INSERT ON {table} FOR EACH ROW WHEN ({when}) \
              EXECUTE FUNCTION nan5424_test_reject()"
-        ))
+        )))
         .execute(&self.pg)
         .await
         .expect("create trigger");
@@ -192,7 +192,7 @@ impl Harness {
 
     async fn drop_triggers(&mut self) {
         for (name, table) in self.triggers.drain(..) {
-            let _ = sqlx::query(&format!("DROP TRIGGER IF EXISTS {name} ON {table}"))
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER IF EXISTS {name} ON {table}")))
                 .execute(&self.pg)
                 .await;
         }
@@ -488,6 +488,43 @@ async fn a_nul_entity_alerts_and_its_cooldown_key_still_suppresses() {
     let rule = h.cycle(rule_id).await;
     assert_eq!(rule.consecutive_failures, 0, "{:?}", rule.last_error);
     assert_eq!(h.alert_events(rule_id).await.len(), 1, "cooldown must still apply");
+    h.teardown().await;
+}
+
+#[tokio::test]
+async fn a_long_entity_is_anchored_and_its_cooldown_suppresses() {
+    // NAN-5429: an entity longer than a btree index entry (~2.7 KB) that does
+    // not compress must still get a cooldown anchor.
+    let _ocsf = crate::schema::pin_active_schema_for_test(crate::schema::SchemaId::Ocsf);
+    let Some(mut h) = Harness::connect().await else { return };
+    let st = h.source_type("cooldown-long");
+    let rule_id = h
+        .create_rule_with(
+            "grouped cooldown long entity",
+            &st,
+            "grouped",
+            Duration::minutes(10),
+            json!({"risk_entity_field": "actor.user.name", "alert_cooldown_minutes": 60}),
+        )
+        .await;
+    let long: String = (0..132).map(|_| Uuid::new_v4().simple().to_string()).collect();
+    assert!(long.len() > 4000);
+    h.insert_event(&st, "first", &long, Utc::now() - Duration::minutes(5)).await;
+    let rule = h.cycle(rule_id).await;
+    assert_eq!(rule.consecutive_failures, 0, "{:?}", rule.last_error);
+    assert_eq!(h.alert_events(rule_id).await.len(), 1);
+    let anchors: Vec<(String,)> =
+        sqlx::query_as("SELECT entity FROM detection_alert_entity_cooldowns WHERE rule_id = $1")
+            .bind(rule_id)
+            .fetch_all(&h.pg)
+            .await
+            .unwrap();
+    assert_eq!(anchors, vec![(long.clone(),)], "full value kept next to the digest key");
+
+    h.insert_event(&st, "second", &long, Utc::now() - Duration::seconds(20)).await;
+    let rule = h.cycle(rule_id).await;
+    assert_eq!(rule.consecutive_failures, 0, "{:?}", rule.last_error);
+    assert_eq!(h.alert_events(rule_id).await.len(), 1, "cooldown must apply to the long entity");
     h.teardown().await;
 }
 

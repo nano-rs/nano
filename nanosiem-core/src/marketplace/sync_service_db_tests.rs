@@ -99,7 +99,7 @@ async fn a_failed_reparse_is_not_stamped_and_the_next_sync_retries() {
     // transaction the other one would already be written (or kept) when the
     // sync fails.
     let func = format!("nan4930_fail_{tag}");
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
            IF NEW.slug = '{fail_slug}' THEN RAISE EXCEPTION 'nan4930 forced catalog failure'; END IF;
@@ -107,7 +107,7 @@ async fn a_failed_reparse_is_not_stamped_and_the_next_sync_retries() {
          END $$;
          CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON marketplace_catalog
            FOR EACH ROW EXECUTE FUNCTION {func}();"
-    ))
+    )))
     .execute(&pool)
     .await
     .unwrap();
@@ -116,7 +116,7 @@ async fn a_failed_reparse_is_not_stamped_and_the_next_sync_retries() {
     let first = service.sync_repository(repo_id).await;
     let after_failure = (repo_state(&pool, repo_id).await, catalog_slugs(&pool, repo_id).await);
 
-    sqlx::raw_sql(&format!("DROP TRIGGER {func} ON marketplace_catalog; DROP FUNCTION {func}();"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TRIGGER {func} ON marketplace_catalog; DROP FUNCTION {func}();")))
         .execute(&pool)
         .await
         .unwrap();

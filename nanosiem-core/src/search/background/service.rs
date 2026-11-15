@@ -593,6 +593,67 @@ impl BackgroundSearchJobs {
         }
     }
 
+    /// Fenced completion with a fallback for a summary PostgreSQL refuses.
+    ///
+    /// The rows are already stored; only `result_meta` (field stats, warnings)
+    /// is written here. A write PostgreSQL refuses because of the data
+    /// (SQLSTATE class 22 / 54) would fail the same way on every retry, so it
+    /// must not be left to lapse the lease (that re-runs the ClickHouse query
+    /// and ends as a misleading `worker_lost`). Instead the summary is retried
+    /// once without field stats, and if that is refused too the job is failed
+    /// with a real cause. Other errors (connection loss) keep the lease-lapse
+    /// retry, which is the right behavior for a transient outage.
+    async fn record_completion(
+        &self,
+        job_id: Uuid,
+        attempt: i32,
+        row_count: i64,
+        truncated: bool,
+        response: &mut SearchResponse,
+    ) -> Result<bool, SearchError> {
+        let inner = &self.inner;
+        let first = inner
+            .repo
+            .complete(job_id, &inner.worker_id, attempt, row_count, truncated, response)
+            .await;
+        let err = match first {
+            Err(e) if is_deterministic_write_error(&e) => e,
+            other => return other,
+        };
+        tracing::error!(
+            job_id = %job_id,
+            attempt,
+            error = %crate::db::pg_text::pg_safe_error_text(&err.to_string()),
+            "Storing the background search summary was refused; retrying without field statistics"
+        );
+        strip_field_stats(response);
+        match inner
+            .repo
+            .complete(job_id, &inner.worker_id, attempt, row_count, truncated, response)
+            .await
+        {
+            Err(e) if is_deterministic_write_error(&e) => {
+                tracing::error!(
+                    job_id = %job_id,
+                    attempt,
+                    error = %crate::db::pg_text::pg_safe_error_text(&e.to_string()),
+                    "Storing the background search summary was refused again; failing the job"
+                );
+                inner
+                    .repo
+                    .fail(
+                        job_id,
+                        &inner.worker_id,
+                        attempt,
+                        JobErrorKind::Internal,
+                        "Storing the search result summary failed: the database refused it",
+                    )
+                    .await
+            }
+            other => other,
+        }
+    }
+
     /// Execute one claimed attempt end to end. Never panics on job failure:
     /// every outcome is a fenced PG write or a deliberate abandonment.
     async fn run_attempt(&self, job: DurableSearchJob, previous_query_id: Option<String>) {
@@ -669,16 +730,7 @@ impl BackgroundSearchJobs {
                 drop(rows);
                 let written = match stored {
                     Ok(()) => {
-                        inner
-                            .repo
-                            .complete(
-                                job_id,
-                                &inner.worker_id,
-                                attempt,
-                                row_count as i64,
-                                truncated,
-                                &response,
-                            )
+                        self.record_completion(job_id, attempt, row_count as i64, truncated, &mut response)
                             .await
                     }
                     Err(e) => {
@@ -761,4 +813,36 @@ impl BackgroundSearchJobs {
 /// Key of a job's rows in `search_job_results`.
 fn results_key(id: Uuid) -> String {
     id.simple().to_string()
+}
+
+/// Whether a completion write failed because of the data written (it would
+/// fail identically on retry): PostgreSQL SQLSTATE class 22 (data exception,
+/// e.g. 22P05 / 22021) or 54 (program limit, e.g. an oversized jsonb), or the
+/// summary could not be serialized at all. Decided by type/SQLSTATE only.
+pub(super) fn is_deterministic_write_error(error: &SearchError) -> bool {
+    match error {
+        SearchError::DatabaseError(sqlx::Error::Database(db)) => db
+            .code()
+            .is_some_and(|code| code.starts_with("22") || code.starts_with("54")),
+        SearchError::SqlValidationError(_) => true,
+        _ => false,
+    }
+}
+
+/// Drop the event-derived field statistics from a job summary (the fallback
+/// when PostgreSQL refuses the full summary) and say so in its warnings.
+pub(super) fn strip_field_stats(response: &mut SearchResponse) {
+    for field in &mut response.fields {
+        field.top_values.clear();
+        field.cardinality = None;
+    }
+    response.warnings.get_or_insert_with(Vec::new).push(
+        crate::search::types::QueryWarningOutput {
+            severity: "warning".to_string(),
+            code: "field_stats_not_saved".to_string(),
+            message: "Field statistics for this job could not be saved and are not shown.".to_string(),
+            suggestion: None,
+            impact: None,
+        },
+    );
 }

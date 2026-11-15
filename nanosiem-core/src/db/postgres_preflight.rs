@@ -272,7 +272,7 @@ pub async fn check_postgres_compatibility(
         // user input; quoting handles the dash in uuid-ossp.
         // WITH SCHEMA public matches the migrations exactly.
         let create = format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\" WITH SCHEMA public");
-        match sqlx::query(&create).execute(&mut *tx).await {
+        match sqlx::query(sqlx::AssertSqlSafe(create.as_str())).execute(&mut *tx).await {
             Ok(_) => creatable.push((*ext).to_string()),
             Err(err) => missing.push(MissingExtension {
                 name: (*ext).to_string(),

@@ -28,8 +28,8 @@ async fn repairs_all_epoch_millisecond_table_classes_and_reruns_as_noop() {
         .with_password(env("NANOSIEM_TEST_CLICKHOUSE_PASSWORD"))
         .with_validation(false)
         .with_compression(clickhouse::Compression::None)
-        .with_option("async_insert", "0")
-        .with_option("wait_for_async_insert", "1");
+        .with_setting("async_insert", "0")
+        .with_setting("wait_for_async_insert", "1");
     let database = format!("nan4939_{}", Uuid::new_v4().simple());
     exec(&ch, &format!("CREATE DATABASE {database}")).await;
 

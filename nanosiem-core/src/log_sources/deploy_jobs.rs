@@ -624,13 +624,13 @@ impl DeployJobStore for PgDeployJobStore {
         // A queued job can finish between the conflicting insert and the
         // read; retry the pair a few times.
         for _ in 0..5 {
-            let inserted: Option<JobRow> = sqlx::query_as(&format!(
+            let inserted: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO log_source_deploy_jobs \
                      (id, kind, log_source_id, coalesce_key, coalescible, requested_by, owner_instance) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (coalesce_key) WHERE state = 'queued' AND coalescible DO NOTHING \
                  RETURNING {JOB_COLUMNS}"
-            ))
+            )))
             .bind(Uuid::now_v7())
             .bind(new.kind.as_str())
             .bind(new.log_source_id)
@@ -643,10 +643,10 @@ impl DeployJobStore for PgDeployJobStore {
             if let Some(row) = inserted {
                 return Ok((row.into_job(), false));
             }
-            let existing: Option<JobRow> = sqlx::query_as(&format!(
+            let existing: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {JOB_COLUMNS} FROM log_source_deploy_jobs \
                  WHERE coalesce_key = $1 AND state = 'queued' AND coalescible"
-            ))
+            )))
             .bind(&key)
             .fetch_optional(&self.pool)
             .await?;
@@ -714,9 +714,9 @@ impl DeployJobStore for PgDeployJobStore {
     }
 
     async fn get(&self, id: Uuid) -> Result<Option<DeployJob>, DeployJobError> {
-        let row: Option<JobRow> = sqlx::query_as(&format!(
+        let row: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {JOB_COLUMNS} FROM log_source_deploy_jobs WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -729,11 +729,11 @@ impl DeployJobStore for PgDeployJobStore {
         limit: i64,
     ) -> Result<Vec<DeployJob>, DeployJobError> {
         // Deploy-all jobs cover every source, so they are listed too.
-        let rows: Vec<JobRow> = sqlx::query_as(&format!(
+        let rows: Vec<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {JOB_COLUMNS} FROM log_source_deploy_jobs \
              WHERE log_source_id = $1 OR kind = 'deploy_all' \
              ORDER BY created_at DESC LIMIT $2"
-        ))
+        )))
         .bind(log_source_id)
         .bind(limit)
         .fetch_all(&self.pool)

@@ -1057,7 +1057,7 @@ pub async fn alert_velocity(
     "#
     );
 
-    let mut velocity_query = sqlx::query(&sql).bind(start).bind(now).bind(kinds);
+    let mut velocity_query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(start).bind(now).bind(kinds);
     if let Some(denied) = &deny_vec {
         velocity_query = velocity_query.bind(denied);
     }

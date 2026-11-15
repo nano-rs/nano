@@ -50,8 +50,8 @@ fn ch_client() -> Client {
 /// queryable on return (repo convention for CH inserts from Rust tests).
 fn ch_insert_client() -> Client {
     ch_client()
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
 }
 
 /// The canonical entity-grain projection (shared by the entity list, the

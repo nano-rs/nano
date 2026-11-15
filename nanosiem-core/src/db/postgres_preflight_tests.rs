@@ -163,7 +163,7 @@ async fn preflight_refuses_a_role_without_create_on_public() {
         format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'"),
         format!("CREATE DATABASE {db} OWNER {role}"),
     ] {
-        sqlx::query(&sql).execute(&admin).await.expect("setup");
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&admin).await.expect("setup");
     }
     let mut opts: sqlx::postgres::PgConnectOptions = url.parse().expect("parse url");
     let admin_db = sqlx::postgres::PgPoolOptions::new()
@@ -178,7 +178,7 @@ async fn preflight_refuses_a_role_without_create_on_public() {
         "REVOKE ALL ON SCHEMA public FROM PUBLIC".to_string(),
         "GRANT USAGE ON SCHEMA public TO PUBLIC".to_string(),
     ] {
-        sqlx::query(&sql).execute(&admin_db).await.expect("schema setup");
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&admin_db).await.expect("schema setup");
     }
     opts = opts.database(&db).username(&role).password(&password);
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -205,7 +205,7 @@ async fn preflight_refuses_a_role_without_create_on_public() {
     pool.close().await;
 
     // The documented fix makes the same role pass.
-    sqlx::query(&format!("GRANT ALL ON SCHEMA public TO {role}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("GRANT ALL ON SCHEMA public TO {role}")))
         .execute(&admin_db)
         .await
         .unwrap();
@@ -218,8 +218,8 @@ async fn preflight_refuses_a_role_without_create_on_public() {
     assert!(report.schema_warning.is_none());
     pool.close().await;
     admin_db.close().await;
-    sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)")).execute(&admin).await.unwrap();
-    sqlx::query(&format!("DROP ROLE {role}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {db} WITH (FORCE)"))).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {role}"))).execute(&admin).await.unwrap();
 }
 
 #[tokio::test]

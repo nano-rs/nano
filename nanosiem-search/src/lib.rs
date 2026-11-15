@@ -200,9 +200,13 @@ impl SearchState {
         // Add inputlookup service for URL-based enrichment. Wire the internal
         // lookup layer so `| inputlookup <internal_table>` reads the CH/PG-backed
         // lookup table directly (NAN-1581 Phase 5).
-        // NAN-5436: `from_env` applies the INPUTLOOKUP_ALLOWED_DOMAINS host
-        // allowlist when set; unset keeps the default (public hosts allowed).
+        // NAN-5443: the host allowlist is INPUTLOOKUP_ALLOWED_DOMAINS merged
+        // with the admin list from Settings > Lookup URLs, re-read every 30 s
+        // (see `nanosiem_core::inputlookup::allowlist` for precedence). An
+        // empty effective list keeps the default (public hosts allowed).
+        nanosiem_core::inputlookup::allowlist::start_refresh(dual_pool.postgres().clone()).await;
         let inputlookup_service = InputLookupService::new(InputLookupConfig::from_env())
+            .with_managed_allowlist(nanosiem_core::inputlookup::allowlist::DeploymentAllowlist::from_env())
             .with_lookup_service(lookup.clone());
         search_svc.set_inputlookup_service(inputlookup_service);
         tracing::info!("InputLookup service configured for Search Service");
@@ -308,11 +312,13 @@ impl SearchState {
         // Create audit emitter for logging sharing events
         let audit_emitter = Arc::new(AuditEmitter::new(dual_pool.clone()));
         // NAN-5437: audit AI searches refused by the AI-search command policy.
-        nanosiem_core::search::ai_command_policy::install_audit_sink(
-            nanosiem_core::search::ai_command_policy::EmitterAiCommandAuditSink::new(
-                audit_emitter.clone(),
-            ),
+        let search_audit_sink = nanosiem_core::search::ai_command_policy::EmitterAiCommandAuditSink::new(
+            audit_emitter.clone(),
+            nanosiem_core::auth::UserRepository::new(dual_pool.postgres().clone()),
         );
+        nanosiem_core::search::ai_command_policy::install_audit_sink(search_audit_sink.clone());
+        // NAN-5443: audit every external lookup fetch (host only) and refusal.
+        nanosiem_core::inputlookup::allowlist::install_fetch_audit_sink(search_audit_sink);
 
         // Connect to Valkey/Redis for search result caching (optional)
         let result_cache = match redis_url {

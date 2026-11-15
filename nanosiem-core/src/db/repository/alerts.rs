@@ -477,7 +477,7 @@ impl AlertRepository {
             WHERE a.id = $1{scope_sql}
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(id);
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str())).bind(id);
         if let Some(denied) = &scope_bind {
             query = query.bind(denied);
         }
@@ -572,7 +572,7 @@ impl AlertRepository {
             LIMIT $3 OFFSET $4
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql)
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(status.map(|s| format!("{:?}", s).to_lowercase()))
             .bind(severity.map(|s| format!("{:?}", s).to_lowercase()))
             .bind(limit)
@@ -610,7 +610,7 @@ impl AlertRepository {
             LIMIT 100
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(rule_id);
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str())).bind(rule_id);
         if let Some(denied) = &scope_bind {
             query = query.bind(denied);
         }
@@ -642,7 +642,7 @@ impl AlertRepository {
             LIMIT $2
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(rule_id).bind(limit);
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str())).bind(rule_id).bind(limit);
         if let Some(denied) = &scope_bind {
             query = query.bind(denied);
         }
@@ -675,7 +675,7 @@ impl AlertRepository {
             RETURNING *
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql)
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(&ack.acknowledged_by)
             .bind(Utc::now());
@@ -723,7 +723,7 @@ impl AlertRepository {
             RETURNING *
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql)
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(&close.disposition)
             .bind(&close.closed_by)
@@ -773,7 +773,7 @@ impl AlertRepository {
             RETURNING *
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql)
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(assignee)
             .bind(assigned_by);
@@ -809,7 +809,7 @@ impl AlertRepository {
             WHERE id = ANY($1) AND status = 'new'{scope_sql}
             "#
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ids)
             .bind(acknowledged_by)
             .bind(Utc::now());
@@ -842,7 +842,7 @@ impl AlertRepository {
             WHERE id = ANY($1) AND status != 'closed'{scope_sql}
             "#
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ids)
             .bind(&disposition)
             .bind(closed_by)
@@ -878,7 +878,7 @@ impl AlertRepository {
                WHERE ($1::text[] IS NULL OR kind = ANY($1)){scope_sql}
                GROUP BY status"#
         );
-        let mut query = sqlx::query_as(&sql).bind(kinds_filter);
+        let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(kinds_filter);
         if let Some(denied) = &scope_bind {
             query = query.bind(denied);
         }
@@ -908,7 +908,7 @@ impl AlertRepository {
                  AND (rule_id IS NULL OR NOT (rule_id = ANY($2))){scope_sql}
                GROUP BY status"#
         );
-        let mut query = sqlx::query_as(&sql).bind(kinds_filter).bind(exclude_rule_ids);
+        let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(kinds_filter).bind(exclude_rule_ids);
         if let Some(denied) = &scope_bind {
             query = query.bind(denied);
         }
@@ -971,7 +971,7 @@ impl AlertRepository {
             LIMIT $3
             "#
         );
-        let mut query = sqlx::query_as::<_, Alert>(&sql)
+        let mut query = sqlx::query_as::<_, Alert>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(after_timestamp)
             .bind(after_id)
             .bind(limit)

@@ -42,6 +42,15 @@
 //!
 //! A refusal is an ordinary search error the model can read and recover from,
 //! and is audited ([`actions::SEARCH_AI_COMMAND_REFUSED`]).
+//!
+//! # Attribution (NAN-5456)
+//!
+//! The Search and API auth layers install the request's caller (the member or
+//! key owner, the API key, and the client IP / user agent) with
+//! [`with_search_audit_caller`] around every authenticated request, so a
+//! refusal is attributed even when a handler checks the query before the
+//! engine sets the request actor. `inputlookup` fetch audits use it too. The caller follows spawned search work through
+//! [`crate::search::request_actor::inherit`].
 
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
@@ -49,7 +58,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::audit::{actions, AuditEvent, AuditSource};
+use crate::audit::{actions, AuditEvent, AuditSource, ClientContext};
 use crate::query::{Command, Query, SearchExpr};
 use crate::search::admission::{self, QueryClass};
 
@@ -304,21 +313,31 @@ pub fn install_audit_sink(sink: Arc<dyn AiCommandAuditSink>) {
     let _ = AUDIT_SINK.set(sink);
 }
 
-/// Sink over the platform [`crate::audit::AuditEmitter`].
+/// Sink over the platform [`crate::audit::AuditEmitter`]. It fills the
+/// member's display name from the users table (NAN-5456), so the entry reads
+/// "by <name>" like the API's own audit events.
 pub struct EmitterAiCommandAuditSink {
     emitter: Arc<crate::audit::AuditEmitter>,
+    users: crate::auth::UserRepository,
 }
 
 impl EmitterAiCommandAuditSink {
-    pub fn new(emitter: Arc<crate::audit::AuditEmitter>) -> Arc<dyn AiCommandAuditSink> {
-        Arc::new(Self { emitter })
+    pub fn new(
+        emitter: Arc<crate::audit::AuditEmitter>,
+        users: crate::auth::UserRepository,
+    ) -> Arc<dyn AiCommandAuditSink> {
+        Arc::new(Self { emitter, users })
     }
 }
 
 impl AiCommandAuditSink for EmitterAiCommandAuditSink {
-    fn submit(&self, event: AuditEvent) {
+    fn submit(&self, mut event: AuditEvent) {
         let emitter = self.emitter.clone();
+        let users = self.users.clone();
         tokio::spawn(async move {
+            if let (Some(actor), None) = (event.actor_id, event.actor_name.as_ref()) {
+                event.actor_name = users.get_user_by_id(actor).await.ok().map(|user| user.name);
+            }
             if let Err(error) = emitter.emit(&event).await {
                 tracing::error!(%error, action = %event.action, "AI search refusal audit could not be emitted");
             }
@@ -326,15 +345,69 @@ impl AiCommandAuditSink for EmitterAiCommandAuditSink {
     }
 }
 
+/// Who a search audit event (an AI-search refusal, an `inputlookup` fetch)
+/// is attributed to (NAN-5456).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchAuditCaller {
+    /// The member: the session user, or the API key's owner.
+    pub actor_id: Option<Uuid>,
+    /// The API key, when the request authenticated with one.
+    pub api_key_id: Option<Uuid>,
+    /// The API key's display name, when the auth layer knows it.
+    pub api_key_name: Option<String>,
+    /// The client IP and user agent.
+    pub client: ClientContext,
+}
+
+tokio::task_local! {
+    static SEARCH_AUDIT_CALLER: Arc<SearchAuditCaller>;
+}
+
+/// Run `future` with `caller` as the attribution of the search audit events
+/// in it. Installed by the Search and API auth layers per request.
+pub async fn with_search_audit_caller<F: Future>(caller: SearchAuditCaller, future: F) -> F::Output {
+    SEARCH_AUDIT_CALLER.scope(Arc::new(caller), future).await
+}
+
+/// The installed request caller, if any (for [`crate::search::request_actor::inherit`]).
+pub(crate) fn current_search_audit_caller_scope() -> Option<Arc<SearchAuditCaller>> {
+    SEARCH_AUDIT_CALLER.try_with(Arc::clone).ok()
+}
+
+/// Re-install a caller captured with [`current_search_audit_caller_scope`].
+pub(crate) async fn with_search_audit_caller_scope<F: Future>(
+    caller: Arc<SearchAuditCaller>,
+    future: F,
+) -> F::Output {
+    SEARCH_AUDIT_CALLER.scope(caller, future).await
+}
+
+/// Who a search audit event right now is attributed to: the request's caller when
+/// the auth layer installed one, with the request actor
+/// ([`crate::search::request_actor`], set by [`with_ai_origin`] and the
+/// engine) filling a missing member. Outside any request (runners, tests) it
+/// is the request actor alone, or nobody.
+pub fn current_search_audit_caller() -> SearchAuditCaller {
+    let mut caller = current_search_audit_caller_scope()
+        .map(|caller| (*caller).clone())
+        .unwrap_or_default();
+    if caller.actor_id.is_none() {
+        caller.actor_id = crate::search::request_actor::current_request_actor();
+    }
+    caller
+}
+
 /// The audit event for a refused AI search.
 pub fn refusal_audit_event(
-    actor: Option<Uuid>,
+    caller: &SearchAuditCaller,
     refusal: &AiCommandRefusal,
     query: &str,
     entry_point: &str,
 ) -> AuditEvent {
     AuditEvent::builder(AuditSource::Search, actions::SEARCH_AI_COMMAND_REFUSED)
-        .actor(actor, None)
+        .actor(caller.actor_id, None)
+        .api_key(caller.api_key_id, caller.api_key_name.clone())
+        .client_context(&caller.client)
         .resource("search", None, Some(refusal.command.to_string()))
         .success(false)
         .details(json!({
@@ -373,15 +446,16 @@ pub fn enforce(
     let Err(refusal) = check_ai_query(parsed, extra_allowed) else {
         return Ok(());
     };
-    let actor = crate::search::request_actor::current_request_actor();
+    let caller = current_search_audit_caller();
     tracing::warn!(
         command = refusal.command,
-        actor = ?actor,
+        actor = ?caller.actor_id,
+        api_key = ?caller.api_key_id,
         entry_point,
         "AI search refused: restricted nPL command"
     );
     if let Some(sink) = AUDIT_SINK.get() {
-        sink.submit(refusal_audit_event(actor, &refusal, query_text, entry_point));
+        sink.submit(refusal_audit_event(&caller, &refusal, query_text, entry_point));
     }
     Err(crate::search::SearchError::SqlValidationError(refusal.to_string()))
 }

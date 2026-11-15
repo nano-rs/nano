@@ -518,6 +518,9 @@ fn ssrf_error_to_api(err: SsrfError) -> ApiError {
         SsrfError::ClientBuildFailed(msg) => {
             ApiError::ValidationError(format!("Ingestion URL client error: {}", msg))
         }
+        e @ (SsrfError::EgressProxyRequired(_) | SsrfError::EgressProxyMisconfigured(_)) => {
+            ApiError::ValidationError(e.to_string())
+        }
     }
 }
 

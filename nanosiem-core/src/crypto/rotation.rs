@@ -339,7 +339,7 @@ async fn read_page(
         col = target.column,
         table = target.table,
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(after)
         .bind(PAGE)
         .fetch_all(&mut *conn)
@@ -509,7 +509,7 @@ async fn apply_page(
                     col = target.column,
                     pk = target.pk,
                 );
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(bytes)
                     .bind(nonce)
                     .bind(&row.pk)
@@ -527,7 +527,7 @@ async fn apply_page(
                     col = target.column,
                     pk = target.pk,
                 );
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(bytes)
                     .bind(&row.pk)
                     .bind(&row.raw)

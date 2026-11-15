@@ -108,7 +108,7 @@ impl ClickHouseExecutor {
         let kill_client = runtime_on_cluster_ddl_options(&on_cluster)
             .iter()
             .fold(self.client.clone(), |client, (name, value)| {
-                client.with_option(*name, *value)
+                client.with_setting(*name, *value)
             });
         kill_client
             .query(&kill_sql)

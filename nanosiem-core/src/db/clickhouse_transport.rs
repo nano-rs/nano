@@ -55,7 +55,7 @@ pub fn client() -> clickhouse::Client {
     // server every read fails with `Decompression("incorrect magic number")`.
     // Pinning it per client keeps the binary working whatever order the server
     // and the services roll in; on pre-26.9 servers LZ4 is already the default.
-    clickhouse::Client::with_http_client(http).with_option("network_compression_method", "LZ4")
+    clickhouse::Client::with_http_client(http).with_setting("network_compression_method", "LZ4")
 }
 
 /// CH-2610 (NAN-4923): whether a server `version()` string knows the

@@ -301,7 +301,7 @@ impl SyntheticRunner {
     /// there is no second, unvalidated hop. Returns the rejection reason on
     /// block (the caller records it as the probe failure). Secure by default:
     /// private/link-local/loopback/metadata ranges are blocked.
-    async fn ssrf_checked_client(target_url: &str) -> Result<reqwest::Client, String> {
+    pub(crate) async fn ssrf_checked_client(target_url: &str) -> Result<reqwest::Client, String> {
         // Shared validate-then-pin guard (NAN-1617): pre-flight validation +
         // re-resolve + per-address re-validation, returning the addrs to pin.
         let (url, addrs) = SsrfValidator::http_allowed_validator()
@@ -309,21 +309,15 @@ impl SyntheticRunner {
             .await
             .map_err(|e| format!("blocked by SSRF guard: {e}"))?;
 
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("nano-synthetic-monitor")
-            // An env proxy re-resolves the host and undoes the pin below.
-            .no_proxy();
+            .user_agent("nano-synthetic-monitor");
 
-        // IP-literal hosts return an empty Vec (reqwest dials the literal,
-        // already validated). DNS-name hosts: pin reqwest to the pre-validated
-        // addrs so DNS can't be rebound to an internal IP after validation.
-        if !addrs.is_empty() {
-            let host = url.host_str().ok_or_else(|| "URL missing host".to_string())?;
-            builder = builder.resolve_to_addrs(host, &addrs);
-        }
-
-        builder
+        // Shared pin (NAN-5441): the pre-validated addrs, never the env proxy;
+        // DESTINATION_EGRESS_PROXY_URL (pinned-IP CONNECT) when set; refused
+        // under NANO_EGRESS_PROXY_REQUIRED with no destination proxy.
+        crate::inputlookup::pin_resolved_addrs(builder, &url, &addrs, crate::inputlookup::ProxyPolicy::Direct)
+            .map_err(|e| format!("blocked by egress policy: {e}"))?
             .build()
             .map_err(|e| format!("HTTP client build failed: {e}"))
     }

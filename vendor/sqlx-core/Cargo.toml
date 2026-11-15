@@ -11,242 +11,48 @@
 
 [package]
 edition = "2021"
+rust-version = "1.94.0"
 name = "sqlx-core"
-version = "0.8.6"
+version = "0.9.0"
 authors = [
     "Ryan Leckey <leckey.ryan@gmail.com>",
     "Austin Bonander <austin.bonander@gmail.com>",
     "Chloe Ross <orangesnowfox@gmail.com>",
     "Daniel Akhterov <akhterovd@gmail.com>",
 ]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 description = "Core of SQLx, the rust SQL toolkit. Not intended to be used directly."
+readme = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/launchbadge/sqlx"
 
 [package.metadata.docs.rs]
 features = ["offline"]
 
-[dependencies.async-io]
-version = "1.9.0"
-optional = true
-
-[dependencies.async-std]
-version = "1.12"
-optional = true
-
-[dependencies.base64]
-version = "0.22.0"
-features = ["std"]
-default-features = false
-
-[dependencies.bigdecimal]
-version = "0.4.0"
-optional = true
-
-[dependencies.bit-vec]
-version = "0.6.3"
-optional = true
-
-[dependencies.bstr]
-version = "1.0"
-features = ["std"]
-optional = true
-default-features = false
-
-[dependencies.bytes]
-version = "1.1.0"
-
-[dependencies.chrono]
-version = "0.4.34"
-features = ["clock"]
-optional = true
-default-features = false
-
-[dependencies.crc]
-version = "3"
-optional = true
-
-[dependencies.crossbeam-queue]
-version = "0.3.2"
-
-[dependencies.either]
-version = "1.6.1"
-
-[dependencies.event-listener]
-version = "5.2.0"
-
-[dependencies.futures-core]
-version = "0.3.19"
-default-features = false
-
-[dependencies.futures-intrusive]
-version = "0.5.0"
-
-[dependencies.futures-io]
-version = "0.3.24"
-
-[dependencies.futures-util]
-version = "0.3.19"
-features = [
-    "alloc",
-    "sink",
-    "io",
-]
-default-features = false
-
-[dependencies.hashbrown]
-version = "0.15.0"
-
-[dependencies.hashlink]
-version = "0.10.0"
-
-[dependencies.indexmap]
-version = "2.0"
-
-[dependencies.ipnet]
-version = "2.3.0"
-optional = true
-
-[dependencies.ipnetwork]
-version = "0.20.0"
-optional = true
-
-[dependencies.log]
-version = "0.4.18"
-default-features = false
-
-[dependencies.mac_address]
-version = "1.1.5"
-optional = true
-
-[dependencies.memchr]
-version = "2.4.1"
-default-features = false
-
-[dependencies.native-tls]
-version = "0.2.10"
-optional = true
-
-[dependencies.once_cell]
-version = "1.9.0"
-
-[dependencies.percent-encoding]
-version = "2.1.0"
-
-[dependencies.regex]
-version = "1.5.5"
-optional = true
-
-[dependencies.rust_decimal]
-version = "1.26.1"
-features = ["std"]
-optional = true
-default-features = false
-
-[dependencies.rustls]
-version = "0.23.15"
-features = [
-    "std",
-    "tls12",
-]
-optional = true
-default-features = false
-
-[dependencies.rustls-native-certs]
-version = "0.8.0"
-optional = true
-
-[dependencies.serde]
-version = "1.0.132"
-features = [
-    "derive",
-    "rc",
-]
-optional = true
-
-[dependencies.serde_json]
-version = "1.0.73"
-features = ["raw_value"]
-optional = true
-
-[dependencies.sha2]
-version = "0.10.0"
-optional = true
-default-features = false
-
-[dependencies.smallvec]
-version = "1.7.0"
-
-[dependencies.thiserror]
-version = "2.0.0"
-
-[dependencies.time]
-version = "0.3.36"
-features = [
-    "formatting",
-    "parsing",
-    "macros",
-]
-optional = true
-
-[dependencies.socket2]
-version = "0.6"
-features = ["all"]
-
-[dependencies.tokio]
-version = "1"
-features = [
-    "time",
-    "net",
-    "sync",
-    "fs",
-    "io-util",
-    "rt",
-]
-optional = true
-default-features = false
-
-[dependencies.tokio-stream]
-version = "0.1.8"
-features = ["fs"]
-optional = true
-
-[dependencies.tracing]
-version = "0.1.37"
-features = ["log"]
-
-[dependencies.url]
-version = "2.2.2"
-
-[dependencies.uuid]
-version = "1.1.2"
-optional = true
-
-[dependencies.webpki-roots]
-version = "0.26"
-optional = true
-
-[dev-dependencies.sqlx]
-version = "=0.8.6"
-features = [
-    "postgres",
-    "sqlite",
-    "mysql",
-    "migrate",
-    "macros",
-    "time",
-    "uuid",
-]
-default-features = false
-
-[dev-dependencies.tokio]
-version = "1"
-features = ["rt"]
-
 [features]
+_rt-async-global-executor = [
+    "async-global-executor",
+    "_rt-async-io",
+    "_rt-async-task",
+]
+_rt-async-io = [
+    "async-io",
+    "async-fs",
+]
 _rt-async-std = [
     "async-std",
-    "async-io",
+    "_rt-async-io",
+]
+_rt-async-task = ["async-task"]
+_rt-smol = [
+    "smol",
+    "_rt-async-io",
+    "_rt-async-task",
 ]
 _rt-tokio = [
     "tokio",
@@ -270,6 +76,7 @@ _tls-rustls-ring-webpki = [
     "rustls/ring",
     "webpki-roots",
 ]
+_unstable-doc = ["sqlx-toml"]
 any = []
 default = []
 json = [
@@ -284,9 +91,245 @@ offline = [
     "serde",
     "either/serde",
 ]
+sqlx-toml = [
+    "serde",
+    "toml/parse",
+]
+
+[lib]
+name = "sqlx_core"
+path = "src/lib.rs"
+
+[dependencies.async-fs]
+version = "2.1"
+optional = true
+
+[dependencies.async-global-executor]
+version = "3.1"
+features = ["async-io"]
+optional = true
+default-features = false
+
+[dependencies.async-io]
+version = "2.4.1"
+optional = true
+
+[dependencies.async-std]
+version = "1.13"
+optional = true
+
+[dependencies.async-task]
+version = "4.7.1"
+optional = true
+
+[dependencies.base64]
+version = "0.22.1"
+features = ["alloc"]
+default-features = false
+
+[dependencies.bigdecimal]
+version = "0.4.0"
+optional = true
+
+[dependencies.bit-vec]
+version = "0.8"
+optional = true
+
+[dependencies.bstr]
+version = "1.0.1"
+features = ["std"]
+optional = true
+default-features = false
+
+[dependencies.bytes]
+version = "1.2.0"
+
+[dependencies.cfg-if]
+version = "1.0.0"
+
+[dependencies.chrono]
+version = "0.4.34"
+features = [
+    "std",
+    "clock",
+]
+optional = true
+default-features = false
+
+[dependencies.crc]
+version = "3"
+optional = true
+
+[dependencies.crossbeam-queue]
+version = "0.3.2"
+
+[dependencies.either]
+version = "1.6.1"
+
+[dependencies.event-listener]
+version = "5.2.0"
+
+[dependencies.futures-core]
+version = "0.3.32"
+default-features = false
+
+[dependencies.futures-intrusive]
+version = "0.5.0"
+
+[dependencies.futures-io]
+version = "0.3.32"
+
+[dependencies.futures-util]
+version = "0.3.32"
+features = [
+    "alloc",
+    "sink",
+    "io",
+]
+default-features = false
+
+[dependencies.hashbrown]
+version = "0.16.0"
+
+[dependencies.hashlink]
+version = "0.11.0"
+
+[dependencies.indexmap]
+version = "2.0"
+
+[dependencies.ipnet]
+version = "2.3.0"
+optional = true
+
+[dependencies.ipnetwork]
+version = "0.21.1"
+optional = true
+
+[dependencies.log]
+version = "0.4.18"
+default-features = false
+
+[dependencies.mac_address]
+version = "1.1.5"
+optional = true
+
+[dependencies.memchr]
+version = "2.5.0"
+default-features = false
+
+[dependencies.native-tls]
+version = "0.2.10"
+optional = true
+
+[dependencies.percent-encoding]
+version = "2.3.0"
+
+[dependencies.rust_decimal]
+version = "1.36.0"
+features = ["std"]
+optional = true
+default-features = false
+
+[dependencies.rustls]
+version = "0.23.24"
+features = [
+    "std",
+    "tls12",
+]
+optional = true
+default-features = false
+
+[dependencies.rustls-native-certs]
+version = "0.8.0"
+optional = true
+
+[dependencies.serde]
+version = "1.0.219"
+features = [
+    "derive",
+    "rc",
+]
+optional = true
+
+[dependencies.serde_json]
+version = "1.0.142"
+features = ["raw_value"]
+optional = true
+
+[dependencies.sha2]
+version = "0.10.0"
+optional = true
+default-features = false
+
+[dependencies.smallvec]
+version = "1.13.1"
+
+[dependencies.smol]
+version = "2.0"
+optional = true
+default-features = false
+
+[dependencies.thiserror]
+version = "2.0.18"
+features = ["std"]
+default-features = false
+
+[dependencies.time]
+version = "0.3.47"
+features = [
+    "formatting",
+    "parsing",
+    "macros",
+]
+optional = true
+
+[dependencies.tokio]
+version = "1.25.0"
+features = [
+    "time",
+    "net",
+    "sync",
+    "fs",
+    "io-util",
+    "rt",
+]
+optional = true
+default-features = false
+
+[dependencies.tokio-stream]
+version = "0.1.8"
+features = ["fs"]
+optional = true
+
+[dependencies.toml]
+version = "0.8.16"
+optional = true
+
+[dependencies.tracing]
+version = "0.1.37"
+features = ["log"]
+
+[dependencies.url]
+version = "2.2.2"
+
+[dependencies.uuid]
+version = "1.12.1"
+optional = true
+
+[dependencies.webpki-roots]
+version = "1"
+optional = true
+
+[dev-dependencies.tokio]
+version = "1.25.0"
+features = ["rt"]
 
 [lints.clippy]
 cast_possible_truncation = "deny"
 cast_possible_wrap = "deny"
 cast_sign_loss = "deny"
 disallowed_methods = "deny"
+
+[dependencies.socket2]
+version = "0.6"
+features = ["all"]

@@ -504,10 +504,10 @@ impl LeaseStore for PgLeaseStore {
 
     async fn probe(&self, lock_id: i64, stale_after: Duration) -> Result<LockProbe, String> {
         let (classid, objid) = lock_key_parts(lock_id);
-        let holder: Option<(Option<String>, Option<f64>)> = sqlx::query_as(&format!(
+        let holder: Option<(Option<String>, Option<f64>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT a.state, EXTRACT(EPOCH FROM (clock_timestamp() - a.state_change))::float8 \
                FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid WHERE {HOLDER_FILTER} LIMIT 1"
-        ))
+        )))
         .bind(classid)
         .bind(objid)
         .fetch_optional(&self.app_pool)
@@ -528,11 +528,11 @@ impl LeaseStore for PgLeaseStore {
         let (classid, objid) = lock_key_parts(lock_id);
         // One statement: the idle re-check and the signal see the same row, so a
         // holder that renewed since the probe is never terminated.
-        let signalled: Option<bool> = sqlx::query_scalar(&format!(
+        let signalled: Option<bool> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT pg_terminate_backend(a.pid) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
               WHERE {HOLDER_FILTER} AND a.state = 'idle' \
                 AND a.state_change < clock_timestamp() - make_interval(secs => $3) LIMIT 1"
-        ))
+        )))
         .bind(classid)
         .bind(objid)
         .bind(stale_after.as_secs_f64())

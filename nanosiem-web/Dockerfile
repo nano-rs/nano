@@ -1,5 +1,6 @@
-# Build stage
-FROM node:20-alpine AS builder
+# Build stage. Node 22 LTS (Jod, maintenance to 2027-04-30), the same major
+# as CI and .nvmrc; Node 20 reached end of life on 2026-04-30.
+FROM node:22.23.5-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a AS builder
 
 WORKDIR /app
 
@@ -37,8 +38,10 @@ FROM scratch AS sbom-npm
 ARG BUILDKIT_SBOM_SCAN_STAGE=true
 COPY --from=sbom-npm-deps /app/node_modules /node_modules
 
-# Production stage - serve with nginx
-FROM nginx:alpine
+# Production stage - serve with nginx. NAN-5411: the same nginx digest as the
+# edge (docker-compose.opensource.yml), so one bump covers both;
+# scripts/check-opensource-pins.sh step 7 fails on drift.
+FROM nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
 
 LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
       org.opencontainers.image.url="https://nano.rs" \

@@ -105,21 +105,13 @@ impl InputLookupConfig {
     /// Unset or empty keeps the default: no allowlist, public hosts allowed.
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        if let Ok(raw) = std::env::var("INPUTLOOKUP_ALLOWED_DOMAINS") {
-            config.allowed_domains = parse_allowed_domains(&raw);
-        }
+        config.allowed_domains = super::allowlist::DeploymentAllowlist::from_env().domains;
         config
     }
 }
 
-/// Split an allowlist value on commas/whitespace, dropping empty entries.
-pub(crate) fn parse_allowed_domains(raw: &str) -> Vec<String> {
-    raw.split([',', ' ', '\t', '\n'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase())
-        .collect()
-}
+#[cfg(test)]
+use super::allowlist::parse_env_list as parse_allowed_domains;
 
 /// Parameters for an inputlookup command execution
 #[derive(Debug, Clone)]

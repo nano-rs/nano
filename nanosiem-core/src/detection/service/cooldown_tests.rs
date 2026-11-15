@@ -10,7 +10,7 @@
 
 use chrono::{Duration, Utc};
 
-use super::helpers::within_alert_cooldown;
+use super::helpers::{cooldown_entity_hash, within_alert_cooldown};
 use super::{DetectionError, DetectionService};
 
 // ---------------------------------------------------------------------------
@@ -131,4 +131,33 @@ fn risk_rule_rejects_modifiers_and_risk_command() {
         ),
         Err(DetectionError::InvalidQuery(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// cooldown_entity_hash — fixed-size anchor key (NAN-5429)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cooldown_key_is_fixed_size_for_any_entity_length() {
+    // Longer than the ~2.7 KB btree entry limit and incompressible-looking.
+    let long: String = (0..4001u32)
+        .map(|i| char::from(b'a' + ((i.wrapping_mul(2654435761)) % 26) as u8))
+        .collect();
+    assert_eq!(cooldown_entity_hash(&long).len(), 32);
+    assert_eq!(cooldown_entity_hash("").len(), 32);
+    assert_eq!(cooldown_entity_hash(&long), cooldown_entity_hash(&long.clone()));
+    assert_ne!(cooldown_entity_hash(&long), cooldown_entity_hash(&long[..4000]));
+}
+
+#[test]
+fn cooldown_key_matches_the_migration_backfill() {
+    // Values from PostgreSQL: encode(sha256(convert_to(v, 'UTF8')), 'hex').
+    assert_eq!(
+        hex::encode(cooldown_entity_hash("shorthost")),
+        "45175fc5f436870c65c5bd6b075c415e546882dff1a2ea028a4dd2c6832186a4"
+    );
+    assert_eq!(
+        hex::encode(cooldown_entity_hash("h\u{e9}llo")),
+        "3c48591d8d098a4538f5e013dfcf406e948eac4d3277b10bf614e295d6068179"
+    );
 }

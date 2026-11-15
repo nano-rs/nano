@@ -35,7 +35,7 @@ async fn pool_with(before: &str) -> Option<(PgPool, String)> {
             move |conn, _| {
                 let schema = schema.clone();
                 Box::pin(async move {
-                    sqlx::Executor::execute(conn, format!("SET search_path TO {schema}").as_str())
+                    sqlx::Executor::execute(conn, sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                         .await
                         .map(|_| ())
                 })
@@ -54,11 +54,11 @@ async fn pool_with(before: &str) -> Option<(PgPool, String)> {
              deployed BOOLEAN NOT NULL DEFAULT FALSE,
              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"
     );
-    sqlx::raw_sql(&setup).execute(&pool).await.expect("setup");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(setup.as_str())).execute(&pool).await.expect("setup");
     if !before.is_empty() {
-        sqlx::raw_sql(before).execute(&pool).await.expect("pre-290 state");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(before)).execute(&pool).await.expect("pre-290 state");
     }
-    sqlx::raw_sql(&MIGRATION.replace("SET LOCAL lock_timeout = '5s';", ""))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(&*MIGRATION.replace("SET LOCAL lock_timeout = '5s';", "")))
         .execute(&pool)
         .await
         .expect("migration 290");
@@ -66,7 +66,7 @@ async fn pool_with(before: &str) -> Option<(PgPool, String)> {
 }
 
 async fn drop_schema(pool: &PgPool, schema: &str) {
-    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(pool)
         .await
         .unwrap();
@@ -113,7 +113,7 @@ async fn migration_picks_the_install_token_mode() {
     let settings = repo.settings().await.unwrap();
     assert_eq!(settings.install_token_mode, InstallTokenMode::LegacyMultiplex);
     assert!(settings.install_token_enabled);
-    sqlx::raw_sql(&MIGRATION.replace("SET LOCAL lock_timeout = '5s';", ""))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(&*MIGRATION.replace("SET LOCAL lock_timeout = '5s';", "")))
         .execute(&upgraded)
         .await
         .expect("idempotent");

@@ -8,8 +8,9 @@ use clickhouse::Client as ClickHouseClient;
 use sqlx::PgPool;
 
 use super::retention::{
-    ClickHouseStorageService, ClickHouseStorageStats, RetentionConfig, RetentionError,
-    RetentionService, StorageStats,
+    read_clickhouse_retention_record, record_ui_clickhouse_retention,
+    validate_clickhouse_retention_days, ClickHouseStorageService, ClickHouseStorageStats,
+    RetentionConfig, RetentionError, RetentionService, StorageStats,
 };
 
 /// Aggregated system settings service
@@ -89,11 +90,25 @@ impl DualSystemSettings {
     pub async fn get_clickhouse_storage_stats(
         &self,
     ) -> Result<ClickHouseStorageStats, RetentionError> {
-        self.clickhouse_storage.get_storage_stats().await
+        let mut stats = self.clickhouse_storage.get_storage_stats().await?;
+        // NAN-5449: who set the retention last. A PG read failure leaves the
+        // fields empty rather than failing the ClickHouse stats.
+        match read_clickhouse_retention_record(self.retention.pool()).await {
+            Ok(record) => {
+                stats.retention_source = record.source;
+                stats.deployment_retention_days = record.env_applied;
+            }
+            Err(e) => tracing::warn!("Failed to read the retention record: {e}"),
+        }
+        Ok(stats)
     }
 
+    /// Apply a retention set in Settings -> Storage (or the API) and record
+    /// it, so the migrator does not overwrite it on a plain restart.
     pub async fn update_clickhouse_retention(&self, days: u32) -> Result<(), RetentionError> {
-        self.clickhouse_storage.update_retention(days).await
+        let days = validate_clickhouse_retention_days(days)?;
+        self.clickhouse_storage.update_retention(days).await?;
+        record_ui_clickhouse_retention(self.retention.pool(), days).await
     }
 
     pub async fn run_clickhouse_retention_now(&self) -> Result<u64, RetentionError> {

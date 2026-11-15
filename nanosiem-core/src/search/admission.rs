@@ -195,7 +195,7 @@ impl std::str::FromStr for QueryPriority {
     }
 }
 
-/// Per-query ClickHouse settings applied via `.with_option()`
+/// Per-query ClickHouse settings applied via `.with_setting()`
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ClickHouseQuerySettings {
     /// Maximum execution time in seconds

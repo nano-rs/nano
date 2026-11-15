@@ -37,7 +37,7 @@ Anything after `--` goes to pytest.
    project.
 2. It starts the app:
    - **native** (the macOS default): `cargo build` with the repo's
-     `rust-toolchain.toml` (1.95), then the migrator, `nanosiem-search`,
+     `rust-toolchain.toml` (1.100), then the migrator, `nanosiem-search`,
      `nanosiem-jobs` and `nanosiem-api` as host processes on free ports.
    - **docker** (the Linux default): `docker build --target api|search|jobs`
      from this tree.

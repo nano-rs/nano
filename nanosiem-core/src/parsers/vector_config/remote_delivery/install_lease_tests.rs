@@ -63,7 +63,7 @@ async fn lease_pool() -> Option<PgPool> {
             move |conn, _| {
                 let schema = schema.clone();
                 Box::pin(async move {
-                    sqlx::Executor::execute(conn, format!("SET search_path TO {schema}").as_str())
+                    sqlx::Executor::execute(conn, sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                         .await
                         .map(|_| ())
                 })
@@ -72,11 +72,11 @@ async fn lease_pool() -> Option<PgPool> {
         .connect(&url)
         .await
         .expect("connect");
-    sqlx::raw_sql(&format!("CREATE SCHEMA {schema}"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&pool)
         .await
         .expect("schema");
-    sqlx::raw_sql(&MIGRATION.replace("public.", &format!("{schema}.")))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(&*MIGRATION.replace("public.", &format!("{schema}."))))
         .execute(&pool)
         .await
         .expect("migration 380");

@@ -354,11 +354,24 @@ pub struct TokenService {
     wait_replicas: std::sync::atomic::AtomicI64,
 }
 
+/// HS256 signing and verifying keys for `secret`.
+///
+/// jsonwebtoken 12 refuses an empty HMAC key (it would make every token
+/// forgeable). The environment path already enforces 32+ characters
+/// (`validate_jwt_secret`), so this only fires for a hand-built empty
+/// `TokenConfig`; fail closed rather than run without a key.
+fn hmac_keys(secret: &str) -> (EncodingKey, DecodingKey) {
+    const REFUSE: &str = "SECURITY ERROR: JWT secret is empty; refusing to sign or verify tokens";
+    (
+        EncodingKey::from_secret(secret.as_bytes()).expect(REFUSE),
+        DecodingKey::from_secret(secret.as_bytes()).expect(REFUSE),
+    )
+}
+
 impl TokenService {
     /// Create a new token service with the given configuration
     pub fn new(config: TokenConfig) -> Self {
-        let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
-        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let (encoding_key, decoding_key) = hmac_keys(&config.jwt_secret);
 
         Self {
             config,
@@ -848,8 +861,7 @@ impl TokenService {
         config: TokenConfig,
         denylist: Arc<DashMap<Uuid, i64>>,
     ) -> Self {
-        let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
-        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let (encoding_key, decoding_key) = hmac_keys(&config.jwt_secret);
 
         Self {
             config,

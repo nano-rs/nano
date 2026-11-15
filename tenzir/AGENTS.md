@@ -75,7 +75,10 @@ Why each argument:
   `OpenSSL error: wrong version number`.
 - `port=9000` — the **native** protocol, not the `8123` HTTP port.
 - `mode="append"` — the table exists; do not create it. (The `json=` argument is
-  create-mode only and **errors** with `append`.)
+  create-mode only and **errors** with `append`.) Since Tenzir 6.20.0 `append`
+  is the default and `to_clickhouse` never creates a table: nano's ClickHouse
+  migrations create `ocsf_logs_raw` (Compose starts Tenzir only after
+  `clickhouse-migrate` completes). Keep `mode="append"` explicit anyway.
 
 ---
 
@@ -253,7 +256,8 @@ scale too — local 2M-row timing can mislead.
 | `OpenSSL error: wrong version number` | `to_clickhouse` defaulted to TLS. Add `tls=false`. |
 | `unsupported ClickHouse type 'JSON'` | Tenzir < 6.4.0, or a clickhouse-cpp sink. Upgrade to ≥ 6.6.0. |
 | `unsupported ClickHouse type 'DateTime64(...)'` / `LowCardinality` | Tenzir < 6.6.0 writing to `ocsf_logs_raw`. Upgrade to ≥ 6.6.0, or target the legacy `ocsf_logs_native_raw` entrypoint. |
-| `required column missing in input` / events silently dropped | Tenzir < 6.6.0 can't omit the server-derived `timestamp`/`id`, or a **null** in a required column (nulls drop the event even with a DEFAULT). Upgrade to ≥ 6.6.0 and guard mapped values with `.otherwise(...)`. |
+| `required column missing in input` / events silently dropped | Tenzir < 6.6.0 can't omit the server-derived `timestamp`/`id`, or a **null** in a required column (Tenzir < 6.20 drops the event even with a DEFAULT; 6.20+ writes the column DEFAULT). Upgrade to ≥ 6.6.0 and guard mapped values with `.otherwise(...)`. |
+| rows land with `source_type` from `metadata.log_source` (or `unknown`) instead of your mapped value | Tenzir ≥ 6.20 writes the ClickHouse column DEFAULT for a **null** in a required column. Your mapping produced a null; guard mapped values with `.otherwise(...)` (the bundled pipeline does for `source_type`). |
 | `ACCESS_DENIED` on insert | `nanosiem_ingest` lacks INSERT/SELECT on the target (`ocsf_logs_raw`, or `ocsf_logs_native_raw` on the legacy path) or `SELECT` on the `*_prevalence_agg` tables the MV cascade reads (NAN-1787). Grants ship in `clickhouse/users.d/nanosiem-users.xml`; reload with `SYSTEM RELOAD USERS` (or redeploy). |
 | Rows land as `source_type='unknown'` | Set a lowercase `source_type` on each record. |
 | Rows present but `timestamp` is "now" | `event.time` missing/garbage → fell back to insert time. Emit epoch ms. |

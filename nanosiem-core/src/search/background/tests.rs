@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::*;
 use crate::auth::{ScopeSet, compose_viewer_scope};
 use crate::search::jobs::SearchJobStatus;
-use crate::search::types::{SearchError, SearchRequest, TimeRangeInput};
+use crate::search::types::{SearchError, SearchRequest, SearchResponse, TimeRangeInput};
 
 fn request(query: &str) -> SearchRequest {
     SearchRequest {
@@ -337,4 +337,88 @@ fn kill_set_covers_every_derived_companion_query_id() {
             "companion query id suffix `-{suffix}` is not in all_query_ids — cancel would leave it running"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Completion write refused by PostgreSQL (NAN-5430)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct FakePgError(&'static str);
+
+impl std::fmt::Display for FakePgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fake PostgreSQL error {}", self.0)
+    }
+}
+
+impl std::error::Error for FakePgError {}
+
+impl sqlx::error::DatabaseError for FakePgError {
+    fn message(&self) -> &str {
+        "fake"
+    }
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some(std::borrow::Cow::Borrowed(self.0))
+    }
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::Other
+    }
+}
+
+fn pg_error(code: &'static str) -> SearchError {
+    SearchError::DatabaseError(sqlx::Error::Database(Box::new(FakePgError(code))))
+}
+
+#[test]
+fn data_refusals_are_deterministic_and_outages_are_not() {
+    use super::service::is_deterministic_write_error;
+    for code in ["22P05", "22021", "54000"] {
+        assert!(is_deterministic_write_error(&pg_error(code)), "{code}");
+    }
+    assert!(is_deterministic_write_error(&SearchError::SqlValidationError(
+        "serialize result meta".into()
+    )));
+    // Connection loss, deadlock, shutdown: the lease-lapse retry is right.
+    for code in ["08006", "40P01", "57P01"] {
+        assert!(!is_deterministic_write_error(&pg_error(code)), "{code}");
+    }
+    assert!(!is_deterministic_write_error(&SearchError::DatabaseError(
+        sqlx::Error::PoolTimedOut
+    )));
+}
+
+#[test]
+fn the_fallback_summary_drops_event_derived_field_stats() {
+    use super::service::strip_field_stats;
+    let mut response: SearchResponse = serde_json::from_value(serde_json::json!({
+        "results": [],
+        "total_count": 2,
+        "execution_time_ms": 1,
+        "fields": [{
+            "name": "process.cmd_line",
+            "field_type": "string",
+            "count": 2,
+            "top_values": [["zz\u{0}", 2]],
+            "cardinality": 1
+        }],
+        "generated_sql": null
+    }))
+    .unwrap();
+    strip_field_stats(&mut response);
+    assert_eq!(response.fields.len(), 1, "the field list itself is kept");
+    assert!(response.fields[0].top_values.is_empty());
+    assert_eq!(response.fields[0].cardinality, None);
+    let warnings = response.warnings.expect("a warning explains the missing stats");
+    assert_eq!(warnings[0].code, "field_stats_not_saved");
+    assert_eq!(response.total_count, 2);
 }

@@ -167,6 +167,9 @@ pub struct PostureInputs {
     pub base_url: Option<String>,
     /// `(env var, value)` for every database password the process sees.
     pub db_passwords: Vec<(String, String)>,
+    /// NAN-5441 egress proxy settings (`NANO_EGRESS_PROXY_REQUIRED`,
+    /// `DESTINATION_EGRESS_PROXY_URL`/`_MODE`, the env proxy).
+    pub egress: crate::egress_proxy::EgressSettings,
 }
 
 impl PostureInputs {
@@ -181,6 +184,7 @@ impl PostureInputs {
                 .is_some_and(|v| v.eq_ignore_ascii_case("true")),
             base_url: var("BASE_URL"),
             db_passwords: db_passwords_from_env(),
+            egress: crate::egress_proxy::EgressSettings::from_env(),
         }
     }
 }
@@ -342,6 +346,47 @@ pub fn posture_findings(inputs: &PostureInputs) -> Vec<PostureFinding> {
                      to generated values (install.sh does this)."
                     .into(),
                 priority: "critical",
+            });
+        }
+    }
+
+    // NAN-5441: egress proxy settings that make outbound paths refuse.
+    if let Err(e) = &inputs.egress.destination {
+        findings.push(PostureFinding {
+            title: "The destination egress proxy setting is invalid".into(),
+            description: format!(
+                "DESTINATION_EGRESS_PROXY_URL / DESTINATION_EGRESS_PROXY_MODE is invalid ({e}). \
+                 Webhooks, notification channels, AI provider URLs, lookup URLs, scheduled \
+                 fetches and synthetic checks refuse every request until it is fixed; nano never \
+                 falls back to a direct connection. Use http://[user:password@]host:port and \
+                 pinned_ip or hostname."
+            ),
+            priority: "high",
+        });
+    }
+    if inputs.egress.required {
+        let mut missing = Vec::new();
+        if !inputs.egress.env_proxy.https {
+            missing.push("HTTPS_PROXY (feeds, content channels, license check-in, OIDC, identity sync)");
+        }
+        if matches!(inputs.egress.destination, Ok(None)) {
+            missing.push(
+                "DESTINATION_EGRESS_PROXY_URL (webhooks, notification channels, AI provider URLs, \
+                 lookup URLs, scheduled fetches, synthetic checks)",
+            );
+        }
+        if !missing.is_empty() {
+            findings.push(PostureFinding {
+                title: "Egress proxy is required but some paths have no proxy".into(),
+                description: format!(
+                    "NANO_EGRESS_PROXY_REQUIRED=true, so these paths refuse every connection to a \
+                     public address: {}. Set the proxy for each path you use, or turn \
+                     NANO_EGRESS_PROXY_REQUIRED off. Connectors, SOAR and custom enrichments \
+                     need CONNECTOR_EGRESS_PROXY_URL, SOAR_EGRESS_PROXY_URL and \
+                     ENRICHMENT_EGRESS_PROXY_URL in the same way.",
+                    missing.join("; ")
+                ),
+                priority: "medium",
             });
         }
     }

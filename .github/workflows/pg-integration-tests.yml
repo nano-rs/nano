@@ -53,7 +53,7 @@ jobs:
     timeout-minutes: 45
     env:
       PG_CONTAINER: nan1272-pgit-${{ github.run_id }}
-      RUST_IMAGE: rust:1.95-bookworm
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     steps:
       # A prior container job can leave root-owned files in this persistent
       # self-hosted workspace. Reclaim them before actions/checkout tries to

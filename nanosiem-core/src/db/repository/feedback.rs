@@ -160,14 +160,14 @@ impl FeedbackRepository {
         let (entries, total): (Vec<FeedbackWithUser>, i64) = match (&query.category, &query.status)
         {
             (Some(cat), Some(status)) => {
-                let entries = sqlx::query_as::<_, FeedbackWithUser>(&sql)
+                let entries = sqlx::query_as::<_, FeedbackWithUser>(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(limit)
                     .bind(offset)
                     .bind(cat)
                     .bind(status)
                     .fetch_all(&self.pool)
                     .await?;
-                let total: i64 = sqlx::query_scalar(&count_sql)
+                let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql.as_str()))
                     .bind(cat)
                     .bind(status)
                     .fetch_one(&self.pool)
@@ -175,13 +175,13 @@ impl FeedbackRepository {
                 (entries, total)
             }
             (Some(cat), None) => {
-                let entries = sqlx::query_as::<_, FeedbackWithUser>(&sql)
+                let entries = sqlx::query_as::<_, FeedbackWithUser>(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(limit)
                     .bind(offset)
                     .bind(cat)
                     .fetch_all(&self.pool)
                     .await?;
-                let total: i64 = sqlx::query_scalar(&count_sql)
+                let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql.as_str()))
                     .bind(cat)
                     .fetch_one(&self.pool)
                     .await?;
@@ -189,13 +189,13 @@ impl FeedbackRepository {
             }
             (None, Some(status)) => {
                 let sql = sql.replace("$3", "$3").replace("$4", "$3");
-                let entries = sqlx::query_as::<_, FeedbackWithUser>(&sql)
+                let entries = sqlx::query_as::<_, FeedbackWithUser>(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(limit)
                     .bind(offset)
                     .bind(status)
                     .fetch_all(&self.pool)
                     .await?;
-                let total: i64 = sqlx::query_scalar(&count_sql)
+                let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql.as_str()))
                     .bind(status)
                     .fetch_one(&self.pool)
                     .await?;

@@ -277,3 +277,36 @@ fn strict_delivery_is_opt_in() {
     );
     assert!(matches!(public, VectorConfigDeliveryCredential::Dedicated(_)), "{public:?}");
 }
+
+// NAN-5441: egress proxy posture.
+#[test]
+fn egress_defaults_add_no_finding() {
+    let titles: Vec<String> = posture_findings(&PostureInputs::default()).into_iter().map(|f| f.title).collect();
+    assert!(!titles.iter().any(|t| t.contains("gress")), "{titles:?}");
+}
+
+#[test]
+fn egress_required_with_missing_proxies_names_each_path() {
+    let inputs = PostureInputs {
+        egress: crate::egress_proxy::EgressSettings::from_values(Some("true"), None, None, crate::egress_proxy::EnvProxy::NONE),
+        ..Default::default()
+    };
+    let f = posture_findings(&inputs).into_iter().find(|f| f.title.contains("Egress proxy is required")).unwrap();
+    assert_eq!(f.priority, "medium");
+    assert!(f.description.contains("HTTPS_PROXY") && f.description.contains("DESTINATION_EGRESS_PROXY_URL"));
+    let covered = PostureInputs {
+        egress: crate::egress_proxy::EgressSettings::from_values(Some("true"), Some("http://proxy:3128"), None, crate::egress_proxy::EnvProxy::ALL),
+        ..Default::default()
+    };
+    assert!(!posture_findings(&covered).iter().any(|f| f.title.contains("gress")));
+}
+
+#[test]
+fn invalid_destination_proxy_is_a_high_finding() {
+    let inputs = PostureInputs {
+        egress: crate::egress_proxy::EgressSettings::from_values(None, Some("https://proxy:3128"), None, crate::egress_proxy::EnvProxy::NONE),
+        ..Default::default()
+    };
+    let f = posture_findings(&inputs).into_iter().find(|f| f.title.contains("destination egress proxy")).unwrap();
+    assert_eq!(f.priority, "high");
+}

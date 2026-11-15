@@ -224,6 +224,94 @@ if nano_transport_ct != "" {
     };
 }
 
+/// NAN-5431: the deepest container level kept in a stored object (the OCSF
+/// `event`, the UDM `ext`). A container nested deeper is stored as its JSON
+/// text instead.
+///
+/// Vector encodes every event as protobuf on its way into a disk buffer, and
+/// that encoding refuses an event nested past a fixed cost (about 32 object
+/// levels in the stored row, measured on nano-rs/vector 0.61.0-nano.12). Such
+/// an event was accepted at ingest and then discarded at the ClickHouse sink's
+/// buffer. 24 keeps a margin under that limit (the row adds a level or two
+/// around the object) and far above real vendor payloads. Keep in step with
+/// the level count in [`nesting_depth_limit_vrl!`] (a test checks it).
+pub(crate) const MAX_STORED_NESTING_DEPTH: usize = 24;
+
+/// One level of the [`nesting_depth_limit_vrl!`] walk: replace the frontier
+/// (paths of the containers at this level) with the paths of their container
+/// children. Sequential, not nested: VRL type-checks nested closures in time
+/// exponential in the nesting (a 14-deep nested walk took ~30 s to compile).
+macro_rules! nesting_depth_level_vrl {
+    ($var:literal) => {
+        concat!(
+            "    nano_depth_next = []\n",
+            "    for_each(nano_depth_frontier) -> |_nano_depth_i, nano_depth_path| {\n",
+            "        nano_depth_value = get(", $var, ", nano_depth_path) ?? null\n",
+            "        if is_object(nano_depth_value) {\n",
+            "            for_each(object!(nano_depth_value)) -> |nano_depth_key, nano_depth_child| {\n",
+            "                if is_object(nano_depth_child) || is_array(nano_depth_child) { nano_depth_next = push(nano_depth_next, push(nano_depth_path, nano_depth_key)) }\n",
+            "            }\n",
+            "        } else if is_array(nano_depth_value) {\n",
+            "            for_each(array!(nano_depth_value)) -> |nano_depth_index, nano_depth_child| {\n",
+            "                if is_object(nano_depth_child) || is_array(nano_depth_child) { nano_depth_next = push(nano_depth_next, push(nano_depth_path, nano_depth_index)) }\n",
+            "            }\n",
+            "        }\n",
+            "    }\n",
+            "    nano_depth_frontier = nano_depth_next\n",
+        )
+    };
+}
+
+/// NAN-5431: store any container nested deeper than
+/// [`MAX_STORED_NESTING_DEPTH`] levels inside the object variable `$var` as
+/// its JSON text, so the event fits Vector's disk-buffer encoding instead of
+/// being discarded after ingest acknowledged it. Nothing is lost: the subtree
+/// is kept verbatim as a string, the event is marked with `true` at
+/// `$marker_path` (a VRL path array literal, e.g. `["nano_nesting_truncated"]`)
+/// so affected events are searchable, and a rate-limited warning is logged.
+///
+/// Gate: a value can only be nested N levels deep when its JSON text has at
+/// least N opening brackets, so events with fewer skip the walk after one
+/// linear scan. The gate counts brackets, not depth: a wide event (many
+/// small objects) also passes it and pays for the walk, which visits each
+/// container once and stops early once a level has no containers left. The
+/// walk is breadth first over container paths; the level block is repeated
+/// [`MAX_STORED_NESTING_DEPTH`] times.
+macro_rules! nesting_depth_limit_vrl {
+    ($var:literal, $marker_path:literal) => {
+        concat!(
+            "# NAN-5431: containers nested deeper than 24 levels are stored as JSON text;\n",
+            "# see nesting_depth_limit_vrl! in vector_config/mod.rs.\n",
+            "if match(encode_json(", $var, "), r'^(?:[^\\[{]*[\\[{]){25}') {\n",
+            "    nano_depth_frontier = [[]]\n",
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
+            "    if length(nano_depth_frontier) > 0 {\n",
+            "        for_each(nano_depth_frontier) -> |_nano_depth_i, nano_depth_path| {\n",
+            "            nano_depth_sub = get(", $var, ", nano_depth_path) ?? null\n",
+            "            ", $var, " = set(", $var, ", nano_depth_path, encode_json(nano_depth_sub)) ?? ", $var, "\n",
+            "        }\n",
+            "        ", $var, " = set(", $var, ", ", $marker_path, ", true) ?? ", $var, "\n",
+            "        log(\"Stored an event's deeply nested values as JSON text (nesting limit 24)\", level: \"warn\", rate_limit_secs: 60)\n",
+            "    }\n",
+            "}\n",
+        )
+    };
+}
+
+#[cfg(test)]
+pub(crate) const NESTING_DEPTH_LIMIT_TEST_VRL: &str = nesting_depth_limit_vrl!("nano_test_value", r#"["nano_nesting_truncated"]"#);
+
 /// NAN-5032: platform-owned `source_type` values are rewritten at the UDM
 /// storage boundary, whatever lane an event arrived on.
 ///
@@ -304,6 +392,9 @@ pub(crate) mod config_lock;
 #[cfg(test)]
 #[path = "claim_metadata_tests.rs"]
 mod claim_metadata_tests;
+#[cfg(test)]
+#[path = "nesting_depth_limit_tests.rs"]
+mod nesting_depth_limit_tests;
 #[cfg(test)]
 #[path = "credential_precheck_tests.rs"]
 mod credential_precheck_tests;

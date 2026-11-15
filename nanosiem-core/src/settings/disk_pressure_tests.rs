@@ -22,6 +22,7 @@ fn daily_tables_are_local_tables_never_distributed_wrappers() {
 fn partition_reads_cover_every_daily_table_scoped_to_the_database() {
     for sql in [
         partition_snapshot_sql("system.parts", "nanosiem", "20261104").unwrap(),
+        oldest_partition_sql("system.parts", "nanosiem", "20261104").unwrap(),
         avg_partition_bytes_sql("system.parts", "nanosiem"),
         tables_with_partition_sql("system.parts", "nanosiem"),
     ] {
@@ -64,9 +65,11 @@ fn drop_statement_refuses_unknown_tables_and_non_date_partitions() {
 
 #[test]
 fn audit_details_name_the_tables_actually_dropped() {
-    let d = drop_audit_details("20261001", &["ocsf_logs".to_string(), "signals".to_string()]);
+    let evicted = Evicted { dropped: vec!["ocsf_logs".to_string(), "signals".to_string()], archived_from: vec![], archived_rows: 0 };
+    let d = drop_audit_details("20261001", &evicted, 7);
     assert_eq!(d["partition_date"], "20261001");
     assert_eq!(d["tables"], serde_json::json!(["ocsf_logs", "signals"]));
+    assert_eq!(d["min_retention_days"], 7);
     assert!(d["candidate_tables"].as_array().unwrap().iter().any(|t| t == "ocsf_logs"));
 }
 
@@ -76,8 +79,11 @@ fn database_literal_is_escaped() {
 }
 
 #[test]
-fn warm_ttl_never_rewrites_the_ocsf_store() {
-    assert!(!WARM_TTL_TABLES.iter().any(|(t, _)| t.starts_with("ocsf_logs")));
+fn nan5448_jobs_start_never_rewrites_a_delete_ttl() {
+    // The service must not carry any TTL DDL: retention owns the DELETE TTL.
+    let src = include_str!("disk_pressure.rs");
+    assert!(!src.contains("MODIFY TTL"), "disk pressure must not issue MODIFY TTL (NAN-5448)");
+    assert!(!src.contains("WARM_RETENTION_DAYS\")"), "WARM_RETENTION_DAYS must not be read");
 }
 
 fn policy(name: &str, priority: u64, disks: &[&str]) -> (String, u64, Vec<String>) {
@@ -93,12 +99,33 @@ fn an_unused_multi_volume_policy_is_not_tiering() {
 }
 
 #[test]
-fn a_used_multi_volume_or_object_storage_policy_is_tiering() {
+fn nan5445_two_local_volumes_are_not_tiering() {
+    // Multi-host Compose creates `logs` on the repo placeholder `tiered`
+    // (hot + warm, both Local). Nothing leaves the box: cleanup must run.
+    let placeholder = [policy("tiered", 1, &["default"]), policy("tiered", 2, &["warm_disk"])];
+    assert!(!tiering_applies(&["tiered".to_string()], &placeholder, &[]));
+}
+
+#[test]
+fn a_used_object_storage_policy_is_tiering() {
     let policies = [policy("default", 1, &["default"]), policy("default", 2, &["s3"])];
-    assert!(tiering_applies(&["default".to_string()], &policies, &[]));
+    assert!(tiering_applies(&["default".to_string()], &policies, &["s3".to_string()]));
     let single = [policy("s3only", 1, &["s3"])];
     assert!(tiering_applies(&["s3only".to_string()], &single, &["s3".to_string()]));
     assert!(!tiering_applies(&["default".to_string()], &single, &["s3".to_string()]));
+}
+
+/// Only `ObjectStorage` disks count: the placeholder policy on an encrypted
+/// local disk is still local, and the disk query names object storage only.
+#[test]
+fn only_object_storage_disks_make_tiering() {
+    let placeholder = [policy("tiered", 1, &["default"]), policy("tiered", 2, &["warm_enc"])];
+    // `warm_enc` is type Encrypted: not in the object-storage list.
+    assert!(!tiering_applies(&["tiered".to_string()], &placeholder, &["s3_cache".to_string()]));
+    let configured = [policy("nano_tiered", 1, &["default"]), policy("nano_tiered", 2, &["s3_cache"])];
+    assert!(tiering_applies(&["nano_tiered".to_string()], &configured, &["s3_cache".to_string()]));
+    // Configured in the server but no daily table uses it: not tiering.
+    assert!(!tiering_applies(&["tiered".to_string()], &configured, &["s3_cache".to_string()]));
 }
 
 #[test]
@@ -113,7 +140,12 @@ fn used_policies_read_the_daily_tables() {
 const TODAY: &str = "20261104";
 
 fn snap(oldest: Option<&str>, newest: Option<&str>) -> PartitionSnapshot {
-    PartitionSnapshot { oldest_before_today: oldest.map(str::to_string), newest: newest.map(str::to_string) }
+    PartitionSnapshot { oldest_before_cutoff: oldest.map(str::to_string), newest: newest.map(str::to_string) }
+}
+
+/// The pre-floor tests run with the floor at 0 (cutoff = today).
+fn evictable(s: &PartitionSnapshot, today: &str) -> Option<String> {
+    evictable_partition(s, today, today)
 }
 
 #[test]
@@ -126,23 +158,23 @@ fn snapshot_reads_oldest_before_today_and_newest_in_one_query() {
 #[test]
 fn a_future_partition_never_makes_today_evictable() {
     // Today + one 2099 event: the old floor (protect max) would drop today.
-    assert_eq!(evictable_partition(&snap(None, Some("20991231")), TODAY), None);
+    assert_eq!(evictable(&snap(None, Some("20991231")), TODAY), None);
     // An old partition is still evictable beside a future one.
-    assert_eq!(evictable_partition(&snap(Some("20261001"), Some("20991231")), TODAY).as_deref(), Some("20261001"));
+    assert_eq!(evictable(&snap(Some("20261001"), Some("20991231")), TODAY).as_deref(), Some("20261001"));
 }
 
 #[test]
 fn today_and_later_are_never_candidates() {
-    assert_eq!(evictable_partition(&snap(Some(TODAY), Some("20991231")), TODAY), None);
-    assert_eq!(evictable_partition(&snap(Some("20261105"), Some("20261105")), TODAY), None);
-    assert_eq!(evictable_partition(&snap(Some("2026110"), Some(TODAY)), TODAY), None);
+    assert_eq!(evictable(&snap(Some(TODAY), Some("20991231")), TODAY), None);
+    assert_eq!(evictable(&snap(Some("20261105"), Some("20261105")), TODAY), None);
+    assert_eq!(evictable(&snap(Some("2026110"), Some(TODAY)), TODAY), None);
 }
 
 #[test]
 fn the_newest_partition_is_never_a_candidate() {
     // Only an old partition is left (today has no data yet): it is the newest.
-    assert_eq!(evictable_partition(&snap(Some("20261001"), Some("20261001")), TODAY), None);
-    assert_eq!(evictable_partition(&snap(None, None), TODAY), None);
+    assert_eq!(evictable(&snap(Some("20261001"), Some("20261001")), TODAY), None);
+    assert_eq!(evictable(&snap(None, None), TODAY), None);
 }
 
 /// Fake partitions: `parts` is the live set. A partition can vanish either
@@ -157,28 +189,28 @@ struct Fake {
 
 #[async_trait::async_trait]
 impl PartitionDropper for Fake {
-    async fn partition_snapshot(&self, today: &str) -> Result<PartitionSnapshot, DiskPressureError> {
+    async fn partition_snapshot(&self, cutoff: &str) -> Result<PartitionSnapshot, DiskPressureError> {
         let mut parts = self.parts.lock().unwrap();
         if let Some(v) = self.vanish_on_snapshot.lock().unwrap().take() {
             parts.retain(|p| *p != v);
         }
         Ok(PartitionSnapshot {
-            oldest_before_today: parts.iter().filter(|p| p.as_str() < today).min().cloned(),
+            oldest_before_cutoff: parts.iter().filter(|p| p.as_str() < cutoff).min().cloned(),
             newest: parts.iter().max().cloned(),
         })
     }
     async fn usage(&self) -> Result<f64, DiskPressureError> {
         Ok(0.99)
     }
-    async fn drop_partition(&self, date: &str) -> Result<Vec<String>, DiskPressureError> {
+    async fn drop_partition(&self, date: &str) -> Result<Evicted, DiskPressureError> {
         self.drop_attempts.lock().unwrap().push(date.to_string());
         self.parts.lock().unwrap().retain(|p| p != date);
         if self.vanish_on_drop.lock().unwrap().take().as_deref() == Some(date) {
-            return Ok(Vec::new());
+            return Ok(Evicted::default());
         }
-        Ok(vec!["ocsf_logs".to_string()])
+        Ok(Evicted { dropped: vec!["ocsf_logs".to_string()], archived_from: vec![], archived_rows: 0 })
     }
-    async fn dropped(&self, date: &str, _tables: &[String]) {
+    async fn dropped(&self, date: &str, _evicted: &Evicted) {
         self.reported_drops.lock().unwrap().push(date.to_string());
     }
 }
@@ -196,7 +228,7 @@ fn fake(parts: &[&str], vanish_on_snapshot: Option<&str>, vanish_on_drop: Option
 async fn run(f: &Fake) -> DropLoopOutcome {
     // A disabled fence never touches the pool.
     let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://unused@127.0.0.1:1/unused").unwrap();
-    fifo_drop_loop(f, &crate::leader::LeaderFence::disabled(), &pool, 0.70, 10, std::time::Duration::ZERO, TODAY).await
+    fifo_drop_loop(f, &crate::leader::LeaderFence::disabled(), &pool, 0.70, 10, std::time::Duration::ZERO, TODAY, TODAY).await
 }
 
 #[tokio::test]
@@ -251,4 +283,78 @@ fn all_replica_reads_skip_a_down_replica_only_on_a_cluster() {
         all_replicas_read_settings(Some("default")),
         &[("skip_unavailable_shards", "1")]
     );
+}
+
+/// NAN-5450: "Est. retention" counts to the high watermark, not to 100 %.
+#[test]
+fn estimated_retention_counts_to_the_high_watermark() {
+    let gib = 1u64 << 30;
+    // 100 GiB disk, 40 GiB used, 10 days of 2 GiB: (80 - 40) / 2 = 20 more days.
+    assert_eq!(retention_days_at_high_watermark(100 * gib, 40 * gib, 0.80, (2 * gib) as f64, 10), 30.0);
+    // Past the high watermark the estimate is below the stored days.
+    assert_eq!(retention_days_at_high_watermark(100 * gib, 90 * gib, 0.80, (2 * gib) as f64, 10), 5.0);
+    assert_eq!(retention_days_at_high_watermark(100 * gib, 99 * gib, 0.80, (1u64 << 20) as f64, 1), 0.0);
+    assert_eq!(retention_days_at_high_watermark(100 * gib, 10 * gib, 0.80, 0.0, 0), 0.0);
+}
+
+// -- NAN-5446: automatic ingestion pause ------------------------------------
+
+fn pause_config(pause_ingestion: bool, pause_threshold: f64) -> DiskPressureConfig {
+    DiskPressureConfig {
+        check_interval_secs: 60,
+        high_watermark: 0.80,
+        low_watermark: 0.70,
+        critical_threshold: 0.90,
+        emergency_threshold: 0.95,
+        pause_ingestion,
+        pause_threshold,
+        ..Default::default()
+    }
+    .sanitized()
+}
+
+#[test]
+fn the_default_pauses_at_92_percent_below_the_emergency_level() {
+    assert_eq!(DEFAULT_PAUSE_THRESHOLD, 0.92);
+    let cfg = pause_config(true, DEFAULT_PAUSE_THRESHOLD);
+    assert!(cfg.pause_threshold < cfg.emergency_threshold);
+    assert!(!cfg.should_pause(0.91));
+    assert!(cfg.should_pause(0.92));
+    // Critical (90%) but under the pause threshold: drop, don't pause yet.
+    assert!(!cfg.should_pause(0.905));
+    assert!(cfg.should_pause(0.99));
+}
+
+#[test]
+fn auto_pause_off_never_pauses() {
+    let cfg = pause_config(false, DEFAULT_PAUSE_THRESHOLD);
+    assert!(!cfg.should_pause(1.0));
+}
+
+#[test]
+fn a_pause_threshold_below_the_high_watermark_is_clamped_so_it_cannot_flap() {
+    // Normal (< high watermark) lifts an automatic pause every cycle, so a
+    // pause threshold under it would pause and resume forever.
+    let cfg = pause_config(true, 0.50);
+    assert_eq!(cfg.pause_threshold, 0.80);
+    assert!(!cfg.should_pause(0.79));
+}
+
+#[test]
+fn a_nonsense_pause_threshold_falls_back_or_clamps() {
+    assert_eq!(pause_config(true, f64::NAN).pause_threshold, DEFAULT_PAUSE_THRESHOLD);
+    assert_eq!(pause_config(true, 1.5).pause_threshold, 0.99);
+}
+
+#[test]
+fn the_env_default_turns_auto_pause_on() {
+    // Read through Default (env-driven). The test environment does not set
+    // DISK_PRESSURE_PAUSE_INGESTION / DISK_PRESSURE_PAUSE_THRESHOLD.
+    if std::env::var_os("DISK_PRESSURE_PAUSE_INGESTION").is_none()
+        && std::env::var_os("DISK_PRESSURE_PAUSE_THRESHOLD").is_none()
+    {
+        let cfg = DiskPressureConfig::default();
+        assert!(cfg.pause_ingestion);
+        assert_eq!(cfg.pause_threshold, DEFAULT_PAUSE_THRESHOLD);
+    }
 }

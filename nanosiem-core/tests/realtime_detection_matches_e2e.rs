@@ -65,11 +65,11 @@ fn env() -> Env {
 /// Fresh, migrated scratch database on the disposable server.
 async fn scratch_db(env: &Env, name: &str) -> (PgPool, String, PgPool) {
     let admin = PgPool::connect(&env.pg_admin_url).await.expect("connect PG");
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")))
         .execute(&admin)
         .await
         .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&admin)
         .await
         .expect("create scratch");
@@ -130,8 +130,8 @@ async fn insert_events(ch: &clickhouse::Client, source: &str, n: usize) {
         })
         .collect();
     ch.clone()
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .query(&format!(
             "INSERT INTO nanosiem.logs (id, timestamp, source_type, message, src_ip) VALUES {}",
             rows.join(", ")

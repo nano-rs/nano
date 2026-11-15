@@ -130,7 +130,7 @@ async fn fresh_pg() -> (sqlx::PgPool, String) {
         .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("pf_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
-    sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();
     let (base, _) = url.rsplit_once('/').unwrap();
     let pool = sqlx::PgPool::connect(&format!("{base}/{name}")).await.unwrap();
     nanosiem_core::db::run_postgres_migrations(&pool).await.unwrap();
@@ -517,7 +517,7 @@ async fn install_policy_against_real_clickhouse_and_postgres() {
     ch.query(&format!("DROP DATABASE {db}")).execute().await.unwrap();
     pool.close().await;
     let admin = sqlx::PgPool::connect(&std::env::var("NANOSIEM_TEST_DATABASE_URL").unwrap()).await.unwrap();
-    sqlx::query(&format!("DROP DATABASE {pg_name}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {pg_name}"))).execute(&admin).await.unwrap();
 }
 
 #[derive(clickhouse::Row, serde::Deserialize)]

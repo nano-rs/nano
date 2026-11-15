@@ -15,7 +15,10 @@
 //!   admin `cluster()` probe, reads it).
 //! * The raw-SQL users hold no system grant at all (no `system.query_log`,
 //!   no `system.users`), and nobody but the admin identity reads
-//!   `system.query_log.query` or `system.users`.
+//!   `system.query_log.query` or `system.users`. The one exception is the
+//!   enterprise Agent Lane query-audit reader (NAN-5362), which holds
+//!   column-scoped SELECT on `system.query_log` / `system.session_log`
+//!   confined by row policies to `agentlane_*` rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -74,14 +77,24 @@ const RUNTIME_SYSTEM_GRANTS: &[(&str, &[&str])] = &[
 ];
 
 /// Read only by the admin identity on its local node (admin holds ALL):
-/// migrator user/profile bootstrap, ingest watchdog pressure samples.
-const ADMIN_ONLY: &[&str] = &["users", "scheduler", "asynchronous_inserts", "metrics"];
+/// migrator user/profile bootstrap, ingest watchdog pressure samples, and
+/// the Agent Lane control plane (NAN-5359/5360/5363/5404: role grant drift,
+/// token user/quota/profile/workload reconcile, live schema), which reads
+/// through `AccessManager`'s admin client or the migrator's admin client,
+/// never the runtime user. `session_log`: the SIEM Health refusal probe
+/// (admin `system_probe_client`, NAN-5390); the Agent Lane audit reader's
+/// own read of it is checked in `agentlane_audit_reader_grants_are_confined`.
+const ADMIN_ONLY: &[&str] = &[
+    "users", "scheduler", "asynchronous_inserts", "metrics",
+    "grants", "role_grants", "roles", "quotas", "settings_profile_elements", "workloads",
+    "data_skipping_indices", "session_log",
+];
 
 /// `system.<x>` tokens in code that are not reads of a system table: OCSF
 /// field paths (`device.os.system.*`, `autonomous_system.number`), operator
 /// messages and comments, and the raw-SQL validator's rejection tests.
 const NOT_READS: &[&str] = &[
-    "number", "name", "cpu", "memory", "network", "clone", "grants", "stack_trace",
+    "number", "name", "cpu", "memory", "network", "clone", "stack_trace",
     "distributed_ddl_queue",
 ];
 
@@ -316,5 +329,36 @@ fn every_system_table_the_code_reads_is_mapped() {
     // No stale entries: every mapped table is still named somewhere.
     for t in ADMIN_ONLY.iter().chain(NOT_READS).chain(granted.iter()) {
         assert!(reads.contains_key(*t), "system.{t} is mapped but no longer read by code; drop it from the map");
+    }
+}
+
+/// The enterprise Agent Lane query-audit reader (NAN-5362) is the only
+/// non-admin identity that reads other users' `system.query_log.query`. Its
+/// grants must stay column-scoped SELECT on exactly the two system logs, each
+/// confined by a row policy to `agentlane_*` rows. Skipped on the open-core
+/// mirror, where the enterprise crate is stripped.
+#[test]
+fn agentlane_audit_reader_grants_are_confined() {
+    let Ok(src) = std::fs::read_to_string(repo_root().join("nanosiem-enterprise/src/agentlane/audit.rs")) else {
+        return;
+    };
+    let ddl = src.split("pub fn auditor_ddl(").nth(1).expect("auditor_ddl in agentlane/audit.rs");
+    let ddl = ddl.split("\n}\n").next().unwrap();
+    let tables: BTreeSet<&str> = regex::Regex::new(r"system\.([a-z_]+)")
+        .unwrap()
+        .captures_iter(ddl)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
+    assert_eq!(tables, BTreeSet::from(["query_log", "session_log"]), "audit reader reads only the two system logs");
+    assert!(
+        ddl.contains("GRANT{oc} SELECT({qc}) ON system.query_log, SELECT({sc}) ON system.session_log TO {user}"),
+        "audit reader grants must be column-scoped SELECT on the two logs"
+    );
+    assert!(!ddl.contains("*.*") && !ddl.contains("GRANT{oc} ALL") && !ddl.contains("SHOW USERS"));
+    for table in ["query_log", "session_log"] {
+        assert!(
+            ddl.contains(&format!("ON system.{table} FOR SELECT")) && ddl.contains("'agentlane_')"),
+            "system.{table} needs a row policy confining the audit reader to agentlane rows"
+        );
     }
 }

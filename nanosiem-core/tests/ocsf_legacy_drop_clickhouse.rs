@@ -242,7 +242,7 @@ async fn a_cluster_with_an_unavailable_shard_is_refused() {
         .await;
     // Broken cluster, with a session that would skip unavailable shards: the
     // proof pins skip_unavailable_shards = 0 and the coverage check refuses.
-    let skipping = ch.clone().with_option("skip_unavailable_shards", "1");
+    let skipping = ch.clone().with_setting("skip_unavailable_shards", "1");
     let broken = ClickHouseMigrator::new(skipping, &db)
         .with_cluster(Some("nan4918_broken".into()))
         .drop_ocsf_legacy(true)

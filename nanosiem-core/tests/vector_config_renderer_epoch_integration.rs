@@ -55,14 +55,14 @@ async fn isolated_pool() -> (PgPool, PgPool, String) {
         .expect("TEST_DATABASE_URL must reference a disposable PostgreSQL database");
     let admin = PgPool::connect(&url).await.expect("connect test PostgreSQL");
     let schema = format!("vector_epoch_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await.unwrap();
     let search_path = schema.clone();
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .after_connect(move |connection, _| {
             let statement = format!("SET search_path TO {search_path}");
             Box::pin(async move {
-                sqlx::query(&statement).execute(connection).await?;
+                sqlx::query(sqlx::AssertSqlSafe(statement.as_str())).execute(connection).await?;
                 Ok(())
             })
         })
@@ -135,7 +135,7 @@ async fn same_build_rejoins_after_reinstall_and_never_flip_flops() {
         .unwrap();
     assert_eq!(allocations, 1, "one build, one allocation");
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
 }
 
 #[tokio::test]
@@ -162,7 +162,7 @@ async fn a_new_build_is_allocated_above_every_known_epoch() {
     assert!(matches!(outcome, PublicationOutcome::Published { .. }), "{outcome:?}");
     assert_eq!(committed_epoch(&pool).await, 42, "this build supersedes every older one");
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
 }
 
 #[tokio::test]
@@ -192,5 +192,5 @@ async fn concurrent_first_publishers_share_one_allocation() {
         .unwrap();
     assert_eq!(allocations, 1);
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
 }

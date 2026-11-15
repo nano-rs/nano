@@ -100,7 +100,7 @@ pub async fn run_demo_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         info!(version = version, filename = %filename, "Applying demo migration");
 
         // Use raw_sql for multi-statement migration files
-        sqlx::raw_sql(&sql).execute(pool).await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str())).execute(pool).await?;
 
         // Record as applied
         sqlx::query("INSERT INTO demo.migrations (version, filename) VALUES ($1, $2)")

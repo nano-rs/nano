@@ -292,7 +292,7 @@ def hosts() -> Board:
     b.ts("Memory used", [(f'1 - node_memory_MemAvailable_bytes{{{n}}} / node_memory_MemTotal_bytes{{{n}}}', "{{host}}")],
          unit="percentunit")
     b.ts("Disk free", [(f'node_filesystem_avail_bytes{{{n}, {fs}}} / node_filesystem_size_bytes{{{n}, {fs}}}', "{{host}} {{mountpoint}}")],
-         unit="percentunit", description="The NanoDiskPressure alert fires below 15%, NanoDiskCritical below 8%.")
+         unit="percentunit", description="The NanoDiskPressure alert fires below 20%, NanoDiskCritical below 10%.")
     b.ts("Disk I/O", [(f'sum by (host) (rate(node_disk_read_bytes_total{{{n}}}[$__rate_interval]))', "read {{host}}"),
                       (f'sum by (host) (rate(node_disk_written_bytes_total{{{n}}}[$__rate_interval]))', "write {{host}}")],
          unit="Bps")

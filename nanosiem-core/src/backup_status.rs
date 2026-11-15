@@ -357,9 +357,9 @@ impl BackupStatusRepository {
 
     /// The stored status, `None` when no report was ever received.
     pub async fn get(&self) -> Result<Option<BackupStatus>, sqlx::Error> {
-        sqlx::query_as::<_, BackupStatus>(&format!(
+        sqlx::query_as::<_, BackupStatus>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLUMNS} FROM backup_status WHERE id = 1"
-        ))
+        )))
         .fetch_optional(&self.pool)
         .await
     }
@@ -371,9 +371,9 @@ impl BackupStatusRepository {
         report: &ValidatedBackupReport,
     ) -> Result<(Option<BackupStatus>, BackupStatus), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let before = sqlx::query_as::<_, BackupStatus>(&format!(
+        let before = sqlx::query_as::<_, BackupStatus>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLUMNS} FROM backup_status WHERE id = 1 FOR UPDATE"
-        ))
+        )))
         .fetch_optional(&mut *tx)
         .await?;
         let after = sqlx::query_as::<_, BackupStatus>(UPSERT_SQL)

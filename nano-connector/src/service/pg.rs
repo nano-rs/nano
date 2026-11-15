@@ -253,7 +253,7 @@ impl PgFeedStore {
     }
 
     pub async fn list_feeds(&self) -> Result<Vec<FeedSummary>, AdminError> {
-        let rows = sqlx::query(&format!("SELECT {SUMMARY_COLUMNS} FROM public.connector_feeds ORDER BY name"))
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {SUMMARY_COLUMNS} FROM public.connector_feeds ORDER BY name")))
             .fetch_all(&self.pool)
             .await
             .map_err(admin_db)?;
@@ -261,7 +261,7 @@ impl PgFeedStore {
     }
 
     pub async fn get_feed(&self, id: Uuid) -> Result<FeedSummary, AdminError> {
-        let row = sqlx::query(&format!("SELECT {SUMMARY_COLUMNS} FROM public.connector_feeds WHERE id = $1"))
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {SUMMARY_COLUMNS} FROM public.connector_feeds WHERE id = $1")))
             .bind(id)
             .fetch_optional(&self.pool)
             .await

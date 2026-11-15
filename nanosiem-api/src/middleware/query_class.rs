@@ -13,9 +13,13 @@
 //!   `x-nano-query-class: agent`; a header never raises agent to human.
 //!
 //! The agent class is the AI-search origin, so every search the request runs
-//! is checked by `nanosiem_core::search::ai_command_policy`.
+//! is checked by `nanosiem_core::search::ai_command_policy`. This layer also
+//! installs the request's caller, so an AI-search refusal or a lookup fetch
+//! is audited with the member and client IP (NAN-5456).
 
 use axum::{extract::Request, middleware::Next, response::Response};
+use nanosiem_core::audit::ClientContext;
+use nanosiem_core::search::ai_command_policy::{self, SearchAuditCaller};
 use nanosiem_core::search::admission;
 
 use crate::middleware::AuthContext;
@@ -42,7 +46,24 @@ pub async fn query_class_middleware(request: Request, next: Next) -> Response {
             .get(admission::QUERY_CLASS_HEADER)
             .and_then(|value| value.to_str().ok()),
     );
-    admission::with_query_class(class, next.run(request)).await
+    // NAN-5456: attribute AI-search refusals and lookup fetches in this request to
+    // the member (the key owner for an API key, the key named too) and the
+    // client IP the auth layer recorded.
+    let caller = request.extensions().get::<AuthContext>().map(|auth| SearchAuditCaller {
+        actor_id: Some(auth.user_id()),
+        api_key_id: auth.api_key_id,
+        api_key_name: auth.api_key_name.clone(),
+        client: request
+            .extensions()
+            .get::<ClientContext>()
+            .cloned()
+            .unwrap_or_default(),
+    });
+    let run = admission::with_query_class(class, next.run(request));
+    match caller {
+        Some(caller) => ai_command_policy::with_search_audit_caller(caller, run).await,
+        None => run.await,
+    }
 }
 
 #[cfg(test)]

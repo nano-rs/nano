@@ -194,6 +194,37 @@ pub(crate) fn extract_ip_address(request: &Request, connect_info: Option<&Socket
     nanosiem_api_lib::extract_client_ip(request.headers(), connect_info)
 }
 
+/// The client IP and user agent of `request`, for audit events.
+pub(crate) fn client_context(request: &Request) -> nanosiem_core::audit::ClientContext {
+    let connect_info = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    nanosiem_core::audit::ClientContext::new(
+        extract_ip_address(request, connect_info.as_ref()),
+        request
+            .headers()
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.chars().take(512).collect()),
+    )
+}
+
+/// NAN-5456: who a search audit event (an AI-search refusal, a lookup fetch) in this request is attributed to: the
+/// key owner when there is one (the key itself named on the event), else the
+/// session user, and the client IP.
+pub(crate) fn search_audit_caller(
+    auth: &AuthContext,
+    request: &Request,
+) -> nanosiem_core::search::ai_command_policy::SearchAuditCaller {
+    nanosiem_core::search::ai_command_policy::SearchAuditCaller {
+        actor_id: Some(auth.ownership_user_id().unwrap_or(auth.claims.sub)),
+        api_key_id: auth.api_key_id,
+        api_key_name: None,
+        client: client_context(request),
+    }
+}
+
 /// Authentication state that holds the services needed for auth
 #[derive(Clone)]
 pub struct AuthState {
@@ -653,7 +684,17 @@ pub async fn admission_wait_budget_middleware(request: Request, next: Next) -> R
             .get(admission::QUERY_CLASS_HEADER)
             .and_then(|value| value.to_str().ok()),
     );
-    admission::with_wait_budget(budget, admission::with_query_class(class, next.run(request))).await
+    // NAN-5456: attribute AI-search refusals and lookup fetches in this request (the
+    // handlers check before the engine sets the request actor).
+    let caller = request
+        .extensions()
+        .get::<AuthContext>()
+        .map(|auth| search_audit_caller(auth, &request));
+    let run = admission::with_wait_budget(budget, admission::with_query_class(class, next.run(request)));
+    match caller {
+        Some(caller) => nanosiem_core::search::ai_command_policy::with_search_audit_caller(caller, run).await,
+        None => run.await,
+    }
 }
 
 // ============================================================================

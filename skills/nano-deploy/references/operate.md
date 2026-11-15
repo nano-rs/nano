@@ -151,6 +151,61 @@ republishes the generated TLS tree and recreates the host's containers. Run
 `cluster-health.py` after each host. Changing the **CA** is a coordinated
 change that briefly breaks trust between hosts. Plan it with nano support.
 
+## Storage tiering
+
+Enterprise edition (Compose and Helm). Off by default; install.sh offers it
+(`Enable cold storage tiering? [y/N]`, or `--tiering <provider>` flags).
+ClickHouse moves older parts to object storage when local free space drops
+below `move_factor` (0.3: at 70 % used); moved data stays searchable until the
+table's DELETE TTL (365 days by default). Full guide:
+`docs/administration/storage-tiering.md` (nano.rs/docs).
+
+Keys (single host: `.env`; role-split: the inventory `tiering:` block without
+the `NANO_TIERING_` prefix, secrets in the shared `.env`): `NANO_TIERING`
+(on|off), `NANO_TIERING_PROVIDER` (s3 | s3-compatible | gcs | azure),
+`NANO_TIERING_BUCKET`, `NANO_TIERING_REGION` (required for s3),
+`NANO_TIERING_ENDPOINT` (required for s3-compatible), `NANO_TIERING_PREFIX`
+(nano), `NANO_TIERING_MOVE_FACTOR` (0.3; 0 pauses), `NANO_TIERING_CACHE_SIZE`
+(10Gi), `NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS` (s3 instance role, gcs VM
+service account), `NANO_TIERING_AZURE_ACCOUNT_URL` / `_CONTAINER` /
+`_ACCOUNT_NAME`. Secrets: `NANO_TIERING_ACCESS_KEY_ID`,
+`NANO_TIERING_SECRET_ACCESS_KEY`, `NANO_TIERING_AZURE_ACCOUNT_KEY`. Never ask
+for the secret values in chat; the operator types them on the host.
+
+At install: [single-node.md](single-node.md#optional-storage-tiering-mutating-secret)
+or [multi-node-ha.md](multi-node-ha.md#step-2-inventory).
+
+After install, single host:
+
+```bash
+# Operator, in their own terminal (secret lines on stdin, then Ctrl-D):
+ssh -t $H 'cd ~/nano && scripts/nano tiering configure --provider s3 --bucket <b> --region <r> --secrets-stdin'
+$SSH $H 'cd ~/nano && scripts/nano tiering apply'     # recreates ClickHouse (brief ingest pause), reruns clickhouse-migrate
+$SSH $H 'cd ~/nano && scripts/nano tiering status'    # read-only
+$SSH $H 'cd ~/nano && scripts/nano tiering test'      # probe part written, moved to cold, read back, dropped
+$SSH $H 'cd ~/nano && scripts/nano tiering pause'     # or: resume [--move-factor 0.2]
+```
+
+After install, role-split: edit the inventory block (same bytes on every host),
+then rerun `install.sh --role ... --inventory ...` on each ClickHouse host, one
+at a time. Status: `scripts/nano tiering status` on a ClickHouse host, or
+`GET /api/settings/tiering` (Settings > Tiering is read-only, "managed by
+deployment").
+
+Turning it off: once the tables use `nano_tiered`, the policy must stay
+rendered (ClickHouse refuses to start without it), so the installer refuses
+`NANO_TIERING=off`. Pause instead. `scripts/nano tiering disable` only works
+while no table uses the policy. A store outage does not delete data: hot
+ingest and search continue, cold searches fail, and a full local disk means
+ingest backpressure (disk-pressure cleanup does not drop tiered partitions).
+
+Moving it: never change provider, endpoint, bucket, prefix, region, Azure
+account or container, or rename a role-split ClickHouse host, once parts are
+cold: every cold part points at objects under the old location. The renderer
+refuses; `NANO_TIERING_ALLOW_RELOCATE=1` overrides it only after the objects
+were copied, or when `system.parts` has no part on `nano_cold_cache`. Ask the
+operator before setting it.
+
 ## Support bundle
 
 Every install ships `scripts/nano support-bundle` (v2.0.11 and later). Run it

@@ -244,7 +244,7 @@ impl ClickHouseMigrator {
     fn proof_client(&self) -> clickhouse::Client {
         PROOF_SETTINGS
             .iter()
-            .fold(self.client.clone(), |c, (k, v)| c.with_option(*k, *v))
+            .fold(self.client.clone(), |c, (k, v)| c.with_setting(*k, *v))
     }
 
     async fn proof_count(&self, sql: &str) -> Result<u64, ClickHouseMigrateError> {

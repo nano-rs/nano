@@ -32,6 +32,16 @@ case "${1:-}" in
         exec python3 -I "$SCRIPT_DIR/nano-cluster-health" \
             --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
         ;;
+    tiering)
+        # NAN-5445: ClickHouse hot/cold storage tiering (status, test,
+        # configure, apply, pause, resume, disable).
+        shift
+        if [[ ! -f "$SCRIPT_DIR/nano-tiering.py" ]]; then
+            echo "scripts/nano tiering: storage tiering is an enterprise feature (not in this edition)" >&2
+            exit 2
+        fi
+        exec python3 -I "$SCRIPT_DIR/nano-tiering.py" --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
+        ;;
     backup-schedule)
         # NAN-5204: automatic backups (the nano-backup Compose service).
         shift
@@ -171,6 +181,7 @@ Usage:
                        [--install-dir DIR] [--skip-backup-I-understand] [--resume]
                        [--include-clickhouse-data]
                        [--allow-siem-health-regression REASON]
+                       [--ack-clickhouse-network-lockout]
   scripts/nano upgrade --abandon-incomplete RUN_ID --abandon-reason REASON
   scripts/nano rollback [--inventory FILE]
   scripts/nano feeds <status | update [--file FILE]>
@@ -179,6 +190,10 @@ Usage:
   scripts/nano support-bundle [--since 24h] [--max-log-mb 20] [--out-dir DIR]
                               [--inventory FILE] [--local-only]
   scripts/nano cluster-health                    (role-split hosts)
+  scripts/nano tiering [status [--json] | test | apply | pause | resume [--move-factor F]
+                       | disable | configure --provider s3|s3-compatible|gcs|azure
+                         [--bucket B] [--region R] [--endpoint URL] [--prefix P]
+                         [--move-factor F] [--cache-size 10Gi] [--secrets-stdin] [--apply]]
 
 Local ClickHouse archives are inside the AES-256-GCM encrypted payload.
 External disks are accepted only when ClickHouse reports disk type `encrypted`;

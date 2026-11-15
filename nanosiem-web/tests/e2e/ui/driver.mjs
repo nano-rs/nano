@@ -215,8 +215,29 @@ async function texts(page, f) {
   return page.evaluate((ff) => window.__e2e.all(ff).map((e) => e.textContent || ''), f);
 }
 
+// NAN-5465: after picking a select option, wait for the listbox to close and
+// its exit animation to settle. Since Radix Select 2.4 / Dialog 1.3 the next
+// click, if it lands while the select is closing, is swallowed: a dialog's
+// submit clicked right after picking an option sent no request and the dialog
+// stayed open (bisected: 0 ms stuck, 300 ms created). A user never clicks
+// that fast.
+async function settleAfterOption(page) {
+  await until(async () => page.evaluate(() => !document.querySelector('[role=listbox]')),
+    { timeout: 5000, desc: 'select listbox to close' }).catch(() => {});
+  await sleep(350);
+}
+
 async function click(page, f, opts) {
   const el = await find(page, f, opts);
+  const isOption = await page.evaluate((e) => e.getAttribute('role') === 'option', el).catch(() => false);
+  try {
+    await clickElement(page, el, f);
+  } finally {
+    if (isOption) await settleAfterOption(page);
+  }
+}
+
+async function clickElement(page, el, f) {
   await until(async () => page.evaluate((e) => !e.disabled && e.getAttribute('aria-disabled') !== 'true', el), { desc: `${JSON.stringify(f)} enabled` });
   // Dialogs/sheets animate in: click only once the box has stopped moving,
   // or the click lands where the element was a frame ago.
@@ -267,7 +288,7 @@ async function fill(s, page, field) {
 // Radix select: open the trigger, pick the option.
 async function choose(page, trigger, option, exact = false) {
   await click(page, trigger);
-  await click(page, { role: 'option', name: option, exact });
+  await click(page, { role: 'option', name: option, exact }); // settles (see click)
 }
 
 async function waitText(page, text, { exact = true, timeout = TIMEOUT, gone = false } = {}) {

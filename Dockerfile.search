@@ -2,7 +2,7 @@
 # Multi-stage build for minimal production image
 
 # Stage 1: Build
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -25,7 +25,7 @@ RUN mkdir -p nanosiem-api/src && echo "fn main() {}" > nanosiem-api/src/main.rs
 RUN cargo build --release --package nanosiem-search
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

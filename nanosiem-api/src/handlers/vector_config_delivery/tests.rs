@@ -443,7 +443,7 @@ mod install_token_switch_db {
                 move |conn, _| {
                     let schema = schema.clone();
                     Box::pin(async move {
-                        sqlx::Executor::execute(conn, format!("SET search_path TO {schema}").as_str())
+                        sqlx::Executor::execute(conn, sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                             .await
                             .map(|_| ())
                     })
@@ -455,7 +455,7 @@ mod install_token_switch_db {
         // An UPGRADED install (a real user exists), so migration 290 starts the
         // install token in legacy multiplex mode, enabled: the exact state in
         // which the v2.0.x delivery fallback is in use.
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "CREATE SCHEMA {schema};
              CREATE TABLE {schema}.users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), status TEXT);
              INSERT INTO {schema}.users (status) VALUES ('system'), ('active');
@@ -464,11 +464,11 @@ mod install_token_switch_db {
                  match_values TEXT[], enabled BOOLEAN NOT NULL DEFAULT TRUE,
                  deployed BOOLEAN NOT NULL DEFAULT FALSE,
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("setup");
-        sqlx::raw_sql(&MIGRATION.replace("SET LOCAL lock_timeout = '5s';", ""))
+        sqlx::raw_sql(sqlx::AssertSqlSafe(&*MIGRATION.replace("SET LOCAL lock_timeout = '5s';", "")))
             .execute(&pool)
             .await
             .expect("migration 290");
@@ -563,6 +563,6 @@ mod install_token_switch_db {
             Err(StatusCode::SERVICE_UNAVAILABLE)
         );
 
-        sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&pool).await.unwrap();
     }
 }

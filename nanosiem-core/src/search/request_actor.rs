@@ -14,6 +14,8 @@
 //! - the caller's admission wait budget (NAN-4664) and query class
 //!   (NAN-4703), so a side task of an agent search admits in the agent class
 //!   and waits no longer than its request may,
+//! - the AI-search refusal caller (NAN-5456), so a refusal inside spawned
+//!   work is still attributed to the member and client IP,
 //! - the current tracing span and subscriber.
 
 use std::future::Future;
@@ -65,6 +67,14 @@ where
     let class = crate::search::admission::current_query_class();
     let future: std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> =
         Box::pin(crate::search::admission::with_query_class(class, future));
+    // NAN-5456: the AI-search refusal attribution follows too.
+    let future: std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> =
+        match crate::search::ai_command_policy::current_search_audit_caller_scope() {
+            Some(caller) => Box::pin(crate::search::ai_command_policy::with_search_audit_caller_scope(
+                caller, future,
+            )),
+            None => future,
+        };
     use tracing::instrument::WithSubscriber;
     use tracing::Instrument;
     let future = Box::pin(

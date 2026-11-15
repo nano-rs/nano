@@ -136,3 +136,60 @@ async fn human_callers_are_unaffected() {
         }
     }
 }
+
+/// NAN-5456: a refusal in an API-process search is attributed to the member
+/// (the key owner, with the key named) and the client IP the auth layer
+/// recorded, never "by system".
+#[tokio::test]
+async fn refusal_is_attributed_to_the_member_and_client_ip() {
+    use nanosiem_core::audit::ClientContext;
+
+    async fn attribution() -> axum::response::Response {
+        let caller = ai_command_policy::current_search_audit_caller();
+        axum::Json(serde_json::json!({
+            "actor": caller.actor_id,
+            "key": caller.api_key_id,
+            "key_name": caller.api_key_name,
+            "ip": caller.client.ip_address,
+        }))
+        .into_response()
+    }
+
+    async fn call_as(auth: AuthContext) -> serde_json::Value {
+        let app = Router::new()
+            .route("/api/rules/test", post(attribution))
+            .layer(middleware::from_fn(query_class_middleware))
+            .layer(middleware::from_fn(move |mut request: Request, next: Next| {
+                let auth = auth.clone();
+                async move {
+                    request.extensions_mut().insert(auth);
+                    request
+                        .extensions_mut()
+                        .insert(ClientContext::new(Some("198.51.100.20".into()), None));
+                    next.run(request).await
+                }
+            }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/rules/test")
+            .header(admission::QUERY_CLASS_HEADER, "agent")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    let member = session();
+    let seen = call_as(member.clone()).await;
+    assert_eq!(seen["actor"], member.user_id().to_string(), "{seen}");
+    assert_eq!(seen["ip"], "198.51.100.20", "{seen}");
+    assert!(seen["key"].is_null(), "{seen}");
+
+    let key = api_key("ci export");
+    let seen = call_as(key.clone()).await;
+    assert_eq!(seen["actor"], key.user_id().to_string(), "the key owner: {seen}");
+    assert_eq!(seen["key"], key.api_key_id.unwrap().to_string(), "{seen}");
+    assert_eq!(seen["key_name"], "ci export", "{seen}");
+    assert_eq!(seen["ip"], "198.51.100.20", "{seen}");
+}

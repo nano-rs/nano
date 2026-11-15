@@ -45,7 +45,7 @@ async fn isolated_pool() -> (PgPool, PgPool, String) {
         .await
         .expect("connect test PostgreSQL");
     let schema = format!("vector_publication_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&admin)
         .await
         .expect("create isolated publication schema");
@@ -56,7 +56,7 @@ async fn isolated_pool() -> (PgPool, PgPool, String) {
         .after_connect(move |connection, _| {
             let statement = format!("SET search_path TO {search_path}");
             Box::pin(async move {
-                sqlx::query(&statement).execute(connection).await?;
+                sqlx::query(sqlx::AssertSqlSafe(statement.as_str())).execute(connection).await?;
                 Ok(())
             })
         })
@@ -322,7 +322,7 @@ async fn stale_two_node_publish_and_post_commit_restart_recovery() {
 
     drop((node_a, node_b, restarted, failing, good));
     pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await
         .expect("drop isolated publication schema");

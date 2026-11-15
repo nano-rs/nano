@@ -9,7 +9,7 @@
 ///
 /// This is injected by the auth middleware and can be extracted in handlers
 /// to include client information in audit events.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientContext {
     /// Client IP address (from X-Forwarded-For, X-Real-IP, or connection)
     pub ip_address: Option<String>,

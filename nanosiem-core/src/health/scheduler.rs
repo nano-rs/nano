@@ -18,6 +18,7 @@ use crate::system_health::{
 };
 
 use super::ai_monitor::{AiMonitor, AiProviderConnectivityChecker};
+use super::disk_monitor::{self, DiskComponent, DiskLevel, DiskVolumeHealth};
 use super::feed_monitor::FeedMonitor;
 use super::repository::{HealthNotification, HealthRepository};
 use super::stuck_query_monitor::StuckQueryMonitor;
@@ -32,6 +33,8 @@ pub struct HealthScheduler {
     stuck_query_monitor: StuckQueryMonitor,
     audit_emitter: AuditEmitter,
     system_health_repo: SystemHealthRepository,
+    /// NAN-5450: disk usage probes (ClickHouse, PostgreSQL, Vector buffers).
+    dual_pool: DualPool,
 }
 
 impl HealthScheduler {
@@ -59,7 +62,8 @@ impl HealthScheduler {
             ai_monitor: AiMonitor::new(pool.clone(), ai_checker, airgap),
             feed_monitor: FeedMonitor::with_clickhouse(pool, dual_pool.clickhouse().clone()),
             stuck_query_monitor,
-            audit_emitter: AuditEmitter::new(dual_pool),
+            audit_emitter: AuditEmitter::new(dual_pool.clone()),
+            dual_pool,
         }
     }
 
@@ -111,6 +115,219 @@ impl HealthScheduler {
         if let Err(e) = self.check_stuck_queries().await {
             error!(error = %e, "Failed to check for stuck ClickHouse queries");
         }
+
+        // NAN-5450: no settings gate either. PostgreSQL and the Vector
+        // buffers have no other in-app disk signal, and a full PostgreSQL
+        // stops the jobs leader (and with it the disk-pressure evictor).
+        if let Err(e) = self.check_disk_usage().await {
+            error!(error = %e, "Failed to check disk usage");
+        }
+    }
+
+    /// NAN-5450: tiered disk escalation, per underlying disk (a volume that
+    /// shares another's filesystem, single-host PostgreSQL on the ClickHouse
+    /// disk, is covered by that disk and skipped).
+    ///
+    /// * 80 %: one in-app notification to admins and a system-health event
+    ///   (SIEM Health and Settings -> Storage show it too).
+    /// * 90 %, or forecast to fill within 24 hours: one more notification,
+    ///   and the event escalates to High, which re-notifies the configured
+    ///   channels (email, Slack, webhook, PagerDuty) once. The ClickHouse disk
+    ///   already has the disk-pressure service's event and 90 % notification,
+    ///   so for it this adds the 80 % notification and the forecast escalation.
+    /// * 95 % (imminent): a Critical event of its own that notifies the
+    ///   channels, then repeats to the channels and to admins every hour
+    ///   while it lasts ([`IMMINENT_REMINDER_EVERY`]).
+    ///
+    /// Each cycle also records a usage sample per disk for the forecast.
+    async fn check_disk_usage(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let report = disk_monitor::collect_from_dual_pool(&self.dual_pool).await;
+        if let Err(e) = disk_monitor::record_samples(self.dual_pool.postgres(), &report).await {
+            warn!(error = %e, "Failed to record disk usage samples (no forecast until they are)");
+        }
+        let issue_type = HealthIssueType::DiskUsage.to_string();
+        // NAN-5450 review: the ClickHouse disk warns above the evictor's high
+        // watermark, so its resolve point (hysteresis) follows that level and
+        // a capped install cycling 70-80 % neither warns nor re-arms.
+        let band = disk_monitor::EvictorBand::from_env();
+        for volume in report.volumes.iter().filter(|v| v.shared_with.is_none()) {
+            let forecast_escalated = volume.forecast.as_ref().is_some_and(|f| f.escalated);
+            for (step, threshold) in [
+                (DiskLevel::Warning, disk_monitor::warn_fraction_for(volume.component, &band)),
+                (DiskLevel::Critical, disk_monitor::DISK_CRITICAL_FRACTION),
+                (DiskLevel::Imminent, disk_monitor::DISK_IMMINENT_FRACTION),
+            ] {
+                let issue_key = Self::disk_issue_key(volume, step);
+                match disk_step_action(volume, step, threshold) {
+                    DiskStepAction::Notify => {
+                        if volume.component == DiskComponent::Clickhouse
+                            && step == DiskLevel::Critical
+                            && !forecast_escalated
+                        {
+                            continue;
+                        }
+                        let notification = Self::disk_notification(volume, step);
+                        if let Some(recipients) = self
+                            .health_repo
+                            .notify_issue_once(&issue_type, &issue_key, &notification)
+                            .await?
+                        {
+                            info!(volume = %volume.key(), level = step.as_str(), recipients,
+                                "Sent disk usage notifications to admin users");
+                        }
+                    }
+                    DiskStepAction::Resolve => {
+                        self.health_repo.resolve_issue(&issue_type, &issue_key).await?;
+                    }
+                    DiskStepAction::Hold => {}
+                }
+            }
+
+            // The per-volume event (80 % / 90 %). For ClickHouse only when the
+            // forecast escalated it: the disk-pressure event covers the rest.
+            if volume.component != DiskComponent::Clickhouse || forecast_escalated {
+                let dedup = Self::disk_dedup_key(volume);
+                match volume.level {
+                    DiskLevel::Warning | DiskLevel::Critical | DiskLevel::Imminent => {
+                        if let Err(error) = self.system_health_repo.publish(&Self::disk_health_event(volume)).await {
+                            warn!(volume = %volume.key(), %error, "Failed to publish disk usage system health event");
+                        }
+                    }
+                    DiskLevel::Ok => {
+                        if let Err(error) = self.system_health_repo.resolve_by_dedup_key(&dedup).await {
+                            warn!(volume = %volume.key(), %error, "Failed to resolve disk usage system health event");
+                        }
+                    }
+                    DiskLevel::Unknown => {}
+                }
+            } else if volume.level != DiskLevel::Unknown {
+                let _ = self.system_health_repo.resolve_by_dedup_key(&Self::disk_dedup_key(volume)).await;
+            }
+
+            // Imminent: its own Critical event, repeated hourly.
+            let imminent_dedup = Self::disk_imminent_dedup_key(volume);
+            match disk_step_action(volume, DiskLevel::Imminent, disk_monitor::DISK_IMMINENT_FRACTION) {
+                DiskStepAction::Notify => {
+                    if let Err(error) = self.system_health_repo.publish(&Self::disk_imminent_event(volume)).await {
+                        warn!(volume = %volume.key(), %error, "Failed to publish imminent disk event");
+                        continue;
+                    }
+                    match self.system_health_repo.remind_if_due(&imminent_dedup, IMMINENT_REMINDER_EVERY).await {
+                        Ok(true) => {
+                            let notification = Self::disk_notification(volume, DiskLevel::Imminent);
+                            match self.health_repo.notify_admins(&notification).await {
+                                Ok(recipients) => info!(volume = %volume.key(), recipients,
+                                    "Repeated the imminent disk notification (hourly)"),
+                                Err(error) => warn!(volume = %volume.key(), %error,
+                                    "Failed to repeat the imminent disk notification"),
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => warn!(volume = %volume.key(), %error, "Failed to schedule the imminent disk reminder"),
+                    }
+                }
+                DiskStepAction::Resolve => {
+                    if let Err(error) = self.system_health_repo.resolve_by_dedup_key(&imminent_dedup).await {
+                        warn!(volume = %volume.key(), %error, "Failed to resolve imminent disk event");
+                    }
+                }
+                DiskStepAction::Hold => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn disk_imminent_dedup_key(volume: &DiskVolumeHealth) -> String {
+        format!("storage:disk:imminent:{}", volume.key())
+    }
+
+    fn disk_imminent_event(volume: &DiskVolumeHealth) -> PublishHealthEvent {
+        let mut event = Self::disk_health_event(volume);
+        event.dedup_key = Self::disk_imminent_dedup_key(volume);
+        event.severity = HealthSeverity::Critical;
+        event.title = format!("{} is about to fill", volume.display_name());
+        event.summary = format!(
+            "{}. {}",
+            volume.detail,
+            "Ingest will pause and the oldest data will be dropped; PostgreSQL stops if its disk fills."
+        );
+        event
+    }
+
+    fn disk_issue_key(volume: &DiskVolumeHealth, step: DiskLevel) -> String {
+        let mut key = format!("{}:{}", volume.key(), step.as_str());
+        // health_issue_tracker.issue_key is VARCHAR(255).
+        if key.len() > 255 {
+            let mut cut = 255;
+            while !key.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            key.truncate(cut);
+        }
+        key
+    }
+
+    fn disk_dedup_key(volume: &DiskVolumeHealth) -> String {
+        format!("storage:disk:{}", volume.key())
+    }
+
+    fn disk_notification(volume: &DiskVolumeHealth, step: DiskLevel) -> HealthNotification {
+        let pct = volume
+            .usage_fraction
+            .map(|f| format!("{:.1}%", f * 100.0))
+            .unwrap_or_else(|| "unknown".into());
+        let what = match step {
+            DiskLevel::Imminent => "about to fill",
+            DiskLevel::Critical if volume.forecast.as_ref().is_some_and(|f| f.escalated) => "filling fast",
+            DiskLevel::Critical => "critically full",
+            _ => "filling up",
+        };
+        HealthNotification {
+            notification_type: NotificationType::DiskPressureWarning,
+            title: format!("{} {what}: {pct}", volume.display_name()),
+            message: Some(format!(
+                "{}: {}. {}",
+                volume.display_name(),
+                volume.detail,
+                disk_remediation(volume.component)
+            )),
+            link: Some("/settings/storage".to_string()),
+            metadata: serde_json::json!({
+                "component": volume.component.as_str(),
+                "host": volume.host,
+                "name": volume.name,
+                "usage_fraction": volume.usage_fraction,
+                "level": step.as_str(),
+            }),
+        }
+    }
+
+    fn disk_health_event(volume: &DiskVolumeHealth) -> PublishHealthEvent {
+        let severity = if volume.level >= DiskLevel::Critical {
+            HealthSeverity::High
+        } else {
+            HealthSeverity::Medium
+        };
+        let mut event = PublishHealthEvent::new(
+            Self::disk_dedup_key(volume),
+            HealthCategory::Storage,
+            severity,
+            format!("{} is {}", volume.display_name(), volume.level.as_str()),
+            volume.detail.clone(),
+            volume.component.as_str(),
+            "health_scheduler.disk_monitor",
+        );
+        event.resource_id = Some(volume.key());
+        event.resource_name = Some(volume.display_name());
+        event.diagnostic_context = serde_json::json!({
+            "total_bytes": volume.total_bytes,
+            "used_bytes": volume.used_bytes,
+            "free_bytes": volume.free_bytes,
+            "usage_fraction": volume.usage_fraction,
+            "forecast": volume.forecast,
+        });
+        event.remediation = Some(disk_remediation(volume.component).to_string());
+        event
     }
 
     /// Check if AI provider monitoring is enabled
@@ -550,6 +767,48 @@ impl HealthScheduler {
                 feed = %status.feed_name,
                 "Emitted audit event for stale feed"
             );
+        }
+    }
+}
+
+/// NAN-5450: how often an imminent disk re-notifies channels and admins.
+pub(crate) const IMMINENT_REMINDER_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// What one threshold step does for one volume this cycle.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DiskStepAction {
+    Notify,
+    Resolve,
+    Hold,
+}
+
+/// Hysteresis: a step resolves only 5 points below its threshold, so a volume
+/// hovering at 80 % does not notify on every cycle. Unknown usage holds (a
+/// failed probe must not resolve and re-arm the notification).
+const DISK_RESOLVE_MARGIN: f64 = 0.05;
+
+pub(crate) fn disk_step_action(volume: &DiskVolumeHealth, step: DiskLevel, threshold: f64) -> DiskStepAction {
+    match volume.usage_fraction {
+        _ if volume.level == DiskLevel::Unknown => DiskStepAction::Hold,
+        Some(_) if volume.level >= step => DiskStepAction::Notify,
+        Some(f) if f < threshold - DISK_RESOLVE_MARGIN => DiskStepAction::Resolve,
+        _ => DiskStepAction::Hold,
+    }
+}
+
+fn disk_remediation(component: DiskComponent) -> &'static str {
+    match component {
+        DiskComponent::Clickhouse => {
+            "Free space or grow the disk. The disk-pressure service drops the oldest partitions above its \
+             high watermark; see docs/administration/disk-full-recovery.md."
+        }
+        DiskComponent::Postgres => {
+            "Free space or grow the PostgreSQL volume before it fills: a full WAL disk stops PostgreSQL and \
+             every nano service with it. See docs/administration/disk-full-recovery.md."
+        }
+        DiskComponent::VectorBuffer => {
+            "Vector is holding events it cannot deliver, usually because ClickHouse refuses writes. A full \
+             buffer pushes back on senders. Check ClickHouse health and disk space."
         }
     }
 }

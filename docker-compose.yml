@@ -757,30 +757,6 @@ services:
     pid: host
     restart: unless-stopped
 
-  # =============================================================================
-  # Documentation (Fumadocs - Next.js static export)
-  # =============================================================================
-
-  docs:
-    build:
-      context: .
-      dockerfile: Dockerfile.docs
-    image: nanosiem-docs:latest
-    container_name: nanosiem-docs
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp:noexec,nosuid,size=50m
-    ports:
-      - "127.0.0.1:8001:8000"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
 volumes:
   nanosiem-data:
   vector-data:

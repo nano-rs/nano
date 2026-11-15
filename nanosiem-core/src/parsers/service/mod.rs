@@ -43,6 +43,11 @@ pub enum ParserServiceError {
     VectorConfigError(#[from] VectorConfigError),
     #[error("VRL validation failed: {0}")]
     VrlValidationFailed(String),
+    /// NAN-5401: a deploy waited the full `BOUNDED_VALIDATION_MAX_WAIT` for a
+    /// parser validation worker slot. Nothing was judged invalid; retry
+    /// (HTTP 503).
+    #[error("{0}")]
+    ValidationBusy(String),
     #[error("Vector validation failed: {0}")]
     VectorValidationFailed(String),
     #[error("Deployment failed: {0}")]

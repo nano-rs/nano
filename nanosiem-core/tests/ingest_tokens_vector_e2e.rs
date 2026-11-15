@@ -54,7 +54,7 @@ async fn pool(url: &str) -> PgPool {
             move |conn, _| {
                 let schema = schema.clone();
                 Box::pin(async move {
-                    sqlx::Executor::execute(conn, format!("SET search_path TO {schema}").as_str())
+                    sqlx::Executor::execute(conn, sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                         .await
                         .map(|_| ())
                 })
@@ -63,7 +63,7 @@ async fn pool(url: &str) -> PgPool {
         .connect(url)
         .await
         .expect("connect");
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {schema};
          CREATE TABLE {schema}.users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), status TEXT);
          CREATE TABLE {schema}.log_sources (
@@ -74,12 +74,12 @@ async fn pool(url: &str) -> PgPool {
          INSERT INTO {schema}.log_sources (id, name, source_type, match_values) VALUES
              ('{APACHE}', 'Apache', 'routed', ARRAY['apache_access']),
              ('{FIREWALL}', 'Palo Alto', 'splunk_hec', ARRAY['pan_traffic']);"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("setup");
     // A fresh install: strict mode, install token unbound.
-    sqlx::raw_sql(&MIGRATION.replace("SET LOCAL lock_timeout = '5s';", ""))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(&*MIGRATION.replace("SET LOCAL lock_timeout = '5s';", "")))
         .execute(&pool)
         .await
         .expect("migration 290");

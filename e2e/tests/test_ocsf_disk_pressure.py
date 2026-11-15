@@ -6,13 +6,24 @@ an upgraded install also carries the 1.8 store migration 180 renamed to
 the side tables, so an OCSF box running out of disk never reclaimed space from
 its event store.
 
-Forced low-disk scenario: the jobs leader is restarted with watermarks below
-the box's real usage (high 0.01%, critical 99.9%: Elevated, the FIFO drop
-path), old daily partitions plus one far-future (2099) partition are seeded in `ocsf_logs` (through the ingest
-view), `ocsf_logs_legacy_v179` and `logs`, and the scenario waits until the
-evictor has dropped every old partition from every table, kept the newest one
-(the floor), and written one `partition_dropped` audit entry per date naming
-the tables it dropped from.
+Forced low-disk scenario: old daily partitions plus one far-future (2099)
+event are seeded in `ocsf_logs` (through the ingest view),
+`ocsf_logs_legacy_v179` and `logs`, and the jobs leader is restarted with
+watermarks just below the disk's real usage (critical 99.9%: Elevated, the
+FIFO drop path). The scenario waits until the evictor has dropped every old
+partition from every table, kept today's (the floor) and the far-future event,
+and written one `partition_dropped` audit entry per date naming the tables it
+dropped from.
+
+NAN-5464: since NAN-5447 the evictor refuses to drop when the non-ClickHouse
+bytes alone are at or above the low watermark (deleting history could not
+relieve that disk). A fixed 0.005% low watermark is therefore always refused
+on a real box. The scenario instead seeds a few GiB of ClickHouse data in a
+test-owned table and derives the watermarks from the live disk so that
+ClickHouse is what holds the disk above the high watermark:
+`non_clickhouse < low < high < used`. The far-future event is clamped to the
+insert time by the ingest view, so it is asserted by its row, not by a 2099
+partition.
 
 The legacy table is created here with the 1.8 store's partitioning when the
 stack is a fresh install (only an upgraded install has it).
@@ -33,11 +44,16 @@ from nano_e2e.waits import eventually
 
 FORCED = {
     "DISK_PRESSURE_CHECK_INTERVAL_SECS": "5",
-    "DISK_PRESSURE_HIGH_WATERMARK": "0.0001",
-    "DISK_PRESSURE_LOW_WATERMARK": "0.00005",
     "DISK_PRESSURE_CRITICAL_THRESHOLD": "0.999",
     "DISK_PRESSURE_EMERGENCY_THRESHOLD": "0.9999",
 }
+# Test-owned ClickHouse bytes that make ClickHouse the cause of the forced
+# pressure (NAN-5464). Not a table the evictor knows, so it stays put and keeps
+# the disk above the high watermark until every old partition is gone; dropped
+# in `finally`. No materialized view reads it.
+FILLER = "nan5464_disk_filler"
+FILLER_BYTES = 6 * 1024**3
+FILLER_ROW = 8192
 LEGACY = "ocsf_logs_legacy_v179"
 # A skewed source: one event stamped far in the future. It must neither be
 # evicted nor make today's partition evictable (the old floor protected only
@@ -59,6 +75,29 @@ def _day(days_ago: int) -> datetime:
 
 def _partition(d: datetime) -> str:
     return d.strftime("%Y%m%d")
+
+
+def _watermarks_with_clickhouse_filler(ch) -> dict[str, str]:
+    """Seed FILLER_BYTES of ClickHouse data, then return high/low watermarks
+    between the non-ClickHouse share and the current usage of the data disk
+    (NAN-5464). Figures are physical (`+ keep_free_space`), as the evictor
+    compares them since NAN-5463."""
+    ch(f"CREATE TABLE IF NOT EXISTS nanosiem.{FILLER} (b String CODEC(NONE)) ENGINE = MergeTree ORDER BY tuple()")
+    ch(f"INSERT INTO nanosiem.{FILLER} SELECT randomString({FILLER_ROW}) FROM numbers({FILLER_BYTES // FILLER_ROW}) "
+       "SETTINGS async_insert = 0, max_insert_threads = 4")
+    disk = json.loads(ch(
+        "SELECT toUInt64(total_space + keep_free_space) AS total, toUInt64(free_space + keep_free_space) AS free "
+        "FROM system.disks WHERE name = 'default' FORMAT JSONEachRow"))
+    total, free = int(disk["total"]), int(disk["free"])
+    ch_bytes = int(ch("SELECT toUInt64(sum(bytes_on_disk)) FROM system.parts WHERE active "
+                      "AND disk_name IN (SELECT name FROM system.disks WHERE path LIKE '/var/lib/clickhouse/%')"))
+    assert ch_bytes >= FILLER_BYTES, f"filler not on disk yet: {ch_bytes}"
+    usage, ch_share = (total - free) / total, ch_bytes / total
+    # non-ClickHouse share = usage - ch_share < low < high < usage. Margins are
+    # fractions of the ClickHouse share (GiBs), far above disk churn in 4 min.
+    high, low = usage - 0.25 * ch_share, usage - 0.6 * ch_share
+    assert 0 < low < high < usage, (usage, ch_share)
+    return {"DISK_PRESSURE_HIGH_WATERMARK": f"{high:.8f}", "DISK_PRESSURE_LOW_WATERMARK": f"{low:.8f}"}
 
 
 def test_disk_pressure_evicts_the_oldest_ocsf_partitions(stack: Stack, nano: Nano, timeline) -> None:
@@ -97,14 +136,19 @@ def test_disk_pressure_evicts_the_oldest_ocsf_partitions(stack: Stack, nano: Nan
 
     app_env = stack.run_dir / "app.env"
     original = app_env.read_text()
-    app_env.write_text(original.rstrip("\n") + "\n" + "".join(f"export {k}={v}\n" for k, v in FORCED.items()))
     try:
+        forced = {**FORCED, **_watermarks_with_clickhouse_filler(ch)}
+        timeline.step("clickhouse filler seeded", filler_bytes=FILLER_BYTES)
+        app_env.write_text(original.rstrip("\n") + "\n" + "".join(f"export {k}={v}\n" for k, v in forced.items()))
         stack.svc("restart", "jobs")
-        timeline.step("jobs restarted with forced watermarks", **FORCED)
+        timeline.step("jobs restarted with forced watermarks", **forced)
         left = eventually(parts, timeout=240, interval=5, desc="old OCSF / legacy / UDM partitions evicted",
                           ok=lambda p: not (seeded & p))
         assert ("ocsf_logs", today) in left, f"today's partition must survive beside a future one: {sorted(left)}"
-        assert ("ocsf_logs", "20991231") in left, f"a future partition is never evicted: {sorted(left)}"
+        future_rows = ch("SELECT count() FROM nanosiem.ocsf_logs WHERE source_type = 'nan4982_disk' "
+                         f"AND `metadata.uid` = 'disk-{_partition(FUTURE)}'")
+        # >= 1: a kept stack carries the same uid from earlier runs.
+        assert int(future_rows) >= 1, f"the far-future event is never evicted: {future_rows}"
         timeline.step("evicted", remaining=sorted(left))
 
         def drops() -> list[dict]:
@@ -123,6 +167,7 @@ def test_disk_pressure_evicts_the_oldest_ocsf_partitions(stack: Stack, nano: Nan
         timeline.step("audited", by_date=by_date)
     finally:
         app_env.write_text(original)
+        ch(f"DROP TABLE IF EXISTS nanosiem.{FILLER} SYNC")
         stack.svc("restart", "jobs")
         if created_legacy:
             ch(f"DROP TABLE IF EXISTS nanosiem.{LEGACY}")

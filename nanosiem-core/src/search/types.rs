@@ -181,7 +181,14 @@ const CH_QUERY_CODES: &[u32] = &[
 /// classifies it — never a substring of the exception text, which can echo
 /// event data. Messages without a code (client-side / synthetic) keep the
 /// message patterns below.
+///
+/// NAN-5432: the text is made one inert line first
+/// ([`crate::db::pg_text::pg_safe_error_text`]): ClickHouse can quote the
+/// offending value byte for byte (NUL, line breaks, ESC), and every variant
+/// below can carry part of the text into a response, a log line or a
+/// PostgreSQL row.
 pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
+    let error_msg = &crate::db::pg_text::pg_safe_error_text(error_msg);
     let Some(code) = clickhouse_error_code(error_msg) else {
         return parse_clickhouse_error_message(error_msg);
     };

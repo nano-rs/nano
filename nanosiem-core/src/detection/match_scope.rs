@@ -186,7 +186,7 @@ impl DetectionMatchRepository {
             sql.push_str(&MatchScope::sql_predicate("source_types", 4));
         }
 
-        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(&sql)
+        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(rule_id)
             .bind(start)
             .bind(end);
@@ -222,7 +222,7 @@ impl DetectionMatchRepository {
         }
         sql.push_str(" GROUP BY rule_id");
 
-        let mut q = sqlx::query_as::<_, (Uuid, i64)>(&sql).bind(since);
+        let mut q = sqlx::query_as::<_, (Uuid, i64)>(sqlx::AssertSqlSafe(sql.as_str())).bind(since);
         if !scope.is_unrestricted() {
             q = q.bind(scope.deny_bind_values());
         }
@@ -246,7 +246,7 @@ impl DetectionMatchRepository {
         }
         sql.push_str(" RETURNING disposition");
 
-        let mut q = sqlx::query_as::<_, (String,)>(&sql)
+        let mut q = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(match_id)
             .bind(disposition);
         if !scope.is_unrestricted() {
@@ -290,7 +290,7 @@ impl DetectionMatchRepository {
         "#,
         );
 
-        let mut q = sqlx::query_as::<_, (DateTime<Utc>, Option<Uuid>, Option<String>)>(&sql)
+        let mut q = sqlx::query_as::<_, (DateTime<Utc>, Option<Uuid>, Option<String>)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(match_id)
             .bind(reviewed_at)
             .bind(reviewed_by)
@@ -335,7 +335,7 @@ impl DetectionMatchRepository {
         "#
         );
 
-        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(match_id);
+        let mut q = sqlx::query_as::<_, (Uuid,)>(sqlx::AssertSqlSafe(sql.as_str())).bind(match_id);
         if !scope.is_unrestricted() {
             q = q.bind(scope.deny_bind_values());
         }

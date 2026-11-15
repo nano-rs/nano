@@ -265,32 +265,30 @@ impl WebhookService {
     /// config-time validation and connect. Redirects are disabled so there is no
     /// second, unvalidated hop. Returns the rejection reason on block (recorded
     /// as the delivery failure).
-    async fn ssrf_checked_client(url: &str) -> Result<reqwest::Client, String> {
+    pub(crate) async fn ssrf_checked_client(url: &str) -> Result<reqwest::Client, String> {
         let (parsed, addrs) = Self::validator()
             .validate_and_resolve(url)
             .await
             .map_err(|e| format!("blocked by SSRF guard: {e}"))?;
 
-        let mut builder = reqwest::Client::builder()
-            // An environment proxy would resolve the destination itself and
-            // bypass our validated IP pins. Webhooks must dial those pins.
-            .no_proxy()
+        let builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(DELIVERY_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none());
 
-        // IP-literal hosts return an empty Vec (reqwest dials the already-
-        // validated literal). DNS-name hosts: pin reqwest to the pre-validated
-        // addrs so DNS can't be rebound after validation.
-        if !addrs.is_empty() {
-            let host = parsed
-                .host_str()
-                .ok_or_else(|| "URL missing host".to_string())?;
-            builder = builder.resolve_to_addrs(host, &addrs);
-        }
-
-        builder
-            .build()
-            .map_err(|e| format!("HTTP client build failed: {e}"))
+        // Shared pin (NAN-5441): dials the pre-validated addrs, never the env
+        // proxy (it would resolve the destination itself and bypass the pins);
+        // through DESTINATION_EGRESS_PROXY_URL with a pinned-IP CONNECT when
+        // the operator set one; refused when NANO_EGRESS_PROXY_REQUIRED is on
+        // and no destination proxy is set.
+        crate::inputlookup::pin_resolved_addrs(
+            builder,
+            &parsed,
+            &addrs,
+            crate::inputlookup::ProxyPolicy::Direct,
+        )
+        .map_err(|e| format!("blocked by egress policy: {e}"))?
+        .build()
+        .map_err(|e| format!("HTTP client build failed: {e}"))
     }
 
     /// Read at most `RESPONSE_READ_CAP` bytes of a receiver's response, then

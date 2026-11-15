@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+publish = false
 description = "Core library for NanoSIEM - data models, query parsing, and business logic"
 
 [dependencies]
@@ -56,13 +57,13 @@ dashmap = "6.1"
 # Redis for distributed job store (active/active search)
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
 # Encryption for credentials
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 # NAN-4933: credential key ring (port of main NAN-4401 CP2a): HKDF for v2
 # envelopes, zeroize for key material held in memory.
-hkdf = "0.12"
-sha2_10 = { package = "sha2", version = "0.10" }
+hkdf = "0.13"
 zeroize = "1.8"
 base64 = "0.22"
+percent-encoding = "2"
 hex = "0.4"
 urlencoding = "2.1"
 # OpenAPI schema derives
@@ -75,8 +76,11 @@ cron = "0.16"
 chrono-tz = "0.10"
 # Authentication
 bcrypt = "0.19"
-totp-rs = { version = "5.7", features = ["gen_secret", "otpauth", "qr", "serde_support"] }
-jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+# NAN-5412: 6.x without the deprecated `migration` shims; `zeroize` keeps the
+# secret wiping 5.7 did unconditionally. nano never serialises a Totp (secrets
+# are stored as encrypted base32 text), so no `serde`.
+totp-rs = { version = "6", default-features = false, features = ["std", "gen_secret", "otpauth", "qr", "zeroize"] }
+jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 # Async trait for dyn-compatible async traits
 async-trait = "0.1"
 # Temp file handling for sandbox execution
@@ -90,7 +94,7 @@ vrl = { version = "0.38", default-features = false, features = ["compiler", "std
 toml = "0.9"
 # Air-gapped signed bundle verification (NAN-1202): detached Ed25519 signature
 # over a canonical manifest + streaming tar.gz payload checksum verification.
-ed25519-dalek = { version = "2", features = ["pkcs8"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
 tar = "0.4"
 # Platform feed bundle consumer (NAN-4948): O_NOFOLLOW opens of the signed
 # container, and iteration of the IPinfo Lite MMDB it carries into the

@@ -113,8 +113,26 @@ PATTERNS = [
     (re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}"), "[REDACTED:AI_KEY]"),
 ]
 
+# Secret despite a non-secret-looking suffix: object-store access key ids (an
+# access key id is half of the credential pair, NAN-5445 storage tiering).
+ALWAYS_SECRET_KEYS = frozenset({
+    "NANO_TIERING_ACCESS_KEY_ID",
+    "NANO_TIERING_SECRET_ACCESS_KEY",
+    "NANO_TIERING_AZURE_ACCOUNT_KEY",
+    "COLD_ACCESS_KEY_ID",
+    "COLD_SECRET_ACCESS_KEY",
+    "COLD_ACCOUNT_KEY",
+    "AWS_ACCESS_KEY_ID",
+})
+
+
+def _always_secret(key: str) -> bool:
+    return key.strip("\"' ").upper() in ALWAYS_SECRET_KEYS
+
 
 def is_secret_key(key: str) -> bool:
+    if _always_secret(key):
+        return True
     return bool(SECRET_KEY_RE.search(key)) and not NON_SECRET_SUFFIX_RE.search(key)
 
 
@@ -122,7 +140,7 @@ def _kv_sub(m) -> str:
     """Redact a secret-keyed value to its END: a quoted value whole (quotes kept),
     an unquoted one to the end of the line or tab-separated field."""
     key, sep, value = m.group(1), m.group(2), m.group(3)
-    if NON_SECRET_SUFFIX_RE.search(key) or value.lstrip("\"'").startswith("[REDACTED"):
+    if (NON_SECRET_SUFFIX_RE.search(key) and not _always_secret(key)) or value.lstrip("\"'").startswith("[REDACTED"):
         return m.group(0)
     if value[0] in "\"'":
         return f"{key}{sep}{value[0]}[REDACTED]{value[0]}"
@@ -253,7 +271,11 @@ def read_env(path: str) -> dict:
                 if key.startswith("export "):
                     key = key[7:].strip()
                 value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    # Compose double quotes: \\ \" \$ and $$ (scripts/nano-tiering.py
+                    # writes a secret holding a single quote this way).
+                    value = re.sub(r'\\([\\"$])|\$\$', lambda m: m.group(1) or "$", value[1:-1])
+                elif len(value) >= 2 and value[0] == value[-1] == "'":
                     value = value[1:-1]
                 out[key] = value
     except (FileNotFoundError, PermissionError, IsADirectoryError):

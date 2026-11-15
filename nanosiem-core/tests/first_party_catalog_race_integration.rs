@@ -63,14 +63,14 @@ impl Schema {
             .expect("TEST_DATABASE_URL must reference a disposable PostgreSQL database");
         let admin = PgPool::connect(&url).await.expect("connect test PostgreSQL");
         let name = format!("first_party_race_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {name}")).execute(&admin).await.expect("create schema");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}"))).execute(&admin).await.expect("create schema");
         let search_path = name.clone();
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .after_connect(move |connection, _| {
                 let statement = format!("SET search_path TO {search_path}");
                 Box::pin(async move {
-                    sqlx::query(&statement).execute(connection).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(statement.as_str())).execute(connection).await?;
                     Ok(())
                 })
             })
@@ -85,7 +85,7 @@ impl Schema {
     }
 
     async fn count(&self, table: &str, needle: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE lower(url) LIKE '%' || $1 || '%'"))
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table} WHERE lower(url) LIKE '%' || $1 || '%'")))
             .bind(needle)
             .fetch_one(&self.pool)
             .await
@@ -94,7 +94,7 @@ impl Schema {
 
     async fn drop(self) {
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.name))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {} CASCADE", self.name)))
             .execute(&self.admin)
             .await
             .expect("drop schema");

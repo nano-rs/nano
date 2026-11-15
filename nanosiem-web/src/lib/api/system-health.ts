@@ -1,5 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { DiskLevel, DiskVolumeHealth } from './siem-health';
+
+/** NAN-5450: `GET /api/system/disk-alert`. */
+export interface DiskAlertResponse {
+  level: DiskLevel;
+  disks: DiskVolumeHealth[];
+  ingestion_paused: boolean;
+  ingestion_pause_source?: 'disk_pressure' | 'manual';
+  warn_fraction: number;
+  critical_fraction: number;
+  imminent_fraction: number;
+  runbook: string;
+  checked_at: string;
+}
+
 export type SystemHealthStatus = 'active' | 'resolved';
 export type SystemHealthSeverity = 'critical' | 'high' | 'medium' | 'low' | 'informational';
 
@@ -117,6 +132,11 @@ export class SystemHealthApi {
 
   listDeliveries(id: string, limit = 50): Promise<SystemHealthDelivery[]> {
     return this.request(`/api/system-health/events/${id}/deliveries?limit=${limit}`);
+  }
+
+  /** NAN-5450: data disks at 80 % or more, with the forecast, for the admin banner. */
+  getDiskAlert(): Promise<DiskAlertResponse> {
+    return this.request('/api/system/disk-alert');
   }
 
   /** NAN-5204: automatic backup status reported by the nano-backup sidecar. */

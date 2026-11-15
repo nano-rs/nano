@@ -6,7 +6,9 @@
 //! query/cron validation, and version management.
 
 use chrono::{DateTime, Utc};
-use tracing::{debug, info, warn};
+use metrics::counter;
+use sha2::{Digest, Sha256};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::models::{DetectionRule, NewDetectionRule, RuleMode};
@@ -336,6 +338,14 @@ pub(super) fn within_alert_cooldown(
     }
 }
 
+/// Primary-key digest for a cooldown anchor (NAN-5429): sha256 of the
+/// entity's UTF-8 bytes. Matches the migration-386 backfill
+/// (`sha256(convert_to(entity, 'UTF8'))`), and keeps the btree key at 32
+/// bytes so entities of any length can be anchored.
+pub(super) fn cooldown_entity_hash(entity: &str) -> Vec<u8> {
+    Sha256::digest(entity.as_bytes()).to_vec()
+}
+
 impl DetectionService {
     // ========================================================================
     // Entity Grouping Helpers
@@ -559,29 +569,32 @@ impl DetectionService {
         // NAN-5424: entities are event-derived and PG text rejects U+0000.
         // Anchors are stored sanitized; map the rows back to the caller's
         // spelling so the membership test below matches what it passed in.
+        // NAN-5429: anchors are keyed on a digest of the (sanitized) entity,
+        // so an entity of any length can be looked up and stored.
         let safe = crate::db::pg_text::pg_safe_strings(entities);
-        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+        let hashes: Vec<Vec<u8>> = safe.iter().map(|e| cooldown_entity_hash(e)).collect();
+        let rows: Vec<(Vec<u8>, DateTime<Utc>)> = sqlx::query_as(
             r#"
-            SELECT entity, last_alert_at
+            SELECT entity_hash, last_alert_at
             FROM detection_alert_entity_cooldowns
-            WHERE rule_id = $1 AND entity = ANY($2)
+            WHERE rule_id = $1 AND entity_hash = ANY($2)
             "#,
         )
         .bind(rule_id)
-        .bind(safe.as_ref())
+        .bind(&hashes)
         .fetch_all(&self.pg_pool)
         .await?;
 
         let now = Utc::now();
-        let cooled: std::collections::HashSet<String> = rows
+        let cooled: std::collections::HashSet<Vec<u8>> = rows
             .into_iter()
             .filter(|(_, last)| within_alert_cooldown(Some(*last), now, cooldown_minutes))
-            .map(|(entity, _)| entity)
+            .map(|(hash, _)| hash)
             .collect();
         Ok(entities
             .iter()
-            .zip(safe.iter())
-            .filter(|(_, stored)| cooled.contains(*stored))
+            .zip(hashes.iter())
+            .filter(|(_, hash)| cooled.contains(*hash))
             .map(|(original, _)| original.clone())
             .collect())
     }
@@ -591,7 +604,8 @@ impl DetectionService {
     /// failure is logged, not propagated (the alert already exists). Under a
     /// PERSISTENT anchor-write failure (schema/permission damage narrow enough
     /// to spare the alert insert itself) the throttle degrades to the
-    /// pre-cooldown window-dedup behavior — noisy and WARN-logged every cycle,
+    /// pre-cooldown window-dedup behavior — noisy, ERROR-logged and counted in
+    /// `nanosiem_detection_cooldown_anchor_write_failures_total` every cycle,
     /// never silently lossy.
     ///
     /// Also opportunistically prunes this rule's anchors that have been stale
@@ -601,24 +615,41 @@ impl DetectionService {
         if entities.is_empty() {
             return;
         }
-        // DISTINCT: the same entity may appear twice in a batch; a duplicate
-        // inside one INSERT would trip "ON CONFLICT cannot affect row twice".
+        // NAN-5429: key on the entity digest (the btree key stays 32 bytes no
+        // matter how long the entity is); the full value is kept unindexed.
+        // Dedup by digest: a duplicate inside one INSERT would trip
+        // "ON CONFLICT cannot affect row twice".
+        let safe = crate::db::pg_text::pg_safe_strings(entities);
+        let mut seen = std::collections::HashSet::new();
+        let (values, hashes): (Vec<&str>, Vec<Vec<u8>>) = safe
+            .iter()
+            .map(|e| (e.as_str(), cooldown_entity_hash(e)))
+            .filter(|(_, h)| seen.insert(h.clone()))
+            .unzip();
         let result = sqlx::query(
             r#"
-            INSERT INTO detection_alert_entity_cooldowns (rule_id, entity, last_alert_at)
-            SELECT DISTINCT $1, unnest($2::text[]), now()
-            ON CONFLICT (rule_id, entity) DO UPDATE SET last_alert_at = EXCLUDED.last_alert_at
+            INSERT INTO detection_alert_entity_cooldowns (rule_id, entity, entity_hash, last_alert_at)
+            SELECT $1, v.entity, v.entity_hash, now()
+            FROM unnest($2::text[], $3::bytea[]) AS v(entity, entity_hash)
+            ON CONFLICT (rule_id, entity_hash)
+                DO UPDATE SET last_alert_at = EXCLUDED.last_alert_at, entity = EXCLUDED.entity
             "#,
         )
         .bind(rule_id)
-        .bind(crate::db::pg_text::pg_safe_strings(entities).as_ref())
+        .bind(&values)
+        .bind(&hashes)
         .execute(&self.pg_pool)
         .await;
         if let Err(e) = result {
-            warn!(
+            // Surfaced, not just warned: a failed anchor write means the
+            // cooldown is NOT applied to these entities, so every further
+            // match alerts again until a write succeeds.
+            counter!("nanosiem_detection_cooldown_anchor_write_failures_total").increment(1);
+            error!(
                 rule_id = %rule_id,
-                error = %e,
-                "Failed to record alert-cooldown anchors; affected entities may re-alert once before the next successful write"
+                entities = values.len(),
+                error = %crate::db::pg_text::pg_safe_error_text(&e.to_string()),
+                "Failed to record alert-cooldown anchors; the cooldown is not applied to these entities until a write succeeds"
             );
             return;
         }

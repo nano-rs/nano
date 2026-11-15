@@ -3,8 +3,8 @@
 //! NAN-5217: the cluster-wide "pause ingestion" control and its enforcement.
 //!
 //! The pause is decided in one place, `system_settings.ingestion_paused` in
-//! PostgreSQL, either by the disk-pressure monitor at the emergency level
-//! (`source = disk_pressure`) or by an administrator (`source = manual`).
+//! PostgreSQL, either by the disk-pressure monitor at its pause threshold
+//! (`DISK_PRESSURE_PAUSE_THRESHOLD`, default 92%, `source = disk_pressure`) or by an administrator (`source = manual`).
 //! Every host reads the same row, so every app host reports the same answer.
 //!
 //! Three things enforce it:
@@ -71,7 +71,7 @@ const MAX_REASON_LEN: usize = 500;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IngestionPauseSource {
-    /// The disk-pressure monitor, at the emergency level.
+    /// The disk-pressure monitor, at its pause threshold.
     DiskPressure,
     /// An administrator.
     Manual,
@@ -261,7 +261,7 @@ impl IngestionPauseService {
         .await?
         .rows_affected()
             > 0;
-        // Repeated calls (the emergency level re-asserts every check) issue no
+        // Repeated calls (the pause threshold re-asserts every check) issue no
         // DDL once the guard is in place.
         if changed || self.guard_state().await != IngestionGuardState::Applied {
             if let Err(error) = self.apply_guard().await {

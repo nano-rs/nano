@@ -41,7 +41,7 @@ impl LogSourceService {
         ensure_unchanged(id, ls.updated_at, expected_updated_at)?;
 
         // Validate working copy VRL
-        let validation = self.validate_vrl(&ls.parser_vrl).await;
+        let validation = self.validate_vrl(&ls.parser_vrl).await?;
         if !validation.valid {
             return Ok(DeploymentResult {
                 success: false,
@@ -78,7 +78,7 @@ impl LogSourceService {
         if ls.extension_enabled {
             if let Some(ref ext) = ls.extension_vrl {
                 if !ext.trim().is_empty() {
-                    let ext_validation = self.validate_vrl(ext).await;
+                    let ext_validation = self.validate_vrl(ext).await?;
                     if !ext_validation.valid {
                         return Ok(DeploymentResult {
                             success: false,

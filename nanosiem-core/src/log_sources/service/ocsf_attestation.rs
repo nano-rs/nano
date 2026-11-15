@@ -446,11 +446,11 @@ impl LogSourceService {
             revision: log_source.updated_at,
             parser_sha256: source_parser_sha256(&log_source),
         };
-        if !self.validate_vrl(&log_source.parser_vrl).await.valid {
+        if !self.validate_vrl(&log_source.parser_vrl).await?.valid {
             return Ok(checked);
         }
         if let Some(extension) = effective_extension(&log_source) {
-            if !self.validate_vrl(extension).await.valid {
+            if !self.validate_vrl(extension).await?.valid {
                 return Ok(checked);
             }
         }

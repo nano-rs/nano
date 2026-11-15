@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!--
+  Empty target for the NAN-5445 storage tiering bind mount. Docker must find
+  this file inside the read-only config.d parent bind before it can overlay the
+  rendered file (.nano-generated/clickhouse/tiering.xml). Keep this placeholder
+  inert: install.sh, scripts/nano tiering or the enterprise inventory renderer
+  supplies the active contents (scripts/lib/clickhouse_tiering.py).
+-->
+<clickhouse/>

@@ -48,6 +48,8 @@ on:
       - scripts/tests/clickhouse-sizing-mount.test.sh
       - scripts/tests/fixtures/resource-sizing.snap
       - scripts/tests/resource-sizing-planned-volume.test.sh
+      - scripts/lib/retention-sizing.sh
+      - scripts/tests/retention-sizing.test.sh
       - scripts/tests/fixtures/resource-sizing-unplanned.golden
       - scripts/tests/resource-sizing-evidence-pack.test.sh
       - nanosiem-enterprise/src/evidence_pack/memory.rs
@@ -201,6 +203,7 @@ jobs:
           if [ -f scripts/tests/resource-sizing.test.sh ]; then
             bash scripts/tests/resource-sizing.test.sh
             bash scripts/tests/resource-sizing-planned-volume.test.sh
+            bash scripts/tests/retention-sizing.test.sh
             bash scripts/tests/resource-sizing-evidence-pack.test.sh
             bash scripts/tests/install-resource-sizing.test.sh
             bash scripts/tests/clickhouse-sizing-mount.test.sh
@@ -343,7 +346,7 @@ jobs:
         run: |
           docker run --rm \
             -v "$PWD:/workspace:ro" -w /workspace \
-            node:22-bookworm \
+            node:22.23.5-bookworm@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb \
             bash -euo pipefail -c '
               if ! command -v rsync >/dev/null 2>&1; then
                 apt-get update
@@ -360,7 +363,7 @@ jobs:
     timeout-minutes: 45
     env:
       PG_CONTAINER: opencore-relations-${{ github.run_id }}
-      RUST_IMAGE: rust:1.95-bookworm
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     steps:
       - name: Reclaim workspace before checkout (NAN-773)
         run: |

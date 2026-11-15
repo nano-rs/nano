@@ -8,6 +8,7 @@
 //! organizational context for AI prompt customization,
 //! and developer settings for scheduler control.
 
+pub mod clickhouse_ttl;
 mod developer_repository;
 pub mod disk_pressure;
 pub mod ingestion_pause;
@@ -19,7 +20,9 @@ pub mod search_query_limits;
 mod service;
 pub mod tier;
 pub mod usage_meter;
-mod tiering;
+// NAN-5445: storage tiering is enterprise-only (stripped from the mirror).
+#[cfg(feature = "enterprise")]
+pub mod tiering;
 
 pub use developer_repository::*;
 pub use disk_pressure::*;
@@ -31,4 +34,5 @@ pub use search_admission::*;
 pub use search_query_limits::*;
 pub use service::*;
 pub use tier::*;
+#[cfg(feature = "enterprise")]
 pub use tiering::*;

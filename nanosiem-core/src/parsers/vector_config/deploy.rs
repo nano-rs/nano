@@ -2850,7 +2850,9 @@ if nano_ingest_client_ip != "" {
 if nano_ingest_peer != "" {
     ext_existing = set!(ext_existing, ["ingest_peer"], nano_ingest_peer)
 }
-.ext = ext_existing
+"#,
+            nesting_depth_limit_vrl!("ext_existing", r#"["nano_nesting_truncated"]"#),
+            r#".ext = ext_existing
 
 .ingest_time = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S.%f")
 '''
@@ -3065,7 +3067,9 @@ otlp_time = to_string(.timestamp) ?? ""
 if otlp_time != "" {
     ocsf_event.time = otlp_time
 }
-
+"#,
+        nesting_depth_limit_vrl!("ocsf_event", r#"["unmapped", "nano_nesting_truncated"]"#),
+        r#"
 skew_seconds = to_int(get_env_var("NANO_FUTURE_TIMESTAMP_SKEW_SECONDS") ?? "86400") ?? 86400
 if skew_seconds < 0 { skew_seconds = 86400 }
 . = { "event": ocsf_event, "timestamp": format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type, "future_timestamp_skew_seconds": skew_seconds }

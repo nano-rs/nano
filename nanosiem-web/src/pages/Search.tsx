@@ -78,6 +78,7 @@ import {
 } from '@/hooks/use-api';
 import { api } from '@/lib/api';
 import type { ApiError, ParseErrorDetails, MelodApiResponse } from '@/lib/api';
+import { isLookupAllowlistRefusal, LOOKUP_URLS_SETTINGS_PATH } from '@/lib/api/lookup-url-allowlist';
 import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useAuth } from '@/contexts/AuthContext';
 import { useSearchHistory } from '@/hooks/useSearchHistory';
@@ -4907,6 +4908,14 @@ export function Search() {
                     <>
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-sm text-muted-foreground">{searchError.message}</span>
+                        {isLookupAllowlistRefusal(searchError.message) && (
+                          <RouterLink
+                            to={LOOKUP_URLS_SETTINGS_PATH}
+                            className="text-xs font-mono text-primary hover:underline"
+                          >
+                            Manage lookup URLs
+                          </RouterLink>
+                        )}
                       </div>
                       {searchError.details?.suggestions && searchError.details.suggestions.length > 0 && (
                         <div className="flex flex-wrap items-center gap-2 mt-2">

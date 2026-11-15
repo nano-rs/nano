@@ -1215,9 +1215,9 @@ mod tests {
         ordered.sort_by_key(|m| m.version);
 
         for m in ordered {
-            let created = created_tables(&m.sql);
-            let guarded = guarded_tables(&m.sql);
-            for t in referenced_tables(&m.sql) {
+            let created = created_tables(m.sql.as_str());
+            let guarded = guarded_tables(m.sql.as_str());
+            for t in referenced_tables(m.sql.as_str()) {
                 if guarded.contains(&t) {
                     continue;
                 }
@@ -1278,7 +1278,7 @@ mod tests {
         let migrator = sqlx::migrate!("../migrations/postgres");
         let mut restored = std::collections::BTreeSet::new();
         for m in migrator.iter().filter(|m| m.version > OPEN_INIT_BASELINE_VERSION) {
-            for table in created_tables(&m.sql) {
+            for table in created_tables(m.sql.as_str()) {
                 if enterprise.contains(&table) {
                     restored.insert(format!("{} (core {})", table, m.version));
                 }

@@ -41,6 +41,7 @@ import { AgentLaneApi } from '@/enterprise/api/agentlane';
 import { SoarApi } from '@/enterprise/api/soar';
 import { EvidencePackApi } from '@/enterprise/api/evidence-pack';
 import { InternalDomainsApi } from './internal-domains';
+import { LookupUrlAllowlistApi } from './lookup-url-allowlist';
 import { RiskWatchlistsApi } from '@/enterprise/api/risk-watchlists';
 import { NotificationsApi } from './notifications';
 import { FeedbackApi } from '@/enterprise/api/feedback';
@@ -290,6 +291,7 @@ class ApiClient {
   private _soar: SoarApi;
   private _evidencePack: EvidencePackApi;
   private _internalDomains: InternalDomainsApi;
+  private _lookupUrlAllowlist: LookupUrlAllowlistApi;
   private _riskWatchlists: RiskWatchlistsApi;
   private _notifications: NotificationsApi;
   private _feedback: FeedbackApi;
@@ -382,6 +384,7 @@ class ApiClient {
     this._soar = new SoarApi(this.request.bind(this));
     this._evidencePack = new EvidencePackApi(this.request.bind(this), this.requestRaw.bind(this));
     this._internalDomains = new InternalDomainsApi(this.request.bind(this));
+    this._lookupUrlAllowlist = new LookupUrlAllowlistApi(this.request.bind(this));
     this._riskWatchlists = new RiskWatchlistsApi(this.request.bind(this));
     this._notifications = new NotificationsApi(this.request.bind(this));
     this._feedback = new FeedbackApi(this.request.bind(this));
@@ -428,6 +431,10 @@ class ApiClient {
   /** NAN-3226: internal DNS suffixes (internal hosts, not domains). */
   get internalDomains(): InternalDomainsApi {
     return this._internalDomains;
+  }
+
+  get lookupUrlAllowlist(): LookupUrlAllowlistApi {
+    return this._lookupUrlAllowlist;
   }
 
   /** NAN-3219: deployment-wide AI tuning mode (on / manual / off). */
@@ -2239,6 +2246,24 @@ class ApiClient {
   // Storage
   async getStorageOverview(): Promise<import('./types').StorageOverview> {
     return this._storage.getStorageOverview();
+  }
+
+  async updateClickHouseRetention(
+    retentionDays: number,
+  ): Promise<import('./types').UpdateClickHouseRetentionResponse> {
+    return this._storage.updateClickHouseRetention(retentionDays);
+  }
+
+  async getTieringStatus(): Promise<import('./types').TieringConfig> {
+    return this._storage.getTieringStatus();
+  }
+
+  async getTierStats(): Promise<import('./types').TierStats> {
+    return this._storage.getTierStats();
+  }
+
+  async testColdTier(): Promise<import('./types').TieringConnectionTestResult> {
+    return this._storage.testColdTier();
   }
 
   async pauseIngestion(reason?: string): Promise<import('./types').IngestionPauseStatus> {

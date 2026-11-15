@@ -218,7 +218,7 @@ impl MarketplaceRepository {
 
         query.push_str(" ORDER BY category, name");
 
-        let mut q = sqlx::query_as::<_, MarketplaceCatalogEntry>(&query);
+        let mut q = sqlx::query_as::<_, MarketplaceCatalogEntry>(sqlx::AssertSqlSafe(query.as_str()));
 
         if let Some(ref category) = filter.category {
             q = q.bind(category);

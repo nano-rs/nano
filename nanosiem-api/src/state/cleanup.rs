@@ -245,6 +245,30 @@ impl AppState {
         })
     }
 
+    /// NAN-5450: prune the in-app notification bell daily. `delete_old`
+    /// existed with no caller, so `notifications` grew forever (every disk,
+    /// feed and partition-drop alert to every admin). Read notifications go
+    /// after 30 days, unread ones after 90.
+    pub fn start_notification_cleanup(&self) -> tokio::task::JoinHandle<()> {
+        const READ_DAYS: i64 = 30;
+        const ANY_DAYS: i64 = 90;
+        const BATCH: i64 = 5_000;
+        let repo = nanosiem_core::db::repository::NotificationRepository::new(self.pool.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 60 * 60));
+            loop {
+                interval.tick().await;
+                match repo.prune(READ_DAYS, ANY_DAYS, BATCH).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!("Notification cleanup removed {} old notifications", removed)
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("Notification cleanup failed: {}", e),
+                }
+            }
+        })
+    }
+
     /// Start the prevalence-dictionary health monitor (audit D4, fail-loud).
     ///
     /// Prevalence-filtered detection rules ride the dict pushdown, which returns

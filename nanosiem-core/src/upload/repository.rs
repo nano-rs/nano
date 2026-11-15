@@ -98,7 +98,8 @@ impl UploadRepository {
         .bind(records_success)
         .bind(records_failed)
         .bind(status)
-        .bind(error_message)
+        // ClickHouse insert errors can quote the uploaded row.
+        .bind(crate::db::pg_text::pg_safe_error_bind(error_message))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(UploadRepositoryError::UploadNotFound(upload_id))?;
@@ -125,7 +126,7 @@ impl UploadRepository {
             "#,
         )
         .bind(upload_id)
-        .bind(error_message)
+        .bind(crate::db::pg_text::pg_safe_error_bind(error_message))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(UploadRepositoryError::UploadNotFound(upload_id))?;
@@ -193,7 +194,7 @@ impl UploadRepository {
         }
 
         // Build and execute query with bindings
-        let mut q = sqlx::query_as::<_, UploadRecord>(&query);
+        let mut q = sqlx::query_as::<_, UploadRecord>(sqlx::AssertSqlSafe(query.as_str()));
 
         if let Some(ref dest_type) = filter.destination_type {
             q = q.bind(dest_type);

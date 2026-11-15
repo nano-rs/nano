@@ -49,19 +49,18 @@ async fn recreate_test_db() -> Result<(), sqlx::Error> {
     // Terminate any lingering connections so DROP succeeds.
     let _ = admin
         .execute(
-            format!(
+            sqlx::AssertSqlSafe(format!(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
                  WHERE datname = '{}' AND pid <> pg_backend_pid()",
                 TEST_DB_NAME
-            )
-            .as_str(),
+            )),
         )
         .await;
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {}", TEST_DB_NAME).as_str())
+        .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {}", TEST_DB_NAME)))
         .await?;
     admin
-        .execute(format!("CREATE DATABASE {}", TEST_DB_NAME).as_str())
+        .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {}", TEST_DB_NAME)))
         .await?;
     Ok(())
 }

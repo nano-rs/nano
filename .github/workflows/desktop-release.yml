@@ -51,10 +51,10 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95
+        uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100
         with:
           targets: ${{ matrix.rust_target }}
 
@@ -92,3 +92,6 @@ jobs:
           releaseDraft: true
           prerelease: true
           includeUpdaterJson: false
+          # Arguments after `--` go to cargo: build from the committed
+          # nano-desktop/src-tauri/Cargo.lock, never a fresh resolve (NAN-5412).
+          args: -- --locked

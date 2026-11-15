@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import importlib.util
 import io
+import ipaddress
 import json
 import os
 import pathlib
@@ -203,6 +204,49 @@ ROLE_SERVICES: dict[str, tuple[str, ...]] = {
     "app": APP_SERVICES,
     "monitoring": ("prometheus", "alertmanager", "grafana", "redis-exporter"),
 }
+
+
+INGEST_USER_NAME = "nanosiem_ingest"
+
+
+def allow_list_networks(networks_xml: pathlib.Path) -> dict[str, list[Any]]:
+    """Per-user IP networks of a rendered ClickHouse allow-list (NAN-5435)."""
+    root = ET.parse(networks_xml).getroot()
+    users = root.find("users")
+    allowed: dict[str, list[Any]] = {}
+    for user in users if users is not None else []:
+        networks = user.find("networks")
+        entries = []
+        for item in networks.findall("ip") if networks is not None else []:
+            try:
+                entries.append(ipaddress.ip_network((item.text or "").strip(), strict=False))
+            except ValueError:
+                continue
+        allowed[user.tag] = entries
+    return allowed
+
+
+def refused_clients(rows: str, allowed: dict[str, list[Any]]) -> list[tuple[str, str, str, str]]:
+    """`user, address, count, last_seen` TSV rows (system.query_log) whose
+    non-loopback address no network of that user's allow-list admits."""
+    refused = []
+    for line in rows.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4 or fields[0] not in allowed:
+            continue
+        try:
+            address = ipaddress.ip_address(fields[1].strip())
+        except ValueError:
+            continue
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if address.is_loopback or any(
+            address.version == network.version and address in network
+            for network in allowed[fields[0]]
+        ):
+            continue
+        refused.append((fields[0], str(address), fields[2], fields[3]))
+    return refused
 
 
 def exact_role_services(
@@ -1899,6 +1943,11 @@ class LocalOps:
         self.roles = frozenset(filter(None, self.role_env.get("NANO_ROLE_PROFILES", "").split(",")))
         if not self.roles:
             self.roles = frozenset({"clickhouse", "postgres", "ingest", "app"})
+            # NAN-5434: a single node's optional monitoring profile is the
+            # monitoring role, rolled (and its floor charged) as on a cluster's
+            # monitoring host. install.sh sizes it the same way.
+            if self._enabled_profiles() & {"monitoring", "*"}:
+                self.roles = self.roles | {"monitoring"}
         # NAN-5214: a Patroni member when the inventory has 2+ postgres hosts.
         self.pg_ha = self.role_env.get("NANO_POSTGRES_HA") == "true"
         self.pg_service = "postgres-ha" if self.pg_ha else "postgres"
@@ -1920,6 +1969,14 @@ class LocalOps:
             self.schema_profile = self.env.get("NANO_SCHEMA_PROFILE", "udm")
         self.compose_args = self._compose_args()
 
+    def _enabled_profiles(self) -> frozenset[str]:
+        """The Compose profiles this host enables (COMPOSE_PROFILES, the
+        environment over .env, as Compose reads it)."""
+        profiles = os.environ.get(
+            "COMPOSE_PROFILES", getattr(self, "env", {}).get("COMPOSE_PROFILES", "")
+        )
+        return frozenset(item.strip() for item in profiles.split(",") if item.strip())
+
     def _resource_roles(self) -> frozenset[str]:
         """Return the services that contribute signed resource minima.
 
@@ -1931,10 +1988,7 @@ class LocalOps:
         roles = set(self.roles)
         if getattr(self, "role_env", {}):
             return frozenset(roles)
-        profiles = os.environ.get(
-            "COMPOSE_PROFILES", getattr(self, "env", {}).get("COMPOSE_PROFILES", "")
-        )
-        enabled = {item.strip() for item in profiles.split(",") if item.strip()}
+        enabled = self._enabled_profiles()
         if "tenzir" in enabled or "*" in enabled:
             if not self._service_exists("tenzir"):
                 raise UpgradeError(
@@ -2058,6 +2112,279 @@ class LocalOps:
             ["bash", str(helper), "ensure", subnet, *self.compose_args[2:]],
             timeout=120, check=False,
         )
+
+    def _network_pin_owned(self) -> bool:
+        """NAN-5435: a canonical single node, where install.sh pins nano's
+        Compose network; role-split hosts and legacy layouts never pin."""
+        return not (
+            getattr(self, "role_env", None)
+            or getattr(self, "legacy_layout", None) is not None
+            or getattr(self, "_legacy_transition_rollout", False)
+            or getattr(self, "_legacy_bridge_rollout", False)
+        )
+
+    def _network_pin_helpers(self) -> bool:
+        return all(
+            (self.install_dir / "scripts/lib" / name).is_file()
+            for name in ("network-pin.sh", "compose_network_pin.py")
+        )
+
+    def _network_pin(self, command: str) -> dict[str, str]:
+        """`scripts/lib/network-pin.sh plan|preview|apply`: install.sh's own
+        pin steps (preview is plan without creating anything)."""
+        result = self.runner.run(
+            ["bash", str(self.install_dir / "scripts/lib/network-pin.sh"), command,
+             self.env.get("NANO_COMPOSE_SUBNET", ""), *self.compose_args[2:]],
+            timeout=600, check=False,
+        )
+        if result.returncode != 0:
+            raise UpgradeError(
+                f"could not {command} nano's Compose network pin: {self._safe_service_failure(result)}"
+            )
+        lines = (result.stdout or "").strip().splitlines()
+        fields = (lines[-1] if lines else "").split("\t")
+        fields += [""] * (5 - len(fields))
+        return {
+            "action": fields[0] or "none", "subnet": fields[1],
+            "network": fields[2], "reason": fields[3], "status": fields[4],
+        }
+
+    def _network_pin_failure(self, plan: dict[str, str]) -> str | None:
+        """Why a plan would leave a RECORDED pin unpinned: the Compose config,
+        the subnet choice or the network create failed. Rendering the
+        allow-list from the Docker pools then would widen it, so the caller
+        refuses instead. `managed` (the operator's Compose files own the
+        network) is not a failure: install.sh renders the pools there too."""
+        recorded = self.env.get("NANO_COMPOSE_SUBNET", "")
+        if not recorded or plan.get("subnet") or plan.get("status") == "managed":
+            return None
+        return (
+            f"nano's Compose network is pinned to {recorded} (NANO_COMPOSE_SUBNET in .env) "
+            f"but the pin could not be planned: {plan.get('reason') or 'unknown reason'}. "
+            "Fix the cause (docker compose config, docker network ls) and rerun the upgrade "
+            "with --resume; the ClickHouse allow-list was not changed."
+        )
+
+    def _render_networks_candidate(self, compose_subnet: str, output: pathlib.Path) -> str:
+        """Render the ClickHouse user allow-list to `output` with the same
+        scripts/lib/clickhouse_networks.py call install.sh makes."""
+        script = self.install_dir / "scripts/lib/clickhouse_networks.py"
+        users = self.install_dir / "clickhouse/users.d/nanosiem-users.xml"
+        result = self.runner.run(
+            ["python3", "-I", str(script), "--users-xml", str(users),
+             "--output", str(output),
+             "--compose-subnet", compose_subnet,
+             "--ingest-networks", self.env.get("NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS", ""),
+             "--from-docker", "--", *self.compose_args[2:]],
+            timeout=180, check=False,
+        )
+        if result.returncode != 0:
+            raise UpgradeError(
+                "could not render the ClickHouse network allow-list: "
+                f"{self._safe_service_failure(result)}"
+            )
+        return (result.stdout or "").strip()
+
+    def _check_agentlane_networks(self, networks_xml: pathlib.Path) -> None:
+        """NAN-5361: the Agent Lane allow-list must not overlap nano's users'
+        networks (install.sh's check-networks gate)."""
+        script = self.install_dir / "deploy/compose/agentlane.py"
+        if not script.is_file():
+            return
+        result = self.runner.run(
+            ["python3", "-I", str(script), "check-networks",
+             "--env-file", str(self.install_dir / ".env"),
+             "--networks-xml", str(networks_xml)],
+            timeout=60, check=False,
+        )
+        if result.returncode != 0:
+            raise UpgradeError(
+                "the Agent Lane allow-list overlaps the ClickHouse network allow-list: "
+                f"{self._safe_service_failure(result)}. Nothing was restarted; fix "
+                "NANO_AGENTLANE_ALLOW_CIDRS in .env and rerun the upgrade with --resume."
+            )
+
+    def _render_clickhouse_networks(self, compose_subnet: str) -> str:
+        """NAN-5435: render the allow-list to a private candidate, gate it
+        (Agent Lane overlap), then install it in place (Compose bind-mounts the
+        file; ClickHouse reloads it within seconds)."""
+        script = self.install_dir / "scripts/lib/clickhouse_networks.py"
+        users = self.install_dir / "clickhouse/users.d/nanosiem-users.xml"
+        if not script.is_file() or not users.is_file():
+            eprint(
+                "warning: scripts/lib/clickhouse_networks.py or clickhouse/users.d is missing; "
+                "ClickHouse users keep their current network allow-list."
+            )
+            return "skipped"
+        target = self.install_dir / ".nano-generated/clickhouse/networks.xml"
+        with tempfile.TemporaryDirectory(prefix="nano-ch-networks.") as scratch:
+            candidate = pathlib.Path(scratch) / "networks.xml"
+            self._render_networks_candidate(compose_subnet, candidate)
+            self._check_agentlane_networks(candidate)
+            text = candidate.read_text(encoding="utf-8")
+        changed = not target.is_file() or target.read_text(encoding="utf-8") != text
+        if changed:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            mode = "r+" if target.is_file() else "w"
+            with open(target, mode, encoding="utf-8") as handle:
+                handle.seek(0)
+                handle.write(text)
+                handle.truncate()
+            target.chmod(0o644)
+        networks_file = "./.nano-generated/clickhouse/networks.xml"
+        if self.env.get("NANO_CLICKHOUSE_NETWORKS_FILE") != networks_file:
+            self.env_file.replace("NANO_CLICKHOUSE_NETWORKS_FILE", networks_file)
+            self.env["NANO_CLICKHOUSE_NETWORKS_FILE"] = networks_file
+        ingest = self.env.get("NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS", "")
+        eprint(
+            f"ClickHouse users accept connections from loopback and "
+            f"{compose_subnet or 'the Docker networks'} only"
+            + (f" (nanosiem_ingest also from {ingest})" if ingest else "")
+        )
+        return "changed" if changed else "unchanged"
+
+    def _check_clickhouse_network_clients(self) -> str:
+        """NAN-5435 preflight: clients that used nano's ClickHouse users in the
+        last 7 days from an address the upgraded allow-list refuses (an
+        external direct-OCSF writer, a BI tool on the LAN). Same pattern as
+        install.sh's clickhouse_default_user_preflight; read-only."""
+        script = self.install_dir / "scripts/lib/clickhouse_networks.py"
+        users_xml = self.install_dir / "clickhouse/users.d/nanosiem-users.xml"
+        if not script.is_file() or not users_xml.is_file():
+            return "allow-list renderer is not installed; nothing changes"
+        preview = {"subnet": "", "status": "", "reason": "", "action": "none"}
+        if self._network_pin_helpers():
+            preview = self._network_pin("preview")
+            failure = self._network_pin_failure(preview)
+            if failure:
+                raise UpgradeError(failure)
+        with tempfile.TemporaryDirectory(prefix="nano-ch-networks.") as scratch:
+            candidate = pathlib.Path(scratch) / "networks.xml"
+            self._render_networks_candidate(preview["subnet"], candidate)
+            self._check_agentlane_networks(candidate)
+            allowed = allow_list_networks(candidate)
+        names = [name for name in allowed if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)]
+        if not names:
+            return "no ClickHouse users to check"
+        quoted = ", ".join(f"'{name}'" for name in names)
+        try:
+            rows = self._ch_query(
+                "SELECT user, IPv6NumToString(address), count(), max(event_time) "
+                "FROM system.query_log WHERE event_date >= today() - 7 AND type = 'QueryStart' "
+                f"AND user IN ({quoted}) GROUP BY user, address ORDER BY count() DESC LIMIT 200",
+                timeout=120,
+            )
+        except UpgradeError as error:
+            # As install.sh's clickhouse_default_user_preflight: no query log
+            # (disabled, or ClickHouse down) means nothing to report.
+            return f"could not read system.query_log ({error}); clients not checked"
+        refused = refused_clients(rows, allowed)
+        if not refused:
+            return (
+                f"no client of {len(names)} ClickHouse users in the last 7 days is outside "
+                f"the upgraded allow-list ({preview['subnet'] or 'Docker networks'})"
+            )
+        listing = "; ".join(f"{user} from {address} ({count} queries, last {last})"
+                            for user, address, count, last in refused)
+        ingest = [address for user, address, _, _ in refused if user == INGEST_USER_NAME]
+        others = sorted({user for user, _, _, _ in refused if user != INGEST_USER_NAME})
+        advice = []
+        if ingest:
+            current = [item for item in re.split(r"[,\s]+", self.env.get(
+                "NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS", "")) if item]
+            value = ",".join(dict.fromkeys([*current, *ingest]))
+            advice.append(
+                f"keep the direct writers: set NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS={value} in .env"
+            )
+        if others:
+            advice.append(
+                f"{', '.join(others)} accept only loopback and nano's network after the upgrade: "
+                "move those clients to nanosiem_ingest (writers) or accept that they stop"
+            )
+        message = (
+            "after the upgrade ClickHouse refuses these clients (last 7 days): "
+            f"{listing}. To continue, {'; '.join(advice)}, or rerun with "
+            "--ack-clickhouse-network-lockout (NANO_ACK_CH_NETWORK_LOCKOUT=1)."
+        )
+        if os.environ.get("NANO_ACK_CH_NETWORK_LOCKOUT") == "1":
+            return f"acknowledged (NANO_ACK_CH_NETWORK_LOCKOUT=1): {message}"
+        raise UpgradeError(message)
+
+    def network_pin_plan(self) -> dict[str, Any]:
+        """NAN-5435: what install.sh does before ClickHouse restarts. Pin nano's
+        Compose network (an install from before v2.0.25 runs on Compose's own,
+        and keeps its subnet), record NANO_COMPOSE_SUBNET, and narrow the
+        ClickHouse allow-list to it. Moving the stack onto the pinned network
+        is network_pin_apply, after the rollout."""
+        if not self._network_pin_owned():
+            return {"action": "skipped"}
+        if not self._network_pin_helpers():
+            eprint("warning: scripts/lib/network-pin.sh is missing; nano's Compose network is not pinned.")
+            if self.env.get("NANO_COMPOSE_SUBNET"):
+                raise UpgradeError(
+                    "NANO_COMPOSE_SUBNET is recorded but scripts/lib/network-pin.sh is missing; "
+                    "refusing to widen the ClickHouse allow-list to the Docker pools"
+                )
+            return {"action": "skipped", "allow_list": self._render_clickhouse_networks("")}
+        plan = self._network_pin("plan")
+        failure = self._network_pin_failure(plan)
+        if failure:
+            raise UpgradeError(failure)
+        if plan["subnet"]:
+            if self.env.get("NANO_COMPOSE_SUBNET") != plan["subnet"]:
+                self.env_file.replace("NANO_COMPOSE_SUBNET", plan["subnet"])
+                self.env["NANO_COMPOSE_SUBNET"] = plan["subnet"]
+            eprint(f"nano's Compose network {plan['network']} is pinned to {plan['subnet']}")
+        else:
+            eprint(
+                f"warning: nano's Compose network is not pinned ({plan['reason'] or 'unknown reason'}); "
+                "ClickHouse keeps admitting Docker's address pools."
+            )
+        return {**plan, "allow_list": self._render_clickhouse_networks(plan["subnet"])}
+
+    def network_pin_apply(self, timeout: int, resumed: bool = False) -> dict[str, Any]:
+        """NAN-5435: move the stack onto (or off) nano's pinned network, as
+        install.sh does right before it starts the stack: Vector drained, a
+        one-time stop of every service, the network replaced, then the whole
+        stack started. `resumed`: an earlier attempt of this step was
+        interrupted, possibly after it stopped the stack, so the stack is
+        started even when the network needs nothing more, but never unpinned."""
+        if not self._network_pin_owned() or not self._network_pin_helpers():
+            return {"action": "skipped"}
+        plan = self._network_pin("plan")
+        failure = self._network_pin_failure(plan)
+        if failure:
+            raise UpgradeError(failure)
+        if plan["action"] not in {"replace", "release"}:
+            if resumed:
+                if (
+                    self.env.get("NANO_COMPOSE_SUBNET")
+                    and plan["status"] != "managed"
+                    and (not plan["subnet"] or plan["reason"])
+                ):
+                    raise UpgradeError(
+                        "the interrupted network move cannot be finished: "
+                        f"{plan['reason'] or 'no pinned subnet was planned'}. The stack was "
+                        "not started unpinned; fix the cause and rerun the upgrade with --resume."
+                    )
+                self.compose(["up", "-d", "--pull", "missing"], timeout=timeout)
+            return plan
+        if plan["action"] == "replace":
+            eprint(
+                f"Moving every service onto nano's pinned network {plan['network']} "
+                f"({plan['subnet']}): draining Vector and stopping the stack first"
+            )
+        else:
+            eprint(
+                "Your Compose files manage nano's network now: draining Vector and stopping "
+                f"the stack to retire the pinned {plan['network']}"
+            )
+        # The same drain the ingest rollout does before it stops Vector: every
+        # buffered event is delivered before `down`.
+        self._drain_vector(min(timeout, 300))
+        applied = self._network_pin("apply")
+        self.compose(["up", "-d", "--pull", "missing"], timeout=timeout)
+        return applied
 
     def compose(
         self, arguments: Sequence[str], *, timeout: int = 120,
@@ -2732,10 +3059,16 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         total, source = self._ram_capacity_bytes()
         if total < required:
             missing = required - total
+            # NAN-5434: a single node's monitoring profile is now charged.
+            way_out = (
+                "; turn the monitoring profile off (remove it from COMPOSE_PROFILES in .env) "
+                "or add RAM"
+                if "monitoring" in roles and not getattr(self, "role_env", None) else ""
+            )
             raise UpgradeError(
                 f"roles {','.join(sorted(roles))} require {_format_bytes(required)} RAM, "
                 f"host has {_format_bytes(total)} ({source}); missing {_format_bytes(missing)}; "
-                f"computed {formula}"
+                f"computed {formula}{way_out}"
             )
         return (
             f"host has {_format_bytes(total)} RAM ({source}); roles "
@@ -2793,6 +3126,24 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             if result.returncode == 0 and "state = running" in result.stdout:
                 return "macOS timed service reports running"
         raise UpgradeError("NTP synchronization could not be proven")
+
+    def _check_tenzir_pipeline(self) -> str:
+        """NAN-5411: compose_stale_mounts.guard_tenzir_pipeline on this host.
+
+        The running Tenzir node is the only copy left of an operator-edited
+        pipeline that the extracted release package replaced; once the
+        rollout recreates it (a new image) the edit is gone. The guard saves
+        it to tenzir/pipeline.tql.bak and this check fails once; a re-run
+        with the backup in place passes with a warning."""
+        if not self._service_exists("tenzir"):
+            return "no bundled Tenzir node"
+        containers = self.compose(["ps", "-q", "tenzir"], timeout=30).stdout.split()
+        if not containers:
+            return "the bundled Tenzir node is not running"
+        try:
+            return compose_stale_mounts.guard_tenzir_pipeline(self.install_dir, containers[0])
+        except compose_stale_mounts.OperatorFileReplaced as error:
+            raise UpgradeError(str(error)) from error
 
     def _check_ports(self) -> str:
         expected = set(self.compose(["ps", "-q"], timeout=30).stdout.split())
@@ -3610,6 +3961,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         check("rendered-config", self._check_compose)
         check("runtime-config", self._check_runtime_config)
         check("ports", self._check_ports)
+        # NAN-5411: an extracted release package replaces tenzir/pipeline.tql;
+        # refuse before the rollout recreates Tenzir over an edited one.
+        check("tenzir-pipeline", self._check_tenzir_pipeline)
         # Role-split only: a single-node stack serves Vector its config from a
         # shared volume (NANO_VECTOR_CONFIG_DELIVERY=off), never over HTTP.
         if getattr(self, "role_env", None) and self.roles.intersection({"app", "ingest"}):
@@ -3637,6 +3991,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             check("postgres", self._check_postgres)
         if "clickhouse" in self.roles:
             check("clickhouse", self._check_clickhouse)
+            # NAN-5435: the upgrade narrows the allow-list on a single node.
+            if self._network_pin_owned():
+                check("clickhouse-network-clients", self._check_clickhouse_network_clients)
         if "keeper" in self.roles:
             check("keeper", self._check_keeper)
         # The authoritative cached license state lives in PostgreSQL. On a
@@ -5796,6 +6153,12 @@ printf 'consumer generation %s ready\n' "$generation"
             # NAN-5250: Prometheus and Grafana carry no nano state; recreate
             # whatever this host runs and wait for it to be up.
             services = self._up_existing(selected, timeout, exact=True)
+            # NAN-5434: on a single node the monitoring profile also runs
+            # node-exporter (a cluster rolls it with every role, below).
+            if not getattr(self, "role_env", None) and not self._monitoring_enabled():
+                services += self._up_existing(
+                    self._running_services(["node-exporter"]), timeout, exact=True,
+                )
             if services:
                 self._wait_services(services, timeout)
         elif role == "app":
@@ -6660,6 +7023,17 @@ class NodeExecutor:
             self._remote("render-config", arguments, 300, input_text=inventory_text),
             "remote render-config",
         )
+
+    def network_pin_plan(self) -> dict[str, Any]:
+        """NAN-5435: single node only (role-split hosts never pin)."""
+        if not self.local:
+            raise UpgradeError("the Compose network pin is a single-node step")
+        return self.local_ops.network_pin_plan()
+
+    def network_pin_apply(self, timeout: int, resumed: bool = False) -> dict[str, Any]:
+        if not self.local:
+            raise UpgradeError("the Compose network pin is a single-node step")
+        return self.local_ops.network_pin_apply(timeout, resumed)
 
     def rollout(self, role: str, timeout: int, require_lb_hooks: bool = False) -> dict[str, Any]:
         if self.local:
@@ -8157,6 +8531,9 @@ def abandon_command(args: argparse.Namespace) -> int:
 
 
 def upgrade_command(args: argparse.Namespace) -> int:
+    if getattr(args, "ack_clickhouse_network_lockout", False):
+        # NAN-5435: read by the single-node clickhouse-network-clients preflight.
+        os.environ["NANO_ACK_CH_NETWORK_LOCKOUT"] = "1"
     install_dir = pathlib.Path(args.install_dir).expanduser().resolve()
     nano_cli = pathlib.Path(args.nano_cli or SCRIPT_DIR / "nano").expanduser().resolve()
     runner = Runner()
@@ -8636,6 +9013,13 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         return {key: value for key, value in result.items() if key != "diff"}
 
                     run_step(journal, state, f"render-config:{node.name}", render)
+                else:
+                    # NAN-5435: install.sh's network pin and ClickHouse
+                    # allow-list, before ClickHouse rolls with the new list.
+                    run_step(
+                        journal, state, f"network-pin:plan:{node.name}",
+                        lambda: executors[node.name].network_pin_plan(),
+                    )
                 prepared.add(node.name)
 
             for role in ROLE_ORDER:
@@ -8687,6 +9071,18 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         lambda node=node, role=role: executors[node.name].rollout(role, args.timeout, require_lb_hooks),
                     )
 
+            if not role_split:
+                # NAN-5435: a single node from before the pin moves onto its
+                # pinned network once, as install.sh does before `up`.
+                apply_step = f"network-pin:apply:{nodes[0].name}"
+                apply_resumed = any(
+                    event.get("event") == "step_started" and event.get("step") == apply_step
+                    for event in state.events
+                )
+                run_step(
+                    journal, state, apply_step,
+                    lambda: executors[nodes[0].name].network_pin_apply(args.timeout, apply_resumed),
+                )
             ledger_after = {node.name: executors[node.name].ledger() for node in nodes}
             ledger_checks = validate_manifest_ledgers(
                 manifest, list(ledger_after.values()), require_complete=True, schema_profile=schema_profile,
@@ -9127,6 +9523,11 @@ def parser() -> argparse.ArgumentParser:
     )
     upgrade.add_argument("--lb-drain-command")
     upgrade.add_argument("--lb-rejoin-command")
+    upgrade.add_argument(
+        "--ack-clickhouse-network-lockout", action="store_true",
+        help="continue although clients outside the upgraded ClickHouse network "
+        "allow-list used nano's users in the last 7 days (NANO_ACK_CH_NETWORK_LOCKOUT=1)",
+    )
     upgrade.add_argument(
         "--allow-siem-health-regression", metavar="REASON",
         help="audited emergency override for new post-upgrade critical SIEM Health findings",

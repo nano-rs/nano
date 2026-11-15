@@ -23,6 +23,7 @@ use reqwest::{redirect::Policy, Client, Response};
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use super::allowlist::{self, DeploymentAllowlist, FetchOutcome};
 use super::ssrf::{SsrfConfig, SsrfError, SsrfValidator};
 use super::types::InputLookupConfig;
 
@@ -39,10 +40,17 @@ pub enum FetchError {
     RateLimitExceeded,
 
     #[error(
-        "outbound lookup to host '{host}' is not permitted: it is not in the inputlookup \
-         allowlist (INPUTLOOKUP_ALLOWED_DOMAINS)"
+        "outbound lookup to host '{host}' is not permitted: it is not in the lookup URL \
+         allowlist. An administrator can add it in Settings > Lookup URLs ({path})",
+        path = allowlist::SETTINGS_PATH
     )]
     DomainNotAllowed { host: String },
+
+    #[error(
+        "outbound lookups are unavailable: the lookup URL allowlist has not been read from \
+         the database yet. Retry shortly"
+    )]
+    AllowlistUnavailable,
 
     #[error("Response too large: {size} bytes exceeds limit of {limit} bytes")]
     ResponseTooLarge { size: usize, limit: usize },
@@ -85,6 +93,18 @@ pub struct UrlFetcher {
     rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     /// Configuration
     config: InputLookupConfig,
+    /// Where the host allowlist comes from.
+    host_policy: HostPolicy,
+}
+
+/// Where a fetcher's host allowlist comes from.
+#[derive(Debug, Clone)]
+enum HostPolicy {
+    /// A fixed list (`InputLookupConfig::allowed_domains`).
+    Static(Vec<String>),
+    /// The deployment list merged with the admin list from Settings, read
+    /// process-wide ([`allowlist`]).
+    Managed(DeploymentAllowlist),
 }
 
 impl UrlFetcher {
@@ -128,25 +148,46 @@ impl UrlFetcher {
         // Create cache
         let cache = Arc::new(DashMap::new());
 
+        let host_policy = HostPolicy::Static(config.allowed_domains.clone());
         Self {
             client,
             validator,
             cache,
             rate_limiter,
             config,
+            host_policy,
         }
     }
 
-    /// Enforce the outbound host allowlist (NAN-5436).
+    /// Use the managed allowlist (NAN-5443): `deployment` merged with the
+    /// admin list from Settings, as last read by this process.
+    pub fn with_managed_allowlist(mut self, deployment: DeploymentAllowlist) -> Self {
+        self.host_policy = HostPolicy::Managed(deployment);
+        self
+    }
+
+    /// The host allowlist in force now. Empty = no host restriction.
+    fn allowed_domains(&self) -> Result<Vec<String>, FetchError> {
+        match &self.host_policy {
+            HostPolicy::Static(domains) => Ok(domains.clone()),
+            HostPolicy::Managed(deployment) if deployment.locked => Ok(deployment.domains.clone()),
+            HostPolicy::Managed(deployment) => allowlist::admin_domains()
+                .map(|admin| deployment.effective(&admin))
+                .ok_or(FetchError::AllowlistUnavailable),
+        }
+    }
+
+    /// Enforce the outbound host allowlist (NAN-5436, managed since NAN-5443).
     ///
-    /// - `allowed_domains` empty → no restriction here (unchanged behavior; the
+    /// - the allowlist is empty → no restriction here (unchanged behavior; the
     ///   SSRF guard and `blocked_domains` still apply).
     /// - non-empty → the host must equal an entry or be a subdomain of one,
     ///   case-insensitively, ignoring a trailing root dot.
     ///
     /// Callers run this BEFORE any DNS resolution of the host.
     fn check_domain_allowed(&self, url: &Url) -> Result<(), FetchError> {
-        if self.config.allowed_domains.is_empty() {
+        let allowed = self.allowed_domains()?;
+        if allowed.is_empty() {
             return Ok(());
         }
         let host = url
@@ -157,13 +198,7 @@ impl UrlFetcher {
             .trim_end_matches('.')
             .to_ascii_lowercase();
 
-        let permitted = self.config.allowed_domains.iter().any(|entry| {
-            // A trailing root dot (`example.com.`) names the same host.
-            let entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
-            !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
-        });
-
-        if permitted {
+        if allowlist::host_allowed(&host, &allowed) {
             Ok(())
         } else {
             Err(FetchError::DomainNotAllowed { host })
@@ -172,6 +207,12 @@ impl UrlFetcher {
 
     /// Resolve a redirect `Location` against the current hop and apply the
     /// allowlist to the target before anything resolves it.
+    /// Whether `url` parses and its host passes the allowlist in force now
+    /// (gates the cache read, NAN-5443).
+    fn host_allowed_now(&self, url: &str) -> bool {
+        Url::parse(url).is_ok_and(|parsed| self.check_domain_allowed(&parsed).is_ok())
+    }
+
     fn redirect_target(&self, base: &Url, location: &str) -> Result<Url, FetchError> {
         let target = base
             .join(location)
@@ -192,8 +233,11 @@ impl UrlFetcher {
         timeout_secs: Option<u32>,
         cache_ttl_secs: u32,
     ) -> Result<FetchResult, FetchError> {
-        // Check cache first (if caching is enabled)
-        if cache_ttl_secs > 0 {
+        // Check cache first (if caching is enabled). NAN-5443: only for a host
+        // the allowlist admits NOW, so a host an administrator removes stops
+        // being served from cache at once. A refused host skips the cache and
+        // takes the normal path, which rate-limits, refuses and audits it.
+        if cache_ttl_secs > 0 && self.host_allowed_now(url) {
             if let Some(cached) = self.get_cached(url) {
                 debug!("Cache hit for URL: {}", url);
                 return Ok(FetchResult {
@@ -205,8 +249,16 @@ impl UrlFetcher {
             }
         }
 
+        // NAN-5443: every outbound attempt and every allowlist/SSRF refusal is
+        // audited with the host only (never the path or query). Cache hits and
+        // rate-limited calls are not: nothing leaves the process. Every audited
+        // call passed the rate limiter, so audit volume is bounded by it.
+        let audit_host = allowlist::audit_host(url).unwrap_or_else(|| "<invalid url>".to_string());
+
         // Check rate limit
         if self.rate_limiter.check().is_err() {
+            // Not audited: nothing left the process, and an enrichment over
+            // many keys would write one event per key past the limit.
             warn!("Rate limit exceeded for inputlookup");
             return Err(FetchError::RateLimitExceeded);
         }
@@ -217,11 +269,19 @@ impl UrlFetcher {
         let timeout =
             Duration::from_secs(timeout_secs.unwrap_or(self.config.default_timeout_secs) as u64);
 
-        let response = self.fetch_with_redirects(url, timeout, 0).await?;
+        let response = match self.fetch_with_redirects(url, timeout, 0).await {
+            Ok(response) => response,
+            Err(error) => {
+                let (outcome, refused) = classify_fetch_error(&error);
+                allowlist::audit_fetch(&audit_host, outcome, None, refused);
+                return Err(error);
+            }
+        };
         let status = response.status();
 
         // Check status code
         if !status.is_success() {
+            allowlist::audit_fetch(&audit_host, FetchOutcome::HttpError, Some(status.as_u16()), None);
             return Err(FetchError::HttpStatus {
                 status: status.as_u16(),
                 message: status.canonical_reason().unwrap_or("Unknown").to_string(),
@@ -229,8 +289,15 @@ impl UrlFetcher {
         }
 
         // Read body with size limit
-        let body = self.read_body_limited(response).await?;
+        let body = match self.read_body_limited(response).await {
+            Ok(body) => body,
+            Err(error) => {
+                allowlist::audit_fetch(&audit_host, FetchOutcome::Failed, Some(status.as_u16()), None);
+                return Err(error);
+            }
+        };
         let fetch_duration = start.elapsed();
+        allowlist::audit_fetch(&audit_host, FetchOutcome::Fetched, Some(status.as_u16()), None);
 
         // Cache the response if caching is enabled
         if cache_ttl_secs > 0 {
@@ -322,14 +389,23 @@ impl UrlFetcher {
     /// `addrs` is empty (it was validated directly) and the shared client is
     /// reused — reqwest dials the literal with no rebinding window.
     fn pinned_client(&self, validated: &Url, addrs: &[SocketAddr]) -> Result<Client, FetchError> {
-        if addrs.is_empty() {
+        let settings = crate::egress_proxy::EgressSettings::current();
+        let plain_direct = !settings.required && matches!(settings.destination, Ok(None));
+        if addrs.is_empty() && plain_direct {
             return Ok(self.client.clone());
         }
-        let host = validated.host_str().ok_or(SsrfError::MissingHostname)?;
-        Self::base_client_builder(&self.config)
-            .resolve_to_addrs(host, addrs)
-            .build()
-            .map_err(FetchError::HttpError)
+        // Shared pin (NAN-5441): through DESTINATION_EGRESS_PROXY_URL with a
+        // pinned-IP CONNECT when set, refused under NANO_EGRESS_PROXY_REQUIRED
+        // with no destination proxy, otherwise the pinned addrs directly.
+        super::ssrf::pin_resolved_addrs_with(
+            Self::base_client_builder(&self.config),
+            validated,
+            addrs,
+            super::ssrf::ProxyPolicy::Direct,
+            &settings,
+        )?
+        .build()
+        .map_err(FetchError::HttpError)
     }
 
     /// Read response body with size limit.
@@ -399,6 +475,23 @@ impl UrlFetcher {
             expired_entries: expired,
             active_entries: total - expired,
         }
+    }
+}
+
+/// The audit outcome of a failed fetch, plus the refused host when a redirect
+/// target (not the first host) was refused.
+fn classify_fetch_error(error: &FetchError) -> (FetchOutcome, Option<&str>) {
+    match error {
+        FetchError::DomainNotAllowed { host } => (FetchOutcome::RefusedAllowlist, Some(host.as_str())),
+        FetchError::AllowlistUnavailable => (FetchOutcome::AllowlistUnavailable, None),
+        FetchError::SsrfValidation(_) => (FetchOutcome::RefusedSsrf, None),
+        FetchError::RateLimitExceeded => (FetchOutcome::RateLimited, None),
+        FetchError::Timeout { .. } => (FetchOutcome::Timeout, None),
+        FetchError::HttpError(e) if e.is_timeout() => (FetchOutcome::Timeout, None),
+        FetchError::HttpStatus { .. } => (FetchOutcome::HttpError, None),
+        FetchError::HttpError(_)
+        | FetchError::ResponseTooLarge { .. }
+        | FetchError::BodyReadError(_) => (FetchOutcome::Failed, None),
     }
 }
 
@@ -591,6 +684,20 @@ mod tests {
         // Empty list: redirects behave as before (no allowlist restriction).
         let open = UrlFetcher::new(InputLookupConfig::default());
         assert!(open.redirect_target(&base, "https://elsewhere.test/f").is_ok());
+    }
+
+    /// NAN-5443: the allowlist gates the cache read, so a host removed from
+    /// the list stops being served from cache at once; a listed host still is.
+    #[tokio::test]
+    async fn allowlist_is_checked_before_the_cache() {
+        let fetcher = UrlFetcher::new(listed(&["good.example"]));
+        fetcher.set_cached("https://gone.invalid/x", "stale", Duration::from_secs(60));
+        fetcher.set_cached("https://good.example/x", "fresh", Duration::from_secs(60));
+        let err = fetcher.fetch("https://gone.invalid/x", None, 60).await.unwrap_err();
+        assert!(matches!(err, FetchError::DomainNotAllowed { ref host } if host == "gone.invalid"), "{err}");
+        let hit = fetcher.fetch("https://good.example/x", None, 60).await.unwrap();
+        assert!(hit.from_cache);
+        assert_eq!(hit.body, "fresh");
     }
 }
 

@@ -378,7 +378,7 @@ fn current_code(secret: &str, email: &str) -> String {
     nanosiem_core::auth::totp_from_secret(secret, email)
         .unwrap()
         .generate_current()
-        .unwrap()
+        .to_string()
 }
 
 /// A code that is not valid now (TOTP skew 1 accepts neighbours, so pick one
@@ -387,7 +387,7 @@ fn wrong_code(secret: &str, email: &str) -> String {
     let totp = nanosiem_core::auth::totp_from_secret(secret, email).unwrap();
     (0u32..)
         .map(|n| format!("{n:06}"))
-        .find(|c| !totp.check_current(c).unwrap())
+        .find(|c| totp.check_current(c).is_none())
         .unwrap()
 }
 

@@ -118,16 +118,16 @@ pub(crate) fn with_query_options(
     settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
 ) -> clickhouse::query::Query {
     if let Some(id) = query_id {
-        query = query.with_option("query_id", id);
+        query = query.with_setting("query_id", id);
     }
     if let Some(s) = settings {
         query = query
-            .with_option("max_execution_time", &s.max_execution_time.to_string())
-            .with_option("max_threads", &s.max_threads.to_string())
-            .with_option("priority", &s.priority.to_string())
-            .with_option("queue_max_wait_ms", &s.queue_max_wait_ms.to_string());
+            .with_setting("max_execution_time", &s.max_execution_time.to_string())
+            .with_setting("max_threads", &s.max_threads.to_string())
+            .with_setting("priority", &s.priority.to_string())
+            .with_setting("queue_max_wait_ms", &s.queue_max_wait_ms.to_string());
         if let Some(max_memory_usage_bytes) = s.max_memory_usage_bytes {
-            query = query.with_option(
+            query = query.with_setting(
                 "max_memory_usage",
                 &max_memory_usage_bytes.to_string(),
             );

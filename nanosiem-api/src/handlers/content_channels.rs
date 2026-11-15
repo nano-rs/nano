@@ -93,10 +93,10 @@ impl AppContentApplier {
 
     async fn due_ids(&self, table: &str, channel: &Channel) -> Result<Vec<uuid::Uuid>, sqlx::Error> {
         let Some((_, name)) = channel.repo.split_once('/') else { return Ok(Vec::new()) };
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT id FROM {table} WHERE enabled AND last_synced_at IS NULL AND btrim(url) ~* $1 \
              AND COALESCE(NULLIF(btrim(branch), ''), 'main') = $2"
-        ))
+        )))
         .bind(repo_url_pattern(name))
         .bind(channel.branch)
         .fetch_all(&self.state.pool)

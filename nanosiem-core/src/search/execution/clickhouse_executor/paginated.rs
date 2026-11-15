@@ -305,19 +305,19 @@ impl ClickHouseExecutor {
 
         // Build the query with options
         let mut query_builder = self.client.query(&escaped_sql);
-        query_builder = query_builder.with_option("query_id", query_id);
+        query_builder = query_builder.with_setting("query_id", query_id);
 
         if let Some(settings) = settings {
             query_builder = query_builder
-                .with_option(
+                .with_setting(
                     "max_execution_time",
                     &settings.max_execution_time.to_string(),
                 )
-                .with_option("max_threads", &settings.max_threads.to_string())
-                .with_option("priority", &settings.priority.to_string())
-                .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
+                .with_setting("max_threads", &settings.max_threads.to_string())
+                .with_setting("priority", &settings.priority.to_string())
+                .with_setting("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
             if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-                query_builder = query_builder.with_option(
+                query_builder = query_builder.with_setting(
                     "max_memory_usage",
                     &max_memory_usage_bytes.to_string(),
                 );

@@ -59,6 +59,16 @@ pub enum SsrfError {
 
     #[error("Failed to build outbound HTTP client: {0}")]
     ClientBuildFailed(String),
+
+    /// `NANO_EGRESS_PROXY_REQUIRED` is on and no proxy is configured for
+    /// this destination (NAN-5441). Nothing was sent.
+    #[error("An egress proxy is required (NANO_EGRESS_PROXY_REQUIRED) but none is configured for this destination ({0}); the request was refused")]
+    EgressProxyRequired(&'static str),
+
+    /// The destination proxy setting is invalid (NAN-5441). Refused rather
+    /// than sent direct.
+    #[error("Egress proxy setting is invalid ({0}); the request was refused")]
+    EgressProxyMisconfigured(String),
 }
 
 /// An IPv4/IPv6 CIDR block used for the SSRF egress allowlist. Parsed from
@@ -672,8 +682,11 @@ pub fn ai_base_url_validator() -> SsrfValidator {
 pub enum ProxyPolicy {
     /// A user controls the destination (lookup `url=`, AI provider
     /// `base_url`, scheduled fetch URLs, SOAR/catalog targets, URL fetch
-    /// tools). Never proxied, so the pin (and the DNS-rebind guard) holds
-    /// and private targets are not routed through the corporate proxy.
+    /// tools). Never through the env proxy, so the pin (and the DNS-rebind
+    /// guard) holds and private targets are not routed through the corporate
+    /// proxy. An operator may route these through
+    /// `DESTINATION_EGRESS_PROXY_URL` instead, which keeps the pin with a
+    /// pinned-IP CONNECT (NAN-5441, [`crate::egress_proxy`]).
     Direct,
     /// The destination is operator configuration or a fixed host (feeds,
     /// OIDC IdP, identity directories). Honors the env proxy, because on
@@ -771,9 +784,67 @@ pub fn pin_resolved_addrs(
     addrs: &[SocketAddr],
     proxy: ProxyPolicy,
 ) -> Result<reqwest::ClientBuilder, SsrfError> {
+    pin_resolved_addrs_with(builder, validated, addrs, proxy, &crate::egress_proxy::EgressSettings::current())
+}
+
+/// [`pin_resolved_addrs`] with explicit egress settings (NAN-5441).
+///
+/// * `Direct` to a public destination with a destination proxy configured:
+///   the client goes through it (pinned-IP CONNECT by default, see
+///   [`crate::egress_proxy`]). The env proxy is still never used.
+/// * `Direct` to a public destination with no destination proxy: dials the
+///   pinned addresses, unless "proxy required" is on, which refuses with
+///   [`SsrfError::EgressProxyRequired`].
+/// * `Direct` to an internal destination (admitted only by an operator
+///   opt-in such as private AI endpoints or the webhook CIDR allowlist):
+///   dials the pinned addresses directly, as before.
+/// * `Environment`: honors the env proxy as before; with "proxy required" on
+///   and no env proxy set, refuses.
+pub fn pin_resolved_addrs_with(
+    builder: reqwest::ClientBuilder,
+    validated: &Url,
+    addrs: &[SocketAddr],
+    proxy: ProxyPolicy,
+    settings: &crate::egress_proxy::EgressSettings,
+) -> Result<reqwest::ClientBuilder, SsrfError> {
     let builder = match proxy {
-        ProxyPolicy::Direct => builder.no_proxy(),
-        ProxyPolicy::Environment => builder,
+        ProxyPolicy::Direct => {
+            let destination = settings
+                .destination
+                .as_ref()
+                .map_err(|e| SsrfError::EgressProxyMisconfigured(e.to_string()))?;
+            // An internal destination (allowed only by an operator opt-in)
+            // stays direct: an internet egress proxy cannot reach it.
+            let literal = validated
+                .host_str()
+                .and_then(|h| h.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok());
+            let public = literal
+                .into_iter()
+                .chain(addrs.iter().map(|a| a.ip()))
+                .any(|ip| settings.is_public(ip));
+            match destination {
+                Some(dest) if public => {
+                    let relay = crate::egress_proxy::destination_proxy(dest, validated, addrs)
+                        .map_err(|e| SsrfError::ClientBuildFailed(e.to_string()))?;
+                    // The relay carries the pin; no resolver override needed.
+                    return Ok(builder.no_proxy().proxy(relay));
+                }
+                None if public && settings.required => {
+                    return Err(SsrfError::EgressProxyRequired("set DESTINATION_EGRESS_PROXY_URL"));
+                }
+                _ => builder.no_proxy(),
+            }
+        }
+        ProxyPolicy::Environment => {
+            if settings.required && !settings.env_proxy.covers(validated.scheme()) {
+                return Err(SsrfError::EgressProxyRequired(if validated.scheme() == "http" {
+                    "set HTTP_PROXY or ALL_PROXY"
+                } else {
+                    "set HTTPS_PROXY or ALL_PROXY"
+                }));
+            }
+            builder
+        }
     };
     if addrs.is_empty() {
         return Ok(builder);

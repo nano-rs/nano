@@ -22,7 +22,7 @@ async fn repo() -> Option<(CredentialRepository, PgPool, String)> {
             move |conn, _| {
                 let schema = schema.clone();
                 Box::pin(async move {
-                    sqlx::Executor::execute(conn, format!("SET search_path TO {schema}").as_str())
+                    sqlx::Executor::execute(conn, sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                         .await
                         .map(|_| ())
                 })
@@ -31,7 +31,7 @@ async fn repo() -> Option<(CredentialRepository, PgPool, String)> {
         .connect(&url)
         .await
         .expect("connect");
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {schema};
          CREATE TABLE {schema}.cloud_credentials (
              id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL UNIQUE,
@@ -48,7 +48,7 @@ async fn repo() -> Option<(CredentialRepository, PgPool, String)> {
              created_at TIMESTAMPTZ NOT NULL DEFAULT now());
          CREATE TABLE {schema}.vector_config_publication_state (singleton BOOLEAN PRIMARY KEY);
          INSERT INTO {schema}.vector_config_publication_state VALUES (TRUE);"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("schema");
@@ -154,5 +154,5 @@ async fn rollback_to_a_legacy_invalid_gcp_version_is_refused() {
         .expect("valid version restores");
     assert_eq!(v.reverted_from_version, Some(1));
 
-    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&pool).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&pool).await.unwrap();
 }

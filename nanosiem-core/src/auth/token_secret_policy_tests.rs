@@ -3,7 +3,7 @@
 //! JWT secrets. Every value nano shipped as a default or example is public, so
 //! anyone could sign tokens with it.
 
-use super::validate_jwt_secret;
+use super::{validate_jwt_secret, TokenConfig, TokenService};
 
 #[test]
 fn shipped_default_and_example_secrets_are_refused() {
@@ -31,4 +31,12 @@ fn short_secrets_are_refused_and_generated_ones_pass() {
         "5d1f0c8a9b7e6d4c3b2a19087f6e5d4c3b2a19087f6e5d4c3b2a19087f6e5d4c"
     )
     .is_ok());
+}
+
+/// NAN-5412: jsonwebtoken 12 refuses an empty HMAC key. A hand-built
+/// empty `TokenConfig` must fail closed at construction, never run keyless.
+#[test]
+#[should_panic(expected = "JWT secret is empty")]
+fn an_empty_secret_never_builds_a_token_service() {
+    let _ = TokenService::new(TokenConfig::new(String::new()));
 }

@@ -43,6 +43,7 @@ pub mod demo;
 pub mod deployment_posture;
 pub mod detection;
 pub mod detection_code_target;
+pub mod egress_proxy;
 pub mod enrichment;
 pub mod entity_extraction;
 pub mod extensions;

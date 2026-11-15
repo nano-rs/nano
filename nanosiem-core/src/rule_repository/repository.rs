@@ -360,7 +360,7 @@ impl RepositoryRulesRepository {
         }
 
         // Build the query with dynamic parameters
-        let mut sqlx_query = sqlx::query_as::<_, RepositoryRule>(&query);
+        let mut sqlx_query = sqlx::query_as::<_, RepositoryRule>(sqlx::AssertSqlSafe(query.as_str()));
         sqlx_query = sqlx_query.bind(repository_id);
 
         if let Some(ref path_prefix) = filter.path_prefix {

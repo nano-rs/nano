@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<!-- NAN-5445: storage tiering off. install.sh renders the active file into
+     .nano-generated/clickhouse/tiering.xml and points NANO_CLICKHOUSE_TIERING_FILE at it. -->
+<clickhouse/>

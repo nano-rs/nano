@@ -28,7 +28,7 @@ const PASSWORD: &str = "Setup-Claim-5237-pass!";
 async fn scratch_db() -> (PgPool, PgPool, String) {
     let admin = common::migrated_pool().await;
     let name = format!("nan5237_{}", Uuid::now_v7().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&admin)
         .await
         .expect("create scratch database");
@@ -52,7 +52,7 @@ async fn scratch_db() -> (PgPool, PgPool, String) {
 
 async fn drop_db(admin: PgPool, pool: PgPool, name: String) {
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")))
         .execute(&admin)
         .await
         .ok();

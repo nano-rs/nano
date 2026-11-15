@@ -289,7 +289,7 @@ impl RepositoryParsersRepository {
         }
 
         // Build the query dynamically with binds
-        let mut q = sqlx::query_as::<_, RepositoryParser>(&query).bind(repository_id);
+        let mut q = sqlx::query_as::<_, RepositoryParser>(sqlx::AssertSqlSafe(query.as_str())).bind(repository_id);
 
         if let Some(ref category) = filter.category {
             q = q.bind(category);

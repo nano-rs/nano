@@ -19,10 +19,14 @@ pub mod analyzer;
 // NAN-5390: ClickHouse refusing nano's logins or writes.
 pub mod clickhouse_refusals;
 pub mod collector;
+// NAN-5450: data volumes at 80 % / 90 %.
+pub mod disk_findings;
 // NAN-5097: reads an enterprise table (migration 9000094).
 #[cfg(feature = "enterprise")]
 pub mod enrichment_wasm_findings;
 pub mod finding_signature;
+// NAN-5431: events Vector discarded after ingest accepted them.
+pub mod pipeline_drops;
 pub mod repository;
 pub mod scheduler;
 pub mod shard_skew;

@@ -67,10 +67,12 @@ accept_http $listen { read_ndjson }
 // `message`, so put something meaningful there. Leave `raw_data` unset and you
 // pay nothing for it (empty column), but the original is gone.
 this = { event: this, source_type: "tenzir" }
-// Guard: `to_clickhouse` drops an event that has a NULL in a required column —
-// even one that has a ClickHouse DEFAULT (only ABSENT columns take the default).
-// If you map `source_type` from event data and it can be null, keep this
-// fallback so a missing value lands as `unknown` instead of dropping the row.
+// Guard: what a NULL in a required column does depends on the Tenzir version.
+// Tenzir < 6.20 drops the event even when the column has a ClickHouse DEFAULT
+// (only ABSENT columns took it); 6.20+ writes the column's DEFAULT instead
+// (source_type's derives from event.metadata.log_source, else 'unknown'). If
+// you map `source_type` from event data and it can be null, keep this fallback
+// so the value is explicit and the event lands on every version.
 source_type = source_type.otherwise("unknown")
 // ───────────────────────────────────────────────────────────────────────────
 

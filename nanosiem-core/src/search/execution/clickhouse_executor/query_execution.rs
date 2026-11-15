@@ -248,7 +248,7 @@ impl ClickHouseExecutor {
         let mut cursor = self
             .client
             .query(&escaped_sql)
-            .with_option("query_id", query_id)
+            .with_setting("query_id", query_id)
             .fetch_bytes("JSONEachRow")
             .map_err(|e| crate::search::search_error_from_error(&e))?;
 
@@ -314,7 +314,7 @@ impl ClickHouseExecutor {
 
     /// Execute a dynamic query with a custom query_id and per-query settings
     ///
-    /// Settings are applied via `.with_option()` which maps to HTTP query params
+    /// Settings are applied via `.with_setting()` which maps to HTTP query params
     /// on the clickhouse-rs client. Works on both self-hosted and Cloud.
     pub(crate) async fn execute_dynamic_query_with_settings(
         &self,
@@ -334,16 +334,16 @@ impl ClickHouseExecutor {
         let mut query = self
             .client
             .query(&escaped_sql)
-            .with_option("query_id", query_id)
-            .with_option(
+            .with_setting("query_id", query_id)
+            .with_setting(
                 "max_execution_time",
                 &settings.max_execution_time.to_string(),
             )
-            .with_option("max_threads", &settings.max_threads.to_string())
-            .with_option("priority", &settings.priority.to_string())
-            .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
+            .with_setting("max_threads", &settings.max_threads.to_string())
+            .with_setting("priority", &settings.priority.to_string())
+            .with_setting("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
         if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-            query = query.with_option(
+            query = query.with_setting(
                 "max_memory_usage",
                 &max_memory_usage_bytes.to_string(),
             );
@@ -425,21 +425,21 @@ impl ClickHouseExecutor {
         let mut query = self
             .client
             .query(&escaped_sql)
-            .with_option("query_id", query_id)
-            .with_option("max_result_rows", &limits.max_result_rows.to_string())
-            .with_option("max_result_bytes", &limits.max_result_bytes.to_string())
-            .with_option("result_overflow_mode", "throw");
+            .with_setting("query_id", query_id)
+            .with_setting("max_result_rows", &limits.max_result_rows.to_string())
+            .with_setting("max_result_bytes", &limits.max_result_bytes.to_string())
+            .with_setting("result_overflow_mode", "throw");
         if let Some(settings) = settings {
             query = query
-                .with_option(
+                .with_setting(
                     "max_execution_time",
                     &settings.max_execution_time.to_string(),
                 )
-                .with_option("max_threads", &settings.max_threads.to_string())
-                .with_option("priority", &settings.priority.to_string())
-                .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
+                .with_setting("max_threads", &settings.max_threads.to_string())
+                .with_setting("priority", &settings.priority.to_string())
+                .with_setting("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
             if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-                query = query.with_option(
+                query = query.with_setting(
                     "max_memory_usage",
                     &max_memory_usage_bytes.to_string(),
                 );

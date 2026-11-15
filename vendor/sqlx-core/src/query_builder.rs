@@ -3,6 +3,7 @@
 use std::fmt::Display;
 use std::fmt::Write;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::arguments::{Arguments, IntoArguments};
 use crate::database::Database;
@@ -11,6 +12,9 @@ use crate::from_row::FromRow;
 use crate::query::Query;
 use crate::query_as::QueryAs;
 use crate::query_scalar::QueryScalar;
+use crate::sql_str::AssertSqlSafe;
+use crate::sql_str::SqlSafeStr;
+use crate::sql_str::SqlStr;
 use crate::types::Type;
 use crate::Either;
 
@@ -21,26 +25,28 @@ use crate::Either;
 /// and `UNNEST()`. [See our FAQ] for details.
 ///
 /// [See our FAQ]: https://github.com/launchbadge/sqlx/blob/master/FAQ.md#how-can-i-bind-an-array-to-a-values-clause-how-can-i-do-bulk-inserts
-pub struct QueryBuilder<'args, DB>
+pub struct QueryBuilder<DB>
 where
     DB: Database,
 {
-    query: String,
+    query: Arc<String>,
     init_len: usize,
-    arguments: Option<<DB as Database>::Arguments<'args>>,
+    arguments: Option<<DB as Database>::Arguments>,
 }
 
-impl<'args, DB: Database> Default for QueryBuilder<'args, DB> {
+impl<DB: Database> Default for QueryBuilder<DB> {
     fn default() -> Self {
         QueryBuilder {
             init_len: 0,
-            query: String::default(),
+            query: Default::default(),
             arguments: Some(Default::default()),
         }
     }
 }
 
-impl<'args, DB: Database> QueryBuilder<'args, DB>
+const ERROR: &str = "BUG: query must not be shared at this point in time";
+
+impl<DB: Database> QueryBuilder<DB>
 where
     DB: Database,
 {
@@ -49,13 +55,13 @@ where
     /// Start building a query with an initial SQL fragment, which may be an empty string.
     pub fn new(init: impl Into<String>) -> Self
     where
-        <DB as Database>::Arguments<'args>: Default,
+        <DB as Database>::Arguments: Default,
     {
         let init = init.into();
 
         QueryBuilder {
             init_len: init.len(),
-            query: init,
+            query: init.into(),
             arguments: Some(Default::default()),
         }
     }
@@ -67,13 +73,13 @@ where
     pub fn with_arguments<A>(init: impl Into<String>, arguments: A) -> Self
     where
         DB: Database,
-        A: IntoArguments<'args, DB>,
+        A: IntoArguments<DB>,
     {
         let init = init.into();
 
         QueryBuilder {
             init_len: init.len(),
-            query: init,
+            query: init.into(),
             arguments: Some(arguments.into_arguments()),
         }
     }
@@ -115,8 +121,9 @@ where
     /// e.g. check that strings aren't too long, numbers are within expected ranges, etc.
     pub fn push(&mut self, sql: impl Display) -> &mut Self {
         self.sanity_check();
+        let query: &mut String = Arc::get_mut(&mut self.query).expect(ERROR);
 
-        write!(self.query, "{sql}").expect("error formatting `sql`");
+        write!(query, "{sql}").expect("error formatting `sql`");
 
         self
     }
@@ -145,9 +152,9 @@ where
     ///
     /// [`SQLITE_LIMIT_VARIABLE_NUMBER`]: https://www.sqlite.org/limits.html#max_variable_number
     /// [postgres-limit-issue]: https://github.com/launchbadge/sqlx/issues/671#issuecomment-687043510
-    pub fn push_bind<T>(&mut self, value: T) -> &mut Self
+    pub fn push_bind<'t, T>(&mut self, value: T) -> &mut Self
     where
-        T: 'args + Encode<'args, DB> + Type<DB>,
+        T: Encode<'t, DB> + Type<DB>,
     {
         self.sanity_check();
 
@@ -157,8 +164,9 @@ where
             .expect("BUG: Arguments taken already");
         arguments.add(value).expect("Failed to add argument");
 
+        let query: &mut String = Arc::get_mut(&mut self.query).expect(ERROR);
         arguments
-            .format_placeholder(&mut self.query)
+            .format_placeholder(query)
             .expect("error in format_placeholder");
 
         self
@@ -191,10 +199,8 @@ where
     /// assert!(sql.ends_with("in (?, ?) "));
     /// # }
     /// ```
-
-    pub fn separated<'qb, Sep>(&'qb mut self, separator: Sep) -> Separated<'qb, 'args, DB, Sep>
+    pub fn separated<Sep>(&mut self, separator: Sep) -> Separated<'_, DB, Sep>
     where
-        'args: 'qb,
         Sep: Display,
     {
         self.sanity_check();
@@ -306,7 +312,7 @@ where
     pub fn push_values<I, F>(&mut self, tuples: I, mut push_tuple: F) -> &mut Self
     where
         I: IntoIterator,
-        F: FnMut(Separated<'_, 'args, DB, &'static str>, I::Item),
+        F: FnMut(Separated<'_, DB, &'static str>, I::Item),
     {
         self.sanity_check();
 
@@ -418,7 +424,7 @@ where
     pub fn push_tuples<I, F>(&mut self, tuples: I, mut push_tuple: F) -> &mut Self
     where
         I: IntoIterator,
-        F: FnMut(Separated<'_, 'args, DB, &'static str>, I::Item),
+        F: FnMut(Separated<'_, DB, &'static str>, I::Item),
     {
         self.sanity_check();
 
@@ -450,11 +456,11 @@ where
     /// to the state it was in immediately after [`new()`][Self::new].
     ///
     /// Calling any other method but `.reset()` after `.build()` will panic for sanity reasons.
-    pub fn build(&mut self) -> Query<'_, DB, <DB as Database>::Arguments<'args>> {
+    pub fn build(&mut self) -> Query<'_, DB, <DB as Database>::Arguments> {
         self.sanity_check();
 
         Query {
-            statement: Either::Left(&self.query),
+            statement: Either::Left(self.sql()),
             arguments: self.arguments.take().map(Ok),
             database: PhantomData,
             persistent: true,
@@ -475,7 +481,7 @@ where
     /// Calling any other method but `.reset()` after `.build()` will panic for sanity reasons.
     pub fn build_query_as<'q, T: FromRow<'q, DB::Row>>(
         &'q mut self,
-    ) -> QueryAs<'q, DB, T, <DB as Database>::Arguments<'args>> {
+    ) -> QueryAs<'q, DB, T, <DB as Database>::Arguments> {
         QueryAs {
             inner: self.build(),
             output: PhantomData,
@@ -496,7 +502,7 @@ where
     /// Calling any other method but `.reset()` after `.build()` will panic for sanity reasons.
     pub fn build_query_scalar<'q, T>(
         &'q mut self,
-    ) -> QueryScalar<'q, DB, T, <DB as Database>::Arguments<'args>>
+    ) -> QueryScalar<'q, DB, T, <DB as Database>::Arguments>
     where
         DB: Database,
         (T,): for<'r> FromRow<'r, DB::Row>,
@@ -511,20 +517,28 @@ where
     /// The query is truncated to the initial fragment provided to [`new()`][Self::new] and
     /// the bind arguments are reset.
     pub fn reset(&mut self) -> &mut Self {
-        self.query.truncate(self.init_len);
+        // Someone can hold onto a clone of `self.query`, to avoid panicking here we should just
+        // allocate a new `String`.
+        let query: &mut String = Arc::make_mut(&mut self.query);
+        query.truncate(self.init_len);
         self.arguments = Some(Default::default());
 
         self
     }
 
     /// Get the current build SQL; **note**: may not be syntactically correct.
-    pub fn sql(&self) -> &str {
-        &self.query
+    pub fn sql(&self) -> SqlStr {
+        AssertSqlSafe(self.query.clone()).into_sql_str()
     }
 
     /// Deconstruct this `QueryBuilder`, returning the built SQL. May not be syntactically correct.
-    pub fn into_sql(self) -> String {
-        self.query
+    pub fn into_string(self) -> String {
+        Arc::unwrap_or_clone(self.query)
+    }
+
+    /// Deconstruct this `QueryBuilder`, returning the built SQL. May not be syntactically correct.
+    pub fn into_sql(self) -> SqlStr {
+        AssertSqlSafe(self.query).into_sql_str()
     }
 }
 
@@ -532,16 +546,16 @@ where
 ///
 /// See [`QueryBuilder::separated()`] for details.
 #[allow(explicit_outlives_requirements)]
-pub struct Separated<'qb, 'args: 'qb, DB, Sep>
+pub struct Separated<'qb, DB, Sep>
 where
     DB: Database,
 {
-    query_builder: &'qb mut QueryBuilder<'args, DB>,
+    query_builder: &'qb mut QueryBuilder<DB>,
     separator: Sep,
     push_separator: bool,
 }
 
-impl<'qb, 'args: 'qb, DB, Sep> Separated<'qb, 'args, DB, Sep>
+impl<DB, Sep> Separated<'_, DB, Sep>
 where
     DB: Database,
     Sep: Display,
@@ -572,9 +586,9 @@ where
     /// Push the separator if applicable, then append a bind argument.
     ///
     /// See [`QueryBuilder::push_bind()`] for details.
-    pub fn push_bind<T>(&mut self, value: T) -> &mut Self
+    pub fn push_bind<'t, T>(&mut self, value: T) -> &mut Self
     where
-        T: 'args + Encode<'args, DB> + Type<DB>,
+        T: Encode<'t, DB> + Type<DB>,
     {
         if self.push_separator {
             self.query_builder.push(&self.separator);
@@ -590,9 +604,9 @@ where
     /// without a separator.
     ///
     /// Simply calls [`QueryBuilder::push_bind()`] directly.
-    pub fn push_bind_unseparated<T>(&mut self, value: T) -> &mut Self
+    pub fn push_bind_unseparated<'t, T>(&mut self, value: T) -> &mut Self
     where
-        T: 'args + Encode<'args, DB> + Type<DB>,
+        T: Encode<'t, DB> + Type<DB>,
     {
         self.query_builder.push_bind(value);
         self

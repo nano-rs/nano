@@ -226,7 +226,25 @@ class EdgeSite:
         self.url = url.rstrip("/")
 
     def start(self) -> EdgeSite:
-        return self
+        # NAN-5465: the edge serves this dir through a bind mount; right after
+        # the copy, nginx can still answer 404 for /login (Docker Desktop's
+        # file sharing lags), and the session's first scenario then times out
+        # at the login form. Wait until the SPA is served.
+        import time
+
+        import httpx
+
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                r = httpx.get(f"{self.url}/login", timeout=5)
+                if r.status_code == 200 and "<div id=" in r.text:
+                    return self
+            except httpx.HTTPError:
+                pass
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"edge {self.url} does not serve the SPA at /login after 60s")
+            time.sleep(0.5)
 
     def stop(self) -> None:
         pass

@@ -153,26 +153,26 @@ impl SchedulerRepository {
         // Build the query dynamically
         let rows = match (filter.enabled, filter.destination_type.as_ref()) {
             (Some(enabled), Some(dest_type)) => {
-                sqlx::query_as::<_, ScheduledJobRow>(&query)
+                sqlx::query_as::<_, ScheduledJobRow>(sqlx::AssertSqlSafe(query.as_str()))
                     .bind(enabled)
                     .bind(dest_type)
                     .fetch_all(&self.pool)
                     .await?
             }
             (Some(enabled), None) => {
-                sqlx::query_as::<_, ScheduledJobRow>(&query)
+                sqlx::query_as::<_, ScheduledJobRow>(sqlx::AssertSqlSafe(query.as_str()))
                     .bind(enabled)
                     .fetch_all(&self.pool)
                     .await?
             }
             (None, Some(dest_type)) => {
-                sqlx::query_as::<_, ScheduledJobRow>(&query)
+                sqlx::query_as::<_, ScheduledJobRow>(sqlx::AssertSqlSafe(query.as_str()))
                     .bind(dest_type)
                     .fetch_all(&self.pool)
                     .await?
             }
             (None, None) => {
-                sqlx::query_as::<_, ScheduledJobRow>(&query)
+                sqlx::query_as::<_, ScheduledJobRow>(sqlx::AssertSqlSafe(query.as_str()))
                     .fetch_all(&self.pool)
                     .await?
             }

@@ -62,8 +62,254 @@ pub(crate) fn retention_tables_for(active: &'static str) -> Vec<&'static str> {
 /// The DELETE TTL a retention change applies to `table`. A metadata ALTER;
 /// the server re-evaluates existing parts in a background mutation
 /// (`materialize_ttl_after_modify`), so the request never waits on a rewrite.
+///
+/// NAN-5449: every table except the UDM `logs` keeps the NAN-1384 guard from
+/// migration 127 (`DELETE WHERE timestamp > 2000-01-01`). Without it a
+/// retention change re-armed the TTL that deleted direct-write rows with a
+/// garbage pre-2000 `timestamp` at part-write while the INSERT returned 200.
 pub(crate) fn retention_ttl_sql(table: &str, on_cluster: &str, days: u32) -> String {
-    format!("ALTER TABLE {table}{on_cluster} MODIFY TTL timestamp + INTERVAL {days} DAY DELETE")
+    if table == "logs" {
+        format!("ALTER TABLE {table}{on_cluster} MODIFY TTL timestamp + INTERVAL {days} DAY DELETE")
+    } else {
+        format!(
+            "ALTER TABLE {table}{on_cluster} MODIFY TTL timestamp + INTERVAL {days} DAY DELETE \
+             WHERE timestamp > toDateTime64('2000-01-01 00:00:00', 3, 'UTC')"
+        )
+    }
+}
+
+/// Smallest and largest event retention nano accepts (API, UI, migrator).
+pub const MIN_CLICKHOUSE_RETENTION_DAYS: u32 = 1;
+pub const MAX_CLICKHOUSE_RETENTION_DAYS: u32 = 3650;
+
+/// Validate an event retention value against the accepted range.
+pub fn validate_clickhouse_retention_days(days: u32) -> Result<u32, RetentionError> {
+    if (MIN_CLICKHOUSE_RETENTION_DAYS..=MAX_CLICKHOUSE_RETENTION_DAYS).contains(&days) {
+        Ok(days)
+    } else {
+        Err(RetentionError::InvalidPeriod(format!(
+            "retention must be between {MIN_CLICKHOUSE_RETENTION_DAYS} and \
+             {MAX_CLICKHOUSE_RETENTION_DAYS} days, got {days}"
+        )))
+    }
+}
+
+/// NAN-5449: the deployment retention setting. Unset or blank means "the
+/// deployment does not manage retention": the migrator leaves the TTL alone.
+pub const RETENTION_DAYS_ENV: &str = "NANO_RETENTION_DAYS";
+
+/// Parse `NANO_RETENTION_DAYS`. `Ok(None)` for unset or blank; an error for
+/// anything else that is not a whole number of days in range, so a typo
+/// fails the migrator in its first second instead of being ignored.
+pub fn retention_days_from_env(raw: Option<&str>) -> Result<Option<u32>, RetentionError> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let days: u32 = raw.parse().map_err(|_| {
+        RetentionError::Config(format!(
+            "{RETENTION_DAYS_ENV}={raw:?} is not a whole number of days"
+        ))
+    })?;
+    validate_clickhouse_retention_days(days)
+        .map(Some)
+        .map_err(|e| RetentionError::Config(format!("{RETENTION_DAYS_ENV}: {e}")))
+}
+
+// Settings -> Storage and the NAN-5448 TTL repair read the TTL with
+// `settings::clickhouse_ttl::delete_ttl_days` (NAN-5445). This parser stays
+// for the enterprise Evidence Pack only, which also reports month/year TTLs.
+
+/// The DELETE TTL in days from a `CREATE TABLE` statement, if any. Accepts the
+/// normalized forms ClickHouse prints: `toIntervalDay(N)`, `INTERVAL N DAY`,
+/// and `toIntervalMonth(N)` / `toIntervalYear(N)` (30 / 365 days). A move-only
+/// TTL (`TO DISK` / `TO VOLUME`) is not a retention.
+/// Used by the enterprise Evidence Pack.
+pub fn parse_ttl_days(create_table_query: &str) -> Option<i64> {
+    let upper = create_table_query.to_ascii_uppercase();
+    let ttl_at = find_ttl_clause(&upper)?;
+    let clause_end = upper[ttl_at..]
+        .find(" SETTINGS ")
+        .map(|i| ttl_at + i)
+        .unwrap_or(upper.len());
+    let clause = &upper[ttl_at..clause_end];
+    // A TTL clause can list several expressions; take each DELETE (the default
+    // action) and report the shortest.
+    let mut best: Option<i64> = None;
+    for expr in clause.split(',') {
+        if expr.contains(" TO DISK") || expr.contains(" TO VOLUME") || expr.contains(" RECOMPRESS") {
+            continue;
+        }
+        if let Some(days) = interval_days(expr) {
+            best = Some(best.map_or(days, |b| b.min(days)));
+        }
+    }
+    best
+}
+
+fn find_ttl_clause(upper: &str) -> Option<usize> {
+    // The table-level TTL follows ORDER BY / PARTITION BY; column TTLs appear
+    // inside the column list. The last top-level " TTL " is the table TTL.
+    let mut found = None;
+    let mut depth = 0i32;
+    let bytes = upper.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'\'' => {
+                // Skip a string literal.
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if depth == 0 && upper[i..].starts_with(" TTL ") {
+                    found = Some(i + 5);
+                }
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+fn interval_days(expr: &str) -> Option<i64> {
+    let number_after = |s: &str, prefix: &str| -> Option<i64> {
+        let at = s.find(prefix)? + prefix.len();
+        let digits: String = s[at..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    };
+    if let Some(n) = number_after(expr, "TOINTERVALDAY(") {
+        return Some(n);
+    }
+    if let Some(n) = number_after(expr, "TOINTERVALMONTH(") {
+        return Some(n * 30);
+    }
+    if let Some(n) = number_after(expr, "TOINTERVALYEAR(") {
+        return Some(n * 365);
+    }
+    if let Some(at) = expr.find("INTERVAL ") {
+        let rest = &expr[at + 9..];
+        let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+        let n: i64 = digits.parse().ok()?;
+        let unit = rest.trim_start()[digits.len()..].trim_start();
+        return if unit.starts_with("DAY") {
+            Some(n)
+        } else if unit.starts_with("MONTH") {
+            Some(n * 30)
+        } else if unit.starts_with("YEAR") {
+            Some(n * 365)
+        } else {
+            None
+        };
+    }
+    None
+}
+
+/// Who set the event retention last (`system_settings`, NAN-5449).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClickHouseRetentionRecord {
+    pub days: Option<u32>,
+    pub source: Option<String>,
+    pub env_applied: Option<u32>,
+}
+
+/// What the migrator did with `NANO_RETENTION_DAYS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentRetentionOutcome {
+    /// Unset: the deployment does not manage retention.
+    NotConfigured,
+    /// Same value as the last apply: a UI change since then is kept.
+    Unchanged(u32),
+    /// Applied to the ClickHouse TTL and recorded.
+    Applied(u32),
+}
+
+/// Whether the migrator should apply `env_days`. Only a value that differs
+/// from the one it last applied: editing `.env` (or Helm values) is an
+/// explicit operator action and wins, while a plain restart keeps a value
+/// set in Settings -> Storage since then.
+pub fn deployment_retention_needs_apply(env_days: u32, record: &ClickHouseRetentionRecord) -> bool {
+    record.env_applied != Some(env_days)
+}
+
+/// Read the retention record. Missing row or columns read as empty.
+pub async fn read_clickhouse_retention_record(
+    pool: &PgPool,
+) -> Result<ClickHouseRetentionRecord, RetentionError> {
+    let row = sqlx::query_as::<_, (Option<i32>, Option<String>, Option<i32>)>(
+        r#"
+        SELECT clickhouse_retention_days, clickhouse_retention_source,
+               clickhouse_retention_env_applied
+        FROM system_settings
+        WHERE id = 'default'
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some((days, source, env_applied)) => ClickHouseRetentionRecord {
+            days: days.and_then(|d| u32::try_from(d).ok()),
+            source,
+            env_applied: env_applied.and_then(|d| u32::try_from(d).ok()),
+        },
+        None => ClickHouseRetentionRecord::default(),
+    })
+}
+
+/// Record a retention value set in Settings -> Storage (or the API).
+pub async fn record_ui_clickhouse_retention(pool: &PgPool, days: u32) -> Result<(), RetentionError> {
+    sqlx::query(
+        r#"
+        UPDATE system_settings
+        SET clickhouse_retention_days = $1,
+            clickhouse_retention_source = 'ui',
+            updated_at = NOW()
+        WHERE id = 'default'
+        "#,
+    )
+    .bind(days as i32)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// NAN-5449: apply `NANO_RETENTION_DAYS` to the ClickHouse TTL (migrator).
+/// `client` must be allowed to ALTER the event tables (the admin client).
+pub async fn apply_deployment_retention(
+    pool: &PgPool,
+    client: &ClickHouseClient,
+    env_days: Option<u32>,
+) -> Result<DeploymentRetentionOutcome, RetentionError> {
+    let Some(days) = env_days else {
+        return Ok(DeploymentRetentionOutcome::NotConfigured);
+    };
+    let record = read_clickhouse_retention_record(pool).await?;
+    if !deployment_retention_needs_apply(days, &record) {
+        return Ok(DeploymentRetentionOutcome::Unchanged(days));
+    }
+    ClickHouseStorageService::new(client.clone())
+        .update_retention(days)
+        .await?;
+    sqlx::query(
+        r#"
+        UPDATE system_settings
+        SET clickhouse_retention_days = $1,
+            clickhouse_retention_source = 'deployment',
+            clickhouse_retention_env_applied = $1,
+            updated_at = NOW()
+        WHERE id = 'default'
+        "#,
+    )
+    .bind(days as i32)
+    .execute(pool)
+    .await?;
+    Ok(DeploymentRetentionOutcome::Applied(days))
 }
 
 /// Database predicate for `system.parts` reads. `currentDatabase()` is unsafe
@@ -88,6 +334,36 @@ pub enum RetentionError {
     Config(String),
     #[error("ClickHouse error: {0}")]
     ClickHouse(String),
+    /// NAN-5450: ClickHouse refused the work for lack of disk space
+    /// (NOT_ENOUGH_SPACE, 243). The message says what to do.
+    #[error("ClickHouse disk full: {0}")]
+    DiskFull(String),
+}
+
+/// NAN-5450: "Run retention now" refuses below this much ClickHouse free
+/// space (above `keep_free_space_bytes`).
+pub(crate) const RETENTION_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// NAN-5450: a ClickHouse error caused by a full disk: NOT_ENOUGH_SPACE (243),
+/// `Cannot reserve N MiB`, or ENOSPC surfacing as a write error.
+pub(crate) fn is_disk_full_error(message: &str) -> bool {
+    message.contains("NOT_ENOUGH_SPACE")
+        || message.contains("Code: 243")
+        || message.contains("Cannot reserve")
+        || message.contains("No space left on device")
+}
+
+/// The [`RetentionError`] for a failed retention statement on `table`.
+pub(crate) fn retention_ch_error(table: &str, message: String) -> RetentionError {
+    if is_disk_full_error(&message) {
+        RetentionError::DiskFull(format!(
+            "ClickHouse has no free space to run retention on {table}. Free space first: see \
+             docs/administration/disk-full-recovery.md (lower keep_free_space_bytes, SYSTEM RELOAD \
+             CONFIG, drop the oldest partitions, restore the reserve)."
+        ))
+    } else {
+        RetentionError::ClickHouse(format!("{table}: {message}"))
+    }
 }
 
 /// Retention policy configuration
@@ -151,8 +427,14 @@ pub struct ClickHouseStorageStats {
     pub compression_ratio: f64,
     /// Uncompressed size in bytes
     pub uncompressed_size_bytes: u64,
-    /// TTL retention days (from table settings)
+    /// The event table's DELETE TTL in days, read from its DDL
+    /// (`system.tables.create_table_query`). `None` when it cannot be read.
     pub ttl_days: Option<u32>,
+    /// Who set the retention last: `deployment` (`NANO_RETENTION_DAYS`),
+    /// `ui`, or `None` (the shipped default).
+    pub retention_source: Option<String>,
+    /// The `NANO_RETENTION_DAYS` value the migrator last applied.
+    pub deployment_retention_days: Option<u32>,
 }
 
 /// Service for managing data retention
@@ -163,6 +445,10 @@ pub struct RetentionService {
 impl RetentionService {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Get current retention configuration
@@ -370,28 +656,24 @@ impl ClickHouseStorageService {
 
     /// Get ClickHouse storage statistics for the logs table
     pub async fn get_storage_stats(&self) -> Result<ClickHouseStorageStats, RetentionError> {
-        // First check if logs table exists
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct TableExists {
-            exists: u8,
-        }
-
-        let table_check: TableExists = self
+        // Whether the active event table (ocsf_logs under OCSF) exists. Its
+        // TTL is read below (`active_table_ttl_days`, NAN-5385 / NAN-5445).
+        let engine: Option<String> = self
             .client
             .query(
                 r#"
-                SELECT count() > 0 as exists
+                SELECT name
                 FROM system.tables
-                WHERE database = currentDatabase() AND name = 'logs'
+                WHERE database = currentDatabase() AND name = ?
             "#,
             )
-            .fetch_one()
+            .bind(crate::schema::active_logs_table())
+            .fetch_optional()
             .await
             .map_err(|e| {
                 RetentionError::ClickHouse(format!("Failed to check table existence: {}", e))
             })?;
-
-        if table_check.exists == 0 {
+        if engine.is_none() {
             // Return empty stats if logs table doesn't exist
             return Ok(ClickHouseStorageStats {
                 total_size_bytes: 0,
@@ -403,7 +685,9 @@ impl ClickHouseStorageService {
                 newest_log: None,
                 compression_ratio: 1.0,
                 uncompressed_size_bytes: 0,
-                ttl_days: Some(90),
+                ttl_days: None,
+                retention_source: None,
+                deployment_retention_days: None,
             });
         }
 
@@ -563,8 +847,31 @@ impl ClickHouseStorageService {
             newest_log,
             compression_ratio,
             uncompressed_size_bytes: uncompressed_bytes,
-            ttl_days: Some(90), // Default from init.sql
+            // NAN-5385 / NAN-5445: the real DELETE TTL of the active event
+            // table, not a hard-coded 90.
+            ttl_days: self.active_table_ttl_days().await,
+            retention_source: None,
+            deployment_retention_days: None,
         })
+    }
+
+    /// DELETE TTL in days of the active event table, read from its DDL.
+    async fn active_table_ttl_days(&self) -> Option<u32> {
+        let table = crate::schema::active_logs_table();
+        let local = format!("{table}_local");
+        self.client
+            .query(
+                "SELECT create_table_query FROM system.tables WHERE database = currentDatabase() \
+                 AND name IN (?, ?) ORDER BY name = ? DESC LIMIT 1",
+            )
+            .bind(table)
+            .bind(local.as_str())
+            .bind(local.as_str())
+            .fetch_optional::<String>()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|q| crate::settings::clickhouse_ttl::delete_ttl_days(&q))
     }
 
     /// Update ClickHouse TTL retention period
@@ -586,6 +893,28 @@ impl ClickHouseStorageService {
         Ok(())
     }
 
+    /// Free bytes above `keep_free_space_bytes` on the connected node's
+    /// ClickHouse data disk (its largest Local disk, as disk pressure picks).
+    /// A failed read (a role without access to `system.disks`) does not block
+    /// retention: it answers "unknown" as `u64::MAX` and the run goes ahead.
+    async fn min_data_disk_free(&self) -> Result<u64, RetentionError> {
+        match self
+            .client
+            .query(
+                "SELECT free_space FROM system.disks WHERE type = 'Local' AND total_space > 0 \
+                 ORDER BY total_space DESC LIMIT 1",
+            )
+            .fetch_optional::<u64>()
+            .await
+        {
+            Ok(free) => Ok(free.unwrap_or(u64::MAX)),
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not read ClickHouse free space before retention; running it anyway");
+                Ok(u64::MAX)
+            }
+        }
+    }
+
     /// Force materialize TTL (delete expired data now)
     pub async fn run_retention_now(&self) -> Result<u64, RetentionError> {
         // Get row count before
@@ -597,7 +926,7 @@ impl ClickHouseStorageService {
         // NAN-1241: force TTL on the active ingested-events table (ocsf_logs
         // under OCSF — where the retention-relevant bulk data lives). UDM-identical.
         // NAN-1728 H1: before/after counts read the `_distributed` wrapper so
-        // they see all shards; MATERIALIZE TTL / OPTIMIZE FINAL run on the LOCAL
+        // they see all shards; MATERIALIZE TTL runs on the LOCAL
         // MergeTree with `ON CLUSTER` fanning them out to every shard (empty
         // clause on single-node → byte-identical).
         let local_logs_table = crate::schema::active_logs_table();
@@ -610,23 +939,38 @@ impl ClickHouseStorageService {
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
 
-        // Force TTL materialization
+        // NAN-5450: refuse up front when ClickHouse has no room. Probed on
+        // clickhouse-server 26.10.4.207 with a full disk: MATERIALIZE TTL is
+        // accepted, then its mutation waits for space forever (with
+        // mutations_sync the call hangs; without, a stuck mutation is left
+        // queued ahead of every later one), and OPTIMIZE FINAL returns
+        // success having done nothing.
+        let free = self.min_data_disk_free().await?;
+        if free < RETENTION_MIN_FREE_BYTES {
+            return Err(RetentionError::DiskFull(format!(
+                "ClickHouse has {} free above its reserve, too little to run retention. Free space \
+                 first: see docs/administration/disk-full-recovery.md (lower keep_free_space_bytes, \
+                 SYSTEM RELOAD CONFIG, drop the oldest partitions, restore the reserve).",
+                format_bytes(free)
+            )));
+        }
+
+        // NAN-5450: MATERIALIZE TTL only. With `ttl_only_drop_parts = 1`
+        // (server default, clickhouse/config.d/mergetree.xml) expired parts
+        // are dropped whole, which frees space without a merge. The old
+        // `OPTIMIZE ... FINAL` that followed rewrote the whole table: heavy on
+        // a healthy disk and refused (silently, as far as the caller could
+        // tell) on a full one, where it needs room for a merged copy.
+        // `mutations_sync = 1` waits for this replica's mutation so the
+        // returned count reflects the drop (the handler bounds the wait).
         self.client
             .query(&format!(
                 "ALTER TABLE {local_logs_table}{on_cluster} MATERIALIZE TTL"
             ))
+            .with_setting("mutations_sync", "1")
             .execute()
             .await
-            .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
-
-        // Optimize to merge parts and actually delete data
-        self.client
-            .query(&format!(
-                "OPTIMIZE TABLE {local_logs_table}{on_cluster} FINAL"
-            ))
-            .execute()
-            .await
-            .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
+            .map_err(|e| retention_ch_error(local_logs_table, e.to_string()))?;
 
         // Get row count after
         let after: RowCount = self
@@ -645,7 +989,7 @@ impl ClickHouseStorageService {
                 .query(&format!("ALTER TABLE {table}{on_cluster} MATERIALIZE TTL"))
                 .execute()
                 .await
-                .map_err(|e| RetentionError::ClickHouse(format!("{table}: {e}")))?;
+                .map_err(|e| retention_ch_error(table, e.to_string()))?;
         }
 
         Ok(before.count.saturating_sub(after.count))
@@ -675,3 +1019,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 #[path = "retention_tables_tests.rs"]
 mod retention_tables_tests;
+
+#[cfg(test)]
+#[path = "retention_disk_full_tests.rs"]
+mod retention_disk_full_tests;

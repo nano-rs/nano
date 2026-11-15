@@ -482,7 +482,7 @@ mod tests {
             "mitre_techniques",
             "mitre_tactics",
         ] {
-            sqlx::query(&format!("DELETE FROM {table}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                 .execute(&mut *transaction)
                 .await
                 .unwrap();

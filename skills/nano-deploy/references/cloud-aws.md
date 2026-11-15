@@ -140,14 +140,19 @@ groups.
 Two buckets, both in the deployment region, Block Public Access on, default
 encryption on, versioning on:
 
-- `<name>-cold`: ClickHouse cold tier. Configure it after install in
-  **Settings → Storage & Retention** (endpoint `https://s3.<region>.amazonaws.com`).
-  Today moves are free-space driven; TTL-driven moves are planned.
+- `<name>-cold`: ClickHouse cold tier. Enable it at install: `NANO_TIERING=on
+  NANO_TIERING_PROVIDER=s3 NANO_TIERING_BUCKET=<name>-cold NANO_TIERING_REGION=<region>`
+  plus the access key in `NANO_TIERING_ACCESS_KEY_ID` / `NANO_TIERING_SECRET_ACCESS_KEY`
+  (single host), or the inventory `tiering:` block (`plan.py --tiering-provider s3
+  ...`) with the keys in the shared `.env` (role-split). On EC2 with an instance
+  role, `NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS=true` and metadata hop limit 2.
+  Moves are free-space driven (move_factor 0.3). See
+  [operate.md](operate.md#storage-tiering).
 - `<name>-backup`: `scripts/nano backup` / the automatic backup service
   (`NANO_BACKUP_DESTINATION=s3`). Backups hold metadata by default, not event
   data. Add a lifecycle rule for old noncurrent versions.
 
-nano's S3 clients take an access key, not an instance role. Create **one IAM
+nano's backup S3 client takes an access key, not an instance role. Create **one IAM
 user per bucket** with only this policy (replace `<bucket>`), and have the
 operator create the access key and enter it in nano themselves:
 

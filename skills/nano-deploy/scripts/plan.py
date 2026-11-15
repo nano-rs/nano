@@ -818,8 +818,6 @@ def tuning(load, ch, ing, nodes, schema) -> tuple[dict, list[dict]]:
          True, "nano-measured: acks off today; a 200 means 'in Vector's disk buffer'"),
         ("Vector role split (N readers per host)", f"~{VECTOR_HOST_EPS_ROLE_SPLIT_REF // int(NANO_VECTOR_PIPELINE_FACTOR)} ev/s per 32-vCPU host after the split",
          "Vector role split", not ing["colocated"] and ingest_hosts > 4, "MEASURED-external: 9 readers ~50k ev/s per 32-vCPU VM"),
-        ("TTL-driven tiering (TO VOLUME cold)", f"move after {ch['hot_days']} d", "TTL tiering", ch["cold_days"] > 0,
-         "nano-measured config: today tiering is free-space driven (move_factor 0.3)"),
     ]
     for setting, value, topic, applies, source in pending:
         if applies:
@@ -1322,6 +1320,94 @@ def host_id(cluster: str, name: str) -> str:
     return hid
 
 
+# --- Storage tiering (NAN-5445) --------------------------------------------------------
+TIER_PROVIDERS = ("s3", "s3-compatible", "gcs", "azure")
+TIER_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
+TIER_SIMPLE_RE = re.compile(r"^[A-Za-z0-9._:/\[\]-]{1,256}$")
+TIER_MOVE_RE = re.compile(r"^(?:0|1)(?:\.[0-9]{1,3})?$")
+
+
+def tiering_plan(a: argparse.Namespace) -> dict | None:
+    """The inventory `tiering:` block and single-host .env keys for the cold tier.
+
+    Never takes or prints a secret: it names the env vars the operator sets in
+    the shared .env. scripts/lib/clickhouse_tiering.py does the full
+    validation when install.sh renders it."""
+    if a.tiering_provider is None:
+        return None
+    provider = a.tiering_provider
+    block: dict[str, str] = {"provider": provider}
+    if provider == "azure":
+        need = {"--tiering-azure-account-url": a.tiering_azure_account_url,
+                "--tiering-azure-container": a.tiering_azure_container,
+                "--tiering-azure-account-name": a.tiering_azure_account_name}
+        missing = [flag for flag, value in need.items() if not value]
+        if missing:
+            raise PlanError(f"--tiering-provider azure needs {', '.join(missing)}")
+        block |= {"azure_account_url": a.tiering_azure_account_url, "azure_container": a.tiering_azure_container,
+                  "azure_account_name": a.tiering_azure_account_name}
+        secrets = ["NANO_TIERING_AZURE_ACCOUNT_KEY"]
+        if a.tiering_use_environment_credentials:
+            raise PlanError("--tiering-use-environment-credentials applies to s3 and gcs only")
+    else:
+        if not a.tiering_bucket or not TIER_BUCKET_RE.match(a.tiering_bucket):
+            raise PlanError(f"--tiering-provider {provider} needs a valid --tiering-bucket")
+        block["bucket"] = a.tiering_bucket
+        if provider == "s3" and not a.tiering_region:
+            raise PlanError("--tiering-provider s3 needs --tiering-region")
+        if provider == "s3-compatible" and not a.tiering_endpoint:
+            raise PlanError("--tiering-provider s3-compatible needs --tiering-endpoint (https://host[:port])")
+        if a.tiering_use_environment_credentials and provider == "s3-compatible":
+            raise PlanError("--tiering-use-environment-credentials applies to s3 and gcs only")
+        if a.tiering_region:
+            block["region"] = a.tiering_region
+        if a.tiering_endpoint:
+            block["endpoint"] = a.tiering_endpoint
+        if a.tiering_use_environment_credentials:
+            block["use_environment_credentials"] = "true"
+            secrets = []
+        else:
+            secrets = ["NANO_TIERING_ACCESS_KEY_ID", "NANO_TIERING_SECRET_ACCESS_KEY"]
+    if not TIER_MOVE_RE.match(a.tiering_move_factor) or float(a.tiering_move_factor) > 1:
+        raise PlanError("--tiering-move-factor must be a number from 0 to 1")
+    block["prefix"] = a.tiering_prefix
+    block["move_factor"] = a.tiering_move_factor
+    block["cache_size"] = a.tiering_cache_size
+    for key, value in block.items():
+        if not TIER_SIMPLE_RE.match(value):
+            raise PlanError(f"tiering {key} contains characters the renderer refuses")
+    env = {"NANO_TIERING": "on"} | {f"NANO_TIERING_{k.upper()}": v for k, v in block.items()}
+    # install.sh flags for an unattended single-host install (enterprise).
+    # Secrets are never flags: the operator puts secret_env in the host's
+    # environment (or answers the hidden prompt).
+    flags = ["--tiering", provider]
+    for key, value in block.items():
+        if key == "provider":
+            continue
+        if key == "use_environment_credentials":
+            flags.append("--tiering-use-environment-credentials")
+            continue
+        flags += [f"--tiering-{key.replace('_', '-')}", value]
+    return {
+        "edition": "enterprise",
+        "inventory_block": block,
+        "single_host_env": env,
+        "install_flags": flags,
+        "secret_env": secrets,
+        "notes": [
+            "role-split: the inventory tiering: block holds only these non-secret fields; put "
+            + (", ".join(secrets) if secrets else "no secret (environment credentials)")
+            + " in the shared .env on the app host before the first install.sh run, then copy that .env to every host",
+            "enterprise edition only: the open edition refuses NANO_TIERING=on",
+            "single host: run install.sh with install_flags and the secrets in the environment (or let the "
+            "interactive install ask 'Enable cold storage tiering? [y/N]'), or run scripts/nano tiering "
+            "configure after install",
+            "each ClickHouse host writes under <prefix>/<host name>/; moves start at "
+            f"{(1 - float(a.tiering_move_factor)) * 100:.0f} % local disk use (move_factor {a.tiering_move_factor})",
+        ],
+    }
+
+
 def render_inventory(plan: dict, a: argparse.Namespace, schema_name: str) -> str:
     schema = schema_for(schema_name)
     for label, value in (("cluster-name", a.cluster_name), ("deployment-id", a.deployment_id)):
@@ -1355,6 +1441,10 @@ def render_inventory(plan: dict, a: argparse.Namespace, schema_name: str) -> str
             raise PlanError("--ingest-lb-address needs a cloud plan (its trusted CIDR is the planned LB subnet)")
         lines += ["load_balancer:", "  ingest_endpoint:", f"    address: {a.ingest_lb_address}",
                   f"    tls_name: {a.ingest_lb_tls_name}", f"    trusted_cidr: {plan['network']['lb_supernet']}"]
+    if plan.get("tiering"):
+        lines += ["# Storage tiering (cold tier). Secrets (" + (", ".join(plan["tiering"]["secret_env"]) or "none")
+                  + ") go in the shared .env, never here.", "tiering:"]
+        lines += [f"  {k}: {v}" for k, v in plan["tiering"]["inventory_block"].items()]
     lines.append("hosts:")
     skipped = []
     seen_app = seen_pg = False
@@ -1982,11 +2072,17 @@ def make_plan(a: argparse.Namespace, cat: dict | None = None) -> dict:
     if load["sized_tb_per_day"] >= 15:
         warnings.append("at 15-20+ TB/day Vector is the first bottleneck; plan the Vector role split with nano before go-live")
     if ch["cold_days"] > 0:
-        warnings.append(f"hot data stays {ch['hot_days']} d on local disk; {ch['cold_days']} d live in object storage "
-                        "(configure tiering in Settings -> Storage & Retention after install; TTL-driven moves are planned)")
+        warnings.append(f"local ClickHouse disk is sized for about {ch['hot_days']} d of data; the other {ch['cold_days']} d "
+                        "live in object storage. There is no age-based window: parts move when local free space falls "
+                        "below move_factor "
+                        "(enable tiering at install with --tiering-provider, which writes the inventory tiering: block, "
+                        "or later with the inventory block and install.sh; default move_factor 0.3 = moves start at 70 % disk use)")
+        if a.tiering_provider is None:
+            warnings.append("no --tiering-provider given: without tiering every retained day must fit the local "
+                            "ClickHouse disks")
     if not hosts_mode and ch["cold_days"] > 0 and not cat["clouds"][a.cloud]["object_storage"].get("s3_compatible", True):
-        warnings.append("the cold tier needs an S3-compatible store and Azure Blob has no S3 API: run RustFS on Azure "
-                        "managed disks or use an external S3-compatible store (the cold-tier price is a Blob placeholder), "
+        warnings.append("Azure Blob has no S3 API; nano tiers to it natively (--tiering-provider azure with "
+                        "--tiering-azure-account-url/--tiering-azure-container/--tiering-azure-account-name), "
                         "or keep all retention local with --hot-days " + str(a.retention_days))
     if ch.get("local_nvme"):
         warnings.append("ClickHouse uses local NVMe: it is wiped when a VM stops or is replaced; the other replica re-seeds it. "
@@ -2064,6 +2160,9 @@ def make_plan(a: argparse.Namespace, cat: dict | None = None) -> dict:
         "warnings": warnings,
         "lab": lab,
     }
+    tier = tiering_plan(a)
+    if tier is not None:
+        plan["tiering"] = tier
     plan["cost"] = None if hosts_mode else cost_estimate(cat, a, load, ch, nodes)
     if plan["cost"] and a.budget_usd_month and plan["cost"]["low_usd_month"] > a.budget_usd_month:
         plan["warnings"].append(
@@ -2157,6 +2256,13 @@ def print_text(p: dict) -> None:
         for u in c["unverified"]:
             print(f"  unverified: {u}")
         print(f"  excludes {c['excludes']}")
+    if p.get("tiering"):
+        print()
+        print("Storage tiering (inventory tiering: block):")
+        for k, v in p["tiering"]["inventory_block"].items():
+            print(f"  {k}: {v}")
+        print("  secrets to set in the shared .env: " + (", ".join(p["tiering"]["secret_env"]) or "none"))
+        print("  single host (enterprise): install.sh " + " ".join(p["tiering"]["install_flags"]))
     print_warnings(p)
     if p.get("lab"):
         print()
@@ -2272,6 +2378,19 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--lab", "--allow-undersized", dest="lab", action="store_true",
                    help="with --hosts: plan hosts that miss the production sizing anyway, for evaluation and test "
                    "clusters only; the plan, inventory and firewall script are labelled NOT FOR PRODUCTION")
+    p.add_argument("--tiering-provider", choices=TIER_PROVIDERS,
+                   help="enable ClickHouse cold-tier object storage (NAN-5445): writes the inventory tiering: block")
+    p.add_argument("--tiering-bucket")
+    p.add_argument("--tiering-region")
+    p.add_argument("--tiering-endpoint", help="https://host[:port]; required for s3-compatible")
+    p.add_argument("--tiering-prefix", default="nano")
+    p.add_argument("--tiering-move-factor", default="0.3", help="free-space fraction that starts moves; 0 pauses")
+    p.add_argument("--tiering-cache-size", default="10Gi")
+    p.add_argument("--tiering-use-environment-credentials", action="store_true",
+                   help="s3: EC2 instance role; gcs: GCE VM service account (no keys in .env)")
+    p.add_argument("--tiering-azure-account-url")
+    p.add_argument("--tiering-azure-container")
+    p.add_argument("--tiering-azure-account-name")
     p.add_argument("--json", action="store_true")
     p.add_argument("--nodes-tsv", action="store_true",
                    help="print one tab-separated line per VM (for the cloud CLI loops) and exit")

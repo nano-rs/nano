@@ -85,6 +85,7 @@ pub use nanosiem_enterprise::handlers::integration_generation;
 pub mod backup_status;
 pub mod credential_keys;
 pub mod ingest_tokens;
+pub mod inputlookup_allowlist;
 pub mod ip_allowlist;
 #[cfg(feature = "enterprise")]
 pub mod license;

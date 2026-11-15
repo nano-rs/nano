@@ -176,6 +176,8 @@ pub async fn run_health_check_with_trigger(
     analyzer::ensure_reserved_source_name_findings(&mut analysis, &metrics);
     // NAN-5342: one shard taking more writes / parts / merges than the rest.
     analyzer::ensure_shard_skew_findings(&mut analysis, &metrics);
+    // NAN-5450: ClickHouse, PostgreSQL or Vector buffer volume at 80 / 90 %.
+    super::disk_findings::ensure_disk_findings(&mut analysis, &metrics);
     // Security review 2026-11-08: insecure-but-accepted deployment settings.
     analyzer::ensure_deployment_posture_findings(
         &mut analysis,
@@ -199,6 +201,11 @@ pub async fn run_health_check_with_trigger(
         }
     };
     super::clickhouse_refusals::ensure_clickhouse_refusal_findings(&mut analysis, &refusals);
+    // NAN-5431: events Vector discarded after ingest accepted them.
+    match super::pipeline_drops::pipeline_drops(ch_client, is_clustered).await {
+        Ok(rows) => super::pipeline_drops::ensure_pipeline_drop_findings(&mut analysis, &rows),
+        Err(e) => warn!("Failed to read Vector drop reports: {}", e),
+    }
     // NAN-5204: automatic backups enabled but none succeeded in 36 hours.
     match crate::backup_status::BackupStatusRepository::new(pool.clone()).get().await {
         Ok(status) => {

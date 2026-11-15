@@ -158,3 +158,44 @@ async fn stored_plans_validate_in_the_worker_like_validate_vrl() {
         assert_eq!(row.error, expected);
     }
 }
+
+/// NAN-5401: the save / publish / deploy / attestation validation
+/// (`validate_vrl_bounded`, deploy-gate budget) and the AI-loop validation
+/// (`validate_vrl_interactive`, `validate_vrl_collect_errors_interactive`,
+/// interactive budget) go through the real worker and answer exactly what
+/// in-process validation answers, stored plans included.
+#[tokio::test]
+async fn bounded_validation_through_the_worker_matches_in_process() {
+    use serde_json::json;
+    let _serial = SERIAL.lock().await;
+    let validator = validator();
+    let advanced_ok = stored_plan(&[("vrl", json!({"code": ".parsed = upcase!(.message)"}))]);
+    let metadata_write = stored_plan(&[("vrl", json!({"code": "%source_type = \"spoofed\""}))]);
+    for source in [
+        ".parsed = upcase!(.message)",
+        ".timestamp = now()\n.message = .message",
+        COMPILE_ERROR,
+        ".x = no_such_function_nan5401()\n.y = also_missing_nan5401()",
+        ".foo = { bar",
+        ".foo = exec('ls')",
+        "",
+        advanced_ok.as_str(),
+        metadata_write.as_str(),
+    ] {
+        assert_eq!(
+            validator.validate_vrl_bounded(source).await.unwrap(),
+            validator.validate_vrl(source).await.unwrap(),
+            "{source}"
+        );
+        assert_eq!(
+            validator.validate_vrl_interactive(source).await.unwrap(),
+            validator.validate_vrl(source).await.unwrap(),
+            "{source}"
+        );
+        assert_eq!(
+            validator.validate_vrl_collect_errors_interactive(source).await.unwrap(),
+            validator.validate_vrl_collect_errors(source).await.unwrap(),
+            "{source}"
+        );
+    }
+}

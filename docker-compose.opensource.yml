@@ -61,10 +61,18 @@ x-logging-verbose: &verbose-logging
 # check-in, OIDC and identity sync use the proxy. Clients whose destination a
 # user controls (lookup url=, AI provider base URLs, webhooks, scheduled
 # fetches, synthetic checks) never do: a proxy re-resolves the host and would
-# undo their SSRF pin.
+# undo their SSRF pin. They use DESTINATION_EGRESS_PROXY_URL instead when it
+# is set, which keeps the pin with a pinned-IP CONNECT (NAN-5441;
+# DESTINATION_EGRESS_PROXY_MODE=hostname lets the proxy enforce egress).
+# NANO_EGRESS_PROXY_REQUIRED=true refuses every direct public connection
+# (connectors, SOAR, the enrichment sandbox, user-set destinations): a path
+# with no proxy configured fails closed with a named error.
 x-nano-egress-env: &nano-egress-env
   HTTPS_PROXY:
   HTTP_PROXY:
+  NANO_EGRESS_PROXY_REQUIRED: ${NANO_EGRESS_PROXY_REQUIRED:-false}
+  DESTINATION_EGRESS_PROXY_URL:
+  DESTINATION_EGRESS_PROXY_MODE:
   NO_PROXY: "localhost,127.0.0.1,::1,postgres,clickhouse,clickhouse-proxy,dragonfly,vector,vector-tap,ingest-proxy,ingest-edge,app-internal-edge,nginx,nano-api,nano-search,nano-jobs,nano-web,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${NO_PROXY:+,${NO_PROXY}}"
   AIRGAP_MODE: ${AIRGAP_MODE:-}
   # BYO AI on a private address (docs/administration/direct-ai-endpoint.md).
@@ -219,6 +227,16 @@ services:
       # connect password can never diverge.
       CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+      # NAN-5445: object-store credentials for the tiering disk, resolved by
+      # from_env in config.d/zzz-nano-tiering.xml. ClickHouse only; empty
+      # (and unread) while tiering is off. NANO_TIERING_CONFIG_SHA256 is the
+      # rendered file's digest (install.sh): a changed tiering config changes
+      # this service's definition, so `up` recreates ClickHouse BEFORE the
+      # clickhouse-migrate run that switches the event tables to the policy.
+      NANO_TIERING_ACCESS_KEY_ID: ${NANO_TIERING_ACCESS_KEY_ID:-}
+      NANO_TIERING_SECRET_ACCESS_KEY: ${NANO_TIERING_SECRET_ACCESS_KEY:-}
+      NANO_TIERING_AZURE_ACCOUNT_KEY: ${NANO_TIERING_AZURE_ACCOUNT_KEY:-}
+      NANO_TIERING_CONFIG_SHA256: ${NANO_TIERING_CONFIG_SHA256:-}
     volumes:
       - nano-clickhouse-data:/var/lib/clickhouse
       - nano-clickhouse-logs:/var/log/clickhouse-server
@@ -233,6 +251,12 @@ services:
       # nanosiem_ingest). The checked-in fallback is empty, leaving the
       # loopback + private-range lists in users.d/nanosiem-users.xml.
       - ${NANO_CLICKHOUSE_NETWORKS_FILE:-./config/sizing-defaults/clickhouse-networks.xml}:/etc/clickhouse-server/users.d/zzzz-nano-networks.xml:ro
+      # NAN-5445: hot/cold storage tiering (policy nano_tiered) rendered by
+      # scripts/lib/clickhouse_tiering.py from the NANO_TIERING* keys in .env.
+      # The checked-in fallback is an empty <clickhouse/>; Docker needs the
+      # matching placeholder clickhouse/config.d/zzz-nano-tiering.xml as the
+      # bind target inside the read-only config.d mount.
+      - ${NANO_CLICKHOUSE_TIERING_FILE:-./config/sizing-defaults/clickhouse-tiering.xml}:/etc/clickhouse-server/config.d/zzz-nano-tiering.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -358,6 +382,11 @@ services:
       # it for a declared planned volume; empty means the shipped 10 minutes
       # (a no-op on untouched views, a reset after a larger tier).
       NANO_PREVALENCE_REFRESH_MINUTES: ${NANO_PREVALENCE_REFRESH_MINUTES:-}
+      # NAN-5449: event retention in days (the ClickHouse TTL), 1-3650. Empty
+      # leaves the TTL alone (365 days, or what Settings -> Storage set). The
+      # migrator applies it only when it changes, so a plain restart keeps a
+      # value set in the UI since.
+      NANO_RETENTION_DAYS: ${NANO_RETENTION_DAYS:-}
       # NAN-5359: per-server read caps of the Agent Lane `agentlane` profile.
       # Empty means the defaults (500M rows / 50 GiB); 0 is refused.
       NANO_AGENTLANE_MAX_ROWS_TO_READ: ${NANO_AGENTLANE_MAX_ROWS_TO_READ:-}
@@ -435,6 +464,9 @@ services:
       # bypass the connector's SSRF-pinned dialer.
       CONNECTOR_EGRESS_PROXY_URL:
       CONNECTOR_EGRESS_PROXY_MODE:
+      # NAN-5441: with this on and no CONNECTOR_EGRESS_PROXY_URL, the
+      # runner refuses every public connection instead of going direct.
+      NANO_EGRESS_PROXY_REQUIRED: ${NANO_EGRESS_PROXY_REQUIRED:-false}
       NANO_CONNECTOR_SECCOMP: prefer
       NANO_CONNECTOR_CGROUP: prefer
       RUST_LOG: ${RUST_LOG:-info}
@@ -690,6 +722,10 @@ services:
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
+      # NAN-5450: postgres and clickhouse data are named volumes on the same
+      # Docker filesystem here, so the disk check reports PostgreSQL usage as
+      # that filesystem's. The role-split compose turns it off.
+      NANO_POSTGRES_SHARES_CLICKHOUSE_DISK: "true"
       POSTGRES_DICT_HOST: postgres
       POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
@@ -718,6 +754,7 @@ services:
       # subdomains match). Unset = any public host, as before. Same value on
       # nano-api, nano-jobs and nano-search.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
+      INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config delivery — api writes here, vector reads from same volume.
       VECTOR_CONFIG_DIR: /app/config/vector
@@ -772,13 +809,25 @@ services:
       NANOSIEM_DATA_DIR: /app/data
       NRT_MAX_CONCURRENT_RULES: "50"
       NRT_PHASE_MAX_SECS: "300"
-      HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
-      WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
-      COLD_STORAGE_ENABLED: "false"
+      # NAN-5448: HOT_RETENTION_DAYS / WARM_RETENTION_DAYS / COLD_STORAGE_ENABLED
+      # are gone. Nothing read HOT_RETENTION_DAYS, and the cold-storage flag made
+      # jobs rewrite the 365-day delete TTL to WARM_RETENTION_DAYS. Tiering is
+      # the ClickHouse storage policy (NANO_TIERING*), retention is the table TTL.
       NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      # NAN-5446: disk-pressure thresholds (fractions of the ClickHouse disk).
+      # Ingestion pauses at DISK_PRESSURE_PAUSE_THRESHOLD (503 + Retry-After at
+      # the ingest edge) so Vector never fills the shared disk. Set in .env.
+      DISK_PRESSURE_CHECK_INTERVAL_SECS: ${DISK_PRESSURE_CHECK_INTERVAL_SECS:-60}
+      DISK_PRESSURE_HIGH_WATERMARK: ${DISK_PRESSURE_HIGH_WATERMARK:-0.80}
+      DISK_PRESSURE_LOW_WATERMARK: ${DISK_PRESSURE_LOW_WATERMARK:-0.70}
+      DISK_PRESSURE_CRITICAL_THRESHOLD: ${DISK_PRESSURE_CRITICAL_THRESHOLD:-0.90}
+      DISK_PRESSURE_EMERGENCY_THRESHOLD: ${DISK_PRESSURE_EMERGENCY_THRESHOLD:-0.95}
+      DISK_PRESSURE_PAUSE_INGESTION: ${DISK_PRESSURE_PAUSE_INGESTION:-true}
+      DISK_PRESSURE_PAUSE_THRESHOLD: ${DISK_PRESSURE_PAUSE_THRESHOLD:-0.92}
+      DISK_PRESSURE_MIN_RETENTION_DAYS: ${DISK_PRESSURE_MIN_RETENTION_DAYS:-}
       # Online license check-in (enterprise only; the open binary has no checker).
       # Empty on self-run installs, which use the C05 authority. Managed tenants
       # transitioned from the v0.1.x platform layout keep their .env tuple:
@@ -854,6 +903,10 @@ services:
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
+      # NAN-5450: postgres and clickhouse data are named volumes on the same
+      # Docker filesystem here, so the disk check reports PostgreSQL usage as
+      # that filesystem's. The role-split compose turns it off.
+      NANO_POSTGRES_SHARES_CLICKHOUSE_DISK: "true"
       POSTGRES_DICT_HOST: postgres
       POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
@@ -873,6 +926,7 @@ services:
       NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}
       # NAN-5436: scheduled rules run `inputlookup` here too; same value as nano-api.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
+      INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       VECTOR_RELOAD_ACK_TIMEOUT_SECS: ${VECTOR_RELOAD_ACK_TIMEOUT_SECS:-}
@@ -895,13 +949,25 @@ services:
       NANOSIEM_DATA_DIR: /app/data
       NRT_MAX_CONCURRENT_RULES: "50"
       NRT_PHASE_MAX_SECS: "300"
-      HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
-      WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
-      COLD_STORAGE_ENABLED: "false"
+      # NAN-5448: HOT_RETENTION_DAYS / WARM_RETENTION_DAYS / COLD_STORAGE_ENABLED
+      # are gone. Nothing read HOT_RETENTION_DAYS, and the cold-storage flag made
+      # jobs rewrite the 365-day delete TTL to WARM_RETENTION_DAYS. Tiering is
+      # the ClickHouse storage policy (NANO_TIERING*), retention is the table TTL.
       NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      # NAN-5446: disk-pressure thresholds (fractions of the ClickHouse disk).
+      # Ingestion pauses at DISK_PRESSURE_PAUSE_THRESHOLD (503 + Retry-After at
+      # the ingest edge) so Vector never fills the shared disk. Set in .env.
+      DISK_PRESSURE_CHECK_INTERVAL_SECS: ${DISK_PRESSURE_CHECK_INTERVAL_SECS:-60}
+      DISK_PRESSURE_HIGH_WATERMARK: ${DISK_PRESSURE_HIGH_WATERMARK:-0.80}
+      DISK_PRESSURE_LOW_WATERMARK: ${DISK_PRESSURE_LOW_WATERMARK:-0.70}
+      DISK_PRESSURE_CRITICAL_THRESHOLD: ${DISK_PRESSURE_CRITICAL_THRESHOLD:-0.90}
+      DISK_PRESSURE_EMERGENCY_THRESHOLD: ${DISK_PRESSURE_EMERGENCY_THRESHOLD:-0.95}
+      DISK_PRESSURE_PAUSE_INGESTION: ${DISK_PRESSURE_PAUSE_INGESTION:-true}
+      DISK_PRESSURE_PAUSE_THRESHOLD: ${DISK_PRESSURE_PAUSE_THRESHOLD:-0.92}
+      DISK_PRESSURE_MIN_RETENTION_DAYS: ${DISK_PRESSURE_MIN_RETENTION_DAYS:-}
       # Online license check-in; see nano-api. NANO_DEPLOYMENT_ID is set below.
       LICENSE_URL: ${LICENSE_URL:-}
       LICENSE_TOKEN: ${LICENSE_TOKEN:-${DEPLOYMENT_TOKEN:-}}
@@ -988,6 +1054,7 @@ services:
       # subdomains match). Unset = any public host, as before. Same value on
       # nano-api, nano-jobs and nano-search.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
+      INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
       REDIS_URL: redis://dragonfly:6379
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-}
@@ -1099,10 +1166,12 @@ services:
   # Requires Tenzir >= 6.6.0 (direct ocsf_logs_raw write). OCSF schema profile only.
   tenzir:
     profiles: ["tenzir"]
-    # Pinned to v6.6.0 — the first release whose to_clickhouse writes directly to
-    # ocsf_logs_raw (LowCardinality + DateTime64(TZ) + server-DEFAULT column omission).
+    # v6.6.0+ writes directly to ocsf_logs_raw (LowCardinality + DateTime64(TZ) +
+    # server-DEFAULT column omission). Since v6.20.0 to_clickhouse never creates
+    # tables: nano's ClickHouse migrations own ocsf_logs_raw (depends_on
+    # clickhouse-migrate below) and the pipeline writes with mode="append".
     # Tag kept for readability; the @sha256 is what `docker pull` enforces.
-    image: tenzir/tenzir:v6.6.0@sha256:315419b4c8290721eab2e28513565cca395115587be8f728537718f23ff76863
+    image: tenzir/tenzir:v6.22.0@sha256:bf8067a122f4b7144fbdb6d2f73fecf9cd98b2d4e35e9e47c67a23ce9b789e20
     container_name: nano-tenzir
     restart: unless-stopped
     logging: *default-logging
@@ -1261,7 +1330,7 @@ services:
 
   redis-exporter:
     profiles: ["monitoring"]
-    image: oliver006/redis_exporter:v1.96.0@sha256:3d57b9eb142a62ffc600063606a41cd471cd53d81bed10be5b56b3a8918f2c26
+    image: oliver006/redis_exporter:v1.97.0@sha256:f5f903fbe77571d455ede0453b084d6840bc62fc105efac001034421cab83b99
     container_name: nano-redis-exporter
     restart: unless-stopped
     logging: *default-logging

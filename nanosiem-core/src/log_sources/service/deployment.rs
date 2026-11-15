@@ -129,10 +129,14 @@ impl LogSourceService {
         } else {
             self.vrl_validator.as_ref()
         };
+        // NAN-5401: compiled in the bounded worker, waiting for a slot.
         let vrl_result = validator
-            .validate_vrl(vrl_to_validate)
+            .validate_vrl_bounded(vrl_to_validate)
             .await
-            .map_err(|e| LogSourceServiceError::VrlValidationFailed(e.to_string()))?;
+            .map_err(|e| match e {
+                crate::parsers::VrlValidatorError::Busy(message) => LogSourceServiceError::ValidationBusy(message),
+                other => LogSourceServiceError::VrlValidationFailed(other.to_string()),
+            })?;
 
         if !vrl_result.valid {
             let error_msg = vrl_result

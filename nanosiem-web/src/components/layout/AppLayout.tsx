@@ -66,6 +66,7 @@ import { DemoBanner } from '@/components/DemoBanner';
 import { LicenseBanner } from '@/components/LicenseBanner';
 import { UpdateAvailableBanner } from '@/components/UpdateAvailableBanner';
 import { BackupStatusBanner } from '@/components/BackupStatusBanner';
+import { DiskSpaceBanner } from '@/components/DiskSpaceBanner';
 import { CapacityWarningBanner } from '@/components/CapacityWarningBanner';
 import { AppBreadcrumbs, useCurrentPageTitle } from '@/components/layout/AppBreadcrumbs';
 import { useNotebookOptional } from '@/enterprise/contexts/NotebookContext';
@@ -1165,6 +1166,7 @@ function MainAppShell({ children }: AppLayoutProps) {
             {(() => {
               const mainContent = (
                 <main className="flex-1 flex flex-col min-w-0 overflow-x-hidden md:[overflow-x:clip]">
+                  <DiskSpaceBanner />
                   <LicenseBanner />
                   <UpdateAvailableBanner />
                   <BackupStatusBanner />

@@ -154,6 +154,37 @@ impl NotificationRepository {
         Ok(result.rows_affected() as i64)
     }
 
+    /// NAN-5450: retention for the bell. Deletes read notifications older
+    /// than `read_days` and every notification older than `any_days`, in
+    /// batches of `batch` rows so a first run on a large table never holds one
+    /// long transaction. Returns the rows deleted.
+    pub async fn prune(&self, read_days: i64, any_days: i64, batch: i64) -> Result<i64, NotificationError> {
+        let mut total = 0i64;
+        loop {
+            let deleted = sqlx::query(
+                r#"
+                DELETE FROM notifications
+                WHERE ctid IN (
+                    SELECT ctid FROM notifications
+                    WHERE (read_at IS NOT NULL AND created_at < NOW() - INTERVAL '1 day' * $1)
+                       OR created_at < NOW() - INTERVAL '1 day' * $2
+                    LIMIT $3
+                )
+                "#,
+            )
+            .bind(read_days)
+            .bind(any_days)
+            .bind(batch)
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as i64;
+            total += deleted;
+            if deleted < batch {
+                return Ok(total);
+            }
+        }
+    }
+
     /// Delete old notifications (for cleanup)
     pub async fn delete_old(&self, days: i64) -> Result<i64, NotificationError> {
         let result = sqlx::query(

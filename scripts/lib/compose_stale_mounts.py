@@ -11,6 +11,7 @@ old sizing, and the upgrade still reports success.
 
 Usage: compose_stale_mounts.py --root INSTALL_DIR CONTAINER_ID...
        compose_stale_mounts.py --root INSTALL_DIR --prune-overlay OVERLAY...
+       compose_stale_mounts.py --root INSTALL_DIR --guard-tenzir-pipeline CONTAINER
 
 For each container, every bind mount whose host source is a regular file under
 INSTALL_DIR (at most 4 MiB) is compared byte for byte with what the container
@@ -126,6 +127,94 @@ def stale_services(root: pathlib.Path, containers: list[str]) -> list[str]:
     return stale
 
 
+# NAN-5411: tenzir/pipeline.tql is the one shipped file install.sh tells
+# operators to edit (the bundled Tenzir node's pipeline). Extracting a release
+# package over the install directory replaces it, and the next `up -d` (a new
+# Tenzir image) or the stale-mount recreate above starts Tenzir on the shipped
+# file: the operator's pipeline would be gone without a word. Until the old
+# container is recreated it still reads the operator's file (the old inode),
+# so that is the last moment the edit can be recovered.
+TENZIR_PIPELINE = pathlib.PurePosixPath("tenzir/pipeline.tql")
+TENZIR_PIPELINE_DESTINATION = "/pipeline.tql"
+# sha256 of every tenzir/pipeline.tql nano has shipped (git log --
+# tenzir/pipeline.tql). A running pipeline with one of these digests is
+# unedited. Add the new digest whenever the file changes;
+# scripts/tests/test_compose_stale_mounts.py fails until it is listed.
+SHIPPED_TENZIR_PIPELINE_SHA256 = frozenset({
+    "e605ec3f513f1e3bec84019e6593506ee58e0e2f9b0c37da8312ce421cb8ae91",  # NAN-1604
+    "6cd7b4c53cdc67b3f26527b83d10b3120a6ceeee07871fc6b3fa04fd51942ed8",  # NAN-1788
+    "cc9fe93da3d216e627db38c43c4a4764dd582afb47ecf45e3e46897f38337ad1",  # NAN-1827
+    "352dc3f3716d7aa531878cea6a393c02a72c814f211edee04e9927eb412fa528",  # NAN-1839
+    "2edeb3f1d1aa002d180a0b9da388c45d995cf664af3ee413cc62915750ed4006",  # NAN-5345
+    "29478f154305574de8ec1087c109fdb7e6dba7cb89709f8f47748efd2d83721a",  # NAN-5352 (v2.0.26)
+    "1f1eee114524fbfa2289e80d274508b2e28380b15240d14f87c1d7d87907bb85",  # NAN-5411 (Tenzir 6.22)
+})
+
+
+class OperatorFileReplaced(Exception):
+    """The release package replaced an operator-edited file (message: what to do)."""
+
+
+def guard_tenzir_pipeline(root: pathlib.Path, container: str) -> str:
+    """Refuse to go on when the release package replaced an edited pipeline.
+
+    Compares what the running Tenzir `container` reads at /pipeline.tql with
+    <root>/tenzir/pipeline.tql. When they differ, the running one is not a
+    shipped version (the operator edited it) and the host file is a shipped
+    version (the package overwrote it), the running pipeline is saved to
+    tenzir/pipeline.tql.bak and OperatorFileReplaced is raised: once the
+    container is recreated the edit is gone. Re-running after that proceeds
+    (the .bak already holds exactly the running pipeline). Anything this
+    cannot prove (no such container, not running, unreadable) passes.
+    Returns a one-line status."""
+    host_path = root / TENZIR_PIPELINE
+    try:
+        host = host_path.read_bytes()
+    except OSError:
+        return "no tenzir/pipeline.tql in the install directory"
+    state, running = read_container_file(container, TENZIR_PIPELINE_DESTINATION)
+    if state != "ok":
+        return f"{container} is not running or its pipeline cannot be read; nothing to compare"
+    if running == host:
+        return "the running Tenzir pipeline is the one in the install directory"
+    digest = hashlib.sha256(running).hexdigest()
+    if digest in SHIPPED_TENZIR_PIPELINE_SHA256:
+        return "the running Tenzir pipeline is an unedited shipped version; the new one applies"
+    if hashlib.sha256(host).hexdigest() not in SHIPPED_TENZIR_PIPELINE_SHA256:
+        return "tenzir/pipeline.tql was edited since Tenzir started; it applies on recreate"
+    # pipeline.tql.bak, or (when that holds something else) a digest-named one.
+    candidates = (
+        host_path.with_name(host_path.name + ".bak"),
+        host_path.with_name(f"{host_path.name}.bak.{digest[:12]}"),
+    )
+    for backup in candidates:
+        try:
+            if backup.is_file() and backup.read_bytes() == running:
+                return (
+                    f"WARNING: your edited Tenzir pipeline was replaced by the shipped one; "
+                    f"it is kept in {backup} (continuing with the shipped pipeline)"
+                )
+        except OSError:
+            pass
+    backup = candidates[1] if candidates[0].exists() else candidates[0]
+    # 0600: an operator pipeline can carry sink credentials (to_splunk hec_token, ...).
+    temporary = backup.with_name(f".{backup.name}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(running)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, backup)
+    raise OperatorFileReplaced(
+        f"The release package replaced your edited {TENZIR_PIPELINE} with the shipped "
+        f"pipeline, and recreating Tenzir would discard your version. It is saved to "
+        f"{backup}. Review it against the new {TENZIR_PIPELINE} (Tenzir 6.18 to 6.20 changes: "
+        "HTTPS hostname checks on to_http/to_splunk/..., client-certificate trust of "
+        "accept_*, the legacy executor is gone), then either copy your version back "
+        f"(cp {backup} {host_path}) or keep the shipped one, and re-run. A re-run "
+        "with the backup in place continues."
+    )
+
+
 CONTROL_DIR = ".nano-v2-control"
 TRANSITION_RECORD = ".nano-legacy-transition.json"
 SETTLED_TRANSITION_STATES = frozenset({"complete", "archived"})
@@ -215,9 +304,21 @@ def main(argv: list[str] | None = None) -> int:
         "--prune-overlay", type=pathlib.Path, action="append", default=[],
         help="drop control-copy config pins from this legacy-preserved overlay (see prune_control_pins)",
     )
+    parser.add_argument(
+        "--guard-tenzir-pipeline", metavar="CONTAINER",
+        help="refuse (exit 3) when the release package replaced an edited tenzir/pipeline.tql "
+        "that CONTAINER still runs; saves it to tenzir/pipeline.tql.bak (see guard_tenzir_pipeline)",
+    )
     parser.add_argument("containers", nargs="*")
     args = parser.parse_args(argv)
     root = args.root.resolve()
+    if args.guard_tenzir_pipeline:
+        try:
+            print(guard_tenzir_pipeline(root, args.guard_tenzir_pipeline), file=sys.stderr)
+        except OperatorFileReplaced as error:
+            print(str(error), file=sys.stderr)
+            return 3
+        return 0
     if args.prune_overlay:
         for overlay in args.prune_overlay:
             for entry in prune_control_pins(root, overlay if overlay.is_absolute() else root / overlay):

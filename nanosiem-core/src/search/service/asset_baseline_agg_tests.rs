@@ -194,7 +194,7 @@ mod live {
     /// coverage purely by choosing this timestamp — no more per-day filler.
     async fn set_active_since(ch: &clickhouse::Client, ts: DateTime<Utc>) {
         ch.query("ALTER TABLE nanosiem.baseline_agg_meta DELETE WHERE 1")
-            .with_option("mutations_sync", "2")
+            .with_setting("mutations_sync", "2")
             .execute()
             .await
             .expect("clear meta");
@@ -203,8 +203,8 @@ mod live {
              VALUES ('active_since', toDateTime64('{}', 6))",
             ts.format("%Y-%m-%d %H:%M:%S%.6f")
         ))
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .execute()
         .await
         .expect("set active_since");
@@ -219,7 +219,7 @@ mod live {
             from.format("%Y-%m-%d"),
             to.format("%Y-%m-%d"),
         ))
-        .with_option("mutations_sync", "2")
+        .with_setting("mutations_sync", "2")
         .execute()
         .await
         .expect("clear markers");
@@ -241,8 +241,8 @@ mod live {
             "INSERT INTO nanosiem.entity_dimension_day_agg_backfill_progress (lane, day) VALUES {}",
             values.join(", ")
         ))
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .execute()
         .await
         .expect("set markers");
@@ -515,8 +515,8 @@ mod live {
              VALUES ('{p}', 'nan1895_act', '{host}', 'realknown.exe', 'k')",
             p = ts(peer_ts)
         ))
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .execute()
         .await
         .expect("real peer insert");
@@ -528,8 +528,8 @@ mod live {
             d = d.format("%Y-%m-%d"),
             p = ts(peer_ts),
         ))
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .execute()
         .await
         .expect("phantom insert");
@@ -645,8 +645,8 @@ mod live {
              VALUES ('{p}', 'nan1895_race', '{host}', 'realknown.exe', 'k')",
             p = ts(peer_ts)
         ))
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .execute()
         .await
         .expect("real peer insert");
@@ -658,15 +658,15 @@ mod live {
             d = d.format("%Y-%m-%d"),
             p = ts(peer_ts),
         ))
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .execute()
         .await
         .expect("phantom insert");
 
         // Simulate the race: TWO rows, different active_since (no delete between).
         ch.query("ALTER TABLE nanosiem.baseline_agg_meta DELETE WHERE 1")
-            .with_option("mutations_sync", "2")
+            .with_setting("mutations_sync", "2")
             .execute()
             .await
             .expect("clear meta");
@@ -676,8 +676,8 @@ mod live {
             e = ts(early),
             l = ts(late),
         ))
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .execute()
         .await
         .expect("race insert");

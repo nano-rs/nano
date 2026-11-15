@@ -303,10 +303,10 @@ impl RepositoryApplier {
         if !exists {
             return Ok(0);
         }
-        let done = sqlx::query(&format!(
+        let done = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET last_synced_at = NULL WHERE enabled \
              AND btrim(url) ~* $1 AND COALESCE(NULLIF(btrim(branch), ''), 'main') = $2"
-        ))
+        )))
         .bind(repo_url_pattern(name))
         .bind(channel.branch)
         .execute(&self.pool)
@@ -426,6 +426,8 @@ impl FeedHttp for DevHttp {
         license: Option<&[u8]>,
     ) -> Result<crate::platform_enrichment::consumer::MetadataResponse, String> {
         use base64::Engine;
+        // NAN-5441: under "proxy required", no direct fallback.
+        crate::egress_proxy::require_env_proxy(url).map_err(|e| e.to_string())?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
@@ -450,6 +452,7 @@ impl FeedHttp for DevHttp {
         deployment_id: &str,
         token: &str,
     ) -> Result<crate::platform_enrichment::consumer::MetadataResponse, String> {
+        crate::egress_proxy::require_env_proxy(url).map_err(|e| e.to_string())?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
@@ -474,6 +477,7 @@ impl FeedHttp for DevHttp {
     async fn download(&self, url: &str, dest: &Path, cap: u64) -> Result<String, String> {
         use sha2::Digest;
         use std::os::unix::fs::OpenOptionsExt;
+        crate::egress_proxy::require_env_proxy(url).map_err(|e| e.to_string())?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(300))

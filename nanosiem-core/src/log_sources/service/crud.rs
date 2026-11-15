@@ -194,7 +194,10 @@ impl LogSourceService {
         );
 
         // Validate VRL and set validation status
-        let validation = self.validate_vrl(&log_source.parser_vrl).await;
+        let validation = match self.validate_vrl(&log_source.parser_vrl).await {
+            Ok(validation) => validation,
+            Err(busy) => return Err(self.mark_validation_pending(log_source.id, busy).await),
+        };
         let error_msg = if validation.valid {
             None
         } else {
@@ -219,19 +222,30 @@ impl LogSourceService {
         parser_vrl: &str,
         extension_enabled: bool,
         extension_vrl: Option<&str>,
-    ) -> Result<(), Vec<String>> {
+    ) -> Result<Result<(), Vec<String>>, LogSourceServiceError> {
         let stub = parser_vrl.trim().is_empty()
             && extension_enabled
             && extension_vrl.is_some_and(|v| !v.trim().is_empty());
         if kind == "enrichment" || stub {
-            return Ok(());
+            return Ok(Ok(()));
         }
-        let validation = self.validate_vrl(parser_vrl).await;
-        if validation.valid {
+        let validation = self.validate_vrl(parser_vrl).await?;
+        Ok(if validation.valid {
             Ok(())
         } else {
             Err(validation.errors)
+        })
+    }
+
+    /// NAN-5401: the source was written but no validation worker freed up in
+    /// time. Fail closed (not validated, so it cannot be enabled on a stale
+    /// verdict) with a message saying why, and return the retryable error.
+    async fn mark_validation_pending(&self, id: Uuid, busy: LogSourceServiceError) -> LogSourceServiceError {
+        let note = format!("Validation pending: {busy}");
+        if let Err(e) = self.repository().set_validation_status(id, false, Some(&note)).await {
+            tracing::warn!(log_source_id = %id, error = %e, "Could not mark the log source validation as pending");
         }
+        busy
     }
 
     /// Update a log source
@@ -292,7 +306,7 @@ impl LogSourceService {
                     update.extension_enabled.unwrap_or(current.extension_enabled);
                 let parser_ok = self
                     .parser_part_valid(&current.kind, parser_vrl, extension_enabled, extension_vrl)
-                    .await
+                    .await?
                     .is_ok();
                 if !parser_ok
                     || check_extension(extension_enabled, extension_vrl).is_err()
@@ -337,7 +351,7 @@ impl LogSourceService {
         let extension_changed =
             update.extension_vrl.is_some() || update.extension_enabled.is_some();
         if update.parser_vrl.is_some() || extension_changed {
-            let mut errors = self
+            let mut errors = match self
                 .parser_part_valid(
                     &log_source.kind,
                     &log_source.parser_vrl,
@@ -345,8 +359,10 @@ impl LogSourceService {
                     log_source.extension_vrl.as_deref(),
                 )
                 .await
-                .err()
-                .unwrap_or_default();
+            {
+                Ok(verdict) => verdict.err().unwrap_or_default(),
+                Err(busy) => return Err(self.mark_validation_pending(id, busy).await),
+            };
             if let Err(e) = check_extension(
                 log_source.extension_enabled,
                 log_source.extension_vrl.as_deref(),

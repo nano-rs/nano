@@ -335,26 +335,31 @@ groups:
 
   - name: nano_hosts
     rules:
+      # NAN-5450: warn at 80 % used and go critical at 90 %, the same
+      # thresholds as nano's own disk check (/health/detailed, SIEM Health).
+      # The Helm chart rewrites job="node" to monitoring.prometheusRule.
+      # nodeExporterSelector (kube-prometheus-stack labels it node-exporter).
       - alert: NanoDiskPressure
         expr: |
           (node_filesystem_avail_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}
-            / node_filesystem_size_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}) < 0.15
+            / node_filesystem_size_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}) < 0.20
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.mountpoint }} on {{ $labels.host }} has {{ $value | humanizePercentage }} free"
+          summary: "{{ $labels.mountpoint }} on {{ with $labels.host }}{{ . }}{{ else }}{{ $labels.instance }}{{ end }} has {{ $value | humanizePercentage }} free"
+          description: "Free space or grow the disk before it fills. Recovery steps: docs/administration/disk-full-recovery.md."
 
       - alert: NanoDiskCritical
         expr: |
           (node_filesystem_avail_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}
-            / node_filesystem_size_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}) < 0.08
+            / node_filesystem_size_bytes{job="node", fstype!~"tmpfs|overlay|squashfs|ramfs"}) < 0.10
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.mountpoint }} on {{ $labels.host }} is nearly full ({{ $value | humanizePercentage }} free)"
-          description: "ClickHouse stops merging and Vector buffers stop accepting events when the disk fills."
+          summary: "{{ $labels.mountpoint }} on {{ with $labels.host }}{{ . }}{{ else }}{{ $labels.instance }}{{ end }} is nearly full ({{ $value | humanizePercentage }} free)"
+          description: "ClickHouse stops merging and refuses inserts, PostgreSQL stops on a full WAL disk, and Vector buffers stop accepting events when the disk fills. Recovery steps: docs/administration/disk-full-recovery.md."
 
       - alert: NanoHostMemoryPressure
         expr: node_memory_MemAvailable_bytes{job="node"} / node_memory_MemTotal_bytes{job="node"} < 0.1

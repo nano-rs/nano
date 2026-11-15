@@ -662,11 +662,11 @@ impl AuditEmitter {
         let base = self.dual_pool.clickhouse().clone().with_validation(false);
         if durable {
             base
-                .with_option("async_insert", "0")
-                .with_option("wait_end_of_query", "1")
+                .with_setting("async_insert", "0")
+                .with_setting("wait_end_of_query", "1")
         } else {
-            base.with_option("async_insert", "1")
-                .with_option("wait_for_async_insert", "0")
+            base.with_setting("async_insert", "1")
+                .with_setting("wait_for_async_insert", "0")
         }
     }
 
@@ -680,8 +680,7 @@ impl AuditEmitter {
     ) -> Result<(), AuditEmitError> {
         let ingest_time = Utc::now();
         let logs_table = self.dual_pool.table_names().local("logs");
-        let mut insert = client
-            .insert::<ClickHouseLogRow>(&logs_table)
+        let mut insert = crate::db::clickhouse_insert::insert::<ClickHouseLogRow>(client, &logs_table)
             .await
             .map_err(|e| AuditEmitError::Storage(e.to_string()))?;
         for e in events {

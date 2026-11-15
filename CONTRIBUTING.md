@@ -24,10 +24,12 @@ take it away.
 
 Prerequisites:
 
-- Rust stable (we test on the latest stable; nightly not required)
-- Node 20+ and npm
-- PostgreSQL 18+
-- ClickHouse 24+
+- Rust 1.100 or newer. `rust-toolchain.toml` pins the exact toolchain and rustup
+  installs it on the first build; nightly is not required
+- Node 22 LTS and npm (`.nvmrc` pins the major for local tools and CI; the web image builds on the same major)
+- PostgreSQL 16 to 18 (nano ships 17)
+- ClickHouse 26.3.62.3 (LTS) or newer; see
+  [Supported versions](docs/administration/supported-versions.md)
 - Optional: `cargo-watch`, `sqlx-cli`
 
 > **Note on the local-dev story.** A polished `docker-compose.yml` +

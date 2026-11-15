@@ -563,7 +563,7 @@ impl DemoService {
             };
 
             let query = format!("DELETE FROM {} WHERE id = ANY($1)", table);
-            sqlx::query(&query)
+            sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
                 .bind(&resource_ids)
                 .execute(&mut **tx)
                 .await?;

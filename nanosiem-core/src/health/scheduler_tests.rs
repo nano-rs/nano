@@ -127,3 +127,73 @@ fn ai_provider_failure_and_recovery_share_stable_health_lifecycle() {
     assert_eq!(event.dedup_key, "service:ai_provider:openai:unavailable");
     assert_eq!(event.resource_type, "ai_provider");
 }
+
+fn disk_volume(component: DiskComponent, usage: Option<f64>) -> DiskVolumeHealth {
+    DiskVolumeHealth {
+        component,
+        host: Some("pg-0".into()),
+        name: "database".into(),
+        path: None,
+        total_bytes: Some(100),
+        used_bytes: usage.map(|u| (u * 100.0) as u64),
+        free_bytes: None,
+        usage_fraction: usage,
+        level: usage.map(disk_monitor::classify_usage).unwrap_or(DiskLevel::Unknown),
+        detail: "database 85 B".into(),
+        forecast: None,
+        shared_with: None,
+    }
+}
+
+#[test]
+fn disk_steps_notify_at_threshold_and_resolve_with_hysteresis() {
+    let warn = |u| disk_step_action(&disk_volume(DiskComponent::Postgres, u), DiskLevel::Warning, 0.80);
+    let crit = |u| disk_step_action(&disk_volume(DiskComponent::Postgres, u), DiskLevel::Critical, 0.90);
+    assert_eq!(warn(Some(0.80)), DiskStepAction::Notify);
+    assert_eq!(warn(Some(0.95)), DiskStepAction::Notify);
+    assert_eq!(crit(Some(0.85)), DiskStepAction::Hold, "inside the 5-point margin");
+    assert_eq!(crit(Some(0.84)), DiskStepAction::Resolve);
+    assert_eq!(warn(Some(0.77)), DiskStepAction::Hold, "hovering just under 80% keeps the issue");
+    assert_eq!(warn(Some(0.74)), DiskStepAction::Resolve);
+    assert_eq!(warn(None), DiskStepAction::Hold, "a failed probe never resolves");
+}
+
+/// NAN-5450 review: a capped install whose evictor cycles the ClickHouse
+/// disk between 70 % and 80 % never notifies, never re-arms, and its SIEM
+/// Health level stays Ok.
+#[test]
+fn an_evictor_cycling_70_to_80_percent_never_warns() {
+    let band = disk_monitor::EvictorBand::DEFAULT;
+    let threshold = disk_monitor::warn_fraction_for(DiskComponent::Clickhouse, &band);
+    let ch = |u: f64| {
+        let mut v = disk_volume(DiskComponent::Clickhouse, Some(u));
+        v.level = disk_monitor::classify_usage_from(u, band.clickhouse_warn_fraction());
+        v
+    };
+    for u in [0.70, 0.74, 0.78, 0.80, 0.81, 0.82] {
+        assert_eq!(ch(u).level, DiskLevel::Ok, "{u}");
+        assert_ne!(disk_step_action(&ch(u), DiskLevel::Warning, threshold), DiskStepAction::Notify, "{u}");
+    }
+    // The evictor not keeping up (above the band) warns, once, and resolves
+    // only back inside the band.
+    assert_eq!(disk_step_action(&ch(0.85), DiskLevel::Warning, threshold), DiskStepAction::Notify);
+    assert_eq!(disk_step_action(&ch(0.80), DiskLevel::Warning, threshold), DiskStepAction::Hold);
+    assert_eq!(disk_step_action(&ch(0.72), DiskLevel::Warning, threshold), DiskStepAction::Resolve);
+}
+
+#[test]
+fn disk_notification_names_volume_level_and_runbook() {
+    let v = disk_volume(DiskComponent::Postgres, Some(0.91));
+    let n = HealthScheduler::disk_notification(&v, DiskLevel::Critical);
+    assert_eq!(n.notification_type, NotificationType::DiskPressureWarning);
+    assert!(n.title.contains("PostgreSQL volume database on pg-0"), "{}", n.title);
+    assert!(n.title.contains("critically full"), "{}", n.title);
+    assert!(n.message.as_deref().unwrap().contains("disk-full-recovery.md"));
+    assert_eq!(n.metadata["level"], "critical");
+    assert_eq!(
+        HealthScheduler::disk_issue_key(&v, DiskLevel::Warning),
+        "postgres:pg-0:database:warning"
+    );
+    let e = HealthScheduler::disk_health_event(&v);
+    assert_eq!(e.dedup_key, "storage:disk:postgres:pg-0:database");
+}

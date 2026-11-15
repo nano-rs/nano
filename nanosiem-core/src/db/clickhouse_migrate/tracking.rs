@@ -248,7 +248,7 @@ impl ClickHouseMigrator {
             .client
             .clone()
             .with_database("default")
-            .with_option(
+            .with_setting(
                 "distributed_ddl_output_mode",
                 DATABASE_BOOTSTRAP_DDL_OUTPUT_MODE,
             );

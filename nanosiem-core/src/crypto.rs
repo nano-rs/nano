@@ -265,7 +265,7 @@ impl EncryptionService {
         let cipher =
             Aes256Gcm::new_from_slice(self.ring.active_key().as_ref()).expect("validated key");
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .encrypt(&Nonce::from(nonce), plaintext)
             .map_err(|_| CryptoError::EncryptionFailed("authentication failed".into()))?;
         Ok(EncryptedData {
             ciphertext: STANDARD.encode(ciphertext),
@@ -285,7 +285,7 @@ impl EncryptionService {
         bytes.extend(
             cipher
                 .encrypt(
-                    Nonce::from_slice(&nonce),
+                    &Nonce::from(nonce),
                     Payload {
                         msg: plaintext,
                         aad: &context.aad(&header)?,
@@ -327,7 +327,7 @@ impl EncryptionService {
             let plain = Aes256Gcm::new_from_slice(key.as_ref())
                 .expect("derived key")
                 .decrypt(
-                    Nonce::from_slice(&nonce),
+                    &Nonce::from(nonce),
                     Payload {
                         msg: ciphertext,
                         aad: &context.aad(header)?,
@@ -342,7 +342,7 @@ impl EncryptionService {
         for id in self.ring.decrypt_candidates() {
             let cipher =
                 Aes256Gcm::new_from_slice(self.ring.keys[id].as_ref()).expect("validated key");
-            if let Ok(plain) = cipher.decrypt(Nonce::from_slice(&nonce), bytes.as_slice()) {
+            if let Ok(plain) = cipher.decrypt(&Nonce::from(nonce), bytes.as_slice()) {
                 return Ok((plain, id.clone()));
             }
         }
@@ -417,7 +417,7 @@ fn decode_nonce(value: &str) -> Result<[u8; 12], CryptoError> {
 
 fn derive(root: &[u8], context: &CredentialContext) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let mut key = Zeroizing::new([0; 32]);
-    hkdf::Hkdf::<sha2_10::Sha256>::new(Some(b"nano.credential-keys.hkdf.v2"), root)
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(b"nano.credential-keys.hkdf.v2"), root)
         .expand(&context.info()?, key.as_mut())
         .map_err(|_| CryptoError::InvalidEnvelope)?;
     Ok(key)

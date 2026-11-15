@@ -344,11 +344,11 @@ pub async fn find_first_party_catalog(
     tx: &mut Transaction<'_, Postgres>,
     catalog: &CatalogSpec,
 ) -> Result<Option<ExistingCatalog>, sqlx::Error> {
-    let rows: Vec<(Uuid, String, String, String, bool, bool)> = sqlx::query_as(&format!(
+    let rows: Vec<(Uuid, String, String, String, bool, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, name, url, branch, COALESCE(enabled, TRUE), COALESCE(auto_sync_enabled, FALSE) \
          FROM {} ORDER BY created_at, id FOR UPDATE",
         catalog.table()
-    ))
+    )))
     .fetch_all(&mut **tx)
     .await?;
     let mut matches: Vec<ExistingCatalog> = rows
@@ -396,11 +396,11 @@ async fn reconcile_one(
             }
         },
         CatalogPlan::Update { id, branch, enable_auto_sync } => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {table} SET branch = COALESCE($2, branch), \
                     auto_sync_enabled = COALESCE(auto_sync_enabled, FALSE) OR $3, \
                     last_synced_at = NULL, last_sync_commit = NULL, updated_at = NOW() WHERE id = $1"
-            ))
+            )))
             .bind(id)
             .bind(branch.as_deref())
             .bind(*enable_auto_sync)
@@ -417,7 +417,7 @@ async fn reconcile_one(
     // (`https://github.com/<owner>/<repo>`), whatever form an older build or
     // the operator stored (`www.`, `.git`, case, trailing slash).
     if let Some(id) = repository_id {
-        sqlx::query(&format!("UPDATE {table} SET url = $2, updated_at = NOW() WHERE id = $1 AND url <> $2"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET url = $2, updated_at = NOW() WHERE id = $1 AND url <> $2")))
             .bind(id)
             .bind(catalog.url())
             .execute(&mut **tx)

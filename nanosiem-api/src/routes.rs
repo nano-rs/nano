@@ -810,6 +810,23 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/cases/{id}/status",
                 post(handlers::cases::change_case_status::<AppState>),
             )
+            // NAN-5438: pivt case actions — list, approve/dismiss proposals, undo.
+            .route(
+                "/api/cases/{id}/ai-actions",
+                get(handlers::cases::list_case_ai_actions::<AppState>),
+            )
+            .route(
+                "/api/cases/{id}/ai-actions/{action_id}/approve",
+                post(handlers::cases::approve_case_ai_action::<AppState>),
+            )
+            .route(
+                "/api/cases/{id}/ai-actions/{action_id}/dismiss",
+                post(handlers::cases::dismiss_case_ai_action::<AppState>),
+            )
+            .route(
+                "/api/cases/{id}/ai-actions/{action_id}/undo",
+                post(handlers::cases::undo_case_ai_action::<AppState>),
+            )
             .route(
                 "/api/cases/{id}/related",
                 get(handlers::cases::get_related_cases::<AppState>)
@@ -1550,28 +1567,33 @@ pub fn create_router(state: AppState) -> Router {
             "/api/settings/storage/clickhouse/retention/run",
             post(handlers::run_clickhouse_retention_now),
         )
-        // Storage tiering settings
-        .route("/api/settings/tiering", get(handlers::get_tiering_config))
-        .route(
-            "/api/settings/tiering",
-            put(handlers::update_tiering_config),
-        )
-        .route(
-            "/api/settings/tiering/credentials",
-            post(handlers::set_tiering_credentials),
-        )
-        .route(
-            "/api/settings/tiering/test",
-            post(handlers::test_tiering_connection),
-        )
-        .route(
-            "/api/settings/tiering/apply",
-            post(handlers::apply_tiering_config),
-        )
-        .route("/api/settings/tiering/stats", get(handlers::get_tier_stats))
         // Risk settings (weight stays open; decay TTL config is enterprise)
         .route("/api/settings/risk", get(handlers::get_risk_config))
         .route("/api/settings/risk", put(handlers::update_risk_config));
+
+    // NAN-5445: storage tiering status (enterprise). The cold tier is
+    // deployment config rendered by enterprise tooling; the open edition has
+    // no tiering surface (disk-pressure safety and SIEM Health still detect a
+    // cold tier from ClickHouse in both editions).
+    #[cfg(feature = "enterprise")]
+    {
+        licensed_app = licensed_app
+            .route("/api/settings/tiering", get(handlers::get_tiering_config))
+            .route("/api/settings/tiering", put(handlers::update_tiering_config))
+            .route(
+                "/api/settings/tiering/credentials",
+                post(handlers::set_tiering_credentials),
+            )
+            .route(
+                "/api/settings/tiering/test",
+                post(handlers::test_tiering_connection),
+            )
+            .route(
+                "/api/settings/tiering/apply",
+                post(handlers::apply_tiering_config),
+            )
+            .route("/api/settings/tiering/stats", get(handlers::get_tier_stats));
+    }
 
     // Risk decay TTL + risk-notable config — enterprise only
     // (RiskAnalyticsService, NAN-1792; since NAN-1805 the notable config is a
@@ -2125,6 +2147,12 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/ingest-tokens/{credential_id}/revoke",
             post(handlers::ingest_tokens::revoke_ingest_token),
+        )
+        // Lookup URL allowlist (NAN-5443)
+        .route(
+            "/api/settings/inputlookup-allowed-domains",
+            get(handlers::inputlookup_allowlist::get_inputlookup_allowed_domains)
+                .put(handlers::inputlookup_allowlist::update_inputlookup_allowed_domains),
         )
         // IP Allowlist settings
         .route(
@@ -2856,6 +2884,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/system/config",
             get(handlers::system::get_system_config),
         )
+        // NAN-5450: admin disk banner (settings:system).
+        .route("/api/system/disk-alert", get(handlers::health::get_disk_alert))
         // NAN-5204: automatic backup status (settings:system).
         .route(
             "/api/system/backup-status",

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+publish = false
 description = "Shared event generation core for log-blaster and injector tools"
 
 [dependencies]

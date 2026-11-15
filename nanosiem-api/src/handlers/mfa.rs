@@ -228,7 +228,15 @@ pub async fn setup_mfa(
         )
     })?;
 
-    let otpauth_uri = totp.get_url();
+    let otpauth_uri = totp.to_url().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(MfaApiError {
+                error: "qr_error".into(),
+                message: e.to_string(),
+            }),
+        )
+    })?;
 
     // Encrypt and store the secret (pending, not yet active)
     let encrypted =

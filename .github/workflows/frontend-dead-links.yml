@@ -42,7 +42,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
 
       - name: Check for new dead internal links
         run: node nanosiem-web/tests/e2e/check-dead-links.mjs

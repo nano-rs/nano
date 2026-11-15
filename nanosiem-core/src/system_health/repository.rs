@@ -149,6 +149,60 @@ impl SystemHealthRepository {
         Ok(stored)
     }
 
+    /// NAN-5450: re-notify the configured channels about an active condition
+    /// at most once per `every` (an imminent disk: hourly). Returns whether a
+    /// reminder was sent this call.
+    ///
+    /// The slot is claimed by one conditional UPDATE on `last_reminded_at`
+    /// (see [`reminder_due`]), so concurrent callers on several hosts never
+    /// both send. The outbox keeps one row per (event, webhook, action), so
+    /// the previous, finished `reminder` rows of this event are removed before
+    /// the new ones are queued; a reminder still being delivered is left alone
+    /// (its insert is a no-op), which also caps a slow channel at one pending
+    /// reminder.
+    pub async fn remind_if_due(
+        &self,
+        dedup_key: &str,
+        every: std::time::Duration,
+    ) -> Result<bool, SystemHealthError> {
+        let every_secs = i64::try_from(every.as_secs()).unwrap_or(i64::MAX).max(1);
+        let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query_as::<_, SystemHealthEvent>(
+            r#"
+            UPDATE system_health_events
+            SET last_reminded_at = NOW()
+            WHERE tenant_id = $1 AND dedup_key = $2 AND status = 'active'
+              AND first_seen_at <= NOW() - make_interval(secs => $3)
+              AND (last_reminded_at IS NULL OR last_reminded_at <= NOW() - make_interval(secs => $3))
+            RETURNING id, tenant_id, dedup_key, category, severity, status, title, summary,
+                      resource_type, resource_id, resource_name, diagnostic_context,
+                      remediation, source, occurrence_count, first_seen_at, last_seen_at,
+                      last_notified_at, acknowledged_at, acknowledged_by, resolved_at,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(DEFAULT_TENANT_ID)
+        .bind(dedup_key)
+        .bind(every_secs as f64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(event) = claimed else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        sqlx::query(
+            "DELETE FROM system_health_outbox WHERE tenant_id = $1 AND event_id = $2 \
+             AND event_action = 'reminder' AND status IN ('delivered', 'dead')",
+        )
+        .bind(DEFAULT_TENANT_ID)
+        .bind(event.id)
+        .execute(&mut *tx)
+        .await?;
+        enqueue_matching_destinations(&mut tx, &event, "reminder").await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn resolve_by_dedup_key(
         &self,
         dedup_key: &str,
@@ -597,6 +651,19 @@ fn truncate(value: &str, max: usize) -> &str {
         end -= 1;
     }
     &value[..end]
+}
+
+/// NAN-5450: whether a repeat reminder is due (the predicate of
+/// [`SystemHealthRepository::remind_if_due`]'s UPDATE): the condition has
+/// been active for at least `every` (its first notification was the trigger)
+/// and the last reminder, if any, is at least `every` old.
+pub fn reminder_due(
+    first_seen: chrono::DateTime<chrono::Utc>,
+    last_reminded: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    every: chrono::Duration,
+) -> bool {
+    first_seen <= now - every && last_reminded.is_none_or(|t| t <= now - every)
 }
 
 #[cfg(test)]

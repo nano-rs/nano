@@ -35,7 +35,7 @@ async fn fresh_db() -> (sqlx::PgPool, sqlx::PgPool, String) {
         .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("ipinfo_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
-    sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();
     let (base, _) = url.rsplit_once('/').unwrap();
     let pool = sqlx::PgPool::connect(&format!("{base}/{name}")).await.unwrap();
     (admin, pool, name)
@@ -130,7 +130,7 @@ async fn upgrade_from_dev_with_a_byo_token_disables_native_ipinfo_and_drops_the_
     assert_eq!(entry(&pool).await, after);
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}"))).execute(&admin).await.unwrap();
 }
 
 struct IocSeed {

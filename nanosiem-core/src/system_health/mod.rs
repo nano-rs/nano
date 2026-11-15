@@ -19,3 +19,7 @@ pub use types::{
     HealthSeverity, PublishHealthEvent, SystemHealthEvent, DEFAULT_TENANT_ID,
     SYSTEM_HEALTH_EVENT_TYPE,
 };
+
+#[cfg(test)]
+#[path = "reminder_tests.rs"]
+mod reminder_tests;

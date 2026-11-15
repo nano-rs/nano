@@ -638,7 +638,7 @@ impl ShardSkewSource for ClickHouseShardSkewSource<'_> {
 impl ClickHouseShardSkewSource<'_> {
     fn fan_out(&self, sql: &str) -> clickhouse::query::Query {
         let (name, value) = super::collector::PROBE_SKIP_UNAVAILABLE_REPLICAS;
-        self.0.clone().with_option(name, value).query(sql)
+        self.0.clone().with_setting(name, value).query(sql)
     }
 }
 

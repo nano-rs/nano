@@ -18,6 +18,10 @@ mod prevalence_cadence;
 mod runner;
 mod schema_profile_guard;
 mod sql_transform;
+// NAN-5445: enterprise-only (stripped from the mirror).
+#[cfg(feature = "enterprise")]
+mod storage_tiering;
+mod ttl_repair;
 mod tracking;
 mod types;
 
@@ -47,6 +51,12 @@ pub use agentlane::{
     WORKLOAD_MAX_MEMORY_ENV,
 };
 pub use prevalence_cadence::prevalence_refresh_minutes_from_env;
+#[cfg(feature = "enterprise")]
+pub use storage_tiering::StorageTieringOutcome;
+pub use ttl_repair::{
+    plan_ttl_repairs, report_ttl_repairs, saved_settings_retention, TtlRepair, TtlRepairInput, TtlRepairOutcome, TTL_REPAIR_MARKER,
+    TTL_RESTORED_HEALTH_KEY,
+};
 pub use types::{ClickHouseMigrateError, ClickHouseMigrator, Migration};
 
 #[cfg(test)]

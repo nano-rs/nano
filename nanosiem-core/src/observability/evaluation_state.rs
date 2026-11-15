@@ -79,23 +79,23 @@ pub async fn list_current_metric_monitor_state(
             AND s.definition_updated_at = d.updated_at \
             AND s.evaluated_at > NOW() - GREATEST(INTERVAL '10 minutes', \
                                                   d.eval_interval_secs * INTERVAL '2 seconds')";
-    let summaries = sqlx::query_as(&format!(
+    let summaries = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT monitor_id, max(evaluated_at) AS evaluated_at, count(*) AS series, \
                 count(*) FILTER (WHERE breaching) AS breaching, \
                 count(*) FILTER (WHERE no_data) AS no_data, \
                 count(*) > $1 AS truncated \
            FROM ({CURRENT}) c GROUP BY monitor_id ORDER BY monitor_id"
-    ))
+    )))
     .bind(MONITOR_SERIES_SAMPLE)
     .fetch_all(pool)
     .await?;
-    let sample = sqlx::query_as(&format!(
+    let sample = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT monitor_id, series_key, value, breaching, no_data, evaluated_at FROM ( \
            SELECT c.*, row_number() OVER (PARTITION BY monitor_id \
                     ORDER BY breaching DESC, no_data ASC, series_key) AS rn \
              FROM ({CURRENT}) c) ranked \
           WHERE rn <= $1 ORDER BY monitor_id, rn"
-    ))
+    )))
     .bind(MONITOR_SERIES_SAMPLE)
     .fetch_all(pool)
     .await?;

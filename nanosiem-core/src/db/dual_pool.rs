@@ -471,6 +471,9 @@ pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     // health and operator reads need cluster-wide visibility.
     "ingest_watchdog_journal",
     "ingest_watchdog_replica_status",
+    // NAN-5447: eviction audit archive (clickhouse/201). The evictor INSERTs
+    // into the LOCAL table; the audit reader reads every shard.
+    "audit_archive",
 ];
 
 /// Canonical ` ON CLUSTER \`<name>\`` clause for **runtime** DDL sites.
@@ -871,7 +874,7 @@ impl DualPool {
             &fleet_versions,
             super::clickhouse_transport::supports_skip_null_typed_paths,
         ) {
-            clickhouse = clickhouse.with_option("type_json_skip_null_typed_paths", "1");
+            clickhouse = clickhouse.with_setting("type_json_skip_null_typed_paths", "1");
         } else if fleet_versions.is_ok() {
             tracing::info!(
                 "A ClickHouse server predates type_json_skip_null_typed_paths; hinted JSON paths render NULL when absent"
@@ -905,13 +908,13 @@ impl DualPool {
             None
         };
         if let Some(bytes) = &external_set_option {
-            clickhouse = clickhouse.with_option("max_bytes_before_external_set", bytes);
+            clickhouse = clickhouse.with_setting("max_bytes_before_external_set", bytes);
         }
 
         // NAN-5426: ClickHouse replaces invalid UTF-8 in JSON output with
         // U+FFFD, so one row's bytes cannot fail a search or a rule query.
         let (utf8_setting, utf8_value) = super::clickhouse_transport::JSON_VALIDATE_UTF8_SETTING;
-        clickhouse = clickhouse.with_option(utf8_setting, utf8_value);
+        clickhouse = clickhouse.with_setting(utf8_setting, utf8_value);
 
         // NAN-2001: build the two raw-SQL feature clients. FAIL BOOT if a
         // credential is missing (never fall back to the broad `nanosiem` client)
@@ -1075,11 +1078,11 @@ impl DualPool {
         // NAN-4934: same IN-set spill threshold as the main client (26.10+ only).
         // The rawsql profile is readonly=2, which still accepts per-query settings.
         if let Some(bytes) = external_set_spill {
-            client = client.with_option("max_bytes_before_external_set", bytes);
+            client = client.with_setting("max_bytes_before_external_set", bytes);
         }
         // NAN-5426: same JSON UTF-8 replacement as the main client.
         let (utf8_setting, utf8_value) = super::clickhouse_transport::JSON_VALIDATE_UTF8_SETTING;
-        client = client.with_option(utf8_setting, utf8_value);
+        client = client.with_setting(utf8_setting, utf8_value);
 
         client
             .query("SELECT 1")
@@ -1281,7 +1284,7 @@ impl DualPool {
     /// (NAN-4954).
     pub fn with_clickhouse_setting(&self, name: &str, value: &str) -> Self {
         let mut pool = self.clone();
-        pool.clickhouse = pool.clickhouse.with_option(name, value);
+        pool.clickhouse = pool.clickhouse.with_setting(name, value);
         pool
     }
 
@@ -1294,8 +1297,8 @@ impl DualPool {
     pub fn with_clickhouse_read_settings(&self, settings: &[(&str, &str)]) -> Self {
         let mut pool = self.clone();
         for (name, value) in settings {
-            pool.clickhouse = pool.clickhouse.with_option(*name, *value);
-            pool.clickhouse_admin = pool.clickhouse_admin.with_option(*name, *value);
+            pool.clickhouse = pool.clickhouse.with_setting(*name, *value);
+            pool.clickhouse_admin = pool.clickhouse_admin.with_setting(*name, *value);
         }
         pool
     }

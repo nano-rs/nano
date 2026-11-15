@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.26"
+version = "2.0.27"
 edition = "2021"
 authors = ["NanoSIEM Team"]
 license = "AGPL-3.0-or-later"
@@ -24,8 +24,8 @@ license = "AGPL-3.0-or-later"
 tokio = { version = "1.48", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "rust_decimal", "migrate", "macros"] }
-clickhouse = { version = "0.14", features = ["uuid", "time", "rustls-tls-aws-lc", "rustls-tls-webpki-roots"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "rust_decimal", "migrate", "macros"] }
+clickhouse = { version = "0.15", features = ["uuid", "time", "rustls-tls-aws-lc", "rustls-tls-webpki-roots"] }
 rust_decimal = { version = "1.36", features = ["serde"] }
 
 # Serialization
@@ -51,12 +51,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 nom = "8.0"
 
 # SQL parsing
-sqlparser = "0.61"
+sqlparser = "0.64"
 
 # Web framework (for API)
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "set-header", "catch-panic"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "set-header", "catch-panic"] }
 
 # Testing
 proptest = "1.9"
@@ -66,8 +66,8 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
 # OpenAPI / Swagger documentation
-utoipa = { version = "5", features = ["chrono", "uuid", "axum_extras"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
+utoipa = { version = "6", features = ["chrono", "uuid", "axum_extras"] }
+utoipa-swagger-ui = { version = "10", features = ["axum"] }
 
 [patch.crates-io]
 # NAN-4949 / NAN-4955: opt-in client TCP keepalive (NANO_SQLX_TCP_KEEPALIVE_SECS,

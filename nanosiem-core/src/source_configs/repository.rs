@@ -393,7 +393,7 @@ impl SourceConfigRepository {
         );
 
         // Build query dynamically
-        let mut query_builder = sqlx::query_as::<_, SourceConfigRow>(&query).bind(id);
+        let mut query_builder = sqlx::query_as::<_, SourceConfigRow>(sqlx::AssertSqlSafe(query.as_str())).bind(id);
 
         if let Some(ref name) = request.name {
             query_builder = query_builder.bind(name);
@@ -852,7 +852,7 @@ impl SourceConfigRepository {
             updates.join(", ")
         );
 
-        let mut query_builder = sqlx::query_as::<_, RoutingRuleRow>(&query).bind(rule_id);
+        let mut query_builder = sqlx::query_as::<_, RoutingRuleRow>(sqlx::AssertSqlSafe(query.as_str())).bind(rule_id);
 
         if let Some(priority) = request.priority {
             query_builder = query_builder.bind(priority);
@@ -1216,7 +1216,7 @@ mod tests {
         qb.push(" LIMIT ").push_bind(limit);
         qb.push(" OFFSET ").push_bind(offset);
 
-        qb.into_sql()
+        qb.into_string()
     }
 
     #[test]

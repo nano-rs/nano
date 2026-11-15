@@ -84,7 +84,7 @@ async fn fresh_pg() -> sqlx::PgPool {
         .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("cc_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
-    sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();
     let (base, _) = url.rsplit_once('/').unwrap();
     let pool = sqlx::PgPool::connect(&format!("{base}/{name}")).await.unwrap();
     nanosiem_core::db::run_postgres_migrations(&pool).await.unwrap();

@@ -273,7 +273,7 @@
     {
       "type": "timeseries",
       "title": "Disk free",
-      "description": "The NanoDiskPressure alert fires below 15%, NanoDiskCritical below 8%.",
+      "description": "The NanoDiskPressure alert fires below 20%, NanoDiskCritical below 10%.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

@@ -25,10 +25,10 @@ impl Database for Any {
     type Value = AnyValue;
     type ValueRef<'r> = AnyValueRef<'r>;
 
-    type Arguments<'q> = AnyArguments<'q>;
-    type ArgumentBuffer<'q> = AnyArgumentBuffer<'q>;
+    type Arguments = AnyArguments;
+    type ArgumentBuffer = AnyArgumentBuffer;
 
-    type Statement<'q> = AnyStatement<'q>;
+    type Statement = AnyStatement;
 
     const NAME: &'static str = "Any";
 

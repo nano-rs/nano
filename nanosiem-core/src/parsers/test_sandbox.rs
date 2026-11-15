@@ -236,6 +236,9 @@ pub enum Work {
     /// NAN-5400: [`super::VrlValidator::validate_vrl`] of one stored source
     /// (every gate, the compile and its warnings), for the validate endpoint.
     Validate { code: String },
+    /// NAN-5401: [`super::VrlValidator::validate_vrl_collect_errors`] of one
+    /// stored source, for the AI parser loops (one entry per diagnostic).
+    ValidateCollect { code: String },
     /// A processing plan with native steps, plus an optional extension.
     Native {
         plan: crate::parsers::pipe::Plan,
@@ -262,13 +265,15 @@ pub enum Outcome {
     /// A validation verdict; an error validating reads as an invalid result
     /// carrying that error.
     Validate(super::VrlValidationResult),
+    /// A verdict plus each diagnostic on its own (NAN-5401).
+    ValidateCollect(super::VrlValidationResult, Vec<String>),
 }
 
 impl ParserTestJob {
     fn inputs(&self) -> usize {
         match &self.work {
             Work::Each { inputs, .. } | Work::Native { inputs, .. } => inputs.len(),
-            Work::Chain { .. } | Work::Validate { .. } => 1,
+            Work::Chain { .. } | Work::Validate { .. } | Work::ValidateCollect { .. } => 1,
         }
     }
 
@@ -297,6 +302,7 @@ impl ParserTestJob {
             (Work::Native { inputs, .. }, Outcome::Native(Ok(rows))) => rows.len() == inputs.len(),
             (Work::Native { .. }, Outcome::Native(Err(_))) => true,
             (Work::Validate { .. }, Outcome::Validate(_)) => true,
+            (Work::ValidateCollect { .. }, Outcome::ValidateCollect(..)) => true,
             _ => false,
         }
     }
@@ -394,7 +400,7 @@ pub fn choose_executor(registered: Option<&Path>, in_process_permitted: bool) ->
     }
 }
 
-fn current_executor() -> Executor {
+pub(crate) fn current_executor() -> Executor {
     choose_executor(
         WORKER_EXECUTABLE.get().map(PathBuf::as_path),
         cfg!(test) || IN_PROCESS_FOR_TEST_HARNESS.load(Ordering::SeqCst),
@@ -658,6 +664,23 @@ pub fn execute_phased(job: &ParserTestJob, on_compiled: impl FnOnce()) -> Outcom
                     }
                 }),
             )
+        }
+        Work::ValidateCollect { code } => {
+            let validator = super::VrlValidator::for_registry(job.registry).inside_worker();
+            match futures::executor::block_on(validator.validate_vrl_collect_errors(code)) {
+                Ok((result, errors)) => Outcome::ValidateCollect(result, errors),
+                Err(error) => {
+                    let message = error.to_string();
+                    Outcome::ValidateCollect(
+                        super::VrlValidationResult {
+                            valid: false,
+                            error: Some(message.clone()),
+                            warnings: Vec::new(),
+                        },
+                        vec![message],
+                    )
+                }
+            }
         }
         Work::Each { code, inputs } => Outcome::Each(compile(job.registry, code).map(|(code, program)| {
             on_compiled();

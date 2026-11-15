@@ -84,9 +84,9 @@ impl ContentStore {
     }
 
     pub async fn get(&self, channel: &str) -> Result<Option<ChannelRow>, sqlx::Error> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {STATE_COLUMNS} FROM content_channel_state WHERE channel = $1"
-        ))
+        )))
         .bind(channel)
         .fetch_optional(&self.pool)
         .await?;
@@ -94,9 +94,9 @@ impl ContentStore {
     }
 
     pub async fn list(&self) -> Result<Vec<ChannelRow>, sqlx::Error> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {STATE_COLUMNS} FROM content_channel_state ORDER BY channel"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(row_from).collect())

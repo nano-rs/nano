@@ -133,6 +133,15 @@ pub struct DirectDialer;
 #[async_trait::async_trait]
 impl Dialer for DirectDialer {
     async fn dial(&self, target: DialTarget<'_>) -> std::io::Result<TcpStream> {
+        // NAN-5441: under "proxy required" a direct connection to a public
+        // address is never made, however the broker was configured. Internal
+        // addresses (SOAR self-managed hosts, an internal SMTP relay) stay
+        // direct: an internet egress proxy cannot reach them.
+        if nanosiem_core::egress_proxy::is_public_destination(target.addr.ip())
+            && nanosiem_core::egress_proxy::proxy_required()
+        {
+            return Err(crate::egress::ProxyRefusal::Required.into_io());
+        }
         TcpStream::connect(target.addr).await
     }
 }

@@ -86,3 +86,21 @@ fn user_actionable_errors_pass_through() {
 
     assert_eq!(client_error_message(&SearchError::Cancelled), "Query was cancelled");
 }
+
+/// NAN-5432: ClickHouse quotes the failing value byte for byte; whatever
+/// variant carries part of the text is one inert line with no NUL.
+#[test]
+fn quoted_control_bytes_never_survive_parsing() {
+    for raw in [
+        "Code: 999. DB::Exception: Cannot frobnicate here: zz\u{0}\nFAKE LOG LINE\u{1b}[31m (SOMETHING) (version 25.8)",
+        "network error: Cannot parse date here: zz\u{0}\r\nFAKE LOG LINE",
+        "Code: 47. DB::Exception: Unknown expression identifier `a\u{0}\nb` in scope x. (UNKNOWN_IDENTIFIER)",
+    ] {
+        let parsed = parse_clickhouse_error(raw).to_string();
+        assert!(!parsed.contains('\0'), "NUL survived: {parsed:?}");
+        assert!(!parsed.contains('\n') && !parsed.contains('\r'), "line break survived: {parsed:?}");
+        assert!(!parsed.contains('\u{1b}'), "ESC survived: {parsed:?}");
+        let surfaced = surfaced(raw);
+        assert!(!surfaced.contains('\0') && !surfaced.contains('\n'), "{surfaced:?}");
+    }
+}

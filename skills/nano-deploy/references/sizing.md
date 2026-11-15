@@ -40,8 +40,10 @@ The guides mark the ratios as extrapolated until load-tested.
   6 GB for ClickHouse. Any host with 16 GB of RAM or more clears that. The
   installer sizes every container from the host on each run. To pin a value,
   add it below the managed block in `.env`.
-- Older data can move to S3-compatible object storage (storage tiering) and
-  stays searchable. Configure that after install.
+- Older data can move to object storage (storage tiering: S3, S3-compatible,
+  GCS or Azure Blob) and stays searchable. Enable it at install with the
+  `NANO_TIERING*` keys or later with `scripts/nano tiering`; moves start at
+  70 % local disk use (move_factor 0.3). See [operate.md](operate.md#storage-tiering).
 
 ## Worked example: ~140 EPS, 1-year retention
 
@@ -166,7 +168,6 @@ from the inventory yet". Each row carries a plain-words topic:
 | prevalence `*_final_refresh` every 30 min (60 at ≥ 10 TB/day; 10 default) | ≥ 1 TB/day | `NANO_PLANNED_GB_PER_DAY` in the shared `.env`; Helm `migrations.prevalenceRefreshMinutes` (NAN-5345) | refresh CPU |
 | sink acks, DLQ, `delete_failed_message=false` | always | not settable | Vector delivery |
 | Vector role split | more than 4 ingest hosts | not available | Vector role split |
-| TTL-driven tiering | when part of retention is cold | free-space tiering only | TTL tiering |
 
 Growth: adding shards or replicas to a live cluster is not a supported flow
 yet. Pass `--growth` for the 12-month volume.

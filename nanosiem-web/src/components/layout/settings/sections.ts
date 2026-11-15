@@ -45,6 +45,7 @@ import {
   MessageSquare,
   Zap,
   PackageOpen,
+  Link2,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -314,6 +315,18 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     desc: 'Default lookback, concurrency, query timeout.',
     href: '/settings/search',
     permissions: 'settings:system',
+    status: 'ok',
+  },
+  {
+    // NAN-5443: hosts `inputlookup url=` may fetch from (admin list merged
+    // with INPUTLOOKUP_ALLOWED_DOMAINS).
+    id: 'lookup-urls',
+    label: 'Lookup URLs',
+    group: 'detection',
+    icon: Link2,
+    desc: 'Hosts that inputlookup url= may fetch from.',
+    href: '/settings/lookup-urls',
+    permissions: ['settings:view', 'settings:system'],
     status: 'ok',
   },
   {

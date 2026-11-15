@@ -154,17 +154,17 @@ impl IngestTokenRepository {
     /// Every token, active first, newest first. Pending rotation
     /// replacements are not listed (their value has not been handed out yet).
     pub async fn list(&self) -> Result<Vec<IngestToken>, IngestTokenRepositoryError> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{TOKEN_SELECT} WHERE NOT t.rotation_pending
              ORDER BY (t.revoked_at IS NULL) DESC, t.created_at DESC, t.id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(row_to_token).collect::<Result<_, _>>()?)
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<IngestToken>, IngestTokenRepositoryError> {
-        let row = sqlx::query(&format!("{TOKEN_SELECT} WHERE t.id = $1"))
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("{TOKEN_SELECT} WHERE t.id = $1")))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -173,9 +173,9 @@ impl IngestTokenRepository {
 
     /// Log sources a token can be bound to (push-capable transports), by name.
     pub async fn bindable_sources(&self) -> Result<Vec<BindableSource>, IngestTokenRepositoryError> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {SOURCE_COLUMNS} FROM log_sources ORDER BY lower(name), id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         let sources: Vec<BindableSource> = rows.iter().map(row_to_source).collect::<Result<_, _>>()?;
@@ -188,7 +188,7 @@ impl IngestTokenRepository {
         &self,
         source_id: Uuid,
     ) -> Result<Option<BindableSource>, IngestTokenRepositoryError> {
-        let row = sqlx::query(&format!("SELECT {SOURCE_COLUMNS} FROM log_sources WHERE id = $1"))
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {SOURCE_COLUMNS} FROM log_sources WHERE id = $1")))
             .bind(source_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -420,9 +420,9 @@ impl IngestTokenRepository {
     }
 
     pub async fn settings(&self) -> Result<IngestTokenSettings, IngestTokenRepositoryError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {SETTINGS_COLUMNS} FROM ingest_token_settings WHERE singleton"
-        ))
+        )))
         .fetch_optional(&self.pool)
         .await?;
         Ok(match row {
@@ -436,7 +436,7 @@ impl IngestTokenRepository {
         enabled: bool,
         updated_by: Option<Uuid>,
     ) -> Result<IngestTokenSettings, IngestTokenRepositoryError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO ingest_token_settings (singleton, install_token_enabled, updated_by, updated_at)
              VALUES (TRUE, $1, $2, NOW())
              ON CONFLICT (singleton) DO UPDATE
@@ -444,7 +444,7 @@ impl IngestTokenRepository {
                    updated_by = EXCLUDED.updated_by,
                    updated_at = EXCLUDED.updated_at
              RETURNING {SETTINGS_COLUMNS}"
-        ))
+        )))
         .bind(enabled)
         .bind(updated_by)
         .fetch_one(&self.pool)
@@ -458,7 +458,7 @@ impl IngestTokenRepository {
         &self,
         updated_by: Option<Uuid>,
     ) -> Result<IngestTokenSettings, IngestTokenRepositoryError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO ingest_token_settings (singleton, install_token_mode, updated_by, updated_at)
              VALUES (TRUE, 'strict', $1, NOW())
              ON CONFLICT (singleton) DO UPDATE
@@ -466,7 +466,7 @@ impl IngestTokenRepository {
                    updated_by = EXCLUDED.updated_by,
                    updated_at = EXCLUDED.updated_at
              RETURNING {SETTINGS_COLUMNS}"
-        ))
+        )))
         .bind(updated_by)
         .fetch_one(&self.pool)
         .await?;
@@ -483,7 +483,7 @@ impl IngestTokenRepository {
         source_id: Uuid,
         actor: Option<Uuid>,
     ) -> Result<Option<IngestTokenSettings>, IngestTokenRepositoryError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO ingest_token_settings
                 (singleton, install_token_enabled, install_token_mode, install_token_source_id,
                  install_token_source_bound_at, install_token_source_bound_by, updated_by, updated_at)
@@ -497,7 +497,7 @@ impl IngestTokenRepository {
                    updated_at = EXCLUDED.updated_at
              WHERE ingest_token_settings.install_token_source_id IS NOT DISTINCT FROM $1
              RETURNING {SETTINGS_COLUMNS}"
-        ))
+        )))
         .bind(expected)
         .bind(source_id)
         .bind(actor)

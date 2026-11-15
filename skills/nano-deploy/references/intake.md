@@ -131,9 +131,13 @@ emails support@nano.rs.
 8. Existing network: a VPC/VNet to reuse and its CIDR (default plan
    `10.40.0.0/16`), DNS zone for the two hostnames, TLS certificates (ACM, Key
    Vault or Google-managed for the public names), a management CIDR for SSH.
-9. Object storage for the cold tier and backups: the cloud's S3-compatible
-   store (S3, Cloud Storage), RustFS, or none (all retention local). On Azure,
-   Blob has no S3 API: RustFS or an external S3-compatible store.
+9. Object storage for the cold tier and backups: AWS S3, Cloud Storage, Azure
+   Blob (cold tier only; backups need an S3-compatible store or a file share),
+   an S3-compatible store (Wasabi, RustFS), or none (all retention local). Ask
+   for the bucket (or Azure container) name and region; never ask for the keys.
+   They feed `plan.py --tiering-*`: the inventory `tiering:` block
+   (role-split) or install.sh `--tiering*` flags (single host). Cold-tier
+   storage tiering is enterprise; on the open edition plan all retention local.
 10. The nano release they will install. Full HA needs 2.0.7 or newer
     ([known-issues.md](known-issues.md)).
 

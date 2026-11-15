@@ -172,6 +172,11 @@ pub const SEARCH_SOURCE_SCOPE_DENIED: &str = "search.source_scope_denied";
 /// Desktop agents) used an nPL command AI searches may not run (external
 /// fetch, AI call, write) and was refused before it ran.
 pub const SEARCH_AI_COMMAND_REFUSED: &str = "search.ai_command_refused";
+/// NAN-5443: an `inputlookup url=...` fetch was attempted or refused. Details
+/// carry the host (never the path or query), the query class and the outcome.
+pub const SEARCH_INPUTLOOKUP_FETCH: &str = "search.inputlookup_fetch";
+/// NAN-5443: an administrator changed the lookup URL allowlist.
+pub const INPUTLOOKUP_ALLOWED_DOMAINS_UPDATED: &str = "inputlookup_allowed_domains_updated";
 
 // =============================================================================
 // Credential Actions
@@ -832,6 +837,9 @@ pub const RETENTION_CONFIG_UPDATED: &str = "retention_config_updated";
 pub const RETENTION_RUN_TRIGGERED: &str = "retention_run_triggered";
 /// ClickHouse retention was updated
 pub const CH_RETENTION_UPDATED: &str = "ch_retention_updated";
+/// NAN-5448: the upgrade restored a delete TTL the pre-2.0.27 cold-storage
+/// code had cut (one-time repair by the ClickHouse migrator)
+pub const CH_RETENTION_RESTORED: &str = "ch_retention_restored";
 /// ClickHouse retention was manually triggered
 pub const CH_RETENTION_RUN_TRIGGERED: &str = "ch_retention_run_triggered";
 /// Risk configuration was updated

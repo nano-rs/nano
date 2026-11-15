@@ -13,6 +13,7 @@ import type {
   UpdateCaseRequest,
   AddAlertToCaseRequest,
   CaseWallEntry,
+  CaseAiAction,
   AddWallEntryRequest,
   ChangeCaseStatusRequest,
   EscalateCaseRequest,
@@ -103,6 +104,18 @@ export class CasesApi {
     _assignedTo: string | null,
     _assignedGroup?: string | null,
   ): Promise<Case> {
+    return ENTERPRISE_ONLY();
+  }
+  listCaseAiActions(_caseId: string, _sessionId?: string): Promise<CaseAiAction[]> {
+    return ENTERPRISE_ONLY();
+  }
+  approveCaseAiAction(_caseId: string, _actionId: string): Promise<CaseAiAction> {
+    return ENTERPRISE_ONLY();
+  }
+  dismissCaseAiAction(_caseId: string, _actionId: string): Promise<CaseAiAction> {
+    return ENTERPRISE_ONLY();
+  }
+  undoCaseAiAction(_caseId: string, _actionId: string): Promise<CaseAiAction> {
     return ENTERPRISE_ONLY();
   }
   changeCaseStatus(_caseId: string, _request: ChangeCaseStatusRequest): Promise<Case> {

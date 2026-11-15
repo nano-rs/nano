@@ -86,7 +86,14 @@ pub struct ClickHouseStorageStatsResponse {
     pub newest_log: Option<String>,
     pub compression_ratio: f64,
     pub uncompressed_size_bytes: u64,
+    /// The event table's DELETE TTL in days, read from its DDL. `null` when
+    /// it cannot be read.
     pub ttl_days: Option<u32>,
+    /// Who set the retention last: `deployment` (`NANO_RETENTION_DAYS`),
+    /// `ui`, or `null` (the shipped default).
+    pub retention_source: Option<String>,
+    /// The `NANO_RETENTION_DAYS` value the migrator last applied, if any.
+    pub deployment_retention_days: Option<u32>,
 }
 
 impl From<ClickHouseStorageStats> for ClickHouseStorageStatsResponse {
@@ -102,6 +109,8 @@ impl From<ClickHouseStorageStats> for ClickHouseStorageStatsResponse {
             compression_ratio: stats.compression_ratio,
             uncompressed_size_bytes: stats.uncompressed_size_bytes,
             ttl_days: stats.ttl_days,
+            retention_source: stats.retention_source,
+            deployment_retention_days: stats.deployment_retention_days,
         }
     }
 }
@@ -156,6 +165,8 @@ pub struct StorageOverviewResponse {
 /// Request to update ClickHouse retention
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateClickHouseRetentionRequest {
+    /// Event retention in days (1 to 3650).
+    #[schema(minimum = 1, maximum = 3650)]
     pub retention_days: u32,
 }
 
@@ -419,7 +430,9 @@ pub async fn get_clickhouse_storage_stats(
 ///
 /// PUT /api/settings/storage/clickhouse/retention
 ///
-/// Updates the TTL retention period for ClickHouse logs.
+/// Updates the TTL retention period for ClickHouse logs and records it as
+/// set in the UI. The migrator re-applies `NANO_RETENTION_DAYS` only when that
+/// deployment value changes, so this value survives a plain restart.
 #[utoipa::path(
     put,
     path = "/api/settings/storage/clickhouse/retention",
@@ -443,11 +456,7 @@ pub async fn update_clickhouse_retention(
 
     let dual_pool = state.dual_pool();
 
-    if request.retention_days < 1 {
-        return Err(ApiError::ValidationError(
-            "Retention period must be at least 1 day".to_string(),
-        ));
-    }
+    nanosiem_core::settings::validate_clickhouse_retention_days(request.retention_days)?;
 
     let settings =
         DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone())
@@ -485,7 +494,9 @@ pub async fn update_clickhouse_retention(
 ///
 /// POST /api/settings/storage/clickhouse/retention/run
 ///
-/// Forces ClickHouse to materialize TTL and delete expired data.
+/// Forces ClickHouse to materialize TTL and drop expired parts.
+/// NAN-5450: answers 503 with recovery steps when ClickHouse has no disk
+/// space to run it, instead of a generic storage error.
 #[utoipa::path(
     post,
     path = "/api/settings/storage/clickhouse/retention/run",
@@ -494,7 +505,8 @@ pub async fn update_clickhouse_retention(
         (status = 200, description = "Retention job completed", body = serde_json::Value),
         (status = 400, description = "ClickHouse not enabled", body = ErrorResponse),
         (status = 403, description = "Missing permission", body = ErrorResponse),
-        (status = 500, description = "Internal error", body = ErrorResponse)
+        (status = 500, description = "Internal error", body = ErrorResponse),
+        (status = 503, description = "ClickHouse disk is full; the message names the recovery steps", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -511,7 +523,7 @@ pub async fn run_clickhouse_retention_now(
         DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone())
             .with_fanout_client(dual_pool.clickhouse_fanout().cloned());
 
-    // OPTIMIZE TABLE FINAL + MATERIALIZE TTL can take minutes on large tables.
+    // MATERIALIZE TTL (waited on, NAN-5450) can take minutes on large tables.
     // Run with a timeout to return a proper error instead of a GKE 502.
     const CH_RETENTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 

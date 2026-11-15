@@ -178,7 +178,55 @@ export interface CollectedMetrics {
   alerting: AlertingMetrics;
   /** NAN-4954: security-critical audit outbox (PostgreSQL → ClickHouse). Absent on older reports / failed probe. */
   audit_durability?: AuditDurabilityMetrics | null;
+  /** NAN-5450: ClickHouse, PostgreSQL and Vector buffer volume usage. Absent on older reports. */
+  disk?: DiskHealthReport | null;
   collected_at: string;
+}
+
+/**
+ * NAN-5450: warning at 80 %, critical at 90 % (or forecast to fill within 24 h),
+ * imminent at 95 %; `unknown` when not measurable.
+ */
+export type DiskLevel = 'ok' | 'unknown' | 'warning' | 'critical' | 'imminent';
+
+export interface DiskForecast {
+  /** Least-squares growth of used bytes per hour over the last 6 hours. */
+  growth_bytes_per_hour: number;
+  /** Hours until "full" at that rate; absent when not growing. */
+  hours_to_full?: number;
+  /** What "full" means: the ingest-pause fraction (0.92) on the ClickHouse disk, 1.0 elsewhere. */
+  full_fraction?: number;
+  samples: number;
+  span_hours: number;
+  /** The forecast raised the level to critical below 90 %. */
+  escalated: boolean;
+}
+
+export interface DiskVolumeHealth {
+  component: 'clickhouse' | 'postgres' | 'vector_buffer';
+  host?: string;
+  name: string;
+  path?: string;
+  total_bytes?: number;
+  used_bytes?: number;
+  free_bytes?: number;
+  usage_fraction?: number;
+  level: DiskLevel;
+  detail: string;
+  forecast?: DiskForecast;
+  /** Key of the volume whose filesystem this one shares (single host). */
+  shared_with?: string;
+}
+
+export interface DiskHealthReport {
+  status: DiskLevel;
+  warn_fraction: number;
+  critical_fraction: number;
+  imminent_fraction?: number;
+  forecast_critical_hours?: number;
+  volumes: DiskVolumeHealth[];
+  notes: string[];
+  checked_at: string;
 }
 
 export interface AuditDurabilityMetrics {

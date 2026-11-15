@@ -47,7 +47,7 @@ pub async fn find_by_id<T>(pool: &PgPool, table: &str, id: Uuid) -> Result<T, Re
 where
     T: Send + Unpin + for<'r> FromRow<'r, PgRow>,
 {
-    sqlx::query_as::<_, T>(&format!("SELECT * FROM {table} WHERE id = $1"))
+    sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(format!("SELECT * FROM {table} WHERE id = $1")))
         .bind(id)
         .fetch_optional(pool)
         .await?
@@ -61,7 +61,7 @@ pub async fn find_by_slug<T>(pool: &PgPool, table: &str, slug: &str) -> Result<T
 where
     T: Send + Unpin + for<'r> FromRow<'r, PgRow>,
 {
-    sqlx::query_as::<_, T>(&format!("SELECT * FROM {table} WHERE slug = $1"))
+    sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(format!("SELECT * FROM {table} WHERE slug = $1")))
         .bind(slug)
         .fetch_optional(pool)
         .await?
@@ -91,11 +91,11 @@ where
     T: Send + Unpin + for<'r> FromRow<'r, PgRow>,
 {
     // Clean up stuck "syncing" statuses (best-effort; ignore errors).
-    let _ = sqlx::query(&reset_stuck_syncing_sql(table))
+    let _ = sqlx::query(sqlx::AssertSqlSafe(&*reset_stuck_syncing_sql(table)))
         .execute(pool)
         .await;
 
-    let rows = sqlx::query_as::<_, T>(&format!("SELECT * FROM {table} ORDER BY name ASC"))
+    let rows = sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(format!("SELECT * FROM {table} ORDER BY name ASC")))
         .fetch_all(pool)
         .await?;
 
@@ -108,7 +108,7 @@ pub async fn list_for_auto_sync<T>(pool: &PgPool, table: &str) -> Result<Vec<T>,
 where
     T: Send + Unpin + for<'r> FromRow<'r, PgRow>,
 {
-    let rows = sqlx::query_as::<_, T>(&format!(
+    let rows = sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(format!(
         r#"
             SELECT * FROM {table}
             WHERE enabled = TRUE
@@ -119,7 +119,7 @@ where
               )
             ORDER BY last_synced_at ASC NULLS FIRST
             "#
-    ))
+    )))
     .fetch_all(pool)
     .await?;
 
@@ -129,7 +129,7 @@ where
 /// `DELETE FROM <table> WHERE id = $1`, mapping zero affected rows to
 /// `RepoError::NotFound(id)`.
 pub async fn delete(pool: &PgPool, table: &str, id: Uuid) -> Result<(), RepoError> {
-    let result = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE id = $1")))
         .bind(id)
         .execute(pool)
         .await?;
@@ -153,7 +153,7 @@ pub async fn update_sync_status<'e, E: sqlx::PgExecutor<'e>>(
     count: Option<i32>,
     error: Option<&str>,
 ) -> Result<(), RepoError> {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
             UPDATE {table} SET
                 last_sync_status = $2,
@@ -164,7 +164,7 @@ pub async fn update_sync_status<'e, E: sqlx::PgExecutor<'e>>(
                 updated_at = NOW()
             WHERE id = $1
             "#
-    ))
+    )))
     .bind(id)
     .bind(status)
     .bind(commit)
@@ -251,7 +251,7 @@ pub async fn count_for_repository(
     repository_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
     let count: (i64,) =
-        sqlx::query_as(&format!("SELECT COUNT(*) FROM {table} WHERE repository_id = $1"))
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table} WHERE repository_id = $1")))
             .bind(repository_id)
             .fetch_one(pool)
             .await?;
@@ -265,7 +265,7 @@ pub async fn delete_by_repository<'e, E: sqlx::PgExecutor<'e>>(
     table: &str,
     repository_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
-    let result = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE repository_id = $1")))
         .bind(repository_id)
         .execute(pool)
         .await?;
@@ -282,9 +282,9 @@ pub async fn prune_not_in_paths<'e, E: sqlx::PgExecutor<'e>>(
     repository_id: Uuid,
     paths: &[String],
 ) -> Result<i64, sqlx::Error> {
-    let result = sqlx::query(&format!(
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {table} WHERE repository_id = $1 AND file_path != ALL($2)"
-    ))
+    )))
     .bind(repository_id)
     .bind(paths)
     .execute(pool)

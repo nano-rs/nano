@@ -2216,7 +2216,18 @@ export interface ClickHouseStorageStats {
   newest_log: string | null;
   compression_ratio: number;
   uncompressed_size_bytes: number;
+  /** The event table's DELETE TTL in days, read from its DDL (null: unreadable). */
   ttl_days: number | null;
+  /** NAN-5449: who set the retention last (null: the shipped default). */
+  retention_source?: 'deployment' | 'ui' | null;
+  /** NAN-5449: the NANO_RETENTION_DAYS value the migrator last applied. */
+  deployment_retention_days?: number | null;
+}
+
+export interface UpdateClickHouseRetentionResponse {
+  success: boolean;
+  retention_days: number;
+  message: string;
 }
 
 export interface DiskPressureStatus {
@@ -2261,36 +2272,29 @@ export interface UpdateClickHouseRetentionRequest {
   retention_days: number;
 }
 
-// Storage Tiering types
-export type TieringStatus = 'unconfigured' | 'pending' | 'applying' | 'active' | 'error';
+// Storage Tiering types (NAN-5445). Read-only: the cold tier is deployment
+// config (install.sh / scripts/nano tiering on Compose, clickhouse.coldStorage
+// on Helm); the write endpoints answer 409.
+export type TieringStatus = 'unconfigured' | 'active' | 'partial';
+
+export interface TableTiering {
+  table: string;
+  storage_policy: string;
+  on_tiering_policy: boolean;
+}
 
 export interface TieringConfig {
   enabled: boolean;
-  s3_endpoint: string | null;
-  s3_bucket: string | null;
-  s3_region: string;
-  s3_path_style: boolean;
-  has_credentials: boolean;
-  retention_days: number;
-  move_factor: number;
   status: TieringStatus;
   status_message: string | null;
-  last_applied_at: string | null;
-}
-
-export interface UpdateTieringRequest {
-  enabled?: boolean;
-  s3_endpoint?: string;
-  s3_bucket?: string;
-  s3_region?: string;
-  s3_path_style?: boolean;
-  retention_days?: number;
-  move_factor?: number;
-}
-
-export interface SetTieringCredentialsRequest {
-  access_key_id: string;
-  secret_access_key: string;
+  managed_by: string;
+  policy: string | null;
+  cold_volume: string | null;
+  cold_disks: string[];
+  provider: string | null;
+  move_factor: number | null;
+  retention_days: number | null;
+  tables: TableTiering[];
 }
 
 export interface TierInfo {
@@ -4605,6 +4609,39 @@ export interface CaseWallEntry {
   created_at: string;
 }
 
+/** NAN-5438: a case action pivt performed or proposed (`case_ai_actions`). */
+export type CaseAiActionState = 'pending' | 'applied' | 'dismissed' | 'failed' | 'undone';
+export type CaseAiActionTier = 'auto' | 'confirm';
+
+export interface CaseAiAction {
+  id: string;
+  case_id: string;
+  notebook_id?: string | null;
+  /** Chat thread the action came from. */
+  session_id?: string | null;
+  origin: 'notebook_chat' | 'investigation_loop' | 'shadow_investigation' | string;
+  action_type: string;
+  params: Record<string, unknown>;
+  tier: CaseAiActionTier;
+  tier_reason?: string | null;
+  state: CaseAiActionState;
+  summary: string;
+  on_behalf_of?: string | null;
+  on_behalf_of_name?: string | null;
+  /** `tier:auto`, `analyst` or `policy:auto_close`. */
+  authorized_by?: string | null;
+  undo_plan?: Record<string, unknown> | null;
+  applied_state?: Record<string, unknown> | null;
+  error?: string | null;
+  decided_by?: string | null;
+  decided_by_name?: string | null;
+  decided_at?: string | null;
+  undone_by?: string | null;
+  undone_by_name?: string | null;
+  undone_at?: string | null;
+  created_at: string;
+}
+
 export interface CaseRelation {
   source_case_id: string;
   target_case_id: string;
@@ -5090,6 +5127,8 @@ export interface CaseSettings {
   autonomy_mode: AutonomyMode;
   auto_close_min_confidence: number; // 0.0–1.0
   auto_close_max_severity: string;
+  /** NAN-5438: pivt case actions that reduce visibility wait for analyst approval. Default off. */
+  ai_action_confirmation: boolean;
 }
 
 export interface UpdateCaseSettingsRequest {
@@ -5102,6 +5141,7 @@ export interface UpdateCaseSettingsRequest {
   autonomy_mode?: AutonomyMode;
   auto_close_min_confidence?: number;
   auto_close_max_severity?: string;
+  ai_action_confirmation?: boolean;
 }
 
 // ============================================================================

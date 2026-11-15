@@ -254,6 +254,7 @@ const UserSettings = lazyWithRetryNamed(() => import('@/pages/Settings/UserSetti
 const NotificationSettings = lazyWithRetryNamed(() => import('@/pages/Settings/NotificationSettings'), 'NotificationSettings');
 const SearchSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SearchSettings'), 'SearchSettings');
 const SourceScopes = lazyWithRetryNamed(() => import('@/pages/Settings/SourceScopes'), 'SourceScopes');
+const LookupUrls = lazyWithRetryNamed(() => import('@/pages/Settings/LookupUrls'), 'LookupUrls');
 const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
 const AirgapImportPage = lazyWithRetryNamed(() => import('@/enterprise/airgap/AirgapImportPage'), 'AirgapImportPage');
 const LicenseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/License'), 'LicenseSettings');
@@ -1102,6 +1103,14 @@ function ProtectedAppRoutes() {
               deep links / bookmarks so nobody lands on the retired page. */}
           <Route path="/settings/webhooks" element={
             <Navigate to="/settings/notifications" replace />
+          } />
+          {/* NAN-5443: lookup URL allowlist (open core). */}
+          <Route path="/settings/lookup-urls" element={
+            <PermissionRoute anyPermission={['settings:view', 'settings:system']} element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <LookupUrls key={resetKey} />
+              </Suspense>
+            } />
           } />
           <Route path="/settings/gdpr" element={
             <PermissionRoute permission="gdpr:anonymize" element={

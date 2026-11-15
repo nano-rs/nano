@@ -14,7 +14,7 @@
 # -----------------------------------------------------------------------------
 # Base: Rust with cargo-chef and build tools (cached layer)
 # -----------------------------------------------------------------------------
-FROM rust:1.95-bookworm AS chef
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS chef
 
 # NAN-5409: cargo-auditable embeds each binary's exact crate list (name, version,
 # source; feature-resolved for that build) in a section of the binary, so syft,
@@ -156,7 +156,11 @@ RUN case "$NANO_NON_RELEASE_BUILD:$NANO_LAB_UPGRADE_MIGRATION_FIXTURE" in \
 # -----------------------------------------------------------------------------
 # Stage 3: API Runtime
 # -----------------------------------------------------------------------------
-FROM debian:bookworm-slim AS api
+# NAN-5411: runtime stages run Debian 13 (trixie) slim, pinned by digest (bump
+# tag and digest together). The bookworm builder's binaries need only
+# libc/libm/libgcc_s, which trixie's newer glibc (2.41) serves; the runtime
+# must never be older than the builder.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS api
 
 # OCI image metadata. The `image.source` label is what binds the GHCR package
 # to the nano-rs/nano open-core repo so it appears on the repo's Packages tab
@@ -240,7 +244,7 @@ CMD ["nanosiem-api"]
 # -----------------------------------------------------------------------------
 # Stage 4: Search Runtime
 # -----------------------------------------------------------------------------
-FROM debian:bookworm-slim AS search
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS search
 
 LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
       org.opencontainers.image.url="https://nano.rs" \
@@ -279,7 +283,7 @@ CMD ["nanosiem-search"]
 # -----------------------------------------------------------------------------
 # Stage 5: Jobs Runtime (background tasks: detection, enrichment, tuning, cleanup)
 # -----------------------------------------------------------------------------
-FROM debian:bookworm-slim AS jobs
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS jobs
 
 LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
       org.opencontainers.image.url="https://nano.rs" \
@@ -361,7 +365,7 @@ COPY . .
 RUN cargo update --workspace --offline \
     && cargo auditable build --release --locked -p nano-connector --bin nano-connector-runner
 
-FROM debian:bookworm-slim AS connector-runner
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS connector-runner
 
 LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
       org.opencontainers.image.url="https://nano.rs" \

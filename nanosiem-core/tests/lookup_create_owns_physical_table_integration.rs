@@ -41,7 +41,7 @@ fn rows(ids: &[i64]) -> Vec<HashMap<String, serde_json::Value>> {
 }
 
 async fn physical_rows(pool: &PgPool, physical: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{physical}\""))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM \"{physical}\"")))
         .fetch_one(pool)
         .await
         .unwrap_or_else(|e| panic!("count rows in {physical}: {e}"))

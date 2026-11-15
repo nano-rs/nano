@@ -74,11 +74,11 @@ fn env() -> Env {
 
 async fn scratch_db(env: &Env) -> (PgPool, String, PgPool) {
     let admin = PgPool::connect(&env.pg_admin_url).await.expect("connect PG");
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")))
         .execute(&admin)
         .await
         .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {SCRATCH_DB}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {SCRATCH_DB}")))
         .execute(&admin)
         .await
         .expect("create scratch");
@@ -137,8 +137,8 @@ async fn insert_events(ch: &clickhouse::Client, source: &str, n: usize, message_
         })
         .collect();
     ch.clone()
-        .with_option("async_insert", "0")
-        .with_option("wait_end_of_query", "1")
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
         .query(&format!(
             "INSERT INTO nanosiem.logs (id, timestamp, source_type, message, src_ip) VALUES {}",
             rows.join(", ")
@@ -183,7 +183,7 @@ async fn one_failing_signal_does_not_stall_other_realtime_rules() {
     .expect("seed watermark");
 
     // Deterministic alert-write failure for the poison rule's events only.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         CREATE FUNCTION nan5428_poison() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
@@ -193,7 +193,7 @@ async fn one_failing_signal_does_not_stall_other_realtime_rules() {
             RETURN NEW;
         END $$;
         "#
-    ))
+    )))
     .execute(&pg)
     .await
     .expect("poison function");
@@ -264,7 +264,7 @@ async fn one_failing_signal_does_not_stall_other_realtime_rules() {
         let _ = admin_ch.query(&format!("DROP VIEW IF EXISTS {mv}")).execute().await;
     }
     pg.close().await;
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)"))
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")))
         .execute(&admin)
         .await;
 
@@ -383,7 +383,7 @@ async fn systemic_failure_trips_the_breaker_and_raises_health() {
     handle.abort();
     let _ = dual_pool.clickhouse_admin().query(&format!("DROP VIEW IF EXISTS {mv}")).execute().await;
     pg.close().await;
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)"))
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")))
         .execute(&admin)
         .await;
 

@@ -197,7 +197,11 @@ NANO_SCHEMA_PROFILE=udm curl -fsSL https://get.nano.rs | bash
 The [Install](#install) flow above is the right path if you just want
 to run nano. To hack on the engine itself:
 
-- Prereqs: Rust stable, Node 20+, PostgreSQL 18+, ClickHouse 24+
+- Prereqs:
+  - Rust 1.100 or newer (`rust-toolchain.toml` pins it; rustup installs it on first build)
+  - Node 22+ (CI builds on Node 22 LTS)
+  - PostgreSQL 16 to 18
+  - ClickHouse 26.3.62.3+ (LTS) or newer
 - Bring up Postgres + ClickHouse via your usual local tooling
 - `./scripts/start-microservices-dev.sh` — launches `nanosiem-api` (3000),
   `nanosiem-search` (3002), and `nanosiem-jobs` with sane local defaults

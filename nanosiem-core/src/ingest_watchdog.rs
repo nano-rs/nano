@@ -335,7 +335,11 @@ impl From<SampleRow> for WatchdogSample {
 
 #[derive(Debug, Row, Deserialize)]
 struct JournalStateRow {
+    // NAN-5461: RowBinary validation expects UUID as the (u64, u64) pair this
+    // adapter writes; the uuid crate's default length-prefixed bytes fail it.
+    #[serde(with = "clickhouse::serde::uuid")]
     event_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
     transition_id: Uuid,
     action: String,
     phase: String,
@@ -1467,8 +1471,8 @@ async fn journal(
         let durable_client = replica
             .client
             .clone()
-            .with_option("async_insert", "0")
-            .with_option("wait_end_of_query", "1");
+            .with_setting("async_insert", "0")
+            .with_setting("wait_end_of_query", "1");
         let result = tokio::time::timeout(
             IO_TIMEOUT,
             durable_client
@@ -1596,6 +1600,40 @@ fn ch_error(error: clickhouse::error::Error) -> IngestWatchdogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-5461: `load_state_row` must decode against a real server with
+    /// RowBinary validation on (the default). Before the fix every pass failed
+    /// with "ClickHouse type UUID as &[u8; 64]". Needs no tables:
+    ///
+    ///   NANOSIEM_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+    ///   NANOSIEM_TEST_CLICKHOUSE_USER=... NANOSIEM_TEST_CLICKHOUSE_PASSWORD=... \
+    ///   cargo test -p nanosiem-core --lib journal_state_row_decodes_live -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a live ClickHouse"]
+    async fn journal_state_row_decodes_live() {
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set"));
+        let client = Client::default()
+            .with_url(env("NANOSIEM_TEST_CLICKHOUSE_URL"))
+            .with_user(env("NANOSIEM_TEST_CLICKHOUSE_USER"))
+            .with_password(env("NANOSIEM_TEST_CLICKHOUSE_PASSWORD"));
+        let event_id = Uuid::now_v7();
+        let transition_id = Uuid::now_v7();
+        let row = client
+            .query(
+                "SELECT toUUID(?) AS event_id, toUUID(?) AS transition_id, 'auto_stop' AS action, \
+                 'intent' AS phase, 'auto' AS mode, toInt64(1) AS event_time_ms, \
+                 CAST([], 'Array(String)') AS owned_views",
+            )
+            .bind(event_id.to_string())
+            .bind(transition_id.to_string())
+            .fetch_one::<JournalStateRow>()
+            .await
+            .expect("JournalStateRow must pass RowBinary validation");
+        assert_eq!(row.event_id, event_id);
+        assert_eq!(row.transition_id, transition_id);
+        let state = state_from_journal_row(row).unwrap();
+        assert_eq!(state.pending.map(|p| p.id), Some(transition_id));
+    }
 
     #[test]
     fn incomplete_auto_stop_remains_auto_and_reconcilable() {

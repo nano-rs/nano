@@ -7,7 +7,7 @@
 
 use base64::Engine;
 use thiserror::Error;
-use totp_rs::{Algorithm, Secret, TOTP};
+use totp_rs::{Algorithm, Builder, Secret, Totp};
 
 use crate::crypto::{CryptoError, EncryptedData, EncryptionService};
 
@@ -44,56 +44,49 @@ impl From<CryptoError> for MfaError {
     }
 }
 
+/// The one TOTP shape nano issues and verifies: SHA-1, 6 digits, ±1 step of
+/// skew (30 s tolerance), 30 s steps, issuer "nano". Google Authenticator
+/// compatible. `build()` enforces RFC 6238 (128+ bit secret, 6-8 digits), the
+/// same checks totp-rs 5's `TOTP::new` made.
+fn build_totp(secret: Secret, email: &str) -> Result<Totp, MfaError> {
+    Builder::new()
+        .with_algorithm(Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(secret)
+        .with_issuer(Some("nano"))
+        .with_account_name(email)
+        .build()
+        .map_err(|e| MfaError::TotpError(e.to_string()))
+}
+
 /// Generate a new TOTP secret and return the TOTP object + base32 secret
-pub fn generate_totp_secret(email: &str) -> Result<(TOTP, String), MfaError> {
-    let secret = Secret::generate_secret();
-    let secret_base32 = secret.to_encoded().to_string();
-
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,  // digits
-        1,  // skew (allows ±1 period = 30 second tolerance)
-        30, // step (seconds)
-        secret
-            .to_bytes()
-            .map_err(|e| MfaError::TotpError(e.to_string()))?,
-        Some("nano".to_string()),
-        email.to_string(),
-    )
-    .map_err(|e| MfaError::TotpError(e.to_string()))?;
-
+pub fn generate_totp_secret(email: &str) -> Result<(Totp, String), MfaError> {
+    let secret = Secret::generate();
+    // Unpadded RFC 4648 base32, the same text totp-rs 5 stored.
+    let secret_base32 = secret.to_base32();
+    let totp = build_totp(secret, email)?;
     Ok((totp, secret_base32))
 }
 
 /// Generate a QR code as a base64-encoded PNG from a TOTP object
-pub fn generate_qr_code(totp: &TOTP) -> Result<String, MfaError> {
-    totp.get_qr_base64()
+pub fn generate_qr_code(totp: &Totp) -> Result<String, MfaError> {
+    totp.to_qr_base64()
         .map_err(|e| MfaError::TotpError(e.to_string()))
 }
 
 /// Reconstruct a TOTP from a base32 secret for verification
-pub fn totp_from_secret(secret_base32: &str, email: &str) -> Result<TOTP, MfaError> {
-    let secret = Secret::Encoded(secret_base32.to_string());
-    TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret
-            .to_bytes()
-            .map_err(|e| MfaError::TotpError(e.to_string()))?,
-        Some("nano".to_string()),
-        email.to_string(),
-    )
-    .map_err(|e| MfaError::TotpError(e.to_string()))
+pub fn totp_from_secret(secret_base32: &str, email: &str) -> Result<Totp, MfaError> {
+    let secret = Secret::try_from_base32(secret_base32)
+        .map_err(|e| MfaError::TotpError(e.to_string()))?;
+    build_totp(secret, email)
 }
 
 /// Verify a TOTP code against a base32 secret
 pub fn verify_totp(secret_base32: &str, email: &str, code: &str) -> Result<bool, MfaError> {
     let totp = totp_from_secret(secret_base32, email)?;
-    Ok(totp
-        .check_current(code)
-        .map_err(|e| MfaError::TotpError(e.to_string()))?)
+    Ok(totp.check_current(code).is_some())
 }
 
 /// Generate 10 random 8-character alphanumeric backup codes
@@ -188,6 +181,10 @@ pub fn decrypt_backup_codes(
 }
 
 #[cfg(test)]
+#[path = "mfa_compat_tests.rs"]
+mod compat_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -196,13 +193,13 @@ mod tests {
         let (totp, secret) = generate_totp_secret("test@example.com").unwrap();
         assert!(!secret.is_empty());
         // Verify we can generate a code (doesn't panic)
-        let _code = totp.generate_current().unwrap();
+        let _code = totp.generate_current();
     }
 
     #[test]
     fn test_verify_totp() {
         let (totp, secret) = generate_totp_secret("test@example.com").unwrap();
-        let code = totp.generate_current().unwrap();
+        let code = totp.generate_current().to_string();
         assert!(verify_totp(&secret, "test@example.com", &code).unwrap());
         assert!(!verify_totp(&secret, "test@example.com", "000000").unwrap());
     }

@@ -110,3 +110,90 @@ async fn human_search_is_not_checked() {
         assert_eq!((status, body.as_str()), (200, "ran"), "{key:?}");
     }
 }
+
+/// NAN-5456: `/api/search` checks the query before the engine sets the
+/// request actor, so the production middleware installs the caller: a
+/// refusal is attributed to the member (the key owner for an API key, with
+/// the key named) and the client IP, never "by system".
+#[tokio::test]
+async fn refusal_is_attributed_to_the_member_and_client_ip() {
+    use axum::extract::ConnectInfo;
+    use nanosiem_core::auth::TokenClaims;
+    use std::net::SocketAddr;
+
+    async fn attribution(body: String) -> axum::response::Response {
+        let refusal = ai_command_policy::check_ai_query(
+            &nanosiem_core::query::parse_query(&body).expect("test query parses"),
+            &[],
+        )
+        .expect_err("restricted");
+        let event = ai_command_policy::refusal_audit_event(
+            &ai_command_policy::current_search_audit_caller(),
+            &refusal,
+            &body,
+            "search",
+        );
+        axum::Json(serde_json::json!({
+            "actor": event.actor_id,
+            "key": event.api_key_id,
+            "ip": event.ip_address,
+            "message": event.message(),
+        }))
+        .into_response()
+    }
+
+    async fn call_as(context: AuthContext) -> serde_json::Value {
+        let app = Router::new()
+            .route("/api/search", post(attribution))
+            .layer(middleware::from_fn(admission_wait_budget_middleware))
+            .layer(middleware::from_fn(move |mut request: Request, next: Next| {
+                let context = context.clone();
+                async move {
+                    request.extensions_mut().insert(context);
+                    request
+                        .extensions_mut()
+                        .insert(ConnectInfo("203.0.113.9:51000".parse::<SocketAddr>().unwrap()));
+                    next.run(request).await
+                }
+            }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/search")
+            .header(admission::QUERY_CLASS_HEADER, "agent")
+            .body(Body::from(URL_LOOKUP.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    let member = Uuid::now_v7();
+    let session = AuthContext::from_jwt(TokenClaims {
+        iss: "t".into(),
+        aud: "t".into(),
+        sub: member,
+        roles: vec![],
+        permissions: vec!["search:execute".into()],
+        exp: i64::MAX,
+        iat: 0,
+        jti: Uuid::now_v7(),
+        purpose: "access".into(),
+    });
+    let seen = call_as(session).await;
+    assert_eq!(seen["actor"], member.to_string(), "{seen}");
+    assert_eq!(seen["ip"], "203.0.113.9", "{seen}");
+    assert!(seen["key"].is_null(), "{seen}");
+
+    let (owner, key) = (Uuid::now_v7(), Uuid::now_v7());
+    let seen = call_as(AuthContext::from_api_key(&ApiKeyInfo {
+        id: key,
+        name: "ci export".to_string(),
+        permissions: vec!["search:execute".to_string()],
+        user_id: Some(owner),
+    }))
+    .await;
+    assert_eq!(seen["actor"], owner.to_string(), "the key OWNER is the member: {seen}");
+    assert_eq!(seen["key"], key.to_string(), "{seen}");
+    assert_eq!(seen["ip"], "203.0.113.9", "{seen}");
+    assert!(!seen["message"].as_str().unwrap().ends_with("by system"), "{seen}");
+}

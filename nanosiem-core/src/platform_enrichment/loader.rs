@@ -483,16 +483,16 @@ impl ClickHouseLoader {
         self.ch
             .clone()
             .with_validation(false)
-            .with_option("async_insert", "0")
-            .with_option("wait_end_of_query", "1")
+            .with_setting("async_insert", "0")
+            .with_setting("wait_end_of_query", "1")
             // NAN-4957: the IPinfo load streams 4.38M rows through ONE insert,
             // which the server cut into 1,048,449-row blocks: 465 MiB per block
             // on a 2G box (limit 1.6 GiB), where it hit 241 and the feed never
             // installed. Smaller blocks bound the writer, not the result: each
             // generation stays invisible until its commit row.
-            .with_option("max_insert_block_size", LOAD_INSERT_BLOCK_ROWS)
-            .with_option("min_insert_block_size_rows", LOAD_INSERT_BLOCK_ROWS)
-            .with_option("min_insert_block_size_bytes", LOAD_INSERT_BLOCK_BYTES)
+            .with_setting("max_insert_block_size", LOAD_INSERT_BLOCK_ROWS)
+            .with_setting("min_insert_block_size_rows", LOAD_INSERT_BLOCK_ROWS)
+            .with_setting("min_insert_block_size_bytes", LOAD_INSERT_BLOCK_BYTES)
     }
 
     fn commits_read(&self) -> String {
@@ -539,7 +539,7 @@ impl ClickHouseLoader {
         });
         let writer = self.writer();
         let write = async {
-            let mut insert = writer.insert::<IpRow>(&self.table(IP_TABLE)).await?;
+            let mut insert = crate::db::clickhouse_insert::insert::<IpRow>(&writer, &self.table(IP_TABLE)).await?;
             let mut written = 0u64;
             while let Some(rows) = rx.recv().await {
                 for row in &rows {
@@ -618,7 +618,7 @@ impl ClickHouseLoader {
         let write = async {
             let mut written = 0u64;
             while let Some(rows) = rx.recv().await {
-                let mut insert = writer.insert::<IocRow>(&self.table(IOC_TABLE)).await?;
+                let mut insert = crate::db::clickhouse_insert::insert::<IocRow>(&writer, &self.table(IOC_TABLE)).await?;
                 for row in &rows {
                     insert.write(row).await?;
                 }
@@ -647,10 +647,9 @@ impl ClickHouseLoader {
         if commits.is_empty() {
             return Ok(());
         }
-        let mut insert = self
-            .writer()
-            .insert::<CommitRow>(&self.table(PLATFORM_FEED_COMMITS_TABLE))
-            .await?;
+        let mut insert =
+            crate::db::clickhouse_insert::insert::<CommitRow>(&self.writer(), &self.table(PLATFORM_FEED_COMMITS_TABLE))
+                .await?;
         for row in commits {
             insert.write(row).await?;
         }
@@ -799,7 +798,7 @@ impl ClickHouseLoader {
             // NAN-5215: don't wait out a down replica's DDL timeout.
             crate::db::dual_pool::runtime_on_cluster_ddl_options(&self.on_cluster)
                 .iter()
-                .fold(self.ch.clone(), |client, (name, value)| client.with_option(*name, *value))
+                .fold(self.ch.clone(), |client, (name, value)| client.with_setting(*name, *value))
                 .query(&format!("SYSTEM RELOAD DICTIONARY{} {IOC_DICT}", self.on_cluster))
                 .execute()
                 .await?;

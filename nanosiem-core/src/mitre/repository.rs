@@ -643,7 +643,7 @@ impl MitreRepository {
 
         // Execute dynamic query with bind parameters
         let rule_technique_rows: Vec<RuleTechniqueRow> = {
-            let mut q = sqlx::query_as(&query);
+            let mut q = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()));
             for val in &bind_values {
                 q = q.bind(val);
             }
@@ -948,11 +948,11 @@ mod sync_integration_tests {
         // snapshot. Run that destructive proof in an isolated schema so an
         // ignored test can never replace a developer's real MITRE catalog.
         let schema = format!("mitre_sync_test_{}", uuid::Uuid::now_v7().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&mut *connection)
             .await
             .unwrap();
-        sqlx::query(&format!("SET search_path TO {schema}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
             .execute(&mut *connection)
             .await
             .unwrap();
@@ -1162,7 +1162,7 @@ mod sync_integration_tests {
             .execute(&mut *connection)
             .await
             .unwrap();
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&mut *connection)
             .await
             .unwrap();

@@ -155,12 +155,12 @@ impl SearchJobRepository {
             .await
             .map_err(db)?;
 
-        let existing = sqlx::query_as::<_, JobRow>(&format!(
+        let existing = sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {JOB_COLUMNS} FROM search_jobs \
              WHERE owner_user_id = $1 AND identity_hash = $2 \
                AND state IN ('queued', 'running') \
              LIMIT 1"
-        ))
+        )))
         .bind(new.owner_user_id)
         .bind(&new.identity_hash)
         .fetch_optional(&mut *tx)
@@ -187,13 +187,13 @@ impl SearchJobRepository {
             )));
         }
 
-        let row = sqlx::query_as::<_, JobRow>(&format!(
+        let row = sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO search_jobs (id, owner_user_id, identity_hash, query, request, \
                  time_start, time_end, scope_deny, scope_artifact_deny, origin, max_attempts, \
                  page_limit) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              RETURNING {JOB_COLUMNS}"
-        ))
+        )))
         .bind(new.id)
         .bind(new.owner_user_id)
         .bind(&new.identity_hash)
@@ -222,12 +222,12 @@ impl SearchJobRepository {
         identity_hash: &str,
         settled_after: DateTime<Utc>,
     ) -> Result<Option<DurableSearchJob>, SearchError> {
-        sqlx::query_as::<_, JobRow>(&format!(
+        sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {JOB_COLUMNS} FROM search_jobs \
              WHERE owner_user_id = $1 AND identity_hash = $2 AND state = 'completed' \
                AND row_count > 0 AND finished_at >= $3 AND expires_at > NOW() \
              ORDER BY finished_at DESC LIMIT 1"
-        ))
+        )))
         .bind(owner)
         .bind(identity_hash)
         .bind(settled_after)
@@ -239,9 +239,9 @@ impl SearchJobRepository {
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<DurableSearchJob>, SearchError> {
-        sqlx::query_as::<_, JobRow>(&format!(
+        sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {JOB_COLUMNS} FROM search_jobs WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await
@@ -290,7 +290,7 @@ impl SearchJobRepository {
         worker_id: &str,
         lease_ttl: Duration,
     ) -> Result<Option<(DurableSearchJob, Option<String>)>, SearchError> {
-        let row = sqlx::query_as::<_, JobRow>(&format!(
+        let row = sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
             "WITH next AS ( \
                  SELECT id FROM search_jobs \
                  WHERE state = 'queued' \
@@ -315,7 +315,7 @@ impl SearchJobRepository {
                 .map(|c| format!("j.{}", c.trim()))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ))
+        )))
         .bind(worker_id)
         .bind(secs(lease_ttl))
         .fetch_optional(&self.pool)
@@ -444,10 +444,10 @@ impl SearchJobRepository {
         owner: Uuid,
         limit: i64,
     ) -> Result<Vec<DurableSearchJob>, SearchError> {
-        sqlx::query_as::<_, JobRow>(&format!(
+        sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {JOB_COLUMNS} FROM search_jobs WHERE owner_user_id = $1 \
              ORDER BY created_at DESC LIMIT $2"
-        ))
+        )))
         .bind(owner)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -460,9 +460,9 @@ impl SearchJobRepository {
 
     /// Every job, newest first (admin view; the caller filters by scope).
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<DurableSearchJob>, SearchError> {
-        sqlx::query_as::<_, JobRow>(&format!(
+        sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {JOB_COLUMNS} FROM search_jobs ORDER BY created_at DESC LIMIT $1"
-        ))
+        )))
         .bind(limit)
         .fetch_all(&self.pool)
         .await

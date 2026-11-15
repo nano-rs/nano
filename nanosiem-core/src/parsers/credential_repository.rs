@@ -91,7 +91,7 @@ impl CredentialRepository {
     /// List all credentials (metadata only, no secrets)
     pub async fn list(&self) -> Result<Vec<CloudCredential>, CredentialRepositoryError> {
         let sql = format!("SELECT {CRED_SELECT} FROM cloud_credentials ORDER BY name");
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).fetch_all(&self.pool).await?;
         Ok(rows.iter().map(Self::row_to_credential).collect())
     }
 
@@ -103,7 +103,7 @@ impl CredentialRepository {
         let sql = format!(
             "SELECT {CRED_SELECT} FROM cloud_credentials WHERE provider = $1 ORDER BY name"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(provider)
             .fetch_all(&self.pool)
             .await?;
@@ -113,7 +113,7 @@ impl CredentialRepository {
     /// Get credential metadata by ID (no secrets)
     pub async fn get(&self, id: Uuid) -> Result<CloudCredential, CredentialRepositoryError> {
         let sql = format!("SELECT {CRED_SELECT} FROM cloud_credentials WHERE id = $1");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -189,7 +189,7 @@ impl CredentialRepository {
             RETURNING {CRED_SELECT}
             "#
         );
-        let row = sqlx::query(&parent_sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(parent_sql.as_str()))
             .bind(&req.name)
             .bind(&req.provider)
             .bind(&ciphertext_bytes)
@@ -273,7 +273,7 @@ impl CredentialRepository {
             RETURNING {CRED_SELECT}
             "#
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(&req.name)
             .bind(&req.description)
@@ -363,7 +363,7 @@ impl CredentialRepository {
             RETURNING {CRED_SELECT}
             "#
         );
-        let parent_row = sqlx::query(&parent_sql)
+        let parent_row = sqlx::query(sqlx::AssertSqlSafe(parent_sql.as_str()))
             .bind(id)
             .bind(&ciphertext_bytes)
             .bind(&nonce)
@@ -484,7 +484,7 @@ impl CredentialRepository {
             RETURNING {CRED_SELECT}
             "#
         );
-        let parent_row = sqlx::query(&parent_sql)
+        let parent_row = sqlx::query(sqlx::AssertSqlSafe(parent_sql.as_str()))
             .bind(id)
             .bind(&target_ciphertext)
             .bind(&target_nonce)

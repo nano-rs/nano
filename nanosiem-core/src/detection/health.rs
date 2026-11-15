@@ -58,9 +58,9 @@ pub struct FailingRuleSummary {
 
 /// Number of failing rules (see the module docs).
 pub async fn count_failing_rules(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*)::bigint FROM detection_rules r WHERE {FAILING_PREDICATE}"
-    ))
+    )))
     .fetch_one(pool)
     .await
 }
@@ -68,7 +68,7 @@ pub async fn count_failing_rules(pool: &PgPool) -> Result<i64, sqlx::Error> {
 /// The health rollup used by `/health/detailed`.
 pub async fn read_execution_health(pool: &PgPool) -> Result<DetectionExecutionHealth, sqlx::Error> {
     let (failing_rules, currently_failing_rules, coverage_gaps_24h): (i64, i64, i64) =
-        sqlx::query_as(&format!(
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
             r#"
             SELECT
                 (SELECT COUNT(*)::bigint FROM detection_rules r WHERE {FAILING_PREDICATE}),
@@ -79,7 +79,7 @@ pub async fn read_execution_health(pool: &PgPool) -> Result<DetectionExecutionHe
                 (SELECT COUNT(*)::bigint FROM detection_coverage_gaps
                   WHERE recorded_at >= NOW() - make_interval(hours => 24))
             "#
-        ))
+        )))
         .fetch_one(pool)
         .await?;
     Ok(DetectionExecutionHealth {
@@ -100,7 +100,7 @@ pub async fn read_execution_health(pool: &PgPool) -> Result<DetectionExecutionHe
 /// Failing rules, most recent error first (capped at `limit`).
 pub async fn list_failing_rules(pool: &PgPool, limit: i64) -> Result<Vec<FailingRuleSummary>, sqlx::Error> {
     let rows: Vec<(Uuid, String, i16, Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>)> =
-        sqlx::query_as(&format!(
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
             r#"
             SELECT r.id, r.name, r.consecutive_failures, r.failing_since, r.last_error, r.last_error_at
             FROM detection_rules r
@@ -108,7 +108,7 @@ pub async fn list_failing_rules(pool: &PgPool, limit: i64) -> Result<Vec<Failing
             ORDER BY r.last_error_at DESC NULLS LAST, r.name
             LIMIT $1
             "#
-        ))
+        )))
         .bind(limit)
         .fetch_all(pool)
         .await?;

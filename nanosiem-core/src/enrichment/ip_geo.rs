@@ -383,7 +383,7 @@ pub async fn reload_pair_dictionaries(ch: &clickhouse::Client, on_cluster: &str)
     // replays the queued reload.
     let ch = crate::db::dual_pool::runtime_on_cluster_ddl_options(on_cluster)
         .iter()
-        .fold(ch.clone(), |client, (name, value)| client.with_option(*name, *value));
+        .fold(ch.clone(), |client, (name, value)| client.with_setting(*name, *value));
     for sql in reload_statements(on_cluster) {
         reload_with_retry(&ch, &sql).await?;
     }

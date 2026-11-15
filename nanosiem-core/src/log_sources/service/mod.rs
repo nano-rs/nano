@@ -55,6 +55,11 @@ pub enum LogSourceServiceError {
     /// Every parser-test worker is busy (NAN-5234): retry shortly (HTTP 429).
     #[error("{0}")]
     ParserTestBusy(String),
+    /// NAN-5401: a save, publish or deploy waited the full
+    /// `BOUNDED_VALIDATION_MAX_WAIT` for a parser validation worker slot.
+    /// Nothing was judged invalid; retry (HTTP 503).
+    #[error("{0}")]
+    ValidationBusy(String),
     #[error("Invalid source type: {0}")]
     InvalidSourceType(String),
     #[error("Invalid source config: {0}")]

@@ -436,7 +436,7 @@ fn audit(
 }
 
 #[utoipa::path(get, path = "/api/connector-specs", tag = "connector_feeds",
-    responses((status = 200, body = Vec<ConnectorSpecInfo>), (status = 403, description = "Forbidden")),
+    responses((status = 200, description = "Available connector specs", body = Vec<ConnectorSpecInfo>), (status = 403, description = "Forbidden")),
     security(("api_key" = [])))]
 pub async fn list_connector_specs(
     Extension(auth): Extension<AuthContext>,
@@ -466,7 +466,7 @@ pub async fn list_connector_specs(
 }
 
 #[utoipa::path(get, path = "/api/connector-feeds", tag = "connector_feeds",
-    responses((status = 200, body = Vec<ConnectorFeedView>), (status = 403, description = "Forbidden")),
+    responses((status = 200, description = "Connector feeds", body = Vec<ConnectorFeedView>), (status = 403, description = "Forbidden")),
     security(("api_key" = [])))]
 pub async fn list_connector_feeds(
     State(state): State<AppState>,
@@ -479,7 +479,7 @@ pub async fn list_connector_feeds(
 
 #[utoipa::path(get, path = "/api/connector-feeds/{id}", tag = "connector_feeds",
     params(("id" = String, Path, description = "Feed ID (cfeed_...)")),
-    responses((status = 200, body = ConnectorFeedDetail), (status = 404, description = "Not found"), (status = 403, description = "Forbidden")),
+    responses((status = 200, description = "Connector feed with stream state", body = ConnectorFeedDetail), (status = 404, description = "Not found"), (status = 403, description = "Forbidden")),
     security(("api_key" = [])))]
 pub async fn get_connector_feed(
     State(state): State<AppState>,
@@ -499,7 +499,7 @@ pub async fn get_connector_feed(
 }
 
 #[utoipa::path(post, path = "/api/connector-feeds", tag = "connector_feeds", request_body = CreateConnectorFeed,
-    responses((status = 201, body = ConnectorFeedCreated), (status = 400, description = "Invalid input or parser lane not deployed"),
+    responses((status = 201, description = "Connector feed created", body = ConnectorFeedCreated), (status = 400, description = "Invalid input or parser lane not deployed"),
         (status = 403, description = "Requires log_sources:create + log_sources:deploy, credentials:use (+ credentials:create for an inline credential), and enrichments:configure for an identity feed"),
         (status = 409, description = "Name already in use")),
     security(("api_key" = [])))]
@@ -624,7 +624,7 @@ pub async fn create_connector_feed(
 
 #[utoipa::path(patch, path = "/api/connector-feeds/{id}", tag = "connector_feeds",
     params(("id" = String, Path, description = "Feed ID (cfeed_...)")), request_body = SetConnectorFeedEnabled,
-    responses((status = 200, body = ConnectorFeedView), (status = 400, description = "Parser lane must be deployed"),
+    responses((status = 200, description = "Connector feed updated", body = ConnectorFeedView), (status = 400, description = "Parser lane must be deployed"),
         (status = 404, description = "Not found"), (status = 403, description = "Forbidden")),
     security(("api_key" = [])))]
 pub async fn set_connector_feed_enabled(
@@ -696,7 +696,7 @@ pub async fn delete_connector_feed(
 
 #[utoipa::path(post, path = "/api/connector-feeds/{id}/reset", tag = "connector_feeds",
     params(("id" = String, Path, description = "Feed ID (cfeed_...)")), request_body = ResetConnectorFeedStream,
-    responses((status = 200, body = ConnectorFeedResetResult), (status = 400, description = "Unknown or non-window stream"),
+    responses((status = 200, description = "Stream window reset", body = ConnectorFeedResetResult), (status = 400, description = "Unknown or non-window stream"),
         (status = 404, description = "Not found"), (status = 403, description = "Forbidden")),
     security(("api_key" = [])))]
 pub async fn reset_connector_feed_stream(
@@ -752,7 +752,7 @@ pub struct ConnectorFeedAdoptResult {
 /// stream keeps its shrink-guard baseline, so its next full run is guarded).
 #[utoipa::path(post, path = "/api/connector-feeds/{id}/adopt-spec", tag = "connector_feeds",
     params(("id" = String, Path, description = "Feed ID (cfeed_...)")),
-    responses((status = 200, body = ConnectorFeedAdoptResult),
+    responses((status = 200, description = "Feed adopted the current connector spec", body = ConnectorFeedAdoptResult),
         (status = 400, description = "The feed no longer fits the bundled spec; recreate it"),
         (status = 404, description = "Not found"),
         (status = 403, description = "Requires log_sources:edit + log_sources:deploy (+ enrichments:configure for an identity feed)")),

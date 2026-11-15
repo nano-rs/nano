@@ -16,6 +16,7 @@
  *   - metrics.enrichment (geoip/asn/ioc/identity fill, per_source_coverage) → enrichment stage detail
  *   - metrics.detection (stale_rules, noisy_rules, alerts_24h_by_severity) → detection stage detail
  *   - metrics.alerting (volume + delta, by_status, mtta, webhook health, routing) → alerting stage detail
+ *   - metrics.disk (ClickHouse / PostgreSQL / Vector buffer volumes, NAN-5450) → ingestion stage detail
  *   - summary (markdown) → narrative
  *   - dimension_details.{ingestion,parsing,enrichment,detection,alerting} → per-stage analysis prose
  *   - recommendations[] → ranked actions
@@ -62,6 +63,7 @@ import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
 import { api } from '@/lib/api';
 import type {
   CollectedMetrics,
+  DiskHealthReport,
   FindingSuppression,
   Recommendation,
   SiemHealthReport,
@@ -893,7 +895,11 @@ function StageDetail({
 
       {/* Stage-specific content */}
       {stage.id === 'ingestion' && (
-        <IngestionDetail metrics={report.metrics?.ingestion} audit={report.metrics?.audit_durability} />
+        <IngestionDetail
+          metrics={report.metrics?.ingestion}
+          audit={report.metrics?.audit_durability}
+          disk={report.metrics?.disk}
+        />
       )}
       {stage.id === 'parsing' && (
         <ParsingDetail metrics={report.metrics?.parsing} />
@@ -938,9 +944,11 @@ function StageDetail({
 function IngestionDetail({
   metrics,
   audit,
+  disk,
 }: {
   metrics?: CollectedMetrics['ingestion'];
   audit?: CollectedMetrics['audit_durability'];
+  disk?: CollectedMetrics['disk'];
 }) {
   if (!metrics) return <EmptyDetail label="ingestion" />;
   const total = metrics.total_events_24h;
@@ -1114,6 +1122,7 @@ function IngestionDetail({
           },
         ]}
       />
+      {disk && <DiskPanel disk={disk} />}
       {integrityRows.length > 0 && (
         <SubPanel
           title="Insert integrity"
@@ -1743,6 +1752,80 @@ function CoverageCell({ label, pct }: { label: string; pct: number }) {
         {Math.round(pct)}%
       </span>
     </div>
+  );
+}
+
+/** NAN-5450: data volume usage; mirrors DISK_WARN_FRACTION / DISK_CRITICAL_FRACTION. */
+const DISK_TONE: Record<DiskHealthReport['status'], Tone> = {
+  ok: 'good',
+  unknown: 'fg-3',
+  warning: 'high',
+  critical: 'critical',
+  imminent: 'critical',
+};
+
+const DISK_COMPONENT_LABEL: Record<DiskHealthReport['volumes'][number]['component'], string> = {
+  clickhouse: 'ClickHouse',
+  postgres: 'PostgreSQL',
+  vector_buffer: 'Vector buffers',
+};
+
+/** `45m`, `7h`, `3d`: the dense form of the server's forecast. */
+export function formatHours(h: number): string {
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))}m`;
+  if (h < 48) return `${Math.round(h)}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
+export function DiskPanel({ disk }: { disk: DiskHealthReport }) {
+  const alarming = disk.volumes.filter(
+    (v) => v.level === 'warning' || v.level === 'critical' || v.level === 'imminent',
+  ).length;
+  return (
+    <SubPanel
+      title="Disks"
+      subtitle={
+        alarming > 0
+          ? `${alarming} volume${alarming === 1 ? '' : 's'} at or above ${Math.round(disk.warn_fraction * 100)}%`
+          : `warn ${Math.round(disk.warn_fraction * 100)}% · critical ${Math.round(disk.critical_fraction * 100)}%`
+      }
+    >
+      <div className="divide-y divide-border">
+        {disk.volumes.map((v) => {
+          const tone = DISK_TONE[v.level];
+          const key = `${v.component}:${v.host ?? '-'}:${v.name}`;
+          return (
+            <div key={key} className="flex items-center gap-3 px-5 py-2.5 hover:bg-foreground/[.02]">
+              <span className="h-[6px] w-[6px] shrink-0 rounded-full" style={{ background: TONE_DOT[tone] }} />
+              <span className="w-[110px] shrink-0 text-[12px] text-foreground">
+                {DISK_COMPONENT_LABEL[v.component]}
+              </span>
+              <span className="flex-1 truncate font-mono text-[11px] text-muted-foreground" title={v.detail}>
+                {[v.host, v.name].filter(Boolean).join(' · ')}
+                {v.total_bytes !== undefined &&
+                  v.free_bytes !== undefined &&
+                  ` · ${formatBytes(v.total_bytes - v.free_bytes)} / ${formatBytes(v.total_bytes)}`}
+              </span>
+              <span
+                className="w-[96px] shrink-0 text-right font-mono text-[10.5px] tabular-nums text-muted-foreground"
+                data-testid="disk-forecast"
+                title={v.forecast ? `${formatBytes(Math.max(0, v.forecast.growth_bytes_per_hour))}/h over ${v.forecast.span_hours.toFixed(1)} h` : undefined}
+              >
+                {v.forecast?.hours_to_full !== undefined ? `full ~${formatHours(v.forecast.hours_to_full)}` : ''}
+              </span>
+              <span className={cn('w-[64px] shrink-0 text-right font-mono text-[11px] tabular-nums', TONE_FG[tone])}>
+                {v.usage_fraction !== undefined ? `${(v.usage_fraction * 100).toFixed(1)}%` : v.level}
+              </span>
+            </div>
+          );
+        })}
+        {disk.notes.map((note) => (
+          <div key={note} className="px-5 py-2 font-mono text-[10.5px] text-muted-foreground/70">
+            {note}
+          </div>
+        ))}
+      </div>
+    </SubPanel>
   );
 }
 

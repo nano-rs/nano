@@ -130,7 +130,7 @@ impl DetectionCodeTargetRepository {
         );
         let mut tx = self.pool.begin().await?;
         acquire_autonomous_tuning_dac_lock(&mut tx).await?;
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&req.name)
             .bind(&req.repo_url)
             .bind(req.base_branch.as_deref().unwrap_or("main"))
@@ -153,13 +153,13 @@ impl DetectionCodeTargetRepository {
 
     pub async fn list(&self) -> Result<Vec<DetectionCodeTarget>, DetectionCodeTargetError> {
         let sql = format!("SELECT {DCT_SELECT} FROM detection_code_targets ORDER BY name ASC");
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).fetch_all(&self.pool).await?;
         Ok(rows.iter().map(Self::row_to_target).collect())
     }
 
     pub async fn get(&self, id: Uuid) -> Result<DetectionCodeTarget, DetectionCodeTargetError> {
         let sql = format!("SELECT {DCT_SELECT} FROM detection_code_targets WHERE id = $1");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -178,7 +178,7 @@ impl DetectionCodeTargetRepository {
              WHERE enabled = TRUE AND token_encrypted IS NOT NULL \
              ORDER BY updated_at DESC LIMIT 1"
         );
-        let row = sqlx::query(&sql).fetch_optional(&self.pool).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).fetch_optional(&self.pool).await?;
         Ok(row.as_ref().map(Self::row_to_target))
     }
 
@@ -209,7 +209,7 @@ impl DetectionCodeTargetRepository {
         );
         let mut tx = self.pool.begin().await?;
         acquire_autonomous_tuning_dac_lock(&mut tx).await?;
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(&req.name)
             .bind(&req.repo_url)
@@ -242,7 +242,7 @@ impl DetectionCodeTargetRepository {
         );
         let mut tx = self.pool.begin().await?;
         acquire_autonomous_tuning_dac_lock(&mut tx).await?;
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(&ciphertext)
             .bind(&nonce)

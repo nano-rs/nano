@@ -126,6 +126,14 @@ ssh $H2 'cd ~/nano && python3 -I deploy/compose/render-inventory.py --inventory 
 
 All three print the same `sha256`.
 
+Storage tiering (optional, intake question 9): add a top-level `tiering:`
+block with the non-secret fields (`provider`, `bucket`, `region`, `endpoint`,
+`prefix`, `move_factor`, `cache_size`, `use_environment_credentials`, or the
+`azure_*` fields). `plan.py --tiering-provider ... --inventory-out` writes it;
+for `ha3-inventory.py` output, paste the block from `plan.py --json`
+(`tiering.inventory_block`). Adding it does not change the identity `sha256`.
+The secrets go in the shared `.env` in Step 4.
+
 ## Step 3: private TLS material (privileged, secret)
 
 Use the operator's PKI, or create a CA and certificate with
@@ -168,6 +176,19 @@ ssh $H1 'cd ~/nano && set -a && . ~/.nano-admin-credentials && set +a &&
 Then add the enrollment values on nano-1 with `apply-enrollment.sh` (Step 7 of
 [single-node.md](single-node.md)). Its `NANO_DEPLOYMENT_ID` must equal the
 inventory's `deployment_id`. If they differ, stop.
+
+With a `tiering:` block (and no environment credentials), the operator records
+the object-store secrets in nano-1's `.env` before Step 5 distributes it. The
+values are typed on the host, never into chat:
+
+```bash
+# Operator, in their own terminal; lines NANO_TIERING_ACCESS_KEY_ID=... and
+# NANO_TIERING_SECRET_ACCESS_KEY=... (azure: NANO_TIERING_AZURE_ACCOUNT_KEY=...), then Ctrl-D
+ssh -t $H1 'cd ~/nano && scripts/nano tiering configure --secrets-stdin'
+```
+
+The ClickHouse hosts' installs fail with the missing key's name if this is
+skipped.
 
 ## Step 5: distribute .env (secret)
 

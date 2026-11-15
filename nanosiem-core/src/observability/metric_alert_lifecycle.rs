@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder, Transaction};
 use uuid::Uuid;
 
-fn scope<'a>(query: &mut QueryBuilder<'a, Postgres>, tenant: Option<Uuid>) {
+fn scope<'a>(query: &mut QueryBuilder<Postgres>, tenant: Option<Uuid>) {
     if let Some(tenant) = tenant {
         query.push(" AND tenant_id = ").push_bind(tenant);
     }
@@ -211,7 +211,7 @@ async fn consolidate(
         }
     }
     merge.push_str(" WHERE k.id = $1");
-    sqlx::query(&merge)
+    sqlx::query(sqlx::AssertSqlSafe(merge.as_str()))
         .bind(keeper)
         .bind(&all)
         .execute(&mut **tx)
@@ -241,10 +241,10 @@ async fn consolidate(
     // A closed duplicate no longer counts toward the keeper's case/incident.
     for (enabled, col) in [(links.case_id, "case_id"), (links.incident_id, "incident_id")] {
         if enabled {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE alerts d SET {col} = NULL FROM alerts k \
                  WHERE k.id = $1 AND d.id = ANY($2) AND d.{col} = k.{col}"
-            ))
+            )))
             .bind(keeper)
             .bind(&dups)
             .execute(&mut **tx)

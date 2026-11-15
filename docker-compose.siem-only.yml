@@ -159,6 +159,11 @@ services:
       CLICKHOUSE_INGEST_PASSWORD: ${CLICKHOUSE_INGEST_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       # Defined even though SIEM-only has no bundled Vector; users.d is shared.
       CLICKHOUSE_VECTOR_PASSWORD: ${CLICKHOUSE_VECTOR_PASSWORD:?CLICKHOUSE_VECTOR_PASSWORD is required}
+      # NAN-5445: tiering object-store credentials (see docker-compose.opensource.yml).
+      NANO_TIERING_ACCESS_KEY_ID: ${NANO_TIERING_ACCESS_KEY_ID:-}
+      NANO_TIERING_SECRET_ACCESS_KEY: ${NANO_TIERING_SECRET_ACCESS_KEY:-}
+      NANO_TIERING_AZURE_ACCOUNT_KEY: ${NANO_TIERING_AZURE_ACCOUNT_KEY:-}
+      NANO_TIERING_CONFIG_SHA256: ${NANO_TIERING_CONFIG_SHA256:-}
     # SIEM-only divergence: the ClickHouse HTTP interface is PUBLISHED so an
     # external aggregator (Tenzir/Cribl/forwarder) can INSERT directly into
     # nanosiem.ocsf_logs_raw. The full-stack opensource compose keeps this port
@@ -197,6 +202,8 @@ services:
       # nanosiem_ingest). The checked-in fallback is empty, leaving the
       # loopback + private-range lists in users.d/nanosiem-users.xml.
       - ${NANO_CLICKHOUSE_NETWORKS_FILE:-./config/sizing-defaults/clickhouse-networks.xml}:/etc/clickhouse-server/users.d/zzzz-nano-networks.xml:ro
+      # NAN-5445: hot/cold storage tiering (see docker-compose.opensource.yml).
+      - ${NANO_CLICKHOUSE_TIERING_FILE:-./config/sizing-defaults/clickhouse-tiering.xml}:/etc/clickhouse-server/config.d/zzz-nano-tiering.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -285,6 +292,8 @@ services:
       # nanosiem.ocsf_logs and refuses to start instead of repointing the
       # deployment at an empty table.
       NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}
+      # NAN-5449: event retention in days (the ClickHouse TTL); empty leaves it.
+      NANO_RETENTION_DAYS: ${NANO_RETENTION_DAYS:-}
       # The migrator substitutes these into {pg_dict_*} placeholders in
       # clickhouse/init.sql so the PG-sourced dictionaries can authenticate
       # without hardcoded creds (NAN-807 bug #3).
@@ -361,6 +370,7 @@ services:
       # subdomains match). Unset = any public host, as before. Same value on
       # nano-api, nano-jobs and nano-search.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
+      INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config staging. With no Vector to consume them, the parser-editor
       # surface still writes here harmlessly (a no-op in BYO-aggregator mode —
@@ -377,13 +387,25 @@ services:
       NANOSIEM_DATA_DIR: /app/data
       NRT_MAX_CONCURRENT_RULES: "50"
       NRT_PHASE_MAX_SECS: "300"
-      HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
-      WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
-      COLD_STORAGE_ENABLED: "false"
+      # NAN-5448: HOT_RETENTION_DAYS / WARM_RETENTION_DAYS / COLD_STORAGE_ENABLED
+      # are gone. Nothing read HOT_RETENTION_DAYS, and the cold-storage flag made
+      # jobs rewrite the 365-day delete TTL to WARM_RETENTION_DAYS. Tiering is
+      # the ClickHouse storage policy (NANO_TIERING*), retention is the table TTL.
       NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      # NAN-5446: disk-pressure thresholds (fractions of the ClickHouse disk).
+      # Ingestion pauses at DISK_PRESSURE_PAUSE_THRESHOLD (503 + Retry-After at
+      # the ingest edge) so Vector never fills the shared disk. Set in .env.
+      DISK_PRESSURE_CHECK_INTERVAL_SECS: ${DISK_PRESSURE_CHECK_INTERVAL_SECS:-60}
+      DISK_PRESSURE_HIGH_WATERMARK: ${DISK_PRESSURE_HIGH_WATERMARK:-0.80}
+      DISK_PRESSURE_LOW_WATERMARK: ${DISK_PRESSURE_LOW_WATERMARK:-0.70}
+      DISK_PRESSURE_CRITICAL_THRESHOLD: ${DISK_PRESSURE_CRITICAL_THRESHOLD:-0.90}
+      DISK_PRESSURE_EMERGENCY_THRESHOLD: ${DISK_PRESSURE_EMERGENCY_THRESHOLD:-0.95}
+      DISK_PRESSURE_PAUSE_INGESTION: ${DISK_PRESSURE_PAUSE_INGESTION:-true}
+      DISK_PRESSURE_PAUSE_THRESHOLD: ${DISK_PRESSURE_PAUSE_THRESHOLD:-0.92}
+      DISK_PRESSURE_MIN_RETENTION_DAYS: ${DISK_PRESSURE_MIN_RETENTION_DAYS:-}
       REDIS_URL: redis://dragonfly:6379
       LOG_FORMAT: ${LOG_FORMAT:-}
       SIEM_FORWARD_URL: ${SIEM_FORWARD_URL:-}
@@ -449,6 +471,7 @@ services:
       NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-ocsf}  # must match the migrator service
       # NAN-5436: scheduled rules run `inputlookup` here too; same value as nano-api.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
+      INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       # NAN-1913: see nano-api note above.
@@ -458,13 +481,25 @@ services:
       NANOSIEM_DATA_DIR: /app/data
       NRT_MAX_CONCURRENT_RULES: "50"
       NRT_PHASE_MAX_SECS: "300"
-      HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
-      WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
-      COLD_STORAGE_ENABLED: "false"
+      # NAN-5448: HOT_RETENTION_DAYS / WARM_RETENTION_DAYS / COLD_STORAGE_ENABLED
+      # are gone. Nothing read HOT_RETENTION_DAYS, and the cold-storage flag made
+      # jobs rewrite the 365-day delete TTL to WARM_RETENTION_DAYS. Tiering is
+      # the ClickHouse storage policy (NANO_TIERING*), retention is the table TTL.
       NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      # NAN-5446: disk-pressure thresholds (fractions of the ClickHouse disk).
+      # Ingestion pauses at DISK_PRESSURE_PAUSE_THRESHOLD (503 + Retry-After at
+      # the ingest edge) so Vector never fills the shared disk. Set in .env.
+      DISK_PRESSURE_CHECK_INTERVAL_SECS: ${DISK_PRESSURE_CHECK_INTERVAL_SECS:-60}
+      DISK_PRESSURE_HIGH_WATERMARK: ${DISK_PRESSURE_HIGH_WATERMARK:-0.80}
+      DISK_PRESSURE_LOW_WATERMARK: ${DISK_PRESSURE_LOW_WATERMARK:-0.70}
+      DISK_PRESSURE_CRITICAL_THRESHOLD: ${DISK_PRESSURE_CRITICAL_THRESHOLD:-0.90}
+      DISK_PRESSURE_EMERGENCY_THRESHOLD: ${DISK_PRESSURE_EMERGENCY_THRESHOLD:-0.95}
+      DISK_PRESSURE_PAUSE_INGESTION: ${DISK_PRESSURE_PAUSE_INGESTION:-true}
+      DISK_PRESSURE_PAUSE_THRESHOLD: ${DISK_PRESSURE_PAUSE_THRESHOLD:-0.92}
+      DISK_PRESSURE_MIN_RETENTION_DAYS: ${DISK_PRESSURE_MIN_RETENTION_DAYS:-}
       REDIS_URL: redis://dragonfly:6379
       LOG_FORMAT: ${LOG_FORMAT:-}
       SIEM_FORWARD_URL: ${SIEM_FORWARD_URL:-}
@@ -527,6 +562,7 @@ services:
       # subdomains match). Unset = any public host, as before. Same value on
       # nano-api, nano-jobs and nano-search.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
+      INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
       REDIS_URL: redis://dragonfly:6379
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-}

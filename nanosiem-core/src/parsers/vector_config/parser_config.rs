@@ -119,7 +119,9 @@ if is_object(ocsf_event) {
     }
     if nano_ingest_peer != "" { ocsf_event.unmapped.ingest_peer = nano_ingest_peer }
 }
-. = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type, "future_timestamp_skew_seconds": skew_seconds }"#
+"#,
+    nesting_depth_limit_vrl!("ocsf_event", r#"["unmapped", "nano_nesting_truncated"]"#),
+    r#". = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type, "future_timestamp_skew_seconds": skew_seconds }"#
 );
 
 /// NAN-5070: OCSF parsers report a failed parse in `unmapped.parse_error` (the

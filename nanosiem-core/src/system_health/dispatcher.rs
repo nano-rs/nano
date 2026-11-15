@@ -127,7 +127,15 @@ impl SystemHealthDispatcher {
             health_summary: Some(event.summary.clone()),
             health_diagnostic_context: Some(event.diagnostic_context.clone()),
             health_remediation: event.remediation.clone(),
-            idempotency_key: Some(format!("{}:{}", event.id, delivery.event_action)),
+            // NAN-5450: a reminder can repeat (hourly while a disk is about
+            // to fill), each from a new outbox row; key it per row so the
+            // receiver does not drop the repeat as a duplicate. Retries of one
+            // row keep one key.
+            idempotency_key: Some(if delivery.event_action == "reminder" {
+                format!("{}:reminder:{}", event.id, delivery.id)
+            } else {
+                format!("{}:{}", event.id, delivery.event_action)
+            }),
         };
 
         match self

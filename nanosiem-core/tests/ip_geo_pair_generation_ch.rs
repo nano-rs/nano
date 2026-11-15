@@ -29,7 +29,7 @@ fn client() -> clickhouse::Client {
     if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
         c = c.with_password(password);
     }
-    c.with_option("network_compression_method", "LZ4")
+    c.with_setting("network_compression_method", "LZ4")
 }
 
 const SOURCE: &str = "nan4957-pair-test";

@@ -93,6 +93,50 @@ const SUSPICIOUS_PATTERNS: &[(&str, &str)] = &[
 /// The security-filtered stdlib lives in [`super::vrl_functions`], shared with
 /// the AI parser prompt catalog so the model is told exactly what compiles.
 pub use super::vrl_functions::VrlRegistry;
+
+/// Longest a save, publish or deploy waits in total for a parser-test worker
+/// slot (NAN-5401) before answering [`VrlValidatorError::Busy`]. Each attempt
+/// already queues for [`super::test_sandbox::DEPLOY_GATE_ADMISSION_WAIT`], so
+/// this is a handful of re-queues, not a spin.
+pub const BOUNDED_VALIDATION_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Re-run `attempt` while it finds no parser-test worker slot (NAN-5401):
+/// saves, publishes and deploys wait their turn instead of answering busy,
+/// for at most [`BOUNDED_VALIDATION_MAX_WAIT`] in total. Past that the last
+/// busy answer is returned with a message saying how long it waited, which
+/// the save paths turn into a retryable 503 (never an invalid-VRL verdict).
+async fn until_admitted<T, F, Fut>(attempt: F) -> Result<T, VrlValidatorError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, VrlValidatorError>>,
+{
+    until_admitted_within(BOUNDED_VALIDATION_MAX_WAIT, attempt).await
+}
+
+async fn until_admitted_within<T, F, Fut>(max_wait: std::time::Duration, mut attempt: F) -> Result<T, VrlValidatorError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, VrlValidatorError>>,
+{
+    let started = tokio::time::Instant::now();
+    loop {
+        match attempt().await {
+            Err(VrlValidatorError::Busy(_)) if started.elapsed() < max_wait => {
+                tracing::info!("Every parser-test worker slot is busy; the VRL validation keeps waiting for one");
+            }
+            Err(VrlValidatorError::Busy(_)) => {
+                let waited = started.elapsed().as_secs();
+                tracing::warn!(waited_secs = waited, "VRL validation gave up waiting for a parser-test worker slot");
+                return Err(VrlValidatorError::Busy(format!(
+                    "VRL validation waited {waited}s for a parser validation worker and every one stayed busy. \
+                     Nothing was marked invalid; retry in a minute."
+                )));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 use super::vrl_functions::parser_vrl_functions;
 
@@ -321,6 +365,114 @@ impl VrlValidator {
                 warnings: gates.warnings,
             }),
         }
+    }
+
+    /// NAN-5401: [`Self::validate_vrl`] for the paths that persist or deploy
+    /// tenant VRL (log source and parser save, validate, publish, deploy and
+    /// OCSF attestation). The AI parser loops use
+    /// [`Self::validate_vrl_interactive`] instead.
+    ///
+    /// In a process with a parser-test worker (the API and jobs binaries
+    /// register one in `main`), the compile runs in the bounded worker under
+    /// the deploy-gate budget ([`super::test_sandbox::Budget::DeployGate`]):
+    /// the same verdict, but a save waits for a slot behind interactive tests
+    /// (re-queuing every [`super::test_sandbox::DEPLOY_GATE_ADMISSION_WAIT`])
+    /// and answers [`VrlValidatorError::Busy`] only after waiting
+    /// [`BOUNDED_VALIDATION_MAX_WAIT`] in total (the request's own deadline
+    /// may end it sooner). It also gets the deploy gate's compile
+    /// allowance, so whatever saves also publishes. Waiting cannot deadlock:
+    /// a request that already holds an admission ([`super::test_sandbox::admitted`])
+    /// takes turns in its own slot instead of asking for another.
+    ///
+    /// A process with no worker executable (library callers, test harnesses,
+    /// examples) compiles in-process as before: it is not the API, so there
+    /// is no tenant traffic to bound there, and failing closed would break
+    /// every non-service caller. Code already inside a worker also compiles
+    /// in-process.
+    pub async fn validate_vrl_bounded(
+        &self,
+        vrl_code: &str,
+    ) -> Result<VrlValidationResult, VrlValidatorError> {
+        match self.bounded_route(super::test_sandbox::current_executor()) {
+            Some(bounded) => until_admitted(|| bounded.validate_vrl_isolated(vrl_code)).await,
+            None => self.validate_vrl(vrl_code).await,
+        }
+    }
+
+    /// [`Self::validate_vrl`] for the AI parser loops (NAN-5401): model-written
+    /// VRL compiles in the bounded worker under the **interactive** budget
+    /// ([`super::test_sandbox::Budget::Interactive`]), one attempt, so a busy
+    /// pool answers [`VrlValidatorError::Busy`] to the loop (as a parser test
+    /// does) instead of queueing behind saves with the deploy-gate CPU
+    /// allowance. With no worker executable it compiles in-process.
+    pub async fn validate_vrl_interactive(
+        &self,
+        vrl_code: &str,
+    ) -> Result<VrlValidationResult, VrlValidatorError> {
+        match self.interactive_route(super::test_sandbox::current_executor()) {
+            Some(bounded) => bounded.validate_vrl_isolated(vrl_code).await,
+            None => self.validate_vrl(vrl_code).await,
+        }
+    }
+
+    /// [`Self::validate_vrl_collect_errors`], bounded as
+    /// [`Self::validate_vrl_interactive`] is (NAN-5401): for the AI parser
+    /// loops, which validate model-written VRL round after round.
+    pub async fn validate_vrl_collect_errors_interactive(
+        &self,
+        vrl_code: &str,
+    ) -> Result<(VrlValidationResult, Vec<String>), VrlValidatorError> {
+        let Some(bounded) = self.interactive_route(super::test_sandbox::current_executor()) else {
+            return self.validate_vrl_collect_errors(vrl_code).await;
+        };
+        let outcome = bounded
+            .execute_job(super::test_sandbox::Work::ValidateCollect {
+                code: vrl_code.to_string(),
+            })
+            .await?;
+        match outcome {
+            Ok(super::test_sandbox::Outcome::ValidateCollect(result, errors)) => Ok((result, errors)),
+            Ok(_) => Err(VrlValidatorError::ExecutionError(
+                "Invalid parser test worker response".into(),
+            )),
+            Err(bound) => Ok(single_error_result(
+                format!("VRL validation stopped: {bound}"),
+                Vec::new(),
+            )),
+        }
+    }
+
+    /// Where a bounded validation compiles (NAN-5401): `Some` is the
+    /// validator to send it through (worker isolation, deploy-gate budget),
+    /// `None` compiles in this process (already inside a worker, or no
+    /// worker executable registered).
+    pub(crate) fn bounded_route(&self, executor: super::test_sandbox::Executor) -> Option<Self> {
+        self.worker_route(executor).map(Self::for_deploy_gate)
+    }
+
+    /// [`Self::bounded_route`] for the AI loops: the same routing, but the
+    /// interactive budget (NAN-5401).
+    pub(crate) fn interactive_route(&self, executor: super::test_sandbox::Executor) -> Option<Self> {
+        self.worker_route(executor).map(|mut v| {
+            v.budget = super::test_sandbox::Budget::Interactive;
+            v
+        })
+    }
+
+    fn worker_route(&self, executor: super::test_sandbox::Executor) -> Option<Self> {
+        use super::test_sandbox::Executor;
+        if self.isolation == Isolation::InProcess {
+            return None;
+        }
+        match executor {
+            Executor::Worker(_) | Executor::InProcessTestHarness => Some(self.clone()),
+            Executor::Unavailable => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn budget(&self) -> super::test_sandbox::Budget {
+        self.budget
     }
 
     /// The parser-test path's validation (NAN-5396): every gate of
@@ -2066,6 +2218,55 @@ if !is_array(groups) { groups = [] }
 
 #[cfg(test)]
 mod tests {
+    /// NAN-5401: a save keeps waiting through busy answers and passes any
+    /// other result straight through.
+    #[tokio::test]
+    async fn until_admitted_retries_busy_only() {
+        let mut calls = 0;
+        let out = super::until_admitted(|| {
+            calls += 1;
+            let busy = calls < 3;
+            async move {
+                if busy {
+                    Err(VrlValidatorError::Busy("busy".into()))
+                } else {
+                    Ok(7)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let out: Result<(), _> = super::until_admitted(|| {
+            calls += 1;
+            async { Err(VrlValidatorError::ExecutionError("boom".into())) }
+        })
+        .await;
+        assert!(matches!(out, Err(VrlValidatorError::ExecutionError(_))));
+        assert_eq!(calls, 1);
+    }
+
+    /// NAN-5401: the wait is capped. A pool that stays busy past the cap
+    /// answers busy (saying how long it waited) instead of hanging forever.
+    #[tokio::test]
+    async fn until_admitted_gives_up_after_the_cap() {
+        let mut calls = 0;
+        let out: Result<(), _> = super::until_admitted_within(std::time::Duration::from_millis(50), || {
+            calls += 1;
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Err(VrlValidatorError::Busy("busy".into()))
+            }
+        })
+        .await;
+        let Err(VrlValidatorError::Busy(message)) = out else { panic!("expected busy: {out:?}") };
+        assert!(message.contains("retry"), "{message}");
+        assert!((2..100).contains(&calls), "re-queued until the cap, then stopped: {calls}");
+        assert!(super::BOUNDED_VALIDATION_MAX_WAIT <= std::time::Duration::from_secs(300));
+    }
+
     use super::*;
 
     #[test]
@@ -2722,3 +2923,4 @@ mod tests {
         );
     }
 }
+

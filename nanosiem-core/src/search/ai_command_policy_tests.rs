@@ -95,9 +95,23 @@ fn normalize_allowlist_rejects_unknown_names() {
 fn refusal_audit_event_names_actor_command_and_query() {
     let actor = Uuid::now_v7();
     let refusal = check(URL_LOOKUP, &[]).unwrap_err();
-    let event = refusal_audit_event(Some(actor), &refusal, URL_LOOKUP, "search");
+    let key = Uuid::now_v7();
+    let caller = SearchAuditCaller {
+        actor_id: Some(actor),
+        api_key_id: Some(key),
+        api_key_name: Some("ci export".into()),
+        client: ClientContext::new(Some("203.0.113.7".into()), Some("curl/8".into())),
+    };
+    let event = refusal_audit_event(&caller, &refusal, URL_LOOKUP, "search");
     assert_eq!(event.action, actions::SEARCH_AI_COMMAND_REFUSED);
     assert!(!event.success);
+    // NAN-5456: the member, the key and the client are on the event.
+    assert_eq!(event.actor_id, Some(actor));
+    assert_eq!(event.api_key_id, Some(key));
+    assert_eq!(event.api_key_name.as_deref(), Some("ci export"));
+    assert_eq!(event.ip_address.as_deref(), Some("203.0.113.7"));
+    assert_eq!(event.user_agent.as_deref(), Some("curl/8"));
+    assert!(!event.message().ends_with("by system"), "{}", event.message());
     let details = event.details.expect("details");
     assert_eq!(details["command"], "inputlookup");
     assert_eq!(details["origin"], "ai");
@@ -185,4 +199,45 @@ fn internal_lookup_detection_matches_execution() {
     ] {
         assert_eq!(refused_command(npl), "inputlookup", "{npl}");
     }
+}
+
+/// NAN-5456: the request caller installed by the auth layer attributes a
+/// refusal even before the engine sets the request actor, and follows the
+/// search into spawned work.
+#[tokio::test]
+async fn search_audit_caller_comes_from_the_request_scope() {
+    assert_eq!(current_search_audit_caller(), SearchAuditCaller::default(), "nobody outside a request");
+    let member = Uuid::now_v7();
+    let caller = SearchAuditCaller {
+        actor_id: Some(member),
+        api_key_id: None,
+        api_key_name: None,
+        client: ClientContext::new(Some("198.51.100.4".into()), None),
+    };
+    let (here, spawned) = with_search_audit_caller(caller.clone(), async {
+        let spawned = tokio::spawn(crate::search::request_actor::inherit(async { current_search_audit_caller() }))
+            .await
+            .unwrap();
+        (current_search_audit_caller(), spawned)
+    })
+    .await;
+    assert_eq!(here, caller);
+    assert_eq!(spawned, caller, "the caller follows spawned search work");
+}
+
+/// Without a request caller (in-process AI paths) the request actor that
+/// `with_ai_origin` sets is used; a caller without a member is filled from it.
+#[tokio::test]
+async fn search_audit_caller_falls_back_to_the_request_actor() {
+    let actor = Uuid::now_v7();
+    let bare = with_ai_origin(Some(actor), async { current_search_audit_caller() }).await;
+    assert_eq!(bare.actor_id, Some(actor));
+    assert_eq!(bare.client, ClientContext::default());
+    let partial = SearchAuditCaller {
+        client: ClientContext::new(Some("192.0.2.1".into()), None),
+        ..Default::default()
+    };
+    let filled = with_search_audit_caller(partial, with_ai_origin(Some(actor), async { current_search_audit_caller() })).await;
+    assert_eq!(filled.actor_id, Some(actor));
+    assert_eq!(filled.client.ip_address.as_deref(), Some("192.0.2.1"));
 }

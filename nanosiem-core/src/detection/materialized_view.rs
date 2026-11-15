@@ -304,7 +304,7 @@ impl MaterializedViewGenerator {
         Self::ddl_settings(&Self::on_cluster_clause())
             .iter()
             .fold(self.clickhouse_client.clone(), |client, (name, value)| {
-                client.with_option(*name, *value)
+                client.with_setting(*name, *value)
             })
     }
 

@@ -123,7 +123,7 @@ impl PostgresLookupRepository {
             Self::LOOKUP_TABLES_SELECT,
             Self::LOOKUP_TABLES_FROM_JOIN,
         );
-        let rows = sqlx::query_as::<_, LookupTableRow>(&sql)
+        let rows = sqlx::query_as::<_, LookupTableRow>(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(&self.pool)
             .await?;
 
@@ -138,7 +138,7 @@ impl PostgresLookupRepository {
             Self::LOOKUP_TABLES_SELECT,
             Self::LOOKUP_TABLES_FROM_JOIN,
         );
-        let row = sqlx::query_as::<_, LookupTableRow>(&sql)
+        let row = sqlx::query_as::<_, LookupTableRow>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(name)
             .fetch_optional(&self.pool)
             .await?
@@ -484,10 +484,10 @@ impl PostgresLookupRepository {
         .execute(&mut *tx)
         .await?;
         if drop_physical_in_tx {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP TABLE IF EXISTS \"{}\" CASCADE",
                 table.table_name
-            ))
+            )))
             .execute(&mut *tx)
             .await?;
             sqlx::query("DELETE FROM lookup_generation_cleanup WHERE physical_name = $1")
@@ -554,7 +554,7 @@ impl PostgresLookupRepository {
             column_defs.join(", ")
         );
 
-        if let Err(error) = sqlx::query(&create_sql).execute(&self.pool).await {
+        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(create_sql.as_str())).execute(&self.pool).await {
             let duplicate = error
                 .as_database_error()
                 .and_then(|db| db.code())
@@ -574,7 +574,7 @@ impl PostgresLookupRepository {
                 "CREATE INDEX IF NOT EXISTS \"{}\" ON \"{}\" (\"{}\")",
                 index_name, table_name, pk
             );
-            sqlx::query(&index_sql).execute(&self.pool).await?;
+            sqlx::query(sqlx::AssertSqlSafe(index_sql.as_str())).execute(&self.pool).await?;
         }
 
         Ok(())
@@ -590,7 +590,7 @@ impl PostgresLookupRepository {
         }
 
         let drop_sql = format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table_name);
-        sqlx::query(&drop_sql).execute(&self.pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(drop_sql.as_str())).execute(&self.pool).await?;
 
         Ok(())
     }
@@ -613,7 +613,7 @@ impl PostgresLookupRepository {
         }
 
         let truncate_sql = format!("TRUNCATE TABLE \"{}\"", table_name);
-        sqlx::query(&truncate_sql).execute(&self.pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(truncate_sql.as_str())).execute(&self.pool).await?;
 
         Ok(())
     }
@@ -709,7 +709,7 @@ impl PostgresLookupRepository {
                 values_parts.join(", ")
             );
 
-            let mut query = sqlx::query(&insert_sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()));
 
             for record in chunk {
                 for (col_idx, col_name) in column_names.iter().enumerate() {
@@ -764,7 +764,7 @@ impl PostgresLookupRepository {
             "CREATE UNIQUE INDEX IF NOT EXISTS \"{}\" ON \"{}\" (\"_row_id\")",
             index_name, table_name
         );
-        sqlx::query(&sql).execute(&self.pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -794,7 +794,7 @@ impl PostgresLookupRepository {
             "SELECT COUNT(*), COUNT(*) FILTER (WHERE \"_row_id\" = ANY($1)) FROM \"{}\"",
             table_name
         );
-        let (current, existing): (i64, i64) = sqlx::query_as(&sql)
+        let (current, existing): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&row_ids)
             .fetch_one(&self.pool)
             .await?;
@@ -839,7 +839,7 @@ impl PostgresLookupRepository {
                 quoted_columns.join(", "),
                 values_parts.join(", ")
             );
-            let mut query = sqlx::query(&insert_sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()));
             for (offset, record) in chunk.iter().enumerate() {
                 query = query.bind(row_ids[chunk_index * 500 + offset]);
                 for (column_index, column_name) in column_names.iter().enumerate() {
@@ -869,7 +869,7 @@ impl PostgresLookupRepository {
         }
 
         let count_sql = format!("SELECT COUNT(*) FROM \"{}\"", table_name);
-        let count: (i64,) = sqlx::query_as(&count_sql).fetch_one(&self.pool).await?;
+        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(count_sql.as_str())).fetch_one(&self.pool).await?;
 
         Ok(count.0)
     }
@@ -948,7 +948,7 @@ impl PostgresLookupRepository {
         // Convert key value to string for binding
         let key_str = Self::json_value_to_string(key_value);
 
-        let row: Option<sqlx::postgres::PgRow> = sqlx::query(&query_sql)
+        let row: Option<sqlx::postgres::PgRow> = sqlx::query(sqlx::AssertSqlSafe(query_sql.as_str()))
             .bind(&key_str)
             .fetch_optional(&self.pool)
             .await?;
@@ -1024,7 +1024,7 @@ impl PostgresLookupRepository {
             select_clause, table_name, where_clause
         );
 
-        let rows = sqlx::query(&query_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query_sql.as_str()))
             .bind(&key_strings)
             .fetch_all(&self.pool)
             .await?;
@@ -1059,7 +1059,7 @@ impl PostgresLookupRepository {
 
         let query_sql = format!("SELECT * FROM \"{}\" LIMIT {}", table_name, limit);
 
-        let rows = sqlx::query(&query_sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query_sql.as_str())).fetch_all(&self.pool).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -1096,7 +1096,7 @@ impl PostgresLookupRepository {
             table_name, limit, offset
         );
 
-        let rows = sqlx::query(&query_sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query_sql.as_str())).fetch_all(&self.pool).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -1139,7 +1139,7 @@ impl PostgresLookupRepository {
             placeholders.join(", ")
         );
 
-        let mut query = sqlx::query_scalar::<_, i64>(&insert_sql);
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(insert_sql.as_str()));
 
         for (col_idx, col_name) in column_names.iter().enumerate() {
             let value = record.get(*col_name);
@@ -1181,7 +1181,7 @@ impl PostgresLookupRepository {
             column_names.len() + 1
         );
 
-        let mut query = sqlx::query(&update_sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()));
 
         for (col_idx, col_name) in column_names.iter().enumerate() {
             let value = record.get(*col_name);
@@ -1213,7 +1213,7 @@ impl PostgresLookupRepository {
         }
 
         let delete_sql = format!("DELETE FROM \"{}\" WHERE _row_id = $1", table_name);
-        let result = sqlx::query(&delete_sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(delete_sql.as_str()))
             .bind(row_id)
             .execute(&self.pool)
             .await?;
@@ -1246,7 +1246,7 @@ impl PostgresLookupRepository {
             "DELETE FROM \"{}\" WHERE _row_id = ANY($1::bigint[])",
             table_name
         );
-        let result = sqlx::query(&delete_sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(delete_sql.as_str()))
             .bind(row_ids)
             .execute(&self.pool)
             .await?;

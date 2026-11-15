@@ -21,6 +21,9 @@ pub enum HealthIssueType {
     ModelDeprecated,
     /// A cancelled ClickHouse query is still running (unkillable planner wedge)
     StuckQuery,
+    /// A data volume (ClickHouse, PostgreSQL, Vector buffers) is at or above
+    /// 80 % / 90 % (NAN-5450). One issue per volume and level.
+    DiskUsage,
 }
 
 impl std::fmt::Display for HealthIssueType {
@@ -31,6 +34,7 @@ impl std::fmt::Display for HealthIssueType {
             HealthIssueType::DiskPressure => write!(f, "disk_pressure"),
             HealthIssueType::ModelDeprecated => write!(f, "model_deprecated"),
             HealthIssueType::StuckQuery => write!(f, "stuck_query"),
+            HealthIssueType::DiskUsage => write!(f, "disk_usage"),
         }
     }
 }
@@ -43,6 +47,7 @@ impl HealthIssueType {
             "disk_pressure" => Some(HealthIssueType::DiskPressure),
             "model_deprecated" => Some(HealthIssueType::ModelDeprecated),
             "stuck_query" => Some(HealthIssueType::StuckQuery),
+            "disk_usage" => Some(HealthIssueType::DiskUsage),
             _ => None,
         }
     }

@@ -373,7 +373,7 @@ signal_owned() {
 }
 
 cargo_bin() {
-    # rustup's proxies honour rust-toolchain.toml (1.95); a non-rustup cargo would not.
+    # rustup's proxies honour rust-toolchain.toml (1.100); a non-rustup cargo would not.
     if [[ -n "${E2E_CARGO:-}" ]]; then printf '%s' "$E2E_CARGO"; return; fi
     local brew_rustup
     if command -v brew >/dev/null 2>&1 && brew_rustup="$(brew --prefix rustup 2>/dev/null)" \

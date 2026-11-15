@@ -73,7 +73,7 @@ async fn a_shadowing_caller_search_path_cannot_redirect_the_grant_bump() {
         format!("INSERT INTO {schema}.grant_authority_version VALUES (TRUE, 0)"),
         format!("SET LOCAL search_path = {schema}, public"),
     ] {
-        sqlx::query(&sql).execute(&mut *tx).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&mut *tx).await.unwrap();
     }
 
     // Any grant-table write fires the statement trigger.
@@ -97,9 +97,9 @@ async fn a_shadowing_caller_search_path_cannot_redirect_the_grant_bump() {
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    let shadow: i64 = sqlx::query_scalar(&format!(
+    let shadow: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT version FROM {schema}.grant_authority_version WHERE singleton"
-    ))
+    )))
     .fetch_one(&mut *tx)
     .await
     .unwrap();

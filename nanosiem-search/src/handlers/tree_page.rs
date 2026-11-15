@@ -210,7 +210,7 @@ pub fn page_tree(
 
 #[utoipa::path(post, path = "/api/search/tree-page", tag = "search", request_body = TreePageRequest,
     responses((status = 200, description = "Bounded roots or children, or job progress", body = TreePageResponse),
-        (status = 400, body = ErrorResponse), (status = 401, description = "Unauthorized"), (status = 403, description = "Missing search permission"),
+        (status = 400, description = "Invalid request or query", body = ErrorResponse), (status = 401, description = "Unauthorized"), (status = 403, description = "Missing search permission"),
         (status = 404, description = "Job or path unavailable")), security(("bearer_auth" = []), ("api_key" = [])))]
 pub async fn get_tree_page(
     State(state): State<SearchState>,

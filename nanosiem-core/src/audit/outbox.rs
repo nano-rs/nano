@@ -444,9 +444,9 @@ impl SecurityAuditOutbox {
                     lower($8)) > 0)
         "#;
 
-        let rows: Vec<EventRow> = sqlx::query_as(&format!(
+        let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT event_id, occurred_at, event {FILTER} ORDER BY occurred_at DESC LIMIT $9 OFFSET $10"
-        ))
+        )))
         .bind(start)
         .bind(end)
         .bind(query.actor_id)
@@ -460,7 +460,7 @@ impl SecurityAuditOutbox {
         .fetch_all(&self.pool)
         .await?;
 
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {FILTER}"))
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {FILTER}")))
             .bind(start)
             .bind(end)
             .bind(query.actor_id)
@@ -499,11 +499,15 @@ fn row_to_entry(row: EventRow) -> ClickHouseAuditEntry {
     }
 }
 
-/// Keep stored errors bounded (ClickHouse exceptions can carry long stacks).
+/// The ClickHouse error stored on an outbox row: one inert line (ClickHouse
+/// can quote the audit values it failed on, NUL and line breaks included,
+/// and a NUL would fail this very write), capped at 2000 bytes (exceptions
+/// can carry long stacks).
 fn truncate_error(error: &str) -> String {
     const MAX: usize = 2000;
+    let error = crate::db::pg_text::pg_safe_error_text(error);
     if error.len() <= MAX {
-        return error.to_string();
+        return error;
     }
     let mut end = MAX;
     while !error.is_char_boundary(end) {
@@ -511,3 +515,7 @@ fn truncate_error(error: &str) -> String {
     }
     format!("{}…", &error[..end])
 }
+
+#[cfg(test)]
+#[path = "outbox_error_text_tests.rs"]
+mod error_text_tests;

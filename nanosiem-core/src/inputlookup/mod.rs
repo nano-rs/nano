@@ -39,6 +39,7 @@
 //! - `rate_limit_per_minute`: Rate limit per user (default: 60)
 //! - `allow_http`: Whether to allow plain HTTP (default: false)
 
+pub mod allowlist;
 mod fetcher;
 mod response_parser;
 mod service;
@@ -49,7 +50,7 @@ pub use fetcher::{CacheStats, FetchError, FetchResult, UrlFetcher};
 pub use response_parser::ParseError;
 pub use service::{internal_lookup_table, params_from_command, InputLookupError, InputLookupOutcome, InputLookupService};
 pub use ssrf::{
-    ai_base_url_validator, describe_ai_base_url_error, pin_resolved_addrs, private_ai_endpoints_allowed,
+    ai_base_url_validator, describe_ai_base_url_error, pin_resolved_addrs, pin_resolved_addrs_with, private_ai_endpoints_allowed,
     restricted_redirect_policy, IpCidr, ProxyPolicy, SsrfConfig, SsrfError, SsrfValidator,
     ALLOW_PRIVATE_AI_ENDPOINTS_ENV, PRIVATE_AI_ENDPOINTS_HINT,
 };

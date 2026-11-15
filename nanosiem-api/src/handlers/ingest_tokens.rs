@@ -352,7 +352,7 @@ async fn install_token_state(
 }
 
 #[utoipa::path(get, path = "/api/ingest-tokens", tag = "ingest_tokens",
-    responses((status = 200, body = IngestTokenList), (status = 403, description = "Forbidden"),
+    responses((status = 200, description = "Ingest tokens (values are never returned)", body = IngestTokenList), (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found")),
     security(("bearer_auth" = []), ("api_key" = [])))]
 pub async fn list_ingest_tokens(
@@ -520,7 +520,7 @@ pub async fn rotate_ingest_token(
 
 #[utoipa::path(post, path = "/api/ingest-tokens/{credential_id}/revoke", tag = "ingest_tokens",
     params(("credential_id" = Uuid, Path, description = "Credential id")),
-    responses((status = 200, body = IngestToken), (status = 403, description = "Forbidden (admins only)"),
+    responses((status = 200, description = "Revoked", body = IngestToken), (status = 403, description = "Forbidden (admins only)"),
         (status = 404, description = "Not found"), (status = 409, description = "Already revoked"),
         (status = 503, description = "Revoked, but Vector's tokens file update is still pending")),
     security(("bearer_auth" = []), ("api_key" = [])))]
@@ -563,7 +563,7 @@ pub async fn revoke_ingest_token(
 
 #[utoipa::path(put, path = "/api/ingest-tokens/install-token", tag = "ingest_tokens",
     request_body = UpdateInstallTokenRequest,
-    responses((status = 200, body = InstallTokenState),
+    responses((status = 200, description = "Install token state", body = InstallTokenState),
         (status = 400, description = "Empty request, `mode: legacy_multiplex` (one-way), or the source does not exist / cannot receive pushed events"),
         (status = 403, description = "Forbidden (admins only)"),
         (status = 409, description = "The install token is already bound (bindings never change)"),

@@ -66,7 +66,7 @@ async fn gated_settings_stay_off_while_any_replica_is_old() {
     }
 
     // The hazard the gate prevents: the option on the client fails on the old pod.
-    let enabled = ch.clone().with_option("max_bytes_before_external_set", "67108864");
+    let enabled = ch.clone().with_setting("max_bytes_before_external_set", "67108864");
     let mut failures = 0;
     for _ in 0..ROUNDS {
         if let Err(e) = enabled.query(SPILL_PROBE).fetch_one::<u64>().await {

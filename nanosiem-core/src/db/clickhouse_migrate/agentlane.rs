@@ -863,7 +863,7 @@ impl ClickHouseMigrator {
         )
         .iter()
         .fold(self.client.clone(), |client, (name, value)| {
-            client.with_option(*name, *value)
+            client.with_setting(*name, *value)
         });
 
         let existing = self

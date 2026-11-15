@@ -637,6 +637,9 @@ pub(super) fn candidate_read_error(class: &str, raw: &str) -> (StatusCode, Strin
             StatusCode::BAD_REQUEST,
             format!("Invalid query: {message}"),
         ),
+        // NAN-5424 moved size refusals (memory limit, too many rows) out of
+        // SqlValidationError; they are still narrowable by the caller.
+        SearchError::ResourceLimit(message) => (StatusCode::BAD_REQUEST, message),
         SearchError::Timeout(_) => (
             StatusCode::GATEWAY_TIMEOUT,
             format!("The {class} artifact read timed out; narrow the time range or the query"),

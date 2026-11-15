@@ -43,6 +43,9 @@
 //!   migrations and before the distributed-wrapper pass, so overlay tables
 //!   listed in `DISTRIBUTED_TABLES` get their `_distributed` wrapper in the
 //!   same run.
+//! - `NANO_RETENTION_DAYS`       — optional event retention in days (1-3650).
+//!   Applied to the event TTL when it differs from the value last applied
+//!   (NAN-5449); unset leaves the TTL alone.
 //!
 //! Operator subcommand (never run by a deploy):
 //!
@@ -672,6 +675,11 @@ async fn run() -> Result<()> {
     // NAN-5359: validate the Agent Lane settings before any DDL, so a bad
     // value fails in the first second instead of after the schema work.
     let agentlane_caps = agentlane_settings()?;
+    // NAN-5449: same for the deployment retention.
+    let deployment_retention = nanosiem_core::settings::retention_days_from_env(
+        std::env::var(nanosiem_core::settings::RETENTION_DAYS_ENV).ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     // NAN-5213: a role-split cluster with several app hosts starts one
     // migrator per host. Serialize the whole run behind a cluster-wide
@@ -1000,6 +1008,80 @@ async fn run() -> Result<()> {
         .await
         .context("applying the planned-volume prevalence refresh cadence (NAN-5345)")?;
 
+    // NAN-5445: move the event tables onto the deployment's cold-tier storage
+    // policy (Compose `nano_tiered`, Helm `tiered`) when one is configured. A
+    // metadata ALTER per table; never fatal (SIEM Health reports a table that
+    // cannot switch).
+    // Enterprise-only: open core has no storage tiering.
+    #[cfg(feature = "enterprise")]
+    {
+        let tiering = migrator.ensure_storage_tiering().await;
+        match (&tiering.policy, &tiering.skipped) {
+            (_, Some(reason)) => tracing::warn!("NAN-5445: storage tiering step skipped: {reason}"),
+            (None, None) => tracing::info!("NAN-5445: no cold storage tier configured"),
+            (Some(policy), None) => tracing::info!(
+                "NAN-5445: storage tiering policy '{}': {} table(s) switched, {} already on it, {} cannot switch, {} failed",
+                policy,
+                tiering.switched.len(),
+                tiering.already.len(),
+                tiering.incompatible.len(),
+                tiering.failed.len()
+            ),
+        }
+    }
+
+    // NAN-5448: one-time repair of the delete TTLs the pre-2.0.27
+    // cold-storage code cut to WARM_RETENTION_DAYS (conservative: exact old
+    // fingerprint, untouched tables only, recorded once in `_migrations`). Never
+    // fatal; a failed ALTER is retried on the next run.
+    // NAN-5449: the restore target prefers the retention saved in Settings.
+    // Unreadable PostgreSQL only loses that preference (NANO_RETENTION_DAYS,
+    // the uncut table's TTL, then 365 still apply).
+    let saved_retention = match Database::connect(&config.postgres_url).await {
+        Ok(pg_db) => {
+            let record = nanosiem_core::settings::read_clickhouse_retention_record(pg_db.pool()).await;
+            pg_db.close().await;
+            match record {
+                Ok(r) => nanosiem_core::db::clickhouse_migrate::saved_settings_retention(&r),
+                Err(e) => {
+                    tracing::warn!(error = %e, "NAN-5448: cannot read the saved retention; repairing without it");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "NAN-5448: PostgreSQL unreachable; repairing without the saved retention");
+            None
+        }
+    };
+    // Runs BEFORE the NANO_RETENTION_DAYS apply at the end of this function.
+    let ttl_repair = migrator.repair_legacy_warm_ttl(saved_retention).await;
+    if let Some(reason) = &ttl_repair.skipped {
+        tracing::warn!("NAN-5448: TTL repair skipped this run: {reason}");
+    } else if !ttl_repair.already_done {
+        tracing::info!(
+            restored = ttl_repair.restored.len(),
+            failed = ttl_repair.failed.len(),
+            "NAN-5448: delete-TTL repair evaluated"
+        );
+    }
+    if !ttl_repair.restored.is_empty() {
+        match Database::connect(&config.postgres_url).await {
+            Ok(pg_db) => {
+                nanosiem_core::db::clickhouse_migrate::report_ttl_repairs(
+                    pg_db.pool(),
+                    &ttl_repair.restored,
+                )
+                .await;
+                pg_db.close().await;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "NAN-5448: TTLs restored, but PostgreSQL is unreachable for the audit event and health notice"
+            ),
+        }
+    }
+
     // NAN-1116: surface any FAILED dictionaries in the deploy log. A FAILED
     // dict referenced by a dictGet()-backed MATERIALIZED column silently drops
     // 100% of ingestion at runtime; this makes it loud at every migrate instead
@@ -1012,6 +1094,41 @@ async fn run() -> Result<()> {
              ingestion through their enrichment columns will be dropped until resolved",
             failed_dicts
         );
+    }
+
+    // NAN-5449: `NANO_RETENTION_DAYS` sets the event TTL. Last, so the event
+    // tables exist, and AFTER the one-time NAN-5448 TTL repair (#9627, which
+    // runs earlier in this function once merged): the repair restores the
+    // TTLs the old cold-storage code cut, and the deployment value must be
+    // applied on top of the restored state, never be overwritten by it. Applied only when the value differs from the one this
+    // step last applied (recorded in PostgreSQL): changing the deployment
+    // value wins, a plain restart keeps a value set in Settings -> Storage.
+    // Unset leaves the TTL alone. Fatal on failure: an operator who set a
+    // retention must not get a silent 365 days.
+    if deployment_retention.is_some() {
+        let pg_db = Database::connect(&config.postgres_url)
+            .await
+            .context("connecting to PostgreSQL to apply NANO_RETENTION_DAYS")?;
+        let (retention_client, _) = config.create_admin_clickhouse_client();
+        let outcome = nanosiem_core::settings::apply_deployment_retention(
+            pg_db.pool(),
+            &retention_client,
+            deployment_retention,
+        )
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("applying NANO_RETENTION_DAYS (NAN-5449)")?;
+        pg_db.close().await;
+        match outcome {
+            nanosiem_core::settings::DeploymentRetentionOutcome::Applied(days) => {
+                tracing::info!(days, "NANO_RETENTION_DAYS applied to the event TTL")
+            }
+            nanosiem_core::settings::DeploymentRetentionOutcome::Unchanged(days) => tracing::info!(
+                days,
+                "NANO_RETENTION_DAYS unchanged since the last apply; keeping the current TTL"
+            ),
+            nanosiem_core::settings::DeploymentRetentionOutcome::NotConfigured => {}
+        }
     }
 
     Ok(())

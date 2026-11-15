@@ -5,7 +5,7 @@
 //! Split into focused submodules by domain:
 //! - `retention` — PostgreSQL retention + ClickHouse storage
 //! - `risk` — risk weight + decay + notable thresholds
-//! - `tiering` — S3 warm/cold storage tiering
+//! - `tiering` — storage tiering status (enterprise, NAN-5445)
 //! - `ai_providers` — multi-provider AI config, models, agents, catalog
 //! - `operational` — org context, health monitoring, developer settings, search admission
 //! - `webhooks` — webhook CRUD + test + deliveries
@@ -28,6 +28,8 @@ mod risk;
 #[cfg(feature = "enterprise")]
 mod risk_enterprise;
 mod tier;
+// NAN-5445: storage tiering status is enterprise (stripped from the mirror).
+#[cfg(feature = "enterprise")]
 mod tiering;
 mod webhooks;
 
@@ -42,6 +44,7 @@ pub use risk::*;
 #[cfg(feature = "enterprise")]
 pub use risk_enterprise::*;
 pub use tier::*;
+#[cfg(feature = "enterprise")]
 pub use tiering::*;
 pub use webhooks::*;
 
@@ -73,7 +76,7 @@ pub struct SettingsApiDoc;
 #[cfg(feature = "enterprise")]
 impl utoipa::OpenApi for SettingsApiDoc {
     fn openapi() -> utoipa::openapi::OpenApi {
-        use nanosiem_core::settings::UpdateTieringRequest;
+        use tiering::UpdateTieringRequest;
         use utoipa::OpenApi;
 
         #[derive(OpenApi)]
@@ -167,6 +170,7 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     retention::ClickHouseStorageStatsResponse,
                     retention::UpdateClickHouseRetentionRequest,
                     tiering::TieringConfigResponse,
+                    tiering::TableTieringResponse,
                     UpdateTieringRequest,
                     tiering::SetTieringCredentialsRequest,
                     tiering::TieringConnectionTestResponse,
@@ -247,7 +251,6 @@ impl utoipa::OpenApi for SettingsApiDoc {
 #[cfg(not(feature = "enterprise"))]
 impl utoipa::OpenApi for SettingsApiDoc {
     fn openapi() -> utoipa::openapi::OpenApi {
-        use nanosiem_core::settings::UpdateTieringRequest;
         use utoipa::OpenApi;
 
         #[derive(OpenApi)]
@@ -267,12 +270,6 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 retention::get_clickhouse_storage_stats,
                 retention::update_clickhouse_retention,
                 retention::run_clickhouse_retention_now,
-                tiering::get_tiering_config,
-                tiering::update_tiering_config,
-                tiering::set_tiering_credentials,
-                tiering::test_tiering_connection,
-                tiering::apply_tiering_config,
-                tiering::get_tier_stats,
                 operational::get_organizational_context,
                 operational::update_organizational_context,
                 operational::get_health_monitoring_settings,
@@ -308,12 +305,6 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     retention::StorageOverviewResponse,
                     retention::ClickHouseStorageStatsResponse,
                     retention::UpdateClickHouseRetentionRequest,
-                    tiering::TieringConfigResponse,
-                    UpdateTieringRequest,
-                    tiering::SetTieringCredentialsRequest,
-                    tiering::TieringConnectionTestResponse,
-                    tiering::TierStatsResponse,
-                    tiering::TierInfoResponse,
                     operational::OrganizationalContextResponse,
                     operational::UpdateOrganizationalContextApiRequest,
                     operational::HealthMonitoringSettingsResponse,
