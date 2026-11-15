@@ -259,7 +259,24 @@ impl BackgroundSearchJobs {
                         .to_string(),
                 ));
             }
-            Ok(_) => {}
+            // NAN-5437: a job runs on a worker with no request context, so an
+            // AI-written search is checked here, at submission.
+            Ok(parsed) => {
+                let ai_allowed = self
+                    .inner
+                    .search
+                    .query_limits()
+                    .read()
+                    .await
+                    .ai_allowed_commands()
+                    .to_vec();
+                crate::search::ai_command_policy::enforce(
+                    &request.query,
+                    &parsed,
+                    &ai_allowed,
+                    "search_job",
+                )?;
+            }
         }
         let normalized = normalize_job_request(request, self.inner.config.result_cap);
         let identity = identity_hash(&normalized, owner, scope);

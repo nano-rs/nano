@@ -33,7 +33,16 @@ pub struct InputLookupConfig {
     #[serde(default = "default_rate_limit_per_minute")]
     pub rate_limit_per_minute: u32,
 
-    /// Allowed domains (empty = allow all non-blocked)
+    /// Host allowlist for outbound `http(s)://` lookups (NAN-5436).
+    ///
+    /// When non-empty, a fetch is permitted only when the URL host equals an
+    /// entry or is a subdomain of one (`host == entry` or
+    /// `host.ends_with(".{entry}")`), case-insensitively, checked before any DNS
+    /// resolution and again for every redirect target.
+    ///
+    /// Empty (the default): any public host is allowed, subject to
+    /// `blocked_domains` and the SSRF guard — unchanged behavior. Internal
+    /// `lookup://` tables bypass the fetcher and are never subject to this list.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
 
@@ -88,6 +97,28 @@ impl Default for InputLookupConfig {
             user_agent: default_user_agent(),
         }
     }
+}
+
+impl InputLookupConfig {
+    /// [`Default`] plus the host allowlist from `INPUTLOOKUP_ALLOWED_DOMAINS`
+    /// (comma/whitespace-separated, e.g. `api.ipinfo.io,intel.example.com`).
+    /// Unset or empty keeps the default: no allowlist, public hosts allowed.
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        if let Ok(raw) = std::env::var("INPUTLOOKUP_ALLOWED_DOMAINS") {
+            config.allowed_domains = parse_allowed_domains(&raw);
+        }
+        config
+    }
+}
+
+/// Split an allowlist value on commas/whitespace, dropping empty entries.
+pub(crate) fn parse_allowed_domains(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
 }
 
 /// Parameters for an inputlookup command execution
@@ -174,6 +205,15 @@ mod tests {
             result,
             Some("https://api.example.com/search?q=hello%20world".to_string())
         );
+    }
+
+    #[test]
+    fn parse_allowed_domains_splits_and_drops_empty() {
+        assert_eq!(
+            parse_allowed_domains(" API.ipinfo.io, feeds.example.com\n,, other.test "),
+            vec!["api.ipinfo.io", "feeds.example.com", "other.test"]
+        );
+        assert!(parse_allowed_domains("  , ").is_empty());
     }
 
     #[test]

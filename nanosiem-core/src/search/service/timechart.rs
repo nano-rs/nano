@@ -517,7 +517,8 @@ fn response_cardinality(response: &SearchResponse) -> Option<u64> {
 }
 
 fn probe_error_uses_fallback(error: &SearchError) -> bool {
-    if matches!(error, SearchError::Timeout(_)) {
+    // NAN-5424: size refusals are typed (classified by ClickHouse code).
+    if matches!(error, SearchError::Timeout(_) | SearchError::ResourceLimit(_)) {
         return true;
     }
     let message = error.to_string();

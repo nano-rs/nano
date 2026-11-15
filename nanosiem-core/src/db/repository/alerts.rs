@@ -302,7 +302,12 @@ impl AlertRepository {
         // values of its matched events, derived HERE so every producer (all six
         // AlertInsert construction sites) gets it without changes. The read
         // side enforces per-source RBAC via array overlap on this column.
-        let source_types = distinct_source_types(insert.matched_events);
+        // NAN-5424: event values come from ClickHouse and may carry U+0000,
+        // which PostgreSQL rejects in jsonb (22P05) and text[] (22021). Every
+        // alert producer funnels through here, so sanitize once before any
+        // bind. The caller's `event_hash` is left as passed.
+        let matched_events = crate::db::pg_text::pg_safe_json(insert.matched_events);
+        let source_types = distinct_source_types(&matched_events);
         match insert.event_hash {
             Some(event_hash) => {
                 // Atomic insert with conflict detection - no race condition window
@@ -316,7 +321,7 @@ impl AlertRepository {
                 )
                 .bind(insert.rule_id)
                 .bind(insert.severity)
-                .bind(insert.matched_events)
+                .bind(matched_events.as_ref())
                 .bind(&event_hash)
                 .bind(insert.kind)
                 .bind(&insert.source_id)
@@ -345,7 +350,7 @@ impl AlertRepository {
                 )
                 .bind(insert.rule_id)
                 .bind(insert.severity)
-                .bind(insert.matched_events)
+                .bind(matched_events.as_ref())
                 .bind(insert.kind)
                 .bind(&insert.source_id)
                 .bind(match_count_col)

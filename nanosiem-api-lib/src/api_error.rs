@@ -283,6 +283,16 @@ impl From<nanosiem_core::SearchError> for ApiError {
                     "Search is busy assembling other views; retry shortly".to_string(),
                 )
             }
+            // NAN-5424: typed ClickHouse classes. Same envelopes as before the
+            // split (transport → database error, size → validation).
+            nanosiem_core::SearchError::Unavailable(e) => {
+                tracing::error!(error = %e, "ClickHouse unavailable in search");
+                ApiError::DatabaseError("A database error occurred".to_string())
+            }
+            nanosiem_core::SearchError::ResourceLimit(msg) => ApiError::SqlValidationError(msg),
+            error @ nanosiem_core::SearchError::DataError { .. } => {
+                ApiError::SqlValidationError(error.to_string())
+            }
         }
     }
 }
@@ -320,6 +330,16 @@ impl From<nanosiem_core::DetectionError> for ApiError {
             )),
             nanosiem_core::DetectionError::InvalidStateTransition(msg) => {
                 ApiError::Conflict(format!("Invalid state transition: {}", msg))
+            }
+            // NAN-5424: typed search failures (rule tests, backtests). The
+            // messages are nano's own templates (no ClickHouse text).
+            nanosiem_core::DetectionError::WindowTooLarge(msg)
+            | nanosiem_core::DetectionError::QueryDataError(msg) => {
+                ApiError::SqlValidationError(msg.clone())
+            }
+            nanosiem_core::DetectionError::BackendUnavailable(msg) => {
+                tracing::error!(error = %msg, "Detection backend unavailable");
+                ApiError::ServiceUnavailable("Search backend unavailable; retry shortly".to_string())
             }
             _ => {
                 tracing::error!(error = %err, "Unhandled detection error");

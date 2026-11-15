@@ -126,6 +126,7 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
                 insert_integrity_recommendations(&metrics.ingestion.insert_integrity);
             recs.extend(lowercase_invariant_recommendations(&metrics.parsing));
             recs.extend(coverage_gap_recommendations(&metrics.detection));
+            recs.extend(failing_rule_recommendations(&metrics.detection));
             recs
         },
         // NAN-2357: same framing problem as the summary heading. The scores and
@@ -1128,15 +1129,61 @@ fn coverage_gap_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
             d.coverage_gaps_7d_total
         ),
         description: format!(
-            "The detection scheduler gave up on these windows after the smallest \
-             catch-up slice kept failing for a size reason (ClickHouse memory \
-             limit, too many rows/bytes, server-side query timeout): {examples}. Events in those windows are stored \
-             but were never checked by the rule, so a detection may have been missed. \
-             Narrow the rule (more selective filters, fewer fields) or raise the \
-             ClickHouse memory/time limits, then replay the windows listed in \
-             detection_coverage_gaps by hand (e.g. a retro hunt over each window)."
+            "The detection scheduler gave up on these windows after bounded retries \
+             (the smallest catch-up slice kept hitting a ClickHouse size limit, or \
+             the rule's results could not be stored): {examples}. Events in those \
+             windows are stored but were never checked by the rule, so a detection \
+             may have been missed. Fix the cause shown in each gap's error (narrow \
+             the rule, raise ClickHouse limits, or check the rule's last error), \
+             then replay the windows listed in detection_coverage_gaps by hand \
+             (e.g. a retro hunt over each window)."
         ),
-        priority: "high".to_string(),
+        // NAN-5424: an unevaluated window is a detection blind spot.
+        priority: "critical".to_string(),
+    }]
+}
+
+/// NAN-5424: a rule whose executions fail (for example because PostgreSQL
+/// refuses its matched events) silently stops alerting; surface it without
+/// an LLM.
+fn failing_rule_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
+    if d.failing_rules_total <= 0 {
+        return vec![];
+    }
+    let examples = d
+        .failing_rules
+        .iter()
+        .take(5)
+        .map(|r| {
+            let error: String = r
+                .last_error
+                .as_deref()
+                .unwrap_or("no error recorded")
+                .chars()
+                .take(160)
+                .collect();
+            if r.consecutive_failures > 0 {
+                format!("{} ({} failed runs in a row: {error})", r.rule_name, r.consecutive_failures)
+            } else {
+                format!("{} ({error})", r.rule_name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    vec![Recommendation {
+        title: format!(
+            "{} detection rule(s) failed to run or to store their matches in the last 24 hours",
+            d.failing_rules_total
+        ),
+        description: format!(
+            "These rules hit execution errors: {examples}. While a rule fails, \
+             its matches are not alerted. The scheduler retries each window a \
+             bounded number of times, then records it in detection_coverage_gaps \
+             and moves on. Check the rule's last error in the rule details and \
+             replay any recorded gaps."
+        ),
+        // Detection that silently stops alerting is the SIEM's core failure.
+        priority: "critical".to_string(),
     }]
 }
 
@@ -1198,7 +1245,9 @@ fn score_detection(m: &DetectionMetrics) -> i32 {
     let noise_penalty = (m.noisy_rules.len() as i32) * 5;
     // NAN-4910: windows a rule never evaluated are a coverage hole.
     let gap_penalty = if m.coverage_gaps_7d_total > 0 { 20 } else { 0 };
-    (100 - stale_penalty - noise_penalty - gap_penalty).clamp(0, 100)
+    // NAN-5424: rules that fail to run or to store matches.
+    let failing_penalty = if m.failing_rules_total > 0 { 30 } else { 0 };
+    (100 - stale_penalty - noise_penalty - gap_penalty - failing_penalty).clamp(0, 100)
 }
 
 fn score_alerting(m: &AlertingMetrics, d: &DetectionMetrics) -> i32 {
@@ -1420,6 +1469,8 @@ pub(crate) mod tests {
                 alerts_24h_by_severity: vec![],
                 coverage_gaps_7d: vec![],
                 coverage_gaps_7d_total: 0,
+                failing_rules: vec![],
+                failing_rules_total: 0,
             },
             audit_durability: None,
             reserved_source_names: Default::default(),
@@ -1514,6 +1565,8 @@ pub(crate) mod tests {
             alerts_24h_by_severity: vec![],
             coverage_gaps_7d: vec![],
             coverage_gaps_7d_total: 0,
+            failing_rules: vec![],
+            failing_rules_total: 0,
         }
     }
 
@@ -1564,7 +1617,7 @@ pub(crate) mod tests {
         }];
         let recs = coverage_gap_recommendations(&gapped);
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].priority, "high");
+        assert_eq!(recs[0].priority, "critical");
         assert!(recs[0].title.starts_with("2 detection window(s)"), "{}", recs[0].title);
         assert!(recs[0].description.contains("Brute force [2026-07-05 03:00:00Z"));
         assert!(score_detection(&gapped) < score_detection(&clean));

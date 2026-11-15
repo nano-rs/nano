@@ -420,6 +420,29 @@ fn is_datetime_function(name: &str) -> bool {
     )
 }
 
+/// NAN-5427: a DateTime conversion that never throws on row data. Unlike
+/// `toDateTimeOrNull` it also accepts DateTime/Date/numeric input, so it is
+/// safe whatever the column type; an unparseable value or NaN/Inf becomes
+/// NULL for that row. The cast goes through `DateTime64(3)` so a fractional
+/// epoch (`epoch_ms / 1000`, `1700000000.5`) still converts: a direct
+/// `accurateCastOrNull(x, 'DateTime')` rejects any non-integer number.
+pub(crate) fn non_throwing_datetime_sql(arg: &str) -> String {
+    format!("toDateTime(accurateCastOrNull({arg}, 'DateTime64(3)'))")
+}
+
+/// ClickHouse's longest input for `editDistance`; longer input throws
+/// TOO_LARGE_STRING_SIZE and aborts the whole query.
+const EDIT_DISTANCE_MAX_BYTES: u32 = 65_536;
+
+/// NAN-5427: `editDistance` that yields NULL instead of throwing on an
+/// oversized row value. `if` short-circuits, so the guarded call never runs.
+fn guarded_edit_distance_sql(a: &str, b: &str) -> String {
+    format!(
+        "if(length({a}) > {EDIT_DISTANCE_MAX_BYTES} OR length({b}) > {EDIT_DISTANCE_MAX_BYTES}, \
+         NULL, editDistance({a}, {b}))"
+    )
+}
+
 /// The DateTime SQL of a datetime-valued expression, or `None`: the event
 /// time column, a datetime function, or `<datetime> ± INTERVAL …`.
 fn datetime_sql(
@@ -668,6 +691,36 @@ fn guarded_ip_predicate(ip: &str, predicate: &str) -> String {
     format!(
         "ifNull((isIPv4String(toString({ip})) OR isIPv6String(toString({ip}))) AND ({predicate}), 0)"
     )
+}
+
+/// NAN-5426: whether an eval argument is an `Array(T)`, so `reverse` keeps
+/// element order semantics for it: a physical array column / array stage
+/// column, an eval variable assigned an array (upstream or earlier in the
+/// same `eval`), or a call to an array-returning multivalue function.
+pub(crate) fn is_array_valued(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> bool {
+    match expr {
+        EvalExpression::FunctionCall { name, args } => match name.to_lowercase().as_str() {
+            "split" | "mvappend" | "mvdedup" | "mvsort" | "mvfilter" | "mvrange" | "mvzip" => {
+                true
+            }
+            // `reverse` keeps its argument's type.
+            "reverse" => args
+                .first()
+                .is_some_and(|arg| is_array_valued(gen, arg, field_override)),
+            _ => false,
+        },
+        EvalExpression::Field(name)
+            if field_override.is_none_or(|resolve| resolve(name, false).is_none())
+                && gen.is_upstream_eval_array(name) =>
+        {
+            true
+        }
+        _ => array_subject(gen, expr, field_override).is_some(),
+    }
 }
 
 /// The array leaf a predicate subject names, if any: a raw event field the
@@ -1054,16 +1107,23 @@ fn eval_function_to_sql(
             Ok(format!("length({})", arg))
         }
         "substr" | "substring" => {
+            // NAN-5426: character offsets (`substringUTF8`), not byte offsets.
+            // The byte form split a multibyte character and returned invalid
+            // UTF-8, which failed the whole response. `toString` keeps numeric,
+            // FixedString and Enum inputs valid for the UTF-8 function.
             match arg_sqls.len() {
                 2 => {
                     // ClickHouse substring is 1-indexed, but we accept 0-indexed
-                    // Convert: substr(str, 0, len) -> substring(str, 1, len)
-                    Ok(format!("substring({}, {} + 1)", arg_sqls[0], arg_sqls[1]))
+                    // Convert: substr(str, 0, len) -> substringUTF8(str, 1, len)
+                    Ok(format!(
+                        "substringUTF8(toString({}), {} + 1)",
+                        arg_sqls[0], arg_sqls[1]
+                    ))
                 }
                 3 => {
-                    // Convert: substr(str, start, len) -> substring(str, start+1, len)
+                    // Convert: substr(str, start, len) -> substringUTF8(str, start+1, len)
                     Ok(format!(
-                        "substring({}, {} + 1, {})",
+                        "substringUTF8(toString({}), {} + 1, {})",
                         arg_sqls[0], arg_sqls[1], arg_sqls[2]
                     ))
                 }
@@ -1105,7 +1165,13 @@ fn eval_function_to_sql(
             let arg = arg_sqls
                 .first()
                 .ok_or_else(|| SqlGenError::InvalidQuery("reverse() requires 1 argument".into()))?;
-            Ok(format!("reverse({})", arg))
+            // NAN-5426: an array (multivalue field, `split(...)`) reverses its
+            // elements; text reverses by character, never by byte.
+            if is_array_valued(gen, &args[0], field_override) {
+                Ok(format!("reverse({})", arg))
+            } else {
+                Ok(format!("reverseUTF8(toString({}))", arg))
+            }
         }
         "split" => {
             // ClickHouse: splitByString(separator, string)
@@ -1137,7 +1203,9 @@ fn eval_function_to_sql(
             // search on the first malformed value (truncated / mis-padded
             // PowerShell blobs are common); a hunter needs that row to yield
             // NULL and the rest to decode.
-            Ok(format!("nullIf(tryBase64Decode(toString({arg})), '')"))
+            // NAN-5426: decoded bytes are arbitrary; replace invalid UTF-8 so
+            // one row cannot fail the whole response.
+            Ok(format!("toValidUTF8(nullIf(tryBase64Decode(toString({arg})), ''))"))
         }
         "hex_encode" | "hexencode" | "tohex" => {
             let arg = arg_sqls.first().ok_or_else(|| {
@@ -1149,7 +1217,8 @@ fn eval_function_to_sql(
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("hex_decode() requires 1 argument".into())
             })?;
-            Ok(format!("unhex({})", arg))
+            // NAN-5426: see base64_decode.
+            Ok(format!("toValidUTF8(unhex({}))", arg))
         }
         "url_encode" | "urlencode" => {
             let arg = arg_sqls.first().ok_or_else(|| {
@@ -1161,7 +1230,8 @@ fn eval_function_to_sql(
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("url_decode() requires 1 argument".into())
             })?;
-            Ok(format!("decodeURLComponent({})", arg))
+            // NAN-5426: `%FF` decodes to a lone invalid byte; see base64_decode.
+            Ok(format!("toValidUTF8(decodeURLComponent({}))", arg))
         }
 
         // ============================================================
@@ -1373,7 +1443,15 @@ fn eval_function_to_sql(
             let arg = arg_sqls
                 .first()
                 .ok_or_else(|| SqlGenError::InvalidQuery("epoch() requires 1 argument".into()))?;
-            Ok(format!("toUnixTimestamp({})", arg))
+            // NAN-5427: a non-datetime argument (a string field) is parsed by
+            // `toUnixTimestamp`, which throws on one unparseable row and aborts
+            // the whole query. Cast it without throwing; a known datetime keeps
+            // the direct form.
+            if datetime_sql(gen, &args[0], field_override)?.is_some() {
+                Ok(format!("toUnixTimestamp({})", arg))
+            } else {
+                Ok(format!("toUnixTimestamp({})", non_throwing_datetime_sql(arg)))
+            }
         }
         "from_epoch" | "fromepoch" => {
             let arg = arg_sqls.first().ok_or_else(|| {
@@ -1598,15 +1676,18 @@ fn eval_function_to_sql(
             }
             Ok(format!("toTimeZone({}, {})", arg_sqls[1], arg_sqls[0]))
         }
+        // NAN-5427: row values are untrusted text. The throwing forms
+        // (`toDateTime`, `parseDateTime`, `toDate`) abort the whole query on
+        // one unparseable value; these yield NULL for that row instead.
         "to_timestamp" | "totimestamp" => match arg_sqls.len() {
-            1 => Ok(format!("toDateTime({})", arg_sqls[0])),
-            2 => Ok(format!("parseDateTime({}, {})", arg_sqls[0], arg_sqls[1])),
+            1 => Ok(non_throwing_datetime_sql(&arg_sqls[0])),
+            2 => Ok(format!("parseDateTimeOrNull({}, {})", arg_sqls[0], arg_sqls[1])),
             _ => Err(SqlGenError::InvalidQuery(
                 "to_timestamp() requires 1 or 2 arguments".into(),
             )),
         },
         "to_date" | "todate" => match arg_sqls.len() {
-            1 => Ok(format!("toDate({})", arg_sqls[0])),
+            1 => Ok(format!("accurateCastOrNull({}, 'Date')", arg_sqls[0])),
             2 => {
                 // Honor the explicit format instead of dropping it (the old
                 // parseDateTimeBestEffort ignored arg 1, silently misparsing ambiguous
@@ -1696,9 +1777,19 @@ fn eval_function_to_sql(
                     "make_date() requires 3 arguments (year, month, day)".into(),
                 ));
             }
+            // NAN-5427: numeric constructor, like make_timestamp. The
+            // `toDate(concat(...))` form threw on unpadded or non-numeric parts.
+            // `makeDate` rolls an invalid date over (Feb 31 -> Mar 2, month 13
+            // -> 1970-01-01); keep it only when it round-trips, else NULL.
+            let (y, m, d) = (
+                format!("toUInt16OrNull(toString({}))", arg_sqls[0]),
+                format!("toUInt8OrNull(toString({}))", arg_sqls[1]),
+                format!("toUInt8OrNull(toString({}))", arg_sqls[2]),
+            );
+            let date = format!("makeDate({y}, {m}, {d})");
             Ok(format!(
-                "toDate(concat({}, '-', {}, '-', {}))",
-                arg_sqls[0], arg_sqls[1], arg_sqls[2]
+                "if(toYear({date}) = {y} AND toMonth({date}) = {m} AND toDayOfMonth({date}) = {d}, \
+                 {date}, NULL)"
             ))
         }
         "make_time" | "maketime" => {
@@ -2146,7 +2237,7 @@ fn eval_function_to_sql(
                     "levenshtein() requires 2 arguments".into(),
                 ));
             }
-            Ok(format!("editDistance({}, {})", arg_sqls[0], arg_sqls[1]))
+            Ok(guarded_edit_distance_sql(&arg_sqls[0], &arg_sqls[1]))
         }
         "levenshtein_normalized" | "edit_distance_normalized" => {
             // Normalized edit distance (0-1 range) - easier to set thresholds
@@ -2157,8 +2248,10 @@ fn eval_function_to_sql(
             }
             // Normalize by max length of the two strings
             Ok(format!(
-                "(editDistance({}, {}) / greatest(length({}), length({}), 1))",
-                arg_sqls[0], arg_sqls[1], arg_sqls[0], arg_sqls[1]
+                "({} / greatest(length({}), length({}), 1))",
+                guarded_edit_distance_sql(&arg_sqls[0], &arg_sqls[1]),
+                arg_sqls[0],
+                arg_sqls[1]
             ))
         }
         "ngram_distance" | "ngramdistance" => {
@@ -2591,7 +2684,10 @@ mod tests {
             &override_first_seen,
         )
         .unwrap();
-        assert_eq!(sql, "toUnixTimestamp(PREVALENCE_FIRST_SEEN_CASE)");
+        assert_eq!(
+            sql,
+            "toUnixTimestamp(toDateTime(accurateCastOrNull(PREVALENCE_FIRST_SEEN_CASE, 'DateTime64(3)')))"
+        );
 
         let forbidden = EvalExpression::FunctionCall {
             name: "sleepEachRow".into(),

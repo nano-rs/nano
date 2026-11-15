@@ -197,5 +197,42 @@ fn version_at_least(version: &str, min: (u32, u32)) -> bool {
     matches!((major, minor), (Some(maj), Some(min_)) if (maj, min_) >= min)
 }
 
+/// NAN-5426: the read setting that makes ClickHouse replace invalid UTF-8 in
+/// JSON output with U+FFFD. Without it a byte-level function (`substring`,
+/// `unhex`, …) or a stored invalid byte sequence reaches the client raw, and
+/// one such row used to fail the whole response. Measured on CH 26.10: +0.6%
+/// median server time on a 945 MiB JSONEachRow dump, within run noise.
+pub const JSON_VALIDATE_UTF8_SETTING: (&str, &str) = ("output_format_json_validate_utf8", "1");
+
+/// NAN-5426: decode a ClickHouse text response without failing the whole
+/// result on invalid UTF-8. A clean response is returned without copying;
+/// otherwise each invalid sequence becomes U+FFFD and the event is counted,
+/// so one row can no longer fail a search or pin a detection rule.
+///
+/// Lossy by design: every invalid sequence becomes the same U+FFFD, so values
+/// that differed only in their invalid bytes (`a\xFF` and `a\xFE`) decode
+/// to one string and group, compare and dedup as equal. The stored event in
+/// ClickHouse keeps the original bytes.
+pub fn decode_response_text(bytes: Vec<u8>, context: &'static str) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            metrics::counter!(
+                "nanosiem_clickhouse_invalid_utf8_responses_total",
+                "context" => context
+            )
+            .increment(1);
+            // debug, not warn: the streaming path decodes per line, and the
+            // bytes are row data an attacker can repeat; the counter is the signal.
+            tracing::debug!(
+                context,
+                valid_up_to = error.utf8_error().valid_up_to(),
+                "ClickHouse response held invalid UTF-8; decoded lossily"
+            );
+            String::from_utf8_lossy(error.as_bytes()).into_owned()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

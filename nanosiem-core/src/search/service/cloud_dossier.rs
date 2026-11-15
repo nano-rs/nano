@@ -1504,15 +1504,7 @@ async fn fetch_rows(
             }
         }
     }
-    let text = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(subquery, error = %e, "Cloud dossier subquery non-utf8 bytes");
-            return Err(SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "cloud dossier subquery {subquery} non-utf8 bytes: {e}"
-            ))));
-        }
-    };
+    let text = crate::db::clickhouse_transport::decode_response_text(bytes, "cloud_dossier");
     Ok(text
         .lines()
         .filter(|l| !l.is_empty())

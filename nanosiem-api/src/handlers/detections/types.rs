@@ -261,6 +261,12 @@ pub struct DetectionHealthSummary {
     pub noisy_count: i64,
     /// Count of Live/Alerting rules with no matches in the last 7 days
     pub silent_count: i64,
+    /// NAN-5424: rules whose executions are currently failing
+    /// (`consecutive_failures > 0` or a pending size-class retry), or that
+    /// recorded an execution / skipped-event error or a coverage gap in the
+    /// last 24h.
+    #[serde(default)]
+    pub failing_count: i64,
 }
 
 /// Query parameters for GET /api/rules/noisy
@@ -315,8 +321,9 @@ pub struct FleetHealthSummary {
     /// Rules that ran on schedule but whose most-recent recorded execution
     /// time is at or above [`SLOW_DURATION_MS`].
     pub slow: i64,
-    /// Rules whose `next_run_at` is more than [`STUCK_THRESHOLD_SECS`] past due.
-    /// The scheduler is failing to advance them — typically because every run
-    /// is timing out, the node holding the claim crashed, or the rule throws.
+    /// Rules whose `next_run_at` is more than [`STUCK_THRESHOLD_SECS`] past
+    /// due (stuck claim, node crash), or whose executions are currently
+    /// failing (`consecutive_failures > 0` or a pending size-class retry,
+    /// NAN-5424).
     pub errors: i64,
 }

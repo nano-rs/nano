@@ -49,6 +49,8 @@ on:
       - scripts/tests/fixtures/resource-sizing.snap
       - scripts/tests/resource-sizing-planned-volume.test.sh
       - scripts/tests/fixtures/resource-sizing-unplanned.golden
+      - scripts/tests/resource-sizing-evidence-pack.test.sh
+      - nanosiem-enterprise/src/evidence_pack/memory.rs
       - skills/nano-deploy/**
       - scripts/tests/nano_deploy_plan_support.py
       - scripts/tests/test_nano_deploy_plan*.py
@@ -199,6 +201,7 @@ jobs:
           if [ -f scripts/tests/resource-sizing.test.sh ]; then
             bash scripts/tests/resource-sizing.test.sh
             bash scripts/tests/resource-sizing-planned-volume.test.sh
+            bash scripts/tests/resource-sizing-evidence-pack.test.sh
             bash scripts/tests/install-resource-sizing.test.sh
             bash scripts/tests/clickhouse-sizing-mount.test.sh
           else

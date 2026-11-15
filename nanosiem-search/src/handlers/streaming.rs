@@ -138,6 +138,13 @@ pub async fn search_stream(
     // NAN-4928 review P2: a probe of a hidden source must reach the audited
     // source gate, so it never takes the reuse or cache fast paths.
     let probes_hidden_source = crate::inflight::names_denied_source(&request.query, scope.deny_set());
+    // NAN-5437: refuse an AI search's restricted command before the job
+    // reuse / cache replay below can answer it.
+    {
+        let limits = state.search.query_limits();
+        let allowed = limits.read().await.ai_allowed_commands().to_vec();
+        nanosiem_core::search::ai_command_policy::enforce_text(&request.query, &allowed, "search_stream")?;
+    }
     if accept_async && !progressive && !probes_hidden_source && crate::cache::reads_result_cache(bypass, explicit_use_cache) {
         let now = chrono::Utc::now();
         if let Some(job) = state

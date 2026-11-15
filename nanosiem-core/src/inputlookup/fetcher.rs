@@ -38,6 +38,12 @@ pub enum FetchError {
     #[error("Rate limit exceeded. Please wait before making more requests")]
     RateLimitExceeded,
 
+    #[error(
+        "outbound lookup to host '{host}' is not permitted: it is not in the inputlookup \
+         allowlist (INPUTLOOKUP_ALLOWED_DOMAINS)"
+    )]
+    DomainNotAllowed { host: String },
+
     #[error("Response too large: {size} bytes exceeds limit of {limit} bytes")]
     ResponseTooLarge { size: usize, limit: usize },
 
@@ -131,6 +137,49 @@ impl UrlFetcher {
         }
     }
 
+    /// Enforce the outbound host allowlist (NAN-5436).
+    ///
+    /// - `allowed_domains` empty → no restriction here (unchanged behavior; the
+    ///   SSRF guard and `blocked_domains` still apply).
+    /// - non-empty → the host must equal an entry or be a subdomain of one,
+    ///   case-insensitively, ignoring a trailing root dot.
+    ///
+    /// Callers run this BEFORE any DNS resolution of the host.
+    fn check_domain_allowed(&self, url: &Url) -> Result<(), FetchError> {
+        if self.config.allowed_domains.is_empty() {
+            return Ok(());
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| FetchError::DomainNotAllowed {
+                host: "<missing host>".to_string(),
+            })?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+
+        let permitted = self.config.allowed_domains.iter().any(|entry| {
+            // A trailing root dot (`example.com.`) names the same host.
+            let entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+            !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
+        });
+
+        if permitted {
+            Ok(())
+        } else {
+            Err(FetchError::DomainNotAllowed { host })
+        }
+    }
+
+    /// Resolve a redirect `Location` against the current hop and apply the
+    /// allowlist to the target before anything resolves it.
+    fn redirect_target(&self, base: &Url, location: &str) -> Result<Url, FetchError> {
+        let target = base
+            .join(location)
+            .map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
+        self.check_domain_allowed(&target)?;
+        Ok(target)
+    }
+
     /// Fetch a URL with SSRF validation, caching, and rate limiting
     ///
     /// # Arguments
@@ -220,6 +269,14 @@ impl UrlFetcher {
             // connect time, so a rebind between validate and dial reached
             // internal addresses. Every redirect hop re-validates and re-pins
             // (this fn recurses per hop).
+            // NAN-5436: enforce the host allowlist on every hop BEFORE any DNS
+            // resolution. `validate_and_resolve` looks the host up, and a
+            // templated host carries field values in the query itself, so the
+            // check must not wait for it. The SSRF validator guards only IP
+            // classes and blocked domains; this decides which hosts may be
+            // contacted at all (see `check_domain_allowed`).
+            let parsed = Url::parse(url).map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
+            self.check_domain_allowed(&parsed)?;
             let (validated, addrs) = self.validator.validate_and_resolve(url).await?;
             let client = self.pinned_client(&validated, &addrs)?;
             let response = client.get(validated.clone()).timeout(timeout).send().await?;
@@ -232,10 +289,10 @@ impl UrlFetcher {
                         message: "Invalid redirect location header".to_string(),
                     })?;
 
-                    // Resolve relative URLs against the validated base.
-                    let redirect_url = validated
-                        .join(redirect_url)
-                        .map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
+                    // Resolve relative URLs against the validated base, and
+                    // allowlist the target before the redirect validator
+                    // resolves it.
+                    let redirect_url = self.redirect_target(&validated, redirect_url)?;
 
                     // Stricter redirect policy (blocks IP-literal / non-https
                     // redirects); the recursion below re-validates and re-pins.
@@ -455,6 +512,85 @@ mod tests {
         let url = Url::parse("https://93.184.216.34/").unwrap();
         // Empty addrs (IP literal) => must not fail building a client.
         assert!(fetcher.pinned_client(&url, &[]).is_ok());
+    }
+
+    // --- NAN-5436: outbound host allowlist ---
+
+    fn listed(domains: &[&str]) -> InputLookupConfig {
+        InputLookupConfig {
+            allowed_domains: domains.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn check(config: InputLookupConfig, url: &str) -> Result<(), FetchError> {
+        UrlFetcher::new(config).check_domain_allowed(&Url::parse(url).unwrap())
+    }
+
+    fn denied(r: Result<(), FetchError>) -> bool {
+        matches!(r, Err(FetchError::DomainNotAllowed { .. }))
+    }
+
+    /// Empty list = unchanged behavior: any host passes this check; the SSRF
+    /// guard (covered above) remains the only gate.
+    #[test]
+    fn allowlist_empty_leaves_behavior_unchanged() {
+        let config = InputLookupConfig::default();
+        assert!(config.allowed_domains.is_empty());
+        assert!(check(config.clone(), "https://example.com/x").is_ok());
+        assert!(check(config, "https://anything.test/{v}").is_ok());
+    }
+
+    #[test]
+    fn allowlist_permits_listed_hosts_and_subdomains_only() {
+        let config = listed(&["api.ipinfo.io", "Intel.Example.com"]);
+        assert!(check(config.clone(), "https://api.ipinfo.io/8.8.8.8/json").is_ok());
+        assert!(check(config.clone(), "https://INTEL.EXAMPLE.COM/x").is_ok());
+        assert!(check(config.clone(), "https://feeds.intel.example.com/x").is_ok());
+        // Trailing root dot names the same host.
+        assert!(check(config.clone(), "https://api.ipinfo.io./x").is_ok());
+        // Unlisted, suffix confusion, and prefix confusion are denied.
+        assert!(denied(check(config.clone(), "https://example.com/x")));
+        assert!(denied(check(config.clone(), "https://notintel.example.com/x")));
+        assert!(denied(check(config.clone(), "https://evilexample.com/x")));
+        assert!(denied(check(config, "https://api.ipinfo.io.other.test/x")));
+    }
+
+    /// A templated host carries field values in its DNS query, so a denied host
+    /// must be rejected before resolution. `.invalid` never resolves: reaching
+    /// DNS would surface an SSRF/DNS error instead of `DomainNotAllowed`.
+    #[tokio::test]
+    async fn allowlist_rejects_before_dns_resolution() {
+        let fetcher = UrlFetcher::new(listed(&["good.example"]));
+        let err = fetcher
+            .fetch("https://row-value.not-listed.invalid/x", None, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::DomainNotAllowed { ref host } if host == "row-value.not-listed.invalid"),
+            "{err}"
+        );
+    }
+
+    /// Every redirect target is allowlisted (absolute and relative Location).
+    #[test]
+    fn allowlist_applies_to_redirect_targets() {
+        let fetcher = UrlFetcher::new(listed(&["good.example"]));
+        let base = Url::parse("https://good.example/feed").unwrap();
+        assert_eq!(
+            fetcher.redirect_target(&base, "/v2/feed").unwrap().as_str(),
+            "https://good.example/v2/feed"
+        );
+        assert!(fetcher
+            .redirect_target(&base, "https://cdn.good.example/f")
+            .is_ok());
+        assert!(matches!(
+            fetcher.redirect_target(&base, "https://elsewhere.test/f?u=row"),
+            Err(FetchError::DomainNotAllowed { ref host }) if host == "elsewhere.test"
+        ));
+        // Empty list: redirects behave as before (no allowlist restriction).
+        let open = UrlFetcher::new(InputLookupConfig::default());
+        assert!(open.redirect_target(&base, "https://elsewhere.test/f").is_ok());
     }
 }
 

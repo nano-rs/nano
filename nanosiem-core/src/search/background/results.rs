@@ -82,7 +82,7 @@ impl std::fmt::Debug for SearchJobResultStore {
 }
 
 fn ch(e: clickhouse::error::Error) -> SearchError {
-    crate::search::types::parse_clickhouse_error(&e.to_string())
+    crate::search::search_error_from_error(&e)
 }
 
 /// NAN-5215: ClickHouse `TOO_FEW_LIVE_REPLICAS` (285). `insert_quorum =

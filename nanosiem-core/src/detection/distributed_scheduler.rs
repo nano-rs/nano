@@ -22,7 +22,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::repository::detection_rules::{DetectionCoverageGap, DetectionRuleRepository};
+use crate::db::repository::detection_rules::{
+    ClaimRelease, DetectionCoverageGap, DetectionRuleRepository, RuleFailureCounters,
+};
 use crate::models::{DetectionMode, DetectionRule};
 use crate::search::TimeRangeInput;
 use crate::settings::DeveloperSettingsRepository;
@@ -339,14 +341,26 @@ impl DistributedDetectionScheduler {
                         counter!("nanosiem_detection_execution_panics_total").increment(1);
                         let retry_at = Utc::now() + Duration::seconds(PANIC_RETRY_BACKOFF_SECS);
                         // A panic is not a size failure (NAN-4910): keep the
-                        // rule's current catch-up slice size unchanged.
-                        let size_failures = rule_repo
-                            .get_catchup_size_failures(rule_id)
+                        // rule's current catch-up slice size unchanged. An
+                        // execution panic is caught inside
+                        // `execute_and_release` and goes through the bounded
+                        // retry (NAN-5424); this path only sees panics in the
+                        // release bookkeeping itself, so count and record it.
+                        let counters = rule_repo
+                            .get_failure_counters(rule_id)
                             .await
-                            .unwrap_or(0);
-                        if let Err(e) = rule_repo
-                            .release_claim(rule_id, &node_id, retry_at, None, size_failures, None)
-                            .await
+                            .unwrap_or_default();
+                        let release = ClaimRelease {
+                            next_run_at: retry_at,
+                            advance_last_run_to: None,
+                            catchup_size_failures: counters.catchup_size_failures,
+                            consecutive_failures: counters.consecutive_failures.saturating_add(1),
+                            failing_since: Some(counters.failing_since.unwrap_or_else(Utc::now)),
+                            failure_class: Some(ExecutionOutcome::OtherFailure.as_label()),
+                            error: Some("[other] Rule execution task panicked"),
+                            coverage_gap: None,
+                        };
+                        if let Err(e) = rule_repo.release_claim(rule_id, &node_id, &release).await
                         {
                             error!(%rule_id, "Failed to release claim after panic: {}", e);
                         }
@@ -406,20 +420,44 @@ async fn execute_and_release(
     // success, `last_run_at` can be stamped to exactly this value (audit D2) —
     // see `compute_window_start` / `compute_window_end` for the precedence
     // rules. NAN-4910: a backlog is worked oldest-first in bounded slices; the
-    // slice shrinks after consecutive size-class failures.
+    // slice shrinks after consecutive size-class failures. NAN-5424: the
+    // consecutive non-size failure count bounds how often one window is
+    // retried.
     let marker_driven = is_marker_driven(rule);
-    let prior_size_failures = if marker_driven {
-        rule_repo
-            .get_catchup_size_failures(rule.id)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(rule_id = %rule.id, "Failed to read catch-up size failures: {}", e);
-                0
-            })
+    let mut counters = rule_repo
+        .get_failure_counters(rule.id)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(rule_id = %rule.id, "Failed to read rule failure counters: {}", e);
+            RuleFailureCounters::default()
+        });
+    // NAN-5424: earlier claims that never released died mid-run (crash /
+    // OOM). Count each as an unclassified failed attempt at this window, so a
+    // window that kills the process cannot pin the rule either.
+    if counters.crashed_attempts > 0 {
+        let other = ExecutionOutcome::OtherFailure.as_label();
+        warn!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            crashed_attempts = counters.crashed_attempts,
+            "Earlier executions of this rule never released their claim; counting them as failed attempts"
+        );
+        counter!("nanosiem_detection_execution_crashes_total").increment(counters.crashed_attempts as u64);
+        if counters.failure_class.as_deref() != Some(other) {
+            counters.consecutive_failures = 0;
+            counters.failing_since = None;
+        }
+        counters.consecutive_failures =
+            counters.consecutive_failures.saturating_add(counters.crashed_attempts);
+        counters.failing_since.get_or_insert_with(Utc::now);
+        counters.failure_class = Some(other.to_string());
+    }
+    let size_failures_for_chunk = if marker_driven {
+        counters.catchup_size_failures
     } else {
         0
     };
-    let chunk_minutes = catchup_chunk_minutes(config.max_catchup_minutes, prior_size_failures);
+    let chunk_minutes = catchup_chunk_minutes(config.max_catchup_minutes, size_failures_for_chunk);
     let now = Utc::now();
     let end = compute_window_end(rule.lookback_minutes, rule.last_run_at, now, chunk_minutes);
     let start = compute_window_start(
@@ -440,16 +478,28 @@ async fn execute_and_release(
         "Executing claimed rule"
     );
 
-    // Execute with timing and timeout
+    // Execute with timing and timeout. NAN-5424: a panic inside the execution
+    // is a failure of THIS window and goes through the same bounded retry as
+    // any other failure, so a payload that panics the engine cannot pin the
+    // rule either.
     let exec_start = std::time::Instant::now();
     let timeout_duration = tokio::time::Duration::from_secs(config.execution_timeout_secs);
+    let mut panicked = false;
     let result = match tokio::time::timeout(
         timeout_duration,
-        detection_service.execute_rule(rule, Some(time_range)),
+        AssertUnwindSafe(detection_service.execute_rule(rule, Some(time_range))).catch_unwind(),
     )
     .await
     {
-        Ok(result) => result,
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            panicked = true;
+            error!(rule_id = %rule.id, rule_name = %rule.name, "Rule execution panicked");
+            counter!("nanosiem_detection_execution_panics_total").increment(1);
+            Err(crate::detection::DetectionError::QueryExecutionError(
+                "Rule execution panicked".to_string(),
+            ))
+        }
         Err(_) => {
             error!(
                 rule_id = %rule.id,
@@ -457,12 +507,12 @@ async fn execute_and_release(
                 timeout_secs = config.execution_timeout_secs,
                 "Rule execution timed out"
             );
-            Err(crate::detection::DetectionError::QueryExecutionError(
-                format!(
-                    "Rule execution timed out after {}s",
-                    config.execution_timeout_secs
-                ),
-            ))
+            // NAN-5424: the outer timeout also fires on a stalled backend or
+            // a lock; it proves nothing about the window (NAN-4910).
+            Err(crate::detection::DetectionError::BackendUnavailable(format!(
+                "Rule execution timed out after {}s",
+                config.execution_timeout_secs
+            )))
         }
     };
     let duration_secs = exec_start.elapsed().as_secs_f64();
@@ -492,7 +542,13 @@ async fn execute_and_release(
         }
         Ok(None) => {}
         Err(e) => {
-            error!(rule_id = %rule.id, rule_name = %rule.name, "Rule execution failed: {}", e);
+            // Errors can quote event bytes; log the sanitized single line.
+            error!(
+                rule_id = %rule.id,
+                rule_name = %rule.name,
+                "Rule execution failed: {}",
+                crate::db::repository::detection_rules::rule_error_text(&e.to_string())
+            );
         }
     }
 
@@ -506,16 +562,19 @@ async fn execute_and_release(
         .ok()
         .flatten()
         .or_else(|| rule.schedule_cron.clone());
-    let outcome = match &result {
-        Ok(_) => ExecutionOutcome::Success,
-        Err(e) if e.is_window_size_dependent() => ExecutionOutcome::SizeFailure,
-        Err(_) => ExecutionOutcome::OtherFailure,
-    };
+    let outcome = classify_outcome(&result);
+    if outcome != ExecutionOutcome::Success {
+        counter!(
+            "nanosiem_detection_execution_failures_total",
+            "class" => outcome.as_label()
+        )
+        .increment(1);
+    }
     let decision = decide_release(
         outcome,
         marker_driven,
         rule.last_run_at,
-        prior_size_failures,
+        &counters,
         start,
         end,
         now,
@@ -547,33 +606,44 @@ async fn execute_and_release(
     if is_deterministic_failure(&result) {
         next_run_at = next_run_at.max(Utc::now() + Duration::seconds(DETERMINISTIC_FAILURE_BACKOFF_SECS));
     }
+    // NAN-3080: a panicking execution backs off like the release-path panic.
+    if panicked && decision.coverage_gap.is_none() {
+        next_run_at = next_run_at.max(Utc::now() + Duration::seconds(PANIC_RETRY_BACKOFF_SECS));
+    }
 
-    let coverage_gap = decision.coverage_gap.map(|(window_start, window_end)| {
-        let error_message: String = result
-            .as_ref()
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default()
-            .chars()
-            .take(1000)
-            .collect();
-        DetectionCoverageGap {
+    // NAN-5424: what the rule API, coverage gaps and SIEM Health show is the
+    // class plus the ClickHouse code / PostgreSQL SQLSTATE; database error
+    // text can quote event values. The full (sanitized) text is logged above.
+    let error_message: Option<String> = result
+        .as_ref()
+        .err()
+        .map(|e| format!("[{}] {}", outcome.as_label(), e.redacted_summary()));
+    let coverage_gap = decision
+        .coverage_gap
+        .map(|(window_start, window_end, attempts)| DetectionCoverageGap {
             window_start,
             window_end,
-            attempts: i32::from(prior_size_failures) + 1,
-            error_message,
-        }
-    });
+            attempts,
+            error_message: error_message.clone().unwrap_or_else(|| {
+                "[recovered] not evaluated while the rule was failing (its lookback no longer reaches this interval)"
+                    .to_string()
+            }),
+        });
     if let Some(gap) = &coverage_gap {
-        counter!("nanosiem_detection_coverage_gaps_total").increment(1);
+        counter!(
+            "nanosiem_detection_coverage_gaps_total",
+            "class" => outcome.as_label()
+        )
+        .increment(1);
         warn!(
             rule_id = %rule.id,
             rule_name = %rule.name,
             window_start = %gap.window_start,
             window_end = %gap.window_end,
             attempts = gap.attempts,
+            class = outcome.as_label(),
             error = %gap.error_message,
-            "Detection window could not be evaluated at the minimum slice; recorded a coverage gap and moved past it"
+            "Detection window could not be evaluated after bounded retries; recorded a coverage gap and moved past it"
         );
     } else if outcome == ExecutionOutcome::SizeFailure && marker_driven {
         info!(
@@ -584,23 +654,32 @@ async fn execute_and_release(
                 catchup_chunk_minutes(config.max_catchup_minutes, decision.catchup_size_failures),
             "Detection window failed on size; retrying a smaller slice"
         );
+    } else if outcome != ExecutionOutcome::Success {
+        warn!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            consecutive_failures = decision.consecutive_failures,
+            class = outcome.as_label(),
+            "Detection window failed; keeping the high-water mark for a bounded retry"
+        );
     }
 
     // Decide how last_run_at advances (audit D1). Success stamps the executed
-    // window end; a normal failure leaves the high-water mark untouched so the
-    // failed window is re-scanned next cycle instead of being silently dropped;
-    // a recorded coverage gap moves it past the gap (NAN-4910).
-    if let Err(e) = rule_repo
-        .release_claim(
-            rule.id,
-            node_id,
-            next_run_at,
-            decision.advance_last_run_to,
-            decision.catchup_size_failures,
-            coverage_gap.as_ref(),
-        )
-        .await
-    {
+    // window end; a retryable failure leaves the high-water mark untouched so
+    // the failed window is re-scanned next cycle instead of being silently
+    // dropped; a recorded coverage gap moves it past the gap (NAN-4910,
+    // NAN-5424) in the same statement that records the gap.
+    let release = ClaimRelease {
+        next_run_at,
+        advance_last_run_to: decision.advance_last_run_to,
+        catchup_size_failures: decision.catchup_size_failures,
+        consecutive_failures: decision.consecutive_failures,
+        failing_since: decision.failing_since,
+        failure_class: decision.failure_class,
+        error: error_message.as_deref(),
+        coverage_gap: coverage_gap.as_ref(),
+    };
+    if let Err(e) = rule_repo.release_claim(rule.id, node_id, &release).await {
         error!(
             rule_id = %rule.id,
             "Failed to release claim: {}. Rule will be reclaimed after stale timeout.",
@@ -609,22 +688,61 @@ async fn execute_and_release(
     }
 }
 
-/// How one execution attempt ended, for the release decision (NAN-4910).
+/// How one execution attempt ended, for the release decision (NAN-4910,
+/// NAN-5424).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionOutcome {
     Success,
     /// Failed because of the window's size ([`crate::detection::DetectionError::is_window_size_dependent`]).
     SizeFailure,
+    /// The rule's own query is invalid (NAN-4031): independent of the data,
+    /// so the window is kept for when the rule is fixed.
+    DeterministicFailure,
+    /// PostgreSQL refused the data being persisted
+    /// ([`crate::detection::DetectionError::is_persistence_data_error`]).
+    DataFailure,
+    /// The backend was unreachable or stalled
+    /// ([`crate::detection::DetectionError::is_transient_infrastructure`]).
+    TransientFailure,
+    /// Anything else, including an execution panic.
     OtherFailure,
 }
 
-/// What `release_claim` should write after an attempt (NAN-4910).
+impl ExecutionOutcome {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::SizeFailure => "size",
+            Self::DeterministicFailure => "deterministic",
+            Self::DataFailure => "data",
+            Self::TransientFailure => "transient",
+            Self::OtherFailure => "other",
+        }
+    }
+}
+
+fn classify_outcome<T>(result: &Result<T, crate::detection::DetectionError>) -> ExecutionOutcome {
+    match result {
+        Ok(_) => ExecutionOutcome::Success,
+        Err(e) if e.is_window_size_dependent() => ExecutionOutcome::SizeFailure,
+        Err(_) if is_deterministic_failure(result) => ExecutionOutcome::DeterministicFailure,
+        Err(e) if e.is_persistence_data_error() => ExecutionOutcome::DataFailure,
+        Err(e) if e.is_transient_infrastructure() => ExecutionOutcome::TransientFailure,
+        Err(_) => ExecutionOutcome::OtherFailure,
+    }
+}
+
+/// What `release_claim` should write after an attempt (NAN-4910, NAN-5424).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseDecision {
     advance_last_run_to: Option<DateTime<Utc>>,
     catchup_size_failures: i16,
-    /// `[start, end]` of a window recorded as not evaluated.
-    coverage_gap: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    consecutive_failures: i16,
+    failing_since: Option<DateTime<Utc>>,
+    failure_class: Option<&'static str>,
+    /// `[start, end]` of a window recorded as not evaluated, and the attempts
+    /// it took.
+    coverage_gap: Option<(DateTime<Utc>, DateTime<Utc>, i32)>,
     reclaim_immediately: bool,
 }
 
@@ -637,10 +755,35 @@ const MIN_CATCHUP_CHUNK_MINUTES: i64 = 5;
 /// minimum slice does not cost coverage.
 const MIN_CHUNK_ATTEMPTS: i16 = 3;
 
+/// NAN-5424: attempts at one window that PostgreSQL refused for its data
+/// (SQLSTATE 22xxx / 54xxx) before the window is recorded as a coverage gap.
+/// Re-running writes the same rows, so only a short budget (for a fix that
+/// lands mid-incident) is useful.
+pub(crate) const DATA_FAILURE_ATTEMPTS: i16 = 3;
+
+/// NAN-5424: an unclassified failure (including an execution panic or a
+/// crash mid-run) becomes a coverage gap only after at least this many
+/// attempts AND [`OTHER_FAILURE_MIN_PIN`] of continuous failure. Only failures
+/// POSITIVELY identified as data-caused get the short budget.
+pub(crate) const OTHER_FAILURE_ATTEMPTS: i16 = 5;
+
+/// See [`OTHER_FAILURE_ATTEMPTS`].
+pub(crate) const OTHER_FAILURE_MIN_PIN: Duration = Duration::hours(1);
+
+/// NAN-5424: an infrastructure failure (backend unreachable or stalled)
+/// becomes a coverage gap only after at least this many attempts AND
+/// [`TRANSIENT_FAILURE_MAX_PIN`] of continuous failure. Shorter outages keep
+/// the window, which is caught up once the backend is back (NAN-4910); the
+/// rule reads as failing the whole time.
+pub(crate) const TRANSIENT_FAILURE_ATTEMPTS: i16 = 10;
+
+/// See [`TRANSIENT_FAILURE_ATTEMPTS`].
+pub(crate) const TRANSIENT_FAILURE_MAX_PIN: Duration = Duration::hours(6);
+
 /// A rule whose window is driven by its `last_run_at` high-water mark (no
 /// sliding `lookback_minutes`, has run before, not a retro hunt). Only these
-/// get shrinking slices and recorded gaps: a sliding-lookback rule never
-/// advances a marker, and a retro hunt evaluates its own historical window.
+/// get shrinking slices: a sliding-lookback rule never advances a marker, and
+/// a retro hunt evaluates its own historical window.
 fn is_marker_driven(rule: &DetectionRule) -> bool {
     rule.lookback_minutes.is_none() && rule.last_run_at.is_some() && !rule.is_retro_hunt()
 }
@@ -668,36 +811,139 @@ fn size_failures_at_min_chunk(max_catchup_minutes: i64) -> i16 {
     failures
 }
 
-/// Decide the release writes for one attempt (NAN-4910). `now` is the
-/// evaluation time the window was derived from.
+/// Decide the release writes for one attempt (NAN-4910, NAN-5424). `now` is
+/// the evaluation time the window was derived from.
+///
+/// Coverage invariant: every interval the rule did not successfully evaluate
+/// is either still ahead of the high-water mark (it will be retried) or
+/// recorded in `coverage_gap`:
+/// - a marker-driven rule only moves its mark past a failed window together
+///   with a gap row for exactly that window;
+/// - a sliding-lookback rule cannot hold a window. When its retry budget is
+///   spent, the gap covers everything since its last successful run
+///   (`[last_run_at, end]`); when it recovers after a failure streak whose
+///   length outran its lookback, `[last_run_at, start)` is recorded.
+///
+/// A failure streak is per class: a failure of another class starts a new
+/// one, so one class's attempts never spend another's budget.
 #[allow(clippy::too_many_arguments)]
 fn decide_release(
     outcome: ExecutionOutcome,
     marker_driven: bool,
     prior_last_run_at: Option<DateTime<Utc>>,
-    prior_size_failures: i16,
+    prior: &RuleFailureCounters,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     now: DateTime<Utc>,
     max_catchup_minutes: i64,
 ) -> ReleaseDecision {
-    let keep_marker = ReleaseDecision {
+    let class = outcome.as_label();
+    let same_class = prior.failure_class.as_deref() == Some(class);
+    let (prior_consecutive, prior_since) = if same_class {
+        (prior.consecutive_failures.max(0), prior.failing_since)
+    } else {
+        (0, None)
+    };
+    let failing_since = Some(prior_since.unwrap_or(now));
+    let streak_age = now - failing_since.unwrap_or(now);
+    let failure_class = Some(class);
+    let keep_marker = |consecutive_failures: i16| ReleaseDecision {
         advance_last_run_to: next_last_run_at(false, prior_last_run_at, start, end),
-        catchup_size_failures: prior_size_failures,
+        catchup_size_failures: prior.catchup_size_failures,
+        consecutive_failures,
+        failing_since,
+        failure_class,
         coverage_gap: None,
         reclaim_immediately: false,
     };
-    match outcome {
-        ExecutionOutcome::Success => ReleaseDecision {
-            advance_last_run_to: next_last_run_at(true, prior_last_run_at, start, end),
+    // Everything since the last successful run, for a sliding-lookback rule.
+    let sliding_gap_start = match prior_last_run_at {
+        Some(last) if !marker_driven && last < start => last,
+        _ => start,
+    };
+    // NAN-5424: retry the same window while `exhausted` says the budget is
+    // not spent, then record it as a coverage gap and move past it.
+    let bounded = |exhausted: &dyn Fn(i16) -> bool| {
+        let failures = prior_consecutive.saturating_add(1);
+        if !exhausted(failures) || start >= end {
+            return keep_marker(failures);
+        }
+        ReleaseDecision {
+            advance_last_run_to: Some(end),
             catchup_size_failures: 0,
-            coverage_gap: None,
-            reclaim_immediately: end < now,
-        },
-        ExecutionOutcome::OtherFailure => keep_marker,
-        ExecutionOutcome::SizeFailure if !marker_driven => keep_marker,
+            consecutive_failures: 0,
+            failing_since: None,
+            failure_class: None,
+            coverage_gap: Some((sliding_gap_start, end, i32::from(failures))),
+            reclaim_immediately: marker_driven && end < now,
+        }
+    };
+    // NAN-5424: for a marker-driven rule, a data / unclassified failure first
+    // narrows the window through the NAN-4910 slice ladder, so a value that
+    // breaks one window costs at most the minimum slice, not a whole catch-up
+    // chunk. Narrowing steps do not spend the retry budget.
+    let shrink_first = |budgeted: &dyn Fn() -> ReleaseDecision| {
+        let current = catchup_chunk_minutes(max_catchup_minutes, prior.catchup_size_failures);
+        if marker_driven
+            && current > MIN_CATCHUP_CHUNK_MINUTES
+            && end - start > Duration::minutes(MIN_CATCHUP_CHUNK_MINUTES)
+        {
+            let next = prior.catchup_size_failures.saturating_add(1);
+            let next_chunk = Duration::minutes(catchup_chunk_minutes(max_catchup_minutes, next));
+            return ReleaseDecision {
+                advance_last_run_to: None,
+                catchup_size_failures: next,
+                consecutive_failures: prior_consecutive,
+                failing_since,
+                failure_class,
+                coverage_gap: None,
+                reclaim_immediately: next_chunk < end - start,
+            };
+        }
+        budgeted()
+    };
+    match outcome {
+        ExecutionOutcome::Success => {
+            // A sliding-lookback rule recovering from a streak longer than
+            // its lookback never evaluated [last_run_at, start).
+            let was_failing = prior.consecutive_failures > 0 || prior.failing_since.is_some();
+            let missed = match prior_last_run_at {
+                Some(last) if !marker_driven && was_failing && last < start => {
+                    Some((last, start, i32::from(prior.consecutive_failures.max(0))))
+                }
+                _ => None,
+            };
+            ReleaseDecision {
+                advance_last_run_to: next_last_run_at(true, prior_last_run_at, start, end),
+                catchup_size_failures: 0,
+                consecutive_failures: 0,
+                failing_since: None,
+                failure_class: None,
+                coverage_gap: missed,
+                reclaim_immediately: end < now,
+            }
+        }
+        // NAN-4031: independent of the data; keep the window for when the
+        // rule is fixed, but count the failure so the rule reads as failing.
+        ExecutionOutcome::DeterministicFailure => {
+            keep_marker(prior_consecutive.saturating_add(1))
+        }
+        ExecutionOutcome::DataFailure => {
+            shrink_first(&|| bounded(&|n| n >= DATA_FAILURE_ATTEMPTS))
+        }
+        ExecutionOutcome::OtherFailure => shrink_first(&|| {
+            bounded(&|n| n >= OTHER_FAILURE_ATTEMPTS && streak_age >= OTHER_FAILURE_MIN_PIN)
+        }),
+        ExecutionOutcome::TransientFailure => bounded(&|n| {
+            n >= TRANSIENT_FAILURE_ATTEMPTS && streak_age >= TRANSIENT_FAILURE_MAX_PIN
+        }),
+        // A sliding-lookback rule cannot shrink its window: treat a size
+        // failure like an unclassified bounded failure.
+        ExecutionOutcome::SizeFailure if !marker_driven => bounded(&|n| {
+            n >= OTHER_FAILURE_ATTEMPTS && streak_age >= OTHER_FAILURE_MIN_PIN
+        }),
         ExecutionOutcome::SizeFailure => {
-            let failures = prior_size_failures.max(0);
+            let failures = prior.catchup_size_failures.max(0);
             let first_min = size_failures_at_min_chunk(max_catchup_minutes);
             if failures >= first_min && failures - first_min + 1 >= MIN_CHUNK_ATTEMPTS {
                 // The minimum slice failed MIN_CHUNK_ATTEMPTS times in a row
@@ -707,7 +953,10 @@ fn decide_release(
                 ReleaseDecision {
                     advance_last_run_to: Some(end),
                     catchup_size_failures: 0,
-                    coverage_gap: Some((start, end)),
+                    consecutive_failures: 0,
+                    failing_since: None,
+                    failure_class: None,
+                    coverage_gap: Some((start, end, i32::from(failures) + 1)),
                     reclaim_immediately: end < now,
                 }
             } else {
@@ -716,6 +965,9 @@ fn decide_release(
                 ReleaseDecision {
                     advance_last_run_to: None,
                     catchup_size_failures: next,
+                    consecutive_failures: prior_consecutive,
+                    failing_since,
+                    failure_class,
                     coverage_gap: None,
                     // Retry right away only when the next slice is actually
                     // smaller than the window that just failed.
@@ -830,3 +1082,9 @@ mod tests;
 
 #[cfg(test)]
 mod catchup_tests;
+
+#[cfg(test)]
+mod bounded_retry_tests;
+
+#[cfg(test)]
+mod nul_persistence_integration_tests;

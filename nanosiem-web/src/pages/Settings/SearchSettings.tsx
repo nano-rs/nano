@@ -18,6 +18,20 @@ import { useToast } from '@/hooks/use-toast';
 
 type Priority = 'realtime' | 'interactive' | 'analytics';
 
+/** nPL commands AI-written searches may not run unless allowed here. */
+const AI_RESTRICTED_COMMANDS: { name: string; label: string; hint: string }[] = [
+  {
+    name: 'inputlookup',
+    label: 'inputlookup url=',
+    hint: 'Fetches an external URL from inside the search. Lookups of internal tables are always allowed.',
+  },
+  { name: 'ai', label: 'ai', hint: 'Sends result rows to the AI provider.' },
+  { name: 'output', label: 'output', hint: 'Writes results to a destination.' },
+];
+
+const sameCommandSet = (a: string[], b: string[]) =>
+  a.length === b.length && a.every((name) => b.includes(name));
+
 const PRIORITIES: Array<{
   key: Priority;
   label: string;
@@ -59,6 +73,7 @@ export function SearchSettings() {
   const [maxPostProcessingGroups, setMaxPostProcessingGroups] = useState(1000000);
   const [maxStreamingCacheRows, setMaxStreamingCacheRows] = useState(50000);
   const [blockOnCostErrors, setBlockOnCostErrors] = useState(false);
+  const [aiAllowedCommands, setAiAllowedCommands] = useState<string[]>([]);
 
   const baseId = useId();
 
@@ -84,6 +99,7 @@ export function SearchSettings() {
       setMaxPostProcessingGroups(queryLimits.max_post_processing_groups);
       setMaxStreamingCacheRows(queryLimits.max_streaming_cache_rows);
       setBlockOnCostErrors(queryLimits.block_on_cost_errors);
+      setAiAllowedCommands(queryLimits.ai_search_allowed_commands ?? []);
     }
   }, [queryLimits]);
 
@@ -109,7 +125,8 @@ export function SearchSettings() {
       maxMvexpandRows !== queryLimits.max_mvexpand_rows ||
       maxPostProcessingGroups !== queryLimits.max_post_processing_groups ||
       maxStreamingCacheRows !== queryLimits.max_streaming_cache_rows ||
-      blockOnCostErrors !== queryLimits.block_on_cost_errors);
+      blockOnCostErrors !== queryLimits.block_on_cost_errors ||
+      !sameCommandSet(aiAllowedCommands, queryLimits.ai_search_allowed_commands ?? []));
 
   const handleSave = async () => {
     if (validationError) return;
@@ -145,6 +162,7 @@ export function SearchSettings() {
         max_post_processing_groups: maxPostProcessingGroups,
         max_streaming_cache_rows: maxStreamingCacheRows,
         block_on_cost_errors: blockOnCostErrors,
+        ai_search_allowed_commands: aiAllowedCommands,
       });
       toast({ title: 'Query limits saved', description: 'New caps apply to subsequent queries.' });
       refetchLimits();
@@ -473,6 +491,39 @@ export function SearchSettings() {
               className="h-4 w-7"
             />
           </div>
+
+          <div className="pt-3 pb-1">
+            <div className="text-[12.5px] font-medium text-foreground">Commands allowed in AI searches</div>
+            <div className="text-[11px] text-muted-foreground mt-0.5">
+              Searches written by pivt, the nano MCP and Desktop agents cannot run these commands unless allowed here. Analysts' own searches are not affected.
+            </div>
+          </div>
+          {AI_RESTRICTED_COMMANDS.map((cmd) => (
+            <div
+              key={cmd.name}
+              className="flex items-center justify-between gap-4 py-2 border-b border-border/60"
+            >
+              <div className="min-w-0 flex-1">
+                <label
+                  htmlFor={id(`ai-cmd-${cmd.name}`)}
+                  className="font-mono text-[12px] text-foreground cursor-pointer"
+                >
+                  {cmd.label}
+                </label>
+                <div className="text-[11px] text-muted-foreground mt-0.5">{cmd.hint}</div>
+              </div>
+              <Switch
+                id={id(`ai-cmd-${cmd.name}`)}
+                checked={aiAllowedCommands.includes(cmd.name)}
+                onCheckedChange={(on) =>
+                  setAiAllowedCommands((current) =>
+                    on ? [...current.filter((n) => n !== cmd.name), cmd.name] : current.filter((n) => n !== cmd.name),
+                  )
+                }
+                className="h-4 w-7"
+              />
+            </div>
+          ))}
         </div>
 
         <div className="flex justify-end items-center gap-2 pt-4">

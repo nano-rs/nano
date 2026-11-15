@@ -202,7 +202,11 @@ where
 {
     let set: BTreeSet<String> = values
         .into_iter()
-        .map(|source_type| source_type.as_ref().trim().to_lowercase())
+        // NAN-5424: source types come from event data and are stored as
+        // PostgreSQL text[]; U+0000 is rejected there.
+        .map(|source_type| {
+            crate::db::pg_text::pg_safe_string(source_type.as_ref().trim().to_lowercase())
+        })
         .filter(|source_type| !source_type.is_empty())
         .collect();
     set.into_iter().collect()

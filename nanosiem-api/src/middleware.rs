@@ -18,6 +18,7 @@ pub mod ip_allowlist;
 #[cfg(feature = "enterprise")]
 pub mod license_guard;
 pub mod logging;
+pub mod query_class;
 pub mod rate_limit;
 pub mod sanitize_errors;
 pub mod tier_guard;

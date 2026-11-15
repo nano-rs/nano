@@ -158,7 +158,7 @@ impl RetroHuntRepository {
         )
         .bind(rule_id)
         .bind(watermark)
-        .bind(watermark_value)
+        .bind(watermark_value.map(crate::db::pg_text::pg_safe_str))
         .bind(last_run_at)
         .execute(&self.pool)
         .await?;
@@ -179,6 +179,10 @@ impl RetroHuntRepository {
         if values.is_empty() {
             return Ok(HashSet::new());
         }
+        // NAN-5424: indicator values come from ClickHouse; they are stored
+        // sanitized (PostgreSQL text rejects U+0000). Look them up the same
+        // way and answer in the caller's spelling.
+        let safe = crate::db::pg_text::pg_safe_strings(values);
         let rows: Vec<String> = sqlx::query_scalar(
             r#"
             SELECT indicator_value
@@ -187,10 +191,16 @@ impl RetroHuntRepository {
             "#,
         )
         .bind(rule_id)
-        .bind(values)
+        .bind(safe.as_ref())
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().collect())
+        let hunted: HashSet<String> = rows.into_iter().collect();
+        Ok(values
+            .iter()
+            .zip(safe.iter())
+            .filter(|(_, stored)| hunted.contains(*stored))
+            .map(|(original, _)| original.clone())
+            .collect())
     }
 
     /// Record `(value, type)` pairs as hunted (idempotent). Call AFTER the hunt's
@@ -207,7 +217,9 @@ impl RetroHuntRepository {
             "INSERT INTO retro_hunt_hunted_indicators (rule_id, indicator_value, indicator_type) ",
         );
         qb.push_values(indicators, |mut b, (value, ty)| {
-            b.push_bind(rule_id).push_bind(value).push_bind(ty);
+            b.push_bind(rule_id)
+                .push_bind(crate::db::pg_text::pg_safe_str(value).into_owned())
+                .push_bind(ty);
         });
         qb.push(" ON CONFLICT (rule_id, indicator_value) DO NOTHING");
         qb.build().execute(&self.pool).await?;

@@ -58,6 +58,22 @@ pub enum DetectionError {
 
     #[error("Concurrent modification detected for rule {0} - refresh and try again")]
     ConcurrentModification(Uuid),
+
+    /// NAN-5424: the backend could not be reached or stalled (identified by
+    /// the client error type, or the scheduler's own timeout). Says nothing
+    /// about the query or the data.
+    #[error("Backend unavailable: {0}")]
+    BackendUnavailable(String),
+
+    /// NAN-4910 / NAN-5424: ClickHouse refused the window for its size
+    /// (identified by error code / typed variant). A smaller window can work.
+    #[error("Window too large: {0}")]
+    WindowTooLarge(String),
+
+    /// NAN-5424: ClickHouse failed on the stored values in the window
+    /// (identified by error code). The message carries the code only.
+    #[error("Query failed on the stored data: {0}")]
+    QueryDataError(String),
 }
 
 impl DetectionError {
@@ -67,65 +83,114 @@ impl DetectionError {
     /// minimum slice keeps failing, records a coverage gap instead of pinning
     /// the rule on that window forever.
     ///
-    /// Only explicit ClickHouse size-limit refusals qualify, because a gap
-    /// advances the high-water mark past events that were never evaluated:
-    /// - memory limit (MEMORY_LIMIT_EXCEEDED, 241);
-    /// - result / read limits (TOO_MANY_ROWS 158, TOO_MANY_BYTES 307,
-    ///   TOO_MANY_ROWS_OR_BYTES 396) and an oversized response;
-    /// - a SERVER-SIDE `max_execution_time` timeout that reports the time the
-    ///   query actually ran (`TIMEOUT_EXCEEDED ... elapsed N ms`, surfaced as
-    ///   `Query timeout after Nms` with N > 0) — ClickHouse was executing it.
-    ///
-    /// Everything else keeps the high-water mark and is retried as-is: in
-    /// particular the scheduler's own outer timeout (`Rule execution timed
-    /// out`), which also fires on a stalled connection, an outage or a lock,
-    /// a timeout with no elapsed time, connection errors, bad queries.
-    ///
-    /// ClickHouse errors reach the detection engine as text (see
-    /// `search::types::parse_clickhouse_error`), so this matches both the raw
-    /// ClickHouse error names and the friendly messages they are mapped to.
+    /// NAN-5424: decided by TYPE only. `WindowTooLarge` is produced from the
+    /// ClickHouse error code (memory limit 241, too many rows / bytes 158 /
+    /// 307 / 396), a server-side timeout that reports elapsed time, or an
+    /// oversized response ([`crate::detection::service::detection_error_from_search`]).
+    /// Error text is never scanned: ClickHouse quotes event values in it.
     pub fn is_window_size_dependent(&self) -> bool {
-        let message = match self {
-            Self::QueryExecutionError(message) | Self::SearchError(message) => message,
-            _ => return false,
+        matches!(self, Self::WindowTooLarge(_))
+    }
+
+    /// NAN-5424: the failure is POSITIVELY identified as caused by the data
+    /// in the window: PostgreSQL refused the data being persisted (SQLSTATE
+    /// class 22 data exception, e.g. 22P05 / 22021, or 54 program limit), or
+    /// ClickHouse failed on a stored value (by error code). Re-running the
+    /// same window fails the same way, so these get a short retry budget.
+    pub fn is_persistence_data_error(&self) -> bool {
+        match self {
+            Self::QueryDataError(_) => true,
+            Self::DatabaseError(e) => sqlx_error_is_data(e),
+            _ => false,
+        }
+    }
+
+    /// NAN-5424: the BACKEND was unreachable or stalled, identified by type:
+    /// a ClickHouse transport failure or the scheduler's own timeout
+    /// (`BackendUnavailable`), a PostgreSQL connection-level sqlx error, or a
+    /// PostgreSQL SQLSTATE in class 08 (connection), 40 (transaction
+    /// rollback, e.g. 40P01 deadlock / 40001 serialization), 53
+    /// (insufficient resources), 57 (operator intervention) or 58 (system
+    /// error). Re-running the same window later is expected to work, so the
+    /// scheduler keeps the window much longer (an outage is caught up, not
+    /// gapped). Never decided by message text.
+    pub fn is_transient_infrastructure(&self) -> bool {
+        match self {
+            Self::BackendUnavailable(_) => true,
+            Self::DatabaseError(e) => sqlx_error_is_transient(e),
+            _ => false,
+        }
+    }
+
+    /// NAN-5424: the error as shown on the rule, in coverage gaps and in SIEM
+    /// Health. Database / ClickHouse error text can quote event values, so it
+    /// is reduced to the error class plus the ClickHouse code or PostgreSQL
+    /// SQLSTATE; messages nano writes itself (query validation, our own
+    /// timeouts) are kept. The full text goes to the jobs log only.
+    pub fn redacted_summary(&self) -> String {
+        let text = match self {
+            Self::DatabaseError(sqlx::Error::Database(db)) => match db.code() {
+                Some(code) => format!("PostgreSQL error (SQLSTATE {code})"),
+                None => "PostgreSQL error".to_string(),
+            },
+            Self::DatabaseError(e) => format!("Database error ({})", sqlx_error_kind(e)),
+            Self::SearchError(message) | Self::QueryExecutionError(message) | Self::RepositoryError(message) => {
+                match crate::search::clickhouse_error_code(message) {
+                    Some(code) => format!("ClickHouse error (Code {code})"),
+                    None => "Execution error (details in the jobs log)".to_string(),
+                }
+            }
+            Self::BackendUnavailable(_) => "Backend unavailable (connection failed or timed out)".to_string(),
+            // Our own templates (code-mapped), no event text.
+            Self::WindowTooLarge(m) | Self::QueryDataError(m) | Self::InvalidQuery(m) | Self::QueryParseError(m) => {
+                m.clone()
+            }
+            other => other.to_string(),
         };
-        if message.contains("Rule execution timed out") {
-            return false;
-        }
-        const SIZE_LIMIT_MARKERS: &[&str] = &[
-            "MEMORY_LIMIT_EXCEEDED",
-            "exceeded memory limit",
-            "TOO_MANY_ROWS",
-            "TOO_MANY_BYTES",
-            "too many rows",
-            "Response too large",
-        ];
-        if SIZE_LIMIT_MARKERS.iter().any(|marker| message.contains(marker)) {
-            return true;
-        }
-        server_side_timeout_with_progress(message)
+        crate::db::pg_text::pg_safe_error_text(&text)
     }
 }
 
-/// A ClickHouse `max_execution_time` refusal that proves the server ran the
-/// query: raw `TIMEOUT_EXCEEDED` carrying `elapsed`, or the mapped
-/// `Query timeout after Nms` with a parsed, non-zero N (N is 0 when no
-/// elapsed time could be read).
-fn server_side_timeout_with_progress(message: &str) -> bool {
-    if message.contains("TIMEOUT_EXCEEDED") && message.contains("elapsed") {
-        return true;
+/// See [`DetectionError::is_persistence_data_error`]: PostgreSQL refused the
+/// data being written (SQLSTATE class 22 data exception or 54 program limit).
+/// Shared with the real-time signal processor (NAN-5428).
+pub(crate) fn sqlx_error_is_data(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => db
+            .code()
+            .is_some_and(|code| code.starts_with("22") || code.starts_with("54")),
+        _ => false,
     }
-    const MAPPED: &str = "Query timeout after ";
-    message
-        .find(MAPPED)
-        .map(|at| {
-            let digits: String = message[at + MAPPED.len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            digits.parse::<u64>().map(|ms| ms > 0).unwrap_or(false)
-        })
-        .unwrap_or(false)
+}
+
+/// See [`DetectionError::is_transient_infrastructure`]. Shared with the
+/// real-time signal processor (NAN-5428).
+pub(crate) fn sqlx_error_is_transient(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Tls(_) => true,
+        sqlx::Error::Database(db) => db.code().is_some_and(|code| {
+            ["08", "40", "53", "57", "58"].iter().any(|class| code.starts_with(class))
+        }),
+        _ => false,
+    }
+}
+
+fn sqlx_error_kind(e: &sqlx::Error) -> &'static str {
+    match e {
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::PoolTimedOut => "pool timed out",
+        sqlx::Error::PoolClosed => "pool closed",
+        sqlx::Error::WorkerCrashed => "worker crashed",
+        sqlx::Error::Tls(_) => "tls",
+        sqlx::Error::Protocol(_) => "protocol",
+        sqlx::Error::RowNotFound => "row not found",
+        sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_) => "decode",
+        _ => "other",
+    }
 }
 
 impl From<crate::db::repository::detection_rules::DetectionRuleRepositoryError> for DetectionError {

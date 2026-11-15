@@ -191,6 +191,8 @@ export interface SearchQueryLimitsConfig {
   max_post_processing_groups: number;
   max_streaming_cache_rows: number;
   block_on_cost_errors: boolean;
+  /** Restricted nPL commands AI-written searches may still use (`inputlookup`, `ai`, `output`). Omit on update to keep the stored list. */
+  ai_search_allowed_commands?: string[];
 }
 
 // ============================================================================

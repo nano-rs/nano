@@ -1273,6 +1273,32 @@ impl SearchService {
         }
     }
 
+    /// NAN-5437: keep this process's copy of the search settings current
+    /// (now, then every 60s). The Search service runs its own poller; a
+    /// process that runs searches in-process (the API's pivt / meloD paths)
+    /// calls this so the admin's AI-search allowlist applies there too.
+    pub fn spawn_query_limits_refresh(&self, pool: sqlx::PgPool) {
+        let limits = self.query_limits.clone();
+        tokio::spawn(async move {
+            let settings = crate::settings::SearchQueryLimitsSettings::new(pool);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                match settings.get_config().await {
+                    Ok(config) => {
+                        let mut current = limits.write().await;
+                        if *current != config {
+                            *current = config;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "could not read search query limits");
+                    }
+                }
+            }
+        });
+    }
+
     /// Get a reference to the query tracker
     pub fn query_tracker(&self) -> &super::query_tracking::QueryTracker {
         &self.query_tracker

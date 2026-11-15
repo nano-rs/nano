@@ -312,6 +312,12 @@ impl ClickHouseSqlGenerator {
 
                 for assignment in assignments {
                     let expr_sql = eval_expression_to_sql(self, &assignment.expression)?;
+                    // NAN-5426: type the output before the next assignment so
+                    // `eval parts=split(...), r=reverse(parts)` sees an array.
+                    self.note_eval_assignment_array(
+                        &assignment.field,
+                        super::eval_functions::is_array_valued(self, &assignment.expression, None),
+                    );
                     // Escape the target alias like every other output-naming command
                     // (bin/rex/spath/mvexpand/stats/rename). The parser accepts a quoted
                     // eval alias carrying arbitrary characters (`eval "a, b"=1`), so a raw
@@ -548,11 +554,12 @@ impl ClickHouseSqlGenerator {
                                 // Then ARRAY JOIN to create one row per window the event belongs to
                                 Ok(format!(
                                     "  SELECT * EXCEPT ({field}), \
-                                    toDateTime(toInt64(toDateTime({field})) - toInt64(toDateTime({field})) % {advance} + window_offset) AS {alias}, \
-                                    toDateTime(toInt64(toDateTime({field})) - toInt64(toDateTime({field})) % {advance} + window_offset + {span}) AS {alias_end} \
+                                    toDateTime(toInt64({ts}) - toInt64({ts}) % {advance} + window_offset) AS {alias}, \
+                                    toDateTime(toInt64({ts}) - toInt64({ts}) % {advance} + window_offset + {span}) AS {alias_end} \
                                     FROM {source} \
                                     ARRAY JOIN arrayMap(x -> -x * {advance}, range(0, {num_windows})) AS window_offset",
                                     field = escape_identifier(&field_name),
+                                    ts = self.bin_window_datetime_sql(&field_name),
                                     advance = advance_seconds,
                                     span = span_seconds,
                                     alias = escape_identifier(&alias_name),
@@ -570,9 +577,10 @@ impl ClickHouseSqlGenerator {
                                 Ok(format!(
                                     "  SELECT *, \
                                     {field} AS {alias}, \
-                                    toDateTime(toInt64(toDateTime({field})) + {span}) AS {alias_end} \
+                                    toDateTime(toInt64({ts}) + {span}) AS {alias_end} \
                                     FROM {source}",
                                     field = escape_identifier(&field_name),
+                                    ts = self.bin_window_datetime_sql(&field_name),
                                     span = span_seconds,
                                     alias = escape_identifier(&alias_name),
                                     alias_end = escape_identifier(&format!("{alias_name}_end")),
@@ -1241,7 +1249,7 @@ impl ClickHouseSqlGenerator {
                     }
                     RiskScoreExpr::Dynamic(expr) => {
                         let expr_sql = eval_expression_to_sql(self, expr)?;
-                        format!("least(100, greatest(0, toInt32({})))", expr_sql)
+                        dynamic_risk_score_sql(&expr_sql)
                     }
                 };
 
@@ -1511,4 +1519,20 @@ fn top_rare_bounds_alias_collision(
         || by_fields
             .iter()
             .any(|b| CANONICAL.contains(&by_field_output_name(b, generator)))
+}
+
+/// NAN-5427: the clamped 0-100 score of a dynamic `| risk score=<expr>`.
+/// `toInt32` throws on NaN/Inf (`tonumber("nan")`) and on unparseable text, so
+/// one row value aborted the whole rule query.
+///
+/// The value is read once, as Float64, without throwing (`accurateCastOrNull`
+/// keeps numbers, numeric strings and `true` = 1). A non-numeric or NULL value
+/// contributes 0, never NULL: the accumulated `risk_score + <raw>` of a later
+/// pipe would otherwise wipe every earlier score and drop the finding. NaN
+/// clamps to 0 (`greatest(0, nan)` is 0) and ±Inf to 100 / 0, so `toInt32`
+/// only ever sees a finite value in range.
+pub(crate) fn dynamic_risk_score_sql(expr_sql: &str) -> String {
+    format!(
+        "toInt32(least(100, greatest(0, ifNull(accurateCastOrNull({expr_sql}, 'Float64'), 0))))"
+    )
 }

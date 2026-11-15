@@ -359,12 +359,17 @@ file_size() {
     nano_file_size "$1" || die "cannot determine file size: $1"
 }
 
+# NAN-5440: awk only extracts df's free-KiB field, as text; the byte arithmetic
+# and the comparison are bash 64-bit integers. mawk (Debian's and Ubuntu's
+# default awk) prints any product above 2^31 as %.6g ("3.94609e+10"), so
+# `print $4 * 1024` failed the check on every host with more than 2 GiB free.
 ensure_host_space() {
-    local path="$1" needed="$2" available
-    available="$(df -Pk "$path" | awk 'NR==2 {print $4 * 1024}')"
-    [[ "$available" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "cannot determine free space for $path"
-    awk -v available="$available" -v needed="$needed" 'BEGIN { exit !(available >= needed) }' \
-        || die "insufficient private restore workspace: need $needed bytes, have ${available%.*}"
+    local path="$1" needed="$2" available_kb available
+    available_kb="$(df -Pk "$path" | awk 'NR==2 {print $4}')"
+    [[ "$available_kb" =~ ^[0-9]+$ ]] || die "cannot determine free space for $path"
+    available=$(( 10#$available_kb * 1024 ))
+    (( available >= needed )) \
+        || die "insufficient private restore workspace: need $needed bytes, have $available"
 }
 
 version_ge() {
@@ -1243,12 +1248,24 @@ trust_args() {
     [[ -z "$SIGNING_KEY" ]] || printf -- '--trust\0%s\0' "$SIGNING_KEY"
 }
 
+# snapshot_bundle runs inside $(...), so a die in it (the workspace space check)
+# exits only that subshell, after printing its own reason. It returns
+# SNAPSHOT_INCOMPLETE only for a bundle that is genuinely missing a file;
+# snapshot_failed reports that, and passes any other failure through without
+# blaming the bundle (NAN-5440: a space-check failure read "bundle is incomplete").
+SNAPSHOT_INCOMPLETE=3
+snapshot_failed() {
+    local status="$1" message="$2"
+    (( status == SNAPSHOT_INCOMPLETE )) && die "$message"
+    exit "$status"
+}
+
 snapshot_bundle() {
     local source="$1" label="$2" destination item size
     destination="$WORK_DIR/bundles/$label"
-    [[ -d "$source" && ! -L "$source" ]] || return 1
+    [[ -d "$source" && ! -L "$source" ]] || return "$SNAPSHOT_INCOMPLETE"
     for item in manifest.json manifest.sig payload.cms; do
-        [[ -f "$source/$item" && ! -L "$source/$item" ]] || return 1
+        [[ -f "$source/$item" && ! -L "$source/$item" ]] || return "$SNAPSHOT_INCOMPLETE"
     done
     size="$(file_size "$source/payload.cms")"
     ensure_host_space "$WORK_DIR" "$((size + 67108864))"
@@ -1957,7 +1974,7 @@ PY
     fi
     [[ "$ch_in" != true ]] || install_legacy_clickhouse_backup_config
     if [[ -n "$base_bundle" ]]; then
-        base_snapshot="$(snapshot_bundle "$base_bundle" base)" || die "base backup is incomplete"
+        base_snapshot="$(snapshot_bundle "$base_bundle" base)" || snapshot_failed "$?" "base backup is incomplete"
         load_snapshot "$base_snapshot" "$key_file" base || die "base backup signature/schema/digest verification failed"
         save_base_fields
         [[ -z "$B_BASE_ID" ]] || die "incremental-on-incremental is unsupported; provide a full base"
@@ -2133,7 +2150,7 @@ recovery_set_create_command() {
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nano-recovery-set.XXXXXX")"; chmod 700 "$WORK_DIR"
     local index=0
     for bundle in "${bundles[@]}"; do
-        snapshot="$(snapshot_bundle "$bundle" "component-$index")" || die "component bundle is incomplete: $bundle"
+        snapshot="$(snapshot_bundle "$bundle" "component-$index")" || snapshot_failed "$?" "component bundle is incomplete: $bundle"
         load_snapshot "$snapshot" "$key" "component-$index" || die "component bundle failed signature/schema/digest verification: $bundle"
         [[ -n "$L_SET_ID" && -n "$L_QUIESCE_EPOCH" ]] || die "component lacks recovery-set metadata: $bundle"
         if [[ -z "$set_id" ]]; then set_id=$L_SET_ID; epoch=$L_QUIESCE_EPOCH; fi
@@ -2820,7 +2837,7 @@ restore_command() {
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nano-restore.XXXXXX")"; chmod 700 "$WORK_DIR"
     RESTORE_SOURCE_LABEL="$bundle"
     local primary_snapshot base_snapshot="" payload="$WORK_DIR/payload" base_payload="$WORK_DIR/base-payload" restored="$WORK_DIR/restored.env"
-    primary_snapshot="$(snapshot_bundle "$bundle" primary)" || die "backup bundle is incomplete"
+    primary_snapshot="$(snapshot_bundle "$bundle" primary)" || snapshot_failed "$?" "backup bundle is incomplete"
     load_snapshot "$primary_snapshot" "$key" primary || die "backup signature/schema/payload digest verification failed"
     save_primary_fields; ensure_target_compatible "$restore_layout"
     if [[ "$M_CH_DATA" == included ]]; then
@@ -2834,7 +2851,7 @@ restore_command() {
     fi
     if [[ -n "$M_BASE_ID" ]]; then
         [[ -n "$base" ]] || die "incremental requires --base before any target write"
-        base_snapshot="$(snapshot_bundle "$base" base)" || die "base bundle is incomplete"
+        base_snapshot="$(snapshot_bundle "$base" base)" || snapshot_failed "$?" "base bundle is incomplete"
         load_snapshot "$base_snapshot" "$key" base || die "base signature/schema/payload digest verification failed"
         save_base_fields
         [[ -z "$B_BASE_ID" ]] || die "incremental base is not full; complete base chain is required"

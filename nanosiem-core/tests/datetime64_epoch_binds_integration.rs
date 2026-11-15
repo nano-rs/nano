@@ -134,6 +134,10 @@ fn rule() -> DetectionRule {
         source_repo_url: None,
         kind: "standard".to_string(),
         alert_cooldown_minutes: None,
+        consecutive_failures: 0,
+        failing_since: None,
+        last_error: None,
+        last_error_at: None,
     }
 }
 

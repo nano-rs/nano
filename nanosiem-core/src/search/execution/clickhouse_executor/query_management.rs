@@ -12,7 +12,7 @@ use crate::db::dual_pool::{
     on_cluster_clause, processes_read_settings, runtime_on_cluster_ddl_options,
     system_processes_source,
 };
-use crate::search::{parse_clickhouse_error, SearchError};
+use crate::search::{SearchError};
 use crate::sql_hygiene::escape_sql_string;
 
 impl ClickHouseExecutor {
@@ -64,7 +64,7 @@ impl ClickHouseExecutor {
             .client
             .query(&check_sql)
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         let mut response_bytes = Vec::new();
         // Propagate a mid-stream Err instead of treating it as EOF — a failed
@@ -73,16 +73,11 @@ impl ClickHouseExecutor {
             match cursor.next().await {
                 Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
                 Ok(None) => break,
-                Err(e) => return Err(parse_clickhouse_error(&e.to_string())),
+                Err(e) => return Err(crate::search::search_error_from_error(&e)),
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in cancel check response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "query_management");
 
         let running_count = response_str
             .lines()
@@ -119,7 +114,7 @@ impl ClickHouseExecutor {
             .query(&kill_sql)
             .execute()
             .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         info!("Successfully killed queries {:?}", query_ids);
         Ok(true)
@@ -155,19 +150,14 @@ impl ClickHouseExecutor {
             .client
             .query(&sql)
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         let mut response_bytes = Vec::new();
         while let Ok(Some(chunk)) = cursor.next().await {
             response_bytes.extend_from_slice(&chunk);
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in progress response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "query_management");
 
         // Parse the first line of JSON response
         if let Some(line) = response_str.lines().next() {
@@ -228,7 +218,7 @@ impl ClickHouseExecutor {
             super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
                 .fetch_one::<u64>()
                 .await
-                .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+                .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         Ok(result)
     }

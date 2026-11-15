@@ -605,7 +605,7 @@ impl SearchService {
                     // NAN-1593: propagate so a transient failure isn't cached as
                     // a degraded (empty-facet) cloud view by the main search cache.
                     tracing::warn!("Cloud facet query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };
@@ -619,7 +619,7 @@ impl SearchService {
                 .fetch_bytes("JSONEachRow")
                 .map_err(|e| {
                     tracing::warn!("Cloud events query failed: {}", e);
-                    parse_clickhouse_error(&e.to_string())
+                    crate::search::search_error_from_error(&e)
                 })?;
             let mut response_bytes = Vec::new();
             loop {
@@ -628,16 +628,11 @@ impl SearchService {
                     Ok(None) => break,
                     Err(e) => {
                         tracing::warn!("Cloud events query failed mid-stream: {}", e);
-                        return Err(parse_clickhouse_error(&e.to_string()));
+                        return Err(crate::search::search_error_from_error(&e));
                     }
                 }
             }
-            let response_str = String::from_utf8(response_bytes).map_err(|e| {
-                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                    "Invalid UTF-8 in cloud events response: {}",
-                    e
-                )))
-            })?;
+            let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "cloud");
             Ok::<Vec<serde_json::Value>, SearchError>(
                 response_str
                     .lines()
@@ -652,7 +647,7 @@ impl SearchService {
                 Ok(cnt) => Ok(cnt),
                 Err(e) => {
                     tracing::warn!("Cloud count query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };
@@ -689,7 +684,7 @@ impl SearchService {
                     .collect::<Vec<_>>()),
                 Err(e) => {
                     tracing::warn!("Cloud resource query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };
@@ -718,7 +713,7 @@ impl SearchService {
                     )),
                     Err(e) => {
                         tracing::warn!("Cloud MFA query failed: {}", e);
-                        Err(parse_clickhouse_error(&e.to_string()))
+                        Err(crate::search::search_error_from_error(&e))
                     }
                 }
             } else {
@@ -809,7 +804,7 @@ impl SearchService {
                 }
                 Err(e) => {
                     tracing::warn!("Cloud user activity query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };
@@ -1184,7 +1179,7 @@ impl SearchService {
                     Ok(rows) => Ok(rows),
                     Err(e) => {
                         tracing::warn!("Cloud paginated facet query failed: {}", e);
-                        Err(parse_clickhouse_error(&e.to_string()))
+                        Err(crate::search::search_error_from_error(&e))
                     }
                 }
             } else {
@@ -1201,7 +1196,7 @@ impl SearchService {
             }
             let mut cursor = q.fetch_bytes("JSONEachRow").map_err(|e| {
                 tracing::warn!("Cloud paginated events query failed: {}", e);
-                parse_clickhouse_error(&e.to_string())
+                crate::search::search_error_from_error(&e)
             })?;
             let mut response_bytes = Vec::new();
             loop {
@@ -1213,16 +1208,11 @@ impl SearchService {
                             "Cloud paginated events query failed mid-stream: {}",
                             e
                         );
-                        return Err(parse_clickhouse_error(&e.to_string()));
+                        return Err(crate::search::search_error_from_error(&e));
                     }
                 }
             }
-            let response_str = String::from_utf8(response_bytes).map_err(|e| {
-                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                    "Invalid UTF-8 in cloud paginated events response: {}",
-                    e
-                )))
-            })?;
+            let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "cloud");
             Ok::<Vec<serde_json::Value>, SearchError>(
                 response_str
                     .lines()
@@ -1241,7 +1231,7 @@ impl SearchService {
                 Ok(cnt) => Ok(cnt),
                 Err(e) => {
                     tracing::warn!("Cloud paginated count query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };
@@ -1280,7 +1270,7 @@ impl SearchService {
                     )),
                     Err(e) => {
                         tracing::warn!("Cloud paginated resource query failed: {}", e);
-                        Err(parse_clickhouse_error(&e.to_string()))
+                        Err(crate::search::search_error_from_error(&e))
                     }
                 }
             } else {
@@ -1346,7 +1336,7 @@ impl SearchService {
                     )),
                     Err(e) => {
                         tracing::warn!("Cloud paginated user activity query failed: {}", e);
-                        Err(parse_clickhouse_error(&e.to_string()))
+                        Err(crate::search::search_error_from_error(&e))
                     }
                 }
             } else {
@@ -1507,7 +1497,7 @@ impl SearchService {
             }
             let mut cursor = q.fetch_bytes("JSONEachRow").map_err(|e| {
                 tracing::warn!("Cloud user timeline events query failed: {}", e);
-                parse_clickhouse_error(&e.to_string())
+                crate::search::search_error_from_error(&e)
             })?;
             let mut response_bytes = Vec::new();
             loop {
@@ -1519,16 +1509,11 @@ impl SearchService {
                             "Cloud user timeline events query failed mid-stream: {}",
                             e
                         );
-                        return Err(parse_clickhouse_error(&e.to_string()));
+                        return Err(crate::search::search_error_from_error(&e));
                     }
                 }
             }
-            let response_str = String::from_utf8(response_bytes).map_err(|e| {
-                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                    "Invalid UTF-8 in cloud user timeline response: {}",
-                    e
-                )))
-            })?;
+            let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "cloud");
             Ok::<Vec<serde_json::Value>, SearchError>(
                 response_str
                     .lines()
@@ -1599,7 +1584,7 @@ impl SearchService {
                 }),
                 Err(e) => {
                     tracing::warn!("Cloud user timeline summary query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };
@@ -1802,7 +1787,7 @@ impl SearchService {
             }
             let mut cursor = q.fetch_bytes("JSONEachRow").map_err(|e| {
                 tracing::warn!("Cloud entity pivot events query failed: {}", e);
-                parse_clickhouse_error(&e.to_string())
+                crate::search::search_error_from_error(&e)
             })?;
             let mut response_bytes = Vec::new();
             loop {
@@ -1814,16 +1799,11 @@ impl SearchService {
                             "Cloud entity pivot events query failed mid-stream: {}",
                             e
                         );
-                        return Err(parse_clickhouse_error(&e.to_string()));
+                        return Err(crate::search::search_error_from_error(&e));
                     }
                 }
             }
-            let response_str = String::from_utf8(response_bytes).map_err(|e| {
-                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                    "Invalid UTF-8 in cloud entity pivot response: {}",
-                    e
-                )))
-            })?;
+            let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "cloud");
             Ok::<Vec<serde_json::Value>, SearchError>(
                 response_str
                     .lines()
@@ -1856,7 +1836,7 @@ impl SearchService {
                     .collect::<Vec<_>>()),
                 Err(e) => {
                     tracing::warn!("Cloud entity pivot cross-ref query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };
@@ -1888,7 +1868,7 @@ impl SearchService {
                 Ok(None) => Ok(json!({})),
                 Err(e) => {
                     tracing::warn!("Cloud entity pivot summary query failed: {}", e);
-                    Err(parse_clickhouse_error(&e.to_string()))
+                    Err(crate::search::search_error_from_error(&e))
                 }
             }
         };

@@ -17,6 +17,8 @@ mod analysis;
 #[cfg(test)]
 mod cooldown_tests;
 mod execution;
+pub(crate) use execution::detection_error_from_search;
+mod per_event;
 mod provenance;
 pub(crate) mod helpers;
 mod retro_hunt;

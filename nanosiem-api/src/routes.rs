@@ -3374,6 +3374,13 @@ pub fn create_router(state: AppState) -> Router {
             crate::middleware::denied_source_audit::sink(state.clone()),
             crate::middleware::denied_source_audit::denied_source_audit_middleware,
         ))
+        // NAN-5437: a Desktop agent key (or `x-nano-query-class: agent`) runs
+        // its searches in the agent class, the AI-search origin, so the
+        // AI-search nPL command policy applies to every search this process
+        // runs for it (rule test, dashboard panel query, ...). Needs AuthContext.
+        .layer(axum_middleware::from_fn(
+            crate::middleware::query_class::query_class_middleware,
+        ))
         // Add auth middleware (must be before CORS and logging)
         .layer(axum_middleware::from_fn_with_state(
             auth_state,

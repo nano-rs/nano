@@ -18,6 +18,53 @@ pub struct DetectionCoverageGap {
     pub error_message: String,
 }
 
+/// What `release_claim` writes after an execution attempt (NAN-4910,
+/// NAN-5424).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRelease<'a> {
+    pub next_run_at: chrono::DateTime<chrono::Utc>,
+    /// New `last_run_at`; `None` keeps the current high-water mark.
+    pub advance_last_run_to: Option<chrono::DateTime<chrono::Utc>>,
+    /// New consecutive size-class failure count (NAN-4910).
+    pub catchup_size_failures: i16,
+    /// New consecutive non-size failure count (NAN-5424).
+    pub consecutive_failures: i16,
+    /// Start of the current failure streak; `None` when healthy (NAN-5424).
+    pub failing_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Class of the current streak; `None` when healthy (NAN-5424).
+    pub failure_class: Option<&'a str>,
+    /// Error to record as the rule's `last_error` (stamped `NOW()`); `None`
+    /// leaves the previous error in place.
+    pub error: Option<&'a str>,
+    /// A window recorded as not evaluated; inserted in the same statement.
+    pub coverage_gap: Option<&'a DetectionCoverageGap>,
+}
+
+/// Consecutive-failure counters the scheduler reads before an attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleFailureCounters {
+    pub catchup_size_failures: i16,
+    pub consecutive_failures: i16,
+    pub failing_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Class of the current streak (NAN-5424).
+    pub failure_class: Option<String>,
+    /// Earlier claims of this rule that were never released: the process
+    /// executing them died mid-run (NAN-5424). Excludes the current claim.
+    pub crashed_attempts: i16,
+}
+
+/// Longest `last_error` stored (characters).
+pub const MAX_RULE_ERROR_CHARS: usize = 1000;
+
+/// Truncate and sanitize an error message for `last_error` /
+/// `detection_coverage_gaps.error_message`, SIEM Health and logs. Errors can
+/// quote event data verbatim (U+0000, line breaks, escape sequences); see
+/// [`crate::db::pg_text::pg_safe_error_text`].
+pub fn rule_error_text(message: &str) -> String {
+    let truncated: String = message.chars().take(MAX_RULE_ERROR_CHARS).collect();
+    crate::db::pg_text::pg_safe_error_text(&truncated)
+}
+
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
 
 impl DetectionRuleRepository {
@@ -101,7 +148,10 @@ impl DetectionRuleRepository {
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE detection_rules SET claimed_by = $2, claimed_at = NOW()
+            UPDATE detection_rules SET claimed_by = $2, claimed_at = NOW(),
+                -- NAN-5424: reset on release; > 1 here means an earlier
+                -- claim died without releasing (crash / OOM mid-run).
+                inflight_claims = LEAST(inflight_claims, 1000) + 1
             WHERE id IN (SELECT id FROM claimable)
             RETURNING *
             "#,
@@ -124,35 +174,35 @@ impl DetectionRuleRepository {
     /// - on success → the executed window `end`, so the next window starts
     ///   exactly where this one ended (a 60s query no longer skips 60s of
     ///   events), rather than `NOW()` at query-completion time;
-    /// - on a normal failure → `None`, leaving the existing high-water mark
+    /// - on a retryable failure → `None`, leaving the existing high-water mark
     ///   untouched (`COALESCE`) so the failed window is re-scanned next cycle
     ///   instead of being silently dropped;
-    /// - on a recorded coverage gap (NAN-4910) → the gap's end.
+    /// - on a recorded coverage gap (NAN-4910, NAN-5424) → the gap's end.
     ///
-    /// `catchup_size_failures` is the new consecutive size-failure count that
-    /// selects the next catch-up slice size (NAN-4910). When `coverage_gap` is
-    /// set, the unevaluated window is inserted into `detection_coverage_gaps`
-    /// in the same statement, and only if this node still holds the claim.
+    /// The failure counters select the next catch-up slice size (NAN-4910) and
+    /// bound how often one window is retried (NAN-5424). When `coverage_gap`
+    /// is set, the unevaluated window is inserted into
+    /// `detection_coverage_gaps` in the same statement, and only if this node
+    /// still holds the claim: the high-water mark can never move past a
+    /// window without the gap row.
     ///
     /// This makes `release_claim` the sole writer of `last_run_at`.
     pub async fn release_claim(
         &self,
         rule_id: Uuid,
         node_id: &str,
-        next_run_at: chrono::DateTime<chrono::Utc>,
-        advance_last_run_to: Option<chrono::DateTime<chrono::Utc>>,
-        catchup_size_failures: i16,
-        coverage_gap: Option<&DetectionCoverageGap>,
+        release: &ClaimRelease<'_>,
     ) -> Result<(), DetectionRuleRepositoryError> {
-        let (gap_start, gap_end, gap_attempts, gap_error) = match coverage_gap {
+        let (gap_start, gap_end, gap_attempts, gap_error) = match release.coverage_gap {
             Some(gap) => (
                 Some(gap.window_start),
                 Some(gap.window_end),
                 Some(gap.attempts),
-                Some(gap.error_message.as_str()),
+                Some(rule_error_text(&gap.error_message)),
             ),
             None => (None, None, None, None),
         };
+        let error = release.error.map(rule_error_text);
         sqlx::query(
             r#"
             WITH released AS (
@@ -161,7 +211,13 @@ impl DetectionRuleRepository {
                     claimed_at = NULL,
                     last_run_at = COALESCE($4, last_run_at),
                     next_run_at = $2,
-                    catchup_size_failures = $5
+                    catchup_size_failures = $5,
+                    consecutive_failures = $10,
+                    failing_since = $12,
+                    failure_class = $13,
+                    inflight_claims = 0,
+                    last_error = COALESCE($11, last_error),
+                    last_error_at = CASE WHEN $11::text IS NULL THEN last_error_at ELSE NOW() END
                 WHERE id = $1 AND claimed_by = $3
                 RETURNING id
             )
@@ -173,18 +229,114 @@ impl DetectionRuleRepository {
             "#,
         )
         .bind(rule_id)
-        .bind(next_run_at)
+        .bind(release.next_run_at)
         .bind(node_id)
-        .bind(advance_last_run_to)
-        .bind(catchup_size_failures)
+        .bind(release.advance_last_run_to)
+        .bind(release.catchup_size_failures)
         .bind(gap_start)
         .bind(gap_end)
         .bind(gap_attempts)
         .bind(gap_error)
+        .bind(release.consecutive_failures)
+        .bind(error)
+        .bind(release.failing_since)
+        .bind(release.failure_class)
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    /// Record an error against a rule without changing its schedule or
+    /// failure counters: a matched event that could not be persisted and was
+    /// skipped while the rest of the batch went through (NAN-5424).
+    pub async fn record_rule_error(
+        &self,
+        rule_id: Uuid,
+        message: &str,
+    ) -> Result<(), DetectionRuleRepositoryError> {
+        sqlx::query(
+            "UPDATE detection_rules SET last_error = $2, last_error_at = NOW() WHERE id = $1",
+        )
+        .bind(rule_id)
+        .bind(rule_error_text(message))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Durable record of a matched event whose writes PostgreSQL refused
+    /// (NAN-5424). Only identifiers and the SQLSTATE, never the content.
+    /// `reference_alert_id` is the minimal alert raised for it, if any
+    /// (`Uuid::nil()` = raised by an earlier run).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_skipped_event(
+        &self,
+        rule_id: Uuid,
+        event_id: &str,
+        event_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        window: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        sqlstate: Option<&str>,
+        error_class: &str,
+        reference_alert_id: Option<Uuid>,
+    ) -> Result<(), DetectionRuleRepositoryError> {
+        let reference_alert_id = reference_alert_id.filter(|id| !id.is_nil());
+        sqlx::query(
+            r#"
+            INSERT INTO detection_skipped_events (
+                rule_id, event_id, event_timestamp, window_start, window_end,
+                sqlstate, error_class, reference_alert_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (rule_id, event_id) DO UPDATE SET
+                window_start = EXCLUDED.window_start,
+                window_end = EXCLUDED.window_end,
+                sqlstate = EXCLUDED.sqlstate,
+                reference_alert_id = COALESCE(EXCLUDED.reference_alert_id, detection_skipped_events.reference_alert_id),
+                recorded_at = NOW()
+            "#,
+        )
+        .bind(rule_id)
+        .bind(crate::db::pg_text::pg_safe_error_text(event_id))
+        .bind(event_timestamp)
+        .bind(window.map(|w| w.0))
+        .bind(window.map(|w| w.1))
+        .bind(sqlstate.map(crate::db::pg_text::pg_safe_error_text))
+        .bind(error_class)
+        .bind(reference_alert_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Both consecutive-failure counters for a rule (NAN-4910, NAN-5424).
+    pub async fn get_failure_counters(
+        &self,
+        id: Uuid,
+    ) -> Result<RuleFailureCounters, DetectionRuleRepositoryError> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(i16, i16, Option<chrono::DateTime<chrono::Utc>>, Option<String>, i16)> =
+            sqlx::query_as(
+                "SELECT catchup_size_failures, consecutive_failures, failing_since, \
+                        failure_class, inflight_claims \
+                 FROM detection_rules WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(
+                |(catchup_size_failures, consecutive_failures, failing_since, failure_class, inflight)| {
+                    RuleFailureCounters {
+                        catchup_size_failures,
+                        consecutive_failures,
+                        failing_since,
+                        failure_class,
+                        crashed_attempts: (inflight - 1).max(0),
+                    }
+                },
+            )
+            .unwrap_or_default())
     }
 
     /// Current consecutive size-failure count for a rule's catch-up (NAN-4910).
@@ -227,7 +379,7 @@ impl DetectionRuleRepository {
         let result = sqlx::query(
             r#"
             UPDATE detection_rules
-            SET claimed_by = NULL, claimed_at = NULL
+            SET claimed_by = NULL, claimed_at = NULL, inflight_claims = 0
             WHERE claimed_by = $1
             "#,
         )

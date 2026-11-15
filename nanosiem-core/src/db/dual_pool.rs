@@ -908,6 +908,11 @@ impl DualPool {
             clickhouse = clickhouse.with_option("max_bytes_before_external_set", bytes);
         }
 
+        // NAN-5426: ClickHouse replaces invalid UTF-8 in JSON output with
+        // U+FFFD, so one row's bytes cannot fail a search or a rule query.
+        let (utf8_setting, utf8_value) = super::clickhouse_transport::JSON_VALIDATE_UTF8_SETTING;
+        clickhouse = clickhouse.with_option(utf8_setting, utf8_value);
+
         // NAN-2001: build the two raw-SQL feature clients. FAIL BOOT if a
         // credential is missing (never fall back to the broad `nanosiem` client)
         // and if a client's granted table set drifts from the expected allowlist.
@@ -1072,6 +1077,9 @@ impl DualPool {
         if let Some(bytes) = external_set_spill {
             client = client.with_option("max_bytes_before_external_set", bytes);
         }
+        // NAN-5426: same JSON UTF-8 replacement as the main client.
+        let (utf8_setting, utf8_value) = super::clickhouse_transport::JSON_VALIDATE_UTF8_SETTING;
+        client = client.with_option(utf8_setting, utf8_value);
 
         client
             .query("SELECT 1")

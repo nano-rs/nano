@@ -661,6 +661,13 @@ pub struct DetectionMetrics {
     /// NAN-4910: total recorded coverage gaps in the last 7 days (uncapped).
     #[serde(default)]
     pub coverage_gaps_7d_total: i64,
+    /// NAN-5424: rules failing now or with an execution / skipped-event error
+    /// or coverage gap in the last 24h (most recent error first, capped).
+    #[serde(default)]
+    pub failing_rules: Vec<crate::detection::health::FailingRuleSummary>,
+    /// NAN-5424: total failing rules (uncapped).
+    #[serde(default)]
+    pub failing_rules_total: i64,
 }
 
 /// A detection window recorded as not evaluated (NAN-4910).

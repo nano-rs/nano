@@ -69,10 +69,12 @@ impl SiemHealthRepository {
         .bind(detection_score)
         .bind(enrichment_score)
         .bind(alerting_score)
-        .bind(summary)
-        .bind(metrics)
-        .bind(recommendations)
-        .bind(dimension_details)
+        // NAN-5424: reports quote ClickHouse error text, rule names and
+        // field values; PostgreSQL text / jsonb reject U+0000.
+        .bind(crate::db::pg_text::pg_safe_str(summary))
+        .bind(crate::db::pg_text::pg_safe_json(metrics).as_ref())
+        .bind(crate::db::pg_text::pg_safe_json(recommendations).as_ref())
+        .bind(crate::db::pg_text::pg_safe_json(dimension_details).as_ref())
         .bind(provenance.source_types())
         .bind(provenance.is_complete())
         .bind(triggered_by)

@@ -369,8 +369,10 @@ impl SearchJobRepository {
         truncated: bool,
         meta: &SearchResponse,
     ) -> Result<bool, SearchError> {
-        let meta = serde_json::to_value(meta)
+        let mut meta = serde_json::to_value(meta)
             .map_err(|e| SearchError::SqlValidationError(format!("serialize result meta: {e}")))?;
+        // NAN-5424: field stats carry ClickHouse top values; jsonb rejects U+0000.
+        crate::db::pg_text::sanitize_json_for_pg(&mut meta);
         let done = sqlx::query(
             "UPDATE search_jobs SET state = 'completed', result_attempt = $3, row_count = $4, \
                  result_truncated = $5, result_meta = $6, lease_owner = NULL, \
@@ -409,7 +411,7 @@ impl SearchJobRepository {
         .bind(worker_id)
         .bind(attempt)
         .bind(kind.as_str())
-        .bind(message)
+        .bind(crate::db::pg_text::pg_safe_error_bind(message))
         .execute(&self.pool)
         .await
         .map_err(db)?;

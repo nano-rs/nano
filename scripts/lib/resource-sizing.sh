@@ -23,6 +23,7 @@ planned_gb_per_day=""
 ingest_path=""
 avg_event_bytes=""
 vector_sources=""
+edition=open
 
 # NAN-5345: planned-volume tiers. Large-deployment settings apply only when
 # the operator declares a planned daily volume that needs them; an install
@@ -56,6 +57,14 @@ VECTOR_BASE_SOURCES=16
 VECTOR_MIB_PER_EXTRA_SOURCE=64
 # Raw parsing at >=1 TB/day: readers run 8-12 GiB (2 GiB OOM-looped).
 VECTOR_LARGE_TIER_MEMORY_MIB=8192
+# NAN-5433: the enterprise Evidence Pack runs inside nano-api and refuses to
+# start without enough free memory under the API's limit (about 2x a pack's
+# measured peak: 166 MiB for 30 days, 232 MiB for 365, over an idle API of
+# about 210 MiB). The proportional split gave a 10 GiB host 449 MiB, so on an
+# enterprise install the API gets at least this much where co-located
+# PostgreSQL (above 512 MiB) or ClickHouse (above its floor) can fund it.
+# Open-core installs have no Evidence Pack and keep the proportional split.
+ENTERPRISE_API_MIN_MIB=1024
 
 fail() {
     printf 'resource sizing error: %s\n' "$*" >&2
@@ -87,6 +96,9 @@ Usage: resource-sizing.sh [options]
                                planned volume into events/s for Vector CPU
   --vector-sources COUNT       Planned deployed log sources (NANO_VECTOR_SOURCES,
                                default 16) for Vector's memory allowance
+  --edition open|enterprise    Install edition (default open). Enterprise gives
+                               the API at least 1 GiB for the Evidence Pack
+                               where co-located roles can fund it (NAN-5433)
 EOF
 }
 
@@ -118,6 +130,7 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || fail "--avg-event-bytes needs a value"
             avg_event_bytes="$2"; shift 2 ;;
         --vector-sources) [[ $# -ge 2 ]] || fail "--vector-sources needs a value"; vector_sources="$2"; shift 2 ;;
+        --edition) [[ $# -ge 2 ]] || fail "--edition needs a value"; edition="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown option $1" ;;
     esac
@@ -125,6 +138,7 @@ done
 
 [[ "$topology" == single || "$topology" == role ]] || fail "--topology must be single or role"
 [[ "$format" == env ]] || fail "only --format env is supported"
+[[ "$edition" == open || "$edition" == enterprise ]] || fail "--edition must be open or enterprise"
 [[ "$shards" =~ ^[1-9][0-9]*$ ]] || fail "--shards must be a positive integer"
 
 # This file is the one source of truth for both the rendered graph inventory
@@ -526,6 +540,57 @@ fi
 (( keeper_mcpu > 0 )) || keeper_mcpu=500
 (( tenzir_mcpu > 0 )) || tenzir_mcpu=500
 
+# Split the app role budget across concurrently-running services. Floors are
+# paid for by API/search headroom, so the sum remains inside the role budget.
+api_mib=$(( app_mib * 35 / 100 ))
+search_mib=$(( app_mib * 25 / 100 ))
+jobs_mib=$(( app_mib * 15 / 100 ))
+valkey_mib=$(( app_mib * 12 / 100 ))
+web_mib=$(( app_mib * 8 / 100 ))
+nginx_mib=$(( app_mib - api_mib - search_mib - jobs_mib - valkey_mib - web_mib ))
+(( api_mib < 160 )) && api_mib=160
+(( search_mib < 128 )) && search_mib=128
+(( jobs_mib < 96 )) && jobs_mib=96
+(( valkey_mib < 320 )) && valkey_mib=320
+(( web_mib < 64 )) && web_mib=64
+(( nginx_mib < 32 )) && nginx_mib=32
+app_service_total=$(( api_mib + search_mib + jobs_mib + valkey_mib + web_mib + nginx_mib ))
+app_service_excess=$(( app_service_total - app_mib ))
+if (( app_service_excess > 0 )); then
+    take=$(( api_mib - 160 )); (( take > app_service_excess )) && take=$app_service_excess
+    api_mib=$(( api_mib - take )); app_service_excess=$(( app_service_excess - take ))
+    take=$(( search_mib - 128 )); (( take > app_service_excess )) && take=$app_service_excess
+    search_mib=$(( search_mib - take )); app_service_excess=$(( app_service_excess - take ))
+    take=$(( jobs_mib - 96 )); (( take > app_service_excess )) && take=$app_service_excess
+    jobs_mib=$(( jobs_mib - take )); app_service_excess=$(( app_service_excess - take ))
+    take=$(( nginx_mib - 32 )); (( take > app_service_excess )) && take=$app_service_excess
+    nginx_mib=$(( nginx_mib - take )); app_service_excess=$(( app_service_excess - take ))
+fi
+(( app_service_excess <= 0 )) || fail "app role RAM is below service minimums"
+api_mib=$(( api_mib + (app_mib - api_mib - search_mib - jobs_mib - valkey_mib - web_mib - nginx_mib) ))
+
+# NAN-5433: enterprise API floor for the Evidence Pack (ENTERPRISE_API_MIN_MIB).
+# Done here, before the ClickHouse and PostgreSQL settings below are derived
+# from their budgets. Funded only by co-located roles on this host, in the
+# order the Vector target uses: PostgreSQL down to 512 MiB, then ClickHouse
+# down to its floor (the 6 GiB platform-feed floor where that applies). Vector's target and the other app services are
+# left alone; a host with nothing to give keeps the proportional API share.
+# The opt-in connector-runner (pull-feeds profile) keeps the proportional API
+# share: the floor is for the pack, which runs only inside nano-api.
+api_share_mib=$api_mib
+if [[ "$edition" == enterprise ]] && has_role app && (( api_mib < ENTERPRISE_API_MIN_MIB )); then
+    api_shortfall=$(( ENTERPRISE_API_MIN_MIB - api_mib ))
+    memory_excess=$api_shortfall
+    has_role postgres && reduce_memory_budget pg_mib 512
+    if has_role clickhouse; then
+        ch_floor_mib=2048
+        [[ "$topology" == single ]] && (( memory_mib >= 12288 )) && ch_floor_mib=6144
+        reduce_memory_budget ch_mib "$ch_floor_mib"
+    fi
+    api_mib=$(( api_mib + api_shortfall - memory_excess ))
+    memory_excess=0
+fi
+
 ch_cores=$(ceil_div "$ch_mcpu" 1000)
 ch_cores=$(clamp "$ch_cores" 2 64)
 if (( ch_mib <= 4096 )); then
@@ -654,35 +719,6 @@ else
 fi
 vector_memory_buffer_events=$(clamp "$(( vector_batch_events * 2 ))" 50000 500000)
 
-# Split the app role budget across concurrently-running services. Floors are
-# paid for by API/search headroom, so the sum remains inside the role budget.
-api_mib=$(( app_mib * 35 / 100 ))
-search_mib=$(( app_mib * 25 / 100 ))
-jobs_mib=$(( app_mib * 15 / 100 ))
-valkey_mib=$(( app_mib * 12 / 100 ))
-web_mib=$(( app_mib * 8 / 100 ))
-nginx_mib=$(( app_mib - api_mib - search_mib - jobs_mib - valkey_mib - web_mib ))
-(( api_mib < 160 )) && api_mib=160
-(( search_mib < 128 )) && search_mib=128
-(( jobs_mib < 96 )) && jobs_mib=96
-(( valkey_mib < 320 )) && valkey_mib=320
-(( web_mib < 64 )) && web_mib=64
-(( nginx_mib < 32 )) && nginx_mib=32
-app_service_total=$(( api_mib + search_mib + jobs_mib + valkey_mib + web_mib + nginx_mib ))
-app_service_excess=$(( app_service_total - app_mib ))
-if (( app_service_excess > 0 )); then
-    take=$(( api_mib - 160 )); (( take > app_service_excess )) && take=$app_service_excess
-    api_mib=$(( api_mib - take )); app_service_excess=$(( app_service_excess - take ))
-    take=$(( search_mib - 128 )); (( take > app_service_excess )) && take=$app_service_excess
-    search_mib=$(( search_mib - take )); app_service_excess=$(( app_service_excess - take ))
-    take=$(( jobs_mib - 96 )); (( take > app_service_excess )) && take=$app_service_excess
-    jobs_mib=$(( jobs_mib - take )); app_service_excess=$(( app_service_excess - take ))
-    take=$(( nginx_mib - 32 )); (( take > app_service_excess )) && take=$app_service_excess
-    nginx_mib=$(( nginx_mib - take )); app_service_excess=$(( app_service_excess - take ))
-fi
-(( app_service_excess <= 0 )) || fail "app role RAM is below service minimums"
-api_mib=$(( api_mib + (app_mib - api_mib - search_mib - jobs_mib - valkey_mib - web_mib - nginx_mib) ))
-
 api_mcpu=$(( app_mcpu * 35 / 100 )); (( api_mcpu < 100 )) && api_mcpu=100
 search_mcpu=$(( app_mcpu * 25 / 100 )); (( search_mcpu < 75 )) && search_mcpu=75
 jobs_mcpu=$(( app_mcpu * 15 / 100 )); (( jobs_mcpu < 50 )) && jobs_mcpu=50
@@ -799,7 +835,7 @@ if [[ "$topology" == role ]] && has_role app; then
 fi
 NANO_NGINX_MEM_LIMIT=$(memory_string "$nginx_instance_mib")
 NANO_NGINX_CPU_LIMIT=$(cpu_string "$nginx_instance_mcpu")
-CONNECTOR_MEM_LIMIT=$(memory_string "$(max 256 "$api_mib")")
+CONNECTOR_MEM_LIMIT=$(memory_string "$(max 256 "$api_share_mib")")
 CONNECTOR_CPU_LIMIT=$(cpu_string "$(max 250 "$api_mcpu")")
 NANO_MIGRATE_MEM_LIMIT=$(memory_string "$(max 256 "$jobs_mib")")
 NANO_MIGRATE_CPU_LIMIT=$(cpu_string "$(max 250 "$jobs_mcpu")")

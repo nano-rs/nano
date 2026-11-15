@@ -26,6 +26,10 @@ struct RuleModel {
     lookback_minutes: Option<i32>,
     last_run_at: Option<DateTime<Utc>>,
     size_failures: i16,
+    /// NAN-5424: non-size failure streak.
+    consecutive_failures: i16,
+    failing_since: Option<DateTime<Utc>>,
+    failure_class: Option<&'static str>,
     /// Successfully evaluated windows, in execution order.
     evaluated: Vec<(DateTime<Utc>, DateTime<Utc>)>,
     /// Windows recorded as coverage gaps.
@@ -56,7 +60,13 @@ impl RuleModel {
             outcome,
             marker_driven,
             self.last_run_at,
-            failures,
+            &RuleFailureCounters {
+                catchup_size_failures: self.size_failures,
+                consecutive_failures: self.consecutive_failures,
+                failing_since: self.failing_since,
+                failure_class: self.failure_class.map(str::to_string),
+                crashed_attempts: 0,
+            },
             start,
             end,
             now,
@@ -65,13 +75,16 @@ impl RuleModel {
         if outcome == ExecutionOutcome::Success {
             self.evaluated.push((start, end));
         }
-        if let Some(gap) = decision.coverage_gap {
-            self.gaps.push(gap);
+        if let Some((gap_start, gap_end, _attempts)) = decision.coverage_gap {
+            self.gaps.push((gap_start, gap_end));
         }
         if let Some(mark) = decision.advance_last_run_to {
             self.last_run_at = Some(mark);
         }
         self.size_failures = decision.catchup_size_failures;
+        self.consecutive_failures = decision.consecutive_failures;
+        self.failing_since = decision.failing_since;
+        self.failure_class = decision.failure_class;
         decision
     }
 
@@ -256,6 +269,9 @@ fn an_unrecoverable_slice_is_recorded_as_a_coverage_gap_and_the_rule_moves_on() 
 
 #[test]
 fn a_transient_failure_keeps_the_marker_and_never_records_a_gap() {
+    // NAN-5424: an infrastructure failure (backend unreachable) keeps the
+    // window until the rule has been failing for TRANSIENT_FAILURE_MAX_PIN;
+    // time is frozen here, so it never reaches that.
     let now = t("2026-07-05T12:00:00Z");
     let mark = now - Duration::hours(30);
     let mut rule = RuleModel {
@@ -263,7 +279,7 @@ fn a_transient_failure_keeps_the_marker_and_never_records_a_gap() {
         ..RuleModel::default()
     };
     for _ in 0..20 {
-        let decision = rule.step(now, &|_, _| ExecutionOutcome::OtherFailure);
+        let decision = rule.step(now, &|_, _| ExecutionOutcome::TransientFailure);
         assert_eq!(decision.advance_last_run_to, None);
         assert!(!decision.reclaim_immediately);
     }
@@ -273,7 +289,7 @@ fn a_transient_failure_keeps_the_marker_and_never_records_a_gap() {
 }
 
 #[test]
-fn a_sliding_lookback_rule_never_shrinks_or_records_a_gap() {
+fn a_sliding_lookback_rule_never_shrinks_its_window() {
     let now = t("2026-07-05T12:00:00Z");
     let mut rule = RuleModel {
         lookback_minutes: Some(60),
@@ -284,9 +300,11 @@ fn a_sliding_lookback_rule_never_shrinks_or_records_a_gap() {
         let decision = rule.step(now, &|_, _| ExecutionOutcome::SizeFailure);
         assert_eq!(decision.advance_last_run_to, None);
         assert_eq!(decision.catchup_size_failures, 0);
-        assert!(decision.coverage_gap.is_none());
     }
     assert!(rule.attempts.iter().all(|(s, e, _)| *e - *s == Duration::minutes(60)));
+    // NAN-5424: it can't shrink, so it is bounded like an unclassified
+    // failure (attempts AND a time floor); time is frozen here, so no gap.
+    assert!(rule.gaps.is_empty());
 }
 
 #[test]
@@ -303,35 +321,34 @@ fn a_first_run_size_failure_pins_the_bootstrap_window() {
 
 #[test]
 fn size_dependent_errors_are_classified() {
+    // NAN-5424: by type / ClickHouse code only (see `detection_error_from_search`).
+    use crate::detection::service::detection_error_from_search as map;
+    use crate::search::{parse_clickhouse_error, SearchError};
     for error in [
-        DetectionError::SearchError("Query timeout after 30012ms".into()),
-        DetectionError::QueryExecutionError(
-            "Code: 159. DB::Exception: Timeout exceeded: elapsed 10030.03 ms, maximum: 10000 ms (TIMEOUT_EXCEEDED)".into(),
-        ),
-        DetectionError::SearchError(
-            "SQL validation error: Query exceeded memory limit. Try adding more filters, reducing the time range, or using sampling."
-                .into(),
-        ),
-        DetectionError::QueryExecutionError(
-            "Code: 241. DB::Exception: Memory limit (for query) exceeded (MEMORY_LIMIT_EXCEEDED)".into(),
-        ),
-        DetectionError::QueryExecutionError(
-            "Code: 396. DB::Exception: Limit for result exceeded (TOO_MANY_ROWS_OR_BYTES)".into(),
-        ),
-        DetectionError::SearchError("Response too large: 900 bytes exceeds limit of 100 bytes".into()),
+        map(SearchError::Timeout(30_012)),
+        map(parse_clickhouse_error(
+            "Code: 159. DB::Exception: Timeout exceeded: elapsed 10030.03 ms, maximum: 10000 ms (TIMEOUT_EXCEEDED)",
+        )),
+        map(parse_clickhouse_error(
+            "Code: 241. DB::Exception: Memory limit (for query) exceeded (MEMORY_LIMIT_EXCEEDED)",
+        )),
+        map(parse_clickhouse_error(
+            "Code: 396. DB::Exception: Limit for result exceeded (TOO_MANY_ROWS_OR_BYTES)",
+        )),
+        map(SearchError::ResponseTooLarge(900, 100)),
     ] {
         assert!(error.is_window_size_dependent(), "{error}");
     }
     for error in [
         DetectionError::InvalidQuery("bad".into()),
-        DetectionError::SearchError("SQL validation error: Query syntax error.".into()),
-        DetectionError::QueryExecutionError("connection refused".into()),
-        DetectionError::RepositoryError("Rule execution timed out".into()),
+        map(parse_clickhouse_error("Code: 62. DB::Exception: Syntax error (SYNTAX_ERROR)")),
+        map(SearchError::Unavailable("network error: client error (Connect)".into())),
         // The scheduler's outer timeout also fires on a stalled backend.
-        DetectionError::QueryExecutionError("Rule execution timed out after 300s".into()),
+        DetectionError::BackendUnavailable("Rule execution timed out after 300s".into()),
         // A timeout with no elapsed time does not prove ClickHouse ran it.
-        DetectionError::SearchError("Query timeout after 0ms".into()),
-        DetectionError::QueryExecutionError("Code: 210. Connection refused (NETWORK_ERROR)".into()),
+        map(SearchError::Timeout(0)),
+        // Text is never trusted.
+        DetectionError::SearchError("MEMORY_LIMIT_EXCEEDED".into()),
     ] {
         assert!(!error.is_window_size_dependent(), "{error}");
     }
@@ -349,12 +366,9 @@ fn a_stalled_backend_timeout_never_creates_a_gap() {
         last_run_at: Some(mark),
         ..RuleModel::default()
     };
-    let stalled = DetectionError::QueryExecutionError("Rule execution timed out after 300s".into());
-    let outcome = if stalled.is_window_size_dependent() {
-        ExecutionOutcome::SizeFailure
-    } else {
-        ExecutionOutcome::OtherFailure
-    };
+    let stalled = DetectionError::BackendUnavailable("Rule execution timed out after 300s".into());
+    let outcome = classify_outcome::<()>(&Err(stalled));
+    assert_eq!(outcome, ExecutionOutcome::TransientFailure);
     for _ in 0..50 {
         rule.step(now, &|_, _| outcome);
     }

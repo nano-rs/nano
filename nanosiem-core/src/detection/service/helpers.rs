@@ -177,7 +177,10 @@ pub(crate) async fn store_detection_match_with_pool(
 ) -> Result<(), DetectionError> {
     let event_count = events.len() as i32;
     let severity_str = format!("{:?}", rule.severity).to_lowercase();
-    let matched_events = serde_json::Value::Array(events.to_vec());
+    let mut matched_events = serde_json::Value::Array(events.to_vec());
+    // NAN-5424: PostgreSQL rejects U+0000 in jsonb (22P05) and text[] (22021);
+    // sanitize before deriving the source_types stamp, the hash and the bind.
+    crate::db::pg_text::sanitize_json_for_pg(&mut matched_events);
 
     // NAN-1808: stamp the match with the distinct normalized source_type
     // values of its events (per-event `source_type` plus the aggregate
@@ -292,8 +295,9 @@ pub(crate) async fn record_finding_emissions_with_pool(
         "INSERT INTO detection_finding_emissions (rule_id, entity, finding_hash, window_end) ",
     );
     qb.push_values(findings, |mut b, f| {
+        // NAN-5424: entity values are event-derived; PG text rejects U+0000.
         b.push_bind(rule_id)
-            .push_bind(&f.entity)
+            .push_bind(crate::db::pg_text::pg_safe_str(&f.entity).into_owned())
             .push_bind(&f.finding_hash)
             .push_bind(f.window_end);
     });
@@ -429,7 +433,8 @@ impl DetectionService {
 
             b.push_bind(rule_id)
                 .push_bind(kind.as_str())
-                .push_bind(event_id)
+                // NAN-5424: the id can come from an event field.
+                .push_bind(crate::db::pg_text::pg_safe_string(event_id))
                 .push_bind(timestamp);
         });
 
@@ -551,6 +556,10 @@ impl DetectionService {
         if cooldown_minutes <= 0 || entities.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
+        // NAN-5424: entities are event-derived and PG text rejects U+0000.
+        // Anchors are stored sanitized; map the rows back to the caller's
+        // spelling so the membership test below matches what it passed in.
+        let safe = crate::db::pg_text::pg_safe_strings(entities);
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
             r#"
             SELECT entity, last_alert_at
@@ -559,15 +568,21 @@ impl DetectionService {
             "#,
         )
         .bind(rule_id)
-        .bind(entities)
+        .bind(safe.as_ref())
         .fetch_all(&self.pg_pool)
         .await?;
 
         let now = Utc::now();
-        Ok(rows
+        let cooled: std::collections::HashSet<String> = rows
             .into_iter()
             .filter(|(_, last)| within_alert_cooldown(Some(*last), now, cooldown_minutes))
             .map(|(entity, _)| entity)
+            .collect();
+        Ok(entities
+            .iter()
+            .zip(safe.iter())
+            .filter(|(_, stored)| cooled.contains(*stored))
+            .map(|(original, _)| original.clone())
             .collect())
     }
 
@@ -596,7 +611,7 @@ impl DetectionService {
             "#,
         )
         .bind(rule_id)
-        .bind(entities)
+        .bind(crate::db::pg_text::pg_safe_strings(entities).as_ref())
         .execute(&self.pg_pool)
         .await;
         if let Err(e) = result {

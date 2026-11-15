@@ -1728,6 +1728,10 @@ snapshot_effective_sizing_env() {
     ' "$sizing_keys" "$source_env" > "$output"
 }
 
+# Prints a fixed-point number for report_sizing_changes' comparison only.
+# printf, never print: mawk (Debian/Ubuntu's default awk) prints any value
+# above 2^31 as %.6g, so two ~8 GiB byte limits that differ by under 10 KB
+# printed alike and a reduction went unreported (NAN-5440 audit).
 sizing_numeric_value() {
     local key="$1" value="$2"
     value="${value%\"}" value="${value#\"}"
@@ -1737,9 +1741,9 @@ sizing_numeric_value() {
             if (key ~ /CPU/) {
                 if (value ~ /^[0-9]+([.][0-9]+)?m$/) {
                     sub(/m$/, "", value)
-                    print value / 1000
+                    printf "%.6f\n", value / 1000
                 } else if (value ~ /^[0-9]+([.][0-9]+)?$/) {
-                    print value + 0
+                    printf "%.6f\n", value + 0
                 }
                 exit
             }
@@ -1752,11 +1756,11 @@ sizing_numeric_value() {
                 if (unit ~ /^K/) number /= 1024
                 else if (unit ~ /^G/) number *= 1024
                 else if (unit ~ /^T/) number *= 1048576
-                print number + 0
+                printf "%.6f\n", number + 0
                 exit
             }
             if (value ~ /^[0-9]+([.][0-9]+)?$/)
-                print value + 0
+                printf "%.6f\n", value + 0
         }
     '
 }
@@ -2489,6 +2493,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     "$RESOURCE_SIZING" \
         --topology single \
         --roles "$sizing_roles" \
+        --edition "$NANO_EDITION" \
         --shards 1 \
         --planned-gb-per-day "$PLANNED_GB_PER_DAY" \
         --ingest-path "$PLANNED_INGEST_PATH" \
@@ -2514,6 +2519,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     "$RESOURCE_SIZING" \
         --topology single \
         --roles "$sizing_roles" \
+        --edition "$NANO_EDITION" \
         --shards 1 \
         --planned-gb-per-day "$PLANNED_GB_PER_DAY" \
         --ingest-path "$PLANNED_INGEST_PATH" \

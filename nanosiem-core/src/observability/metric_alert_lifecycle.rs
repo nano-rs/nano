@@ -427,6 +427,13 @@ pub async fn apply_evaluation(
     now: DateTime<Utc>,
 ) -> Result<Vec<IncidentOpened>, sqlx::Error> {
     use super::eval::{metric_breach, metric_monitor_source_id, metric_payload};
+    // NAN-5424: series keys are ClickHouse label values; they become
+    // PostgreSQL text / jsonb (cursor rows, alert source ids and payloads),
+    // which reject U+0000.
+    let results: Vec<(String, Option<f64>)> = results
+        .into_iter()
+        .map(|(key, value)| (crate::db::pg_text::pg_safe_string(key), value))
+        .collect();
     let mut tx = pool.begin().await?;
     lock_monitor(&mut tx, None, monitor.id).await?;
     // Monitor-wide generation fence (migration 295): every result set —

@@ -168,6 +168,10 @@ pub const SOURCE_SCOPE_REVOKED: &str = "source_scope_revoked";
 /// because it is source-scoped (outcome `refused`). Rate limited per
 /// (actor, label, entry point); the user response is unchanged.
 pub const SEARCH_SOURCE_SCOPE_DENIED: &str = "search.source_scope_denied";
+/// NAN-5437: an AI-written search (pivt, meloD tool loops, the nano MCP,
+/// Desktop agents) used an nPL command AI searches may not run (external
+/// fetch, AI call, write) and was refused before it ran.
+pub const SEARCH_AI_COMMAND_REFUSED: &str = "search.ai_command_refused";
 
 // =============================================================================
 // Credential Actions

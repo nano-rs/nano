@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::sql_helpers::escape_question_marks_in_strings;
 use super::types::ClickHouseExecutor;
-use crate::search::{parse_clickhouse_error, FieldInfo, SearchError};
+use crate::search::{FieldInfo, SearchError};
 use crate::sql_hygiene::escape_sql_string;
 
 /// Build the SQL that enumerates top-level ext (JSON) field names from recent data.
@@ -304,7 +304,7 @@ impl ClickHouseExecutor {
             .client
             .query(&escaped_sql)
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         // Schema queries should be small, but add limit as safeguard
         const MAX_SCHEMA_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
@@ -327,17 +327,12 @@ impl ClickHouseExecutor {
                 Ok(None) => break,
                 Err(e) => {
                     warn!("ClickHouse columns query failed mid-stream: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in columns response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "field_stats");
 
         let columns: Vec<String> = response_str
             .lines()
@@ -515,7 +510,7 @@ impl ClickHouseExecutor {
                 .fetch_bytes("JSONEachRow")
                 .map_err(|e| {
                     warn!("ClickHouse field stats query failed to start: {}", e);
-                    parse_clickhouse_error(&e.to_string())
+                    crate::search::search_error_from_error(&e)
                 })?;
 
         // Limit response size to prevent OOM on large field stats
@@ -535,17 +530,12 @@ impl ClickHouseExecutor {
                 Ok(None) => break,
                 Err(e) => {
                     warn!("ClickHouse field stats streaming error: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in field stats response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "field_stats");
 
         debug!("Field stats response length: {} bytes", response_str.len());
 
@@ -678,7 +668,7 @@ impl ClickHouseExecutor {
             .client
             .query(&escaped_sql)
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         let mut response_bytes = Vec::new();
         loop {
@@ -698,17 +688,12 @@ impl ClickHouseExecutor {
                     // degrade gracefully on an error, so surface it (NAN-1510:
                     // the prior `break` returned a silent empty despite this note).
                     warn!("ext field names query failed mid-stream: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in ext field names response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "field_stats");
 
         let names: Vec<String> = response_str
             .lines()
@@ -812,7 +797,7 @@ impl ClickHouseExecutor {
             .fetch_bytes("JSONEachRow")
             .map_err(|e| {
                 warn!("ClickHouse field values query failed: {}", e);
-                parse_clickhouse_error(&e.to_string())
+                crate::search::search_error_from_error(&e)
             })?;
 
         let mut response_bytes = Vec::new();
@@ -822,17 +807,12 @@ impl ClickHouseExecutor {
                 Ok(None) => break,
                 Err(e) => {
                     warn!("ClickHouse field values streaming error: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in field values response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "field_stats");
 
         if response_str.is_empty() {
             return Ok(Vec::new());

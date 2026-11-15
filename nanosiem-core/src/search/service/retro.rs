@@ -608,7 +608,7 @@ impl SearchService {
             .query(sql)
             .fetch_all::<RetroSummaryRow>()
             .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
         let row = match rows.into_iter().next() {
             Some(r) => r,
             None => return Ok((0, 0, None, None, Vec::new())),
@@ -761,7 +761,7 @@ impl SearchService {
             .query(&sql)
             .fetch_all::<RetroListRowRaw>()
             .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         // no_hits computed against the COMPLETE result set.
         let hit_values: std::collections::HashSet<String> =
@@ -852,7 +852,7 @@ impl SearchService {
             .query(&sql)
             .fetch_all::<RetroPivotRowRaw>()
             .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         let has_more = fetched.len() > limit;
         if has_more {
@@ -1092,7 +1092,7 @@ impl SearchService {
             .query(&sql)
             .fetch_all::<RetroFeedCandidateRow>()
             .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
         Ok(rows
             .into_iter()
             .map(|r| RetroFeedCandidate {
@@ -1130,7 +1130,7 @@ impl SearchService {
             .query(&sql)
             .fetch_one::<u64>()
             .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))
+            .map_err(|e| crate::search::search_error_from_error(&e))
     }
 
     /// Batched retro hunt over an explicit indicator set (NAN-1791).
@@ -1184,7 +1184,7 @@ impl SearchService {
             .query(&sql)
             .fetch_all::<RetroListRowRaw>()
             .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         // Unscoped denominator too (system path — see the build_list_sql note).
         let total_hosts = self.retro_total_hosts(None).await;

@@ -152,7 +152,9 @@ impl DetectionService {
             Err(e) => {
                 if let Err(fe) = repo
                     .finish_run(
-                        run_id, "error", 0, 0, 0, false, 0, watermark_before, Some(&e.to_string()),
+                        run_id, "error", 0, 0, 0, false, 0, watermark_before,
+                        // NAN-5424: redacted (error text can quote event values).
+                        Some(&e.redacted_summary()),
                     )
                     .await
                 {
@@ -205,7 +207,7 @@ impl DetectionService {
                         limit,
                     )
                     .await
-                    .map_err(|e| DetectionError::SearchError(e.to_string()))
+                    .map_err(super::execution::detection_error_from_search)
             },
             |values| async move {
                 repo.already_hunted(rule.id, &values)
@@ -240,7 +242,7 @@ impl DetectionService {
                 .search_service
                 .retro_hunt_over_indicators(values, config.lookback_days as i64)
                 .await
-                .map_err(|e| DetectionError::SearchError(e.to_string()))?;
+                .map_err(super::execution::detection_error_from_search)?;
             debug!(
                 rule_id = %rule.id,
                 key_type = %key_type,
@@ -255,7 +257,9 @@ impl DetectionService {
         let alert = if hits.is_empty() {
             None
         } else {
-            let results = build_hit_events(rule.id, &hits, &to_hunt);
+            let mut results = build_hit_events(rule.id, &hits, &to_hunt);
+            // NAN-5424: hit summaries carry ClickHouse values bound for PG.
+            crate::db::pg_text::sanitize_events_for_pg(&mut results);
             self.emit_retro_matches(rule, results).await?
         };
 
@@ -361,19 +365,19 @@ impl DetectionService {
                 self.rule_repo
                     .record_daily_stats(rule.id, today, match_count, 0)
                     .await?;
-                match rule.alert_mode {
+                let per_event = match rule.alert_mode {
                     AlertMode::PerEvent => {
-                        for event in &results {
-                            self.store_detection_match(rule, std::slice::from_ref(event))
-                                .await?;
-                        }
+                        // NAN-5424: per-event failure isolation.
+                        self.store_detection_matches_per_event(rule, &results, None)
+                            .await?
                     }
                     AlertMode::Grouped => {
                         self.store_detection_match(rule, &results).await?;
+                        super::per_event::PerEventOutcome::default()
                     }
-                }
+                };
                 let emitted = self.log_live_findings(rule, &results, global_weight).await;
-                self.record_matched_events(rule.id, matched_kind, &results)
+                self.record_matched_events(rule.id, matched_kind, &per_event.recordable(&results))
                     .await?;
                 info!(
                     "Retro-hunt rule {} (LIVE) found {} indicators in logs, emitted {} findings",
@@ -385,23 +389,28 @@ impl DetectionService {
                 self.rule_repo
                     .update_execution_stats(rule.id, match_count)
                     .await?;
+                let mut per_event = super::per_event::PerEventOutcome::default();
                 let alert = match rule.alert_mode {
                     AlertMode::Grouped => {
                         self.handle_grouped_alert(rule, &results, match_count, today, global_weight)
                             .await?
                     }
                     AlertMode::PerEvent => {
-                        self.handle_per_event_alerts(
-                            rule,
-                            &results,
-                            match_count,
-                            today,
-                            global_weight,
-                        )
-                        .await?
+                        let (alert, outcome) = self
+                            .handle_per_event_alerts(
+                                rule,
+                                &results,
+                                match_count,
+                                today,
+                                global_weight,
+                                None,
+                            )
+                            .await?;
+                        per_event = outcome;
+                        alert
                     }
                 };
-                self.record_matched_events(rule.id, matched_kind, &results)
+                self.record_matched_events(rule.id, matched_kind, &per_event.recordable(&results))
                     .await?;
                 Ok(alert)
             }
@@ -644,7 +653,7 @@ impl DetectionService {
         self.search_service
             .list_ioc_feed_names()
             .await
-            .map_err(|e| DetectionError::SearchError(e.to_string()))
+            .map_err(super::execution::detection_error_from_search)
     }
 }
 

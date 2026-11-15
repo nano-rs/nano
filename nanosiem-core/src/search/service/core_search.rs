@@ -659,6 +659,14 @@ impl SearchService {
             Ok(q) => q,
             Err(e) => return Err(convert_parse_error(e)),
         };
+        // NAN-5437: an AI-written search may not use a command that reaches
+        // outside nano or writes. Checked before anything below runs.
+        crate::search::ai_command_policy::enforce(
+            &request.query,
+            &query,
+            query_limits.ai_allowed_commands(),
+            "search",
+        )?;
         // NAN-3385: resolve `timechart bins=N` against the effective window so
         // every later reader (histogram, presentation wrapper) sees the real span.
         crate::query::resolve_timechart_bins(

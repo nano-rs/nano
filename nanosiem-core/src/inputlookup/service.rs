@@ -26,6 +26,14 @@ use crate::query::{InputLookupFormat, UrlTemplate};
 /// [`UrlFetcher`] (NAN-1581 Phase 5).
 const LOOKUP_SCHEME: &str = "lookup://";
 
+/// The internal table an inputlookup URL template addresses (`lookup://<name>`,
+/// exact prefix), or `None` for an external URL. The ONE test for "internal
+/// lookup": execution routes on it, and the AI-search command policy
+/// (NAN-5437, `search::ai_command_policy`) allows exactly what it matches.
+pub fn internal_lookup_table(url: &str) -> Option<&str> {
+    url.strip_prefix(LOOKUP_SCHEME).map(str::trim)
+}
+
 /// Errors that can occur during inputlookup execution
 #[derive(Debug, Error)]
 pub enum InputLookupError {
@@ -116,11 +124,6 @@ impl InputLookupService {
         self
     }
 
-    /// Detect a `lookup://<name>` URL and return the (trimmed) table name.
-    fn internal_lookup_table(url: &str) -> Option<&str> {
-        url.strip_prefix(LOOKUP_SCHEME).map(str::trim)
-    }
-
     /// Read EVERY row of an internal lookup table as JSON search results,
     /// matching the shape the HTTP/CSV data-source path produces (user columns
     /// only; internal columns stripped by `LookupService::read_all_rows`).
@@ -173,7 +176,7 @@ impl InputLookupService {
     ) -> Result<Vec<Value>, InputLookupError> {
         // INTERNAL lookup table (`lookup://<name>`): read it directly through the
         // lookup layer and bypass the HTTP fetcher entirely (NAN-1581 Phase 5).
-        if let Some(table) = Self::internal_lookup_table(&params.url.template) {
+        if let Some(table) = internal_lookup_table(&params.url.template) {
             debug!("inputlookup data source: internal table '{}'", table);
             return self.read_internal_lookup(table).await;
         }
@@ -283,7 +286,7 @@ impl InputLookupService {
         // INTERNAL lookup table (`lookup://<name>`) in enrichment mode: read the
         // whole table once and join in-memory on the key field, bypassing the
         // HTTP fetcher entirely (NAN-1581 Phase 5).
-        if let Some(table) = Self::internal_lookup_table(&params.url.template) {
+        if let Some(table) = internal_lookup_table(&params.url.template) {
             return self
                 .enrich_results_internal(results, table, key_field)
                 .await;

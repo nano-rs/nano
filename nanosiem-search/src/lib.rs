@@ -200,7 +200,9 @@ impl SearchState {
         // Add inputlookup service for URL-based enrichment. Wire the internal
         // lookup layer so `| inputlookup <internal_table>` reads the CH/PG-backed
         // lookup table directly (NAN-1581 Phase 5).
-        let inputlookup_service = InputLookupService::new(InputLookupConfig::default())
+        // NAN-5436: `from_env` applies the INPUTLOOKUP_ALLOWED_DOMAINS host
+        // allowlist when set; unset keeps the default (public hosts allowed).
+        let inputlookup_service = InputLookupService::new(InputLookupConfig::from_env())
             .with_lookup_service(lookup.clone());
         search_svc.set_inputlookup_service(inputlookup_service);
         tracing::info!("InputLookup service configured for Search Service");
@@ -305,6 +307,12 @@ impl SearchState {
 
         // Create audit emitter for logging sharing events
         let audit_emitter = Arc::new(AuditEmitter::new(dual_pool.clone()));
+        // NAN-5437: audit AI searches refused by the AI-search command policy.
+        nanosiem_core::search::ai_command_policy::install_audit_sink(
+            nanosiem_core::search::ai_command_policy::EmitterAiCommandAuditSink::new(
+                audit_emitter.clone(),
+            ),
+        );
 
         // Connect to Valkey/Redis for search result caching (optional)
         let result_cache = match redis_url {
@@ -979,6 +987,9 @@ pub fn create_router(
 
 #[cfg(test)]
 mod admission_wiring_tests;
+
+#[cfg(test)]
+mod ai_search_policy_wiring_tests;
 
 #[cfg(test)]
 mod ip_allowlist_wiring_tests;

@@ -269,3 +269,28 @@ fn query_memory_ceiling_is_a_share_of_the_server_limit() {
     // Unknown limit: the ClickHouse profile stays in control.
     assert_eq!(query_memory_ceiling(None, 0), None);
 }
+
+// NAN-5426: a ClickHouse response with invalid UTF-8 decodes lossily.
+#[test]
+fn decode_response_text_replaces_invalid_sequences() {
+    assert_eq!(decode_response_text(b"plain".to_vec(), "test"), "plain");
+    assert_eq!(
+        decode_response_text("é αβγ".as_bytes().to_vec(), "test"),
+        "é αβγ"
+    );
+    // `substring` cut inside `é` (C3 A9), a lone 0xFF, and the CESU-8 bytes
+    // ClickHouse stores for a lone surrogate (ED A0 80).
+    let mut bytes = b"abcdefghi\xC3".to_vec();
+    bytes.extend_from_slice(b"|\xFF|\xED\xA0\x80|");
+    let text = decode_response_text(bytes, "test");
+    assert!(text.starts_with("abcdefghi\u{FFFD}|\u{FFFD}|"), "{text:?}");
+    assert!(text.ends_with('|'), "{text:?}");
+}
+
+#[test]
+fn json_validate_utf8_setting_is_the_clickhouse_name() {
+    assert_eq!(
+        JSON_VALIDATE_UTF8_SETTING,
+        ("output_format_json_validate_utf8", "1")
+    );
+}

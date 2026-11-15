@@ -230,6 +230,20 @@ impl SearchService {
                 return;
             }
         };
+        // NAN-5437: the same AI-search command policy as the batch path.
+        let ai_allowed = self.query_limits.read().await.ai_allowed_commands().to_vec();
+        if let Err(error) = crate::search::ai_command_policy::enforce(
+            &request.query,
+            &query,
+            &ai_allowed,
+            "search_stream",
+        ) {
+            send_event!(SearchStreamEvent::Error {
+                code: "VALIDATION_ERROR".to_string(),
+                message: error.to_string(),
+            });
+            return;
+        }
         // NAN-3385: same `timechart bins=N` resolution as the batch path.
         crate::query::resolve_timechart_bins(
             &mut query,

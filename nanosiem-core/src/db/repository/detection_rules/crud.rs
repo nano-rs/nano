@@ -197,6 +197,12 @@ impl DetectionRuleRepository {
                 -- NAN-1805: COALESCE patch semantics — send 0 to disable the
                 -- cooldown; None leaves the stored value unchanged.
                 alert_cooldown_minutes = COALESCE($37, alert_cooldown_minutes),
+                -- NAN-5424: an edited rule starts a fresh failure streak
+                -- (the old failures were about the old definition).
+                consecutive_failures = 0,
+                failing_since = NULL,
+                failure_class = NULL,
+                catchup_size_failures = 0,
                 updated_at = NOW()
             WHERE id = $1 AND updated_at = $31
             RETURNING *

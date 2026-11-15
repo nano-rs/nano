@@ -21,5 +21,7 @@ mod scheduling;
 mod stats;
 mod types;
 
-pub use scheduling::DetectionCoverageGap;
+pub use scheduling::{
+    rule_error_text, ClaimRelease, DetectionCoverageGap, RuleFailureCounters, MAX_RULE_ERROR_CHARS,
+};
 pub use types::{DailyStat, DetectionRuleRepository, DetectionRuleRepositoryError};

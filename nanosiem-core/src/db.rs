@@ -10,6 +10,7 @@ pub mod dual_pool;
 pub mod future_timestamp_repair;
 pub mod migration_refresh;
 pub mod migrations;
+pub mod pg_text;
 pub mod pool;
 pub mod postgres_preflight;
 pub mod repo_error;

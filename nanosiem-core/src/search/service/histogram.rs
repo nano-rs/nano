@@ -175,18 +175,13 @@ impl SearchService {
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!("Histogram query failed mid-stream: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
 
         // Parse JSONEachRow format
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in ClickHouse response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "histogram");
 
         let histogram: Vec<HistogramBucket> = response_str
             .lines()

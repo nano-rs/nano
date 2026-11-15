@@ -12,7 +12,7 @@ use crate::search::evaluator::helpers::{
     clickhouse_row_to_json, convert_timestamps_to_iso8601, flatten_ext_field_in_place,
     strip_empty_values,
 };
-use crate::search::{parse_clickhouse_error, SearchError};
+use crate::search::{SearchError};
 
 impl ClickHouseExecutor {
     /// Execute a ClickHouse query using the typed ClickHouseLogReadRow struct
@@ -41,7 +41,7 @@ impl ClickHouseExecutor {
                     "Typed query failed: {} - falling back to dynamic",
                     error_str
                 );
-                parse_clickhouse_error(&error_str)
+                crate::search::search_error_from_error(&e)
             })?;
 
         debug!("Successfully fetched {} rows from ClickHouse", rows.len());
@@ -73,7 +73,7 @@ impl ClickHouseExecutor {
             .client
             .query(&escaped_sql)
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         // Collect all bytes from the cursor with proper error handling
         // Limit response size to 100MB to prevent OOM
@@ -100,7 +100,7 @@ impl ClickHouseExecutor {
                 Err(e) => {
                     let error_str = e.to_string();
                     tracing::error!("Error reading ClickHouse response chunk: {}", error_str);
-                    return Err(parse_clickhouse_error(&error_str));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
@@ -111,12 +111,7 @@ impl ClickHouseExecutor {
         );
 
         // Parse JSONEachRow format (one JSON object per line)
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in ClickHouse response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "search");
 
         let results: Vec<serde_json::Value> = response_str
             .lines()
@@ -187,7 +182,7 @@ impl ClickHouseExecutor {
         let mut cursor =
             super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
                 .fetch_bytes("JSONEachRow")
-                .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+                .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         // Count queries should be small, but add limit as safeguard
         const MAX_COUNT_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
@@ -211,16 +206,11 @@ impl ClickHouseExecutor {
                     response_bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
-                Err(e) => return Err(parse_clickhouse_error(&e.to_string())),
+                Err(e) => return Err(crate::search::search_error_from_error(&e)),
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in count response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "search");
 
         // Parse the count from the first line
         if let Some(line) = response_str.lines().next() {
@@ -260,7 +250,7 @@ impl ClickHouseExecutor {
             .query(&escaped_sql)
             .with_option("query_id", query_id)
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         let mut response_bytes = Vec::new();
         loop {
@@ -275,17 +265,12 @@ impl ClickHouseExecutor {
                 Err(e) => {
                     let error_str = e.to_string();
                     tracing::error!("Error reading ClickHouse response chunk: {}", error_str);
-                    return Err(parse_clickhouse_error(&error_str));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in ClickHouse response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "search");
 
         let results: Vec<serde_json::Value> = response_str
             .lines()
@@ -365,7 +350,7 @@ impl ClickHouseExecutor {
         }
         let mut cursor = query
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         let mut response_bytes = Vec::new();
         loop {
@@ -380,17 +365,12 @@ impl ClickHouseExecutor {
                 Err(e) => {
                     let error_str = e.to_string();
                     tracing::error!("Error reading ClickHouse response chunk: {}", error_str);
-                    return Err(parse_clickhouse_error(&error_str));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         }
 
-        let response_str = String::from_utf8(response_bytes).map_err(|e| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in ClickHouse response: {}",
-                e
-            )))
-        })?;
+        let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "search");
 
         let results: Vec<serde_json::Value> = response_str
             .lines()
@@ -468,7 +448,7 @@ impl ClickHouseExecutor {
 
         let mut cursor = query
             .fetch_bytes("JSONEachRow")
-            .map_err(|error| parse_clickhouse_error(&error.to_string()))?;
+            .map_err(|error| crate::search::search_error_from_error(&error))?;
         let byte_limit = usize::try_from(limits.max_result_bytes).unwrap_or(usize::MAX);
         let mut response_bytes = Vec::new();
         loop {
@@ -487,15 +467,11 @@ impl ClickHouseExecutor {
                     response_bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
-                Err(error) => return Err(parse_clickhouse_error(&error.to_string())),
+                Err(error) => return Err(crate::search::search_error_from_error(&error)),
             }
         }
 
-        let response = String::from_utf8(response_bytes).map_err(|error| {
-            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "Invalid UTF-8 in bounded ClickHouse response: {error}"
-            )))
-        })?;
+        let response = crate::db::clickhouse_transport::decode_response_text(response_bytes, "search");
         let mut results = Vec::new();
         for line in response.lines().filter(|line| !line.is_empty()) {
             let row = Self::parse_and_postprocess_row(line, !preserve_columns).ok_or_else(|| {

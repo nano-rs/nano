@@ -206,6 +206,31 @@ pub(crate) fn detection_error_from_search(e: crate::search::SearchError) -> Dete
         ref parse @ (SearchError::ParseError(_) | SearchError::StructuredParseError { .. }) => {
             DetectionError::QueryParseError(parse.to_string())
         }
+        // NAN-5424: classification by type / ClickHouse code, never by text.
+        ref size @ (SearchError::ResourceLimit(_) | SearchError::ResponseTooLarge(..)) => {
+            DetectionError::WindowTooLarge(size.to_string())
+        }
+        // A server-side `max_execution_time` that reports the time ClickHouse
+        // spent is a size failure; a timeout without elapsed time proves
+        // nothing about the window (NAN-4910).
+        ref timeout @ SearchError::Timeout(ms) if ms > 0 => {
+            DetectionError::WindowTooLarge(timeout.to_string())
+        }
+        ref unavailable @ (SearchError::Unavailable(_)
+        | SearchError::Timeout(_)
+        | SearchError::Cancelled
+        | SearchError::AdmissionDenied(_)
+        | SearchError::ViewMemoryBusy { .. }) => {
+            DetectionError::BackendUnavailable(unavailable.to_string())
+        }
+        ref data @ SearchError::DataError { .. } => DetectionError::QueryDataError(data.to_string()),
+        // PostgreSQL failures keep their SQLSTATE for classification.
+        SearchError::DatabaseError(e @ (sqlx::Error::Database(_)
+        | sqlx::Error::Io(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Tls(_))) => DetectionError::DatabaseError(e),
         other => DetectionError::SearchError(other.to_string()),
     }
 }
@@ -666,6 +691,22 @@ impl DetectionService {
             )
             .await?;
 
+        // NAN-5424: ClickHouse returns event values verbatim, U+0000 included,
+        // and PostgreSQL rejects that code point in jsonb (22P05) and text
+        // (22021). Every downstream write of these events (detection_matches,
+        // alerts, matched-event dedup, finding/cooldown entities, case
+        // grouping) is PostgreSQL, so sanitize the window's events once, here.
+        // The raw event in ClickHouse is untouched.
+        let sanitized = crate::db::pg_text::sanitize_events_for_pg(&mut results);
+        if sanitized > 0 {
+            counter!("nanosiem_detection_events_sanitized_total").increment(sanitized as u64);
+            debug!(
+                rule_id = %rule.id,
+                sanitized,
+                "Replaced U+0000 in matched event values before PostgreSQL writes"
+            );
+        }
+
         // Audit D19: if a single window hit the 1M safety cap the rule is far too
         // broad — matches beyond 1M are still truncated, but now VISIBLY (a warn)
         // instead of silently at 100.
@@ -786,17 +827,21 @@ impl DetectionService {
 
                     // Store detection match for review
                     // Per-event rules store one match per event for consistent display
-                    match rule.alert_mode {
+                    let per_event = match rule.alert_mode {
                         AlertMode::PerEvent => {
-                            for event in &results {
-                                self.store_detection_match(rule, std::slice::from_ref(event))
-                                    .await?;
-                            }
+                            // NAN-5424: per-event failure isolation.
+                            self.store_detection_matches_per_event(
+                                rule,
+                                &results,
+                                Some((time_range.start, time_range.end)),
+                            )
+                            .await?
                         }
                         AlertMode::Grouped => {
                             self.store_detection_match(rule, &results).await?;
+                            super::per_event::PerEventOutcome::default()
                         }
-                    }
+                    };
 
                     // Log per-entity live findings, deduped per (rule, entity,
                     // window) and stamped with the source event window so
@@ -808,9 +853,14 @@ impl DetectionService {
                     // the 'live' namespace (audit D17). A crash before here leaves
                     // them un-recorded so the next run re-evaluates them.
                     // Unconditional (audit D29): the 5s overlap dedups even
-                    // lookback-NULL rules.
-                    self.record_matched_events(rule.id, matched_kind, &results)
-                        .await?;
+                    // lookback-NULL rules. NAN-5424: events that could not be
+                    // stored are left unrecorded.
+                    self.record_matched_events(
+                        rule.id,
+                        matched_kind,
+                        &per_event.recordable(&results),
+                    )
+                    .await?;
 
                     info!(
                         "Rule {} (LIVE mode) matched {} events, emitted {} new findings",
@@ -836,6 +886,7 @@ impl DetectionService {
                     self.annotate_source_types_for_scoping(rule, &mut results, &time_range)
                         .await;
 
+                    let mut per_event = super::per_event::PerEventOutcome::default();
                     let alert = match rule.alert_mode {
                         AlertMode::Grouped => {
                             self.handle_grouped_alert(
@@ -848,14 +899,18 @@ impl DetectionService {
                             .await?
                         }
                         AlertMode::PerEvent => {
-                            self.handle_per_event_alerts(
-                                rule,
-                                &results,
-                                match_count,
-                                today,
-                                global_weight,
-                            )
-                            .await?
+                            let (alert, outcome) = self
+                                .handle_per_event_alerts(
+                                    rule,
+                                    &results,
+                                    match_count,
+                                    today,
+                                    global_weight,
+                                    Some((time_range.start, time_range.end)),
+                                )
+                                .await?;
+                            per_event = outcome;
+                            alert
                         }
                     };
 
@@ -864,9 +919,15 @@ impl DetectionService {
                     // before here (propagated by `?`) leaves them un-recorded so
                     // the next run re-evaluates them instead of dropping the
                     // detection forever. Unconditional (audit D29): the 5s overlap
-                    // dedups even lookback-NULL rules.
-                    self.record_matched_events(rule.id, matched_kind, &results)
-                        .await?;
+                    // dedups even lookback-NULL rules. NAN-5424: events that
+                    // could not be stored (and got no reference alert) are
+                    // left unrecorded.
+                    self.record_matched_events(
+                        rule.id,
+                        matched_kind,
+                        &per_event.recordable(&results),
+                    )
+                    .await?;
 
                     Ok(alert)
                 } else {

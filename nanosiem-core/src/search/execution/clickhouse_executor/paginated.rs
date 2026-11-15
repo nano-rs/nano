@@ -14,7 +14,7 @@ use super::sql_helpers::{
     wrap_aggregation_with_pagination, wrap_query_for_count, BoundedCountInput,
 };
 use super::types::ClickHouseExecutor;
-use crate::search::{client_error_message, parse_clickhouse_error, SearchError, StreamingChunk};
+use crate::search::{client_error_message, SearchError, StreamingChunk};
 
 /// NAN-1645 (finding 3.5): companion queries (count / histogram) only run for
 /// the FIRST page of a paginated search.
@@ -326,10 +326,12 @@ impl ClickHouseExecutor {
 
         let mut cursor = query_builder
             .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+            .map_err(|e| crate::search::search_error_from_error(&e))?;
 
-        // Buffer for partial JSON lines that span chunk boundaries
-        let mut line_buffer = String::new();
+        // Buffer for partial JSON lines that span chunk boundaries. Bytes, not
+        // text: a chunk boundary can split a multibyte character, and a row may
+        // hold invalid UTF-8 (NAN-5426); each complete line is decoded alone.
+        let mut line_buffer: Vec<u8> = Vec::new();
         // Batch of parsed rows awaiting delivery
         let mut row_batch: Vec<serde_json::Value> = Vec::with_capacity(50);
         let mut last_flush = std::time::Instant::now();
@@ -358,34 +360,27 @@ impl ClickHouseExecutor {
                         ));
                     }
 
-                    // Decode chunk and append to line buffer
-                    let chunk_str = match std::str::from_utf8(&chunk) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = chunk_tx
-                                .send(StreamingChunk::Error(format!(
-                                    "Invalid UTF-8 in response: {}",
-                                    e
-                                )))
-                                .await;
-                            return Err(SearchError::DatabaseError(sqlx::Error::Protocol(
-                                format!("Invalid UTF-8 in ClickHouse response: {}", e),
-                            )));
-                        }
-                    };
+                    line_buffer.extend_from_slice(&chunk);
 
-                    line_buffer.push_str(chunk_str);
-
-                    // Parse complete lines from the buffer
-                    while let Some(newline_pos) = line_buffer.find('\n') {
-                        let line = &line_buffer[..newline_pos];
+                    // Parse complete lines from the buffer, then drop them in
+                    // one drain so the partial tail is moved once per chunk.
+                    let mut consumed = 0;
+                    while let Some(offset) =
+                        line_buffer[consumed..].iter().position(|&b| b == b'\n')
+                    {
+                        let line_bytes = line_buffer[consumed..consumed + offset].to_vec();
+                        consumed += offset + 1;
+                        let line = crate::db::clickhouse_transport::decode_response_text(
+                            line_bytes,
+                            "search_stream",
+                        );
                         if !line.is_empty() {
-                            if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties) {
+                            if let Some(row) = Self::parse_and_postprocess_row(&line, strip_empties) {
                                 row_batch.push(row);
                             }
                         }
-                        line_buffer = line_buffer[newline_pos + 1..].to_string();
                     }
+                    line_buffer.drain(..consumed);
 
                     // Flush batch if size or time threshold met
                     if row_batch.len() >= BATCH_SIZE
@@ -404,7 +399,11 @@ impl ClickHouseExecutor {
                 Ok(None) => {
                     // End of stream — parse any remaining partial line
                     if !line_buffer.is_empty() {
-                        let line = line_buffer.trim();
+                        let line = crate::db::clickhouse_transport::decode_response_text(
+                            std::mem::take(&mut line_buffer),
+                            "search_stream",
+                        );
+                        let line = line.trim();
                         if !line.is_empty() {
                             if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties) {
                                 row_batch.push(row);
@@ -416,7 +415,7 @@ impl ClickHouseExecutor {
                 Err(e) => {
                     let error_str = e.to_string();
                     tracing::error!("Error reading streaming ClickHouse chunk: {}", error_str);
-                    let parsed = parse_clickhouse_error(&error_str);
+                    let parsed = crate::search::search_error_from_error(&e);
                     // NAN-5161: the chunk error reaches the client as a stream
                     // event; send the masked message, never the raw text.
                     let _ = chunk_tx

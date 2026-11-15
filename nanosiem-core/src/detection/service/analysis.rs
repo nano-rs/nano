@@ -153,7 +153,7 @@ impl DetectionService {
             // NAN-2054: the CALLER's scope, not an unconditional SYSTEM view.
             .search(request, scope)
             .await
-            .map_err(|e| DetectionError::SearchError(e.to_string()))?;
+            .map_err(super::execution::detection_error_from_search)?;
 
         let (matches_by_bucket, bucket_size_seconds) = self
             .compute_match_buckets(&rule.query, &time_range, rule.dataset.clone(), scope)
@@ -670,7 +670,7 @@ impl DetectionService {
             // NAN-2054: the CALLER's scope, not an unconditional SYSTEM view.
             .search(request, scope)
             .await
-            .map_err(|e| DetectionError::SearchError(e.to_string()))?;
+            .map_err(super::execution::detection_error_from_search)?;
 
         let (matches_by_bucket, bucket_size_seconds) = self
             .compute_match_buckets(query, &time_range, None, scope)

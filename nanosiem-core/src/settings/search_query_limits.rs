@@ -23,6 +23,21 @@ pub struct SearchQueryLimitsConfig {
     pub max_streaming_cache_rows: u32,
     /// Whether to block queries that trigger Error-severity cost analysis warnings (default: false)
     pub block_on_cost_errors: bool,
+    /// NAN-5437: restricted nPL commands an AI-written search (pivt, meloD,
+    /// the nano MCP, Desktop agents) may use anyway. AI searches may not use
+    /// `inputlookup url=…`, `ai` or `output` unless named here (see
+    /// `search::ai_command_policy`). Human searches are not affected.
+    /// Always present in a response. On update, omit it to keep the stored
+    /// list; `[]` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_search_allowed_commands: Option<Vec<String>>,
+}
+
+impl SearchQueryLimitsConfig {
+    /// The admin's AI-search command allowlist (empty when unset).
+    pub fn ai_allowed_commands(&self) -> &[String] {
+        self.ai_search_allowed_commands.as_deref().unwrap_or(&[])
+    }
 }
 
 impl Default for SearchQueryLimitsConfig {
@@ -33,6 +48,7 @@ impl Default for SearchQueryLimitsConfig {
             max_post_processing_groups: 1_000_000,
             max_streaming_cache_rows: 50_000,
             block_on_cost_errors: false,
+            ai_search_allowed_commands: Some(Vec::new()),
         }
     }
 }
@@ -58,14 +74,15 @@ impl SearchQueryLimitsSettings {
 
     /// Get current search query limits configuration
     pub async fn get_config(&self) -> Result<SearchQueryLimitsConfig, SearchQueryLimitsError> {
-        let row = sqlx::query_as::<_, (i32, i32, i32, i32, bool)>(
+        let row = sqlx::query_as::<_, (i32, i32, i32, i32, bool, Vec<String>)>(
             r#"
             SELECT
                 search_max_group_array_size,
                 search_max_mvexpand_rows,
                 search_max_post_processing_groups,
                 search_max_streaming_cache_rows,
-                search_block_on_cost_errors
+                search_block_on_cost_errors,
+                COALESCE(search_ai_allowed_commands, '{}'::text[])
             FROM system_settings
             WHERE id = 'default'
             "#,
@@ -80,12 +97,14 @@ impl SearchQueryLimitsSettings {
                 max_post_processing_groups,
                 max_streaming_cache_rows,
                 block_on_cost_errors,
+                ai_search_allowed_commands,
             )) => Ok(SearchQueryLimitsConfig {
                 max_group_array_size: max_group_array_size as u32,
                 max_mvexpand_rows: max_mvexpand_rows as u32,
                 max_post_processing_groups: max_post_processing_groups as u32,
                 max_streaming_cache_rows: max_streaming_cache_rows as u32,
                 block_on_cost_errors,
+                ai_search_allowed_commands: Some(ai_search_allowed_commands),
             }),
             None => Ok(SearchQueryLimitsConfig::default()),
         }
@@ -94,9 +113,15 @@ impl SearchQueryLimitsSettings {
     /// Update search query limits configuration
     pub async fn update_config(
         &self,
-        config: SearchQueryLimitsConfig,
+        mut config: SearchQueryLimitsConfig,
     ) -> Result<SearchQueryLimitsConfig, SearchQueryLimitsError> {
         self.validate(&config)?;
+        if let Some(names) = config.ai_search_allowed_commands.as_deref() {
+            config.ai_search_allowed_commands = Some(
+                crate::search::ai_command_policy::normalize_allowlist(names)
+                    .map_err(SearchQueryLimitsError::Validation)?,
+            );
+        }
 
         sqlx::query(
             r#"
@@ -106,6 +131,7 @@ impl SearchQueryLimitsSettings {
                 search_max_post_processing_groups = $3,
                 search_max_streaming_cache_rows = $4,
                 search_block_on_cost_errors = $5,
+                search_ai_allowed_commands = COALESCE($6, search_ai_allowed_commands),
                 updated_at = NOW()
             WHERE id = 'default'
             "#,
@@ -115,10 +141,12 @@ impl SearchQueryLimitsSettings {
         .bind(config.max_post_processing_groups as i32)
         .bind(config.max_streaming_cache_rows as i32)
         .bind(config.block_on_cost_errors)
+        .bind(config.ai_search_allowed_commands.clone())
         .execute(&self.pool)
         .await?;
 
-        Ok(config)
+        // Return what is stored (an omitted allowlist kept its value).
+        self.get_config().await
     }
 
     /// Validate configuration ranges

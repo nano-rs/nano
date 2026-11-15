@@ -11,6 +11,8 @@ on:
       - "scripts/tests/lock-provenance.test.sh"
       - "scripts/tests/release-notes-preflight.test.sh"
       - "scripts/tests/check-mirror-includes.test.sh"
+      # NAN-5440: awk portability across every shipped shell script, under Debian 12's mawk.
+      - "scripts/tests/awk-portability.test.sh"
       - "deploy/helm/nano/**"
       - "deploy/release/**"
       - ".github/workflows/build-and-push.yml"
@@ -34,6 +36,7 @@ on:
       # dependency's license, so a dependency change is checked here too.
       - ".github/workflows/release-sbom.yml"
       - "scripts/tests/sbom.test.sh"
+      - "scripts/tests/publish-github-release.test.sh"
       - "Cargo.lock"
       - "nanosiem-web/package-lock.json"
       - "nanosiem-enterprise/sandbox-compiler/package-lock.json"

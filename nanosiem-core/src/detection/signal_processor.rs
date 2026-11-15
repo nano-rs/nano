@@ -51,6 +51,14 @@ use crate::extensions::{
 use crate::models::{AlertMode, DetectionRule, NewAlert, RuleMode};
 use crate::webhooks::WebhookService;
 
+#[path = "signal_failure.rs"]
+mod failure;
+use failure::{
+    classify_signal_error, clear_all_realtime_rules_failing, clear_realtime_rule_failing,
+    disposition, mark_all_realtime_rules_failing, mark_realtime_rule_failing, record_dropped_signal, record_poll_skip_gaps, DroppedSignalGap, SignalDisposition,
+    SignalFailure, SignalFailureClass,
+};
+
 /// Configuration for the signal processor
 #[derive(Debug, Clone)]
 pub struct SignalProcessorConfig {
@@ -176,10 +184,21 @@ pub struct ProcessorWatermark {
     pub last_signal_id: Option<Uuid>,
     pub processed_count: u64,
     /// Transient (in-memory only): the `(inserted_at, id)` of the signal that
-    /// stalled the current batch, so the force-skip can dead-letter *exactly*
-    /// that signal instead of a coarse 1-second window (audit D7). Cleared on
+    /// stalled the current batch. While it is set the run loop never
+    /// force-skips (NAN-5428: the per-signal disposition decides). Cleared on
     /// any fully-successful poll.
     pub last_error_signal: Option<(DateTime<Utc>, Uuid)>,
+    /// Transient (in-memory only): how many polls in a row `last_error_signal`
+    /// has failed, for the unrecognised-error cap
+    /// (`MAX_UNRECOGNISED_ATTEMPTS`) and the per-signal backoff (NAN-5428).
+    pub last_error_attempts: u32,
+    /// Transient (in-memory only): the rule marked failing for a held signal
+    /// (NAN-5428), cleared once the signal goes through.
+    pub held_rule: Option<Uuid>,
+    /// Transient (in-memory only): consecutive signals dead-lettered with the
+    /// same unrecognised error key, for the systemic breaker (NAN-5428).
+    /// Reset by any successfully processed signal.
+    pub dead_letter_streak: Option<(String, u32)>,
 }
 
 impl Default for ProcessorWatermark {
@@ -189,6 +208,9 @@ impl Default for ProcessorWatermark {
             last_signal_id: None,
             processed_count: 0,
             last_error_signal: None,
+            last_error_attempts: 0,
+            held_rule: None,
+            dead_letter_streak: None,
         }
     }
 }
@@ -342,6 +364,9 @@ impl SignalProcessor {
 
         let handle = tokio::spawn(async move {
             let mut consecutive_errors: u32 = 0;
+            // NAN-5428: poll-level infrastructure outage alarm raised (every
+            // active real-time rule marked failing).
+            let mut poll_outage_alarm = false;
 
             while running.load(Ordering::SeqCst) {
                 // Poll for new signals
@@ -362,7 +387,29 @@ impl SignalProcessor {
                         consecutive_errors = 0;
                         // Fully-successful poll → we're unstuck; forget any
                         // dead-letter candidate.
-                        watermark.write().await.last_error_signal = None;
+                        let held_rule = {
+                            let mut wm = watermark.write().await;
+                            wm.last_error_signal = None;
+                            wm.last_error_attempts = 0;
+                            wm.held_rule.take()
+                        };
+                        // NAN-5428: the held signal went through; lower the
+                        // rule's health alarm.
+                        if poll_outage_alarm {
+                            match clear_all_realtime_rules_failing(dual_pool.postgres()).await {
+                                Ok(()) => poll_outage_alarm = false,
+                                Err(e) => warn!(
+                                    "Could not clear real-time rules failing state: {}",
+                                    crate::db::pg_text::pg_safe_error_text(&e.to_string())
+                                ),
+                            }
+                        } else if let Some(rule_id) = held_rule {
+                            if let Err(e) =
+                                clear_realtime_rule_failing(dual_pool.postgres(), rule_id).await
+                            {
+                                warn!(rule_id = %rule_id, "Could not clear real-time rule failing state: {}", e);
+                            }
+                        }
                         if processed > 0 {
                             debug!("Processed {} signals", processed);
                         }
@@ -370,40 +417,82 @@ impl SignalProcessor {
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
 
-                        if consecutive_errors >= config.max_skip_threshold {
-                            // After too many consecutive errors, dead-letter the
-                            // problematic batch by advancing the watermark to
-                            // prevent permanent stuckness. Audit D7/D33: this must
-                            // advance the PERSISTED watermark — poll_and_process
-                            // re-reads the PG row each cycle, so the previous
-                            // in-memory-only advance was ignored while the seeded
-                            // row exists, making the force-skip a no-op.
+                        // NAN-5428: a held SIGNAL (infrastructure outage,
+                        // systemic fault, unrecordable dead-letter) is never
+                        // force-skipped: poll_and_process decided to hold it.
+                        // Only a poll-level failure that is not infrastructure
+                        // may skip, and only after recording the skipped second
+                        // as coverage gaps.
+                        let (signal_held, signal_attempts) = {
+                            let wm = watermark.read().await;
+                            (wm.last_error_signal.is_some(), wm.last_error_attempts)
+                        };
+                        let failure = classify_signal_error(&e);
+                        if !signal_held
+                            && failure.class != SignalFailureClass::Infrastructure
+                            && consecutive_errors >= config.max_skip_threshold
+                        {
                             error!(
                                 consecutive_errors,
-                                "Signal processor stuck for {} consecutive errors, advancing persisted watermark to skip problematic signals",
+                                failure_class = failure.class.as_str(),
+                                failure_key = %failure.key,
+                                "Signal poll stuck for {} consecutive errors; recording coverage gaps and skipping one second of signals",
                                 consecutive_errors
                             );
-                            if let Err(e) =
-                                Self::force_advance_watermark(&dual_pool, &watermark).await
+                            match Self::force_advance_watermark(
+                                &dual_pool,
+                                &watermark,
+                                consecutive_errors,
+                                &failure,
+                            )
+                            .await
                             {
-                                error!("Failed to persist force-skip watermark advance: {}", e);
+                                Ok(()) => consecutive_errors = 0,
+                                Err(e) => error!(
+                                    "Poll skip not taken (coverage gaps or watermark not persisted): {}",
+                                    e
+                                ),
                             }
-                            consecutive_errors = 0;
                         } else if consecutive_errors >= config.max_retries {
                             error!(
                                 consecutive_errors,
-                                "Signal processor experiencing repeated errors: {}", e
+                                failure_key = %failure.key,
+                                "Signal processor experiencing repeated errors: {}",
+                                crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
                             );
+                            // NAN-5428: the poll itself is down (no signal held):
+                            // raise detection health once for the outage.
+                            if !signal_held
+                                && !poll_outage_alarm
+                                && failure.class == SignalFailureClass::Infrastructure
+                            {
+                                let message = format!(
+                                    "[infrastructure] real-time signal poll failing ({}) for {} consecutive attempts",
+                                    failure.key, consecutive_errors
+                                );
+                                match mark_all_realtime_rules_failing(dual_pool.postgres(), &message).await {
+                                    Ok(_) => poll_outage_alarm = true,
+                                    Err(mark_error) => warn!(
+                                        "Could not mark real-time rules failing: {}",
+                                        crate::db::pg_text::pg_safe_error_text(&mark_error.to_string())
+                                    ),
+                                }
+                            }
                         } else {
                             warn!(
                                 consecutive_errors,
-                                "Signal processor error (will retry): {}", e
+                                failure_key = %failure.key,
+                                "Signal processor error (will retry): {}",
+                                crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
                             );
                         }
 
-                        // Exponential backoff
-                        let backoff_secs =
-                            config.backoff_base_secs.saturating_pow(consecutive_errors);
+                        // Exponential backoff. NAN-5428: for a held signal it
+                        // follows THAT signal's attempts, so a new failing
+                        // signal (after a dead-letter) starts again at the
+                        // base instead of inheriting the previous streak.
+                        let backoff_exp = if signal_held { signal_attempts } else { consecutive_errors };
+                        let backoff_secs = config.backoff_base_secs.saturating_pow(backoff_exp);
                         let backoff_secs = backoff_secs.min(60); // Cap at 60 seconds
                         sleep(Duration::from_secs(backoff_secs)).await;
                         continue;
@@ -505,12 +594,12 @@ impl SignalProcessor {
                     toString(id) as signal_id,
                     reinterpretAsInt64(timestamp) as ts,
                     toString(rule_id) as detection_rule_id,
-                    rule_name,
-                    severity,
+                    toValidUTF8(rule_name) as rule_name,
+                    toValidUTF8(severity) as severity,
                     risk_score,
-                    risk_entity,
+                    toValidUTF8(risk_entity) as risk_entity,
                     toString(matched_log_id) as log_id,
-                    metadata,
+                    toValidUTF8(metadata) as metadata,
                     reinterpretAsInt64(_inserted_at) as inserted_ts
                 FROM {signals_table}
                 WHERE (_inserted_at > toDateTime64('{watermark_str}', 6)
@@ -527,12 +616,12 @@ impl SignalProcessor {
                     toString(id) as signal_id,
                     reinterpretAsInt64(timestamp) as ts,
                     toString(rule_id) as detection_rule_id,
-                    rule_name,
-                    severity,
+                    toValidUTF8(rule_name) as rule_name,
+                    toValidUTF8(severity) as severity,
                     risk_score,
-                    risk_entity,
+                    toValidUTF8(risk_entity) as risk_entity,
                     toString(matched_log_id) as log_id,
-                    metadata,
+                    toValidUTF8(metadata) as metadata,
                     reinterpretAsInt64(_inserted_at) as inserted_ts
                 FROM {signals_table}
                 WHERE _inserted_at > toDateTime64('{watermark_str}', 6)
@@ -651,7 +740,10 @@ impl SignalProcessor {
         let mut batch_error: Option<anyhow::Error> = None;
         // The exact (inserted_at, id) of the stalled signal, so the force-skip
         // can dead-letter precisely it rather than a coarse 1s window (audit D7).
-        let mut stuck_signal: Option<(DateTime<Utc>, Uuid)> = None;
+        let mut stuck_signal: Option<((DateTime<Utc>, Uuid), u32)> = None;
+        // NAN-5428: signals dead-lettered this cycle (recorded as coverage
+        // gaps; the watermark moves past them like processed signals).
+        let mut dead_lettered: usize = 0;
         // Per-cycle skip aggregation (see the summary logs after the loop).
         let mut missing_log_count: u64 = 0;
         let mut missing_rule_count: u64 = 0;
@@ -682,6 +774,13 @@ impl SignalProcessor {
             {
                 Ok(outcome) => {
                     processed += 1;
+                    // NAN-5428: a success ends any systemic-breaker streak.
+                    {
+                        let mut wm = watermark.write().await;
+                        if wm.dead_letter_streak.is_some() {
+                            wm.dead_letter_streak = None;
+                        }
+                    }
                     // Only a signal that processed successfully is recorded: a
                     // failed one is retried next poll and recorded then.
                     if let Some((rule, event)) = review_match.take() {
@@ -703,20 +802,133 @@ impl SignalProcessor {
                     last_processed_signal = Some(signal);
                 }
                 Err(e) => {
-                    // Audit D7: do NOT advance the watermark past a signal that
-                    // failed to process — a transient CH/PG/alert error would
-                    // otherwise drop the detection forever. Stop the batch here
-                    // (watermark stays at the last successful signal) and
-                    // propagate below so the run loop retries next poll; its
-                    // consecutive-error force-skip dead-letters a poison signal.
-                    warn!(
-                        signal_id = %signal.id,
-                        rule_id = %signal.rule_id,
-                        "Failed to process signal, holding watermark for retry: {}",
-                        e
-                    );
+                    // NAN-5428: isolate the failure to this signal (see
+                    // `signal_failure`): bad data is dead-lettered at once,
+                    // infrastructure holds (uncapped, audit D7) with a health
+                    // alarm, unrecognised errors retry a few times and are
+                    // then dead-lettered behind the systemic breaker. A
+                    // dead-letter is recorded as a coverage gap first.
+                    let key = (signal.inserted_at, signal.id);
+                    let (attempts, streak) = {
+                        let wm = watermark.read().await;
+                        let attempts = if wm.last_error_signal == Some(key) {
+                            wm.last_error_attempts.saturating_add(1)
+                        } else {
+                            1
+                        };
+                        (attempts, wm.dead_letter_streak.clone())
+                    };
+                    let failure = classify_signal_error(&e);
+                    let same_key_streak = streak
+                        .as_ref()
+                        .filter(|(k, _)| *k == failure.key)
+                        .map_or(0, |(_, n)| *n);
+                    match disposition(&failure, attempts, same_key_streak) {
+                        SignalDisposition::DeadLetter => {
+                            let gap = DroppedSignalGap::new(
+                                signal.id,
+                                signal.rule_id,
+                                signal.timestamp,
+                                attempts,
+                                &failure,
+                            );
+                            match record_dropped_signal(dual_pool.postgres(), &gap).await {
+                                Ok(()) => {
+                                    metrics::counter!(
+                                        "nanosiem_realtime_signals_dead_lettered_total",
+                                        "class" => failure.class.as_str()
+                                    )
+                                    .increment(1);
+                                    metrics::counter!("nanosiem_detection_coverage_gaps_total")
+                                        .increment(1);
+                                    error!(
+                                        signal_id = %signal.id,
+                                        rule_id = %signal.rule_id,
+                                        event_ts = %signal.timestamp,
+                                        attempts,
+                                        failure_class = failure.class.as_str(),
+                                        failure_key = %failure.key,
+                                        "Real-time signal dead-lettered and recorded as a coverage gap; \
+                                         continuing with the next signal"
+                                    );
+                                    if failure.class == SignalFailureClass::BadData {
+                                        Self::reference_alert_for_dropped_signal(
+                                            rule_repo, alert_repo, &signal, &failure,
+                                        )
+                                        .await;
+                                    } else {
+                                        let mut wm = watermark.write().await;
+                                        wm.dead_letter_streak =
+                                            Some((failure.key.clone(), same_key_streak + 1));
+                                    }
+                                    dead_lettered += 1;
+                                    last_processed_signal = Some(signal);
+                                    continue;
+                                }
+                                Err(record_error) => {
+                                    // Never drop silently: hold until the
+                                    // record can be written.
+                                    error!(
+                                        signal_id = %signal.id,
+                                        rule_id = %signal.rule_id,
+                                        "Could not record dead-lettered signal as a coverage gap; \
+                                         holding watermark: {}",
+                                        crate::db::pg_text::pg_safe_error_text(&record_error.to_string())
+                                    );
+                                }
+                            }
+                        }
+                        SignalDisposition::HoldAndAlarm => {
+                            metrics::counter!(
+                                "nanosiem_realtime_signal_holds_total",
+                                "class" => failure.class.as_str()
+                            )
+                            .increment(1);
+                            let systemic = failure.class != SignalFailureClass::Infrastructure;
+                            let message = if systemic {
+                                format!(
+                                    "[systemic] real-time signal processing held: {} different signals \
+                                     failed with {} in a row",
+                                    same_key_streak, failure.key
+                                )
+                            } else {
+                                format!(
+                                    "[infrastructure] real-time signal processing held: backend \
+                                     unavailable ({}), attempt {attempts}",
+                                    failure.key
+                                )
+                            };
+                            warn!(
+                                signal_id = %signal.id,
+                                rule_id = %signal.rule_id,
+                                attempts,
+                                failure_key = %failure.key,
+                                "{message}; holding watermark"
+                            );
+                            match mark_realtime_rule_failing(dual_pool.postgres(), signal.rule_id, &message)
+                                .await
+                            {
+                                Ok(()) => watermark.write().await.held_rule = Some(signal.rule_id),
+                                Err(mark_error) => warn!(
+                                    rule_id = %signal.rule_id,
+                                    "Could not mark real-time rule failing: {}",
+                                    crate::db::pg_text::pg_safe_error_text(&mark_error.to_string())
+                                ),
+                            }
+                        }
+                        SignalDisposition::Retry => {
+                            warn!(
+                                signal_id = %signal.id,
+                                rule_id = %signal.rule_id,
+                                attempts,
+                                failure_key = %failure.key,
+                                "Failed to process signal (unrecognised error), holding watermark for retry: {}",
+                                crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
+                            );
+                        }
+                    }
                     batch_error = Some(e);
-                    stuck_signal = Some((signal.inserted_at, signal.id));
+                    stuck_signal = Some((key, attempts));
                     break;
                 }
             }
@@ -764,7 +976,8 @@ impl SignalProcessor {
         // Update watermark after processing and commit the transaction
         // (releasing the FOR UPDATE row lock)
         if let Some(signal) = last_processed_signal {
-            let new_count = processed_count.saturating_add(processed as u64);
+            let new_count =
+                processed_count.saturating_add((processed + dead_lettered) as u64);
 
             // Audit D33: UPSERT (not UPDATE-only) so a missing/deleted 'default'
             // row is recreated instead of silently persisting nothing — which
@@ -801,8 +1014,10 @@ impl SignalProcessor {
 
         // Record the stalled signal (in-memory only) so the run loop's force-skip
         // can dead-letter exactly it.
-        if stuck_signal.is_some() {
-            watermark.write().await.last_error_signal = stuck_signal;
+        if let Some((key, attempts)) = stuck_signal {
+            let mut wm = watermark.write().await;
+            wm.last_error_signal = Some(key);
+            wm.last_error_attempts = attempts;
         }
 
         // Audit D7: if a signal errored mid-batch, propagate now — AFTER
@@ -816,97 +1031,120 @@ impl SignalProcessor {
         Ok(processed)
     }
 
-    /// Advance the PERSISTED watermark by 1s (dropping the tie-break signal id)
-    /// to dead-letter signals that have failed `max_skip_threshold` polls in a
-    /// row. `poll_and_process` re-reads the PG row each cycle, so the previous
-    /// in-memory-only advance was ignored while the seeded row exists — the
-    /// force-skip was a no-op (audit D7/D33). Upserts so a missing row is
-    /// recreated rather than silently dropped.
+    /// Skip one second of signals after a poll-level failure that keeps
+    /// recurring (NAN-5428; audit D7/D33). The skipped second is first
+    /// recorded as a coverage gap for every active real-time rule, then the
+    /// PERSISTED watermark advances 1s (dropping the tie-break signal id):
+    /// `poll_and_process` re-reads the PG row each cycle, so an in-memory-only
+    /// advance would be ignored. If the gaps cannot be recorded, nothing is
+    /// skipped. Never used for a held signal (see the run loop).
     async fn force_advance_watermark(
         dual_pool: &DualPool,
         watermark: &Arc<RwLock<ProcessorWatermark>>,
+        attempts: u32,
+        failure: &SignalFailure,
     ) -> anyhow::Result<()> {
-        let (stuck, seed_ts) = {
-            let wm = watermark.read().await;
-            (
-                wm.last_error_signal,
-                wm.last_inserted_at + chrono::Duration::seconds(1),
+        let current = {
+            let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
+                "SELECT last_inserted_at FROM signal_processor_watermarks WHERE id = 'default'",
             )
+            .fetch_optional(dual_pool.postgres())
+            .await?;
+            match row {
+                Some((ts,)) => ts,
+                None => watermark.read().await.last_inserted_at,
+            }
         };
+        let gaps = record_poll_skip_gaps(dual_pool.postgres(), current, attempts, failure).await?;
+        metrics::counter!("nanosiem_detection_coverage_gaps_total").increment(gaps);
+        metrics::counter!("nanosiem_realtime_signal_poll_skips_total").increment(1);
 
-        // Advance the PERSISTED watermark MONOTONICALLY against the authoritative
-        // PG value (GREATEST / self-referential increment) so a stale in-memory
-        // cache can never move it backward — which would reprocess signals and
-        // re-attempt alerts (codex). When the exact stalled signal is known,
-        // dead-letter precisely it; otherwise (a poll-level failure) skip the
-        // current 1s window. RETURNING syncs the in-memory cache to what PG now
-        // holds.
-        let (new_ts, new_id): (DateTime<Utc>, Option<Uuid>) = match stuck {
-            Some((ts, id)) => {
-                // Advance to exactly the stalled signal, but ONLY if that
-                // position is strictly ahead of the persisted watermark in the
-                // poll's `(inserted_at, id)` tie-break order — where a NULL
-                // persisted id means "already past every signal at that
-                // microsecond", so it must never be regressed to a concrete id.
-                // Both columns move together under one predicate so the tuple
-                // can't rewind (codex). `updated_at` always changes, so
-                // RETURNING yields the current row even when the position holds.
-                sqlx::query_as(
-                    r#"
-                    INSERT INTO signal_processor_watermarks
-                        (id, last_inserted_at, last_signal_id, updated_at)
-                    VALUES ('default', $1, $2, NOW())
-                    ON CONFLICT (id) DO UPDATE SET
-                        last_inserted_at = CASE
-                            WHEN EXCLUDED.last_inserted_at > signal_processor_watermarks.last_inserted_at
-                              OR (EXCLUDED.last_inserted_at = signal_processor_watermarks.last_inserted_at
-                                  AND signal_processor_watermarks.last_signal_id IS NOT NULL
-                                  AND EXCLUDED.last_signal_id > signal_processor_watermarks.last_signal_id)
-                            THEN EXCLUDED.last_inserted_at
-                            ELSE signal_processor_watermarks.last_inserted_at
-                        END,
-                        last_signal_id = CASE
-                            WHEN EXCLUDED.last_inserted_at > signal_processor_watermarks.last_inserted_at
-                              OR (EXCLUDED.last_inserted_at = signal_processor_watermarks.last_inserted_at
-                                  AND signal_processor_watermarks.last_signal_id IS NOT NULL
-                                  AND EXCLUDED.last_signal_id > signal_processor_watermarks.last_signal_id)
-                            THEN EXCLUDED.last_signal_id
-                            ELSE signal_processor_watermarks.last_signal_id
-                        END,
-                        updated_at = NOW()
-                    RETURNING last_inserted_at, last_signal_id
-                    "#,
-                )
-                .bind(ts)
-                .bind(id)
-                .fetch_one(dual_pool.postgres())
-                .await?
-            }
-            None => {
-                sqlx::query_as(
-                    r#"
-                    INSERT INTO signal_processor_watermarks
-                        (id, last_inserted_at, last_signal_id, updated_at)
-                    VALUES ('default', $1, NULL, NOW())
-                    ON CONFLICT (id) DO UPDATE SET
-                        last_inserted_at =
-                            signal_processor_watermarks.last_inserted_at + INTERVAL '1 second',
-                        last_signal_id = NULL,
-                        updated_at = NOW()
-                    RETURNING last_inserted_at, last_signal_id
-                    "#,
-                )
-                .bind(seed_ts)
-                .fetch_one(dual_pool.postgres())
-                .await?
-            }
-        };
+        // Monotonic against the authoritative PG value (self-referential
+        // increment), so a stale in-memory cache can never move it backward.
+        let (new_ts, new_id): (DateTime<Utc>, Option<Uuid>) = sqlx::query_as(
+            r#"
+            INSERT INTO signal_processor_watermarks
+                (id, last_inserted_at, last_signal_id, updated_at)
+            VALUES ('default', $1 + INTERVAL '1 second', NULL, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                last_inserted_at =
+                    signal_processor_watermarks.last_inserted_at + INTERVAL '1 second',
+                last_signal_id = NULL,
+                updated_at = NOW()
+            RETURNING last_inserted_at, last_signal_id
+            "#,
+        )
+        .bind(current)
+        .fetch_one(dual_pool.postgres())
+        .await?;
 
         let mut wm = watermark.write().await;
         wm.last_inserted_at = new_ts;
         wm.last_signal_id = new_id;
         wm.last_error_signal = None;
+        wm.last_error_attempts = 0;
         Ok(())
+    }
+
+    /// NAN-5428: a signal dead-lettered for its own data still pages, as the
+    /// scheduled path does for an unstorable event (NAN-5424): for an
+    /// Alerting rule, a minimal reference alert carrying only identifiers
+    /// (no event content, which is what failed) is raised, and the event is
+    /// recorded in `detection_skipped_events`. Best-effort: the coverage gap
+    /// is already written.
+    async fn reference_alert_for_dropped_signal(
+        rule_repo: &DetectionRuleRepository,
+        alert_repo: &AlertRepository,
+        signal: &ClickHouseSignal,
+        failure: &SignalFailure,
+    ) {
+        let rule = match rule_repo.find_by_id(signal.rule_id).await {
+            Ok(rule) => rule,
+            Err(_) => return,
+        };
+        let alert_id = if matches!(rule.mode, RuleMode::Alerting) {
+            let event = serde_json::json!({
+                "id": signal.matched_log_id.to_string(),
+                "timestamp": signal.timestamp.to_rfc3339(),
+                "_nano_unstored_event": true,
+                "_nano_unstored_reason": format!(
+                    "The matched event could not be processed ({}); only its identifiers are kept",
+                    failure.key
+                ),
+            });
+            let new_alert = NewAlert {
+                rule_id: rule.id,
+                severity: rule.severity,
+                matched_events: serde_json::Value::Array(vec![event]),
+                event_hash: None,
+                match_count: Some(1),
+            };
+            match alert_repo.create(&new_alert).await {
+                Ok(alert) => Some(alert.id),
+                Err(AlertRepositoryError::DuplicateAlert(..)) => Some(Uuid::nil()),
+                Err(e) => {
+                    error!(rule_id = %rule.id, "Failed to raise a reference alert for a dropped signal: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let sqlstate = failure.key.strip_prefix("pg:");
+        if let Err(e) = rule_repo
+            .record_skipped_event(
+                rule.id,
+                &signal.matched_log_id.to_string(),
+                Some(signal.timestamp),
+                None,
+                sqlstate,
+                failure.class.as_str(),
+                alert_id,
+            )
+            .await
+        {
+            error!(rule_id = %rule.id, "Failed to record a dropped real-time signal: {}", e);
+        }
     }
 
     /// Process a single signal: create alert, group into case, log finding
@@ -942,11 +1180,8 @@ impl SignalProcessor {
                 // Transient error (PG saturation / connection blip). Audit D6:
                 // propagate — do NOT classify as RuleMissing, or the whole batch
                 // is dropped and the watermark advances past real detections.
-                return Err(anyhow::anyhow!(
-                    "Transient error fetching rule {}: {}",
-                    signal.rule_id,
-                    e
-                ));
+                return Err(anyhow::Error::new(e)
+                    .context(format!("Transient error fetching rule {}", signal.rule_id)));
             }
         };
 
@@ -1020,6 +1255,9 @@ impl SignalProcessor {
             risk_result.entity = signal.risk_entity.clone();
             risk_result.entity_field = rule.risk_entity_field.clone();
         }
+        // NAN-5428: the MV-resolved entity is bound as text (finding
+        // emissions); the matched event itself is sanitized at fetch.
+        risk_result.entity = crate::db::pg_text::pg_safe_string(std::mem::take(&mut risk_result.entity));
 
         // Audit D13: Grouped rules (the default) dedup per (rule, entity, window
         // bucket) through the SAME persistent emission store the scheduled path
@@ -1187,7 +1425,8 @@ impl SignalProcessor {
                 return Ok(SignalOutcome::Duplicate);
             }
             Err(e) => {
-                return Err(anyhow::anyhow!("Failed to create alert: {}", e));
+                // NAN-5428: keep the source so the failure can be classified.
+                return Err(anyhow::Error::new(e).context("Failed to create alert"));
             }
         };
 
@@ -1432,9 +1671,13 @@ impl SignalProcessor {
         // Resolve a UDM-semantic entity field to a SELECT clause aliased back to
         // the canonical name. When the active schema has no column for that
         // concept, emit `'' AS <field>` so the typed row keeps its shape.
+        // NAN-5428: every event-derived text column is read through
+        // `toValidUTF8`. The typed (RowBinary) fetch rejects a `String` holding
+        // invalid UTF-8, so one stored byte sequence (e.g. a lone surrogate)
+        // made this signal's fetch fail on every attempt.
         let entity_col = |udm_field: &str| -> String {
             match profile.udm_column_sql(udm_field) {
-                Some(sql) => format!("{sql} AS {udm_field}"),
+                Some(sql) => format!("toValidUTF8(toString({sql})) AS {udm_field}"),
                 None => format!("'' AS {udm_field}"),
             }
         };
@@ -1453,7 +1696,7 @@ impl SignalProcessor {
             SELECT
                 toString(id) as log_id,
                 toUnixTimestamp64Micro(timestamp) as ts,
-                formatRowNoNewline('JSONEachRow', *) AS row_json,
+                toValidUTF8(formatRowNoNewline('JSONEachRow', *)) AS row_json,
                 {modifier_expr}
             FROM {logs_table}
             WHERE timestamp BETWEEN '{ts_lower}' AND '{ts_upper}' AND id = '{log_id}'
@@ -1469,9 +1712,9 @@ impl SignalProcessor {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => "metadata".to_string(),
+            | crate::schema::SchemaId::Risk => "toValidUTF8(metadata) AS metadata".to_string(),
             crate::schema::SchemaId::Ocsf => {
-                format!("toString({}) AS metadata", profile.json_tail_column())
+                format!("toValidUTF8(toString({})) AS metadata", profile.json_tail_column())
             }
         };
 
@@ -1481,9 +1724,9 @@ impl SignalProcessor {
             SELECT
                 toString(id) as log_id,
                 toUnixTimestamp64Micro(timestamp) as ts,
-                message,
+                toValidUTF8(message) AS message,
                 {metadata},
-                source_type,
+                toValidUTF8(source_type) AS source_type,
                 {src_ip},
                 {dest_ip},
                 {src_host},
@@ -1531,7 +1774,7 @@ impl SignalProcessor {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        format!("toJSONString(map({pairs})) AS modifier_fields")
+        format!("toValidUTF8(toJSONString(map({pairs}))) AS modifier_fields")
     }
 
     /// Merge the rule's modifier columns into the event as flat keys, never
@@ -1600,6 +1843,26 @@ impl SignalProcessor {
     /// `max_execution_time` (18.2 GiB / 1.22B rows), whose error propagated up
     /// and silently dropped the alert.
     async fn fetch_matched_log(
+        dual_pool: &DualPool,
+        log_id: Uuid,
+        event_ts: DateTime<Utc>,
+        modifiers: &[RiskModifier],
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        // NAN-5424: the matched event is written to PostgreSQL (alerts,
+        // detection_matches, finding/cooldown entities), which rejects U+0000
+        // in jsonb and text. Sanitize it at the one place the real-time path
+        // reads it from ClickHouse, mirroring the scheduled path.
+        let mut event =
+            Self::fetch_matched_log_raw(dual_pool, log_id, event_ts, modifiers).await?;
+        if let Some(event) = event.as_mut() {
+            if crate::db::pg_text::sanitize_json_for_pg(event) {
+                metrics::counter!("nanosiem_detection_events_sanitized_total").increment(1);
+            }
+        }
+        Ok(event)
+    }
+
+    async fn fetch_matched_log_raw(
         dual_pool: &DualPool,
         log_id: Uuid,
         event_ts: DateTime<Utc>,
@@ -1799,16 +2062,16 @@ pub(crate) mod tests {
             SELECT
                 toString(id) as log_id,
                 toUnixTimestamp64Micro(timestamp) as ts,
-                message,
-                metadata,
-                source_type,
-                src_ip AS src_ip,
-                dest_ip AS dest_ip,
-                src_host AS src_host,
-                dest_host AS dest_host,
-                src_user AS src_user,
-                dest_user AS dest_user,
-                risk_entity AS risk_entity,
+                toValidUTF8(message) AS message,
+                toValidUTF8(metadata) AS metadata,
+                toValidUTF8(source_type) AS source_type,
+                toValidUTF8(toString(src_ip)) AS src_ip,
+                toValidUTF8(toString(dest_ip)) AS dest_ip,
+                toValidUTF8(toString(src_host)) AS src_host,
+                toValidUTF8(toString(dest_host)) AS dest_host,
+                toValidUTF8(toString(src_user)) AS src_user,
+                toValidUTF8(toString(dest_user)) AS dest_user,
+                toValidUTF8(toString(risk_entity)) AS risk_entity,
                 '{}' AS modifier_fields
             FROM nanosiem.logs
             WHERE timestamp BETWEEN '2026-07-02 20:25:55.774000' AND '2026-07-02 22:25:55.774000' AND id = '019e3bf3-ff47-7273-936a-8d426d333343'
@@ -1851,7 +2114,7 @@ pub(crate) mod tests {
             &cols,
         );
         assert!(
-            query.contains("toJSONString(map('auth_result', toString(auth_result))) AS modifier_fields"),
+            query.contains("toValidUTF8(toJSONString(map('auth_result', toString(auth_result)))) AS modifier_fields"),
             "modifier map must select the resolved column: {query}"
         );
     }
@@ -1985,6 +2248,10 @@ pub(crate) mod tests {
             source_repo_url: None,
             kind: "standard".to_string(),
             alert_cooldown_minutes: None,
+            consecutive_failures: 0,
+            failing_since: None,
+            last_error: None,
+            last_error_at: None,
         }
     }
 
@@ -2087,7 +2354,7 @@ pub(crate) mod tests {
         // NAN-5304: the whole OCSF row as one JSON object keyed by the
         // physical columns — no UDM-semantic entity projection.
         assert!(
-            query.contains("formatRowNoNewline('JSONEachRow', *) AS row_json"),
+            query.contains("toValidUTF8(formatRowNoNewline('JSONEachRow', *)) AS row_json"),
             "OCSF must fetch the whole row: {query}"
         );
         for udm in ["AS src_ip", "AS src_user", "AS src_host", "AS dest_ip", "AS risk_entity", "AS metadata"] {

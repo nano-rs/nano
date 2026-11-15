@@ -293,7 +293,7 @@ impl ReportRepository {
         .bind(node_id)
         .bind(generation)
         .bind(status.as_str())
-        .bind(error)
+        .bind(crate::db::pg_text::pg_safe_error_bind(error))
         .bind(next_run_at)
         .execute(&self.pool)
         .await?;
@@ -500,7 +500,7 @@ impl ReportRepository {
         )
         .bind(run_id)
         .bind(duration_ms)
-        .bind(error)
+        .bind(crate::db::pg_text::pg_safe_error_bind(error))
         .execute(&mut *tx)
         .await?;
 

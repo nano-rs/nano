@@ -1346,6 +1346,12 @@ pub struct ClickHouseSqlGenerator {
     /// NAN-4295: fields an upstream `mvexpand` already expanded (one row per
     /// element). Same scope rules as `upstream_computed_fields`.
     upstream_mvexpanded: RwLock<HashSet<String>>,
+    /// NAN-5426: eval outputs whose value is an `Array(T)` (`eval parts =
+    /// split(...)`), so a later `reverse(parts)` reverses elements instead of
+    /// the array's text form. Same scope rules as `upstream_string_fields`;
+    /// the eval codegen updates it per assignment, so a reference later in
+    /// the same `eval` sees it too.
+    upstream_eval_arrays: RwLock<HashSet<String>>,
     /// NAN-5350: stage columns holding an array field under a projected or
     /// renamed name (see `upstream_arrays`). Same scope rules as
     /// `upstream_computed_fields`.
@@ -1458,6 +1464,7 @@ impl Clone for ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             upstream_string_fields: RwLock::new(HashSet::new()),
             upstream_mvexpanded: RwLock::new(HashSet::new()),
+            upstream_eval_arrays: RwLock::new(HashSet::new()),
             upstream_arrays: RwLock::new(Default::default()),
             subsearch_arrays: RwLock::new(Default::default()),
             pending_subsearch_arrays: RwLock::new(None),
@@ -1512,6 +1519,7 @@ impl ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             upstream_string_fields: RwLock::new(HashSet::new()),
             upstream_mvexpanded: RwLock::new(HashSet::new()),
+            upstream_eval_arrays: RwLock::new(HashSet::new()),
             upstream_arrays: RwLock::new(Default::default()),
             subsearch_arrays: RwLock::new(Default::default()),
             pending_subsearch_arrays: RwLock::new(None),
@@ -1546,6 +1554,7 @@ impl ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             upstream_string_fields: RwLock::new(HashSet::new()),
             upstream_mvexpanded: RwLock::new(HashSet::new()),
+            upstream_eval_arrays: RwLock::new(HashSet::new()),
             upstream_arrays: RwLock::new(Default::default()),
             subsearch_arrays: RwLock::new(Default::default()),
             pending_subsearch_arrays: RwLock::new(None),
@@ -2115,6 +2124,18 @@ impl ClickHouseSqlGenerator {
         }
     }
 
+    /// NAN-5427: the DateTime a hop/sliding `bin` window is computed from. The
+    /// time column converts directly; any other field holds row text, where
+    /// `toDateTime` would throw on one unparseable value and abort the query.
+    pub(crate) fn bin_window_datetime_sql(&self, field_name: &str) -> String {
+        let column = helpers::escape_identifier(field_name);
+        if field_name == self.time_column() {
+            format!("toDateTime({column})")
+        } else {
+            eval_functions::non_throwing_datetime_sql(&column)
+        }
+    }
+
     /// NAN-3385: the span `timechart bins=N` uses when the search service did
     /// not already resolve it (saved rules, dashboards) — the shared round-span ladder in
     /// `query::time_bins`.
@@ -2498,6 +2519,17 @@ impl ClickHouseSqlGenerator {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(field.clone());
         }
+        // NAN-5426: a name any other command (re)computes is no longer an
+        // eval array; an `eval` already typed its own outputs during codegen.
+        if !matches!(cmd, Command::Eval { .. }) {
+            let mut guard = self
+                .upstream_eval_arrays
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for name in &added {
+                guard.remove(name);
+            }
+        }
         // NAN-5350: typed against the scope BEFORE this command's outputs.
         let arrays = self.upstream_arrays_after(cmd, &added);
         {
@@ -2712,6 +2744,37 @@ impl ClickHouseSqlGenerator {
         }
     }
 
+    /// Whether an upstream (or earlier same-`eval`) assignment made `field`
+    /// an array (NAN-5426; see `upstream_eval_arrays`).
+    pub(crate) fn is_upstream_eval_array(&self, field: &str) -> bool {
+        self.upstream_eval_arrays
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(field)
+    }
+
+    /// Record whether the eval assignment just generated for `field` is an
+    /// array (NAN-5426).
+    pub(crate) fn note_eval_assignment_array(&self, field: &str, is_array: bool) {
+        let mut guard = self
+            .upstream_eval_arrays
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if is_array {
+            guard.insert(field.to_string());
+        } else {
+            guard.remove(field);
+        }
+    }
+
+    fn swap_upstream_eval_arrays(&self, new: HashSet<String>) -> HashSet<String> {
+        let mut guard = self
+            .upstream_eval_arrays
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *guard, new)
+    }
+
     fn swap_upstream_mvexpanded(&self, new: HashSet<String>) -> HashSet<String> {
         match self.upstream_mvexpanded.write() {
             Ok(mut guard) => std::mem::replace(&mut *guard, new),
@@ -2881,6 +2944,7 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_computed(HashSet::new());
         self.swap_upstream_strings(HashSet::new());
         self.swap_upstream_mvexpanded(HashSet::new());
+        self.swap_upstream_eval_arrays(HashSet::new());
         self.swap_upstream_arrays(Default::default());
         self.reset_subsearch_array_slots();
 
@@ -2904,6 +2968,7 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_computed(HashSet::new());
         self.swap_upstream_strings(HashSet::new());
         self.swap_upstream_mvexpanded(HashSet::new());
+        self.swap_upstream_eval_arrays(HashSet::new());
         self.swap_stage_tail_aliases(Default::default());
         self.swap_upstream_time_alias(None);
         self.swap_upstream_arrays(Default::default());
@@ -4352,6 +4417,7 @@ impl ClickHouseSqlGenerator {
         let outer_scope = self.swap_upstream_computed(HashSet::new());
         let outer_strings = self.swap_upstream_strings(HashSet::new());
         let outer_mvexpanded = self.swap_upstream_mvexpanded(HashSet::new());
+        let outer_eval_arrays = self.swap_upstream_eval_arrays(HashSet::new());
         let outer_arrays = self.swap_upstream_arrays(Default::default());
         // NAN-4903: the base-column scope is per pipeline too — a projection
         // inside the subsearch must not mark the outer stages as projected.
@@ -4367,6 +4433,7 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_computed(outer_scope);
         self.swap_upstream_strings(outer_strings);
         self.swap_upstream_mvexpanded(outer_mvexpanded);
+        self.swap_upstream_eval_arrays(outer_eval_arrays);
         let sub_arrays = self.swap_upstream_arrays(outer_arrays);
         self.set_subsearch_arrays(sub_arrays);
         result
@@ -5338,9 +5405,13 @@ mod ocsf_search_command_tests;
 #[cfg(test)]
 mod regex_numeric_field_tests;
 #[cfg(test)]
+mod utf8_safe_eval_tests;
+#[cfg(test)]
 mod dc_missing_value_tests;
 #[cfg(test)]
 mod table_alias_tests;
+#[cfg(test)]
+mod non_throwing_conversion_tests;
 
 #[cfg(test)]
 #[path = "clickhouse_sql_gen/ci_like_tests.rs"]

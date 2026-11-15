@@ -130,6 +130,13 @@ pub struct DualHealthResponse {
     /// Downstream service health (Ingest and Search services)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<DownstreamServicesHealth>,
+    /// NAN-5424: detection execution health. `degraded` when a rule is
+    /// failing or a detection window went unevaluated in the last 24h; the
+    /// overall `status` is then `degraded` too. Only on this authenticated
+    /// endpoint: the public `/health` answers infrastructure liveness and
+    /// must not tell an unauthenticated caller that detection is impaired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detection: Option<nanosiem_core::detection::health::DetectionExecutionHealth>,
 }
 
 /// Health status for a single database
@@ -446,8 +453,25 @@ pub async fn health_check_detailed(
     let ingest_ok = services_health.ingest.status == "healthy";
     let search_ok = services_health.search.status == "healthy";
 
+    // NAN-5424: a rule that cannot persist its matches, or a detection
+    // window recorded as never evaluated, degrades the platform status.
+    let detection = if postgres_healthy {
+        match nanosiem_core::detection::health::read_execution_health(&state.pool).await {
+            Ok(health) => Some(health),
+            Err(e) => {
+                tracing::warn!("Detection execution health read failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let detection_ok = detection.as_ref().is_none_or(|d| d.status == "ok");
+
     let overall_status = if is_healthy {
-        if ingest_ok && search_ok {
+        if !detection_ok {
+            "degraded"
+        } else if ingest_ok && search_ok {
             "ok"
         } else if services_health.ingest.status == "unavailable"
             && services_health.search.status == "unavailable"
@@ -479,6 +503,7 @@ pub async fn health_check_detailed(
         clickhouse: Some(clickhouse_health),
         dual_mode_enabled: true,
         services: Some(services_health),
+        detection,
     }))
 }
 
@@ -491,7 +516,8 @@ pub async fn health_check_detailed(
         DualHealthResponse,
         DatabaseHealth,
         DownstreamServicesHealth,
-        ServiceHealth
+        ServiceHealth,
+        nanosiem_core::detection::health::DetectionExecutionHealth
     ))
 )]
 pub struct HealthApiDoc;

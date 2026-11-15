@@ -11,6 +11,7 @@
 //! - Async job support for long-running queries
 
 pub mod admission;
+pub mod ai_command_policy;
 pub mod background;
 pub mod classification;
 mod config;
@@ -86,7 +87,8 @@ pub use service::{RawSqlAuditAccess, SearchService};
 pub use service::prevalence_where_sql;
 pub use streaming::{is_query_streamable, SearchStreamEvent, StreamingChunk};
 pub use types::{
-    client_error_message, parse_clickhouse_error, AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,
+    client_error_message, clickhouse_error_code, parse_clickhouse_error, search_error_from_error,
+    AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,
     CloudFacets, CloudUserActivity, CloudUserSessionSummary, DisplayType, EntityCrossReference,
     FieldInfo, FieldStatistics, FieldValueInfo, HistogramBucket, QueryWarningOutput, RawSqlRequest,
     RetroFeedCandidate, RetroHuntHit, RetroIndicatorSummary, RetroListRow, RetroPivotRow,

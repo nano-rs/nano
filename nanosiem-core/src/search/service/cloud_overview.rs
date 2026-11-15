@@ -1313,15 +1313,7 @@ async fn fetch_rows(
             }
         }
     }
-    let text = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(subquery, error = %e, "Cloud overview subquery non-utf8 bytes");
-            return Err(parse_clickhouse_error(&format!(
-                "cloud overview subquery {subquery} failed: {e}"
-            )));
-        }
-    };
+    let text = crate::db::clickhouse_transport::decode_response_text(bytes, "cloud_overview");
     Ok(text
         .lines()
         .filter(|l| !l.is_empty())

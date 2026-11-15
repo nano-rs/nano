@@ -3,7 +3,6 @@
 use super::*;
 use super::lateral::source_scope_sql_predicate;
 use crate::auth::ScopeSet;
-use crate::search::parse_clickhouse_error;
 
 /// Parse an asset time-range timestamp (`query_asset_true_time_range` emits
 /// RFC3339-ish `%Y-%m-%dT%H:%M:%SZ`) into a UTC instant. Returns None on any
@@ -778,13 +777,12 @@ impl SearchService {
 
         let events_binds_clone = events_binds.clone();
         let events_future = async {
-            let mut events: Vec<serde_json::Value> = Vec::new();
             let query = apply_binds(clickhouse.query(&events_sql), &events_binds_clone);
             let mut cursor = match query.fetch_bytes("JSONEachRow") {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("Asset events query failed to start: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             };
 
@@ -795,18 +793,19 @@ impl SearchService {
                     Ok(None) => break,
                     Err(e) => {
                         tracing::warn!("Asset events query error reading chunk: {}", e);
-                        return Err(parse_clickhouse_error(&e.to_string()));
+                        return Err(crate::search::search_error_from_error(&e));
                     }
                 }
             }
 
-            if let Ok(response_str) = String::from_utf8(response_bytes) {
-                events = response_str
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-            }
+            // NAN-5426: one invalid byte used to drop every event silently.
+            let response_str =
+                crate::db::clickhouse_transport::decode_response_text(response_bytes, "asset_events");
+            let events: Vec<serde_json::Value> = response_str
+                .lines()
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
             Ok::<Vec<serde_json::Value>, SearchError>(events)
         };
 
@@ -836,7 +835,7 @@ impl SearchService {
                     Ok(count) => Ok(count),
                     Err(e) => {
                         tracing::warn!("Asset count query failed: {}", e);
-                        Err(parse_clickhouse_error(&e.to_string()))
+                        Err(crate::search::search_error_from_error(&e))
                     }
                 }
             };
@@ -890,7 +889,7 @@ impl SearchService {
                     Ok(rows) => Ok(rows),
                     Err(e) => {
                         tracing::warn!("Asset combined facet query failed: {}", e);
-                        Err(parse_clickhouse_error(&e.to_string()))
+                        Err(crate::search::search_error_from_error(&e))
                     }
                 }
             };
@@ -910,7 +909,7 @@ impl SearchService {
                     }
                     Err(e) => {
                         tracing::warn!("Asset user facet query failed: {}", e);
-                        return Err(parse_clickhouse_error(&e.to_string()));
+                        return Err(crate::search::search_error_from_error(&e));
                     }
                 }
                 Ok::<Vec<(String, u64)>, SearchError>(facets)
@@ -924,7 +923,7 @@ impl SearchService {
                     Ok(count) => Ok(count),
                     Err(e) => {
                         tracing::warn!("Asset count query failed: {}", e);
-                        Err(parse_clickhouse_error(&e.to_string()))
+                        Err(crate::search::search_error_from_error(&e))
                     }
                 }
             };
@@ -1295,7 +1294,7 @@ impl SearchService {
             }
             Err(e) => {
                 tracing::warn!("Failed to query true asset time range: {}", e);
-                Err(parse_clickhouse_error(&e.to_string()))
+                Err(crate::search::search_error_from_error(&e))
             }
         }
     }
@@ -1481,7 +1480,7 @@ impl SearchService {
             }).collect(),
             Err(e) => {
                 tracing::warn!("Failed to query asset artifact hashes: {}", e);
-                return Err(parse_clickhouse_error(&e.to_string()));
+                return Err(crate::search::search_error_from_error(&e));
             }
         };
 
@@ -1491,7 +1490,7 @@ impl SearchService {
             }).collect(),
             Err(e) => {
                 tracing::warn!("Failed to query asset artifact domains: {}", e);
-                return Err(parse_clickhouse_error(&e.to_string()));
+                return Err(crate::search::search_error_from_error(&e));
             }
         };
 
@@ -1654,7 +1653,7 @@ impl SearchService {
                 }).collect(),
                 Err(e) => {
                     tracing::warn!("Failed to query asset artifact hash occurrences: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         };
@@ -1672,7 +1671,7 @@ impl SearchService {
                 }).collect(),
                 Err(e) => {
                     tracing::warn!("Failed to query asset artifact domain occurrences: {}", e);
-                    return Err(parse_clickhouse_error(&e.to_string()));
+                    return Err(crate::search::search_error_from_error(&e));
                 }
             }
         };
@@ -1812,7 +1811,7 @@ impl SearchService {
                     "entity_time_range_agg lookup failed: {}",
                     e
                 );
-                Err(parse_clickhouse_error(&e.to_string()))
+                Err(crate::search::search_error_from_error(&e))
             }
         }
     }
@@ -2028,7 +2027,7 @@ impl SearchService {
                 .collect()),
             Err(e) => {
                 tracing::warn!(entity_type, "entity_dimension_firsts scan failed: {}", e);
-                Err(parse_clickhouse_error(&e.to_string()))
+                Err(crate::search::search_error_from_error(&e))
             }
         }
     }
@@ -2363,7 +2362,7 @@ impl SearchService {
                 .collect()),
             Err(e) => {
                 tracing::warn!(entity_type, "entity_hourly_activity_scoped scan failed: {}", e);
-                Err(parse_clickhouse_error(&e.to_string()))
+                Err(crate::search::search_error_from_error(&e))
             }
         }
     }

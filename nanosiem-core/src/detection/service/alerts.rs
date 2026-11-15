@@ -720,7 +720,8 @@ impl DetectionService {
         match_count: i64,
         today: chrono::NaiveDate,
         global_weight: f64,
-    ) -> Result<Option<Alert>, DetectionError> {
+        window: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    ) -> Result<(Option<Alert>, super::per_event::PerEventOutcome), DetectionError> {
         let case_permissions = self.get_case_permissions(rule).await;
         let mut first_alert: Option<Alert> = None;
         let mut alerts_created: i64 = 0;
@@ -764,6 +765,7 @@ impl DetectionService {
         };
         let mut fired_entities: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut cooldown_suppressed = 0usize;
+        let mut failures = super::per_event::PerEventFailures::new(window);
 
         for event in results.iter().take(alert_cap) {
             // NAN-1805: cooldown gate before any per-event writes.
@@ -784,9 +786,17 @@ impl DetectionService {
                 continue;
             }
 
+            // NAN-5424: a write failure is this event's, not the batch's —
+            // record it and move on to the next event (see `per_event`).
+            failures.attempt();
             // Store each event as its own detection match (1:1 with alerts)
-            self.store_detection_match(rule, std::slice::from_ref(event))
-                .await?;
+            if let Err(e) = self
+                .store_detection_match(rule, std::slice::from_ref(event))
+                .await
+            {
+                failures.record(rule, event, e);
+                continue;
+            }
             let matched_events = serde_json::json!([event]);
             let new_alert = NewAlert {
                 rule_id: rule.id,
@@ -807,7 +817,10 @@ impl DetectionService {
                     );
                     continue;
                 }
-                Err(e) => return Err(DetectionError::from(e)),
+                Err(e) => {
+                    failures.record(rule, event, DetectionError::from(e));
+                    continue;
+                }
             };
 
             alerts_created += 1;
@@ -844,12 +857,16 @@ impl DetectionService {
             .record_daily_stats(rule.id, today, match_count, alerts_created)
             .await?;
 
+        // NAN-5424: settle per-event failures only after the alerts that did
+        // persist were fully processed (stats, cooldown anchors above).
+        let outcome = failures.finish(self, rule, true).await?;
+
         info!(
             "Rule {} (ALERTING/per_event) matched {} events, created {} alerts",
             rule.name, match_count, alerts_created
         );
 
-        Ok(first_alert)
+        Ok((first_alert, outcome))
     }
 
     // ========================================================================

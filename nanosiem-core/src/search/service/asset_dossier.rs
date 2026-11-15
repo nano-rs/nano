@@ -17,7 +17,7 @@ use super::SearchService;
 use crate::auth::ScopeSet;
 use crate::query::TimeRange;
 use crate::schema::SchemaProfile;
-use crate::search::{parse_clickhouse_error, SearchError};
+use crate::search::SearchError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -442,7 +442,7 @@ async fn fetch_rows(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(subquery, error = %e, "Asset dossier subquery failed to start");
-            return Err(parse_clickhouse_error(&e.to_string()));
+            return Err(crate::search::search_error_from_error(&e));
         }
     };
     let mut bytes = Vec::new();
@@ -452,20 +452,11 @@ async fn fetch_rows(
             Ok(None) => break,
             Err(e) => {
                 tracing::error!(subquery, error = %e, "Asset dossier subquery chunk read failed");
-                return Err(parse_clickhouse_error(&e.to_string()));
+                return Err(crate::search::search_error_from_error(&e));
             }
         }
     }
-    let text = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(subquery, error = %e, "Asset dossier subquery non-utf8 bytes");
-            return Err(SearchError::DatabaseError(sqlx::Error::Protocol(format!(
-                "asset dossier subquery {} returned non-utf8 bytes: {}",
-                subquery, e
-            ))));
-        }
-    };
+    let text = crate::db::clickhouse_transport::decode_response_text(bytes, "asset_dossier");
     let rows = text
         .lines()
         .filter(|l| !l.is_empty())

@@ -1648,12 +1648,28 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
             }
         };
 
+    // NAN-5424: rules whose executions fail (e.g. matched events PostgreSQL
+    // refuses) — the same predicate as the rule-health API.
+    let failing_rules_total = crate::detection::health::count_failing_rules(pool)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to count failing detection rules: {}", e);
+            0
+        });
+    let failing_rules = crate::detection::health::list_failing_rules(pool, 20)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to list failing detection rules: {}", e);
+            vec![]
+        });
+
     info!(
-        "Collected detection metrics: {} enabled rules, {} stale, {} noisy, {} coverage gaps (7d)",
+        "Collected detection metrics: {} enabled rules, {} stale, {} noisy, {} coverage gaps (7d), {} failing",
         total_enabled,
         stale_rules.len(),
         noisy_rules.len(),
-        coverage_gaps_7d_total
+        coverage_gaps_7d_total,
+        failing_rules_total
     );
 
     DetectionMetrics {
@@ -1665,6 +1681,8 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         alerts_24h_by_severity: alerts_24h,
         coverage_gaps_7d,
         coverage_gaps_7d_total,
+        failing_rules,
+        failing_rules_total,
     }
 }
 

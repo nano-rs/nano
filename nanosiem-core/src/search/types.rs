@@ -69,10 +69,155 @@ pub enum SearchError {
     /// memory budget and none freed within the wait window. Retryable 503.
     #[error("Search is busy assembling other views ({view} waited {waited_ms} ms for memory); retry shortly")]
     ViewMemoryBusy { view: String, waited_ms: u64 },
+    /// NAN-5424: the ClickHouse transport failed (connection refused / reset,
+    /// client timeout), identified by the client error TYPE, not its text.
+    /// Says nothing about the query or the data; retrying later is expected
+    /// to work.
+    #[error("Search backend unavailable: {0}")]
+    Unavailable(String),
+    /// NAN-5424: ClickHouse refused the query for its size (memory limit,
+    /// too many rows / bytes), identified by the error CODE. A smaller time
+    /// window can succeed.
+    #[error("{0}")]
+    ResourceLimit(String),
+    /// NAN-5424: ClickHouse failed while evaluating stored values (a value
+    /// that does not parse / convert, division by zero), identified by the
+    /// error CODE. Depends on the data in the window, not on the query alone.
+    /// The message names the code only; ClickHouse's text can quote the
+    /// offending value.
+    #[error("Query failed on the stored data: {name} (Code {code})")]
+    DataError { code: u32, name: String },
 }
 
-/// Parse a ClickHouse error message and convert to a user-friendly SearchError
+/// Map a failure from the ClickHouse client to a [`SearchError`].
+///
+/// NAN-5424: the TYPE decides the transport cases. A refused / reset
+/// connection (`clickhouse::error::Error::Network`) or the client's own timeout
+/// (`clickhouse::error::Error::TimedOut`) is [`SearchError::Unavailable`]; their text
+/// ("network error: client error (Connect)", "timeout expired") never matched
+/// any message pattern. The `source()` chain is walked so a wrapped client
+/// error is still recognised; IO errors anywhere in it are transport too.
+/// Server responses go through [`parse_clickhouse_error`].
+pub fn search_error_from_error(error: &(dyn std::error::Error + 'static)) -> SearchError {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = current {
+        if let Some(ch) = e.downcast_ref::<clickhouse::error::Error>() {
+            return match ch {
+                clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => {
+                    SearchError::Unavailable(crate::db::pg_text::pg_safe_error_text(&ch.to_string()))
+                }
+                clickhouse::error::Error::BadResponse(message) => parse_clickhouse_error(message),
+                other => parse_clickhouse_error(&other.to_string()),
+            };
+        }
+        if e.downcast_ref::<std::io::Error>().is_some() {
+            return SearchError::Unavailable(crate::db::pg_text::pg_safe_error_text(&error.to_string()));
+        }
+        current = e.source();
+    }
+    parse_clickhouse_error(&error.to_string())
+}
+
+/// The ClickHouse error code of a server error message (`Code: N. DB::Exception: …`).
+///
+/// NAN-5424: only the code that precedes the exception text is trusted. The
+/// exception text itself can quote column values verbatim, often UNQUOTED
+/// (`Cannot read floating point value here: <value>`), so no substring of it
+/// may decide how an error is classified.
+pub fn clickhouse_error_code(error_msg: &str) -> Option<u32> {
+    let at = error_msg.find("Code: ")?;
+    if let Some(exception) = error_msg.find("DB::Exception") {
+        if exception < at {
+            return None;
+        }
+    }
+    let digits: String = error_msg[at + "Code: ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// ClickHouse codes for a query refused for its size (NAN-4910 / NAN-5424).
+const CH_SIZE_CODES: &[(u32, &str)] = &[
+    (241, "MEMORY_LIMIT_EXCEEDED"),
+    (158, "TOO_MANY_ROWS"),
+    (307, "TOO_MANY_BYTES"),
+    (396, "TOO_MANY_ROWS_OR_BYTES"),
+    (160, "TOO_SLOW"),
+];
+
+/// ClickHouse codes raised while evaluating stored VALUES: the same query
+/// succeeds on other data (NAN-5424).
+const CH_DATA_CODES: &[(u32, &str)] = &[
+    (6, "CANNOT_PARSE_TEXT"),
+    (27, "CANNOT_PARSE_INPUT_ASSERTION_FAILED"),
+    (38, "CANNOT_PARSE_DATE"),
+    (41, "CANNOT_PARSE_DATETIME"),
+    (69, "ARGUMENT_OUT_OF_BOUND"),
+    (70, "CANNOT_CONVERT_TYPE"),
+    (72, "CANNOT_PARSE_NUMBER"),
+    (153, "ILLEGAL_DIVISION"),
+    (376, "CANNOT_PARSE_UUID"),
+    (407, "DECIMAL_OVERFLOW"),
+];
+
+/// ClickHouse codes describing the QUERY itself (it fails the same way on
+/// any data): the friendly message rewrites below apply only to these.
+const CH_QUERY_CODES: &[u32] = &[
+    16,  // NO_SUCH_COLUMN_IN_TABLE
+    42,  // NUMBER_OF_ARGUMENTS_DOESNT_MATCH
+    46,  // UNKNOWN_FUNCTION
+    47,  // UNKNOWN_IDENTIFIER
+    62,  // SYNTAX_ERROR
+    184, // ILLEGAL_AGGREGATION
+    386, // NO_COMMON_TYPE
+    427, // CANNOT_COMPILE_REGEXP
+];
+
+/// Parse a ClickHouse error message and convert to a user-friendly SearchError.
+///
+/// NAN-5424: a server error carries `Code: N`, and then only the code
+/// classifies it — never a substring of the exception text, which can echo
+/// event data. Messages without a code (client-side / synthetic) keep the
+/// message patterns below.
 pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
+    let Some(code) = clickhouse_error_code(error_msg) else {
+        return parse_clickhouse_error_message(error_msg);
+    };
+    if code == 394 {
+        return SearchError::Cancelled;
+    }
+    if code == 159 {
+        // TIMEOUT_EXCEEDED: "elapsed N ms" is part of ClickHouse's own text,
+        // which precedes any quoted data.
+        return SearchError::Timeout(parse_elapsed_ms(error_msg).unwrap_or(0));
+    }
+    if let Some((_, name)) = CH_SIZE_CODES.iter().find(|(c, _)| *c == code) {
+        return SearchError::ResourceLimit(if *name == "MEMORY_LIMIT_EXCEEDED" {
+            "Query exceeded memory limit. Try adding more filters, reducing the time range, or using sampling.".to_string()
+        } else {
+            "Query returned too many rows. Add more filters or use head/limit to reduce the result size.".to_string()
+        });
+    }
+    if let Some((_, name)) = CH_DATA_CODES.iter().find(|(c, _)| *c == code) {
+        return SearchError::DataError { code, name: (*name).to_string() };
+    }
+    if CH_QUERY_CODES.contains(&code) {
+        return match parse_clickhouse_error_message(error_msg) {
+            // A query-shape code whose text no rewrite recognised.
+            SearchError::DatabaseError(_) => {
+                SearchError::SqlValidationError(format!("Query error (ClickHouse code {code})."))
+            }
+            friendly => friendly,
+        };
+    }
+    let cleaned_msg = clean_clickhouse_error(error_msg);
+    SearchError::DatabaseError(sqlx::Error::Protocol(cleaned_msg))
+}
+
+/// Message-pattern mapping for errors that carry no ClickHouse code.
+fn parse_clickhouse_error_message(error_msg: &str) -> SearchError {
     // Pattern: Code 394 — the query was killed (search cancel / KILL QUERY).
     // Checked first: it is the most specific signal and must not fall through
     // to the generic DatabaseError mapping, which the HTTP layer renders as a
@@ -314,8 +459,12 @@ pub fn client_error_message(error: &SearchError) -> String {
         | SearchError::Cancelled
         | SearchError::JobResultsUnavailable(_)
         | SearchError::ViewTooLarge { .. }
-        | SearchError::ViewMemoryBusy { .. } => error.to_string(),
-        SearchError::DatabaseError(_) => "A database error occurred".to_string(),
+        | SearchError::ViewMemoryBusy { .. }
+        | SearchError::ResourceLimit(_)
+        | SearchError::DataError { .. } => error.to_string(),
+        SearchError::DatabaseError(_) | SearchError::Unavailable(_) => {
+            "A database error occurred".to_string()
+        }
         SearchError::PrevalenceError(_) => "An internal error occurred".to_string(),
     }
 }
@@ -885,7 +1034,8 @@ mod tests {
             parse_clickhouse_error(
                 "Code: 241. DB::Exception: Memory limit (for query) exceeded (MEMORY_LIMIT_EXCEEDED)"
             ),
-            SearchError::SqlValidationError(_)
+            // NAN-5424: size refusals are their own typed class.
+            SearchError::ResourceLimit(_)
         ));
         assert!(matches!(
             parse_clickhouse_error("Code: 159. DB::Exception: Timeout exceeded: elapsed 1.2 seconds (TIMEOUT_EXCEEDED)"),

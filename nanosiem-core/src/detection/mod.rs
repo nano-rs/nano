@@ -19,6 +19,7 @@ pub mod error;
 pub mod event_envelope;
 pub(crate) mod finding_evidence;
 pub mod findings;
+pub mod health;
 pub mod match_scope;
 pub mod materialized_view;
 pub mod query_enrichment;

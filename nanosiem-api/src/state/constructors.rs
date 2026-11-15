@@ -216,7 +216,9 @@ impl AppState {
         // Create inputlookup service for URL-based enrichment. The internal
         // lookup layer is wired so `| inputlookup <internal_table>` reads the
         // CH/PG-backed lookup table directly (NAN-1581 Phase 5).
-        let inputlookup_service = InputLookupService::new(InputLookupConfig::default())
+        // NAN-5436: `from_env` applies the INPUTLOOKUP_ALLOWED_DOMAINS host
+        // allowlist when set; unset keeps the default (public hosts allowed).
+        let inputlookup_service = InputLookupService::new(InputLookupConfig::from_env())
             .with_lookup_service(Arc::new(lookup_service.clone()));
 
         // Create search service and add inputlookup. The active schema profile
@@ -230,6 +232,15 @@ impl AppState {
             config.schema_profile(),
         );
         search_service.set_inputlookup_service(inputlookup_service);
+        // NAN-5437: pivt / meloD paths run AI-written searches in this
+        // process; apply the admin's AI-search command allowlist here too and
+        // audit refusals.
+        search_service.spawn_query_limits_refresh(dual_pool.postgres().clone());
+        nanosiem_core::search::ai_command_policy::install_audit_sink(
+            nanosiem_core::search::ai_command_policy::EmitterAiCommandAuditSink::new(
+                audit_emitter.clone(),
+            ),
+        );
 
         // Wire the enterprise `CloudRiskProvider` impl onto the search service
         // so cloud overview / dossier surfaces render risk badges. Open-core

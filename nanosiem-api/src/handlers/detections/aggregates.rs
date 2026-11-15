@@ -104,10 +104,16 @@ pub async fn get_detection_health_summary(
     .fetch_one(&state.pool)
     .await?;
 
+    // NAN-5424: failing rules — the same predicate the fleet-health errors
+    // bucket, `/health/detailed` and SIEM Health use.
+    let failing_count: i64 =
+        nanosiem_core::detection::health::count_failing_rules(&state.pool).await?;
+
     Ok(Json(DetectionHealthSummary {
         needs_tuning,
         noisy_count,
         silent_count,
+        failing_count,
     }))
 }
 
@@ -214,10 +220,11 @@ pub async fn get_noisy_rules(
 /// path that produces these signals.
 ///
 /// Buckets:
-/// - `errors`: `next_run_at` more than `STUCK_THRESHOLD_SECS` past due. The
-///   scheduler can't advance the rule — execution timing out, node crashed
-///   mid-claim, or the rule itself throws. Computed first so a stuck-and-slow
-///   rule still surfaces as an error.
+/// - `errors`: `next_run_at` more than `STUCK_THRESHOLD_SECS` past due (the
+///   scheduler can't advance the rule — node crashed mid-claim), or the
+///   rule's executions are currently failing (NAN-5424: the scheduler keeps
+///   retrying, then records coverage gaps). A failing rule is never counted
+///   healthy or slow.
 /// - `slow`: not stuck, and the most-recent `detection_rule_metrics` row in
 ///   the last `RECENT_METRICS_WINDOW_HOURS` reports `execution_time_ms >=
 ///   SLOW_DURATION_MS`.
@@ -255,7 +262,8 @@ pub async fn get_fleet_health(
     let row: (i64, i64, i64, i64) = sqlx::query_as(
         r#"
         WITH fleet AS (
-            SELECT id, last_run_at, next_run_at
+            SELECT id, last_run_at, next_run_at,
+                   (consecutive_failures > 0 OR catchup_size_failures > 0) AS failing
             FROM detection_rules
             WHERE archived = false
               AND mode IN ('live', 'alerting')
@@ -273,17 +281,20 @@ pub async fn get_fleet_health(
             COUNT(*)::bigint AS total,
             COUNT(*) FILTER (
                 WHERE f.last_run_at IS NOT NULL
+                  AND NOT f.failing
                   AND (f.next_run_at IS NULL OR f.next_run_at >= NOW() - make_interval(secs => $1))
                   AND COALESCE(m.execution_time_ms, 0) < $2
             )::bigint AS healthy,
             COUNT(*) FILTER (
                 WHERE f.last_run_at IS NOT NULL
+                  AND NOT f.failing
                   AND (f.next_run_at IS NULL OR f.next_run_at >= NOW() - make_interval(secs => $1))
                   AND m.execution_time_ms >= $2
             )::bigint AS slow,
             COUNT(*) FILTER (
-                WHERE f.next_run_at IS NOT NULL
-                  AND f.next_run_at < NOW() - make_interval(secs => $1)
+                WHERE f.failing
+                   OR (f.next_run_at IS NOT NULL
+                       AND f.next_run_at < NOW() - make_interval(secs => $1))
             )::bigint AS errors
         FROM fleet f
         LEFT JOIN latest_metrics m ON m.rule_id = f.id

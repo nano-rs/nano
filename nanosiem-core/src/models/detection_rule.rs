@@ -268,6 +268,25 @@ pub struct DetectionRule {
     #[sqlx(default)]
     #[serde(default)]
     pub alert_cooldown_minutes: Option<i32>,
+    /// Consecutive failed executions since the rule last succeeded (NAN-5424).
+    /// Non-zero = the rule is currently failing. Size-class catch-up failures
+    /// are tracked separately by the scheduler (NAN-4910).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub consecutive_failures: i16,
+    /// When the current failure streak began; `None` while healthy (NAN-5424).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub failing_since: Option<DateTime<Utc>>,
+    /// Most recent execution or per-event persistence error (NAN-5424). Kept
+    /// as history after the rule recovers; read with `last_error_at`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// When `last_error` was recorded (NAN-5424).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub last_error_at: Option<DateTime<Utc>>,
 }
 
 /// Serde default for [`DetectionRule::kind`]: a rule with no explicit kind is a

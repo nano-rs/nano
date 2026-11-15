@@ -19,6 +19,8 @@ mod query_execution;
 mod query_management;
 mod sql_helpers;
 mod types;
+#[cfg(test)]
+mod utf8_response_tests;
 
 // Re-export all public items for backward compatibility
 pub use sql_helpers::{

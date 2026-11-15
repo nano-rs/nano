@@ -47,7 +47,7 @@ mod types;
 
 pub use fetcher::{CacheStats, FetchError, FetchResult, UrlFetcher};
 pub use response_parser::ParseError;
-pub use service::{params_from_command, InputLookupError, InputLookupOutcome, InputLookupService};
+pub use service::{internal_lookup_table, params_from_command, InputLookupError, InputLookupOutcome, InputLookupService};
 pub use ssrf::{
     ai_base_url_validator, describe_ai_base_url_error, pin_resolved_addrs, private_ai_endpoints_allowed,
     restricted_redirect_policy, IpCidr, ProxyPolicy, SsrfConfig, SsrfError, SsrfValidator,

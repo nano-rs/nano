@@ -243,8 +243,7 @@ impl ClickHouseLookupRepository {
         while let Some(chunk) = cursor.next().await.map_err(Self::ch_err)? {
             bytes.extend_from_slice(&chunk);
         }
-        let text = String::from_utf8(bytes)
-            .map_err(|e| LookupRepositoryError::ClickHouseError(e.to_string()))?;
+        let text = crate::db::clickhouse_transport::decode_response_text(bytes, "lookup_rows");
 
         let mut out = Vec::new();
         for line in text.lines().filter(|l| !l.is_empty()) {
