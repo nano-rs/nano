@@ -22,7 +22,13 @@ import {
   getQueryAutocompleteSuggestions,
   type AutocompleteOption as QueryOption,
 } from '@/lib/query-autocomplete';
-import { COMPLETION_TOKEN_BEFORE, COMPLETION_VALID_FOR } from './search-autocomplete';
+import {
+  completionRange,
+  completionValidFor,
+  valueCompletionApply,
+  valueOptionsAfterTyping,
+  type CompletionRange,
+} from './search-autocomplete';
 import { api } from '@/lib/api';
 import {
   schemaField,
@@ -175,10 +181,8 @@ function yamlOptionsToCompletions(options: YamlOption[], from: number, field?: s
  */
 function queryOptionsToCompletions(
   options: QueryOption[],
-  from: number,
+  range: CompletionRange,
   context: string | null,
-  insideQuotes = false,
-  toPosition?: number
 ): CompletionResult {
   const completions: Completion[] = options.map((opt, index) => {
     const completion: Completion = {
@@ -213,8 +217,7 @@ function queryOptionsToCompletions(
         break;
       case 'source_type':
         completion.type = 'enum';
-        // Only wrap in quotes if not already inside quotes
-        completion.apply = insideQuotes ? opt.value : `"${opt.value}"`;
+        completion.apply = valueCompletionApply(opt.value, range);
         break;
       case 'table_wildcard':
         completion.type = 'keyword';
@@ -226,18 +229,12 @@ function queryOptionsToCompletions(
     return completion;
   });
 
-  const result: CompletionResult = {
-    from,
+  return {
+    from: range.from,
+    to: range.to,
     options: completions,
-    validFor: COMPLETION_VALID_FOR,
+    validFor: completionValidFor(context, range, options.map((o) => o.value)),
   };
-
-  // If we have a specific end position (e.g., to replace closing quote too)
-  if (toPosition !== undefined) {
-    result.to = toPosition;
-  }
-
-  return result;
 }
 
 /**
@@ -293,39 +290,15 @@ export async function queryAutocomplete(context: CompletionContext): Promise<Com
   // Get suggestions from existing utility
   const result = await getQueryAutocompleteSuggestions(doc, pos, []);
 
-  if (result.options.length === 0) {
+  // Same replacement span as the search bar: whole dotted field names, whole
+  // nPL value tokens (hyphens, dots, colons…) for values (NAN-5500).
+  const range = completionRange(doc, pos, result.context);
+  const options = valueOptionsAfterTyping(result.options, doc, range, result.context, context.explicit);
+  if (options.length === 0) {
     return null;
   }
 
-  // Calculate the from position based on what the user has typed
-  const textBefore = doc.substring(0, pos);
-  const textAfter = doc.substring(pos);
-
-  // Find where the current word starts
-  let from = pos;
-  const wordMatch = textBefore.match(COMPLETION_TOKEN_BEFORE);
-  if (wordMatch) {
-    from = pos - wordMatch[0].length;
-  }
-
-  // For source_type context, check if we're already inside quotes
-  let insideQuotes = false;
-  let toPosition: number | undefined;
-
-  if (result.context === 'source_type') {
-    // Check if there's a quote before the word
-    const charBeforeWord = from > 0 ? doc[from - 1] : '';
-    if (charBeforeWord === '"') {
-      insideQuotes = true;
-      // Also check for closing quote and include it in replacement
-      const closingQuoteMatch = textAfter.match(/^[\w]*"/);
-      if (closingQuoteMatch) {
-        toPosition = pos + closingQuoteMatch[0].length - (pos - from);
-      }
-    }
-  }
-
-  return queryOptionsToCompletions(result.options, from, result.context, insideQuotes, toPosition);
+  return queryOptionsToCompletions(options, range, result.context);
 }
 
 /**

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import contextlib
 import dataclasses
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -421,6 +423,9 @@ BUNDLE_IMAGE_ROLES: dict[str, frozenset[str]] = {
 }
 INSTALL_OPERATION_RESERVE_BYTES = 256 * 1024**2
 METRICS_EXPOSE_OVERLAY = "docker-compose.metrics-expose.yml"
+# NAN-5511: the single-node TLS overlay; its nginx answers on :443 and only
+# 301-redirects :80 to https.
+TLS_OVERLAY = "docker-compose.tls.yml"
 _METRICS_OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])"
 _METRICS_ADDRESS = re.compile(rf"{_METRICS_OCTET}\.{_METRICS_OCTET}\.{_METRICS_OCTET}\.{_METRICS_OCTET}")
 
@@ -1577,6 +1582,144 @@ def recover_legacy_backup_services(
     return True
 
 
+# NAN-5521: overlays install.sh adds and removes itself (from Agent Lane and
+# NANO_METRICS_BIND_ADDRESS), never carried over from a running stack.
+SELF_MANAGED_COMPOSE_FILES = frozenset({
+    "docker-compose.opensource.yml", "docker-compose.agentlane.yml", METRICS_EXPOSE_OVERLAY,
+})
+COMPOSE_OVERLAY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml")
+VECTOR_NATIVE_PORT = 6000
+PROC_NET = pathlib.Path("/proc/net")
+
+
+def running_compose_overlays(
+    runner: Any, install_dir: pathlib.Path, project: str = "",
+) -> list[str] | None:
+    """NAN-5521: the overlay file names (in INSTALL_DIR) the running
+    single-node stack was started with, from the
+    com.docker.compose.project.config_files label of its nginx container (else
+    any container of the project). Installs made before 2.0.30 were given
+    NANO_COMPOSE_OVERLAYS (docker-compose.tls.yml) in the environment only, so
+    .env does not list them. None when it cannot tell. Mirrors
+    nano_running_compose_overlays in scripts/lib/install-preflight.sh."""
+    directories = [str(install_dir)]
+    with contextlib.suppress(OSError):
+        physical = str(install_dir.resolve())
+        if physical not in directories:
+            directories.append(physical)
+    filters = [f"label=com.docker.compose.project.working_dir={directory}" for directory in directories]
+    if project:
+        filters.append(f"label=com.docker.compose.project={project}")
+    line = ""
+    for selector in filters:
+        for extra in (["--filter", "label=com.docker.compose.service=nginx"], []):
+            try:
+                result = runner.run(
+                    ["docker", "ps", "-a", "--filter", selector, *extra,
+                     "--format", '{{.Label "com.docker.compose.project.config_files"}}'],
+                    timeout=20, check=False,
+                )
+            except UpgradeError:
+                return None
+            if result.returncode != 0:
+                continue
+            line = next((item.strip() for item in (result.stdout or "").splitlines() if item.strip()), "")
+            if line:
+                break
+        if line:
+            break
+    if not line:
+        return None
+    overlays: list[str] = []
+    for path in line.split(","):
+        directory, _, name = path.strip().rpartition("/")
+        if directory not in directories or not COMPOSE_OVERLAY_NAME_RE.fullmatch(name):
+            continue
+        if name in SELF_MANAGED_COMPOSE_FILES or name in overlays:
+            continue
+        candidate = install_dir / name
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        overlays.append(name)
+    return overlays
+
+
+def _proc_net_address(hex_address: str) -> str:
+    raw = bytes.fromhex(hex_address)
+    if len(raw) == 4:
+        return socket.inet_ntop(socket.AF_INET, raw[::-1])
+    # /proc/net/tcp6: four 32-bit words, each in host (little-endian) order.
+    swapped = b"".join(raw[index:index + 4][::-1] for index in range(0, 16, 4))
+    return socket.inet_ntop(socket.AF_INET6, swapped)
+
+
+def host_tcp_listeners(port: int, proc_net: pathlib.Path = PROC_NET) -> list[str] | None:
+    """NAN-5521: local addresses with a TCP listener on PORT (Linux
+    /proc/net/tcp and tcp6, every process, no privileges needed). None when
+    /proc/net is not readable (not Linux)."""
+    found: list[str] = []
+    readable = False
+    for name in ("tcp", "tcp6"):
+        try:
+            lines = (proc_net / name).read_text(encoding="ascii", errors="replace").splitlines()[1:]
+        except OSError:
+            continue
+        readable = True
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != "0A":
+                continue
+            address, _, hex_port = fields[1].partition(":")
+            try:
+                if int(hex_port, 16) != port:
+                    continue
+                listener = _proc_net_address(address)
+            except ValueError:
+                continue
+            if listener not in found:
+                found.append(listener)
+    return found if readable else None
+
+
+WILDCARD_ADDRESSES = frozenset({"", "*", "0.0.0.0", "::", "[::]"})
+
+
+def listener_blocks_bind(listener: str, bind: str) -> bool:
+    """True when a listener on LISTENER stops Docker publishing on BIND."""
+    listener = listener.strip("[]")
+    bind = bind.strip("[]")
+    if listener in WILDCARD_ADDRESSES:
+        return True
+    # A specific IPv6 listener (::1) does not hold an IPv4 bind, nor the
+    # reverse; Compose publishes "0.0.0.0:6000" on IPv4 only.
+    ipv6_listener = ":" in listener and not listener.startswith("::ffff:")
+    if (":" in bind) != ipv6_listener:
+        return False
+    if bind in WILDCARD_ADDRESSES:
+        return True
+    return listener == bind
+
+
+def published_addresses(ports_field: str, port: int) -> set[str]:
+    """Host addresses a `docker ps`/`docker compose ps` .Ports value publishes
+    TCP PORT on ("0.0.0.0:6000->6000/tcp, [::]:6000->6000/tcp", ranges too)."""
+    addresses: set[str] = set()
+    for entry in ports_field.replace("\n", ",").split(","):
+        entry = entry.strip()
+        if "->" not in entry or not entry.endswith("/tcp"):
+            continue
+        host = entry.split("->", 1)[0]
+        address, _, host_ports = host.rpartition(":")
+        low, _, high = host_ports.partition("-")
+        try:
+            if not int(low) <= port <= int(high or low):
+                continue
+        except ValueError:
+            continue
+        addresses.add(address.strip("[]") or "0.0.0.0")
+    return addresses
+
+
 def test_compose_override_arguments(install_dir: pathlib.Path) -> list[str]:
     """Return the build-bound N-1 overlay without coupling layout selection."""
     raw_override = os.environ.get("NANO_UPGRADE_TEST_COMPOSE_OVERRIDE", "")
@@ -2311,6 +2454,75 @@ class LocalOps:
             timeout=120, check=False,
         )
 
+    def _ensure_vector_native_pki(self) -> None:
+        """NAN-5515: before the first `up`, prepare the Vector-native
+        listener's mutual-TLS files with scripts/lib/vector-native-pki.sh,
+        exactly as install.sh does (same commands, same SAN rule). The upgraded
+        Vector config refuses plaintext on :6000; without these files Vector's
+        entrypoint locks the listener (every sender refused) rather than
+        failing. Single host: listener CA, listener certificate and the sender
+        anchor bundle. Role-split ingest host: the anchor bundle from the shared
+        .env (its listener is the cluster TLS certificate). Other role-split
+        hosts run no Vector. A running Vector is restarted when its files
+        changed (it reads them only when the source starts)."""
+        if getattr(self, "_vector_native_pki_checked", False):
+            return
+        self._vector_native_pki_checked = True
+        helper = self.install_dir / "scripts/lib/vector-native-pki.sh"
+        role_env = getattr(self, "role_env", None) or {}
+        if getattr(self, "legacy_layout", None) is not None or not helper.is_file():
+            return
+        if role_env and "ingest" not in (getattr(self, "roles", None) or ()):
+            return
+        tls_dir = self.install_dir / "config/vector-native"
+        if role_env:
+            had = (tls_dir / "client-ca.crt").is_file()
+            arguments = ["bash", str(helper), "ensure-ingest", "--tls-dir", str(tls_dir),
+                         "--env-file", str(self.install_dir / ".env")]
+            environment = None
+        else:
+            had = (tls_dir / "server.crt").is_file()
+            environment = {**os.environ, "NANO_VECTOR_NATIVE_SANS": self.env.get("NANO_VECTOR_NATIVE_SANS", "")}
+            arguments = [
+                "bash", str(helper), "ensure",
+                "--pki-dir", str(self.install_dir / ".nano-pki/vector-native"),
+                "--tls-dir", str(tls_dir),
+                "--base-url", self.env.get("BASE_URL", ""),
+            ]
+            # Same rule as install.sh: only a specific native bind address.
+            bind = self.env.get("NANO_VECTOR_NATIVE_BIND_ADDRESS", "")
+            if bind:
+                arguments += ["--san", bind]
+        result = self.runner.run(arguments, timeout=120, check=False, env=environment)
+        if result.returncode != 0:
+            detail = ((result.stderr or "").strip().splitlines() or [f"exit {result.returncode}"])[-3:]
+            eprint(
+                "warning: the Vector-native TLS files were not prepared (" + " ".join(detail)[:600] + "); port "
+                "6000 refuses every sender until this is fixed and `./install.sh` is re-run on this host."
+            )
+            return
+        output = result.stdout or ""
+        if had and ("server=issued" in output or "anchors=changed" in output or "changed=1" in output):
+            # Vector reads its TLS files when the source starts: restart a
+            # running one (the `up` may not recreate it).
+            self.runner.run([*self.compose_args, "restart", "vector"], timeout=180, check=False)
+        if role_env and self.role_env.get("NANO_PRIVATE_TLS", "") != "true":
+            eprint("warning: Vector native :6000 is locked on this host: the cluster has no private TLS (plaintext lab).")
+        if not had:
+            # NAN-5521: repeated in the final summary (role-split hosts print it here only).
+            self.vector_native_cutover = not role_env
+            eprint("!! Vector native port 6000 now REQUIRES mutual TLS (NAN-5515).")
+            eprint("!! Senders without a client certificate from this install's Vector-native anchors are refused.")
+            eprint("!! Issue one per sender: scripts/nano vector-client-cert <name>  (prints the Vector sink config;")
+            eprint("!! on a role-split cluster, on the first app host)")
+        if not role_env:
+            expiring = self.runner.run(
+                ["bash", str(helper), "expiring", "--pki-dir", str(self.install_dir / ".nano-pki/vector-native"),
+                 "--tls-dir", str(tls_dir)], timeout=60, check=False)
+            for line in (expiring.stdout or "").splitlines():
+                if line.strip():
+                    eprint(f"warning: {line.strip()}")
+
     def _network_pin_owned(self) -> bool:
         """NAN-5435: a canonical single node, where install.sh pins nano's
         Compose network; role-split hosts and legacy layouts never pin."""
@@ -2814,6 +3026,7 @@ class LocalOps:
     ) -> subprocess.CompletedProcess[str]:
         if arguments and arguments[0] == "up":
             self._ensure_network_pin()
+            self._ensure_vector_native_pki()
         return self.runner.run(
             [*self.compose_args, *arguments], timeout=timeout,
             input_text=input_text, check=check, env=env,
@@ -3092,6 +3305,13 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         retag: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         load_environment = dict(env or os.environ)
+        # NAN-5524: the loader pulls only nano's private images with the
+        # private docker config; every other image keeps the user's own.
+        session = getattr(self, "_registry_docker_config", None)
+        if session is not None and session.logged_in and session.path is not None:
+            load_environment["NANO_REGISTRY_DOCKER_CONFIG"] = str(session.path)
+        else:
+            load_environment.pop("NANO_REGISTRY_DOCKER_CONFIG", None)
         # The loader selects this host's images from its roles; pass them
         # explicitly instead of relying on the worker's working directory.
         if getattr(self, "role_env", None) and getattr(self, "roles", None):
@@ -3115,7 +3335,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         target = f"{head}/{last.split(':', 1)[0]}@{digest}"
         probe = self.runner.run(
             ["docker", "buildx", "imagetools", "inspect", "--raw", target],
-            timeout=60, check=False,
+            timeout=60, check=False, env=self._registry_env(),
         )
         if probe.returncode == 0:
             return f"registry accepted this host's credential for {head.split('/', 1)[0]}"
@@ -3131,6 +3351,125 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             f"({detail[-160:] or f'exit {probe.returncode}'}): log in again with a fresh "
             "pull credential from app.nano.rs, then rerun"
         )
+
+    def _license_registry_login(self, manifest: dict[str, Any]) -> str:
+        """NAN-5509: before the preflight pull, the license-API registry login."""
+        refs = []
+        for image in private_registry_images(manifest):
+            ref, digest = str(image.get("ref", "")), str(image.get("digest", ""))
+            head, _, last = ref.rpartition("/")
+            repository = f"{head}/{last.split('@', 1)[0].split(':', 1)[0]}" if head else ref
+            refs.append(f"{repository}@{digest}" if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) else ref)
+        # NAN-5518: even when this release's images are already local (a
+        # --resume after the first run pulled them): the registry-pull check
+        # right after still asks the registry, and without this the helper
+        # skipped the login and check_registry_login refused.
+        return self._registry_login_with_license(refs, even_if_local=True)
+
+    def _registry_license_online(self) -> bool:
+        """True when .env holds an online license the helper can fetch a
+        registry credential with (registry-login.sh's own rule: not offline
+        or airgap, LICENSE_TOKEN (or DEPLOYMENT_TOKEN) and NANO_DEPLOYMENT_ID)."""
+        env = getattr(self, "env", None) or {}
+        if env.get("NANO_LICENSE_MODE", "").strip() in {"offline", "airgap"}:
+            return False
+        if env.get("AIRGAP_MODE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return False
+        token = env.get("LICENSE_TOKEN", "").strip() or env.get("DEPLOYMENT_TOKEN", "").strip()
+        return bool(token and env.get("NANO_DEPLOYMENT_ID", "").strip())
+
+    def _private_lock_refs(self) -> list[str]:
+        """This install's private images (repo@digest) from the control tree's
+        enterprise locks, for steps that run without the bundle manifest."""
+        prefix = (getattr(self, "env", None) or {}).get("NANO_IMAGE_PREFIX", "")
+        if not prefix:
+            return []
+        refs: list[str] = []
+        for name in ("images.enterprise.customer.lock", "images.enterprise.lock"):
+            path = self.install_dir / name
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+            except OSError:
+                continue
+            for line in lines:
+                fields = line.split()
+                if (
+                    len(fields) >= 2 and fields[0].startswith(f"{prefix}-")
+                    and re.fullmatch(r"sha256:[0-9a-f]{64}", fields[1])
+                    and image_needs_registry_login(fields[0])
+                ):
+                    refs.append(f"{fields[0]}@{fields[1]}")
+        return list(dict.fromkeys(refs))
+
+    def _registry_login_with_license(self, refs: list[str], *, even_if_local: bool = False) -> str:
+        """NAN-5509: log docker in with a pull credential from the license API.
+
+        Runs scripts/lib/registry-login.sh, the wrapper around install.sh's own
+        helper (scripts/lib/image-pull.sh), so install and upgrade share one
+        implementation. The wrapper reads the license values from .env itself:
+        the token never passes through argv or the environment. Returns a
+        detail for the check, "" when nothing was needed (images local, a
+        working login, or a license that is not online); raises UpgradeError
+        with the helper's own explanation when the credential cannot be had.
+        `even_if_local` still checks the login when the images are local (a
+        later pull of a present digest still asks the registry).
+        """
+        helper = SCRIPT_DIR / "lib" / "registry-login.sh"
+        if not refs or not helper.is_file():
+            return ""
+        # NAN-5524: the login goes into a private, temporary docker config,
+        # never the user's own (see PrivateDockerConfig).
+        session = self._registry_session()
+        argv = [
+            "bash", str(helper), "--env-file", str(self.install_dir / ".env"),
+            "--docker-config", str(session.ensure()),
+        ]
+        if even_if_local:
+            argv.append("--even-if-local")
+        result = self.runner.run(argv, input_text="\n".join(refs) + "\n", timeout=300, check=False)
+        messages = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+        if result.returncode != 0:
+            reason = next(
+                (line for line in reversed(messages) if not line.startswith(("==>", "ok:"))),
+                f"exit {result.returncode}",
+            )
+            raise UpgradeError(f"could not get a registry pull credential from the license API: {reason[:600]}")
+        outcome = ((result.stdout or "").strip().splitlines() or [""])[-1]
+        if outcome.startswith("logged-in "):
+            registry = outcome.split(" ", 1)[1].strip()
+            session.logged_in = True
+            return f"logged in to {registry} with a pull credential from the license API"
+        return ""
+
+    def _registry_session(self) -> "PrivateDockerConfig":
+        session = getattr(self, "_registry_docker_config", None)
+        if session is None:
+            session = PrivateDockerConfig()
+            self._registry_docker_config = session
+        return session
+
+    def _registry_env(self, base: dict[str, str] | None = None) -> dict[str, str] | None:
+        """NAN-5524: the environment for a docker command that may need the
+        license-API credential: DOCKER_CONFIG points at the private config
+        while this process's login is in use. None (inherit) otherwise, so a
+        host whose own docker login works keeps using it untouched."""
+        session = getattr(self, "_registry_docker_config", None)
+        if session is None or not session.logged_in or session.path is None:
+            return base
+        environment = dict(base if base is not None else os.environ)
+        environment["DOCKER_CONFIG"] = str(session.path)
+        return environment
+
+    def _registry_forget_ours(self) -> None:
+        """Drop the credential the license helper fetched: remove the private
+        docker config it lives in. No `docker logout` (that would delete a
+        customer's own entry for the registry) and the user's docker config is
+        never touched. Also removes the marker file older upgraders left."""
+        session = getattr(self, "_registry_docker_config", None)
+        if session is not None:
+            session.close()
+        with contextlib.suppress(OSError):
+            (self.install_dir / REGISTRY_LOGIN_MARKER).unlink()
 
     def _pull_registry_images(self, bundle: pathlib.Path, manifest: dict[str, Any] | None = None) -> str:
         auth = self._registry_auth_probe(manifest or {})
@@ -3591,6 +3930,125 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     raise UpgradeError(f"published port {published} is owned by an unexpected container")
                 checked += 1
         return f"{checked} published port binding(s) are free or owned by this install"
+
+    def _record_running_overlays(self) -> str:
+        """NAN-5521: a single node started before 2.0.30 with
+        NANO_COMPOSE_OVERLAYS (docker-compose.tls.yml) in the environment only
+        runs overlays .env does not list; recreating nginx without them turns
+        HTTPS off while the probes on :80 still pass. Append them to .env
+        (validated: named, regular files in the install directory). Only ever
+        adds: the overlays .env records, managed ones included, stay. A dry
+        run reports and writes nothing."""
+        if not all(hasattr(self, name) for name in ("env", "env_file", "runner", "install_dir")):
+            return "not checked (no single-node install context)"
+        recorded = self.env.get("NANO_COMPOSE_OVERLAYS", "").split()
+        running = running_compose_overlays(
+            self.runner, self.install_dir, self.env.get("COMPOSE_PROJECT_NAME", ""),
+        )
+        if running is None:
+            return "running overlays not determinable; using .env as recorded"
+        missing = [overlay for overlay in running if overlay not in recorded]
+        if not missing:
+            return f"overlays in .env match the running stack ({' '.join(recorded) or 'none'})"
+        value = " ".join([*recorded, *missing])
+        reason = f"the running stack uses {' '.join(missing)}, which .env did not list"
+        if getattr(self, "dry_run", False):
+            eprint(f"Dry run: the upgrade would record NANO_COMPOSE_OVERLAYS={value} in .env ({reason}).")
+            return f"would record NANO_COMPOSE_OVERLAYS={value} in .env ({reason}); dry run, not written"
+        self.env_file.replace_many({"NANO_COMPOSE_OVERLAYS": value})
+        self.env = self.env_file.values()
+        self.compose_args = self._compose_args()
+        eprint(f"Recorded NANO_COMPOSE_OVERLAYS={value} in .env ({reason}); this upgrade and later runs keep it.")
+        return f"recorded NANO_COMPOSE_OVERLAYS={value} in .env ({reason})"
+
+    def _check_vector_native_port(self) -> str:
+        if getattr(self, "legacy_layout", None) is not None or "ingest" not in getattr(self, "roles", ()):
+            return "no Vector-native listener on this host"
+        if not hasattr(self, "runner") or not hasattr(self, "compose_args"):
+            return "not checked (no install context)"
+        if os.environ.get("NANO_SKIP_PORT_CHECK") == "1":
+            return "skipped (NANO_SKIP_PORT_CHECK=1)"
+        role_env = getattr(self, "role_env", None) or {}
+        env = getattr(self, "env", None) or {}
+        key = "NANO_VECTOR_NATIVE_BIND_ADDRESS"
+        bind = role_env.get(key) or env.get(key) or ""
+        if not bind and role_env:
+            bind = role_env.get("NANO_CLUSTER_BIND_ADDRESS") or env.get("NANO_CLUSTER_BIND_ADDRESS") or ""
+        bind = bind or "0.0.0.0"
+        port = VECTOR_NATIVE_PORT
+        own_result = self.compose(["ps", "--format", "{{.Ports}}"], timeout=30, check=False)
+        if own_result.returncode != 0:
+            # Without this install's own bindings its docker-proxy would read
+            # as a foreign listener: never refuse on a guess.
+            return f"port {port} not checked (could not list this install's published ports)"
+        own = published_addresses(own_result.stdout or "", port)
+        own_wildcard = bool(own & WILDCARD_ADDRESSES)
+        listeners = host_tcp_listeners(port, getattr(self, "proc_net", PROC_NET))
+        if listeners is None:
+            if own:
+                return f"port {port} is published by this install"
+            probe = socket.socket(socket.AF_INET6 if ":" in bind else socket.AF_INET, socket.SOCK_STREAM)
+            # TIME_WAIT leftovers are not a listener.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((bind.strip("[]"), port))
+                return f"port {port} is free on {bind}"
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    return f"port {port} on {bind} not checked ({error.strerror})"
+                blocking = [bind]
+            finally:
+                probe.close()
+        else:
+            blocking = [
+                listener for listener in listeners
+                if listener_blocks_bind(listener, bind)
+                and not (listener in own or (own_wildcard and listener in WILDCARD_ADDRESSES))
+            ]
+        if not blocking:
+            return f"port {port} is free on {bind} (or held by this install)"
+        holder = ""
+        with contextlib.suppress(UpgradeError):
+            result = self.runner.run(["ss", "-ltnp", f"sport = :{port}"], timeout=10, check=False)
+            match = re.search(r'users:\(\("([^"]+)",pid=(\d+)', result.stdout or "")
+            if match:
+                holder = f"{match.group(1)} (pid {match.group(2)})"
+        holder = holder or f"another process (see which: sudo ss -ltnp 'sport = :{port}')"
+        raise UpgradeError(
+            f"port {port} (Vector native, mutual TLS) is already in use on this host by {holder} "
+            f"on {', '.join(blocking)}; this release publishes it on {bind}"
+            f"{' (every interface, the new default)' if bind in WILDCARD_ADDRESSES else ''}, so Vector "
+            "would fail to start mid-rollout and stop all ingest. Stop that process, or set "
+            "NANO_VECTOR_NATIVE_BIND_ADDRESS in .env to a specific free address of this host "
+            "(127.0.0.1 if no remote sender uses :6000), then re-run. Nothing was changed"
+        )
+
+    def vector_native_cutover_summary(self) -> list[str]:
+        """NAN-5521: the :6000 mutual-TLS notice for the final summary when
+        this run turned it on, with the last 24 h vector_native event count
+        (NAN-5523: from the table the install's schema profile writes)."""
+        if not getattr(self, "vector_native_cutover", False):
+            return []
+        lines = [
+            "!! Vector native port 6000 now REQUIRES mutual TLS (NAN-5515).",
+            "!! Senders without a client certificate from this install's Vector-native anchors are refused.",
+        ]
+        count = ""
+        with contextlib.suppress(UpgradeError, OSError):
+            query = self.runner.run(
+                ["bash", str(self.install_dir / "scripts/lib/vector-native-pki.sh"), "events-query",
+                 "--profile", getattr(self, "schema_profile", "") or ""],
+                timeout=20, check=False,
+            )
+            if query.returncode == 0 and (query.stdout or "").strip():
+                count = self._ch_query(query.stdout.strip(), timeout=30).strip()
+        if count.isdigit():
+            lines.append(
+                f"!! In the last 24 hours this install took {count} event(s) on :6000 (source_type=vector_native);"
+            )
+            lines.append("!! senders that sent them without a client certificate are refused from now on.")
+        lines.append("!! Issue one per sender: scripts/nano vector-client-cert <name>  (prints the Vector sink config)")
+        return lines
 
     def _check_compose(self) -> str:
         # NAN-5470: the v2.0.28 Compose file requires the workload-identity
@@ -4380,6 +4838,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             except (UpgradeError, OSError, ValueError, json.JSONDecodeError) as error:
                 checks.append(Check(name, False, str(error), self.host_name))
 
+        # NAN-5521: first, so every later check and the rollout compose the
+        # graph the stack actually runs (HTTPS stays on).
+        if not getattr(self, "role_env", None) and getattr(self, "legacy_layout", None) is None:
+            check("compose-overlays", self._record_running_overlays)
         check("disk", lambda: self._check_disk(manifest, bundle, prepared))
         # NAN-5285 F1: every host that writes a backup component (PostgreSQL
         # on whichever member leads at backup time; ClickHouse only with
@@ -4405,17 +4867,31 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 login: list[str] = []
 
                 def registry_login() -> str:
-                    detail = check_registry_login(manifest)
+                    # NAN-5509: the same one-hour license-API credential
+                    # install.sh fetches before its pull (install.sh never
+                    # leaves one behind, so there is never one left).
+                    licensed = self._license_registry_login(manifest)
+                    env = self._registry_env()
+                    detail = check_registry_login(
+                        manifest, online_license=self._registry_license_online(),
+                        docker_config=env.get("DOCKER_CONFIG") if env else None,
+                    )
+                    if licensed:
+                        detail = f"{licensed}; {detail}"
                     login.append(detail)
                     return detail
 
-                check("registry-login", registry_login)
-                if login:
-                    # NAN-5251: pull (and digest-check) this host's images now,
-                    # before the backup and before any host restarts, so an
-                    # expired or unreachable registry fails while nothing has
-                    # changed. Pulling only fills the local image cache.
-                    check("registry-pull", lambda: self._pull_registry_images(bundle, manifest))
+                try:
+                    check("registry-login", registry_login)
+                    if login:
+                        # NAN-5251: pull (and digest-check) this host's images now,
+                        # before the backup and before any host restarts, so an
+                        # expired or unreachable registry fails while nothing has
+                        # changed. Pulling only fills the local image cache.
+                        check("registry-pull", lambda: self._pull_registry_images(bundle, manifest))
+                finally:
+                    # NAN-5524: prepare fetches its own credential.
+                    self._registry_forget_ours()
         if (
             manifest.get("source") != "registry"
             and str(manifest.get("version", "")) != nano_legacy_bridge.TARGET_VERSION
@@ -4442,6 +4918,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         check("rendered-config", self._check_compose)
         check("runtime-config", self._check_runtime_config)
         check("ports", self._check_ports)
+        # NAN-5521: a host process (not a container) on :6000, which this
+        # release publishes on every interface by default, fails vector-netns
+        # mid-rollout and stops all ingest. Refuse before anything changes.
+        check("vector-native-port", self._check_vector_native_port)
         # NAN-5411: an extracted release package replaces tenzir/pipeline.tql;
         # refuse before the rollout recreates Tenzir over an edited one.
         check("tenzir-pipeline", self._check_tenzir_pipeline)
@@ -5407,10 +5887,22 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         # install's NANO_IMAGE_PREFIX. The legacy bridge selects its own names,
         # and so does the legacy transition (NANO_IMAGE_PREFIX from the bundle's
         # own enterprise lock), as preflight's bundle-image-names check assumes.
-        loaded = self._bundle_load(bundle, load_environment, retag=not (
-            legacy_bridge or getattr(self, "legacy_layout", None) is not None
-            or getattr(self, "transition_record", self.install_dir / ".nano-legacy-transition.json").is_file()
-        ))
+        if is_compose_package(bundle) and not legacy_bridge:
+            # NAN-5509: the preflight's one-hour credential may have expired
+            # during the backup; refresh it (or keep a login that still works).
+            # Best effort: when it cannot, the pull below names the real error.
+            try:
+                self._registry_login_with_license(self._private_lock_refs(), even_if_local=True)
+            except UpgradeError as error:
+                eprint(f"warning: {error}; pulling with this host's current docker login")
+        try:
+            loaded = self._bundle_load(bundle, load_environment, retag=not (
+                legacy_bridge or getattr(self, "legacy_layout", None) is not None
+                or getattr(self, "transition_record", self.install_dir / ".nano-legacy-transition.json").is_file()
+            ))
+        finally:
+            # The last pull of the upgrade: drop a login the license helper made.
+            self._registry_forget_ours()
         if loaded.returncode != 0:
             # `nano bundle` prints one safe reason line (no credentials).
             reason = (loaded.stderr or "").strip().splitlines()
@@ -6398,6 +6890,35 @@ printf 'consumer generation %s ready\n' "$generation"
         if "ingest-edge" in selected:
             self._wait_services(("ingest-edge",), timeout)
 
+    def _netns_detached(self, services: Iterable[str]) -> list[str]:
+        """Running vector / vector-tap containers not in the CURRENT
+        vector-netns namespace (NAN-5525). Best effort: [] when unknown."""
+        candidates = [s for s in services if s in ("vector", "vector-tap")]
+        if not candidates:
+            return []
+        try:
+            anchor = self.compose(["ps", "-q", "vector-netns"], timeout=30).stdout.split()
+            if len(anchor) != 1:
+                return []
+            detached: list[str] = []
+            for service in candidates:
+                ids = self.compose(["ps", "-q", service], timeout=30).stdout.split()
+                for container in ids:
+                    mode = self.runner.run(
+                        ["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", container],
+                        timeout=30, check=False,
+                    ).stdout.strip()
+                    if not mode.startswith("container:"):
+                        continue
+                    target = mode.split(":", 1)[1]
+                    # ps -q and NetworkMode may differ in ID length.
+                    if not (target.startswith(anchor[0]) or anchor[0].startswith(target)):
+                        detached.append(service)
+                        break
+            return detached
+        except Exception:  # noqa: BLE001 - a probe; never fails the rollout
+            return []
+
     def _up_ingest_services(
         self, services: Iterable[str], timeout: int, *, exact: bool = False,
         on_vector_ready: Callable[[], Any] | None = None,
@@ -6407,9 +6928,17 @@ printf 'consumer generation %s ready\n' "$generation"
         ]
         before_edge = [service for service in selected if service != "ingest-edge"]
         if before_edge:
+            recreate = self._recreate_args(before_edge)
+            if not recreate and self._netns_detached(before_edge):
+                # NAN-5525: Vector and its tap share vector-netns's network
+                # namespace. When the anchor was recreated (its published
+                # ports changed) but their own definitions did not, Compose
+                # may keep them in the old, dead namespace; checked against
+                # the running state, so a resumed upgrade is covered too.
+                recreate = ["--force-recreate"]
             self.compose(
                 ["up", "-d", "--no-deps", "--pull", "never",
-                 *self._recreate_args(before_edge), *before_edge],
+                 *recreate, *before_edge],
                 timeout=timeout,
             )
             if on_vector_ready is not None and "vector" in before_edge:
@@ -6924,11 +7453,15 @@ printf 'consumer generation %s ready\n' "$generation"
                             # NAN-5488: no new events while Vector drains.
                             self._close_ingest_edge()
                         self._drain_vector(min(timeout, 300))
-                        # NAN-5250: the namespace anchor publishes Vector's
-                        # ports (the monitoring host scrapes :9598 through it).
-                        # Recreated only when its definition changed; Vector
-                        # is drained and recreated right after.
-                        if self._monitoring_enabled() and self._service_expected("vector-netns"):
+                        # NAN-5250 / NAN-5525: the namespace anchor publishes
+                        # Vector's ports: the monitoring host scrapes :9598
+                        # through it, and from 2.0.30 Vector native :6000
+                        # moves off loopback to the ingest interface (mTLS,
+                        # NAN-5515). Not only with monitoring on: `up -d`
+                        # recreates it whenever its definition changed (a
+                        # no-op otherwise); Vector is drained and recreated
+                        # right after.
+                        if self._service_expected("vector-netns"):
                             self.compose([
                                 "up", "-d", "--no-deps", "--pull", "never",
                                 *self._recreate_args(["vector-netns"]), "vector-netns",
@@ -7045,14 +7578,27 @@ printf 'consumer generation %s ready\n' "$generation"
             service_version = str(health.get("version", "unavailable"))
         return {"release": target, "service_version": service_version, "first_party_images": first_party}
 
+    def _single_node_tls_edge(self) -> bool:
+        """NAN-5511: the single-node nginx serves HTTPS on :443 and only
+        301-redirects :80, so loopback probes must use https (the certificate
+        names the public host, so they skip verification). Same rule as
+        install.sh (NAN-5124): the TLS overlay on a single node; a role-split
+        host never composes NANO_COMPOSE_OVERLAYS."""
+        if getattr(self, "role_env", None):
+            return False
+        overlays = (getattr(self, "env", None) or {}).get("NANO_COMPOSE_OVERLAYS", "")
+        return TLS_OVERLAY in overlays.split()
+
     def _probe_app_route(self) -> dict[str, Any]:
         internal_scheme = "https" if self.role_env.get("NANO_PRIVATE_TLS") == "true" else "http"
         legacy_bridge = getattr(self, "_legacy_bridge_rollout", False)
-        nginx_url = (
-            "https://127.0.0.1:443/api/users/me"
-            if legacy_bridge
-            else "http://127.0.0.1:80/api/health"
-        )
+        if legacy_bridge:
+            nginx_url = "https://127.0.0.1:443/api/users/me"
+        elif self._single_node_tls_edge():
+            # NAN-5511: verification is skipped for https URLs below.
+            nginx_url = "https://127.0.0.1:443/api/health"
+        else:
+            nginx_url = "http://127.0.0.1:80/api/health"
         routes = [
             ("nginx", nginx_url),
             ("app-internal-edge", f"{internal_scheme}://127.0.0.1:3000/health"),
@@ -7165,11 +7711,13 @@ else
   exit 127
 fi
 '''
-        ingest_url = (
-            "https://127.0.0.1:443/ingest/"
-            if getattr(self, "_legacy_bridge_rollout", False)
-            else "http://127.0.0.1:80/ingest"
-        )
+        if getattr(self, "_legacy_bridge_rollout", False):
+            ingest_url = "https://127.0.0.1:443/ingest/"
+        elif self._single_node_tls_edge():
+            # NAN-5511: :80 only 301s here; curl -f counts a 301 as success.
+            ingest_url = "https://127.0.0.1:443/ingest"
+        else:
+            ingest_url = "http://127.0.0.1:80/ingest"
         # NAN-5419: a single host has no consumer/edge readiness gate, and a
         # resumed run may get here while a just-recreated Vector is still
         # compiling: wait for it, then retry "not listening yet" answers.
@@ -8135,8 +8683,53 @@ def private_registry_images(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def check_registry_login(manifest: dict[str, Any]) -> str:
-    """Pulls happen mid-upgrade; refuse up front when no credential is configured."""
+# NAN-5509: the registry a license-API login of an older upgrader logged in
+# to. NAN-5524 no longer writes it; it is only removed when found.
+REGISTRY_LOGIN_MARKER = ".nano-registry-login"
+
+
+class PrivateDockerConfig:
+    """NAN-5524: a private, temporary DOCKER_CONFIG for the license-API login.
+
+    The one-hour pull credential is written here (by registry-login.sh), never
+    into the user's own docker config: an interrupt cannot leave it behind
+    there, a customer's own entry for the registry is never overwritten or
+    logged out, and a credential helper configured for the registry is never
+    in the way. The directory is a mkdtemp (0700); close() removes it, and an
+    atexit hook backs that up (SIGTERM/SIGHUP raise SystemExit through
+    install_termination_handlers, Ctrl-C raises KeyboardInterrupt, so both
+    unwind through `finally` and atexit). registry-login.sh writes its
+    config.json with the user's CLI plugin dirs and current context."""
+
+    def __init__(self) -> None:
+        self.path: pathlib.Path | None = None
+        self.logged_in = False
+        self._hooked = False
+
+    def ensure(self) -> pathlib.Path:
+        if self.path is None or not self.path.is_dir():
+            self.path = pathlib.Path(tempfile.mkdtemp(prefix="nano-docker-config."))
+            self.path.chmod(0o700)
+            self.logged_in = False
+            if not self._hooked:
+                atexit.register(self.close)
+                self._hooked = True
+        return self.path
+
+    def close(self) -> None:
+        path, self.path, self.logged_in = self.path, None, False
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def check_registry_login(
+    manifest: dict[str, Any], *, online_license: bool = False, docker_config: str | None = None,
+) -> str:
+    """Pulls happen mid-upgrade; refuse up front when no credential is configured.
+
+    `online_license`: .env holds an online license (NAN-5518: the refusal only
+    says "no online license" when that is true). `docker_config`: the private
+    config the license-API login wrote (NAN-5524), else this user's own."""
     if manifest.get("edition") != "enterprise":
         return "open images come from a public registry"
     registries = sorted({
@@ -8145,7 +8738,7 @@ def check_registry_login(manifest: dict[str, Any]) -> str:
     })
     if not registries:
         return "no private registry images"
-    config_dir = pathlib.Path(os.environ.get("DOCKER_CONFIG") or pathlib.Path.home() / ".docker")
+    config_dir = pathlib.Path(docker_config or os.environ.get("DOCKER_CONFIG") or pathlib.Path.home() / ".docker")
     try:
         config = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -8162,10 +8755,23 @@ def check_registry_login(manifest: dict[str, Any]) -> str:
             key == registry or key.rstrip("/").endswith(f"//{registry}") for key in auths
         )
     ]
+    if missing and online_license:
+        raise UpgradeError(
+            f"not logged in to {', '.join(missing)}: the license-API login did not leave a docker login "
+            "for it in this user's docker config "
+            f"({config_dir / 'config.json'}). Rerun as the same user that runs scripts/nano upgrade, "
+            "not with sudo (root's docker login is not this user's), or log in with a registry pull "
+            f"credential from app.nano.rs (docker login {missing[0]} -u oauth2accesstoken --password-stdin; "
+            "it lasts about an hour), then rerun"
+        )
     if missing:
         raise UpgradeError(
-            f"not logged in to {', '.join(missing)}: log in with a fresh registry credential "
-            "from app.nano.rs on this host (it lasts about an hour), then rerun"
+            f"not logged in to {', '.join(missing)}, and this install has no online license "
+            "(LICENSE_TOKEN and NANO_DEPLOYMENT_ID in .env) to get a credential from: log in with a "
+            f"registry pull credential from app.nano.rs (docker login {missing[0]} -u oauth2accesstoken "
+            "--password-stdin; it lasts about an hour) as the same user that runs scripts/nano upgrade, "
+            "not with sudo (root's docker login is not this user's), or load the offline image bundle, "
+            "then rerun"
         )
     return f"logged in to {', '.join(registries)}"
 
@@ -9520,6 +10126,8 @@ def upgrade_command(args: argparse.Namespace) -> int:
             recover_legacy_backup_services(install_dir, runner)
         eprint("Recovered the exact legacy service set stopped by the interrupted backup.")
     ops = LocalOps(install_dir, nano_cli, runner)
+    # NAN-5521: preflight's overlay check reports, never writes, on a dry run.
+    ops.dry_run = bool(getattr(args, "dry_run", False))
     if args.test_license_rehearsal:
         if ops.edition != "enterprise":
             raise UpgradeError("--test-license-rehearsal is enterprise-only")
@@ -10172,6 +10780,9 @@ def upgrade_command(args: argparse.Namespace) -> int:
             )
             print(f"Upgrade complete: {installed_version} -> {target}")
             print(f"Journal: {state.journal}")
+            with contextlib.suppress(Exception):
+                for line in ops.vector_native_cutover_summary():
+                    print(line)
             return 0
         except BaseException as error:
             if state is not None:

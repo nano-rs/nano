@@ -1581,7 +1581,10 @@ def ensure_keys(install_dir: pathlib.Path, prompter: "Prompter | None", say: Cal
         else:
             say(f"The recovery key is still at {recovery}. Delete it once you have a copy elsewhere.")
     else:
-        say(f"Unattended install: move {recovery} off this server, then delete it.")
+        # install.sh hands over its answers non-interactively (NAN-5508): the
+        # key is never deleted mid-install; copying it off needs a second
+        # terminal, so the installer only says where it is.
+        say(f"Copy or move {recovery} off this server (scp, a vault or a password manager), then delete it here.")
     say("")
 
 

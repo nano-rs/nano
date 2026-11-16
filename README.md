@@ -73,9 +73,9 @@ when it finishes.
 
 **Prereqs:** Docker, docker compose v2, git, openssl, curl.
 
-**Minimum host:** 2 vCPU, 4 GB RAM — the lowest stable spec, suitable for up to ~10 GB/day of ingest. Below this, ClickHouse and the API will OOM under load.
+**Minimum host:** 2 vCPU, 8 GB RAM and 40 GB free on Docker's data disk for a lab install with the enrichment feeds off (`PLATFORM_FEEDS_AUTO_UPDATE=false`); 16 GB RAM with the feeds on. Up to 5 GB/day, plan 4 vCPU / 16 GB. `install.sh` checks this before any prompt and refuses a smaller host (`NANO_SKIP_HOST_MINIMUMS=1` installs anyway, unsupported).
 
-**Hardware sizing:** `install.sh` detects CPU and RAM on every install or rerun and scales ClickHouse query/merge/insert settings, PostgreSQL, Vector, and the containers while reserving host headroom. The 2 vCPU / 4 GB floor keeps ClickHouse at 2 GB with the NAN-4988 admission limits. Add any setting after the installer-owned sizing block in `.env` to pin an operator override.
+**Hardware sizing:** `install.sh` detects CPU and RAM on every install or rerun and scales ClickHouse query/merge/insert settings, PostgreSQL, Vector, and the containers while reserving host headroom. On a small host it never sizes nano-api below what it needs to start; a host that cannot fund it is refused. Add any setting after the installer-owned sizing block in `.env` to pin an operator override.
 
 **ClickHouse memory:** without enrichment, 2–4 GB for ClickHouse is fine for small and test tenants. **Enrichment (the IPinfo, Tor and ThreatFox feeds, on by default) requires 6 GB:** use a larger host or set `CLICKHOUSE_MEM_LIMIT=6G` in `.env`, or turn the feeds off with `PLATFORM_FEEDS_AUTO_UPDATE=false`. Plan for 6 GB if you enrich. With too little memory the IP dictionary cannot load: events get no geo/ASN, ingest keeps working, and SIEM Health shows the dictionary failing and how much memory the dictionaries take. `install.sh` prints a notice when feeds are on and the limit is below 6 GB.
 

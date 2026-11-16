@@ -1004,7 +1004,8 @@ export function RuleEditorRedesign() {
   const handleRunTest = useCallback(async () => {
     try {
       let result: TestDetectionResult;
-      if (id && !isNewMode) {
+      // NAN-5501: unsaved edits must be tested as edited, not as persisted.
+      if (id && !isNewMode && editorContent === savedContent) {
         result = await testDetectionMut({ id, days: 7 });
       } else {
         if (!actualQuery.trim()) {
@@ -1022,7 +1023,7 @@ export function RuleEditorRedesign() {
     } catch (e: unknown) {
       toast.error('Test failed', { description: e instanceof Error ? e.message : 'Unknown error' });
     }
-  }, [id, isNewMode, actualQuery, testDetectionMut, testQueryMut]);
+  }, [id, isNewMode, actualQuery, editorContent, savedContent, testDetectionMut, testQueryMut]);
 
   const lastSavedLabel = useMemo(() => {
     if (!apiRule?.updated_at) return undefined;
@@ -1258,7 +1259,10 @@ export function RuleEditorRedesign() {
         open={testDrawerOpen}
         onClose={() => setTestDrawerOpen(false)}
         query={actualQuery}
-        ruleId={isNewMode ? undefined : id}
+        // NAN-5501: the saved-rule endpoint tests the PERSISTED rule, so only
+        // use it while the editor matches what's saved — otherwise the drawer
+        // would run the stale rule instead of the one being edited.
+        ruleId={isNewMode || editorContent !== savedContent ? undefined : id}
         runSavedTest={testDetectionMut}
         runUnsavedTest={testQueryMut}
         onApplyQuery={

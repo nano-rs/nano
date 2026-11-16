@@ -143,11 +143,13 @@ def _run(
     *,
     input_bytes: bytes | None = None,
     error: str,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     try:
         proc = subprocess.run(
             list(argv),
             input=input_bytes,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -1042,6 +1044,19 @@ def install_image_retags(
     return pairs
 
 
+def _private_pull_env(ref: str) -> dict[str, str] | None:
+    """NAN-5524: `scripts/nano upgrade` logs in to nano's private registry
+    under a private, temporary docker config (NANO_REGISTRY_DOCKER_CONFIG),
+    never the user's own. Only a private image pulls with it; every other
+    image keeps the user's own docker config (their Docker Hub login, a
+    mirror's credential helper)."""
+    private_config = os.environ.get("NANO_REGISTRY_DOCKER_CONFIG", "")
+    prefix = os.environ.get("NANO_PRIVATE_IMAGE_PREFIX") or "us-central1-docker.pkg.dev/nano-rs/"
+    if not private_config or not ref.startswith(prefix):
+        return None
+    return dict(os.environ, DOCKER_CONFIG=private_config)
+
+
 def load_registry_images(
     verified: VerifiedBundle,
     *,
@@ -1063,6 +1078,7 @@ def load_registry_images(
                 f"cannot pull {immutable} (log in to {ref.split('/', 1)[0]} with a fresh "
                 "registry credential on this host, then retry)"
             ),
+            env=_private_pull_env(immutable),
         )
         image_id, repo_digests = _docker_identity(docker, immutable)
         if not _digest_matches(immutable, digest, image_id, repo_digests):

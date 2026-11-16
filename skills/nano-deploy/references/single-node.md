@@ -197,7 +197,9 @@ The installer never changes the firewall. Propose rules and apply them only if
 the operator asks you to. Allow 443 (and 80 for redirects) from users, and
 only the ingest ports in use from the log sources. HTTP ingest goes through
 nginx on 80/443 at `/ingest`; Vector's 8080 and the HEC port 8088 are
-token-gated. Keep 6000, 4317, 4318 and 24224 on loopback (the default).
+token-gated. Vector native 6000 is mutual TLS only (client certificates from
+`scripts/nano vector-client-cert <name>`); allow it only from the senders that
+use it. Keep 4317, 4318 and 24224 on loopback (the default).
 Docker-published ports bypass UFW's `INPUT` rules: enforce source limits in
 the `DOCKER-USER` chain, as described in [multi-node-ha.md](multi-node-ha.md#firewall).
 

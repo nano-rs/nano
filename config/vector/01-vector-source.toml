@@ -5,21 +5,41 @@
 # Use case: On-premise Vector aggregator forwarding to cloud SIEM
 # Events arrive pre-structured, minimal processing needed
 #
-# NAN-4907: this listener has NO credential check (the vector source has no
-# auth option), so it can never decide a source the way an ingest token does.
-# Its events land under the fixed route `vector_native` and a declared
-# `.source_type` survives only as `claimed_source_type`, so a sender that can
-# reach :6000 cannot select a parser. A deployment that trusts every sender
-# on this port (private network, upstream aggregators it controls) can opt
-# back into the declared type with NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=true.
-# Keep the port off untrusted networks either way (the open-core compose binds
-# it to loopback by default).
-
-# NAN-5268: the Helm chart binds it to loopback unless vector.native.enabled.
+# NAN-5515: ALWAYS mutual TLS. The Vector protocol has no token auth, so the
+# client certificate is the credential: a sender must present a certificate
+# that chains to an anchor in tls.ca_file, or the TLS handshake is refused
+# before any event is read. There is no plaintext mode and no switch to turn
+# verification off. Issue sender certificates with
+# `scripts/nano vector-client-cert <name>` (Compose) or from the chart's
+# Secrets (Helm, docs/getting-started/kubernetes.md).
+#
+# tls.ca_file is a BUNDLE of per-sender anchors (one small CA per sender), so
+# revoking one sender removes only its anchor; the listener certificate comes
+# from a separate listener CA that is never in the bundle. Defaults:
+# /etc/nano/vector-native/{server.crt,server.key,client-ca.crt}; Compose
+# mounts <install>/config/vector-native there (install.sh / nano upgrade
+# issue it), role-split ingest hosts mount the cluster's private TLS
+# certificate as the listener, Helm mounts its Secrets. When a file is
+# missing or unreadable the entrypoint substitutes LOCKED material (an anchor
+# whose key never existed), so the listener refuses every sender instead of
+# falling back to plaintext.
+#
+# NAN-4907: a client certificate proves a sender may send, not which source it
+# is. Events land under the fixed route `vector_native` and a declared
+# `.source_type` survives only as `claimed_source_type`, so a sender cannot
+# select a parser. A deployment that trusts every certificate holder's
+# declared type can opt back in with NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=true.
 [sources.vector_native]
 type = "vector"
 address = "${NANO_VECTOR_NATIVE_ADDRESS:-0.0.0.0:6000}"
 version = "2"  # Vector protocol version
+tls.enabled = true
+tls.crt_file = "${NANO_VECTOR_NATIVE_CRT_FILE:-/etc/nano/vector-native/server.crt}"
+tls.key_file = "${NANO_VECTOR_NATIVE_KEY_FILE:-/etc/nano/vector-native/server.key}"
+tls.ca_file = "${NANO_VECTOR_NATIVE_CA_FILE:-/etc/nano/vector-native/client-ca.crt}"
+# Require and verify a client certificate (a connection without one, or with
+# one that chains to no anchor in the bundle, is refused).
+tls.verify_certificate = true
 
 # Acknowledgements ensure upstream Vector knows events were received
 acknowledgements.enabled = true
@@ -32,8 +52,7 @@ acknowledgements.enabled = true
 type = "remap"
 inputs = ["vector_native"]
 source = '''
-# Vector-to-Vector typically uses shared token auth at the sink level
-# Mark as authenticated (upstream already validated)
+# NAN-5515: the TLS handshake verified the sender's client certificate.
 .auth_status = "vector_forwarded"
 
 # Ensure source_type exists
@@ -44,7 +63,7 @@ if !exists(.source_type) || !is_string(.source_type) {
 # Normalize source_type to lowercase
 .source_type = downcase(to_string(.source_type) ?? "unknown")
 
-# NAN-4907: an unauthenticated sender never selects a parser route.
+# NAN-4907: a sender never selects a parser route unless trust is configured.
 del(.claimed_source_type)
 del(%nano_claimed_source_type)
 if (get_env_var("NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE") ?? "") != "true" {

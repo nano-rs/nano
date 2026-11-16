@@ -214,6 +214,26 @@ for h in $H1 $H2 $H3; do ssh $h 'stat -c "%U %a" ~/nano/.env; sha256sum ~/nano/.
 The owner must be the installer user, the mode `600`, and the digest prefixes
 must match.
 
+Vector native :6000 (mutual TLS only) needs no extra step and no CA copying.
+An ingest host's listener certificate is the cluster certificate staged in
+Step 3 (senders verify it with the cluster `ca.crt` and
+`tls.server_name = <private server name>`), and the sender anchors travel in the
+shared `.env` (`NANO_VECTOR_NATIVE_CLIENT_ANCHORS`, public certificates only).
+Issue and revoke senders on the first app host; its PKI and keys never leave it:
+
+```bash
+ssh $H1 'cd ~/nano && scripts/nano vector-client-cert edge-dc1 --address <ingest name or LB>:6000'
+```
+
+Each issue or `--revoke` changes `.env`, and the command says it is NOT yet
+effective on the ingest hosts: stream `.env` to every host as above and re-run
+each ingest host's install command (that rebuilds the bundle and restarts
+Vector). Until then a revoked sender is still accepted there. Port 6000 binds
+the inventory `bind_address`; set `NANO_VECTOR_NATIVE_BIND_ADDRESS=0.0.0.0` in
+`.env` for senders outside the private network, and allow 6000 only from the
+senders that use it. A plaintext lab cluster has no Vector-native listener (it
+stays locked).
+
 ## Step 6: ClickHouse and Keeper first, then the app, then ingest
 
 Run one host at a time and wait for each to succeed before the next:

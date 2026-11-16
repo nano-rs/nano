@@ -598,8 +598,11 @@ services:
       - "8080:8080"
       # Dedicated acknowledged enrichment lane; loopback-only on the host.
       - "127.0.0.1:8090:8090"
-      # Vector -> Vector native protocol is unauthenticated; loopback by default.
-      - "${NANO_VECTOR_NATIVE_BIND_ADDRESS:-127.0.0.1}:6000:6000"
+      # Vector -> Vector native protocol. NAN-5515: always mutual TLS (a client
+      # certificate from `scripts/nano vector-client-cert`), so it is published
+      # on the host's ingest interfaces like HEC and HTTP ingest.
+      # NANO_VECTOR_NATIVE_BIND_ADDRESS narrows it to one address.
+      - "${NANO_VECTOR_NATIVE_BIND_ADDRESS:-0.0.0.0}:6000:6000"
       # HEC
       - "8088:8088"
       # Raw OTLP is unauthenticated; loopback by default. Remote OTLP/HTTP uses
@@ -657,8 +660,8 @@ services:
       # multiplex credential when the file is missing). Default: a missing
       # file fails closed.
       NANO_INGEST_STATIC_FALLBACK: ${NANO_INGEST_STATIC_FALLBACK:-false}
-      # NAN-4907: the unauthenticated Vector-native :6000 listener routes on a
-      # fixed `vector_native` source unless this is "true" (trusted network).
+      # NAN-4907: the Vector-native :6000 listener (mutual TLS, NAN-5515)
+      # routes on a fixed `vector_native` source unless this is "true".
       NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE: ${NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE:-false}
       NANO_FUTURE_TIMESTAMP_SKEW_SECONDS: ${NANO_FUTURE_TIMESTAMP_SKEW_SECONDS:-86400}
       VECTOR_DATA_DIR: /var/lib/vector
@@ -681,6 +684,9 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_VECTOR_PASSWORD:?CLICKHOUSE_VECTOR_PASSWORD is required}
     volumes:
       - ./config/vector:/etc/vector:ro
+      # NAN-5515: the Vector-native listener certificate, key and client CA
+      # (install.sh / nano upgrade issue them; never the CA key).
+      - ./config/vector-native:/etc/nano/vector-native:ro
       - nano-vector-dynamic:/etc/vector/dynamic
       - nano-vector-data:/var/lib/vector
       # NAN-4936: source-isolation requests (outside /etc/vector, see above).

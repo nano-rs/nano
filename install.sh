@@ -7,7 +7,8 @@
 #   curl -fsSL https://get.nano.rs | bash
 #
 # What it does:
-#   1. Validates prerequisites (docker, docker compose v2, git, openssl, curl)
+#   1. Validates prerequisites (docker, docker compose v2, openssl, curl,
+#      python3; git only for a git checkout)
 #   2. Clones (or pulls) nano-rs/nano into $NANO_INSTALL_DIR (default ~/nano)
 #   3. Prompts for admin email / password / public BASE_URL and the storage
 #      schema profile (UDM or OCSF) (reads /dev/tty even when stdin is piped
@@ -19,6 +20,14 @@
 #   8. Waits for the API to report healthy
 #   9. POSTs to /api/setup/initialize to create the first admin account
 #  10. Prints the login URL
+#
+# Interactive runs (NAN-5508) ask every question first, then show a numbered
+# review screen: Enter installs, a number changes that answer, q quits with
+# nothing written. `back` (or `<`) at any prompt re-asks the previous one.
+# Nothing (no .env, secret, docker login or container) happens before Enter.
+# (A prepared .env whose admin account is not created yet still asks for the
+# admin after start, as before.)
+# A re-run that moves to a newer release says so and asks first.
 #
 # Non-interactive use: set the prompt values as env vars before running.
 #   NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL
@@ -34,8 +43,14 @@
 #   the recorded one. NANO_ADMIN_EMAIL / NANO_ADMIN_NAME are kept in .env (the
 #   password never is), so a prepare-then-install second run needs neither.
 #   Single-node in one command:
-#     NANO_IMAGES_LOCK=images.enterprise.customer.lock LICENSE_URL=… \
-#       LICENSE_TOKEN=… NANO_DEPLOYMENT_ID=… ./install.sh
+#     LICENSE_URL=… LICENSE_TOKEN=… NANO_DEPLOYMENT_ID=… ./install.sh
+#   Enterprise images (NAN-5505): the bundle's images.enterprise.customer.lock
+#   is the default lock (NANO_IMAGES_LOCK overrides it). With an online
+#   license, right before the pull the installer logs docker in to the private
+#   registry with a one-hour credential from the license API, unless the
+#   images are already local or this host's own docker login works. Offline
+#   and air-gapped installs never call the API: load the image bundle
+#   (scripts/nano bundle load) or docker login yourself first.
 #   NANO_ALLOW_PRIVATE_AI_ENDPOINTS (true | false, default false) — allow AI
 #   providers on private addresses (a local LLM); asked once, kept in .env.
 #   NANO_EGRESS_PROXY_REQUIRED (true | false) — refuse every direct public
@@ -63,6 +78,24 @@
 #   checks the disk against it (plan.py's model, scripts/lib/retention-sizing.sh):
 #   it warns when the disk holds fewer days, and a fresh install refuses a
 #   disk that holds under 7 days unless NANO_ALLOW_UNDERSIZED_DISK=true.
+#   Host size (NAN-5506, scripts/lib/host-minimums.sh): before any prompt the
+#   installer refuses a host under 2 vCPU, 8 GB RAM (16 GB with the enrichment
+#   feeds on; PLATFORM_FEEDS_AUTO_UPDATE=false for a lab install) or 40 GB free
+#   on Docker's data filesystem; role-split hosts without ClickHouse have lower
+#   floors. A host that already runs nano only gets a warning, and so does a
+#   planned volume above the recommended size. NANO_SKIP_HOST_MINIMUMS=1
+#   installs anyway with a loud warning (unsupported).
+#   Before any prompt (NAN-5509), the TLS overlay (docker-compose.tls.yml in
+#   NANO_COMPOSE_OVERLAYS) needs config/nginx/ssl/fullchain.pem and privkey.pem:
+#   present, matching and unexpired. Before the pull, every port the graph
+#   publishes must be free (NANO_SKIP_PORT_CHECK=1 skips that check).
+#   NAN-5521: on an existing install a certificate problem is a loud warning,
+#   not a refusal; NANO_SKIP_TLS_PREFLIGHT=1 skips the certificate check. A
+#   re-run without NANO_COMPOSE_OVERLAYS in the environment records in .env any
+#   overlay the running stack uses that .env lacks (so HTTPS stays on).
+#   NANO_CONFIRM_UPGRADE=1 answers the "Upgrade to X now?" question (asked on a
+#   terminal when a re-run moves to another release) with yes. Declining exits
+#   3 (answered no) or 4 (no answer: Enter or EOF); nothing is changed.
 #   Enterprise: NANO_TIERING (on | off, default off; or --tiering) and NANO_TIERING_PROVIDER (s3 |
 #   s3-compatible | gcs | azure), NANO_TIERING_BUCKET, NANO_TIERING_REGION,
 #   NANO_TIERING_ENDPOINT, NANO_TIERING_PREFIX (default nano),
@@ -96,10 +129,20 @@
 # NANO_CHECK_ONLY=1 validates the inputs, prints the resolved edition, release
 # and image source, and exits before writing .env, pulling or starting anything.
 # Set NANO_SKIP_IMAGE_VERIFY=1 to skip the image digest supply-chain check.
-# Unauthenticated ingest ports (Vector native :6000, raw OTLP :4317/:4318,
-# Fluent :24224, bundled Tenzir :9095) bind 127.0.0.1. Opt in to exposing them
-# with NANO_VECTOR_NATIVE_BIND_ADDRESS / NANO_OTLP_BIND_ADDRESS /
-# NANO_FLUENT_BIND_ADDRESS / NANO_TENZIR_BIND_ADDRESS (persisted to .env).
+# Unauthenticated ingest ports (raw OTLP :4317/:4318, Fluent :24224, bundled
+# Tenzir :9095) bind 127.0.0.1. Opt in to exposing them with
+# NANO_OTLP_BIND_ADDRESS / NANO_FLUENT_BIND_ADDRESS / NANO_TENZIR_BIND_ADDRESS
+# (persisted to .env).
+# Vector native :6000 (NAN-5515) is published on the host's ingest interface
+# like HEC and HTTP ingest, and ALWAYS requires mutual TLS: the installer
+# creates this install's Vector-native listener CA and anchor store
+# (.nano-pki/vector-native, mode 0700) and the listener files
+# (config/vector-native), and senders need a client certificate from
+# `scripts/nano vector-client-cert <name>`.
+# NANO_VECTOR_NATIVE_BIND_ADDRESS narrows the bind to one address;
+# NANO_VECTOR_NATIVE_SANS (comma separated) adds names/addresses senders use
+# that the host cannot see (a NAT or cloud public address, a load balancer);
+# NANO_VECTOR_NATIVE_PUBLIC_HOST is the address printed in sender configs.
 
 main() {
 set -euo pipefail
@@ -154,6 +197,12 @@ cleanup_env_temp() {
     [[ -z "$ENV_TEMP_FILE" ]] || rm -f -- "$ENV_TEMP_FILE"
     [[ -z "$SETUP_HEADER_FILE" ]] || rm -f -- "$SETUP_HEADER_FILE"
     [[ -z "$SETUP_RESPONSE_FILE" ]] || rm -f -- "$SETUP_RESPONSE_FILE"
+    # NAN-5524: the private docker config holding a license-API pull
+    # credential (scripts/lib/image-pull.sh), on success, failure and
+    # interrupt alike. bash runs this trap on SIGINT/SIGTERM too.
+    if declare -F nano_registry_cleanup >/dev/null 2>&1; then
+        nano_registry_cleanup || true
+    fi
 }
 trap cleanup_env_temp EXIT
 while [[ $# -gt 0 ]]; do
@@ -348,8 +397,12 @@ validate_env_file() {
         owner=$(stat -c '%u' "$target" 2>/dev/null) || fail "Cannot inspect owner of $path; no secrets were read."
         mode=$(stat -c '%a' "$target" 2>/dev/null) || fail "Cannot inspect mode of $path; no secrets were read."
     fi
-    [[ "$owner" == "$(id -u)" ]] \
-        || fail "$path is owned by uid $owner, not the current uid $(id -u). Correct ownership before retrying; no secrets were read."
+    # NAN-5509: usually left by an earlier `sudo ./install.sh`.
+    if [[ "$owner" != "$(id -u)" ]]; then
+        [[ "$(id -u)" != 0 ]] \
+            || fail "$path belongs to uid $owner, not root. Run install.sh as the user that owns the install (without sudo). No secrets were read."
+        fail "$path is owned by uid $owner, not by you ($(id -un), uid $(id -u)); an earlier run probably used sudo. Take the install back: sudo chown -R $(id -un): $(dirname "$target"), then re-run install.sh without sudo. No secrets were read."
+    fi
     [[ "$mode" == "600" ]] \
         || fail "$path has mode $mode; run 'chmod 600 $path' before retrying. No secrets were read."
 }
@@ -455,8 +508,7 @@ valid_no_proxy() {
 # NANO_NO_PROXY). No TTY and no input means no proxy. A proxy already
 # exported in the installer's shell is offered as the default.
 configure_outbound_proxy() {
-    local answer url extra auth="" user="" pass="" confirm default_answer="N"
-    local shell_proxy="${HTTPS_PROXY:-${https_proxy:-}}"
+    local url extra user="" pass=""
     if [[ -n "$(env_value HTTPS_PROXY)" || -n "$(env_value NANO_OUTBOUND_PROXY_ASKED)" ]]; then
         return 0
     fi
@@ -464,44 +516,15 @@ configure_outbound_proxy() {
     if [[ -n "${NANO_HTTPS_PROXY:-}" ]]; then
         url="$NANO_HTTPS_PROXY" extra="${NANO_NO_PROXY:-}"
         user="${NANO_PROXY_USERNAME:-}" pass="${NANO_PROXY_PASSWORD:-}"
-    elif have_controlling_tty; then
-        # Offer an exported proxy as the default, without any credentials it
-        # carries (they would be shown in the prompt).
-        shell_proxy=$(strip_proxy_userinfo "$shell_proxy")
-        valid_proxy_hostport "$shell_proxy" || shell_proxy=""
-        [[ -n "$shell_proxy" ]] && default_answer="Y"
-        answer=$(ask_yes_no "Does this server reach the internet through an HTTP(S) proxy?" "$default_answer")
-        if [[ "$answer" == "true" ]]; then
-            while :; do
-                url=$(prompt_tty "Proxy URL (http://host:port)" "$shell_proxy")
-                valid_proxy_hostport "$url" && break
-                warn "Enter the proxy as http://host:port or https://host:port (no credentials, quotes or spaces)."
-            done
-            auth=$(ask_yes_no "Does the proxy require a username and password?" "N")
-            if [[ "$auth" == "true" ]]; then
-                while :; do
-                    user=$(prompt_tty "Proxy username (DOMAIN\\user is fine)")
-                    [[ -n "$user" ]] && break
-                    warn "Enter the proxy username."
-                done
-                while :; do
-                    pass=$(prompt_tty "Proxy password" "" secret)
-                    confirm=$(prompt_tty "Confirm proxy password" "" secret)
-                    if [[ -z "$pass" ]]; then
-                        warn "Enter the proxy password."
-                    elif [[ "$pass" != "$confirm" ]]; then
-                        warn "The passwords do not match. Enter them again."
-                    else
-                        break
-                    fi
-                done
+    else
+        # NAN-5508: asked by collect_answers before anything was written; a
+        # direct call on a terminal asks just these questions.
+        [[ "${WANT_proxy:-0}" == 1 ]] || ! have_controlling_tty || answer_ask_group proxy
+        if [[ "${WANT_proxy:-0}" == 1 && "${ANS_PROXY:-false}" == true ]]; then
+            url="$ANS_PROXY_URL" extra="${ANS_NO_PROXY:-}"
+            if [[ "${ANS_PROXY_AUTH:-false}" == true ]]; then
+                user="$ANS_PROXY_USER" pass="$ANS_PROXY_PASS"
             fi
-            while :; do
-                extra=$(prompt_tty "Extra hosts that bypass the proxy, comma-separated (blank = none)" "${NO_PROXY:-${no_proxy:-}}")
-                [[ -z "$extra" ]] && break
-                valid_no_proxy "$extra" && break
-                warn "Enter comma-separated host names, domains, IPs or CIDRs (no spaces)."
-            done
         fi
     fi
     if [[ -n "$url" && -n "$user" ]]; then
@@ -509,7 +532,7 @@ configure_outbound_proxy() {
         # percent-encoded (DOMAIN\user, p@ss:w/rd!# ...). reqwest decodes it.
         url="${url%%://*}://$(pct_encode "$user"):$(pct_encode "$pass")@${url#*://}"
     fi
-    user="" pass="" confirm=""
+    user="" pass="" ANS_PROXY_PASS=""
     # Set in place (NAN-5251): a symlinked .env stays a link and keeps its
     # 0600 mode, and no key is ever duplicated.
     if [[ -n "$url" ]]; then
@@ -574,7 +597,7 @@ configure_egress_policy() {
 # .env so a re-run or upgrade never asks again. Unattended installs pass
 # NANO_ALLOW_PRIVATE_AI_ENDPOINTS=true|false; with no TTY the default is false.
 configure_private_ai_endpoints() {
-    local recorded answer
+    local recorded
     recorded=$(env_value NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS)
     if [[ -n "$recorded" ]]; then
         PRIVATE_AI_ENDPOINTS="$recorded"
@@ -582,14 +605,10 @@ configure_private_ai_endpoints() {
     fi
     if [[ -n "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" ]]; then
         PRIVATE_AI_ENDPOINTS=$(normalize_bool "$NANO_ALLOW_PRIVATE_AI_ENDPOINTS")
-    elif have_controlling_tty; then
-        while :; do
-            answer=$(prompt_tty "Will nano use an AI model hosted on your own network (e.g. a local LLM on 192.168.x / 10.x)? This allows the AI provider URL to point at private addresses (cloud-metadata stays blocked). [y/N]")
-            [[ -z "$answer" ]] && answer=n
-            PRIVATE_AI_ENDPOINTS=$(normalize_bool "$answer")
-            [[ -n "$PRIVATE_AI_ENDPOINTS" ]] && break
-            warn "Answer y or n."
-        done
+    elif [[ "${WANT_ai:-0}" == 1 ]] || have_controlling_tty; then
+        # NAN-5508: asked by collect_answers before anything was written.
+        [[ "${WANT_ai:-0}" == 1 ]] || answer_ask_group ai
+        PRIVATE_AI_ENDPOINTS="${ANS_AI:-false}"
     else
         PRIVATE_AI_ENDPOINTS=false
     fi
@@ -678,7 +697,7 @@ validate_planned_volume_input() {
 configure_planned_volume() {
     local input="${NANO_PLANNED_GB_PER_DAY:-}" path_input="${NANO_INGEST_PATH:-}"
     local bytes_input="${NANO_AVG_EVENT_BYTES:-}"
-    local recorded recorded_path recorded_bytes answer default_path=raw
+    local recorded recorded_path recorded_bytes default_path=raw
     validate_planned_volume_input
     [[ "${BUNDLE_TENZIR:-0}" == "1" ]] && default_path=preshaped
     recorded=$(env_value NANO_PLANNED_GB_PER_DAY)
@@ -693,21 +712,12 @@ configure_planned_volume() {
     if [[ -n "$recorded_bytes" ]] && ! valid_avg_event_bytes "$recorded_bytes"; then
         fail "NANO_AVG_EVENT_BYTES in .env must be a whole number of bytes, 50-999999 (got '$recorded_bytes'). Fix .env and re-run."
     fi
-    if [[ -z "$input" && -z "$recorded" && "${REUSE_ENV:-0}" != "1" && "${MULTI_NODE:-0}" != "1" ]] \
-        && have_controlling_tty; then
-        while :; do
-            answer=$(prompt_tty "Planned log volume in GB per day (Enter to skip: settings then follow this host's size only)")
-            answer=$(printf '%s' "$answer" | tr -d '[:space:]')
-            [[ -z "$answer" ]] && break
-            valid_planned_gb_per_day "$answer" && { input=$answer; break; }
-            warn "Enter a whole number of GB per day, or press Enter to skip."
-        done
+    # NAN-5508: asked by collect_answers (whenever nothing is recorded and
+    # this host has never started nano), before anything was written.
+    if [[ -z "$input" && -z "$recorded" && "${WANT_volume:-0}" == 1 ]]; then
+        input="${ANS_VOLUME:-}"
         if [[ -n "$input" && "$input" != 0 && -z "$path_input" && -z "$recorded_path" ]]; then
-            while :; do
-                answer=$(prompt_tty "Do events arrive as raw logs that nano parses, or pre-shaped OCSF (Tenzir/Cribl)? raw/preshaped" "$default_path")
-                [[ "$answer" == raw || "$answer" == preshaped ]] && { path_input=$answer; break; }
-                warn "Enter raw or preshaped."
-            done
+            path_input="${ANS_INGEST_PATH:-$default_path}"
         fi
     fi
     [[ -n "$input" ]] && input=$(( 10#$input ))
@@ -788,20 +798,15 @@ validate_retention_input() {
 }
 
 configure_retention_days() {
-    local input="${NANO_RETENTION_DAYS:-}" recorded answer
+    local input="${NANO_RETENTION_DAYS:-}" recorded
     validate_retention_input
     recorded=$(env_value NANO_RETENTION_DAYS)
     if [[ -n "$recorded" ]] && ! valid_retention_days "$recorded"; then
         fail "NANO_RETENTION_DAYS in .env must be a whole number of days, 1-3650 (got '$recorded'). Fix .env and re-run."
     fi
-    if [[ -z "$input" && -z "$recorded" && "${REUSE_ENV:-0}" != "1" && "${MULTI_NODE:-0}" != "1" ]] \
-        && have_controlling_tty; then
-        while :; do
-            answer=$(prompt_tty "Event retention in days (the disk still caps it; change later in Settings -> Storage)" "365")
-            answer=$(printf '%s' "$answer" | tr -d '[:space:]')
-            valid_retention_days "$answer" && { input=$answer; break; }
-            warn "Enter a whole number of days, 1-3650."
-        done
+    # NAN-5508: asked by collect_answers, like the planned volume.
+    if [[ -z "$input" && -z "$recorded" && "${WANT_retention:-0}" == 1 ]]; then
+        input="${ANS_RETENTION:-}"
     fi
     [[ -n "$input" ]] && input=$(( 10#$input ))
     # Role-split: one shared .env, edited on the app host (see above).
@@ -841,15 +846,22 @@ retention_existing_install() {
 
 report_retention_fit() {
     local env_file="$1" planned capacity buffers docker_reserve overhead sizing
-    local supported needed verdict min_days need_gib cap_gib
+    local supported needed verdict min_days need_gib cap_gib tiering=0 check_days
     [[ -f "$env_file" && -f scripts/lib/retention-sizing.sh ]] || return 0
     planned="${PLANNED_GB_PER_DAY:-0}"
     [[ "$planned" =~ ^[0-9]+$ ]] && (( planned > 0 )) || return 0
     # Cold tier on (NAN-5445): object storage holds the older days, so the
     # local disk does not cap retention (Helm skips the check the same way).
+    # NAN-5509: but every event lands on the local disk first and moves only
+    # once that disk passes the move threshold, so the local disk must still
+    # hold the 7-day minimum; only the full-retention warning is dropped.
     case "$(printf '%s' "${NANO_TIERING:-$(env_value NANO_TIERING 2>/dev/null)}" | tr 'A-Z' 'a-z')" in
-        on|true|yes|1) return 0 ;;
+        on|true|yes|1) tiering=1 ;;
     esac
+    check_days="${RETENTION_DAYS:-365}"
+    if (( tiering )) && [[ "$check_days" =~ ^[0-9]+$ ]] && (( check_days > 7 )); then
+        check_days=7
+    fi
     # Bind/external Vector storage: the probed capacity is not ClickHouse's disk.
     [[ "${NANO_VECTOR_DATA_STORAGE_MODE:-named}" == named ]] || return 0
     capacity=$(sizing_file_value "$env_file" VECTOR_DATA_CAPACITY_BYTES)
@@ -861,7 +873,7 @@ report_retention_fit() {
     overhead=$(( buffers + docker_reserve + 10737418240 ))
     sizing=$(bash scripts/lib/retention-sizing.sh \
         --gb-per-day "$planned" \
-        --retention-days "${RETENTION_DAYS:-365}" \
+        --retention-days "$check_days" \
         --disk-bytes "$capacity" \
         --overhead-bytes "$overhead") || { warn "Could not check the disk against the planned volume and retention."; return 0; }
     supported=$(printf '%s\n' "$sizing" | awk -F= '$1 == "NANO_RETENTION_SUPPORTED_DAYS" { print $2 }')
@@ -870,6 +882,12 @@ report_retention_fit() {
     min_days=$(printf '%s\n' "$sizing" | awk -F= '$1 == "NANO_RETENTION_MIN_DAYS" { print $2 }')
     need_gib=$(( (needed + 1073741823) / 1073741824 ))
     cap_gib=$(( capacity / 1073741824 ))
+    local retention_what=retention
+    (( tiering )) && retention_what="local hot window (storage tiering moves older data to object storage)"
+    if (( tiering )) && [[ "$verdict" != refuse ]]; then
+        log "Disk: ${cap_gib} GiB holds about ${supported} days at ${planned} GB/day locally; storage tiering moves older data to object storage"
+        return 0
+    fi
     case "$verdict" in
         ok)
             log "Disk: ${cap_gib} GiB holds about ${supported} days at ${planned} GB/day (retention ${RETENTION_DAYS:-365} days)"
@@ -880,9 +898,9 @@ report_retention_fit() {
         refuse)
             if [[ "$(normalize_bool "${NANO_ALLOW_UNDERSIZED_DISK:-false}")" == "true" ]] \
                 || retention_existing_install; then
-                warn "This host's disk (${cap_gib} GiB) holds only about ${supported} days of events at ${planned} GB/day (under the ${min_days}-day minimum; the ${RETENTION_DAYS:-365}-day retention needs about ${need_gib} GiB). nano drops the oldest days whenever ClickHouse passes 80 % of the disk. Grow the disk."
+                warn "This host's disk (${cap_gib} GiB) holds only about ${supported} days of events at ${planned} GB/day (under the ${min_days}-day minimum; the ${check_days}-day ${retention_what} needs about ${need_gib} GiB). nano drops the oldest days whenever ClickHouse passes 80 % of the disk. Grow the disk."
             else
-                fail "This host's disk (${cap_gib} GiB) holds only about ${supported} days of events at ${planned} GB/day, under the ${min_days}-day minimum (the ${RETENTION_DAYS:-365}-day retention needs about ${need_gib} GiB at 5:1 compression). Nothing was started. Grow the disk, lower NANO_PLANNED_GB_PER_DAY if it overstates the volume, or set NANO_ALLOW_UNDERSIZED_DISK=true to install anyway."
+                fail "This host's disk (${cap_gib} GiB) holds only about ${supported} days of events at ${planned} GB/day, under the ${min_days}-day minimum (the ${check_days}-day ${retention_what} needs about ${need_gib} GiB at 5:1 compression). Nothing was started. Grow the disk, lower NANO_PLANNED_GB_PER_DAY if it overstates the volume, or set NANO_ALLOW_UNDERSIZED_DISK=true to install anyway."
             fi
             ;;
     esac
@@ -910,8 +928,49 @@ configure_automatic_backups() {
         warn "Automatic backups need python3 on this host; install it, then run scripts/nano backup-schedule --configure."
         return 0
     fi
-    python3 -I scripts/nano-backup-scheduler.py --install-dir "$PWD" configure --from-installer \
-        || fail "Automatic backup setup failed (see above). Fix the destination, or set NANO_BACKUP_ENABLED=false, and re-run."
+    if [[ "${WANT_backup:-0}" != 1 && -z "${NANO_BACKUP_ENABLED+set}" ]] && have_controlling_tty; then
+        answer_ask_group backup
+    fi
+    if [[ "${WANT_backup:-0}" != 1 ]]; then
+        python3 -I scripts/nano-backup-scheduler.py --install-dir "$PWD" configure --from-installer \
+            || fail "Automatic backup setup failed (see above). Fix the destination, or set NANO_BACKUP_ENABLED=false, and re-run."
+        return 0
+    fi
+    # NAN-5508: answered before anything was written. The destination check
+    # (a test write) runs now; a rejected destination asks the backup
+    # questions again instead of ending the install.
+    while ! backup_apply_answers; do
+        [[ "${ANS_BACKUP:-false}" == true ]] \
+            || fail "Automatic backup setup failed (see above). Run scripts/nano backup-schedule --configure after install."
+        answer_yes_no "Change the backup answers? (n leaves automatic backups off for now)" true || ANSWER_REPLY=true
+        if [[ "$ANSWER_REPLY" == true ]]; then
+            answer_ask_group backup
+        else
+            ANS_BACKUP=false
+        fi
+    done
+}
+
+# The collected backup answers, handed to the scheduler through its
+# NANO_BACKUP_* environment (never argv). Non-interactive there: it probes
+# the destination, writes the keys and records .env, or fails with a reason.
+backup_apply_answers() {
+    (
+        if [[ "${ANS_BACKUP:-false}" != true ]]; then
+            export NANO_BACKUP_ENABLED=false
+        else
+            export NANO_BACKUP_ENABLED=true NANO_BACKUP_DESTINATION="$ANS_BACKUP_DEST" \
+                NANO_BACKUP_SCHEDULE="$ANS_BACKUP_SCHEDULE" NANO_BACKUP_KEEP="$ANS_BACKUP_KEEP"
+            if [[ "$ANS_BACKUP_DEST" == path ]]; then
+                export NANO_BACKUP_PATH="$ANS_BACKUP_PATH"
+            else
+                export NANO_BACKUP_S3_ENDPOINT="$ANS_BACKUP_S3_ENDPOINT" NANO_BACKUP_S3_BUCKET="$ANS_BACKUP_S3_BUCKET" \
+                    NANO_BACKUP_S3_REGION="$ANS_BACKUP_S3_REGION" NANO_BACKUP_S3_PREFIX="$ANS_BACKUP_S3_PREFIX" \
+                    NANO_BACKUP_S3_ACCESS_KEY="$ANS_BACKUP_S3_ACCESS" NANO_BACKUP_S3_SECRET_KEY="$ANS_BACKUP_S3_SECRET"
+            fi
+        fi
+        python3 -I scripts/nano-backup-scheduler.py --install-dir "$PWD" configure --from-installer </dev/null
+    )
 }
 
 # NAN-5445: ClickHouse hot/cold storage tiering (single host). Asked once on
@@ -934,8 +993,68 @@ configure_storage_tiering() {
         [[ -z "${NANO_TIERING:-}" ]] || fail "Storage tiering needs python3 on this host."
         return 0
     fi
-    python3 -I scripts/nano-tiering.py --install-dir "$PWD" configure --from-installer \
-        || fail "Storage tiering settings are invalid (see above). Fix the NANO_TIERING* values, or set NANO_TIERING=off, and re-run."
+    if [[ "${WANT_tiering:-0}" != 1 ]] && have_controlling_tty && tiering_question_applies; then
+        answer_ask_group tiering
+    fi
+    if [[ "${WANT_tiering:-0}" != 1 ]]; then
+        python3 -I scripts/nano-tiering.py --install-dir "$PWD" configure --from-installer \
+            || fail "Storage tiering settings are invalid (see above). Fix the NANO_TIERING* values, or set NANO_TIERING=off, and re-run."
+        return 0
+    fi
+    # NAN-5508: answered (and checked) before anything was written. Record
+    # them, then check the object store from this host now: a store this
+    # host cannot write to asks the tiering questions again.
+    while :; do
+        tiering_apply_answers \
+            || fail "Storage tiering settings are invalid (see above). Fix them with scripts/nano tiering configure, or re-run with NANO_TIERING=off."
+        [[ "${ANS_TIERING:-false}" == true && "${NANO_TIERING_SKIP_PROBE:-}" != "1" ]] || return 0
+        TIERING_PROBED=1
+        if tiering_probe=$(python3 -I scripts/lib/clickhouse_tiering.py probe --env-file .env </dev/null 2>&1); then
+            ok "Object store check from this host: $tiering_probe"
+            return 0
+        fi
+        tiering_probe="${tiering_probe#tiering: }"
+        warn "Object store check from this host failed: ${tiering_probe}.$(tiering_probe_cause "$tiering_probe" "$ANS_TIER_PROVIDER")"
+        # NAN-5509: new settings whose store refuses a test write are never
+        # installed; here the answers can be fixed instead of re-running.
+        answer_yes_no "Change the object store answers? (n stops here; nothing has started)" true \
+            || ANSWER_REPLY=true
+        if [[ "$ANSWER_REPLY" != true ]]; then
+            fail "Storage tiering is on, but writing a test object to the bucket from this host failed. Without a working store the local disk fills up later instead of moving old data. Fix the credentials or bucket and re-run, set NANO_TIERING=off, or (for a store only the Compose network can reach) re-run with NANO_TIERING_SKIP_PROBE=1."
+        fi
+        # Nothing has started yet: forget the recorded store, so another
+        # provider's answers are checked without the old one's keys.
+        nano_env_set_keys .env NANO_TIERING= NANO_TIERING_PROVIDER= NANO_TIERING_BUCKET= NANO_TIERING_REGION= \
+            NANO_TIERING_ENDPOINT= NANO_TIERING_PREFIX= NANO_TIERING_MOVE_FACTOR= NANO_TIERING_CACHE_SIZE= \
+            NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS= NANO_TIERING_AZURE_ACCOUNT_URL= NANO_TIERING_AZURE_CONTAINER= \
+            NANO_TIERING_AZURE_ACCOUNT_NAME= NANO_TIERING_ACCESS_KEY_ID= NANO_TIERING_SECRET_ACCESS_KEY= \
+            NANO_TIERING_AZURE_ACCOUNT_KEY= || fail "Could not reset the tiering settings in .env."
+        answer_ask_group tiering
+    done
+}
+
+# A likely cause for a failed object-store probe ($1 = probe output, $2 =
+# provider), as a sentence with a leading space; empty when none is known.
+tiering_probe_cause() {
+    if [[ "${2:-}" == gcs ]]; then
+        case "$1" in
+            *403* | *AccessDenied* | *"Access denied"* | *insufficient* | *Forbidden*)
+                printf '%s' " On Google Cloud this is usually a VM whose service account has the read-only storage scope (the default): use an HMAC key (NANO_TIERING_ACCESS_KEY_ID / NANO_TIERING_SECRET_ACCESS_KEY) with Storage Object Admin on the bucket, or stop the VM and give it the storage read-write scope." ;;
+        esac
+    fi
+    return 0
+}
+
+# The collected tiering answers, handed to nano-tiering.py through its
+# NANO_TIERING* environment (secrets never on argv).
+tiering_apply_answers() {
+    (
+        local assignment
+        while IFS= read -r assignment; do
+            export "${assignment?}"
+        done < <(answer_tiering_env)
+        python3 -I scripts/nano-tiering.py --install-dir "$PWD" configure --from-installer </dev/null
+    )
 }
 
 # ----------------------------------------------------------------------------
@@ -994,7 +1113,8 @@ resolve_offline_license_file() {
         warn "Offline license file must be 1 to $OFFLINE_LICENSE_MAX_BYTES bytes (got $size): $path" >&2
         return 1
     fi
-    first=$(tr -d ' \t\r\n' < "$path" | head -c 1)
+    first=$(tr -d ' \t\r\n' < "$path")
+    first=${first:0:1}
     [[ "$first" == "{" ]] || { warn "Offline license file is not a signed license JSON file: $path" >&2; return 1; }
     printf '%s/%s' "$(cd "$(dirname "$path")" && pwd -P)" "$(basename "$path")"
 }
@@ -1012,6 +1132,15 @@ validate_license_inputs() {
     fi
     if [[ -n "$LICENSE_TOKEN_INPUT" ]] && ! valid_license_token "$LICENSE_TOKEN_INPUT"; then
         fail "LICENSE_TOKEN is not an enrollment token (expected 32+ letters, digits, '-' or '_'; value not shown). Copy it from $LICENSE_PAGE_HINT."
+    fi
+    # NAN-5509: a new token alone ("re-run with LICENSE_TOKEN=<new token>",
+    # after Regenerate on app.nano.rs) belongs to the deployment this install
+    # already checks in for: take its recorded LICENSE_URL and ID.
+    if [[ -n "$LICENSE_TOKEN_INPUT" && -z "$LICENSE_DEPLOYMENT_ID_INPUT" ]] \
+        && valid_deployment_id "$(env_value NANO_DEPLOYMENT_ID)" \
+        && [[ -n "$(env_value LICENSE_URL)" ]]; then
+        LICENSE_DEPLOYMENT_ID_INPUT=$(env_value NANO_DEPLOYMENT_ID)
+        log "Using the deployment ID recorded in .env ($LICENSE_DEPLOYMENT_ID_INPUT) with the new LICENSE_TOKEN"
     fi
     # NANO_DEPLOYMENT_ID alone is not a license input: older role-split
     # guides exported it for other purposes. It is checked with a token.
@@ -1045,8 +1174,7 @@ validate_license_inputs() {
 # Prompts at most once, only with a controlling TTY.
 LICENSE_ENV_LINES="" LICENSE_MODE="" LICENSE_IMPORT_FILE="" LICENSE_DEPLOYMENT_ID=""
 resolve_license() {
-    local first_install="$1" recorded_mode recorded_url recorded_token recorded_id choice default_choice
-    local url token deployment_id path
+    local first_install="$1" recorded_mode recorded_url recorded_token recorded_id url
     LICENSE_ENV_LINES="" LICENSE_MODE="" LICENSE_IMPORT_FILE="" LICENSE_DEPLOYMENT_ID=""
     if [[ "$NANO_EDITION" != "enterprise" ]]; then
         if [[ -n "$LICENSE_TOKEN_INPUT$LICENSE_FILE_INPUT" ]]; then
@@ -1092,46 +1220,21 @@ resolve_license() {
     elif [[ "$recorded_mode" == "offline" || "$recorded_mode" == "airgap" ]]; then
         LICENSE_MODE="$recorded_mode"
     # 3. Nothing known: ask once.
-    elif have_controlling_tty; then
-        # A pre-2.0.5 install that reaches here was admitted by an offline
-        # license imported in the UI (or not licensed yet): keep that default.
-        default_choice=online
-        [[ "$first_install" == "0" && -z "$recorded_mode" ]] && default_choice=offline
-        while :; do
-            choice=$(prompt_tty "License: online check-in (paste the 3 values from app.nano.rs) or offline file (path)? [online/offline]" "$default_choice")
-            choice=$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-            case "$choice" in
-                online|on|1) choice=online; break ;;
-                offline|off|file|2) choice=offline; break ;;
-                *) warn "Answer online or offline." ;;
-            esac
-        done
-        if [[ "$choice" == "online" ]]; then
-            while :; do
-                url=$(strip_license_paste "$(prompt_tty "LICENSE_URL" "$LICENSE_DEFAULT_URL")" LICENSE_URL)
-                valid_license_url "$url" && break
-                warn "Enter the https:// license URL shown on the deployment page."
-            done
-            while :; do
-                token=$(strip_license_paste "$(prompt_tty "LICENSE_TOKEN (input hidden)" "" secret)" LICENSE_TOKEN)
-                valid_license_token "$token" && break
-                warn "That is not an enrollment token (value not shown). Paste LICENSE_TOKEN from the deployment page; if it was lost, regenerate it there."
-            done
-            while :; do
-                deployment_id=$(strip_license_paste "$(prompt_tty "NANO_DEPLOYMENT_ID")" NANO_DEPLOYMENT_ID)
-                valid_deployment_id "$deployment_id" && break
-                warn "Enter the deployment ID from the deployment page (deploy_ followed by 26 characters)."
-            done
-            LICENSE_MODE=online LICENSE_DEPLOYMENT_ID="$deployment_id"
-            LICENSE_ENV_LINES="LICENSE_URL=$url"$'\n'"LICENSE_TOKEN=$token"$'\n'"NANO_DEPLOYMENT_ID=$deployment_id"$'\n'
-            token=""
+    elif [[ "${WANT_license:-0}" == 1 ]] || have_controlling_tty; then
+        # NAN-5508: asked by collect_answers before anything was written (a
+        # direct call on a terminal asks just these questions). A pre-2.0.5
+        # install that reaches here was admitted by an offline license
+        # imported in the UI (or not licensed yet): offline is its default.
+        if [[ "${WANT_license:-0}" != 1 ]]; then
+            ANSWER_LICENSE_DEFAULT=online
+            [[ "$first_install" == "0" && -z "$recorded_mode" ]] && ANSWER_LICENSE_DEFAULT=offline
+            answer_ask_group license
+        fi
+        if [[ "$ANS_LIC_MODE" == "online" ]]; then
+            LICENSE_MODE=online LICENSE_DEPLOYMENT_ID="$ANS_LIC_ID"
+            LICENSE_ENV_LINES="LICENSE_URL=$ANS_LIC_URL"$'\n'"LICENSE_TOKEN=$ANS_LIC_TOKEN"$'\n'"NANO_DEPLOYMENT_ID=$ANS_LIC_ID"$'\n'
         else
-            LICENSE_MODE=offline
-            while :; do
-                path=$(prompt_tty "Offline license file path (blank = import it after install under Settings → License)")
-                [[ -z "$path" ]] && break
-                LICENSE_IMPORT_FILE=$(resolve_offline_license_file "$path") && break
-            done
+            LICENSE_MODE=offline LICENSE_IMPORT_FILE="${ANS_LIC_FILE:-}"
         fi
     elif [[ "$first_install" == "0" && -z "$recorded_mode" ]]; then
         # Unattended upgrade of an install from before this choice existed:
@@ -1143,7 +1246,7 @@ resolve_license() {
         warn "No license values yet. Before running ./install.sh, add LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID to .env (from $LICENSE_PAGE_HINT), or pass them to ./install.sh, or set NANO_LICENSE_MODE=offline."
         return 0
     else
-        fail "No license for this unattended enterprise install (no TTY to ask). Pass LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID from $LICENSE_PAGE_HINT, for example: NANO_IMAGES_LOCK=images.enterprise.customer.lock LICENSE_URL=$LICENSE_DEFAULT_URL LICENSE_TOKEN=<token> NANO_DEPLOYMENT_ID=<deployment id> ./install.sh. Without access to api.nano.rs, set NANO_LICENSE_MODE=offline (import the license file after install) or AIRGAP_MODE=true. Nothing was started."
+        fail "No license for this unattended enterprise install (no TTY to ask). Pass LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID from $LICENSE_PAGE_HINT, for example: LICENSE_URL=$LICENSE_DEFAULT_URL LICENSE_TOKEN=<token> NANO_DEPLOYMENT_ID=<deployment id> ./install.sh. Without access to api.nano.rs, set NANO_LICENSE_MODE=offline (import the license file after install) or AIRGAP_MODE=true. Nothing was started."
     fi
     [[ "$LICENSE_MODE" == "$recorded_mode" ]] || LICENSE_ENV_LINES+="NANO_LICENSE_MODE=$LICENSE_MODE"$'\n'
     return 0
@@ -1344,18 +1447,20 @@ revalidate_recorded_base_url() {
     [[ -n "$recorded" ]] || return 0
     normalize_base_url "$recorded" >/dev/null && return 0
     if have_controlling_tty && [[ "${MULTI_NODE:-0}" != "1" || ",${ROLE_ARG:-}," == *,app,* ]]; then
-        warn "This install's .env has BASE_URL='$recorded', which is not a URL users can open nano at."
+        [[ -n "${ANS_BASE_URL:-}" ]] \
+            || warn "This install's .env has BASE_URL='$recorded', which is not a URL users can open nano at."
         # Enter must never silently record http://localhost (and dev mode): a
         # bare host name or IP (a dotted name, an IPv4 address or a bracketed
         # IPv6 address, optionally with :port) is offered back as
         # https://<recorded>; anything else, "N" included, has no default and
         # is asked until a valid URL is typed.
-        recorded=$(trim_space "$recorded")
-        if [[ "$recorded" != *://* && ( "$recorded" == *.* || "$recorded" == \[* ) ]] \
-            && normalize_base_url "https://$recorded" >/dev/null; then
-            default=$(normalize_base_url "https://$recorded")
+        # NAN-5508: asked with the other questions, before anything is written.
+        if [[ -n "${ANS_BASE_URL:-}" ]]; then
+            BASE_URL=$ANS_BASE_URL
+        else
+            default=$(base_url_reask_default)
+            prompt_base_url "$default"
         fi
-        prompt_base_url "$default"
         dev=false
         [[ "$BASE_URL" == http://* ]] && dev=true
         nano_env_set_keys .env "BASE_URL=$BASE_URL" "NANOSIEM_DEV_MODE=$dev" \
@@ -1365,6 +1470,750 @@ revalidate_recorded_base_url() {
         warn "This install's .env has BASE_URL='$recorded', which is not a valid http(s)://host[:port] URL; sign-in links and the ingest examples use it. Set BASE_URL=https://<host> in $PWD/.env (role-split: on the app host, then copy .env to every host), or re-run with NANO_BASE_URL=https://<host> ./install.sh."
     fi
 }
+# >>> interactive answers (NAN-5508) >>>
+# ----------------------------------------------------------------------------
+# Every interactive question is asked here, before anything is written: no
+# .env, no generated secret on disk, no docker login, no container. The run
+# then shows a numbered review screen: Enter installs, a number asks that
+# answer (and the answers that depend on it) again, q quits with nothing
+# written. `back` (or `<`) at any prompt asks the previous question again.
+# Without a controlling terminal nothing is asked and nothing changes: the
+# configure_* functions take their values from the environment as before.
+#
+# Each question is a step (ANSWER_STEPS). answer_step_applies decides whether
+# a step is asked this run; answer_ask_step asks it and returns 0 (answered),
+# 2 (back) or 3 (go to ANSWER_JUMP). The answers live in ANS_* variables,
+# which the configure_* functions and the first-install .env writer read.
+# ----------------------------------------------------------------------------
+ANSWER_REPLY="" ANSWER_JUMP="" ANSWER_TIERING_INTRO=0
+ANSWER_STEPS=(admin_email admin_name admin_password base_url schema
+    lic_mode lic_url lic_token lic_id lic_file
+    proxy proxy_url proxy_auth proxy_user proxy_pass no_proxy
+    ai
+    backup backup_dest backup_path backup_s3_endpoint backup_s3_bucket backup_s3_region
+    backup_s3_prefix backup_s3_access backup_s3_secret backup_schedule backup_keep
+    volume ingest_path retention
+    tiering tier_provider tier_azure_url tier_azure_name tier_azure_container tier_azure_key
+    tier_bucket tier_endpoint tier_region tier_prefix tier_env_creds tier_access tier_secret
+    tier_move tier_cache)
+# Review screen lines: "item first-step last-step label".
+ANSWER_ITEMS=("admin_email admin_email admin_email Admin email"
+    "admin_name admin_name admin_name Admin name"
+    "admin_password admin_password admin_password Admin password"
+    "base_url base_url base_url Base URL"
+    "schema schema schema Schema profile"
+    "license lic_mode lic_file License"
+    "proxy proxy no_proxy Outbound proxy"
+    "ai ai ai Local AI network"
+    "backup backup backup_keep Automatic backups"
+    "volume volume ingest_path Planned volume"
+    "retention retention retention Retention"
+    "tiering tiering tier_cache Cold storage tiering")
+
+# Reads one answer from the terminal into ANSWER_REPLY ($2 is shown as
+# [default] and taken on Enter; $3 = secret reads without echo). Returns 2
+# when the answer is `back` or `<`. End of input stops the installer: a
+# closed terminal must not re-ask forever.
+answer_read() {
+    local prompt="$1" default="${2:-}" secret="${3:-}" shown="$1" reply=""
+    [[ -n "$default" ]] && shown="$prompt [$default]"
+    printf '%s: ' "$shown" > /dev/tty
+    if [[ -n "$secret" ]]; then
+        IFS= read -rs reply < /dev/tty || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
+        printf '\n' > /dev/tty
+    else
+        IFS= read -r reply < /dev/tty || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
+    fi
+    reply=${reply%$'\r'}
+    case "$(trim_space "$reply")" in
+        back|BACK|Back|"<") ANSWER_REPLY=""; return 2 ;;
+    esac
+    [[ -z "$reply" && -n "$default" ]] && reply="$default"
+    ANSWER_REPLY="$reply"
+    return 0
+}
+
+# Yes/no into ANSWER_REPLY (true/false); $2 is the current answer or default.
+answer_yes_no() {
+    local question="$1" current="$2" hint="[y/N]" value
+    [[ "$current" == true ]] && hint="[Y/n]"
+    while :; do
+        answer_read "$question $hint" || return
+        value="$ANSWER_REPLY"
+        [[ -z "$value" ]] && value="$current"
+        value=$(normalize_bool "$value")
+        [[ -n "$value" ]] && { ANSWER_REPLY="$value"; return 0; }
+        warn "Answer y or n."
+    done
+}
+
+# A value .env and Python both read verbatim: no whitespace, quotes, $, `, \ or #.
+answer_env_safe() {
+    [[ -n "${1:-}" && "$1" != *[[:space:]\'\"\$\`\\#]* ]]
+}
+
+# Validates the collected tiering answers with nano-tiering.py (nothing is
+# written; secrets go through the environment, never argv).
+answer_tiering_check() {
+    NANO_TIERING=on NANO_TIERING_PROVIDER="$ANS_TIER_PROVIDER" NANO_TIERING_BUCKET="${ANS_TIER_BUCKET:-}" \
+        NANO_TIERING_ENDPOINT="${ANS_TIER_ENDPOINT:-}" NANO_TIERING_REGION="${ANS_TIER_REGION:-}" \
+        NANO_TIERING_PREFIX="${ANS_TIER_PREFIX:-}" NANO_TIERING_MOVE_FACTOR="${ANS_TIER_MOVE:-}" \
+        NANO_TIERING_CACHE_SIZE="${ANS_TIER_CACHE:-}" \
+        NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS="${ANS_TIER_ENV_CREDS:-false}" \
+        NANO_TIERING_AZURE_ACCOUNT_URL="${ANS_TIER_AZURE_URL:-}" NANO_TIERING_AZURE_ACCOUNT_NAME="${ANS_TIER_AZURE_NAME:-}" \
+        NANO_TIERING_AZURE_CONTAINER="${ANS_TIER_AZURE_CONTAINER:-}" NANO_TIERING_AZURE_ACCOUNT_KEY="${ANS_TIER_AZURE_KEY:-}" \
+        NANO_TIERING_ACCESS_KEY_ID="${ANS_TIER_ACCESS:-}" NANO_TIERING_SECRET_ACCESS_KEY="${ANS_TIER_SECRET:-}" \
+        python3 -I scripts/nano-tiering.py --install-dir "$PWD" configure --from-installer --check </dev/null 2>&1
+}
+
+# The tiering answers as NANO_TIERING* assignments for `env` (apply phase).
+answer_tiering_env() {
+    if [[ "${ANS_TIERING:-false}" != true ]]; then
+        printf '%s\n' NANO_TIERING=off
+        return 0
+    fi
+    printf '%s\n' NANO_TIERING=on "NANO_TIERING_PROVIDER=$ANS_TIER_PROVIDER" \
+        "NANO_TIERING_MOVE_FACTOR=$ANS_TIER_MOVE" "NANO_TIERING_CACHE_SIZE=$ANS_TIER_CACHE"
+    if [[ "$ANS_TIER_PROVIDER" == azure ]]; then
+        printf '%s\n' "NANO_TIERING_AZURE_ACCOUNT_URL=$ANS_TIER_AZURE_URL" \
+            "NANO_TIERING_AZURE_ACCOUNT_NAME=$ANS_TIER_AZURE_NAME" \
+            "NANO_TIERING_AZURE_CONTAINER=$ANS_TIER_AZURE_CONTAINER" \
+            "NANO_TIERING_AZURE_ACCOUNT_KEY=$ANS_TIER_AZURE_KEY"
+        return 0
+    fi
+    printf '%s\n' "NANO_TIERING_BUCKET=$ANS_TIER_BUCKET" "NANO_TIERING_PREFIX=$ANS_TIER_PREFIX" \
+        "NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS=${ANS_TIER_ENV_CREDS:-false}"
+    [[ "$ANS_TIER_PROVIDER" == s3-compatible ]] && printf '%s\n' "NANO_TIERING_ENDPOINT=$ANS_TIER_ENDPOINT"
+    [[ "$ANS_TIER_PROVIDER" == s3 || "$ANS_TIER_PROVIDER" == s3-compatible ]] \
+        && printf '%s\n' "NANO_TIERING_REGION=$ANS_TIER_REGION"
+    if [[ "${ANS_TIER_ENV_CREDS:-false}" != true ]]; then
+        printf '%s\n' "NANO_TIERING_ACCESS_KEY_ID=$ANS_TIER_ACCESS" "NANO_TIERING_SECRET_ACCESS_KEY=$ANS_TIER_SECRET"
+    fi
+    return 0
+}
+
+# Whether this run asks review item $1 (WANT_<item>=1, set by collect_answers).
+answer_wanted() {
+    local flag="WANT_$1"
+    [[ "${!flag:-0}" == 1 ]]
+}
+
+answer_step_applies() {
+    case "$1" in
+        admin_email|admin_name|admin_password|base_url|schema|ai|retention)
+            answer_wanted "$1" ;;
+        lic_mode) [[ "${WANT_license:-0}" == 1 ]] ;;
+        lic_url|lic_token|lic_id) [[ "${WANT_license:-0}" == 1 && "${ANS_LIC_MODE:-}" == online ]] ;;
+        lic_file) [[ "${WANT_license:-0}" == 1 && "${ANS_LIC_MODE:-}" == offline ]] ;;
+        proxy) [[ "${WANT_proxy:-0}" == 1 ]] ;;
+        proxy_url|proxy_auth|no_proxy) [[ "${WANT_proxy:-0}" == 1 && "${ANS_PROXY:-}" == true ]] ;;
+        proxy_user|proxy_pass) [[ "${WANT_proxy:-0}" == 1 && "${ANS_PROXY:-}" == true && "${ANS_PROXY_AUTH:-}" == true ]] ;;
+        backup) [[ "${WANT_backup:-0}" == 1 ]] ;;
+        backup_dest|backup_schedule|backup_keep) [[ "${WANT_backup:-0}" == 1 && "${ANS_BACKUP:-}" == true ]] ;;
+        backup_path) [[ "${WANT_backup:-0}" == 1 && "${ANS_BACKUP:-}" == true && "${ANS_BACKUP_DEST:-}" == path ]] ;;
+        backup_s3_*) [[ "${WANT_backup:-0}" == 1 && "${ANS_BACKUP:-}" == true && "${ANS_BACKUP_DEST:-}" == s3 ]] ;;
+        volume) [[ "${WANT_volume:-0}" == 1 ]] ;;
+        ingest_path) [[ "${WANT_volume:-0}" == 1 && "${WANT_ingest_path:-0}" == 1 && -n "${ANS_VOLUME:-}" && "${ANS_VOLUME:-}" != 0 ]] ;;
+        tiering) [[ "${WANT_tiering:-0}" == 1 ]] ;;
+        tier_provider|tier_move|tier_cache) [[ "${WANT_tiering:-0}" == 1 && "${ANS_TIERING:-}" == true ]] ;;
+        tier_azure_*) [[ "${WANT_tiering:-0}" == 1 && "${ANS_TIERING:-}" == true && "${ANS_TIER_PROVIDER:-}" == azure ]] ;;
+        tier_bucket|tier_prefix) [[ "${WANT_tiering:-0}" == 1 && "${ANS_TIERING:-}" == true && "${ANS_TIER_PROVIDER:-}" != azure ]] ;;
+        tier_endpoint) [[ "${WANT_tiering:-0}" == 1 && "${ANS_TIERING:-}" == true && "${ANS_TIER_PROVIDER:-}" == s3-compatible ]] ;;
+        tier_region) [[ "${WANT_tiering:-0}" == 1 && "${ANS_TIERING:-}" == true \
+            && ( "${ANS_TIER_PROVIDER:-}" == s3 || "${ANS_TIER_PROVIDER:-}" == s3-compatible ) ]] ;;
+        tier_env_creds) [[ "${WANT_tiering:-0}" == 1 && "${ANS_TIERING:-}" == true \
+            && ( "${ANS_TIER_PROVIDER:-}" == s3 || "${ANS_TIER_PROVIDER:-}" == gcs ) ]] ;;
+        tier_access|tier_secret) [[ "${WANT_tiering:-0}" == 1 && "${ANS_TIERING:-}" == true \
+            && "${ANS_TIER_PROVIDER:-}" != azure && "${ANS_TIER_ENV_CREDS:-false}" != true ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Asks one step. Every validating prompt re-asks on a bad answer, as before.
+answer_ask_step() {
+    local value confirm default label err
+    case "$1" in
+        admin_email)
+            while :; do
+                answer_read "Admin email" "${ANS_ADMIN_EMAIL:-}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                valid_admin_email "$value" && { ANS_ADMIN_EMAIL=$value; return 0; }
+                warn "Enter the admin's email address (name@domain, no spaces)."
+            done ;;
+        admin_name)
+            while :; do
+                answer_read "Admin display name" "${ANS_ADMIN_NAME:-Admin}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ -n "$value" ]] && { ANS_ADMIN_NAME=$value; return 0; }
+                warn "Enter a display name."
+            done ;;
+        admin_password)
+            while :; do
+                answer_read "Admin password (blank = autogenerate)" "" secret || return
+                if [[ -z "$ANSWER_REPLY" ]]; then
+                    ANS_ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)" ANS_PASSWORD_GENERATED=1
+                    return 0
+                fi
+                admin_password_ok "$ANSWER_REPLY" \
+                    && { ANS_ADMIN_PASSWORD=$ANSWER_REPLY ANS_PASSWORD_GENERATED=0; return 0; }
+                warn "$ADMIN_PASSWORD_RULE"
+            done ;;
+        base_url)
+            while :; do
+                answer_read "Public base URL" "${ANS_BASE_URL:-$ANSWER_BASE_URL_DEFAULT}" || return
+                value=$(normalize_base_url "$(trim_space "$ANSWER_REPLY")") && { ANS_BASE_URL=$value; return 0; }
+                warn "Enter the URL users open nano at, as http(s)://host[:port] (for example https://nano.example.com)."
+            done ;;
+        schema)
+            while :; do
+                answer_read "Schema profile — 'ocsf' (recommended), 'ocsf+tenzir' (OCSF + a bundled Tenzir node for direct ingestion), or 'udm' (legacy CIM-style)" "${ANS_SCHEMA:-ocsf}" || return
+                value=$(printf '%s' "$ANSWER_REPLY" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                case "$value" in
+                    ""|ocsf) ANS_SCHEMA=ocsf; return 0 ;;
+                    udm) ANS_SCHEMA=udm; return 0 ;;
+                    ocsf+tenzir)
+                        # NAN-5506: the bundled Tenzir node raises this host's floor.
+                        if [[ "${MULTI_NODE:-0}" == "1" ]]; then
+                            warn "The bundled Tenzir profile is single-node only; choose 'ocsf' or 'udm'."
+                        elif err=$( (nano_host_minimums_gate "$NANO_HOST_SINGLE_NODE_ROLES,tenzir" "$PWD") 2>&1 ); then
+                            ANS_SCHEMA=ocsf+tenzir; return 0
+                        else
+                            printf '%s\n' "$err" >&2
+                            warn "This host is too small for the bundled Tenzir node; choose 'ocsf' or 'udm'."
+                        fi ;;
+                    *) warn "Enter 'ocsf', 'ocsf+tenzir', or 'udm'." ;;
+                esac
+            done ;;
+        lic_mode)
+            while :; do
+                answer_read "License: online check-in (paste the 3 values from app.nano.rs) or offline file (path)? [online/offline]" "${ANS_LIC_MODE:-$ANSWER_LICENSE_DEFAULT}" || return
+                value=$(printf '%s' "$ANSWER_REPLY" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                case "$value" in
+                    online|on|1) ANS_LIC_MODE=online; return 0 ;;
+                    offline|off|file|2) ANS_LIC_MODE=offline; return 0 ;;
+                    *) warn "Answer online or offline." ;;
+                esac
+            done ;;
+        lic_url)
+            while :; do
+                answer_read "LICENSE_URL" "${ANS_LIC_URL:-$LICENSE_DEFAULT_URL}" || return
+                value=$(strip_license_paste "$ANSWER_REPLY" LICENSE_URL)
+                valid_license_url "$value" && { ANS_LIC_URL=$value; return 0; }
+                warn "Enter the https:// license URL shown on the deployment page."
+            done ;;
+        lic_token)
+            label="LICENSE_TOKEN (input hidden)"
+            [[ -n "${ANS_LIC_TOKEN:-}" ]] && label="LICENSE_TOKEN (input hidden) [keep]"
+            while :; do
+                answer_read "$label" "" secret || return
+                [[ -z "$ANSWER_REPLY" && -n "${ANS_LIC_TOKEN:-}" ]] && return 0
+                value=$(strip_license_paste "$ANSWER_REPLY" LICENSE_TOKEN)
+                valid_license_token "$value" && { ANS_LIC_TOKEN=$value; return 0; }
+                warn "That is not an enrollment token (value not shown). Paste LICENSE_TOKEN from the deployment page; if it was lost, regenerate it there."
+            done ;;
+        lic_id)
+            while :; do
+                answer_read "NANO_DEPLOYMENT_ID" "${ANS_LIC_ID:-}" || return
+                value=$(strip_license_paste "$ANSWER_REPLY" NANO_DEPLOYMENT_ID)
+                valid_deployment_id "$value" && { ANS_LIC_ID=$value; return 0; }
+                warn "Enter the deployment ID from the deployment page (deploy_ followed by 26 characters)."
+            done ;;
+        lic_file)
+            while :; do
+                answer_read "Offline license file path (blank = import it after install under Settings → License)" "${ANS_LIC_FILE:-}" || return
+                [[ -z "$ANSWER_REPLY" ]] && { ANS_LIC_FILE=""; return 0; }
+                value=$(resolve_offline_license_file "$ANSWER_REPLY") && { ANS_LIC_FILE=$value; return 0; }
+            done ;;
+        proxy)
+            # Offer an exported proxy as the default, without any credentials
+            # it carries (they would be shown in the prompt).
+            ANSWER_SHELL_PROXY=$(strip_proxy_userinfo "${HTTPS_PROXY:-${https_proxy:-}}")
+            valid_proxy_hostport "$ANSWER_SHELL_PROXY" || ANSWER_SHELL_PROXY=""
+            default=false
+            [[ -n "$ANSWER_SHELL_PROXY" ]] && default=true
+            answer_yes_no "Does this server reach the internet through an HTTP(S) proxy?" "${ANS_PROXY:-$default}" || return
+            ANS_PROXY=$ANSWER_REPLY ;;
+        proxy_url)
+            while :; do
+                answer_read "Proxy URL (http://host:port)" "${ANS_PROXY_URL:-$ANSWER_SHELL_PROXY}" || return
+                valid_proxy_hostport "$ANSWER_REPLY" && { ANS_PROXY_URL=$ANSWER_REPLY; return 0; }
+                warn "Enter the proxy as http://host:port or https://host:port (no credentials, quotes or spaces)."
+            done ;;
+        proxy_auth)
+            answer_yes_no "Does the proxy require a username and password?" "${ANS_PROXY_AUTH:-false}" || return
+            ANS_PROXY_AUTH=$ANSWER_REPLY ;;
+        proxy_user)
+            while :; do
+                answer_read "Proxy username (DOMAIN\\user is fine)" "${ANS_PROXY_USER:-}" || return
+                [[ -n "$ANSWER_REPLY" ]] && { ANS_PROXY_USER=$ANSWER_REPLY; return 0; }
+                warn "Enter the proxy username."
+            done ;;
+        proxy_pass)
+            while :; do
+                answer_read "Proxy password" "" secret || return
+                value=$ANSWER_REPLY
+                answer_read "Confirm proxy password" "" secret || return
+                confirm=$ANSWER_REPLY
+                if [[ -z "$value" ]]; then
+                    warn "Enter the proxy password."
+                elif [[ "$value" != "$confirm" ]]; then
+                    warn "The passwords do not match. Enter them again."
+                else
+                    ANS_PROXY_PASS=$value
+                    return 0
+                fi
+            done ;;
+        no_proxy)
+            while :; do
+                answer_read "Extra hosts that bypass the proxy, comma-separated (blank = none)" "${ANS_NO_PROXY-${NO_PROXY:-${no_proxy:-}}}" || return
+                [[ -z "$ANSWER_REPLY" ]] && { ANS_NO_PROXY=""; return 0; }
+                valid_no_proxy "$ANSWER_REPLY" && { ANS_NO_PROXY=$ANSWER_REPLY; return 0; }
+                warn "Enter comma-separated host names, domains, IPs or CIDRs (no spaces)."
+            done ;;
+        ai)
+            answer_yes_no "Will nano use an AI model hosted on your own network (e.g. a local LLM on 192.168.x / 10.x)? This allows the AI provider URL to point at private addresses (cloud-metadata stays blocked)." "${ANS_AI:-false}" || return
+            ANS_AI=$ANSWER_REPLY ;;
+        backup)
+            answer_yes_no "Set up automatic backups?" "${ANS_BACKUP:-false}" || return
+            ANS_BACKUP=$ANSWER_REPLY ;;
+        backup_dest)
+            default=1
+            [[ "${ANS_BACKUP_DEST:-}" == s3 ]] && default=2
+            while :; do
+                answer_read "Destination: (1) local or mounted path (NFS/SMB share), (2) S3-compatible bucket (AWS S3, Wasabi, RustFS ...)" "$default" || return
+                case "$(trim_space "$ANSWER_REPLY")" in
+                    1|path) ANS_BACKUP_DEST=path; return 0 ;;
+                    2|s3) ANS_BACKUP_DEST=s3; return 0 ;;
+                esac
+                warn "Enter 1 or 2."
+            done ;;
+        backup_path)
+            while :; do
+                answer_read "Backup directory (absolute path; mount the share first)" "${ANS_BACKUP_PATH:-}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" == /* ]] && answer_env_safe "$value" && { ANS_BACKUP_PATH=$value; return 0; }
+                warn "Enter an absolute directory path (no spaces, quotes, \$, \`, \\ or #)."
+            done ;;
+        backup_s3_endpoint)
+            while :; do
+                answer_read "S3 endpoint URL" "${ANS_BACKUP_S3_ENDPOINT:-https://s3.us-east-1.amazonaws.com}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" =~ ^https?://[^/[:space:]]+ ]] && answer_env_safe "$value" && { ANS_BACKUP_S3_ENDPOINT=$value; return 0; }
+                warn "Enter the endpoint as https://host[:port]."
+            done ;;
+        backup_s3_bucket)
+            while :; do
+                answer_read "Bucket" "${ANS_BACKUP_S3_BUCKET:-}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] && { ANS_BACKUP_S3_BUCKET=$value; return 0; }
+                warn "Enter a bucket name: 3-63 lower-case letters, digits, '.' or '-'."
+            done ;;
+        backup_s3_region)
+            while :; do
+                answer_read "Region" "${ANS_BACKUP_S3_REGION:-us-east-1}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" =~ ^[A-Za-z0-9-]{1,64}$ ]] && { ANS_BACKUP_S3_REGION=$value; return 0; }
+                warn "Enter a region such as us-east-1."
+            done ;;
+        backup_s3_prefix)
+            while :; do
+                answer_read "Key prefix" "${ANS_BACKUP_S3_PREFIX-nano}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" =~ ^[A-Za-z0-9!_.*/()-]{0,256}$ ]] && { ANS_BACKUP_S3_PREFIX=$value; return 0; }
+                warn "Enter a key prefix of letters, digits and !_.*()/- only."
+            done ;;
+        backup_s3_access|backup_s3_secret)
+            label="Access key ID"
+            [[ "$1" == backup_s3_secret ]] && label="Secret access key"
+            [[ -n "$(answer_current "$1")" ]] && label+=" [keep]"
+            while :; do
+                answer_read "$label" "" secret || return
+                [[ -z "$ANSWER_REPLY" && -n "$(answer_current "$1")" ]] && return 0
+                if answer_env_safe "$ANSWER_REPLY"; then
+                    if [[ "$1" == backup_s3_access ]]; then ANS_BACKUP_S3_ACCESS=$ANSWER_REPLY; else ANS_BACKUP_S3_SECRET=$ANSWER_REPLY; fi
+                    return 0
+                fi
+                warn "Enter the key (it cannot be blank or hold whitespace, quotes, \$, \`, \\ or #)."
+            done ;;
+        backup_schedule)
+            while :; do
+                answer_read "Daily backup time (HH:MM, local)" "${ANS_BACKUP_SCHEDULE:-02:00}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && { ANS_BACKUP_SCHEDULE=$value; return 0; }
+                warn "Enter a 24-hour time as HH:MM (for example 02:00)."
+            done ;;
+        backup_keep)
+            while :; do
+                answer_read "Backups to keep" "${ANS_BACKUP_KEEP:-7}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" =~ ^[1-9][0-9]{0,3}$ ]] && { ANS_BACKUP_KEEP=$value; return 0; }
+                warn "Enter a whole number from 1 to 9999."
+            done ;;
+        volume)
+            while :; do
+                answer_read "Planned log volume in GB per day (Enter to skip: settings then follow this host's size only)" "${ANS_VOLUME:-}" || return
+                value=$(printf '%s' "$ANSWER_REPLY" | tr -d '[:space:]')
+                [[ -z "$value" ]] && { ANS_VOLUME=""; return 0; }
+                valid_planned_gb_per_day "$value" && { ANS_VOLUME=$(( 10#$value )); return 0; }
+                warn "Enter a whole number of GB per day, or press Enter to skip."
+            done ;;
+        ingest_path)
+            default=raw
+            [[ "${ANS_SCHEMA:-}" == ocsf+tenzir || "${BUNDLE_TENZIR:-0}" == 1 ]] && default=preshaped
+            while :; do
+                answer_read "Do events arrive as raw logs that nano parses, or pre-shaped OCSF (Tenzir/Cribl)? raw/preshaped" "${ANS_INGEST_PATH:-$default}" || return
+                value=$(trim_space "$ANSWER_REPLY")
+                [[ "$value" == raw || "$value" == preshaped ]] && { ANS_INGEST_PATH=$value; return 0; }
+                warn "Enter raw or preshaped."
+            done ;;
+        retention)
+            while :; do
+                answer_read "Event retention in days (the disk still caps it; change later in Settings -> Storage)" "${ANS_RETENTION:-365}" || return
+                value=$(printf '%s' "$ANSWER_REPLY" | tr -d '[:space:]')
+                valid_retention_days "$value" && { ANS_RETENTION=$(( 10#$value )); return 0; }
+                warn "Enter a whole number of days, 1-3650."
+            done ;;
+        tiering)
+            if [[ "$ANSWER_TIERING_INTRO" == 0 ]]; then
+                ANSWER_TIERING_INTRO=1
+                printf '%s\n' "Cold storage tiering keeps recent events on this host's disk and moves older ClickHouse parts to object storage (AWS S3, S3-compatible, GCS or Azure Blob) when the disk fills; they stay searchable. You can turn it on later with: scripts/nano tiering configure" > /dev/tty
+            fi
+            answer_yes_no "Enable cold storage tiering?" "${ANS_TIERING:-false}" || return
+            ANS_TIERING=$ANSWER_REPLY ;;
+        tier_provider)
+            while :; do
+                answer_read "Object store: s3, s3-compatible (Wasabi, RustFS, ...), gcs or azure" "${ANS_TIER_PROVIDER:-s3}" || return
+                value=$(printf '%s' "$ANSWER_REPLY" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                case "$value" in
+                    s3|s3-compatible|gcs|azure)
+                        # A different store: its location and credentials are asked anew.
+                        if [[ "$value" != "${ANS_TIER_PROVIDER:-}" ]]; then
+                            ANS_TIER_BUCKET="" ANS_TIER_ENDPOINT="" ANS_TIER_REGION="" ANS_TIER_ACCESS="" ANS_TIER_SECRET=""
+                            ANS_TIER_ENV_CREDS="" ANS_TIER_AZURE_URL="" ANS_TIER_AZURE_NAME="" ANS_TIER_AZURE_CONTAINER="" ANS_TIER_AZURE_KEY=""
+                        fi
+                        ANS_TIER_PROVIDER=$value; return 0 ;;
+                esac
+                warn "Enter s3, s3-compatible, gcs or azure."
+            done ;;
+        tier_azure_url) answer_read "Storage account URL (https://<account>.blob.core.windows.net)" "${ANS_TIER_AZURE_URL:-}" || return
+            ANS_TIER_AZURE_URL=$(trim_space "$ANSWER_REPLY") ;;
+        tier_azure_name) answer_read "Storage account name" "${ANS_TIER_AZURE_NAME:-}" || return
+            ANS_TIER_AZURE_NAME=$(trim_space "$ANSWER_REPLY") ;;
+        tier_azure_container) answer_read "Container (must exist)" "${ANS_TIER_AZURE_CONTAINER:-}" || return
+            ANS_TIER_AZURE_CONTAINER=$(trim_space "$ANSWER_REPLY") ;;
+        tier_azure_key)
+            label="Storage account key"
+            [[ -n "${ANS_TIER_AZURE_KEY:-}" ]] && label+=" [keep]"
+            answer_read "$label" "" secret || return
+            [[ -z "$ANSWER_REPLY" && -n "${ANS_TIER_AZURE_KEY:-}" ]] || ANS_TIER_AZURE_KEY=$(trim_space "$ANSWER_REPLY") ;;
+        tier_bucket) answer_read "Bucket (must exist)" "${ANS_TIER_BUCKET:-}" || return
+            ANS_TIER_BUCKET=$(trim_space "$ANSWER_REPLY") ;;
+        tier_endpoint) answer_read "Endpoint (https://host[:port])" "${ANS_TIER_ENDPOINT:-}" || return
+            ANS_TIER_ENDPOINT=$(trim_space "$ANSWER_REPLY") ;;
+        tier_region) answer_read "Region" "${ANS_TIER_REGION:-us-east-1}" || return
+            ANS_TIER_REGION=$(trim_space "$ANSWER_REPLY") ;;
+        tier_prefix) answer_read "Key prefix inside the bucket" "${ANS_TIER_PREFIX:-nano}" || return
+            ANS_TIER_PREFIX=$(trim_space "$ANSWER_REPLY") ;;
+        tier_env_creds)
+            label="an EC2 instance role"
+            [[ "$ANS_TIER_PROVIDER" == gcs ]] && label="this GCE VM's service account"
+            answer_yes_no "Use $label instead of access keys?" "${ANS_TIER_ENV_CREDS:-false}" || return
+            ANS_TIER_ENV_CREDS=$ANSWER_REPLY ;;
+        tier_access)
+            label="Access key ID"
+            [[ "$ANS_TIER_PROVIDER" == gcs ]] && label="HMAC access key"
+            answer_read "$label" "${ANS_TIER_ACCESS:-}" || return
+            ANS_TIER_ACCESS=$(trim_space "$ANSWER_REPLY") ;;
+        tier_secret)
+            label="Secret"
+            [[ -n "${ANS_TIER_SECRET:-}" ]] && label="Secret [keep]"
+            answer_read "$label" "" secret || return
+            [[ -z "$ANSWER_REPLY" && -n "${ANS_TIER_SECRET:-}" ]] || ANS_TIER_SECRET=$(trim_space "$ANSWER_REPLY") ;;
+        tier_move) answer_read "Start moving parts when free local disk falls below (fraction, 0 = paused)" "${ANS_TIER_MOVE:-0.3}" || return
+            ANS_TIER_MOVE=$(trim_space "$ANSWER_REPLY") ;;
+        tier_cache)
+            answer_read "Local cache for cold reads" "${ANS_TIER_CACHE:-10Gi}" || return
+            ANS_TIER_CACHE=$(trim_space "$ANSWER_REPLY")
+            # The last tiering answer: check the whole set now (no network),
+            # so a bad value is fixed here rather than after install.
+            if ! err=$(answer_tiering_check); then
+                printf '%s\n' "${err#nano }" >&2
+                answer_yes_no "Enter the object store settings again?" true || return
+                if [[ "$ANSWER_REPLY" == true ]]; then
+                    ANSWER_JUMP=tier_provider
+                    return 3
+                fi
+                ANS_TIERING=false
+            fi ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Asks one review item's questions on their own (a configure_* function
+# called directly on a terminal, or an answer to fix after a failed check).
+answer_ask_group() {
+    local entry item first last label
+    for entry in "${ANSWER_ITEMS[@]}"; do
+        read -r item first last label <<< "$entry"
+        [[ "$item" == "$1" ]] && break
+    done
+    [[ "$item" == "$1" ]] || fail "Internal error: no question group $1."
+    printf -v "WANT_$1" '%s' 1
+    answer_run_steps "$(answer_step_index "$first")" "$(answer_step_index "$last")"
+}
+
+# The current value of a secret step, to offer "[keep]".
+answer_current() {
+    case "$1" in
+        backup_s3_access) printf '%s' "${ANS_BACKUP_S3_ACCESS:-}" ;;
+        backup_s3_secret) printf '%s' "${ANS_BACKUP_S3_SECRET:-}" ;;
+    esac
+}
+
+answer_step_index() {
+    local i
+    for i in "${!ANSWER_STEPS[@]}"; do
+        [[ "${ANSWER_STEPS[i]}" == "$1" ]] && { printf '%s' "$i"; return 0; }
+    done
+    return 1
+}
+
+# Runs steps $1..$2 (indexes into ANSWER_STEPS). `back` moves to the previous
+# step asked in this range; at its first step it asks that step again.
+answer_run_steps() {
+    local first="$1" last="$2" i="$1" j rc
+    while (( i <= last )); do
+        if ! answer_step_applies "${ANSWER_STEPS[i]}"; then
+            i=$((i + 1))
+            continue
+        fi
+        rc=0
+        answer_ask_step "${ANSWER_STEPS[i]}" || rc=$?
+        case "$rc" in
+            0) i=$((i + 1)) ;;
+            2)
+                j=$((i - 1))
+                while (( j >= first )) && ! answer_step_applies "${ANSWER_STEPS[j]}"; do j=$((j - 1)); done
+                if (( j < first )); then
+                    warn "This is the first question here; answer it (Enter keeps the value shown in brackets)."
+                else
+                    i=$j
+                fi ;;
+            3) i=$(answer_step_index "$ANSWER_JUMP") ;;
+            *) fail "Internal error asking ${ANSWER_STEPS[i]}." ;;
+        esac
+    done
+}
+
+# One review line's value. Secrets are never shown.
+answer_item_value() {
+    local text
+    case "$1" in
+        admin_email) printf '%s' "$ANS_ADMIN_EMAIL" ;;
+        admin_name) printf '%s' "$ANS_ADMIN_NAME" ;;
+        admin_password)
+            if [[ "${ANS_PASSWORD_GENERATED:-0}" == 1 ]]; then printf 'autogenerate (shown at the end)'; else printf 'set (hidden)'; fi ;;
+        base_url) printf '%s' "$ANS_BASE_URL" ;;
+        schema) printf '%s' "$ANS_SCHEMA" ;;
+        license)
+            if [[ "$ANS_LIC_MODE" == online ]]; then
+                text="online check-in, deployment $ANS_LIC_ID, token set (hidden)"
+                [[ "$ANS_LIC_URL" == "$LICENSE_DEFAULT_URL" ]] || text+=", $ANS_LIC_URL"
+                printf '%s' "$text"
+            elif [[ -n "${ANS_LIC_FILE:-}" ]]; then
+                printf 'offline file %s' "$ANS_LIC_FILE"
+            else
+                printf 'offline, import the file after install'
+            fi ;;
+        proxy)
+            if [[ "$ANS_PROXY" != true ]]; then printf 'none'; return 0; fi
+            text="$ANS_PROXY_URL"
+            [[ "$ANS_PROXY_AUTH" == true ]] && text+=" (user $ANS_PROXY_USER, password set (hidden))"
+            [[ -n "${ANS_NO_PROXY:-}" ]] && text+=", bypass $ANS_NO_PROXY"
+            printf '%s' "$text" ;;
+        ai) if [[ "$ANS_AI" == true ]]; then printf 'yes (private AI provider addresses allowed)'; else printf 'no'; fi ;;
+        backup)
+            if [[ "$ANS_BACKUP" != true ]]; then printf 'off'; return 0; fi
+            if [[ "$ANS_BACKUP_DEST" == path ]]; then text="$ANS_BACKUP_PATH"
+            else text="$ANS_BACKUP_S3_ENDPOINT bucket $ANS_BACKUP_S3_BUCKET${ANS_BACKUP_S3_PREFIX:+/$ANS_BACKUP_S3_PREFIX} ($ANS_BACKUP_S3_REGION), keys set (hidden)"; fi
+            printf 'daily at %s to %s, keep %s' "$ANS_BACKUP_SCHEDULE" "$text" "$ANS_BACKUP_KEEP" ;;
+        volume)
+            if [[ -z "${ANS_VOLUME:-}" || "$ANS_VOLUME" == 0 ]]; then printf 'not declared (sized from this host)'; return 0; fi
+            text="$ANS_VOLUME GB/day"
+            answer_step_applies ingest_path && text+=", ${ANS_INGEST_PATH} ingest"
+            printf '%s' "$text" ;;
+        retention) printf '%s days' "$ANS_RETENTION" ;;
+        tiering)
+            if [[ "$ANS_TIERING" != true ]]; then printf 'off'; return 0; fi
+            if [[ "$ANS_TIER_PROVIDER" == azure ]]; then
+                text="azure $ANS_TIER_AZURE_URL container $ANS_TIER_AZURE_CONTAINER, key set (hidden)"
+            else
+                text="$ANS_TIER_PROVIDER bucket $ANS_TIER_BUCKET/$ANS_TIER_PREFIX"
+                [[ "$ANS_TIER_PROVIDER" == s3-compatible ]] && text+=" at $ANS_TIER_ENDPOINT"
+                [[ -n "${ANS_TIER_REGION:-}" ]] && answer_step_applies tier_region && text+=" ($ANS_TIER_REGION)"
+                if [[ "${ANS_TIER_ENV_CREDS:-false}" == true ]]; then text+=", instance credentials"; else text+=", keys set (hidden)"; fi
+            fi
+            printf '%s, move below %s free, cache %s' "$text" "$ANS_TIER_MOVE" "$ANS_TIER_CACHE" ;;
+    esac
+}
+
+answer_review() {
+    local entry item first last label n choice
+    local -a review_items=()
+    while :; do
+        printf '\nReview your answers\n' > /dev/tty
+        review_items=()
+        for entry in "${ANSWER_ITEMS[@]}"; do
+            read -r item first last label <<< "$entry"
+            answer_wanted "$item" || continue
+            review_items+=("$entry")
+            printf '  %2d  %-22s %s\n' "${#review_items[@]}" "$label" "$(answer_item_value "$item")" > /dev/tty
+        done
+        printf '\n' > /dev/tty
+        if ! answer_read "Enter to install, a number to change that answer, or q to quit (nothing written yet)"; then
+            # `back` here is not a confirmation: show the review again.
+            warn "Type the number of the answer to change, or press Enter to install."
+            continue
+        fi
+        choice=$(trim_space "$ANSWER_REPLY")
+        case "$choice" in
+            "") return 0 ;;
+            q|Q|quit)
+                printf '%s\n' "Stopped at the review: nothing was written and nothing was started." > /dev/tty
+                exit 0 ;;
+        esac
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice >= 1 && 10#$choice <= ${#review_items[@]} )); then
+            n=$(( 10#$choice - 1 ))
+            read -r item first last label <<< "${review_items[n]}"
+            answer_run_steps "$(answer_step_index "$first")" "$(answer_step_index "$last")"
+        else
+            warn "Press Enter to install, type a number from 1 to ${#review_items[@]}, or q to quit."
+        fi
+    done
+}
+
+# Decides which questions this run asks (the same conditions the configure_*
+# functions use), asks them, and shows the review screen. $1 = 1 on a first
+# install (no .env yet).
+# shellcheck disable=SC2034  # WANT_* are read through answer_wanted.
+collect_answers() {
+    local first_install="$1" recorded_mode wanted=0 name
+    have_controlling_tty || return 0
+    WANT_admin_email=0 WANT_admin_name=0 WANT_admin_password=0 WANT_base_url=0 WANT_schema=0
+    WANT_license=0 WANT_proxy=0 WANT_ai=0 WANT_backup=0 WANT_volume=0 WANT_ingest_path=0
+    WANT_retention=0 WANT_tiering=0
+    ANSWER_BASE_URL_DEFAULT="http://localhost" ANSWER_LICENSE_DEFAULT=online
+    if [[ "$first_install" == 1 ]]; then
+        [[ -n "${NANO_ADMIN_EMAIL:-}" ]] || WANT_admin_email=1
+        [[ -n "${NANO_ADMIN_NAME:-}" ]] || WANT_admin_name=1
+        [[ -n "${NANO_ADMIN_PASSWORD:-}" || "${NANO_PREPARE_ONLY:-0}" == "1" ]] || WANT_admin_password=1
+        [[ -n "${NANO_BASE_URL:-}" ]] || WANT_base_url=1
+        [[ -n "${NANO_SCHEMA_PROFILE:-}" ]] || WANT_schema=1
+    elif [[ -z "${NANO_BASE_URL:-}" ]] && base_url_needs_reask; then
+        # A reused .env holding a BASE_URL that is not a URL (v2.0.28 "N"):
+        # no default unless it is a bare host, offered back as https://.
+        WANT_base_url=1
+        ANSWER_BASE_URL_DEFAULT=$(base_url_reask_default)
+        warn "This install's .env has BASE_URL='$(env_value BASE_URL)', which is not a URL users can open nano at."
+    fi
+    if license_question_applies "$first_install"; then
+        WANT_license=1
+        recorded_mode=$(env_value NANO_LICENSE_MODE)
+        [[ "$first_install" == "0" && -z "$recorded_mode" ]] && ANSWER_LICENSE_DEFAULT=offline
+    fi
+    [[ -z "$(env_value HTTPS_PROXY)" && -z "$(env_value NANO_OUTBOUND_PROXY_ASKED)" && -z "${NANO_HTTPS_PROXY:-}" ]] \
+        && WANT_proxy=1
+    [[ -z "$(env_value NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS)" && -z "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" ]] && WANT_ai=1
+    if [[ "${MULTI_NODE:-0}" != "1" && "$(env_value NANO_BACKUP_ASKED)" != "true" && -z "${NANO_BACKUP_ENABLED+set}" \
+        && -f scripts/nano-backup-scheduler.py ]] && command -v python3 >/dev/null 2>&1; then
+        WANT_backup=1
+    fi
+    if planned_volume_question_applies; then
+        WANT_volume=1
+        [[ -z "${NANO_INGEST_PATH:-}" && -z "$(env_value NANO_INGEST_PATH)" ]] && WANT_ingest_path=1
+    fi
+    retention_question_applies && WANT_retention=1
+    tiering_question_applies && WANT_tiering=1
+    for name in admin_email admin_name admin_password base_url schema license proxy ai backup volume retention tiering; do
+        answer_wanted "$name" && wanted=1
+    done
+    [[ "$wanted" == 1 ]] || return 0
+    # Ctrl-C before the review is confirmed: nothing has been written yet.
+    trap 'printf "\n" >/dev/tty; warn "Interrupted before the answers were confirmed: nothing was written and nothing was started."; exit 130' INT
+    printf '\n%s\n%s\n\n' "Answer each question; Enter takes the [default]. Type back to fix the previous answer." \
+        "Nothing is written until you confirm the review at the end; Ctrl-C leaves this host untouched." > /dev/tty
+    answer_run_steps 0 $(( ${#ANSWER_STEPS[@]} - 1 ))
+    answer_review
+    trap - INT
+}
+
+# Whether the license is asked (resolve_license's "nothing known" branch).
+license_question_applies() {
+    local first_install="$1" recorded_mode recorded_token recorded_id
+    [[ "$NANO_EDITION" == enterprise ]] || return 1
+    [[ "${MULTI_NODE:-0}" == "1" && ",${ROLE_ARG:-}," != *,app,* ]] && return 1
+    [[ -z "$LICENSE_TOKEN_INPUT" && -z "$LICENSE_FILE_INPUT" && "$LICENSE_MODE_INPUT" != offline ]] || return 1
+    is_truthy "${AIRGAP_MODE:-}" && return 1
+    is_truthy "$(env_value AIRGAP_MODE)" && return 1
+    recorded_mode=$(env_value NANO_LICENSE_MODE)
+    recorded_token=$(env_value LICENSE_TOKEN)
+    [[ -n "$recorded_token" ]] || recorded_token=$(env_value DEPLOYMENT_TOKEN)
+    recorded_id=$(env_value NANO_DEPLOYMENT_ID)
+    [[ -n "$recorded_token" && -n "$recorded_id" ]] && return 1
+    [[ "$recorded_mode" == offline || "$recorded_mode" == airgap ]] && return 1
+    [[ "$first_install" == 1 ]] || return 0
+    return 0
+}
+
+# Planned volume and retention are asked when neither the environment nor
+# .env gives them, on a single host that has never started nano (a fresh
+# install, or a re-run after a Ctrl-C or a refused destination).
+volume_questions_open() {
+    [[ "${MULTI_NODE:-0}" != "1" ]] || return 1
+    [[ "${REUSE_ENV:-0}" != "1" && ! -f .env ]] && return 0
+    install_never_ran
+}
+planned_volume_question_applies() {
+    [[ -z "${NANO_PLANNED_GB_PER_DAY:-}" && -z "$(env_value NANO_PLANNED_GB_PER_DAY)" ]] && volume_questions_open
+}
+retention_question_applies() {
+    [[ -z "${NANO_RETENTION_DAYS:-}" && -z "$(env_value NANO_RETENTION_DAYS)" ]] && volume_questions_open
+}
+tiering_question_applies() {
+    local key
+    [[ "${MULTI_NODE:-0}" != "1" && "$NANO_EDITION" == enterprise ]] || return 1
+    [[ -f scripts/nano-tiering.py && -f scripts/lib/clickhouse_tiering.py ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    [[ -z "$(env_value NANO_TIERING)" ]] || return 1
+    for key in NANO_TIERING NANO_TIERING_PROVIDER NANO_TIERING_BUCKET NANO_TIERING_REGION NANO_TIERING_ENDPOINT \
+        NANO_TIERING_PREFIX NANO_TIERING_MOVE_FACTOR NANO_TIERING_CACHE_SIZE NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS \
+        NANO_TIERING_AZURE_ACCOUNT_URL NANO_TIERING_AZURE_CONTAINER NANO_TIERING_AZURE_ACCOUNT_NAME \
+        NANO_TIERING_ACCESS_KEY_ID NANO_TIERING_SECRET_ACCESS_KEY NANO_TIERING_AZURE_ACCOUNT_KEY; do
+        [[ -z "$(trim_space "${!key:-}")" ]] || return 1
+    done
+    return 0
+}
+
+# A reused .env whose BASE_URL is not a URL users can open, on a host that
+# owns .env (single node or the app role).
+base_url_needs_reask() {
+    local recorded
+    recorded=$(env_value BASE_URL)
+    [[ -n "$recorded" ]] || return 1
+    normalize_base_url "$recorded" >/dev/null && return 1
+    [[ "${MULTI_NODE:-0}" != "1" || ",${ROLE_ARG:-}," == *,app,* ]]
+}
+base_url_reask_default() {
+    local recorded
+    recorded=$(trim_space "$(env_value BASE_URL)")
+    if [[ "$recorded" != *://* && ( "$recorded" == *.* || "$recorded" == \[* ) ]] \
+        && normalize_base_url "https://$recorded" >/dev/null; then
+        normalize_base_url "https://$recorded"
+    fi
+    return 0
+}
+# <<< interactive answers (NAN-5508) <<<
 # NAN-4957: enrichment (the IPinfo, Tor, ThreatFox platform feeds) REQUIRES a
 # 6G ClickHouse. Informational only — does not change the sizing above, and
 # says nothing about smaller limits when the feeds are off (2-4G is fine for
@@ -1532,7 +2381,7 @@ repo_digest_of() {
     local line
     line=$(docker image inspect "$1" \
         --format '{{range .RepoDigests}}{{println .}}{{end}}' </dev/null 2>/dev/null \
-        | grep -F "${2}@" | head -1)
+        | grep -F "${2}@" | awk 'NR == 1')
     printf '%s' "${line##*@}"
 }
 
@@ -1568,7 +2417,7 @@ verify_one_digest() {
 # The "# Release: vX.Y.Z" header of a lock file, without the leading v.
 lock_release() {
     local r
-    r=$(sed -n 's/^# Release: v\{0,1\}//p' "$1" 2>/dev/null | head -1)
+    r=$(sed -n 's/^# Release: v\{0,1\}//p' "$1" 2>/dev/null | awk 'NR == 1')
     printf '%s' "${r%% *}"
 }
 
@@ -1665,13 +2514,62 @@ verify_image_digests() {
 # ----------------------------------------------------------------------------
 log "Checking prerequisites"
 
-require_cmd docker   "Install Docker: https://docs.docker.com/get-docker/"
-require_cmd git      "Install git (most package managers)."
-require_cmd openssl  "Install openssl (most distros ship it by default)."
-require_cmd curl     "Install curl."
+# NAN-5509: the package manager command for this host, inferred from
+# /etc/os-release (ID and ID_LIKE), so a missing tool's message names the exact
+# install line. Prints nothing when the family is unknown.
+os_release_path=/etc/os-release os_kernel=$(uname -s)
+if [[ -n "${NANO_INSTALLER_TEST_OS_RELEASE:-}" && "${NANO_INSTALLER_TEST_MODE:-0}" == "1" ]]; then
+    os_release_path="$NANO_INSTALLER_TEST_OS_RELEASE" os_kernel=Linux
+fi
+os_family=""
+if [[ "$os_kernel" == Darwin ]]; then
+    os_family=macos
+elif [[ -r "$os_release_path" ]]; then
+    os_ids=$(awk -F= '$1 == "ID" || $1 == "ID_LIKE" { gsub(/"/, "", $2); printf "%s ", $2 }' "$os_release_path")
+    case " $os_ids " in
+        *" debian "* | *" ubuntu "*) os_family=apt ;;
+        *" fedora "* | *" rhel "* | *" centos "* | *" rocky "* | *" almalinux "* | *" amzn "* | *" ol "*) os_family=dnf ;;
+        *" suse "* | *" opensuse "* | *" sles "*) os_family=zypper ;;
+        *" alpine "*) os_family=apk ;;
+        *" arch "*) os_family=pacman ;;
+    esac
+fi
+# install_hint <package>: "Install it: sudo apt-get install -y <package>."
+install_hint() {
+    case "$os_family" in
+        apt) printf 'Install it: sudo apt-get update && sudo apt-get install -y %s' "$1" ;;
+        dnf) printf 'Install it: sudo dnf install -y %s' "$1" ;;
+        zypper) printf 'Install it: sudo zypper install -y %s' "$1" ;;
+        apk) printf 'Install it: sudo apk add %s' "$1" ;;
+        pacman) printf 'Install it: sudo pacman -S --needed %s' "$1" ;;
+        macos) printf 'Install it: brew install %s' "$1" ;;
+        *) printf 'Install the %s package with your package manager' "$1" ;;
+    esac
+    printf ', then re-run.'
+}
 
+require_cmd docker   "Install Docker Engine: https://docs.docker.com/engine/install/ (then add your user to the docker group: sudo usermod -aG docker \$USER, log out and back in)."
+# git only fetches a get.nano.rs checkout (or clones a new one); an extracted
+# release bundle never uses it.
+if [[ ! -e "$NANO_INSTALL_DIR" || -e "$NANO_INSTALL_DIR/.git" ]] \
+    && [[ ! -f "$NANO_INSTALL_DIR/.nano-bundle" ]]; then
+    require_cmd git  "$(install_hint git)"
+fi
+require_cmd openssl  "$(install_hint openssl)"
+require_cmd curl     "$(install_hint curl)"
+# Every install renders ClickHouse's config with python3 (network allow-list,
+# config directories); without it the install failed after every prompt.
+require_cmd python3  "$(install_hint python3) (nano's installer needs Python 3.9 or later; node is not a substitute)."
+
+compose_plugin_hint() {
+    case "$os_family" in
+        apt | dnf) printf 'Install the compose plugin from Docker'"'"'s repository: sudo %s install -y docker-compose-plugin (see https://docs.docker.com/compose/install/linux/).' \
+            "$([[ "$os_family" == apt ]] && printf apt-get || printf dnf)" ;;
+        *) printf 'Update Docker or install the compose plugin: https://docs.docker.com/compose/install/linux/' ;;
+    esac
+}
 if ! docker compose version </dev/null >/dev/null 2>&1; then
-    fail "docker compose v2 is required. Update Docker or install the compose plugin."
+    fail "docker compose v2 is required (the 'docker compose' plugin, not the old docker-compose). $(compose_plugin_hint)"
 fi
 
 # Docker Compose 2.24.4 or later: role-split renders and the NAN-5408 metrics
@@ -1679,7 +2577,7 @@ fi
 compose_version=""
 compose_at_least_2_24_4() {
     local major minor patch
-    compose_version=$(docker compose version --short </dev/null 2>/dev/null | sed 's/^v//' | cut -d- -f1)
+    compose_version=$(docker compose version --short </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | awk 'NR == 1')
     IFS=. read -r major minor patch <<< "$compose_version"
     [[ "$major" =~ ^[0-9]+$ ]] || major=0
     [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
@@ -1689,14 +2587,30 @@ compose_at_least_2_24_4() {
 
 if [[ -n "$INVENTORY_ARG" ]]; then
     require_cmd python3 "Install Python 3 (used only to validate and render the sovereign host inventory)."
-    compose_at_least_2_24_4 || fail "Role-split installs require Docker Compose 2.24.4+ (found $compose_version)."
+    compose_at_least_2_24_4 || fail "Role-split installs require Docker Compose 2.24.4+ (found $compose_version). $(compose_plugin_hint)"
     [[ -f "$INVENTORY_ARG" ]] || fail "Inventory not found: $INVENTORY_ARG"
     INVENTORY_PATH="$(cd "$(dirname "$INVENTORY_ARG")" && pwd -P)/$(basename "$INVENTORY_ARG")"
+elif ! compose_at_least_2_24_4; then
+    # Single node: the metrics overlay (NANO_METRICS_BIND_ADDRESS) uses
+    # `!reset`, which older Compose rejects; the base stack still starts.
+    warn "Docker Compose ${compose_version:-unknown} is older than 2.24.4, which nano is tested with (publishing metrics with NANO_METRICS_BIND_ADDRESS needs it). $(compose_plugin_hint)"
 fi
 
+# NAN-5509: a user outside the docker group used to see only "can't talk to
+# it", ran `sudo ./install.sh`, and left a root-owned install behind.
+if [[ "$(id -u)" == 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+    warn "Running as root through sudo. Every later install.sh and scripts/nano run must then use sudo too, and the files it writes belong to root. Prefer: sudo usermod -aG docker $SUDO_USER, log out and back in (or run: newgrp docker), then run install.sh without sudo."
+fi
 if [[ "${NANO_PREPARE_ONLY:-0}" != "1" && "${NANO_CHECK_ONLY:-0}" != "1" ]] \
-    && ! docker info </dev/null >/dev/null 2>&1; then
-    fail "Docker daemon is not running or this user can't talk to it. Start Docker and retry."
+    && ! docker_info_err=$(docker info </dev/null 2>&1 >/dev/null); then
+    case "$docker_info_err" in
+        *"permission denied"* | *"Permission denied"*)
+            fail "Your user ($(id -un)) cannot use Docker: permission denied on the Docker socket. Add it to the docker group: sudo usermod -aG docker \$USER, then log out and back in (or run: newgrp docker) and re-run install.sh. Do not run install.sh with sudo: the install would belong to root, and every later run and upgrade would need sudo too." ;;
+        *"Cannot connect to the Docker daemon"* | *"Is the docker daemon running"* | *"connect: no such file"*)
+            fail "The Docker daemon is not running. Start it (sudo systemctl enable --now docker; on Docker Desktop, open the app) and re-run." ;;
+        *)
+            fail "Docker is not usable by this user: $(printf '%s' "$docker_info_err" | tr '\n' ' ' | cut -c1-300) Start Docker, or fix the error above, and re-run." ;;
+    esac
 fi
 
 # NAN-4906 / NAN-4999: ClickHouse 26.6+ and ClickHouse Keeper need AVX2 on
@@ -1736,8 +2650,27 @@ ok "All prerequisites present"
 if [[ -e "$NANO_INSTALL_DIR/.env" || -L "$NANO_INSTALL_DIR/.env" ]]; then
     validate_env_file "$NANO_INSTALL_DIR/.env"
     if tr -d '\r"'"'"'' < "$NANO_INSTALL_DIR/.env" \
-        | grep -qE '^(COMPOSE_PROFILES=(.*,)?(lake|lean)(,|$)|NANO_LOG_QUERY_BACKEND=lake|NANO_ENABLE_LAKE_CONTROL_PLANE=(1|true)|NANO_LAKE_[A-Z_]+=)'; then
+        | grep -E '^(COMPOSE_PROFILES=(.*,)?(lake|lean)(,|$)|NANO_LOG_QUERY_BACKEND=lake|NANO_ENABLE_LAKE_CONTROL_PLANE=(1|true)|NANO_LAKE_[A-Z_]+=)' >/dev/null; then
         fail "The install at $NANO_INSTALL_DIR runs the 1.x object-lake edition, which cannot be upgraded in place to this release. Install into a new directory (NANO_INSTALL_DIR=\$HOME/nano-v2) and move sources there."
+    fi
+fi
+
+# NAN-5509: an install directory left behind by an earlier `sudo ./install.sh`
+# failed later as "Could not fetch the current release ... Check the network"
+# (git refuses a checkout owned by another user) or as a write error.
+if [[ -d "$NANO_INSTALL_DIR" && "$(id -u)" != 0 ]]; then
+    install_dir_owner=""
+    # git refuses a checkout another user owns; anything else only needs to be
+    # writable (a shared, group-writable directory is fine).
+    if [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
+        # BSD stat first; GNU `stat -f` means file-system status and fails here.
+        install_dir_owner=$(stat -f '%u' "$NANO_INSTALL_DIR/.git" 2>/dev/null) \
+            || install_dir_owner=$(stat -c '%u' "$NANO_INSTALL_DIR/.git" 2>/dev/null) \
+            || install_dir_owner=""
+        [[ "$install_dir_owner" != "$(id -u)" ]] || install_dir_owner=""
+    fi
+    if [[ -n "$install_dir_owner" || ! -w "$NANO_INSTALL_DIR" ]]; then
+        fail "$NANO_INSTALL_DIR ${install_dir_owner:+is owned by uid $install_dir_owner}${install_dir_owner:-is not writable}, not by you ($(id -un)); an earlier run probably used sudo. Take it back: sudo chown -R $(id -un): $NANO_INSTALL_DIR, then re-run install.sh without sudo."
     fi
 fi
 
@@ -1766,6 +2699,49 @@ fi
 #     (tenzir/.pipeline.tql.local.*) is restored first, before anything else.
 # With nothing to update (the fetched tree is the checked-out one), local
 # changes are kept as they are.
+# NAN-5508: a re-run that moves the install to another release says so before
+# anything changes, and asks on a terminal (unattended runs print it and go
+# on). A git checkout asks in update_git_checkout, before its reset.
+confirm_upgrade() {
+    local from="$1" to="$2" how="$3"
+    [[ "$from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -n "$to" && "$from" != "$to" ]] || return 0
+    UPGRADE_CONFIRMED=1
+    warn "This upgrades nano $from → $to. Database migrations run on start and can't be undone (keep a backup: scripts/nano backup)."
+    # NAN-5521: NANO_CONFIRM_UPGRADE=1 pre-answers yes (a pty-driven run).
+    if [[ "${NANO_CONFIRM_UPGRADE:-}" == "1" ]]; then
+        log "NANO_CONFIRM_UPGRADE=1: upgrading. $how"
+        return 0
+    fi
+    if ! have_controlling_tty; then
+        log "Unattended run: upgrading. $how"
+        return 0
+    fi
+    log "$how"
+    # Declining exits non-zero (NAN-5521: a run that did not upgrade must not
+    # read as success): 3 for an explicit no, 4 for no answer (Enter or EOF).
+    local reply eof
+    while :; do
+        reply="" eof=0
+        printf '%s ' "Upgrade to $to now? [y/N]:" > /dev/tty
+        IFS= read -r reply < /dev/tty || eof=1
+        [[ "$eof" == 0 ]] || printf '\n' > /dev/tty
+        case "$(normalize_bool "$reply")" in
+            true) return 0 ;;
+            false)
+                printf '%s\n' "Not upgraded: nothing was changed." > /dev/tty
+                printf '%s\n' "install.sh: upgrade declined; nothing was changed (exit 3)." >&2
+                exit 3
+                ;;
+        esac
+        if [[ -z "${reply//[[:space:]]/}" ]]; then
+            printf '%s\n' "Not upgraded: nothing was changed." > /dev/tty
+            printf '%s\n' "install.sh: no answer to the upgrade question; nothing was changed (exit 4). Answer y, or set NANO_CONFIRM_UPGRADE=1 to upgrade without asking." >&2
+            exit 4
+        fi
+        warn "Answer y or n." >&2
+    done
+}
+
 restore_pipeline_and_exit() {
     cp -p "$PIPELINE_RESTORE_FROM" "$PIPELINE_RESTORE_TO" && rm -f "$PIPELINE_RESTORE_FROM"
     exit "$1"
@@ -1773,7 +2749,7 @@ restore_pipeline_and_exit() {
 
 update_git_checkout() {
     local dir="$1" branch="$2" tracked untracked conflicts pipeline="tenzir/pipeline.tql"
-    local keep_pipeline="" pipeline_copy="" shipped_pipeline_changed=0 leftovers
+    local keep_pipeline="" pipeline_copy="" shipped_pipeline_changed=0 leftovers recorded target lock
     leftovers=$(find "$dir/tenzir" -maxdepth 1 -name '.pipeline.tql.local.*' -type f 2>/dev/null | sort)
     if [[ -n "$leftovers" ]]; then
         if [[ "$(printf '%s\n' "$leftovers" | wc -l)" -eq 1 ]] \
@@ -1792,6 +2768,21 @@ update_git_checkout() {
     if git -C "$dir" diff --quiet HEAD FETCH_HEAD -- </dev/null 2>/dev/null; then
         log "Checkout at $dir is already the current release"
         return 0
+    fi
+    # NAN-5508: say (and on a terminal ask) before the reset when the fetched
+    # release differs from the one this install runs.
+    if [[ -f "$dir/.env" ]]; then
+        recorded=$(awk 'index($0, "NANO_VERSION=") == 1 { v = substr($0, 14); gsub(/[\r"'"'"']/, "", v) } END { print v }' "$dir/.env")
+        target="${NANO_VERSION:-}"
+        if [[ -z "$target" ]]; then
+            for lock in images.lock images.enterprise.lock; do
+                target=$(git -C "$dir" show "FETCH_HEAD:$lock" </dev/null 2>/dev/null \
+                    | sed -n 's/^# Release: v\{0,1\}//p' | awk 'NR == 1')
+                target="${target%% *}"
+                [[ -z "$target" ]] || break
+            done
+        fi
+        confirm_upgrade "$recorded" "$target" "To restart without upgrading, re-run with NANO_SKIP_GIT_UPDATE=1 ./install.sh."
     fi
     # Tracked changes (staged or not) against the checked-out release.
     tracked=$(git -C "$dir" diff --name-status --no-renames HEAD -- </dev/null) \
@@ -2321,9 +3312,76 @@ for src in "the source tree (.nano-edition)=$MARKER_EDITION" "this install's .en
 done
 [[ -n "$NANO_EDITION" ]] || fail "Cannot determine the edition: $NANO_INSTALL_DIR has no .nano-edition marker and no recorded install. Set NANO_EDITION=open or NANO_EDITION=enterprise."
 
+# The <prefix>-api line of a lock names the install's image prefix.
+lock_image_prefix() {
+    awk '$1 ~ /-api$/ && $2 ~ /^sha256:/ {sub(/-api$/, "", $1); print $1; exit}' "$1" 2>/dev/null
+}
+
+# NAN-5505: an enterprise bundle ships two locks with the same digests.
+# images.enterprise.customer.lock names the customer repository, the only one
+# the license-issued pull credential can read; images.enterprise.lock names
+# nano's internal repository. Without NANO_IMAGES_LOCK the customer lock is
+# the default when the bundle ships it, except for an install already running
+# the internal images (it keeps them; switching would recreate everything).
+CUSTOMER_LOCK=images.enterprise.customer.lock
+INTERNAL_LOCK=images.enterprise.lock
+CUSTOMER_PREFIX="" INTERNAL_PREFIX=""
+[[ -f "$CUSTOMER_LOCK" ]] && CUSTOMER_PREFIX=$(lock_image_prefix "$CUSTOMER_LOCK")
+[[ -f "$INTERNAL_LOCK" ]] && INTERNAL_PREFIX=$(lock_image_prefix "$INTERNAL_LOCK")
+
+# A customer Self-run install: license values given to this run or recorded.
+has_customer_license() {
+    [[ -n "$LICENSE_TOKEN_INPUT$LICENSE_FILE_INPUT" ]] && return 0
+    [[ "$LICENSE_MODE_INPUT" == offline || "$LICENSE_MODE_INPUT" == online ]] && return 0
+    [[ -n "$(env_value LICENSE_TOKEN)$(env_value DEPLOYMENT_TOKEN)" ]] && return 0
+    case "$(env_value NANO_LICENSE_MODE)" in online|offline) return 0 ;; esac
+    return 1
+}
+
+# True when no container was ever created for this install: none carries this
+# directory's Compose label and none runs an image under the recorded prefix.
+# Unknown (docker cannot list containers) counts as "has run".
+install_never_ran() {
+    local listing here physical
+    here="$PWD" physical=$(pwd -P)
+    listing=$(docker ps -a --format '{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}' </dev/null 2>/dev/null) || return 1
+    while IFS='|' read -r image workdir; do
+        [[ -z "$image$workdir" ]] && continue
+        if [[ -n "$workdir" ]]; then
+            [[ "$workdir" == "$here" || "$workdir" == "$physical" ]] && return 1
+            [[ -d "$workdir" && "$(cd "$workdir" 2>/dev/null && pwd -P)" == "$physical" ]] && return 1
+        fi
+        [[ -n "$RECORDED_PREFIX" && "$image" == "$RECORDED_PREFIX-"* ]] && return 1
+    done <<< "$listing"
+    return 0
+}
+
+# NAN-5505: v2.0.29 and earlier defaulted to the internal lock, so a plain
+# ./install.sh recorded nano's internal prefix in .env before the pull failed.
+# Such a customer install never started anything and may move to the customer
+# prefix (same digests). An install that ever ran keeps the refusal below.
+internal_to_customer_switch_ok() {
+    [[ -n "$CUSTOMER_PREFIX" && -n "$INTERNAL_PREFIX" && "$RECORDED_PREFIX" == "$INTERNAL_PREFIX" ]] || return 1
+    # Role-split: only the app host decides; other hosts follow the prefix in
+    # the .env copied from it, so the cluster never mixes prefixes.
+    [[ -n "$INVENTORY_ARG" && ",${ROLE_ARG}," != *,app,* ]] && return 1
+    has_customer_license || return 1
+    install_never_ran
+}
+
 case "$NANO_EDITION" in
     open) IMAGES_LOCK="images.lock" ;;
-    enterprise) IMAGES_LOCK="${NANO_IMAGES_LOCK:-images.enterprise.lock}" ;;
+    enterprise)
+        if [[ -n "${NANO_IMAGES_LOCK:-}" ]]; then
+            IMAGES_LOCK="$NANO_IMAGES_LOCK"
+        elif [[ -z "$CUSTOMER_PREFIX" ]]; then
+            IMAGES_LOCK="$INTERNAL_LOCK"
+        elif [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" == "$INTERNAL_PREFIX" ]] && ! internal_to_customer_switch_ok; then
+            IMAGES_LOCK="$INTERNAL_LOCK"
+        else
+            IMAGES_LOCK="$CUSTOMER_LOCK"
+        fi
+        ;;
 esac
 [[ -f "$IMAGES_LOCK" ]] || fail "$IMAGES_LOCK not found in $NANO_INSTALL_DIR. Edition $NANO_EDITION needs it (the enterprise lock ships only in the enterprise compose bundle)."
 
@@ -2346,14 +3404,17 @@ if [[ -z "$NANO_VERSION" ]]; then
         || fail "$IMAGES_LOCK is for release $NANO_VERSION, which is not a v${RELEASE_FLOOR_MAJOR}+ release. This source tree has not been released yet; use a released bundle or checkout."
 fi
 
-NANO_IMAGE_PREFIX=$(awk '$1 ~ /-api$/ && $2 ~ /^sha256:/ {sub(/-api$/, "", $1); print $1; exit}' "$IMAGES_LOCK")
+NANO_IMAGE_PREFIX=$(lock_image_prefix "$IMAGES_LOCK")
 [[ -n "$NANO_IMAGE_PREFIX" ]] || fail "$IMAGES_LOCK records no <prefix>-api image."
 OPEN_IMAGE_PREFIX="ghcr.io/nano-rs/nano"
 if [[ "$NANO_EDITION" == open && "$NANO_IMAGE_PREFIX" != "$OPEN_IMAGE_PREFIX" ]] \
     || [[ "$NANO_EDITION" == enterprise && "$NANO_IMAGE_PREFIX" == "$OPEN_IMAGE_PREFIX" ]]; then
     fail "$IMAGES_LOCK lists $NANO_IMAGE_PREFIX-* images, which are not the $NANO_EDITION edition's."
 fi
-if [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]]; then
+if [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]] \
+    && [[ "$NANO_IMAGE_PREFIX" == "$CUSTOMER_PREFIX" ]] && internal_to_customer_switch_ok; then
+    log "Switching this install from nano's internal image repository ($RECORDED_PREFIX-*) to the customer repository ($NANO_IMAGE_PREFIX-*): same image digests, and nothing has run here yet"
+elif [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]]; then
     fail "This install runs $RECORDED_PREFIX-* images but $IMAGES_LOCK lists $NANO_IMAGE_PREFIX-*. Refusing to switch image source on a re-run."
 fi
 ok "Edition $NANO_EDITION (from $EDITION_FROM), release $NANO_VERSION ($NANO_IMAGE_PREFIX-*)"
@@ -2376,7 +3437,7 @@ check_required_stops() {
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        if tr -d '[:space:]' < "$policy" | grep -q '"required_stops":\["'; then
+        if tr -d '[:space:]' < "$policy" | grep '"required_stops":\["' >/dev/null; then
             fail "This release's upgrade policy has required stops, and python3 is needed to check the path from $PRE_RUN_NANO_VERSION to $NANO_VERSION. Install Python 3, then re-run."
         fi
         return 0
@@ -2386,6 +3447,14 @@ check_required_stops() {
         || fail "Refusing to upgrade: ${out#nano bundle: } (install each required release with its own bundle or checkout, then re-run this one)."
 }
 check_required_stops
+
+if [[ "${UPGRADE_CONFIRMED:-0}" != 1 ]]; then
+    if [[ -e .git ]]; then
+        confirm_upgrade "$PRE_RUN_NANO_VERSION" "$NANO_VERSION" "To restart without upgrading, re-run with NANO_SKIP_GIT_UPDATE=1 ./install.sh."
+    else
+        confirm_upgrade "$PRE_RUN_NANO_VERSION" "$NANO_VERSION" "To stay on $PRE_RUN_NANO_VERSION, run ./install.sh from its own bundle instead."
+    fi
+fi
 
 validate_egress_policy_input
 if [[ -n "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" && -z "$(normalize_bool "$NANO_ALLOW_PRIVATE_AI_ENDPOINTS")" ]]; then
@@ -2413,10 +3482,70 @@ validate_license_inputs
 validate_ingest_ack_durability_input
 validate_planned_volume_input
 validate_retention_input
+if [[ -n "${NANO_BASE_URL:-}" ]]; then
+    # A value pasted with a trailing space or saved with CRLF endings is
+    # trimmed first, the same as a typed answer.
+    normalize_base_url "$(trim_space "$NANO_BASE_URL")" >/dev/null \
+        || fail "NANO_BASE_URL must be http(s)://host[:port][/path] (got '$NANO_BASE_URL')."
+fi
 
 if [[ "${NANO_CHECK_ONLY:-0}" == "1" ]]; then
     printf 'edition=%s\nversion=%s\nimage_prefix=%s\nlock=%s\n' "$NANO_EDITION" "$NANO_VERSION" "$NANO_IMAGE_PREFIX" "$IMAGES_LOCK"
     exit 0
+fi
+
+# NAN-5506: host size (vCPU, RAM, free disk) against nano's minimum for this
+# host's roles, before any prompt or .env write. The first point the sources
+# (and so the shared minimums) exist on a curl | bash install.
+[[ -r scripts/lib/host-minimums.sh ]] \
+    || fail "scripts/lib/host-minimums.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+# shellcheck source=scripts/lib/host-minimums.sh
+. scripts/lib/host-minimums.sh
+log "Checking host size"
+nano_host_minimums_gate "$ROLE_ARG" "$PWD"
+
+[[ -r scripts/lib/install-preflight.sh ]] \
+    || fail "scripts/lib/install-preflight.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+# shellcheck source=scripts/lib/install-preflight.sh
+. scripts/lib/install-preflight.sh
+
+# NAN-5521: a stack started before 2.0.30 with NANO_COMPOSE_OVERLAYS in the
+# environment only (the portal's TLS command) has those overlays on its running
+# containers but not in .env, so this re-run would recreate nginx without
+# docker-compose.tls.yml and turn HTTPS off. Record what the running stack uses
+# unless this run sets NANO_COMPOSE_OVERLAYS itself (an explicit choice).
+if [[ "$MULTI_NODE" != "1" && -z "${NANO_COMPOSE_OVERLAYS+set}" && -f .env ]]; then
+    running_overlays=$(nano_running_compose_overlays "$PWD" "$(env_value COMPOSE_PROJECT_NAME)")
+    if merged_overlays=$(nano_merge_running_overlays "$(env_value NANO_COMPOSE_OVERLAYS)" "$running_overlays"); then
+        nano_env_set_keys .env "NANO_COMPOSE_OVERLAYS=$merged_overlays" \
+            || fail "Could not record NANO_COMPOSE_OVERLAYS in .env."
+        warn "The running stack uses compose overlay(s) .env did not list; recorded NANO_COMPOSE_OVERLAYS=$merged_overlays in .env so this run keeps them (to drop one, run with NANO_COMPOSE_OVERLAYS set to the list you want)."
+    fi
+fi
+
+# NAN-5509: the TLS overlay (NANO_COMPOSE_OVERLAYS in the environment, or as
+# recorded in .env) makes nginx load config/nginx/ssl/{fullchain,privkey}.pem.
+# Without them every prompt, the pull and the migrations ran, and the install
+# ended 5 minutes later as "API did not become healthy (HTTP 000)".
+if [[ -n "${NANO_COMPOSE_OVERLAYS+set}" ]]; then
+    tls_overlay_list="$NANO_COMPOSE_OVERLAYS"
+else
+    tls_overlay_list="$(env_value NANO_COMPOSE_OVERLAYS)"
+fi
+# NAN-5521: on an existing install (.env and its containers or volumes) nginx
+# is already serving these files, so a problem is a loud warning, not a
+# refusal; a fresh install still refuses. NANO_SKIP_TLS_PREFLIGHT=1 skips it.
+if [[ "$MULTI_NODE" != "1" ]] && nano_tls_overlay_requested "$tls_overlay_list"; then
+    if [[ "${NANO_SKIP_TLS_PREFLIGHT:-0}" == "1" ]]; then
+        warn "NANO_SKIP_TLS_PREFLIGHT=1: not checking the HTTPS certificate in config/nginx/ssl. If nginx cannot load it, HTTPS stays down after this run."
+    elif tls_problem=$(nano_tls_cert_check "$PWD"); then
+        ok "HTTPS certificate: config/nginx/ssl/fullchain.pem and privkey.pem match and are valid"
+    elif nano_host_min_existing_install "$PWD"; then
+        warn "!! ${tls_problem% Nothing was changed.}"
+        warn "!! Continuing because this is an existing install (nginx may already be serving these files). Fix the certificate soon: if nginx cannot load it after this run, HTTPS is down. Set NANO_SKIP_TLS_PREFLIGHT=1 to skip this check."
+    else
+        fail "$tls_problem"
+    fi
 fi
 
 # ----------------------------------------------------------------------------
@@ -2465,8 +3594,103 @@ if [[ "$MULTI_NODE" == "1" && ! -f .env && "$APP_SECRET_OWNER" != "1" ]]; then
     fail "A role-split cluster's shared .env must be created on an app-role host first (use NANO_PREPARE_ONLY=1), then copied securely to this host before installing role(s) $ROLE_ARG."
 fi
 
+# NAN-5508: no .env, but this Compose project's databases are still on the
+# host (a moved or deleted install directory, a re-extracted bundle). A new
+# .env would generate new database passwords, and PostgreSQL and ClickHouse
+# keep the ones their data was created with. Stop before asking anything.
+compose_project_name() {
+    local name="${COMPOSE_PROJECT_NAME:-}"
+    [[ -n "$name" ]] || name=$(basename "$PWD")
+    name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+    while [[ "$name" == [_-]* ]]; do name=${name#?}; done
+    printf '%s' "$name"
+}
+refuse_fresh_env_over_volumes() {
+    local project volumes="" volume
+    project=$(compose_project_name)
+    [[ -n "$project" ]] || return 0
+    for volume in nano-postgres-data nano-clickhouse-data; do
+        volumes+=$(docker volume ls -q --filter "label=com.docker.compose.project=$project" \
+            --filter "label=com.docker.compose.volume=$volume" </dev/null 2>/dev/null | tr '\n' ' ' || true)
+    done
+    volumes=$(trim_space "$volumes")
+    [[ -z "$volumes" ]] && return 0
+    fail "This Docker host still holds nano's databases from an earlier install of $PWD (Compose project '$project': $volumes), but there is no .env here. Those databases only accept the passwords in the .env they were created with, so the installer will not generate new ones. Restore that .env to $PWD/.env (from a backup or the old install directory, mode 600) and re-run. To delete the old data and start fresh instead: docker compose -f $COMPOSE_FILE -p $project down -v (this DELETES ALL nano data on this host), then re-run. Nothing was written."
+}
+if [[ ! -f .env && "$MULTI_NODE" != "1" ]]; then
+    refuse_fresh_env_over_volumes
+fi
+
+# NAN-5509/NAN-5513: refuse when another program holds a port nano publishes.
+# CONFIG_JSON is `docker compose config --format json`; PORTS its
+# nano_published_ports lines. Ports this install's own Compose project holds
+# (a re-run of a running install) are not conflicts. NANO_SKIP_PORT_CHECK=1
+# skips the check.
+fail_on_port_conflicts() {
+    local config_json="$1" ports="$2" done_sentence="$3" project conflicts
+    [[ -n "$ports" && "${NANO_SKIP_PORT_CHECK:-0}" != "1" ]] || return 0
+    project=$(printf '%s' "$config_json" | nano_compose_project 2>/dev/null) || project=""
+    [[ -n "$project" ]] || project=$(compose_project_name)
+    conflicts=$(nano_port_conflicts "$ports" "$NANO_INSTALL_DIR" "$project")
+    [[ -z "$conflicts" ]] && return 0
+    printf '%s\n' "$conflicts" | sed 's/^/  - /' >&2
+    fail "nano cannot publish the port(s) above: another program already uses them. Stop it (for a system service: sudo systemctl disable --now <service>), or move it to another port, then re-run install.sh. $done_sentence NANO_SKIP_PORT_CHECK=1 skips this check."
+}
+# NAN-5513: check the base graph's ports before the first question, so a busy
+# port does not cost the operator every answer first. The overlays and
+# profiles the answers choose are re-checked after rendering, before the pull.
+if [[ "$MULTI_NODE" != "1" && "${NANO_SKIP_PORT_CHECK:-0}" != "1" ]]; then
+    # A fresh install has no .env yet: stand in for the variables the graph
+    # requires (${VAR:?}) so it still renders. Placeholders only, never
+    # secrets, and only when unset; ports do not depend on them.
+    early_env=()
+    if [[ ! -f .env ]]; then
+        while IFS= read -r early_var; do
+            # Compose sees only the exported environment (install.sh has set
+            # some of these, e.g. NANO_VERSION, as plain shell variables).
+            [[ -n "$early_var" && -z "$(printenv "$early_var" 2>/dev/null || true)" ]] \
+                && early_env+=("$early_var=placeholder")
+        done < <(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*:\?' "$COMPOSE_FILE" 2>/dev/null | sed 's/^\${//; s/:?$//' | sort -u)
+    fi
+    early_config=$(env ${early_env[@]+"${early_env[@]}"} docker compose -f "$COMPOSE_FILE" config --format json </dev/null 2>/dev/null) || early_config=""
+    early_ports=$(printf '%s' "$early_config" | nano_published_ports 2>/dev/null) || early_ports=""
+    fail_on_port_conflicts "$early_config" "$early_ports" "Nothing was changed."
+fi
+
+# NAN-5508: every interactive question, then the review screen, before
+# anything below writes .env, generates a secret or starts a container.
 if [[ -f .env ]]; then
-    warn ".env already exists — keeping existing secrets, will only (re)start the stack."
+    collect_answers 0
+else
+    collect_answers 1
+fi
+
+# NAN-5508: NANO_BASE_URL given to a re-run changes BASE_URL (and the dev mode
+# it implies) in .env; it was only used for this run's messages before.
+record_base_url_input() {
+    local recorded url dev mode=off
+    [[ -n "${NANO_BASE_URL:-}" ]] || return 0
+    url=$(normalize_base_url "$(trim_space "$NANO_BASE_URL")") \
+        || fail "NANO_BASE_URL must be http(s)://host[:port][/path] (got '$NANO_BASE_URL')."
+    BASE_URL=$url
+    recorded=$(env_value BASE_URL)
+    [[ "$url" == "$recorded" ]] && return 0
+    if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," != *,app,* ]]; then
+        fail "NANO_BASE_URL=$url differs from this host's .env (${recorded:-unset}). Set it on the app host (re-run install.sh there with NANO_BASE_URL), copy that .env to every host, then re-run install.sh here."
+    fi
+    dev=false
+    [[ "$url" == http://* ]] && dev=true mode=on
+    nano_env_set_keys .env "BASE_URL=$url" "NANOSIEM_DEV_MODE=$dev" \
+        || fail "Could not record BASE_URL in .env."
+    log "Changed BASE_URL from ${recorded:-unset} to $url in .env (NANOSIEM_DEV_MODE=$dev: dev mode $mode)"
+}
+
+if [[ -f .env ]]; then
+    if [[ "$PRE_RUN_NANO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$PRE_RUN_NANO_VERSION" != "$NANO_VERSION" ]]; then
+        warn ".env already exists — keeping existing secrets and upgrading the stack from $PRE_RUN_NANO_VERSION to $NANO_VERSION."
+    else
+        warn ".env already exists — keeping existing secrets and restarting the stack on $NANO_VERSION."
+    fi
     REUSE_ENV=1
     shared_env_rebaseline
     # NAN-5263: an earlier installer (v2.0.8) could leave a key twice (a second
@@ -2474,6 +3698,7 @@ if [[ -f .env ]]; then
     collapsed_keys=$(nano_env_collapse_duplicates .env) \
         || fail "Could not collapse duplicate lines in .env."
     [[ -z "$collapsed_keys" ]] || ok "Collapsed duplicate .env line(s) for $collapsed_keys (kept the value in effect)"
+    record_base_url_input
     revalidate_recorded_base_url
     # Role-split compose intentionally exposes only the five fixed roles. The
     # single-node-only Tenzir profile is not silently dropped or allowed to
@@ -2518,7 +3743,7 @@ if [[ -f .env ]]; then
     # stored as hashes in PostgreSQL and keep working unchanged.
     if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]]; then
         warn "VECTOR_AUTH_TOKEN (the forwarder install token) was a publicly known default, which nano now refuses; replaced it with a generated one."
-        warn "Senders using named ingest tokens keep working. Senders that still send the old public token get HTTP 401: issue each one a named token in $BASE_URL/ingestion/ingest-tokens."
+        warn "Senders using named ingest tokens keep working. Senders that still send the old public token get HTTP 401: issue each one a named token under Ingestion → Log Sources → Credentials ($BASE_URL/ingestion/log-sources/credentials)."
         if [[ "$MULTI_NODE" == "1" ]]; then
             warn "Securely copy $NANO_INSTALL_DIR/.env to every inventory host before re-running install.sh there: their copy still holds the public token, which they now refuse."
         fi
@@ -2605,6 +3830,12 @@ else
     REUSE_ENV=0
     log "Configuring first-time admin account"
 
+    # NAN-5508: the answers confirmed on the review screen.
+    [[ "${WANT_admin_email:-0}" == 1 ]] && ADMIN_EMAIL=$ANS_ADMIN_EMAIL
+    [[ "${WANT_admin_name:-0}" == 1 ]] && ADMIN_NAME=$ANS_ADMIN_NAME
+    if [[ "${WANT_admin_password:-0}" == 1 ]]; then
+        ADMIN_PASSWORD=$ANS_ADMIN_PASSWORD GENERATED_PASSWORD=${ANS_PASSWORD_GENERATED:-0}
+    fi
     [[ -z "$ADMIN_EMAIL" ]]    && prompt_admin_email
     [[ -z "$ADMIN_EMAIL" ]]    && fail "Admin email is required."
 
@@ -2622,7 +3853,9 @@ else
 
     # An explicit environment value makes the documented non-interactive
     # install path fully non-interactive.
-    if [[ -z "${NANO_BASE_URL:-}" ]]; then
+    if [[ -n "${ANS_BASE_URL:-}" ]]; then
+        BASE_URL=$ANS_BASE_URL
+    elif [[ -z "${NANO_BASE_URL:-}" ]]; then
         prompt_base_url "$BASE_URL"
     else
         # A value pasted with a trailing space or saved with CRLF endings is
@@ -2651,7 +3884,7 @@ else
     # (compose `tenzir` profile) pre-wired to the native OCSF entrypoint, for
     # direct ingestion. It resolves to NANO_SCHEMA_PROFILE=ocsf + BUNDLE_TENZIR=1.
     BUNDLE_TENZIR=0
-    SCHEMA_PROFILE="${NANO_SCHEMA_PROFILE:-}"
+    SCHEMA_PROFILE="${NANO_SCHEMA_PROFILE:-${ANS_SCHEMA:-}}"
     if [[ -z "$SCHEMA_PROFILE" ]] && ! have_controlling_tty; then
         # Fully non-interactive (no TTY): take the default rather than fail.
         SCHEMA_PROFILE=ocsf
@@ -2677,6 +3910,11 @@ else
     fi
     if [[ "$MULTI_NODE" == "1" && "$BUNDLE_TENZIR" == "1" ]]; then
         fail "The bundled Tenzir profile is single-node only; role-split installs must use the ocsf or udm schema profile without bundled Tenzir."
+    fi
+    # NAN-5506: an ocsf+tenzir pick made at the prompt (after the host-size
+    # check) needs the Tenzir single node's floor; checked before .env exists.
+    if [[ "$BUNDLE_TENZIR" == "1" && "$MULTI_NODE" != "1" && "${HM_ROLES:-}" != *,tenzir* ]]; then
+        nano_host_minimums_gate "$NANO_HOST_SINGLE_NODE_ROLES,tenzir" "$PWD"
     fi
 
     # License: asked here, before anything is written, and fails closed for an
@@ -2742,6 +3980,16 @@ configure_private_ai_endpoints
 configure_ingest_ack_durability
 configure_automatic_backups
 configure_planned_volume
+# NAN-5506: the recommended size for the planned volume (warning only), and a
+# PLATFORM_FEEDS_AUTO_UPDATE given for this run (the host-size check honored
+# it) kept in .env so later restarts and upgrades keep the feeds the same.
+nano_host_minimums_recommend "$PLANNED_GB_PER_DAY" "$ROLE_ARG"
+if [[ "${PLATFORM_FEEDS_AUTO_UPDATE:-}" =~ ^[A-Za-z0-9]+$ && "${MULTI_NODE:-0}" != "1" \
+    && "$(env_value PLATFORM_FEEDS_AUTO_UPDATE)" != "$PLATFORM_FEEDS_AUTO_UPDATE" ]]; then
+    nano_env_set_keys .env "PLATFORM_FEEDS_AUTO_UPDATE=$PLATFORM_FEEDS_AUTO_UPDATE" \
+        || fail "Could not record PLATFORM_FEEDS_AUTO_UPDATE in .env."
+    log "Recorded PLATFORM_FEEDS_AUTO_UPDATE=$PLATFORM_FEEDS_AUTO_UPDATE in .env"
+fi
 configure_retention_days
 configure_storage_tiering
 
@@ -2954,6 +4202,22 @@ for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
     fi
     [[ -f "$overlay" ]] || fail "NANO_COMPOSE_OVERLAYS: '$overlay' does not exist in $NANO_INSTALL_DIR"
 done
+# NAN-5508: an overlay list given to this run (the portal's TLS command sets
+# docker-compose.tls.yml) is kept in .env, which a plain re-run, scripts/nano
+# and nano upgrade read. Before, it applied to this run only and the next
+# restart silently went back to plain HTTP.
+# A converted pre-v2 host's docker-compose.legacy-preserved.yml stays recorded.
+overlays_to_record="${NANO_OVERLAY_LIST[*]-}"
+if [[ " $(env_value NANO_COMPOSE_OVERLAYS) " == *" docker-compose.legacy-preserved.yml "* \
+    && " $overlays_to_record " != *" docker-compose.legacy-preserved.yml "* ]]; then
+    overlays_to_record="docker-compose.legacy-preserved.yml${overlays_to_record:+ $overlays_to_record}"
+fi
+if [[ "$MULTI_NODE" != "1" && -n "${NANO_COMPOSE_OVERLAYS+set}" ]] \
+    && [[ "$overlays_to_record" != "$(env_value NANO_COMPOSE_OVERLAYS)" ]]; then
+    nano_env_set_keys .env "NANO_COMPOSE_OVERLAYS=$overlays_to_record" \
+        || fail "Could not record NANO_COMPOSE_OVERLAYS in .env."
+    log "Recorded NANO_COMPOSE_OVERLAYS=$overlays_to_record in .env; later runs, scripts/nano and upgrades keep it."
+fi
 
 # NAN-4997: single-node sizing is recalculated on every install/upgrade. The
 # managed block contains defaults only; any same-named assignment outside it,
@@ -2986,7 +4250,8 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         --planned-gb-per-day "$PLANNED_GB_PER_DAY" \
         --ingest-path "$PLANNED_INGEST_PATH" \
         --avg-event-bytes "$PLANNED_AVG_EVENT_BYTES" \
-        --format env </dev/null > "$sizing_defaults"
+        --format env </dev/null > "$sizing_defaults" \
+        || { rm -f "$sizing_defaults"; fail "Resource sizing refused this host (the reason is above). Nothing was started."; }
 
     old_sizing_env="" old_sizing_server="" old_sizing_users=""
     if [[ "$REUSE_ENV" == "1" ]]; then
@@ -3015,7 +4280,8 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         --override-env .env \
         --server-output .nano-generated/sizing/clickhouse-config.xml \
         --users-output .nano-generated/sizing/clickhouse-users.xml \
-        --format env </dev/null > "$new_sizing_env"
+        --format env </dev/null > "$new_sizing_env" \
+        || { rm -f "$new_sizing_env"; fail "Resource sizing refused these settings (the reason is above). Nothing was started."; }
     mv "$new_sizing_env" .nano-generated/sizing/host.env
     if [[ "$REUSE_ENV" == "1" ]]; then
         report_sizing_changes \
@@ -3032,16 +4298,20 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     report_retention_fit .nano-generated/sizing/host.env
 fi
 
-# NAN-3322 / NAN-4909: the unauthenticated ingest ports (Vector native :6000,
-# raw OTLP :4317/:4318, Fluent :24224, bundled Tenzir :9095) bind 127.0.0.1
-# unless the operator opts
-# in. A bind override given to the installer must survive a later plain
+# NAN-3322 / NAN-4909: the unauthenticated ingest ports (raw OTLP
+# :4317/:4318, Fluent :24224, bundled Tenzir :9095) bind 127.0.0.1 unless the
+# operator opts in. NAN-5515: Vector native :6000 is mutual-TLS only and binds
+# the ingest interface; NANO_VECTOR_NATIVE_BIND_ADDRESS only narrows it. A
+# bind override given to the installer must survive a later plain
 # `docker compose up`, which reads only .env, so persist it there.
-for key in NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_OTLP_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS NANO_TENZIR_BIND_ADDRESS; do
+for key in NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_VECTOR_NATIVE_SANS NANO_VECTOR_NATIVE_PUBLIC_HOST NANO_OTLP_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS NANO_TENZIR_BIND_ADDRESS; do
     if [[ -n "${!key:-}" ]]; then
         # Set in place (NAN-5251): re-runs used to append one more line each.
         nano_env_set_keys .env "$key=${!key}" || fail "Could not record $key in .env."
-        log "Persisted $key=${!key} to .env (re-exposes an unauthenticated ingest port)"
+        case "$key" in
+            NANO_VECTOR_NATIVE_*) log "Persisted $key=${!key} to .env (Vector native :6000, mutual TLS)" ;;
+            *) log "Persisted $key=${!key} to .env (re-exposes an unauthenticated ingest port)" ;;
+        esac
     fi
 done
 
@@ -3243,7 +4513,7 @@ clickhouse_default_user_preflight() {
     local query remote
     [[ "${REUSE_ENV:-0}" == "1" && "$MULTI_NODE" != "1" ]] || return 0
     docker compose "${COMPOSE_ARGS[@]}" ps --status running --services 2>/dev/null </dev/null \
-        | grep -qx clickhouse || return 0
+        | grep -x clickhouse >/dev/null || return 0
     query="SELECT IPv6NumToString(address) AS client, count() AS queries, max(event_time) AS last_seen FROM system.query_log WHERE user = 'default' AND event_date >= today() - 7 AND type = 'QueryStart' AND NOT (address = toIPv6('::1') OR isIPAddressInRange(IPv6NumToString(address), '::ffff:127.0.0.0/104')) GROUP BY address ORDER BY queries DESC LIMIT 20 FORMAT TSV"
     # The admin password is already in the ClickHouse container's environment;
     # it never appears on this host's command line.
@@ -3342,6 +4612,99 @@ nano_env_set_keys .env "NANO_EDITION=$NANO_EDITION" "NANO_VERSION=$NANO_VERSION"
     || fail "Could not record NANO_EDITION/NANO_VERSION/NANO_IMAGE_PREFIX in .env."
 export NANO_VERSION NANO_IMAGE_PREFIX
 
+# NAN-5515: Vector native :6000 always requires mutual TLS. Two trust paths:
+# a listener CA (verifies nano for senders; never rotated) and one small
+# anchor CA per sender, bundled as the listener's client-ca.crt, so revoking a
+# sender only removes its anchor. Single host: .nano-pki/vector-native holds
+# the listener CA and the anchors (keys 0600, never in .env, never mounted into
+# a container); config/vector-native (listener certificate re-issued when its
+# SANs or the CA change, and the bundle) is mounted read-only into Vector.
+# Role split: no CA key leaves the first app host. An ingest host's listener is
+# the cluster's staged private TLS certificate (the cluster CA verifies it) and
+# its bundle comes from the shared .env (NANO_VECTOR_NATIVE_CLIENT_ANCHORS,
+# public certificates), so enabling it needs nothing beyond the existing TLS
+# staging and .env distribution. Without cluster TLS (a plaintext lab) the
+# listener is locked: it refuses every sender, never runs plaintext.
+VECTOR_NATIVE_PKI_DIR=.nano-pki/vector-native
+VECTOR_NATIVE_TLS_DIR=config/vector-native
+VECTOR_NATIVE_STATE=""
+VECTOR_NATIVE_NEW=0
+VECTOR_NATIVE_RESTART=0
+VECTOR_NATIVE_RECENT_EVENTS=""
+vector_native_recent_events() {
+    # Best effort, read-only: events the running stack took on :6000 in the
+    # last 24 h. Senders without a client certificate are refused from now on.
+    local query count
+    [[ "$MULTI_NODE" != "1" ]] || return 0
+    docker compose "${COMPOSE_ARGS[@]}" ps --status running --services 2>/dev/null </dev/null \
+        | grep -x clickhouse >/dev/null || return 0
+    # NAN-5523: OCSF profiles (the default) store events in nanosiem.ocsf_logs.
+    query=$(bash scripts/lib/vector-native-pki.sh events-query \
+        --profile "$(env_value NANO_SCHEMA_PROFILE)" </dev/null 2>/dev/null) || return 0
+    # The admin password is already in the ClickHouse container's environment;
+    # it never appears on this host's command line.
+    # shellcheck disable=SC2016
+    count=$(docker compose "${COMPOSE_ARGS[@]}" exec -T clickhouse sh -c \
+        'clickhouse-client --user nanosiem_admin --password "$CLICKHOUSE_ADMIN_PASSWORD" --query "$1"' \
+        sh "$query" </dev/null 2>/dev/null) || return 0
+    [[ "$count" =~ ^[0-9]+$ ]] && VECTOR_NATIVE_RECENT_EVENTS=$count
+    return 0
+}
+vector_native_pki_step() {
+    local had=0 result bind status=0 new_ca_args=() san_args=() sans_env expiring line
+    [[ -r scripts/lib/vector-native-pki.sh ]] \
+        || fail "scripts/lib/vector-native-pki.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        # Vector runs on ingest hosts only.
+        [[ ",${ROLE_ARG}," == *,ingest,* ]] || return 0
+        [[ -s "$VECTOR_NATIVE_TLS_DIR/client-ca.crt" ]] && had=1
+        result=$(bash scripts/lib/vector-native-pki.sh ensure-ingest \
+            --tls-dir "$VECTOR_NATIVE_TLS_DIR" --env-file .env </dev/null) \
+            || fail "Could not prepare the Vector-native sender anchors in $NANO_INSTALL_DIR/$VECTOR_NATIVE_TLS_DIR (above). Nothing was started."
+        VECTOR_NATIVE_STATE=$result
+        [[ "$had" == 1 ]] || VECTOR_NATIVE_NEW=1
+        [[ "$result" != *changed=1* || "$had" == 0 ]] || VECTOR_NATIVE_RESTART=1
+        if [[ "${NANO_PRIVATE_TLS:-}" != "true" ]]; then
+            VECTOR_NATIVE_STATE="$result server=locked"
+            warn "Vector native :6000 is locked on this host (refuses every sender): this cluster has no private TLS, and the listener certificate is the cluster's TLS certificate. Plaintext lab clusters have no Vector-native listener."
+        else
+            ok "Vector native :6000: mutual TLS with the cluster certificate; ${result%% *} sender anchor(s) from the shared .env"
+        fi
+        return 0
+    fi
+    [[ -s "$VECTOR_NATIVE_TLS_DIR/server.crt" ]] && had=1
+    if [[ "$had" == 0 && "${REUSE_ENV:-0}" == "1" ]]; then
+        vector_native_recent_events
+    fi
+    # A specific bind address is one senders connect to (a wildcard adds
+    # nothing). Same rule as scripts/nano-upgrade.py.
+    bind=${NANO_VECTOR_NATIVE_BIND_ADDRESS:-$(env_value NANO_VECTOR_NATIVE_BIND_ADDRESS)}
+    [[ -z "$bind" ]] || san_args+=(--san "$bind")
+    [[ "${NANO_VECTOR_NATIVE_NEW_CA:-0}" != "1" ]] || new_ca_args=(--new-ca)
+    sans_env=${NANO_VECTOR_NATIVE_SANS:-$(env_value NANO_VECTOR_NATIVE_SANS)}
+    result=$(NANO_VECTOR_NATIVE_SANS="$sans_env" bash scripts/lib/vector-native-pki.sh ensure \
+        --pki-dir "$VECTOR_NATIVE_PKI_DIR" --tls-dir "$VECTOR_NATIVE_TLS_DIR" \
+        --base-url "$BASE_URL" "${new_ca_args[@]}" "${san_args[@]}" </dev/null) || status=$?
+    if [[ "$status" == 3 ]]; then
+        fail "The Vector-native listener CA is missing but this install already issued certificates (above). Restore $VECTOR_NATIVE_PKI_DIR from a backup (scripts/nano restore), or re-run with NANO_VECTOR_NATIVE_NEW_CA=1 to start over (every sender then needs a new certificate). Nothing was started."
+    elif [[ "$status" != 0 ]]; then
+        fail "Could not prepare the Vector-native TLS files in $NANO_INSTALL_DIR/$VECTOR_NATIVE_TLS_DIR (above). Nothing was started."
+    fi
+    VECTOR_NATIVE_STATE=$result
+    [[ "$had" == 1 ]] || VECTOR_NATIVE_NEW=1
+    if [[ "$had" == 1 && ( "$result" == *server=issued* || "$result" == *anchors=changed* ) ]]; then
+        VECTOR_NATIVE_RESTART=1
+    fi
+    [[ "$result" != *server=issued* ]] \
+        || ok "Vector native :6000 listener certificate issued (mutual TLS; SANs in $VECTOR_NATIVE_TLS_DIR/.sans)"
+    expiring=$(bash scripts/lib/vector-native-pki.sh expiring --pki-dir "$VECTOR_NATIVE_PKI_DIR" \
+        --tls-dir "$VECTOR_NATIVE_TLS_DIR" </dev/null 2>/dev/null) || expiring=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] || warn "$line"
+    done <<< "$expiring"
+}
+vector_native_pki_step
+
 if [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
     ok "Prepared .env and role configuration without pulling the application stack or starting services (the pinned Vector image may be cached/pulled for the storage-capacity probe)"
     if [[ "$MULTI_NODE" == "1" ]]; then
@@ -3368,6 +4731,19 @@ fi
 
 ACTIVE_IMAGES=$(docker compose "${COMPOSE_ARGS[@]}" config --images </dev/null)
 
+# NAN-5509: the host ports this graph publishes (overlays and profiles
+# included). A port another process holds failed `up` after the whole pull,
+# and nginx's :80 only after the migrations. Also feeds the summary's firewall
+# line. NANO_SKIP_PORT_CHECK=1 skips the in-use check.
+# The early check before the questions saw only the base graph; this one
+# covers the overlays and profiles the answers chose.
+PUBLISHED_PORTS=""
+if [[ "$MULTI_NODE" != "1" ]]; then
+    rendered_config=$(docker compose "${COMPOSE_ARGS[@]}" config --format json </dev/null 2>/dev/null) || rendered_config=""
+    PUBLISHED_PORTS=$(printf '%s' "$rendered_config" | nano_published_ports 2>/dev/null) || PUBLISHED_PORTS=""
+    fail_on_port_conflicts "$rendered_config" "$PUBLISHED_PORTS" "Nothing was pulled or started."
+fi
+
 # NAN-5197: every active image is pinned (third-party by @sha256 in the Compose
 # files, first-party by the images lock), so only images whose pinned digest
 # is not already local are pulled, by digest, each attempt bounded by
@@ -3378,15 +4754,80 @@ NANO_PULL_LOCK=""
 if [[ -f "$IMAGES_LOCK" && "$(lock_release "$IMAGES_LOCK")" == "${NANO_VERSION#v}" ]]; then
     NANO_PULL_LOCK="$IMAGES_LOCK"
 fi
+# NAN-5505: enterprise images are in a private registry. Right before the
+# pull (the license credential lasts one hour), log docker in with a credential
+# from the license API, unless every private image is already local at its pin
+# or this host's own docker login already reads the registry. Offline and
+# air-gapped installs never call the API.
+REGISTRY_LICENSE_MODE="" REGISTRY_LOGIN_FAILED=0
+# NAN-5524: a login this run made lives in a private, temporary docker config
+# (never the user's ~/.docker; scripts/lib/image-pull.sh) and is not needed
+# once the images are local (every later run or upgrade gets a fresh one).
+# Drop it right after the pull; the EXIT trap (cleanup_env_temp) also drops
+# it on every failure and on an interrupt. No `docker logout`: that would
+# delete a customer's own entry for the registry.
+registry_forget_ours() {
+    if [[ -n "${NANO_REGISTRY_LOGGED_IN_AT:-}" ]]; then
+        log "Dropped this run's registry pull credential"
+    fi
+    nano_registry_cleanup
+}
+if [[ "$NANO_EDITION" == "enterprise" ]]; then
+    REGISTRY_LICENSE_MODE="${LICENSE_MODE:-$(env_value NANO_LICENSE_MODE)}"
+    if [[ "$REGISTRY_LICENSE_MODE" != offline && "$REGISTRY_LICENSE_MODE" != airgap ]] \
+        && is_truthy "${AIRGAP_MODE:-$(env_value AIRGAP_MODE)}"; then
+        REGISTRY_LICENSE_MODE=airgap
+    fi
+    # Read by nano_registry_login_if_needed (scripts/lib/image-pull.sh); not
+    # exported, so the token stays out of every child's environment.
+    # shellcheck disable=SC2034
+    NANO_REGISTRY_LICENSE_MODE="$REGISTRY_LICENSE_MODE"
+    while :; do
+        # shellcheck disable=SC2034
+        NANO_REGISTRY_LICENSE_URL="$(env_value LICENSE_URL)"
+        NANO_REGISTRY_LICENSE_TOKEN="$(env_value LICENSE_TOKEN)"
+        [[ -n "$NANO_REGISTRY_LICENSE_TOKEN" ]] || NANO_REGISTRY_LICENSE_TOKEN="$(env_value DEPLOYMENT_TOKEN)"
+        # shellcheck disable=SC2034
+        NANO_REGISTRY_DEPLOYMENT_ID="$(env_value NANO_DEPLOYMENT_ID)"
+        # shellcheck disable=SC2034
+        NANO_REGISTRY_PROXY="$(env_value HTTPS_PROXY)"
+        REGISTRY_LOGIN_FAILED=0
+        NANO_PULL_LOCK="$NANO_PULL_LOCK" NANO_PULL_TRUST_TAGS="${NANO_SKIP_IMAGE_VERIFY:-0}" \
+            nano_registry_login_if_needed "$ACTIVE_IMAGES" || REGISTRY_LOGIN_FAILED=1
+        # NAN-5508: the license values typed at this run's prompts were first
+        # used just now (the check-in needs the network). On a terminal, a
+        # refusal asks them again instead of ending the install.
+        [[ "$REGISTRY_LOGIN_FAILED" == 1 && "${WANT_license:-0}" == 1 && "${ANS_LIC_MODE:-}" == online ]] \
+            && have_controlling_tty || break
+        answer_yes_no "Enter the license values again? (n stops here; nothing has started)" true || ANSWER_REPLY=true
+        [[ "$ANSWER_REPLY" == true ]] || break
+        answer_run_steps "$(answer_step_index lic_url)" "$(answer_step_index lic_id)"
+        LICENSE_MODE=online LICENSE_DEPLOYMENT_ID="$ANS_LIC_ID"
+        LICENSE_ENV_LINES="LICENSE_URL=$ANS_LIC_URL"$'\n'"LICENSE_TOKEN=$ANS_LIC_TOKEN"$'\n'"NANO_DEPLOYMENT_ID=$ANS_LIC_ID"$'\n'
+        record_license .env
+    done
+    if [[ "$REGISTRY_LOGIN_FAILED" == 1 ]]; then
+        registry_forget_ours
+        fail "Could not get a registry pull credential from the license API (see above). Nothing was pulled or restarted."
+    fi
+fi
 # NANO_SKIP_IMAGE_VERIFY=1 is the escape hatch for a store whose digest
 # readback is unusable; presence then falls back to a plain inspect.
 if ! NANO_PULL_LOCK="$NANO_PULL_LOCK" NANO_PULL_TRUST_TAGS="${NANO_SKIP_IMAGE_VERIFY:-0}" \
     nano_pull_images "$ACTIVE_IMAGES"; then
+    registry_forget_ours
     if [[ "$NANO_EDITION" == "enterprise" ]]; then
-        fail "Image pull failed. Enterprise images are in a private registry: log in to ${NANO_IMAGE_PREFIX%%/*} with the pull credential nano issued you, then re-run."
+        case "$REGISTRY_LICENSE_MODE" in
+            offline|airgap)
+                fail "Image pull failed. Enterprise images are in a private registry and this install's license is $REGISTRY_LICENSE_MODE, so the installer does not request a pull credential. Either load the offline image bundle first (scripts/nano bundle load <nano-enterprise images bundle>), or log in with a registry pull credential from app.nano.rs: docker login ${NANO_IMAGE_PREFIX%%/*} -u oauth2accesstoken --password-stdin (paste it, then Ctrl-D; it lasts about an hour). Run docker login as the same user that runs install.sh, not with sudo: root's docker login is not this user's. Then re-run." ;;
+            *)
+                fail "Image pull failed (see above). Enterprise images are in a private registry. With an online license (LICENSE_TOKEN and NANO_DEPLOYMENT_ID in .env) the installer logs in with a one-hour credential from the license API before pulling; without one, log in with a registry pull credential from app.nano.rs (docker login ${NANO_IMAGE_PREFIX%%/*} -u oauth2accesstoken --password-stdin, as the same user that runs install.sh, not with sudo) or load the offline image bundle (scripts/nano bundle load). Then re-run." ;;
+        esac
     fi
-    fail "Image pull failed. If you see '401 Unauthorized', the GHCR packages may still be private — run 'docker login ghcr.io' or wait for nano-rs to flip them public."
+    fail "Image pull failed (see above). The open edition's images are public on ghcr.io and Docker Hub, so this is usually the network: check that this host reaches ghcr.io and registry-1.docker.io (DNS, firewall, proxy). For Docker Hub rate limits (429 / toomanyrequests), run docker login as the same user that runs install.sh (not with sudo), then re-run."
 fi
+
+registry_forget_ours
 
 # Runs whether or not anything was pulled: every active image is re-checked
 # against the lock before anything starts.
@@ -3587,6 +5028,9 @@ if [[ "$MULTI_NODE" != "1" && "$NANO_EDITION" == enterprise && -f scripts/lib/cl
         || fail "Could not render the ClickHouse storage tiering config (above). Nothing was started."
     tiering_state=$(sed -n 's/^state=//p' <<<"$tiering_render")
     tiering_sha=$(sed -n 's/^sha256=//p' <<<"$tiering_render")
+    # NAN-5509: settings this run turns on or changes (vs. the last recorded
+    # render) must prove the store works now; an unchanged one only warns.
+    tiering_prev_sha=$(env_value NANO_TIERING_CONFIG_SHA256)
     [[ "$(env_value NANO_CLICKHOUSE_TIERING_FILE)" == "./.nano-generated/clickhouse/tiering.xml" ]] \
         || nano_env_set_keys .env "NANO_CLICKHOUSE_TIERING_FILE=./.nano-generated/clickhouse/tiering.xml" \
         || fail "Could not record NANO_CLICKHOUSE_TIERING_FILE in .env."
@@ -3596,13 +5040,20 @@ if [[ "$MULTI_NODE" != "1" && "$NANO_EDITION" == enterprise && -f scripts/lib/cl
     if [[ "$tiering_state" == "active" ]]; then
         python3 -I scripts/lib/clickhouse_tiering.py check --env-file .env </dev/null 2>/dev/null \
             | sed 's/^/    /' >&2 || true
-        if [[ "${NANO_TIERING_SKIP_PROBE:-}" != "1" ]]; then
+        if [[ "${NANO_TIERING_SKIP_PROBE:-}" != "1" && "${TIERING_PROBED:-0}" != 1 ]]; then
             # Host-side write/read/delete probe; a store only the Compose
             # network can resolve (http://rustfs:9000) cannot be probed here.
             if tiering_probe=$(python3 -I scripts/lib/clickhouse_tiering.py probe --env-file .env </dev/null 2>&1); then
                 ok "Object store check from this host: $tiering_probe"
             else
-                warn "Object store check from this host failed: ${tiering_probe#tiering: }. ClickHouse still starts (cold parts wait for the store); check with: scripts/nano tiering test"
+                tiering_probe="${tiering_probe#tiering: }"
+                tiering_cause=$(tiering_probe_cause "$tiering_probe" "$(env_value NANO_TIERING_PROVIDER)")
+                if [[ "$tiering_sha" != "$tiering_prev_sha" ]]; then
+                    # Put the previous digest back so a re-run probes again.
+                    nano_env_set_keys .env "NANO_TIERING_CONFIG_SHA256=$tiering_prev_sha" || true
+                    fail "Storage tiering is on, but writing a test object to the bucket from this host failed: ${tiering_probe}.${tiering_cause} Without a working store the local disk fills up later instead of moving old data. Fix the credentials or bucket and re-run, set NANO_TIERING=off, or (for a store only the Compose network can reach) re-run with NANO_TIERING_SKIP_PROBE=1."
+                fi
+                warn "Object store check from this host failed: ${tiering_probe}.${tiering_cause} ClickHouse still starts (cold parts wait for the store); check with: scripts/nano tiering test"
             fi
         fi
         log "ClickHouse storage tiering on (policy nano_tiered); clickhouse-migrate switches the event tables. Status: scripts/nano tiering status"
@@ -3670,16 +5121,104 @@ fi
 # containers: a migration that is merely slow keeps running.
 compose_up_timeout=${NANO_COMPOSE_UP_TIMEOUT:-3600}
 [[ "$compose_up_timeout" =~ ^[0-9]+$ && "$compose_up_timeout" -ge 60 ]] || compose_up_timeout=3600
+# NAN-5514: how many times the kernel killed nano-api (container CID) for
+# memory since this run's `up` started. Docker's OOMKilled describes only the
+# current run, so a restart loop of OOM kills read "OOMKilled false". Counts
+# docker's oom events, and the kernel log where this user can read it (best
+# effort: dmesg is often restricted). Prints "<count> <source>".
+compose_up_started_at=""
+nano_api_oom_kills() {
+    local cid="$1" limit=() events=0 kernel=0 since="${compose_up_started_at:-}"
+    command -v timeout >/dev/null 2>&1 && limit=(timeout 15)
+    if [[ "$since" =~ ^[0-9]+$ ]]; then
+        events=$(${limit[@]+"${limit[@]}"} docker events --since "$since" --until "$(date +%s)" \
+            --filter "container=$cid" --filter event=oom --format '{{.Action}}' </dev/null 2>/dev/null \
+            | awk 'NF { n++ } END { print n + 0 }') || events=0
+        if command -v journalctl >/dev/null 2>&1; then
+            kernel=$(${limit[@]+"${limit[@]}"} journalctl -k -q --no-pager --since "@$since" </dev/null 2>/dev/null \
+                | awk '/[Oo]ut of memory: Killed process [0-9]+ \(nanosiem-api\)/ { n++ } END { print n + 0 }') || kernel=0
+        fi
+    fi
+    [[ "$events" =~ ^[0-9]+$ ]] || events=0
+    [[ "$kernel" =~ ^[0-9]+$ ]] || kernel=0
+    if (( kernel > events )); then
+        printf '%s kernel log\n' "$kernel"
+    else
+        printf '%s docker events\n' "$events"
+    fi
+}
 compose_up_hint() {
-    local service
-    for service in clickhouse-migrate postgres-ha clickhouse keeper; do
+    local service listing name state health code extra="" shown=" " cid inspect
+    local status exit_code oom restarts memory nano_cpus limits oom_kills oom_source
+    # NAN-5509: beside the usual suspects, every service that exited with an
+    # error, is restarting or dead, or reports unhealthy (a password mismatch
+    # on reused volumes restart-loops nano-api; a port clash stops nginx).
+    listing=$(docker compose "${COMPOSE_ARGS[@]}" ps -a \
+        --format '{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}' </dev/null 2>/dev/null || true)
+    while IFS='|' read -r name state health code; do
+        [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+        case "$state" in
+            restarting | dead) extra+=" $name" ;;
+            exited) [[ "$code" == 0 ]] || extra+=" $name" ;;
+            *) [[ "$health" == unhealthy ]] && extra+=" $name" ;;
+        esac
+    done <<< "$listing"
+    for service in clickhouse-migrate postgres-ha postgres clickhouse keeper nano-api nginx vector $extra; do
+        [[ "$shown" == *" $service "* ]] && continue
+        shown+="$service "
         docker compose "${COMPOSE_ARGS[@]}" ps -a --format '{{.Service}}' "$service" </dev/null 2>/dev/null \
-            | grep -qx "$service" || continue
+            | grep -x "$service" >/dev/null || continue
         printf '\n--- last lines of %s ---\n' "$service" >&2
+        # NAN-5499: error lines carry a long prefix (the migrator prints the
+        # first 120 characters of the failing SQL) before ClickHouse's reason,
+        # so a flat 400-character cut hid the one part that mattered. Keep
+        # ERROR / exception lines whole (bounded) and trim only the rest.
         docker compose "${COMPOSE_ARGS[@]}" logs --no-color --tail 15 "$service" </dev/null 2>&1 \
-            | sed -e 's/\x1b\[[0-9;]*m//g' | cut -c1-400 >&2 || true
+            | sed -e 's/\x1b\[[0-9;]*m//g' \
+            | awk '{ max = ($0 ~ /ERROR|Exception|Code: [0-9]+/) ? 4000 : 400
+                     if (length($0) > max) print substr($0, 1, max) " ..."; else print }' >&2 || true
+        if [[ "$service" == clickhouse-migrate ]]; then
+            docker compose "${COMPOSE_ARGS[@]}" logs --no-color --tail 40 "$service" </dev/null 2>&1 \
+                | grep -oE 'Code: [0-9]+\. DB::Exception: .*' | tail -n 1 | cut -c1-1500 \
+                | sed -e 's/^/ClickHouse error: /' >&2 || true
+        fi
+        if [[ "$service" == clickhouse ]]; then
+            # ClickHouse logs to files after startup; compose logs only show
+            # the config merge, never the reason a query failed.
+            printf -- '--- last lines of clickhouse-server.err.log ---\n' >&2
+            # Bounded: a wedged container or a slow dockerd must not hang
+            # the failure path (timeout is optional on the host).
+            local hint_limit=()
+            command -v timeout >/dev/null 2>&1 && hint_limit=(timeout 20)
+            ${hint_limit[@]+"${hint_limit[@]}"} docker compose "${COMPOSE_ARGS[@]}" exec -T clickhouse \
+                tail -n 20 /var/log/clickhouse-server/clickhouse-server.err.log </dev/null 2>&1 \
+                | cut -c1-1500 >&2 || true
+        fi
+        if [[ "$service" == nano-api ]]; then
+            # NAN-5509: an undersized host showed only a silent restart loop.
+            # Say how the container ended and what it may use.
+            cid=$(docker compose "${COMPOSE_ARGS[@]}" ps -a -q nano-api </dev/null 2>/dev/null | awk 'NR == 1')
+            [[ -n "$cid" ]] || continue
+            inspect=$(docker inspect --format '{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.RestartCount}}|{{.HostConfig.Memory}}|{{.HostConfig.NanoCpus}}' \
+                "$cid" </dev/null 2>/dev/null) || continue
+            [[ "$inspect" == *"|"* ]] || continue
+            IFS='|' read -r status exit_code oom restarts memory nano_cpus <<< "$inspect"
+            limits=""
+            [[ "$memory" =~ ^[1-9][0-9]*$ ]] && limits+="memory limit $(( memory / 1048576 )) MiB"
+            if [[ "$nano_cpus" =~ ^[1-9][0-9]*$ ]]; then
+                limits+="${limits:+, }CPU limit $(( nano_cpus / 1000000000 )).$(( nano_cpus % 1000000000 / 10000000 / 10 ))"
+            fi
+            printf 'nano-api container: %s, exit code %s, OOMKilled %s, %s restart(s)%s\n' \
+                "${status:-?}" "${exit_code:-?}" "${oom:-?}" "${restarts:-?}" "${limits:+, $limits}" >&2
+            read -r oom_kills oom_source <<< "$(nano_api_oom_kills "$cid")"
+            [[ "$oom_kills" =~ ^[0-9]+$ ]] || oom_kills=0
+            if (( oom_kills > 0 )) || [[ "$oom" == true ]]; then
+                printf '%s\n' "nano-api was killed for running out of memory$( (( oom_kills > 0 )) && printf ' %s time(s) since this run started (%s)' "$oom_kills" "$oom_source")${limits:+ ($limits)}. The host is too small for nano, or NANO_API_MEM_LIMIT in .env is set too low: use a host that meets nano's minimum, then re-run install.sh." >&2
+            fi
+        fi
     done
 }
+compose_up_started_at=$(date +%s)
 docker compose "${COMPOSE_ARGS[@]}" "${compose_up_args[@]}" </dev/null &
 compose_up_pid=$!
 # A background job of a non-interactive shell ignores Ctrl-C; pass it on so an
@@ -3736,6 +5275,16 @@ recreate_stale_mount_services() {
         || warn "Could not recreate ${services[*]} onto the updated configuration; they keep running their previous configuration files. Run: docker compose ${COMPOSE_ARGS[*]} up -d --no-deps --force-recreate ${services[*]}"
 }
 recreate_stale_mount_services
+
+# NAN-5515: Vector reads its TLS files when the source starts, so a listener
+# certificate re-issued in place (new SANs, a rotated CA) needs a restart of a
+# Vector the `up` above did not recreate. Rare: only when the files changed.
+if [[ "$VECTOR_NATIVE_RESTART" == "1" ]] \
+    && docker compose "${COMPOSE_ARGS[@]}" ps --status running --services 2>/dev/null </dev/null | grep -x vector >/dev/null; then
+    log "Restarting Vector to load the re-issued Vector-native listener certificate"
+    docker compose "${COMPOSE_ARGS[@]}" restart vector </dev/null \
+        || warn "Could not restart Vector; it keeps the previous Vector-native certificate until it restarts. Run: docker compose ${COMPOSE_ARGS[*]} restart vector"
+fi
 
 # NAN-5404: ClickHouse cannot confine a user to a listener, so with the Agent
 # Lane port published EVERY ClickHouse user other than a token user must
@@ -3824,7 +5373,7 @@ if [[ -n "$VALKEY_REVOCATIONS_FILE" ]]; then
         [[ "$key" =~ ^auth:revoked_jti:[0-9A-Fa-f-]{1,64}$ && "$value" =~ ^[A-Za-z0-9:._-]{1,64}$ && "$ttl" =~ ^[0-9]{1,12}$ ]] || continue
         { printf 'SET %s %s PX %s NX\r\n' "$key" "$value" "$ttl"; sleep 1; } \
             | docker compose "${COMPOSE_ARGS[@]}" exec -T "$VALKEY_SHARED_ENDPOINT" nc -w 3 127.0.0.1 6379 2>/dev/null \
-            | grep -q '^+OK\|^\$-1' && carried=$((carried + 1))
+            | grep '^+OK\|^\$-1' >/dev/null && carried=$((carried + 1))
     done < "$VALKEY_REVOCATIONS_FILE"
     rm -f -- "$VALKEY_REVOCATIONS_FILE"
     ok "Carried $carried JWT revocation(s) to the shared Valkey"
@@ -3887,7 +5436,12 @@ if [[ "$HAS_APP" == "1" ]]; then
         sleep 3
     done
     if ! health_code=$(api_call /dev/null "$HEALTH_URL"); then
-        fail "API did not become healthy within 5 min (HTTP $health_code from $HEALTH_URL). Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx clickhouse-migrate'."
+        # NAN-5509: show the logs here too; this is where an unhealthy API,
+        # a restart loop and an nginx that cannot start all end.
+        compose_up_hint
+        health_note=""
+        [[ "$health_code" == 000 ]] && health_note=" HTTP 000 means nothing answered at $HEALTH_URL: nginx is not running or not listening there (its last lines are above)."
+        fail "API did not become healthy within 5 min (HTTP $health_code from $HEALTH_URL).${health_note} Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx clickhouse-migrate'."
     fi
     if [[ "$MULTI_NODE" == "1" ]]; then
         log "Waiting for every ClickHouse asynchronous-loader object to become OK"
@@ -3914,12 +5468,12 @@ else
         [[ "$role_service" == postgres && "${NANO_POSTGRES_HA:-false}" == "true" ]] && role_service=postgres-ha
         case "$role_service" in
             postgres|postgres-ha|clickhouse|keeper)
-                docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -qx "$role_service" \
+                docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -x "$role_service" >/dev/null \
                     || fail "$role_service did not stay running. Check 'docker compose ${COMPOSE_ARGS[*]} logs $role_service'." ;;
             # NAN-5250: the monitoring role is Prometheus + Grafana.
             monitoring)
                 for monitoring_service in prometheus grafana; do
-                    docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -qx "$monitoring_service" \
+                    docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -x "$monitoring_service" >/dev/null \
                         || fail "$monitoring_service did not stay running. Check 'docker compose ${COMPOSE_ARGS[*]} logs $monitoring_service'."
                 done ;;
         esac
@@ -3940,7 +5494,7 @@ else
     fi
     STATUS_JSON=$(cat "$STATUS_FILE")
     rm -f "$STATUS_FILE"
-    if echo "$STATUS_JSON" | grep -q '"initialized":true'; then
+    if echo "$STATUS_JSON" | grep '"initialized":true' >/dev/null; then
         warn "System is already initialized — skipping admin creation."
     else
         if [[ "$REUSE_ENV" == "1" ]]; then
@@ -4087,7 +5641,7 @@ if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" && "$SHOW_INGEST_SUMMARY" == "1" 
     # per source (shown once in the UI); the install token is not an ingest
     # credential on a fresh install. An upgraded install keeps it in the
     # deprecated legacy multiplex mode (routed by X-Source-Type / sourcetype).
-    printf "  Ingest tokens: issue one per sender in %s/ingestion/ingest-tokens\n" "$BASE_URL"
+    printf "  Ingest tokens: issue one per sender under Ingestion → Log Sources → Credentials (%s/ingestion/log-sources/credentials)\n" "$BASE_URL"
     printf "              (bound to one log source, which it decides; shown once)\n"
     if [[ "${REUSE_ENV:-0}" == "1" ]] && ! is_line_release "${PRE_RUN_NANO_VERSION:-}"; then
         printf "  Install token: VECTOR_AUTH_TOKEN in %s/.env  ← legacy multiplex (deprecated), kept for senders set up before v2\n" "$NANO_INSTALL_DIR"
@@ -4111,9 +5665,18 @@ if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" && "$SHOW_INGEST_SUMMARY" == "1" 
     echo
     printf "  OTLP:     POST %s/otlp/v1/{logs,traces,metrics}  (Authorization: Bearer <ingest token>)\n" "$INGEST_BASE_URL"
     echo
-    printf "  Vector:   %s:6000  (Vector → Vector native protocol, v2; loopback by default)\n" "$INGEST_HOST"
-    printf "              no credential check: events land as source_type=vector_native\n"
-    printf "              (prefer an HEC sink with a named ingest token per source)\n"
+    # NAN-5515: always mutual TLS; the client certificate is the credential.
+    if [[ "$VECTOR_NATIVE_STATE" == *server=locked* ]]; then
+        printf "  Vector:   %s:6000  (Vector native protocol v2, mTLS required; LOCKED on this host, see the warning above)\n" "$INGEST_HOST"
+    else
+        printf "  Vector:   %s:6000  (Vector native protocol v2, mTLS required)\n" "$INGEST_HOST"
+    fi
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        printf "              issue a client certificate per sender on the first app host: scripts/nano vector-client-cert <name>\n"
+    else
+        printf "              issue a client certificate per sender: scripts/nano vector-client-cert <name>\n"
+    fi
+    printf "              (prints the Vector sink config; events land as source_type=vector_native)\n"
     # NAN-1603 / NAN-1604: direct OCSF ingestion (Tenzir / Cribl / custom) writes
     # straight into ClickHouse, bypassing Vector. Only meaningful on the OCSF profile.
     if [[ "$SCHEMA_PROFILE" == "ocsf" ]]; then
@@ -4136,9 +5699,33 @@ if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" && "$SHOW_INGEST_SUMMARY" == "1" 
             printf "                                 (add your sources + OCSF mapping; the sink is pre-wired)\n"
             printf "              Apply edits:       docker compose -f %s/%s restart tenzir\n" "$NANO_INSTALL_DIR" "$COMPOSE_FILE"
         else
-            printf "            Native client (Tenzir ≥ 6.4.0): configure TLS to match the inventory transport mode\n"
+            if [[ "$MULTI_NODE" == "1" ]]; then
+                printf "            Native client (Tenzir ≥ 6.4.0): configure TLS to match the inventory transport mode\n"
+            else
+                printf "            Native client (Tenzir ≥ 6.4.0): run it as a container on nano's Docker network (the native port is not published on the host)\n"
+            fi
         fi
     fi
+fi
+# NAN-5509: which inbound ports the customer must open, and the ufw trap.
+firewall_ports=$(nano_firewall_summary "${PUBLISHED_PORTS:-}")
+if [[ -n "$firewall_ports" ]]; then
+    echo
+    printf "  Firewall: allow inbound %s\n" "$firewall_ports"
+    printf "            in your firewall or cloud security group, only from your users and log sources.\n"
+    printf "            Docker publishes these ports itself: ufw rules do not filter them. Restrict them\n"
+    printf "            with the DOCKER-USER chain or bind addresses: https://docs.docker.com/engine/network/packet-filtering-firewalls/\n"
+fi
+# NAN-5515: an existing install whose :6000 listener just became mTLS-only.
+if [[ "$VECTOR_NATIVE_NEW" == "1" && "${REUSE_ENV:-0}" == "1" ]]; then
+    echo
+    printf "  %b!! Vector native port 6000 now REQUIRES mutual TLS.%b\n" "$c_bold" "$c_reset"
+    printf "  !! Senders without a client certificate signed by this install's Vector-native CA are refused.\n"
+    if [[ -n "$VECTOR_NATIVE_RECENT_EVENTS" ]]; then
+        printf "  !! In the last 24 hours this install took %s event(s) on :6000 (source_type=vector_native);\n" "$VECTOR_NATIVE_RECENT_EVENTS"
+        printf "  !! senders that sent them without a client certificate are refused from now on.\n"
+    fi
+    printf "  !! Issue one per sender: scripts/nano vector-client-cert <name>  (prints the Vector sink config)\n"
 fi
 echo
 echo "  Logs:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} logs -f"

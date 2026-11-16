@@ -71,10 +71,13 @@ In the open-core stack, Vector's `8080` (HTTP) and `8088` (Splunk HEC) require
 `VECTOR_AUTH_TOKEN` — a blank token **fails closed** (`config/vector/00-base.toml`),
 so misconfiguration doesn't silently accept anonymous ingest.
 
-The Vector native port `6000` does **not** verify a token — it trusts the upstream
-forwarder. Treat it as an unauthenticated, **ingest-only** path (a caller can push
-logs; it cannot read stored data or control the system) and **firewall it to your
-trusted aggregators**.
+The Vector native port `6000` has no token; it is **always mutual TLS** instead: a
+sender must present a client certificate from the install's per-sender anchors
+(`scripts/nano vector-client-cert <name>`), or the TLS handshake is refused. It is
+an **ingest-only** path (a sender can push logs; it cannot read stored data or
+control the system). Revoking a sender removes only its anchor; Vector has no
+CRL support, so the listener restarts to apply it. Firewall it to your
+aggregators as well.
 
 `docker-compose.opensource.yml` also publishes `4317`/`4318` (OpenTelemetry) and
 `24224` (Fluent Forward), but the shipped config defines **no source on those

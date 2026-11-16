@@ -27,3 +27,12 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    # NAN-5511: :80 only 301-redirects to https here, so the base file's
+    # `wget http://127.0.0.1:80/api/health` check fails on every run and nginx
+    # stays "unhealthy" (nano upgrade waits for healthy and then gives up).
+    # Probe the HTTPS listener on loopback instead: same /api/health route,
+    # through TLS. The certificate names the public host, not 127.0.0.1, so
+    # this loopback-only probe skips verification (busybox wget verifies by
+    # default and fails on any self-signed or public-name cert).
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-check-certificate -qO- https://127.0.0.1:443/api/health >/dev/null 2>&1 || exit 1"]

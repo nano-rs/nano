@@ -16,6 +16,7 @@ import {
   getQueryAutocompleteSuggestions,
   type AutocompleteOption,
 } from '@/lib/query-autocomplete';
+import { nplQuotedBody } from '@/lib/npl-quote';
 import {
   FIELD_SECTION_LABELS,
   FIELD_SECTION_RANK,
@@ -40,13 +41,115 @@ export const COMPLETION_TOKEN_BEFORE = /[\w.*]+$/;
 export const COMPLETION_VALID_FOR = /^[\w.*]*$/;
 
 /**
+ * Characters of an unquoted nPL value. Mirrors `is_unquoted_value_char` in
+ * nanosiem-core/src/query/parser/values.rs: alphanumerics plus
+ * `_ - . * ? / : @ \ +`. A value completion (`metadata.log_source=web-app-json`)
+ * must replace this whole token; stopping at `-` replaced only `json` and
+ * produced `web-app-"web-app-json"` (NAN-5500).
+ */
+// `\p{Alphabetic}` (not `\p{L}`) matches Rust `char::is_alphanumeric`, which
+// includes combining marks.
+const VALUE_CHARS = String.raw`\p{Alphabetic}\p{N}_\-.*?/:@\\+`;
+const VALUE_TOKEN_BEFORE = new RegExp(`[${VALUE_CHARS}]+$`, 'u');
+const VALUE_TOKEN_AFTER = new RegExp(`^[${VALUE_CHARS}]*`, 'u');
+/** A value that needs no quotes when inserted bare. */
+export const UNQUOTED_VALUE = new RegExp(`^[${VALUE_CHARS}]+$`, 'u');
+export const VALUE_VALID_FOR = new RegExp(`^[${VALUE_CHARS}]*$`, 'u');
+/** Body of a `"…"` value as query-autocomplete matches it (`"?([^"\s]*)$`). */
+const QUOTED_VALUE_BEFORE = /=\s*"([^"\s]*)$/;
+const QUOTED_VALUE_AFTER = /^[^"\s]*/;
+const QUOTED_VALUE_VALID_FOR = /^[^"\s]*$/;
+
+/** Completion contexts whose options are field VALUES, not names. */
+const VALUE_CONTEXTS = new Set(['source_type']);
+
+export interface CompletionRange {
+  /** Start of the token being replaced. */
+  from: number;
+  /** End of the token being replaced (past the cursor when editing mid-token). */
+  to: number;
+  /** Value context: the token sits inside an open `"…"` literal. */
+  quoted: boolean;
+  /** Value context: a closing `"` already follows the token. */
+  closed: boolean;
+}
+
+/**
+ * The span an accepted completion replaces. Field/command names use the
+ * `[\w.*]` token; value contexts use the nPL unquoted-value token (or the
+ * body of an open `"…"`), extended past the cursor so the whole value is
+ * replaced on Enter, Tab or click.
+ */
+export function completionRange(doc: string, pos: number, context: string | null): CompletionRange {
+  const before = doc.slice(0, pos);
+  const after = doc.slice(pos);
+  if (!context || !VALUE_CONTEXTS.has(context)) {
+    const m = before.match(COMPLETION_TOKEN_BEFORE);
+    return { from: m ? pos - m[0].length : pos, to: pos, quoted: false, closed: false };
+  }
+  const quotedMatch = before.match(QUOTED_VALUE_BEFORE);
+  if (quotedMatch) {
+    const quotedTo = pos + (after.match(QUOTED_VALUE_AFTER)?.[0].length ?? 0);
+    const closed = doc[quotedTo] === '"';
+    // Unclosed literal: only the value token is ours, not `|stats` after it.
+    const to = closed ? quotedTo : pos + (after.match(VALUE_TOKEN_AFTER)?.[0].length ?? 0);
+    return { from: pos - quotedMatch[1].length, to, quoted: true, closed };
+  }
+  const m = before.match(VALUE_TOKEN_BEFORE);
+  const to = pos + (after.match(VALUE_TOKEN_AFTER)?.[0].length ?? 0);
+  return { from: m ? pos - m[0].length : pos, to, quoted: false, closed: false };
+}
+
+/**
+ * Text inserted for a value completion: bare when nPL takes it bare as a
+ * literal, else quoted. `*` / `?` are wildcards when bare, so values carrying
+ * them are always quoted.
+ */
+export function valueCompletionApply(value: string, range: CompletionRange): string {
+  if (range.quoted) return range.closed ? nplQuotedBody(value) : `${nplQuotedBody(value)}"`;
+  return UNQUOTED_VALUE.test(value) && !/[*?]/.test(value) ? value : `"${nplQuotedBody(value)}"`;
+}
+
+/**
+ * Value completions once the user may have typed a value in full. When the
+ * token already equals an option (case-insensitively, as query-autocomplete
+ * filters), the popup must close, or Enter accepts a completion (possibly a
+ * longer sibling like `web-app-json-v2`) instead of running the search
+ * (NAN-5500). An explicit request (Ctrl-Space) still lists the siblings.
+ * Non-value contexts are returned unchanged.
+ */
+export function valueOptionsAfterTyping<T extends { value: string }>(
+  options: T[],
+  doc: string,
+  range: CompletionRange,
+  context: string | null,
+  explicit: boolean,
+): T[] {
+  if (!context || !VALUE_CONTEXTS.has(context)) return options;
+  const typed = doc.slice(range.from, range.to).toLowerCase();
+  if (!typed || !options.some((o) => o.value.toLowerCase() === typed)) return options;
+  return explicit ? options.filter((o) => o.value.toLowerCase() !== typed) : [];
+}
+
+/** `validFor` for a result: value contexts re-query once the token is an exact option. */
+export function completionValidFor(
+  context: string | null,
+  range: CompletionRange,
+  labels: string[],
+): RegExp | ((text: string) => boolean) {
+  if (!context || !VALUE_CONTEXTS.has(context)) return COMPLETION_VALID_FOR;
+  const pattern = range.quoted ? QUOTED_VALUE_VALID_FOR : VALUE_VALID_FOR;
+  const exact = new Set(labels.map((l) => l.toLowerCase()));
+  return (text: string) => pattern.test(text) && !exact.has(text.toLowerCase());
+}
+
+/**
  * Convert query autocomplete options to CodeMirror completions
  */
 function toCompletions(
   options: AutocompleteOption[],
-  from: number,
+  range: CompletionRange,
   context: string | null,
-  doc: string,
 ): CompletionResult {
   const completions: Completion[] = options.map((opt, index) => {
     const completion: Completion = {
@@ -80,10 +183,7 @@ function toCompletions(
         break;
       case 'source_type':
         completion.type = 'enum';
-        // Check if we're already inside quotes
-        if (from > 0 && doc[from - 1] !== '"') {
-          completion.apply = `"${opt.value}"`;
-        }
+        completion.apply = valueCompletionApply(opt.value, range);
         break;
       case 'table_wildcard':
         completion.type = 'keyword';
@@ -96,9 +196,10 @@ function toCompletions(
   });
 
   return {
-    from,
+    from: range.from,
+    to: range.to,
     options: completions,
-    validFor: COMPLETION_VALID_FOR,
+    validFor: completionValidFor(context, range, options.map((o) => o.value)),
   };
 }
 
@@ -111,19 +212,13 @@ export async function searchQueryAutocomplete(context: CompletionContext): Promi
 
   const result = await getQueryAutocompleteSuggestions(doc, pos, [], { explicit: context.explicit });
 
-  if (result.options.length === 0) {
+  const range = completionRange(doc, pos, result.context);
+  const options = valueOptionsAfterTyping(result.options, doc, range, result.context, context.explicit);
+  if (options.length === 0) {
     return null;
   }
 
-  // Find where the current word starts
-  const textBefore = doc.substring(0, pos);
-  let from = pos;
-  const wordMatch = textBefore.match(COMPLETION_TOKEN_BEFORE);
-  if (wordMatch) {
-    from = pos - wordMatch[0].length;
-  }
-
-  return toCompletions(result.options, from, result.context, doc);
+  return toCompletions(options, range, result.context);
 }
 
 /**

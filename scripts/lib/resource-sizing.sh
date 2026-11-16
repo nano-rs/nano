@@ -66,6 +66,23 @@ VECTOR_LARGE_TIER_MEMORY_MIB=8192
 # PostgreSQL (above 512 MiB) or ClickHouse (above its floor) can fund it.
 # Open-core installs have no Evidence Pack and keep the proportional split.
 ENTERPRISE_API_MIN_MIB=1024
+# NAN-5506: nano-api idles at about 210 MiB, so the old 160 MiB service floor
+# (a 4 GiB single node) left it restart-looping with no hint why. Open core's
+# API gets at least this much, funded like the enterprise floor; a host that
+# cannot fund the floor for its edition is refused with the RAM shortfall
+# instead of rendering a limit nano-api cannot boot in.
+OPEN_API_MIN_MIB=384
+# NAN-5506: the enterprise refusal point. ENTERPRISE_API_MIN_MIB stays the
+# funded target, but a host that ends a few MiB under it (12 GiB + monitoring:
+# 1022 MiB, ClickHouse held at its 6 GiB feed floor) still runs a pack. The pack
+# needs a busy API (~300 MiB) plus a 400-day pack's headroom (~239 MiB); below
+# this it cannot run, so the host is refused rather than sized.
+ENTERPRISE_API_REFUSE_MIB=640
+# NAN-5506: a nano-api CPU limit below a quarter core starves its start-up
+# (migration checks, cache warm-up) past the health-check window. Funded from
+# a co-located ClickHouse share above its 500m floor, then PostgreSQL above
+# 250m; a host that cannot fund it is refused.
+API_MIN_MCPU=250
 
 fail() {
     printf 'resource sizing error: %s\n' "$*" >&2
@@ -618,12 +635,20 @@ api_mib=$(( api_mib + (app_mib - api_mib - search_mib - jobs_mib - valkey_mib - 
 # from their budgets. Funded only by co-located roles on this host, in the
 # order the Vector target uses: PostgreSQL down to 512 MiB, then ClickHouse
 # down to its floor (the 6 GiB platform-feed floor where that applies). Vector's target and the other app services are
-# left alone; a host with nothing to give keeps the proportional API share.
+# left alone. NAN-5506: open core is funded the same way up to OPEN_API_MIN_MIB,
+# and a host that still cannot fund its edition's floor is refused below
+# (after operator overrides), never rendered with an API that cannot boot.
 # The opt-in connector-runner (pull-feeds profile) keeps the proportional API
 # share: the floor is for the pack, which runs only inside nano-api.
 api_share_mib=$api_mib
-if [[ "$edition" == enterprise ]] && has_role app && (( api_mib < ENTERPRISE_API_MIN_MIB )); then
-    api_shortfall=$(( ENTERPRISE_API_MIN_MIB - api_mib ))
+api_min_mib=$OPEN_API_MIN_MIB
+api_refuse_mib=$OPEN_API_MIN_MIB
+if [[ "$edition" == enterprise ]]; then
+    api_min_mib=$ENTERPRISE_API_MIN_MIB
+    api_refuse_mib=$ENTERPRISE_API_REFUSE_MIB
+fi
+if has_role app && (( api_mib < api_min_mib )); then
+    api_shortfall=$(( api_min_mib - api_mib ))
     memory_excess=$api_shortfall
     has_role postgres && reduce_memory_budget pg_mib 512
     if has_role clickhouse; then
@@ -829,6 +854,19 @@ if [[ "$topology" == role ]] && has_role app; then
     fi
 fi
 
+# NAN-5506: nano-api CPU floor (API_MIN_MCPU). A 2 vCPU single node splits to
+# about 0.13 CPU for the API; move the difference from co-located ClickHouse
+# (down to its 500m floor), then PostgreSQL (down to 250m). The host total is
+# unchanged. Refused below, after overrides, if it still falls short.
+if has_role app && (( api_mcpu < API_MIN_MCPU )); then
+    cpu_excess=$(( API_MIN_MCPU - api_mcpu ))
+    api_cpu_shortfall=$cpu_excess
+    has_role clickhouse && reduce_cpu_budget ch_mcpu 500
+    has_role postgres && reduce_cpu_budget pg_mcpu 250
+    api_mcpu=$(( api_mcpu + api_cpu_shortfall - cpu_excess ))
+    cpu_excess=0
+fi
+
 CLICKHOUSE_MEM_LIMIT=$(memory_string "$ch_mib")
 CLICKHOUSE_CPU_LIMIT=$(cpu_string "$ch_mcpu")
 CLICKHOUSE_MAX_THREADS=$ch_cores
@@ -985,6 +1023,10 @@ apply_override() {
     is_sizing_key "$key" || fail "unsupported override key $key"
     validate_override "$key" "$value"
     printf -v "$key" '%s' "$value"
+    # NAN-5514: remember where an explicit nano-api limit came from, so a
+    # too-small one is blamed on the setting, not on the host.
+    [[ "$key" == NANO_API_MEM_LIMIT ]] && api_mem_set_in="${override_origin:-an override}"
+    return 0
 }
 
 # NAN-5082: Valkey replaced Dragonfly. An operator override written under the
@@ -1030,8 +1072,13 @@ legacy_value_from_environment() {
     printenv "$1" 2>/dev/null
 }
 
+# NAN-5514: the nano-api limit this host's sizing computed, before overrides.
+sized_api_mem_limit="$NANO_API_MEM_LIMIT"
+api_mem_set_in=""
+override_origin=""
 if [[ -n "$override_env" ]]; then
     [[ -f "$override_env" ]] || fail "override env does not exist: $override_env"
+    override_origin="$override_env"
     apply_legacy_overrides legacy_value_from_file
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
@@ -1051,6 +1098,7 @@ fi
 
 # The invoking environment is the normal one-shot override path. It wins over
 # .env, matching Docker Compose interpolation semantics.
+override_origin="the environment"
 apply_legacy_overrides legacy_value_from_environment
 for key in $SIZING_KEYS; do
     case "$key" in
@@ -1064,10 +1112,57 @@ for key in $SIZING_KEYS; do
 done
 
 if [[ -n "$cli_overrides" ]]; then
+    override_origin="--override"
     while IFS= read -r assignment; do
         [[ -n "$assignment" ]] || continue
         apply_override "${assignment%%=*}" "${assignment#*=}"
     done <<< "$cli_overrides"
+fi
+
+# NAN-5506: refuse, with the shortfall, a nano-api limit it cannot boot in.
+# Checked on the final values, so an explicit operator override still wins.
+# NANO_SKIP_HOST_MINIMUMS=1 (set by the operator, or by install.sh for a host
+# that already runs nano) renders the limits anyway with a warning.
+api_floor_fail() {
+    if [[ "${NANO_SKIP_HOST_MINIMUMS:-0}" == "1" ]]; then
+        printf 'resource sizing warning: %s (NANO_SKIP_HOST_MINIMUMS=1: sizing it anyway)\n' "$*" >&2
+    else
+        fail "$*"
+    fi
+}
+mib_from_memory_string() { # Docker memory value -> MiB (rounded down); "" when unparseable
+    local v="$1" n unit
+    [[ "$v" =~ ^([1-9][0-9]*)([KkMmGgTt]?)(i?[Bb]?)$ ]] || return 0
+    n=${BASH_REMATCH[1]}; unit=${BASH_REMATCH[2]}
+    case "$unit" in
+        [Kk]) printf '%s\n' "$(( n / 1024 ))" ;;
+        [Mm]) printf '%s\n' "$n" ;;
+        [Gg]) printf '%s\n' "$(( n * 1024 ))" ;;
+        [Tt]) printf '%s\n' "$(( n * 1048576 ))" ;;
+        *) printf '%s\n' "$(( n / 1048576 ))" ;;
+    esac
+}
+if has_role app; then
+    final_api_mib=$(mib_from_memory_string "$NANO_API_MEM_LIMIT")
+    if [[ -n "$final_api_mib" ]] && (( final_api_mib < api_refuse_mib )); then
+        api_need_what="nano-api needs at least ${api_refuse_mib} MiB (${api_min_mib} MiB recommended)"
+        (( api_refuse_mib == api_min_mib )) && api_need_what="nano-api needs at least ${api_min_mib} MiB"
+        [[ "$edition" == enterprise ]] && api_need_what="${api_need_what} on an enterprise install (Evidence Pack, NAN-5433)"
+        api_effect="it would not stay up (it idles at about 210 MiB)"
+        (( final_api_mib >= OPEN_API_MIN_MIB )) && api_effect="the Evidence Pack would refuse to run"
+        sized_api_mib=$(mib_from_memory_string "$sized_api_mem_limit")
+        if [[ -n "$api_mem_set_in" && "$NANO_API_MEM_LIMIT" != "$sized_api_mem_limit" ]] \
+            && [[ -n "$sized_api_mib" ]] && (( sized_api_mib >= api_refuse_mib )); then
+            # An explicit setting, not the host: name it and the floor.
+            api_floor_fail "NANO_API_MEM_LIMIT=${NANO_API_MEM_LIMIT} (set in ${api_mem_set_in}) is below nano-api's minimum of ${api_refuse_mib} MiB${edition:+ on an ${edition} install}; ${api_effect}. Remove that setting so the installer sizes nano-api for this host (${sized_api_mem_limit}), or raise it to at least ${api_refuse_mib}M."
+        else
+            api_floor_fail "${api_need_what}, but this host's ${memory_mib} MiB of RAM leaves it only ${final_api_mib} MiB ($(( api_refuse_mib - final_api_mib )) MiB short) after the OS reserve and the other roles' minimums (roles ${roles}); ${api_effect}. Use a larger host (nano's minimum is 8 GB RAM, 16 GB with the enrichment feeds on) or move roles to other hosts."
+        fi
+    fi
+    final_api_mcpu=$(mcpu_from_cpu_string "$NANO_API_CPU_LIMIT")
+    if (( final_api_mcpu < API_MIN_MCPU )); then
+        api_floor_fail "nano-api needs at least $(cpu_string "$API_MIN_MCPU") CPU, but this host's ${cpu_cores} CPU leave it only ${NANO_API_CPU_LIMIT} after the other roles' minimums (roles ${roles}). Use a host with more CPUs (nano's minimum is 2 vCPU) or move roles to other hosts."
+    fi
 fi
 
 # ClickHouse 26.10 rejects a server configuration when its fixed MergeTree

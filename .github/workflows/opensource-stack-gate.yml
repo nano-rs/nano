@@ -28,6 +28,7 @@ on:
       - clickhouse/users.d/**
       - scripts/tests/clickhouse-default-user.live.sh
       - scripts/tests/test_install_clickhouse_default_preflight.py
+      - scripts/tests/test_install_compose_up_hint.py
       - nanosiem-web/**
       - tools/sync-to-nano-mirror.sh
       - tools/scan-mirror-secrets.sh
@@ -41,6 +42,18 @@ on:
       - scripts/tests/install-bind-address-probes.test.sh
       - scripts/tests/test_nano_upgrade_bind_address.py
       - scripts/tests/install-image-pull.test.sh
+      - scripts/tests/install-registry-login.test.sh
+      - scripts/tests/install-errors-prereqs.test.sh
+      - scripts/tests/test_nano_upgrade_license_registry_login.py
+      - scripts/tests/install-rerun-upgrade.test.sh
+      - scripts/tests/install-v2030-audit.test.sh
+      - scripts/tests/test_nano_upgrade_v2030_audit.py
+      - scripts/lib/install-preflight.sh
+      - scripts/lib/registry-login.sh
+      - scripts/lib/vector-native-pki.sh
+      - scripts/tests/vector-native-mtls.test.sh
+      - scripts/tests/vector-native-mtls.live.sh
+      - scripts/tests/test_nano_upgrade_vector_native_pki.py
       - scripts/lib/data-mount.sh
       - scripts/tests/install-data-mount.test.sh
       - scripts/lib/image-pull.sh
@@ -121,6 +134,7 @@ jobs:
         run: |
           if command -v shellcheck >/dev/null 2>&1; then
             shellcheck -x install.sh scripts/lib/resource-sizing.sh scripts/check-opensource-pins.sh
+            shellcheck -S warning scripts/lib/vector-native-pki.sh
           else
             echo "shellcheck not installed on runner — skipping."
           fi
@@ -178,6 +192,69 @@ jobs:
             bash scripts/tests/install-image-pull.test.sh
           else
             echo "install-image-pull test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5505: enterprise installs log in to the private registry with the
+      # license-issued pull credential and default to the customer lock.
+      - name: install.sh registry login
+        run: |
+          if [ -f scripts/tests/install-registry-login.test.sh ]; then
+            bash scripts/tests/install-registry-login.test.sh
+          else
+            echo "install-registry-login test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5515: Vector native :6000 is mutual TLS only (CA, listener and
+      # client certificates; compose bind; installer summary).
+      - name: Vector-native mutual TLS
+        run: |
+          if [ -f scripts/tests/vector-native-mtls.test.sh ]; then
+            bash scripts/tests/vector-native-mtls.test.sh
+            python3 -I scripts/tests/test_nano_upgrade_vector_native_pki.py
+          else
+            echo "vector-native-mtls test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5515 (M5): the TLS-layer proof with the pinned Vector image on this
+      # Linux runner: valid sender delivers; no cert, plaintext, foreign
+      # anchor, the listener cert as a client and a revoked sender are
+      # refused; revocation leaves the other senders untouched; a sender
+      # anchor cannot act as a listener; missing/unreadable files lock :6000.
+      - name: Vector-native mutual TLS, live (Docker)
+        run: |
+          if [ -f scripts/tests/vector-native-mtls.live.sh ]; then
+            TMPDIR="$RUNNER_TEMP" bash scripts/tests/vector-native-mtls.live.sh
+          else
+            echo "vector-native-mtls live test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5509: installer errors, prerequisites and recovery hints (TLS
+      # certificate preflight, python3/git, docker permissions, log hint,
+      # host-minimum re-run commands, license login on upgrade, ports).
+      - name: install.sh errors and prerequisites
+        run: |
+          if [ -f scripts/tests/install-errors-prereqs.test.sh ]; then
+            bash scripts/tests/install-errors-prereqs.test.sh
+            python3 -I scripts/tests/test_nano_upgrade_license_registry_login.py
+          else
+            echo "install-errors-prereqs test not in this tree (public mirror); skipping"
+          fi
+
+      - name: install.sh re-run and upgrade regressions
+        run: |
+          if [ -f scripts/tests/install-rerun-upgrade.test.sh ]; then
+            bash scripts/tests/install-rerun-upgrade.test.sh
+          else
+            echo "install-rerun-upgrade test not in this tree (public mirror); skipping"
+          fi
+
+      - name: v2.0.30 audit regressions (overlays, TLS preflight, :6000, backup)
+        run: |
+          if [ -f scripts/tests/install-v2030-audit.test.sh ]; then
+            bash scripts/tests/install-v2030-audit.test.sh
+            python3 -I scripts/tests/test_nano_upgrade_v2030_audit.py
+          else
+            echo "install-v2030-audit test not in this tree (public mirror); skipping"
           fi
 
       # NAN-5251: never install onto Docker's root disk while the data disk
@@ -328,6 +405,7 @@ jobs:
           if [ -f scripts/tests/clickhouse-default-user.live.sh ]; then
             bash scripts/tests/clickhouse-default-user.live.sh
             python3 -I scripts/tests/test_install_clickhouse_default_preflight.py
+            python3 -I scripts/tests/test_install_compose_up_hint.py
           else
             echo "ClickHouse default-user tests not in this tree (public mirror); skipping"
           fi

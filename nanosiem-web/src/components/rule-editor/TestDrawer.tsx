@@ -37,6 +37,7 @@ import { cn } from '@/lib/utils';
 import type { TestDetectionResult, TimeRange } from '@/lib/api/types';
 import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
 import { QueryEditor } from '@/components/editor';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { isClickHouseDefault } from '@/lib/utils';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { eventDetailEntries } from '@/components/search/event-row-line';
@@ -125,14 +126,17 @@ function rangeSpanDays(range: TimeRange): number {
 interface TestDrawerProps {
   open: boolean;
   onClose: () => void;
-  /** The current editor query body (unsaved drafts ok). Feeds the seed value
-   *  of the drawer's working copy every time the drawer opens, but once open
-   *  the working copy is independent — user exploration isn't clobbered by
-   *  upstream edits. `Reset to editor` pulls in the parent's current value. */
+  /** The current editor query body (unsaved drafts ok). NAN-5501: while the
+   *  analyst hasn't typed in the drawer, the working query FOLLOWS this prop
+   *  live — editing the rule in CODE / FORM changes what Run tests. Only a
+   *  deliberate edit inside the drawer forks a panel-local copy; `reset`
+   *  drops the fork and resumes following the editor. */
   query: string;
   /** If present and the working copy matches `query`, the saved-rule test
    *  endpoint runs (more accurate). Any divergence falls back to the
-   *  unsaved `testQuery` path. */
+   *  unsaved `testQuery` path. The parent MUST omit this while the editor
+   *  holds unsaved changes — otherwise the persisted rule, not the edited
+   *  one, is what gets tested (NAN-5501). */
   ruleId?: string;
   /** `useTestDetection` mutation. Now accepts an explicit `timeRange` —
    *  NAN-741 added stepped per-window evaluation to `/api/rules/{id}/test`,
@@ -170,7 +174,14 @@ export function TestDrawer({
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [liveMode, setLiveMode] = useState(false);
   const [lastRunAt, setLastRunAt] = useState<Date | null>(null);
-  const [workingQuery, setWorkingQuery] = useState(query);
+  // NAN-5501: the editor owns the query. `panelQuery` is null while the drawer
+  // follows the editor, and holds the analyst's panel-local copy once they
+  // deliberately edit inside the drawer. `forkBase` is the editor query at the
+  // moment of that fork, so we can tell when the editor moved on since.
+  const [panelQuery, setPanelQuery] = useState<string | null>(null);
+  const [forkBase, setForkBase] = useState<string | null>(null);
+  const [confirmApplyOpen, setConfirmApplyOpen] = useState(false);
+  const workingQuery = panelQuery ?? query;
   const runRef = useRef<() => Promise<void>>(null);
   const wasOpenRef = useRef(false);
 
@@ -198,17 +209,59 @@ export function TestDrawer({
     dragRef.current = null;
   };
 
-  // Seed the working copy on open — a closed→open transition pulls whatever
-  // the editor currently has. While open, edits to `query` (e.g., the author
-  // typed in CODE) don't clobber the drawer; `Reset to editor` does that.
+  // A closed→open transition drops any panel-local fork so the drawer starts
+  // out testing exactly what the editor holds.
   useEffect(() => {
     if (open && !wasOpenRef.current) {
-      setWorkingQuery(query);
+      setPanelQuery(null);
+      setForkBase(null);
+      setConfirmApplyOpen(false);
     }
     wasOpenRef.current = open;
-  }, [open, query]);
+  }, [open]);
 
-  const queryDirty = workingQuery.trim() !== query.trim();
+  // The editor caught up with the panel copy (e.g. the analyst typed the same
+  // thing in CODE) — drop the fork so the panel follows the editor again
+  // instead of claiming "synced" while it silently stays pinned.
+  useEffect(() => {
+    if (panelQuery !== null && panelQuery.trim() === query.trim()) {
+      setPanelQuery(null);
+      setForkBase(null);
+    }
+  }, [panelQuery, query]);
+
+  const queryDirty = panelQuery !== null && panelQuery.trim() !== query.trim();
+  // The editor changed after the analyst forked the panel copy — applying the
+  // panel copy would discard those editor edits.
+  const editorChangedSinceFork =
+    queryDirty && forkBase !== null && forkBase.trim() !== query.trim();
+
+  const handlePanelChange = useCallback(
+    (next: string) => {
+      if (next.trim() === query.trim()) {
+        // Typed back to the editor's value — resume following the editor.
+        setPanelQuery(null);
+        setForkBase(null);
+        return;
+      }
+      setPanelQuery(next);
+      setForkBase((base) => base ?? query);
+    },
+    [query],
+  );
+
+  const resetToEditor = useCallback(() => {
+    setPanelQuery(null);
+    setForkBase(null);
+  }, []);
+
+  const applyToEditor = useCallback(() => {
+    if (!onApplyQuery || panelQuery === null) return;
+    onApplyQuery(panelQuery);
+    // The editor now holds the panel copy — follow it again.
+    setPanelQuery(null);
+    setForkBase(null);
+  }, [onApplyQuery, panelQuery]);
 
   // Range exceeds the 14-day backend cap. Block the run client-side so the
   // user sees inline feedback in the drawer instead of a transient toast
@@ -272,18 +325,19 @@ export function TestDrawer({
     return () => clearInterval(tick);
   }, [open, liveMode]);
 
-  // Esc to close.
+  // Esc to close. While the Apply confirm is up, Esc belongs to the dialog —
+  // closing the drawer too would throw away the panel edit (NAN-5501).
   useEffect(() => {
-    if (!open) return;
+    if (!open || confirmApplyOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !e.defaultPrevented) {
         e.preventDefault();
         onClose();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  }, [open, confirmApplyOpen, onClose]);
 
   const events = run?.sample_events || [];
   const selected = selectedIndex != null ? events[selectedIndex] : null;
@@ -339,19 +393,54 @@ export function TestDrawer({
 
       <QueryPane
         value={workingQuery}
-        onChange={setWorkingQuery}
+        onChange={handlePanelChange}
         onRun={() => void runOnce()}
         onApply={
           onApplyQuery && queryDirty
-            ? () => {
-                onApplyQuery(workingQuery);
-              }
+            ? () => setConfirmApplyOpen(true)
             : undefined
         }
-        onReset={queryDirty ? () => setWorkingQuery(query) : undefined}
+        onReset={queryDirty ? resetToEditor : undefined}
         dirty={queryDirty}
+        editorChanged={editorChangedSinceFork}
         running={running}
       />
+
+      {/* NAN-5501: Apply replaces the rule's query body, so it never happens
+          silently — show both sides and make the analyst confirm. */}
+      <ConfirmDialog
+        open={confirmApplyOpen}
+        onOpenChange={setConfirmApplyOpen}
+        title="Replace the rule's query?"
+        description={
+          editorChangedSinceFork
+            ? 'The rule was edited in the editor after you changed the test query. Applying discards those editor changes to the query.'
+            : "The editor's query will be replaced with the test panel's query. Frontmatter is kept."
+        }
+        confirmLabel="Replace editor query"
+        variant={editorChangedSinceFork ? 'warning' : 'default'}
+        className="max-w-2xl"
+        onConfirm={applyToEditor}
+      >
+        <div className="grid grid-cols-2 gap-2" data-testid="apply-query-diff">
+          <div className="min-w-0">
+            <div className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground mb-1">
+              Editor (current)
+            </div>
+            <pre className="max-h-48 overflow-auto rounded-[3px] border border-border bg-background p-2 font-mono text-[11px] whitespace-pre-wrap break-all">
+              {query}
+            </pre>
+          </div>
+          <div className="min-w-0">
+            <div className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground mb-1">
+              Test panel (will replace)
+            </div>
+            <pre className="max-h-48 overflow-auto rounded-[3px] border border-border bg-background p-2 font-mono text-[11px] whitespace-pre-wrap break-all">
+              {workingQuery}
+            </pre>
+          </div>
+        </div>
+      </ConfirmDialog>
 
       {rangeTooLong && (
         <div
@@ -422,6 +511,7 @@ function QueryPane({
   onApply,
   onReset,
   dirty,
+  editorChanged,
   running,
 }: {
   value: string;
@@ -430,19 +520,28 @@ function QueryPane({
   onApply?: () => void;
   onReset?: () => void;
   dirty: boolean;
+  editorChanged: boolean;
   running: boolean;
 }) {
   return (
     <div className="border-b border-border bg-background shrink-0">
       <div className="h-7 px-3 flex items-center gap-2 border-b border-border/60 text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground">
         <ArrowLeft className="w-3 h-3 rotate-[-90deg]" strokeWidth={1.75} />
-        Working query
+        {dirty ? 'Test query' : 'Working query'}
         {dirty ? (
-          <span className="normal-case tracking-normal text-[var(--warning)] flex items-center gap-1">
-            · modified — not yet applied to editor
+          <span
+            data-testid="test-query-status"
+            className="normal-case tracking-normal text-[var(--warning)] flex items-center gap-1"
+          >
+            {editorChanged
+              ? '· edited in this panel — testing this, not the rule (rule changed since)'
+              : '· edited in this panel — testing this, not the rule'}
           </span>
         ) : (
-          <span className="normal-case tracking-normal text-muted-foreground/70">
+          <span
+            data-testid="test-query-status"
+            className="normal-case tracking-normal text-muted-foreground/70"
+          >
             · synced with editor
           </span>
         )}
@@ -453,10 +552,10 @@ function QueryPane({
             type="button"
             onClick={onReset}
             className="inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-muted-foreground hover:text-foreground hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] normal-case tracking-normal"
-            title="Revert working copy to the editor's current query"
+            title="Discard the panel edit and test the editor's current query"
           >
             <Undo2 className="w-2.5 h-2.5" strokeWidth={1.75} />
-            reset
+            use rule query
           </button>
         )}
         {onApply && (
@@ -536,10 +635,10 @@ function TestDrawerHeader({
           <span
             className="inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[9.5px] font-mono font-semibold tracking-[0.08em] uppercase text-[var(--warning)]"
             style={{ background: 'color-mix(in srgb, var(--warning) 15%, transparent)' }}
-            title="Working query differs from the editor"
+            title="Testing a query edited in this panel, not the rule in the editor"
           >
             <span className="w-1 h-1 rounded-full bg-[var(--warning)]" />
-            modified
+            panel query
           </span>
         )}
       </div>

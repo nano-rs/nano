@@ -234,4 +234,49 @@ if [ "${NANO_INGEST_STATIC_FALLBACK:-}" = true ]; then
 fi
 # END nano-public-install-token
 
+# --- Vector-native mutual TLS (NAN-5515) -------------------------------------------------
+# The vector_native source (01-vector-source.toml) is mutual TLS only: it loads the listener
+# certificate and key and the sender anchor bundle from NANO_VECTOR_NATIVE_{CRT,KEY,CA}_FILE
+# (default /etc/nano/vector-native/, which install.sh / nano upgrade fill). A missing or
+# unreadable file would make Vector refuse its WHOLE config (every ingest lane down), so
+# substitute LOCKED material: an anchor whose key is deleted at once. :6000 then refuses every
+# sender; it never falls back to plaintext.
+NV_CRT="${NANO_VECTOR_NATIVE_CRT_FILE:-/etc/nano/vector-native/server.crt}"
+NV_KEY="${NANO_VECTOR_NATIVE_KEY_FILE:-/etc/nano/vector-native/server.key}"
+NV_CA="${NANO_VECTOR_NATIVE_CA_FILE:-/etc/nano/vector-native/client-ca.crt}"
+NV_BAD=""
+for NV_F in "$NV_CRT" "$NV_KEY" "$NV_CA"; do
+    if [ ! -s "$NV_F" ]; then
+        NV_BAD="$NV_BAD missing:$NV_F"
+    elif [ ! -r "$NV_F" ]; then
+        NV_BAD="$NV_BAD unreadable:$NV_F"
+    fi
+done
+if [ -n "$NV_BAD" ]; then
+    NV_LOCKED=/tmp/nano-vector-native-locked
+    rm -rf "$NV_LOCKED"
+    if (umask 077 && mkdir -p "$NV_LOCKED" \
+        && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+            -subj "/O=nano/CN=nano vector-native LOCKED" \
+            -keyout "$NV_LOCKED/ca.key" -out "$NV_LOCKED/client-ca.crt" \
+        && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+            -subj "/O=nano/CN=nano vector-native listener" \
+            -keyout "$NV_LOCKED/server.key" -out "$NV_LOCKED/server.crt") >/dev/null 2>&1; then
+        rm -f "$NV_LOCKED/ca.key"
+        NANO_VECTOR_NATIVE_CRT_FILE="$NV_LOCKED/server.crt"
+        NANO_VECTOR_NATIVE_KEY_FILE="$NV_LOCKED/server.key"
+        NANO_VECTOR_NATIVE_CA_FILE="$NV_LOCKED/client-ca.crt"
+        export NANO_VECTOR_NATIVE_CRT_FILE NANO_VECTOR_NATIVE_KEY_FILE NANO_VECTOR_NATIVE_CA_FILE
+        case "$NV_BAD" in
+            *unreadable:*)
+                echo "nano-vector: ERROR: Vector-native TLS files are not readable by Vector (${NV_BAD# }). With Docker userns-remap or a rootless daemon, container root cannot read a 0600 key owned by the install user: disable userns-remap for nano or make the key readable to the remapped root. Port 6000 refuses every sender until then." >&2 ;;
+            *)
+                echo "nano-vector: WARNING: no Vector-native TLS files (${NV_BAD# }); port 6000 refuses every sender until install.sh or scripts/nano upgrade issues them" >&2 ;;
+        esac
+    else
+        rm -rf "$NV_LOCKED"
+        echo "nano-vector: could not create locked Vector-native TLS material in $NV_LOCKED" >&2
+    fi
+fi
+
 exec "$VECTOR" "$@"
