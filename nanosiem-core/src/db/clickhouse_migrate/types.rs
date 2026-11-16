@@ -62,6 +62,10 @@ pub struct ClickHouseMigrator {
     /// whose grantees are all XML users is skipped instead of executed: it
     /// can only fail with Code 495 and leave a `system.errors` entry.
     pub(super) xml_users: Option<std::collections::HashSet<String>>,
+    /// NAN-5470: the dictionary identity's credentials, set once its login is
+    /// proven on every server (dict_source_user.rs). `None`: dictionary
+    /// placeholders resolve to the self credentials.
+    pub(super) dict_source: Option<(String, String)>,
 }
 
 /// NAN-1029: default distributed DDL coordination timeout for every query the
@@ -110,6 +114,7 @@ impl ClickHouseMigrator {
             cluster: None,
             server_version: None,
             xml_users: None,
+            dict_source: None,
         }
     }
 }

@@ -152,6 +152,11 @@ RECIPIENT_CERT = f"{KEYS_DIR}/recipient.crt"
 SIGNING_KEY = f"{KEYS_DIR}/signing.pem"
 RECOVERY_KEY = f"{KEYS_DIR}/recovery-key.pem"
 BACKUP_ROLE = "nano_backup"
+# NAN-5470: nano_backup's own hourly quota. A run issues a handful of
+# queries (one Native export of the lookup rows plus probes); the caps only
+# stop a runaway or a leaked credential. Per user, per server.
+BACKUP_QUOTA = "nano_backup_quota"
+BACKUP_QUOTA_LIMITS = "queries = 1000, errors = 200, execution_time = 7200"
 # NAN-5367: the SELECT-only ClickHouse backup user never accepts connections
 # from any address: loopback and private address space (the Compose, inventory
 # and pod networks the scheduler runs on).
@@ -875,6 +880,23 @@ class Database:
         self.ch(f"ALTER USER {BACKUP_ROLE}{cluster} HOST {hosts}", admin=True)
         return True
 
+    def ensure_backup_quota(self, cluster: str) -> bool:
+        """NAN-5470: nano_backup carries its own hourly quota (every SQL-created
+        nano user has one). Read locally first, so a routine run on a user that
+        already has it issues no cluster DDL. Returns whether it (re)created it."""
+        raw = self.ch(f"SELECT apply_to_list FROM system.quotas WHERE name = '{BACKUP_QUOTA}' "
+                      f"FORMAT JSONEachRow", admin=True)
+        for line in raw.decode(errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and BACKUP_ROLE in (row.get("apply_to_list") or []):
+                return False
+        self.ch(f"CREATE QUOTA OR REPLACE {BACKUP_QUOTA}{cluster} KEYED BY user_name "
+                f"FOR INTERVAL 1 hour MAX {BACKUP_QUOTA_LIMITS} TO {BACKUP_ROLE}", admin=True)
+        return True
+
     def provision_clickhouse(self) -> None:
         """Review M4: touch the cluster only when the `nano_backup`
         credential does not work. A working user is left alone, so a routine
@@ -889,6 +911,7 @@ class Database:
             # user's. A local read; a routine run on a user already in line
             # issues no cluster DDL.
             self.align_backup_hosts(cluster)
+            self.ensure_backup_quota(cluster)
             return
         except BackupError as error:
             if "unreachable" in str(error):
@@ -900,6 +923,7 @@ class Database:
                 f"'{self.backup_ch_password}' HOST {hosts}", admin=True)
         for table in ("lookup_rows", "lookup_rows_distributed"):
             self.ch(f"GRANT{cluster} SELECT ON nanosiem.{table} TO {BACKUP_ROLE}", admin=True)
+        self.ensure_backup_quota(cluster)
 
     def lookup_table(self, admin: bool = False) -> str:
         exists = self.ch("EXISTS TABLE nanosiem.lookup_rows_distributed FORMAT TSVRaw", admin=admin)

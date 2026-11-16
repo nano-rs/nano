@@ -228,7 +228,7 @@ impl ClickHouseMigrator {
     /// CH treats `\` as an escape character inside `'...'` strings, so a
     /// backslash in a substituted value can escape the closing quote and
     /// break the literal. Double `\` first, then double `'`. NAN-788.
-    fn escape_for_string_literal(value: &str) -> String {
+    pub(super) fn escape_for_string_literal(value: &str) -> String {
         value.replace('\\', "\\\\").replace('\'', "''")
     }
 

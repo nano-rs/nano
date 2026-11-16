@@ -1116,6 +1116,19 @@ impl SearchService {
     /// boot passes the profile resolved from `NANO_SCHEMA_PROFILE`.
     ///
     /// [`with_dual_pool_lookup_and_prevalence`]: SearchService::with_dual_pool_lookup_and_prevalence
+    /// NAN-5470: this service with its event-query client replaced by
+    /// `client` (the interactive search identity, `DualPool::clickhouse_search`).
+    /// Everything else (generator, lookups, prevalence, raw-SQL identities,
+    /// admission, AI and risk providers, the hot-reloaded query limits) is
+    /// shared with `self`. The API uses it for AI-written searches so they run
+    /// under the search identity's limits and quota, not the app's own.
+    pub fn with_clickhouse_identity(&self, client: clickhouse::Client) -> Self {
+        let mut service = self.clone();
+        service.ch_executor = Some(ClickHouseExecutor::new(client.clone()));
+        service.ch_client = Some(client);
+        service
+    }
+
     pub fn with_dual_pool_lookup_and_prevalence_and_profile(
         dual_pool: &DualPool,
         lookup_service: LookupService,

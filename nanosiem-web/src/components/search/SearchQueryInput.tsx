@@ -2,14 +2,12 @@
 
 import { useRef, useCallback, useEffect, useState, useMemo } from 'react';
 import { Clock, Pin, Search, X, Settings2, Trash2, Info } from 'lucide-react';
-import { PivtIcon } from '@/components/icons/PivtIcon';
 import type { SearchHistoryEntry } from '@/hooks/useSearchHistory';
 import { formatRelativeCompact } from '@/lib/date-utils';
 import { SearchQueryEditor, type SearchQueryEditorRef } from '@/components/editor';
 import type { EditorView } from '@codemirror/view';
 import { setAutocompleteTimeRange } from '@/lib/query-autocomplete';
 
-const NL_HINT_DISMISSED_KEY = 'nanosiem-nl-hint-dismissed';
 
 interface SavedSearchSuggestion {
   id: string;
@@ -88,16 +86,6 @@ export function SearchQueryInput({
     };
   }, []);
 
-  // Natural language hint state
-  const [isFocused, setIsFocused] = useState(false);
-  const [nlHintDismissed, setNlHintDismissed] = useState(() => {
-    return localStorage.getItem(NL_HINT_DISMISSED_KEY) === 'true';
-  });
-
-  const dismissNlHint = useCallback(() => {
-    setNlHintDismissed(true);
-    localStorage.setItem(NL_HINT_DISMISSED_KEY, 'true');
-  }, []);
 
   // Reset history limit/filter when dropdown closes, focus filter when it opens
   useEffect(() => {
@@ -186,8 +174,6 @@ export function SearchQueryInput({
     ? 'Search logs… try metadata.log_source=windows_sysmon or class_uid=3002 status_id=2'
     : 'SELECT … FROM logs';
 
-  // Show hint when focused and not dismissed (and no dropdowns open)
-  const showNlHint = isFocused && !nlHintDismissed && !showHistorySuggestions && !aiMode;
 
   // Retro hunts scan every event in the selected time range (no narrow-window
   // shortcut), so surface that the moment a `| retro` command is typed — it tells
@@ -269,14 +255,8 @@ export function SearchQueryInput({
     }
   }, [aiMode, onAiSearch, onSearch]);
 
-  // Handle focus
-  const handleFocus = useCallback(() => {
-    setIsFocused(true);
-  }, []);
-
   // Handle blur
   const handleBlur = useCallback(() => {
-    setIsFocused(false);
     // Don't close history if focus moved to the history filter input
     // (editor blur fires after 150ms delay - check at that point)
     if (historyFilterRef.current && historyFilterRef.current.contains(document.activeElement)) return;
@@ -290,24 +270,6 @@ export function SearchQueryInput({
 
   return (
     <div className="flex-1 flex flex-col">
-      {/* Natural language hint - slides in above input */}
-      <div className={`overflow-hidden transition-all duration-300 ease-out ${
-        showNlHint ? 'max-h-8 opacity-100 mb-1.5' : 'max-h-0 opacity-0 mb-0'
-      }`}>
-        <div className="flex items-center gap-1.5 px-1 text-xs text-muted-foreground">
-          <PivtIcon className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--ai)' }} />
-          <span>Try natural language like</span>
-          <span className="italic" style={{ color: 'var(--ai)' }}>"show me failed logins from yesterday"</span>
-          <button
-            className="p-0.5 rounded hover:bg-accent transition-colors flex-shrink-0"
-            onClick={dismissNlHint}
-            onMouseDown={(e) => e.preventDefault()}
-          >
-            <X className="h-3 w-3 text-muted-foreground/50 hover:text-muted-foreground" />
-          </button>
-        </div>
-      </div>
-
       <div className="relative">
         <div className={`search-console-input-shell relative border rounded-md min-h-[34px] resize-y overflow-hidden transition-colors duration-300 ease-out ${
           aiMode
@@ -323,7 +285,6 @@ export function SearchQueryInput({
           sqlMode={queryMode === 'sql'}
           onKeyDown={handleEditorKeyDown}
 
-          onFocus={handleFocus}
           onBlur={handleBlur}
           onSubmit={handleSubmit}
           onTabPress={() => setShowHistorySuggestions(false)}

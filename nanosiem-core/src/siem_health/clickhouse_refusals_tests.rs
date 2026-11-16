@@ -107,3 +107,13 @@ fn no_refusals_change_nothing() {
     ensure_clickhouse_refusal_findings(&mut a, &[]);
     assert_eq!((a.overall_score, a.recommendations.len()), before);
 }
+
+/// NAN-5470: an INSERT refused to the search identity (background job
+/// results) is a finding like any other nano writer's.
+#[test]
+fn search_identity_is_a_watched_writer() {
+    assert!(super::WRITER_USERS.contains(&"nanosiem_search"));
+    for user in ["nanosiem_vector", "nanosiem_ingest", "nanosiem"] {
+        assert!(super::WRITER_USERS.contains(&user), "{user}");
+    }
+}

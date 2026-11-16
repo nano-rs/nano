@@ -15,6 +15,11 @@ use crate::db::dual_pool::{
 use crate::search::{SearchError};
 use crate::sql_hygiene::escape_sql_string;
 
+
+/// The ClickHouse users whose queries a search cancel may kill: the app's own
+/// identity (API / jobs searches) and the interactive search identity.
+pub const SEARCH_KILLABLE_USERS: [&str; 2] = ["nanosiem", "nanosiem_search"];
+
 impl ClickHouseExecutor {
     /// Cancel a running query by its query_id
     ///
@@ -97,9 +102,16 @@ impl ClickHouseExecutor {
         // an empty string on single-node, so the emitted SQL is byte-identical to
         // the pre-cluster `KILL QUERY WHERE … SYNC`.
         let on_cluster = on_cluster_clause();
+        // NAN-5470: KILL QUERY is a global grant (ClickHouse has no
+        // per-user scope for it), so the statement itself only ever matches
+        // searches nano's search paths started: never an admin, migrator,
+        // Vector, ingest, dictionary or Agent Lane query that happens to
+        // carry a matching id.
         let kill_sql = format!(
-            "KILL QUERY{} WHERE query_id IN ({}) SYNC",
-            on_cluster, id_list
+            "KILL QUERY{} WHERE query_id IN ({}) AND user IN ({}) SYNC",
+            on_cluster,
+            id_list,
+            SEARCH_KILLABLE_USERS.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>().join(", ")
         );
         info!("Killing {} running queries: {}", running_count, kill_sql);
 
@@ -275,5 +287,11 @@ mod tests {
         }
         assert!(bodies.contains("KILL QUERY"));
         assert!(bodies.contains(" SYNC"));
+        // NAN-5470: the kill can only ever match nano's own search users,
+        // whatever ids it is handed (KILL QUERY itself is a global grant).
+        assert!(
+            bodies.contains("AND user IN ('nanosiem', 'nanosiem_search') SYNC"),
+            "kill not scoped to the search users: {bodies}"
+        );
     }
 }

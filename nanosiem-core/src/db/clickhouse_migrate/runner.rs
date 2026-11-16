@@ -128,7 +128,7 @@ fn ensure_distributed_ddl_timeout(sql: &str) -> String {
 
 impl ClickHouseMigrator {
     /// Apply a single migration
-    async fn apply_migration(
+    pub(super) async fn apply_migration(
         &self,
         migration: &Migration,
         is_cloud: bool,
@@ -153,6 +153,11 @@ impl ClickHouseMigrator {
         // NAN-5367: 110/112/114 hard-code the default self credentials; give
         // them the placeholders first (the file and its checksum stay as-is).
         let migration_sql = Self::rewrite_legacy_self_source_credentials(&migration_sql);
+        // NAN-5470: dictionary-identity placeholders resolve to the dictionary
+        // user once it is ready everywhere, else to the self placeholders the
+        // next step fills in (dict_source_user.rs).
+        let migration_sql =
+            super::dict_source_user::substitute_dict_source_vars(&migration_sql, self.dict_source.as_ref());
         let migration_sql = Self::substitute_clickhouse_self_vars(&migration_sql);
 
         // NAN-1728: resolve the `{dist_suffix}` placeholder to `_distributed` on
@@ -527,6 +532,10 @@ impl ClickHouseMigrator {
         // password containing `--` can't be misread as a comment start. See
         // sql_transform::strip_sql_line_comments for the full rationale.
         let sql = Self::strip_sql_line_comments(init_sql);
+
+        // NAN-5470: dictionary-identity placeholders (see apply_migration).
+        self.refresh_dict_source_readiness().await;
+        let sql = super::dict_source_user::substitute_dict_source_vars(&sql, self.dict_source.as_ref());
 
         // Substitute placeholders that point at the local CH instance and the
         // platform PostgreSQL. NAN-707 lifted the CH-self substitution out of
@@ -909,6 +918,9 @@ impl ClickHouseMigrator {
 
         // Ensure migrations table exists (cluster-aware)
         self.ensure_migrations_table().await?;
+
+        // NAN-5470: decide what the dictionary-identity placeholders resolve to.
+        self.refresh_dict_source_readiness().await;
 
         // Get already applied migrations
         let applied = self.get_applied_migrations().await?;

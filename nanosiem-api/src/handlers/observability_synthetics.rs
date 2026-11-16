@@ -244,7 +244,7 @@ async fn enrich(
     };
 
     let history = state
-        .search_service
+        .user_search_service
         .observability_synthetic_history(&key, time_range, Some(HISTORY_LIMIT))
         .await
         .map_err(|e| {
@@ -296,7 +296,7 @@ pub async fn list_synthetics(
 
     let time_range = summary_time_range();
     let summaries = state
-        .search_service
+        .user_search_service
         .observability_synthetics_summary(&time_range)
         .await
         .map_err(|e| {

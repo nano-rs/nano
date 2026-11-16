@@ -1,7 +1,9 @@
 # Agent skills
 
-Skills in the open [Agent Skills](https://agentskills.io) format, for coding
-agents such as Claude Code and Codex.
+The official nano agent skills, in the open
+[Agent Skills](https://agentskills.io) format, for coding agents such as
+Claude Code, Codex and Cursor. Overview, versioning and safety rules:
+[Agent skills](https://nano.rs/docs/agents/skills/).
 
 | Skill | What it does |
 |---|---|
@@ -29,4 +31,21 @@ The same commands install `nano-agentlane`: replace `nano-deploy` with
 For an agent without skill support, copy the folder anywhere and tell the
 agent: *"Read `nano-deploy/SKILL.md` and follow it."*
 
-Guide: [Deploy with your AI agent](https://nano.rs/docs/getting-started/deploy-with-ai-agent/).
+## Versions
+
+The skills ship from this repository's `main` branch; the commands above
+always fetch the latest copy. Each `SKILL.md` names the nano version it was
+tested with in its `metadata`. Releases from v2.0.25 on are tagged here too:
+to match your release, download `archive/refs/tags/v<version>.tar.gz` and take
+`nano-<version>/skills/<skill>`.
+
+## Guides
+
+- [Agent skills](https://nano.rs/docs/agents/skills/): both skills, install,
+  versions and safety.
+- [Deploy with your AI agent](https://nano.rs/docs/getting-started/deploy-with-ai-agent/):
+  `nano-deploy`.
+- [Hunt with your AI agent](https://nano.rs/docs/agents/hunt-with-ai-agent/):
+  `nano-agentlane`.
+- [Agent Lane](https://nano.rs/docs/agents/agent-lane/): turning Agent Lane on,
+  tokens, limits and audit.

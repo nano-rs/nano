@@ -1039,6 +1039,37 @@ export function Search() {
         console.warn('Failed to fetch full field stats:', err);
       });
   }, [fetchFieldStats]);
+  // Field stats for a finished rows search, in the background: the results
+  // and histogram never wait on them (NAN-5486). Every raw-events run path
+  // (stream, batch, job hand-off, drilldown) calls this once its rows landed.
+  // Small, specific result set (a real backend count under the threshold) →
+  // the FULL inventory directly; broad or unknown → the reduced column set
+  // (NAN-1427/1508/1509). `cacheKey` persists the stats to the result cache.
+  const startBackgroundFieldStats = useCallback((
+    fsRequest: NonNullable<typeof lastFieldStatsRequestRef.current>,
+    totalCount: number,
+    rows: SearchResult[],
+    cacheKey?: string,
+  ) => {
+    lastFieldStatsRequestRef.current = fsRequest;
+    const fsSmall = totalCount > 0 && totalCount < AUTO_SHOW_ALL_RESULT_THRESHOLD;
+    fetchFieldStats({ ...fsRequest, columns: fsSmall ? undefined : collectFieldStatsColumns(rows), signal: runControllerRef.current?.signal })
+      .then(fieldStatsResponse => {
+        if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
+          setServerFieldStats(fieldStatsResponse.fields);
+          setFieldStatsReduced(!fsSmall);
+          // NAN-1509: persist field stats + reduced flag to the cache entry
+          // so a cached restore keeps the teaser/auto-fetch behavior.
+          const cached = cacheKey ? searchResultCache.get(cacheKey) : undefined;
+          if (cached) {
+            cached.serverFieldStats = fieldStatsResponse.fields;
+            cached.fieldStatsReduced = !fsSmall;
+          }
+        }
+      })
+      // Field stats are non-critical: the panel keeps its client-side stats.
+      .catch(err => console.warn('Failed to fetch field stats:', err));
+  }, [fetchFieldStats]);
   const { data: savedSearches, refetch: refetchSaved } = useSavedSearches();
   const { data: sharedSearches } = useSharedSearches();
 
@@ -1481,26 +1512,8 @@ export function Search() {
         request_id: currentRequestIdRef.current ?? undefined,
         dataset: effectiveDataset, // NAN-1559: stats must enumerate the same dataset the search targeted
       };
-      lastFieldStatsRequestRef.current = fsRequest;
-      // Small, specific result set → fetch the FULL inventory directly (no
-      // reduced set / teaser); broad → reduced. Only on a real backend count.
-      const fsSmall = (response.total_count ?? 0) > 0 && (response.total_count ?? 0) < AUTO_SHOW_ALL_RESULT_THRESHOLD;
-      fetchFieldStats({ ...fsRequest, columns: fsSmall ? undefined : collectFieldStatsColumns(results), signal: runControllerRef.current?.signal })
-        .then(fieldStatsResponse => {
-          if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
-            setServerFieldStats(fieldStatsResponse.fields);
-            setFieldStatsReduced(!fsSmall);
-            // Update cache entry with field stats
-            const cached = searchResultCache.get(cacheKey);
-            if (cached) {
-              cached.serverFieldStats = fieldStatsResponse.fields;
-              cached.fieldStatsReduced = !fsSmall;
-            }
-          }
-        })
-        .catch(err => {
-          console.warn('Failed to fetch field stats:', err);
-        });
+      // Only on a real backend count (absent/0 → reduced set).
+      startBackgroundFieldStats(fsRequest, response.total_count ?? 0, results, cacheKey);
     }
 
     // Capture search in notebook (if active)
@@ -1534,7 +1547,7 @@ export function Search() {
         return updated;
       });
     }
-  }, [fetchFieldStats, captureSearch, toApiTimeRange, requestQueryReview, dataset]);
+  }, [startBackgroundFieldStats, captureSearch, toApiTimeRange, requestQueryReview, dataset]);
 
   // Start polling for async job results
   const startAsyncJobPolling = useCallback((
@@ -1823,29 +1836,10 @@ export function Search() {
             // stale closure here (not in this callback's dep list).
             dataset: request.dataset,
           };
-          lastFieldStatsRequestRef.current = fsRequest;
           // NAN-1508/1509: the streaming path is the default piped-search path —
-          // apply the same auto-load gate. Small specific result set → full
-          // inventory directly; broad/unknown → reduced. Reliable count only:
-          // raw streamedMetadata.totalCount (absent/0 → safe reduced path).
-          const fsSmall = (streamedMetadata.totalCount ?? 0) > 0 && (streamedMetadata.totalCount ?? 0) < AUTO_SHOW_ALL_RESULT_THRESHOLD;
-          fetchFieldStats({ ...fsRequest, columns: fsSmall ? undefined : collectFieldStatsColumns(searchResultsRef.current), signal: runControllerRef.current?.signal })
-            .then(fieldStatsResponse => {
-              if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
-                setServerFieldStats(fieldStatsResponse.fields);
-                setFieldStatsReduced(!fsSmall);
-                // NAN-1509: persist field stats + reduced flag to the cache entry
-                // so a cached restore keeps the teaser/auto-fetch behavior.
-                if (cacheKey) {
-                  const cached = searchResultCache.get(cacheKey);
-                  if (cached) {
-                    cached.serverFieldStats = fieldStatsResponse.fields;
-                    cached.fieldStatsReduced = !fsSmall;
-                  }
-                }
-              }
-            })
-            .catch(err => console.warn('Failed to fetch field stats:', err));
+          // same auto-load gate. Reliable count only: raw
+          // streamedMetadata.totalCount (absent/0 → safe reduced path).
+          startBackgroundFieldStats(fsRequest, streamedMetadata.totalCount ?? 0, searchResultsRef.current, cacheKey);
         }
 
         // Capture search in notebook
@@ -1916,7 +1910,7 @@ export function Search() {
     }, { bypass: bypassCache, acceptAsync: true });
 
     sseControllerRef.current = controller;
-  }, [clearAsyncJob, processAsyncJobResult, startAsyncJobPolling, queryClient, fetchFieldStats, toApiTimeRange, captureSearch, requestQueryCorrection]);
+  }, [clearAsyncJob, processAsyncJobResult, startAsyncJobPolling, queryClient, startBackgroundFieldStats, toApiTimeRange, captureSearch, requestQueryCorrection]);
 
   // Main search function
   const handleSearch = useCallback(async (page: number = 1, append: boolean = false, searchQuery?: string, searchMode?: 'piped' | 'sql', searchTimeRange?: TimeRangeValue, useCache?: boolean, searchDataset?: import('@/lib/api/types').SearchDataset) => {
@@ -2269,30 +2263,9 @@ export function Search() {
           request_id: requestId,
           dataset: currentDataset, // NAN-1559: stats must enumerate the same dataset the search targeted
         };
-        lastFieldStatsRequestRef.current = fsRequest;
-        // Small, specific result set → full inventory directly; broad → reduced.
         // effectiveTotalCount is already page-full-aware (estimates large when a
         // full page came back), so it never falsely reads as "small".
-        const fsSmall = effectiveTotalCount > 0 && effectiveTotalCount < AUTO_SHOW_ALL_RESULT_THRESHOLD;
-        fetchFieldStats({ ...fsRequest, columns: fsSmall ? undefined : collectFieldStatsColumns(results), signal: runControllerRef.current?.signal })
-          .then(fieldStatsResponse => {
-            if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
-              setServerFieldStats(fieldStatsResponse.fields);
-              setFieldStatsReduced(!fsSmall);
-              // Update cache entry with field stats
-              if (cacheKey) {
-                const cached = searchResultCache.get(cacheKey);
-                if (cached) {
-                  cached.serverFieldStats = fieldStatsResponse.fields;
-                  cached.fieldStatsReduced = !fsSmall;
-                }
-              }
-            }
-          })
-          .catch(err => {
-            // Field stats failure is non-critical, just log it
-            console.warn('Failed to fetch field stats:', err);
-          });
+        startBackgroundFieldStats(fsRequest, effectiveTotalCount, results, cacheKey ?? undefined);
       } else if (!append) {
         // For aggregate queries or SQL mode, we compute field stats client-side
         setServerFieldStats(null);
@@ -2333,7 +2306,7 @@ export function Search() {
       }
       setHasSearched(true);
     }
-  }, [query, queryMode, timeRange, pageSize, search, searchSql, updateUrl, beginRunScope, addToSearchHistory, refreshHistory, captureSearch, prevalenceMax, showSql, explainQuery, startStreamingSearch, requestQueryCorrection, dataset]);
+  }, [query, queryMode, timeRange, pageSize, search, searchSql, updateUrl, beginRunScope, addToSearchHistory, refreshHistory, captureSearch, prevalenceMax, showSql, explainQuery, startStreamingSearch, startBackgroundFieldStats, requestQueryCorrection, dataset]);
 
   /** The query a tail read sends: comments stripped, rarity filter applied. */
   const tailRequestQuery = useCallback((tailQuery: string): string => {
@@ -2772,7 +2745,10 @@ export function Search() {
 
       const response = queryMode === 'sql'
         ? await searchSql({ sql: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset })
-        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true, skip_histogram: offset > 0, dataset });
+        // NAN-5486: table_view like page 1 of the run, or a later page came
+        // back as `SELECT *` plus every prevalence column (the server still
+        // widens the projection for pipes that need every field).
+        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, dataset });
 
       if (abortControllerRef.current?.signal.aborted) return;
 
@@ -3243,7 +3219,14 @@ export function Search() {
           const cleanQuery = stripComments(newQuery);
           // NAN-1825: drilldowns must stay on the dataset the source search ran
           // against — dropping it silently re-queried logs for spans/metrics/risk.
-          const response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset: 0, dataset });
+          // NAN-5486: the same request shape as a typed run. table_view keeps
+          // the rows to the slim column list (it was `SELECT *` plus every
+          // prevalence column), and skip_field_stats stops the response from
+          // waiting on the all-column stats companion; the sidebar's stats
+          // follow in the background below.
+          const requestId = safeRandomUUID();
+          currentRequestIdRef.current = requestId;
+          const response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset: 0, skip_field_stats: true, table_view: true, request_id: requestId, dataset });
           
           const results: SearchResult[] = (response.results || [])
             .filter((r: unknown) => r != null && typeof r === 'object')
@@ -3266,7 +3249,15 @@ export function Search() {
           // Set display type and column order from response (needed for | table queries)
           if (response.display_type) setDisplayType(response.display_type);
           setColumnOrder(response.column_order);
-          setIsAggregateQuery(checkIfAggregateQuery(newQuery));
+          const drillIsAggregate = checkIfAggregateQuery(newQuery);
+          setIsAggregateQuery(drillIsAggregate);
+          if (!drillIsAggregate) {
+            startBackgroundFieldStats(
+              { query: cleanQuery, start: apiTimeRange.start, end: apiTimeRange.end, request_id: requestId, dataset },
+              response.total_count ?? 0,
+              results,
+            );
+          }
           // Always set histogram (even if empty) to ensure stale data is replaced
           setHistogramData(
             response.histogram && response.histogram.length > 0
@@ -3296,7 +3287,7 @@ export function Search() {
       
       runDrilldownSearch();
     }, 0);
-  }, [query, timeRange, search, pageSize, updateUrl, beginRunScope, addToSearchHistory, refreshHistory, captureSearch, dataset]);
+  }, [query, timeRange, search, pageSize, updateUrl, beginRunScope, addToSearchHistory, refreshHistory, captureSearch, startBackgroundFieldStats, dataset]);
 
   // Toggle functions
   const toggleField = useCallback((field: string) => {

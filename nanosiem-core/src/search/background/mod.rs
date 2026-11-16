@@ -38,7 +38,9 @@ mod tests;
 pub use identity::{freeze_time_window, identity_hash, normalize_job_request};
 pub use repository::SearchJobRepository;
 pub use results::SearchJobResultStore;
-pub use service::{BackgroundJobConfig, BackgroundSearchJobs};
+pub use service::{
+    BackgroundJobConfig, BackgroundSearchJobs, SEARCH_PROFILE_MAX_EXECUTION_SECS, SEARCH_PROFILE_MAX_RESULT_ROWS,
+};
 pub use types::{
     DurableJobInfo, DurableSearchJob, JobErrorKind, JobOrigin, JobResultsPage, NewSearchJob,
     SubmitOutcome, classify_search_error, decode_job_id, encode_job_id, is_durable_job_id,

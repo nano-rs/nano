@@ -108,6 +108,16 @@ async fn async_main() -> Result<()> {
         .refresh_cluster_state(&dual_pool_config.clickhouse_database)
         .await;
 
+    // NAN-5484: every query nano-search runs is user-facing (searches, the
+    // stream endpoint, field stats, background search jobs), so the whole
+    // service runs as the interactive search identity (`nanosiem_search`: own
+    // profile limits, hourly quota and query_log user). Compose and Helm
+    // already set this service's CLICKHOUSE_USER to it; a launcher that keeps
+    // CLICKHOUSE_USER=nanosiem and passes CLICKHOUSE_SEARCH_PASSWORD (the native
+    // local stack, start-microservices-dev.sh) used to leave every search on
+    // the app's uncapped identity while the boot log named nanosiem_search.
+    let dual_pool = nanosiem_search::search_identity_pool(dual_pool);
+
     tracing::info!("Database connections established");
 
     // Initialize auth services

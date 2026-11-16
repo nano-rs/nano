@@ -128,6 +128,21 @@ const MIGRATION_172: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/172_prevalence_dict_cache_cells_by_box.sql"
 ));
+/// NAN-5470: re-issues every ClickHouse-sourced dictionary with the dictionary
+/// identity's placeholders; otherwise each body is its canonical one.
+const MIGRATION_202: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/202_dictionary_source_user.sql"
+));
+
+/// NAN-5470: the init files and migration 202 log in as the dictionary
+/// identity; the body comparisons below are about everything else.
+fn dict_login_as_self(sql: &str) -> String {
+    sql.replace("{clickhouse_dict_user}", "{clickhouse_self_user}")
+        .replace("{clickhouse_dict_password}", "{clickhouse_self_password}")
+        // 202's login fingerprint is metadata, not part of the body.
+        .replace("\nCOMMENT '{clickhouse_dict_fingerprint}'", "")
+}
 
 /// NAN-1732 P2-C deduplicated the enrichment refresh MVs: the SELECT now wraps
 /// its source in an `argMax(col, version) GROUP BY namespace, …` subquery so a
@@ -600,8 +615,8 @@ fn numbered_migrations_from_130_have_memory_bounded_dict_queries() {
 /// or the two paths diverge silently.
 #[test]
 fn migration_133_matches_init_definitions() {
-    let udm_dicts = create_dictionary_statements(UDM_INIT);
-    let ocsf_dicts = create_dictionary_statements(OCSF_INIT);
+    let udm_dicts = create_dictionary_statements(&dict_login_as_self(UDM_INIT));
+    let ocsf_dicts = create_dictionary_statements(&dict_login_as_self(OCSF_INIT));
     let mig_dicts = create_dictionary_statements(MIGRATION_133);
     let mig136_dicts = create_dictionary_statements(MIGRATION_136);
     let mig148_dicts = create_dictionary_statements(MIGRATION_148);
@@ -921,4 +936,31 @@ fn migration_184_owns_the_platform_feed_schema_and_init_sql_stays_pre_184() {
         MIGRATION_184.find("CREATE TABLE IF NOT EXISTS nanosiem.platform_feed_commits").unwrap() < first_modify,
         "the commits table must exist before the MVs reference it"
     );
+}
+
+/// NAN-5470: migration 202 changes only the source login. Each of its bodies,
+/// with the login read back as the self placeholders, is the dictionary's
+/// current definition (172 / 185 / 188 / 133), so re-pointing the user can
+/// never also change a layout, lifetime or source query.
+#[test]
+fn migration_202_changes_only_the_source_login() {
+    const MIGRATION_185: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../clickhouse/185_ip_geo_dict_split.sql"));
+    const MIGRATION_188: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../clickhouse/188_ocsf_ioc_stamping_parity.sql"));
+    let mig202 = create_dictionary_statements(&dict_login_as_self(MIGRATION_202));
+    assert!(!MIGRATION_202.contains("{clickhouse_self_user}"), "202 must log in as the dictionary identity");
+    let canonical: Vec<(&str, BTreeMap<String, String>)> = vec![
+        ("172", create_dictionary_statements(MIGRATION_172)),
+        ("185", create_dictionary_statements(MIGRATION_185)),
+        ("188", create_dictionary_statements(MIGRATION_188)),
+        ("133", create_dictionary_statements(MIGRATION_133)),
+    ];
+    assert_eq!(mig202.len(), 10, "202 re-issues every ClickHouse-sourced dictionary");
+    for (name, body) in &mig202 {
+        let (source, want) = canonical
+            .iter()
+            .find_map(|(n, m)| m.get(name).map(|b| (*n, b)))
+            .unwrap_or_else(|| panic!("{name}: no canonical definition"));
+        assert_eq!(Some(body), Some(want), "{name}: migration 202 differs from migration {source} beyond the login");
+    }
 }

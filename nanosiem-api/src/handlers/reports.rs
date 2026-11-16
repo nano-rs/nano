@@ -159,7 +159,7 @@ pub struct TriggerReportResponse {
 fn report_service(state: &AppState) -> ReportService {
     ReportService::with_node_id(
         state.pool.clone(),
-        state.search_service.clone(),
+        state.user_search_service.clone(),
         state.node_id.clone(),
     )
     .with_denied_source_audit(

@@ -16,6 +16,8 @@
 #[cfg(feature = "enterprise")]
 pub mod agentlane_findings;
 pub mod analyzer;
+// NAN-5470: nano's ClickHouse users meeting their hourly quota.
+pub mod clickhouse_quota;
 // NAN-5390: ClickHouse refusing nano's logins or writes.
 pub mod clickhouse_refusals;
 pub mod collector;

@@ -275,6 +275,33 @@ impl AppState {
             ),
         );
 
+        // NAN-5470: AI-written searches the API runs in process (pivt notebook
+        // chat, the shadow investigation's hunts) run as the interactive search
+        // identity (`nanosiem_search`: own profile limits and hourly quota), not
+        // as the app's uncapped internal identity. Without a search credential
+        // (older .env, dev stacks) this is the same service.
+        let user_search_service = if dual_pool.has_clickhouse_search() {
+            // Boot check: a search identity that cannot log in (password not
+            // rendered on ClickHouse yet, a restore that changed it) fails
+            // every user-facing search. Say so at boot, loudly; SIEM Health
+            // reports the refused logins (clickhouse_refusals).
+            let probe = dual_pool.clickhouse_search().clone();
+            tokio::spawn(async move {
+                match probe.query("SELECT 1").fetch_one::<u8>().await {
+                    Ok(_) => tracing::info!("ClickHouse search identity (nanosiem_search) logs in"),
+                    Err(error) => tracing::error!(
+                        %error,
+                        "ClickHouse search identity (nanosiem_search) cannot run queries: user-facing \
+                         searches will fail until ClickHouse has its rendered user (re-run install.sh \
+                         or nano upgrade; Helm: check the clickhouse_search_password hash)"
+                    ),
+                }
+            });
+            search_service.with_clickhouse_identity(dual_pool.clickhouse_search().clone())
+        } else {
+            search_service.clone()
+        };
+
         // Create melod_service Arc (initialized as None, reloaded later in reload_melod_service).
         // Open-core build skips the meloD handles entirely; shadow_investigation
         // wires NoopAiClient and the engine falls back to its non-AI path.
@@ -307,7 +334,7 @@ impl AppState {
             let svc = Arc::new(
                 ShadowInvestigationService::new(
                     pg_pool.clone(),
-                    search_service.clone(),
+                    user_search_service.clone(),
                     shadow_ai_client,
                     3, // max 3 concurrent investigations
                 )
@@ -438,6 +465,7 @@ impl AppState {
         Self {
             // Services using DualPool for ClickHouse log queries
             search_service,
+            user_search_service,
             detection_service,
             // NAN-1581: flag-aware lookup service shared with the management
             // handlers so create/upload/row ops follow LOOKUP_STORAGE_BACKEND.

@@ -122,7 +122,7 @@ pub async fn panel_query(
         // Raw SQL is neither cached nor routed through admission control here.
         (
             state
-                .search_service
+                .user_search_service
                 .search_sql(sql_request, &sql_scope, audit_access)
                 .await?,
             false,
@@ -202,7 +202,7 @@ pub async fn panel_query(
         // user-initiated `bypass_cache` (the panel Refresh affordance). Falls
         // through to a plain `search_with_admission` when REDIS_URL is unset.
         let user_id = auth.claims.sub;
-        let search_service = state.search_service.clone();
+        let search_service = state.user_search_service.clone();
         // NAN-1799: move a clone of the effective scope into the admission
         // closure so the original `scope` stays available for the scoped
         // cache-key computation below.

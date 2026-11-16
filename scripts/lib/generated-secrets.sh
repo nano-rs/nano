@@ -72,6 +72,9 @@ nano_cluster_shared_secret_keys() {
         CLICKHOUSE_VECTOR_PASSWORD \
         CLICKHOUSE_RAWSQL_PASSWORD \
         CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD \
+        CLICKHOUSE_SEARCH_PASSWORD \
+        CLICKHOUSE_DICT_PASSWORD \
+        NANO_CLICKHOUSE_CLUSTER_SECRET \
         JWT_SECRET \
         NANOSIEM_ENCRYPTION_KEY \
         VECTOR_AUTH_TOKEN \
@@ -88,6 +91,14 @@ nano_cluster_shared_secret_keys() {
         NANO_GRAFANA_ADMIN_PASSWORD
 }
 
+# NAN-5470 (v2.0.28): CLICKHOUSE_SEARCH_PASSWORD / CLICKHOUSE_DICT_PASSWORD
+# are the interactive search and dictionary-source ClickHouse identities, and
+# NANO_CLICKHOUSE_CLUSTER_SECRET (NAN-5472) authenticates role-split cluster
+# hops (deploy/compose/render-inventory.py CLUSTER_AUTH_*). They
+# are cluster-shared and deliberately NOT transitional: every ClickHouse
+# server defines those users from them, so a role host whose copied .env
+# predates them must stop (copy the app host's .env) rather than start
+# ClickHouse without them.
 # Cluster-shared keys added after v2.0.0. A role host missing one warns
 # instead of failing; see the contract above.
 # NANO_SETUP_TOKEN (NAN-5237) gates first-admin setup on nano-api; only app

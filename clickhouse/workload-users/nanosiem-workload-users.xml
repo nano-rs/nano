@@ -1,0 +1,128 @@
+<clickhouse>
+  <!--
+    NAN-5470: nano's ClickHouse workload identities (v2.0.28): interactive
+    search (nanosiem_search) and dictionary sources (nanosiem_dict).
+
+    TEMPLATE, never loaded as is. ClickHouse loads a `from_env` password whose
+    variable is not set as an EMPTY password (verified on 26.10), so every
+    deployment path renders this file with the SHA-256 of each password
+    (`password_sha256_hex`) and the deployment's networks, and refuses to
+    render when a password is missing:
+      * single-node Compose: install.sh / `nano upgrade` via
+        scripts/lib/clickhouse_networks.py (users-dir-output: the rendered
+        .nano-generated/clickhouse/users.d that Compose mounts as users.d);
+      * role-split: render-inventory.py (generated users.d);
+      * Helm: files/clickhouse/users.json, password_sha256_hex from the
+        nano Secret (templates/clickhouse/_settings.tpl).
+    The rendered file holds no plaintext and needs nothing from the
+    ClickHouse container's environment, so it is safe whenever it loads:
+    live, before a container is recreated, or after a restart.
+    Guards: nanosiem-core/tests/clickhouse_workload_users_guard.rs.
+  -->
+  <users>
+    <!--
+      NAN-5470: the interactive search identity. nano-search (UI searches,
+      dashboards, pivt and the MCP / Desktop agents that call the search API)
+      and the API's AI search paths (pivt notebook chat, meloD data access)
+      connect as this user, so their queries carry their own profile limits,
+      their own hourly quota (`nano_search`) and their own system.query_log
+      `user`, separate from the app's internal `nanosiem` work (detections,
+      jobs, ingest pipelines). It reads every nanosiem table but writes only
+      what the search service writes (its audit events and background-job
+      results), holds no DDL, ALTER, DROP or dictionary-reload privilege, and
+      its profile (`search`, query_limits.xml) pins those off.
+    -->
+    <nanosiem_search>
+      <profile>search</profile>
+      <networks>
+        <!-- NAN-5367: see "Networks" in users.d/nanosiem-users.xml. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
+      </networks>
+      <password from_env="CLICKHOUSE_SEARCH_PASSWORD"/>
+      <quota>nano_search</quota>
+      <access_management>0</access_management>
+      <allow_ddl>0</allow_ddl>
+      <grants>
+        <!-- Generated searches read every nanosiem table and dictionary
+             (events, OTel, prevalence, entity, lookup and job tables). -->
+        <query>GRANT SELECT ON nanosiem.*</query>
+        <query>GRANT dictGet ON nanosiem.*</query>
+        <!-- Search audit events (audit::emitter): the OCSF landing table, or
+             the shard-local UDM logs table. Bare and _local names: clusters
+             write the _local table, single-node the bare one. -->
+        <query>GRANT INSERT ON nanosiem.ocsf_logs_system_raw</query>
+        <query>GRANT INSERT ON nanosiem.ocsf_logs_system_raw_local</query>
+        <query>GRANT INSERT ON nanosiem.logs</query>
+        <query>GRANT INSERT ON nanosiem.logs_local</query>
+        <!-- Durable background search jobs (search::background::results). -->
+        <query>GRANT INSERT ON nanosiem.search_job_results</query>
+        <query>GRANT INSERT ON nanosiem.search_job_results_local</query>
+        <!-- Search cancel: KILL QUERY ON CLUSTER fans out the kill. It needs
+             CLUSTER and KILL QUERY on *.*, even for this user's own queries
+             (497 otherwise, verified on 26.10); KILL QUERY also lets an admin
+             cancel (settings:system) stop a search the API or jobs started
+             as nanosiem. ClickHouse has no narrower KILL grant, so the app's
+             statement is scoped instead: tracked query ids AND
+             user IN (nanosiem, nanosiem_search), never another user's query
+             (query_management.rs SEARCH_KILLABLE_USERS). -->
+        <query>GRANT CLUSTER ON *.*</query>
+        <query>GRANT KILL QUERY ON *.*</query>
+        <!-- Search cancel / progress. KILL rejects a column-scoped grant
+             (NAN-1435); clusters read nanosiem.cluster_processes instead,
+             covered by SELECT ON nanosiem.* above. -->
+        <query>GRANT SELECT ON system.processes</query>
+        <!-- Boot: cluster-name convergence; per-search memory ceiling
+             (getServerSetting('max_server_memory_usage')). -->
+        <query>GRANT SELECT(cluster, shard_num, replica_num, host_name, database_replica_name) ON system.clusters</query>
+        <query>GRANT SELECT(name, value) ON system.server_settings</query>
+        <!-- Prevalence coverage (prevalence::coverage) and lookup sizes. -->
+        <query>GRANT SELECT(database, view, exception, retry, last_success_time, last_refresh_time, status, next_refresh_time) ON system.view_refreshes</query>
+        <query>GRANT SELECT(bytes_on_disk, rows, data_uncompressed_bytes, partition, database, table, active, disk_name) ON system.parts</query>
+      </grants>
+    </nanosiem_search>
+
+    <!--
+      NAN-5470: the dictionary SOURCE identity. Every ClickHouse-sourced
+      dictionary (prevalence CACHE dictionaries, IP geo, IOC, custom
+      enrichment, user registry) reads its source as this user, through
+      localhost on each server (migration 202, init.sql, ocsf/init.sql). It
+      can read exactly the nine source tables and nothing else. The quota is
+      `nano_service` (tracks, caps nothing): the three prevalence CACHE
+      dictionaries query on every insert-time cache miss, and a capped
+      dictionary source fails the insert (CACHE_DICTIONARY_UPDATE_FAIL,
+      NAN-5457). Same profile gate as nanosiem_search above.
+    -->
+    <nanosiem_dict>
+      <profile>dict_source</profile>
+      <networks>
+        <!-- NAN-5367: see "Networks" in users.d/nanosiem-users.xml. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+        <ip>fc00::/7</ip>
+      </networks>
+      <password from_env="CLICKHOUSE_DICT_PASSWORD"/>
+      <quota>nano_service</quota>
+      <access_management>0</access_management>
+      <allow_ddl>0</allow_ddl>
+      <grants>
+        <query>GRANT SELECT ON nanosiem.hash_prevalence_final</query>
+        <query>GRANT SELECT ON nanosiem.domain_prevalence_final</query>
+        <query>GRANT SELECT ON nanosiem.ip_prevalence_final</query>
+        <query>GRANT SELECT ON nanosiem.ip_enrichment_dict_staging</query>
+        <query>GRANT SELECT ON nanosiem.ip_geo_attrs_history</query>
+        <query>GRANT SELECT ON nanosiem.ioc_enrichment_dict_staging</query>
+        <query>GRANT SELECT ON nanosiem.custom_ioc_enrichment_dict_staging</query>
+        <query>GRANT SELECT ON nanosiem.custom_enrichment_dict_staging</query>
+        <query>GRANT SELECT ON nanosiem.user_registry_dict_staging</query>
+      </grants>
+    </nanosiem_dict>
+  </users>
+</clickhouse>

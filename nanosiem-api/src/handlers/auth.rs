@@ -37,15 +37,16 @@ use crate::handlers::AuditExt;
 use crate::middleware::{require_session_auth, AuthContext};
 use crate::state::AppState;
 
-// The Set-Cookie helpers (`build_access_token_cookie`,
-// `build_refresh_token_cookie`, the `clear_*` variants, and
+// The Set-Cookie helpers (`build_access_token_cookie`, the paired
+// `append_refresh_token_cookies` / `append_clear_refresh_token_cookies`
+// (refresh cookie + `nano_session` presence cookie, NAN-5483), and
 // `extract_refresh_token_cookie`) were lifted to nanosiem-api-lib in NAN-751
 // so that the OIDC handlers in nanosiem-enterprise can reuse them without
 // creating a circular crate dependency. Re-exported here so existing
 // `crate::handlers::auth::*` imports continue to resolve.
 pub use nanosiem_api_lib::{
-    build_access_token_cookie, build_refresh_token_cookie, clear_access_token_cookie,
-    clear_refresh_token_cookie, extract_refresh_token_cookie,
+    append_clear_refresh_token_cookies, append_refresh_token_cookies, build_access_token_cookie,
+    clear_access_token_cookie, extract_refresh_token_cookie,
 };
 
 /// Error response for auth endpoints
@@ -192,19 +193,17 @@ pub async fn login(
                 &response.tokens.access_token,
                 response.tokens.expires_in,
             );
-            // Set refresh_token HttpOnly cookie (scoped to /api/auth)
-            let refresh_cookie = build_refresh_token_cookie(
-                &response.tokens.refresh_token,
-                state.token_service.refresh_token_ttl(),
-            );
             let mut res = Json(&response).into_response();
             res.headers_mut().append(
                 SET_COOKIE,
                 access_cookie.parse().expect("valid cookie header"),
             );
-            res.headers_mut().append(
-                SET_COOKIE,
-                refresh_cookie.parse().expect("valid cookie header"),
+            // Set refresh_token HttpOnly cookie (scoped to /api/auth) plus
+            // its JS-readable presence cookie (NAN-5483)
+            append_refresh_token_cookies(
+                res.headers_mut(),
+                &response.tokens.refresh_token,
+                state.token_service.refresh_token_ttl(),
             );
             Ok(res)
         }
@@ -430,12 +429,7 @@ pub async fn logout(
             .parse()
             .expect("valid cookie header"),
     );
-    res.headers_mut().append(
-        SET_COOKIE,
-        clear_refresh_token_cookie()
-            .parse()
-            .expect("valid cookie header"),
-    );
+    append_clear_refresh_token_cookies(res.headers_mut());
     Ok(res)
 }
 
@@ -526,12 +520,7 @@ pub async fn refresh_token(
                     .parse()
                     .expect("valid cookie header"),
             );
-            res.headers_mut().append(
-                SET_COOKIE,
-                clear_refresh_token_cookie()
-                    .parse()
-                    .expect("valid cookie header"),
-            );
+            append_clear_refresh_token_cookies(res.headers_mut());
             return Ok(res);
         }
     };
@@ -556,13 +545,10 @@ pub async fn refresh_token(
         access_cookie.parse().expect("valid cookie header"),
     );
     if rotated {
-        let refresh_cookie = build_refresh_token_cookie(
+        append_refresh_token_cookies(
+            res.headers_mut(),
             &response.refresh_token,
             state.token_service.refresh_token_ttl(),
-        );
-        res.headers_mut().append(
-            SET_COOKIE,
-            refresh_cookie.parse().expect("valid cookie header"),
         );
     }
     Ok(res)
@@ -849,12 +835,7 @@ pub async fn change_password(
             .parse()
             .expect("valid cookie header"),
     );
-    res.headers_mut().append(
-        SET_COOKIE,
-        clear_refresh_token_cookie()
-            .parse()
-            .expect("valid cookie header"),
-    );
+    append_clear_refresh_token_cookies(res.headers_mut());
     Ok(res)
 }
 

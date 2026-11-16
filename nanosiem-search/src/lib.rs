@@ -694,6 +694,21 @@ impl<S: Clone + Send + Sync + 'static> DefaultCacheControl for Router<S> {
     }
 }
 
+/// NAN-5484: the pool nano-search serves from. Every ClickHouse query this
+/// service runs is user-facing, so when a distinct search credential is
+/// configured (`CLICKHOUSE_SEARCH_PASSWORD` next to `CLICKHOUSE_USER=nanosiem`)
+/// the runtime client becomes [`DualPool::clickhouse_search`]. When
+/// `CLICKHOUSE_USER` already is the search identity (compose, Helm) the pool is
+/// unchanged.
+pub fn search_identity_pool(dual_pool: DualPool) -> DualPool {
+    if dual_pool.has_clickhouse_search() {
+        tracing::info!("nano-search runs its queries as the interactive search identity");
+        dual_pool.with_search_identity()
+    } else {
+        dual_pool
+    }
+}
+
 /// Create the Axum router for the Search Service
 pub fn create_router(
     state: SearchState,

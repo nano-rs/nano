@@ -51,7 +51,7 @@ pub async fn export_prevalence(
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
+        dual_pool.clickhouse_search().clone(),
         dual_pool.table_names(),
         &state.pool,
     )

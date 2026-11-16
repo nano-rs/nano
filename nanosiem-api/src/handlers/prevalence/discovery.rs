@@ -65,7 +65,7 @@ pub async fn get_rare_artifacts(
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
+        dual_pool.clickhouse_search().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
@@ -145,7 +145,7 @@ pub async fn get_new_artifacts(
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
+        dual_pool.clickhouse_search().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
@@ -230,7 +230,7 @@ pub async fn get_artifact_explorer(
     let dual_pool = state.dual_pool();
 
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
+        dual_pool.clickhouse_search().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
@@ -380,7 +380,7 @@ pub async fn get_artifact_detail(
     let dual_pool = state.dual_pool();
 
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
+        dual_pool.clickhouse_search().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
@@ -450,7 +450,7 @@ async fn populate_threat_intel(
     use nanosiem_core::enrichment::ioc::lookup_ioc_all_sources;
     use nanosiem_core::prevalence::ArtifactThreatIntelEntry;
 
-    let ch = state.dual_pool.clickhouse();
+    let ch = state.dual_pool.clickhouse_search();
     let hits = match lookup_ioc_all_sources(ch, &response.artifact).await {
         Ok(v) => v,
         Err(e) => {
@@ -568,7 +568,7 @@ pub async fn get_scatter_data(
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
+        dual_pool.clickhouse_search().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
@@ -728,7 +728,7 @@ pub async fn get_query_artifacts(
 
     // Create prevalence service with database config
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
+        dual_pool.clickhouse_search().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
@@ -746,7 +746,7 @@ pub async fn get_query_artifacts(
     let time_range = parse_time_range_value(&request.time_range);
 
     // Query for unique hashes and domains from the search results
-    let ch = dual_pool.clickhouse();
+    let ch = dual_pool.clickhouse_search();
 
     // Build time filter
     let time_filter = match &time_range {

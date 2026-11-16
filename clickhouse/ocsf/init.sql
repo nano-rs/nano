@@ -646,8 +646,8 @@ PRIMARY KEY file_hash
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT file_hash,
                   argMax(host_count, version) AS host_count,
@@ -672,8 +672,8 @@ PRIMARY KEY domain
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT domain,
                   argMax(host_count, version) AS host_count,
@@ -698,8 +698,8 @@ PRIMARY KEY ip
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT ip,
                   argMax(host_count, version) AS host_count,

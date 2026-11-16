@@ -144,8 +144,8 @@ PRIMARY KEY network
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT network, country, country_code, continent, continent_code, asn, as_name, as_domain FROM nanosiem.ip_enrichment_dict_staging'
 ))
@@ -240,8 +240,8 @@ PRIMARY KEY ioc_value
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT lower(ioc_value) AS ioc_value, ioc_type, source_id, threat_type, malware, confidence_level, tags FROM nanosiem.ioc_enrichment_dict_staging'
 ))
@@ -511,8 +511,8 @@ PRIMARY KEY key_type, key_value
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT key_type, key_value, tags, risk_score, enrichment_names FROM nanosiem.custom_enrichment_dict_staging'
 ))
@@ -603,8 +603,8 @@ PRIMARY KEY key_type, key_value
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT key_type, lower(key_value) AS key_value, threat_type, malware, confidence, tags, enrichment_names FROM nanosiem.custom_ioc_enrichment_dict_staging'
 ))
@@ -684,8 +684,8 @@ PRIMARY KEY file_hash
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT file_hash,
                   argMax(host_count, version) AS host_count,
@@ -710,8 +710,8 @@ PRIMARY KEY domain
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT domain,
                   argMax(host_count, version) AS host_count,
@@ -741,8 +741,8 @@ PRIMARY KEY ip
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT ip,
                   argMax(host_count, version) AS host_count,
@@ -866,8 +866,8 @@ PRIMARY KEY username
 SOURCE(CLICKHOUSE(
     HOST '{clickhouse_self_host}'
     PORT {clickhouse_self_port}
-    USER '{clickhouse_self_user}'
-    PASSWORD '{clickhouse_self_password}'
+    USER '{clickhouse_dict_user}'
+    PASSWORD '{clickhouse_dict_password}'
     DB 'nanosiem'
     QUERY 'SELECT username, email, display_name, department, title, manager_upn, manager_display_name, company, groups, account_enabled, account_status, mfa_enabled, employee_type, country, office_location FROM nanosiem.user_registry_dict_staging'
 ))

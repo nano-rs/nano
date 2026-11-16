@@ -226,9 +226,25 @@ def allow_list_networks(networks_xml: pathlib.Path) -> dict[str, list[Any]]:
     return allowed
 
 
-def refused_clients(rows: str, allowed: dict[str, list[Any]]) -> list[tuple[str, str, str, str]]:
-    """`user, address, count, last_seen` TSV rows (system.query_log) whose
-    non-loopback address no network of that user's allow-list admits."""
+def refused_clients(
+    rows: str,
+    allowed: dict[str, list[Any]],
+    current: dict[str, list[Any]] | None = None,
+) -> list[tuple[str, str, str, str]]:
+    """`user, address, count, last_seen` TSV rows (system.query_log) of
+    clients the upgraded allow-list `allowed` newly refuses (NAN-5435).
+
+    Never flagged (NAN-5474):
+      * loopback, and the unspecified address (0.0.0.0 / ::). No network peer
+        can connect from the unspecified address: ClickHouse logs it for its
+        own work (refreshable materialized views, server-side inserts).
+      * addresses the allow-list ClickHouse enforces today (`current`, read
+        from system.users) already refuses. Such a row predates that allow-list, typically nano's own
+        containers on the Compose network it used before the network pin,
+        and the upgrade changes nothing for it: the client is refused today.
+        A user missing from `current` (or no `current` at all) counts as
+        admitted today, so the check never under-reports.
+    """
     refused = []
     for line in rows.splitlines():
         fields = line.split("\t")
@@ -240,13 +256,47 @@ def refused_clients(rows: str, allowed: dict[str, list[Any]]) -> list[tuple[str,
             continue
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
             address = address.ipv4_mapped
-        if address.is_loopback or any(
-            address.version == network.version and address in network
-            for network in allowed[fields[0]]
-        ):
+        if address.is_loopback or address.is_unspecified or _admits(allowed[fields[0]], address):
+            continue
+        if current is not None and fields[0] in current and not _admits(current[fields[0]], address):
             continue
         refused.append((fields[0], str(address), fields[2], fields[3]))
     return refused
+
+
+def _admits(networks: list[Any], address: Any) -> bool:
+    forms = [address]
+    if address.version == 4:
+        forms.append(ipaddress.IPv6Address(f"::ffff:{address}"))
+    return any(form.version == network.version and form in network
+               for form in forms for network in networks)
+
+
+def enforced_allow_list(rows: str) -> dict[str, list[Any]]:
+    """NAN-5474: `name, host_ip CSV, host_names CSV, pattern count` TSV rows
+    of system.users: the per-user IP networks ClickHouse enforces now.
+
+    A user ClickHouse admits by a host name other than localhost or by a
+    regexp/LIKE pattern cannot be judged by address, so it is left out (and
+    refused_clients then treats it as admitting everyone today)."""
+    enforced: dict[str, list[Any]] = {}
+    for line in rows.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4:
+            continue
+        name, host_ip, host_names, patterns = fields
+        names = {item for item in host_names.split(",") if item}
+        if patterns.strip() not in {"", "0"} or names - {"localhost"}:
+            continue
+        networks = []
+        for item in (entry for entry in host_ip.split(",") if entry):
+            try:
+                networks.append(ipaddress.ip_network(item.strip(), strict=False))
+            except ValueError:
+                break
+        else:
+            enforced[name] = networks
+    return enforced
 
 
 def exact_role_services(
@@ -916,6 +966,77 @@ def check_vector_install_token(env: dict[str, str], role_split: bool) -> str:
         "Senders using named ingest tokens keep working; senders still sending the public "
         "token get HTTP 401"
     )
+
+
+# NAN-5470 (v2.0.28): passwords of the ClickHouse workload identities
+# (interactive search, dictionary sources). Every ClickHouse server defines
+# those users from the shared .env, and its Compose service refuses to start
+# without them.
+# NAN-5472: the role-split cluster secret travels the same way.
+WORKLOAD_IDENTITY_KEYS = (
+    "CLICKHOUSE_SEARCH_PASSWORD", "CLICKHOUSE_DICT_PASSWORD", "NANO_CLICKHOUSE_CLUSTER_SECRET",
+)
+WORKLOAD_TEMPLATE = "clickhouse/workload-users/nanosiem-workload-users.xml"
+# NAN-5470: the rendered users.d ClickHouse mounts (scripts/lib/
+# clickhouse_networks.py --users-dir-output), never inside a package.
+CLICKHOUSE_USERS_DIR = ".nano-generated/clickhouse/users.d"
+
+
+def check_workload_identity_passwords(env: dict[str, str], role_split: bool) -> str:
+    """NAN-5470: a single node gets missing workload-identity passwords from
+    the upgrade's first step ([`backfill_single_node_env`]). A role-split cluster
+    must share one value, generated once on the app host and copied before any
+    ClickHouse host is upgraded, so a host whose .env lacks them is refused
+    here, before anything changes. Values are never reported."""
+    missing = [key for key in WORKLOAD_IDENTITY_KEYS if not env.get(key, "").strip()]
+    if not missing:
+        return "present"
+    if not role_split:
+        return f"the upgrade generates {', '.join(missing)} before preflight (a dry run writes nothing)"
+    raise UpgradeError(
+        f"this host's .env has no {', '.join(missing)} (v2.0.28: dedicated ClickHouse users for "
+        "interactive search and dictionary sources and the ClickHouse cluster secret, used by every "
+        "ClickHouse server from the shared .env). Fix, on the app host: run the install.sh from the NEW release bundle as "
+        "`NANO_PREPARE_ONLY=1 ./install.sh --inventory <inventory> --role <its roles>` (it "
+        "generates them into .env and starts nothing), securely copy that .env to every "
+        "inventory host, then re-run nano upgrade"
+    )
+
+
+def backfill_workload_identity_passwords(env_file: "EnvFile") -> list[str]:
+    """NAN-5470: generate missing workload-identity passwords (single node).
+    Idempotent: a present value is never replaced. One atomic write (temp
+    file in the same directory, mode 0600, fsync, rename; EnvFile has already
+    checked the file is a regular file owned by this uid)."""
+    values = env_file.values()
+    generated = {
+        key: secrets.token_hex(32)
+        for key in WORKLOAD_IDENTITY_KEYS if not values.get(key, "").strip()
+    }
+    env_file.replace_many(generated)
+    return list(generated)
+
+
+def backfill_single_node_env(args: argparse.Namespace, ops: "LocalOps") -> list[str]:
+    """NAN-5470: the first change a single-node `nano upgrade` makes, right
+    after the bundle signature is verified and before preflight, the
+    mandatory backup, prepare or any other compose call (never on a dry run).
+    The new release's services need the workload-identity passwords; the
+    Compose file itself tolerates their absence, so every tool keeps working
+    on a v2.0.27 .env until then. A generated-but-unused password is harmless: v2.0.27 never reads it, so a
+    failed preflight, an abandoned run or a rollback keeps working. Role-split
+    hosts are never written here (preflight refuses them without the shared
+    values). Returns the generated key names (never values), for the journal."""
+    if args.inventory or ops.role_env:
+        return []
+    added = backfill_workload_identity_passwords(ops.env_file)
+    if added:
+        ops.env = ops.env_file.values()
+        eprint(
+            f"note: generated {', '.join(added)} in .env (v2.0.28 ClickHouse workload "
+            "identities; the new Compose file requires them)."
+        )
+    return added
 
 
 def rotate_public_install_token(env_file: "EnvFile") -> bool:
@@ -2165,13 +2286,24 @@ class LocalOps:
             "with --resume; the ClickHouse allow-list was not changed."
         )
 
-    def _render_networks_candidate(self, compose_subnet: str, output: pathlib.Path) -> str:
+    def _render_networks_candidate(
+        self, compose_subnet: str, output: pathlib.Path, users_dir: pathlib.Path | None = None,
+    ) -> str:
         """Render the ClickHouse user allow-list to `output` with the same
-        scripts/lib/clickhouse_networks.py call install.sh makes."""
+        scripts/lib/clickhouse_networks.py call install.sh makes, and (NAN-5470)
+        the users.d ClickHouse mounts (shipped users + workload identities)
+        to `users_dir`."""
         script = self.install_dir / "scripts/lib/clickhouse_networks.py"
         users = self.install_dir / "clickhouse/users.d/nanosiem-users.xml"
+        extra: list[str] = []
+        if users_dir is not None:
+            extra = [
+                "--workload-template", str(self.install_dir / WORKLOAD_TEMPLATE),
+                "--workload-env-file", str(self.install_dir / ".env"),
+                "--users-dir-output", str(users_dir),
+            ]
         result = self.runner.run(
-            ["python3", "-I", str(script), "--users-xml", str(users),
+            ["python3", "-I", str(script), "--users-xml", str(users), *extra,
              "--output", str(output),
              "--compose-subnet", compose_subnet,
              "--ingest-networks", self.env.get("NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS", ""),
@@ -2204,6 +2336,29 @@ class LocalOps:
                 "NANO_AGENTLANE_ALLOW_CIDRS in .env and rerun the upgrade with --resume."
             )
 
+    def _render_workload_users(self, compose_subnet: str) -> str:
+        """NAN-5470: render the users.d ClickHouse mounts (the shipped users
+        plus the workload identities with password_sha256_hex from .env and
+        the same networks as every other nano user) to CLICKHOUSE_USERS_DIR,
+        and record it in .env. Safe at any time: complete users with hashed
+        passwords, nothing from the ClickHouse container's environment, and a
+        directory no installer package contains. Single node only (role-split
+        renders its users.d with render-inventory.py)."""
+        if getattr(self, "role_env", None):
+            return "role-split: rendered by render-inventory.py"
+        if not (self.install_dir / WORKLOAD_TEMPLATE).is_file():
+            return "this release ships no workload identities"
+        target = self.install_dir / CLICKHOUSE_USERS_DIR
+        with tempfile.TemporaryDirectory(prefix="nano-ch-networks.") as scratch:
+            self._render_networks_candidate(
+                compose_subnet, pathlib.Path(scratch) / "networks.xml", users_dir=target,
+            )
+        relative = "./" + CLICKHOUSE_USERS_DIR
+        if self.env.get("NANO_CLICKHOUSE_USERS_DIR") != relative:
+            self.env_file.replace("NANO_CLICKHOUSE_USERS_DIR", relative)
+            self.env["NANO_CLICKHOUSE_USERS_DIR"] = relative
+        return "rendered"
+
     def _render_clickhouse_networks(self, compose_subnet: str) -> str:
         """NAN-5435: render the allow-list to a private candidate, gate it
         (Agent Lane overlap), then install it in place (Compose bind-mounts the
@@ -2231,6 +2386,8 @@ class LocalOps:
                 handle.write(text)
                 handle.truncate()
             target.chmod(0o644)
+        # NAN-5470: the workload identities follow the same allow-list.
+        self._render_workload_users(compose_subnet)
         networks_file = "./.nano-generated/clickhouse/networks.xml"
         if self.env.get("NANO_CLICKHOUSE_NETWORKS_FILE") != networks_file:
             self.env_file.replace("NANO_CLICKHOUSE_NETWORKS_FILE", networks_file)
@@ -2269,16 +2426,25 @@ class LocalOps:
         quoted = ", ".join(f"'{name}'" for name in names)
         try:
             rows = self._ch_query(
+                # NAN-5474: only queries a client sent. ClickHouse's own work
+                # (refreshable materialized views, distributed sub-queries,
+                # clickhouse-local) never crosses the allow-list.
                 "SELECT user, IPv6NumToString(address), count(), max(event_time) "
                 "FROM system.query_log WHERE event_date >= today() - 7 AND type = 'QueryStart' "
-                f"AND user IN ({quoted}) GROUP BY user, address ORDER BY count() DESC LIMIT 200",
+                "AND is_initial_query = 1 AND toString(interface) NOT IN ('Local', 'Background') "
+                "AND address NOT IN (toIPv6('::'), toIPv6('::ffff:0.0.0.0'), toIPv6('::1')) "
+                "AND NOT isIPAddressInRange(IPv6NumToString(address), '::ffff:127.0.0.0/104') "
+                # No LIMIT: the rows are (user, address) groups, a handful per
+                # client, and a cap would drop a low-volume external writer
+                # behind busy internal ones before the filtering in Python.
+                f"AND user IN ({quoted}) GROUP BY user, address ORDER BY count() DESC",
                 timeout=120,
             )
         except UpgradeError as error:
             # As install.sh's clickhouse_default_user_preflight: no query log
             # (disabled, or ClickHouse down) means nothing to report.
             return f"could not read system.query_log ({error}); clients not checked"
-        refused = refused_clients(rows, allowed)
+        refused = refused_clients(rows, allowed, self._current_clickhouse_allow_list(names))
         if not refused:
             return (
                 f"no client of {len(names)} ClickHouse users in the last 7 days is outside "
@@ -2309,6 +2475,24 @@ class LocalOps:
         if os.environ.get("NANO_ACK_CH_NETWORK_LOCKOUT") == "1":
             return f"acknowledged (NANO_ACK_CH_NETWORK_LOCKOUT=1): {message}"
         raise UpgradeError(message)
+
+    def _current_clickhouse_allow_list(self, names: list[str]) -> dict[str, list[Any]] | None:
+        """NAN-5474: the allow-list ClickHouse ENFORCES now, read from
+        system.users. Not .env or the rendered file: an earlier failed run may
+        have rendered and recorded the pinned list before ClickHouse was
+        recreated onto it. Any error is "unknown" (None): every client the
+        upgraded list refuses is then reported."""
+        quoted = ", ".join(f"'{name}'" for name in names)
+        try:
+            rows = self._ch_query(
+                "SELECT name, arrayStringConcat(host_ip, ','), arrayStringConcat(host_names, ','), "
+                "length(host_names_regexp) + length(host_names_like) "
+                f"FROM system.users WHERE name IN ({quoted})",
+                timeout=60,
+            )
+        except UpgradeError:
+            return None
+        return enforced_allow_list(rows)
 
     def network_pin_plan(self) -> dict[str, Any]:
         """NAN-5435: what install.sh does before ClickHouse restarts. Pin nano's
@@ -3168,8 +3352,36 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         return f"{checked} published port binding(s) are free or owned by this install"
 
     def _check_compose(self) -> str:
+        # NAN-5470: the v2.0.28 Compose file requires the workload-identity
+        # passwords; a single node's upgrade generated them before preflight
+        # (backfill_single_node_env), a role-split host without them is
+        # refused by its own preflight.
         self.compose(["config", "--quiet"], timeout=60)
         return "rendered compose configuration validates"
+
+    def _check_ingestion_not_paused(self) -> str:
+        """NAN-5470 audit: ingestion paused (disk pressure at its pause
+        threshold, or an administrator) makes the rollout's ingest smoke
+        probe fail after the stack has already been replaced. Refuse up
+        front, with the fix. Releases before the pause (no column) pass."""
+        has_column = self._pg_query(
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'system_settings' "
+            "AND column_name = 'ingestion_paused'"
+        )
+        if has_column != "1":
+            return "this release has no ingestion pause"
+        row = self._pg_query(
+            "SELECT ingestion_paused::text || '|' || coalesce(ingestion_pause_source, '') "
+            "FROM system_settings WHERE id = 'default'"
+        )
+        paused, _, source = (row or "false|").partition("|")
+        if paused == "true":
+            why = "disk pressure (free disk space first)" if source == "disk_pressure" else source or "an administrator"
+            raise UpgradeError(
+                f"ingestion is paused ({why}); the upgrade's ingest checks cannot pass. Resume it "
+                "(Settings > Disk pressure, or free disk space below the pause threshold) and re-run"
+            )
+        return "ingestion is running"
 
     def _check_postgres(self) -> str:
         blocked = self._pg_query(
@@ -3517,6 +3729,14 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             staged_output.mkdir(mode=0o755)
             staged_output.chmod(0o755)
             staged_env = scratch / "role.env"
+            # NAN-5472: a ClickHouse host switching to cluster secret mode
+            # must not leave a peer that would reject its hops.
+            if "clickhouse" in roles.split(",") and hasattr(renderer, "check_cluster_auth"):
+                try:
+                    report = renderer.check_cluster_auth(inventory, roles, self.host_name, self.install_dir / ".env")
+                except Exception as error:  # InventoryError
+                    raise UpgradeError(f"cluster secret check failed: {error}") from error
+                eprint(f"cluster secret check ({self.host_name}): {json.dumps(report, sort_keys=True)}")
             try:
                 renderer._render_host(
                     inventory, roles, staged_output, staged_env,
@@ -3978,6 +4198,12 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     self.env_file.values(), bool(getattr(self, "role_env", None)),
                 ),
             )
+        check(
+            "clickhouse-workload-identities",
+            lambda: check_workload_identity_passwords(
+                self.env_file.values(), bool(getattr(self, "role_env", None)),
+            ),
+        )
         if self.roles.intersection({"app", "ingest"}):
             check(
                 "enrichment-control-tree",
@@ -3989,6 +4215,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             )
         if "postgres" in self.roles:
             check("postgres", self._check_postgres)
+            check("ingestion-not-paused", self._check_ingestion_not_paused)
         if "clickhouse" in self.roles:
             check("clickhouse", self._check_clickhouse)
             # NAN-5435: the upgrade narrows the allow-list on a single node.
@@ -4957,6 +5184,15 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     "the app host and restart nano-api; v2.1 enforces it regardless."
                 )
         else:
+            # NAN-5470: single node only; preflight refuses a role-split host
+            # without them (one cluster-wide value, generated on the app host).
+            # The coordinator generated any missing password before preflight
+            # (backfill_single_node_env); this is a no-op unless prepare runs
+            # without it.
+            for key in backfill_workload_identity_passwords(self.env_file):
+                self.env[key] = self.env_file.values()[key]
+                eprint(f"note: generated {key} in .env (v2.0.28 ClickHouse workload identity).")
+            eprint(f"ClickHouse workload identities: {self._render_workload_users(self.env.get('NANO_COMPOSE_SUBNET', ''))}")
             rotated_install_token = rotate_public_install_token(self.env_file)
             if rotated_install_token:
                 self.env["VECTOR_AUTH_TOKEN"] = self.env_file.values()["VECTOR_AUTH_TOKEN"]
@@ -6481,7 +6717,37 @@ fi
             ))
         except UpgradeError as error:
             checks.append(Check("rollback-images", False, str(error), self.host_name))
+        secret_check = self._rollback_cluster_secret_check()
+        if secret_check is not None:
+            checks.append(secret_check)
         return checks
+
+    def _rollback_cluster_secret_check(self) -> Check | None:
+        """NAN-5472: a release before v2.0.28 renders remote_servers without
+        the cluster secret, and a server without it refuses the secret hops of
+        every server that still has it. Rolling a cluster in secret mode back
+        host by host therefore recreates exactly that mixed state. Refused on
+        every ClickHouse host whose shared .env or rendered config is in
+        secret mode (the coordinator runs this on every host, so one is enough).
+        """
+        role_env = getattr(self, "role_env", None)
+        if not role_env or "clickhouse" not in role_env.get("NANO_ROLE_PROFILES", "").split(","):
+            return None
+        env_mode = self.env_file.values().get("NANO_CLICKHOUSE_CLUSTER_AUTH", "").strip().lower()
+        rendered = self.install_dir / ".nano-generated/clickhouse/config.d/zz-sovereign-cluster.xml"
+        rendered_mode = ""
+        if rendered.is_file():
+            match = re.search(r"<nano_cluster_auth>([a-z]+)</nano_cluster_auth>", rendered.read_text(errors="replace"))
+            rendered_mode = match.group(1) if match else ""
+        in_secret = "secret" in (env_mode, rendered_mode)
+        return Check(
+            "rollback-cluster-secret", not in_secret,
+            "ClickHouse cluster hops use the cluster secret, which a release before v2.0.28 "
+            "cannot accept: set NANO_CLICKHOUSE_CLUSTER_AUTH=staged and re-run all ClickHouse "
+            "hosts first (copy the .env to every host, re-run them back to back), then roll back"
+            if in_secret else f"cluster secret mode: {rendered_mode or env_mode or 'password'}",
+            self.host_name,
+        )
 
     def rollback_role(
         self, role: str, previous: str, target: str, timeout: int,
@@ -7218,8 +7484,8 @@ def check_registry_control_tree(install_dir: pathlib.Path, target: str) -> str:
             f"install directory holds the {found} control tree, not v{target}. Verify "
             f"nano-compose-<edition>-{target}.tar.gz against its .sha256 and .sha256.sig "
             "(scripts/nano bundle verify <package>, or the Upgrade guide's check) and only "
-            f"then extract it over {install_dir} on this host "
-            f"(tar -xzf <package> --strip-components=1 -C {install_dir}); it keeps .env"
+            f"then extract it over {install_dir} on this host as the user that owns it, "
+            f"not root (tar -xzf <package> --strip-components=1 -C {install_dir}); it keeps .env"
         )
     return f"control tree is v{target}"
 
@@ -8608,6 +8874,11 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 nano_cli, bundle, runner, ops.env.get("NANO_IMAGE_PREFIX", ""),
             )
             require_bundle_digest(bundle, bundle_digest)
+            # NAN-5470: right after the bundle's signature is verified and
+            # before preflight, the backup, prepare or any other compose call
+            # (args.inventory is final here, `--resume` included). A dry run
+            # writes nothing: the Compose file tolerates the missing keys.
+            generated_env_keys = [] if args.dry_run else backfill_single_node_env(args, ops)
             target = canonical_version(str(manifest["version"]))
             mandatory_backup = enforce_signed_backup_policy(
                 manifest, skip_requested=args.skip_backup_I_understand
@@ -8900,6 +9171,10 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     "backup_output": str(args.backup_output or ""),
                     "include_clickhouse_data": bool(getattr(args, "include_clickhouse_data", False)),
                 })
+                if generated_env_keys:
+                    # Names only. Idempotent on --resume (the keys exist); a
+                    # rollback leaves them in .env, unread by the old release.
+                    journal.append(state, "env_keys_generated", keys=generated_env_keys)
                 journal.append(
                     state, "preflight_passed",
                     checks=[check.as_dict() for check in checks], ledger_before=ledgers,

@@ -183,6 +183,11 @@ pub struct AppState {
     pub dual_pool: DualPool,
     /// Search service
     pub search_service: SearchService,
+    /// NAN-5470: the search service on the interactive search identity
+    /// (`DualPool::clickhouse_search`), for AI-written searches (pivt notebook
+    /// chat, shadow investigation). Same as `search_service` when no search
+    /// credential is configured.
+    pub user_search_service: SearchService,
     /// Flag-aware lookup service (NAN-1581). Shared with the lookup MANAGEMENT
     /// handlers so create/upload/row ops honor LOOKUP_STORAGE_BACKEND (registry
     /// ops always stay in Postgres; row ops follow the backend).
@@ -995,7 +1000,8 @@ impl nanosiem_enterprise::handlers::notebooks::NotebooksAppState for AppState {
         &self.agent_config_registry
     }
     fn search_service(&self) -> &nanosiem_core::SearchService {
-        &self.search_service
+        // NAN-5470: notebook chat runs AI-written searches.
+        &self.user_search_service
     }
     fn log_source_service(&self) -> &nanosiem_core::LogSourceService {
         &self.log_source_service

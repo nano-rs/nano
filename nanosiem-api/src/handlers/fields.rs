@@ -93,7 +93,7 @@ pub async fn get_field_values(
 
     let time_range = query.time_range();
     let values = state
-        .search_service
+        .user_search_service
         .get_named_field_values(&field_name, &time_range, query.limit, &scope)
         .await?;
 
@@ -188,7 +188,7 @@ pub async fn get_source_types(
     let time_range = query.time_range();
 
     {
-        let ch_client = state.dual_pool.clickhouse();
+        let ch_client = state.dual_pool.clickhouse_search();
 
         // Resolve the FROM table from the active schema profile (OCSF Phase 7,
         // NAN-1241) so the source picker queries `ocsf_logs` under the OCSF
@@ -214,7 +214,14 @@ pub async fn get_source_types(
             .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
         let mut response_bytes = Vec::new();
-        while let Ok(Some(chunk)) = cursor.next().await {
+        // NAN-5470: a ClickHouse error (a refused login, a quota, a limit)
+        // arrives on the first read; it used to end the loop silently and the
+        // handler answered `200 []` ("no sources").
+        while let Some(chunk) = cursor
+            .next()
+            .await
+            .map_err(|e| ApiError::DatabaseError(e.to_string()))?
+        {
             response_bytes.extend_from_slice(&chunk);
         }
 
@@ -353,7 +360,7 @@ async fn ext_field_names(
     let scope = auth.effective_viewer_scope();
 
     let names = state
-        .search_service
+        .user_search_service
         .get_dynamic_field_names(
             params.bucket.unwrap_or_default(),
             params.query.as_deref(),

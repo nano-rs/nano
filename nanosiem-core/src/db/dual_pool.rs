@@ -77,6 +77,13 @@ pub struct DualPoolConfig {
     /// Username defaults to `nanosiem_rawsql_noaudit`; password REQUIRED.
     pub clickhouse_rawsql_noaudit_user: String,
     pub clickhouse_rawsql_noaudit_password: Option<String>,
+    /// NAN-5470: the interactive search identity (`nanosiem_search`, own
+    /// profile and hourly quota). The API's AI search paths (pivt notebook
+    /// chat, meloD data access) use it through [`DualPool::clickhouse_search`].
+    /// Optional: unset (older .env, dev stacks) keeps those paths on the
+    /// runtime client. nano-search itself sets it as its `CLICKHOUSE_USER`.
+    pub clickhouse_search_user: String,
+    pub clickhouse_search_password: Option<String>,
     /// Maximum PostgreSQL connections
     pub pg_max_connections: u32,
     /// Minimum PostgreSQL connections
@@ -119,6 +126,8 @@ impl Default for DualPoolConfig {
             clickhouse_rawsql_password: None,
             clickhouse_rawsql_noaudit_user: "nanosiem_rawsql_noaudit".to_string(),
             clickhouse_rawsql_noaudit_password: None,
+            clickhouse_search_user: "nanosiem_search".to_string(),
+            clickhouse_search_password: None,
             pg_max_connections: 20, // Increased for tuning workload
             pg_min_connections: 2,  // Maintain ready connections
             ch_max_connections: 10,
@@ -178,6 +187,12 @@ impl DualPoolConfig {
             .unwrap_or_else(|_| "nanosiem_rawsql_noaudit".to_string());
         let clickhouse_rawsql_noaudit_password =
             std::env::var("CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD").ok();
+        // NAN-5470: interactive search identity (optional, see the field).
+        let clickhouse_search_user =
+            std::env::var("CLICKHOUSE_SEARCH_USER").unwrap_or_else(|_| "nanosiem_search".to_string());
+        let clickhouse_search_password = std::env::var("CLICKHOUSE_SEARCH_PASSWORD")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
 
         let pg_max_connections = std::env::var("PG_MAX_CONNECTIONS")
             .ok()
@@ -231,6 +246,8 @@ impl DualPoolConfig {
             clickhouse_rawsql_password,
             clickhouse_rawsql_noaudit_user,
             clickhouse_rawsql_noaudit_password,
+            clickhouse_search_user,
+            clickhouse_search_password,
             pg_max_connections,
             pg_min_connections,
             ch_max_connections,
@@ -686,6 +703,12 @@ pub struct DualPool {
     /// their grant sets are asserted against the expected allowlist at boot.
     clickhouse_rawsql: ClickHouseClient,
     clickhouse_rawsql_noaudit: ClickHouseClient,
+    /// NAN-5470: the interactive search identity, derived from `clickhouse`
+    /// (same URL and per-client settings, other credentials). `None` when no
+    /// search credential is configured or when `clickhouse` already is that
+    /// identity (nano-search); [`Self::clickhouse_search`] then returns
+    /// `clickhouse`.
+    clickhouse_search: Option<ClickHouseClient>,
     /// Whether distributed tables exist (logs_distributed, etc.)
     /// Detected at init time by checking system.tables.
     is_clustered: bool,
@@ -759,13 +782,29 @@ impl DualPool {
             if !password.is_empty() {
                 bootstrap = bootstrap.with_password(&password);
             }
-            match bootstrap
-                .query(&format!(
-                    "CREATE DATABASE IF NOT EXISTS `{}`",
-                    config.clickhouse_database
-                ))
-                .execute()
+            // NAN-5470: only CREATE when missing. A narrow identity (the
+            // search service's `nanosiem_search`, no admin credentials on
+            // single-node Compose) is denied CREATE DATABASE even when the
+            // database exists, which logged a refusal on every boot.
+            let exists = bootstrap
+                .query("SELECT count() FROM system.databases WHERE name = ?")
+                .bind(&config.clickhouse_database)
+                .fetch_one::<u64>()
                 .await
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            let created = if exists {
+                Ok(())
+            } else {
+                bootstrap
+                    .query(&format!(
+                        "CREATE DATABASE IF NOT EXISTS `{}`",
+                        config.clickhouse_database
+                    ))
+                    .execute()
+                    .await
+            };
+            match created
             {
                 Ok(_) => {
                     tracing::info!("ClickHouse database '{}' ready", config.clickhouse_database);
@@ -1021,6 +1060,16 @@ impl DualPool {
             "ClickHouse memory budget for searches"
         );
 
+        // NAN-5470: the interactive search identity for the API's AI search
+        // paths. Same per-client settings as the runtime client.
+        let clickhouse_search = match &config.clickhouse_search_password {
+            Some(password) if config.clickhouse_search_user != config.clickhouse_user => {
+                tracing::info!(user = %config.clickhouse_search_user, "ClickHouse interactive search identity configured");
+                Some(clickhouse.clone().with_user(&config.clickhouse_search_user).with_password(password))
+            }
+            _ => None,
+        };
+
         Ok(Self {
             postgres,
             clickhouse,
@@ -1028,6 +1077,7 @@ impl DualPool {
             has_clickhouse_admin: using_admin,
             clickhouse_rawsql,
             clickhouse_rawsql_noaudit,
+            clickhouse_search,
             is_clustered,
             logs_table,
             server_memory_limit_bytes,
@@ -1349,6 +1399,31 @@ impl DualPool {
         &self.clickhouse_rawsql_noaudit
     }
 
+    /// NAN-5470: the interactive search identity (`nanosiem_search`): own
+    /// profile limits and hourly quota. AI-written searches the API runs in
+    /// process (pivt notebook chat, meloD data access) use it, so they share
+    /// the search budget instead of the app's uncapped internal identity.
+    /// Falls back to [`Self::clickhouse`] when no search credential is set.
+    pub fn clickhouse_search(&self) -> &ClickHouseClient {
+        self.clickhouse_search.as_ref().unwrap_or(&self.clickhouse)
+    }
+
+    /// NAN-5470: this pool with its runtime client replaced by
+    /// [`Self::clickhouse_search`], for services constructed from a whole pool
+    /// (the API's AI `SearchService`). Admin, raw-SQL and PostgreSQL are the
+    /// same.
+    pub fn with_search_identity(&self) -> Self {
+        let mut pool = self.clone();
+        pool.clickhouse = self.clickhouse_search().clone();
+        pool.clickhouse_search = None;
+        pool
+    }
+
+    /// NAN-5470: whether [`Self::clickhouse_search`] is a distinct identity.
+    pub fn has_clickhouse_search(&self) -> bool {
+        self.clickhouse_search.is_some()
+    }
+
     /// Whether this ClickHouse deployment has distributed tables (cluster mode).
     /// When true, queries should target `logs_distributed` instead of `logs`.
     pub fn is_clustered(&self) -> bool {
@@ -1383,6 +1458,7 @@ impl DualPool {
             has_clickhouse_admin: false,
             clickhouse_rawsql: ClickHouseClient::default(),
             clickhouse_rawsql_noaudit: ClickHouseClient::default(),
+            clickhouse_search: None,
             is_clustered,
             logs_table: if is_clustered { "logs_distributed" } else { "logs" },
             server_memory_limit_bytes: 0,

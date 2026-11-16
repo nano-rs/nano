@@ -4,10 +4,13 @@ description: Hunt and investigate on a nano SIEM's event data through Agent Lane
 license: AGPL-3.0-or-later
 compatibility: Needs an Agent Lane token (nal_...) and the install's Agent Lane HTTPS URL from a nano admin, plus an HTTP client - curl, Python clickhouse-connect or the JS @clickhouse/client. Agent Lane is part of nano Self-run (enterprise); an admin turns it on. The listener speaks HTTPS only, so the native clickhouse-client does not connect to it.
 metadata:
+  author: nano-rs
+  version: "1.0"
   product: nano Agent Lane
   tested-with: nano 2.0.23
   schema-head: clickhouse 200, ocsf/197
-  clickhouse: 26.10
+  clickhouse: "26.10"
+  docs: https://nano.rs/docs/agents/hunt-with-ai-agent/
 ---
 
 # nano Agent Lane

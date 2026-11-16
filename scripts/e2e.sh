@@ -308,6 +308,23 @@ initialize_e2e_clickhouse_config() {
         >/dev/null || die "could not render the ClickHouse network allow-list"
 }
 
+# NAN-5470: the workload identities, rendered exactly as install.sh renders
+# them (password_sha256_hex from the run's secrets, the same networks), over
+# their users.d placeholder in the run-dir copy (this overlay replaces the
+# opensource compose's mount of the rendered file).
+render_e2e_workload_users() {
+    local target="$RUN_DIR/clickhouse"
+    python3 -I "$ROOT/scripts/lib/clickhouse_networks.py" \
+        --users-xml "$target/users.d/nanosiem-users.xml" \
+        --output "$RUN_DIR/clickhouse/networks.scratch.xml" \
+        --docker-pools-json "$(docker info --format '{{json .DefaultAddressPools}}' 2>/dev/null || true)" \
+        --workload-template "$ROOT/clickhouse/workload-users/nanosiem-workload-users.xml" \
+        --workload-env-file "$RUN_DIR/compose.env" \
+        --workload-output "$target/users.d/nanosiem-workload-users.xml" \
+        >/dev/null || die "could not render the ClickHouse workload identities"
+    rm -f "$RUN_DIR/clickhouse/networks.scratch.xml"
+}
+
 # Optional NAN-4997 capacity emulation. The normal e2e defaults stay unchanged;
 # a sizing regression can set the two variables below to exercise the exact
 # installer model and generated ClickHouse XML on a throwaway owned stack.
@@ -440,6 +457,8 @@ write_app_env() {
                 "CLICKHOUSE_VECTOR_PASSWORD=$CLICKHOUSE_VECTOR_PASSWORD" \
                 "CLICKHOUSE_RAWSQL_PASSWORD=$CLICKHOUSE_RAWSQL_PASSWORD" \
                 "CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD=$CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD" \
+                "CLICKHOUSE_SEARCH_PASSWORD=$CLICKHOUSE_SEARCH_PASSWORD" \
+                "CLICKHOUSE_DICT_PASSWORD=$CLICKHOUSE_DICT_PASSWORD" \
                 POSTGRES_DICT_HOST=postgres "POSTGRES_DICT_PASSWORD=$POSTGRES_PASSWORD" \
                 "REDIS_URL=redis://127.0.0.1:${redis}" \
                 "JWT_SECRET=$JWT_SECRET" "NANOSIEM_ENCRYPTION_KEY=$NANOSIEM_ENCRYPTION_KEY" \
@@ -617,6 +636,23 @@ native_start() {
         . "$RUN_DIR/app.env"
         # shellcheck disable=SC1091
         [[ "$svc" == connector ]] && . "$RUN_DIR/connector.env"
+        # NAN-5470: nano-search runs as the interactive search identity, as
+        # docker-compose.opensource.yml configures it.
+        # Production-faithful: like the compose service, it holds no admin,
+        # self, Vector, dictionary or app (nanosiem) ClickHouse credential, so
+        # a path that needs one fails here as it would in a deployment.
+        # NAN-5484: E2E_SEARCH_CH_LAUNCH=app-user (set by a scenario for one
+        # `svc restart search`) launches it the way scripts/local-stack.sh and
+        # start-microservices-dev.sh do instead: CLICKHOUSE_USER=nanosiem with
+        # CLICKHOUSE_SEARCH_PASSWORD next to it. nano-search must still run its
+        # queries as nanosiem_search (tests/test_search_identity.py).
+        if [[ "$svc" == search && "${E2E_SEARCH_CH_LAUNCH:-}" == app-user ]]; then
+            :
+        elif [[ "$svc" == search ]]; then
+            export CLICKHOUSE_USER=nanosiem_search CLICKHOUSE_PASSWORD="$CLICKHOUSE_SEARCH_PASSWORD"
+            unset CLICKHOUSE_ADMIN_USER CLICKHOUSE_ADMIN_PASSWORD CLICKHOUSE_SELF_USER CLICKHOUSE_SELF_PASSWORD \
+                CLICKHOUSE_VECTOR_PASSWORD CLICKHOUSE_SEARCH_PASSWORD CLICKHOUSE_DICT_PASSWORD
+        fi
         export E2E_PROC_OWNER="$token"
         cd "$ROOT"
         exec "$exe" >>"$RUN_DIR/pids/$svc.log" 2>&1 </dev/null
@@ -799,6 +835,7 @@ cmd_up() {
     log "run dir: $RUN_DIR"
 
     gen_secrets
+    render_e2e_workload_users
     render_resource_sizing
     if [[ "$APP_MODE" != native ]]; then docker_images >> "$RUN_DIR/compose.env"; fi
     {
@@ -1026,6 +1063,8 @@ write_stack_env() {
             put CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD "$(env_get "$c" CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD)"
             put CLICKHOUSE_INGEST_PASSWORD "$(env_get "$c" CLICKHOUSE_INGEST_PASSWORD)"
             put CLICKHOUSE_VECTOR_PASSWORD "$(env_get "$c" CLICKHOUSE_VECTOR_PASSWORD)"
+            put CLICKHOUSE_SEARCH_PASSWORD "$(env_get "$c" CLICKHOUSE_SEARCH_PASSWORD)"
+            put CLICKHOUSE_DICT_PASSWORD "$(env_get "$c" CLICKHOUSE_DICT_PASSWORD)"
             # CLICKHOUSE_SELF_* is how ClickHouse reaches ITSELF (dictionary
             # sources), so it is the in-container address, not the host port.
             put CLICKHOUSE_SELF_HOST localhost; put CLICKHOUSE_SELF_PORT 9000

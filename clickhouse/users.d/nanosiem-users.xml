@@ -20,6 +20,18 @@
     explicit NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS /
     cluster.clickhouse_ingest_allowed_networks / clickhouse.ingestAllowedNetworks
     allow-lists. Guard: nanosiem-core/tests/clickhouse_networks_guard.rs.
+
+    Quotas (NAN-5457, NAN-5470): the service users (nanosiem_admin, nanosiem,
+    nanosiem_vector, nanosiem_ingest, nanosiem_dict) use `nano_service`, which
+    tracks usage but caps nothing; their query count grows with ingest volume.
+    The interactive search identity (nanosiem_search) uses `nano_search`. The
+    raw-SQL users keep `default` (100,000 queries per hour). All three are
+    defined in query_limits.xml. nanosiem_search and nanosiem_dict live in
+    clickhouse/workload-users/nanosiem-workload-users.xml (see that file for
+    why they are not in this one).
+    Guards: nanosiem-core/tests/clickhouse_service_quota_guard.rs and
+    nanosiem-core/tests/clickhouse_workload_users_guard.rs (which workload
+    connects as which user).
   -->
   <users>
     <!-- Admin user for migrations (DDL enabled) -->
@@ -35,7 +47,7 @@
         <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_ADMIN_PASSWORD"/>
-      <quota>default</quota>
+      <quota>nano_service</quota>
       <access_management>1</access_management>
       <allow_ddl>1</allow_ddl>
     </nanosiem_admin>
@@ -53,7 +65,7 @@
         <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_NANOSIEM_PASSWORD"/>
-      <quota>default</quota>
+      <quota>nano_service</quota>
       <access_management>0</access_management>
       <allow_ddl>0</allow_ddl>
       <!-- Grant access to nanosiem database -->
@@ -154,6 +166,17 @@
                probe (getMacro needs this grant with the setting on). -->
         <query>GRANT SELECT(name) ON system.disks</query>
         <query>GRANT SELECT(policy_name, volume_priority, disks) ON system.storage_policies</query>
+        <!-- Settings > Tiering (settings/tiering/policy.rs STORAGE_POLICIES_SQL,
+             DISKS_SQL): the MOVE target volume, its move factor and the
+             object-store provider. Without them GET /api/settings/tiering
+             and /stats returned 500 (497) since v2.0.27. -->
+        <query>GRANT SELECT(volume_name, move_factor) ON system.storage_policies</query>
+        <query>GRANT SELECT(object_storage_type) ON system.disks</query>
+        <!-- Search cancel: KILL QUERY ON CLUSTER (every clustered install)
+             needs KILL QUERY ON *.* even for the caller's own queries (497
+             otherwise; cancels ran to max_execution_time). The app kills only
+             query ids it tracks for the cancelling principal. -->
+        <query>GRANT KILL QUERY ON *.*</query>
         <query>GRANT SELECT(disk_name) ON system.parts</query>
         <query>GRANT SELECT(database, table, data_files, error_count, last_exception) ON system.distribution_queue</query>
         <query>GRANT SELECT(name) ON system.settings_profiles</query>
@@ -180,7 +203,7 @@
         <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_VECTOR_PASSWORD"/>
-      <quota>default</quota>
+      <quota>nano_service</quota>
       <access_management>0</access_management>
       <allow_ddl>0</allow_ddl>
       <grants>
@@ -249,7 +272,12 @@
       Contract: docs/user-guide/direct-ocsf-ingestion.md.
     -->
     <nanosiem_ingest>
-      <profile>ingestion</profile>
+      <!-- NAN-5473: `ingest_direct` = the ingestion profile plus bounded
+           reads (max_execution_time, max_rows_to_read, constraints). This
+           login is reachable from external writers, and its column-scoped
+           SELECT on ocsf_logs (needed by the MV chain) must not run unbounded
+           scans. Inserts are unaffected (query_limits.xml). -->
+      <profile>ingest_direct</profile>
       <networks>
         <!-- NAN-5367: see "Networks" at the top of this file. -->
         <ip>127.0.0.1</ip>
@@ -260,7 +288,7 @@
         <ip>fc00::/7</ip>
       </networks>
       <password from_env="CLICKHOUSE_INGEST_PASSWORD"/>
-      <quota>default</quota>
+      <quota>nano_service</quota>
       <access_management>0</access_management>
       <allow_ddl>0</allow_ddl>
       <grants>

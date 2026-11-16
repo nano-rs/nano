@@ -12,6 +12,7 @@ mod agentlane;
 mod busy_retry;
 mod cluster_reachability;
 mod detection;
+mod dict_source_user;
 mod distributed;
 mod ocsf_legacy_drop;
 mod prevalence_cadence;
@@ -35,6 +36,8 @@ mod prevalence_cadence_tests;
 mod soft_fail_tests;
 #[cfg(test)]
 mod busy_retry_tests;
+#[cfg(test)]
+mod dict_source_user_tests;
 
 pub use cluster_reachability::server_cluster_rows_predicate;
 pub(crate) use detection::configured_or_detected_cluster;
@@ -49,6 +52,9 @@ pub use agentlane::{
     NodeCredentials, AGENTLANE_PROFILE, AGENTLANE_ROLE, AGENTLANE_WORKLOAD,
     MAX_BYTES_TO_READ_ENV, MAX_CONCURRENT_THREADS_ENV, MAX_MEMORY_PER_TOKEN_ENV, MAX_ROWS_TO_READ_ENV,
     WORKLOAD_MAX_MEMORY_ENV,
+};
+pub use dict_source_user::{
+    DICT_SOURCE_DEFAULT_USER, DICT_SOURCE_DICTIONARIES, DICT_SOURCE_MIGRATION_FILE,
 };
 pub use prevalence_cadence::prevalence_refresh_minutes_from_env;
 #[cfg(feature = "enterprise")]

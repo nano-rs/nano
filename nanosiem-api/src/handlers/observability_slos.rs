@@ -169,7 +169,7 @@ async fn enrich(state: &AppState, def: SloDefinition) -> Result<Slo, ApiError> {
     let time_range = TimeRange::new(begin, now);
 
     let (current, _total, no_data, complete) = state
-        .search_service
+        .user_search_service
         .observability_slo_compute_with_coverage(
             &def.service,
             def.sli_kind.to_query_kind(),

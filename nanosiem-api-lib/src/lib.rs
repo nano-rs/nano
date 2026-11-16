@@ -37,9 +37,11 @@ pub use auth_context::{
     check_all_permissions, check_any_permission, check_permission, ensure_interactive_session,
     ensure_permission, require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
 };
+// NAN-5483: the refresh cookie is only exported as a pair with its
+// `nano_session` presence cookie; the bare builders stay crate-private.
 pub use cookies::{
-    build_access_token_cookie, build_refresh_token_cookie, clear_access_token_cookie,
-    clear_refresh_token_cookie, extract_refresh_token_cookie,
+    append_clear_refresh_token_cookies, append_refresh_token_cookies, build_access_token_cookie,
+    clear_access_token_cookie, extract_refresh_token_cookie, SESSION_PRESENCE_COOKIE,
 };
 pub use headers::{
     extract_client_ip, extract_client_ip_origin, extract_user_agent, ClientIp, ClientIpHeader,

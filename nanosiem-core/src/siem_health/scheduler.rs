@@ -20,7 +20,7 @@ use crate::auth::ScopeSet;
 use crate::extensions::SiemHealthAiAnalyzer;
 
 /// Default interval: 12 hours
-const DEFAULT_INTERVAL_SECS: u64 = 12 * 60 * 60;
+pub(crate) const DEFAULT_INTERVAL_SECS: u64 = 12 * 60 * 60;
 
 /// Initial delay before first run (5 minutes — let other services stabilize)
 const INITIAL_DELAY_SECS: u64 = 5 * 60;
@@ -201,6 +201,17 @@ pub async fn run_health_check_with_trigger(
         }
     };
     super::clickhouse_refusals::ensure_clickhouse_refusal_findings(&mut analysis, &refusals);
+    // NAN-5470: a nano ClickHouse user refused for, or close to, its hourly
+    // quota (the NAN-5457 outage class, now per workload).
+    let quota_cluster = if is_clustered {
+        std::env::var("CLICKHOUSE_CLUSTER").ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
+    } else {
+        None
+    };
+    match super::clickhouse_quota::clickhouse_quota(system_probe_client, quota_cluster.as_deref()).await {
+        Ok(found) => super::clickhouse_quota::ensure_clickhouse_quota_findings(&mut analysis, &found),
+        Err(e) => warn!("Failed to read ClickHouse quota usage: {}", e),
+    }
     // NAN-5431: events Vector discarded after ingest accepted them.
     match super::pipeline_drops::pipeline_drops(ch_client, is_clustered).await {
         Ok(rows) => super::pipeline_drops::ensure_pipeline_drop_findings(&mut analysis, &rows),

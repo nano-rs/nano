@@ -27,6 +27,8 @@ refused everywhere.
 CLI:
     clickhouse_networks.py --users-xml clickhouse/users.d/nanosiem-users.xml \
         --output .nano-generated/clickhouse/networks.xml \
+        [--workload-template clickhouse/workload-users/nanosiem-workload-users.xml \
+         --workload-env-file .env --users-dir-output .nano-generated/clickhouse/users.d] \
         (--compose-subnet CIDR | --docker-pools-json "$(docker info --format '{{json .DefaultAddressPools}}')") \
         [--network CIDR ...] [--ingest-networks "cidr,cidr"]
 
@@ -140,16 +142,125 @@ def compose_ipam_subnets(config_path: Path | None) -> list[str]:
     return out
 
 
-def users_with_networks(users_xml: Path) -> list[str]:
-    """The users the base users.d file defines (each gets a <networks> override)."""
+def _user_elements(users_xml: Path) -> list[ET.Element]:
     root = ET.parse(users_xml).getroot()
     users = root.find("users")
     if users is None:
         raise NetworkError(f"{users_xml}: no <users> element")
-    names = [user.tag for user in users if isinstance(user.tag, str) and user.find("password") is not None]
-    if not names:
+    found = [user for user in users if isinstance(user.tag, str) and user.find("password") is not None]
+    if not found:
         raise NetworkError(f"{users_xml}: defines no password-authenticated users")
+    return found
+
+
+def users_with_networks(*users_xml: Path) -> list[str]:
+    """The users the given users.d files define (each gets a <networks> override)."""
+    names: list[str] = []
+    for path in users_xml:
+        for user in _user_elements(path):
+            if user.tag not in names:
+                names.append(user.tag)
     return names
+
+
+WORKLOAD_PLACEHOLDER = "rendered by scripts/lib/clickhouse_networks.py"
+
+
+def dotenv_values(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines of a .env (last wins, surrounding quotes removed)."""
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def workload_users(
+    template: Path, env: dict[str, str], networks: list[str],
+    per_user: dict[str, list[str]] | None = None,
+) -> ET.Element:
+    """NAN-5470: the workload identities as a complete users.d file.
+
+    The template (clickhouse/workload-users/nanosiem-workload-users.xml) names
+    each password's .env key in `<password from_env=...>`; ClickHouse would
+    load an unset `from_env` password as EMPTY (verified on 26.10). This
+    renders the SHA-256 of the value instead, so the file never depends on the
+    container's environment: it is safe to load live, at any time, before or
+    after ClickHouse is recreated. A missing or empty password is an error,
+    never a user without one. `networks` replaces the template's fallback
+    list (the same one every other nano user gets)."""
+    import hashlib
+
+    root = ET.parse(template).getroot()
+    users = root.find("users")
+    if users is None:
+        raise NetworkError(f"{template}: no <users> element")
+    for user in users:
+        if not isinstance(user.tag, str):
+            continue
+        password = user.find("password")
+        key = password.get("from_env", "") if password is not None else ""
+        value = env.get(key, "") if key else ""
+        if not value.strip():
+            raise NetworkError(f"{user.tag}: {key or 'its password key'} is not set in .env (install.sh generates it)")
+        if "$" in value:
+            # Compose interpolates `$` in .env values, so the app would log in
+            # with a different password than the one hashed here.
+            raise NetworkError(f"{key} contains '$', which Docker Compose interpolates; set a value without '$' "
+                               "(install.sh generates hex values)")
+        user.remove(password)
+        ET.SubElement(user, "password_sha256_hex").text = hashlib.sha256(value.encode()).hexdigest()
+        # `per_user` narrows one user's list (role-split: nanosiem_dict only
+        # from the ClickHouse servers, which run the dictionary sources).
+        own = (per_user or {}).get(user.tag, networks)
+        if own:
+            old = user.find("networks")
+            if old is not None:
+                user.remove(old)
+            nets = ET.SubElement(user, "networks")
+            for kind, entry in _dedupe(own):
+                ET.SubElement(nets, kind).text = entry
+    # Comments in the template (documentation) stay in the source tree.
+    for parent in [root, users]:
+        for child in list(parent):
+            if not isinstance(child.tag, str):
+                parent.remove(child)
+    root.insert(0, ET.Comment(f" {WORKLOAD_PLACEHOLDER} from clickhouse/workload-users (NAN-5470). Do not edit. "))
+    return root
+
+
+def rehash_workload(template: Path, env: dict[str, str], rendered: Path) -> bool:
+    """NAN-5470: set the password hashes of an already rendered workload file
+    from `env`, keeping its networks (a restore that replaced .env on a
+    role-split ClickHouse host, whose networks render-inventory.py chose).
+    A missing user or password is an error. Returns True when it changed."""
+    import hashlib
+
+    keys = {}
+    template_users = ET.parse(template).getroot().find("users")
+    for user in template_users if template_users is not None else []:
+        if isinstance(user.tag, str) and user.find("password") is not None:
+            keys[user.tag] = user.find("password").get("from_env", "")
+    root = ET.parse(rendered).getroot()
+    users = root.find("users")
+    for name, key in keys.items():
+        user = users.find(name) if users is not None else None
+        if user is None or user.find("password_sha256_hex") is None:
+            raise NetworkError(f"{rendered}: no rendered {name}; re-run the inventory render")
+        value = env.get(key, "")
+        if not value.strip() or "$" in value:
+            raise NetworkError(f"{key} is missing, empty or contains '$' in .env")
+        user.find("password_sha256_hex").text = hashlib.sha256(value.encode()).hexdigest()
+    return write(root, rendered)
 
 
 def _dedupe(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -210,6 +321,61 @@ def write(root: ET.Element, path: Path) -> bool:
     return True
 
 
+# NAN-5470: the rendered users.d that ClickHouse mounts (single node). Built
+# from the shipped clickhouse/users.d plus the workload identities, under
+# .nano-generated/, which no installer package contains: extracting a package
+# (tar unlinks and recreates every shipped file) never touches it. A file
+# bind-mounted over a SHIPPED placeholder inside a mounted directory is
+# detached by that unlink on Linux, and ClickHouse then reloads the empty
+# placeholder: the workload users vanished on every re-extract.
+WORKLOAD_FILE_NAME = "nanosiem-workload-users.xml"
+# Bind-mount targets inside the rendered directory (Compose mounts the
+# networks / sizing files over them): created once, never replaced, or the
+# rename would detach those mounts the same way.
+NESTED_MOUNT_TARGETS = ("zzzz-nano-networks.xml", "zzzz-nano-sizing.xml")
+
+
+def sync_users_dir(source: Path, output: Path, workload: ET.Element | None) -> bool:
+    """Make `output` the shipped users.d plus the workload identities.
+
+    Shipped files are copied when their content differs (temp file + rename in
+    the same directory: the directory is the mount, so ClickHouse sees the
+    new file); files no longer shipped are removed; the nested mount targets
+    are only created when missing. Returns True when anything changed."""
+    output.mkdir(parents=True, exist_ok=True)
+    os.chmod(output, 0o755)
+    changed = False
+    shipped = {
+        item.name for item in source.iterdir()
+        if item.is_file() and item.suffix == ".xml" and item.name != WORKLOAD_FILE_NAME
+    }
+    for name in sorted(shipped):
+        target = output / name
+        data = (source / name).read_bytes()
+        if name in NESTED_MOUNT_TARGETS:
+            if target.exists():
+                continue
+        elif target.is_file() and not target.is_symlink() and target.read_bytes() == data:
+            continue
+        fd, tmp = tempfile.mkstemp(prefix=".users.", dir=output)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+        changed = True
+    keep = shipped | set(NESTED_MOUNT_TARGETS) | {WORKLOAD_FILE_NAME}
+    for item in output.iterdir():
+        if item.suffix == ".xml" and item.name not in keep:
+            item.unlink()
+            changed = True
+    if workload is not None:
+        changed = write(workload, output / WORKLOAD_FILE_NAME) or changed
+    elif (output / WORKLOAD_FILE_NAME).exists():
+        (output / WORKLOAD_FILE_NAME).unlink()
+        changed = True
+    return changed
+
+
 CLICKHOUSE_CONTAINER = "nano-clickhouse"
 
 
@@ -256,8 +422,22 @@ def discover_docker(compose_args: list[str], scratch_dir: Path) -> tuple[str, li
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--users-xml", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--users-xml", type=Path, action="append",
+                        help="a users file whose users get the override (repeatable; required unless "
+                        "--rehash-workload)")
+    parser.add_argument("--rehash-workload", type=Path, default=None,
+                        help="NAN-5470: only update the password hashes of this rendered workload file "
+                        "from --workload-env-file (keeps its networks)")
+    parser.add_argument("--workload-template", type=Path, default=None,
+                        help="NAN-5470: clickhouse/workload-users/nanosiem-workload-users.xml")
+    parser.add_argument("--workload-env-file", type=Path, default=None,
+                        help="the .env holding the workload passwords (read, never printed)")
+    parser.add_argument("--workload-output", type=Path, default=None,
+                        help="where to write the rendered workload identities")
+    parser.add_argument("--users-dir-output", type=Path, default=None,
+                        help="NAN-5470: render the users.d ClickHouse mounts (the first --users-xml's "
+                        "directory plus the workload identities) into this directory")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--docker-pools-json", default=None,
                         help="`docker info --format '{{json .DefaultAddressPools}}'` output")
     parser.add_argument("--compose-subnet", default="",
@@ -273,6 +453,19 @@ def main(argv: list[str] | None = None) -> int:
                         "Docker; the arguments after `--` are the `docker compose` arguments")
     parser.add_argument("compose_args", nargs="*", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.rehash_workload is not None:
+        if args.workload_template is None or args.workload_env_file is None:
+            parser.error("--rehash-workload needs --workload-template and --workload-env-file")
+        try:
+            changed = rehash_workload(args.workload_template, dotenv_values(args.workload_env_file),
+                                      args.rehash_workload)
+        except (NetworkError, ET.ParseError, OSError) as error:
+            print(f"clickhouse networks: {error}", file=sys.stderr)
+            return 1
+        print("changed" if changed else "unchanged")
+        return 0
+    if not args.users_xml or args.output is None:
+        parser.error("--users-xml and --output are required")
     if args.compose_args and not args.from_docker:
         parser.error("compose arguments are only accepted with --from-docker")
     if not args.from_docker:
@@ -291,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
 def render(args: argparse.Namespace) -> int:
     """Render and write the allow-list from parsed CLI arguments."""
     try:
-        users = users_with_networks(args.users_xml)
+        users = users_with_networks(*args.users_xml)
         # NAN-5387: a pinned network cannot move, so its subnet replaces the
         # Docker pools (which, unconfigured, include all of 192.168.0.0/16).
         pinned = args.compose_subnet.strip()
@@ -308,7 +501,19 @@ def render(args: argparse.Namespace) -> int:
             "NAN-5367). Do not edit; "
             "set NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS in .env and re-run install.sh.",
         )
+        workload = None
+        if args.workload_template is not None:
+            if args.workload_env_file is None or (args.workload_output is None and args.users_dir_output is None):
+                raise NetworkError(
+                    "--workload-template needs --workload-env-file and --workload-output or --users-dir-output"
+                )
+            common = [normalize(n) for n in (*LOOPBACK, *networks)]
+            workload = workload_users(args.workload_template, dotenv_values(args.workload_env_file), common)
         changed = write(root, args.output)
+        if workload is not None and args.workload_output is not None:
+            changed = write(workload, args.workload_output) or changed
+        if args.users_dir_output is not None:
+            changed = sync_users_dir(args.users_xml[0].parent, args.users_dir_output, workload) or changed
     except (NetworkError, ET.ParseError, OSError) as error:
         print(f"clickhouse networks: {error}", file=sys.stderr)
         return 1

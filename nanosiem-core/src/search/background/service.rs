@@ -79,6 +79,12 @@ impl Default for BackgroundJobConfig {
     }
 }
 
+/// NAN-5470: upper bounds the `search` settings profile
+/// (clickhouse/users.d/query_limits.xml) places on the search identity.
+pub const SEARCH_PROFILE_MAX_EXECUTION_SECS: u32 = 7200;
+/// See [`SEARCH_PROFILE_MAX_EXECUTION_SECS`].
+pub const SEARCH_PROFILE_MAX_RESULT_ROWS: usize = 10_000_000;
+
 impl BackgroundJobConfig {
     /// Defaults overridden by:
     /// `SEARCH_JOB_CONCURRENCY`, `SEARCH_JOB_LEASE_SECS`,
@@ -113,12 +119,18 @@ impl BackgroundJobConfig {
                 .filter(|m| *m >= 100)
                 .map(Duration::from_millis)
                 .unwrap_or(d.poll_interval),
+            // NAN-5470: the `search` ClickHouse profile bounds what the search
+            // identity may ask for (max_result_rows <= 10M, max_execution_time
+            // <= 7200 s); a larger env value would make every job fail the
+            // profile constraint instead of running.
             result_cap: env::<usize>("SEARCH_JOB_RESULT_CAP")
                 .filter(|c| *c >= 1)
-                .unwrap_or(d.result_cap),
+                .unwrap_or(d.result_cap)
+                .min(SEARCH_PROFILE_MAX_RESULT_ROWS - 16),
             max_execution_secs: env::<u32>("SEARCH_JOB_MAX_EXECUTION_SECS")
                 .filter(|s| *s >= 1)
-                .unwrap_or(d.max_execution_secs),
+                .unwrap_or(d.max_execution_secs)
+                .min(SEARCH_PROFILE_MAX_EXECUTION_SECS),
             max_attempts: env::<i32>("SEARCH_JOB_MAX_ATTEMPTS")
                 .filter(|a| *a >= 1)
                 .unwrap_or(d.max_attempts),

@@ -21,6 +21,7 @@ import { sessionCredentials } from '../lib/session-credentials';
 import { accessOnlyRefreshResult, coordinateBrowserRefresh } from '../lib/refresh-coordinator';
 import { setAccessToken, getAccessToken, clearAccessToken, persistDemoSession, restoreDemoSession, getDemoRefreshToken } from '../lib/auth-token';
 import { ProviderMissingError } from '@/lib/stale-build';
+import { clearSessionPresenceCookie, shouldProbeSilentRefresh } from '../lib/session-presence';
 
 // ============================================================================
 // Types
@@ -448,6 +449,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
         return;
       }
 
+      // NAN-5483: no presence cookie means the API never issued (or has
+      // cleared) a refresh cookie — the probe could only 400, which the
+      // browser logs in red on every signed-out load. Skip it.
+      if (!getDemoRefreshToken() && !shouldProbeSilentRefresh(API_BASE_URL)) {
+        setState(prev => ({ ...prev, isLoading: false }));
+        return;
+      }
+
       // Attempt silent refresh via HttpOnly cookie
       await refreshAuth(true);
     };
@@ -795,6 +804,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
 
     clearAccessToken();
+    // The server clears it too; this covers a logout request that failed.
+    clearSessionPresenceCookie();
     setState({
       user: null,
       isAuthenticated: false,

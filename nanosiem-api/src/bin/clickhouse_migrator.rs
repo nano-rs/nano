@@ -879,6 +879,23 @@ async fn run() -> Result<()> {
         }
     }
 
+    // NAN-5470: once the dictionary identity (`nanosiem_dict`) logs in on every
+    // ClickHouse server, point every dictionary source at it (re-applies
+    // migration 202). Before that, the dictionaries keep the self credentials:
+    // a server without the new user must never get a dictionary it cannot
+    // load. Runs on every migrate, so a Helm upgrade (this binary runs as a
+    // pre-upgrade hook, before ClickHouse has the user) converges on the next
+    // migrate, or earlier through nano-jobs' reconcile.
+    match migrator.ensure_dictionary_source_user(&migrations_dir).await {
+        Ok(true) => tracing::info!("NAN-5470: dictionary sources now read as the dictionary identity"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "NAN-5470: could not re-point dictionary sources at the dictionary identity; they keep \
+             the self credentials until the next migrate"
+        ),
+    }
+
     let dist_count = migrator
         .ensure_distributed_tables()
         .await

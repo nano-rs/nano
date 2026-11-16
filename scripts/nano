@@ -687,6 +687,7 @@ ch_query_params() {
         -u CLICKHOUSE_NANOSIEM_PASSWORD -u CLICKHOUSE_INGEST_PASSWORD \
         -u CLICKHOUSE_VECTOR_PASSWORD -u CLICKHOUSE_RAWSQL_PASSWORD \
         -u CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD -u CLICKHOUSE_SELF_PASSWORD \
+        -u CLICKHOUSE_SEARCH_PASSWORD -u CLICKHOUSE_DICT_PASSWORD \
         /bin/sh -ec '
             IFS= read -r password
             [ -n "$password" ] || { echo "ClickHouse admin credential is empty" >&2; exit 1; }
@@ -2353,9 +2354,9 @@ SQL
 }
 
 merge_restored_env() {
-    python3 -I - "$INSTALL_DIR/.env" "$1" "$2" <<'PY'
-import pathlib,re,sys
-cur,bak,out=map(pathlib.Path,sys.argv[1:])
+    python3 -I - "$INSTALL_DIR/.env" "$1" "$2" "$TOPOLOGY_MODE" <<'PY'
+import pathlib,re,secrets,sys
+cur,bak,out=map(pathlib.Path,sys.argv[1:4]);topology=sys.argv[4]
 def vals(lines):
  r={}
  for line in lines:
@@ -2369,6 +2370,19 @@ protected={"NANO_PG_REPLICATION_PASSWORD","NANO_PATRONI_API_PASSWORD","NANO_VERS
 for k in protected:
  if k in c:b[k]=c[k]
  else:b.pop(k,None)
+# NAN-5470: keys a backup from an older release lacks but this release's
+# Compose file and ClickHouse users need (the workload identities): keep the
+# installed value; a single node generates one when neither has it (a
+# role-split cluster shares one value, written by its app host's install.sh).
+for k in ("CLICKHOUSE_SEARCH_PASSWORD","CLICKHOUSE_DICT_PASSWORD"):
+ if b.get(k,"").strip():continue
+ if c.get(k,"").strip():b[k]=c[k]
+ elif topology=="single":b[k]=secrets.token_hex(32)
+# NAN-5472: the cluster secret and its mode are cluster state the restored
+# .env must not drop (a pre-2.0.28 backup lacks them): every peer keeps
+# sending hops with the installed secret.
+for k in ("NANO_CLICKHOUSE_USERS_DIR","NANO_CLICKHOUSE_CLUSTER_SECRET","NANO_CLICKHOUSE_CLUSTER_AUTH","NANO_CLICKHOUSE_CLUSTER_AUTH_INITIAL"):
+ if k not in b and k in c:b[k]=c[k]
 seen=set();lines=[]
 for line in bl:
  m=re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$",line)
@@ -2380,6 +2394,48 @@ for k in sorted(b.keys()-seen):lines.append(f"{k}={b[k]}")
 out.write_text("\n".join(lines)+"\n")
 PY
     chmod 600 "$2"
+}
+
+# NAN-5470: re-render the ClickHouse workload users from the installed .env.
+# Single node: the whole rendered users.d and the network allow-list, exactly
+# as install.sh renders them. Role-split ClickHouse host: the password hashes
+# of the rendered workload file (render-inventory.py chose its networks).
+# Returns 1 when ClickHouse must be recreated to mount the rendered users.d.
+refresh_clickhouse_workload_users() {
+    local template="$INSTALL_DIR/clickhouse/workload-users/nanosiem-workload-users.xml"
+    [[ -f "$template" && -f "$INSTALL_DIR/scripts/lib/clickhouse_networks.py" ]] || return 0
+    if [[ "$TOPOLOGY_MODE" == role-split ]]; then
+        local generated rendered
+        generated="$(role_env_value NANO_GENERATED_DIR)"
+        rendered="$generated/clickhouse/users.d/nanosiem-workload-users.xml"
+        [[ -n "$generated" && -f "$rendered" ]] || { warn "no rendered ClickHouse workload users on this host; re-run install.sh to render them"; return 0; }
+        python3 -I "$INSTALL_DIR/scripts/lib/clickhouse_networks.py" --rehash-workload "$rendered" \
+            --workload-template "$template" --workload-env-file "$INSTALL_DIR/.env" >/dev/null \
+            || post_cutover_fail "could not re-render the ClickHouse workload users from the restored .env"
+        return 0
+    fi
+    ((!LEGACY_LAYOUT)) || return 0
+    local dir="./.nano-generated/clickhouse/users.d" networks before
+    networks="$(env_value "$INSTALL_DIR/.env" NANO_CLICKHOUSE_NETWORKS_FILE)"
+    networks="${networks:-./.nano-generated/clickhouse/networks.xml}"
+    before="$(env_value "$INSTALL_DIR/.env" NANO_CLICKHOUSE_USERS_DIR)"
+    (cd "$INSTALL_DIR" && python3 -I scripts/lib/clickhouse_networks.py \
+        --users-xml clickhouse/users.d/nanosiem-users.xml --output "$networks" \
+        --workload-template clickhouse/workload-users/nanosiem-workload-users.xml \
+        --workload-env-file .env --users-dir-output "$dir" \
+        --compose-subnet "$(env_value .env NANO_COMPOSE_SUBNET)" \
+        --ingest-networks "$(env_value .env NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS)" \
+        --from-docker -- --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" </dev/null >/dev/null) \
+        || post_cutover_fail "could not re-render the ClickHouse users from the restored .env"
+    [[ "$before" == "$dir" ]] && return 0
+    python3 -I - "$INSTALL_DIR/.env" "NANO_CLICKHOUSE_USERS_DIR=$dir" <<'PY'
+import os,sys,tempfile
+path,item=sys.argv[1:];key=item.split("=",1)[0]
+lines=[l for l in open(path,encoding="utf-8").read().splitlines() if not l.startswith(key+"=")]+[item]
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path));os.write(fd,("\n".join(lines)+"\n").encode());os.close(fd)
+os.chmod(tmp,0o600);os.replace(tmp,path)
+PY
+    return 1
 }
 
 clickhouse_passwords_match() {
@@ -3000,6 +3056,11 @@ PY
     fi
     log "cutting over validated databases and encrypted secrets"
     cp "$restored" "$INSTALL_DIR/.env.restore"; chmod 600 "$INSTALL_DIR/.env.restore"; mv "$INSTALL_DIR/.env.restore" "$INSTALL_DIR/.env"
+    # NAN-5470: the ClickHouse workload users carry the SHA-256 of the .env
+    # passwords, which the restore may just have replaced.
+    if { [[ "$TOPOLOGY_MODE" == single ]] || has_role clickhouse; } && ! refresh_clickhouse_workload_users; then
+        recreate_ch=1
+    fi
     local recreate=()
     # NAN-5214: never recreate a Patroni leader here (that is a failover);
     # the cutover already replicated to every member.

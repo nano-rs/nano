@@ -1631,31 +1631,125 @@ fi
 # ----------------------------------------------------------------------------
 # 2. Clone or update the repo
 # ----------------------------------------------------------------------------
+# NAN-5471: update a get.nano.rs git checkout to the fetched release.
+#
+# The nano-rs/nano mirror is force-regenerated on every sync, so its history
+# diverges from any prior checkout and can never fast-forward: the update is a
+# hard reset to the fetched remote HEAD (NAN-1929: an ff-only merge left a
+# stale images.lock and then failed digest verification).
+#
+# Local state is sorted before that reset:
+#   * tenzir/pipeline.tql is operator-editable (the install summary says so).
+#     An edit is carried across the reset and stays live; `git diff` then
+#     shows it against the new release's shipped pipeline.
+#   * untracked files the release does not ship (tenzir/pipeline.tql.bak*
+#     from the Tenzir guard, the secrets-helper lock, operator notes) survive
+#     a reset untouched, so they never block it.
+#   * any other change to a shipped file, or an untracked file the reset
+#     would overwrite or delete (at a path the release ships, at a directory
+#     the release ships files under, or under a path the release ships as a
+#     file), fails: never install the old release and report success.
+#   * an edited pipeline a previous, interrupted run saved but never put back
+#     (tenzir/.pipeline.tql.local.*) is restored first, before anything else.
+# With nothing to update (the fetched tree is the checked-out one), local
+# changes are kept as they are.
+restore_pipeline_and_exit() {
+    cp -p "$PIPELINE_RESTORE_FROM" "$PIPELINE_RESTORE_TO" && rm -f "$PIPELINE_RESTORE_FROM"
+    exit "$1"
+}
+
+update_git_checkout() {
+    local dir="$1" branch="$2" tracked untracked conflicts pipeline="tenzir/pipeline.tql"
+    local keep_pipeline="" pipeline_copy="" shipped_pipeline_changed=0 leftovers
+    leftovers=$(find "$dir/tenzir" -maxdepth 1 -name '.pipeline.tql.local.*' -type f 2>/dev/null | sort)
+    if [[ -n "$leftovers" ]]; then
+        if [[ "$(printf '%s\n' "$leftovers" | wc -l)" -eq 1 ]] \
+            && git -C "$dir" diff --quiet HEAD -- "$pipeline" </dev/null 2>/dev/null; then
+            cp -p "$leftovers" "$dir/$pipeline" \
+                || fail "Could not put back your edited $dir/$pipeline from $leftovers (saved by an interrupted run)."
+            rm -f "$leftovers"
+            warn "Restored your edited $pipeline, which an interrupted earlier run had saved in $leftovers."
+        else
+            printf '  %s\n' "$leftovers" >&2
+            fail "An interrupted earlier run saved your edited $dir/$pipeline in the file(s) above, and $pipeline has changed since. Nothing was installed. Copy the version you want to keep to $dir/$pipeline, delete the saved file(s), then re-run."
+        fi
+    fi
+    git -C "$dir" fetch --depth 1 origin "$branch" </dev/null \
+        || fail "Could not fetch the current release into $dir (git fetch origin $branch). Check the network and re-run, or re-run with NANO_SKIP_GIT_UPDATE=1 to reinstall the checkout as it is."
+    if git -C "$dir" diff --quiet HEAD FETCH_HEAD -- </dev/null 2>/dev/null; then
+        log "Checkout at $dir is already the current release"
+        return 0
+    fi
+    # Tracked changes (staged or not) against the checked-out release.
+    tracked=$(git -C "$dir" diff --name-status --no-renames HEAD -- </dev/null) \
+        || fail "Could not read the local changes in $dir (git diff)."
+    # Untracked, non-ignored files the reset would overwrite or delete: one
+    # the release ships at the same path, a file where the release ships a
+    # directory (foo vs foo/bar), or one under a path the release ships as a
+    # file (d/x vs d).
+    untracked=$(git -C "$dir" ls-files --others --exclude-standard -z </dev/null \
+        | tr '\0' '\n' | awk '
+            NR == FNR {
+                shipped[$0] = 1
+                path = $0
+                while (sub(/\/[^\/]*$/, "", path)) shipped_dir[path] = 1
+                next
+            }
+            {
+                if ($0 in shipped || $0 in shipped_dir) { print; next }
+                path = $0
+                while (sub(/\/[^\/]*$/, "", path)) if (path in shipped) { print; next }
+            }' <(git -C "$dir" ls-tree -r --name-only FETCH_HEAD </dev/null) -) \
+        || fail "Could not read the untracked files in $dir (git ls-files)."
+    conflicts=$(printf '%s\n' "$tracked" \
+        | awk -F'\t' -v pipeline="$pipeline" 'NF && !($1 == "M" && $2 == pipeline) { print "  " $1 " " $2 }')
+    if [[ -n "$untracked" ]]; then
+        conflicts+="${conflicts:+$'\n'}$(printf '%s\n' "$untracked" | sed 's/^/  untracked (the update would replace or delete it): /')"
+    fi
+    if [[ -n "$conflicts" ]]; then
+        printf '%s\n' "$conflicts" >&2
+        fail "$dir has local changes to files the current release replaces (listed above), so it cannot be updated and nothing was installed. Move each change out of the checkout (git -C $dir stash, or copy the file elsewhere and git -C $dir checkout -- <file>), then re-run. To deliberately reinstall the checkout as it is, without the update, re-run with NANO_SKIP_GIT_UPDATE=1."
+    fi
+    if printf '%s\n' "$tracked" | awk -F'\t' -v pipeline="$pipeline" '$1 == "M" && $2 == pipeline { found = 1 } END { exit !found }'; then
+        keep_pipeline=1
+        git -C "$dir" diff --quiet HEAD FETCH_HEAD -- "$pipeline" </dev/null 2>/dev/null || shipped_pipeline_changed=1
+        # Same directory and mode 0600: an operator pipeline can carry sink
+        # credentials. Removed only once the edit is back in place.
+        pipeline_copy=$(umask 077 && mktemp "$dir/tenzir/.pipeline.tql.local.XXXXXX") \
+            || fail "Could not save your edited $dir/$pipeline before the update."
+        cp -p "$dir/$pipeline" "$pipeline_copy" \
+            || fail "Could not save your edited $dir/$pipeline before the update."
+    fi
+    log "Updating existing checkout at $dir"
+    if [[ -n "$keep_pipeline" ]]; then
+        # Interrupted between the reset and the restore: put the edit back
+        # now (the next run restores a copy left behind by a harder kill).
+        PIPELINE_RESTORE_FROM="$pipeline_copy" PIPELINE_RESTORE_TO="$dir/$pipeline"
+        trap 'restore_pipeline_and_exit 130' INT
+        trap 'restore_pipeline_and_exit 143' TERM
+    fi
+    git -C "$dir" reset --hard FETCH_HEAD </dev/null \
+        || fail "Could not update $dir to the current release.${pipeline_copy:+ Your edited $pipeline is saved in $pipeline_copy.} Remove the checkout and re-run to reclone."
+    if [[ -n "$keep_pipeline" ]]; then
+        # cp -p: the operator's mode too (a 0600 pipeline with sink credentials
+        # must not come back with the shipped file's 0644).
+        cp -p "$pipeline_copy" "$dir/$pipeline" \
+            || fail "Could not restore your edited $dir/$pipeline after the update; it is saved in $pipeline_copy."
+        rm -f "$pipeline_copy"
+        trap - INT TERM
+        if [[ "$shipped_pipeline_changed" == "1" ]]; then
+            warn "Kept your edited $pipeline. This release ships a changed pipeline: review it with git -C $dir diff $pipeline (your edit against the new shipped version) and see \"Bundled Tenzir node\" in the Upgrade guide."
+        else
+            log "Kept your edited $pipeline"
+        fi
+    fi
+}
+
 if [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
     if [[ "${NANO_SKIP_GIT_UPDATE:-0}" == "1" || "$RECORD_PG_HA_IDENTITY_ONLY" == "1" ]]; then
         log "Not updating the checkout (NANO_SKIP_GIT_UPDATE=1 or --record-pg-ha-identity) — installing the checkout at $NANO_INSTALL_DIR as is"
     else
-        # Older checkouts predate the shipped ignore rule for the helper's stable
-        # flock identity. Ignore only that generated, untracked root path; any
-        # tracked change or other untracked customer file still blocks the reset.
-        GIT_DIRTY_STATUS=$(git -C "$NANO_INSTALL_DIR" status --porcelain </dev/null 2>/dev/null \
-            | awk '$0 != "?? .env.nano-generated-secrets.lock"')
-        if [[ -n "$GIT_DIRTY_STATUS" ]]; then
-            warn "$NANO_INSTALL_DIR has local changes — skipping git update so your edits stay intact."
-        else
-            log "Updating existing checkout at $NANO_INSTALL_DIR"
-            git -C "$NANO_INSTALL_DIR" fetch --depth 1 origin "$NANO_BRANCH" </dev/null
-            # The nano-rs/nano mirror is force-regenerated on every sync, so its
-            # history diverges from any prior checkout and can never fast-forward.
-            # Hard-reset to the fetched remote HEAD instead. Safe: the clean-tree
-            # check above already skips this branch (preserving edits) when there
-            # are local changes, so this only resets an unmodified checkout — the
-            # authoritative state is always the mirror. (NAN-1929: an ff-only merge
-            # left a stale images.lock and then failed digest verification against
-            # the freshly-pulled images.)
-            git -C "$NANO_INSTALL_DIR" reset --hard FETCH_HEAD </dev/null \
-                || fail "Could not update $NANO_INSTALL_DIR to the current release. Remove it and re-run to reclone."
-        fi
+        update_git_checkout "$NANO_INSTALL_DIR" "$NANO_BRANCH"
     fi
 elif [[ -f "$NANO_INSTALL_DIR/.nano-bundle" ]]; then
     log "Using extracted release bundle at $NANO_INSTALL_DIR ($(head -1 "$NANO_INSTALL_DIR/.nano-bundle"))"
@@ -2346,6 +2440,32 @@ if [[ -f .env ]]; then
         && "$delivery_token_new" == 1 ]]; then
         fail "Generated NANO_VECTOR_CONFIG_DELIVERY_TOKEN in $NANO_INSTALL_DIR/.env. Ingest hosts need it before nano-api starts: nano-api refuses their install token for Vector config delivery (a publicly known one always, a private one with NANO_VECTOR_CONFIG_DELIVERY_STRICT=true), and a placeholder delivery token too. Securely copy $NANO_INSTALL_DIR/.env to every inventory host, then re-run this command here and install.sh on each ingest host. Nothing was started."
     fi
+    # NAN-5470: the ClickHouse workload identities (interactive search,
+    # dictionary sources) generated just now exist only in this .env. Every
+    # ClickHouse server defines those users from the shared .env, and nano-search
+    # logs in as nanosiem_search, so the app must not start before the
+    # ClickHouse hosts have them. Stop before anything starts; the passwords are
+    # saved, so the re-run after the copy goes ahead.
+    workload_keys_new=""
+    for workload_key in CLICKHOUSE_SEARCH_PASSWORD CLICKHOUSE_DICT_PASSWORD NANO_CLICKHOUSE_CLUSTER_SECRET; do
+        if [[ ",${NANO_BACKFILLED_SECRET_KEYS// /}," == *,"$workload_key",* ]]; then
+            workload_keys_new="${workload_keys_new:+$workload_keys_new, }$workload_key"
+        fi
+    done
+    if [[ "$MULTI_NODE" == "1" && "$secret_mode" == generate && "${NANO_PREPARE_ONLY:-0}" != "1" \
+        && -n "$workload_keys_new" ]]; then
+        fail "Generated $workload_keys_new in $NANO_INSTALL_DIR/.env (v2.0.28: dedicated ClickHouse users for interactive search and dictionary sources). Every ClickHouse host defines those users from the shared .env and nano-search logs in with them, so the ClickHouse hosts need it first. Securely copy $NANO_INSTALL_DIR/.env to every inventory host, re-run install.sh on each Keeper and ClickHouse host (one at a time), then re-run this command here and install.sh on the other hosts. Nothing was started."
+    fi
+    # NAN-5470 (P1-6): on an INSTALLED role-split cluster, NANO_PREPARE_ONLY=1
+    # is the upgrade pre-step that creates the new shared secrets for the
+    # other hosts. It writes only those (above) and stops: no release pin
+    # (NANO_VERSION would make `nano upgrade` see the target as installed),
+    # no re-render of .nano-generated under the running containers.
+    if [[ "${NANO_PREPARE_ONLY:-0}" == "1" && "$MULTI_NODE" == "1" && -n "$(env_value NANO_VERSION)" ]]; then
+        ok "Prepared the shared secrets in $NANO_INSTALL_DIR/.env (${NANO_BACKFILLED_SECRET_KEYS:-none were missing}); the installed release, the generated configuration and every running service are unchanged."
+        printf 'Securely copy %s/.env to every inventory host, then run scripts/nano upgrade from this host.\n' "$NANO_INSTALL_DIR"
+        exit 0
+    fi
     if [[ -n "${NANO_PUBLIC_DB_PASSWORD_KEYS:-}" ]]; then
         warn "Database password(s) $NANO_PUBLIC_DB_PASSWORD_KEYS are publicly known defaults. They are not changed automatically: PostgreSQL and ClickHouse keep the password their data was created with."
         warn "These services are reachable only on the internal Docker network, but change them: see 'Changing a database password' in docs/getting-started/docker-deployment.md."
@@ -2907,6 +3027,14 @@ PY
     if [[ -d .nano-generated || -f .nano-role.env ]]; then
         ROLE_CONFIG_WAS_PUBLISHED=1
     fi
+    # NAN-5472: switching a ClickHouse host to cluster-secret-only must not
+    # leave a peer that still sends (and so only accepts) password hops.
+    if [[ ",$ROLE_ARG," == *,clickhouse,* ]]; then
+        python3 -I deploy/compose/render-inventory.py --check-cluster-auth \
+            --inventory "$INVENTORY_PATH" --roles "$ROLE_ARG" --override-env .env \
+            </dev/null >&2 \
+            || fail "The ClickHouse cluster secret check failed (see above). No services have started."
+    fi
     log "Rendering host roles '$ROLE_ARG' from $INVENTORY_PATH"
     python3 -I deploy/compose/render-inventory.py \
         --inventory "$INVENTORY_PATH" \
@@ -3284,7 +3412,8 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     ch_ingest_networks=${NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS:-$(env_value NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS)}
 fi
 if [[ "$MULTI_NODE" != "1" ]] \
-    && { [[ ! -r scripts/lib/clickhouse_networks.py || ! -r clickhouse/users.d/nanosiem-users.xml ]]; }; then
+    && { [[ ! -r scripts/lib/clickhouse_networks.py || ! -r clickhouse/users.d/nanosiem-users.xml \
+        || ! -r clickhouse/workload-users/nanosiem-workload-users.xml ]]; }; then
     # A partial tree (tests, a hand-copied install): the checked-in
     # loopback + private-range lists apply. Never an any-address fallback.
     [[ -z "$ch_ingest_networks" ]] \
@@ -3297,6 +3426,8 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
     python3 -I scripts/lib/clickhouse_networks.py \
         --users-xml clickhouse/users.d/nanosiem-users.xml \
         --output .nano-generated/clickhouse/networks.xml \
+        --workload-template clickhouse/workload-users/nanosiem-workload-users.xml \
+        --workload-env-file .env --users-dir-output .nano-generated/clickhouse/users.d \
         --compose-subnet "${COMPOSE_SUBNET:-}" \
         --ingest-networks "$ch_ingest_networks" \
         --from-docker -- "${COMPOSE_ARGS[@]}" </dev/null >/dev/null \
@@ -3308,6 +3439,12 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
     [[ "$(env_value NANO_CLICKHOUSE_NETWORKS_FILE)" == "./.nano-generated/clickhouse/networks.xml" ]] \
         || nano_env_set_keys .env "NANO_CLICKHOUSE_NETWORKS_FILE=./.nano-generated/clickhouse/networks.xml" \
         || fail "Could not record NANO_CLICKHOUSE_NETWORKS_FILE in .env."
+    # NAN-5470: the rendered users.d (shipped users + the workload identities
+    # with password_sha256_hex), outside every installer package so an
+    # extract never changes the users ClickHouse runs.
+    [[ "$(env_value NANO_CLICKHOUSE_USERS_DIR)" == "./.nano-generated/clickhouse/users.d" ]] \
+        || nano_env_set_keys .env "NANO_CLICKHOUSE_USERS_DIR=./.nano-generated/clickhouse/users.d" \
+        || fail "Could not record NANO_CLICKHOUSE_USERS_DIR in .env."
     log "ClickHouse users accept connections from loopback and ${COMPOSE_SUBNET:-the Docker networks} only${ch_ingest_networks:+ (nanosiem_ingest also from $ch_ingest_networks)}"
     # NAN-5361: that lock is what refuses nano's own users on the Agent Lane
     # port, so an Agent Lane allow-list must not overlap it.

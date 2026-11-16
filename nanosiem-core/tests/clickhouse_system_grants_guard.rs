@@ -45,8 +45,9 @@ const RUNTIME_SYSTEM_GRANTS: &[(&str, &[&str])] = &[
     // shard skew, lookup sizes.
     ("parts", &["bytes_on_disk", "rows", "data_uncompressed_bytes", "partition", "database", "table", "active", "disk_name"]),
     // Disk pressure (free space, tiering detection).
-    ("disks", &["total_space", "free_space", "type", "name"]),
-    ("storage_policies", &["policy_name", "volume_priority", "disks"]),
+    ("disks", &["total_space", "free_space", "type", "name", "object_storage_type"]),
+    // + Settings > Tiering (policy.rs STORAGE_POLICIES_SQL / DISKS_SQL).
+    ("storage_policies", &["policy_name", "volume_priority", "disks", "volume_name", "move_factor"]),
     // SIEM Health insert integrity. Never the `query` text.
     ("query_log", &["type", "query_kind", "event_time", "tables"]),
     // SIEM Health insert integrity + shard skew.
@@ -88,6 +89,8 @@ const ADMIN_ONLY: &[&str] = &[
     "users", "scheduler", "asynchronous_inserts", "metrics",
     "grants", "role_grants", "roles", "quotas", "settings_profile_elements", "workloads",
     "data_skipping_indices", "session_log",
+    // NAN-5470: SIEM Health quota probe (admin system_probe_client).
+    "quotas_usage",
 ];
 
 /// `system.<x>` tokens in code that are not reads of a system table: OCSF
@@ -361,4 +364,55 @@ fn agentlane_audit_reader_grants_are_confined() {
             "system.{table} needs a row policy confining the audit reader to agentlane rows"
         );
     }
+}
+
+/// NAN-5470: the interactive search identity's system reads: a subset of the
+/// runtime user's (search runs the same code the app did as `nanosiem`) and
+/// exactly what the search paths read: cancel/progress, cluster-name
+/// convergence, the per-search memory ceiling, prevalence coverage and lookup
+/// sizes. Never query_log, users, grants or quotas.
+const SEARCH_SYSTEM_GRANTS: &[(&str, &[&str])] = &[
+    ("processes", &["*"]),
+    ("clusters", &["cluster", "shard_num", "replica_num", "host_name", "database_replica_name"]),
+    ("server_settings", &["name", "value"]),
+    ("view_refreshes", &["database", "view", "exception", "retry", "last_success_time", "last_refresh_time", "status", "next_refresh_time"]),
+    ("parts", &["bytes_on_disk", "rows", "data_uncompressed_bytes", "partition", "database", "table", "active", "disk_name"]),
+];
+
+#[test]
+fn workload_identities_system_grants_are_exact() {
+    let xml = read("clickhouse/workload-users/nanosiem-workload-users.xml");
+    let expected: BTreeMap<String, BTreeSet<String>> = SEARCH_SYSTEM_GRANTS
+        .iter()
+        .map(|(t, cols)| (t.to_string(), cols.iter().map(|c| c.to_string()).collect()))
+        .collect();
+    let search = system_grants(&xml_user_queries(&xml, "nanosiem_search"));
+    assert_eq!(search, expected, "nanosiem_search's system grants drifted from SEARCH_SYSTEM_GRANTS");
+    let runtime = expected_runtime();
+    for (table, cols) in &expected {
+        assert!(
+            runtime.get(table).is_some_and(|r| cols.is_subset(r)),
+            "nanosiem_search reads system.{table} beyond the runtime user's grant"
+        );
+    }
+    let dict = xml_user_queries(&xml, "nanosiem_dict");
+    assert!(!dict.is_empty(), "nanosiem_dict has no grants block (would default to ALL)");
+    for q in &dict {
+        assert!(
+            !q.contains(" system.") && !q.contains("*.*") && !q.contains("nanosiem.*"),
+            "nanosiem_dict reads only its source tables: {q}"
+        );
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&read("deploy/helm/nano/files/clickhouse/users.json")).unwrap();
+    let helm = |user: &str| -> Vec<String> {
+        json["users"][user]["grants"]["query"]
+            .as_array()
+            .unwrap_or_else(|| panic!("helm users.json has no {user} (run sync-files.sh)"))
+            .iter()
+            .map(|q| q.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(system_grants(&helm("nanosiem_search")), expected, "helm users.json drifted (run sync-files.sh)");
+    assert!(system_grants(&helm("nanosiem_dict")).is_empty(), "helm nanosiem_dict holds a system grant");
 }

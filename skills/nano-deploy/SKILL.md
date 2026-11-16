@@ -4,8 +4,11 @@ description: Deploy, size, verify, upgrade and operate nano Self-run (the licens
 license: AGPL-3.0-or-later
 compatibility: Runs from the operator's workstation. Needs ssh, scp, python3 and bash locally; targets are Linux hosts reachable over SSH (or a Kubernetes cluster via kubectl and helm). Cloud VM deployments also use the operator's own logged-in aws, az or gcloud CLI.
 metadata:
+  author: nano-rs
+  version: "1.0"
   product: nano Self-run
   tested-with: nano 2.0.x enterprise compose bundle
+  docs: https://nano.rs/docs/getting-started/deploy-with-ai-agent/
 ---
 
 # nano Self-run deployment

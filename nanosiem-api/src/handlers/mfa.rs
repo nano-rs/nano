@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use uuid::Uuid;
 
-use crate::handlers::auth::{build_access_token_cookie, build_refresh_token_cookie};
+use crate::handlers::auth::{append_refresh_token_cookies, build_access_token_cookie};
 use crate::handlers::AuditExt;
 use crate::middleware::{require_session_auth, AuthContext};
 use crate::state::AppState;
@@ -622,18 +622,15 @@ pub async fn verify_mfa_challenge(
     // Set cookies (same as normal login success)
     let access_cookie =
         build_access_token_cookie(&response.tokens.access_token, response.tokens.expires_in);
-    let refresh_cookie = build_refresh_token_cookie(
-        &response.tokens.refresh_token,
-        state.token_service.refresh_token_ttl(),
-    );
     let mut res = Json(&response).into_response();
     res.headers_mut().append(
         SET_COOKIE,
         access_cookie.parse().expect("valid cookie header"),
     );
-    res.headers_mut().append(
-        SET_COOKIE,
-        refresh_cookie.parse().expect("valid cookie header"),
+    append_refresh_token_cookies(
+        res.headers_mut(),
+        &response.tokens.refresh_token,
+        state.token_service.refresh_token_ttl(),
     );
     Ok(res)
 }

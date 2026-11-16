@@ -88,6 +88,17 @@ fn pick_bucket_size_seconds(window: Duration) -> u32 {
 }
 
 impl DetectionService {
+    /// NAN-5470: this service with its searches on `client` (the interactive
+    /// search identity, `DualPool::clickhouse_search`). For user-controlled
+    /// queries run on a user's behalf (the rule tester, backtests), so they
+    /// run under that identity's profile limits and hourly quota, not the
+    /// scheduler's uncapped `nanosiem`.
+    pub fn with_search_client(&self, client: clickhouse::Client) -> Self {
+        let mut service = self.clone();
+        service.search_service = service.search_service.with_clickhouse_identity(client);
+        service
+    }
+
     // ========================================================================
     // Historical Analysis (for false positive tuning)
     // ========================================================================

@@ -592,7 +592,35 @@ impl ClickHouseMigrator {
             );
         }
 
+        self.ensure_rawsql_sql_quota(&on_cluster).await?;
         Ok(created)
+    }
+
+    /// NAN-5470: raw-SQL users created over SQL (this bootstrap, or an older
+    /// release's) get the same hourly budget the users.d ones have (`default`
+    /// in query_limits.xml). A SQL user is outside users.d, so without this it
+    /// fell back to ClickHouse's built-in quota, which tracks but limits
+    /// nothing. users.d users are left alone: they already carry `default`.
+    pub(super) async fn ensure_rawsql_sql_quota(&mut self, on_cluster: &str) -> Result<(), ClickHouseMigrateError> {
+        let sql_users: Vec<String> = self
+            .client
+            .query(
+                "SELECT name FROM system.users \
+                 WHERE name IN ('nanosiem_rawsql', 'nanosiem_rawsql_noaudit') AND storage != 'users_xml' \
+                 ORDER BY name",
+            )
+            .fetch_all()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(format!("listing SQL raw-SQL users: {e}")))?;
+        if sql_users.is_empty() {
+            return Ok(());
+        }
+        let sql = rawsql_sql_quota_statement(on_cluster, &sql_users);
+        self.client.query(&sql).execute().await.map_err(|e| {
+            ClickHouseMigrateError::ClickHouse(format!("creating the raw-SQL quota for {sql_users:?}: {e}"))
+        })?;
+        tracing::info!(users = ?sql_users, "NAN-5470: raw-SQL SQL users carry the {RAWSQL_SQL_QUOTA} quota");
+        Ok(())
     }
 
     /// One user's host columns (`None`: no such user).
@@ -1848,3 +1876,18 @@ pub(super) fn is_safe_identifier(s: &str) -> bool {
 #[cfg(test)]
 #[path = "distributed_policy_tests.rs"]
 mod policy_tests;
+
+/// NAN-5470: the SQL quota for migrator-created raw-SQL users.
+pub(crate) const RAWSQL_SQL_QUOTA: &str = "nano_rawsql_sql";
+
+/// `CREATE QUOTA OR REPLACE` for SQL raw-SQL users: per user, per server, per
+/// hour, the same limits as users.d's `default` quota (query_limits.xml).
+/// OR REPLACE converges the limits and the user list on every migrate.
+pub(crate) fn rawsql_sql_quota_statement(on_cluster: &str, users: &[String]) -> String {
+    format!(
+        "CREATE QUOTA OR REPLACE {RAWSQL_SQL_QUOTA}{on_cluster} KEYED BY user_name \
+         FOR INTERVAL 1 hour MAX queries = 100000, errors = 100000, result_rows = 1000000000, \
+         read_rows = 100000000000, execution_time = 36000 TO {users}",
+        users = users.join(", "),
+    )
+}

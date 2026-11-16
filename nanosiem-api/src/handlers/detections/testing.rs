@@ -10,7 +10,7 @@ use chrono::{Duration, Utc};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::search::TimeRangeInput;
 use nanosiem_core::typeid::TypeIdParam;
-use nanosiem_core::HistoricalAnalysisResult;
+use nanosiem_core::{DetectionService, HistoricalAnalysisResult};
 
 use super::strip_comments;
 use super::types::*;
@@ -63,6 +63,16 @@ fn resolve_test_range(request: &TestRuleRequest) -> TimeRangeInput {
 /// counts. Hard-capped at 14 days. Per-user concurrency capped at one
 /// in-flight test (returns 429 otherwise) so click-spam can't amplify the
 /// fanout against ClickHouse.
+/// NAN-5470: the rule tester runs the caller's (possibly edited) query, so it
+/// runs as the interactive search identity, like POST /api/search.
+fn user_detection_service(state: &AppState) -> DetectionService {
+    if state.dual_pool.has_clickhouse_search() {
+        state.detection_service.with_search_client(state.dual_pool.clickhouse_search().clone())
+    } else {
+        state.detection_service.clone()
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/api/rules/{id}/test",
@@ -116,17 +126,16 @@ pub async fn test_detection(
     // NAN-2047: run the tester's searches under the caller's effective scope so
     // a source-restricted principal can't read denied sources through it.
     let scope = effective_viewer_scope(&auth);
+    let tester = user_detection_service(&state);
     let result = if clean_query.is_empty() {
         // Standard case: testing the saved rule as-is.
-        state
-            .detection_service
+        tester
             .analyze_rule_stepped(&rule, time_range, &scope)
             .await?
     } else {
         // The drawer lets users edit the query before testing without saving.
         // Step at the saved rule's schedule + lookback against the new query.
-        state
-            .detection_service
+        tester
             .analyze_query_stepped(
                 &clean_query,
                 time_range,
@@ -202,8 +211,7 @@ pub async fn test_query(
 
     // NAN-2047: run under the caller's effective scope (see effective_viewer_scope).
     let scope = effective_viewer_scope(&auth);
-    let result = state
-        .detection_service
+    let result = user_detection_service(&state)
         .analyze_query_stepped(
             &clean_query,
             time_range,

@@ -7,6 +7,9 @@
   - analytics: Long-running reports and threat hunting
   - realtime: NRT detection rules (fast, limited resources)
   - ingestion: Optimized for Vector/insert operations
+  - ingest_direct: ingestion + bounded reads (nanosiem_ingest, NAN-5473)
+  - search: interactive search identity (nanosiem_search, NAN-5470)
+  - dict_source: dictionary source identity (nanosiem_dict, NAN-5470)
 
   These prevent resource exhaustion during incident investigations
   when multiple analysts run concurrent queries.
@@ -328,6 +331,136 @@
         </ingestion>
 
         <!-- =================================================================
+             INGEST_DIRECT PROFILE (NAN-5473)
+             nanosiem_ingest, the login external direct-OCSF writers (Tenzir)
+             use. Everything from `ingestion`, plus bounded reads: that login
+             is reachable from outside (ingestAllowedNetworks) and its
+             column-scoped SELECT on ocsf_logs exists only for the MV chain's
+             insert-time grant check. The MV chain reads the inserted block,
+             never the stored table, so these bounds never touch an insert
+             (max_insert_block_size is 1M rows, far below max_rows_to_read).
+             max_execution_time applies to an INSERT too: 300 s is far above
+             any insert at benchmark rates (a flush is ~1 s) and still bounds
+             a SELECT that used to run forever (ingestion sets 0).
+             ================================================================= -->
+        <ingest_direct>
+            <profile>ingestion</profile>
+            <max_execution_time>300</max_execution_time>
+            <max_rows_to_read>100000000</max_rows_to_read>
+            <read_overflow_mode>throw</read_overflow_mode>
+            <max_result_rows>100000</max_result_rows>
+            <result_overflow_mode>throw</result_overflow_mode>
+            <constraints>
+                <max_execution_time>
+                    <min>1</min>
+                    <max>300</max>
+                </max_execution_time>
+                <max_rows_to_read>
+                    <min>1</min>
+                    <max>100000000</max>
+                </max_rows_to_read>
+                <!-- No <min> on max_result_rows (NAN-5470): ClickHouse resets it
+                     to 0 for a subquery or remote stage, and on a cluster
+                     <secret> hop the shard clamps that 0 to the initial user's
+                     constraints, so MIN 1 fails every multi-row subquery,
+                     IN / GLOBAL IN and distributed join with 396
+                     (agentlane.rs documents the same trap). -->
+                <max_result_rows>
+                    <max>100000</max>
+                </max_result_rows>
+                <read_overflow_mode>
+                    <readonly/>
+                </read_overflow_mode>
+                <result_overflow_mode>
+                    <readonly/>
+                </result_overflow_mode>
+            </constraints>
+        </ingest_direct>
+
+        <!-- =================================================================
+             SEARCH PROFILE (NAN-5470)
+             nanosiem_search: interactive search (nano-search, the API's AI
+             search paths). The analyst `default` profile, minus DDL, with the
+             security-relevant toggles CONST and every resource setting the
+             app sends (search::admission tiers, background jobs, inline
+             SETTINGS) bounded above what it ever asks for, so a crafted
+             SETTINGS clause cannot lift them:
+               max_execution_time  app max 3600 (analytics), jobs 1800 by
+                                   default (clamped to 7200 in the app)
+               max_memory_usage    app max 50 GiB = 53,687,091,200 (analytics
+                                   tier, search::admission); capped at 100 GiB
+               max_threads         app max 32
+               max_rows_to_read    profile 1e9, field stats 200k
+             ================================================================= -->
+        <search>
+            <profile>default</profile>
+            <allow_ddl>0</allow_ddl>
+            <allow_introspection_functions>0</allow_introspection_functions>
+            <constraints>
+                <allow_ddl>
+                    <readonly/>
+                </allow_ddl>
+                <allow_introspection_functions>
+                    <readonly/>
+                </allow_introspection_functions>
+                <max_execution_time>
+                    <min>1</min>
+                    <max>7200</max>
+                </max_execution_time>
+                <max_memory_usage>
+                    <min>1</min>
+                    <max>107374182400</max>
+                </max_memory_usage>
+                <max_threads>
+                    <min>1</min>
+                    <max>32</max>
+                </max_threads>
+                <max_rows_to_read>
+                    <min>1</min>
+                    <max>10000000000</max>
+                </max_rows_to_read>
+                <max_bytes_to_read>
+                    <min>1</min>
+                    <max>500000000000</max>
+                </max_bytes_to_read>
+                <!-- No <min> on max_result_rows (NAN-5470): ClickHouse resets it
+                     to 0 for a subquery or remote stage, and on a cluster
+                     <secret> hop the shard clamps that 0 to the initial user's
+                     constraints, so MIN 1 fails every multi-row subquery,
+                     IN / GLOBAL IN and distributed join with 396
+                     (agentlane.rs documents the same trap). -->
+                <max_result_rows>
+                    <max>10000000</max>
+                </max_result_rows>
+            </constraints>
+        </search>
+
+        <!-- =================================================================
+             DICT_SOURCE PROFILE (NAN-5470)
+             nanosiem_dict: dictionary SOURCE queries. The `default` profile's
+             limits (what the sources ran under as `nanosiem`), read-only.
+             readonly=2, not 1: several source queries carry their own
+             SETTINGS (memory spill, dict_source_memory_guard.rs).
+             ================================================================= -->
+        <dict_source>
+            <profile>default</profile>
+            <readonly>2</readonly>
+            <allow_ddl>0</allow_ddl>
+            <allow_introspection_functions>0</allow_introspection_functions>
+            <constraints>
+                <readonly>
+                    <readonly/>
+                </readonly>
+                <allow_ddl>
+                    <readonly/>
+                </allow_ddl>
+                <allow_introspection_functions>
+                    <readonly/>
+                </allow_introspection_functions>
+            </constraints>
+        </dict_source>
+
+        <!-- =================================================================
              ADMIN PROFILE
              For schema changes and maintenance operations
              ================================================================= -->
@@ -465,10 +598,13 @@
          Map users to profiles
          ======================================================================= -->
     <users>
-        <!-- Main application user -->
+        <!-- Main application user. NAN-5457: the quota is `nano_service` (no
+             query-count cap), matching nanosiem-users.xml. This file sorts after
+             nanosiem-users.xml and users.d files merge, so a `default` here
+             would silently put the cap back. -->
         <nanosiem>
             <profile>default</profile>
-            <quota>default</quota>
+            <quota>nano_service</quota>
             <!-- NAN-5367: <networks> live with the user in nanosiem-users.xml.
                  Users.d files MERGE, so an any-address entry here would re-open it. -->
         </nanosiem>
@@ -479,6 +615,12 @@
          Resource usage limits over time periods
          ======================================================================= -->
     <quotas>
+        <!-- `default`: the budget for people. It applies to the raw-SQL users
+             (nanosiem_rawsql, nanosiem_rawsql_noaudit) and the container-local
+             `default` user. Every key is per user (system.quotas keys =
+             ['user_name']), so one user running out never blocks another.
+             Agent Lane tokens get their own per-token quotas (CREATE QUOTA,
+             nanosiem-enterprise agentlane/sql.rs), not this one. -->
         <default>
             <interval>
                 <duration>3600</duration> <!-- 1 hour -->
@@ -489,5 +631,66 @@
                 <execution_time>36000</execution_time> <!-- 10 hours total -->
             </interval>
         </default>
+
+        <!-- NAN-5470: `nano_search`, for the interactive search identity
+             (nanosiem_search). Per user, per server, per hour. A backstop and
+             an attribution bucket, NOT rationing: per-query limits (`search`
+             profile) and the app's admission control already protect the
+             server, and running out locks every search out for the rest of
+             the hour (the NAN-5457 failure mode), so it errs generous. Sized
+             (clickhouse_service_quota_guard.rs, from the app's config) for,
+             all at once and flat out for the hour, with 2x headroom:
+               * 30 admitted ad-hoc searches (admission ceiling), each with
+                 its parallel count(*) companion;
+               * background search jobs (2 per search process, 4 processes);
+               * user and AI searches nano-api runs in process (another
+                 admission ceiling's worth);
+             = 98 concurrent queries.
+               queries         2,000,000  98 x the 2/s progress poller x 3600
+                                          x 2 = 1,411,200
+               errors            400,000
+               execution_time  1,000,000 s  98 x 3600 x 2 = 705,600
+             read_rows / result_rows are tracked, not capped: per-query
+             max_rows_to_read / max_result_rows in the `search` profile bound
+             them. On a cluster each server counts the shard work it does for
+             this user (cluster secret). SIEM Health reports QUOTA_EXCEEDED for
+             any nano user. -->
+        <nano_search>
+            <interval>
+                <duration>3600</duration>
+                <queries>2000000</queries>
+                <errors>400000</errors>
+                <result_rows>0</result_rows>
+                <read_rows>0</read_rows>
+                <execution_time>1000000</execution_time>
+            </interval>
+        </nano_search>
+
+        <!-- NAN-5457: `nano_service`, for nano's own service users: nanosiem
+             (app, jobs, scheduled detections, connector-runner, the cluster's
+             Distributed hops before the cluster secret), nanosiem_dict
+             (dictionary sources, NAN-5470), nanosiem_vector (Vector inserts),
+             nanosiem_ingest (direct OCSF writers) and nanosiem_admin
+             (migrations). Their query count grows with ingest volume, not with
+             people: each Vector batch, each Distributed block forwarded to
+             another shard and each cache-dictionary miss is one query. At
+             ~24k events/s on a 2-shard cluster the old flat 100,000 queries
+             per hour ran out before the hour did, and inserts failed with
+             QUOTA_EXCEEDED. Every limit is 0 (unlimited): the interval only
+             tracks usage, so system.quotas_usage still shows it. Per-query
+             guards stay in the settings profiles (max_memory_usage,
+             max_execution_time and the rest). Do not give these users a count
+             cap: an insert path must never be rationed by the hour.
+             Guard: nanosiem-core/tests/clickhouse_service_quota_guard.rs. -->
+        <nano_service>
+            <interval>
+                <duration>3600</duration>
+                <queries>0</queries>
+                <errors>0</errors>
+                <result_rows>0</result_rows>
+                <read_rows>0</read_rows>
+                <execution_time>0</execution_time>
+            </interval>
+        </nano_service>
     </quotas>
 </clickhouse>

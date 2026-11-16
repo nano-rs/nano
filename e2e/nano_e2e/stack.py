@@ -81,9 +81,12 @@ class Stack:
         """Where the api writes deployed source-config TOML (Vector's dynamic dir)."""
         return self.vector_dynamic_dir / "sources" / "configs"
 
-    def svc(self, action: str, service: str, timeout: float = 300) -> None:
+    def svc(
+        self, action: str, service: str, timeout: float = 300, env: dict[str, str] | None = None
+    ) -> None:
         """Restart/stop/start/kill a stack service through the runner (same seam in
-        native and docker app mode)."""
+        native and docker app mode). `env` adds runner knobs for this call only
+        (e.g. E2E_SEARCH_CH_LAUNCH=app-user, native mode)."""
         if action not in {"restart", "stop", "start", "kill"}:
             raise ValueError(action)
         if service not in {"api", "search", "jobs", "vector"}:
@@ -94,6 +97,7 @@ class Stack:
             text=True,
             timeout=timeout,
             check=False,
+            env={**os.environ, **(env or {})},
         )
         if proc.returncode != 0:
             raise RuntimeError(

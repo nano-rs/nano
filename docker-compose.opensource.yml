@@ -241,7 +241,16 @@ services:
       - nano-clickhouse-data:/var/lib/clickhouse
       - nano-clickhouse-logs:/var/log/clickhouse-server
       - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
-      - ./clickhouse/users.d:/etc/clickhouse-server/users.d:ro
+      # NAN-5470: install.sh / `nano upgrade` render the users.d ClickHouse
+      # runs (the shipped clickhouse/users.d plus the workload identities
+      # nanosiem_search / nanosiem_dict with password_sha256_hex from .env,
+      # scripts/lib/clickhouse_networks.py --users-dir-output) under
+      # .nano-generated/, which no installer package contains: extracting a
+      # package never changes the users ClickHouse runs (a file mounted over a
+      # shipped placeholder is detached when tar recreates it). Nothing in this
+      # container's environment is needed. Without the rendered directory
+      # (manual compose) the shipped users.d applies, with no workload users.
+      - ${NANO_CLICKHOUSE_USERS_DIR:-./clickhouse/users.d}:/etc/clickhouse-server/users.d:ro
       # NAN-4997 installer-generated, later-loading host sizing. The checked-in
       # fallback files are empty, preserving manual compose on older installs.
       - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-config.xml:/etc/clickhouse-server/config.d/zzzz-nano-sizing.xml:ro
@@ -355,6 +364,9 @@ services:
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
+      # NAN-5470: dictionary sources read as nanosiem_dict once that login works
+      # on every ClickHouse server (migration 202; self credentials until then).
+      CLICKHOUSE_DICT_PASSWORD: ${CLICKHOUSE_DICT_PASSWORD:-}
       # NAN-1476: must match api/search/jobs — when ocsf, the migrator applies
       # the clickhouse/ocsf/init.sql overlay so ocsf_logs exists before boot.
       # NAN-4903/NAN-5271: OCSF is the default. install.sh and
@@ -722,6 +734,9 @@ services:
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
+      # NAN-5470: AI-written searches (pivt notebook chat, meloD data access,
+      # the shadow investigation) run as the interactive search identity.
+      CLICKHOUSE_SEARCH_PASSWORD: ${CLICKHOUSE_SEARCH_PASSWORD:-}
       # NAN-5450: postgres and clickhouse data are named volumes on the same
       # Docker filesystem here, so the disk check reports PostgreSQL usage as
       # that filesystem's. The role-split compose turns it off.
@@ -903,6 +918,9 @@ services:
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
+      # NAN-5470: AI-written searches (pivt notebook chat, meloD data access,
+      # the shadow investigation) run as the interactive search identity.
+      CLICKHOUSE_SEARCH_PASSWORD: ${CLICKHOUSE_SEARCH_PASSWORD:-}
       # NAN-5450: postgres and clickhouse data are named volumes on the same
       # Docker filesystem here, so the disk check reports PostgreSQL usage as
       # that filesystem's. The role-split compose turns it off.
@@ -1027,8 +1045,18 @@ services:
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem
       CLICKHOUSE_CLUSTER: ""
-      CLICKHOUSE_USER: nanosiem
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      # NAN-5470: interactive search runs as its own ClickHouse identity
+      # (own profile limits, hourly quota and query_log user), not as the
+      # app's internal `nanosiem`. It never gets the nanosiem password.
+      # `:-`, not `:?`: every tool that reads this file (scripts/nano backup /
+      # restore, the upgrader's lock and preflight, support bundle, tiering,
+      # cluster health, the backup scheduler) must keep working on a v2.0.27
+      # .env between extracting the package and `nano upgrade`, which (like
+      # install.sh) generates the password before it starts anything. Without
+      # it nano-search only fails to log in; nothing is passwordless (the
+      # rendered user requires the password's SHA-256).
+      CLICKHOUSE_USER: nanosiem_search
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_SEARCH_PASSWORD:-}
       # NAN-2001: read-only raw-SQL pool creds. DualPool::from_env reads these two
       # passwords (usernames default to nanosiem_rawsql / nanosiem_rawsql_noaudit).
       # Identical upgrade-safe expression to the clickhouse service feed, so the CH

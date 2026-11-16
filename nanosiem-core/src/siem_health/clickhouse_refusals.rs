@@ -40,8 +40,11 @@ pub const AUTH_REFUSAL_CODES: [i32; 5] = [192, 193, 194, 195, 516];
 /// ACCESS_DENIED.
 pub const ACCESS_DENIED_CODE: i32 = 497;
 
-/// The users nano writes events with (Vector, direct OCSF writers, the app).
-const WRITER_USERS: [&str; 3] = ["nanosiem_vector", "nanosiem_ingest", "nanosiem"];
+/// The users nano writes events with (Vector, direct OCSF writers, the app)
+/// and, NAN-5470, the interactive search identity (background job results,
+/// search-generated system events). Login refusals cover every `nanosiem*`
+/// user, `nanosiem_dict` included (session_log / system.errors below).
+pub(crate) const WRITER_USERS: [&str; 4] = ["nanosiem_vector", "nanosiem_ingest", "nanosiem", "nanosiem_search"];
 
 /// Fewest refusals from one source that count as a lockout.
 pub const MIN_HITS: u64 = 2;

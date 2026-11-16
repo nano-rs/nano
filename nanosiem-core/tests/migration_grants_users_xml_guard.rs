@@ -16,9 +16,15 @@
 
 use std::path::{Path, PathBuf};
 
-const USERS_XML: &str = include_str!(concat!(
+const BASE_USERS_XML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/users.d/nanosiem-users.xml"
+));
+/// NAN-5470: the workload identities are users.d XML users too (mounted over
+/// their placeholder), so a migration GRANT to them is equally a no-op.
+const WORKLOAD_USERS_XML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/workload-users/nanosiem-workload-users.xml"
 ));
 
 /// The runtime user the Compose and Helm installs run as (`CLICKHOUSE_USER`).
@@ -118,7 +124,8 @@ fn parse(stmt: &str, keyword: &str, joiner: &str) -> Option<Grant> {
 /// `<query>` grants of one users.d user, or `None` when the XML does not
 /// define that user (a SQL-created user: the migration GRANT applies).
 fn xml_grants(user: &str) -> Option<Vec<Grant>> {
-    let block = USERS_XML
+    let xml = if WORKLOAD_USERS_XML.contains(&format!("<{user}>")) { WORKLOAD_USERS_XML } else { BASE_USERS_XML };
+    let block = xml
         .split(&format!("<{user}>"))
         .nth(1)?
         .split(&format!("</{user}>"))

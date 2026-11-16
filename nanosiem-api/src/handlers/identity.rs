@@ -614,8 +614,9 @@ pub async fn resolve_identity_ip(
     "#
     );
 
+    // NAN-5470: an event-data lookup on a user's behalf: the search identity.
     let row = match dual_pool
-        .clickhouse()
+        .clickhouse_search()
         .query(&sql)
         .bind(&ip)
         .bind(reference_time.to_rfc3339())

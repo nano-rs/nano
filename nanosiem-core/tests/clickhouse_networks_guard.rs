@@ -86,6 +86,13 @@ fn every_users_d_user_has_an_explicit_non_wildcard_network_list() {
     ] {
         assert!(names.contains(&expected), "{expected} missing from users.d: {names:?}");
     }
+    // NAN-5470: the workload identities follow the same rule.
+    let workload = read("clickhouse/workload-users/nanosiem-workload-users.xml").expect("workload users");
+    let workload_users = users_networks(&workload);
+    let workload_names: Vec<&str> = workload_users.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(workload_names, ["nanosiem_search", "nanosiem_dict"], "workload identities");
+    let mut users = users;
+    users.extend(workload_users);
     for (user, networks) in &users {
         let inner = networks
             .as_deref()
@@ -111,6 +118,7 @@ fn no_users_d_file_reopens_a_user() {
         "deploy/k8s/clickhouse/users.d",
         "ludus/roles/nanosiem_stack/files/clickhouse/users.d",
         "config/sizing-defaults",
+        "clickhouse/workload-users",
     ];
     let mut checked = 0;
     for dir in dirs {

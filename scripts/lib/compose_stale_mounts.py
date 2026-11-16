@@ -207,9 +207,10 @@ def guard_tenzir_pipeline(root: pathlib.Path, container: str) -> str:
     raise OperatorFileReplaced(
         f"The release package replaced your edited {TENZIR_PIPELINE} with the shipped "
         f"pipeline, and recreating Tenzir would discard your version. It is saved to "
-        f"{backup}. Review it against the new {TENZIR_PIPELINE} (Tenzir 6.18 to 6.20 changes: "
-        "HTTPS hostname checks on to_http/to_splunk/..., client-certificate trust of "
-        "accept_*, the legacy executor is gone), then either copy your version back "
+        f"{backup}. Review it against the new {TENZIR_PIPELINE} (the bundled Tenzir "
+        "release may have changed: HTTPS hostname checks on to_http/to_splunk/..., "
+        "client-certificate trust of accept_*, the legacy executor is gone; see "
+        "\"Bundled Tenzir node\" in the Upgrade guide), then either copy your version back "
         f"(cp {backup} {host_path}) or keep the shipped one, and re-run. A re-run "
         "with the backup in place continues."
     )
