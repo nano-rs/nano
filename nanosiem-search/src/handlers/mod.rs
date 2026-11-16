@@ -98,7 +98,8 @@ pub use saved_searches::{
     list_saved_searches, list_shared_searches, share_saved_search, update_saved_search,
 };
 pub use search::{
-    cancel_search, explain, fetch_log, field_stats_for_query, field_values, prevalence_artifacts,
+    cancel_search, explain, fetch_log, field_inventory, field_stats_for_query, field_values,
+    prevalence_artifacts,
     search, search_sql,
 };
 pub use background_jobs::{get_search_job_results, submit_search_job};
@@ -129,7 +130,8 @@ pub use otel::{
 };
 pub use search::{
     CancelSearchResponse, ExplainRequest, ExplainResponse, FetchLogRequest, FetchLogResponse,
-    FieldStatsRequest, FieldStatsResponse, FieldValuesRequest, FieldValuesResponse,
+    FieldInventoryRequest, FieldStatsRequest, FieldStatsResponse, FieldValuesRequest,
+    FieldValuesResponse,
 };
 pub use background_jobs::{AcceptAsync, HEADER_ACCEPT_ASYNC, HEADER_SEARCH_JOB, JobResultsQuery};
 pub use search_jobs::{AdminSearchJobsResponse, CancelJobResponse, JobStatusQuery};
@@ -158,6 +160,7 @@ pub enum SearchResultResponse {
         search::fetch_log,
         search::prevalence_artifacts,
         search::field_stats_for_query,
+        search::field_inventory,
         search::field_values,
         saved_searches::list_saved_searches,
         saved_searches::list_shared_searches,
@@ -210,6 +213,10 @@ pub enum SearchResultResponse {
         FieldValuesResponse,
         FieldStatsRequest,
         FieldStatsResponse,
+        FieldInventoryRequest,
+        nanosiem_core::search::service::DynamicFieldInventory,
+        nanosiem_core::search::service::DynamicFieldBucket,
+        nanosiem_core::search::service::InventoryGap,
         HealthResponse,
         ReadyResponse,
         nanosiem_core::search::RetroRequest,

@@ -11,6 +11,9 @@ vi.mock('@/lib/api', () => ({
   api: {
     getExtFieldNames: mocks.ext,
     getExtendedFieldNames: async () => [],
+    // NAN-5485: the panel reads the inventories (names + completeness).
+    getFieldInventory: async (req: { query: string; start: string; end: string; bucket?: string }, signal?: AbortSignal) =>
+      ({ names: req.bucket === 'extended' ? [] : await mocks.ext(req.query, req.start, req.end, signal), partial: false }),
     getSchemaFields: async () => ({ schema: 'udm', fields: [] }),
     sourceScopes: { listRestricted: async () => ({ restricted: [] }) },
   },

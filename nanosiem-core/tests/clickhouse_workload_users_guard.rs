@@ -104,7 +104,7 @@ fn single_node_compose_workload_users() {
     // a package), not a file bind-mounted over a shipped placeholder, which
     // tar's unlink + recreate detaches on every extract (users gone, 516).
     assert!(
-        ch.contains("- ${NANO_CLICKHOUSE_USERS_DIR:-./clickhouse/users.d}:/etc/clickhouse-server/users.d:ro"),
+        ch.contains("source: ${NANO_CLICKHOUSE_USERS_DIR:-./.nano-generated/clickhouse/users.d}\n        target: /etc/clickhouse-server/users.d"),
         "the clickhouse service mounts the rendered users.d"
     );
     assert!(!ch.contains("nanosiem-workload-users.xml"), "no file mount for the workload identities");
@@ -113,13 +113,20 @@ fn single_node_compose_workload_users() {
         !Path::new(&format!("{}/../clickhouse/users.d/nanosiem-workload-users.xml", env!("CARGO_MANIFEST_DIR"))).exists(),
         "no shipped placeholder at a mount target"
     );
-    // Every file bind-mounted INTO users.d targets a file the renderer
-    // creates once and never replaces (NESTED_MOUNT_TARGETS).
-    let renderer = read("scripts/lib/clickhouse_networks.py");
-    for line in ch.lines().filter(|l| l.contains(":/etc/clickhouse-server/users.d/")) {
-        let target = line.rsplit("/users.d/").next().unwrap().trim_end_matches(":ro").trim();
-        assert!(renderer.contains(&format!("\"{target}\"")), "users.d/{target} is mounted but not a NESTED_MOUNT_TARGETS entry");
+    // NAN-5494: nothing is bind-mounted INSIDE users.d or config.d. The
+    // networks / sizing / tiering files are copied into the assembled
+    // directories (scripts/lib/clickhouse_config_dirs.py); a file mounted
+    // over a placeholder detaches when an extract replaces the placeholder.
+    for line in ch.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        assert!(
+            !line.contains(":/etc/clickhouse-server/users.d/") && !line.contains(":/etc/clickhouse-server/config.d/"),
+            "file mounted inside a ClickHouse config directory: {line}"
+        );
     }
+    assert!(
+        ch.contains("source: ${NANO_CLICKHOUSE_CONFIG_DIR:-./.nano-generated/clickhouse/config.d}\n        target: /etc/clickhouse-server/config.d"),
+        "the clickhouse service mounts the assembled config.d"
+    );
     let install = read("install.sh");
     assert!(install.contains("--workload-template clickhouse/workload-users/nanosiem-workload-users.xml"));
     assert!(install.contains("--users-dir-output .nano-generated/clickhouse/users.d"));

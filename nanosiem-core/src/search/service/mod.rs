@@ -71,6 +71,7 @@ mod core_search;
 mod field_queries;
 pub use field_queries::{
     dynamic_field_names_for_predicate, queryable_table_columns, DynamicFieldBucket,
+    DynamicFieldInventory, FieldStatsOutcome, InventoryGap,
 };
 mod funnel_view;
 
@@ -174,19 +175,22 @@ fn determine_display_type(query: &Query) -> DisplayType {
 /// Cancellation must kill the data query plus exactly these ids. They are
 /// always matched EXACTLY (never via `LIKE '{id}%'`) because client-provided
 /// request ids can legitimately contain `%`/`_` LIKE metacharacters.
-pub(crate) fn companion_query_ids(query_id: &str) -> [String; 4] {
+pub(crate) fn companion_query_ids(query_id: &str) -> [String; 6] {
     [
         format!("{query_id}-count"),
         format!("{query_id}-hist"),
         format!("{query_id}-fstats"),
         format!("{query_id}-aggregate-count"),
+        // NAN-5485: the sidebar's field inventories.
+        field_queries::inventory_query_id(query_id, DynamicFieldBucket::Spill),
+        field_queries::inventory_query_id(query_id, DynamicFieldBucket::Extended),
     ]
 }
 
 /// The data query id plus all derived companion ids — the full kill set for
 /// one search request (NAN-1428).
 pub(crate) fn all_query_ids(query_id: &str) -> Vec<String> {
-    let mut ids = Vec::with_capacity(5);
+    let mut ids = Vec::with_capacity(7);
     ids.push(query_id.to_string());
     ids.extend(companion_query_ids(query_id));
     ids
@@ -1398,7 +1402,9 @@ mod tests {
                 "req-1-count".to_string(),
                 "req-1-hist".to_string(),
                 "req-1-fstats".to_string(),
-                "req-1-aggregate-count".to_string()
+                "req-1-aggregate-count".to_string(),
+                "req-1-inv-spill".to_string(),
+                "req-1-inv-extended".to_string()
             ]
         );
         assert_eq!(
@@ -1408,14 +1414,23 @@ mod tests {
                 "req-1-count",
                 "req-1-hist",
                 "req-1-fstats",
-                "req-1-aggregate-count"
+                "req-1-aggregate-count",
+                "req-1-inv-spill",
+                "req-1-inv-extended"
             ]
         );
         // Ids with LIKE metacharacters stay literal — derivation is plain
         // concatenation, matching is exact (never LIKE).
         assert_eq!(
             all_query_ids("a%b_c")[1..],
-            ["a%b_c-count", "a%b_c-hist", "a%b_c-fstats", "a%b_c-aggregate-count"]
+            [
+                "a%b_c-count",
+                "a%b_c-hist",
+                "a%b_c-fstats",
+                "a%b_c-aggregate-count",
+                "a%b_c-inv-spill",
+                "a%b_c-inv-extended"
+            ]
         );
     }
 

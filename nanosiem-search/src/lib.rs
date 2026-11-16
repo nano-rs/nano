@@ -814,6 +814,7 @@ pub fn create_router(
             "/api/search/field-stats",
             post(handlers::field_stats_for_query),
         )
+        .route("/api/search/field-inventory", post(handlers::field_inventory))
         .route("/api/search/field-values", post(handlers::field_values))
         // IOC retro-hunt rollup (NAN-1580): companion to the `/api/search` retro marker
         .route("/api/search/retro", post(handlers::retro))

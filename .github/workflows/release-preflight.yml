@@ -13,6 +13,10 @@ on:
       - "scripts/tests/check-mirror-includes.test.sh"
       # NAN-5440: awk portability across every shipped shell script, under Debian 12's mawk.
       - "scripts/tests/awk-portability.test.sh"
+      # NAN-5495: every interactive install prompt on a real pty, and shellcheck of shipped scripts.
+      - "scripts/tests/install-tty-prompts.test.sh"
+      - "scripts/tests/install_tty_prompts.py"
+      - "config/**"
       - "deploy/helm/nano/**"
       - "deploy/release/**"
       - ".github/workflows/build-and-push.yml"
@@ -58,6 +62,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100
 
+      # NAN-5495: also installs the pinned shellcheck (preflight check 15).
       - name: Install pinned SBOM tools
         run: bash scripts/release/install-sbom-tools.sh "$RUNNER_TEMP/sbom-tools" >> "$GITHUB_PATH"
 

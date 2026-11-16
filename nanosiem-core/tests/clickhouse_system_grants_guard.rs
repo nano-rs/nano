@@ -44,8 +44,9 @@ const RUNTIME_SYSTEM_GRANTS: &[(&str, &[&str])] = &[
     // SIEM Health (storage, ingestion), retention, tiering, disk pressure,
     // shard skew, lookup sizes.
     ("parts", &["bytes_on_disk", "rows", "data_uncompressed_bytes", "partition", "database", "table", "active", "disk_name"]),
-    // Disk pressure (free space, tiering detection).
-    ("disks", &["total_space", "free_space", "type", "name", "object_storage_type"]),
+    // Disk pressure (free space, tiering detection, NAN-5463's physical
+    // sample: keep_free_space), SIEM Health's disk table (path; NAN-5490).
+    ("disks", &["total_space", "free_space", "type", "name", "object_storage_type", "path", "keep_free_space"]),
     // + Settings > Tiering (policy.rs STORAGE_POLICIES_SQL / DISKS_SQL).
     ("storage_policies", &["policy_name", "volume_priority", "disks", "volume_name", "move_factor"]),
     // SIEM Health insert integrity. Never the `query` text.
@@ -227,6 +228,135 @@ fn migration_200_reconciles_sql_created_runtime_users() {
     for (table, cols) in &expected {
         assert!(cols.is_subset(&runtime[table]), "system.{table} delta missing from RUNTIME_SYSTEM_GRANTS");
     }
+}
+
+/// NAN-5490: what migration 203 adds for SQL-created runtime users.
+const MIGRATION_203_DELTA: &[(&str, &[&str])] = &[
+    ("disks", &["path", "keep_free_space", "object_storage_type"]),
+    ("storage_policies", &["volume_name", "move_factor"]),
+];
+
+#[test]
+fn migration_203_reconciles_sql_created_runtime_users() {
+    let sql = read("clickhouse/203_system_disks_cluster_hop_grants.sql");
+    let stmts: Vec<String> = sql
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split(';')
+        .map(|s| s.replace("{grant_on_cluster}", "").split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert!(stmts.iter().all(|s| s.contains("TO {clickhouse_runtime_user}")), "{stmts:#?}");
+    let expected: BTreeMap<String, BTreeSet<String>> = MIGRATION_203_DELTA
+        .iter()
+        .map(|(t, cols)| (t.to_string(), cols.iter().map(|c| c.to_string()).collect()))
+        .collect();
+    assert_eq!(system_grants(&stmts), expected, "migration 203 must grant exactly the NAN-5490 delta");
+    // Together with migration 200, a SQL-created runtime user can read every
+    // column it reads on system.disks except the three pre-NAN-5367 ones.
+    let runtime = expected_runtime();
+    for (table, cols) in &expected {
+        assert!(cols.is_subset(&runtime[table]), "system.{table} delta missing from RUNTIME_SYSTEM_GRANTS");
+    }
+}
+
+/// The largest char boundary of `s` at or below `i` (clamped to `s.len()`).
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// NAN-5490: every column a non-test `system.disks` read names (select list
+/// and WHERE / ORDER BY) is granted to the runtime user. Column grants fail
+/// the whole query, and on a cluster the remote half of an admin
+/// clusterAllReplicas() read runs as the runtime user, so a missing column
+/// there fails only on multi-node installs (SIEM Health's `path` did).
+#[test]
+fn every_system_disks_column_the_code_reads_is_granted() {
+    let granted: BTreeSet<String> = expected_runtime()["disks"].clone();
+    // SQL words, functions and aliases that can appear in these reads.
+    let not_columns: BTreeSet<&str> = [
+        "select", "distinct", "from", "where", "and", "or", "not", "order", "by", "desc", "asc", "limit", "as",
+        "in", "like", "format", "tsv", "tsvraw", "jsoneachrow", "settings", "local", "objectstorage", "default",
+        "backups", "hostname", "tostring", "lower", "round", "greatest", "host", "used_pct", "system", "disks",
+        "clusterallreplicas", "src", "disks_src", "order_by", "string", "disk",
+    ]
+    .into_iter()
+    .collect();
+    let ident = regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap();
+    let quoted = regex::Regex::new(r"'[^']*'|\{[^}]*\}").unwrap();
+    let mut missing = Vec::new();
+    let mut reads = 0;
+    for crate_dir in std::fs::read_dir(repo_root()).unwrap().filter_map(Result::ok) {
+        let name = crate_dir.file_name().to_string_lossy().to_string();
+        if !name.starts_with("nanosiem-") || !crate_dir.path().join("src").is_dir() {
+            continue;
+        }
+        let mut stack = vec![crate_dir.path().join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+                let path = entry.path();
+                let file = path.file_name().unwrap().to_string_lossy().to_string();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file.ends_with(".rs") || file.ends_with("_tests.rs") || file.ends_with("_test.rs") || file == "tests.rs" {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap();
+                let src = src.split("#[cfg(test)]").next().unwrap_or("");
+                // A read: a string holding SELECT ... FROM <disks source>: system.disks
+                // itself, `{}` whose first format argument is the cluster helper,
+                // or `{var}` where `let var = ...` (above, same function) names it.
+                for (at, _) in src.match_indices("SELECT ") {
+                    let stmt_end = src[at..].find('"').map_or(src.len(), |e| at + e);
+                    let stmt = &src[at..stmt_end];
+                    let names_disks = |s: &str| s.contains("all_replicas_system(\"disks\")") || s.contains("system.disks");
+                    let from_disks = if stmt.contains("FROM system.disks") {
+                        true
+                    } else if stmt.contains("FROM {}") {
+                        names_disks(&src[stmt_end..floor_boundary(src, stmt_end + 120)])
+                    } else if let Some(var) = regex::Regex::new(r"FROM \{([a-z_]+)\}").unwrap().captures(stmt) {
+                        let before = &src[floor_boundary(src, at.saturating_sub(1500))..at];
+                        before
+                            .rfind(&format!("let {} =", &var[1]))
+                            .is_some_and(|i| names_disks(&before[i..]))
+                    } else {
+                        false
+                    };
+                    if !from_disks {
+                        continue;
+                    }
+                    reads += 1;
+                    let body = quoted.replace_all(stmt, " ");
+                    for word in ident.find_iter(&body) {
+                        let w = word.as_str();
+                        let lw = w.to_ascii_lowercase();
+                        if not_columns.contains(lw.as_str()) || w.chars().all(|c| c.is_ascii_digit()) {
+                            continue;
+                        }
+                        if !granted.contains(w) {
+                            missing.push(format!("{}: system.disks.{w}", path.strip_prefix(repo_root()).unwrap_or(&path).display()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(reads >= 5, "found only {reads} system.disks reads; the scanner lost them");
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "system.disks columns read by code but not granted to the runtime user (users.d/nanosiem-users.xml + a \
+         migration + RUNTIME_SYSTEM_GRANTS), or not yet listed as a SQL word in this test: {missing:#?}"
+    );
 }
 
 #[test]

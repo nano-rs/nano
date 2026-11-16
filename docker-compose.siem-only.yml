@@ -108,11 +108,28 @@ services:
     image: clickhouse/clickhouse-server:26.10.4.207@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035
     container_name: nano-clickhouse-preflight
     entrypoint: ["/bin/sh", "/preflight/clickhouse-preflight.sh", "/config.d"]
+    environment:
+      # NAN-5494: refuse directories this release did not assemble.
+      NANO_PREFLIGHT_REQUIRE_ASSEMBLED: "1"
     logging: *verbose-logging
     security_opt:
       - no-new-privileges:true
     volumes:
-      - ./clickhouse/config.d:/config.d
+      # NAN-5494: fail closed. Never auto-created (an empty root-owned
+      # directory would block the assembler); the preflight refuses a
+      # config.d / users.d that scripts/lib/clickhouse_config_dirs.py did
+      # not assemble.
+      - type: bind
+        source: ${NANO_CLICKHOUSE_CONFIG_DIR:-./.nano-generated/clickhouse/config.d}
+        target: /config.d
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NANO_CLICKHOUSE_USERS_DIR:-./.nano-generated/clickhouse/users.d}
+        target: /users.d
+        read_only: true
+        bind:
+          create_host_path: false
       - ./clickhouse/preflight:/preflight:ro
     restart: "no"
 
@@ -164,6 +181,10 @@ services:
       NANO_TIERING_SECRET_ACCESS_KEY: ${NANO_TIERING_SECRET_ACCESS_KEY:-}
       NANO_TIERING_AZURE_ACCOUNT_KEY: ${NANO_TIERING_AZURE_ACCOUNT_KEY:-}
       NANO_TIERING_CONFIG_SHA256: ${NANO_TIERING_CONFIG_SHA256:-}
+      # NAN-5494: digest of the assembled config.d + users.d (clickhouse_config_dirs.py
+      # --record-env): changed content changes this service, so `up` recreates
+      # ClickHouse onto the new tree (a running server keeps the retired one).
+      NANO_CLICKHOUSE_CONFIG_SHA256: ${NANO_CLICKHOUSE_CONFIG_SHA256:-}
     # SIEM-only divergence: the ClickHouse HTTP interface is PUBLISHED so an
     # external aggregator (Tenzir/Cribl/forwarder) can INSERT directly into
     # nanosiem.ocsf_logs_raw. The full-stack opensource compose keeps this port
@@ -185,25 +206,32 @@ services:
     #     --users-xml clickhouse/users.d/nanosiem-users.xml \
     #     --output .nano-generated/clickhouse/networks.xml \
     #     --ingest-networks "<aggregator IP or CIDR>"
-    # and set NANO_CLICKHOUSE_NETWORKS_FILE=./.nano-generated/clickhouse/networks.xml
-    # in .env. Widen ONLY behind a firewall / IP-allowlist; never leave :8123
+    # set NANO_CLICKHOUSE_NETWORKS_FILE=./.nano-generated/clickhouse/networks.xml
+    # in .env, assemble the directories ClickHouse mounts (NAN-5494)
+    #   python3 -I scripts/lib/clickhouse_config_dirs.py --root . --record-env
+    # (ClickHouse refuses to start until they are assembled; this is needed
+    # before the FIRST `up` too: docs/getting-started/docker-deployment.md).
+    # Widen ONLY behind a firewall / IP-allowlist; never leave :8123
     # open to the internet.
     ports:
       - "127.0.0.1:8123:8123"
     volumes:
       - nano-clickhouse-data:/var/lib/clickhouse
       - nano-clickhouse-logs:/var/log/clickhouse-server
-      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
-      - ./clickhouse/users.d:/etc/clickhouse-server/users.d:ro
-      - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-config.xml:/etc/clickhouse-server/config.d/zzzz-nano-sizing.xml:ro
-      - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-users.xml:/etc/clickhouse-server/users.d/zzzz-nano-sizing.xml:ro
-      # NAN-5367: per-user <networks> rendered by install.sh (Docker address
-      # pools + the NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS allow-list for
-      # nanosiem_ingest). The checked-in fallback is empty, leaving the
-      # loopback + private-range lists in users.d/nanosiem-users.xml.
-      - ${NANO_CLICKHOUSE_NETWORKS_FILE:-./config/sizing-defaults/clickhouse-networks.xml}:/etc/clickhouse-server/users.d/zzzz-nano-networks.xml:ro
-      # NAN-5445: hot/cold storage tiering (see docker-compose.opensource.yml).
-      - ${NANO_CLICKHOUSE_TIERING_FILE:-./config/sizing-defaults/clickhouse-tiering.xml}:/etc/clickhouse-server/config.d/zzz-nano-tiering.xml:ro
+      # NAN-5494: two directories, nothing mounted inside them (see
+      # docker-compose.opensource.yml and scripts/lib/clickhouse_config_dirs.py).
+      - type: bind
+        source: ${NANO_CLICKHOUSE_CONFIG_DIR:-./.nano-generated/clickhouse/config.d}
+        target: /etc/clickhouse-server/config.d
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NANO_CLICKHOUSE_USERS_DIR:-./.nano-generated/clickhouse/users.d}
+        target: /etc/clickhouse-server/users.d
+        read_only: true
+        bind:
+          create_host_path: false
     ulimits:
       nofile:
         soft: 262144

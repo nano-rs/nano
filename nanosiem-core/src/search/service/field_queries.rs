@@ -38,7 +38,7 @@ impl SearchService {
         priority: super::admission::QueryPriority,
         dataset: Option<&str>,
         scope: &ScopeSet,
-    ) -> Result<Vec<FieldInfo>, SearchError> {
+    ) -> Result<FieldStatsOutcome, SearchError> {
         let derived_qid = request_id.map(|r| format!("{r}-fstats"));
 
         // No controller wired up → no gating, run directly (tests,
@@ -85,6 +85,25 @@ impl SearchService {
             .await
     }
 
+    /// NAN-5485: split the profile's verbatim-original-event column (OCSF
+    /// `raw_data`) out of a field-stats column set. It is counted, not
+    /// aggregated: unique per event, its topK(100) was 100 arbitrary raw events
+    /// and ~80% of the stats query's bytes. The panel still lists it (with its
+    /// count) and loads its values on expand. Every other column is kept: no
+    /// column is ever dropped for being "probably empty".
+    pub(crate) fn split_presence_only_columns(
+        profile: &dyn crate::schema::SchemaProfile,
+        mut columns: Vec<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut presence_only = Vec::new();
+        if profile.id() == crate::schema::SchemaId::Ocsf {
+            if let Some(i) = columns.iter().position(|c| c == "raw_data") {
+                presence_only.push(columns.remove(i));
+            }
+        }
+        (columns, presence_only)
+    }
+
     /// Get field statistics for a query (async, separate from main search)
     ///
     /// This endpoint is designed to be called separately from the main search,
@@ -107,10 +126,10 @@ impl SearchService {
         query_id: Option<&str>,
         dataset: Option<&str>,
         scope: &ScopeSet,
-    ) -> Result<Vec<FieldInfo>, SearchError> {
+    ) -> Result<FieldStatsOutcome, SearchError> {
         // Only supported for ClickHouse backend
         if self.backend != SearchBackend::ClickHouse {
-            return Ok(Vec::new());
+            return Ok(FieldStatsOutcome::default());
         }
 
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
@@ -119,11 +138,17 @@ impl SearchService {
             ))
         })?;
 
+        // NAN-5485: in-query `earliest=` / `latest=` set the window exactly as
+        // they do for the rows search (`parse_query` drops the tokens, so the
+        // stats would otherwise cover the picker's window, not the results').
+        let (query, time_range) = super::apply_query_time_bounds_at(query, time_range, chrono::Utc::now())?;
+        let time_range = &time_range;
+
         // NAN-1799: inject the caller's source-scope exclusion before the
         // parse — the companion aggregates over the base search's WHERE, so
         // an ungated text here would leak denied sources' values into the
         // field panel. Empty deny-set → text unchanged.
-        let query = enforce_source_scope(query, scope.deny_set())?;
+        let query = enforce_source_scope(&query, scope.deny_set())?;
 
         // Parse and validate the query
         let parsed_query = parse_query(&query).map_err(|e| convert_parse_error(e))?;
@@ -212,42 +237,59 @@ impl SearchService {
         // panel is best-effort, so a single bad column must NOT 400 the whole
         // request: drop the offender ClickHouse names and retry, rather than
         // failing every other column's stats. Bounded by the column count.
-        let mut columns = columns;
+        let (mut columns, mut presence_only) = Self::split_presence_only_columns(profile.as_ref(), columns);
+        if columns.is_empty() && presence_only.is_empty() {
+            return Err(SearchError::SqlGenError(
+                "field stats: no column of this dataset can be aggregated".to_string(),
+            ));
+        }
+        let mut dropped_columns = false;
         loop {
-            let field_stats_sql = ClickHouseExecutor::build_field_stats_sql(
+            let field_stats_sql = ClickHouseExecutor::build_field_stats_sql_with_presence(
                 &base_sql,
                 None,
                 &columns,
                 Some(FIELD_STATS_ROW_CAP),
+                &presence_only,
             );
             info!(
                 "Executing async field stats query for {} columns",
                 columns.len()
             );
             match ch_executor
-                .execute_field_stats_query(
+                .execute_field_stats_query_with_presence(
                     &field_stats_sql,
                     &columns,
+                    &presence_only,
                     query_id,
                     self.active_ch_settings.as_ref(),
                 )
                 .await
             {
-                Ok(stats) => {
-                    info!("Async field stats returned {} fields with data", stats.len());
-                    return Ok(stats);
+                Ok((fields, rows)) => {
+                    info!("Async field stats returned {} fields with data", fields.len());
+                    return Ok(FieldStatsOutcome {
+                        fields,
+                        rows_examined: rows,
+                        row_cap: Some(FIELD_STATS_ROW_CAP as u64),
+                        columns_dropped: dropped_columns,
+                    });
                 }
                 Err(SearchError::FieldNotFound { field, .. })
-                    if columns.iter().any(|c| c == &field) =>
+                    if columns.iter().chain(presence_only.iter()).any(|c| c == &field) =>
                 {
+                    presence_only.retain(|c| c != &field);
+                    dropped_columns = true;
                     warn!(
                         "Field-stats: column '{}' not resolvable in the query target \
                          (alias/schema drift); dropping it and retrying",
                         field
                     );
                     columns.retain(|c| c != &field);
-                    if columns.is_empty() {
-                        return Ok(Vec::new());
+                    if columns.is_empty() && presence_only.is_empty() {
+                        return Err(SearchError::SqlGenError(
+                            "field stats: no column of this search could be aggregated".to_string(),
+                        ));
                     }
                 }
                 Err(e) => return Err(e),
@@ -549,8 +591,80 @@ impl SearchService {
         time_range: Option<&TimeRangeInput>,
         scope: &ScopeSet,
     ) -> Result<Vec<String>, SearchError> {
+        Ok(self.get_dynamic_field_inventory(bucket, query, time_range, scope, None).await?.names)
+    }
+
+    /// [`Self::get_dynamic_field_inventory`] for the Search page (NAN-5485):
+    /// admitted in the auxiliary lane like field stats, with that priority's
+    /// ClickHouse settings, under the derived `{request_id}-inv-<bucket>` query
+    /// id so the search's cancel kills it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_dynamic_field_inventory_with_admission(
+        &self,
+        bucket: DynamicFieldBucket,
+        query: Option<&str>,
+        time_range: Option<&TimeRangeInput>,
+        request_id: Option<&str>,
+        user_id: uuid::Uuid,
+        priority: super::admission::QueryPriority,
+        dataset: Option<&str>,
+        scope: &ScopeSet,
+    ) -> Result<DynamicFieldInventory, SearchError> {
+        // The inventory reads the logs table's JSON columns; spans, metrics and
+        // risk searches have no such inventory, and say so rather than list
+        // log keys as their complete field set.
+        if !matches!(dataset.map(str::trim), None | Some("") | Some("logs")) {
+            return Ok(DynamicFieldInventory::partial(Vec::new(), InventoryGap::DatasetNotSupported));
+        }
+        // In-query `earliest=` / `latest=` set the window exactly as they do
+        // for the rows search (`parse_query` drops the tokens).
+        let bounded;
+        let (query, time_range) = match (query, time_range) {
+            (Some(q), Some(tr)) => match super::apply_query_time_bounds_at(q, tr, chrono::Utc::now()) {
+                Ok(b) => {
+                    bounded = b;
+                    (Some(bounded.0.as_str()), Some(&bounded.1))
+                }
+                Err(_) => {
+                    return Ok(DynamicFieldInventory::partial(Vec::new(), InventoryGap::QueryNotScanned))
+                }
+            },
+            other => other,
+        };
+        let derived_qid = request_id.map(|r| inventory_query_id(r, bucket));
+        let Some(controller) = self.admission_controller.clone() else {
+            return self
+                .get_dynamic_field_inventory(bucket, query, time_range, scope, derived_qid.as_deref())
+                .await;
+        };
+        let job_id = uuid::Uuid::now_v7().to_string();
+        let _permit = controller
+            .acquire_in_lane(&job_id, user_id, priority, crate::search::admission::AdmissionLane::Auxiliary)
+            .await
+            .map_err(|e| SearchError::AdmissionDenied(e.to_string()))?;
+        let mut service = self.clone();
+        service.active_ch_settings = Some(service.ch_settings_for_priority(priority));
+        service
+            .get_dynamic_field_inventory(bucket, query, time_range, scope, derived_qid.as_deref())
+            .await
+    }
+
+    /// [`Self::get_dynamic_field_names`] plus whether the list is complete
+    /// (NAN-5485). A search's inventory is read from the rows it MATCHES (so a
+    /// key only the hunted host emits is listed), bounded by a `LIMIT` on that
+    /// matched set; when the bound or the output cap is reached, or a scan
+    /// fails, the inventory says so (`partial`) instead of silently listing
+    /// fewer keys.
+    pub async fn get_dynamic_field_inventory(
+        &self,
+        bucket: DynamicFieldBucket,
+        query: Option<&str>,
+        time_range: Option<&TimeRangeInput>,
+        scope: &ScopeSet,
+        query_id: Option<&str>,
+    ) -> Result<DynamicFieldInventory, SearchError> {
         if self.backend != SearchBackend::ClickHouse {
-            return Ok(Vec::new());
+            return Ok(DynamicFieldInventory::complete(Vec::new()));
         }
 
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
@@ -567,7 +681,7 @@ impl SearchService {
         let table = self.table_names.read(Self::logs_table_key(profile));
         // Profiles without an extended column (UDM) have no Extended bucket.
         if bucket == DynamicFieldBucket::Extended && profile.extended_json_column().is_none() {
-            return Ok(Vec::new());
+            return Ok(DynamicFieldInventory::complete(Vec::new()));
         }
 
         let time_only = |tr: &TimeRangeInput| {
@@ -590,23 +704,38 @@ impl SearchService {
         // (which would re-list the cross-source-type keys this fix removes); a query
         // that already ran for the search will parse + generate here too.
         let extended = bucket == DynamicFieldBucket::Extended;
+        let query = query.map(str::trim).filter(|q| !q.is_empty());
+        // NAN-5485: a search's own inventory reads its matched rows (bounded
+        // below); only the context-free fallbacks clamp the Extended window,
+        // and say so through `partial`.
         let clamped;
         let time_range = match time_range {
-            Some(tr) if extended => {
+            Some(tr) if extended && query.is_none() => {
                 clamped = clamp_extended_scan_range(tr);
                 Some(&clamped)
             }
             other => other,
         };
-        let where_predicate = match (query.map(str::trim).filter(|q| !q.is_empty()), time_range) {
+        let matched_rows = query.is_some() && time_range.is_some();
+        // Rows a subsearch adds (`append` / `join`) are not the base search's
+        // matches: their keys are not scanned, and the list says so.
+        let mut subsearch_rows = false;
+        // Fields a pipeline creates (`eval`, `rex`, …) live in its output, not
+        // in the stored JSON columns this inventory reads.
+        let mut derived_fields = false;
+        let where_predicate = match (query, time_range) {
             (Some(q), Some(tr)) => {
                 let Ok(parsed) = parse_query(q) else {
-                    return Ok(Vec::new());
+                    return Ok(DynamicFieldInventory::partial(Vec::new(), InventoryGap::QueryNotScanned));
                 };
+                subsearch_rows = adds_subsearch_rows(&parsed);
+                derived_fields = creates_fields(&parsed);
                 match extract_base_search(&parsed) {
                     Query::Search(expr) => match self.ch_sql_generator.generate_search_expr(&expr) {
                         Ok(filter) => format!("{} AND ({})", time_only(tr), filter),
-                        Err(_) => return Ok(Vec::new()),
+                        Err(_) => {
+                            return Ok(DynamicFieldInventory::partial(Vec::new(), InventoryGap::QueryNotScanned))
+                        }
                     },
                     // extract_base_search always yields Query::Search; defensively
                     // fall back to the window scope rather than erroring.
@@ -644,7 +773,25 @@ impl SearchService {
                 None => where_predicate,
             };
 
-        enumerate_dynamic_field_names(ch_executor, profile, &table, bucket, &where_predicate).await
+        if !matched_rows {
+            // The context-free fallbacks read a per-source slice
+            // (`LIMIT n BY source_type`) of a window, clamped for Extended:
+            // never a complete inventory.
+            let names =
+                enumerate_dynamic_field_names(ch_executor, profile, &table, bucket, &where_predicate).await?;
+            return Ok(DynamicFieldInventory::partial(names, InventoryGap::SampledFallback));
+        }
+        let mut inventory = enumerate_matched_field_names(
+            ch_executor,
+            profile,
+            &table,
+            bucket,
+            &where_predicate,
+            query_id,
+            self.active_ch_settings.as_ref(),
+        )
+        .await?;
+        Ok(mark_pipeline_gaps(inventory, subsearch_rows, derived_fields))
     }
 
     /// Get top values for any field the active search profile can resolve.
@@ -829,6 +976,234 @@ fn clamp_extended_scan_range(tr: &TimeRangeInput) -> TimeRangeInput {
     let floor = tr.end
         - chrono::Duration::minutes(SearchService::EXTENDED_FIELD_NAMES_WINDOW_MINUTES);
     TimeRangeInput::new(tr.start.max(floor), tr.end)
+}
+
+/// Matched rows one search's Spill inventory reads (NAN-5485): a plain
+/// `LIMIT` on the MATCHED set, so a selective hunt reads every row it matched
+/// (a key only the hunted host emits is always listed) and a broad one stops
+/// early. Reaching it marks the inventory partial.
+pub(crate) const SPILL_INVENTORY_MATCHED_ROWS: u64 = 100_000;
+
+/// The Extended inventory re-casts the whole OCSF `event` per row: a smaller
+/// matched-row bound (NAN-5485), same partial flag.
+pub(crate) const EXTENDED_INVENTORY_MATCHED_ROWS: u64 = 10_000;
+
+/// Field stats and the rows they were computed over (NAN-5485). The stats
+/// aggregate at most `row_cap` matched rows, taken in primary-key order: when
+/// `rows_examined` reaches it they are a head sample of the matches (on a
+/// multi-source query a whole source can be absent), and the panel says so.
+#[derive(Debug, Clone, Default)]
+pub struct FieldStatsOutcome {
+    pub fields: Vec<FieldInfo>,
+    pub rows_examined: Option<u64>,
+    pub row_cap: Option<u64>,
+    /// Columns ClickHouse could not resolve for this search were left out.
+    pub columns_dropped: bool,
+}
+
+impl FieldStatsOutcome {
+    /// The stats did not see every matched row.
+    pub fn sampled(&self) -> bool {
+        matches!((self.rows_examined, self.row_cap), (Some(n), Some(cap)) if n >= cap)
+    }
+
+    /// Why the stats may be missing fields or values (NAN-5485), if they may.
+    pub fn partial_reason(&self) -> Option<&'static str> {
+        if self.sampled() {
+            Some("row_cap")
+        } else if self.columns_dropped {
+            Some("columns_dropped")
+        } else {
+            None
+        }
+    }
+}
+
+/// Rows a sparse predicate may scan to find its matched rows before the
+/// inventory gives up (`throw`, reported as [`InventoryGap::ScanFailed`]).
+/// `NANO_FIELD_INVENTORY_MAX_ROWS_TO_READ` overrides it.
+pub(crate) fn inventory_max_rows_to_read() -> u64 {
+    std::env::var("NANO_FIELD_INVENTORY_MAX_ROWS_TO_READ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(50_000_000)
+}
+
+/// The ClickHouse query id of one inventory scan for search `request_id`
+/// (a companion id the search's cancel kills, NAN-5485).
+pub(crate) fn inventory_query_id(request_id: &str, bucket: DynamicFieldBucket) -> String {
+    match bucket {
+        DynamicFieldBucket::Spill => format!("{request_id}-inv-spill"),
+        DynamicFieldBucket::Extended => format!("{request_id}-inv-extended"),
+    }
+}
+
+/// Why an on-demand inventory may be missing names (NAN-5485).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryGap {
+    /// The matched-row bound was reached; other matched rows were not read.
+    RowLimit,
+    /// More names than the list holds.
+    OutputCap,
+    /// The scan failed (timeout, read cap, cancel): nothing could be listed.
+    ScanFailed,
+    /// The query could not be parsed or generated, so it was not scanned.
+    QueryNotScanned,
+    /// `append` / `join` rows come from a subsearch the inventory does not read.
+    SubsearchRowsNotScanned,
+    /// No query: a per-source slice of a recent window, not a full list.
+    SampledFallback,
+    /// The pipeline creates fields (`eval`, `rex`, `spath`, `lookup`, …) that
+    /// are not stored, so they are not in this list.
+    DerivedFieldsNotListed,
+    /// The search's dataset (spans, metrics, risk) has no such inventory.
+    DatasetNotSupported,
+}
+
+/// One on-demand field inventory and whether it is complete (NAN-5485).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct DynamicFieldInventory {
+    /// Field names (bare spill keys, or dotted Extended paths).
+    pub names: Vec<String>,
+    /// The list may be missing names; `reason` says why.
+    pub partial: bool,
+    /// Why the list is partial.
+    pub reason: Option<InventoryGap>,
+    /// Matched rows the inventory read (when it read the search's matches),
+    /// also when those rows carry no keys.
+    pub rows_examined: Option<u64>,
+    /// The matched-row bound that applied.
+    pub row_limit: Option<u64>,
+}
+
+impl DynamicFieldInventory {
+    fn complete(names: Vec<String>) -> Self {
+        Self { names, partial: false, reason: None, rows_examined: None, row_limit: None }
+    }
+
+    fn partial(names: Vec<String>, reason: InventoryGap) -> Self {
+        Self { names, partial: true, reason: Some(reason), rows_examined: None, row_limit: None }
+    }
+}
+
+/// A complete inventory of a pipeline that adds subsearch rows or creates
+/// fields becomes partial, with the first applicable reason; a list already
+/// partial keeps its own (more specific) reason.
+fn mark_pipeline_gaps(
+    mut inventory: DynamicFieldInventory,
+    subsearch_rows: bool,
+    derived_fields: bool,
+) -> DynamicFieldInventory {
+    if inventory.partial {
+        return inventory;
+    }
+    let reason = if subsearch_rows {
+        Some(InventoryGap::SubsearchRowsNotScanned)
+    } else if derived_fields {
+        Some(InventoryGap::DerivedFieldsNotListed)
+    } else {
+        None
+    };
+    if reason.is_some() {
+        inventory.partial = true;
+        inventory.reason = reason;
+    }
+    inventory
+}
+
+/// Whether a parsed search's pipeline creates fields that are not stored
+/// columns or JSON keys.
+fn creates_fields(query: &Query) -> bool {
+    use crate::query::Command as C;
+    match query {
+        Query::Search(_) => false,
+        Query::Piped { source, command } => {
+            matches!(
+                command,
+                C::Eval { .. }
+                    | C::Rex { .. }
+                    | C::Spath { .. }
+                    | C::Lookup { .. }
+                    | C::InputLookup { .. }
+                    | C::Rename { .. }
+            ) || creates_fields(source)
+        }
+    }
+}
+
+/// Whether a parsed search adds rows from a subsearch (`append` / `join`).
+fn adds_subsearch_rows(query: &Query) -> bool {
+    match query {
+        Query::Search(_) => false,
+        Query::Piped { source, command } => {
+            matches!(command, crate::query::Command::Append { .. } | crate::query::Command::Join { .. })
+                || adds_subsearch_rows(source)
+        }
+    }
+}
+
+/// The inventory of a search's matched rows (see [`DynamicFieldInventory`]).
+/// A failed scan is a partial (empty) inventory, never an error or a silently
+/// complete list: the panel labels the section instead of dropping it.
+async fn enumerate_matched_field_names(
+    ch_executor: &crate::search::execution::ClickHouseExecutor,
+    profile: &dyn crate::schema::SchemaProfile,
+    table: &str,
+    bucket: DynamicFieldBucket,
+    where_predicate: &str,
+    query_id: Option<&str>,
+    settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
+) -> Result<DynamicFieldInventory, SearchError> {
+    let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+    let extended = bucket == DynamicFieldBucket::Extended;
+    let (json_col, row_limit) = match bucket {
+        DynamicFieldBucket::Spill => (profile.json_tail_column(), SPILL_INVENTORY_MATCHED_ROWS),
+        DynamicFieldBucket::Extended => match profile.extended_json_column() {
+            Some(col) => (col, EXTENDED_INVENTORY_MATCHED_ROWS),
+            None => return Ok(DynamicFieldInventory::complete(Vec::new())),
+        },
+    };
+    let scan = ch_executor
+        .get_matched_field_names(
+            table,
+            json_col,
+            is_ocsf,
+            extended,
+            where_predicate,
+            row_limit,
+            inventory_max_rows_to_read(),
+            query_id,
+            settings,
+        )
+        .await;
+    let (names, rows_examined, output_capped) = match scan {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(error = %e, ?bucket, "field inventory scan failed; reporting it partial");
+            let mut inventory = DynamicFieldInventory::partial(Vec::new(), InventoryGap::ScanFailed);
+            inventory.row_limit = Some(row_limit);
+            return Ok(inventory);
+        }
+    };
+    let names = if extended { filter_extended_names(profile, json_col, names) } else { names };
+    let output_capped = output_capped
+        || names.len() >= crate::search::execution::clickhouse_executor::EXT_FIELD_NAMES_OUTPUT_LIMIT;
+    let reason = if rows_examined >= row_limit {
+        Some(InventoryGap::RowLimit)
+    } else if output_capped {
+        Some(InventoryGap::OutputCap)
+    } else {
+        None
+    };
+    Ok(DynamicFieldInventory {
+        partial: reason.is_some(),
+        reason,
+        names,
+        rows_examined: Some(rows_examined),
+        row_limit: Some(row_limit),
+    })
 }
 
 /// Run one dynamic-field inventory scan (the fields panel's on-demand

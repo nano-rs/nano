@@ -213,7 +213,23 @@ EOF
 }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "$1 is required ($2)"; }
-dc() { "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" "$@"; }
+# NAN-5494: ClickHouse mounts the assembled .nano-generated/clickhouse/
+# {config.d,users.d} and refuses to start without them (fail closed). Assemble
+# them (idempotent; an unchanged tree is left alone, a changed one is swapped
+# in beside the running server's) before every Compose call that can create
+# a container, so no `nano` command starts ClickHouse on a missing or
+# pre-release tree. Single host only; role-split hosts render theirs.
+ensure_clickhouse_config_dirs() {
+    [[ "$TOPOLOGY_MODE" == single ]] && ((!LEGACY_LAYOUT)) || return 0
+    local assembler="$INSTALL_DIR/scripts/lib/clickhouse_config_dirs.py"
+    [[ -f "$assembler" && -d "$INSTALL_DIR/clickhouse/config.d" ]] || return 0
+    python3 -I "$assembler" --root "$INSTALL_DIR" --env-file "$INSTALL_DIR/.env" --record-env </dev/null >/dev/null \
+        || "${1:-die}" "could not assemble ClickHouse's config.d / users.d (above); ClickHouse was not started"
+}
+dc() {
+    case "${1:-}" in up|create|run) ensure_clickhouse_config_dirs ;; esac
+    "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" "$@"
+}
 has_role() { [[ ",$ROLE_LIST," == *",$1,"* ]]; }
 
 compose_command_text() {
@@ -2381,7 +2397,7 @@ for k in ("CLICKHOUSE_SEARCH_PASSWORD","CLICKHOUSE_DICT_PASSWORD"):
 # NAN-5472: the cluster secret and its mode are cluster state the restored
 # .env must not drop (a pre-2.0.28 backup lacks them): every peer keeps
 # sending hops with the installed secret.
-for k in ("NANO_CLICKHOUSE_USERS_DIR","NANO_CLICKHOUSE_CLUSTER_SECRET","NANO_CLICKHOUSE_CLUSTER_AUTH","NANO_CLICKHOUSE_CLUSTER_AUTH_INITIAL"):
+for k in ("NANO_CLICKHOUSE_USERS_DIR","NANO_CLICKHOUSE_CONFIG_DIR","NANO_CLICKHOUSE_CONFIG_SHA256","NANO_CLICKHOUSE_CLUSTER_SECRET","NANO_CLICKHOUSE_CLUSTER_AUTH","NANO_CLICKHOUSE_CLUSTER_AUTH_INITIAL"):
  if k not in b and k in c:b[k]=c[k]
 seen=set();lines=[]
 for line in bl:
@@ -2427,14 +2443,13 @@ refresh_clickhouse_workload_users() {
         --ingest-networks "$(env_value .env NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS)" \
         --from-docker -- --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" </dev/null >/dev/null) \
         || post_cutover_fail "could not re-render the ClickHouse users from the restored .env"
-    [[ "$before" == "$dir" ]] && return 0
-    python3 -I - "$INSTALL_DIR/.env" "NANO_CLICKHOUSE_USERS_DIR=$dir" <<'PY'
-import os,sys,tempfile
-path,item=sys.argv[1:];key=item.split("=",1)[0]
-lines=[l for l in open(path,encoding="utf-8").read().splitlines() if not l.startswith(key+"=")]+[item]
-fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path));os.write(fd,("\n".join(lines)+"\n").encode());os.close(fd)
-os.chmod(tmp,0o600);os.replace(tmp,path)
-PY
+    # NAN-5494: ClickHouse mounts the assembled config.d / users.d (shipped
+    # files + sizing, tiering, allow-list and workload users copied in), and
+    # their digest in .env recreates it when they changed.
+    local digest_before
+    digest_before="$(env_value "$INSTALL_DIR/.env" NANO_CLICKHOUSE_CONFIG_SHA256)"
+    ensure_clickhouse_config_dirs post_cutover_fail
+    [[ "$before" == "$dir" && "$digest_before" == "$(env_value "$INSTALL_DIR/.env" NANO_CLICKHOUSE_CONFIG_SHA256)" ]] && return 0
     return 1
 }
 

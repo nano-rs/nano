@@ -976,7 +976,7 @@ pub async fn field_stats_for_query(
     // NAN-1427: admission-gated, with the derived companion query_id and
     // per-priority CH settings. `columns` (when sent by the UI) reduces the
     // stat'd column set to what the field panel actually renders.
-    let fields = state
+    let outcome = state
         .search
         .get_field_stats_with_admission(
             &query,
@@ -989,11 +989,19 @@ pub async fn field_stats_for_query(
             &scope,
         )
         .await?;
+    let sampled = outcome.sampled();
+    let partial_reason = outcome.partial_reason().map(str::to_string);
+    let fields = outcome.fields;
     let total_events = fields.iter().map(|f| f.count).max().unwrap_or(0);
 
     let response = FieldStatsResponse {
         fields,
         total_events,
+        rows_examined: outcome.rows_examined,
+        row_cap: outcome.row_cap,
+        sampled,
+        partial: partial_reason.is_some(),
+        partial_reason,
     };
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
@@ -1220,6 +1228,94 @@ pub struct FieldStatsResponse {
     pub fields: Vec<nanosiem_core::search::FieldInfo>,
     /// Total number of events in the time range
     pub total_events: u64,
+    /// NAN-5485: matched rows the stats were computed over.
+    #[serde(default)]
+    pub rows_examined: Option<u64>,
+    /// NAN-5485: the most matched rows the stats aggregate (primary-key order).
+    #[serde(default)]
+    pub row_cap: Option<u64>,
+    /// NAN-5485: the stats did not see every matched row (`rows_examined`
+    /// reached `row_cap`): a head sample in primary-key order, in which a
+    /// whole source of a multi-source search can be absent. The panel says so.
+    #[serde(default)]
+    pub sampled: bool,
+    /// NAN-5485: the stats may be missing fields or values; `partial_reason`
+    /// says why (`row_cap`: a head sample, see `sampled`; `columns_dropped`:
+    /// columns ClickHouse could not resolve for this search were left out).
+    #[serde(default)]
+    pub partial: bool,
+    #[serde(default)]
+    pub partial_reason: Option<String>,
+}
+
+/// Request for the fields panel's on-demand inventory (NAN-5485).
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
+pub struct FieldInventoryRequest {
+    /// The piped query string (its base search scopes the scan).
+    pub query: String,
+    /// Start of time range
+    pub start: chrono::DateTime<chrono::Utc>,
+    /// End of time range
+    pub end: chrono::DateTime<chrono::Utc>,
+    /// `spill` (default): bare keys of the JSON spill (UDM `ext`, OCSF
+    /// `unmapped`). `extended`: dotted OCSF attributes stored in `event`.
+    #[serde(default)]
+    pub bucket: Option<nanosiem_core::search::service::DynamicFieldBucket>,
+    /// Client request id of the originating search: the scan runs under
+    /// `{request_id}-inv-<bucket>`, so `DELETE /api/search/{request_id}`
+    /// cancels it with the search.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// The search's dataset (`logs` default). Spans, metrics and risk have no
+    /// on-demand JSON inventory: the response is partial, `dataset_not_supported`.
+    #[serde(default)]
+    pub dataset: Option<String>,
+}
+
+/// The fields panel's on-demand field inventory and whether it is complete
+/// (NAN-5485). Reads the rows the search MATCHES (up to a bound), admitted in
+/// the auxiliary lane like field stats and cancelled with the search; a scan
+/// that cannot list everything says so (`partial` + `reason`) instead of
+/// silently returning fewer names.
+#[utoipa::path(
+    post,
+    path = "/api/search/field-inventory",
+    tag = "search",
+    request_body = FieldInventoryRequest,
+    security(("bearer_auth" = []), ("api_key" = [])),
+    responses(
+        (status = 200, description = "Field names and whether the list is complete", body = nanosiem_core::search::service::DynamicFieldInventory),
+        (status = 400, description = "Query error", body = ErrorResponse),
+        (status = 401, description = "Unauthorized"),
+    )
+)]
+pub async fn field_inventory(
+    State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
+    Json(request): Json<FieldInventoryRequest>,
+) -> Result<Json<nanosiem_core::search::service::DynamicFieldInventory>, SearchError> {
+    use nanosiem_core::search::QueryPriority;
+    require_search_execute(&auth)?;
+    let scope = effective_scope(&auth);
+    if let Some(rid) = request.request_id.clone() {
+        // NAN-2100: reserve under the CREDENTIAL (see `reserve_query_owner`).
+        reserve_query_owner(&state, rid, auth.credential_principal_id()).await?;
+    }
+    let time_range = TimeRangeInput { start: request.start, end: request.end };
+    let inventory = state
+        .search
+        .get_dynamic_field_inventory_with_admission(
+            request.bucket.unwrap_or_default(),
+            Some(request.query.as_str()),
+            Some(&time_range),
+            request.request_id.as_deref(),
+            super::admission_user(&auth)?,
+            QueryPriority::Interactive,
+            request.dataset.as_deref(),
+            &scope,
+        )
+        .await?;
+    Ok(Json(inventory))
 }
 
 // NAN-2030: the `require_search_execute` gate + its under-scoped-key regression

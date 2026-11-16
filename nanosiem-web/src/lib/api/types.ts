@@ -746,6 +746,16 @@ export interface FieldStatsRequest {
 export interface FieldStatsResponse {
   fields: FieldInfo[];
   total_events: number;
+  /** NAN-5485: matched rows the stats were computed over. */
+  rows_examined?: number | null;
+  /** NAN-5485: the most matched rows the stats aggregate (primary-key order). */
+  row_cap?: number | null;
+  /** NAN-5485: the stats did not see every matched row: a head sample. */
+  sampled?: boolean;
+  /** NAN-5485: the stats may be missing fields or values. */
+  partial?: boolean;
+  /** `row_cap` (a head sample) or `columns_dropped` (unresolvable columns left out). */
+  partial_reason?: string | null;
 }
 
 // On-demand field values (Kibana-style, loaded when user expands a field)

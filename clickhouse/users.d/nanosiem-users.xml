@@ -172,6 +172,12 @@
              and /stats returned 500 (497) since v2.0.27. -->
         <query>GRANT SELECT(volume_name, move_factor) ON system.storage_policies</query>
         <query>GRANT SELECT(object_storage_type) ON system.disks</query>
+        <!-- NAN-5490: SIEM Health's disk table (health/disk_monitor.rs,
+             `path`) and disk pressure's physical-filesystem sample
+             (settings/disk_pressure.rs, `keep_free_space`). On a cluster both
+             run as clusterAllReplicas() from the admin identity, and a
+             staged-auth hop logs in to the other replica as this user. -->
+        <query>GRANT SELECT(path, keep_free_space) ON system.disks</query>
         <!-- Search cancel: KILL QUERY ON CLUSTER (every clustered install)
              needs KILL QUERY ON *.* even for the caller's own queries (497
              otherwise; cancels ran to max_execution_time). The app kills only

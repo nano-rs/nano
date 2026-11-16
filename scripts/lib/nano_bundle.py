@@ -967,6 +967,81 @@ def _image_repository(ref: str) -> str:
     return f"{head}/{repository}" if head else repository
 
 
+# NAN-5487: an image bundle names nano's first-party images after the lock it
+# was built from (the release workflow uses images.enterprise.lock, nano's own
+# repository), while a registry install's Compose asks for its own
+# NANO_IMAGE_PREFIX (the customer repository). `load` retags the signed,
+# digest-verified images to the install's prefix; preflight reports the mapping
+# (and refuses a bundle it cannot map) before anything changes.
+# A slash-less prefix (a Docker Hub library-style name such as ``nanosiem``) is
+# a plain repository too; a registry port needs a repository path after it.
+_IMAGE_PREFIX_RE = re.compile(
+    r"^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]{1,5})?/)?"
+    r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*(?:/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)*$"
+)
+DEFAULT_IMAGE_PREFIX = "ghcr.io/nano-rs/nano"
+
+
+def _prefix_for_validation(image_prefix: str) -> str:
+    """``Registry.Corp.local/sec/nano`` -> ``registry.corp.local/sec/nano``.
+
+    Registry host names are case-insensitive (Docker accepts upper case there),
+    but repository paths must be lower case. Only a first component that is a
+    registry host by Docker's rule (it holds ``.`` or ``:`` or is ``localhost``,
+    and a repository path follows) is lowercased; the rest is checked as given.
+    """
+    host, slash, rest = image_prefix.partition("/")
+    if slash and ("." in host or ":" in host or host.lower() == "localhost"):
+        return f"{host.lower()}/{rest}"
+    return image_prefix
+
+
+def bundle_image_prefix(manifest: dict[str, Any]) -> str | None:
+    """The repository prefix of the bundle's first-party images (``<prefix>-api``)."""
+    prefixes = {
+        _image_repository(str(image.get("ref", "")))[: -len("-api")]
+        for image in manifest.get("images", [])
+        if isinstance(image, dict)
+        and image.get("name") == "api"
+        and _image_repository(str(image.get("ref", ""))).endswith("-api")
+    }
+    return next(iter(prefixes)) if len(prefixes) == 1 else None
+
+
+def install_image_retags(
+    manifest: dict[str, Any], image_prefix: str | None,
+) -> list[tuple[str, str]]:
+    """(bundle ref, install ref) for each first-party image the install names differently.
+
+    Empty when the bundle already uses ``image_prefix`` (or none is given).
+    Third-party images (``nginx:alpine``, ``ghcr.io/nano-rs/vector``, ...) keep
+    their names: Compose asks for them exactly as the lock spells them.
+    """
+    if not image_prefix:
+        return []
+    source = bundle_image_prefix(manifest)
+    # The bundle's own names need no retag, whatever their spelling: compared
+    # before the syntax check so an identical prefix always passes.
+    if source is not None and source == image_prefix:
+        return []
+    if not _IMAGE_PREFIX_RE.fullmatch(_prefix_for_validation(image_prefix)):
+        raise BundleError(
+            f"NANO_IMAGE_PREFIX {image_prefix!r} is not a plain image repository prefix"
+        )
+    if source is None:
+        raise BundleError(
+            "the bundle carries no single first-party api image, so its image names "
+            f"cannot be matched to this install's NANO_IMAGE_PREFIX {image_prefix}"
+        )
+    pairs: list[tuple[str, str]] = []
+    for image in manifest["images"]:
+        ref = str(image["ref"])
+        repository = _image_repository(ref)
+        if repository.startswith(f"{source}-"):
+            pairs.append((ref, f"{image_prefix}{repository[len(source):]}{ref[len(repository):]}"))
+    return pairs
+
+
 def load_registry_images(
     verified: VerifiedBundle,
     *,
@@ -1212,6 +1287,7 @@ def load_bundle(
     selected = [
         image for image in verified.manifest["images"] if _selected_image(image["name"], chosen_roles)
     ]
+    retags = dict(install_image_retags(verified.manifest, image_prefix))
     loaded: list[str] = []
     scratch_parent = Path(os.environ.get("NANO_BUNDLE_TMPDIR", Path.cwd()))
     scratch_parent.mkdir(parents=True, exist_ok=True)
@@ -1250,6 +1326,17 @@ def load_bundle(
             tagged_id, _ = _docker_identity(docker, image["ref"])
             if tagged_id != image_id:
                 raise BundleError(f"loaded image {image['ref']} changed while it was tagged")
+            install_ref = retags.get(image["ref"])
+            if install_ref is not None:
+                # NAN-5487: the same signed image under the name this
+                # install's Compose asks for (its NANO_IMAGE_PREFIX).
+                _run(
+                    [*docker, "tag", image_id, install_ref],
+                    error=f"cannot tag loaded image {install_ref}",
+                )
+                install_id, _ = _docker_identity(docker, install_ref)
+                if install_id != image_id:
+                    raise BundleError(f"loaded image {install_ref} changed while it was tagged")
             _run(
                 [*docker, "image", "rm", image["archive_ref"]],
                 error=f"cannot remove isolated image tag {image['archive_ref']}",
@@ -1938,7 +2025,11 @@ def _parser() -> argparse.ArgumentParser:
         help="verify, then load (image bundle) or pull (compose package) the host-role image subset",
     )
     load.add_argument("file")
-    load.add_argument("--image-prefix")
+    load.add_argument(
+        "--image-prefix",
+        help="the install's NANO_IMAGE_PREFIX: selects a compose package's image lock, "
+        "or names an image bundle's first-party images for this install",
+    )
     path = commands.add_parser(
         "upgrade-path",
         help="refuse an upgrade that would skip a required stop (install.sh re-runs)",

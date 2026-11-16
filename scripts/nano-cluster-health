@@ -601,6 +601,42 @@ def data_disk(run=None, fstab_path: str | None = None, ismount=None, unit_mounts
             "(see the install guide's data-disk step)")
 
 
+# --- the ingest host's edge ----------------------------------------------------
+INGEST_CLOSED_MARKER = "/run/nano-ingest/closed"
+INGEST_CLOSED_STALE_SECONDS = 15 * 60
+
+
+def ingest_edge(run=docker) -> None:
+    """NAN-5488: `nano upgrade` closes the edge (503 to every ingest route) while
+    Vector drains, for seconds to a few minutes. A marker left behind by an
+    interrupted upgrade keeps refusing senders until removed or restarted."""
+    name = service_container("ingest-edge", run)
+    if not name:
+        row("ingest-edge", False, "no running ingest-edge container: senders cannot reach this host")
+        return
+    code, out = run(["exec", name, "sh", "-c",
+                     f'test -e {INGEST_CLOSED_MARKER} && echo $(( $(date +%s) - $(stat -c %Y {INGEST_CLOSED_MARKER}) ))'])
+    if code != 0:
+        row("ingest-edge", True, "open to new events")
+        return
+    try:
+        age = int(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        age = -1
+    reopen = f"docker exec {name} rm -f {INGEST_CLOSED_MARKER}"
+    if 0 <= age < INGEST_CLOSED_STALE_SECONDS:
+        row("ingest-edge", None, (
+            f"closed to new events (503) for {age}s: nano upgrade is draining this host. If no "
+            f"upgrade is running, reopen it: {reopen}"
+        ))
+    else:
+        how_long = f"for {age // 60} min" if age >= 0 else "for an unknown time"
+        row("ingest-edge", False, (
+            f"!!! CLOSED to new events (503) {how_long}, longer than any upgrade window: an "
+            f"interrupted upgrade left it closed and every sender is refused. Reopen it now: {reopen}"
+        ))
+
+
 def main(argv: list[str] | None = None, run=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--install-dir", default="~/nano")
@@ -626,6 +662,8 @@ def main(argv: list[str] | None = None, run=None) -> int:
         gateways(role, run)
         if "app" in roles:
             internal_edge(role, tls, run)
+        if "ingest" in roles:
+            ingest_edge(run)
         if "postgres" in roles:
             postgres_ha(role, run)
     verdict = "FAIL" if FAILS else ("INCONCLUSIVE" if INCONCLUSIVE else "PASS")

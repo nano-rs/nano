@@ -47,6 +47,20 @@ case "$ARCH" in
         ;;
 esac
 
+# ---- 1b. Assembled configuration (NAN-5494, single host) --------------------
+# ClickHouse must only ever start on the config.d / users.d trees that
+# scripts/lib/clickhouse_config_dirs.py assembled (they carry the rendered
+# network allow-list and sizing). Anything else, e.g. an extracted package not
+# yet upgraded, or a v2.0.28 users.d that still holds the empty networks
+# placeholder, would start ClickHouse with every nano user open to all private
+# ranges. Refuse instead.
+if [ "${NANO_PREFLIGHT_REQUIRE_ASSEMBLED:-0}" = 1 ]; then
+    for dir in "$CONFIG_DIR" "${PREFLIGHT_USERS_DIR:-/users.d}"; do
+        [ -f "$dir/.nano-assembled" ] || die "$dir was not assembled by this release's installer, so ClickHouse would start without nano's network allow-list and sizing. Run scripts/nano upgrade (or re-run install.sh), or assemble it: python3 -I scripts/lib/clickhouse_config_dirs.py --root . --record-env, then start again. See docs/getting-started/docker-deployment.md."
+    done
+    echo "clickhouse-preflight: assembled config.d and users.d present"
+fi
+
 # ---- 2. Obsolete s3-disk elements -------------------------------------------
 [ -d "$CONFIG_DIR" ] || die "config dir $CONFIG_DIR does not exist"
 

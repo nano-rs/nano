@@ -168,11 +168,29 @@ services:
     image: clickhouse/clickhouse-server:26.10.4.207@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035
     container_name: nano-clickhouse-preflight
     entrypoint: ["/bin/sh", "/preflight/clickhouse-preflight.sh", "/config.d"]
+    environment:
+      # NAN-5494: refuse directories this release did not assemble.
+      NANO_PREFLIGHT_REQUIRE_ASSEMBLED: "1"
     logging: *verbose-logging
     security_opt:
       - no-new-privileges:true
     volumes:
-      - ./clickhouse/config.d:/config.d
+      # NAN-5494: the same config.d the server mounts (see below).
+      # NAN-5494: fail closed. Never auto-created (an empty root-owned
+      # directory would block the assembler); the preflight refuses a
+      # config.d / users.d that scripts/lib/clickhouse_config_dirs.py did
+      # not assemble.
+      - type: bind
+        source: ${NANO_CLICKHOUSE_CONFIG_DIR:-./.nano-generated/clickhouse/config.d}
+        target: /config.d
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NANO_CLICKHOUSE_USERS_DIR:-./.nano-generated/clickhouse/users.d}
+        target: /users.d
+        read_only: true
+        bind:
+          create_host_path: false
       - ./clickhouse/preflight:/preflight:ro
     restart: "no"
 
@@ -237,35 +255,39 @@ services:
       NANO_TIERING_SECRET_ACCESS_KEY: ${NANO_TIERING_SECRET_ACCESS_KEY:-}
       NANO_TIERING_AZURE_ACCOUNT_KEY: ${NANO_TIERING_AZURE_ACCOUNT_KEY:-}
       NANO_TIERING_CONFIG_SHA256: ${NANO_TIERING_CONFIG_SHA256:-}
+      # NAN-5494: digest of the assembled config.d + users.d (clickhouse_config_dirs.py
+      # --record-env): changed content changes this service, so `up` recreates
+      # ClickHouse onto the new tree (a running server keeps the retired one).
+      NANO_CLICKHOUSE_CONFIG_SHA256: ${NANO_CLICKHOUSE_CONFIG_SHA256:-}
     volumes:
       - nano-clickhouse-data:/var/lib/clickhouse
       - nano-clickhouse-logs:/var/log/clickhouse-server
-      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
-      # NAN-5470: install.sh / `nano upgrade` render the users.d ClickHouse
-      # runs (the shipped clickhouse/users.d plus the workload identities
-      # nanosiem_search / nanosiem_dict with password_sha256_hex from .env,
-      # scripts/lib/clickhouse_networks.py --users-dir-output) under
-      # .nano-generated/, which no installer package contains: extracting a
-      # package never changes the users ClickHouse runs (a file mounted over a
-      # shipped placeholder is detached when tar recreates it). Nothing in this
-      # container's environment is needed. Without the rendered directory
-      # (manual compose) the shipped users.d applies, with no workload users.
-      - ${NANO_CLICKHOUSE_USERS_DIR:-./clickhouse/users.d}:/etc/clickhouse-server/users.d:ro
-      # NAN-4997 installer-generated, later-loading host sizing. The checked-in
-      # fallback files are empty, preserving manual compose on older installs.
-      - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-config.xml:/etc/clickhouse-server/config.d/zzzz-nano-sizing.xml:ro
-      - ${NANO_SIZING_DIR:-./config/sizing-defaults}/clickhouse-users.xml:/etc/clickhouse-server/users.d/zzzz-nano-sizing.xml:ro
-      # NAN-5367: per-user <networks> rendered by install.sh (Docker address
-      # pools + the NANO_CLICKHOUSE_INGEST_ALLOWED_NETWORKS allow-list for
-      # nanosiem_ingest). The checked-in fallback is empty, leaving the
-      # loopback + private-range lists in users.d/nanosiem-users.xml.
-      - ${NANO_CLICKHOUSE_NETWORKS_FILE:-./config/sizing-defaults/clickhouse-networks.xml}:/etc/clickhouse-server/users.d/zzzz-nano-networks.xml:ro
-      # NAN-5445: hot/cold storage tiering (policy nano_tiered) rendered by
-      # scripts/lib/clickhouse_tiering.py from the NANO_TIERING* keys in .env.
-      # The checked-in fallback is an empty <clickhouse/>; Docker needs the
-      # matching placeholder clickhouse/config.d/zzz-nano-tiering.xml as the
-      # bind target inside the read-only config.d mount.
-      - ${NANO_CLICKHOUSE_TIERING_FILE:-./config/sizing-defaults/clickhouse-tiering.xml}:/etc/clickhouse-server/config.d/zzz-nano-tiering.xml:ro
+      # NAN-5494: ClickHouse mounts two DIRECTORIES and nothing inside them.
+      # install.sh / `nano upgrade` assemble both under .nano-generated/,
+      # which no installer package contains (scripts/lib/
+      # clickhouse_config_dirs.py): the shipped clickhouse/config.d and
+      # clickhouse/users.d plus, copied in as plain files, the host sizing
+      # (NAN-4997), the storage tiering policy (NAN-5445), the per-user
+      # <networks> allow-list (NAN-5367) and the workload identities
+      # (NAN-5470). Up to v2.0.28 the rendered files were bind-mounted one by
+      # one over placeholders the package shipped; extracting a package
+      # replaced the placeholders, which detached those mounts, and ClickHouse
+      # reloaded the empty placeholders (every user widened to all private
+      # ranges, sizing reverted). Without the rendered directories (manual
+      # compose) the shipped ones apply: loopback + private-range networks,
+      # default sizing, no tiering, no workload users.
+      - type: bind
+        source: ${NANO_CLICKHOUSE_CONFIG_DIR:-./.nano-generated/clickhouse/config.d}
+        target: /etc/clickhouse-server/config.d
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NANO_CLICKHOUSE_USERS_DIR:-./.nano-generated/clickhouse/users.d}
+        target: /etc/clickhouse-server/users.d
+        read_only: true
+        bind:
+          create_host_path: false
     ulimits:
       nofile:
         soft: 262144
@@ -593,6 +615,9 @@ services:
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
+    # NAN-5488: room for Vector's SIGTERM drain (sources close, in-flight
+    # events reach the disk buffer) before Docker's SIGKILL; the default is 10s.
+    stop_grace_period: 60s
     logging: *verbose-logging
     security_opt:
       - no-new-privileges:true

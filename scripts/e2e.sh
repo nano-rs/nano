@@ -296,16 +296,20 @@ initialize_e2e_clickhouse_config() {
     [[ ! -e "$target/config.d" && ! -e "$target/users.d" ]] \
         || die "ClickHouse config is already initialized in $target"
     mkdir -p "$target"
-    cp -R "$ROOT/clickhouse/config.d" "$target/config.d"
-    cp -R "$ROOT/clickhouse/users.d" "$target/users.d"
     # NAN-5367: the same per-user <networks> install.sh renders (loopback +
     # this Docker daemon's address pools), so every run proves the shipped
     # restriction rather than the private-range fallback.
     python3 -I "$ROOT/scripts/lib/clickhouse_networks.py" \
-        --users-xml "$target/users.d/nanosiem-users.xml" \
-        --output "$target/users.d/zzzz-nano-networks.xml" \
+        --users-xml "$ROOT/clickhouse/users.d/nanosiem-users.xml" \
+        --output "$target/networks.xml" \
         --docker-pools-json "$(docker info --format '{{json .DefaultAddressPools}}' 2>/dev/null || true)" \
         >/dev/null || die "could not render the ClickHouse network allow-list"
+    # NAN-5494: assembled exactly as install.sh assembles them (shipped files
+    # + the allow-list copied in, the stamp the preflight requires).
+    printf 'NANO_CLICKHOUSE_NETWORKS_FILE=%s\n' "$target/networks.xml" > "$target/assemble.env"
+    python3 -I "$ROOT/scripts/lib/clickhouse_config_dirs.py" --root "$ROOT" --env-file "$target/assemble.env" \
+        --config-output "$target/config.d" --users-output "$target/users.d" >/dev/null \
+        || die "could not assemble the ClickHouse config.d / users.d"
 }
 
 # NAN-5470: the workload identities, rendered exactly as install.sh renders

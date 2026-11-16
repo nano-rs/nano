@@ -915,8 +915,9 @@ mod tests {
         // NAN-5443 adds the shared /api/settings/inputlookup-allowed-domains
         // (GET/PUT, one template) to both editions: 701 / 425.
         // NAN-5450 adds GET /api/system/disk-alert to both editions: 702 / 421.
+        // NAN-5485 adds nano-search's POST /api/search/field-inventory: 703 / 422.
         #[cfg(feature = "enterprise")]
-        let min_paths = 702;
+        let min_paths = 703;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
@@ -927,8 +928,8 @@ mod tests {
         // GETs: 423. NAN-5285's install-lease template: 424. NAN-5443's
         // lookup URL allowlist template: 425. NAN-5445 moves the five
         // storage-tiering paths to enterprise: 420.
-        // NAN-5450's disk-alert: 421.
-        let min_paths = 421;
+        // NAN-5450's disk-alert: 421. NAN-5485's field inventory: 422.
+        let min_paths = 422;
 
         assert!(
             path_count >= min_paths,

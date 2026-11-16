@@ -144,6 +144,46 @@ fn build_ext_field_names_sql(
     )
 }
 
+/// NAN-5485: the dynamic field names of the rows `where_predicate` MATCHES,
+/// at most `row_limit` of them (a plain `LIMIT`: the read stops once that many
+/// matched rows are found). ONE row comes back whatever was found: `n` (matched
+/// rows read, also when they carry no keys), `total` (distinct names before
+/// the output cap) and `names` (sorted, capped). Same name forms and Extended
+/// re-cast as [`build_ext_field_names_sql`]; single WHERE. `max_rows_to_read`
+/// (`throw`) bounds what a sparse predicate may scan to find its matches.
+fn build_matched_field_names_sql(
+    table: &str,
+    json_col: &str,
+    nested: bool,
+    extended: bool,
+    where_predicate: &str,
+    row_limit: u64,
+    max_rows_to_read: u64,
+) -> String {
+    let name_expr = if nested { "p" } else { "splitByChar('.', p)[1]" };
+    let paths_input = if extended {
+        format!("CAST({json_col}, 'JSON')")
+    } else {
+        json_col.to_string()
+    };
+    let output_limit = matched_output_limit(extended);
+    format!(
+        "SELECT n, length(all_names) AS total, arraySlice(all_names, 1, {output_limit}) AS names \
+         FROM ( \
+             SELECT n, arraySort(arrayDistinct(arrayFilter(x -> x != '', arrayMap(p -> {name_expr}, paths)))) AS all_names \
+             FROM ( \
+                 SELECT distinctJSONPaths({paths_input}) AS paths, count() AS n \
+                 FROM ( SELECT {json_col} FROM {table} WHERE {where_predicate} LIMIT {row_limit} ) \
+             ) \
+         ) \
+         SETTINGS max_execution_time = 10, max_rows_to_read = {max_rows_to_read}, read_overflow_mode = 'throw'"
+    )
+}
+
+fn matched_output_limit(extended: bool) -> usize {
+    if extended { EXTENDED_FIELD_NAMES_SQL_LIMIT } else { EXT_FIELD_NAMES_OUTPUT_LIMIT }
+}
+
 /// Names returned by one ext-field-names inventory (the `LIMIT` of the spill
 /// scan, and the cap the service applies to the filtered Extended list).
 pub(crate) const EXT_FIELD_NAMES_OUTPUT_LIMIT: usize = 512;
@@ -195,6 +235,15 @@ fn field_stats_quote_ident(name: &str) -> String {
 /// keeping the UDM field-stats SQL and its JSON result keys byte-identical.
 fn field_stats_alias(name: &str) -> String {
     name.replace('.', "_")
+}
+
+/// The SELECT list of a field-stats query (NAN-5485): the aggregates plus
+/// `count() as __rows`, the rows the stats were computed over. It is never
+/// empty (valid SQL with no column), and against the row cap it tells the
+/// caller the stats are a head sample of the matched rows.
+fn non_empty_select(mut parts: Vec<String>) -> String {
+    parts.push("count() as __rows".to_string());
+    parts.join(",\n  ")
 }
 
 impl ClickHouseExecutor {
@@ -362,11 +411,30 @@ impl ClickHouseExecutor {
     /// (LIMIT doesn't truncate), so the common tight-window case stays EXACT;
     /// only large windows become an approximate (PK-order) sample. `None` keeps
     /// the legacy unbounded form (used by tests and any caller that wants exact).
+    #[cfg(test)]
     pub fn build_field_stats_sql(
         base_sql: &str,
         sample_rate: Option<f64>,
         fields: &[String],
         row_cap: Option<usize>,
+    ) -> String {
+        Self::build_field_stats_sql_with_presence(base_sql, sample_rate, fields, row_cap, &[])
+    }
+
+    /// [`Self::build_field_stats_sql`] plus PRESENCE-ONLY columns (NAN-5485):
+    /// String columns counted through their `.size` subcolumn (the offsets,
+    /// never the bytes) instead of topK/uniq. For the OCSF `raw_data` (the
+    /// verbatim original event, unique per row) the aggregates read ~80% of
+    /// the stats query's bytes to produce 100 arbitrary raw events as "top
+    /// values"; its presence count is enough to list it, and expanding it in
+    /// the panel fetches its values on demand. Only the row-capped
+    /// single-table form reads subcolumns; elsewhere they are left out.
+    pub fn build_field_stats_sql_with_presence(
+        base_sql: &str,
+        sample_rate: Option<f64>,
+        fields: &[String],
+        row_cap: Option<usize>,
+        presence_only: &[String],
     ) -> String {
         // NAN-2010 (F26/F27): ASCII-fold (length-preserving) so byte offsets
         // found here stay valid for slicing `base_sql`. `to_uppercase()` is NOT
@@ -397,7 +465,20 @@ impl ClickHouseExecutor {
             select_parts.push(format!("topK(100)(toString({col})) as {alias}_top"));
             select_parts.push(format!("uniq({col}) as {alias}_cardinality"));
         }
-        let select_clause = select_parts.join(",\n  ");
+        // NAN-5485: presence-only columns over a wrapped scope (CTE pipeline or
+        // no row cap) count non-empty values; the row-capped single-table form
+        // below reads only the `.size` subcolumn instead.
+        let wrapped_clause = {
+            let mut parts = select_parts.clone();
+            parts.extend(presence_only.iter().map(|col| {
+                format!(
+                    "countIf(notEmpty(toString({}))) as {}_present",
+                    field_stats_quote_ident(col),
+                    field_stats_alias(col)
+                )
+            }));
+            non_empty_select(parts)
+        };
 
         // Multi-CTE / piped queries (`WITH stage_0 AS (…) … SELECT … FROM stage_N`,
         // e.g. sequence/funnel/stats) cannot be sliced by the first FROM/WHERE —
@@ -414,9 +495,9 @@ impl ClickHouseExecutor {
             return match row_cap {
                 Some(n) => format!(
                     "SELECT\n  {}\nFROM (\nSELECT * FROM (\n{}\n) LIMIT {}\n)",
-                    select_clause, inner, n
+                    wrapped_clause, inner, n
                 ),
-                None => format!("SELECT\n  {}\nFROM (\n{}\n)", select_clause, inner),
+                None => format!("SELECT\n  {}\nFROM (\n{}\n)", wrapped_clause, inner),
             };
         }
 
@@ -462,19 +543,33 @@ impl ClickHouseExecutor {
             // outer `toString(...)`/`uniq(...)` bind to the subquery output.
             // SAMPLE is mutually exclusive with the LIMIT bound, so it's dropped.
             Some(n) => {
-                let proj = fields
+                let mut proj = fields
                     .iter()
                     .map(|f| field_stats_quote_ident(f))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                    .collect::<Vec<_>>();
+                let mut parts = select_parts;
+                for (i, col) in presence_only.iter().enumerate() {
+                    proj.push(format!("{}.size AS __present_{i}", field_stats_quote_ident(col)));
+                    parts.push(format!(
+                        "countIf(__present_{i} > 0) as {}_present",
+                        field_stats_alias(col)
+                    ));
+                }
+                if proj.is_empty() {
+                    proj.push("1 AS __row".to_string());
+                }
                 format!(
                     "SELECT\n  {}\nFROM (\nSELECT {}\n{}{}\nLIMIT {}\n)",
-                    select_clause, proj, table_clause, conditions_part, n
+                    non_empty_select(parts),
+                    proj.join(", "),
+                    table_clause,
+                    conditions_part,
+                    n
                 )
             }
             None => format!(
                 "SELECT\n  {}\n{}{}{}",
-                select_clause, table_clause, sample_clause, conditions_part
+                wrapped_clause, table_clause, sample_clause, conditions_part
             ),
         }
     }
@@ -487,13 +582,20 @@ impl ClickHouseExecutor {
     /// `settings` the resolved per-priority `ClickHouseQuerySettings` so the
     /// heaviest companion is bounded by admission limits, not just the CH
     /// profile. Both are optional and change no result rows.
-    pub async fn execute_field_stats_query(
+    ///
+    /// NAN-5485: for SQL built by [`Self::build_field_stats_sql_with_presence`],
+    /// each present `presence_only` column comes back with its row count and
+    /// no preview values (the panel loads them when the field is expanded).
+    ///
+    /// Returns the fields and the rows they were computed over (`__rows`).
+    pub async fn execute_field_stats_query_with_presence(
         &self,
         sql: &str,
         field_names: &[String],
+        presence_only: &[String],
         query_id: Option<&str>,
         settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
-    ) -> Result<Vec<FieldInfo>, SearchError> {
+    ) -> Result<(Vec<FieldInfo>, Option<u64>), SearchError> {
         info!(
             "Executing field stats query for {} fields (query_id={:?})",
             field_names.len(),
@@ -540,9 +642,11 @@ impl ClickHouseExecutor {
         debug!("Field stats response length: {} bytes", response_str.len());
 
         // Log response for debugging if empty or small
+        // NAN-5485: an aggregate always returns one row; no row is a failure
+        // the panel must label, not "no fields".
         if response_str.is_empty() {
             warn!("Field stats query returned empty response");
-            return Ok(Vec::new());
+            return Err(SearchError::ParseError("field stats: empty ClickHouse response".to_string()));
         }
         if response_str.len() < 100 {
             debug!("Field stats response (small): {}", response_str);
@@ -562,9 +666,12 @@ impl ClickHouseExecutor {
                         &response_str
                     }
                 );
-                return Ok(Vec::new());
+                return Err(SearchError::ParseError(format!("field stats: unreadable response: {e}")));
             }
         };
+        let rows = row
+            .get("__rows")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
 
         let mut fields = Vec::new();
 
@@ -640,10 +747,28 @@ impl ClickHouseExecutor {
             });
         }
 
+        for field_name in presence_only {
+            let key = format!("{}_present", field_stats_alias(field_name));
+            let present = row
+                .get(&key)
+                .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(0);
+            if present > 0 {
+                fields.push(FieldInfo {
+                    name: field_name.to_string(),
+                    field_type: "string".to_string(),
+                    count: present,
+                    top_values: Vec::new(),
+                    // Not aggregated: its distinct count is unknown.
+                    cardinality: None,
+                });
+            }
+        }
+
         // Sort by total count descending (most common fields first)
         fields.sort_by(|a, b| b.count.cmp(&a.count));
 
-        Ok(fields)
+        Ok((fields, rows))
     }
 
     /// Get distinct ext field names that exist in the JSON tail column, scoped by
@@ -660,13 +785,70 @@ impl ClickHouseExecutor {
         where_predicate: &str,
     ) -> Result<Vec<String>, SearchError> {
         let sql = build_ext_field_names_sql(table, json_col, nested, extended, where_predicate);
-
         debug!("Querying ext field names: {}", sql);
+        self.fetch_names(&sql).await
+    }
 
-        let escaped_sql = escape_question_marks_in_strings(&sql);
-        let mut cursor = self
-            .client
-            .query(&escaped_sql)
+    /// NAN-5485: the inventory of a search's matched rows: `(names, matched
+    /// rows read, output cap reached)`. See [`build_matched_field_names_sql`].
+    /// Runs under `query_id` so the search's cancel kills it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_matched_field_names(
+        &self,
+        table: &str,
+        json_col: &str,
+        nested: bool,
+        extended: bool,
+        where_predicate: &str,
+        row_limit: u64,
+        max_rows_to_read: u64,
+        query_id: Option<&str>,
+        settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
+    ) -> Result<(Vec<String>, u64, bool), SearchError> {
+        let sql = build_matched_field_names_sql(
+            table, json_col, nested, extended, where_predicate, row_limit, max_rows_to_read,
+        );
+        debug!("Querying matched-row field names: {}", sql);
+        let rows = self.fetch_json_rows_with(&sql, query_id, settings).await?;
+        let row = rows.first();
+        let num = |key: &str| {
+            row.and_then(|r| r.get(key))
+                .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(0)
+        };
+        let names: Vec<String> = row
+            .and_then(|r| r.get("names"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let capped = num("total") > names.len() as u64;
+        Ok((names, num("n"), capped))
+    }
+
+    /// The `name` column of every row `sql` returns (1 MiB response cap).
+    pub async fn fetch_names(&self, sql: &str) -> Result<Vec<String>, SearchError> {
+        Ok(self
+            .fetch_json_rows(sql)
+            .await?
+            .iter()
+            .filter_map(|v| v.get("name")?.as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// Every JSONEachRow row `sql` returns (1 MiB response cap: an error, not
+    /// a silent truncation, NAN-5485).
+    async fn fetch_json_rows(&self, sql: &str) -> Result<Vec<serde_json::Value>, SearchError> {
+        self.fetch_json_rows_with(sql, None, None).await
+    }
+
+    async fn fetch_json_rows_with(
+        &self,
+        sql: &str,
+        query_id: Option<&str>,
+        settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
+    ) -> Result<Vec<serde_json::Value>, SearchError> {
+        let escaped_sql = escape_question_marks_in_strings(sql);
+        let mut cursor = super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
             .fetch_bytes("JSONEachRow")
             .map_err(|e| crate::search::search_error_from_error(&e))?;
 
@@ -675,7 +857,10 @@ impl ClickHouseExecutor {
             match cursor.next().await {
                 Ok(Some(chunk)) => {
                     if response_bytes.len() + chunk.len() > 1024 * 1024 {
-                        break; // 1MB safety limit
+                        return Err(SearchError::ResponseTooLarge(
+                            response_bytes.len() + chunk.len(),
+                            1024 * 1024,
+                        ));
                     }
                     response_bytes.extend_from_slice(&chunk);
                 }
@@ -695,17 +880,10 @@ impl ClickHouseExecutor {
 
         let response_str = crate::db::clickhouse_transport::decode_response_text(response_bytes, "field_stats");
 
-        let names: Vec<String> = response_str
+        Ok(response_str
             .lines()
-            .filter_map(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
-            })
-            .collect();
-
-        debug!("Found {} ext field names", names.len());
-        Ok(names)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect())
     }
 
     /// Build a simple SQL query to get top values for a SINGLE field.
@@ -1060,13 +1238,16 @@ mod tests {
         ];
         let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, None);
 
+        // NAN-5485: unchanged identifiers; the row count is appended so the
+        // caller can tell a capped sample from complete stats.
         let expected = "SELECT\n  \
             topK(100)(toString(user)) as user_top,\n  \
             uniq(user) as user_cardinality,\n  \
             topK(100)(toString(src_ip)) as src_ip_top,\n  \
             uniq(src_ip) as src_ip_cardinality,\n  \
             topK(100)(toString(action)) as action_top,\n  \
-            uniq(action) as action_cardinality\n \
+            uniq(action) as action_cardinality,\n  \
+            count() as __rows\n \
             FROM nanosiem.logs\n \
             WHERE timestamp >= now()";
         assert_eq!(sql, expected, "UDM field-stats SQL drifted:\n{sql}");
@@ -1248,5 +1429,69 @@ mod tests {
             field_stats_quote_ident("src_endpoint.ip"),
             "\"src_endpoint.ip\""
         );
+    }
+
+    // ---- NAN-5485 -------------------------------------------------------
+
+    #[test]
+    fn matched_inventory_reads_the_matched_rows_with_a_plain_limit() {
+        let pred = "timestamp BETWEEN 'a' AND 'b' AND (\"device.hostname\" = 'ws-1')";
+        let sql = build_matched_field_names_sql("ocsf_logs", "unmapped", true, false, pred, 100_000, 50_000_000);
+        // The search's own predicate, one WHERE, no PREWHERE.
+        assert!(sql.contains(&format!("FROM ocsf_logs WHERE {pred} LIMIT 100000 )")), "{sql}");
+        assert!(!sql.contains("PREWHERE"), "{sql}");
+        // A plain LIMIT (stops the read), not LIMIT BY (NAN-2174).
+        assert!(!sql.contains(" BY source_type"), "{sql}");
+        // One row whatever was found: the matched-row count survives a scan
+        // whose rows carry no keys (no arrayJoin to empty it).
+        assert!(sql.contains("count() AS n"), "{sql}");
+        assert!(!sql.contains("arrayJoin"), "{sql}");
+        assert!(sql.contains("length(all_names) AS total"), "{sql}");
+        assert!(sql.contains("arraySlice(all_names, 1, 512) AS names"), "{sql}");
+        assert!(sql.contains("distinctJSONPaths(unmapped)"), "{sql}");
+        // A read cap that THROWS (reported partial), never one that silently breaks.
+        assert!(sql.contains("max_rows_to_read = 50000000, read_overflow_mode = 'throw'"), "{sql}");
+        assert!(!sql.contains("'break'"), "{sql}");
+        let ext = build_matched_field_names_sql("ocsf_logs", "event", true, true, pred, 10_000, 7);
+        assert!(ext.contains("distinctJSONPaths(CAST(event, 'JSON'))"), "{ext}");
+        assert!(ext.contains("LIMIT 10000 )"), "{ext}");
+        assert!(ext.contains("arraySlice(all_names, 1, 4096)"), "{ext}");
+        // UDM's flat ext collapses to the top-level key.
+        let udm = build_matched_field_names_sql("logs", "ext", false, false, pred, 100_000, 7);
+        assert!(udm.contains("splitByChar('.', p)[1]"), "{udm}");
+    }
+
+    #[test]
+    fn raw_data_is_counted_on_every_stats_path() {
+        let cols = vec!["\"device.hostname\"".trim_matches('"').to_string()];
+        let presence = vec!["raw_data".to_string()];
+        let simple = "SELECT * FROM ocsf_logs WHERE timestamp >= 'a' AND x = 1 ORDER BY timestamp DESC";
+        // Row-capped single table: the offsets subcolumn only.
+        let capped = ClickHouseExecutor::build_field_stats_sql_with_presence(simple, None, &cols, Some(100), &presence);
+        assert!(capped.contains("raw_data.size AS __present_0"), "{capped}");
+        assert!(capped.contains("countIf(__present_0 > 0) as raw_data_present"), "{capped}");
+        assert!(!capped.contains("topK(100)(toString(raw_data))"), "{capped}");
+        // CTE pipeline (eval / where stages): counted over the wrapped rows.
+        let cte = "WITH stage_0 AS (SELECT * FROM ocsf_logs WHERE x = 1) SELECT * FROM stage_0";
+        let wrapped = ClickHouseExecutor::build_field_stats_sql_with_presence(cte, None, &cols, Some(100), &presence);
+        assert!(wrapped.contains("countIf(notEmpty(toString(raw_data))) as raw_data_present"), "{wrapped}");
+        // No row cap.
+        let uncapped = ClickHouseExecutor::build_field_stats_sql_with_presence(simple, None, &cols, None, &presence);
+        assert!(uncapped.contains("countIf(notEmpty(toString(raw_data))) as raw_data_present"), "{uncapped}");
+    }
+
+    #[test]
+    fn a_stats_query_with_no_columns_is_still_valid_sql() {
+        let simple = "SELECT * FROM ocsf_logs WHERE x = 1";
+        let cte = "WITH stage_0 AS (SELECT * FROM ocsf_logs) SELECT * FROM stage_0";
+        for sql in [
+            ClickHouseExecutor::build_field_stats_sql_with_presence(simple, None, &[], Some(100), &[]),
+            ClickHouseExecutor::build_field_stats_sql_with_presence(simple, None, &[], None, &[]),
+            ClickHouseExecutor::build_field_stats_sql_with_presence(cte, None, &[], Some(100), &[]),
+        ] {
+            assert!(!sql.contains("SELECT\n  \nFROM"), "{sql}");
+            assert!(!sql.contains("SELECT \n"), "{sql}");
+            assert!(sql.starts_with("SELECT\n  count() as __rows") || sql.contains("SELECT\n  count() as __rows"), "{sql}");
+        }
     }
 }

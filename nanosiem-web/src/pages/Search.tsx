@@ -135,7 +135,7 @@ import { useHereCardOverride } from '@/contexts/PageContext';
 import { isPageInStoredRange, jobFailureCode, jobPollPolicy, nextContinuationPage, pageableRowCount } from '@/lib/search-job';
 import type { SearchJobSummary } from '@/lib/api';
 import { registerDynamicFields } from '@/components/editor';
-import { spillFieldName } from '@/components/search/field-buckets';
+import { spillFieldName, type FieldStatsGap } from '@/components/search/field-buckets';
 import { SearchDemoHint } from '@/components/DemoHints';
 import { SearchStatsBar } from '@/components/search/SearchStatsBar';
 import { AddToDashboardDialog } from '@/components/dashboard';
@@ -245,6 +245,8 @@ interface CachedSearchResult {
   // Whether serverFieldStats were computed over a reduced column set (so restore
   // can re-offer "Show all fields" / NAN-1503 auto-fetch). Null until stats land.
   fieldStatsReduced: boolean | null;
+  // NAN-5485: how the cached server stats fall short (sampled/partial).
+  fieldStatsGap?: FieldStatsGap | null;
   totalCount: number;
   executionTimeMs: number | null;
   timing?: SearchTimingBreakdown | null;
@@ -259,6 +261,13 @@ interface CachedSearchResult {
 }
 
 const searchResultCache = new Map<string, CachedSearchResult>();
+
+/** NAN-5485: how a field-stats response falls short, or null when complete. */
+function fieldStatsGapOf(resp: { sampled?: boolean; rows_examined?: number | null; partial?: boolean; partial_reason?: string | null }): FieldStatsGap | null {
+  if (resp.sampled) return { sampledFromRows: resp.rows_examined ?? null, partialReason: 'row_cap' };
+  if (resp.partial) return { partialReason: resp.partial_reason ?? 'partial' };
+  return null;
+}
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 function buildCacheKey(
@@ -727,6 +736,8 @@ export function Search() {
   // NAN-1427: whether the current server field stats were computed over the
   // reduced (visible + pinned) column set — gates "Index all fields".
   const [fieldStatsReduced, setFieldStatsReduced] = useState(false);
+  // NAN-5485: how the server field stats fall short (sampled, failed, partial).
+  const [fieldStatsGap, setFieldStatsGap] = useState<FieldStatsGap | null>(null);
   // Parameters of the last field-stats fetch, for the "Index all fields" refetch.
   const lastFieldStatsRequestRef = useRef<{ query: string; start: string; end: string; request_id?: string; dataset?: import('@/lib/api/types').SearchDataset } | null>(null);
 
@@ -1033,6 +1044,7 @@ export function Search() {
         if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
           setServerFieldStats(fieldStatsResponse.fields);
           setFieldStatsReduced(false);
+          setFieldStatsGap(fieldStatsGapOf(fieldStatsResponse));
         }
       })
       .catch(err => {
@@ -1058,17 +1070,26 @@ export function Search() {
         if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
           setServerFieldStats(fieldStatsResponse.fields);
           setFieldStatsReduced(!fsSmall);
+          const gap = fieldStatsGapOf(fieldStatsResponse);
+          setFieldStatsGap(gap);
           // NAN-1509: persist field stats + reduced flag to the cache entry
           // so a cached restore keeps the teaser/auto-fetch behavior.
+          // NAN-5485: and how they fall short, so back-navigation says so too.
           const cached = cacheKey ? searchResultCache.get(cacheKey) : undefined;
           if (cached) {
             cached.serverFieldStats = fieldStatsResponse.fields;
             cached.fieldStatsReduced = !fsSmall;
+            cached.fieldStatsGap = gap;
           }
         }
       })
-      // Field stats are non-critical: the panel keeps its client-side stats.
-      .catch(err => console.warn('Failed to fetch field stats:', err));
+      // Field stats are non-critical, but never silently replaced: the panel
+      // keeps its client-side stats of the loaded rows and says so (NAN-5485).
+      .catch(err => {
+        if ((err as Error)?.name === 'AbortError') return;
+        console.warn('Failed to fetch field stats:', err);
+        setFieldStatsGap({ unavailable: true });
+      });
   }, [fetchFieldStats]);
   const { data: savedSearches, refetch: refetchSaved } = useSavedSearches();
   const { data: sharedSearches } = useSharedSearches();
@@ -2001,7 +2022,7 @@ export function Search() {
       tailEpochRef.current += 1;
       tailSearchRanAtRef.current = Date.now();
       setServerFieldStats(null);
-      setFieldStatsReduced(false);
+      setFieldStatsReduced(false); setFieldStatsGap(null);
       setPeakRowsScanned(0);
       // The timeline belongs to the exact query + window. A different search
       // starts from an empty chart so it never shows the previous search's
@@ -2269,7 +2290,7 @@ export function Search() {
       } else if (!append) {
         // For aggregate queries or SQL mode, we compute field stats client-side
         setServerFieldStats(null);
-        setFieldStatsReduced(false);
+        setFieldStatsReduced(false); setFieldStatsGap(null);
       }
 
       // Capture search in notebook (if active)
@@ -3189,7 +3210,7 @@ export function Search() {
     setTablePage(0); // Reset pagination
     setSearchResults([]); // Clear current results
     setServerFieldStats(null); // Clear server field stats
-    setFieldStatsReduced(false);
+    setFieldStatsReduced(false); setFieldStatsGap(null);
 
     // Use a ref to track the new query and trigger search
     setTimeout(() => {
@@ -3527,8 +3548,14 @@ export function Search() {
           }))
         };
       // Fields whose every value is empty are noise, and internal helper
-      // columns aren't schema fields — don't surface either.
-      }).filter(stat => stat.count > 0 && stat.topValues.length > 0 && !isInternalHelperField(stat.field));
+      // columns aren't schema fields — don't surface either. NAN-5485: a field
+      // the server sent with no preview values at all (OCSF `raw_data`, the
+      // verbatim event: counted, not aggregated) is present; expanding it
+      // loads its values on demand.
+      }).filter((stat, i) =>
+        stat.count > 0
+        && (stat.topValues.length > 0 || serverFieldStats[i].top_values.length === 0)
+        && !isInternalHelperField(stat.field));
     }
 
     // Fall back to client-side calculation (for aggregate queries or when server stats unavailable)
@@ -3896,6 +3923,7 @@ export function Search() {
           // NAN-1503 auto-fetch (was hardcoded false → cached broad searches lost
           // the affordance). Null (stats never landed) → not reduced.
           setFieldStatsReduced(cached.fieldStatsReduced ?? false);
+          setFieldStatsGap(cached.fieldStatsGap ?? null);
           setTotalCount(cached.totalCount);
           setExecutionTimeMs(cached.executionTimeMs);
           setSearchTiming(cached.timing ?? null);
@@ -3931,7 +3959,7 @@ export function Search() {
         setSearchResults([]);
         setHistogramData([]);
         setServerFieldStats(null);
-        setFieldStatsReduced(false);
+        setFieldStatsReduced(false); setFieldStatsGap(null);
         setTotalCount(0);
         setPeakRowsScanned(0);
         setExecutionTimeMs(null);
@@ -5129,6 +5157,9 @@ export function Search() {
                         fetchSearchFieldValues({ field, query: q, start, end, limit: 100, dataset: lastFieldStatsRequestRef.current?.dataset ?? dataset })
                       }
                       isReducedFieldSet={fieldStatsReduced}
+                      statsGap={fieldStatsGap}
+                      dataset={dataset}
+                      requestId={lastFieldStatsRequestRef.current?.request_id}
                       onLoadAllFields={loadAllFieldStats}
                     />
                   </div>
@@ -5237,6 +5268,9 @@ export function Search() {
             isLoading={fieldStatsLoading && fieldStats.length === 0}
             isLoadingMore={fieldStatsLoading && fieldStats.length > 0}
             isReducedFieldSet={fieldStatsReduced}
+                      statsGap={fieldStatsGap}
+                      dataset={dataset}
+                      requestId={lastFieldStatsRequestRef.current?.request_id}
             onLoadAllFields={loadAllFieldStats}
             // NAN-3299: scope to the executed search, not the editor text —
             // a keystroke must not refetch the panel's ext names / values.

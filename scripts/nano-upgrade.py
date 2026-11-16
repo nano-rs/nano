@@ -22,6 +22,7 @@ import secrets
 import selectors
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import stat
@@ -168,6 +169,37 @@ VECTOR_CONFIG_DIRS = (
 # deploy/compose/docker-compose.enterprise.yml): the Debian image has no
 # curl/wget, so ask the loopback-only API over bash's /dev/tcp. Vector starts
 # its API only after the topology (every source) is built.
+# The Vector metrics fetch the drain gates share: curl, then wget, then a
+# bash /dev/tcp request, whichever the Vector image has.
+VECTOR_METRICS_FETCH = r"""
+metrics=$(
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS http://127.0.0.1:9598/metrics
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- http://127.0.0.1:9598/metrics
+  elif command -v bash >/dev/null 2>&1; then
+    bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9598
+printf "GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3
+cat <&3'
+  else
+    echo "no HTTP client is available to inspect Vector buffers" >&2
+    exit 127
+  fi
+)"""
+# NAN-5488: while this file exists in the ingest-edge container, the edge
+# answers new ingest with 503 + Retry-After (nginx.ingest.conf.template). It is
+# on a tmpfs, so any restart of the edge container clears it.
+INGEST_EDGE_CLOSED_MARKER = "/run/nano-ingest/closed"
+# NAN-5488: the Vector source types a closed ingest edge stops (it is their
+# only way in on a role-split ingest host), plus Vector's own internal sources.
+# Any OTHER source with traffic (Kafka, aws_s3, gcp_pubsub, azure_event_hubs,
+# syslog or socket listeners, ...) keeps receiving while the edge is closed,
+# so the drain uses the drain-through gate for it.
+VECTOR_EDGE_FED_SOURCE_TYPES = frozenset({
+    "http_server", "http", "splunk_hec", "opentelemetry", "vector",
+    "internal_metrics", "internal_logs", "host_metrics", "static_metrics",
+})
+INGEST_EDGE_CLOSURE_FILE = ".nano-ingest-edge-closure.json"
 VECTOR_HEALTH_PROBE = (
     "exec 3<>/dev/tcp/127.0.0.1/8686 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 "
     "&& grep -q ' 200 ' <&3"
@@ -270,6 +302,37 @@ def _admits(networks: list[Any], address: Any) -> bool:
         forms.append(ipaddress.IPv6Address(f"::ffff:{address}"))
     return any(form.version == network.version and form in network
                for form in forms for network in networks)
+
+
+def _seen_before(last_seen: str, when: dt.datetime | None) -> bool:
+    """NAN-5494: a system.query_log max(event_time) ('YYYY-MM-DD HH:MM:SS',
+    UTC on nano's ClickHouse) strictly before `when`. Unknown is False."""
+    if when is None:
+        return False
+    try:
+        seen = dt.datetime.strptime(last_seen.strip()[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return False
+    return seen < when
+
+
+def _canonical_networks(networks: Iterable[Any]) -> frozenset[Any]:
+    """NAN-5494: the non-loopback networks in one form (IPv4 as IPv4-mapped
+    IPv6), so a list read from system.users compares equal to the same list
+    read from XML. Loopback is left out: system.users reports it as the
+    `localhost` host name, not in host_ip, and every nano list carries it."""
+    out = set()
+    for network in networks:
+        if network.version == 4:
+            network = ipaddress.ip_network(
+                f"::ffff:{network.network_address}/{96 + network.prefixlen}", strict=False,
+            )
+        if network.network_address.is_loopback or (
+            network.network_address.ipv4_mapped is not None and network.network_address.ipv4_mapped.is_loopback
+        ):
+            continue
+        out.add(network)
+    return frozenset(out)
 
 
 def enforced_allow_list(rows: str) -> dict[str, list[Any]]:
@@ -980,6 +1043,11 @@ WORKLOAD_TEMPLATE = "clickhouse/workload-users/nanosiem-workload-users.xml"
 # NAN-5470: the rendered users.d ClickHouse mounts (scripts/lib/
 # clickhouse_networks.py --users-dir-output), never inside a package.
 CLICKHOUSE_USERS_DIR = ".nano-generated/clickhouse/users.d"
+# NAN-5494: and the rendered config.d. scripts/lib/clickhouse_config_dirs.py
+# assembles both (shipped files + sizing, tiering and the network allow-list
+# copied in); ClickHouse mounts the two directories and nothing inside them.
+CLICKHOUSE_CONFIG_DIR = ".nano-generated/clickhouse/config.d"
+CLICKHOUSE_CONFIG_DIRS_SCRIPT = "scripts/lib/clickhouse_config_dirs.py"
 
 
 def check_workload_identity_passwords(env: dict[str, str], role_split: bool) -> str:
@@ -1036,7 +1104,16 @@ def backfill_single_node_env(args: argparse.Namespace, ops: "LocalOps") -> list[
             f"note: generated {', '.join(added)} in .env (v2.0.28 ClickHouse workload "
             "identities; the new Compose file requires them)."
         )
-    return added
+    # NAN-5494: before any compose call can recreate ClickHouse from the new
+    # Compose file, assemble the config.d / users.d it mounts (the Compose
+    # file refuses to start ClickHouse without them). This never changes what
+    # the RUNNING server reads: a changed tree is built beside the live one
+    # and swapped in by rename, the running container keeps the retired tree
+    # (v2.0.29+) or does not mount these trees at all (v2.0.27; v2.0.28's
+    # users.d keeps its nested mounts on the retired tree), and the recorded
+    # digest makes the ClickHouse rollout recreate it onto the new tree.
+    recorded = ops.assemble_clickhouse_dirs()
+    return added + recorded
 
 
 def rotate_public_install_token(env_file: "EnvFile") -> bool:
@@ -2359,6 +2436,37 @@ class LocalOps:
             self.env["NANO_CLICKHOUSE_USERS_DIR"] = relative
         return "rendered"
 
+    def assemble_clickhouse_dirs(self) -> list[str]:
+        """NAN-5494: assemble .nano-generated/clickhouse/config.d and users.d
+        (scripts/lib/clickhouse_config_dirs.py --record-env, as install.sh
+        does): NANO_CLICKHOUSE_CONFIG_DIR, NANO_CLICKHOUSE_USERS_DIR and the
+        trees' digest NANO_CLICKHOUSE_CONFIG_SHA256 in .env. A changed tree is
+        swapped in beside the running server's, never edited under it.
+        Canonical single node only (role-split renders its own with
+        render-inventory.py). Also before a legacy-layout transition: the
+        v2 Compose file it moves onto refuses to start ClickHouse without the
+        trees. Returns the .env keys whose value changed."""
+        if getattr(self, "role_env", None):
+            return []
+        script = self.install_dir / CLICKHOUSE_CONFIG_DIRS_SCRIPT
+        if not script.is_file() or not (self.install_dir / "clickhouse/config.d").is_dir() \
+                or not (self.install_dir / "docker-compose.opensource.yml").is_file():
+            return []
+        keys = ("NANO_CLICKHOUSE_CONFIG_DIR", "NANO_CLICKHOUSE_USERS_DIR", "NANO_CLICKHOUSE_CONFIG_SHA256")
+        before = {key: self.env.get(key) for key in keys}
+        result = self.runner.run(
+            ["python3", "-I", str(script), "--root", str(self.install_dir),
+             "--env-file", str(self.install_dir / ".env"), "--record-env"],
+            timeout=60, check=False,
+        )
+        if result.returncode != 0:
+            raise UpgradeError(
+                "could not assemble the ClickHouse config.d / users.d directories: "
+                f"{self._safe_service_failure(result)}"
+            )
+        self.env = self.env_file.values()
+        return [key for key in keys if self.env.get(key) != before[key]]
+
     def _render_clickhouse_networks(self, compose_subnet: str) -> str:
         """NAN-5435: render the allow-list to a private candidate, gate it
         (Agent Lane overlap), then install it in place (Compose bind-mounts the
@@ -2388,6 +2496,9 @@ class LocalOps:
             target.chmod(0o644)
         # NAN-5470: the workload identities follow the same allow-list.
         self._render_workload_users(compose_subnet)
+        # NAN-5494: copy the new allow-list (and the sizing / tiering) into the
+        # directories ClickHouse mounts.
+        self.assemble_clickhouse_dirs()
         networks_file = "./.nano-generated/clickhouse/networks.xml"
         if self.env.get("NANO_CLICKHOUSE_NETWORKS_FILE") != networks_file:
             self.env_file.replace("NANO_CLICKHOUSE_NETWORKS_FILE", networks_file)
@@ -2444,12 +2555,57 @@ class LocalOps:
             # As install.sh's clickhouse_default_user_preflight: no query log
             # (disabled, or ClickHouse down) means nothing to report.
             return f"could not read system.query_log ({error}); clients not checked"
-        refused = refused_clients(rows, allowed, self._current_clickhouse_allow_list(names))
+        enforced = self._current_clickhouse_allow_list(names)
+        # NAN-5494: a package extract over a v2.0.27/v2.0.28 install could
+        # detach the allow-list mount, so ClickHouse enforces the SHIPPED
+        # fallback (every private range) instead of the rendered pin. Judge
+        # clients against the rendered pin, never the widened fallback. A
+        # client the widened list admits but the pin refuses is:
+        #   * from before the detach: refused by the pin when it last
+        #     connected (nano's own pre-pin containers), so the upgrade
+        #     changes nothing for it; listed, no acknowledgement;
+        #   * from after it (or when the detach time is unknown): it only got
+        #     in through the widening, and the upgrade locks it out again, so
+        #     it is reported like any other refused client (ack required).
+        current, widened, detached_at = self._undo_widened_allow_list(enforced)
+        refused = refused_clients(rows, allowed, current)
+        note = ""
+        if widened:
+            via_fallback = [row for row in refused_clients(rows, allowed, enforced) if row not in refused]
+            since = [row for row in via_fallback if not _seen_before(row[3], detached_at)]
+            earlier = [row for row in via_fallback if row not in since]
+            refused += since
+            note = (
+                f" WARNING: ClickHouse enforces the shipped fallback allow-list (loopback and every "
+                f"private range) for {', '.join(widened)} instead of the rendered pin "
+                f"({self._rendered_networks_path().relative_to(self.install_dir)}): a ClickHouse config "
+                "file mount was detached when an installer package was extracted (NAN-5494). Clients were "
+                "judged against the rendered pin. The upgrade re-renders ClickHouse's configuration and "
+                "recreates ClickHouse onto it; to restore the pin without upgrading, re-run install.sh from "
+                "this release."
+            )
+            if earlier:
+                note += (
+                    " Refused by the pin before the extract, unchanged by the upgrade: "
+                    + "; ".join(f"{user} from {address} ({count} queries, last {last})"
+                                for user, address, count, last in earlier) + "."
+                )
+            if since:
+                note += (
+                    " Connected only while the allow-list was widened"
+                    + ("" if detached_at else " (detach time unknown)")
+                    + ", refused again after the upgrade: "
+                    + "; ".join(f"{user} from {address}" for user, address, _, _ in since)
+                    + " (listed below)."
+                )
+            else:
+                note += " NANO_ACK_CH_NETWORK_LOCKOUT is not needed for this."
+            eprint(f"warning:{note}")
         if not refused:
             return (
                 f"no client of {len(names)} ClickHouse users in the last 7 days is outside "
                 f"the upgraded allow-list ({preview['subnet'] or 'Docker networks'})"
-            )
+            ) + note
         listing = "; ".join(f"{user} from {address} ({count} queries, last {last})"
                             for user, address, count, last in refused)
         ingest = [address for user, address, _, _ in refused if user == INGEST_USER_NAME]
@@ -2471,10 +2627,91 @@ class LocalOps:
             "after the upgrade ClickHouse refuses these clients (last 7 days): "
             f"{listing}. To continue, {'; '.join(advice)}, or rerun with "
             "--ack-clickhouse-network-lockout (NANO_ACK_CH_NETWORK_LOCKOUT=1)."
-        )
+        ) + note
         if os.environ.get("NANO_ACK_CH_NETWORK_LOCKOUT") == "1":
             return f"acknowledged (NANO_ACK_CH_NETWORK_LOCKOUT=1): {message}"
         raise UpgradeError(message)
+
+    def _rendered_networks_path(self) -> pathlib.Path:
+        value = (self.env.get("NANO_CLICKHOUSE_NETWORKS_FILE") or "").strip() or "./.nano-generated/clickhouse/networks.xml"
+        path = pathlib.Path(value)
+        return path if path.is_absolute() else self.install_dir / path
+
+    def _undo_widened_allow_list(
+        self, current: dict[str, list[Any]] | None,
+    ) -> tuple[dict[str, list[Any]] | None, list[str], dt.datetime | None]:
+        """NAN-5494: users for which ClickHouse enforces exactly the shipped
+        fallback networks (clickhouse/users.d/nanosiem-users.xml) while the
+        running server has the rendered allow-list bind-mounted and reads
+        something else there: the mount was detached by a package extract
+        (_allow_list_mount_detached). Returns `current` with those users'
+        entries replaced by the rendered ones, their names, and when the
+        mount was detached (None: unknown).
+
+        Both conditions are needed: a rendered file that was never mounted
+        (an earlier failed run rendered the pin, ClickHouse never moved onto
+        it) is not what ClickHouse enforced, and its clients are reported."""
+        if not current:
+            return current, [], None
+        rendered_path = self._rendered_networks_path()
+        shipped_path = self.install_dir / "clickhouse/users.d/nanosiem-users.xml"
+        try:
+            rendered = allow_list_networks(rendered_path) if rendered_path.is_file() else {}
+            fallback = allow_list_networks(shipped_path) if shipped_path.is_file() else {}
+        except (ET.ParseError, OSError):
+            return current, [], None
+        widened = sorted(
+            user for user, networks in current.items()
+            if user in rendered and user in fallback
+            and _canonical_networks(networks) == _canonical_networks(fallback[user])
+            and _canonical_networks(rendered[user]) != _canonical_networks(fallback[user])
+        )
+        if not widened:
+            return current, [], None
+        detached, detached_at = self._allow_list_mount_detached(rendered_path)
+        if not detached:
+            return current, [], None
+        return {**current, **{user: rendered[user] for user in widened}}, widened, detached_at
+
+    def _allow_list_mount_detached(self, rendered: pathlib.Path) -> tuple[bool, dt.datetime | None]:
+        """NAN-5494: (True, when) when the running ClickHouse bind-mounts
+        `rendered` as a single file (a v2.0.27/v2.0.28 Compose file) but reads
+        different content at the mount's destination: the extract that
+        replaced the shipped placeholder under it detached the mount. `when`
+        is the placeholder's change time (the extract), None if unknown.
+        Unknown detach state is (False, None)."""
+        try:
+            container = self._service_container("clickhouse")
+            inspected = self.runner.run(
+                ["docker", "inspect", "--format", "{{json .Mounts}}", container], timeout=30, check=False,
+            )
+            mounts = json.loads(inspected.stdout or "[]")
+            expected = rendered.read_bytes()
+            target = rendered.resolve()
+        except Exception:  # UpgradeError, OSError, JSON: cannot prove it
+            return False, None
+        mounts = [mount for mount in mounts if isinstance(mount, dict)] if isinstance(mounts, list) else []
+        for mount in mounts:
+            if mount.get("Type") != "bind":
+                continue
+            destination = str(mount.get("Destination", ""))
+            if not destination.endswith("/users.d/zzzz-nano-networks.xml"):
+                continue
+            try:
+                if pathlib.Path(str(mount.get("Source", ""))).resolve() != target:
+                    continue
+            except OSError:
+                continue
+            state, content = compose_stale_mounts.read_container_file(container, destination)
+            if state == "missing" or (state == "ok" and content != expected):
+                when = None
+                for parent in mounts:
+                    if parent.get("Type") == "bind" and parent.get("Destination") == destination.rsplit("/", 1)[0]:
+                        with contextlib.suppress(OSError):
+                            placeholder = pathlib.Path(str(parent.get("Source", ""))) / destination.rsplit("/", 1)[1]
+                            when = dt.datetime.fromtimestamp(placeholder.stat().st_ctime, dt.timezone.utc)
+                return True, when
+        return False, None
 
     def _current_clickhouse_allow_list(self, names: list[str]) -> dict[str, list[Any]] | None:
         """NAN-5474: the allow-list ClickHouse ENFORCES now, read from
@@ -2850,7 +3087,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 selected.append(size)
         return selected
 
-    def _bundle_load(self, bundle: pathlib.Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def _bundle_load(
+        self, bundle: pathlib.Path, env: dict[str, str] | None = None, *,
+        retag: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         load_environment = dict(env or os.environ)
         # The loader selects this host's images from its roles; pass them
         # explicitly instead of relying on the worker's working directory.
@@ -2858,7 +3098,8 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             load_environment.setdefault("NANO_ROLE_PROFILES", ",".join(sorted(self.roles)))
         return self.runner.run(
             [str(self.nano_cli), "bundle", "load", str(bundle),
-             *bundle_cli_arguments(bundle, self.env.get("NANO_IMAGE_PREFIX", ""))],
+             *(load_cli_arguments(bundle, self.env.get("NANO_IMAGE_PREFIX", ""))
+               if retag else bundle_cli_arguments(bundle, self.env.get("NANO_IMAGE_PREFIX", "")))],
             timeout=7200,
             env=load_environment,
             check=False,
@@ -4175,6 +4416,26 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                     # expired or unreachable registry fails while nothing has
                     # changed. Pulling only fills the local image cache.
                     check("registry-pull", lambda: self._pull_registry_images(bundle, manifest))
+        if (
+            manifest.get("source") != "registry"
+            and str(manifest.get("version", "")) != nano_legacy_bridge.TARGET_VERSION
+        ):
+            # NAN-5487: before any host changes, the image bundle's names must
+            # map onto this install's NANO_IMAGE_PREFIX (the loader retags).
+            def bundle_image_names() -> str:
+                transition_record = getattr(self, "transition_record", None)
+                if getattr(self, "legacy_layout", None) is not None or (
+                    transition_record is not None and transition_record.is_file()
+                ):
+                    # The legacy transition sets NANO_IMAGE_PREFIX from the
+                    # bundle's own authenticated enterprise lock.
+                    return "legacy layout: the transition names the bundle's images itself"
+                return bundle_image_names_detail(
+                    manifest, (getattr(self, "env", None) or {}).get("NANO_IMAGE_PREFIX", ""),
+                    getattr(self, "nano_cli", SCRIPT_DIR / "nano"),
+                )
+
+            check(BUNDLE_IMAGE_NAMES_CHECK, bundle_image_names)
         check("ram", lambda: self._check_ram(manifest))
         check("cpu", lambda: self._check_cpu(manifest))
         check("ntp", self._check_ntp)
@@ -5142,7 +5403,14 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         load_environment["NANO_BUNDLE_TMPDIR"] = str(
             self.install_dir / ".nano-bundle-scratch"
         )
-        loaded = self._bundle_load(bundle, load_environment)
+        # NAN-5487: an image bundle's first-party images are retagged to this
+        # install's NANO_IMAGE_PREFIX. The legacy bridge selects its own names,
+        # and so does the legacy transition (NANO_IMAGE_PREFIX from the bundle's
+        # own enterprise lock), as preflight's bundle-image-names check assumes.
+        loaded = self._bundle_load(bundle, load_environment, retag=not (
+            legacy_bridge or getattr(self, "legacy_layout", None) is not None
+            or getattr(self, "transition_record", self.install_dir / ".nano-legacy-transition.json").is_file()
+        ))
         if loaded.returncode != 0:
             # `nano bundle` prints one safe reason line (no credentials).
             reason = (loaded.stderr or "").strip().splitlines()
@@ -5274,23 +5542,29 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         return selected
 
     def _drain_vector(self, timeout: int) -> None:
+        """Wait until Vector's buffers are empty before Vector is stopped.
+
+        NAN-5488: under live ingest the buffers are never exactly empty, so
+        new events must stop first. A role-split ingest host closes its
+        ingest-edge before this drain (_close_ingest_edge), so the gate stays
+        exactly 0. A single node has no edge in front of Vector (senders post
+        to its published ports), so there the drain also completes once every
+        event buffered when it started has been sent on: the events received
+        since stay in Vector's disk buffer, which survives the restart, and
+        the replacement Vector delivers them.
+        """
         if not self._service_exists("vector"):
             return
-        metrics_command = r"""
-metrics=$(
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS http://127.0.0.1:9598/metrics
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO- http://127.0.0.1:9598/metrics
-  elif command -v bash >/dev/null 2>&1; then
-    bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9598
-printf "GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3
-cat <&3'
-  else
-    echo "no HTTP client is available to inspect Vector buffers" >&2
-    exit 127
-  fi
-)
+        # A role-split ingest host's push senders are stopped at its closed
+        # edge; its other sources (Kafka, S3/SQS, Pub/Sub, Event Hubs, syslog
+        # listeners...) are not. The drain-through gate below loses nothing
+        # for them: every event already in a disk buffer survives the restart
+        # (an exact-zero gate never inspects the transforms either), and a
+        # source with acknowledgements enabled (CrowdStrike FDR, Event Hubs)
+        # commits its position only once the event is in that buffer.
+        direct_senders = not self._service_exists("ingest-edge")
+        self._pull_source_types = None
+        metrics_command = VECTOR_METRICS_FETCH + r"""
 printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
   ($1 ~ /(^|_)vector_buffer_events(\{|$)/ ||
    $1 ~ /(^|_)vector_buffer_size_events(\{|$)/) &&
@@ -5300,6 +5574,7 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
 } END {if (count == 0) {print "MISSING"; exit 3} print s+0}'
 """
         deadline = time.monotonic() + timeout
+        baseline: dict[str, float] | None = None
         while time.monotonic() < deadline:
             result = self.compose(
                 ["exec", "-T", "vector", "sh", "-ec", metrics_command],
@@ -5308,8 +5583,237 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
             )
             if result.returncode == 0 and result.stdout.strip() in {"0", "0.0"}:
                 return
+            if result.returncode == 0 and (
+                direct_senders or self._vector_pull_sources()
+            ):
+                counters = self._vector_buffer_counters()
+                if counters is not None:
+                    received, sent = counters
+                    if baseline is None:
+                        baseline = received
+                    elif baseline and all(
+                        sent.get(key, 0.0) >= value for key, value in baseline.items()
+                    ):
+                        what = (
+                            "senders that post to it directly" if direct_senders
+                            else "its pull sources (" + ", ".join(sorted(self._vector_pull_sources())) + ")"
+                        )
+                        eprint(
+                            f"Vector is still receiving from {what}; every event buffered when "
+                            "the drain started has been sent on. Events received since stay in "
+                            "Vector's disk buffer across the restart and are delivered by the "
+                            "new Vector."
+                        )
+                        return
             time.sleep(2)
         raise UpgradeError(f"Vector buffers did not drain within {timeout}s")
+
+    def _vector_pull_sources(self) -> set[str]:
+        """NAN-5488: source types this Vector runs that the closed edge does not
+        stop (everything outside VECTOR_EDGE_FED_SOURCE_TYPES); cached per drain."""
+        cached = getattr(self, "_pull_source_types", None)
+        if cached is not None:
+            return cached
+        command = VECTOR_METRICS_FETCH + r"""
+printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
+  $1 ~ /(^|_)component_received_events_total\{/ && $1 ~ /component_kind="source"/ {print $1}'
+"""
+        result = self.compose(
+            ["exec", "-T", "vector", "sh", "-ec", command], timeout=20, check=False,
+        )
+        found = set()
+        if result.returncode == 0:
+            for match in re.finditer(r'component_type="([a-z0-9_]+)"', result.stdout):
+                if match.group(1) not in VECTOR_EDGE_FED_SOURCE_TYPES:
+                    found.add(match.group(1))
+        self._pull_source_types = found
+        return found
+
+    def _vector_buffer_counters(self) -> tuple[dict[str, float], dict[str, float]] | None:
+        """NAN-5488: Vector's per-buffer received and sent event totals."""
+        command = VECTOR_METRICS_FETCH + r"""
+printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
+  $1 ~ /(^|_)vector_buffer_(received|sent)_events_total(\{|$)/ &&
+  $0 !~ /component_id="prometheus_metrics"/'
+"""
+        result = self.compose(
+            ["exec", "-T", "vector", "sh", "-ec", command], timeout=20, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        received: dict[str, float] = {}
+        sent: dict[str, float] = {}
+        for line in result.stdout.splitlines():
+            match = re.match(
+                r"^\S*?vector_buffer_(received|sent)_events_total(\{[^}]*\})?\s+(\S+)", line,
+            )
+            if match is None:
+                continue
+            try:
+                value = float(match.group(3))
+            except ValueError:
+                return None
+            target = received if match.group(1) == "received" else sent
+            key = match.group(2) or ""
+            target[key] = target.get(key, 0.0) + value
+        return (received, sent) if received and sent else None
+
+    def _ingest_edge_reports_closed(self) -> bool:
+        """The running edge answers new ingest with its NAN-5488 closed 503."""
+        result = self.compose(
+            [
+                "exec", "-T", "ingest-edge", "sh", "-c",
+                # busybox wget prints no headers for an error status: ask raw.
+                "printf 'POST /ingest HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\nContent-Length: 0\\r\\n"
+                "Connection: close\\r\\n\\r\\n' | nc -w 3 127.0.0.1 80 | tr -d '\\r' "
+                "| grep -qi '^x-nano-ingest: *closed'",
+            ],
+            timeout=30, check=False,
+        )
+        return result.returncode == 0
+
+    def _closure_path(self) -> pathlib.Path | None:
+        install_dir = getattr(self, "install_dir", None)
+        return pathlib.Path(install_dir) / INGEST_EDGE_CLOSURE_FILE if install_dir else None
+
+    def _persist_closure(self, closure: dict[str, Any]) -> None:
+        path = self._closure_path()
+        if path is not None:
+            write_json_atomic(path, {k: v for k, v in closure.items() if not k.startswith("_")})
+
+    def _close_ingest_edge(self) -> None:
+        """NAN-5488: stop NEW events reaching this host's Vector before its drain.
+
+        Without a load-balancer hook (one ingest host) nothing else stops
+        senders, and the exact-zero drain never completes under live ingest.
+        While INGEST_EDGE_CLOSED_MARKER exists (a tmpfs, cleared by any restart
+        of the container) the edge answers every ingest route (HTTP, HEC
+        event/raw incl. /1.0, OTLP, enrichment) with 503 + Retry-After and
+        /healthz with 503; HEC ack and health polls stay open. An edge whose
+        running config predates the closed state (the upgrade from v2.0.28 and
+        earlier), or whose exec fails, is stopped instead. The closure is
+        written to INGEST_EDGE_CLOSURE_FILE BEFORE the edge changes, so a
+        worker killed mid-window is undone by the next rollout, resume or
+        abandon (reconcile_ingest_edge_closure). The window lasts the drain
+        (at most 300 s) plus Vector's restart (at most VECTOR_READY_MAX_SECONDS);
+        _reopen_ingest_edge ends it as soon as Vector is healthy, on failure too.
+        """
+        if getattr(self, "_ingest_edge_closure", None) is not None:
+            return
+        if not self._running_services(("ingest-edge",)):
+            return
+        started = time.monotonic()
+        closed_at = utc_now()
+        # Recorded (in memory and on disk) before anything can fail, so a
+        # reopen always undoes the marker, and a stop, this call made.
+        closure = {
+            "host": getattr(self, "host_name", "single"), "mode": "503",
+            "closed_at": closed_at, "_started": started,
+        }
+        self._ingest_edge_closure = closure
+        self._persist_closure(closure)
+        touched = self.compose(
+            ["exec", "-T", "ingest-edge", "touch", INGEST_EDGE_CLOSED_MARKER],
+            timeout=60, check=False,
+        )
+        # A failed exec (the container restarting, or an edge from before the
+        # closed state, which has no /run/nano-ingest) falls back to a stop.
+        deadline = time.monotonic() + (10 if touched.returncode == 0 else 0)
+        while touched.returncode != 0 or not self._ingest_edge_reports_closed():
+            if time.monotonic() >= deadline:
+                closure["mode"] = "stopped"
+                self._persist_closure(closure)
+                self.compose(["stop", "--timeout", "10", "ingest-edge"], timeout=90)
+                break
+            time.sleep(1)
+        mode = closure["mode"]
+        how = (
+            "new ingest gets 503 with Retry-After" if mode == "503"
+            else "the running edge could not be closed in place (its config predates the "
+            "closed state, or it was restarting), so it was stopped"
+        )
+        eprint(
+            f"{getattr(self, 'host_name', 'single')}: closed the ingest edge to new events at "
+            f"{closed_at} ({how}; senders retry) while Vector drains and restarts"
+        )
+
+    def _start_ingest_edge(self) -> None:
+        """Bring a stopped (or removed) ingest-edge back and prove it runs."""
+        if not self._running_services(("ingest-edge",)):
+            self.compose(["start", "ingest-edge"], timeout=120, check=False)
+        if not self._running_services(("ingest-edge",)):
+            self.compose(
+                ["up", "-d", "--no-deps", "--pull", "never", "ingest-edge"], timeout=180, check=False,
+            )
+        if not self._running_services(("ingest-edge",)):
+            raise UpgradeError(
+                f"ingest-edge on {getattr(self, 'host_name', 'single')} is NOT running: senders "
+                "are refused. Start it: docker compose up -d --no-deps ingest-edge"
+            )
+
+    def _reopen_ingest_edge(self) -> dict[str, Any] | None:
+        """NAN-5488: end the closed window (idempotent; also on failure).
+
+        Raises UpgradeError when the edge does not run afterwards; the closure
+        file then stays, so the next rollout, resume or abandon retries it.
+        """
+        closure = getattr(self, "_ingest_edge_closure", None)
+        if closure is None:
+            return None
+        if closure["mode"] == "stopped":
+            self._start_ingest_edge()
+        self._clear_ingest_edge_marker()
+        self._ingest_edge_closure = None
+        path = self._closure_path()
+        if path is not None:
+            path.unlink(missing_ok=True)
+        seconds = round(time.monotonic() - closure["_started"], 1)
+        record = {key: value for key, value in closure.items() if not key.startswith("_")}
+        record.update({"reopened_at": utc_now(), "closed_seconds": seconds})
+        eprint(f"{record['host']}: reopened the ingest edge after {seconds}s closed")
+        return record
+
+    def reconcile_ingest_edge_closure(self) -> dict[str, Any]:
+        """NAN-5488: undo a closure an earlier, killed worker left on disk.
+
+        Called at the start of the ingest rollout and writer resume, and by
+        `--abandon-incomplete`. Brings the edge back (a stopped one is
+        started) and clears the marker; a no-op without a closure file.
+        """
+        path = self._closure_path()
+        if path is None or not (path.is_file() or path.is_symlink()):
+            return {"reconciled": False}
+        try:
+            stale = read_json(path)
+        except (UpgradeError, OSError, ValueError):
+            stale = {}
+        eprint(
+            f"{getattr(self, 'host_name', 'single')}: an interrupted upgrade left the ingest edge "
+            f"closed (since {stale.get('closed_at', 'unknown')}, mode {stale.get('mode', 'unknown')}); "
+            "reopening it"
+        )
+        if self._service_exists("ingest-edge"):
+            self._start_ingest_edge()
+            self._clear_ingest_edge_marker(running=True)
+        path.unlink(missing_ok=True)
+        return {"reconciled": True, "closure": stale}
+
+    def _reopen_after_failure(self) -> None:
+        """Reopen a closed edge on a failed step without hiding that failure."""
+        try:
+            self._reopen_ingest_edge()
+        except (UpgradeError, OSError) as reopen_error:
+            eprint(
+                f"WARNING: could not reopen the ingest edge: {reopen_error}. Senders are refused "
+                "until it is: rerun `scripts/nano upgrade --resume`, or start it by hand"
+            )
+
+    def _clear_ingest_edge_marker(self, *, running: bool = False) -> None:
+        if running or self._running_services(("ingest-edge",)):
+            self.compose(
+                ["exec", "-T", "ingest-edge", "rm", "-f", INGEST_EDGE_CLOSED_MARKER],
+                timeout=60, check=False,
+            )
 
     def _stop_legacy_vector_gracefully(self, container: str, timeout: int) -> None:
         """Require Vector to finish its SIGTERM drain instead of being SIGKILLed."""
@@ -5868,17 +6372,27 @@ printf 'consumer generation %s ready\n' "$generation"
             "listen. Check 'docker compose logs vector'"
         )
 
-    def _wait_ingest_readiness(self, services: Iterable[str], timeout: int) -> None:
+    def _wait_ingest_readiness(
+        self, services: Iterable[str], timeout: int,
+        on_vector_ready: Callable[[], Any] | None = None,
+    ) -> None:
         selected = list(dict.fromkeys(services))
         prerequisites = [
             service for service in selected
             if service not in {"vector-config-consumer", "ingest-edge"}
         ]
         self._wait_services(prerequisites, timeout)
-        if "vector" in selected and "vector-config-consumer" not in selected:
+        if "vector" in selected and (
+            "vector-config-consumer" not in selected or on_vector_ready is not None
+        ):
             # NAN-5419: single host has no consumer (whose probe already
             # checks Vector's :8686/health) and its Vector no healthcheck.
+            # NAN-5488: a closed edge reopens as soon as Vector is healthy
+            # (it serves the persisted config and tokens), not after the
+            # consumer's convergence gate.
             self._wait_vector_ready(timeout)
+            if on_vector_ready is not None:
+                on_vector_ready()
         if "vector-config-consumer" in selected:
             self._wait_ingest_consumer_ready(timeout)
         if "ingest-edge" in selected:
@@ -5886,6 +6400,7 @@ printf 'consumer generation %s ready\n' "$generation"
 
     def _up_ingest_services(
         self, services: Iterable[str], timeout: int, *, exact: bool = False,
+        on_vector_ready: Callable[[], Any] | None = None,
     ) -> list[str]:
         selected = list(dict.fromkeys(services)) if exact else [
             service for service in services if self._service_expected(service)
@@ -5897,7 +6412,10 @@ printf 'consumer generation %s ready\n' "$generation"
                  *self._recreate_args(before_edge), *before_edge],
                 timeout=timeout,
             )
-            self._wait_ingest_readiness(before_edge, timeout)
+            if on_vector_ready is not None and "vector" in before_edge:
+                self._wait_ingest_readiness(before_edge, timeout, on_vector_ready)
+            else:
+                self._wait_ingest_readiness(before_edge, timeout)
         if "ingest-edge" in selected:
             self.compose(
                 ["up", "-d", "--no-deps", "--pull", "never",
@@ -5905,6 +6423,10 @@ printf 'consumer generation %s ready\n' "$generation"
                 timeout=timeout,
             )
             self._wait_ingest_edge_ready(timeout)
+            if getattr(self, "_ingest_edge_closure", None) is None:
+                # NAN-5488: the marker is on a tmpfs, so a restarted edge has
+                # none; an edge that kept running through a fence still may.
+                self._clear_ingest_edge_marker(running=True)
         return selected
 
     def quiesce(
@@ -5920,9 +6442,30 @@ printf 'consumer generation %s ready\n' "$generation"
         elif role == "ingest":
             if "ingest-edge" in selected:
                 self._lb_hook("drain", require_lb_hooks)
-            if "vector" in selected:
-                self._drain_vector(min(timeout, 300))
-            stopped = self._stop_exact(selected, timeout)
+            try:
+                if "vector" in selected:
+                    if "ingest-edge" in selected:
+                        self._close_ingest_edge()
+                    self._drain_vector(min(timeout, 300))
+                stopped = self._stop_exact(selected, timeout)
+            except BaseException:
+                self._reopen_after_failure()
+                raise
+            # The edge is stopped with the fence; resume_writers starts it and
+            # clears the closed marker (_up_ingest_services).
+            closure = getattr(self, "_ingest_edge_closure", None)
+            self._ingest_edge_closure = None
+            if closure is not None and "ingest-edge" in stopped:
+                # The fence owns the stopped edge now; its resume starts it.
+                path = self._closure_path()
+                if path is not None:
+                    path.unlink(missing_ok=True)
+            result: dict[str, Any] = {"role": role, "services": stopped}
+            if closure is not None:
+                result["ingest_edge_closure"] = {
+                    key: value for key, value in closure.items() if not key.startswith("_")
+                }
+            return self._with_lb_hooks(result)
         else:
             raise UpgradeError(f"cannot quiesce non-writer role {role}")
         return self._with_lb_hooks({"role": role, "services": stopped})
@@ -5938,6 +6481,7 @@ printf 'consumer generation %s ready\n' "$generation"
             started = self._start_exact(selected, timeout)
             dependency_probe = self._wait_app_readiness(started, timeout)
         elif role == "ingest":
+            self.reconcile_ingest_edge_closure()
             started = self._up_ingest_services(selected, timeout, exact=True)
             if "ingest-edge" in started:
                 route_probe = self.smoke_ingest(f"nano-writer-resume-{uuid.uuid4()}")
@@ -6298,6 +6842,8 @@ printf 'consumer generation %s ready\n' "$generation"
             candidates = ROLE_SERVICES[role]
         except KeyError as error:
             raise UpgradeError(f"unsupported rollout role: {role}") from error
+        ingest_edge_closure: dict[str, Any] | None = None
+        ingest_edge_reconciled: dict[str, Any] = {}
         legacy_transition_rollout = getattr(self, "_legacy_transition_rollout", False)
         if legacy_transition_rollout:
             # Legacy application services use different names (api -> nano-api,
@@ -6308,7 +6854,16 @@ printf 'consumer generation %s ready\n' "$generation"
             selected = [service for service in candidates if self._service_expected(service)]
         else:
             selected = self._running_services(candidates)
+            if (
+                role == "ingest" and "ingest-edge" not in selected
+                and self._service_expected("ingest-edge")
+            ):
+                # NAN-5488: an edge an interrupted upgrade stopped is still
+                # this host's edge: roll it (and start it) with the rest.
+                selected.append("ingest-edge")
         selected = self._exact_role_services(role, selected)
+        if role == "ingest" and not legacy_transition_rollout:
+            ingest_edge_reconciled = self.reconcile_ingest_edge_closure()
         if role == "keeper":
             services = self._up_existing(selected, timeout, exact=True)
             if services:
@@ -6365,6 +6920,9 @@ printf 'consumer generation %s ready\n' "$generation"
                             ], timeout=timeout)
                             self._wait_container("vector-netns", timeout)
                     else:
+                        if "ingest-edge" in selected:
+                            # NAN-5488: no new events while Vector drains.
+                            self._close_ingest_edge()
                         self._drain_vector(min(timeout, 300))
                         # NAN-5250: the namespace anchor publishes Vector's
                         # ports (the monitoring host scrapes :9598 through it).
@@ -6376,14 +6934,24 @@ printf 'consumer generation %s ready\n' "$generation"
                                 *self._recreate_args(["vector-netns"]), "vector-netns",
                             ], timeout=timeout)
                             self._wait_container("vector-netns", timeout)
-                services = self._up_ingest_services(selected, timeout, exact=True)
+                reopened: list[dict[str, Any] | None] = []
+                services = self._up_ingest_services(
+                    selected, timeout, exact=True,
+                    on_vector_ready=lambda: reopened.append(self._reopen_ingest_edge()),
+                )
+                # Also when Vector was not restarted (or a reopen is pending).
+                ingest_edge_closure = (reopened[0] if reopened else None) or self._reopen_ingest_edge()
                 if "ingest-edge" in services:
                     route_probe = self.smoke_ingest(f"nano-rollout-{uuid.uuid4()}")
                 if "ingest-edge" in services:
                     self._lb_hook("rejoin", require_lb_hooks)
             except UpgradeError as error:
+                self._reopen_after_failure()
                 if "ingest-edge" in selected:
                     raise self._left_drained(error) from error
+                raise
+            except BaseException:
+                self._reopen_after_failure()
                 raise
         elif role == "monitoring":
             # NAN-5250: Prometheus and Grafana carry no nano state; recreate
@@ -6444,6 +7012,10 @@ printf 'consumer generation %s ready\n' "$generation"
             result["dependency_probe"] = dependency_probe
         elif role == "ingest" and "ingest-edge" in services:
             result["route_probe"] = route_probe
+        if role == "ingest" and ingest_edge_closure is not None:
+            result["ingest_edge_closure"] = ingest_edge_closure
+        if role == "ingest" and ingest_edge_reconciled.get("reconciled"):
+            result["ingest_edge_reconciled"] = ingest_edge_reconciled
         return self._with_lb_hooks(result)
 
     def post_verify(self, target: str, timeout: int) -> dict[str, Any]:
@@ -7313,6 +7885,11 @@ class NodeExecutor:
             return self.local_ops.post_verify(target, timeout)
         return json_object(self._remote("post-verify", ["--target", target, "--timeout", str(timeout)], timeout + 60), "remote post-verify")
 
+    def reconcile_ingest_edge_closure(self) -> dict[str, Any]:
+        if self.local:
+            return self.local_ops.reconcile_ingest_edge_closure()
+        return json_object(self._remote("reopen-ingest-edge", [], 300), "remote reopen-ingest-edge")
+
     def smoke_ingest(self, marker: str) -> dict[str, Any]:
         if self.local:
             return self.local_ops.smoke_ingest(marker)
@@ -7466,6 +8043,46 @@ def is_selfrun_upgrade_gate(status: str, valid: str, reason: str, target: str) -
     return target_key >= max(minimum, SELFRUN_LICENSED_MINIMUM)
 
 
+def upgrader_release(script_dir: pathlib.Path = SCRIPT_DIR) -> str | None:
+    """NAN-5489: the release this upgrader belongs to, from the `.nano-bundle`
+    marker of the tree it runs from. None on a git checkout (no marker)."""
+    try:
+        value = (script_dir.parent / ".nano-bundle").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    match = re.fullmatch(r"nano compose release v(\d+\.\d+\.\d+)", value)
+    return match.group(1) if match else None
+
+
+def older_upgrader_warning(target: str, script_dir: pathlib.Path = SCRIPT_DIR) -> str | None:
+    """NAN-5489: the warning to print when an OLDER release's upgrader runs a
+    newer bundle. The checks and the rollout order are the running
+    upgrader's, so the target's new upgrade steps silently do not run (the
+    v2.0.27 coordinator rolled v2.0.28's ClickHouse hosts without its
+    workload users)."""
+    running = upgrader_release(script_dir)
+    if running is None:
+        return None
+    try:
+        if semver(running) >= semver(target):
+            return None
+    except UpgradeError:
+        return None
+    rule = "!" * 76
+    return "\n".join([
+        rule,
+        f"!! WARNING: this is the v{running} upgrader, and the bundle is v{target}.",
+        f"!! The upgrade runs v{running}'s checks and steps, not v{target}'s: anything",
+        f"!! v{target} added to the upgrade is skipped without an error.",
+        f"!! Stop, extract the v{target} installer package (nano-compose-<edition>-{target}.tar.gz,",
+        "!! verified with scripts/nano bundle verify) over the install directory on",
+        "!! EVERY host as the install owner, then run its scripts/nano upgrade.",
+        "!! The extracted release's upgrader is the one that must run.",
+        "!! See docs/administration/upgrades.md.",
+        rule,
+    ])
+
+
 def check_registry_control_tree(install_dir: pathlib.Path, target: str) -> str:
     """NAN-5251: a registry upgrade runs the target's Compose files and scripts.
 
@@ -7568,6 +8185,84 @@ def bundle_cli_arguments(bundle: pathlib.Path, image_prefix: str) -> list[str]:
     if is_compose_package(bundle) and image_prefix:
         return ["--image-prefix", image_prefix]
     return []
+
+
+def load_cli_arguments(bundle: pathlib.Path, image_prefix: str) -> list[str]:
+    """NAN-5487: `nano bundle load` arguments. An image bundle is retagged to the
+    install's NANO_IMAGE_PREFIX (a registry install names the customer
+    repository; the release bundle carries nano's own image names)."""
+    return ["--image-prefix", image_prefix] if image_prefix else []
+
+
+def bundle_image_names_detail(
+    manifest: dict[str, Any], image_prefix: str, nano_cli: pathlib.Path,
+) -> str:
+    """NAN-5487 preflight: the image bundle's first-party images must reach the
+    names this install's Compose asks for (NANO_IMAGE_PREFIX), checked before
+    any host changes. Raises UpgradeError when they cannot."""
+    loader = load_bundle_library(nano_cli.parent / "lib/nano_bundle.py")
+    effective = image_prefix or loader.DEFAULT_IMAGE_PREFIX
+    try:
+        retags = loader.install_image_retags(manifest, effective)
+    except loader.BundleError as error:
+        raise UpgradeError(f"{error}; nothing was changed") from error
+    source = loader.bundle_image_prefix(manifest)
+    if not retags:
+        return f"bundle images are named {source}-*, as this install expects"
+    if not image_prefix:
+        raise UpgradeError(
+            f"the bundle's images are named {source}-*, but this install has no "
+            f"NANO_IMAGE_PREFIX and its Compose files ask for {effective}-*. Set "
+            f"NANO_IMAGE_PREFIX={source} in .env if this install runs those images, or use "
+            "the release bundle that matches this install; nothing was changed"
+        )
+    return (
+        f"bundle images are named {source}-*; loading retags {len(retags)} first-party "
+        f"image(s) to this install's {image_prefix}-* by their verified digests"
+    )
+
+
+BUNDLE_IMAGE_NAMES_CHECK = "bundle-image-names"
+_BUNDLE_LIBRARIES: dict[str, Any] = {}
+
+
+def missing_bundle_image_name_checks(
+    manifest: dict[str, Any], node_name: str, node_checks: Sequence[Check],
+) -> list[Check]:
+    """NAN-5487: a host whose worker predates the bundle-image-names check also
+    predates the loader's retag, so its load would leave the install's names
+    missing mid-rollout. Refuse it in preflight instead."""
+    if (
+        manifest.get("source") == "registry"
+        or str(manifest.get("version", "")) == nano_legacy_bridge.TARGET_VERSION
+    ):
+        return []
+    if any(check.name == BUNDLE_IMAGE_NAMES_CHECK for check in node_checks):
+        return []
+    return [Check(
+        BUNDLE_IMAGE_NAMES_CHECK, False,
+        "this host's nano predates matching image-bundle names to NANO_IMAGE_PREFIX "
+        "(NAN-5487): extract the target release on it first, then rerun",
+        node_name,
+    )]
+
+
+def load_bundle_library(path: pathlib.Path) -> Any:
+    key = str(path)
+    if key not in _BUNDLE_LIBRARIES:
+        spec = importlib.util.spec_from_file_location(f"_nano_upgrade_loader_{len(_BUNDLE_LIBRARIES)}", path)
+        if spec is None or spec.loader is None:
+            raise UpgradeError(f"cannot load the bundle loader: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        if not hasattr(module, "install_image_retags"):
+            raise UpgradeError(
+                f"this host's bundle loader ({path}) predates image retagging (NAN-5487); "
+                "extract the target release on this host first"
+            )
+        _BUNDLE_LIBRARIES[key] = module
+    return _BUNDLE_LIBRARIES[key]
 
 
 def verify_manifest(
@@ -8783,6 +9478,18 @@ def abandon_command(args: argparse.Namespace) -> int:
         postgres_nodes = node_sort(nodes, "postgres")
         if not postgres_nodes:
             raise UpgradeError("abandon requires a PostgreSQL host")
+        # NAN-5488: an abandoned run must not leave an ingest edge closed.
+        for node in node_sort(nodes, "ingest"):
+            try:
+                reopened = executors[node.name].reconcile_ingest_edge_closure()
+            except (UpgradeError, OSError, ValueError) as error:
+                eprint(
+                    f"WARNING: could not reopen the ingest edge on {node.name}: {error}. Check it "
+                    "with `scripts/nano cluster-health` there"
+                )
+                continue
+            if reopened.get("reconciled"):
+                journal.append(state, "ingest_edge_reopened_on_abandon", node=node.name)
         with executors[postgres_nodes[0].name].upgrade_lock():
             journal.append(
                 state, "run_abandoned", reason=reason, reconciled_by_uid=os.getuid(),
@@ -8874,6 +9581,10 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 nano_cli, bundle, runner, ops.env.get("NANO_IMAGE_PREFIX", ""),
             )
             require_bundle_digest(bundle, bundle_digest)
+            # NAN-5489: say so, loudly, when an older upgrader runs a newer bundle.
+            stale = older_upgrader_warning(canonical_version(str(manifest["version"])))
+            if stale:
+                eprint(stale)
             # NAN-5470: right after the bundle's signature is verified and
             # before preflight, the backup, prepare or any other compose call
             # (args.inventory is final here, `--resume` included). A dry run
@@ -9081,6 +9792,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         lb_roundtrip=lb_roundtrip,
                     ))
                 checks.extend(node_checks)
+                checks.extend(missing_bundle_image_name_checks(manifest, node.name, node_checks))
                 if lb_roundtrip and any(
                     check.name == "lb-hooks" and not check.passed for check in node_checks
                 ):
@@ -9732,6 +10444,8 @@ def worker_command(args: argparse.Namespace) -> int:
         value = ops.post_verify(canonical_version(args.target), args.timeout)
     elif args.worker_action == "smoke-ingest":
         value = ops.smoke_ingest(safe_name(args.marker, "smoke marker"))
+    elif args.worker_action == "reopen-ingest-edge":
+        value = ops.reconcile_ingest_edge_closure()
     elif args.worker_action == "smoke-search":
         value = ops.smoke_search(safe_name(args.marker, "smoke marker"), args.timeout)
     elif args.worker_action == "siem-health":
@@ -9828,7 +10542,7 @@ def parser() -> argparse.ArgumentParser:
     rollback.add_argument("--nano-cli", help=argparse.SUPPRESS)
 
     worker = commands.add_parser("_upgrade-worker", help=argparse.SUPPRESS)
-    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "render-config", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "rollback-preflight", "rollback"))
+    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "render-config", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "rollback-preflight", "rollback", "reopen-ingest-edge"))
     worker.add_argument("--install-dir", required=True)
     worker.add_argument("--candidate", default="")
     worker.add_argument("--bundle")
@@ -9869,6 +10583,20 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def install_termination_handlers() -> None:
+    """NAN-5488: SIGTERM and SIGHUP (a dropped SSH session) raise SystemExit, so
+    the cleanup paths (`finally`, `except BaseException`: reopening a closed
+    ingest edge, releasing fences) run instead of the process dying mid-step.
+    SIGKILL, OOM and a reboot are covered by the on-disk closure record."""
+    def terminate(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            signal.signal(number, terminate)
+
+
 def main() -> int:
     # NAN-5279: line-buffer stdout even when run without -u (scripts/nano
     # passes -u), so a non-TTY caller sees each result line as it is printed.
@@ -9877,6 +10605,7 @@ def main() -> int:
         if reconfigure is not None:
             reconfigure(line_buffering=True)
     args = parser().parse_args()
+    install_termination_handlers()
     if args.command == "backup-set":
         if args.timeout < 1:
             raise UpgradeError("--timeout must be positive")

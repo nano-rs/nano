@@ -157,6 +157,22 @@ export class SearchApi {
     }, cacheOpts);
   }
 
+  /**
+   * NAN-5485: the fields panel's on-demand inventory and whether it is
+   * complete. Reads the search's matched rows (up to `row_limit`), admitted
+   * and cancelled with the search (`request_id`).
+   */
+  async getFieldInventory(
+    request: { query: string; start: string; end: string; bucket?: 'spill' | 'extended'; request_id?: string; dataset?: string },
+    signal?: AbortSignal,
+  ): Promise<DynamicFieldInventory> {
+    return this.request('/api/search/field-inventory', {
+      method: 'POST',
+      body: JSON.stringify(request),
+      ...(signal ? { signal } : {}),
+    });
+  }
+
   // On-demand field values (Kibana-style, fetched when user expands a field)
   async getSearchFieldValues(
     request: FieldValuesRequest,
@@ -701,4 +717,24 @@ export class SearchApi {
 
     return controller;
   }
+}
+
+/** Why an inventory may be missing names (NAN-5485). */
+export type InventoryGap =
+  | 'row_limit'
+  | 'output_cap'
+  | 'scan_failed'
+  | 'query_not_scanned'
+  | 'subsearch_rows_not_scanned'
+  | 'sampled_fallback'
+  | 'derived_fields_not_listed'
+  | 'dataset_not_supported';
+
+/** NAN-5485: `POST /api/search/field-inventory`. */
+export interface DynamicFieldInventory {
+  names: string[];
+  partial: boolean;
+  reason?: InventoryGap | null;
+  rows_examined?: number | null;
+  row_limit?: number | null;
 }

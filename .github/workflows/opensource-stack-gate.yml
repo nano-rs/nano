@@ -15,6 +15,9 @@ on:
       - images.lock
       - install.sh
       - scripts/lib/resource-sizing.sh
+      - scripts/lib/clickhouse_config_dirs.py
+      - scripts/tests/test_compose_mount_reextract_guard.py
+      - scripts/tests/test_clickhouse_config_dirs.py
       - clickhouse/config.d/zzzz-nano-sizing.xml
       - clickhouse/users.d/zzzz-nano-sizing.xml
       - Dockerfile*
@@ -196,6 +199,19 @@ jobs:
             bash scripts/tests/install-umask.live.sh
           else
             echo "install-umask live test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5494: ClickHouse mounts the assembled config.d / users.d only and
+      # refuses to start without them; no package path is a live mount point.
+      - name: ClickHouse config directories (assemble, fail closed, re-extract guard)
+        run: |
+          if [ -f scripts/tests/test_compose_mount_reextract_guard.py ]; then
+            python3 -I scripts/tests/test_clickhouse_config_dirs.py -v
+            python3 -I scripts/tests/test_compose_mount_reextract_guard.py -v
+          else
+            # Public mirror: assemble the checkout's trees the way install.sh does.
+            python3 -I scripts/lib/clickhouse_config_dirs.py --root . --env-file /dev/null \
+              --config-output "$RUNNER_TEMP/ch/config.d" --users-output "$RUNNER_TEMP/ch/users.d"
           fi
 
       - name: Host resource sizing scenarios

@@ -751,6 +751,10 @@ class ApiClient {
   }
 
   // On-demand field values (Kibana-style)
+  async getFieldInventory(request: Parameters<SearchApi['getFieldInventory']>[0], signal?: AbortSignal) {
+    return this._search.getFieldInventory(request, signal);
+  }
+
   async getSearchFieldValues(
     request: import('./types').FieldValuesRequest,
     cacheOpts?: CacheRequestOpts

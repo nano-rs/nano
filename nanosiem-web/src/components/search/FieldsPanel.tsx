@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import type { DynamicFieldInventory } from '@/lib/api/search';
 import { useAuth } from '@/contexts/AuthContext';
 import {
   DropdownMenu,
@@ -22,6 +23,9 @@ import {
   FIELD_BUCKET_TOOLTIPS,
   buildOnDemandFields,
   extendedTooltip,
+  partialInventoryNote,
+  statsGapNote,
+  type FieldStatsGap,
   type OnDemandBucket,
 } from './field-buckets';
 
@@ -84,6 +88,12 @@ interface FieldsPanelProps {
   // NAN-1427: the server stats were computed over a reduced column set
   // (visible + pinned columns); offer "Index all fields" to fetch the rest.
   isReducedFieldSet?: boolean;
+  // NAN-5485: how the server field stats fall short (sampled, failed, partial).
+  statsGap?: FieldStatsGap | null;
+  // NAN-5485: the search's dataset: the inventories answer for logs only.
+  dataset?: string;
+  // NAN-5485: the search's request id: the inventories run (and cancel) with it.
+  requestId?: string;
   onLoadAllFields?: () => void;
 }
 
@@ -196,6 +206,9 @@ export function FieldsPanel({
   timeRange,
   onFetchFieldValues,
   isReducedFieldSet = false,
+  statsGap,
+  dataset,
+  requestId,
   onLoadAllFields,
 }: FieldsPanelProps) {
   const [searchTerm, setSearchTerm] = useState('');
@@ -309,21 +322,43 @@ export function FieldsPanel({
   const hasFieldIndex = (showBaseFields ? baseFieldStats : fieldStats).length > 0;
   const onDemandEnabled = !!onFetchFieldValues && !!timeRange && isExpanded && hasFieldIndex;
   const isOcsf = schemaFields?.schema === 'ocsf';
-  const { data: extFieldNames } = useQuery({
-    queryKey: ['ext-field-names', query, timeRange?.start, timeRange?.end],
-    queryFn: ({ signal }) => api.getExtFieldNames(query, timeRange?.start, timeRange?.end, signal),
+  // NAN-5485: the inventories carry their completeness; a partial list is
+  // labelled in its section, never shown as if it were every field.
+  const inventoryRequest = (bucket: 'spill' | 'extended') => ({
+    query: query ?? '',
+    start: timeRange?.start ?? '',
+    end: timeRange?.end ?? '',
+    ...(bucket === 'extended' ? { bucket } : {}),
+    ...(requestId ? { request_id: requestId } : {}),
+    ...(dataset && dataset !== 'logs' ? { dataset } : {}),
+  });
+  const { data: extInventory, isError: extInventoryFailed } = useQuery({
+    queryKey: ['ext-field-inventory', query, timeRange?.start, timeRange?.end],
+    queryFn: ({ signal }) => api.getFieldInventory(inventoryRequest('spill'), signal),
     staleTime: 5 * 60 * 1000,
     enabled: onDemandEnabled,
   });
+  const extFieldNames = extInventory?.names;
   // NAN-5265: OCSF's Extended bucket — valid attributes stored in the `event`
   // JSON without a promoted column. Discovered on demand like the spill; UDM
   // has no such inventory (its Extended bucket is the `ext` spill above).
-  const { data: extendedFieldNames } = useQuery({
-    queryKey: ['extended-field-names', query, timeRange?.start, timeRange?.end],
-    queryFn: ({ signal }) => api.getExtendedFieldNames(query, timeRange?.start, timeRange?.end, signal),
+  const { data: extendedInventory, isError: extendedInventoryFailed } = useQuery({
+    queryKey: ['extended-field-inventory', query, timeRange?.start, timeRange?.end],
+    queryFn: ({ signal }) => api.getFieldInventory(inventoryRequest('extended'), signal),
     staleTime: 5 * 60 * 1000,
     enabled: onDemandEnabled && isOcsf,
   });
+  const extendedFieldNames = extendedInventory?.names;
+  // Which inventory feeds which section: OCSF Extended = `event` attributes,
+  // Unmapped = the spill; UDM's Extended section IS the `ext` spill.
+  const sectionInventory: Record<OnDemandBucket, DynamicFieldInventory | undefined> = {
+    extended: isOcsf ? extendedInventory : extInventory,
+    unmapped: isOcsf ? extInventory : undefined,
+  };
+  const sectionFailed: Record<OnDemandBucket, boolean> = {
+    extended: isOcsf ? extendedInventoryFailed : extInventoryFailed,
+    unmapped: isOcsf ? extInventoryFailed : false,
+  };
 
   const baseStats = showBaseFields ? baseFieldStats : fieldStats;
   // Merge in the on-demand JSON fields (deduped against real columns) once a
@@ -416,6 +451,11 @@ export function FieldsPanel({
             </div>
           )}
         </div>
+        {isExpanded && statsGapNote(statsGap) && (
+          <p className="px-1 pb-1 font-mono text-[10.5px] text-muted-foreground" data-testid="fields-stats-gap">
+            {statsGapNote(statsGap)}
+          </p>
+        )}
         {isExpanded && (
           <div className="mb-1">
             <div className="relative px-2 py-1.5 my-1 flex items-center gap-1.5 font-mono text-[12px] bg-foreground/[0.02] border border-border rounded-sm">
@@ -769,14 +809,15 @@ export function FieldsPanel({
                      Collapsed by default (there can be dozens); a filter term
                      force-opens so matches always show. Values load on expand
                      (NAN-1506). */
-                  if (sectionStats.length === 0) return null;
+                  const partial = partialInventoryNote(sectionInventory[bucket], sectionFailed[bucket]);
+                  if (sectionStats.length === 0 && !partial) return null;
                   const open = !!searchTerm || openOnDemand.has(bucket);
                   return (
                     <div key={bucket}>
                       <SectionHdr
-                        label={label}
+                        label={partial ? `${label} · partial` : label}
                         count={sectionStats.length}
-                        tooltip={tooltip}
+                        tooltip={partial ? `${tooltip} ${partial}` : tooltip}
                         collapsible
                         open={open}
                         onToggle={() => toggleOnDemand(bucket)}

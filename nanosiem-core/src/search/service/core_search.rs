@@ -1489,11 +1489,16 @@ impl SearchService {
                     // settings so it is cancellable and admission-bounded.
                     // NAN-1506: bound the inline companion scan too (same cap as
                     // the standalone /field-stats path) — see FIELD_STATS_ROW_CAP.
-                    let field_stats_sql = ClickHouseExecutor::build_field_stats_sql(
+                    // NAN-5485: raw_data is counted, not aggregated (as the
+                    // standalone path).
+                    let (columns, presence_only) =
+                        Self::split_presence_only_columns(query_profile.as_ref(), columns);
+                    let field_stats_sql = ClickHouseExecutor::build_field_stats_sql_with_presence(
                         &sql,
                         None,
                         &columns,
                         Some(FIELD_STATS_ROW_CAP),
+                        &presence_only,
                     );
                     debug!("Generated field stats SQL: {}", field_stats_sql);
                     let fstats_qid = format!("{query_id}-fstats");
@@ -1509,16 +1514,17 @@ impl SearchService {
                             self.active_execution_limits.as_ref(),
                             grouped_output,
                         ),
-                        ch_executor.execute_field_stats_query(
+                        ch_executor.execute_field_stats_query_with_presence(
                             &field_stats_sql,
                             &columns,
+                            &presence_only,
                             Some(&fstats_qid),
                             self.active_ch_settings.as_ref()
                         )
                     );
 
                     let (results, total_count) = data_result?;
-                    let field_stats = match field_stats_result {
+                    let field_stats = match field_stats_result.map(|(fields, _rows)| fields) {
                         Ok(stats) => {
                             debug!("Server field stats returned {} fields", stats.len());
                             Some(stats)

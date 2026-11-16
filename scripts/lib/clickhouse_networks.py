@@ -324,56 +324,59 @@ def write(root: ET.Element, path: Path) -> bool:
 # NAN-5470: the rendered users.d that ClickHouse mounts (single node). Built
 # from the shipped clickhouse/users.d plus the workload identities, under
 # .nano-generated/, which no installer package contains: extracting a package
-# (tar unlinks and recreates every shipped file) never touches it. A file
-# bind-mounted over a SHIPPED placeholder inside a mounted directory is
-# detached by that unlink on Linux, and ClickHouse then reloads the empty
-# placeholder: the workload users vanished on every re-extract.
+# (tar unlinks and recreates every shipped file) never touches it.
+# NAN-5494: the networks and sizing files are copied INTO it as plain files
+# (scripts/lib/clickhouse_config_dirs.py), never bind-mounted over a file in
+# it: a file mounted over a placeholder is detached when the placeholder is
+# replaced, and ClickHouse then reloads the placeholder (every user widened to
+# the private ranges, sizing reverted).
 WORKLOAD_FILE_NAME = "nanosiem-workload-users.xml"
-# Bind-mount targets inside the rendered directory (Compose mounts the
-# networks / sizing files over them): created once, never replaced, or the
-# rename would detach those mounts the same way.
-NESTED_MOUNT_TARGETS = ("zzzz-nano-networks.xml", "zzzz-nano-sizing.xml")
 
 
-def sync_users_dir(source: Path, output: Path, workload: ET.Element | None) -> bool:
-    """Make `output` the shipped users.d plus the workload identities.
+def _config_dirs():
+    """scripts/lib/clickhouse_config_dirs.py (loaded by path: `python3 -I`
+    leaves the script directory off sys.path)."""
+    import importlib.util
 
-    Shipped files are copied when their content differs (temp file + rename in
-    the same directory: the directory is the mount, so ClickHouse sees the
-    new file); files no longer shipped are removed; the nested mount targets
-    are only created when missing. Returns True when anything changed."""
-    output.mkdir(parents=True, exist_ok=True)
-    os.chmod(output, 0o755)
-    changed = False
-    shipped = {
-        item.name for item in source.iterdir()
-        if item.is_file() and item.suffix == ".xml" and item.name != WORKLOAD_FILE_NAME
-    }
-    for name in sorted(shipped):
-        target = output / name
-        data = (source / name).read_bytes()
-        if name in NESTED_MOUNT_TARGETS:
-            if target.exists():
-                continue
-        elif target.is_file() and not target.is_symlink() and target.read_bytes() == data:
-            continue
-        fd, tmp = tempfile.mkstemp(prefix=".users.", dir=output)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, target)
-        changed = True
-    keep = shipped | set(NESTED_MOUNT_TARGETS) | {WORKLOAD_FILE_NAME}
-    for item in output.iterdir():
-        if item.suffix == ".xml" and item.name not in keep:
-            item.unlink()
-            changed = True
-    if workload is not None:
-        changed = write(workload, output / WORKLOAD_FILE_NAME) or changed
-    elif (output / WORKLOAD_FILE_NAME).exists():
-        (output / WORKLOAD_FILE_NAME).unlink()
-        changed = True
-    return changed
+    name = "nano_clickhouse_config_dirs"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / "clickhouse_config_dirs.py")
+    if spec is None or spec.loader is None:
+        raise NetworkError("scripts/lib/clickhouse_config_dirs.py is missing")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _xml_bytes(root: ET.Element) -> bytes:
+    ET.indent(root, space="  ")
+    return ('<?xml version="1.0"?>\n' + ET.tostring(root, encoding="unicode") + "\n").encode()
+
+
+def sync_users_dir(
+    source: Path, output: Path, workload: ET.Element | None,
+    *, networks: Path | None = None, env_file: Path | None = None,
+) -> bool:
+    """Publish `output`: the shipped users.d plus the networks and sizing
+    files and the workload identities, all copied in (clickhouse_config_dirs.py
+    builds the tree beside the live one and swaps it in, so a running
+    ClickHouse never reads a half-written or changed tree).
+
+    `networks` is the rendered allow-list; the sizing file is found from
+    `env_file` (NANO_SIZING_DIR, relative to the .env's directory). Returns
+    True when anything changed."""
+    module = _config_dirs()
+    root = env_file.parent if env_file is not None else output.parent
+    env = module.dotenv_values(env_file) if env_file is not None else {}
+    try:
+        return module.assemble_users(
+            root, env, output=output, source=source, networks=networks,
+            workload=_xml_bytes(workload) if workload is not None else b"",
+        )
+    except module.AssembleError as error:
+        raise NetworkError(str(error)) from None
 
 
 CLICKHOUSE_CONTAINER = "nano-clickhouse"
@@ -513,7 +516,10 @@ def render(args: argparse.Namespace) -> int:
         if workload is not None and args.workload_output is not None:
             changed = write(workload, args.workload_output) or changed
         if args.users_dir_output is not None:
-            changed = sync_users_dir(args.users_xml[0].parent, args.users_dir_output, workload) or changed
+            changed = sync_users_dir(
+                args.users_xml[0].parent, args.users_dir_output, workload,
+                networks=args.output, env_file=args.workload_env_file,
+            ) or changed
     except (NetworkError, ET.ParseError, OSError) as error:
         print(f"clickhouse networks: {error}", file=sys.stderr)
         return 1

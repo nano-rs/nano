@@ -10,11 +10,18 @@ import { FieldsPanel, type FieldStat } from './FieldsPanel';
 // Extended (UDM ext.* / valid non-promoted OCSF attributes) and Unmapped (the
 // OCSF unmapped.* spill only) — and never double the spill namespace.
 
-const mocks = vi.hoisted(() => ({ ext: vi.fn(), extended: vi.fn(), schema: vi.fn() }));
+const mocks = vi.hoisted(() => ({ ext: vi.fn(), extended: vi.fn(), schema: vi.fn(), inventory: vi.fn(), requests: [] as Array<Record<string, unknown>> }));
 vi.mock('@/lib/api', () => ({
   api: {
     getExtFieldNames: mocks.ext,
     getExtendedFieldNames: mocks.extended,
+    // NAN-5485: the panel reads the inventories (names + completeness).
+    getFieldInventory: async (req: { query: string; start: string; end: string; bucket?: string }, signal?: AbortSignal) => {
+      mocks.requests.push(req);
+      const bucket = req.bucket ?? 'spill';
+      const names = await (bucket === 'extended' ? mocks.extended : mocks.ext)(req.query, req.start, req.end, signal);
+      return mocks.inventory(bucket) ?? { names, partial: false };
+    },
     getSchemaFields: mocks.schema,
     sourceScopes: { listRestricted: async () => ({ restricted: [] }) },
   },
@@ -44,6 +51,8 @@ beforeEach(() => {
   mocks.ext.mockReset();
   mocks.extended.mockReset();
   mocks.schema.mockReset();
+  mocks.inventory.mockReset();
+  mocks.requests.length = 0;
 });
 afterEach(cleanup);
 
@@ -104,6 +113,80 @@ describe('OCSF', () => {
     // filter that returns rows, not the `unmapped.unmapped.task` that matched 0.
     const [field, value] = onAddToQuery.mock.calls[0];
     expect(`${field}="${value}"`).toBe('unmapped.task="7"');
+  });
+
+  it('labels a partial inventory instead of showing it as every field (NAN-5485)', async () => {
+    mocks.inventory.mockImplementation((bucket: string) =>
+      bucket === 'spill'
+        ? { names: ['client_ip'], partial: true, reason: 'row_limit', rows_examined: 100000, row_limit: 100000 }
+        : undefined);
+    render(panel(props()));
+    const hdr = await screen.findByRole('button', { name: /^Unmapped · partial\s*1$/i });
+    expect(hdr.getAttribute('title')).toContain('Listed from the first 100,000 matching events');
+    // The complete Extended list carries no label.
+    expect(await screen.findByRole('button', { name: /^Extended\s*3$/i })).toBeTruthy();
+  });
+
+  it('shows a failed (empty) partial inventory rather than hiding the section', async () => {
+    mocks.inventory.mockImplementation((bucket: string) =>
+      bucket === 'extended' ? { names: [], partial: true, reason: 'scan_failed', rows_examined: null, row_limit: 10000 } : undefined);
+    render(panel(props()));
+    const hdr = await screen.findByRole('button', { name: /^Extended · partial\s*0$/i });
+    expect(hdr.getAttribute('title')).toContain('The scan for these fields failed');
+  });
+
+  it('labels a section whose inventory request failed instead of dropping it', async () => {
+    mocks.inventory.mockImplementation((bucket: string) => {
+      if (bucket === 'spill') throw new Error('500');
+      return undefined;
+    });
+    render(panel(props()));
+    const hdr = await screen.findByRole('button', { name: /^Unmapped · partial\s*0$/i });
+    expect(hdr.getAttribute('title')).toContain('could not be loaded');
+  });
+
+  it('says when field stats are a head sample of the matched events', async () => {
+    render(panel(props({ statsGap: { sampledFromRows: 100000, partialReason: 'row_cap' } })));
+    expect((await screen.findByTestId('fields-stats-gap')).textContent).toContain('first 100,000 matching events');
+  });
+
+  it('says when field stats failed instead of passing page-local stats off as complete', async () => {
+    render(panel(props({ statsGap: { unavailable: true } })));
+    expect((await screen.findByTestId('fields-stats-gap')).textContent).toContain('Field stats unavailable');
+  });
+
+  it('labels dropped columns and shows no note for complete stats', async () => {
+    render(panel(props({ statsGap: { partialReason: 'columns_dropped' } })));
+    expect((await screen.findByTestId('fields-stats-gap')).textContent).toContain('could not be computed');
+    cleanup();
+    render(panel(props({ statsGap: null })));
+    expect(screen.queryByTestId('fields-stats-gap')).toBeNull();
+  });
+
+  it('asks for the inventory of the search dataset (non-logs are answered partial)', async () => {
+    mocks.inventory.mockImplementation(() => ({ names: [], partial: true, reason: 'dataset_not_supported' }));
+    render(panel(props({ dataset: 'spans' })));
+    await waitFor(() => expect(mocks.requests.length).toBeGreaterThan(0));
+    expect(mocks.requests.every((r) => r.dataset === 'spans')).toBe(true);
+    const hdr = await screen.findByRole('button', { name: /^Unmapped · partial\s*0$/i });
+    expect(hdr.getAttribute('title')).toContain('This dataset has no list of these fields.');
+  });
+
+  it('labels derived fields a pipeline creates as not listed', async () => {
+    mocks.inventory.mockImplementation((bucket: string) =>
+      bucket === 'spill' ? { names: ['client_ip'], partial: true, reason: 'derived_fields_not_listed' } : undefined);
+    render(panel(props({ query: 'source_type=windows_sysmon | eval tag="x"' })));
+    const hdr = await screen.findByRole('button', { name: /^Unmapped · partial\s*1$/i });
+    expect(hdr.getAttribute('title')).toContain('Fields this pipeline creates');
+  });
+
+  it('runs the inventories under the search request id (cancelled with it)', async () => {
+    render(panel(props({ requestId: 'req-42' })));
+    await waitFor(() => expect(mocks.requests.length).toBe(2));
+    expect(mocks.requests.map((r) => [r.bucket ?? 'spill', r.request_id]).sort()).toEqual([
+      ['extended', 'req-42'],
+      ['spill', 'req-42'],
+    ]);
   });
 });
 

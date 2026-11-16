@@ -429,6 +429,8 @@ pct_encode() {
 }
 
 # ask_yes_no <question> <Y|N default> -> true/false; re-asks on anything else.
+# Called as $(ask_yes_no ...): the re-ask hint goes to stderr, or it would be
+# captured into the answer (NAN-5495: "maybe" then "y" read as no).
 ask_yes_no() {
     local answer hint="[y/N]"
     [[ "$2" == "Y" ]] && hint="[Y/n]"
@@ -437,7 +439,7 @@ ask_yes_no() {
         [[ -z "$answer" ]] && answer="$2"
         answer=$(normalize_bool "$answer")
         [[ -n "$answer" ]] && { printf '%s' "$answer"; return 0; }
-        warn "Answer y or n."
+        warn "Answer y or n." >&2
     done
 }
 
@@ -982,17 +984,18 @@ strip_license_paste() {
 
 # Offline license file to import after install: a readable regular file of
 # 1..OFFLINE_LICENSE_MAX_BYTES bytes holding a JSON object. Prints the
-# absolute path. The signature is verified by nano-api at import.
+# absolute path. The signature is verified by nano-api at import. Called as
+# $(...), so its warnings go to stderr (on stdout they were swallowed).
 resolve_offline_license_file() {
     local path="$1" size first
-    [[ -f "$path" && -r "$path" ]] || { warn "Offline license file not found or not readable: $path"; return 1; }
+    [[ -f "$path" && -r "$path" ]] || { warn "Offline license file not found or not readable: $path" >&2; return 1; }
     size=$(wc -c < "$path" | tr -d '[:space:]')
     if (( size < 1 || size > OFFLINE_LICENSE_MAX_BYTES )); then
-        warn "Offline license file must be 1 to $OFFLINE_LICENSE_MAX_BYTES bytes (got $size): $path"
+        warn "Offline license file must be 1 to $OFFLINE_LICENSE_MAX_BYTES bytes (got $size): $path" >&2
         return 1
     fi
     first=$(tr -d ' \t\r\n' < "$path" | head -c 1)
-    [[ "$first" == "{" ]] || { warn "Offline license file is not a signed license JSON file: $path"; return 1; }
+    [[ "$first" == "{" ]] || { warn "Offline license file is not a signed license JSON file: $path" >&2; return 1; }
     printf '%s/%s' "$(cd "$(dirname "$path")" && pwd -P)" "$(basename "$path")"
 }
 
@@ -1231,14 +1234,15 @@ gen_secret() { openssl rand -hex 32 </dev/null; }
 # Keep first-run validation identical to nanosiem-core's authoritative policy.
 # This runs before .env is written or any image is pulled/started, so a weak
 # non-interactive password cannot leave a distributed install half-mutated.
-validate_admin_password() {
+ADMIN_PASSWORD_RULE="Admin password must be 12 to 1024 bytes and contain uppercase, lowercase, a digit, and a special character."
+
+# 0 when $1 meets nano-api's admin password policy (no output).
+admin_password_ok() {
     local password="$1" byte_length i char
     local has_upper=0 has_lower=0 has_digit=0 has_special=0
     local LC_ALL=C
     byte_length=${#password}
-    if (( byte_length < 12 || byte_length > 1024 )); then
-        fail "Admin password must be 12 to 1024 bytes and contain uppercase, lowercase, a digit, and a special character."
-    fi
+    (( byte_length >= 12 && byte_length <= 1024 )) || return 1
     for ((i = 0; i < byte_length; i++)); do
         char=${password:i:1}
         case "$char" in
@@ -1248,8 +1252,117 @@ validate_admin_password() {
             '!'|'@'|'#'|'$'|'%'|'^'|'&'|'*'|'('|')'|'-'|'_'|'='|'+'|'['|']'|'{'|'}'|'|'|'\'|';'|':'|"'"|'"'|','|'.'|'<'|'>'|'/'|'?'|'`'|'~') has_special=1 ;;
         esac
     done
-    if (( ! has_upper || ! has_lower || ! has_digit || ! has_special )); then
-        fail "Admin password must be 12 to 1024 bytes and contain uppercase, lowercase, a digit, and a special character."
+    (( has_upper && has_lower && has_digit && has_special ))
+}
+
+validate_admin_password() {
+    admin_password_ok "$1" || fail "$ADMIN_PASSWORD_RULE"
+}
+
+# NAN-5495: interactive admin password; blank autogenerates one (and sets
+# GENERATED_PASSWORD=1), anything that misses the policy is asked again
+# instead of ending the install.
+prompt_admin_password() {
+    local answer
+    while :; do
+        # `|| exit 1`: prompt_tty's no-TTY failure ends only its subshell; a
+        # caller in a condition (set -e off) would otherwise re-ask forever.
+        answer=$(prompt_tty "Admin password (blank = autogenerate)" "" secret) || exit 1
+        if [[ -z "$answer" ]]; then
+            ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
+            GENERATED_PASSWORD=1
+            return 0
+        fi
+        admin_password_ok "$answer" && { ADMIN_PASSWORD=$answer; return 0; }
+        warn "$ADMIN_PASSWORD_RULE"
+    done
+}
+
+# An address the first admin can sign in with: local@domain, no spaces.
+valid_admin_email() {
+    [[ "${1:-}" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]]
+}
+
+# Sets ADMIN_EMAIL (not a $(...) helper: warn writes to stdout).
+prompt_admin_email() {
+    local answer
+    while :; do
+        answer=$(prompt_tty "Admin email") || exit 1
+        # Trim the ends only: "john smith@x" is refused, never "johnsmith@x".
+        answer=$(trim_space "$answer")
+        valid_admin_email "$answer" && { ADMIN_EMAIL=$answer; return 0; }
+        warn "Enter the admin's email address (name@domain, no spaces)."
+    done
+}
+
+# Leading and trailing whitespace removed; nothing inside is touched.
+trim_space() {
+    local value="${1:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+# NAN-5495: the public base URL is http(s)://host[:port][/path] (v2.0.28
+# accepted "N"). Prints it normalized: scheme lowercased, trailing slashes and
+# one trailing dot on the host removed, port 1-65535 in decimal.
+normalize_base_url() {
+    local url="${1:-}" scheme host port url_path
+    while [[ "$url" == */ ]]; do url="${url%/}"; done
+    if [[ "$url" == *://* ]]; then
+        scheme=$(printf '%s' "${url%%://*}" | tr '[:upper:]' '[:lower:]')
+        url="$scheme://${url#*://}"
+    fi
+    [[ "$url" =~ ^(https?)://([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])\.?(:([0-9]{1,5}))?(/[A-Za-z0-9._~%/-]*)?$ ]] || return 1
+    scheme=${BASH_REMATCH[1]} host=${BASH_REMATCH[2]} port=${BASH_REMATCH[5]} url_path=${BASH_REMATCH[6]}
+    if [[ -n "$port" ]]; then
+        (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+        port=":$(( 10#$port ))"
+    fi
+    printf '%s://%s%s%s' "$scheme" "$host" "$port" "$url_path"
+}
+
+# Sets BASE_URL; $1 is the default.
+prompt_base_url() {
+    local answer url
+    while :; do
+        answer=$(prompt_tty "Public base URL" "$1") || exit 1
+        answer=$(trim_space "$answer")
+        url=$(normalize_base_url "$answer") && { BASE_URL=$url; return 0; }
+        warn "Enter the URL users open nano at, as http(s)://host[:port] (for example https://nano.example.com)."
+    done
+}
+
+# NAN-5495: a reused .env can hold a BASE_URL v2.0.28 accepted unchecked
+# ("N"). With a TTY (and this host owning .env: single node or the app role)
+# it is asked again and recorded; otherwise warned about, never fatal, so an
+# existing install keeps upgrading. A valid value is left exactly as it is.
+revalidate_recorded_base_url() {
+    local recorded dev default=""
+    [[ -z "${NANO_BASE_URL:-}" ]] || return 0
+    recorded=$(env_value BASE_URL)
+    [[ -n "$recorded" ]] || return 0
+    normalize_base_url "$recorded" >/dev/null && return 0
+    if have_controlling_tty && [[ "${MULTI_NODE:-0}" != "1" || ",${ROLE_ARG:-}," == *,app,* ]]; then
+        warn "This install's .env has BASE_URL='$recorded', which is not a URL users can open nano at."
+        # Enter must never silently record http://localhost (and dev mode): a
+        # bare host name or IP (a dotted name, an IPv4 address or a bracketed
+        # IPv6 address, optionally with :port) is offered back as
+        # https://<recorded>; anything else, "N" included, has no default and
+        # is asked until a valid URL is typed.
+        recorded=$(trim_space "$recorded")
+        if [[ "$recorded" != *://* && ( "$recorded" == *.* || "$recorded" == \[* ) ]] \
+            && normalize_base_url "https://$recorded" >/dev/null; then
+            default=$(normalize_base_url "https://$recorded")
+        fi
+        prompt_base_url "$default"
+        dev=false
+        [[ "$BASE_URL" == http://* ]] && dev=true
+        nano_env_set_keys .env "BASE_URL=$BASE_URL" "NANOSIEM_DEV_MODE=$dev" \
+            || fail "Could not record BASE_URL in .env."
+        log "Recorded BASE_URL=$BASE_URL in .env"
+    else
+        warn "This install's .env has BASE_URL='$recorded', which is not a valid http(s)://host[:port] URL; sign-in links and the ingest examples use it. Set BASE_URL=https://<host> in $PWD/.env (role-split: on the app host, then copy .env to every host), or re-run with NANO_BASE_URL=https://<host> ./install.sh."
     fi
 }
 # NAN-4957: enrichment (the IPinfo, Tor, ThreatFox platform feeds) REQUIRES a
@@ -1280,7 +1393,7 @@ ch_mem_feeds_note() {
         return 0   # unparseable: leave it to the operator
     fi
     if (( mib < 6144 )); then
-        warn "Enrichment requires 6 GB for ClickHouse; CLICKHOUSE_MEM_LIMIT is $v and the enrichment feeds (IPinfo, Tor, ThreatFox) are on. Raise it to CLICKHOUSE_MEM_LIMIT=6G in .env, or disable the feeds with PLATFORM_FEEDS_AUTO_UPDATE=false, then docker compose up -d. Without the memory, events get no geo/ASN (ingest keeps working)."
+        warn "Enrichment requires 6 GB for ClickHouse; CLICKHOUSE_MEM_LIMIT is $v and the enrichment feeds (IPinfo, Tor, ThreatFox) are on. Raise it to CLICKHOUSE_MEM_LIMIT=6G in .env, or disable the feeds with PLATFORM_FEEDS_AUTO_UPDATE=false, then re-run install.sh (it reassembles ClickHouse's configuration before starting it). Without the memory, events get no geo/ASN (ingest keeps working)."
     fi
 }
 
@@ -2361,6 +2474,7 @@ if [[ -f .env ]]; then
     collapsed_keys=$(nano_env_collapse_duplicates .env) \
         || fail "Could not collapse duplicate lines in .env."
     [[ -z "$collapsed_keys" ]] || ok "Collapsed duplicate .env line(s) for $collapsed_keys (kept the value in effect)"
+    revalidate_recorded_base_url
     # Role-split compose intentionally exposes only the five fixed roles. The
     # single-node-only Tenzir profile is not silently dropped or allowed to
     # replace the requested host profile set.
@@ -2491,7 +2605,7 @@ else
     REUSE_ENV=0
     log "Configuring first-time admin account"
 
-    [[ -z "$ADMIN_EMAIL" ]]    && ADMIN_EMAIL=$(prompt_tty "Admin email")
+    [[ -z "$ADMIN_EMAIL" ]]    && prompt_admin_email
     [[ -z "$ADMIN_EMAIL" ]]    && fail "Admin email is required."
 
     [[ -z "$ADMIN_NAME" ]]     && ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
@@ -2502,18 +2616,19 @@ else
         # ask for it: ./install.sh asks when it creates the account.
         :
     elif [[ -z "$ADMIN_PASSWORD" ]]; then
-        ADMIN_PASSWORD=$(prompt_tty "Admin password (blank = autogenerate)" "" secret)
-        if [[ -z "$ADMIN_PASSWORD" ]]; then
-            ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
-            GENERATED_PASSWORD=1
-        fi
+        prompt_admin_password
     fi
     [[ -z "$ADMIN_PASSWORD" ]] || validate_admin_password "$ADMIN_PASSWORD"
 
     # An explicit environment value makes the documented non-interactive
     # install path fully non-interactive.
     if [[ -z "${NANO_BASE_URL:-}" ]]; then
-        BASE_URL=$(prompt_tty "Public base URL" "$BASE_URL")
+        prompt_base_url "$BASE_URL"
+    else
+        # A value pasted with a trailing space or saved with CRLF endings is
+        # trimmed first, the same as a typed answer.
+        BASE_URL=$(normalize_base_url "$(trim_space "$NANO_BASE_URL")") \
+            || fail "NANO_BASE_URL must be http(s)://host[:port][/path] (got '$NANO_BASE_URL')."
     fi
 
     # Plain-HTTP deployments need NANOSIEM_DEV_MODE=true so the auth refresh
@@ -3494,6 +3609,21 @@ if [[ "$MULTI_NODE" != "1" && "$NANO_EDITION" == enterprise && -f scripts/lib/cl
     fi
 fi
 
+# NAN-5494: ClickHouse mounts two rendered DIRECTORIES and nothing inside
+# them: .nano-generated/clickhouse/config.d and users.d, the shipped
+# directories plus the sizing, tiering and network allow-list rendered above,
+# copied in as plain files. No installer package contains them, so a later
+# package extract never changes what ClickHouse runs (a file bind-mounted over
+# a shipped placeholder was detached by the extract, and ClickHouse reloaded
+# the empty placeholder: every user widened to all private ranges).
+if [[ "$MULTI_NODE" != "1" && -r scripts/lib/clickhouse_config_dirs.py ]]; then
+    # --record-env: NANO_CLICKHOUSE_CONFIG_DIR / NANO_CLICKHOUSE_USERS_DIR and
+    # NANO_CLICKHOUSE_CONFIG_SHA256, the trees' digest the clickhouse service
+    # carries, so changed sizing or networks recreate ClickHouse on `up`.
+    python3 -I scripts/lib/clickhouse_config_dirs.py --root . --env-file .env --record-env </dev/null >/dev/null \
+        || fail "Could not assemble the ClickHouse config.d / users.d directories (above). Nothing was started."
+fi
+
 # NAN-5408: `up` leaves a service that left the Compose graph running, with its
 # ports still published. With NANO_METRICS_BIND_ADDRESS gone, remove the
 # metrics edge, and the node-exporter it started unless the monitoring
@@ -3822,7 +3952,7 @@ else
             not_initialized+="."
             if [[ -z "$ADMIN_EMAIL" ]]; then
                 have_controlling_tty || fail "$not_initialized"
-                ADMIN_EMAIL=$(prompt_tty "Admin email")
+                prompt_admin_email
                 [[ -n "$ADMIN_EMAIL" ]] || fail "Admin email is required."
                 if persistable_env_value "$ADMIN_EMAIL"; then
                     nano_env_set_keys .env "NANO_ADMIN_EMAIL='$ADMIN_EMAIL'" || fail "Could not record NANO_ADMIN_EMAIL in .env."
@@ -3842,10 +3972,9 @@ else
             fi
             if [[ -z "$ADMIN_PASSWORD" ]]; then
                 have_controlling_tty || fail "$not_initialized"
-                ADMIN_PASSWORD=$(prompt_tty "Admin password (blank = autogenerate)" "" secret)
-                if [[ -z "$ADMIN_PASSWORD" ]]; then
-                    ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
-                    GENERATED_PASSWORD=1
+                GENERATED_PASSWORD=0
+                prompt_admin_password
+                if [[ "$GENERATED_PASSWORD" == 1 ]]; then
                     if grep -qE '^[[:space:]]*(export[[:space:]]+)?INITIAL_ADMIN_PASSWORD=' .env; then
                         # An empty leftover line: set it in place (NAN-5251).
                         nano_env_set_keys .env "INITIAL_ADMIN_PASSWORD=$ADMIN_PASSWORD" \

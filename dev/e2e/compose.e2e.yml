@@ -43,6 +43,9 @@ services:
       # A per-run copy: the preflight rewrites storage files in place, and the
       # checkout must stay untouched.
       - ${E2E_RUN_DIR:?E2E_RUN_DIR must be set}/clickhouse/config.d:/config.d
+      # NAN-5494: the preflight refuses trees the assembler did not build;
+      # scripts/e2e.sh assembles these with scripts/lib/clickhouse_config_dirs.py.
+      - ${E2E_RUN_DIR}/clickhouse/users.d:/users.d:ro
       - ./clickhouse/preflight:/preflight:ro
 
   clickhouse:

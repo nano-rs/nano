@@ -95,3 +95,63 @@ export function buildOnDemandFields(
   }
   return out;
 }
+
+/**
+ * NAN-5485: the note a partial on-demand inventory carries in its section
+ * header, or null when the list is complete. `failed` is a request that did
+ * not return at all: the section still shows, labelled, rather than vanish.
+ */
+export function partialInventoryNote(
+  inventory:
+    | { partial: boolean; reason?: string | null; rows_examined?: number | null; row_limit?: number | null }
+    | undefined,
+  failed = false,
+): string | null {
+  if (failed) return 'This list could not be loaded; fields may be missing.';
+  if (!inventory?.partial) return null;
+  switch (inventory.reason) {
+    case 'row_limit':
+      return `Listed from the first ${(inventory.row_limit ?? 0).toLocaleString('en-US')} matching events; other events may carry more fields.`;
+    case 'output_cap':
+      return 'More fields than the list holds; filter to find the rest.';
+    case 'scan_failed':
+      return 'The scan for these fields failed; fields may be missing.';
+    case 'query_not_scanned':
+      return 'This query could not be scanned for these fields.';
+    case 'subsearch_rows_not_scanned':
+      return 'Rows added by append/join subsearches were not scanned for these fields.';
+    case 'sampled_fallback':
+      return 'Sampled from recent events per source; run a search for its full list.';
+    case 'derived_fields_not_listed':
+      return 'Fields this pipeline creates (eval, rex, spath, lookup, rename) are not stored, so they are not listed here.';
+    case 'dataset_not_supported':
+      return 'This dataset has no list of these fields.';
+    default:
+      return 'This list may be incomplete.';
+  }
+}
+
+/** NAN-5485: how the panel's server field stats fall short, if they do. */
+export interface FieldStatsGap {
+  /** The stats were a head sample of this many matched events. */
+  sampledFromRows?: number | null;
+  /** The stats request failed: the panel shows stats of the loaded rows only. */
+  unavailable?: boolean;
+  /** Any other reason the server gave (`columns_dropped`). */
+  partialReason?: string | null;
+}
+
+/** NAN-5485: the field-stats note for a gap, or null when the stats are complete. */
+export function statsGapNote(gap: FieldStatsGap | null | undefined): string | null {
+  if (!gap) return null;
+  if (gap.unavailable) {
+    return 'Field stats unavailable; values below come from the loaded events only.';
+  }
+  if (gap.sampledFromRows) {
+    return `Stats from the first ${gap.sampledFromRows.toLocaleString('en-US')} matching events (primary-key order); fields only in later events may be missing.`;
+  }
+  if (gap.partialReason === 'columns_dropped') {
+    return 'Some columns could not be computed for this search; their fields are missing.';
+  }
+  return gap.partialReason ? 'Field stats are partial.' : null;
+}
