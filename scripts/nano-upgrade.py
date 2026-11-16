@@ -1192,6 +1192,33 @@ def safe_name(value: Any, label: str) -> str:
     return value
 
 
+# NAN-5528: SIEM Health findings that come from ClickHouse `system.errors`
+# running totals (the product's fallback analyzer titles, by signature).
+# The counter keeps every occurrence until ClickHouse restarts and the finding
+# looks back 24 h, so a burst the upgrade's own restarts caused (dictionaries
+# reloading against the memory limit) would otherwise block the gate, and a
+# plain `--resume`, for a day.
+TRANSIENT_ERROR_FINDINGS: dict[str, str] = {
+    "clickhouse is hitting its memory limit": "MEMORY_LIMIT_EXCEEDED",
+    "cache dictionary updates are failing": "CACHE_DICTIONARY_UPDATE_FAIL",
+}
+TRANSIENT_ERROR_NAMES = tuple(sorted(set(TRANSIENT_ERROR_FINDINGS.values())))
+FAILED_DICTIONARIES_KEY = "failed_dictionaries"
+# How long an error class must stay silent after its last occurrence inside
+# the rollout window before the gate treats it as a finished transient.
+TRANSIENT_ERROR_QUIET_SECONDS = 300
+SIEM_HEALTH_STEP = "post-verify:siem-health"
+SIEM_HEALTH_RESUME_ADVICE = (
+    "The release is fully rolled out; only this final check failed. Fix the cause "
+    "shown in Settings > SIEM Health, then run: scripts/nano upgrade --bundle "
+    "<same-bundle> --resume. The resume requests a fresh SIEM Health report "
+    "(it restarts nano-jobs, whose report runs about 5 minutes after start) and "
+    "re-checks against it. To accept the regression instead, add "
+    "--allow-siem-health-regression \"<reason>\" (audited)."
+)
+_PRIORITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
 def siem_health_finding_signatures(snapshot: dict[str, Any]) -> set[str]:
     findings = snapshot.get("findings", [])
     if not isinstance(findings, list):
@@ -1313,29 +1340,351 @@ def wait_for_fresh_siem_health(
     return after, True
 
 
+def siem_health_gate_resumed(events: Iterable[dict[str, Any]]) -> bool:
+    """Is this run re-entering a SIEM Health gate that already failed once?"""
+    return any(
+        event.get("event") == "step_failed" and event.get("step") == SIEM_HEALTH_STEP
+        for event in events
+    )
+
+
+def siem_health_report_for_gate(
+    fetch: Callable[[], dict[str, Any]],
+    requesters: Sequence[Callable[[], dict[str, Any]]],
+    before: dict[str, Any],
+    rollout_started: str | None,
+    wait_seconds: int,
+    *,
+    resumed: bool,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    now: Callable[[], str] = utc_now,
+    on_requested: Callable[[], None] = lambda: None,
+) -> tuple[dict[str, Any], bool]:
+    """The report the gate evaluates. Returns (report, fresh).
+
+    NAN-5497: on `--resume` after a failed gate, the latest report is the one
+    that failed, and the scheduler only writes a new one every 12 hours, so
+    re-reading it can never see the operator's fix. Request a fresh report and
+    wait (bounded) for one created after the request. If none arrives, fall
+    back to the latest post-upgrade report, as before, and say so."""
+    if not resumed:
+        return wait_for_fresh_siem_health(
+            fetch, before, rollout_started, wait_seconds, sleep=sleep, clock=clock,
+        )
+    # Fresh means a report id other than the one that failed (and not the
+    # baseline): no clock comparison, so host clock skew cannot hide it.
+    stale = fetch()
+    restarted = False
+    on_requested()  # journaled before the first restart: its reloads count
+    # Restart nano-jobs on EVERY app host: only the leader runs the
+    # scheduler, and any host may hold the lease.
+    for request in requesters:
+        try:
+            restarted = bool(request().get("restarted")) or restarted
+        except Exception as error:  # noqa: BLE001 - other hosts may still succeed
+            eprint(f"WARNING: could not request a fresh SIEM Health report: {str(error)[:300]}")
+    if restarted:
+        eprint(
+            f"==> {now()} requested a fresh SIEM Health report (restarted nano-jobs; "
+            "its scheduler reports about 5 minutes after start)"
+        )
+        previous_ids = {value for value in (stale.get("id"), before.get("id")) if value}
+
+        def fetch_new() -> dict[str, Any]:
+            report = fetch()
+            if report.get("id") in previous_ids:
+                return {**report, "status": "no-report-yet"}
+            return report
+
+        after, fresh = wait_for_fresh_siem_health(
+            fetch_new, {}, None, wait_seconds, sleep=sleep, clock=clock,
+        )
+        if fresh:
+            return after, True
+        eprint(
+            f"WARNING: the requested SIEM Health report did not arrive within {wait_seconds}s "
+            "(NANO_UPGRADE_SIEM_HEALTH_WAIT_SECONDS); checking the latest post-upgrade report "
+            "instead. If it still lists a cause you have already fixed, run a report from "
+            "Settings > SIEM Health and run --resume again."
+        )
+    else:
+        eprint(
+            "WARNING: no nano-jobs service was restarted to request a fresh SIEM Health "
+            "report; checking the latest post-upgrade report. If it still lists a cause you "
+            "have already fixed, run a report from Settings > SIEM Health and run --resume again."
+        )
+    return wait_for_fresh_siem_health(
+        fetch, before, rollout_started, 0, sleep=sleep, clock=clock,
+    )
+
+
+def upgrade_transient_findings(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    baseline: dict[str, Any] | None,
+    events: Sequence[dict[str, Any]],
+    readers: Sequence[Callable[[], dict[str, Any]]],
+    *,
+    quiet_seconds: int = TRANSIENT_ERROR_QUIET_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
+) -> dict[str, str]:
+    """NAN-5528: new error-counter findings the upgrade's own rollout caused
+    and that have since stopped (signature -> summary note).
+
+    The window runs from the run's first step to the first start of the SIEM
+    Health check. Errors still inside their quiet period are re-read after a
+    bounded wait (at most `quiet_seconds` per round, two rounds)."""
+    if str(after.get("status", "")) != "critical":
+        return {}
+    candidates = {
+        signature
+        for signature in siem_health_finding_signatures(after) - siem_health_finding_signatures(before)
+        if transient_error_name(signature) is not None
+    }
+    if not candidates:
+        return {}
+
+    def first_start(predicate: Callable[[str], bool]) -> dt.datetime | None:
+        for event in events:
+            if event.get("event") == "step_started" and predicate(str(event.get("step", ""))):
+                return _parse_report_time(event.get("at"))
+        return None
+
+    window_start = first_start(lambda step: True)
+    window_end = first_start(lambda step: step == SIEM_HEALTH_STEP)
+    # A resume's own nano-jobs restart (to get a fresh report) can reload
+    # dictionaries again: that span counts as upgrade-caused too.
+    extra_windows = [
+        (requested, now())
+        for requested in (
+            _parse_report_time(event.get("at"))
+            for event in events if event.get("event") == "siem_health_refresh_requested"
+        )
+        if requested is not None
+    ]
+    transient: dict[str, str] = {}
+    kept: dict[str, str] = {}
+    for attempt in range(3):
+        current = read_clickhouse_error_counters(readers, now)
+        transient, kept, wait = classify_transient_errors(
+            candidates, baseline, current.get("errors") if current else None,
+            window_start, window_end, now(), quiet_seconds, extra_windows,
+            failed_dictionaries=int((current or {}).get(FAILED_DICTIONARIES_KEY) or 0),
+        )
+        if wait <= 0 or attempt == 2:
+            break
+        delay = min(wait + 1, quiet_seconds + 1)
+        eprint(
+            f"==> {utc_now()} waiting {int(delay)}s to confirm the rollout's ClickHouse "
+            "errors have stopped"
+        )
+        sleep(delay)
+    for signature, reason in sorted(kept.items()):
+        eprint(f"note: SIEM Health finding '{signature}' still counts: {reason}")
+    return transient
+
+
+def transient_error_name(signature: str) -> str | None:
+    """The `system.errors` name behind a finding signature, if it is one."""
+    if signature in TRANSIENT_ERROR_FINDINGS:
+        return TRANSIENT_ERROR_FINDINGS[signature]
+    # AI-written titles vary; only an explicit error name maps.
+    if "memory_limit_exceeded" in signature:
+        return "MEMORY_LIMIT_EXCEEDED"
+    if "cache_dictionary_update_fail" in signature:
+        return "CACHE_DICTIONARY_UPDATE_FAIL"
+    return None
+
+
+def _finding_priorities(snapshot: dict[str, Any]) -> dict[str, int]:
+    ranks: dict[str, int] = {}
+    for finding in snapshot.get("findings", []) or []:
+        if not isinstance(finding, dict):
+            continue
+        signature = next(iter(siem_health_finding_signatures({"findings": [finding]})))
+        rank = _PRIORITY_RANK.get(str(finding.get("priority", "")).lower(), 0)
+        ranks[signature] = max(rank, ranks.get(signature, 0))
+    return ranks
+
+
+def _hhmmss(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.timezone.utc).strftime("%H:%M:%SZ")
+
+
+def classify_transient_errors(
+    signatures: Iterable[str],
+    baseline: dict[str, Any] | None,
+    current: dict[str, dict[str, Any]] | None,
+    window_start: dt.datetime | None,
+    window_end: dt.datetime | None,
+    now: dt.datetime,
+    quiet_seconds: int = TRANSIENT_ERROR_QUIET_SECONDS,
+    extra_windows: Sequence[tuple[dt.datetime, dt.datetime]] = (),
+    *,
+    failed_dictionaries: int = 0,
+) -> tuple[dict[str, str], dict[str, str], float]:
+    """NAN-5528: split new error-counter findings into upgrade transients.
+
+    Returns (transient signature -> summary note, kept signature -> why it
+    still counts, seconds to wait before a pending one can be decided).
+
+    A finding is transient only when ALL hold: the pre-upgrade baseline shows
+    no activity of that error in the 24 h before the upgrade; every current
+    occurrence falls inside the upgrade window (first step to the start of the
+    SIEM Health check); and none has occurred for `quiet_seconds`. An error
+    that was already happening, that happened outside the window, or that is
+    still happening keeps failing the gate."""
+    transient: dict[str, str] = {}
+    kept: dict[str, str] = {}
+    wait = 0.0
+    baseline_errors = (baseline or {}).get("errors") if isinstance(baseline, dict) else None
+    baseline_at = _parse_report_time((baseline or {}).get("captured_at")) if baseline else None
+    for signature in sorted(set(signatures)):
+        name = transient_error_name(signature)
+        if name is None:
+            continue
+        if not isinstance(baseline_errors, dict) or baseline_at is None:
+            kept[signature] = "no pre-upgrade ClickHouse error baseline to compare with"
+            continue
+        if window_start is None or window_end is None:
+            kept[signature] = "the upgrade rollout window is unknown"
+            continue
+        if current is None:
+            kept[signature] = "ClickHouse system.errors could not be read"
+            continue
+        before = baseline_errors.get(name) or {}
+        before_last = _parse_report_time(before.get("last_at"))
+        if before_last is not None and baseline_at - before_last <= dt.timedelta(hours=24):
+            kept[signature] = (
+                f"{name} was already occurring before the upgrade "
+                f"(last at {_hhmmss(before_last)})"
+            )
+            continue
+        if failed_dictionaries:
+            kept[signature] = (
+                f"{failed_dictionaries} ClickHouse dictionaries are still failing to load"
+            )
+            continue
+        entry = current.get(name) or {}
+        last = _parse_report_time(entry.get("last_at"))
+        if last is None:
+            kept[signature] = f"no {name} occurrences remain to attribute to the upgrade"
+            continue
+        in_refresh = any(start <= last <= end for start, end in extra_windows)
+        if last < window_start:
+            kept[signature] = f"{name} occurred at {_hhmmss(last)}, before the upgrade started"
+            continue
+        if last > window_end and not in_refresh:
+            kept[signature] = (
+                f"{name} continued after the rollout (last at {_hhmmss(last)})"
+            )
+            continue
+        silent = (now - last).total_seconds()
+        if silent < quiet_seconds:
+            wait = max(wait, quiet_seconds - silent)
+            kept[signature] = f"{name} last occurred {int(silent)}s ago; waiting for it to stay quiet"
+            continue
+        count = int(entry.get("value") or 0)
+        before_value = int(before.get("value") or 0)
+        if 0 < before_value <= count:
+            count -= before_value
+        transient[signature] = (
+            f"{count} {name} during the upgrade rollout "
+            f"(last at {_hhmmss(last)}), none since"
+        )
+    return transient, kept, wait
+
+
+def merge_clickhouse_error_counters(
+    per_node: Iterable[dict[str, Any]], now: dt.datetime,
+) -> dict[str, Any]:
+    """Fold per-host `system.errors` totals into one snapshot: summed counts
+    and the most recent occurrence, as coordinator UTC times."""
+    errors: dict[str, dict[str, Any]] = {}
+    failed_dictionaries = 0
+    for counters in per_node:
+        counters = dict(counters)
+        failed = counters.pop(FAILED_DICTIONARIES_KEY, 0)
+        if not isinstance(failed, int) or failed < 0:
+            raise UpgradeError("ClickHouse failed-dictionary count is invalid")
+        failed_dictionaries += failed
+        for name, entry in counters.items():
+            if name not in TRANSIENT_ERROR_NAMES or not isinstance(entry, dict):
+                raise UpgradeError("ClickHouse error counters are invalid")
+            value, age = entry.get("value"), entry.get("age_seconds")
+            if not isinstance(value, int) or not isinstance(age, int) or value < 0 or age < 0:
+                raise UpgradeError("ClickHouse error counters are invalid")
+            last = (now - dt.timedelta(seconds=age)).replace(microsecond=0)
+            merged = errors.setdefault(name, {"value": 0, "last_at": None})
+            merged["value"] += value
+            previous = _parse_report_time(merged["last_at"])
+            if previous is None or last > previous:
+                merged["last_at"] = last.isoformat().replace("+00:00", "Z")
+    return {
+        "captured_at": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "errors": errors, FAILED_DICTIONARIES_KEY: failed_dictionaries,
+    }
+
+
+def read_clickhouse_error_counters(
+    readers: Iterable[Callable[[], dict[str, Any]]],
+    now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
+) -> dict[str, Any] | None:
+    """Best effort: None when any ClickHouse host cannot be read, which makes
+    the gate keep every error-counter finding (never more permissive)."""
+    try:
+        per_node = [reader() for reader in readers]
+        return merge_clickhouse_error_counters(per_node, now())
+    except Exception as error:  # noqa: BLE001 - a missing probe only narrows the gate
+        eprint(f"note: ClickHouse error counters unavailable ({str(error)[:200]})")
+        return None
+
+
 def gate_siem_health_regressions(
     before: dict[str, Any], after: dict[str, Any], override_reason: str | None = None,
+    transient: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     before_status = str(before.get("status", "not-present"))
     after_status = str(after.get("status", "not-present"))
+    transient = dict(transient or {})
     regressions: list[str] = []
-    if after_status == "critical" and before_status != "critical":
-        regressions.append(f"status worsened from {before_status} to critical")
+    excused: list[str] = []
     if after_status == "critical":
         new_findings = sorted(
             siem_health_finding_signatures(after)
             - siem_health_finding_signatures(before)
         )
-        if new_findings:
-            regressions.append(f"new critical-report findings: {', '.join(new_findings)}")
+        excused = [finding for finding in new_findings if finding in transient]
+        remaining = [finding for finding in new_findings if finding not in transient]
+        if before_status != "critical":
+            # The status worsening is excused only when it is fully explained
+            # by upgrade transients: no other new finding and no pre-existing
+            # finding that rose in priority.
+            before_ranks = _finding_priorities(before)
+            worsened = [
+                signature for signature, rank in _finding_priorities(after).items()
+                if signature in before_ranks and rank > before_ranks[signature]
+            ]
+            if remaining or worsened or not excused:
+                regressions.append(f"status worsened from {before_status} to critical")
+                if worsened:
+                    regressions.append(
+                        f"pre-existing findings worsened: {', '.join(sorted(worsened))}"
+                    )
+        if remaining:
+            regressions.append(f"new critical-report findings: {', '.join(remaining)}")
     if regressions and not override_reason:
         raise UpgradeError(
             "SIEM Health regressed after upgrade: " + "; ".join(regressions)
+            + ". " + SIEM_HEALTH_RESUME_ADVICE
         )
     return {
         "before": before,
         "after": after,
         "regressions": regressions,
+        "transient": [transient[finding] for finding in excused],
         "override": bool(regressions and override_reason),
     }
 
@@ -7800,6 +8149,59 @@ fi
         siem_health_finding_signatures(snapshot)
         return snapshot
 
+    def clickhouse_error_counters(self) -> dict[str, Any]:
+        """NAN-5528: this ClickHouse's `system.errors` totals for the error
+        classes behind SIEM Health's error-counter findings. The age is
+        computed by ClickHouse, so coordinator clock skew cannot move an
+        occurrence in or out of the rollout window."""
+        if "clickhouse" not in self.roles:
+            raise UpgradeError("ClickHouse error counters must be read on a ClickHouse host")
+        names = ", ".join(f"'{name}'" for name in TRANSIENT_ERROR_NAMES)
+        output = self._ch_query(
+            "SELECT name, sum(value), "
+            "toUInt64(greatest(0, dateDiff('second', max(last_error_time), now()))) "
+            f"FROM system.errors WHERE name IN ({names}) GROUP BY name",
+            timeout=60,
+        )
+        counters: dict[str, dict[str, int]] = {}
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if (
+                len(parts) != 3 or parts[0] not in TRANSIENT_ERROR_NAMES
+                or not parts[1].isdigit() or not parts[2].isdigit()
+            ):
+                raise UpgradeError("ClickHouse system.errors returned an unexpected row")
+            counters[parts[0]] = {"value": int(parts[1]), "age_seconds": int(parts[2])}
+        # A dictionary that still cannot load (or whose last reload hit the
+        # memory limit) means the errors have not really stopped: a reload
+        # LIFETIME can be longer than the quiet period.
+        failed = self._ch_query(
+            "SELECT count() FROM system.dictionaries WHERE "
+            "status IN ('FAILED', 'FAILED_AND_RELOADING') OR "
+            "(status != 'NOT_LOADED' AND position(last_exception, 'MEMORY_LIMIT_EXCEEDED') > 0)",
+            timeout=60,
+        )
+        if not failed.isdigit():
+            raise UpgradeError("ClickHouse system.dictionaries returned an unexpected count")
+        counters[FAILED_DICTIONARIES_KEY] = int(failed)
+        return counters
+
+    def request_siem_health_report(self) -> dict[str, Any]:
+        """NAN-5497: ask for a fresh SIEM Health report. The report needs an
+        admin session over the API, which the upgrade does not hold; the
+        leader `nano-jobs` scheduler runs one 5 minutes after it starts, so a
+        restart of this host's jobs service is the credential-free trigger."""
+        if "app" not in self.roles or not self._service_exists("nano-jobs"):
+            return {"host": self.host_name, "restarted": False}
+        result = self.compose(["restart", "nano-jobs"], timeout=180, check=False)
+        if result.returncode != 0:
+            detail = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+            raise UpgradeError(
+                "cannot restart nano-jobs to request a SIEM Health report: "
+                + (detail[-1][:300] if detail else f"exit {result.returncode}")
+            )
+        return {"host": self.host_name, "restarted": True}
+
     def audit(self, run_id: str, action: str, success: bool, details: dict[str, Any]) -> None:
         journal = Journal(self.install_dir)
         journal.ensure_directory()
@@ -8461,6 +8863,20 @@ class NodeExecutor:
         if self.local:
             return self.local_ops.siem_health()
         return json_object(self._remote("siem-health", [], 120), "remote SIEM Health")
+
+    def clickhouse_error_counters(self) -> dict[str, Any]:
+        if self.local:
+            return self.local_ops.clickhouse_error_counters()
+        return json_object(
+            self._remote("clickhouse-errors", [], 120), "remote ClickHouse error counters",
+        )
+
+    def request_siem_health_report(self) -> dict[str, Any]:
+        if self.local:
+            return self.local_ops.request_siem_health_report()
+        return json_object(
+            self._remote("siem-health-refresh", [], 240), "remote SIEM Health request",
+        )
 
     def rollback_preflight(self, previous: str, target: str) -> list[Check]:
         if self.local:
@@ -10439,6 +10855,16 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 siem_health_before = recorded_baseline
             else:
                 siem_health_before = executors[postgres_nodes[0].name].siem_health()
+            # NAN-5528: what ClickHouse's error counters showed before the
+            # upgrade touched anything, so the final gate can tell an error
+            # burst the rollout caused from one that was already happening.
+            if baseline_event is not None and "clickhouse_errors_before" in baseline_event:
+                clickhouse_errors_before = baseline_event.get("clickhouse_errors_before")
+            else:
+                clickhouse_errors_before = read_clickhouse_error_counters(
+                    executors[node.name].clickhouse_error_counters
+                    for node in node_sort(nodes, "clickhouse")
+                )
             checks.append(Check(
                 "siem-health-baseline", True,
                 f"recorded pre-upgrade status {siem_health_before.get('status', 'unknown')}",
@@ -10499,6 +10925,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     state, "preflight_passed",
                     checks=[check.as_dict() for check in checks], ledger_before=ledgers,
                     siem_health_before=siem_health_before,
+                    clickhouse_errors_before=clickhouse_errors_before,
                 )
             else:
                 started = state.latest("run_started") or {}
@@ -10723,10 +11150,18 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     ),
                     None,
                 )
-                after, fresh = wait_for_fresh_siem_health(
-                    executors[postgres_node.name].siem_health,
-                    siem_health_before, rollout_started,
-                    env_seconds("NANO_UPGRADE_SIEM_HEALTH_WAIT_SECONDS", 600),
+                wait_seconds = env_seconds("NANO_UPGRADE_SIEM_HEALTH_WAIT_SECONDS", 600)
+                fetch_report = executors[postgres_node.name].siem_health
+                app_nodes = node_sort(nodes, "app")
+                after, fresh = siem_health_report_for_gate(
+                    fetch_report,
+                    [
+                        lambda executor=executors[node.name]: executor.request_siem_health_report()
+                        for node in app_nodes
+                    ],
+                    siem_health_before, rollout_started, wait_seconds,
+                    resumed=siem_health_gate_resumed(state.events),
+                    on_requested=lambda: journal.append(state, "siem_health_refresh_requested"),
                 )
                 if not fresh:
                     eprint(
@@ -10739,10 +11174,27 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         "override": False, "compared": False,
                         "reason": "no post-upgrade SIEM Health report within the wait",
                     }
+                transient = upgrade_transient_findings(
+                    siem_health_before, after, clickhouse_errors_before, state.events,
+                    [
+                        lambda executor=executors[node.name]: executor.clickhouse_error_counters()
+                        for node in node_sort(nodes, "clickhouse")
+                    ],
+                    quiet_seconds=env_seconds(
+                        "NANO_UPGRADE_TRANSIENT_ERROR_QUIET_SECONDS",
+                        TRANSIENT_ERROR_QUIET_SECONDS,
+                    ),
+                )
                 result = gate_siem_health_regressions(
                     siem_health_before, after, args.allow_siem_health_regression,
+                    transient=transient,
                 )
                 result["compared"] = True
+                for note in result["transient"]:
+                    eprint(
+                        f"note: SIEM Health finding from the upgrade's own rollout, not "
+                        f"counted as a regression: {note}"
+                    )
                 if result["override"]:
                     details = {
                         "reason": args.allow_siem_health_regression,
@@ -10757,7 +11209,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 return result
 
             siem_health = run_step(
-                journal, state, "post-verify:siem-health",
+                journal, state, SIEM_HEALTH_STEP,
                 verify_siem_health_regression,
             )
             installed_version = str(
@@ -10780,6 +11232,8 @@ def upgrade_command(args: argparse.Namespace) -> int:
             )
             print(f"Upgrade complete: {installed_version} -> {target}")
             print(f"Journal: {state.journal}")
+            for note in (siem_health.get("transient") or []) if isinstance(siem_health, dict) else []:
+                print(f"SIEM Health: not counted as a regression (upgrade rollout transient): {note}")
             with contextlib.suppress(Exception):
                 for line in ops.vector_native_cutover_summary():
                     print(line)
@@ -11061,6 +11515,10 @@ def worker_command(args: argparse.Namespace) -> int:
         value = ops.smoke_search(safe_name(args.marker, "smoke marker"), args.timeout)
     elif args.worker_action == "siem-health":
         value = ops.siem_health()
+    elif args.worker_action == "clickhouse-errors":
+        value = ops.clickhouse_error_counters()
+    elif args.worker_action == "siem-health-refresh":
+        value = ops.request_siem_health_report()
     elif args.worker_action == "rollback-preflight":
         value = [
             check.as_dict()
@@ -11153,7 +11611,7 @@ def parser() -> argparse.ArgumentParser:
     rollback.add_argument("--nano-cli", help=argparse.SUPPRESS)
 
     worker = commands.add_parser("_upgrade-worker", help=argparse.SUPPRESS)
-    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "render-config", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "rollback-preflight", "rollback", "reopen-ingest-edge"))
+    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "render-config", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "clickhouse-errors", "siem-health-refresh", "rollback-preflight", "rollback", "reopen-ingest-edge"))
     worker.add_argument("--install-dir", required=True)
     worker.add_argument("--candidate", default="")
     worker.add_argument("--bundle")

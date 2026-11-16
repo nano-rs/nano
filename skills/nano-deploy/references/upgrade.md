@@ -79,6 +79,39 @@ old ID still counts towards the license's two installs for 7 days after its
 last check-in, unless support retires it sooner. Tell the operator before a
 rebuild, and offer to ask support to retire the old ID.
 
+### Upgrading to 2.0.30 or later
+
+Tell the operator before the upgrade:
+
+- **Vector native :6000 becomes mutual TLS.** Upgrading from 2.0.29 or
+  earlier moves the listener off loopback (all interfaces on a single node,
+  the cluster address on a role split; `NANO_VECTOR_NATIVE_BIND_ADDRESS`
+  changes it) and refuses every sender without a client certificate. If
+  anything sends Vector's native protocol, plan to issue each sender a
+  certificate right after the upgrade (`scripts/nano vector-client-cert
+  <name>`, [single-node.md](single-node.md#step-11-vector-native-senders-only-if-the-operator-uses-them),
+  [multi-node-ha.md](multi-node-ha.md) Step 5). Firewall 6000 to those senders.
+- **No manual registry login and no `NANO_IMAGES_LOCK`.** The target's
+  installer and upgrader fetch a one-hour pull credential from the license
+  API with the values in `.env` and use it from a private temporary
+  `DOCKER_CONFIG` (`~/.docker` is never touched). Offline or air-gapped
+  licenses still load the image bundle (`scripts/nano bundle load`) or log in
+  by hand as the install user. Only the steps marked "2.0.29 and earlier"
+  below need a login.
+- **HTTPS installs keep the TLS overlay** on re-runs and upgrades: the
+  installer records it in `.env` and detects it from the running stack. It
+  also checks `config/nginx/ssl/fullchain.pem` and `privkey.pem` first; on an
+  existing install a bad certificate is a loud warning, not a stop, so read
+  the output.
+- **The installer checks host size first** and, on a re-run that changes the
+  release, asks `Upgrade to X now?` on a terminal. Without a terminal (plain
+  `ssh host '...'`) it upgrades, but always pass `NANO_CONFIRM_UPGRADE=1` on
+  installer re-runs so the answer never depends on a terminal (2.0.31 changes
+  the terminal default). Declining exits 3 (no) or 4 (no answer) with nothing
+  changed.
+- A pinned `NANO_API_MEM_LIMIT` under 640 MiB is refused: remove the pin or
+  raise it before the upgrade.
+
 ## Path A: Compose, from v2.0.10 or later (`scripts/nano upgrade`)
 
 > **v2.0.10 → v2.0.11:** the 2.0.11 dry run fails on every role-split cluster
@@ -153,8 +186,10 @@ fresh-install flow does not set them up):
    On every host, extract it over the install directory (it carries no `.env`,
    `.nano-role.env` or generated state; nothing restarts):
    `ssh $h 'tar -xzf /srv/nano/releases/nano-compose-enterprise-<v>.tar.gz --strip-components=1 -C ~/nano'`.
-   Log in to the registry on every host with a fresh pull credential (about
-   one hour) right before the dry run.
+   **Target 2.0.29 or earlier:** log in to the registry on every host with a
+   fresh pull credential (about one hour) right before the dry run. A 2.0.30+
+   target's upgrader logs in itself on every host, before the dry run's pulls
+   and again before each host's prepare.
 3. **Backup:** the upgrade takes a mandatory backup itself
    (`--backup-key-file`, and `--backup-output` on a role split). Make sure the
    key exists and the output has room (the planner's disk row). On a role
@@ -201,9 +236,10 @@ fresh-install flow does not set them up):
    a switchover, then the old leader; the Valkey master is moved off each
    PostgreSQL host before its Valkey and Sentinel restart) → migrations →
    app → ingest, one host at a time, draining each app and ingest host first.
-   If it stops, fix the cause (usually an expired registry login) and re-run
-   with `--resume` and the same package. Never delete `~/nano/upgrade-journal/`.
-   Log out of the registry after. From 2.0.13 the upgrader also:
+   If it stops, fix the cause and re-run with `--resume` and the same
+   package (before 2.0.30 the cause was usually an expired registry login).
+   Never delete `~/nano/upgrade-journal/`. 2.0.29 and earlier targets: log
+   out of the registry after. From 2.0.13 the upgrader also:
    - re-renders each host's configuration from the bundle right after that
      host's `prepare` step (journal step `render-config:<host>`), keeps the
      old render as `~/nano/.nano-generated.previous`, and recreates every
@@ -232,11 +268,15 @@ target's own `scripts/nano upgrade` is used from then on.
    single node `scripts/nano backup --key-file ... --output ...`; role split
    `scripts/nano backup-set --inventory /etc/nano/inventory.yaml --backup-key-file ... --backup-output ...`
    on the first app host ([operate.md](operate.md#backup)).
-3. **Package** on every host and registry login, as in Path A.
+3. **Package** on every host (and, for a 2.0.29 or earlier target, registry
+   login), as in Path A.
 4. **Dry run:** there is none for a rerun. `NANO_CHECK_ONLY=1 ./install.sh`
    on one host validates the inputs, edition, release and image source
    without writing or starting anything; run it on the first host.
-5. **Upgrade, single node:** `cd ~/nano && NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh`.
+5. **Upgrade, single node:** `cd ~/nano && NANO_CONFIRM_UPGRADE=1 ./install.sh`
+   (target 2.0.29 or earlier: `NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh`
+   after the registry login). Each role-split rerun below takes
+   `NANO_CONFIRM_UPGRADE=1` the same way.
 6. **Upgrade, role split**, in the order the planner prints, one host at a
    time, each with its **complete** role list (the planner's layout puts
    Keeper on the PostgreSQL hosts and ingest on the ClickHouse hosts: a

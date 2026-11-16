@@ -342,15 +342,19 @@ no `exposure` WARN left unexplained.
    with the license values and must print `VERIFIED`. It checks the pinned
    release-signing-v1 key, the signature, that the signed `.sha256` names
    exactly this bundle, and the bundle's hash; on any failure it keeps nothing.
-   Never use `sha256sum -c` or a key taken from inside the archive. Just before
-   installing, get the one-hour registry credential the same way with
-   `--registry-cred <file>`. The installer then verifies every image
-   against the digest lock (`NANO_IMAGES_LOCK=images.enterprise.customer.lock`;
-   never set `NANO_SKIP_IMAGE_VERIFY`). For an air-gapped site, the signed image
+   Never use `sha256sum -c` or a key taken from inside the archive. From
+   2.0.30 the installer logs in to the registry itself with the license in
+   the shared `.env` and defaults to `images.enterprise.customer.lock`.
+   **2.0.29 and earlier:** just before installing, get the one-hour registry
+   credential the same way with `--registry-cred <file>` and pass
+   `NANO_IMAGES_LOCK=images.enterprise.customer.lock` to every run. The
+   installer then verifies every image against the digest lock (never set
+   `NANO_SKIP_IMAGE_VERIFY`). For an air-gapped site, the signed image
    bundle is checked with `scripts/nano bundle verify <bundle>` before it is
    loaded.
 3. **Stage the bundle on every host** ([multi-node-ha.md](multi-node-ha.md)
-   Step 1) and log in to the registry with `--password-stdin`.
+   Step 1); 2.0.29 and earlier also log in to the registry with
+   `--password-stdin`.
 4. **Inventory** from the confirmed plan (the same flags as step 2):
 
    ```bash
@@ -479,10 +483,12 @@ hosts the `pg-patroni`, `pg-etcd` and `pg-sentinel` rows check the failover
 stack. The smoke test's `latency` row must show the write landing within its
 bound (default 60 s).
 
-After the install, log every host out of the registry: the pull credential is
-stored unencrypted in `~/.docker/config.json`
+2.0.29 and earlier only: after the install, log every host out of the
+registry: the pull credential is stored unencrypted in `~/.docker/config.json`
 (`ssh $H 'docker logout us-central1-docker.pkg.dev'`). Log in again for every
-installer re-run or upgrade.
+installer re-run or upgrade. From 2.0.30 the installer keeps its credential in
+a private temporary `DOCKER_CONFIG` it removes itself; `~/.docker` is never
+touched, so there is nothing to log out.
 
 From the workstation (outside the cluster), prove nothing but the load
 balancer answers from outside. Use the public addresses, if the hosts have

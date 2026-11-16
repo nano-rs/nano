@@ -278,6 +278,32 @@ hostnames, with the admin credential file there:
 python3 scripts/smoke-test.py --app-url https://APP_FQDN --ingest-url https://INGEST_FQDN --creds ./admin-creds.env
 ```
 
+Vector-native senders (:6000, mutual TLS only; only with
+`vector.native.enabled: true`): the chart keeps, under its fullname (the
+release name when it contains "nano", else `<release>-nano`; `nano` for the
+release used here), the listener CA
+(`<fullname>-vector-native-ca`) and the sender anchor bundle
+(`<fullname>-vector-native-clients`, key `ca.crt`, never overwritten by
+the chart) as Secrets; it starts locked, so no sender is accepted until you
+add one. Issue each sender's certificate on the workstation from
+`scripts/nano` of a nano release bundle or checkout of the same version, keep the PKI directory (it holds the
+anchor keys; store it like a secret), then publish the bundle and restart
+Vector, as in the Kubernetes guide ("Vector-native client certificates"):
+
+```bash
+umask 077; mkdir -p nano-vn
+kubectl -n nano get secret nano-vector-native-ca -o jsonpath='{.data.tls\.crt}' | base64 -d > nano-vn/listener-ca.crt
+scripts/nano vector-client-cert edge-dc1 --pki-dir nano-vn --server-ca nano-vn/listener-ca.crt \
+  --address <ingest address>:6000
+kubectl -n nano create secret generic nano-vector-native-clients \
+  --from-file=ca.crt=nano-vn/client-ca.crt --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+kubectl -n nano rollout restart deployment/nano-vector
+```
+
+`--revoke <name> --pki-dir nano-vn` then the same Secret apply and restart
+removes one sender; `--renew <name>` changes no Secret. GitOps renderers
+without cluster access set `vector.native.tls.existingSecret` instead.
+
 Upgrades: pull the NEW chart over the old one first, because
 `nano/values-customer-images.yaml` pins the digests of the chart it came with
 (reusing the old `./nano` silently keeps the old images), then upgrade from it

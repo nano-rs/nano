@@ -1,0 +1,347 @@
+{
+  "schema": "nano-benchmark/result@1",
+  "run_id": "socday-100",
+  "scenario": "socday",
+  "generated_at": "2026-11-16T20:45:51.399976+00:00",
+  "nano_version": "2.0.29",
+  "schema_profile": "ocsf",
+  "topology": {
+    "name": "bench-soc100",
+    "provider": "Rackspace Spot",
+    "region": "us-central-dfw-2",
+    "hosts": [
+      {
+        "name": "app1",
+        "role": "app",
+        "server_class": "gp.vs2.large-dfw2",
+        "vcpu": 4,
+        "mem_gb": 16,
+        "market_usd_per_hour": 0.04,
+        "bid_usd_per_hour": 0.08,
+        "on_demand_usd_per_hour": 0.09,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ch1",
+        "role": "clickhouse",
+        "server_class": "mh.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 64,
+        "market_usd_per_hour": 0.12,
+        "bid_usd_per_hour": 0.19,
+        "on_demand_usd_per_hour": 0.22,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ing1",
+        "role": "ingest",
+        "server_class": "gp.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 32,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.17,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "blaster1",
+        "role": "load-generator",
+        "server_class": "ch.vs2.large-dfw2",
+        "vcpu": 4,
+        "mem_gb": 8,
+        "market_usd_per_hour": 0.04,
+        "bid_usd_per_hour": 0.06,
+        "on_demand_usd_per_hour": 0.06,
+        "cpu_model": "AMD EPYC-Genoa"
+      }
+    ],
+    "nano_usd_per_hour_market": 0.24,
+    "nano_usd_per_hour_bid_ceiling": 0.43,
+    "active_ingest_hosts": 1,
+    "clickhouse_layout": "shards"
+  },
+  "dataset": {
+    "generator": "tools/log-blaster",
+    "seed_base": 20261114,
+    "assets": 5000,
+    "lateral_chains": false,
+    "source_mix": {
+      "windows_sysmon": 0.6,
+      "windows_event": 0.1,
+      "conduit_proxy": 0.12,
+      "apache_access": 0.1,
+      "aws_cloudtrail": 0.08
+    }
+  },
+  "phases": [
+    {
+      "label": "socday",
+      "window": {
+        "start": "2026-11-16T16:45:21.710464+00:00",
+        "end": "2026-11-16T20:45:23.040130+00:00",
+        "seconds": 14401.3
+      },
+      "target_eps": 1180,
+      "sender": {
+        "processes": 2,
+        "events_sent": 16885890,
+        "events_failed": 0,
+        "achieved_eps": 1172.5,
+        "seed": [
+          20261114,
+          20261115
+        ]
+      },
+      "stored": {
+        "events": 16885890,
+        "raw_bytes": 16576721539,
+        "avg_event_bytes": 981.7,
+        "by_source": {
+          "apache_access": 1690362,
+          "aws_cloudtrail": 1353493,
+          "conduit_proxy": 2024221,
+          "windows_event": 1689749,
+          "windows_sysmon": 10128065
+        }
+      },
+      "throughput": {
+        "eps": 1172.5,
+        "gb_per_day": 99.45
+      },
+      "ingest_lag_ms": {
+        "p50": 6366.5,
+        "p95": 11112,
+        "p99": 11531.09,
+        "max": 16108
+      },
+      "markers": {
+        "sent": 114870,
+        "stored_rows": 114870,
+        "stored_unique": 114870,
+        "exactly_once": true
+      },
+      "slo": {
+        "lag_p99_ok": true,
+        "zero_loss": true,
+        "errors_ok": true,
+        "keeps_up": true,
+        "pass": true
+      },
+      "storage": {
+        "rows_on_ch1": 17081849,
+        "compressed_bytes": 3899448582,
+        "uncompressed_bytes": 44911882215,
+        "compression_ratio": 11.52
+      }
+    }
+  ],
+  "hosts": {
+    "app1": {
+      "samples": 2873,
+      "cpu_busy_pct": {
+        "p50": 3.5,
+        "p95": 7.0,
+        "max": 13.2
+      },
+      "mem_used_pct": {
+        "p50": 13.9,
+        "max": 15.9
+      },
+      "disk_used_pct_end": 16.0,
+      "net_rx_mbps": 0.9,
+      "net_tx_mbps": 1.9,
+      "headroom": {
+        "cpu_pct": 93.0,
+        "mem_pct": 84.1,
+        "disk_pct": 84.0
+      }
+    },
+    "ch1": {
+      "samples": 2872,
+      "cpu_busy_pct": {
+        "p50": 13.9,
+        "p95": 33.4,
+        "max": 90.7
+      },
+      "mem_used_pct": {
+        "p50": 5.5,
+        "max": 8.4
+      },
+      "disk_used_pct_end": 17.0,
+      "net_rx_mbps": 4.5,
+      "net_tx_mbps": 1.0,
+      "headroom": {
+        "cpu_pct": 66.6,
+        "mem_pct": 91.6,
+        "disk_pct": 83.0
+      }
+    },
+    "ing1": {
+      "samples": 2872,
+      "cpu_busy_pct": {
+        "p50": 14.7,
+        "p95": 16.1,
+        "max": 20.0
+      },
+      "mem_used_pct": {
+        "p50": 4.5,
+        "max": 5.0
+      },
+      "disk_used_pct_end": 3.0,
+      "net_rx_mbps": 9.7,
+      "net_tx_mbps": 2.8,
+      "headroom": {
+        "cpu_pct": 83.9,
+        "mem_pct": 95.0,
+        "disk_pct": 97.0
+      }
+    },
+    "blaster1": {
+      "samples": 2873,
+      "cpu_busy_pct": {
+        "p50": 0.6,
+        "p95": 0.9,
+        "max": 3.5
+      },
+      "mem_used_pct": {
+        "p50": 10.7,
+        "max": 11.3
+      },
+      "disk_used_pct_end": 12.0,
+      "net_rx_mbps": 0.2,
+      "net_tx_mbps": 9.4,
+      "headroom": {
+        "cpu_pct": 99.1,
+        "mem_pct": 88.7,
+        "disk_pct": 88.0
+      }
+    }
+  },
+  "queries": {
+    "schema": "nano-benchmark/soc-mix@1",
+    "generated_at": "2026-11-16T20:45:37.020Z",
+    "config": {
+      "analysts": 8,
+      "dashboards": 4,
+      "refresh_secs": 60,
+      "agents": 2,
+      "duration": "4h",
+      "corpus_queries": 94,
+      "panels": 8,
+      "recipes": 24,
+      "agent_think_secs": [
+        6,
+        12
+      ],
+      "agent_tokens": 2
+    },
+    "search_by_tier": {
+      "triage": {
+        "server": {
+          "count": 2705,
+          "p50_ms": 46,
+          "p95_ms": 252.79999999999973,
+          "p99_ms": 424.8800000000001,
+          "max_ms": 924,
+          "avg_ms": 78.51164510166359
+        },
+        "round_trip": {
+          "count": 2705,
+          "p50_ms": 51,
+          "p95_ms": 260.7999999999997,
+          "p99_ms": 430.9200000000001,
+          "max_ms": 929,
+          "avg_ms": 84.76746765249538
+        }
+      },
+      "hunt": {
+        "server": {
+          "count": 4046,
+          "p50_ms": 49,
+          "p95_ms": 291.25,
+          "p99_ms": 458.10000000000036,
+          "max_ms": 1002,
+          "avg_ms": 89.55783489866535
+        },
+        "round_trip": {
+          "count": 4046,
+          "p50_ms": 55,
+          "p95_ms": 298.75,
+          "p99_ms": 471.10000000000036,
+          "max_ms": 1006,
+          "avg_ms": 95.78793870489372
+        }
+      },
+      "ir": {
+        "server": {
+          "count": 2415,
+          "p50_ms": 55,
+          "p95_ms": 263.2999999999997,
+          "p99_ms": 449.30000000000064,
+          "max_ms": 783,
+          "avg_ms": 88.21614906832298
+        },
+        "round_trip": {
+          "count": 2415,
+          "p50_ms": 61,
+          "p95_ms": 269.2999999999997,
+          "p99_ms": 474.78000000000293,
+          "max_ms": 788,
+          "avg_ms": 94.43312629399585
+        }
+      }
+    },
+    "dashboard_refresh": {
+      "count": 961,
+      "p50_ms": 376,
+      "p95_ms": 692,
+      "p99_ms": 876.3999999999996,
+      "max_ms": 1063,
+      "avg_ms": 403.1248699271592
+    },
+    "agent_queries": {
+      "count": 3175,
+      "p50_ms": 18,
+      "p95_ms": 127,
+      "p99_ms": 344.6399999999967,
+      "max_ms": 469,
+      "avg_ms": 37.222677165354334
+    },
+    "error_rates": {
+      "analysts": 0,
+      "dashboards": 0,
+      "agents": 0
+    },
+    "queries_executed": 20029
+  },
+  "detections": {
+    "findings": 74683,
+    "rules_fired": 27,
+    "event_to_alert_ms": {
+      "p50": 19028,
+      "p95": 28913,
+      "p99": 58157
+    },
+    "event_to_alert_ms_tool_launch_rules": {
+      "p50": 19205,
+      "p95": 25267,
+      "p99": 34946
+    },
+    "rule_set": {
+      "requested": 200,
+      "created": 200,
+      "skipped_existing": 0,
+      "failed": 0,
+      "errors": [],
+      "mode": "alerting",
+      "scheduled": 200
+    }
+  },
+  "target_gb_per_day": 100.0,
+  "cost": {
+    "usd_per_hour": 0.24,
+    "usd_per_day": 5.76,
+    "usd_per_gb_ingested": 0.05792,
+    "basis": "Spot market price at provisioning; nano hosts only (load generators excluded)"
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "profile": "ocsf",
+  "nano_version": "2.0.29",
+  "loaded_at": "2026-11-16T16:36:56.801579+00:00",
+  "sources": [
+    {
+      "source_type": "windows_sysmon",
+      "parser_path": "parsers-ocsf/windows_sysmon/parser.yaml",
+      "log_source_id": "lsrc_17nqbr5d5w9369jer8sfa3x8cm",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 57.4,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 57.4,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "windows_event",
+      "parser_path": "parsers-ocsf/windows_event/parser.yaml",
+      "log_source_id": "lsrc_58zy0sj7cg8mnr3dn4e7w451c6",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 56.4,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 56.4,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "conduit_proxy",
+      "parser_path": "parsers-ocsf/conduit_proxy/parser.yaml",
+      "log_source_id": "lsrc_2gr280qsw68c8bjrd4we64yn11",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 61.2,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 61.2,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "apache_access",
+      "parser_path": "parsers-ocsf/apache/parser.yaml",
+      "log_source_id": "lsrc_5a8n0r8rfe9a5s27frzy3bdmba",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 40.4,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 40.4,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "aws_cloudtrail",
+      "parser_path": "parsers-ocsf/aws_cloudtrail/parser.yaml",
+      "log_source_id": "lsrc_1r8982a9t48r88v9y7vt7j6fk2",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 42.0,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 42.0,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "bench_marker",
+      "parser_path": "parsers-ocsf/json_generic/parser.yaml",
+      "log_source_id": "lsrc_3fdm0zqh7s95p8j0za2jy1p6eq",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 64.6,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 64.6,
+          "ok": true
+        }
+      ]
+    }
+  ],
+  "rules": {
+    "requested": 200,
+    "created": 200,
+    "skipped_existing": 0,
+    "failed": 0,
+    "errors": [],
+    "mode": "alerting",
+    "scheduled": 200
+  },
+  "agentlane": {
+    "error": "502 {\"error\":\"clickhouse_error\",\"message\":\"ClickHouse CREATE USER failed: bad response: <html><body><h1>503 Service Unavailable</h1>\"}"
+  }
+}

@@ -20,7 +20,11 @@
  *   DASHBOARDS       dashboard viewers (default 3)
  *   REFRESH_SECS     dashboard refresh interval (default 60)
  *   AGENTS           Agent Lane agents (default 0; 2-3 for the published run)
- *   NAL_TOKENS_FILE  JSON list [{username,password,url}] from setup_content.py
+ *   NAL_TOKENS_FILE  JSON list [{username,password,url}] from setup_content.py;
+ *                    each agent gets its own token (mint at least AGENTS)
+ *   AGENT_THINK_MIN / AGENT_THINK_MAX  seconds between an agent's queries
+ *                    (default 6-12 s: an LLM agent's turn, and under Agent
+ *                    Lane's default per-token quota of 600 queries an hour)
  *   NAL_TABLE_SUFFIX "" on a single ClickHouse node, "_distributed" on a cluster
  *   DURATION         e.g. 10m (default), RESULTS_FILE (default soc_mix.json)
  *
@@ -31,6 +35,7 @@
 import http from "k6/http";
 import encoding from "k6/encoding";
 import { sleep } from "k6";
+import exec from "k6/execution";
 import { Counter, Rate, Trend } from "k6/metrics";
 
 const APP_URL = (__ENV.APP_URL || "http://localhost").replace(/\/$/, "");
@@ -42,6 +47,8 @@ const AGENTS = parseInt(__ENV.AGENTS || "0", 10);
 const DURATION = __ENV.DURATION || "10m";
 const RESULTS_FILE = __ENV.RESULTS_FILE || "soc_mix.json";
 const SUFFIX = __ENV.NAL_TABLE_SUFFIX || "";
+const AGENT_THINK_MIN = parseFloat(__ENV.AGENT_THINK_MIN || "6");
+const AGENT_THINK_MAX = parseFloat(__ENV.AGENT_THINK_MAX || "12");
 
 // --- inputs (read at init) ---------------------------------------------------
 const CORPUS = JSON.parse(open("../../results/soc_ir_corpus.json"));
@@ -149,8 +156,13 @@ export function dashboard() {
   trend("dashboard_panel_rt_ms").add(rt);
 }
 
+// One token per agent. __VU is global across scenarios, so (__VU - 1) % n can
+// give two agents the same token; take the scenario-local order of each VU's
+// first iteration instead (0..AGENTS-1 for a constant-vus scenario).
+let agentTok = null;
 export function agent() {
-  const tok = LANE[(__VU - 1) % LANE.length];
+  if (agentTok === null) agentTok = LANE[exec.scenario.iterationInTest % LANE.length];
+  const tok = agentTok;
   const r = RECIPES[Math.floor(Math.random() * RECIPES.length)];
   const params = Object.entries(r.params)
     .map(([k, v]) => `param_${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
@@ -168,7 +180,7 @@ export function agent() {
   executed.add(1, { kind: "agent" });
   if (res.status === 200) trend("agent_query_rt_ms").add(rt);
   // An agent reads the rows and decides its next query.
-  sleep(2 + Math.random() * 6);
+  sleep(AGENT_THINK_MIN + Math.random() * (AGENT_THINK_MAX - AGENT_THINK_MIN));
 }
 
 // Recipes: `-- @recipe <id>` blocks; `-- @param <name> <Type> <example>`
@@ -213,7 +225,8 @@ export function handleSummary(data) {
     generated_at: new Date().toISOString(),
     config: { analysts: ANALYSTS, dashboards: DASHBOARDS, refresh_secs: REFRESH_SECS,
               agents: scenarios.agents ? AGENTS : 0, duration: DURATION, corpus_queries: QUERIES.length,
-              panels: PANELS.length, recipes: RECIPES.length },
+              panels: PANELS.length, recipes: RECIPES.length,
+              agent_think_secs: [AGENT_THINK_MIN, AGENT_THINK_MAX], agent_tokens: LANE.length },
     search_by_tier: Object.fromEntries(TIERS.map((t) => [t, {
       server: pick(m[`search_${t}_server_ms`]),
       round_trip: pick(m[`search_${t}_rt_ms`]),

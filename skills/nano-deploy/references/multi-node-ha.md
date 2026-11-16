@@ -61,11 +61,19 @@ release. Ask before each step.
 - `deployment_id`, host `name`/`id`, roles and shard/replica numbers are
   permanent identity. Never change them to get past an error.
 - Every invocation names the host and its roles:
-  `NANO_HOST_NAME=<hosts[].name> NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role <roles> --inventory /etc/nano/inventory.yaml`.
-  Every invocation also sets `NANO_IMAGES_LOCK=images.enterprise.customer.lock`
-  so images come from the customer repository your registry credential can pull.
+  `NANO_HOST_NAME=<hosts[].name> ./install.sh --role <roles> --inventory /etc/nano/inventory.yaml`.
+  From 2.0.30 the installer uses `images.enterprise.customer.lock` by default
+  (the app host decides; the other hosts follow the prefix in the shared
+  `.env`) and logs in to the registry itself with the license in `.env`.
+  **2.0.29 and earlier:** add `NANO_IMAGES_LOCK=images.enterprise.customer.lock`
+  to every invocation and log in to the registry on every host first.
   Once a host is fully installed, always run it with its **complete** role
   list, including on upgrades.
+- From 2.0.30 each run checks the host size for its roles before anything
+  else (a host with ClickHouse needs 2 vCPU, 8 GB RAM and 40 GB free on
+  Docker's data filesystem, 16 GB beside the app, ingest, PostgreSQL or
+  Tenzir roles with the enrichment feeds on (Keeper alone does not count); app, ingest, PostgreSQL or Keeper alone need 4 GB and 20 GB).
+  Size the host instead of setting `NANO_SKIP_HOST_MINIMUMS=1`.
 - Do not copy `.nano-role.env` or `.nano-generated/` between hosts. They are
   host-specific and regenerated on every run.
 
@@ -84,8 +92,10 @@ a lab runs without one.
 
 Same as Steps 0–3 in [single-node.md](single-node.md): fetch and verify the
 bundle once with `scripts/fetch-bundle.sh` (it must print `VERIFIED`), copy and
-extract it to `~/nano`, and log in to the registry. Do this on
-**all three** hosts.
+extract it to `~/nano`. Do this on **all three** hosts. Registry login
+(single-node Step 3) is needed only for 2.0.29 and earlier or an offline
+license: from 2.0.30 each host's run logs in with the license from the shared
+`.env`, so apply the enrollment values (Step 4) before Step 5 distributes it.
 
 ## Step 2: inventory
 
@@ -170,7 +180,7 @@ membership is active.
 ssh $H1 "bash -s -- --email ADMIN_EMAIL --name 'ADMIN NAME'" < scripts/admin-credentials.sh
 ssh $H1 'cd ~/nano && set -a && . ~/.nano-admin-credentials && set +a &&
   NANO_HOST_NAME=nano-1 NANO_BASE_URL=<https://app fqdn> NANO_PREPARE_ONLY=1 \
-  NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role app,postgres,keeper --inventory /etc/nano/inventory.yaml'
+  ./install.sh --role app,postgres,keeper --inventory /etc/nano/inventory.yaml'
 ```
 
 Then add the enrollment values on nano-1 with `apply-enrollment.sh` (Step 7 of
@@ -223,7 +233,12 @@ Issue and revoke senders on the first app host; its PKI and keys never leave it:
 
 ```bash
 ssh $H1 'cd ~/nano && scripts/nano vector-client-cert edge-dc1 --address <ingest name or LB>:6000'
+# then: stream nano-1's .env to every host (Step 5) and re-run each ingest host's command
 ```
+
+`--renew <name>` re-signs under the same anchor (copy the new `.crt` to the
+sender; `.env` and the ingest hosts do not change). `--list` shows every
+sender and marks certificates expiring within 30 days.
 
 Each issue or `--revoke` changes `.env`, and the command says it is NOT yet
 effective on the ingest hosts: stream `.env` to every host as above and re-run
@@ -240,17 +255,17 @@ Run one host at a time and wait for each to succeed before the next:
 
 ```bash
 # 1. Data roles on nano-2 and nano-3 (two Keepers already form a quorum)
-ssh $H2 'cd ~/nano && NANO_HOST_NAME=nano-2 NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role clickhouse,keeper --inventory /etc/nano/inventory.yaml'
-ssh $H3 'cd ~/nano && NANO_HOST_NAME=nano-3 NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role clickhouse,keeper --inventory /etc/nano/inventory.yaml'
+ssh $H2 'cd ~/nano && NANO_HOST_NAME=nano-2 ./install.sh --role clickhouse,keeper --inventory /etc/nano/inventory.yaml'
+ssh $H3 'cd ~/nano && NANO_HOST_NAME=nano-3 ./install.sh --role clickhouse,keeper --inventory /etc/nano/inventory.yaml'
 
 # 2. nano-1 with its complete role list: PostgreSQL, Keeper 1, migrations on both
 #    replicas, dictionary readiness, Keeper root ACL, app start and admin creation
 ssh $H1 'cd ~/nano && set -a && . ~/.nano-admin-credentials && set +a &&
-  NANO_HOST_NAME=nano-1 NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role app,postgres,keeper --inventory /etc/nano/inventory.yaml'
+  NANO_HOST_NAME=nano-1 ./install.sh --role app,postgres,keeper --inventory /etc/nano/inventory.yaml'
 
 # 3. Ingest on nano-2 and nano-3: complete role lists (they fetch parsers and tokens from the app)
-ssh $H2 'cd ~/nano && NANO_HOST_NAME=nano-2 NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role clickhouse,keeper,ingest --inventory /etc/nano/inventory.yaml'
-ssh $H3 'cd ~/nano && NANO_HOST_NAME=nano-3 NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role clickhouse,keeper,ingest --inventory /etc/nano/inventory.yaml'
+ssh $H2 'cd ~/nano && NANO_HOST_NAME=nano-2 ./install.sh --role clickhouse,keeper,ingest --inventory /etc/nano/inventory.yaml'
+ssh $H3 'cd ~/nano && NANO_HOST_NAME=nano-3 ./install.sh --role clickhouse,keeper,ingest --inventory /etc/nano/inventory.yaml'
 ```
 
 If a run fails, read its last 40 lines, fix the cause, and re-run **that same

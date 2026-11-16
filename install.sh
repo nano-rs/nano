@@ -93,9 +93,10 @@
 #   not a refusal; NANO_SKIP_TLS_PREFLIGHT=1 skips the certificate check. A
 #   re-run without NANO_COMPOSE_OVERLAYS in the environment records in .env any
 #   overlay the running stack uses that .env lacks (so HTTPS stays on).
-#   NANO_CONFIRM_UPGRADE=1 answers the "Upgrade to X now?" question (asked on a
-#   terminal when a re-run moves to another release) with yes. Declining exits
-#   3 (answered no) or 4 (no answer: Enter or EOF); nothing is changed.
+#   NANO_CONFIRM_UPGRADE=1 answers the "Upgrade to X now? [Y/n]" question
+#   (asked on a terminal when a re-run moves to another release) with yes.
+#   Enter upgrades (NAN-5529). Declining exits 3 (answered n) or 4 (no answer:
+#   end of input); nothing is changed.
 #   Enterprise: NANO_TIERING (on | off, default off; or --tiering) and NANO_TIERING_PROVIDER (s3 |
 #   s3-compatible | gcs | azure), NANO_TIERING_BUCKET, NANO_TIERING_REGION,
 #   NANO_TIERING_ENDPOINT, NANO_TIERING_PREFIX (default nano),
@@ -2717,14 +2718,23 @@ confirm_upgrade() {
         return 0
     fi
     log "$how"
-    # Declining exits non-zero (NAN-5521: a run that did not upgrade must not
-    # read as success): 3 for an explicit no, 4 for no answer (Enter or EOF).
+    # NAN-5529: running ./install.sh to upgrade means yes, so Enter upgrades
+    # (the warning above says what that does). Declining exits non-zero
+    # (NAN-5521: a run that did not upgrade must not read as success): 3 for
+    # an explicit no, 4 for no answer (end of input, e.g. a closed terminal).
     local reply eof
     while :; do
         reply="" eof=0
-        printf '%s ' "Upgrade to $to now? [y/N]:" > /dev/tty
+        printf '%s ' "Upgrade to $to now? [Y/n]:" > /dev/tty
         IFS= read -r reply < /dev/tty || eof=1
+        if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
+            printf '\n' > /dev/tty
+            printf '%s\n' "Not upgraded: nothing was changed." > /dev/tty
+            printf '%s\n' "install.sh: no answer to the upgrade question; nothing was changed (exit 4). Answer y (or press Enter), or set NANO_CONFIRM_UPGRADE=1 to upgrade without asking." >&2
+            exit 4
+        fi
         [[ "$eof" == 0 ]] || printf '\n' > /dev/tty
+        [[ -n "${reply//[[:space:]]/}" ]] || return 0
         case "$(normalize_bool "$reply")" in
             true) return 0 ;;
             false)
@@ -2733,12 +2743,7 @@ confirm_upgrade() {
                 exit 3
                 ;;
         esac
-        if [[ -z "${reply//[[:space:]]/}" ]]; then
-            printf '%s\n' "Not upgraded: nothing was changed." > /dev/tty
-            printf '%s\n' "install.sh: no answer to the upgrade question; nothing was changed (exit 4). Answer y, or set NANO_CONFIRM_UPGRADE=1 to upgrade without asking." >&2
-            exit 4
-        fi
-        warn "Answer y or n." >&2
+        warn "Answer y or n (Enter upgrades)." >&2
     done
 }
 
@@ -4628,7 +4633,7 @@ export NANO_VERSION NANO_IMAGE_PREFIX
 VECTOR_NATIVE_PKI_DIR=.nano-pki/vector-native
 VECTOR_NATIVE_TLS_DIR=config/vector-native
 VECTOR_NATIVE_STATE=""
-VECTOR_NATIVE_NEW=0
+VECTOR_NATIVE_CUTOVER=0
 VECTOR_NATIVE_RESTART=0
 VECTOR_NATIVE_RECENT_EVENTS=""
 vector_native_recent_events() {
@@ -4650,8 +4655,29 @@ vector_native_recent_events() {
     [[ "$count" =~ ^[0-9]+$ ]] && VECTOR_NATIVE_RECENT_EVENTS=$count
     return 0
 }
+# NAN-5526: did this host run the pre-mTLS (v2.0.29 or older) plaintext :6000
+# listener? Only then is "port 6000 now REQUIRES mutual TLS" news. The .env
+# records the release this install ran before this run; a role-split ingest
+# host's .env is copied from the app host, so Vector state this host already
+# has (the step runs before anything starts) also counts: a Vector container,
+# or its data volume (it survives `docker compose down`). A fresh install (no
+# .env, or a copied v2.0.30+ one, and no Vector container or volume) never.
+vector_native_had_plaintext_listener() {
+    local v=${PRE_RUN_NANO_VERSION:-}
+    if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        if (( BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] == 0 && BASH_REMATCH[3] < 30) )); then
+            return 0
+        fi
+    elif [[ "${REUSE_ENV:-0}" == "1" ]]; then
+        # A reused .env without a release recorded predates the key.
+        return 0
+    fi
+    docker compose "${COMPOSE_ARGS[@]}" ps -a --services 2>/dev/null </dev/null | grep -x vector >/dev/null \
+        || docker volume ls -q --filter label=com.docker.compose.volume=nano-vector-data 2>/dev/null </dev/null \
+            | grep . >/dev/null
+}
 vector_native_pki_step() {
-    local had=0 result bind status=0 new_ca_args=() san_args=() sans_env expiring line
+    local had=0 anchor_count result bind status=0 new_ca_args=() san_args=() sans_env expiring line
     [[ -r scripts/lib/vector-native-pki.sh ]] \
         || fail "scripts/lib/vector-native-pki.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
     if [[ "$MULTI_NODE" == "1" ]]; then
@@ -4662,18 +4688,28 @@ vector_native_pki_step() {
             --tls-dir "$VECTOR_NATIVE_TLS_DIR" --env-file .env </dev/null) \
             || fail "Could not prepare the Vector-native sender anchors in $NANO_INSTALL_DIR/$VECTOR_NATIVE_TLS_DIR (above). Nothing was started."
         VECTOR_NATIVE_STATE=$result
-        [[ "$had" == 1 ]] || VECTOR_NATIVE_NEW=1
+        if [[ "$had" == 0 ]] && vector_native_had_plaintext_listener; then
+            VECTOR_NATIVE_CUTOVER=1
+        fi
         [[ "$result" != *changed=1* || "$had" == 0 ]] || VECTOR_NATIVE_RESTART=1
         if [[ "${NANO_PRIVATE_TLS:-}" != "true" ]]; then
             VECTOR_NATIVE_STATE="$result server=locked"
             warn "Vector native :6000 is locked on this host (refuses every sender): this cluster has no private TLS, and the listener certificate is the cluster's TLS certificate. Plaintext lab clusters have no Vector-native listener."
         else
-            ok "Vector native :6000: mutual TLS with the cluster certificate; ${result%% *} sender anchor(s) from the shared .env"
+            # ensure-ingest prints `anchors=<count> changed=<0|1>`.
+            anchor_count=${result%% *}
+            anchor_count=${anchor_count#anchors=}
+            if [[ "$anchor_count" == 1 ]]; then
+                ok "Vector native :6000: mutual TLS with the cluster certificate; 1 sender anchor from the shared .env"
+            else
+                ok "Vector native :6000: mutual TLS with the cluster certificate; $anchor_count sender anchors from the shared .env"
+            fi
         fi
         return 0
     fi
     [[ -s "$VECTOR_NATIVE_TLS_DIR/server.crt" ]] && had=1
-    if [[ "$had" == 0 && "${REUSE_ENV:-0}" == "1" ]]; then
+    if [[ "$had" == 0 ]] && vector_native_had_plaintext_listener; then
+        VECTOR_NATIVE_CUTOVER=1
         vector_native_recent_events
     fi
     # A specific bind address is one senders connect to (a wildcard adds
@@ -4691,7 +4727,6 @@ vector_native_pki_step() {
         fail "Could not prepare the Vector-native TLS files in $NANO_INSTALL_DIR/$VECTOR_NATIVE_TLS_DIR (above). Nothing was started."
     fi
     VECTOR_NATIVE_STATE=$result
-    [[ "$had" == 1 ]] || VECTOR_NATIVE_NEW=1
     if [[ "$had" == 1 && ( "$result" == *server=issued* || "$result" == *anchors=changed* ) ]]; then
         VECTOR_NATIVE_RESTART=1
     fi
@@ -5717,7 +5752,8 @@ if [[ -n "$firewall_ports" ]]; then
     printf "            with the DOCKER-USER chain or bind addresses: https://docs.docker.com/engine/network/packet-filtering-firewalls/\n"
 fi
 # NAN-5515: an existing install whose :6000 listener just became mTLS-only.
-if [[ "$VECTOR_NATIVE_NEW" == "1" && "${REUSE_ENV:-0}" == "1" ]]; then
+# NAN-5526: only an upgrade from a plaintext listener, never a fresh install.
+if [[ "$VECTOR_NATIVE_CUTOVER" == "1" ]]; then
     echo
     printf "  %b!! Vector native port 6000 now REQUIRES mutual TLS.%b\n" "$c_bold" "$c_reset"
     printf "  !! Senders without a client certificate signed by this install's Vector-native CA are refused.\n"

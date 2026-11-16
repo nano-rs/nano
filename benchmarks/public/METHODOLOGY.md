@@ -1,7 +1,8 @@
 # How we benchmark nano
 
-*Draft for the nano.rs docs and marketing page. The numbers are filled in from
-the v2.0.25 runs; until then every figure below is a placeholder (`TBD`).*
+*Draft for the nano.rs docs and marketing page. Every number below comes from
+the nano v2.0.29 runs on 2026-11-16; the raw JSON is in
+[`results/v2.0.29-2026-11-16/`](results/v2.0.29-2026-11-16/).*
 
 nano is a SIEM, so we measure what a security team feels. Can it keep up with
 everything we send? How long until an event is searchable? How long until a
@@ -22,28 +23,47 @@ run it):
 | Role | Hosts | Spot class | vCPU / RAM |
 |---|---|---|---|
 | app (UI, API, search, detections, PostgreSQL, Keeper) | 1 | gp.vs2.xlarge | 8 / 32 GB |
-| ClickHouse (2 shards, also Keeper) | 2 | gp.vs2.2xlarge | 16 / 64 GB |
+| ClickHouse shard 1 (also Keeper) | 1 | gp.vs2.2xlarge | 16 / 64 GB |
+| ClickHouse shard 2 (also Keeper) | 1 | mh.vs2.xlarge | 8 / 64 GB |
 | ingest (Vector behind nginx) | 3, then 4 | ch.vs2.xlarge | 8 / 16 GB |
-| load generators (log-blaster, k6) | 3 | ch.vs2.xlarge | 8 / 16 GB |
+| load generators (log-blaster, k6) | 2 | gp.vs2.xlarge | 8 / 32 GB |
 
-The load generators aren't part of the cluster and aren't in its cost. They
-send straight to the ingest hosts and spread the load evenly, as a customer's
-load balancer would.
+The load generators aren't part of the cluster and aren't in its cost. Twelve
+sender processes send straight to the ingest hosts and spread the load evenly,
+as a customer's load balancer would. All four ingest hosts are installed; in
+the 3-host runs the fourth gets no traffic and is left out of the cost.
 
-**Method.** We ramp events per second in steps. Each step runs for 10 minutes,
-followed by a 90-second drain. After each step we check three service-level
+On 2026-11-16 Spot had no gp.vs2.2xlarge capacity left in us-central-dfw-2
+(spot and on-demand bids both stayed unfulfilled), so the second ClickHouse
+shard ran on an mh.vs2.xlarge (8 vCPU / 64 GB). The v2.0.25 runs used two
+gp.vs2.2xlarge hosts. With 3 ingest hosts, ingest still saturated first. With
+4, the smaller shard did.
+
+**Method.** We ramp events per second in steps. Each step runs for 5 minutes,
+followed by a 60-second drain. After each step we check four service-level
 objectives:
 
 - **Lag:** ingest-to-searchable lag p99 is at most 60 s.
 - **Zero loss:** every event the senders had acknowledged is stored, and
   every sequence marker is stored exactly once.
 - **Errors:** fewer than 0.1% of events fail at the sender after retries.
+- **Keeps up:** the senders achieve at least 95% of the step's target rate.
 
-The **ceiling** is the highest step that meets all three. We report where it
-broke and which resource was saturated.
+The fourth objective is the one that breaks. Past its ceiling, nano doesn't
+drop events or fall behind. The ingest tier pushes back on the senders, so
+they slow down, lag stays flat and nothing is lost. Without "keeps up", a ramp
+would pass every step forever at the same real throughput.
+
+The **ceiling** is the highest step that meets all four. Each configuration
+is ramped three times. The first ramp uses coarse steps (6,000 events/s); the
+second and third start below it and use 2,000 events/s steps. We report the
+median, where it broke and which resource was saturated. For v2.0.29, Spot
+VM freezes forced a second fresh install partway through, so the median
+pools every ramp that reached a passing step on either install: 6 with 3
+ingest hosts and 5 with 4.
 
 We expect Vector on the ingest hosts to saturate first. To show it, we add a
-fourth ingest host and run the ramp again. If the ceiling moves, the
+fourth ingest host and run the ramps again. If the ceiling moves, the
 bottleneck was ingest, not storage.
 
 **Reported:**
@@ -56,12 +76,12 @@ bottleneck was ingest, not storage.
 
 | | 3 ingest hosts | 4 ingest hosts |
 |---|---|---|
-| Sustained events/s | TBD | TBD |
-| Sustained GB/day | TBD | TBD |
-| Ingest lag p50 / p99 | TBD / TBD | TBD / TBD |
-| Search p95 at peak (hunt tier) | TBD | TBD |
-| First saturated resource | TBD | TBD |
-| Cluster cost per hour (Spot market) | TBD | TBD |
+| Sustained events/s | 22,150 | 27,047 |
+| Sustained GB/day | 1,879 | 2,295 |
+| Ingest lag p50 / p99 | 4.7 s / 9.1 s | 5.2 s / 25.0 s |
+| Search p95 at peak (hunt tier) | 676 ms | 959 ms |
+| First saturated resource | ingest (Vector, 62 to 78% CPU; 72 to 78% in 5 of 6 ramps) | ClickHouse shard 2 (8 vCPU, 86 to 95% CPU) |
+| Cluster cost per hour (Spot market) | $0.81 | $0.89 |
 
 ### 2. A normal SOC day
 
@@ -71,11 +91,13 @@ bottleneck was ingest, not storage.
 |---|---|---|---|
 | app | 1 | gp.vs2.large | 4 / 16 GB |
 | ClickHouse | 1 | mh.vs2.xlarge | 8 / 64 GB |
-| ingest | 1 | ch.vs2.xlarge | 8 / 16 GB |
+| ingest | 1 | gp.vs2.xlarge | 8 / 32 GB |
+| load generator (log-blaster, k6) | 1 | ch.vs2.large | 4 / 8 GB |
 
-This is one cluster, run at two sizing tiers: **50 GB/day** and **100 GB/day**.
-Ingest is held steady at the tier's rate for 4 hours, and this all runs at the
-same time:
+This one cluster shape is run at two sizing tiers: **50 GB/day** and
+**100 GB/day**, on two identical clusters side by side. Ingest is held steady
+at the tier's rate for 4 hours, once per tier. All of this runs at the same
+time:
 
 - **Analysts:** 8 analysts replay 94 real investigations from our IR/SOC
   corpus at the time window an analyst actually uses:
@@ -84,12 +106,15 @@ same time:
   - retro IR: up to 7 days.
 
   Each analyst pauses 5–20 s between queries to read results.
-- **Detections:** 200 rules: 180 scheduled (every 1 or 5 minutes) and 20
-  real-time. They cover endpoint, identity, network, proxy and cloud, and are
-  all in alerting mode.
-- **Agents:** 3 AI agents hunt through Agent Lane, nano's read-only SQL lane
-  for agents. They run the agent kit's recipes in native ClickHouse SQL and
-  pause 2–8 s between queries.
+- **Detections:** 200 scheduled rules: 56 run every minute and 144 every 5
+  minutes. They cover endpoint, identity, network, proxy and cloud, and are all
+  in alerting mode.
+- **Agents:** 2 AI agents hunt through Agent Lane, nano's read-only SQL lane
+  for agents. Two is the most active agent tokens Agent Lane allows by default
+  on this cluster size, and each agent has its own token. They run the agent
+  kit's 24 recipes in native ClickHouse SQL and pause 6 to 12 s between
+  queries, about the length of an LLM agent's turn. That keeps each agent
+  under Agent Lane's default quota of 600 queries an hour per token.
 - **Dashboards:** 4 wall displays refresh an 8-panel SOC overview every
   minute, with the cache bypassed.
 
@@ -97,16 +122,16 @@ same time:
 
 | | 50 GB/day | 100 GB/day |
 |---|---|---|
-| Search p50 / p95: triage | TBD | TBD |
-| Search p50 / p95: hunt | TBD | TBD |
-| Search p50 / p95: retro IR | TBD | TBD |
-| Dashboard refresh (8 panels) p95 | TBD | TBD |
-| Agent Lane query p95 | TBD | TBD |
-| Event-to-alert p50 / p95: scheduled rules | TBD | TBD |
-| Event-to-alert p50 / p95: real-time rules | TBD | TBD |
-| Ingest lag p50 / p99 | TBD | TBD |
-| CPU / memory / disk headroom (busiest host) | TBD | TBD |
-| Cost per GB/day ingested | TBD | TBD |
+| Search p50 / p95: triage | 44 / 318 ms | 46 / 253 ms |
+| Search p50 / p95: hunt | 46 / 318 ms | 49 / 291 ms |
+| Search p50 / p95: retro IR | 53 / 310 ms | 55 / 263 ms |
+| Dashboard refresh (8 panels) p95 | 733 ms | 692 ms |
+| Agent Lane query p95 | 82 ms | 127 ms |
+| Event-to-alert p50 / p95: all rules | 19.1 / 32.2 s | 19.0 / 28.9 s |
+| Event-to-alert p50 / p95: tool-launch rules (every minute) | 18.2 / 25.2 s | 19.2 / 25.3 s |
+| Ingest lag p50 / p99 | 6.2 / 11.1 s | 6.4 / 11.5 s |
+| CPU / memory / disk headroom (busiest host) | 74% / 86% / 87% | 67% / 84% / 83% |
+| Cost per GB/day ingested | $0.116 per GB | $0.058 per GB |
 
 ## The data
 
@@ -160,9 +185,10 @@ Nothing is written directly to the database.
   - Dashboard refreshes and Agent Lane queries are reported separately.
 - **Event-to-alert latency:** nano writes every detection as an OCSF
   Detection Finding (class 2004). For each finding, we take the time it was
-  stored minus the timestamp of the newest event it covers. Scheduled and
-  real-time rules are reported separately. Scheduled latency includes the
-  rule's interval by design: a 5-minute rule waits up to 5 minutes.
+  stored minus the timestamp of the newest event it covers. All benchmark
+  rules are scheduled, so this includes the rule's interval by design: a
+  5-minute rule waits up to 5 minutes. We also report the 20 tool-launch
+  rules, which run every minute, on their own.
 - **Headroom:** CPU busy %, memory used % and disk used % on every host,
   sampled every 5 s. Headroom is 100 minus the p95 (CPU) or the max (memory,
   disk).

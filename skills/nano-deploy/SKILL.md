@@ -45,7 +45,8 @@ difference.
    lost before you ask.
 5. **Never weaken security to make something pass.** Do not run `install.sh`
    with `sudo`, `chmod 777`, disable TLS on a production inventory, set
-   `NANO_SKIP_IMAGE_VERIFY=1`, set `NANO_LAB_ONLY_PLAINTEXT=1` outside a
+   `NANO_SKIP_IMAGE_VERIFY=1` or `NANO_SKIP_TLS_PREFLIGHT=1`, set
+   `NANO_LAB_ONLY_PLAINTEXT=1` or `NANO_SKIP_HOST_MINIMUMS=1` outside a
    disposable lab the operator has named as one, use `--skip-backup-I-understand`
    or `--allow-siem-health-regression`, open the firewall wider than the port
    table, or edit the product's scripts. If the product refuses, report the
@@ -81,9 +82,12 @@ them, and skip what the operator has already told you. Record the answers in
 - public hostnames, TLS approach and DNS;
 - enrollment (license) values file (`LICENSE_URL`, `LICENSE_TOKEN`,
   `NANO_DEPLOYMENT_ID`), from app.nano.rs (Deployments, then your Self-run
-  deployment). With it you download and verify the bundle and get a registry
-  credential yourself ([scripts/fetch-bundle.sh](scripts/fetch-bundle.sh)); ask
-  for a release version only if the operator pins one.
+  deployment). With it you download and verify the bundle yourself
+  ([scripts/fetch-bundle.sh](scripts/fetch-bundle.sh)), and from 2.0.30 the
+  installer and `scripts/nano upgrade` use it to log in to the registry; ask
+  for a release version only if the operator pins one;
+- Vector-native senders (Vector's own protocol to port 6000), if any: from
+  2.0.30 each needs its own client certificate.
 
 Size the deployment with `python3 scripts/size.py` (see
 [references/sizing.md](references/sizing.md)) and show the result.
@@ -167,6 +171,45 @@ you are installing before you start.
 Each reference lists its steps with the gate before each mutating step. The
 Self-run order is always: **fetch and verify the bundle → stage it → prepare
 (no services start) → add enrollment values → install → verify.**
+**What the 2.0.30+ installer does itself** (the references rely on it; for
+2.0.29 and earlier they mark the manual steps):
+
+- **Images and registry:** the enterprise bundle defaults to
+  `images.enterprise.customer.lock`, and with an online license in `.env` the
+  installer and `scripts/nano upgrade` fetch a one-hour pull credential from
+  the license API and use it from a private temporary `DOCKER_CONFIG`
+  (`~/.docker` is never touched). No `docker login`, no `NANO_IMAGES_LOCK`.
+  Offline and air-gapped licenses still `scripts/nano bundle load` the image
+  bundle or log in by hand as the install user (never with `sudo`).
+- **Host size first,** before any prompt: 2 vCPU / 8 GB RAM / 40 GB free on
+  Docker's data filesystem; 16 GB with the enrichment feeds on (the default)
+  where ClickHouse shares the host with the app, ingest, PostgreSQL or
+  Tenzir roles; 4 vCPU when app and
+  ClickHouse share it with Keeper or Tenzir; lower floors for role-split
+  hosts without ClickHouse. Resize instead of `NANO_SKIP_HOST_MINIMUMS=1`.
+- **Prompts** (only on a terminal): a review screen before anything is
+  written (Enter installs, a number edits that answer, `q` quits with nothing
+  written; `back` re-asks the previous question), and `Upgrade to X now?` on a
+  re-run that changes the release. Declining exits 3 (no) or 4 (no answer).
+  The skill runs the installer over `ssh` without a terminal and passes every
+  answer as a variable; pass `NANO_CONFIRM_UPGRADE=1` on any re-run that may
+  upgrade, the reliable unattended answer (2.0.31 changes the terminal
+  default).
+- **TLS:** with the overlay, `config/nginx/ssl/fullchain.pem` and
+  `privkey.pem` are checked before any prompt (a fresh install refuses a bad
+  pair; a re-run warns), and the overlay is kept in `.env` and detected from
+  the running stack, so re-runs and upgrades keep HTTPS.
+- **Vector native :6000** is always mutual TLS on the host's real interface
+  (single node: all interfaces; role split: the cluster address;
+  `NANO_VECTOR_NATIVE_BIND_ADDRESS` changes it). Each sender gets a client
+  certificate from `scripts/nano vector-client-cert <name>` (`--list`,
+  `--renew`, `--revoke`, `--csr`). On a role split, issue and revoke on the
+  first app host, then copy its `.env` to every host and re-run each ingest
+  host. Helm keeps the listener CA and sender anchors in the chart's Secrets
+  ([references/helm.md](references/helm.md)).
+- **Failures** print the full ClickHouse error and the logs of every failing
+  service: quote them to the operator before retrying.
+
 **Kubernetes (Helm) does not use the compose bundle**: skip the bundle fetch,
 get only the registry credential from
 `GET https://api.nano.rs/api/license/self-run/registry-token?deploymentId=<id>`
@@ -199,7 +242,8 @@ bundle's own hash. It prints `VERIFIED` or exits non-zero and keeps nothing.
 Never install a bundle it did not print `VERIFIED` for, and never substitute
 `sha256sum -c`: it checks whichever file the `.sha256` names. With
 `--registry-cred` it also writes a one-hour pull credential (password only,
-`0600`); fetch it just before installing. A `401` means the license values are
+`0600`); fetch it just before installing, and only for 2.0.29 and earlier,
+an offline license or Helm. A `401` means the license values are
 wrong or the token was regenerated; a `402` names the billing reason (cancelled,
 unpaid, trial over). A `404` on every request means the license API does not
 offer this route yet: ask the operator for the three files. Without the license values, the operator downloads the
@@ -249,8 +293,10 @@ ask before the backup, the dry run and the upgrade, one at a time.
 When a check fails, a command errors, or the operator reports a problem you
 cannot resolve from [references/known-issues.md](references/known-issues.md):
 
-1. Collect a support bundle right away, before restarting anything (restarts
-   lose the evidence). On any one host of the install:
+1. Read the installer's own failure output first: from 2.0.30 it prints the
+   full ClickHouse error and the logs of every failing service. Then collect
+   a support bundle right away, before restarting anything (restarts lose
+   the evidence). On any one host of the install:
    `ssh $H 'cd ~/nano && scripts/nano support-bundle --since 24h'`. On a role
    split it reaches every host in `/etc/nano/inventory.yaml` over SSH (pass
    `--inventory FILE` if it lives elsewhere). Installs older than v2.0.11

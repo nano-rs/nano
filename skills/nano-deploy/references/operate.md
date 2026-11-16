@@ -107,7 +107,7 @@ runs a restore.
      `<old>` SHA (lowercase, 64 hex, the *existing* identity, not the
      candidate):
      ```bash
-     ssh $H1 'cd ~/nano && NANO_HOST_NAME=nano-1 NANO_IMAGES_LOCK=images.enterprise.customer.lock \
+     ssh $H1 'cd ~/nano && NANO_HOST_NAME=nano-1 \
        ./install.sh --role app,postgres,keeper --inventory /etc/nano/inventory.yaml \
        --accept-topology-migration <old>'
      ```
@@ -117,8 +117,10 @@ runs a restore.
      exactly as in Step 5 of [multi-node-ha.md](multi-node-ha.md). Do this
      before any other host reruns: a host still holding `<old>` is refused the
      same way.
-  4. On the new host: unpack the bundle, registry login, stage TLS, then
-     `NANO_HOST_NAME=<new name> NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh --role ingest --inventory /etc/nano/inventory.yaml`
+  4. On the new host: unpack the bundle, stage TLS, then
+     `NANO_HOST_NAME=<new name> ./install.sh --role ingest --inventory /etc/nano/inventory.yaml`
+     (2.0.29 and earlier: log in to the registry first and add
+     `NANO_IMAGES_LOCK=images.enterprise.customer.lock`)
      **without** the flag (its `.env` already records `<new>`; passing the
      flag when nothing changed fails with "Remove the stale acknowledgement
      flag"). Other existing hosts rerun without the flag too.
@@ -137,6 +139,8 @@ runs a restore.
 **Public TLS, bundled nginx (single node):** replace
 `~/nano/config/nginx/ssl/fullchain.pem` and `privkey.pem` (key `0600`), then
 `docker compose -f docker-compose.opensource.yml -f docker-compose.tls.yml up -d --force-recreate nginx`.
+Or re-run `./install.sh`: from 2.0.30 it checks the new files first (present,
+key matching, not expired) and keeps the TLS overlay recorded in `.env`.
 Check the new expiry with
 `openssl s_client -connect APP_FQDN:443 -servername APP_FQDN </dev/null 2>/dev/null | openssl x509 -noout -enddate`.
 
@@ -150,6 +154,23 @@ same `--output`, and re-run that host's `install.sh` role command. That
 republishes the generated TLS tree and recreates the host's containers. Run
 `cluster-health.py` after each host. Changing the **CA** is a coordinated
 change that briefly breaks trust between hosts. Plan it with nano support.
+On role splits the ingest hosts' Vector-native :6000 listener presents this
+cluster certificate, so Vector-native senders need the new `ca.crt` only
+when the CA changes.
+
+**Vector-native sender certificates (:6000, mutual TLS, 2.0.30+):** on the
+single host, or the first app host of a role split,
+`scripts/nano vector-client-cert --list` shows each sender and marks those
+expiring within 30 days (`install.sh` and `scripts/nano upgrade` warn too).
+`--renew <name> [--days N] [--csr FILE]` re-signs under the same anchor: copy
+the new `.crt` to the sender, nothing restarts. `--revoke <name>` removes that
+sender only and restarts Vector. On a role split, issue and revoke change the
+shared `.env`: stream it to every host and re-run each ingest host's install
+command, or the change is not effective there
+([multi-node-ha.md](multi-node-ha.md), Step 5). Helm: the chart's Secrets
+hold the listener and anchors (`--pki-dir`, see the Kubernetes guide).
+The single-host listener certificate renews itself when `install.sh` runs
+near its expiry.
 
 ## Storage tiering
 

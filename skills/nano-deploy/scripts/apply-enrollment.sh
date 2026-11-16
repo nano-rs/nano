@@ -17,6 +17,9 @@
 # The uploaded copy is deleted on failure too, so a license token never stays
 # behind on the host; upload it again after fixing the cause.
 # Idempotent. Prints key names and a status, never values.
+# From 2.0.30, install.sh and `scripts/nano upgrade` also use these values to
+# fetch their own one-hour registry pull credential, so apply them before the
+# install step: no docker login and no NANO_IMAGES_LOCK are needed then.
 set -euo pipefail
 umask 077
 default_src="$HOME/.nano-enrollment.env"
@@ -31,8 +34,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 # A literal "~/" (quoted on the workstation) means this host's home.
-[[ "$env_file" == "~/"* ]] && env_file="$HOME/${env_file#\~/}"
-[[ "$src" == "~/"* ]] && src="$HOME/${src#\~/}"
+# shellcheck disable=SC2088  # the literal tilde, not an expansion
+tilde='~/'
+[[ "$env_file" == "$tilde"* ]] && env_file="$HOME/${env_file#"$tilde"}"
+[[ "$src" == "$tilde"* ]] && src="$HOME/${src#"$tilde"}"
 
 # On any failure, remove the uploaded token file (and a half-written .env).
 cleanup() {

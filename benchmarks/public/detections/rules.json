@@ -1,7 +1,6 @@
 {
  "version": 1,
  "count": 200,
- "realtime": 20,
  "rules": [
   {
    "name": "bench-001 endpoint: rundll32.exe execution",
@@ -3616,284 +3615,304 @@
    "lookback_minutes": 2
   },
   {
-   "name": "bench-181 realtime: rundll32.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-181 tools: rundll32.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"rundll32.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-182 realtime: sc.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-182 tools: sc.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"sc.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-183 realtime: wmic.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-183 tools: wmic.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"wmic.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-184 realtime: reg.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-184 tools: reg.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"reg.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-185 realtime: schtasks.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-185 tools: schtasks.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"schtasks.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-186 realtime: mimikatz.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-186 tools: mimikatz.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"mimikatz.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-187 realtime: psexesvc.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-187 tools: psexesvc.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"psexesvc.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-188 realtime: procdump.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-188 tools: procdump.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"procdump.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-189 realtime: ntdsutil.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-189 tools: ntdsutil.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"ntdsutil.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-190 realtime: adfind.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-190 tools: adfind.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"adfind.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-191 realtime: rclone.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-191 tools: rclone.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"rclone.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-192 realtime: anydesk.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-192 tools: anydesk.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"anydesk.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-193 realtime: ngrok.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-193 tools: ngrok.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"ngrok.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-194 realtime: plink.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-194 tools: plink.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"plink.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-195 realtime: nc.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-195 tools: nc.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"nc.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-196 realtime: socat.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-196 tools: socat.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"socat.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-197 realtime: chisel.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-197 tools: chisel.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"chisel.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-198 realtime: sharphound.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-198 tools: sharphound.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"sharphound.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-199 realtime: rubeus.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-199 tools: rubeus.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"rubeus.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   },
   {
-   "name": "bench-200 realtime: seatbelt.exe launched (real-time)",
-   "description": "nano public benchmark detection (realtime).",
+   "name": "bench-200 tools: seatbelt.exe launched",
+   "description": "nano public benchmark detection (tools).",
    "query": "class_uid=1007 process.name=\"seatbelt.exe\"",
    "severity": "high",
    "tags": [
     "nano-benchmark",
-    "realtime"
+    "tools"
    ],
    "author": "nano benchmark",
    "alert_cooldown_minutes": 30,
-   "detection_mode": "real-time",
-   "realtime_enabled": true
+   "detection_mode": "scheduled",
+   "schedule_cron": "* * * * *",
+   "lookback_minutes": 2
   }
  ]
 }

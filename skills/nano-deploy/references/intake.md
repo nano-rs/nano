@@ -45,7 +45,10 @@ confirm them. Never disable host key checking.
 1. App hostname that users open (for example `nano.example.com`).
 2. Ingest hostname that log senders use (for example `ingest.nano.example.com`).
    For 3-node HA, the two must differ. On a single node they can be the same
-   host.
+   host. Ask whether any sender uses Vector's own protocol (a Vector `vector`
+   sink to port 6000): from 2.0.30 each one needs a client certificate
+   (`scripts/nano vector-client-cert <name>`), and its addresses go in the
+   firewall rule for 6000. List the sender names.
 3. TLS:
    - **public TLS**: a certificate and key the operator provides (paths), or a
      TLS-terminating load balancer / reverse proxy in front of nano. On a
@@ -73,10 +76,13 @@ emails support@nano.rs.
    `scripts/fetch-bundle.sh`. Ask only if the operator already downloaded
    `nano-compose-enterprise-<version>.tar.gz` with its `.sha256` and
    `.sha256.sig`; verify those the same way before use.
-3. Registry pull credential: normally nothing to ask. `scripts/fetch-bundle.sh
-   --registry-cred FILE` writes one (user `oauth2accesstoken`, one hour). Or
-   the path of a credential file the operator got from the deployment's page.
-   You log in with `--password-stdin`.
+3. Registry pull credential: nothing to ask for 2.0.30 and later with an
+   online license: the installer and `scripts/nano upgrade` fetch it
+   themselves from the enrollment values. For 2.0.29 and earlier, an offline
+   license or Helm: `scripts/fetch-bundle.sh --registry-cred FILE` writes one
+   (user `oauth2accesstoken`, one hour), or the operator gives the path of a
+   credential file from the deployment's page. You log in with
+   `--password-stdin`, as the install user.
 4. Enrollment values: the path of a file (mode `0600`) holding exactly these
    three lines from the deployment page. The token is shown only once:
 
@@ -157,7 +163,8 @@ paths to them:
 - app hostname: ...   ingest hostname: ...
 - public TLS: overlay | load balancer | reverse proxy | none (lab only)
 - private TLS (HA): own PKI | scripts/make-private-ca.sh
-- registry credential file: <path>   username: <user>
+- registry credential file (2.0.29 and earlier, offline, Helm): <path>   username: <user>
+- Vector-native senders (:6000, one client certificate each): <names> | none
 - enrollment file: <path>
 - admin: <email>, <name>; password file on the app host: ~/.nano-admin-credentials
 - backup key path: <path>   backup destination: <path>

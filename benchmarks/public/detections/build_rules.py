@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Build the public benchmark's detection set (rules.json), deterministically.
 
-200 rules in the shape a SOC actually runs: 180 scheduled + 20 real-time,
+200 scheduled rules in the shape a SOC actually runs (every 1 or 5 minutes),
 written in nPL against the OCSF schema (the default for new installs). The
 mix is weighted toward endpoint, like the generated data (about 60% Sysmon).
 
@@ -90,10 +90,10 @@ CLOUD_OPS = ["ConsoleLogin", "CreateUser", "CreateAccessKey", "AttachUserPolicy"
              "PutBucketAcl", "DeleteTrail", "StopLogging", "UpdateTrail", "AuthorizeSecurityGroupIngress",
              "CreateLoginProfile", "UpdateAssumeRolePolicy", "DisableKey", "ScheduleKeyDeletion", "GetSecretValue"]
 
-# Real-time rules: the first five match processes the generated fleet runs
-# every few minutes, so event-to-alert latency for real-time is measured; the
-# rest are classic tools a clean fleet never runs.
-REALTIME = ["rundll32.exe", "sc.exe", "wmic.exe", "reg.exe", "schtasks.exe",
+# High-signal tool launches, run every minute. The first five match processes
+# the generated fleet runs every few minutes, so event-to-alert latency is
+# always measured; the rest are tools a clean fleet never runs.
+TOOLS = ["rundll32.exe", "sc.exe", "wmic.exe", "reg.exe", "schtasks.exe",
             "mimikatz.exe", "psexesvc.exe", "procdump.exe", "ntdsutil.exe", "adfind.exe", "rclone.exe",
             "anydesk.exe", "ngrok.exe", "plink.exe", "nc.exe", "socat.exe", "chisel.exe", "sharphound.exe",
             "rubeus.exe", "seatbelt.exe"]
@@ -123,7 +123,7 @@ def npl_regex(rx):
     return rx.replace("/", ".").replace("(1)?", "1?")
 
 
-def rule(i, cat, title, query, severity, tech=None, realtime=False, every_minute=False):
+def rule(i, cat, title, query, severity, tech=None, every_minute=False):
     r = {
         "name": f"bench-{i:03d} {cat}: {title}",
         "description": f"nano public benchmark detection ({cat}).",
@@ -136,12 +136,9 @@ def rule(i, cat, title, query, severity, tech=None, realtime=False, every_minute
     if tech:
         r["mitre_techniques"] = [tech]
         r["mitre_tactics"] = [TACTIC[tech]]
-    if realtime:
-        r.update({"detection_mode": "real-time", "realtime_enabled": True})
-    else:
-        r.update({"detection_mode": "scheduled",
-                  "schedule_cron": "* * * * *" if every_minute else "*/5 * * * *",
-                  "lookback_minutes": 5 if not every_minute else 2})
+    r.update({"detection_mode": "scheduled",
+              "schedule_cron": "* * * * *" if every_minute else "*/5 * * * *",
+              "lookback_minutes": 2 if every_minute else 5})
     return r
 
 
@@ -151,7 +148,7 @@ def build():
     def add(*a, **k):
         nonlocal i
         i += 1
-        rules.append(rule(i, *a, every_minute=(i % 5 == 0) and not k.get("realtime"), **k))
+        rules.append(rule(i, *a, every_minute=k.pop("every_minute", i % 5 == 0), **k))
 
     for b in LOLBINS:
         add("endpoint", f"{b} execution", f'class_uid=1007 process.name="{b}"', "medium", LOLBIN_TECH.get(b))
@@ -176,8 +173,8 @@ def build():
             "low", "T1071.001")
     for op in CLOUD_OPS:
         add("cloud", f"CloudTrail {op}", f'class_uid=6003 api.operation="{op}"', "medium", "T1078.004")
-    for b in REALTIME:
-        add("realtime", f"{b} launched (real-time)", f'class_uid=1007 process.name="{b}"', "high", None, realtime=True)
+    for b in TOOLS:
+        add("tools", f"{b} launched", f'class_uid=1007 process.name="{b}"', "high", None, every_minute=True)
     assert len(rules) == 200, len(rules)
     return rules
 
@@ -185,5 +182,4 @@ def build():
 if __name__ == "__main__":
     rs = build()
     print(json.dumps({"version": 1, "count": len(rs),
-                      "realtime": sum(r["detection_mode"] == "real-time" for r in rs),
                       "rules": rs}, indent=1))

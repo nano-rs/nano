@@ -1,0 +1,110 @@
+{
+  "profile": "ocsf",
+  "nano_version": "2.0.29",
+  "loaded_at": "2026-11-16T16:37:49.525815+00:00",
+  "sources": [
+    {
+      "source_type": "windows_sysmon",
+      "parser_path": "parsers-ocsf/windows_sysmon/parser.yaml",
+      "log_source_id": "lsrc_7qqqtpynte8fpbbj926h30d17a",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 66.1,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 66.1,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "windows_event",
+      "parser_path": "parsers-ocsf/windows_event/parser.yaml",
+      "log_source_id": "lsrc_45g0wkeast9nsrcm2bxk2ppmnj",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 52.6,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 52.6,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "conduit_proxy",
+      "parser_path": "parsers-ocsf/conduit_proxy/parser.yaml",
+      "log_source_id": "lsrc_0mw094ty8x9yk84gts5pmmxarx",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 55.5,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 55.5,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "apache_access",
+      "parser_path": "parsers-ocsf/apache/parser.yaml",
+      "log_source_id": "lsrc_4wta7tmntd9pzsfaz4pqnmq2mp",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 62.7,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 62.7,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "aws_cloudtrail",
+      "parser_path": "parsers-ocsf/aws_cloudtrail/parser.yaml",
+      "log_source_id": "lsrc_27jkge2nv99m7semcy85age51q",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 60.2,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 60.2,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "source_type": "bench_marker",
+      "parser_path": "parsers-ocsf/json_generic/parser.yaml",
+      "log_source_id": "lsrc_3e8jc8pw9n8pba5c2hxs5xtbp7",
+      "deploy_ok": true,
+      "deploy_attempts": 1,
+      "deploy_secs": 66.9,
+      "deploy_history": [
+        {
+          "status": 200,
+          "secs": 66.9,
+          "ok": true
+        }
+      ]
+    }
+  ],
+  "rules": {
+    "requested": 200,
+    "created": 200,
+    "skipped_existing": 0,
+    "failed": 0,
+    "errors": [],
+    "mode": "alerting",
+    "scheduled": 200
+  },
+  "agentlane": {
+    "tokens": 2,
+    "url": "https://<ch1-private>:8444"
+  }
+}

@@ -264,6 +264,10 @@
               "errors_ok": {
                 "type": "boolean"
               },
+              "keeps_up": {
+                "type": "boolean",
+                "description": "Senders achieved at least 95% of the step's target rate (no backpressure)."
+              },
               "pass": {
                 "type": "boolean"
               }
@@ -293,6 +297,10 @@
         "lag_ms_at_ceiling": {
           "$ref": "#/$defs/quantiles"
         },
+        "host_cpu_p95_at_ceiling": {
+          "type": ["object", "null"],
+          "additionalProperties": {"type": ["number", "null"]}
+        },
         "broke_at": {
           "type": [
             "object",
@@ -312,15 +320,7 @@
           "type": "integer"
         },
         "event_to_alert_ms": {
-          "type": "object",
-          "properties": {
-            "scheduled": {
-              "$ref": "#/$defs/quantiles"
-            },
-            "realtime": {
-              "$ref": "#/$defs/quantiles"
-            }
-          }
+          "$ref": "#/$defs/quantiles"
         },
         "rule_set": {
           "type": [
@@ -332,8 +332,8 @@
           "type": "integer",
           "description": "Detection findings (OCSF 2004) written by bench- rules during the run window."
         },
-        "realtime_findings": {
-          "type": "integer"
+        "event_to_alert_ms_tool_launch_rules": {
+          "$ref": "#/$defs/quantiles"
         }
       }
     },

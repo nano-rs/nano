@@ -9,6 +9,6 @@
   "BLAST_BATCH": 500,
   "ANALYSTS": 8,
   "DASHBOARD_VIEWERS": 4,
-  "AGENTS": 3,
+  "AGENTS": 2,
   "DURATION": "4h"
 }

@@ -18,11 +18,15 @@ product's files.
   `http/protobuf` (the OpenTelemetry SDK and Collector default); a sender set
   to `http/json` needs changing, not a nano fix.
 
-- **TLS overlay during first install.** With `docker-compose.tls.yml` active,
-  plain-HTTP `localhost` calls get a 301 redirect, and the installer's health
-  and admin-creation calls can treat it as success. Install first without the
-  overlay, confirm the admin exists (`smoke-test.py` login passes), then
-  enable the overlay ([single-node.md](single-node.md#step-9-public-tls)).
+- **TLS overlay during first install (2.0.29 and earlier).** With
+  `docker-compose.tls.yml` active, plain-HTTP `localhost` calls get a 301
+  redirect; on 2.0.0 the installer's health and admin-creation calls treated
+  it as success. The skill's order for 2.0.29 and earlier stays: install
+  first without the overlay, confirm the admin exists (`smoke-test.py` login
+  passes), then enable the overlay
+  ([single-node.md](single-node.md#step-9-public-tls)). From 2.0.30 the
+  installer checks the certificate before any prompt, so the overlay may be
+  on from the first install.
 - **The installer needs the admin variables on every app-role run until setup
   is complete.** The prepare step writes `.env`, so the following install is a
   re-run. Pass `NANO_ADMIN_EMAIL`, `NANO_ADMIN_NAME` and `NANO_ADMIN_PASSWORD`
@@ -69,6 +73,34 @@ product's files.
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.
 
+## 2.0.30 (fixed in 2.0.31)
+
+- **The "port 6000 now REQUIRES mutual TLS" notice prints on fresh
+  installs too**: a single host whose `.env` came from a 2.0.30 install, or a
+  role-split ingest host whose `.env` was copied from a 2.0.30 app host. It
+  is harmless there (nothing ever sent plaintext to that listener). 2.0.31
+  prints it only on a real upgrade from an earlier release.
+- **`Upgrade to X now? [y/N]`** on a terminal: Enter (or EOF) declines and
+  exits 4. 2.0.31 changes the terminal default to yes. Pass
+  `NANO_CONFIRM_UPGRADE=1` on every installer re-run that may change the
+  release, so neither default matters.
+
+## Upgrading from 2.0.29 or earlier to 2.0.30 or later
+
+- **Plaintext Vector-native senders are refused.** Port 6000 becomes mutual
+  TLS only. Issue each sender a certificate (`scripts/nano vector-client-cert
+  <name>`) and add the printed `tls.*` settings to its sink. On a role split,
+  stream the first app host's `.env` to every host and re-run each ingest
+  host afterwards.
+- **An install that recorded nano's internal image prefix keeps it.** Up to
+  2.0.29 a plain `./install.sh` without `NANO_IMAGES_LOCK` used
+  `images.enterprise.lock`. The 2.0.30 installer moves such an install to the
+  customer lock only if it never started a container; otherwise it keeps the
+  internal prefix, which the license's pull credential cannot read. Check with
+  `grep ^NANO_IMAGE_PREFIX= ~/nano/.env` (not a secret) before the upgrade:
+  if it is not the prefix of the `-api` line in the new bundle's
+  `images.enterprise.customer.lock`, ask nano support before upgrading.
+
 ## 2.0.23 and earlier, single node (fixed after 2.0.23)
 
 - **`scripts/nano upgrade` always fails preflight on a single-node install**
@@ -83,8 +115,9 @@ product's files.
   **Handling** for a target of 2.0.23 or earlier: take a backup
   (`scripts/nano backup --key-file ... --output ...`), then upgrade with the
   installer rerun from the extracted bundle (Path B, single node:
-  `cd ~/nano && NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh`;
-  open installs drop `NANO_IMAGES_LOCK`). Do not skip or edit the check.
+  `cd ~/nano && NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh`
+  after a registry login; open installs drop `NANO_IMAGES_LOCK`). Do not skip
+  or edit the check.
 
 ## 2.0.13 (fixed in 2.0.14)
 

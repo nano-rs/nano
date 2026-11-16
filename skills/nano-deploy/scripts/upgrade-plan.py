@@ -62,6 +62,13 @@ from dataclasses import asdict, dataclass, field
 LATEST_URL = "https://api.nano.rs/api/releases/latest"
 UPGRADE_DOC = "https://nano.rs/docs/releases/upgrading"
 SCRIPTS_NANO_UPGRADE_FROM = (2, 0, 10)   # first release whose scripts/nano does registry upgrades
+# First target whose install.sh and `scripts/nano upgrade` log in to the registry
+# themselves with the license (a private, temporary DOCKER_CONFIG) and default to
+# images.enterprise.customer.lock: no manual docker login, no NANO_IMAGES_LOCK.
+SELF_REGISTRY_LOGIN_FROM = (2, 0, 30)
+SELF_LOGIN_NOTE = ("No manual registry login: the target installer and upgrader log in themselves with the license "
+                   "in .env (an offline or air-gapped license still needs `scripts/nano bundle load` of the image "
+                   "bundle, or a docker login as the install user).")
 # Targets whose own `scripts/nano upgrade` dry run fails on every
 # cluster (false positives); plan the installer rerun instead.
 UPGRADER_DRY_RUN_BROKEN = {
@@ -556,6 +563,7 @@ def compose_steps(result: dict, units: list[Unit], install_dir: str) -> list[str
     app_hosts = by_role("app")
     first_app = (app_hosts or units)[0].name
     inv = " --inventory /etc/nano/inventory.yaml" if role_split else ""
+    self_login = (parse_version(target) or (0, 0, 0)) >= SELF_REGISTRY_LOGIN_FROM
     steps = [
         f"Precheck: on every host `python3 -I - --install-dir {install_dir} < scripts/cluster-health.py` "
         "(role split) and `smoke-test.py` must PASS. Read the release notes and known-issues.md.",
@@ -567,6 +575,7 @@ def compose_steps(result: dict, units: list[Unit], install_dir: str) -> list[str
         steps += [
             f"On every host, extract it over the install directory (keeps .env, .nano-role.env and generated state): "
             f"`tar -xzf /srv/nano/releases/{package} --strip-components=1 -C {install_dir}`.",
+            SELF_LOGIN_NOTE if self_login else
             "On every host, log in to the registry with a fresh pull credential (about one hour), right before the run.",
         ]
         cmd = (f"cd {install_dir} && scripts/nano upgrade{inv} --bundle /srv/nano/releases/{package}"
@@ -594,23 +603,27 @@ def compose_steps(result: dict, units: list[Unit], install_dir: str) -> list[str
             f"Ask, then run it for real: `{ssh_cmd(first_app)} '{cmd}'`. It takes the mandatory backup and rolls "
             + ("Keeper → ClickHouse → PostgreSQL (replicas, switchover, old leader; Valkey master moved first) → "
                "migrations → app → ingest, one host at a time." if role_split else "the stack."),
-            "If it stops: fix the cause (usually an expired registry login), then re-run with `--resume` and the same "
-            "package. Never delete upgrade-journal/.",
+            "If it stops: fix the cause "
+            + ("(the failing step's message names it)" if self_login else "(usually an expired registry login)")
+            + ", then re-run with `--resume` and the same package. Never delete upgrade-journal/.",
         ]
     else:
-        lock = "NANO_IMAGES_LOCK=images.enterprise.customer.lock"
+        # NANO_CONFIRM_UPGRADE=1 pre-answers the installer's "Upgrade to X now?" (2.0.30+; older ignore it).
+        lock = "NANO_CONFIRM_UPGRADE=1" if self_login else "NANO_IMAGES_LOCK=images.enterprise.customer.lock"
+        login = "" if self_login else ", log in to the registry"
         if not role_split:
             steps += [
                 f"Back up: `{ssh_cmd(first_app)} 'cd {install_dir} && scripts/nano backup --key-file "
                 "/secure/nano-backup/operator.pem --output /mnt/backup/nano-pre-" + target + "'`.",
-                f"Extract the package over {install_dir}, log in to the registry, then re-run the installer: "
+                f"Extract the package over {install_dir}{login}, then re-run the installer: "
                 f"`{ssh_cmd(first_app)} 'cd {install_dir} && {lock} ./install.sh'`.",
-            ]
+            ] + ([SELF_LOGIN_NOTE] if self_login else [])
         else:
             steps.append(f"Back up: `{ssh_cmd(first_app)} 'cd {install_dir} && scripts/nano backup-set --inventory "
                          "/etc/nano/inventory.yaml --backup-key-file /secure/nano-backup/operator.pem --backup-output "
                          f"/mnt/backup/nano-pre-{target}'`.")
-            steps.append(f"On every host: extract the package over {install_dir} and log in to the registry.")
+            steps.append(f"On every host: extract the package over {install_dir}"
+                         + (f". {SELF_LOGIN_NOTE}" if self_login else " and log in to the registry."))
             leader = result["pg_leader"]
             pg_hosts = by_role("postgres")
             members = {u.name: u.member for u in pg_hosts}

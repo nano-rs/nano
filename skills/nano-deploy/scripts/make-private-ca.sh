@@ -18,6 +18,13 @@
 # a private-CA client certificate), so it carries serverAuth + clientAuth and a
 # SAN for the server name and every inventory address.
 #
+# Single node behind the bundled nginx (TLS overlay): install.sh expects
+# config/nginx/ssl/fullchain.pem (server.crt then ca.crt) and privkey.pem
+# (server.key, 0600); from 2.0.30 it checks them before any prompt.
+# Role split: the ingest hosts' Vector-native :6000 listener presents this
+# server certificate; senders verify it with ca.crt (sender client
+# certificates come from `scripts/nano vector-client-cert`, not from here).
+#
 # Output (directory mode 0700): ca.key (0600, keep OFFLINE, never copy to hosts),
 # ca.crt, server.key (0600), server.crt. Copy only ca.crt, server.crt and
 # server.key to each host (see references/multi-node-ha.md), or upload only

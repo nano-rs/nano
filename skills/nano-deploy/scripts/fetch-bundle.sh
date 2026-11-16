@@ -19,6 +19,10 @@
 #    that checks whichever file the .sha256 names.
 # 3. With --registry-cred, writes a one-hour registry pull credential (the
 #    password only) to that file, mode 0600, for `docker login --password-stdin`.
+#    Needed only for a 2.0.29 or earlier compose bundle, or for Helm: from
+#    2.0.30, install.sh and `scripts/nano upgrade` fetch this credential
+#    themselves with the license in .env, into a private temporary
+#    DOCKER_CONFIG (~/.docker is never touched).
 #
 # If a download or a check fails, or it is interrupted (Ctrl-C, TERM) before
 # printing VERIFIED, it exits non-zero and removes the three downloaded files and
@@ -158,4 +162,5 @@ if [[ -n "$cred" ]]; then
     chmod 600 "$tmp" && mv "$tmp" "$cred"
     unset reply
     echo "registry: $registry user $username, credential in $cred (0600, expires $expires)"
+    echo "note: 2.0.30 and later compose installs log in themselves; this credential is for 2.0.29 and earlier or Helm"
 fi

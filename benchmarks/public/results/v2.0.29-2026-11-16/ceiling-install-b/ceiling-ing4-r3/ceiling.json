@@ -1,0 +1,482 @@
+{
+  "schema": "nano-benchmark/result@1",
+  "run_id": "ceiling-ing4-r3",
+  "scenario": "ceiling",
+  "generated_at": "2026-11-16T19:48:37.752388+00:00",
+  "nano_version": "2.0.29",
+  "schema_profile": "ocsf",
+  "topology": {
+    "name": "bench-ceil",
+    "provider": "Rackspace Spot",
+    "region": "us-central-dfw-2",
+    "hosts": [
+      {
+        "name": "app1",
+        "role": "app",
+        "server_class": "gp.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 32,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.17,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ch1",
+        "role": "clickhouse",
+        "server_class": "gp.vs2.2xlarge-dfw2",
+        "vcpu": 16,
+        "mem_gb": 64,
+        "market_usd_per_hour": 0.37,
+        "bid_usd_per_hour": 0.55,
+        "on_demand_usd_per_hour": 0.34,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ch2",
+        "role": "clickhouse",
+        "server_class": "mh.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 64,
+        "market_usd_per_hour": 0.12,
+        "bid_usd_per_hour": 0.24,
+        "on_demand_usd_per_hour": 0.22,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ing1",
+        "role": "ingest",
+        "server_class": "ch.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 16,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.13,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ing2",
+        "role": "ingest",
+        "server_class": "ch.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 16,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.13,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ing3",
+        "role": "ingest",
+        "server_class": "ch.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 16,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.13,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "ing4",
+        "role": "ingest",
+        "server_class": "ch.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 16,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.13,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "blaster1",
+        "role": "load-generator",
+        "server_class": "gp.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 32,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.17,
+        "cpu_model": "AMD EPYC-Genoa"
+      },
+      {
+        "name": "blaster2",
+        "role": "load-generator",
+        "server_class": "gp.vs2.xlarge-dfw2",
+        "vcpu": 8,
+        "mem_gb": 32,
+        "market_usd_per_hour": 0.08,
+        "bid_usd_per_hour": 0.16,
+        "on_demand_usd_per_hour": 0.17,
+        "cpu_model": "AMD EPYC-Genoa"
+      }
+    ],
+    "nano_usd_per_hour_market": 0.89,
+    "nano_usd_per_hour_bid_ceiling": 1.59,
+    "active_ingest_hosts": 4,
+    "clickhouse_layout": "shards"
+  },
+  "dataset": {
+    "generator": "tools/log-blaster",
+    "seed_base": 20261114,
+    "assets": 20000,
+    "lateral_chains": false,
+    "source_mix": {
+      "windows_sysmon": 0.6,
+      "windows_event": 0.1,
+      "conduit_proxy": 0.12,
+      "apache_access": 0.1,
+      "aws_cloudtrail": 0.08
+    }
+  },
+  "phases": [
+    {
+      "label": "ceil01-23996",
+      "window": {
+        "start": "2026-11-16T19:41:56.938258+00:00",
+        "end": "2026-11-16T19:47:05.503972+00:00",
+        "seconds": 308.6
+      },
+      "target_eps": 23988,
+      "sender": {
+        "processes": 12,
+        "events_sent": 6974352,
+        "events_failed": 0,
+        "achieved_eps": 22602.5,
+        "seed": [
+          20261114,
+          20261115,
+          20261116,
+          20261117,
+          20261118,
+          20261119,
+          20261120,
+          20261121,
+          20261122,
+          20261123,
+          20261124,
+          20261125
+        ]
+      },
+      "stored": {
+        "events": 6974352,
+        "raw_bytes": 6849477415,
+        "avg_event_bytes": 982.1,
+        "by_source": {
+          "apache_access": 696059,
+          "aws_cloudtrail": 558260,
+          "conduit_proxy": 836264,
+          "windows_event": 697636,
+          "windows_sysmon": 4186133
+        }
+      },
+      "throughput": {
+        "eps": 22602.5,
+        "gb_per_day": 1917.89
+      },
+      "ingest_lag_ms": {
+        "p50": 18548.5,
+        "p95": 101200.19999999997,
+        "p99": 122104.48000000007,
+        "max": 154280
+      },
+      "markers": {
+        "sent": 10472,
+        "stored_rows": 10472,
+        "stored_unique": 10472,
+        "exactly_once": true
+      },
+      "slo": {
+        "lag_p99_ok": false,
+        "zero_loss": true,
+        "errors_ok": true,
+        "keeps_up": false,
+        "pass": false
+      },
+      "storage": {
+        "rows_on_ch1": 69964146,
+        "compressed_bytes": 15363475496,
+        "uncompressed_bytes": 176324278228,
+        "compression_ratio": 11.48
+      },
+      "queries_at_load": {
+        "search_by_tier": {
+          "triage": {
+            "server": {
+              "count": 13,
+              "p50_ms": 133,
+              "p95_ms": 844.9999999999998,
+              "p99_ms": 931.3999999999999,
+              "max_ms": 953,
+              "avg_ms": 280.15384615384613
+            },
+            "round_trip": {
+              "count": 13,
+              "p50_ms": 140,
+              "p95_ms": 849.9999999999998,
+              "p99_ms": 936.3999999999999,
+              "max_ms": 958,
+              "avg_ms": 285.7692307692308
+            }
+          },
+          "hunt": {
+            "server": {
+              "count": 19,
+              "p50_ms": 382,
+              "p95_ms": 3066.7,
+              "p99_ms": 3158.14,
+              "max_ms": 3181,
+              "avg_ms": 803.2105263157895
+            },
+            "round_trip": {
+              "count": 19,
+              "p50_ms": 388,
+              "p95_ms": 3076.2999999999997,
+              "p99_ms": 3164.86,
+              "max_ms": 3187,
+              "avg_ms": 811.3684210526316
+            }
+          },
+          "ir": {
+            "server": {
+              "count": 12,
+              "p50_ms": 729,
+              "p95_ms": 1920.099999999999,
+              "p99_ms": 2447.2200000000007,
+              "max_ms": 2579,
+              "avg_ms": 856.75
+            },
+            "round_trip": {
+              "count": 12,
+              "p50_ms": 734.5,
+              "p95_ms": 1925.5499999999993,
+              "p99_ms": 2453.1100000000006,
+              "max_ms": 2585,
+              "avg_ms": 862.6666666666666
+            }
+          }
+        },
+        "error_rates": {
+          "analysts": 0,
+          "dashboards": null,
+          "agents": null
+        }
+      },
+      "host_cpu_p95": {
+        "app1": 7.3,
+        "ch1": 56.0,
+        "ch2": 74.9,
+        "ing1": 61.6,
+        "ing2": 60.9,
+        "ing3": 60.9,
+        "ing4": 70.1,
+        "blaster1": 2.5,
+        "blaster2": 2.1
+      }
+    }
+  ],
+  "hosts": {
+    "app1": {
+      "samples": 61,
+      "cpu_busy_pct": {
+        "p50": 3.0,
+        "p95": 7.3,
+        "max": 10.1
+      },
+      "mem_used_pct": {
+        "p50": 19.2,
+        "max": 19.5
+      },
+      "disk_used_pct_end": 7.0,
+      "net_rx_mbps": 2.7,
+      "net_tx_mbps": 4.4,
+      "headroom": {
+        "cpu_pct": 92.7,
+        "mem_pct": 80.5,
+        "disk_pct": 93.0
+      }
+    },
+    "ch1": {
+      "samples": 60,
+      "cpu_busy_pct": {
+        "p50": 27.3,
+        "p95": 56.0,
+        "max": 64.5
+      },
+      "mem_used_pct": {
+        "p50": 13.2,
+        "max": 16.4
+      },
+      "disk_used_pct_end": 20.0,
+      "net_rx_mbps": 40.9,
+      "net_tx_mbps": 13.3,
+      "headroom": {
+        "cpu_pct": 44.0,
+        "mem_pct": 83.6,
+        "disk_pct": 80.0
+      }
+    },
+    "ch2": {
+      "samples": 61,
+      "cpu_busy_pct": {
+        "p50": 45.0,
+        "p95": 74.9,
+        "max": 86.0
+      },
+      "mem_used_pct": {
+        "p50": 11.7,
+        "max": 13.1
+      },
+      "disk_used_pct_end": 50.0,
+      "net_rx_mbps": 31.9,
+      "net_tx_mbps": 13.9,
+      "headroom": {
+        "cpu_pct": 25.1,
+        "mem_pct": 86.9,
+        "disk_pct": 50.0
+      }
+    },
+    "ing1": {
+      "samples": 62,
+      "cpu_busy_pct": {
+        "p50": 57.0,
+        "p95": 61.6,
+        "max": 64.1
+      },
+      "mem_used_pct": {
+        "p50": 11.5,
+        "max": 12.4
+      },
+      "disk_used_pct_end": 6.0,
+      "net_rx_mbps": 47.3,
+      "net_tx_mbps": 11.4,
+      "headroom": {
+        "cpu_pct": 38.4,
+        "mem_pct": 87.6,
+        "disk_pct": 94.0
+      }
+    },
+    "ing2": {
+      "samples": 62,
+      "cpu_busy_pct": {
+        "p50": 56.3,
+        "p95": 60.9,
+        "max": 63.4
+      },
+      "mem_used_pct": {
+        "p50": 11.6,
+        "max": 12.5
+      },
+      "disk_used_pct_end": 6.0,
+      "net_rx_mbps": 47.3,
+      "net_tx_mbps": 10.8,
+      "headroom": {
+        "cpu_pct": 39.1,
+        "mem_pct": 87.5,
+        "disk_pct": 94.0
+      }
+    },
+    "ing3": {
+      "samples": 62,
+      "cpu_busy_pct": {
+        "p50": 55.9,
+        "p95": 60.9,
+        "max": 65.3
+      },
+      "mem_used_pct": {
+        "p50": 11.5,
+        "max": 12.5
+      },
+      "disk_used_pct_end": 4.0,
+      "net_rx_mbps": 45.5,
+      "net_tx_mbps": 10.7,
+      "headroom": {
+        "cpu_pct": 39.1,
+        "mem_pct": 87.5,
+        "disk_pct": 96.0
+      }
+    },
+    "ing4": {
+      "samples": 62,
+      "cpu_busy_pct": {
+        "p50": 56.8,
+        "p95": 70.1,
+        "max": 75.4
+      },
+      "mem_used_pct": {
+        "p50": 11.4,
+        "max": 13.3
+      },
+      "disk_used_pct_end": 4.0,
+      "net_rx_mbps": 44.5,
+      "net_tx_mbps": 11.3,
+      "headroom": {
+        "cpu_pct": 29.9,
+        "mem_pct": 86.7,
+        "disk_pct": 96.0
+      }
+    },
+    "blaster1": {
+      "samples": 61,
+      "cpu_busy_pct": {
+        "p50": 1.8,
+        "p95": 2.5,
+        "max": 4.4
+      },
+      "mem_used_pct": {
+        "p50": 7.1,
+        "max": 7.2
+      },
+      "disk_used_pct_end": 6.0,
+      "net_rx_mbps": 0.5,
+      "net_tx_mbps": 91.8,
+      "headroom": {
+        "cpu_pct": 97.5,
+        "mem_pct": 92.8,
+        "disk_pct": 94.0
+      }
+    },
+    "blaster2": {
+      "samples": 61,
+      "cpu_busy_pct": {
+        "p50": 1.9,
+        "p95": 2.1,
+        "max": 5.7
+      },
+      "mem_used_pct": {
+        "p50": 7.2,
+        "max": 7.4
+      },
+      "disk_used_pct_end": 4.0,
+      "net_rx_mbps": 0.4,
+      "net_tx_mbps": 90.7,
+      "headroom": {
+        "cpu_pct": 97.9,
+        "mem_pct": 92.6,
+        "disk_pct": 96.0
+      }
+    }
+  },
+  "ceiling": {
+    "sustained_eps": null,
+    "sustained_gb_per_day": null,
+    "lag_ms_at_ceiling": null,
+    "host_cpu_p95_at_ceiling": null,
+    "broke_at": {
+      "label": "ceil01-23996",
+      "target_eps": 23988,
+      "slo": {
+        "lag_p99_ok": false,
+        "zero_loss": true,
+        "errors_ok": true,
+        "keeps_up": false,
+        "pass": false
+      }
+    }
+  },
+  "cost": {
+    "usd_per_hour": 0.89,
+    "usd_per_day": 21.36,
+    "usd_per_gb_ingested": 0.01114,
+    "basis": "Spot market price at provisioning; nano hosts only (load generators excluded)"
+  }
+}

@@ -85,6 +85,16 @@ class Api:
     def __init__(self, base: str) -> None:
         self.base = base.rstrip("/")
         self.jwt = ""
+        self.creds: dict | None = None
+
+    def login(self, creds: dict):
+        """Log in; kept so a long run (parser deploys can take 15+ min on a
+        multi-host cluster) re-authenticates when the access token expires."""
+        self.creds, self.jwt = creds, ""
+        st, data, raw = self.call("POST", "/api/auth/login",
+                                  {"email": creds.get("NANO_ADMIN_EMAIL", ""), "password": creds.get("NANO_ADMIN_PASSWORD", "")})
+        self.jwt = (((data or {}).get("tokens") or {}).get("access_token") or "") if isinstance(data, dict) else ""
+        return st, raw
 
     def call(self, method: str, path: str, body=None, timeout: float = 120.0):
         data = json.dumps(body).encode() if body is not None else None
@@ -103,6 +113,10 @@ class Api:
             parsed = json.loads(raw) if raw else None
         except ValueError:
             parsed = None
+        if status == 401 and self.jwt and self.creds and not path.startswith("/api/auth/"):
+            self.login(self.creds)  # expired access token: log in again once, then retry
+            if self.jwt:
+                return self.call(method, path, body, timeout)
         return status, parsed, raw.decode("utf-8", "replace")[:300]
 
 
@@ -190,9 +204,7 @@ def main() -> int:
     os.makedirs(out, mode=0o700, exist_ok=True)
     api = Api(a.app_url)
     creds = read_env(a.creds)
-    st, data, raw = api.call("POST", "/api/auth/login",
-                             {"email": creds.get("NANO_ADMIN_EMAIL", ""), "password": creds.get("NANO_ADMIN_PASSWORD", "")})
-    api.jwt = (((data or {}).get("tokens") or {}).get("access_token") or "") if isinstance(data, dict) else ""
+    st, raw = api.login(creds)
     if not api.jwt:
         log(f"login failed: {st} {raw}")
         return 1
@@ -256,7 +268,7 @@ def main() -> int:
                     errors.append({"name": r["name"], "status": st, "error": raw[:200]})
         content["rules"] = {"requested": len(rules), "created": created, "skipped_existing": skipped,
                             "failed": failed, "errors": errors, "mode": a.rule_mode,
-                            "realtime": sum(1 for r in rules if r.get("detection_mode") == "real-time")}
+                            "scheduled": sum(1 for r in rules if r.get("detection_mode", "scheduled") == "scheduled")}
         log(f"rules: created {created}, skipped {skipped}, failed {failed} (of {len(rules)})")
 
     # 6. Agent Lane tokens (enterprise)

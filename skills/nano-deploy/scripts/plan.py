@@ -2334,7 +2334,10 @@ def print_install_order(p: dict, schema: dict) -> None:
         # rerun keeps the host's other roles (install.sh never narrows).
         if "monitoring" in r[name]:
             steps.append((name, "install", "--role " + ",".join(r[name]) + "  (monitoring last)"))
-    print("step\thost\taction\tcommand (NANO_HOST_NAME=<host> NANO_IMAGES_LOCK=images.enterprise.customer.lock ./install.sh ... --inventory /etc/nano/inventory.yaml)")
+    # 2.0.30+ defaults to the customer lock and logs in to the registry itself;
+    # 2.0.29 and earlier need NANO_IMAGES_LOCK=images.enterprise.customer.lock.
+    print("step\thost\taction\tcommand (NANO_HOST_NAME=<host> ./install.sh ... --inventory /etc/nano/inventory.yaml; "
+          "2.0.29 and earlier: add NANO_IMAGES_LOCK=images.enterprise.customer.lock)")
     for i, (host, action, cmd) in enumerate(steps, 1):
         print(f"{i}\t{host}\t{action}\t{cmd}")
     print("rule\t-\tcopy .env\twhenever a run prints 'The shared .env changed', stream that host's .env "

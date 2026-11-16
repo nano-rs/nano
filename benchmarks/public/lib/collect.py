@@ -17,7 +17,9 @@ Runs on the operator workstation. Reads, over SSH:
 
 SLOs (ceiling): ingest-to-searchable lag p99 <= 60 s; zero loss (stored >=
 accepted, and every accepted marker stored exactly once); sender errors
-< 0.1 % of events.
+< 0.1 % of events; keeps up (the senders achieved >= 95 % of the step's
+target rate). Past saturation the ingest tier applies backpressure instead of
+dropping events, so lag and loss stay clean and only "keeps up" breaks.
 """
 from __future__ import annotations
 
@@ -35,6 +37,7 @@ import sys
 BENCH_SOURCES = ("windows_sysmon", "windows_event", "conduit_proxy", "apache_access", "aws_cloudtrail")
 LAG_P99_SLO_MS = 60_000
 ERROR_SLO = 0.001
+KEEPS_UP_RATIO = 0.95  # achieved / target eps; below this the cluster is backpressuring the senders
 
 
 def load_topology(path: str) -> dict:
@@ -160,10 +163,12 @@ def phase_metrics(h: Hosts, run_id: str, phase: str, table: str, quick: bool) ->
     lag_ok = q[2] is not None and q[2] <= LAG_P99_SLO_MS
     loss_ok = stored >= sent and mrows == msent and muniq == msent
     err_ok = (failed / max(sent + failed, 1)) < ERROR_SLO
+    target = sum(s["target_eps"] for s in sums)
+    keeps_up = (eps / target >= KEEPS_UP_RATIO) if target else True
     m = {
         "label": phase,
         "window": {"start": start.isoformat(), "end": end.isoformat(), "seconds": round(secs, 1)},
-        "target_eps": sum(s["target_eps"] for s in sums),
+        "target_eps": target,
         "sender": {"processes": len(sums), "events_sent": sent, "events_failed": failed, "achieved_eps": round(eps, 1),
                    "seed": sorted({s.get("seed") for s in sums})},
         "stored": {"events": stored, "raw_bytes": raw_bytes,
@@ -174,7 +179,8 @@ def phase_metrics(h: Hosts, run_id: str, phase: str, table: str, quick: bool) ->
         "ingest_lag_ms": {"p50": q[0], "p95": q[1], "p99": q[2], "max": lag[0]["mx"] if lag else None},
         "markers": {"sent": msent, "stored_rows": mrows, "stored_unique": muniq,
                     "exactly_once": mrows == msent == muniq},
-        "slo": {"lag_p99_ok": lag_ok, "zero_loss": loss_ok, "errors_ok": err_ok, "pass": lag_ok and loss_ok and err_ok},
+        "slo": {"lag_p99_ok": lag_ok, "zero_loss": loss_ok, "errors_ok": err_ok, "keeps_up": keeps_up,
+                "pass": lag_ok and loss_ok and err_ok and keeps_up},
     }
     if not quick:
         m["storage"] = storage(h, table)
@@ -197,17 +203,16 @@ def detections(h: Hosts, start: dt.datetime, end: dt.datetime, table: str) -> di
     """Event-to-alert latency from the findings nano writes (OCSF class 2004,
     source_type `findings`): time from the newest event a finding covers
     (`unmapped.last_seen_time`) to the finding being stored (`_inserted_at`).
-    It includes the rule's schedule interval by design."""
+    The benchmark runs scheduled rules only, so this includes each rule's
+    schedule interval by design."""
     w0, w1 = chts(start - dt.timedelta(seconds=10)), chts(end + dt.timedelta(minutes=10))
-    rt = "toString(unmapped.realtime) = 'true'"
     lat = ("dateDiff('millisecond', parseDateTime64BestEffortOrNull(toString(unmapped.last_seen_time), 3), "
            "_inserted_at)")
     try:
         r = h.ch_query(f"""
             SELECT count() AS findings, uniqExact(toString(unmapped.rule_id)) AS rules_fired,
-                   countIf({rt}) AS realtime_findings,
-                   quantilesIf(0.5, 0.95, 0.99)({lat}, NOT ({rt})) AS sched,
-                   quantilesIf(0.5, 0.95, 0.99)({lat}, {rt}) AS realtime
+                   quantiles(0.5, 0.95, 0.99)({lat}) AS q,
+                   quantilesIf(0.5, 0.95, 0.99)({lat}, toString(unmapped.rule_name) LIKE '% tools: %') AS q1m
             FROM nanosiem.{table}
             WHERE source_type = 'findings' AND timestamp BETWEEN '{w0}' AND '{w1}'
               AND startsWith(toString(unmapped.rule_name), 'bench-')""")
@@ -217,15 +222,21 @@ def detections(h: Hosts, start: dt.datetime, end: dt.datetime, table: str) -> di
         return {}
     q = lambda v: {"p50": v[0], "p95": v[1], "p99": v[2]}  # noqa: E731
     return {"findings": int(r[0]["findings"]), "rules_fired": int(r[0]["rules_fired"]),
-            "realtime_findings": int(r[0]["realtime_findings"]),
-            "event_to_alert_ms": {"scheduled": q(r[0]["sched"]), "realtime": q(r[0]["realtime"])}}
+            "event_to_alert_ms": q(r[0]["q"]),
+            "event_to_alert_ms_tool_launch_rules": q(r[0]["q1m"])}
 
 
-def host_stats(h: Hosts, run_id: str, scenario: str, start: dt.datetime, end: dt.datetime) -> dict:
+def host_stats(h: Hosts, run_id: str, scenario: str, start: dt.datetime, end: dt.datetime,
+               cache: dict | None = None) -> dict:
     out = {}
     for ip, name in h.names().items():
-        text = h.run(ip, f"cat ~/bench/hoststat-{shlex.quote(run_id)}-{shlex.quote(scenario)}.csv 2>/dev/null",
-                     check=False)
+        if cache is not None and ip in cache:
+            text = cache[ip]
+        else:
+            text = h.run(ip, f"cat ~/bench/hoststat-{shlex.quote(run_id)}-{shlex.quote(scenario)}.csv 2>/dev/null",
+                         check=False)
+            if cache is not None:
+                cache[ip] = text
         def num(r):
             try:
                 return all(float(r[k]) >= 0 for k in ("unix_ts", "cpu_busy_pct", "mem_used_pct", "net_rx_bytes"))
@@ -257,17 +268,26 @@ def topology_block(t: dict, h: Hosts) -> dict:
         with open(pf, encoding="utf-8") as fh:
             pricing = json.load(fh)
     hosts = []
+    # ACTIVE_INGEST=N (run.sh): only the first N ingest hosts receive traffic;
+    # the others are idle and left out of the cluster's cost.
+    active = int(os.environ.get("ACTIVE_INGEST") or 0) or None
+    n_ing = 0
     for ip, name in h.names().items():
         meta = dict(pricing.get(name, {}))
         role = "app" if name.startswith("app") else "clickhouse" if name.startswith("ch") else \
             "ingest" if name.startswith("ing") else "load-generator"
+        if role == "ingest":
+            n_ing += 1
+            if active and n_ing > active:
+                role = "idle"
         hosts.append({"name": name, "role": role, **meta})
-    nano_cost = sum(x.get("market_usd_per_hour", 0) for x in hosts if x["role"] != "load-generator")
+    counted = [x for x in hosts if x["role"] not in ("load-generator", "idle")]
+    nano_cost = sum(x.get("market_usd_per_hour", 0) for x in counted)
     return {"name": t.get("BENCH_NAME"), "provider": t.get("PROVIDER", "Rackspace Spot"),
             "region": t.get("REGION"), "hosts": hosts,
             "nano_usd_per_hour_market": round(nano_cost, 4),
-            "nano_usd_per_hour_bid_ceiling": round(sum(x.get("bid_usd_per_hour", 0) for x in hosts
-                                                       if x["role"] != "load-generator"), 4),
+            "nano_usd_per_hour_bid_ceiling": round(sum(x.get("bid_usd_per_hour", 0) for x in counted), 4),
+            "active_ingest_hosts": active or n_ing,
             "clickhouse_layout": t.get("CH_LAYOUT", "shards")}
 
 
@@ -311,8 +331,9 @@ def main() -> int:
                     "source_mix": {"windows_sysmon": .60, "windows_event": .10, "conduit_proxy": .12,
                                    "apache_access": .10, "aws_cloudtrail": .08}},
         "phases": pm,
-        "hosts": host_stats(h, a.run_id, a.scenario, start, end),
     }
+    hs_cache: dict = {}
+    res["hosts"] = host_stats(h, a.run_id, a.scenario, start, end, hs_cache)
     if a.scenario == "socday":
         k6 = h.run(h.blasters[0], f"cat ~/bench/k6-socday-{shlex.quote(a.run_id)}.json 2>/dev/null", check=False)
         res["queries"] = json.loads(k6) if k6.strip() else {"error": "no k6 summary"}
@@ -334,6 +355,9 @@ def main() -> int:
             if k6.strip():
                 q = json.loads(k6)
                 p["queries_at_load"] = {"search_by_tier": q.get("search_by_tier"), "error_rates": q.get("error_rates")}
+            if "window" in p:  # CPU per host during this step: shows what saturated first
+                p["host_cpu_p95"] = {n: v["cpu_busy_pct"]["p95"] for n, v in host_stats(
+                    h, a.run_id, a.scenario, iso(p["window"]["start"]), iso(p["window"]["end"]), hs_cache).items()}
         passed = [p for p in pm if p.get("slo", {}).get("pass")]
         broke = next((p for p in pm if not p.get("slo", {}).get("pass")), None)
         best = max(passed, key=lambda p: p["throughput"]["eps"]) if passed else None
@@ -341,6 +365,7 @@ def main() -> int:
             "sustained_eps": best["throughput"]["eps"] if best else None,
             "sustained_gb_per_day": best["throughput"]["gb_per_day"] if best else None,
             "lag_ms_at_ceiling": best["ingest_lag_ms"] if best else None,
+            "host_cpu_p95_at_ceiling": best.get("host_cpu_p95") if best else None,
             "broke_at": {"label": broke["label"], "target_eps": broke.get("target_eps"),
                          "slo": broke.get("slo")} if broke else None,
         }

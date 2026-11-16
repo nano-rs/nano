@@ -147,11 +147,12 @@ fi
 short=FAIL; (( lab )) && short=WARN
 if [[ -z "$ports" ]]; then
     case "$topology" in
-        single) ports=80,443,8080,8088 ;;
+        # 6000: Vector native (mutual TLS); 2.0.30+ publishes it on the host's interfaces.
+        single) ports=80,443,6000,8080,8088 ;;
         *)
             ports=""
             [[ ",$roles," == *,app,* ]] && ports+="80,3000,"
-            [[ ",$roles," == *,ingest,* ]] && ports+="80,8687,"
+            [[ ",$roles," == *,ingest,* ]] && ports+="80,6000,8687,"
             # Full HA (three postgres hosts) adds Patroni, etcd, Valkey and Sentinel on them.
             [[ ",$roles," == *,postgres,* ]] && ports+="5432,8008,2379,2380,6379,26379,"
             [[ ",$roles," == *,lb,* ]] && ports+="443,"
