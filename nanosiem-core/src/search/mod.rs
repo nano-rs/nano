@@ -27,6 +27,7 @@ pub(crate) use execution::validation::DISALLOWED_FUNCTIONS;
 pub mod field_usage;
 pub mod field_utils;
 pub mod jobs;
+pub mod partial_run;
 mod processing;
 pub mod query_processing;
 mod query_tracking;
@@ -81,7 +82,7 @@ pub use service::cloud_dossier::{
     CloudDossierTimeline, CloudDossierTimelineLane, CloudDossierTimelineMarker,
     CloudDossierUserAgent,
 };
-pub use service::{RawSqlAuditAccess, SearchService};
+pub use service::{touches_signals_dataset, RawSqlAuditAccess, SearchService};
 // NAN-4943: prevalence pushdown predicate SQL, for the cross-path parity suite.
 #[doc(hidden)]
 pub use service::prevalence_where_sql;

@@ -39,7 +39,6 @@ import {
   RefreshCw,
   Search,
   Clock,
-  Sparkles,
   ShieldAlert,
   Download,
   ChevronLeft,
@@ -55,6 +54,7 @@ import {
   FileText,
   ShieldCheck,
   Store,
+  Activity,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useArtifactExplorer, useArtifactDetail, useArtifactLookup } from '@/hooks/use-api';
@@ -517,7 +517,7 @@ export function Prevalence() {
           label="New artifacts (24h)"
           value={newCount}
           sub="First seen in last 24 hours"
-          icon={Sparkles}
+          icon={Activity}
           tone="brand"
           loading={loading && !data}
           approximate={countsApproximate}

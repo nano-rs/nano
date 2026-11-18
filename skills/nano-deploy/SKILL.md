@@ -259,7 +259,9 @@ are proven with real output, not assumed:
 - the admin can log in;
 - the license is active (or you report exactly why not);
 - a unique test event is ingested and then found by search
-  ([scripts/smoke-test.py](scripts/smoke-test.py));
+  ([scripts/smoke-test.py](scripts/smoke-test.py)), and HEC plus OTLP
+  logs, traces and metrics over HTTP and gRPC are accepted and stored
+  (`--hec --otlp-all`);
 - on HA, Keeper has a quorum and every ClickHouse replica is healthy
   ([scripts/cluster-health.py](scripts/cluster-health.py)).
 

@@ -51,6 +51,7 @@ import {
   NavDownload,
   NavGear,
   NavCollapse,
+  NavCrosshair,
 } from '@/components/layout/nav-icons';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { ingestionNavigation } from './ingestion-navigation';
@@ -251,9 +252,11 @@ const casesNavigation: NavItem[] = [
 
 /**
  * Secondary navigation items (after Detections)
- * Order: Notebooks > Prevalence > Risk
+ * Order: Hunts > Notebooks > Prevalence > Risk
  */
 const secondaryMainNavigation: NavItem[] = [
+  // NAN-5545: enterprise hunts workspace; the capability is off in open builds.
+  { name: 'Hunts', href: '/hunts', icon: NavCrosshair, permissions: 'hunts:view', capability: 'hunts' },
   { name: 'Notebooks', href: '/notebooks', icon: NavList, permissions: 'notebooks:view', capability: 'notebooks' },
   { name: 'Prevalence', href: '/prevalence', icon: NavChart, permissions: 'prevalence:view' },
   { name: 'Risk', href: '/risk', icon: NavBars, permissions: 'risk:view', capability: 'risk' },

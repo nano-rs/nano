@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
-    decayed_overview_query, entity_scores_query, entity_set_scores_query, entity_types_query,
+    decayed_overview_query, decayed_overview_windows_query, entity_scores_query, entity_set_scores_query, entity_types_query,
     lateral_scores_query, risk_dataset_base_query, risk_for_entities_query, risky_entities_query,
     rule_contributions_query, ClearedBoundaries, EntityScoreSelection,
     RiskChQuery, RiskFindingsSource, RiskSqlBind,
@@ -229,12 +229,12 @@ fn substitute_original(template: &str, ocsf: bool, logs_table: &str) -> String {
     let (entity_col, score_col, rule_name_col, rule_id_col, severity_col, stamped_type_col) =
         if ocsf {
             (
-                "JSONExtractString(toString(unmapped),'risk_entity')",
-                "JSONExtractInt(toString(unmapped), 'risk_score')",
-                "JSONExtractString(toString(unmapped), 'rule_name')",
-                "JSONExtractString(toString(unmapped),'rule_id')",
+                "JSONExtractString(ifNull(toJSONString(unmapped.risk_entity), 'null'))",
+                "JSONExtractInt(ifNull(toJSONString(unmapped.risk_score), 'null'))",
+                "JSONExtractString(ifNull(toJSONString(unmapped.rule_name), 'null'))",
+                "JSONExtractString(ifNull(toJSONString(unmapped.rule_id), 'null'))",
                 "lower(severity)",
-                "JSONExtractString(toString(unmapped),'risk_entity_type')",
+                "JSONExtractString(ifNull(toJSONString(unmapped.risk_entity_type), 'null'))",
             )
         } else {
             (
@@ -547,7 +547,7 @@ fn restricted_ocsf_scope_reads_persisted_unmapped_origin_extension() {
     let source = RiskFindingsSource::new(true, "ocsf_logs_distributed")
         .with_source_scope(&restricted_scope(&["windows_event"]));
     let query = risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared);
-    let origin = "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')";
+    let origin = "JSONExtract(ifNull(toJSONString(unmapped.origin_source_types), 'null'), 'Array(String)')";
 
     assert!(query.sql.contains(&format!("AND notEmpty({origin})")));
     assert!(query.sql.contains(&format!(
@@ -818,7 +818,7 @@ fn entity_type_inference_honors_cloud_account_stamp_only() {
         (false, "JSONExtractString(metadata, 'risk_entity_type')"),
         (
             true,
-            "JSONExtractString(toString(unmapped),'risk_entity_type')",
+            "JSONExtractString(ifNull(toJSONString(unmapped.risk_entity_type), 'null'))",
         ),
     ] {
         let source = RiskFindingsSource::new(ocsf, "logs");
@@ -990,7 +990,7 @@ fn p4_variants_substitute_ocsf_sentinels() {
     for q in &queries {
         assert!(
             q.sql
-                .contains("JSONExtractString(toString(unmapped),'risk_entity')"),
+                .contains("JSONExtractString(ifNull(toJSONString(unmapped.risk_entity), 'null'))"),
             "{}",
             q.sql
         );
@@ -1180,10 +1180,10 @@ fn dataset_base_ocsf_reads_unmapped_sentinels() {
     );
     assert!(q
         .sql
-        .contains("JSONExtractString(toString(unmapped),'risk_entity')"));
+        .contains("JSONExtractString(ifNull(toJSONString(unmapped.risk_entity), 'null'))"));
     assert!(q
         .sql
-        .contains("JSONExtract(toString(unmapped), 'mitre_tactics', 'Array(String)')"));
+        .contains("JSONExtract(ifNull(toJSONString(unmapped.mitre_tactics), 'null'), 'Array(String)')"));
     assert!(q.sql.contains("FROM ocsf_logs_distributed"));
     assert!(!q.sql.contains("__MITRE_TACTICS__"));
     assert_placeholder_bind_parity(&q);
@@ -1452,4 +1452,118 @@ fn member_scores_query_matches_lowered_values_and_binds_in_order() {
     expected.extend([RiskSqlBind::I64(c24), RiskSqlBind::I64(500)]);
     assert_eq!(q.binds, expected);
     assert_placeholder_bind_parity(&q);
+}
+
+/// NAN-5550: no OCSF risk read serializes the whole `unmapped` object. Every
+/// builder (including the restricted-scope origin predicate and the
+/// `dataset=risk` tactics column) reads single `unmapped.<path>` subcolumns.
+#[test]
+fn ocsf_risk_reads_never_serialize_whole_unmapped_object() {
+    let (cleared, _) = one_cleared_entity();
+    let source = RiskFindingsSource::new(true, "ocsf_logs_distributed")
+        .with_source_scope(&restricted_scope(&["windows_event"]));
+    let queries = [
+        entity_scores_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            EntityScoreSelection::MinScores {
+                min_score_24h: 1,
+                min_score_7d: 1,
+                limit: 10,
+            },
+        ),
+        risky_entities_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            RiskTimeWindow::Last24Hours,
+            Some("ip"),
+            1,
+            Some(70),
+            50,
+            0,
+        ),
+        risk_for_entities_query(&source, fixed_now(), &decay_config(), &cleared, &["a".to_string()]),
+        entity_types_query(&source, fixed_now(), &decay_config(), &cleared),
+        decayed_overview_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            RiskTimeWindow::Last7Days,
+        ),
+        rule_contributions_query(&source, fixed_now(), &decay_config(), &["a".to_string()]),
+        risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared),
+    ];
+    for q in &queries {
+        assert!(!q.sql.contains("toString(unmapped)"), "{}", q.sql);
+        assert!(
+            q.sql.contains("toJSONString(unmapped.risk_entity)"),
+            "{}",
+            q.sql
+        );
+        assert!(
+            q.sql.contains("toJSONString(unmapped.origin_source_types)"),
+            "{}",
+            q.sql
+        );
+        assert_placeholder_bind_parity(q);
+    }
+}
+
+/// NAN-5550: the both-windows overview is the single-window statement's CTEs
+/// byte-for-byte (same findings, decay, clears, weights and binds), with one
+/// projection carrying each window's columns.
+#[test]
+fn overview_windows_query_shares_the_single_window_ctes_and_binds() {
+    let (cleared, _) = one_cleared_entity();
+    for source in [
+        RiskFindingsSource::new(false, "logs"),
+        RiskFindingsSource::new(true, "ocsf_logs_distributed")
+            .with_source_scope(&restricted_scope(&["windows_event"])),
+    ] {
+        let both = decayed_overview_windows_query(&source, fixed_now(), &decay_config(), &cleared);
+        for window in [RiskTimeWindow::Last24Hours, RiskTimeWindow::Last7Days] {
+            let single =
+                decayed_overview_query(&source, fixed_now(), &decay_config(), &cleared, window);
+            // Split after the shared `aggregated` CTE (its closing paren).
+            let cte_end = single.sql.rfind("GROUP BY entity\n            )\n").unwrap()
+                + "GROUP BY entity\n            )\n".len();
+            assert_eq!(&both.sql[..cte_end], &single.sql[..cte_end]);
+            assert_eq!(both.binds, single.binds);
+        }
+        for suffix in ["_24h", "_7d"] {
+            for col in [
+                "total_entities",
+                "critical_entities",
+                "high_entities",
+                "medium_entities",
+                "low_entities",
+                "total_signals",
+                "avg_risk_score",
+            ] {
+                assert!(
+                    both.sql.contains(&format!(" AS {col}{suffix}")),
+                    "{col}{suffix} missing:\n{}",
+                    both.sql
+                );
+            }
+        }
+        assert!(both.sql.contains("countIf(decayed_score_24h > 0) AS total_entities_24h"));
+        assert!(both.sql.contains(
+            "toInt64(sumIf(signal_count_7d, decayed_score_7d > 0)) AS total_signals_7d"
+        ));
+        assert!(both.sql.contains(
+            "if(countIf(decayed_score_7d > 0) > 0, avgIf(decayed_score_7d, decayed_score_7d > 0), 0.0) AS avg_risk_score_7d"
+        ));
+        // One scan: the findings table is read once, no outer filter drops a
+        // window's rows.
+        assert_eq!(both.sql.matches("FROM signal_scores").count(), 1);
+        assert!(!both.sql.contains("WHERE decayed_score"));
+        assert!(!both.sql.contains("__"), "leaked sentinel:\n{}", both.sql);
+        assert_placeholder_bind_parity(&both);
+    }
 }

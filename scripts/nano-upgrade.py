@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -83,6 +84,13 @@ ROLE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     # NAN-5250: metrics only; rolled last so it watches the upgrade.
     "monitoring": ("ingest",),
 }
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Report a redirect instead of following it (a POST must not be replayed)."""
+
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return None
 
 
 def _embedded_lab_key_ids() -> tuple[str, ...]:
@@ -202,6 +210,14 @@ VECTOR_EDGE_FED_SOURCE_TYPES = frozenset({
     "internal_metrics", "internal_logs", "host_metrics", "static_metrics",
 })
 INGEST_EDGE_CLOSURE_FILE = ".nano-ingest-edge-closure.json"
+# NAN-5566: a single node's closure (nginx marker + Vector's ingest gate).
+SINGLE_INGEST_CLOSURE_FILE = ".nano-single-ingest-closure.json"
+# NAN-5566: Vector's docker stop timeout, longer than its own 60 s graceful limit.
+VECTOR_STOP_TIMEOUT_SECONDS = 120
+# NAN-5566: what confirms that direct senders to an ungated Vector are paused.
+SENDERS_PAUSED_CONFIRMATIONS = (
+    "NANO_CONFIRM_SENDERS_PAUSED", "NANO_CONFIRM_UPGRADE", "NANO_CONFIRM_LEGACY_UPGRADE",
+)
 VECTOR_HEALTH_PROBE = (
     "exec 3<>/dev/tcp/127.0.0.1/8686 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 "
     "&& grep -q ' 200 ' <&3"
@@ -3363,9 +3379,12 @@ class LocalOps:
             )
         # The same drain the ingest rollout does before it stops Vector: every
         # buffered event is delivered before `down`.
+        self._close_single_node_ingest()
         self._drain_vector(min(timeout, 300))
         applied = self._network_pin("apply")
         self.compose(["up", "-d", "--pull", "missing"], timeout=timeout)
+        # `down` recreated nginx (its tmpfs marker is gone): ingest is open.
+        self._single_ingest_closed = False
         return applied
 
     def compose(
@@ -5192,6 +5211,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         if not getattr(self, "role_env", None) and getattr(self, "legacy_layout", None) is None:
             check("compose-overlays", self._record_running_overlays)
         check("disk", lambda: self._check_disk(manifest, bundle, prepared))
+        # NAN-5566: before anything stops Vector (the backup does first).
+        if getattr(self, "legacy_layout", None) is None:
+            check("senders-paused", self._check_senders_paused)
         # NAN-5285 F1: every host that writes a backup component (PostgreSQL
         # on whichever member leads at backup time; ClickHouse only with
         # --include-clickhouse-data, see backup_components_for) needs a
@@ -5334,6 +5356,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         # The round trip's hook calls are reported by the lb-hooks check (in
         # the journaled preflight); never attribute them to a later step.
         self._take_lb_hook_calls()
+        # NAN-5610: report (never fail on) root-owned dynamic files the api
+        # cannot rewrite; the upgraded Vector's entrypoint re-owns them.
+        if getattr(self, "legacy_layout", None) is None:
+            check("vector-dynamic-ownership", self._check_dynamic_ownership)
         return checks
 
     def ledger(self) -> dict[str, list[list[str]]]:
@@ -6405,16 +6431,29 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         # commits its position only once the event is in that buffer.
         direct_senders = not self._service_exists("ingest-edge")
         self._pull_source_types = None
+        # NAN-5566: a disk buffer's count falls when the sink READS an event,
+        # so the ClickHouse sinks' events taken but not yet sent (or
+        # discarded) count too: zero means no batch is in flight either.
         metrics_command = VECTOR_METRICS_FETCH + r"""
-printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
-  ($1 ~ /(^|_)vector_buffer_events(\{|$)/ ||
-   $1 ~ /(^|_)vector_buffer_size_events(\{|$)/) &&
-  $0 !~ /component_id="prometheus_metrics"/ {
+printf '%s\n' "$metrics" | awk '$0 !~ /^#/ {
   value = (NF >= 3 ? $(NF-1) : $NF)
-  s += value; count += 1
-} END {if (count == 0) {print "MISSING"; exit 3} print s+0}'
+  if (($1 ~ /(^|_)vector_buffer_events(\{|$)/ ||
+       $1 ~ /(^|_)vector_buffer_size_events(\{|$)/) &&
+      $0 !~ /component_id="prometheus_metrics"/) { s += value; count += 1 }
+  if (/component_kind="sink"/ && /component_type="clickhouse"/) {
+    if ($1 ~ /(^|_)component_received_events_total\{/) taken += value
+    if ($1 ~ /(^|_)component_sent_events_total\{/ || $1 ~ /(^|_)component_discarded_events_total\{/) settled += value
+  }
+} END {if (count == 0) {print "MISSING"; exit 3} print s + (taken > settled ? taken - settled : 0)}'
 """
         deadline = time.monotonic() + timeout
+        # NAN-5566: with ingest closed at a single node's nginx, wait for the
+        # exact zero (every accepted event delivered, in-flight batches too)
+        # before settling for the drain-through gate (direct-port senders).
+        through_after = time.monotonic() + (
+            min(120 if getattr(self, "_single_vector_ungated", False) else 60, timeout)
+            if getattr(self, "_single_ingest_closed", False) else 0
+        )
         baseline: dict[str, float] | None = None
         while time.monotonic() < deadline:
             result = self.compose(
@@ -6424,7 +6463,7 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
             )
             if result.returncode == 0 and result.stdout.strip() in {"0", "0.0"}:
                 return
-            if result.returncode == 0 and (
+            if result.returncode == 0 and time.monotonic() >= through_after and (
                 direct_senders or self._vector_pull_sources()
             ):
                 counters = self._vector_buffer_counters()
@@ -6448,6 +6487,73 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
                         return
             time.sleep(2)
         raise UpgradeError(f"Vector buffers did not drain within {timeout}s")
+
+    def _vector_pipeline_identities(self) -> tuple[str, str] | None:
+        """NAN-5564: (running, target) NANO_PIPELINE_IDENTITY of this host's
+        Vector; None when there is no single running Vector or no target."""
+        # `ps` lists running containers only.
+        ids = str(self.compose(["ps", "-q", "vector"], timeout=30, check=False).stdout or "").split()
+        if len(ids) != 1:
+            return None
+        rendered = self.compose(["config", "--format", "json"], timeout=60, check=False)
+        try:
+            services = json.loads(rendered.stdout).get("services") or {}
+            environment = (services.get("vector") or {}).get("environment") or {}
+        except (ValueError, AttributeError):
+            return None
+        target = str(environment.get("NANO_PIPELINE_IDENTITY") or "") if isinstance(environment, dict) else ""
+        if not target:
+            return None
+        inspected = self.runner.run(
+            ["docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", ids[0]],
+            timeout=30, check=False,
+        )
+        running = ""
+        for line in str(inspected.stdout or "").splitlines():
+            if line.startswith("NANO_PIPELINE_IDENTITY="):
+                running = line.split("=", 1)[1]
+                break
+        return running, target
+
+    def _restart_vector_for_pipeline_change(self, timeout: int) -> bool:
+        """NAN-5564: a single host's Vector must not run while the new api
+        renders a different pipeline (release / ack durability / fan-in slots).
+
+        The app role rolls before the ingest role, so the old Vector used to
+        keep serving while the new api rendered its config, and hot-reloaded
+        onto it. A change to a sink's disk buffer (every 0.1.x upgrade) makes
+        that reload fail and Vector exit with events in flight. Instead, drain
+        it and recreate it now: the new container's entrypoint does not start
+        Vector (its ports refuse connections, so nothing is acknowledged and
+        senders retry) until the new api has rendered the config for its
+        identity. A role-split ingest host installs published generations
+        through its consumer and is not handled here.
+        """
+        if "ingest" not in (getattr(self, "roles", None) or ()):
+            return False
+        try:
+            if self._service_exists("vector-config-consumer") or not self._service_exists("vector"):
+                return False
+            identities = self._vector_pipeline_identities()
+        except Exception as error:  # noqa: BLE001 - a probe; the rollout continues as before
+            eprint(f"note: could not compare Vector's pipeline identity ({error}); Vector keeps running")
+            return False
+        if identities is None or identities[0] == identities[1]:
+            return False
+        running, target = identities
+        eprint(
+            f"{getattr(self, 'host_name', 'single')}: Vector runs pipeline "
+            f"{running or '(from before NAN-5564)'}; the new api renders {target}. Draining it and "
+            "recreating it gated: ingest refuses connections until the new pipeline runs"
+        )
+        self._close_single_node_ingest()
+        self._drain_vector(min(timeout, 300))
+        # NAN-5566: a long graceful stop (Vector's own limit is 60 s), then the
+        # new, gated container.
+        self.compose(["stop", "--timeout", str(VECTOR_STOP_TIMEOUT_SECONDS), "vector"],
+                     timeout=VECTOR_STOP_TIMEOUT_SECONDS + 60)
+        self.compose(["up", "-d", "--no-deps", "--pull", "never", "vector"], timeout=timeout)
+        return True
 
     def _vector_pull_sources(self) -> set[str]:
         """NAN-5488: source types this Vector runs that the closed edge does not
@@ -6621,9 +6727,13 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         `--abandon-incomplete`. Brings the edge back (a stopped one is
         started) and clears the marker; a no-op without a closure file.
         """
+        single = self._single_closure_path()
+        if single is not None and (single.is_file() or single.is_symlink()):
+            eprint(f"{getattr(self, 'host_name', 'single')}: an interrupted run left ingest closed; reopening it")
+            self._reopen_single_node_ingest(force=True)
         path = self._closure_path()
         if path is None or not (path.is_file() or path.is_symlink()):
-            return {"reconciled": False}
+            return {"reconciled": bool(single is not None and not single.exists() and getattr(self, "_reconciled_single", False))}
         try:
             stale = read_json(path)
         except (UpgradeError, OSError, ValueError):
@@ -6639,8 +6749,299 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         path.unlink(missing_ok=True)
         return {"reconciled": True, "closure": stale}
 
+    def _single_closure_path(self) -> pathlib.Path | None:
+        install_dir = getattr(self, "install_dir", None)
+        return pathlib.Path(install_dir) / SINGLE_INGEST_CLOSURE_FILE if install_dir else None
+
+    def _close_single_node_ingest(self) -> None:
+        """NAN-5566: close a single node's ingest before its Vector drains.
+
+        Vector's directly published listeners (:8080, :8088, OTLP, :6000) move
+        to loopback-only ports by a hot reload (config/vector/.nano/
+        ingest-gate.sh: direct senders get "connection refused"), and nginx
+        answers its ingest routes with 503 + Retry-After while the marker
+        exists (a tmpfs: a recreated or restarted nginx is open again). The
+        closure is written to SINGLE_INGEST_CLOSURE_FILE BEFORE anything
+        changes, so a killed worker's closure is undone by the next rollout,
+        resume or abandon (reconcile_ingest_edge_closure)."""
+        if getattr(self, "_single_ingest_closed", False):
+            return
+        if "ingest" not in (getattr(self, "roles", None) or ()):
+            return
+        try:
+            if self._service_exists("ingest-edge"):
+                return
+            running = self._running_services(("vector", "nginx"))
+        except Exception as error:  # noqa: BLE001 - a probe; the drain still runs
+            eprint(f"note: could not check nginx and Vector to close ingest ({error})")
+            return
+        if "vector" not in running and "nginx" not in running:
+            return
+        path = self._single_closure_path()
+        if path is not None:
+            write_json_atomic(path, {"host": getattr(self, "host_name", "single"), "closed_at": utc_now()})
+        # From here every exit path reopens (the flag, and the file on disk).
+        self._single_ingest_closed = True
+        if "vector" in running:
+            self._close_single_node_vector_ports()
+        if "nginx" not in running:
+            return
+        touch = ["exec", "-T", "nginx", "sh", "-c", f"mkdir -p /run/nano-ingest && touch {INGEST_EDGE_CLOSED_MARKER}"]
+        if self.compose(touch, timeout=60, check=False).returncode != 0:
+            eprint("WARNING: could not close ingest at nginx; Vector drains under live ingest at nginx")
+            return
+        # A running config from before NAN-5566 has no marker check: reload.
+        self.compose(["exec", "-T", "nginx", "nginx", "-s", "reload"], timeout=60, check=False)
+        if not self._nginx_ingest_closed():
+            # NAN-5566 (live 2a): a bundle upgrade replaces config/nginx with a
+            # new directory, so the running nginx keeps the OLD directory
+            # mount and a reload re-reads the old config, which ignores the
+            # marker. Recreate nginx onto the current files (this also gives
+            # it the marker's tmpfs), then close again.
+            eprint(f"note: {getattr(self, 'host_name', 'single')}: nginx did not answer the closed 503 "
+                   "(its running config predates the marker); recreating it onto the current config")
+            self.compose(["up", "-d", "--no-deps", "--pull", "never", "--force-recreate", "nginx"],
+                         timeout=180, check=False)
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if self.compose(touch, timeout=60, check=False).returncode == 0 and self._nginx_ingest_closed():
+                    break
+                time.sleep(2)
+        if self._nginx_ingest_closed():
+            eprint(f"{getattr(self, 'host_name', 'single')}: closed ingest at nginx (503 + Retry-After) "
+                   "while Vector drains and restarts")
+            return
+        # Last resort (the install tree's nginx config predates the marker,
+        # e.g. the release package was not extracted over the install): stop
+        # nginx for the window, so ingest through it is refused, and record
+        # it so every reopen path (and the next run's reconcile) starts it.
+        if path is not None:
+            write_json_atomic(path, {"host": getattr(self, "host_name", "single"), "closed_at": utc_now(),
+                                     "nginx_stopped": True})
+        self._single_nginx_stopped = True
+        self.compose(["stop", "--timeout", "10", "nginx"], timeout=90, check=False)
+        if "nginx" not in self._running_services(("nginx",)):
+            eprint(f"WARNING: {getattr(self, 'host_name', 'single')}: nginx's config does not honor the "
+                   "ingest-closed marker (was the release package extracted over the install directory?); "
+                   "stopped nginx while Vector drains and restarts, so ingest through it is refused")
+        else:
+            eprint("WARNING: nginx still accepts ingest after the close; the drain runs under live ingest "
+                   "and events in flight when Vector stops can be lost. Pause senders for this step.")
+
+    def _nginx_ingest_closed(self) -> bool:
+        """NAN-5566: does this host's nginx answer /ingest with the closed
+        503 (X-Nano-Ingest: closed)? Asked over the published port, so it
+        is what a sender sees; the TLS edge redirects :80 to :443."""
+        for url in ("http://127.0.0.1/ingest", "https://127.0.0.1/ingest"):
+            request = urllib.request.Request(url, data=b"{}", method="POST",
+                                             headers={"Content-Type": "application/json"})
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=context), NoRedirect(),
+            )
+            try:
+                with opener.open(request, timeout=5) as response:
+                    status, headers = response.status, response.headers
+            except urllib.error.HTTPError as error:
+                status, headers = error.code, error.headers
+                error.close()
+            except (OSError, ValueError):
+                continue
+            if status == 503 and str(headers.get("X-Nano-Ingest", "")).lower() == "closed":
+                return True
+            if status in (301, 302, 307, 308):
+                continue
+            return False
+        return False
+
+    def _close_single_node_vector_ports(self) -> None:
+        """NAN-5566: see _close_single_node_ingest."""
+        result = self.compose(
+            ["exec", "-T", "vector", "sh", "/etc/vector/.nano/ingest-gate.sh", "close"],
+            timeout=240, check=False,
+        )
+        if result.returncode == 3:
+            eprint("note: Vector is still starting; its ports are not listening yet, nothing to close")
+            return
+        if result.returncode in (2, 126, 127):
+            eprint("note: this Vector was started before the ingest gate (NAN-5566); senders "
+                   "posting to its ports directly are closed only by its own shutdown")
+            self._single_vector_ungated = True
+            self._confirm_senders_paused()
+        elif result.returncode == 0:
+            eprint(f"{getattr(self, 'host_name', 'single')}: closed Vector's published ingest ports")
+        else:
+            eprint("note: Vector did not confirm closing its published ingest ports; draining anyway")
+
+    def _clear_pipeline_identity(self) -> bool:
+        """NAN-5564: remove the Vector pipeline identity marker through a
+        running container that mounts it (Vector, else nano-api)."""
+        if getattr(self, "_pipeline_identity_cleared", False):
+            return True
+        for service, path in (("vector", "/etc/vector/dynamic/.nano-pipeline-identity"),
+                              ("nano-api", "/app/config/vector/.nano-pipeline-identity")):
+            try:
+                if service not in self._running_services((service,)):
+                    continue
+                if self.compose(["exec", "-T", service, "rm", "-f", path], timeout=60, check=False).returncode == 0:
+                    self._pipeline_identity_cleared = True
+                    return True
+            except Exception as error:  # noqa: BLE001 - best effort; the api's render rewrites it
+                eprint(f"note: could not clear the Vector pipeline identity marker via {service}: {error}")
+        return False
+
+    def _confirm_senders_paused(self) -> str:
+        """NAN-5566: a Vector from 2.0.31 or older has no ingest gate, so
+        senders posting to its published ports directly cannot be closed before
+        it stops (an event in flight can then be lost, NAN-5567). The operator
+        pauses them first: confirmed on a terminal, or
+        NANO_CONFIRM_SENDERS_PAUSED=1 for automation. Otherwise this stops the
+        upgrade before Vector is touched. A confirmation is passed on to the
+        child `scripts/nano backup` through the environment."""
+        eprint(
+            "WARNING: this host's Vector predates the ingest gate (nano 2.0.31 or older): pause every "
+            "sender that posts to its ports directly (:8080, :8088, OTLP, :6000) before upgrading, or "
+            "events in flight when it stops can be lost. Senders through nginx (/ingest) are closed "
+            "automatically."
+        )
+        # The installer's and upgrader's existing unattended confirmations
+        # count too; the warning above is printed either way.
+        for flag in SENDERS_PAUSED_CONFIRMATIONS:
+            if os.environ.get(flag) == "1":
+                os.environ["NANO_CONFIRM_SENDERS_PAUSED"] = "1"
+                return f"{flag}=1"
+        answer = ""
+        try:
+            with open("/dev/tty", "r+", encoding="utf-8") as tty:
+                tty.write("Are senders that post to Vector directly paused? [y/N] ")
+                tty.flush()
+                answer = tty.readline().strip()
+        except OSError:
+            answer = ""
+        if answer.lower() in {"y", "yes"}:
+            os.environ["NANO_CONFIRM_SENDERS_PAUSED"] = "1"
+            return "confirmed on the terminal"
+        raise UpgradeError(
+            "pause the senders that post to Vector's ports directly, then re-run the upgrade "
+            "(non-interactive: set NANO_CONFIRM_SENDERS_PAUSED=1; NANO_CONFIRM_UPGRADE=1 or "
+            "NANO_CONFIRM_LEGACY_UPGRADE=1 confirm it too)"
+        )
+
+    def _check_dynamic_ownership(self) -> str:
+        """NAN-5610: root-owned files under the Vector dynamic tree (left by an
+        older entrypoint's migration as root) that nano-api cannot rewrite in
+        place. Informational: the upgraded Vector re-owns them at start."""
+        if "ingest" not in (getattr(self, "roles", None) or ()) or getattr(self, "role_env", None):
+            return "not a single node"
+        try:
+            if "vector" not in self._running_services(("vector",)):
+                return "Vector is not running"
+            found = self.compose(
+                ["exec", "-T", "vector", "sh", "-c",
+                 "d=/etc/vector/dynamic; o=$(stat -c %u \"$d\" 2>/dev/null) || exit 0; "
+                 "[ \"$o\" = 0 ] && exit 0; "
+                 "{ find \"$d/sources\" -mindepth 1 -maxdepth 2 -user 0 ! -name .nano-quarantine;"
+                 " find \"$d/quarantine\" -maxdepth 1 -user 0; } 2>/dev/null"],
+                timeout=60, check=False,
+            )
+        except Exception as error:  # noqa: BLE001 - informational
+            return f"could not inspect the Vector dynamic tree ({error})"
+        paths = [line.strip() for line in str(found.stdout or "").splitlines() if line.strip()]
+        if not paths:
+            return "no root-owned files under /etc/vector/dynamic"
+        eprint(
+            f"note: {len(paths)} root-owned path(s) under /etc/vector/dynamic, which nano-api cannot rewrite "
+            f"(e.g. {paths[0]}); the upgraded Vector re-owns them at start (NAN-5610)"
+        )
+        return f"{len(paths)} root-owned path(s) (e.g. {paths[0]}); re-owned when the upgraded Vector starts"
+
+    def _check_senders_paused(self) -> str:
+        """Preflight (single node): an ungated Vector needs paused senders."""
+        if "ingest" not in (getattr(self, "roles", None) or ()) or getattr(self, "role_env", None):
+            return "not a single node"
+        try:
+            if self._service_exists("ingest-edge") or "vector" not in self._running_services(("vector",)):
+                return "no single-node Vector running"
+            gated = self.compose(
+                # The new entrypoint's environment, not its gate files (those
+                # appear only once Vector is about to start).
+                ["exec", "-T", "vector", "sh", "-c", '[ "${NANO_VECTOR_INGEST_GATE:-}" = on ]'],
+                timeout=30, check=False,
+            ).returncode == 0
+        except UpgradeError:
+            raise
+        except Exception as error:  # noqa: BLE001 - a probe; the stop asks again
+            return f"could not inspect Vector ({error}); the Vector stop asks again"
+        if gated:
+            return "Vector has the ingest gate"
+        return self._confirm_senders_paused()
+
+    def _reopen_single_node_ingest(self, *, force: bool = False) -> None:
+        """NAN-5566: end the single-node closed window. Idempotent; with
+        `force` (or a closure file on disk) it reopens whatever is closed,
+        whoever closed it."""
+        path = self._single_closure_path()
+        pending = path is not None and (path.is_file() or path.is_symlink())
+        if not (force or pending or getattr(self, "_single_ingest_closed", False)):
+            return
+        nginx_stopped = getattr(self, "_single_nginx_stopped", False)
+        if pending and not nginx_stopped:
+            try:
+                nginx_stopped = bool(read_json(path).get("nginx_stopped"))
+            except (UpgradeError, OSError, ValueError):
+                nginx_stopped = False
+        if nginx_stopped:
+            self.compose(["start", "nginx"], timeout=120, check=False)
+            if "nginx" not in self._running_services(("nginx",)):
+                self.compose(["up", "-d", "--no-deps", "--pull", "never", "nginx"], timeout=180, check=False)
+            self._single_nginx_stopped = False
+        running = self._running_services(("vector", "nginx"))
+        if "vector" in running:
+            status = self.compose(
+                ["exec", "-T", "vector", "sh", "/etc/vector/.nano/ingest-gate.sh", "status"],
+                timeout=60, check=False,
+            )
+            if str(status.stdout or "").strip() == "closed":
+                self.compose(
+                    ["exec", "-T", "vector", "sh", "/etc/vector/.nano/ingest-gate.sh", "open"],
+                    timeout=240, check=False,
+                )
+        if "nginx" in running:
+            result = self.compose(
+                ["exec", "-T", "nginx", "rm", "-f", INGEST_EDGE_CLOSED_MARKER], timeout=60, check=False,
+            )
+            if result.returncode != 0:
+                eprint("WARNING: could not reopen ingest at nginx; run: docker compose exec nginx rm -f "
+                       f"{INGEST_EDGE_CLOSED_MARKER}")
+                return
+        if getattr(self, "_single_ingest_closed", False) or pending:
+            eprint(f"{getattr(self, 'host_name', 'single')}: reopened ingest")
+        self._single_ingest_closed = False
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+    def _reopen_single_node_after_failure(self) -> None:
+        """NAN-5566: reopen a single node's ingest after a failed step. If that
+        fails too, the closure file stays for the next resume, rollback or
+        abandon, and the exact manual commands are printed."""
+        try:
+            self._reopen_single_node_ingest()
+        except Exception as error:  # noqa: BLE001 - never hide the step's own failure
+            eprint(f"WARNING: could not reopen ingest: {error}")
+        path = self._single_closure_path()
+        if path is not None and (path.is_file() or path.is_symlink()):
+            eprint(
+                "WARNING: ingest is still closed on this host (nginx answers 503, Vector's ports refuse). "
+                "`scripts/nano upgrade --resume` (or --abandon-incomplete) reopens it; by hand: "
+                "docker compose exec nginx rm -f /run/nano-ingest/closed; docker compose start nginx; "
+                "docker compose exec vector sh /etc/vector/.nano/ingest-gate.sh open"
+            )
+
     def _reopen_after_failure(self) -> None:
         """Reopen a closed edge on a failed step without hiding that failure."""
+        self._reopen_single_node_after_failure()
         try:
             self._reopen_ingest_edge()
         except (UpgradeError, OSError) as reopen_error:
@@ -7285,6 +7686,8 @@ printf 'consumer generation %s ready\n' "$generation"
                 # may keep them in the old, dead namespace; checked against
                 # the running state, so a resumed upgrade is covered too.
                 recreate = ["--force-recreate"]
+            if recreate and "vector" in before_edge:
+                self._stop_vector_before_recreate(timeout)
             self.compose(
                 ["up", "-d", "--no-deps", "--pull", "never",
                  *recreate, *before_edge],
@@ -7305,7 +7708,25 @@ printf 'consumer generation %s ready\n' "$generation"
                 # NAN-5488: the marker is on a tmpfs, so a restarted edge has
                 # none; an edge that kept running through a fence still may.
                 self._clear_ingest_edge_marker(running=True)
+        # NAN-5566: Vector is ready again (the readiness wait above).
+        self._reopen_single_node_ingest()
         return selected
+
+    def _stop_vector_before_recreate(self, timeout: int) -> None:
+        """NAN-5566: never let a recreate stop Vector with a short timeout (an
+        old service definition has no stop_grace_period: Docker's 10 s, which
+        cuts the in-flight batch). Close, drain, then a long graceful stop."""
+        try:
+            running = "vector" in self._running_services(("vector",))
+        except Exception as error:  # noqa: BLE001 - a probe; `up` still recreates
+            eprint(f"note: could not check Vector before recreating it ({error})")
+            return
+        if not running:
+            return
+        self._close_single_node_ingest()
+        self._drain_vector(min(timeout, 300))
+        self.compose(["stop", "--timeout", str(VECTOR_STOP_TIMEOUT_SECONDS), "vector"],
+                     timeout=VECTOR_STOP_TIMEOUT_SECONDS + 60)
 
     def quiesce(
         self, role: str, timeout: int, require_lb_hooks: bool = False,
@@ -7324,6 +7745,8 @@ printf 'consumer generation %s ready\n' "$generation"
                 if "vector" in selected:
                     if "ingest-edge" in selected:
                         self._close_ingest_edge()
+                    else:
+                        self._close_single_node_ingest()
                     self._drain_vector(min(timeout, 300))
                 stopped = self._stop_exact(selected, timeout)
             except BaseException:
@@ -7801,6 +8224,9 @@ printf 'consumer generation %s ready\n' "$generation"
                         if "ingest-edge" in selected:
                             # NAN-5488: no new events while Vector drains.
                             self._close_ingest_edge()
+                        else:
+                            # NAN-5566: a single node closes at its nginx.
+                            self._close_single_node_ingest()
                         self._drain_vector(min(timeout, 300))
                         # NAN-5250 / NAN-5525: the namespace anchor publishes
                         # Vector's ports: the monitoring host scrapes :9598
@@ -7849,6 +8275,13 @@ printf 'consumer generation %s ready\n' "$generation"
                 self._wait_services(services, timeout)
         elif role == "app":
             drained = False
+            if not legacy_transition_rollout:
+                # NAN-5564: before the new api renders the Vector config.
+                try:
+                    self._restart_vector_for_pipeline_change(timeout)
+                except BaseException:
+                    self._reopen_after_failure()
+                    raise
             try:
                 drained = self._drain_app_host(selected)
                 services = self._up_app_services(selected, timeout, exact=True)
@@ -7859,10 +8292,16 @@ printf 'consumer generation %s ready\n' "$generation"
                 if drained:
                     self._rejoin_app_host()
             except UpgradeError as error:
+                # NAN-5566: the Vector restart above closed this single node's
+                # ingest; a failed app rollout must not leave it closed.
+                self._reopen_single_node_after_failure()
                 if drained or "nginx" in selected and int(
                     (getattr(self, "role_env", None) or {}).get("NANO_APP_HOST_COUNT", "1") or "1"
                 ) >= 2:
                     raise self._left_drained(error) from error
+                raise
+            except BaseException:
+                self._reopen_single_node_after_failure()
                 raise
         # NAN-5250: node-exporter (with a monitoring host) runs on every host
         # beside whatever role this is; bring it to the target definition too.
@@ -8287,6 +8726,11 @@ fi
         # NAN-5279: the previous release's rendered configuration goes back
         # with its images (once per host; later roles find it restored).
         restored = bool(run_id) and self.restore_previous_render(run_id)
+        # NAN-5564: the identity marker names the release being rolled back;
+        # the previous release's api never rewrites it, so a later re-upgrade
+        # would start its Vector on the previous release's tree without
+        # waiting. Forget it (once, on the first role that can).
+        self._clear_pipeline_identity()
         result = self.rollout(role, timeout, require_lb_hooks)
         return {"version": previous, "role": role, "restored_config": restored, **result}
 
@@ -10555,6 +10999,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
         manual_fence = ManualBackupFence(install_dir)
         try:
             journal = Journal(install_dir)
+            refuse_during_conversion(install_dir)
             if manual_fence.exists():
                 pending_manual = manual_fence.load()
                 if args.dry_run:
@@ -11269,11 +11714,29 @@ def ledger_map(value: Any, nodes: Sequence[Node], label: str) -> dict[str, Any]:
     raise UpgradeError(f"{label} is not an all-node ledger snapshot")
 
 
+def refuse_during_conversion(install_dir: pathlib.Path) -> None:
+    """NAN-5558: an unfinished `scripts/nano convert` owns this install until
+    it is verified or rolled back."""
+    path = install_dir / ".nano-convert.json"
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        state = json.loads(path.read_text(encoding="utf-8")).get("state")
+    except (OSError, ValueError, AttributeError) as error:
+        raise UpgradeError(f"cannot read the conversion journal {path}; finish or roll back the conversion first") from error
+    if state not in {"verified", "rolled-back"}:
+        raise UpgradeError(
+            f"a conversion to enterprise is in progress (state {state}); finish it with "
+            "scripts/nano convert --resume or undo it with scripts/nano convert --rollback first"
+        )
+
+
 def rollback_command(args: argparse.Namespace) -> int:
     install_dir = pathlib.Path(args.install_dir).expanduser().resolve()
     nano_cli = pathlib.Path(args.nano_cli or SCRIPT_DIR / "nano").expanduser().resolve()
     runner = Runner()
     ops = LocalOps(install_dir, nano_cli, runner)
+    refuse_during_conversion(install_dir)
     with acquire_process_lock(install_dir):
         journal = Journal(install_dir)
         state = journal.load_latest_completed()

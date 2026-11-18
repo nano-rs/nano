@@ -699,7 +699,18 @@ impl BackgroundSearchJobs {
 
         let mut request = job.request.clone();
         request.request_id = Some(query_id.clone());
-        let scope = job.scope();
+        let mut scope = job.scope();
+        // NAN-5612: the stamped scope carries no detections-dataset grant;
+        // re-prove the owner's detections:view now, so revoking it after
+        // submission stops a dataset=signals job (fail closed on error).
+        if crate::search::touches_signals_dataset(request.dataset.as_deref(), &request.query) {
+            let allowed = inner
+                .repo
+                .user_holds_permission(job.owner_user_id, crate::auth::permissions::DETECTIONS_VIEW)
+                .await
+                .unwrap_or(false);
+            scope = scope.with_signals_denied(!allowed);
+        }
         let settings = inner.config.ch_settings();
         // Backstop above ClickHouse's own max_execution_time.
         let backstop = Duration::from_secs(u64::from(inner.config.max_execution_secs) + 60);

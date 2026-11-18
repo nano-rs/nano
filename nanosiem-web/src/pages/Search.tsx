@@ -48,7 +48,6 @@ import {
   GitBranch,
   MessageSquare,
   CornerDownLeft,
-  Sparkles,
   LayoutGrid,
   Share2,
   Activity,
@@ -79,6 +78,8 @@ import {
 import { api } from '@/lib/api';
 import type { ApiError, ParseErrorDetails, MelodApiResponse } from '@/lib/api';
 import { isLookupAllowlistRefusal, LOOKUP_URLS_SETTINGS_PATH } from '@/lib/api/lookup-url-allowlist';
+import { parseSearchDataset } from '@/lib/api/types';
+import { datasetOfQuery } from '@/lib/dataset-prefix';
 import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useAuth } from '@/contexts/AuthContext';
 import { useSearchHistory } from '@/hooks/useSearchHistory';
@@ -131,7 +132,7 @@ import { registerSearchAnalysisSource, startSearchAnalysis, MAX_ANALYZE_ROWS, NO
 import { openPivtPanel } from '@/enterprise/components/pivt/commands/router';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { ScheduleReportDialog, type ScheduleReportPreset } from '@/components/reports/ScheduleReportDialog';
-import { useHereCardOverride } from '@/contexts/PageContext';
+import { useSearchPivtPage, type SearchPivtState } from './search/useSearchPivtPage';
 import { isPageInStoredRange, jobFailureCode, jobPollPolicy, nextContinuationPage, pageableRowCount } from '@/lib/search-job';
 import type { SearchJobSummary } from '@/lib/api';
 import { registerDynamicFields } from '@/components/editor';
@@ -443,11 +444,13 @@ export function Search() {
   // this toggle lets analysts run ad-hoc nPL against those tables in-place.
   // "risk" (NAN-1805) targets the derived accumulated-entity-risk grain.
   const [dataset, setDataset] = useState<import('@/lib/api/types').SearchDataset>(() => {
-    const d = searchParams.get('dataset');
-    return d === 'spans' || d === 'metrics' || d === 'risk' ? d : 'logs';
+    // NAN-5612: a dashboard drilldown / "Open in Search" link carries the
+    // dataset as the query's leading `dataset=<name>` token.
+    return searchParams.get('dataset') ? parseSearchDataset(searchParams.get('dataset')) : datasetOfQuery(urlQuery);
   });
   const [query, setQuery] = useState(urlQuery || '');
   const [executedQuery, setExecutedQuery] = useState(''); // Query that was actually executed (for highlighting)
+  const executedModeRef = useRef<'piped' | 'sql'>('piped');
   const [naturalLanguageQuery, setNaturalLanguageQuery] = useState(urlMode === 'natural' ? urlQuery : '');
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(getInitialTimeRange());
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -643,34 +646,6 @@ export function Search() {
   const [peakRowsScanned, setPeakRowsScanned] = useState(0);
   const [limitWarningDismissed, setLimitWarningDismissed] = useState(false);
   const [pageSize] = useState(50);
-
-  // PIVT "Here" card override — reflects live search state so the
-  // assistant can see the user's current query + result count. The
-  // static Search card in the registry only gets used before a query
-  // runs; as soon as results land, this override takes over.
-  useHereCardOverride(
-    hasSearched
-      ? {
-          icon: 'Search',
-          title: 'Search',
-          tags: queryMode === 'sql' ? ['SQL'] : ['nPL'],
-          lines: [
-            { label: 'query', value: query || '— (empty)' },
-            {
-              label: 'results',
-              value:
-                displayTotalCount > 0
-                  ? `${displayTotalCount.toLocaleString()} events`
-                  : 'no matches',
-            },
-          ],
-          suggestions:
-            displayTotalCount > 0
-              ? ['Summarize these results', 'Pivot by source IP', 'Create a detection from this query']
-              : ['Widen the time range', 'Remove a filter', 'Summarize zero-result patterns'],
-        }
-      : null
-  );
 
   // Query execution time
   const [executionTimeMs, setExecutionTimeMs] = useState<number | null>(null);
@@ -1938,6 +1913,8 @@ export function Search() {
     // Use provided parameters or fall back to current state
     const currentQuery = searchQuery ?? query;
     const currentMode = searchMode ?? queryMode;
+    // NAN-5571: the mode the shown results ran in (pivt save/rule cards).
+    executedModeRef.current = currentMode;
     const currentTimeRange = searchTimeRange ?? timeRange;
     // NAN-1825: explicit dataset override for callers that can't rely on this
     // closure's state (e.g. the history-restore effect, whose setDataset
@@ -2626,6 +2603,7 @@ export function Search() {
     return {
       query: executedQuery || query,
       queryMode,
+      queryIsCurrent: !!executedQuery && executedQuery.trim() === query.trim() && executedModeRef.current === queryMode,
       dataset,
       timeRange: scopeTime,
       range: scope?.range ?? toApiTimeRange(scopeTime),
@@ -3616,6 +3594,30 @@ export function Search() {
     return Array.from(fields).sort();
   }, [fieldStats, baseFieldStats]);
 
+  // NAN-5571: what pivt knows and may do on Search (context from this page's
+  // own state; actions through the REST client as the analyst).
+  const pivtState = useMemo<SearchPivtState>(
+    () => ({
+      query: executedQuery || query,
+      queryMode,
+      queryIsCurrent: !!executedQuery && executedQuery.trim() === query.trim() && executedModeRef.current === queryMode,
+      timeLabel: formatTimeWindowLabel(timeRange, toApiTimeRange(timeRange)),
+      hasSearched,
+      total: displayTotalCount,
+      executionTimeMs,
+      topFields: fieldStats.slice(0, 15).map((f) => ({ field: f.field, distinct: f.uniqueCount })),
+      sampleRows: displayResults.slice(0, 5).map((r) => r.fields),
+      runQuery: (q: string) => {
+        setQueryMode('piped');
+        setQuery(q);
+        handleSearch(1, false, q, 'piped', timeRange);
+      },
+      savedTimeRange: () => savedSearchTimeRange(timeRange),
+    }),
+    [executedQuery, query, queryMode, timeRange, hasSearched, displayTotalCount, executionTimeMs, fieldStats, displayResults, handleSearch],
+  );
+  useSearchPivtPage(pivtState);
+
   // Register discovered fields (including ext fields) with the query tokenizer
   // so they get syntax highlighting in the search bar
   useEffect(() => {
@@ -3844,8 +3846,9 @@ export function Search() {
     // dataset boundary (logs ↔ spans/metrics/risk) must re-run against the
     // dataset that search actually targeted.
     const rawUrlDataset = searchParams.get('dataset');
-    const urlDataset: import('@/lib/api/types').SearchDataset =
-      rawUrlDataset === 'spans' || rawUrlDataset === 'metrics' || rawUrlDataset === 'risk' ? rawUrlDataset : 'logs';
+    const urlDataset: import('@/lib/api/types').SearchDataset = rawUrlDataset
+      ? parseSearchDataset(rawUrlDataset)
+      : datasetOfQuery(currentUrlQuery);
     
     // Build time range from URL
     const historyTimeRange: TimeRangeValue = readTimeRangeParams(searchParams)
@@ -5007,7 +5010,7 @@ export function Search() {
       {/* AI Query Best Practices Suggestions */}
       {(queryReviewSuggestions.length > 0 || isReviewingQuery) && (
         <div className="flex items-start gap-3 px-4 py-3 bg-violet-500/5 border border-violet-500/20 rounded-xl text-sm">
-          <Sparkles className="w-4 h-4 text-violet-400 mt-0.5 flex-shrink-0" />
+          <PivtIcon className="w-4 h-4 text-violet-400 mt-0.5 flex-shrink-0" />
           <div className="flex-1 min-w-0">
             {isReviewingQuery ? (
               <div className="flex items-center gap-1.5 text-xs text-muted-foreground">

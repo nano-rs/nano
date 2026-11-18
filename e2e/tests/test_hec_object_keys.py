@@ -18,13 +18,12 @@ ingest token:
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
 
-from nano_e2e import feeds_live, ingest
+from nano_e2e import feeds_live, ingest, schema
 from nano_e2e.client import Nano
 from nano_e2e.feeds_live import VendorParser, row_get
 from nano_e2e.stack import Stack
@@ -38,8 +37,8 @@ SYSLOG = VendorParser("parsers-ocsf/syslog/parser.yaml", "syslog_ocsf", ("syslog
 def bind(stack: Stack, nano: Nano) -> Iterator:
     """Factory: import + publish a first-party parser and issue an ingest token
     bound to its source. Returns the raw token; revoked at teardown."""
-    if not os.environ.get("NANO_SCHEMA_PROFILE", "udm").startswith("ocsf"):
-        pytest.skip("`unmapped.*` is the OCSF lane: needs an ocsf stack (NANO_SCHEMA_PROFILE=ocsf)")
+    if not schema.is_ocsf():
+        pytest.skip("`unmapped.*` is the OCSF lane: this stack is udm, not the ocsf default")
     creds: list[str] = []
 
     def make(parser: VendorParser) -> str:

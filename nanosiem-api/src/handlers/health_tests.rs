@@ -91,3 +91,19 @@ fn shipped_topologies_set_their_probe_addresses() {
     let dev = read("docker-compose.yml");
     assert!(dev.contains("SEARCH_SERVICE_URL: http://nanosiem-search:3002/health"));
 }
+
+/// NAN-5564: a gated Vector shows as "gated" (not healthy) with the reason.
+#[test]
+fn ingest_reports_gated_while_vector_waits_for_the_pipeline() {
+    let probe = || super::ServiceHealth {
+        status: "unavailable".to_string(),
+        url: "http://vector:9598/metrics".to_string(),
+        latency_ms: None,
+        error: Some("connection refused".to_string()),
+    };
+    let gated = super::gated_ingest_health(probe(), true);
+    assert_eq!(gated.status, "gated");
+    assert!(gated.error.as_deref().unwrap_or("").contains("waiting for nano-api"));
+    assert_eq!(gated.url, "http://vector:9598/metrics");
+    assert_eq!(super::gated_ingest_health(probe(), false).status, "unavailable");
+}

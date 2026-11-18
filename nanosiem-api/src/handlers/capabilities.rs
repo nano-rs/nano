@@ -84,6 +84,14 @@ pub struct Capabilities {
     /// Licensed compliance-export surface (`/api/compliance/*`): metadata-only
     /// audit-period exports. Enterprise; access still needs `compliance:export`.
     pub compliance_export: bool,
+    /// Hunts (`/api/hunts*`, NAN-5545): the web hunts workspace (hunts, sweeps,
+    /// leads, rule ideas, knowledge, suppressions). Enterprise; access still
+    /// needs `hunts:view`.
+    pub hunts: bool,
+    /// Hot/cold storage tiering status (`/api/settings/tiering*`, NAN-5445):
+    /// the Settings > Storage tiering panel. Enterprise; open builds have no
+    /// tiering surface, so the FE hides the panel when false.
+    pub storage_tiering: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -164,6 +172,8 @@ pub(crate) fn capabilities_response(licensed: bool) -> CapabilitiesResponse {
             threat_intel: licensed,
             agent_lane: licensed,
             compliance_export: licensed,
+            hunts: licensed,
+            storage_tiering: licensed,
         },
     }
 }
@@ -217,6 +227,8 @@ mod tests {
             body.capabilities.threat_intel,
             body.capabilities.agent_lane,
             body.capabilities.compliance_export,
+            body.capabilities.hunts,
+            body.capabilities.storage_tiering,
         ];
         assert!(licensed_flags.into_iter().all(|available| !available));
         assert!(body.capabilities.siem_health);

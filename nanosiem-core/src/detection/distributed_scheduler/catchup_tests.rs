@@ -354,6 +354,42 @@ fn size_dependent_errors_are_classified() {
     }
 }
 
+/// NAN-5565: ClickHouse refuses query TEXT over `max_query_size` with code 62
+/// (SYNTAX_ERROR). The prevalence rescue's inlined literals grow with the
+/// window, so that refusal is a size failure the scheduler must answer by
+/// shrinking the window, never the deterministic-invalid back-off.
+#[test]
+fn max_query_size_refusal_is_a_size_failure_not_an_invalid_query() {
+    use crate::detection::service::detection_error_from_search as map;
+    use crate::search::{parse_clickhouse_error, SearchError};
+    for message in [
+        // Exact wording from ClickHouse 26.11 (clickhouse-local and an HTTP
+        // server, 2026-11-17); production runs 26.10.
+        "Code: 62. DB::Exception: Max query size exceeded (can be increased with the `max_query_size` setting): Syntax error: failed at position 262120 ('aaaa'): 'aaaa'. . (SYNTAX_ERROR)",
+    ] {
+        let search_error = parse_clickhouse_error(message);
+        assert!(
+            matches!(search_error, SearchError::ResourceLimit(_)),
+            "{message} -> {search_error:?}"
+        );
+        let detection = map(search_error);
+        assert!(detection.is_window_size_dependent(), "{detection}");
+        let result: Result<(), DetectionError> = Err(detection);
+        assert!(!is_deterministic_failure(&result));
+    }
+    // A real syntax error stays a deterministic invalid query, and the marker
+    // inside the QUOTED excerpt (data) is never trusted.
+    for message in [
+        "Code: 62. DB::Exception: Syntax error: failed at position 12 ('FORM'): FORM logs. Expected FROM. (SYNTAX_ERROR)",
+        "Code: 62. DB::Exception: Syntax error: failed at position 40 ('Max query size exceeded'): x. (SYNTAX_ERROR)",
+    ] {
+        let detection = map(parse_clickhouse_error(message));
+        assert!(!detection.is_window_size_dependent(), "{message} -> {detection}");
+        let result: Result<(), DetectionError> = Err(detection);
+        assert!(is_deterministic_failure(&result), "{message}");
+    }
+}
+
 #[test]
 fn a_stalled_backend_timeout_never_creates_a_gap() {
     // ClickHouse accepts connections but stalls past the scheduler's
@@ -380,4 +416,20 @@ fn a_stalled_backend_timeout_never_creates_a_gap() {
         .attempts
         .iter()
         .all(|(s, e, _)| *s == mark - OVERLAP && *e == mark + Duration::minutes(MAX_CATCHUP)));
+}
+
+/// NAN-5565: a run that succeeded but left input out (a prevalence rescue cut
+/// at its key-byte cap) records a `[partial] …` last_error; a failed run keeps
+/// its own error, and a full run records nothing.
+#[test]
+fn a_partial_run_records_a_visible_partial_error() {
+    let ok: Result<(), DetectionError> = Ok(());
+    let failed: Result<(), DetectionError> = Err(DetectionError::InvalidQuery("bad".into()));
+    let notes = vec!["prevalence rescue left out 3 dict-blind artifact(s)".to_string()];
+    assert_eq!(
+        partial_run_error(&ok, &notes).as_deref(),
+        Some("[partial] prevalence rescue left out 3 dict-blind artifact(s)")
+    );
+    assert_eq!(partial_run_error(&ok, &[]), None);
+    assert_eq!(partial_run_error(&failed, &notes), None);
 }

@@ -103,6 +103,14 @@ export const NavInfo = (p: IconProps) => (
   </Ic>
 );
 
+/** Hunts (NAN-5545): a crosshair. */
+export const NavCrosshair = (p: IconProps) => (
+  <Ic {...p}>
+    <circle cx="12" cy="12" r="8" />
+    <path d="M12 2v5M12 17v5M2 12h5M17 12h5" />
+  </Ic>
+);
+
 export const NavSquares = (p: IconProps) => (
   <Ic {...p}>
     <rect x="3" y="3" width="7" height="7" rx="1" />

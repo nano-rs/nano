@@ -92,6 +92,9 @@ import {
 } from '@/components/rule-editor';
 import { usePivtCommands } from '@/enterprise/components/pivt/commands/router';
 import { useRuleEditBridge, type PivtRuleEdit } from '@/hooks/use-rule-edit-bridge';
+import { usePivtPage } from '@/contexts/pivt-page';
+import { editQueryAction, ruleLifecycleActions, ruleSummary } from './rules/rulesPivt';
+import { searchPivotAction } from './alerts/alertsPivt';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { UpstreamMergeModal } from '@/components/repositories/UpstreamMergeModal';
 import { ruleDiffAccess } from '@/components/repositories/repository-action-policy';
@@ -999,6 +1002,67 @@ export function RuleEditorRedesign() {
     onApply: applyPivtEdit,
     navState: location.state,
     clearNavState: () => navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null }),
+  });
+
+  // NAN-5592: pivt knows this rule (saved vs the unsaved buffer, validation)
+  // and can propose a query edit (into the buffer, unsaved) or one confirmed
+  // lifecycle transition for the saved rule, as the analyst.
+  const savedRule = !isNewMode && apiRule && apiRule.id === id ? apiRule : null;
+  const bufferQueryRef = useRef(actualQuery);
+  bufferQueryRef.current = actualQuery;
+  const editorRuleId = isNewMode ? null : (id ?? null);
+  const editorRuleIdRef = useRef(editorRuleId);
+  editorRuleIdRef.current = editorRuleId;
+  // Only once the editor holds the rule (the bridge's own readiness), so a
+  // card never diffs against, or writes into, a buffer a load will replace.
+  const editorReady = isNewMode || (!ruleLoading && apiRule?.id === id && savedContent !== '');
+  const pivtActions = useMemo(
+    () => [
+      ...(editorReady ? [editQueryAction({
+        ruleId: () => editorRuleIdRef.current,
+        currentQuery: () => bufferQueryRef.current,
+        apply: (query) => applyPivtEdit({ kind: 'query', query }),
+      })] : []),
+      ...(savedRule
+        ? ruleLifecycleActions(
+            {
+              visible: () => [savedRule],
+              fixed: () => savedRule,
+              onChanged: () => {
+                refetchRules();
+                refetchRule();
+              },
+            },
+            { mode: savedRule.mode },
+          )
+        : []),
+      searchPivotAction(navigate),
+    ],
+    [editorReady, savedRule, applyPivtEdit, refetchRules, refetchRule, navigate],
+  );
+  usePivtPage({
+    icon: 'Shield',
+    getContext: () => ({
+      pageKey: 'rule-editor',
+      title: savedRule ? `Rule · ${savedRule.name}` : 'New rule',
+      entity: savedRule ? { kind: 'rule', id: savedRule.id, name: savedRule.name } : undefined,
+      facts: [
+        ...(savedRule ? [{ label: 'mode', value: savedRule.mode }, { label: 'severity', value: savedRule.severity }] : []),
+        { label: 'unsaved', value: hasChanges ? 'yes' : 'no' },
+        ...(validation ? [{ label: 'valid', value: validation.valid ? 'yes' : 'no' }] : []),
+      ],
+      data: {
+        rule: savedRule ? ruleSummary(savedRule) : null,
+        saved_query: savedRule?.query ?? null,
+        editor_query: actualQuery,
+        unsaved_changes: hasChanges,
+        validation: validation ? { valid: validation.valid, error: validation.error ?? null } : null,
+      },
+    }),
+    actions: pivtActions,
+    suggestions: savedRule
+      ? ['Explain what this rule detects', 'How could this rule be less noisy?']
+      : ['Help me write this detection'],
   });
 
   const handleRunTest = useCallback(async () => {

@@ -19,7 +19,8 @@
 
 [sources.splunk_hec_ingest]
 type = "splunk_hec"
-address = "0.0.0.0:8088"
+# NAN-5566: see http_ingest in 00-base.toml (single-node ingest gate).
+address = "${NANO_HEC_ADDRESS:-0.0.0.0:8088}"
 valid_tokens = ["${VECTOR_AUTH_TOKEN}"]
 valid_tokens_file.path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
 valid_tokens_file.reload_interval_secs = 2

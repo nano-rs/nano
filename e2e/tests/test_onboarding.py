@@ -5,6 +5,8 @@ real deploy path and parses new events."""
 
 from __future__ import annotations
 
+import pytest
+
 from nano_e2e import ingest
 from nano_e2e.client import Nano, expect, row_text
 from nano_e2e.stack import Stack
@@ -14,6 +16,7 @@ from nano_e2e.waits import INGEST_VISIBLE, eventually
 PARSER = '. = { "message": .message, "ext": { "e2e_parsed": "yes" } }'
 
 
+@pytest.mark.udm_only("parser emits no class_uid, so OCSF search never sees its events (NAN-5594)")
 def test_data_before_parser_publish(stack: Stack, nano: Nano, token_source, mark: str, timeline) -> None:
     src = token_source(warm=False)
     status = expect(nano.api.get(f"/api/log-sources/{src.source_id}/connect-status"), 200)

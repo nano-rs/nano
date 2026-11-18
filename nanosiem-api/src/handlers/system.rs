@@ -360,7 +360,7 @@ async fn get_alert_count(
         r#"
         SELECT COUNT(*) as count
         FROM alerts
-        WHERE created_at >= $1 AND created_at < $2{scope_sql}
+        WHERE created_at >= $1 AND created_at < $2 AND kind <> 'hunt_finding'{scope_sql}
     "#
     );
 
@@ -395,7 +395,7 @@ async fn get_critical_alert_count(
         r#"
         SELECT COUNT(*) as count
         FROM alerts
-        WHERE created_at >= $1 AND created_at < $2 AND severity = 'critical'{scope_sql}
+        WHERE created_at >= $1 AND created_at < $2 AND severity = 'critical' AND kind <> 'hunt_finding'{scope_sql}
     "#
     );
 

@@ -143,6 +143,18 @@ pub(crate) async fn render_corpus(corpus: &[CorpusRow], scope: &ScopeSet) -> Vec
     out
 }
 
+/// NAN-5565: the corpus pins GENERATED SQL. The prevalence pushdown's rescue
+/// note (`prevalence_rescue_explain_note`, a trailing `--` comment block) is
+/// prose about the runtime rescue, not executed SQL, so rewording it must not
+/// churn every prevalence row; rows are hashed without it. Other notes stay
+/// hashed (they describe what the SQL leaves to post-processing).
+fn strip_explain_note(sql: &str) -> &str {
+    match sql.find("\n\n-- Note: at execute time, artifacts the prevalence dict") {
+        Some(at) => &sql[..at],
+        None => sql,
+    }
+}
+
 fn digest(s: &str) -> String {
     hex::encode(&Sha256::digest(s.as_bytes())[..12])
 }
@@ -157,7 +169,7 @@ async fn npl_golden_corpus_sql_is_unchanged() {
         .map(|r| ExpectedRow {
             i: r.index,
             p: r.profile.to_string(),
-            h: digest(&r.sql),
+            h: digest(strip_explain_note(&r.sql)),
         })
         .collect();
 

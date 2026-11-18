@@ -10,6 +10,7 @@
  * - Search Service (port 3002): /api/search, /api/search/sql, /api/search/explain, /api/search/saved/*
  */
 
+import { ORIGIN_HEADER, takeRequestOrigin } from './request-origin';
 import { getServiceUrl, API_BASE_URL } from './utils';
 import { getAccessToken as getInMemoryToken } from '../auth-token';
 import { sessionCredentials } from '../session-credentials';
@@ -40,6 +41,7 @@ import { ScimApi } from '@/enterprise/api/scim';
 import { AgentLaneApi } from '@/enterprise/api/agentlane';
 import { SoarApi } from '@/enterprise/api/soar';
 import { EvidencePackApi } from '@/enterprise/api/evidence-pack';
+import { HuntsApi } from '@/enterprise/api/hunts';
 import { InternalDomainsApi } from './internal-domains';
 import { LookupUrlAllowlistApi } from './lookup-url-allowlist';
 import { RiskWatchlistsApi } from '@/enterprise/api/risk-watchlists';
@@ -290,6 +292,7 @@ class ApiClient {
   private _agentLane: AgentLaneApi;
   private _soar: SoarApi;
   private _evidencePack: EvidencePackApi;
+  private _hunts: HuntsApi;
   private _internalDomains: InternalDomainsApi;
   private _lookupUrlAllowlist: LookupUrlAllowlistApi;
   private _riskWatchlists: RiskWatchlistsApi;
@@ -383,6 +386,7 @@ class ApiClient {
     this._agentLane = new AgentLaneApi(this.request.bind(this));
     this._soar = new SoarApi(this.request.bind(this));
     this._evidencePack = new EvidencePackApi(this.request.bind(this), this.requestRaw.bind(this));
+    this._hunts = new HuntsApi(this.request.bind(this));
     this._internalDomains = new InternalDomainsApi(this.request.bind(this));
     this._lookupUrlAllowlist = new LookupUrlAllowlistApi(this.request.bind(this));
     this._riskWatchlists = new RiskWatchlistsApi(this.request.bind(this));
@@ -479,6 +483,11 @@ class ApiClient {
   /** Evidence Pack compliance export (enterprise; the open build carries a rejecting stub). */
   get evidencePack(): EvidencePackApi {
     return this._evidencePack;
+  }
+
+  /** Hunts workspace (enterprise; the open build carries a rejecting stub). */
+  get hunts(): HuntsApi {
+    return this._hunts;
   }
 
   get dashboards(): DashboardsApi {
@@ -598,10 +607,13 @@ class ApiClient {
     // Use service-aware routing for microservices architecture
     const serviceUrl = getServiceUrl(endpoint);
     const url = `${serviceUrl}${endpoint}`;
+    // NAN-5571: taken synchronously, before the first await (request-origin.ts).
+    const origin = takeRequestOrigin();
     const headers: HeadersInit = {
       'Content-Type': 'application/json',
       // NAN-1595: refresh forces a live server recompute (bypasses Valkey).
       ...(cacheOpts?.bypass ? { 'x-nano-cache-bypass': '1' } : {}),
+      ...(origin ? { [ORIGIN_HEADER]: origin } : {}),
       ...options.headers,
     };
 
@@ -730,6 +742,20 @@ class ApiClient {
 
   async searchSql(request: import('./types').RawSqlRequest): Promise<import('./types').SearchResponse> {
     return this._search.searchSql(request);
+  }
+
+  // NAN-5575: agent SQL → nPL.
+  async sqlToNpl(request: import('./types').SqlToNplRequest): Promise<import('./types').SqlToNplResponse> {
+    return this._search.sqlToNpl(request);
+  }
+
+  async sqlToNplBatch(items: import('./types').SqlToNplRequest[]): Promise<{ results: import('./types').SqlToNplResponse[] }> {
+    return this._search.sqlToNplBatch(items);
+  }
+
+  /** NAN-5575: the AI fallback (enterprise; an explicit click only). */
+  async sqlToNplAi(request: import('./types').SqlToNplRequest): Promise<import('./types').SqlToNplResponse> {
+    return this._melod.sqlToNplAi(request);
   }
 
   async explainQuery(query: string, timeRange: import('./types').TimeRange, dataset?: import('./types').SearchDataset): Promise<{ sql: string }> {

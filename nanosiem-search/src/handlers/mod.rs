@@ -19,6 +19,7 @@ mod retro;
 mod saved_searches;
 mod search;
 mod search_jobs;
+pub(crate) mod sql_to_npl;
 mod streaming;
 pub(crate) mod tree_page;
 
@@ -63,6 +64,30 @@ pub(crate) fn admission_user(auth: &crate::AuthContext) -> Result<uuid::Uuid, cr
     })
 }
 
+/// NAN-5612: searching the detections (`dataset=signals`, or a
+/// `[dataset=signals …]` subsearch) needs `detections:view` ON TOP of
+/// `search:execute` — the permission that guards a rule's stored matches
+/// (`GET /api/rules/{id}/matches`). Of the two gates, the stricter one: both.
+/// The detections are still scoped per source (the deny set reaches the
+/// derived source like any scan); this is the feature-capability gate.
+pub(crate) fn require_dataset_access(
+    auth: &crate::AuthContext,
+    dataset: Option<&str>,
+    query: &str,
+) -> Result<(), crate::error::SearchError> {
+    if nanosiem_core::search::touches_signals_dataset(dataset, query)
+        && !auth
+            .claims
+            .has_permission(nanosiem_core::auth::permissions::DETECTIONS_VIEW)
+    {
+        return Err(crate::error::SearchError::Forbidden(
+            "Searching dataset=signals (detections that fired) requires the detections:view permission"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn require_search_execute(
     auth: &crate::AuthContext,
 ) -> Result<(), crate::error::SearchError> {
@@ -93,6 +118,7 @@ pub use otel::{
     list_metric_names, list_metric_tags, list_services, list_traces,
 };
 pub use retro::retro;
+pub use sql_to_npl::{sql_to_npl, sql_to_npl_batch};
 pub use saved_searches::{
     create_saved_search, delete_saved_search, get_saved_search, list_my_saved_searches,
     list_saved_searches, list_shared_searches, share_saved_search, update_saved_search,

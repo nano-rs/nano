@@ -34,6 +34,8 @@ pub mod scheduler;
 pub mod shard_skew;
 pub mod suppressions_repository;
 pub mod types;
+// NAN-5567: batches ClickHouse permanently rejected, kept by Vector.
+pub mod vector_dead_letters;
 
 pub use repository::{SiemHealthRepository, SiemHealthRepositoryError};
 pub use suppressions_repository::{

@@ -74,6 +74,8 @@ import type { Alert as ApiAlert, AlertCounts, UserDetail } from '@/lib/api/types
 import { cn } from '@/lib/utils';
 import { alertAssigneeLabel } from '@/lib/alert-assignee';
 import { trailingWindowTitle } from '@/lib/time-range';
+import { definePivtAction, usePivtPage } from '@/contexts/pivt-page';
+import { alertActions, alertSummary } from './alerts/alertsPivt';
 
 type StatusFilter = 'all' | 'new' | 'acknowledged' | 'closed';
 type SeverityFilter = 'all' | 'critical' | 'high' | 'medium' | 'low' | 'informational';
@@ -457,6 +459,69 @@ export function Alerts() {
   }, [assignDialog, assignTo, refetch, toast, users]);
 
   const selectionCount = selected.size;
+
+  // NAN-5588: what pivt knows and may do here (the alerts on screen, the
+  // filters and the selection; triage actions run as the analyst).
+  const pivtActions = useMemo(
+    () => [
+      // NAN-1066: triage only where this page offers it (not on Cases tenants).
+      ...alertActions(
+        {
+          visible: () => filteredAlerts,
+          selected: () => Array.from(selected),
+          onChanged: refetch,
+        },
+        { triageAllowed: isOpenCoreTriage },
+      ),
+      definePivtAction<{ status?: StatusFilter; severity?: SeverityFilter }>({
+        name: 'alerts.filter',
+        description: 'Filter the alert list by status and/or severity.',
+        params: {
+          status: { type: 'enum', description: 'Alert status', values: ['all', 'new', 'acknowledged', 'closed'] },
+          severity: {
+            type: 'enum',
+            description: 'Alert severity',
+            values: ['all', 'critical', 'high', 'medium', 'low', 'informational'],
+          },
+        },
+        permission: 'alerts:view',
+        mutates: false,
+        preview: (p) => ({
+          summary: 'Filter the list',
+          rows: [
+            ['status', p.status ?? statusFilter],
+            ['severity', p.severity ?? severityFilter],
+          ],
+        }),
+        run: async (p) => {
+          if (p.status) setStatusFilter(p.status);
+          if (p.severity) setSeverityFilter(p.severity);
+          return { summary: 'Filtered' };
+        },
+      }),
+    ],
+    [filteredAlerts, selected, refetch, statusFilter, severityFilter, isOpenCoreTriage],
+  );
+  usePivtPage({
+    icon: 'AlertTriangle',
+    getContext: () => ({
+      pageKey: 'alerts',
+      title: 'Alerts',
+      facts: [
+        { label: 'showing', value: `${filteredAlerts.length} of ${alerts.length}` },
+        { label: 'filters', value: `${statusFilter} · ${severityFilter} · ${timeRangeFilter}` },
+        ...(selected.size > 0 ? [{ label: 'selected', value: String(selected.size) }] : []),
+      ],
+      selection: selected.size > 0 ? { kind: 'alert', ids: Array.from(selected).slice(0, 20) } : undefined,
+      data: {
+        counts,
+        filters: { status: statusFilter, severity: severityFilter, window: timeRangeFilter, search: searchQuery },
+        alerts: filteredAlerts.slice(0, 15).map(alertSummary),
+      },
+    }),
+    actions: pivtActions,
+    suggestions: ['Which of these alerts look most urgent?', 'Group these alerts by rule'],
+  });
   // NAN-1066: only render selection UI when at least one bulk action is
   // available. In enterprise (cases-mode) all three are hidden, so the
   // checkboxes + bulk bar collapse and the table stays read-only.

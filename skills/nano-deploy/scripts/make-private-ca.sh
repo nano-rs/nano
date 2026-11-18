@@ -13,6 +13,10 @@
 #   make-private-ca.sh --out ./nano-eval-pki --server-name nano.example.com \
 #       --dns ingest.nano.example.com
 #
+# 3. A new host joins (add an ingest host): re-issue the server certificate from
+#    the SAME CA with every address, keeping the CA (hosts keep trusting it):
+#   make-private-ca.sh --out ./nano-pki --reissue --server-name ... --ip ... (all of them)
+#
 # At least one --ip or --dns is required (the server name is always a SAN).
 # The certificate is used as both server and client certificate (Keeper requires
 # a private-CA client certificate), so it carries serverAuth + clientAuth and a
@@ -32,7 +36,7 @@
 # (cloud-gcp.md, cloud-aws.md). Prints no key material.
 set -euo pipefail
 umask 077
-out="" name="" days=825 sans=()
+out="" name="" days=825 sans=() reissue=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --out) out="$2"; shift 2 ;;
@@ -40,17 +44,22 @@ while [[ $# -gt 0 ]]; do
         --ip) sans+=("IP:$2"); shift 2 ;;
         --dns) sans+=("DNS:$2"); shift 2 ;;
         --days) days="$2"; shift 2 ;;
+        --reissue) reissue=1; shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
 [[ -n "$out" && -n "$name" && ${#sans[@]} -gt 0 ]] || { sed -n '2,25p' "$0"; exit 2; }
-if [[ -e "$out/server.key" || -e "$out/ca.key" ]]; then
-    echo "$out already holds keys; refusing to overwrite (move it aside deliberately to re-issue)" >&2
+if (( reissue )); then
+    [[ -s "$out/ca.key" && -s "$out/ca.crt" ]] || { echo "--reissue needs the existing CA in $out (ca.key, ca.crt)" >&2; exit 3; }
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    for f in server.key server.crt; do [[ ! -e "$out/$f" ]] || mv "$out/$f" "$out/$f.$stamp"; done
+elif [[ -e "$out/server.key" || -e "$out/ca.key" ]]; then
+    echo "$out already holds keys; refusing to overwrite (move it aside deliberately to re-issue, or --reissue to keep the CA)" >&2
     exit 3
 fi
 mkdir -p "$out"; chmod 700 "$out"
 san="DNS:$name"; for s in "${sans[@]}"; do san+=",$s"; done
-openssl req -x509 -newkey rsa:3072 -nodes -days "$((days + 365))" -sha256 \
+(( reissue )) || openssl req -x509 -newkey rsa:3072 -nodes -days "$((days + 365))" -sha256 \
     -subj "/CN=nano private CA ($name)" \
     -addext 'basicConstraints=critical,CA:TRUE' \
     -addext 'keyUsage=critical,keyCertSign,cRLSign' \

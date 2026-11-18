@@ -208,12 +208,40 @@ async fn async_main() -> Result<()> {
     // In Docker Compose these exist on disk from the repo. In k8s, the dirs are empty
     // emptyDirs so we must generate them on startup before source configs can deploy.
     tracing::info!("Deploying Vector pipeline configs...");
-    match state.parser_service.deploy_to_vector().await {
-        Ok(()) => tracing::info!("Vector pipeline configs deployed"),
+    match state.parser_service.deploy_to_vector_at_boot().await {
+        Ok(left_out) if left_out.is_empty() => tracing::info!("Vector pipeline configs deployed"),
+        Ok(left_out) => tracing::error!(
+            ?left_out,
+            "Vector pipeline configs deployed WITHOUT parsers that cannot be rendered; fix or disable them"
+        ),
         Err(e) => tracing::warn!(
             "Failed to deploy Vector pipeline configs: {}. Ingestion pipeline may be incomplete.",
             e
         ),
+    }
+    // NAN-5564 review: a gated Vector (single node) starts only once this
+    // render recorded the pipeline identity. A failed boot render must not keep
+    // ingest refused: retry it in the background until it records.
+    if state.parser_service.vector_config().pipeline_identity_pending().await {
+        let parser_service = state.parser_service.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(5);
+            loop {
+                if !parser_service.vector_config().pipeline_identity_pending().await {
+                    tracing::info!("Vector pipeline rendered for this release; a gated Vector may start");
+                    break;
+                }
+                tracing::error!(
+                    retry_in_secs = delay.as_secs(),
+                    "Vector is waiting for this release's pipeline (ingest refuses connections); retrying the render"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                if let Err(error) = parser_service.deploy_to_vector_at_boot().await {
+                    tracing::error!(%error, "Vector pipeline render failed; retrying");
+                }
+            }
+        });
     }
 
     // Deploy all enabled source configurations to sync DB state with Vector config files.

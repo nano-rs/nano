@@ -161,3 +161,24 @@ fn cooldown_key_matches_the_migration_backfill() {
         "3c48591d8d098a4538f5e013dfcf406e948eac4d3277b10bf614e295d6068179"
     );
 }
+
+// --- NAN-5612: detection rules cannot read dataset=signals ---
+
+#[test]
+fn rules_on_dataset_signals_are_refused() {
+    for (dataset, query) in [
+        (Some("signals"), "severity=\"high\""),
+        (Some("SIGNALS"), "*"),
+        (None, r#"* | join risk_entity [dataset=signals severity="high"]"#),
+        (Some("logs"), r#"user IN [dataset=signals | table risk_entity]"#),
+    ] {
+        let err = guard(dataset, query, None, true).expect_err(query);
+        assert!(err.to_string().contains("signal-on-signal"), "{err}");
+    }
+    // Logs and risk rules are unaffected by the signals guard, including
+    // filters that merely contain the text (review P2).
+    assert!(guard(None, "status=500", None, true).is_ok());
+    assert!(guard(None, "event.dataset=signalsciences.waf | stats count", None, true).is_ok());
+    assert!(guard(Some("logs"), "dataset=signal_sciences", None, true).is_ok());
+    assert!(guard(Some("risk"), "score_24h > 100", Some(0), true).is_ok());
+}

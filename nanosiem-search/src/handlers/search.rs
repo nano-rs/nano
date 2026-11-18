@@ -95,6 +95,8 @@ pub(crate) fn effective_scope(auth: &crate::AuthContext) -> nanosiem_core::auth:
         &auth.denied_sources,
         auth.claims.has_permission(permissions::AUDIT_VIEW),
     )
+    // NAN-5612: same flag as `AuthContext::effective_viewer_scope`.
+    .with_signals_denied(!auth.claims.has_permission(permissions::DETECTIONS_VIEW))
 }
 
 /// Execute a piped query
@@ -238,6 +240,8 @@ pub async fn search(
     // NAN-2028: gate on search:execute (matching every sibling handler) before
     // any work — an under-scoped API key must not run piped searches.
     require_search_execute(&auth)?;
+    // NAN-5612: dataset=signals also needs detections:view.
+    super::require_dataset_access(&auth, request.dataset.as_deref(), &request.query)?;
 
     // NAN-1799: compose the effective deny-set (per-user source scope ∪ audit
     // gate) ONCE, before the cache lookup — the scope is folded into the cache
@@ -645,7 +649,7 @@ pub struct ExplainRequest {
     /// Show SQL with table_view field pruning (matches actual search behavior)
     #[serde(default)]
     pub table_view: bool,
-    /// Per-query dataset (`logs`/`spans`/`metrics`/`risk`) so the explained SQL
+    /// Per-query dataset (`logs`/`spans`/`metrics`/`risk`/`signals`) so the explained SQL
     /// matches the executed source — without it, Inspect SQL shows `FROM logs`
     /// for a spans/metrics/risk query (NAN-1569, NAN-1798).
     #[serde(default)]
@@ -684,6 +688,8 @@ pub async fn explain(
     // NAN-2028: explain() returns the generated ClickHouse SQL, so it takes the
     // same search:execute gate as search().
     require_search_execute(&auth)?;
+    // NAN-5612: dataset=signals also needs detections:view.
+    super::require_dataset_access(&auth, request.dataset.as_deref(), &request.query)?;
     // NAN-1799: pass the composed scope so "Inspect SQL" renders the exact
     // gated SQL the executed path runs for this caller.
     let scope = effective_scope(&auth);
@@ -925,6 +931,8 @@ pub async fn field_stats_for_query(
 
     // NAN-2028: runs a query over the log store — same search:execute gate.
     require_search_execute(&auth)?;
+    // NAN-5612: dataset=signals also needs detections:view.
+    super::require_dataset_access(&auth, request.dataset.as_deref(), &request.query)?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of the query here.
     let scope = effective_scope(&auth);
@@ -1039,6 +1047,8 @@ pub async fn field_values(
 
     // NAN-2028: returns log-derived field values — same search:execute gate.
     require_search_execute(&auth)?;
+    // NAN-5612: dataset=signals also needs detections:view.
+    super::require_dataset_access(&auth, request.dataset.as_deref(), &request.query)?;
     validate_field_values_limit(request.limit)?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of the query here.
@@ -1518,11 +1528,21 @@ mod effective_scope_split_tests {
     /// the pre-scoping form.
     #[test]
     fn an_unrestricted_audit_viewer_yields_an_empty_scope() {
+        // NAN-5612: with detections:view too, the scope is exactly unrestricted;
+        // without it, only the signals flag is set (no deny values).
+        for auth in [
+            jwt_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID, "detections:view"]),
+            api_key_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID, "detections:view"]),
+        ] {
+            assert_eq!(super::effective_scope(&auth), ScopeSet::unrestricted());
+        }
         for auth in [
             jwt_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]),
             api_key_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]),
         ] {
-            assert_eq!(super::effective_scope(&auth), ScopeSet::unrestricted());
+            let scope = super::effective_scope(&auth);
+            assert!(scope.deny_set().is_empty() && scope.artifact_deny_set().is_empty());
+            assert!(scope.signals_denied());
         }
     }
 }

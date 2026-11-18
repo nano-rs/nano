@@ -386,11 +386,10 @@ const FACET_AGGREGATED_SELECT: &str = r#"            aggregated AS (
             ORDER BY entity_count DESC, entity_type ASC
         "#;
 
-/// Overview `aggregated` CTE + band-count projection. `__DSCORE__` /
-/// `__SCOUNT__` select the banding window (24h vs 7d columns); bands use the
-/// same 30/50/70 thresholds as the frontend `getRiskLevel`.
-/// Binds: `(cutoff_24h_us, cutoff_24h_us)`.
-const OVERVIEW_AGGREGATED_SELECT: &str = r#"            aggregated AS (
+/// Overview `aggregated` CTE: per-entity decayed scores and finding counts
+/// for BOTH windows (the band projection picks one, or both).
+/// Binds: `(cutoff_24h_us, weights[], entities[], cutoff_24h_us)`.
+const OVERVIEW_AGGREGATED_CTE: &str = r#"            aggregated AS (
                 SELECT
                     entity,
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
@@ -404,7 +403,13 @@ const OVERVIEW_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 FROM signal_scores
                 GROUP BY entity
             )
-            SELECT
+"#;
+
+/// Single-window band-count projection over [`OVERVIEW_AGGREGATED_CTE`].
+/// `__DSCORE__` / `__SCOUNT__` select the banding window (24h vs 7d
+/// columns); bands use the same 30/50/70 thresholds as the frontend
+/// `getRiskLevel`. No binds.
+const OVERVIEW_BAND_SELECT: &str = r#"            SELECT
                 count() AS total_entities,
                 countIf(__DSCORE__ > 70) AS critical_entities,
                 countIf(__DSCORE__ > 50 AND __DSCORE__ <= 70) AS high_entities,
@@ -415,6 +420,19 @@ const OVERVIEW_AGGREGATED_SELECT: &str = r#"            aggregated AS (
             FROM aggregated
             WHERE __DSCORE__ > 0
         "#;
+
+/// One window's band columns for [`decayed_overview_windows_query`]: the
+/// [`OVERVIEW_BAND_SELECT`] aggregates with its `WHERE __DSCORE__ > 0` folded
+/// into each aggregate's condition (`-If` combinators), suffixed `__W__`, so
+/// both windows come out of one scan with the same values the single-window
+/// statement returns. No binds.
+const OVERVIEW_WINDOW_BAND_COLS: &str = r#"                countIf(__DSCORE__ > 0) AS total_entities__W__,
+                countIf(__DSCORE__ > 0 AND __DSCORE__ > 70) AS critical_entities__W__,
+                countIf(__DSCORE__ > 0 AND __DSCORE__ > 50 AND __DSCORE__ <= 70) AS high_entities__W__,
+                countIf(__DSCORE__ > 0 AND __DSCORE__ > 30 AND __DSCORE__ <= 50) AS medium_entities__W__,
+                countIf(__DSCORE__ > 0 AND __DSCORE__ <= 30) AS low_entities__W__,
+                toInt64(sumIf(__SCOUNT__, __DSCORE__ > 0)) AS total_signals__W__,
+                if(countIf(__DSCORE__ > 0) > 0, avgIf(__DSCORE__, __DSCORE__ > 0), 0.0) AS avg_risk_score__W__"#;
 
 /// Rule-grain projection for the contribution breakdown (NAN-1658). Summing
 /// `decayed_contribution_24h/7d` across the returned rules reproduces the
@@ -556,6 +574,17 @@ impl RiskChQuery {
 /// (NAN-1443; `event` is EPHEMERAL); under UDM they are real columns. The
 /// table is the cluster-aware **read** name (`_distributed` wrapper when
 /// clustered) so scans fan out across shards (R7).
+///
+/// NAN-5550: each OCSF field reads ONE `unmapped` path, as
+/// `JSONExtract*(ifNull(toJSONString(unmapped.<path>), 'null'))`. The old
+/// `JSONExtract*(toString(unmapped), '<path>')` serialized the WHOLE vendor
+/// extension (including `matched_events_sample`) for every finding row in
+/// the 7-day window — the same cost NAN-5454 removed from the tuning stats.
+/// The new form reads only that path's subcolumn from disk, and stays
+/// value-identical: `toString(unmapped)` renders each path with the same
+/// JSON serialization as `toJSONString(<path>)`, and the same `JSONExtract*`
+/// function parses it (an absent path is `NULL` → `'null'` → `''` / `0` /
+/// `[]`, exactly what a missing key returned).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiskFindingsSource {
     ocsf: bool,
@@ -614,7 +643,7 @@ impl RiskFindingsSource {
 
     fn entity_col(&self) -> &'static str {
         if self.ocsf {
-            "JSONExtractString(toString(unmapped),'risk_entity')"
+            "JSONExtractString(ifNull(toJSONString(unmapped.risk_entity), 'null'))"
         } else {
             "risk_entity"
         }
@@ -622,7 +651,7 @@ impl RiskFindingsSource {
 
     fn score_col(&self) -> &'static str {
         if self.ocsf {
-            "JSONExtractInt(toString(unmapped), 'risk_score')"
+            "JSONExtractInt(ifNull(toJSONString(unmapped.risk_score), 'null'))"
         } else {
             "risk_score"
         }
@@ -630,7 +659,7 @@ impl RiskFindingsSource {
 
     fn rule_name_col(&self) -> &'static str {
         if self.ocsf {
-            "JSONExtractString(toString(unmapped), 'rule_name')"
+            "JSONExtractString(ifNull(toJSONString(unmapped.rule_name), 'null'))"
         } else {
             "rule_name"
         }
@@ -638,7 +667,7 @@ impl RiskFindingsSource {
 
     fn rule_id_col(&self) -> &'static str {
         if self.ocsf {
-            "JSONExtractString(toString(unmapped),'rule_id')"
+            "JSONExtractString(ifNull(toJSONString(unmapped.rule_id), 'null'))"
         } else {
             "rule_id"
         }
@@ -659,7 +688,7 @@ impl RiskFindingsSource {
     /// through to the value inference.
     fn stamped_type_col(&self) -> &'static str {
         if self.ocsf {
-            "JSONExtractString(toString(unmapped),'risk_entity_type')"
+            "JSONExtractString(ifNull(toJSONString(unmapped.risk_entity_type), 'null'))"
         } else {
             "JSONExtractString(metadata, 'risk_entity_type')"
         }
@@ -672,7 +701,7 @@ impl RiskFindingsSource {
     /// (`build_ocsf_finding_event`) — the same spill the risk fields read from.
     fn tactics_col(&self) -> &'static str {
         if self.ocsf {
-            "JSONExtract(toString(unmapped), 'mitre_tactics', 'Array(String)')"
+            "JSONExtract(ifNull(toJSONString(unmapped.mitre_tactics), 'null'), 'Array(String)')"
         } else {
             "JSONExtract(metadata, 'mitre_tactics', 'Array(String)')"
         }
@@ -681,7 +710,7 @@ impl RiskFindingsSource {
     /// Full-origin provenance persisted by the finding writer (NAN-1800).
     fn origin_source_types_col(&self) -> &'static str {
         if self.ocsf {
-            "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')"
+            "JSONExtract(ifNull(toJSONString(unmapped.origin_source_types), 'null'), 'Array(String)')"
         } else {
             "JSONExtract(metadata, 'origin_source_types', 'Array(String)')"
         }
@@ -1154,6 +1183,10 @@ pub fn lateral_scores_query(
 /// (30/50/70), total findings, and average score over the SAME decayed
 /// computation as [`entity_scores_query`], banded on the `window`'s decayed
 /// field (`Last24Hours` → 24h, else 7d).
+///
+/// NAN-5550: production reads both windows through
+/// [`decayed_overview_windows_query`]; this single-window statement is kept
+/// as the reference oracle its equivalence tests compare against.
 pub fn decayed_overview_query(
     source: &RiskFindingsSource,
     now: DateTime<Utc>,
@@ -1166,16 +1199,55 @@ pub fn decayed_overview_query(
     } else {
         ("decayed_score_7d", "signal_count_7d")
     };
+    let band = OVERVIEW_BAND_SELECT
+        .replace("__DSCORE__", dscore)
+        .replace("__SCOUNT__", scount);
+    overview_statement(source, now, decay, cleared, &band)
+}
 
+/// Both overview windows in ONE pass over the findings (NAN-5550): one row
+/// carrying the [`decayed_overview_query`] columns for 24h (`*_24h`) and 7d
+/// (`*_7d`). The aggregated CTE already computes both windows per entity;
+/// the per-window `WHERE decayed > 0` filter becomes each aggregate's `-If`
+/// condition, so every column equals the single-window statement's value
+/// (an empty window still yields zeros: `countIf`/`sumIf` over no matching
+/// rows are 0, and the average falls back to 0.0 exactly as before).
+pub fn decayed_overview_windows_query(
+    source: &RiskFindingsSource,
+    now: DateTime<Utc>,
+    decay: &RiskDecayConfig,
+    cleared: &ClearedBoundaries,
+) -> RiskChQuery {
+    let window_cols = |dscore: &str, scount: &str, suffix: &str| {
+        OVERVIEW_WINDOW_BAND_COLS
+            .replace("__DSCORE__", dscore)
+            .replace("__SCOUNT__", scount)
+            .replace("__W__", suffix)
+    };
+    let band = format!(
+        "            SELECT\n{},\n{}\n            FROM aggregated\n        ",
+        window_cols("decayed_score_24h", "signal_count_24h", "_24h"),
+        window_cols("decayed_score_7d", "signal_count_7d", "_7d"),
+    );
+    overview_statement(source, now, decay, cleared, &band)
+}
+
+/// The shared overview statement: decayed findings CTE + aggregated CTE,
+/// then `band` (a projection over `aggregated` that binds nothing).
+fn overview_statement(
+    source: &RiskFindingsSource,
+    now: DateTime<Utc>,
+    decay: &RiskDecayConfig,
+    cleared: &ClearedBoundaries,
+    band: &str,
+) -> RiskChQuery {
     let mut sql = String::new();
     sql.push_str(CTE_OPEN);
     sql.push_str(OVERVIEW_SELECT_COLS);
     sql.push_str(DECAY_FACTOR_EXPR);
     sql.push_str(ENTITY_FINDINGS_WHERE);
-    sql.push_str(OVERVIEW_AGGREGATED_SELECT);
-    let sql = sql
-        .replace("__DSCORE__", dscore)
-        .replace("__SCOUNT__", scount);
+    sql.push_str(OVERVIEW_AGGREGATED_CTE);
+    sql.push_str(band);
 
     let cutoffs = DecayCutoffs::at(now);
     let mut binds = decay_factor_binds(&cutoffs, decay);
@@ -1183,7 +1255,7 @@ pub fn decayed_overview_query(
     binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
     source.push_scope_bind(&mut binds);
-    // OVERVIEW_AGGREGATED_SELECT: 24h bound for the decayed sum, the
+    // OVERVIEW_AGGREGATED_CTE: 24h bound for the decayed sum, the
     // score weight lookup, 24h bound for the count.
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     cleared.push_watch_binds(&mut binds);

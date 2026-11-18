@@ -468,7 +468,7 @@ impl MaterializedViewGenerator {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => "logs",
+            | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => "logs",
         }
     }
 

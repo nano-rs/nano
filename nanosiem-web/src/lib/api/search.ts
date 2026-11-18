@@ -59,6 +59,8 @@ import type {
   MetricNamesResponse,
   RetroRequest,
   RetroResponse,
+  SqlToNplRequest,
+  SqlToNplResponse,
   TreePageRequest,
   TreePageResponse,
 } from './types';
@@ -110,6 +112,22 @@ export class SearchApi {
     return this.request('/api/search/sql', {
       method: 'POST',
       body: JSON.stringify(request),
+    });
+  }
+
+  /** NAN-5575: static SQL → nPL conversion (executes nothing). */
+  async sqlToNpl(request: SqlToNplRequest): Promise<SqlToNplResponse> {
+    return this.request('/api/search/sql-to-npl', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** NAN-5575: up to 50 conversions in one call. */
+  async sqlToNplBatch(items: SqlToNplRequest[]): Promise<{ results: SqlToNplResponse[] }> {
+    return this.request('/api/search/sql-to-npl/batch', {
+      method: 'POST',
+      body: JSON.stringify({ items }),
     });
   }
 

@@ -433,6 +433,13 @@ pub struct CaseWithDetails {
     pub triage_completed_at: Option<DateTime<Utc>>,
     // Computed fields
     pub alert_count: i64,
+    /// NAN-5577: events carried by this case's `hunt_finding` alerts (each
+    /// such alert counts once in `alert_count`). The inbox shows
+    /// `alert_count - hunt_alert_count + hunt_event_count` events.
+    #[serde(default)]
+    pub hunt_event_count: i64,
+    #[serde(default)]
+    pub hunt_alert_count: i64,
     pub entity_count: i64,
     pub assignee_name: Option<String>,
     pub assigned_group_name: Option<String>,
@@ -508,6 +515,13 @@ pub struct CaseWithDetailsRow {
     pub first_response_at: Option<DateTime<Utc>>,
     pub triage_completed_at: Option<DateTime<Utc>>,
     pub alert_count: i64,
+    /// NAN-5577: events carried by this case's `hunt_finding` alerts (each
+    /// such alert counts once in `alert_count`). The inbox shows
+    /// `alert_count - hunt_alert_count + hunt_event_count` events.
+    #[sqlx(default)]
+    pub hunt_event_count: i64,
+    #[sqlx(default)]
+    pub hunt_alert_count: i64,
     pub entity_count: i64,
     pub assignee_name: Option<String>,
     pub assigned_group_name: Option<String>,

@@ -9,6 +9,26 @@ use chrono::{Duration, TimeZone, Utc};
 
 const RULE: &str = "process_name=cmd.exe earliest=-4h | stats count | where count > 100";
 
+/// NAN-5612 review P3: a rule always names its dataset, so a leading
+/// `dataset=risk` / `dataset=signals` token in its body stays a field filter
+/// and can never switch the dataset (the NAN-1805 loop guards key on the
+/// rule's dataset).
+#[test]
+fn a_rule_body_never_selects_a_dataset() {
+    let now = Utc.with_ymd_and_hms(2026, 11, 3, 12, 0, 0).unwrap();
+    let slice = TimeRangeInput::new(now - Duration::minutes(5), now);
+    for body in ["dataset=risk | where score_24h > 1", "dataset=signals severity=high"] {
+        let request = window_search_request(body, slice.clone(), None, 1000, None, now).unwrap();
+        assert_eq!(request.dataset.as_deref(), Some("logs"), "{body}");
+        let (_, resolved) = crate::search::query_processing::resolve_dataset_selector(
+            &request.query,
+            request.dataset.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("logs"), "{body}: {}", request.query);
+    }
+}
+
 #[test]
 fn earliest_widens_a_five_minute_scheduler_slice() {
     let now = Utc.with_ymd_and_hms(2026, 11, 3, 12, 0, 0).unwrap();

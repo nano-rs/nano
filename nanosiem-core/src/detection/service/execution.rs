@@ -59,6 +59,9 @@ pub(super) fn dataset_provenance(dataset: Option<&str>) -> DatasetProvenance {
             DatasetProvenance::NotSourceDerived
         }
         crate::query::Dataset::Risk => DatasetProvenance::Unknowable,
+        // NAN-5612: refused at save time (signal-on-signal loop); a stored rule
+        // that names it anyway has no establishable provenance.
+        crate::query::Dataset::Signals => DatasetProvenance::Unknowable,
     }
 }
 
@@ -639,6 +642,17 @@ impl DetectionService {
             return Ok(None);
         }
 
+        // NAN-5612: a rule that reads dataset=signals (persisted through any
+        // path that skipped save-time validation) never runs: it would fire on
+        // its own matches.
+        Self::reject_signals_dataset_rule(rule.dataset.as_deref(), &rule.query)
+            .map_err(|_| {
+                DetectionError::InvalidQuery(format!(
+                    "rule '{}' reads dataset=signals, refusing to execute (signal-on-signal loop guard)",
+                    rule.name
+                ))
+            })?;
+
         // NAN-1805: execution-side feedback-loop guard for dataset=risk rules
         // (belt-and-suspenders — save-time validation already rejects these,
         // but a rule persisted through any other path must not run). A `| risk`
@@ -988,7 +1002,9 @@ pub(crate) fn window_search_request(
         request_id,
         async_mode: false,
         priority: None,
-        dataset,
+        // NAN-5612: always explicit, so a leading `dataset=<name>` token in a
+        // rule body is a field filter, never a dataset switch.
+        dataset: Some(dataset.unwrap_or_else(|| "logs".to_string())),
     })
 }
 

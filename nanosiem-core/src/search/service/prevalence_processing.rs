@@ -878,9 +878,10 @@ impl SearchService {
         })?;
 
         // NAN-1799: gate, then parse. Empty deny-set → text unchanged.
-        let enforced_query = crate::search::query_processing::enforce_source_scope(
+        let enforced_query = crate::search::query_processing::enforce_viewer_scope(
             &request.query,
-            scope.deny_set(),
+            request.dataset.as_deref(),
+            scope,
         )?;
 
         // Parse the query
@@ -888,8 +889,11 @@ impl SearchService {
         let time_range = TimeRange::new(request.time_range.start, request.time_range.end);
 
         // Generate base WHERE clause using ClickHouse generator
+        // A clone: generation state (incl. the NAN-5628 nested-CTE sequence)
+        // is per generation, and this generator is shared.
         let base_sql = self
             .ch_sql_generator
+            .clone()
             .generate(&query, &time_range)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
@@ -1240,7 +1244,7 @@ pub(crate) fn extract_prevalence_artifact(
 /// satisfy `< cutoff`).
 ///
 /// NAN-1705 (D4b): this predicate is UNCHANGED — the rescue is applied one level
-/// up, on the `_hp/_dp_*` projection aliases (see [`rescue_transform_sql`]).
+/// up, on the `_hp/_dp_*` projection aliases (see [`rescue_value_sql`]).
 /// A rescued dict-blind artifact's aliases are rewritten to its TRUE fresh host_count and
 /// first_seen in-SQL, so the predicate matches it directly here — and,
 /// crucially, so does every downstream reference (the decoration CASEs, a user
@@ -1324,10 +1328,21 @@ pub(crate) fn prevalence_filter_condition_to_sql(
 /// cycle — strictly no worse than the pre-NAN-1705 behavior (all dropped).
 pub(crate) const PREVALENCE_RESCUE_MISS_KEY_CAP: usize = 50_000;
 
-/// Upper bound on rescued artifacts inlined into the main query's IN-list.
-/// Keeps the generated SQL far below CH's `max_query_size`. Exceeding it is
-/// logged; the overflow is not rescued this cycle.
-pub(crate) const PREVALENCE_RESCUE_MAX_ARTIFACTS: usize = 1_000;
+/// Upper bound on rescued artifacts PER ENTITY TYPE the probe returns.
+///
+/// NAN-5565: equal to [`PREVALENCE_RESCUE_MISS_KEY_CAP`], so this count can
+/// never drop an artifact the probe examined: the rescued set of one type is a
+/// subset of that type's distinct dict-missed keys, which the probe already
+/// bounds at the miss-key cap. (It used to be 1000, a stand-in for a query-size
+/// bound; the query size is now handled by the executor lifting
+/// `max_query_size` for the query, so every rescued artifact is inlined.) At
+/// this cap three entity types of sha256-length keys render about 17 MB of
+/// SQL, which ClickHouse parses and runs in about a second.
+pub(crate) const PREVALENCE_RESCUE_MAX_ARTIFACTS: usize = PREVALENCE_RESCUE_MISS_KEY_CAP;
+
+/// ClickHouse's default `max_query_size`, re-exported for the explain note and
+/// the size tests.
+pub(crate) use crate::search::execution::clickhouse_executor::CLICKHOUSE_DEFAULT_MAX_QUERY_SIZE;
 
 /// Host-count cutoff above which the dict source deliberately does not track
 /// entities ("common"). Mirrors `HAVING host_count < 1000` in
@@ -1342,16 +1357,18 @@ pub(crate) struct RescuedArtifact {
     pub artifact: String,
     /// Fresh 30d host_count from the summary (always `< 1000` by construction).
     pub host_count: u64,
-    /// Fresh first/last-seen from the summary, as the probe's `toString(...)`
-    /// renders them (`YYYY-MM-DD HH:MM:SS[.ffffff]`), re-parsed into the
-    /// projection via `toDateTime64('…', 6)` (see [`RescueAttr::literal`]).
+    /// Fresh first/last-seen from the summary as Unix epoch MICROSECONDS
+    /// (`toUnixTimestamp64Micro`), re-materialised in the projection via
+    /// `fromUnixTimestamp64Micro` (see [`RescueAttr`]).
     ///
-    /// NAN-1723: the probe SELECTs these as `fs_raw`/`ls_raw` (NOT
-    /// `first_seen`/`last_seen`) precisely so `execute_dynamic_query`'s
-    /// `convert_timestamps_to_iso8601` leaves the space format untouched —
-    /// otherwise `toDateTime64` chokes on the rewritten `T…Z` form.
-    pub first_seen: String,
-    pub last_seen: String,
+    /// NAN-5565: integers replace the NAN-1723 `fs_raw`/`ls_raw` strings. They
+    /// are ~40% of the bytes of a `toDateTime64('…', 6)` literal, are
+    /// timezone-independent (the string round trip re-parsed a `DateTime64(6,
+    /// 'UTC')` summary value in the server timezone), and no field-name
+    /// normaliser can rewrite them (`fs_us`/`ls_us` are integers, outside
+    /// `convert_timestamps_to_iso8601`'s list).
+    pub first_seen_us: i64,
+    pub last_seen_us: i64,
     pub total_occurrences: u64,
 }
 
@@ -1368,6 +1385,96 @@ pub(crate) struct PrevalenceRescue {
     pub hashes: Vec<RescuedArtifact>,
     pub domains: Vec<RescuedArtifact>,
     pub ips: Vec<RescuedArtifact>,
+    /// Rescuable artifacts left out by [`Self::cap_key_bytes`]: not evaluated
+    /// this run, which makes the run PARTIAL (NAN-5565).
+    pub dropped: usize,
+}
+
+/// NAN-5565: cap on the bytes of rescue KEYS inlined into one query (8 MiB).
+/// The executor lifts `max_query_size` for the rescue, so this bounds parser
+/// memory, not the parser limit. It holds ~123,000 sha256-length keys; a full
+/// [`PREVALENCE_RESCUE_MAX_ARTIFACTS`] of hashes plus IPs plus ordinary
+/// domains (~6 MB) fits, so it bites only for extreme windows (e.g. 50,000
+/// rescued hashes AND 50,000 long domains).
+pub(crate) const PREVALENCE_RESCUE_KEY_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+impl PrevalenceRescue {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.hashes.is_empty() && self.domains.is_empty() && self.ips.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.hashes.len() + self.domains.len() + self.ips.len()
+    }
+
+    /// Bytes the rescued keys add to the query (quoted, with separators).
+    pub(crate) fn key_bytes(&self) -> usize {
+        [&self.hashes, &self.domains, &self.ips]
+            .into_iter()
+            .flatten()
+            .map(rescued_key_bytes)
+            .sum()
+    }
+
+    /// NAN-5565: keep the rescue's inlined keys within `cap` bytes, dropping
+    /// the LEAST-rare artifacts across entity types. Ties at equal host_count
+    /// interleave by position, so equal-rarity hashes, domains and IPs share
+    /// the cap. Kept artifacts keep their order. Adds the number dropped to
+    /// [`Self::dropped`] and returns it; the caller must make that loud.
+    pub(crate) fn cap_key_bytes(&mut self, cap: usize) -> usize {
+        if self.key_bytes() <= cap {
+            return 0;
+        }
+        let mut ranked: Vec<(u64, usize, usize)> = [&self.hashes, &self.domains, &self.ips]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(entity, set)| {
+                set.iter()
+                    .enumerate()
+                    .map(move |(pos, r)| (r.host_count, pos, entity))
+            })
+            .collect();
+        ranked.sort_unstable();
+        let mut keep = [
+            vec![false; self.hashes.len()],
+            vec![false; self.domains.len()],
+            vec![false; self.ips.len()],
+        ];
+        let mut used = 0usize;
+        for (_, pos, entity) in ranked {
+            let set = match entity {
+                0 => &self.hashes,
+                1 => &self.domains,
+                _ => &self.ips,
+            };
+            let cost = rescued_key_bytes(&set[pos]);
+            if used + cost > cap {
+                break;
+            }
+            used += cost;
+            keep[entity][pos] = true;
+        }
+        let before = self.len();
+        for (entity, set) in [&mut self.hashes, &mut self.domains, &mut self.ips]
+            .into_iter()
+            .enumerate()
+        {
+            let mut flags = keep[entity].iter();
+            set.retain(|_| *flags.next().unwrap_or(&false));
+        }
+        let dropped = before - self.len();
+        self.dropped += dropped;
+        dropped
+    }
+}
+
+/// Bytes one rescued key adds: its quoted literal plus a `, ` separator.
+fn rescued_key_bytes(r: &RescuedArtifact) -> usize {
+    rescue_key_literal(&r.artifact).len() + 2
+}
+
+fn rescue_key_literal(artifact: &str) -> String {
+    format!("'{}'", crate::sql_hygiene::escape_sql_string(artifact))
 }
 
 /// Build the rescue-probe SQL for one entity type.
@@ -1407,19 +1514,17 @@ pub(crate) fn build_prevalence_rescue_probe_sql(
     // NAN-1723: the outer alias names MUST NOT be `first_seen`/`last_seen`.
     // This probe's rows are read back through `execute_dynamic_query`, whose
     // `convert_timestamps_to_iso8601` post-processor rewrites any field literally
-    // named `first_seen`/`last_seen` (among others) from CH's space format
-    // `YYYY-MM-DD HH:MM:SS.ffffff` into rfc3339 `…T…Z`. `RescueAttr::literal`
-    // then embeds the value into `toDateTime64('…', 6)`, which REJECTS the `T`/`Z`
-    // form → the whole rescued detection query fails (CANNOT_PARSE_TEXT). Aliasing
-    // to `fs_raw`/`ls_raw` (not in that normaliser's field list) keeps the space
-    // format intact so the literal parses. The INNER `min(first_seen)` /
-    // `max(last_seen)` below reference the summary table's real columns and stay.
+    // named `first_seen`/`last_seen` (among others). NAN-5565: the timestamps
+    // now travel as epoch-microsecond integers (`fs_us`/`ls_us`), which no
+    // normaliser touches and which re-materialise timezone-exactly via
+    // `fromUnixTimestamp64Micro` in the main query. The INNER `min(first_seen)`
+    // / `max(last_seen)` below reference the summary table's real columns.
     format!(
         r#"SELECT
     artifact,
     toUInt64(_hc) AS host_count,
-    toString(_fs) AS fs_raw,
-    toString(_ls) AS ls_raw,
+    toUnixTimestamp64Micro(_fs) AS fs_us,
+    toUnixTimestamp64Micro(_ls) AS ls_us,
     toUInt64(_occ) AS total_occurrences
 FROM (
     SELECT
@@ -1693,6 +1798,13 @@ pub(crate) fn filter_rescued_artifacts(
             _ => None,
         }
     }
+    fn get_i64(row: &serde_json::Value, key: &str) -> Option<i64> {
+        match row.get(key)? {
+            serde_json::Value::Number(n) => n.as_i64(),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
 
     let mut rescued: Vec<RescuedArtifact> = Vec::new();
     for row in rows {
@@ -1724,20 +1836,11 @@ pub(crate) fn filter_rescued_artifacts(
         rescued.push(RescuedArtifact {
             artifact: artifact.to_string(),
             host_count,
-            // NAN-1723: read `fs_raw`/`ls_raw`, NOT `first_seen`/`last_seen` —
-            // the probe deliberately aliases them away from the names that
-            // `execute_dynamic_query`'s timestamp normaliser would rewrite to
-            // rfc3339 (which `toDateTime64` then rejects). See the probe SQL.
-            first_seen: row
-                .get("fs_raw")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            last_seen: row
-                .get("ls_raw")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            // NAN-1723 / NAN-5565: epoch-microsecond integers aliased away from
+            // the names `execute_dynamic_query`'s normaliser rewrites. A
+            // missing value reads as epoch 0, the dict default.
+            first_seen_us: get_i64(&row, "fs_us").unwrap_or(0),
+            last_seen_us: get_i64(&row, "ls_us").unwrap_or(0),
             total_occurrences: get_u64(&row, "total_occurrences").unwrap_or(0),
         });
     }
@@ -1745,13 +1848,14 @@ pub(crate) fn filter_rescued_artifacts(
 }
 
 /// Which fresh summary attribute a base_logs projection alias carries, so
-/// [`rescue_transform_sql`] emits a type-matching `transform(...)` `to_array`
-/// (element type must share a supertype with the dict-default it replaces).
+/// [`rescue_value_sql`] emits a type-matching value array (its element type
+/// must equal the dict-default it overrides).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RescueAttr {
     /// `_*_host_count` — `UInt16` (dict default `toUInt16(9999)`).
     HostCount,
-    /// `_*_first_seen` / `_*_last_seen` — `DateTime64(6)` (default `toDateTime64(0, 6)`).
+    /// `_*_first_seen` / `_*_last_seen` — `DateTime64(6)` (default `toDateTime64(0, 6)`),
+    /// carried as epoch microseconds and re-materialised by `fromUnixTimestamp64Micro`.
     FirstSeen,
     LastSeen,
     /// `_*_total_occurrences` — `UInt64` (default `toUInt64(0)`).
@@ -1759,23 +1863,54 @@ pub(crate) enum RescueAttr {
 }
 
 impl RescueAttr {
-    /// Render one rescued artifact's value for this attribute as a CH literal
-    /// with the exact type the wrapped dict default produces.
-    fn literal(self, r: &RescuedArtifact) -> String {
+    /// One rescued artifact's value for this attribute as a bare array element
+    /// (an integer; the array's `CAST` supplies the type).
+    fn element(self, r: &RescuedArtifact) -> String {
         match self {
-            // `host_count < 1000` by construction, so `toUInt16` never truncates.
-            RescueAttr::HostCount => format!("toUInt16({})", r.host_count),
-            RescueAttr::FirstSeen => format!(
-                "toDateTime64('{}', 6)",
-                crate::sql_hygiene::escape_sql_string(&r.first_seen)
-            ),
-            RescueAttr::LastSeen => format!(
-                "toDateTime64('{}', 6)",
-                crate::sql_hygiene::escape_sql_string(&r.last_seen)
-            ),
-            RescueAttr::TotalOccurrences => format!("toUInt64({})", r.total_occurrences),
+            // `host_count < 1000` by construction; clamp so the UInt16 CAST can
+            // never overflow even on a malformed probe row.
+            RescueAttr::HostCount => r.host_count.min(9998).to_string(),
+            RescueAttr::FirstSeen => r.first_seen_us.to_string(),
+            RescueAttr::LastSeen => r.last_seen_us.to_string(),
+            RescueAttr::TotalOccurrences => r.total_occurrences.to_string(),
         }
     }
+
+    fn array_type(self) -> &'static str {
+        match self {
+            RescueAttr::HostCount => "Array(UInt16)",
+            RescueAttr::FirstSeen | RescueAttr::LastSeen => "Array(Int64)",
+            RescueAttr::TotalOccurrences => "Array(UInt64)",
+        }
+    }
+}
+
+/// NAN-5565: the per-row rescue index for one entity type, emitted ONCE.
+///
+/// `transform(<match_key>, ['k1', …], range(1, n + 1), 0)` is the 1-based
+/// position of the row's lookup key among the rescued keys, `0` when the key
+/// was not rescued. `transform` builds a hash table over its constant key
+/// array (`indexOf` scans it per row: 19 s vs 0.2 s for 1000 keys over 5M rows,
+/// measured in clickhouse-local 26.11). The
+/// four [`rescue_value_sql`] projections of that entity read their value by
+/// this position, so each key is written into the SQL exactly once (the
+/// NAN-1705 `transform(...)` form repeated every key list four times).
+///
+/// `match_key` always `ifNull(..)`s the lookup alias, so an empty/NULL key can
+/// never match a rescued (non-empty) key. Returns `None` for an empty rescue.
+pub(crate) fn rescue_index_sql(match_key: &str, rescued: &[RescuedArtifact]) -> Option<String> {
+    if rescued.is_empty() {
+        return None;
+    }
+    let keys = rescued
+        .iter()
+        .map(|r| rescue_key_literal(&r.artifact))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "transform({match_key}, [{keys}], range(1, {end}), 0)",
+        end = rescued.len() + 1
+    ))
 }
 
 /// Wrap a base_logs dict projection so NAN-1705 rescued keys resolve to their
@@ -1784,40 +1919,40 @@ impl RescueAttr {
 /// `rescued` empty → `base_expr` is returned **unchanged** (byte-identical to
 /// the pre-NAN-1705 projection, so an empty rescue leaves the whole generated
 /// query byte-for-byte identical). Otherwise emits
-/// `transform(<transform_key>, ['k1',…], [v1,…], <base_expr>)`:
+/// `if(<idx> = 0, <base_expr>, arrayElement(CAST([v1, …], '<Array(T)>'), <idx>))`
+/// where `<idx>` is the alias of the entity's [`rescue_index_sql`]: a rescued
+/// key reads its fresh value, any other key falls through to `base_expr` (the
+/// original dict-with-window-mask lookup).
 ///
-/// - `transform_key` is the row's lookup key (`ifNull(_hash_lookup, '')` etc.);
-///   a rescued key resolves to its fresh value, any other key falls through to
-///   `base_expr` (the original dict-with-window-mask lookup), and an
-///   empty/NULL key can never match a rescued (non-empty) key → default.
-/// - the `to_array` is bounded by `rescued` (≤ [`PREVALENCE_RESCUE_MAX_ARTIFACTS`]),
-///   so no OOM and the emitted literal stays small.
-///
-/// Because the ALIAS itself now carries the truth, the pushed predicate
+/// Because the ALIAS itself carries the truth, the pushed predicate
 /// (`{alias} < 9999 AND {alias} op N`), the decoration CASEs, AND any
-/// downstream `| where host_count < N` all see the rescued host_count in
-/// ClickHouse — no OR-branch and no post-query patch needed (NAN-1705 D4b, the
-/// downstream-decoration gap).
-pub(crate) fn rescue_transform_sql(
+/// downstream `| where host_count < N` all see the rescued value in
+/// ClickHouse (NAN-1705 D4b, the downstream-decoration gap).
+pub(crate) fn rescue_value_sql(
     base_expr: &str,
-    transform_key: &str,
+    idx_alias: &str,
     rescued: &[RescuedArtifact],
     attr: RescueAttr,
 ) -> String {
     if rescued.is_empty() {
         return base_expr.to_string();
     }
-    let keys = rescued
-        .iter()
-        .map(|r| format!("'{}'", crate::sql_hygiene::escape_sql_string(&r.artifact)))
-        .collect::<Vec<_>>()
-        .join(", ");
     let vals = rescued
         .iter()
-        .map(|r| attr.literal(r))
+        .map(|r| attr.element(r))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("transform({transform_key}, [{keys}], [{vals}], {base_expr})")
+    let value = format!(
+        "arrayElement(CAST([{vals}], '{ty}'), {idx_alias})",
+        ty = attr.array_type()
+    );
+    let value = match attr {
+        RescueAttr::FirstSeen | RescueAttr::LastSeen => {
+            format!("fromUnixTimestamp64Micro({value})")
+        }
+        RescueAttr::HostCount | RescueAttr::TotalOccurrences => value,
+    };
+    format!("if({idx_alias} = 0, {base_expr}, {value})")
 }
 
 #[cfg(test)]

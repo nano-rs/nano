@@ -31,6 +31,7 @@ pub use auto_sort::{apply_auto_sort, auto_sort_warning, AutoSortDecision};
 pub use ocsf_action_note::ocsf_action_column_note;
 pub use query_manipulation::{
     enforce_non_audit_query, enforce_source_scope, enforce_source_type_exclusion,
+    enforce_viewer_scope, resolve_dataset_selector,
     strip_ai_and_after, strip_inputlookup_and_after, strip_lateral_and_after,
     strip_post_prevalence_commands, strip_prevalence_and_after, ScopedQuery,
 };

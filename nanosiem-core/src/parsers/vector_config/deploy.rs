@@ -1452,6 +1452,19 @@ async fn deliver_reload_signal() -> Result<&'static str, String> {
 /// every second).
 const RESPONDER_RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// NAN-5564: does a local Vector answer its metrics? `true` whenever that
+/// cannot be told (Kubernetes, role split, checking switched off), so callers
+/// keep their normal reload path there.
+async fn local_vector_running() -> bool {
+    if local_reload_disabled() || super::remote_delivery::active_publisher().is_some() {
+        return true;
+    }
+    match ReloadAckProbe::from_env() {
+        Some(probe) => probe.read_body().await.is_some(),
+        None => true,
+    }
+}
+
 /// The shared validation volume (`VECTOR_VALIDATION_DIR`), when configured.
 fn validation_dir() -> Option<std::path::PathBuf> {
     std::env::var("VECTOR_VALIDATION_DIR")
@@ -3870,15 +3883,210 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                 None
             }
         };
-        if let Err(error) = self.deploy_parsers(parsers).await {
-            self.restore_after_failed_deploy(backup.as_ref(), false).await;
-            return Err(error);
+        // NAN-5564: a change to a running disk-buffered sink is applied by a
+        // controlled restart, never a hot reload (see `pipeline_gate`). The
+        // hold keeps the restarted Vector waiting until the tree is written.
+        let hold = self.stop_vector_for_buffer_change(parsers).await;
+        let restarting = hold.is_some();
+        let identity_recorded = self
+            .write_tree_under_hold(
+                parsers,
+                backup.as_ref(),
+                hold,
+                super::pipeline_gate::pipeline_identity(),
+            )
+            .await?;
+        // A gated or restarting Vector starts on this tree; there is no reload
+        // to wait for. Waiting would hold the deploy lock that the entrypoint
+        // takes before it starts Vector, delaying the reopen by the whole wait.
+        if (identity_recorded || restarting) && !local_vector_running().await {
+            tracing::info!("Vector is not running (gated or restarting); it starts on the config just written");
+            return Ok(());
         }
         let (ack, result) = self.reload_vector_graded().await;
         if result.is_err() && ack == ReloadAck::Rejected {
+            if identity_recorded {
+                // The restored tree is another identity's: gate it again.
+                super::pipeline_gate::clear_identity(&self.config_dir).await;
+            }
             self.restore_after_failed_deploy(backup.as_ref(), true).await;
         }
         result
+    }
+
+    /// NAN-5564: the order a gated or held Vector depends on: write the tree
+    /// (restoring the snapshot when that fails), record the identity it was
+    /// rendered for, and only THEN release the hold, so a Vector starting the
+    /// moment the hold goes always finds a complete tree. `Ok(true)` when the
+    /// recorded identity changed.
+    pub(super) async fn write_tree_under_hold(
+        &self,
+        parsers: &[Parser],
+        backup: Option<&super::backup::BackupGeneration>,
+        hold: Option<super::pipeline_gate::VectorHold>,
+        identity: Option<String>,
+    ) -> Result<bool, VectorConfigError> {
+        if let Err(error) = self.deploy_parsers(parsers).await {
+            self.restore_after_failed_deploy(backup, false).await;
+            drop(hold);
+            return Err(error);
+        }
+        let recorded = match identity {
+            Some(identity) => self.record_pipeline_identity(&identity).await,
+            None => false,
+        };
+        drop(hold);
+        Ok(recorded)
+    }
+
+    /// NAN-5564 release review (P2-2): the parsers a full render can keep when
+    /// some of them cannot be rendered. Leaves out every parser that makes
+    /// `deploy_parsers` refuse the whole tree: both sides of a source_type
+    /// claim collision or of a generated-identifier collision, and a parser
+    /// whose generated config fails the guard. Returns the kept parsers and
+    /// the names of the left-out ones (sorted).
+    pub(crate) fn renderable_subset(&self, parsers: &[Parser]) -> (Vec<Parser>, Vec<String>) {
+        let safe = self.render_safe_parsers(parsers);
+        let log_parsers: Vec<Parser> = safe.iter().filter(|p| p.kind != "enrichment").cloned().collect();
+        let mut skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for collision in super::router::find_source_type_collisions(&log_parsers) {
+            skipped.extend(collision.parsers);
+        }
+        for collision in crate::vector_naming::find_identity_collisions(
+            log_parsers.iter().map(|p| (p.id, Self::safe_name(&p.name), p.name.clone())),
+        ) {
+            skipped.extend(collision.names);
+        }
+        for parser in log_parsers.iter().filter(|p| p.enabled) {
+            if self.guarded_parser_config(parser).is_err() {
+                skipped.insert(parser.name.clone());
+            }
+        }
+        let kept = safe.into_iter().filter(|p| !skipped.contains(&p.name)).collect();
+        (kept, skipped.into_iter().collect())
+    }
+
+    /// NAN-5564 release review: after the api's boot render wrote the tree,
+    /// rewrite the identity marker unconditionally (never before the tree).
+    pub async fn rewrite_pipeline_identity(&self) {
+        if let Some(identity) = super::pipeline_gate::pipeline_identity() {
+            if let Err(error) = super::pipeline_gate::rewrite_identity(&self.config_dir, &identity).await {
+                tracing::error!(%error, %identity, "could not rewrite the pipeline identity after the boot render");
+            }
+        }
+    }
+
+    /// NAN-5564 review: is a gated Vector still waiting for this api to render
+    /// the tree for its pipeline identity? `false` when no identity is set.
+    pub async fn pipeline_identity_pending(&self) -> bool {
+        match super::pipeline_gate::pipeline_identity() {
+            Some(identity) => {
+                super::pipeline_gate::recorded_identity(&self.config_dir).await.as_deref()
+                    != Some(identity.as_str())
+            }
+            None => false,
+        }
+    }
+
+    /// NAN-5564: record the pipeline identity this api rendered the tree for,
+    /// so the Vector entrypoint's gate lets a Vector of the same identity
+    /// start. `true` when the recorded identity changed.
+    async fn record_pipeline_identity(&self, identity: &str) -> bool {
+        match super::pipeline_gate::record_identity(&self.config_dir, identity).await {
+            Ok(changed) => {
+                if changed {
+                    tracing::info!(%identity, "Vector config rendered for this pipeline identity; a gated Vector may start");
+                }
+                changed
+            }
+            Err(error) => {
+                tracing::error!(%error, %identity, "could not record the pipeline identity; a gated Vector keeps refusing ingest until a deploy records it");
+                false
+            }
+        }
+    }
+
+    /// NAN-5564: when this deploy would change the buffer settings of a
+    /// disk-buffered sink that a local Vector is running, stop that Vector
+    /// gracefully first and hold its restart. `None` means "deliver as
+    /// before" (a hot reload): no local Vector, no buffer change, or a Vector
+    /// container whose responder predates the stop request.
+    async fn stop_vector_for_buffer_change(
+        &self,
+        parsers: &[Parser],
+    ) -> Option<super::pipeline_gate::VectorHold> {
+        use super::pipeline_gate as gate;
+        if local_reload_disabled() || super::remote_delivery::active_publisher().is_some() {
+            return None;
+        }
+        let root = validation_dir()?;
+        if !responder_heartbeat_fresh(&root, std::time::SystemTime::now()).await {
+            return None;
+        }
+        // Buffer settings only change with the rendered identity (release,
+        // ack durability, fan-in slots). Without an identity (dev compose)
+        // every deploy is checked.
+        if let Some(identity) = gate::pipeline_identity() {
+            if gate::recorded_identity(&self.config_dir).await.as_deref() == Some(identity.as_str()) {
+                return None;
+            }
+        }
+        let probe = ReloadAckProbe::from_env()?;
+        probe.read_body().await?; // no running Vector holds a buffer lock
+        let changed = match self.candidate_buffer_changes(parsers).await {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error, "could not render a candidate to compare sink buffers; delivering as a reload");
+                return None;
+            }
+        };
+        if changed.is_empty() {
+            return None;
+        }
+        let hold = match gate::VectorHold::place(&root).await {
+            Ok(hold) => hold,
+            Err(error) => {
+                tracing::warn!(%error, ?changed, "could not hold Vector's restart; delivering the buffer change as a reload");
+                return None;
+            }
+        };
+        if let Err(reason) = gate::request_stop_in(&root, gate::STOP_REQUEST_TIMEOUT).await {
+            tracing::warn!(%reason, ?changed, "Vector cannot be restarted for this buffer change; delivering it as a reload, which Vector may fail to apply (it then restarts)");
+            return None;
+        }
+        tracing::info!(?changed, "sink buffer settings change: stopping Vector gracefully and restarting it on the new config instead of a hot reload");
+        let deadline = tokio::time::Instant::now() + gate::STOP_WAIT;
+        while probe.read_body().await.is_some() {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(?changed, "Vector did not stop within {:?}; writing the new config anyway", gate::STOP_WAIT);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        Some(hold)
+    }
+
+    /// Disk-buffered sinks whose buffer settings this deploy would change,
+    /// from a render of `parsers` into a scratch tree.
+    pub(super) async fn candidate_buffer_changes(&self, parsers: &[Parser]) -> Result<Vec<String>, VectorConfigError> {
+        use super::pipeline_gate as gate;
+        let scratch = tempfile::tempdir()?;
+        // Fetch parsers render only when their source-config route exists.
+        let configs = scratch.path().join("sources").join("configs");
+        fs::create_dir_all(&configs).await?;
+        if let Ok(mut entries) = fs::read_dir(self.config_dir.join("sources").join("configs")).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                    let _ = fs::copy(&path, configs.join(entry.file_name())).await;
+                }
+            }
+        }
+        let candidate = VectorConfigManager::new(scratch.path());
+        candidate.deploy_parsers(parsers).await?;
+        let live = gate::buffer_sections_in(&self.parsers_dir).await;
+        let next = gate::buffer_sections_in(&candidate.parsers_dir).await;
+        Ok(gate::changed_disk_buffers(&live, &next))
     }
 
     /// Put the snapshot taken for this attempt back (and reload Vector onto it

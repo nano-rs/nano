@@ -205,9 +205,18 @@ const MAX_SUGGESTIONS: usize = 4;
 pub(crate) fn parse_dataset(raw: Option<&str>) -> Result<Dataset, String> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(Dataset::Logs),
-        Some(s) => Dataset::from_selector_strict(s).ok_or_else(|| {
-            format!("Unknown dataset '{s}'. Expected one of: logs, spans, metrics, risk")
-        }),
+        // NAN-5612: detection rules cannot read the signals dataset (a rule's
+        // own matches are signals), so the rule editor refuses it like the save
+        // path does (`VALID_DATASETS` omits it).
+        Some(s) => match Dataset::from_selector_strict(s) {
+            Some(Dataset::Signals) => Err(
+                "Detection rules cannot read dataset=signals: a rule's own matches are signals \
+                 (a signal-on-signal loop). Use dataset=risk to alert on several detections."
+                    .to_string(),
+            ),
+            Some(d) => Ok(d),
+            None => Err(format!("Unknown dataset '{s}'. Expected one of: logs, spans, metrics, risk")),
+        },
     }
 }
 
@@ -218,6 +227,7 @@ fn dataset_name(dataset: Dataset) -> &'static str {
         Dataset::Spans => "spans",
         Dataset::Metrics => "metrics",
         Dataset::Risk => "risk",
+        Dataset::Signals => "signals",
     }
 }
 
@@ -351,6 +361,7 @@ fn dataset_profile(
         Dataset::Spans => profile_for_id(SchemaId::Spans),
         Dataset::Metrics => profile_for_id(SchemaId::Metrics),
         Dataset::Risk => profile_for_id(SchemaId::Risk),
+        Dataset::Signals => profile_for_id(SchemaId::Signals),
     }
 }
 

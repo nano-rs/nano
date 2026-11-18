@@ -19,3 +19,39 @@ async fn unprocessable_with_details_keeps_code_and_details() {
     assert_eq!(body["error"]["message"], "refused a, b");
     assert_eq!(body["error"]["details"]["refused"][1]["suffix"], "b");
 }
+
+/// NAN-5561: a 409 can carry structured details too.
+#[tokio::test]
+async fn conflict_with_details_is_a_409_with_its_details() {
+    let response = ApiError::ConflictWithDetails {
+        code: "SOME_GATE",
+        message: "refused".to_string(),
+        details: serde_json::json!({"gate": {"passes": false, "sample": 3}}),
+    }
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "SOME_GATE");
+    assert_eq!(body["error"]["details"]["gate"]["sample"], 3);
+}
+
+/// NAN-5561: a refused policy B opt-in carries the gate's numbers as fields.
+#[cfg(feature = "enterprise")]
+#[tokio::test]
+async fn a_refused_gate_serves_its_numbers_as_fields() {
+    use nanosiem_core::hunts::review::{calibrate, gate};
+    let g = gate(&calibrate(&[]), Some("m1"), 0.9, 20);
+    let err: ApiError = nanosiem_core::hunts::HuntError::GateRefused {
+        message: "case mode refused".into(),
+        gate: Box::new(g),
+    }
+    .into();
+    let response = err.into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "ESCALATION_GATE_NOT_MET");
+    assert_eq!(body["error"]["details"]["gate"]["min_sample"], 20);
+    assert_eq!(body["error"]["details"]["gate"]["passes"], false);
+}

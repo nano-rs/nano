@@ -50,6 +50,46 @@ pub const AGENTLANE_WORKLOAD: &str = "agentlane";
 /// The fair root the workload hangs under (ClickHouse migration 189).
 pub(super) const AGENTLANE_PARENT_WORKLOAD: &str = "nano";
 
+/// The settings profile for INTERNAL Agent Lane identities: tokens nano
+/// mints for its own in-process agents rather than for an external agent.
+/// The same caps as [`AGENTLANE_PROFILE`] (still `readonly = 1 CONST`,
+/// `force_index_by_date`), except `workload = 'agentlane_internal' CONST`, so
+/// internal agent work has its own CPU-slot and memory budget and never takes
+/// the slots external agents use on the `agentlane` workload. Its users still
+/// hold [`AGENTLANE_ROLE`]: what they may READ is identical.
+///
+/// Added alongside the v2.0.31 objects (`agentlane` profile and workload,
+/// `agentlane_reader`), which this step never renames, drops or changes.
+pub const AGENTLANE_INTERNAL_PROFILE: &str = "agentlane_internal";
+/// The scheduler workload internal identities run in. A sibling of
+/// [`AGENTLANE_WORKLOAD`] under the same `nano` fair root, with the same
+/// lowest weight and priority (below ingest, detections and interactive
+/// search, which keep the default priority 0), so internal agent work never
+/// adds detection or analyst latency: it only uses CPU slots nothing else
+/// wants.
+pub const AGENTLANE_INTERNAL_WORKLOAD: &str = "agentlane_internal";
+
+/// CPU-slot cap of the `agentlane_internal` workload, per server. Double the
+/// external lane's default ([`DEFAULT_MAX_CONCURRENT_THREADS`]): P6 measured
+/// 27% of agent queries timing out at 60 s with 2 slots. Still below the
+/// interactive and detection workloads by priority, so the extra slots are
+/// only ever idle capacity.
+pub const DEFAULT_INTERNAL_MAX_CONCURRENT_THREADS: u64 = 4;
+pub const INTERNAL_MAX_CONCURRENT_THREADS_ENV: &str = "NANO_AGENTLANE_INTERNAL_MAX_CONCURRENT_THREADS";
+/// Memory cap of the `agentlane_internal` workload, per server, as an
+/// operator OVERRIDE (wins whenever set).
+///
+/// Unset, this migrator creates the internal workload at the minimal cap
+/// ([`MIN_WORKLOAD_MAX_MEMORY`], 256 MiB) and leaves the external `agentlane`
+/// workload at its full v2.0.31 quarter, byte-identical. A ClickHouse
+/// workload `max_memory` of 0 means UNLIMITED, so "no memory" is expressed as
+/// the minimal cap. The runtime split of the agent quarter between the two
+/// lanes (when internal agent work is actually enabled) is not the migrator's
+/// job: the enterprise control plane converges both workloads at runtime
+/// (see its memory-split module), so re-running this migrator never changes
+/// the v2.0.31 statements.
+pub const INTERNAL_WORKLOAD_MAX_MEMORY_ENV: &str = "NANO_AGENTLANE_INTERNAL_WORKLOAD_MAX_MEMORY";
+
 /// Tables the role may read, with the column that names the event source.
 /// Every granted table carries the audit-hiding policy on that column, so a
 /// table can only be granted together with its policy column. The column is
@@ -162,7 +202,7 @@ pub(super) const MAX_MAX_MEMORY_PER_TOKEN: u64 = 1024 * 1024 * 1024 * 1024;
 pub(super) const WORKLOAD_MEMORY_SERVER_FRACTION_DIVISOR: u64 = 4;
 pub(super) const MIN_DERIVED_WORKLOAD_MAX_MEMORY: u64 = 512 * 1024 * 1024;
 pub(super) const FALLBACK_WORKLOAD_MAX_MEMORY: u64 = 4 * 1024 * 1024 * 1024;
-pub(super) const MIN_WORKLOAD_MAX_MEMORY: u64 = 256 * 1024 * 1024;
+pub const MIN_WORKLOAD_MAX_MEMORY: u64 = 256 * 1024 * 1024;
 pub(super) const MAX_WORKLOAD_MAX_MEMORY: u64 = 1024 * 1024 * 1024 * 1024;
 
 /// No workload `max_concurrent_queries`. Shard hops inherit
@@ -231,6 +271,11 @@ pub struct AgentlaneSettings {
     pub max_memory_per_token: Option<u64>,
     /// `None`: derived from the server memory limit at migrate time.
     pub workload_max_memory: Option<u64>,
+    /// NAN-5546: CPU-slot cap of the `agentlane_internal` workload.
+    pub internal_max_concurrent_threads: u64,
+    /// Memory cap of the `agentlane_internal` workload. `None`: the minimal
+    /// cap ([`MIN_WORKLOAD_MAX_MEMORY`]) at migrate time.
+    pub internal_workload_max_memory: Option<u64>,
 }
 
 impl Default for AgentlaneSettings {
@@ -241,6 +286,8 @@ impl Default for AgentlaneSettings {
             max_concurrent_threads: DEFAULT_MAX_CONCURRENT_THREADS,
             max_memory_per_token: None,
             workload_max_memory: None,
+            internal_max_concurrent_threads: DEFAULT_INTERNAL_MAX_CONCURRENT_THREADS,
+            internal_workload_max_memory: None,
         }
     }
 }
@@ -253,6 +300,8 @@ pub struct AgentlaneEnv<'a> {
     pub max_concurrent_threads: Option<&'a str>,
     pub max_memory_per_token: Option<&'a str>,
     pub workload_max_memory: Option<&'a str>,
+    pub internal_max_concurrent_threads: Option<&'a str>,
+    pub internal_workload_max_memory: Option<&'a str>,
 }
 
 /// Settings from `NANO_AGENTLANE_MAX_ROWS_TO_READ`,
@@ -270,6 +319,8 @@ pub fn agentlane_settings_from_env(
         max_concurrent_threads,
         max_memory_per_token,
         workload_max_memory,
+        internal_max_concurrent_threads,
+        internal_workload_max_memory,
     } = env;
     let defaults = AgentlaneSettings::default();
     Ok(AgentlaneSettings {
@@ -306,6 +357,19 @@ pub fn agentlane_settings_from_env(
             MIN_WORKLOAD_MAX_MEMORY,
             MAX_WORKLOAD_MAX_MEMORY,
         )?,
+        internal_max_concurrent_threads: parse_cap(
+            INTERNAL_MAX_CONCURRENT_THREADS_ENV,
+            internal_max_concurrent_threads,
+            defaults.internal_max_concurrent_threads,
+            MIN_MAX_CONCURRENT_THREADS,
+            MAX_MAX_CONCURRENT_THREADS,
+        )?,
+        internal_workload_max_memory: parse_optional_cap(
+            INTERNAL_WORKLOAD_MAX_MEMORY_ENV,
+            internal_workload_max_memory,
+            MIN_WORKLOAD_MAX_MEMORY,
+            MAX_WORKLOAD_MAX_MEMORY,
+        )?,
     })
 }
 
@@ -336,7 +400,7 @@ pub(super) fn derived_max_memory_per_token(server_memory_limit_bytes: u64) -> u6
 /// The workload memory cap when `NANO_AGENTLANE_WORKLOAD_MAX_MEMORY` is
 /// unset: a quarter of the effective server limit, at least 512 MiB; 4 GiB
 /// when the limit is unknown (0).
-pub(super) fn derived_workload_max_memory(server_memory_limit_bytes: u64) -> u64 {
+pub fn derived_workload_max_memory(server_memory_limit_bytes: u64) -> u64 {
     if server_memory_limit_bytes == 0 {
         return FALLBACK_WORKLOAD_MAX_MEMORY;
     }
@@ -412,6 +476,12 @@ fn parse_cap(
 /// queries). `global` rewrites it to `GLOBAL IN` / `GLOBAL JOIN`: the subquery
 /// runs once on the initiator and ships to the shards as a temporary table.
 pub(super) fn profile_settings_sql(caps: &AgentlaneSettings) -> String {
+    profile_settings_sql_for(caps, AGENTLANE_WORKLOAD)
+}
+
+/// [`profile_settings_sql`] pinned to `workload` (the internal profile is
+/// the same profile on the `agentlane_internal` workload).
+pub(super) fn profile_settings_sql_for(caps: &AgentlaneSettings, workload: &str) -> String {
     let mut parts: Vec<String> = vec![
         "readonly = 1 CONST".into(),
         "allow_ddl = 0 CONST".into(),
@@ -420,7 +490,7 @@ pub(super) fn profile_settings_sql(caps: &AgentlaneSettings) -> String {
         "skip_unavailable_shards = 0 CONST".into(),
         "serialize_query_plan = 0 CONST".into(),
         "distributed_product_mode = 'global' CONST".into(),
-        format!("workload = '{AGENTLANE_WORKLOAD}' CONST"),
+        format!("workload = '{workload}' CONST"),
         format!(
             "max_execution_time = {MAX_EXECUTION_TIME_SECS} MIN 1 MAX {MAX_EXECUTION_TIME_SECS} \
              CHANGEABLE_IN_READONLY"
@@ -465,6 +535,16 @@ pub(super) fn profile_statements(on_cluster: &str, caps: &AgentlaneSettings) -> 
     ]
 }
 
+/// NAN-5546: the `agentlane_internal` profile, created and converged exactly
+/// like [`profile_statements`].
+pub(super) fn internal_profile_statements(on_cluster: &str, caps: &AgentlaneSettings) -> [String; 2] {
+    let settings = profile_settings_sql_for(caps, AGENTLANE_INTERNAL_WORKLOAD);
+    [
+        format!("CREATE SETTINGS PROFILE IF NOT EXISTS {AGENTLANE_INTERNAL_PROFILE}{on_cluster} SETTINGS {settings}"),
+        format!("ALTER SETTINGS PROFILE {AGENTLANE_INTERNAL_PROFILE}{on_cluster} SETTINGS {settings}"),
+    ]
+}
+
 /// The workload: lowest weight, a lower priority than every sibling (lower
 /// value = served first; the siblings use the default 0), and a hard thread
 /// cap (per install, [`DEFAULT_MAX_CONCURRENT_THREADS`]). P0 #5 verified
@@ -477,17 +557,67 @@ pub(super) fn profile_statements(on_cluster: &str, caps: &AgentlaneSettings) -> 
 /// [`WORKLOAD_MAX_MEMORY_ENV`]); deliberately no `max_concurrent_queries`
 /// (distributed deadlock, see [`QUERY_RESOURCE`]). The `OR REPLACE` also
 /// strips `max_concurrent_queries` from a workload an earlier build created.
-pub(super) fn workload_statement(
+pub fn workload_statement(
+    workload_on_cluster: &str,
+    max_concurrent_threads: u64,
+    max_memory: u64,
+) -> String {
+    workload_statement_named(AGENTLANE_WORKLOAD, workload_on_cluster, max_concurrent_threads, max_memory)
+}
+
+/// NAN-5546: the `agentlane_internal` workload: same weight and priority as
+/// [`workload_statement`] (lowest weight, below every default-priority
+/// sibling such as ingest, detections and interactive search), its own
+/// thread and memory caps.
+pub fn internal_workload_statement(
+    workload_on_cluster: &str,
+    max_concurrent_threads: u64,
+    max_memory: u64,
+) -> String {
+    workload_statement_named(AGENTLANE_INTERNAL_WORKLOAD, workload_on_cluster, max_concurrent_threads, max_memory)
+}
+
+fn workload_statement_named(
+    name: &str,
     workload_on_cluster: &str,
     max_concurrent_threads: u64,
     max_memory: u64,
 ) -> String {
     format!(
-        "CREATE OR REPLACE WORKLOAD {AGENTLANE_WORKLOAD}{workload_on_cluster} \
+        "CREATE OR REPLACE WORKLOAD {name}{workload_on_cluster} \
          IN {AGENTLANE_PARENT_WORKLOAD} \
          SETTINGS weight = 1, priority = 10, max_concurrent_threads = {max_concurrent_threads}, \
          max_memory = {max_memory}"
     )
+}
+
+/// The workload, resource, profile and role statements, in order (the
+/// grants and row policies follow). The v2.0.31 statements come first and are
+/// produced by exactly the generators that shipped them, so an upgraded
+/// install converges on the same definitions; the internal lane is only
+/// ever ADDED (its workload before the profile that references it). Every
+/// statement is idempotent: re-running converges, nothing is renamed and the
+/// only DROP is v2.0.31's own `DROP RESOURCE IF EXISTS query`.
+pub(super) fn lane_object_statements(
+    on_cluster: &str,
+    workload_on_cluster: &str,
+    caps: &AgentlaneSettings,
+    workload_max_memory: u64,
+    internal_workload_max_memory: u64,
+) -> Vec<String> {
+    let mut statements =
+        vec![workload_statement(workload_on_cluster, caps.max_concurrent_threads, workload_max_memory)];
+    statements.extend(resource_statements(workload_on_cluster));
+    statements.extend(profile_statements(on_cluster, caps));
+    statements.extend(role_statements(on_cluster));
+    // Added alongside (never instead of) the objects above.
+    statements.push(internal_workload_statement(
+        workload_on_cluster,
+        caps.internal_max_concurrent_threads,
+        internal_workload_max_memory,
+    ));
+    statements.extend(internal_profile_statements(on_cluster, caps));
+    statements
 }
 
 /// Run after [`workload_statement`]: create the MEMORY RESERVATION resource
@@ -541,6 +671,13 @@ pub(super) fn candidate_table_names() -> Vec<String> {
         .iter()
         .flat_map(|(table, _)| TABLE_NAME_SUFFIXES.iter().map(move |s| format!("{table}{s}")))
         .collect()
+}
+
+/// Every table name `agentlane_reader` can be granted `SELECT` on: the
+/// hunts `sql` guard's table allowlist (NAN-5602) is this same list, so the
+/// guard and the grants cannot drift apart.
+pub fn agentlane_table_names() -> Vec<String> {
+    candidate_table_names()
 }
 
 /// Resolve grants and policy targets from what exists. A table absent under
@@ -903,14 +1040,17 @@ impl ClickHouseMigrator {
             ..*caps
         };
 
-        let mut statements = vec![workload_statement(
+        // No internal memory reserved at migrate time (the minimal cap); the
+        // enterprise control plane splits the agent quarter at runtime once
+        // internal agent work is enabled.
+        let internal_workload_max_memory = caps.internal_workload_max_memory.unwrap_or(MIN_WORKLOAD_MAX_MEMORY);
+        let mut statements = lane_object_statements(
+            &on_cluster,
             &workload_on_cluster,
-            caps.max_concurrent_threads,
+            caps,
             workload_max_memory,
-        )];
-        statements.extend(resource_statements(&workload_on_cluster));
-        statements.extend(profile_statements(&on_cluster, caps));
-        statements.extend(role_statements(&on_cluster));
+            internal_workload_max_memory,
+        );
         statements.extend(policy_statements(&self.database, &on_cluster, &objects));
         statements.extend(grant_statement(&self.database, &on_cluster, &objects));
         for sql in &statements {

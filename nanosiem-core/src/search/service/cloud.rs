@@ -337,7 +337,9 @@ impl SearchService {
                     query_str,
                     scope.deny_set(),
                 )?;
-                match self.ch_sql_generator.generate(scoped.query(), time_range) {
+                // A clone: generation state (incl. the NAN-5628 nested-CTE
+                // sequence) is per generation, and this generator is shared.
+                match self.ch_sql_generator.clone().generate(scoped.query(), time_range) {
                     Ok(sql) => sql,
                     Err(e) => {
                         tracing::warn!("Cloud CTE SQL gen failed: {}", e);

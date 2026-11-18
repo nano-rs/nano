@@ -74,6 +74,8 @@ pub async fn search_stream(
     // search:execute before any work, exactly like POST /api/search. This path
     // was authenticated but UNAUTHORIZED (a parity gap vs. the batch `search`).
     super::require_search_execute(&auth)?;
+    // NAN-5612: dataset=signals also needs detections:view.
+    super::require_dataset_access(&auth, request.dataset.as_deref(), &request.query)?;
 
     // NAN-1799: compose the effective deny-set (per-user source scope ∪ audit
     // gate) ONCE, before the cache lookup below — the scope is folded into

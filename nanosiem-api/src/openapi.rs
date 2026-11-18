@@ -916,8 +916,36 @@ mod tests {
         // (GET/PUT, one template) to both editions: 701 / 425.
         // NAN-5450 adds GET /api/system/disk-alert to both editions: 702 / 421.
         // NAN-5485 adds nano-search's POST /api/search/field-inventory: 703 / 422.
+        // NAN-5546 adds the ENTERPRISE hunt lease renewal
+        // (/api/hunts/runners/{id}/sweeps/{sweep_id}/renew): 704.
+        // NAN-5547 adds the ENTERPRISE hunt pipeline reads
+        // (/api/hunts/sweeps/{id}/context, /api/hunts/sweeps/{id}/tasks,
+        // /api/hunts/funnel): 707.
+        // NAN-5547 Part F adds the ENTERPRISE hunt templates
+        // (/api/hunts/templates, /api/hunts/templates/{id}/instantiate): 709.
+        // NAN-5548 adds 8 ENTERPRISE hunt reviewer templates
+        // (/api/hunts/leads/{id}/reviews, /api/hunts/leads/{id}/review,
+        // /api/hunts/leads/{id}/rulings, /api/hunts/escalations,
+        // /api/hunts/escalations/{lead_id}/acknowledge, /api/hunts/rulings,
+        // /api/hunts/{id}/calibration, /api/hunts/{id}/escalation-mode): 717.
+        // NAN-5560 adds 11 ENTERPRISE campaign templates
+        // (/api/hunts/campaigns, /api/hunts/campaigns/{id},
+        // /api/hunts/campaigns/{id}/activate, …/deactivate, …/close,
+        // …/hunts, …/hunts/{hunt_id}, …/events, …/rechecks,
+        // /api/hunts/campaign-candidates, /api/hunts/leads/{id}/campaign): 729.
+        // NAN-5575 adds the shared /api/search/sql-to-npl and
+        // /api/search/sql-to-npl/batch (search service, both editions) and the
+        // enterprise /api/melod/sql-to-npl AI fallback: 732 / 425.
+        // NAN-5543 adds 2 ENTERPRISE hunt authoring templates
+        // (/api/hunts/pivots/validate, /api/hunts/source-inventory): 734.
+        // NAN-5581 adds 9 ENTERPRISE agent detection templates
+        // (/api/hunts/agent-detections, …/settings, …/{id}/trips, …/{id}/pause,
+        // …/{id}/resume, …/{id}/retire, /api/hunts/{id}/agent-detections,
+        // …/gate, …/create): 743.
+        // NAN-5561 adds 3 ENTERPRISE templates (/api/hunts/{id}/evals,
+        // /api/hunts/evals/{eval_id}, /api/hunts/leads/counts): 746.
         #[cfg(feature = "enterprise")]
-        let min_paths = 703;
+        let min_paths = 746;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
@@ -929,7 +957,9 @@ mod tests {
         // lookup URL allowlist template: 425. NAN-5445 moves the five
         // storage-tiering paths to enterprise: 420.
         // NAN-5450's disk-alert: 421. NAN-5485's field inventory: 422.
-        let min_paths = 422;
+        // NAN-5548's webhook event-types list: 423.
+        // NAN-5575's two sql-to-npl search paths: 425.
+        let min_paths = 425;
 
         assert!(
             path_count >= min_paths,

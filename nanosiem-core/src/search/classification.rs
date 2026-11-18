@@ -198,7 +198,7 @@ pub fn event_kind_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static st
         crate::schema::SchemaId::Udm
         | crate::schema::SchemaId::Spans
         | crate::schema::SchemaId::Metrics
-        | crate::schema::SchemaId::Risk => EVENT_KIND_SQL,
+        | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => EVENT_KIND_SQL,
     }
 }
 
@@ -209,7 +209,7 @@ pub fn lane_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
         crate::schema::SchemaId::Udm
         | crate::schema::SchemaId::Spans
         | crate::schema::SchemaId::Metrics
-        | crate::schema::SchemaId::Risk => LANE_SQL,
+        | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => LANE_SQL,
     }
 }
 
@@ -220,7 +220,7 @@ pub fn auth_predicate(profile: &dyn crate::schema::SchemaProfile) -> &'static st
         crate::schema::SchemaId::Udm
         | crate::schema::SchemaId::Spans
         | crate::schema::SchemaId::Metrics
-        | crate::schema::SchemaId::Risk => AUTH_PREDICATE,
+        | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => AUTH_PREDICATE,
     }
 }
 
@@ -231,7 +231,7 @@ pub fn file_predicate(profile: &dyn crate::schema::SchemaProfile) -> &'static st
         crate::schema::SchemaId::Udm
         | crate::schema::SchemaId::Spans
         | crate::schema::SchemaId::Metrics
-        | crate::schema::SchemaId::Risk => FILE_PREDICATE,
+        | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => FILE_PREDICATE,
     }
 }
 

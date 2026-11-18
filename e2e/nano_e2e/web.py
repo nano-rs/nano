@@ -217,13 +217,26 @@ class EdgeSite:
                 f"{dist}/index.html missing: build the web UI first (scripts/e2e.sh run ui)"
             )
         web_dir.mkdir(parents=True, exist_ok=True)
-        for child in web_dir.iterdir():
-            if child.is_dir():
+        # Sync in place: remove files the new build doesn't have, but keep
+        # directories. Docker Desktop's file sharing can keep serving an
+        # emptied view of a bind-mounted subdirectory that was deleted and
+        # recreated (the edge saw 0 files in /srv/web/assets until restarted).
+        wanted = {p.relative_to(dist) for p in dist.rglob("*")}
+        for child in sorted(web_dir.rglob("*"), reverse=True):
+            rel = child.relative_to(web_dir)
+            if rel in wanted:
+                continue
+            if child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child)
             else:
                 child.unlink()
         shutil.copytree(dist, web_dir, dirs_exist_ok=True)
         self.url = url.rstrip("/")
+        index = (dist / "index.html").read_text(errors="replace")
+        import re
+
+        m = re.search(r'src="(/assets/[^"]+\.js)"', index)
+        self._probe_asset = m.group(1) if m else None
 
     def start(self) -> EdgeSite:
         # NAN-5465: the edge serves this dir through a bind mount; right after
@@ -239,11 +252,17 @@ class EdgeSite:
             try:
                 r = httpx.get(f"{self.url}/login", timeout=5)
                 if r.status_code == 200 and "<div id=" in r.text:
-                    return self
+                    # The SPA shell is not enough: the entry module must be
+                    # served as JS, not the index.html fallback.
+                    if self._probe_asset is None:
+                        return self
+                    a = httpx.get(f"{self.url}{self._probe_asset}", timeout=5)
+                    if a.status_code == 200 and "javascript" in a.headers.get("content-type", ""):
+                        return self
             except httpx.HTTPError:
                 pass
             if time.monotonic() > deadline:
-                raise RuntimeError(f"edge {self.url} does not serve the SPA at /login after 60s")
+                raise RuntimeError(f"edge {self.url} does not serve the SPA and its entry module after 60s")
             time.sleep(0.5)
 
     def stop(self) -> None:

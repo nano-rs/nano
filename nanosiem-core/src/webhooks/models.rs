@@ -32,6 +32,54 @@ pub const VALID_EVENT_TYPES: [&str; 5] = [
     EVENT_TYPE_SYSTEM_HEALTH,
 ];
 
+/// Event streams registered at startup by builds that add surfaces of their
+/// own (an extension crate calls [`register_extension_event_types`]); open
+/// builds register none. A registered stream is subscribable exactly like a
+/// core one and is fired through
+/// [`WebhookService::fire_extension_event`](super::service::WebhookService::fire_extension_event),
+/// so the core never names the extension's concepts. Same pattern as
+/// `audit::register_security_critical_actions`.
+static EXTENSION_EVENT_TYPES: std::sync::OnceLock<std::sync::Mutex<Vec<&'static str>>> =
+    std::sync::OnceLock::new();
+
+/// Whether `name` is a well-formed stream name: `[a-z][a-z0-9_]{0,39}`.
+fn is_stream_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && name.len() <= 40
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Register extra subscribable event streams. Idempotent; malformed names and
+/// names that shadow a core stream are ignored.
+pub fn register_extension_event_types(extra: &[&'static str]) {
+    let lock = EXTENSION_EVENT_TYPES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut list = lock.lock().unwrap_or_else(|e| e.into_inner());
+    for name in extra {
+        if is_stream_name(name) && !VALID_EVENT_TYPES.contains(name) && !list.contains(name) {
+            list.push(name);
+        }
+    }
+}
+
+/// Every subscribable stream in this build: the core ones, then the
+/// registered extension ones in registration order.
+pub fn subscribable_event_types() -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = VALID_EVENT_TYPES.to_vec();
+    if let Some(lock) = EXTENSION_EVENT_TYPES.get() {
+        all.extend(lock.lock().unwrap_or_else(|e| e.into_inner()).iter().copied());
+    }
+    all
+}
+
+/// Whether `event_type` is a subscribable stream in this build.
+pub fn is_subscribable_event_type(event_type: &str) -> bool {
+    VALID_EVENT_TYPES.contains(&event_type)
+        || EXTENSION_EVENT_TYPES
+            .get()
+            .is_some_and(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()).contains(&event_type))
+}
+
 /// The default subscription for a new (or pre-column) webhook: both alert
 /// streams, no cases. Mirrors migration 217's column default so the Rust default
 /// and the SQL default never drift.
@@ -43,13 +91,14 @@ pub fn default_event_types() -> Vec<String> {
 }
 
 /// Map an `alerts.kind` discriminator to the webhook subscription category that
-/// gates it. `detection` and `risk_notable` → SIEM (both are security-analyst
+/// gates it. `detection`, `risk_notable` and `hunt_finding` → SIEM (security-analyst
 /// alert streams; risk notables aggregate detection-rule risk, NAN-1792);
 /// everything else (`metric_monitor`, `slo`, `synthetic`) is observability.
 /// Centralized so the fire site and any future alert kind agree on the mapping.
 pub fn alert_kind_to_event_type(kind: &str) -> &'static str {
     match kind {
-        "detection" | "risk_notable" => EVENT_TYPE_SIEM_ALERT,
+        // NAN-5577: a hunt finding is security content, never an obs alert.
+        "detection" | "risk_notable" | "hunt_finding" => EVENT_TYPE_SIEM_ALERT,
         _ => EVENT_TYPE_OBS_ALERT,
     }
 }
@@ -399,13 +448,15 @@ fn validate_event_types(event_types: Option<&[String]>) -> Result<(), String> {
     if let Some(types) = event_types {
         if types.is_empty() {
             return Err(format!(
-                "event_types cannot be empty; specify at least one of {VALID_EVENT_TYPES:?} (omit the field to keep the default)"
+                "event_types cannot be empty; specify at least one of {:?} (omit the field to keep the default)",
+                subscribable_event_types()
             ));
         }
         for t in types {
-            if !VALID_EVENT_TYPES.contains(&t.as_str()) {
+            if !is_subscribable_event_type(t) {
                 return Err(format!(
-                    "invalid event_type '{t}'; expected one of {VALID_EVENT_TYPES:?}"
+                    "invalid event_type '{t}'; expected one of {:?}",
+                    subscribable_event_types()
                 ));
             }
         }
@@ -530,6 +581,92 @@ pub struct WebhookPayload {
     /// Stable logical-delivery key for downstream idempotency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// A short, bounded, human-readable summary of the event (extension
+    /// events, [`ExtensionEvent`]). Never raw event text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Bounded label → value facts rendered by every channel formatter
+    /// (extension events). Absent for alerts / cases / reports / health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Facts an extension event carries at most, and the bounds on each.
+pub const MAX_EXTENSION_DETAILS: usize = 16;
+pub const MAX_EXTENSION_DETAIL_CHARS: usize = 300;
+pub const MAX_EXTENSION_SUMMARY_CHARS: usize = 1_000;
+
+/// An event of an extension-registered stream ([`register_extension_event_types`]).
+/// The extension decides the content; the core bounds it and routes it with
+/// the same subscription, severity filter, formatters, delivery spine and
+/// delivery log as every other stream.
+#[derive(Debug, Clone)]
+pub struct ExtensionEvent {
+    /// The subscription stream (a registered name).
+    pub stream: &'static str,
+    /// The fine-grained event name, e.g. `thing.happened`.
+    pub event_type: String,
+    /// The card title.
+    pub title: String,
+    /// `critical` | `high` | `medium` | `low` | `informational`: drives the
+    /// severity filter and the formatters' colors.
+    pub severity: String,
+    pub entity: Option<String>,
+    /// The nano UI path the "View in nano" link opens (no leading slash).
+    pub link_path: Option<String>,
+    pub summary: Option<String>,
+    /// Label → value facts, in order of the key.
+    pub details: std::collections::BTreeMap<String, String>,
+    /// A stable logical-delivery key.
+    pub idempotency_key: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+fn bounded(value: &str, max: usize) -> String {
+    let one_line: String = value.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        let kept: String = one_line.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+impl ExtensionEvent {
+    /// The payload every channel renders: title in `rule_name`, severity,
+    /// entity, link, plus the bounded `summary` and `details`.
+    pub fn to_payload(&self, link_url: Option<String>) -> WebhookPayload {
+        let details: std::collections::BTreeMap<String, String> = self
+            .details
+            .iter()
+            .take(MAX_EXTENSION_DETAILS)
+            .map(|(k, v)| (bounded(k, 60), bounded(v, MAX_EXTENSION_DETAIL_CHARS)))
+            .collect();
+        WebhookPayload {
+            event_type: bounded(&self.event_type, 80),
+            kind: Some(self.stream.to_string()),
+            alert_id: None,
+            rule_id: None,
+            rule_name: Some(bounded(&self.title, 200)),
+            severity: Some(self.severity.clone()),
+            entity: self.entity.as_deref().map(|e| bounded(e, 300)),
+            link_url,
+            matched_event_count: None,
+            matched_events: None,
+            created_at: self.created_at,
+            health_event_id: None,
+            health_status: None,
+            health_category: None,
+            health_resource_type: None,
+            health_resource_id: None,
+            health_summary: None,
+            health_diagnostic_context: None,
+            health_remediation: None,
+            idempotency_key: self.idempotency_key.clone(),
+            summary: self.summary.as_deref().map(|s| bounded(s, MAX_EXTENSION_SUMMARY_CHARS)),
+            details: (!details.is_empty()).then_some(details),
+        }
+    }
 }
 
 /// Result of a test delivery

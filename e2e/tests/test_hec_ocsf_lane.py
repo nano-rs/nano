@@ -17,14 +17,13 @@ agree; `metadata.log_source="unknown"` must not find it.
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from nano_e2e import feeds_live, ingest
+from nano_e2e import feeds_live, ingest, schema
 from nano_e2e.client import Nano
 from nano_e2e.feeds_live import OKTA_PARSER, row_get
 from nano_e2e.stack import Stack
@@ -59,8 +58,8 @@ def _okta_deactivate(event_uuid: str, login: str) -> dict:
 
 
 def test_connector_hec_event_lands_on_its_lane(stack: Stack, nano: Nano, mark: str, timeline) -> None:
-    if not os.environ.get("NANO_SCHEMA_PROFILE", "udm").startswith("ocsf"):
-        pytest.skip("the lane is an OCSF field: needs an ocsf stack (`scripts/e2e.sh up` with NANO_SCHEMA_PROFILE=ocsf)")
+    if not schema.is_ocsf():
+        pytest.skip("the lane is an OCSF field: this stack is udm, not the ocsf default")
     source_id = feeds_live.ensure_vendor_parser(nano, OKTA_PARSER)
     timeline.step("okta_ocsf published", source=source_id, lanes=OKTA_PARSER.lanes)
     timeline.step("vector reloads settled", waited=round(vector_reloads_quiet(stack.project)))

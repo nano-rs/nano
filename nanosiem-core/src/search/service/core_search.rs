@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::auth::ScopeSet;
-use crate::search::query_processing::enforce_source_scope;
 
 /// The asset view is a single synthetic row carrying the real event total in
 /// `_asset_pagination.total_count`. Lift it so `SearchResponse.total_count`
@@ -612,10 +611,16 @@ impl SearchService {
     #[instrument(skip(self, scope), fields(query = %request.query))]
     pub async fn search(
         &self,
-        request: SearchRequest,
+        mut request: SearchRequest,
         scope: &ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
+        // NAN-5612: a leading `dataset=<name>` in the text selects the dataset
+        // (dashboard panels, saved searches, AI queries carry only text).
+        let (selected_query, selected_dataset) =
+            crate::search::query_processing::resolve_dataset_selector(&request.query, request.dataset.as_deref())?;
+        request.query = selected_query;
+        request.dataset = selected_dataset;
 
         // Read query safety limits (hot-reloadable from DB settings)
         let query_limits = self.query_limits.read().await.clone();
@@ -647,7 +652,12 @@ impl SearchService {
         // the cloud view builder all derive from `cleaned_query`, so a single
         // injection here gates every scan this search fans out to. Empty
         // deny-set returns the text unchanged (byte-identical).
-        let cleaned_query = enforce_source_scope(&cleaned_query, scope.deny_set())?;
+        // NAN-5612: the dataset permission check rides the same gate.
+        let cleaned_query = crate::search::query_processing::enforce_viewer_scope(
+            &cleaned_query,
+            request.dataset.as_deref(),
+            scope,
+        )?;
 
         // Adjust time range based on modifiers (NAN-4288: one side each; an
         // empty result is a 400, not an inverted window).
@@ -955,12 +965,26 @@ impl SearchService {
             // the post-processing prevalence path instead (correct results;
             // only the pushdown optimization is skipped). The explain path
             // applies the SAME condition so "Inspect SQL" matches execution.
-            && !super::touches_risk_dataset(request.dataset.as_deref(), &request.query);
+            && !super::touches_risk_dataset(request.dataset.as_deref(), &request.query)
+            // NAN-5612: likewise for the derived signals source (the pushdown's
+            // base scan is the tenant logs generator).
+            && !super::touches_signals_dataset(request.dataset.as_deref(), &request.query);
 
         // NAN-1798 P2: prevalence is a logs-artifact concept (hash/domain/ip
         // host-counts). The derived risk grain has no artifact columns, so the
         // post-processing fallback would silently pass every entity through
         // the filter and decorate nothing — reject loudly instead.
+        if !prevalence_commands.is_empty()
+            && crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs"))
+                == crate::query::Dataset::Signals
+        {
+            // NAN-5612: the detections grain has no artifact columns either.
+            return Err(SearchError::PrevalenceError(
+                "prevalence operates on log artifacts (hashes, domains, IPs) and is not supported \
+                 on dataset=signals. Search the matched events instead."
+                    .to_string(),
+            ));
+        }
         if !prevalence_commands.is_empty()
             && crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs"))
                 == crate::query::Dataset::Risk
@@ -1276,6 +1300,7 @@ impl SearchService {
                 // their explicit input caps.
                 limit: sql_limit_plan.generator_limit,
                 unordered: false,
+                omit_settings: false,
             };
             // Apply current query safety limits to the SQL generator.
             let mut ch_gen = self
@@ -1445,6 +1470,10 @@ impl SearchService {
             && !is_baseline_query
             && !request.skip_field_stats
             && request_dataset != crate::query::Dataset::Risk
+            // NAN-5612: the signals base source is a derived union with no
+            // `system.columns` inventory either; the client-side fallback
+            // computes exact stats over the result set.
+            && request_dataset != crate::query::Dataset::Signals
             && self.ch_sql_generator.pipeline_output_is_wide(&query_for_sql);
 
         let (mut results, total_count, server_field_stats) = {

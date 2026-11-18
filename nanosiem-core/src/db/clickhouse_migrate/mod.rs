@@ -48,10 +48,13 @@ pub use schema_profile_guard::{
     check_unset_profile_against_install, classify_installed_logs_schema, InstalledLogsSchema,
 };
 pub use agentlane::{
-    agentlane_settings_from_env, AgentlaneEnv, AgentlaneOutcome, AgentlaneSettings,
-    NodeCredentials, AGENTLANE_PROFILE, AGENTLANE_ROLE, AGENTLANE_WORKLOAD,
-    MAX_BYTES_TO_READ_ENV, MAX_CONCURRENT_THREADS_ENV, MAX_MEMORY_PER_TOKEN_ENV, MAX_ROWS_TO_READ_ENV,
-    WORKLOAD_MAX_MEMORY_ENV,
+    agentlane_settings_from_env, agentlane_table_names, AgentlaneEnv, AgentlaneOutcome, AgentlaneSettings,
+    NodeCredentials, AGENTLANE_INTERNAL_PROFILE, AGENTLANE_INTERNAL_WORKLOAD, AGENTLANE_PROFILE,
+    AGENTLANE_ROLE, AGENTLANE_WORKLOAD, INTERNAL_MAX_CONCURRENT_THREADS_ENV,
+    INTERNAL_WORKLOAD_MAX_MEMORY_ENV, MAX_BYTES_TO_READ_ENV, MAX_CONCURRENT_THREADS_ENV,
+    MAX_MEMORY_PER_TOKEN_ENV, MAX_ROWS_TO_READ_ENV, WORKLOAD_MAX_MEMORY_ENV,
+    derived_workload_max_memory, internal_workload_statement, workload_statement,
+    DEFAULT_INTERNAL_MAX_CONCURRENT_THREADS, DEFAULT_MAX_CONCURRENT_THREADS, MIN_WORKLOAD_MAX_MEMORY,
 };
 pub use dict_source_user::{
     DICT_SOURCE_DEFAULT_USER, DICT_SOURCE_DICTIONARIES, DICT_SOURCE_MIGRATION_FILE,

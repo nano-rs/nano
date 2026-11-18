@@ -134,6 +134,17 @@ pub async fn panel_query(
         // addition, matching the retro/search paths.
         ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
+        // NAN-5612: resolve a leading `dataset=<name>` token (how a stored panel
+        // targets signals / risk / spans / metrics) and run the dataset
+        // permission check BEFORE the result-cache lookup below, so a cached
+        // signals result is never served to a viewer without detections:view.
+        // The service runs the same check again on execution.
+        let (query, dataset) = nanosiem_core::search::query_processing::resolve_dataset_selector(
+            &query,
+            request.dataset.as_deref(),
+        )?;
+        nanosiem_core::search::service::check_dataset_access(&scope, dataset.as_deref(), &query)?;
+
         // NAN-1799: the piped audit + per-source gate is applied by the service,
         // which injects the composed deny-set (`&scope`) into the query AST. The
         // handler no longer runs its own `enforce_non_audit_query` rewrite — the
@@ -162,7 +173,7 @@ pub async fn panel_query(
             request_id: None,
             async_mode: false,
             priority: None,
-            dataset: None,
+            dataset,
         };
 
         // NAN-708: parse once, then (a) reject surface-bound commands

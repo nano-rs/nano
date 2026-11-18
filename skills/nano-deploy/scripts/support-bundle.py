@@ -114,7 +114,7 @@ PATTERNS = [
 ]
 
 # Secret despite a non-secret-looking suffix: object-store access key ids (an
-# access key id is half of the credential pair, NAN-5445 storage tiering).
+# access key id is half of the credential pair for storage tiering).
 ALWAYS_SECRET_KEYS = frozenset({
     "NANO_TIERING_ACCESS_KEY_ID",
     "NANO_TIERING_SECRET_ACCESS_KEY",

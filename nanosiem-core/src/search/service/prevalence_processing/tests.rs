@@ -297,31 +297,35 @@ mod first_seen_comparison {
 
 // ---------------------------------------------------------------------------
 // NAN-1705 (D4b): rescue plumbing — probe row filtering, probe SQL shape, and
-// the `transform(...)` projection rewrite that makes a rescued dict-blind
-// artifact's host_count / first_seen / … TRUE in-SQL (so the pushed predicate,
-// the decoration CASEs, and any downstream `| where host_count < N` all agree).
+// the projection rewrite that makes a rescued dict-blind artifact's
+// host_count / first_seen / … TRUE in-SQL (so the pushed predicate, the
+// decoration CASEs, and any downstream `| where host_count < N` all agree).
+// NAN-5565: keys are written once (a `transform` index) and every rescued
+// artifact is inlined; the executor lifts `max_query_size` when needed.
 // ---------------------------------------------------------------------------
 mod rescue {
     use super::super::{
-        build_prevalence_rescue_probe_sql, filter_rescued_artifacts, rescue_transform_sql,
-        RescueAttr, RescuedArtifact, PREVALENCE_RESCUE_MAX_ARTIFACTS,
-        PREVALENCE_RESCUE_MISS_KEY_CAP,
+        build_prevalence_rescue_probe_sql, filter_rescued_artifacts, rescue_index_sql,
+        rescue_value_sql, PrevalenceRescue, RescueAttr, RescuedArtifact,
+        PREVALENCE_RESCUE_MAX_ARTIFACTS, PREVALENCE_RESCUE_MISS_KEY_CAP,
     };
     use crate::query::{
         PrevalenceCondition, PrevalenceField, PrevalenceOperator, PrevalenceThreshold,
     };
     use serde_json::json;
 
-    // NAN-1723: the probe SQL SELECTs the timestamps as `fs_raw`/`ls_raw`, and
-    // that is what a row looks like AFTER `execute_dynamic_query`'s
-    // `convert_timestamps_to_iso8601` runs (those names are outside its list, so
-    // the space format is preserved). Mock rows must use the same keys.
+    /// 2026-07-06 10:00:00 UTC / 10:05:00.123456 UTC as epoch microseconds.
+    const FS_US: i64 = 1_783_332_000_000_000;
+    const LS_US: i64 = 1_783_332_300_123_456;
+
+    // A row exactly as the probe SQL emits it after `execute_dynamic_query`'s
+    // post-processing (`fs_us`/`ls_us` are outside the timestamp normaliser).
     fn probe_row(artifact: &str, host_count: u64) -> serde_json::Value {
         json!({
             "artifact": artifact,
             "host_count": host_count,
-            "fs_raw": "2026-07-06 10:00:00.000000",
-            "ls_raw": "2026-07-06 10:05:00.000000",
+            "fs_us": FS_US,
+            "ls_us": LS_US,
             "total_occurrences": 4,
         })
     }
@@ -338,8 +342,8 @@ mod rescue {
         RescuedArtifact {
             artifact: artifact.to_string(),
             host_count,
-            first_seen: "2026-07-06 10:00:00.000000".to_string(),
-            last_seen: "2026-07-06 10:05:00.000000".to_string(),
+            first_seen_us: FS_US,
+            last_seen_us: LS_US,
             total_occurrences: 4,
         }
     }
@@ -382,8 +386,8 @@ mod rescue {
         let rows = vec![json!({
             "artifact": "q",
             "host_count": "2",
-            "fs_raw": "2026-07-06 10:00:00.000000",
-            "ls_raw": "2026-07-06 10:05:00.000000",
+            "fs_us": FS_US.to_string(),
+            "ls_us": LS_US.to_string(),
             "total_occurrences": "17",
         })];
         let conds = [lte(5)];
@@ -392,6 +396,8 @@ mod rescue {
         assert_eq!(rescued.len(), 1);
         assert_eq!(rescued[0].host_count, 2);
         assert_eq!(rescued[0].total_occurrences, 17);
+        assert_eq!(rescued[0].first_seen_us, FS_US);
+        assert_eq!(rescued[0].last_seen_us, LS_US);
     }
 
     #[test]
@@ -422,62 +428,38 @@ mod rescue {
         assert!(sql.contains(&format!("LIMIT {}", PREVALENCE_RESCUE_MAX_ARTIFACTS + 1)));
         // No extra summary filter for hash (empty arg).
         assert!(sql.contains("WHERE file_hash IN ("));
-        // NAN-1723: the outer timestamp aliases MUST be fs_raw/ls_raw (NOT
-        // first_seen/last_seen) so `execute_dynamic_query`'s normaliser leaves
-        // the space format intact for `toDateTime64`.
-        assert!(sql.contains("toString(_fs) AS fs_raw"), "probe must alias first_seen away from the normaliser: {sql}");
-        assert!(sql.contains("toString(_ls) AS ls_raw"));
+        // NAN-1723 / NAN-5565: the timestamps leave the probe as epoch-µs
+        // integers under names the executor's normaliser never rewrites.
+        assert!(sql.contains("toUnixTimestamp64Micro(_fs) AS fs_us"), "{sql}");
+        assert!(sql.contains("toUnixTimestamp64Micro(_ls) AS ls_us"), "{sql}");
         assert!(!sql.contains("AS first_seen"), "outer alias must not be `first_seen`: {sql}");
         assert!(!sql.contains("AS last_seen"), "outer alias must not be `last_seen`: {sql}");
     }
 
-    /// NAN-1723 regression: the rescue timestamps must survive
-    /// `execute_dynamic_query`'s `convert_timestamps_to_iso8601` post-processor
-    /// and yield a `toDateTime64` literal ClickHouse can actually parse. The
-    /// previous `first_seen`/`last_seen` aliases were rewritten to rfc3339
-    /// (`…T…Z`), which `toDateTime64('…', 6)` rejects → the whole rescued
-    /// detection query 500'd. This test drives the REAL normaliser (not a
-    /// hand-built RescuedArtifact) so the regression can't hide behind a mock.
+    /// NAN-1723 regression, re-pinned for NAN-5565: the rescue timestamps must
+    /// survive `execute_dynamic_query`'s `convert_timestamps_to_iso8601` (which
+    /// rewrote `first_seen`/`last_seen` strings to an rfc3339 form
+    /// `toDateTime64` rejected) and reach the projection as integers.
     #[test]
     fn rescue_timestamps_survive_executor_normaliser() {
         use crate::search::evaluator::helpers::convert_timestamps_to_iso8601;
 
-        // Row exactly as the probe SQL emits it, before the executor post-processes it.
-        let mut row = json!({
-            "artifact": "abc123",
-            "host_count": 1,
-            "fs_raw": "2026-07-06 10:00:00.000000",
-            "ls_raw": "2026-07-06 10:05:00.000000",
-            "total_occurrences": 4,
-        });
+        let mut row = probe_row("abc123", 1);
         convert_timestamps_to_iso8601(row.as_object_mut().unwrap());
+        assert_eq!(row["fs_us"], FS_US);
+        assert_eq!(row["ls_us"], LS_US);
 
-        // fs_raw/ls_raw are outside the normaliser's field list → untouched space format.
-        assert_eq!(row["fs_raw"], "2026-07-06 10:00:00.000000");
-        assert_eq!(row["ls_raw"], "2026-07-06 10:05:00.000000");
-
-        // Guard: the OLD alias names WOULD be corrupted to the unparseable rfc3339
-        // form — this is exactly the NAN-1723 failure the rename avoids.
-        let mut legacy = json!({ "first_seen": "2026-07-06 10:00:00.000000" });
-        convert_timestamps_to_iso8601(legacy.as_object_mut().unwrap());
-        assert_eq!(legacy["first_seen"], "2026-07-06T10:00:00.000000Z");
-
-        // End-to-end: filter → transform literal must be a parseable toDateTime64
-        // (space format, NO `T`/`Z`).
         let conds = [lte(5)];
         let cond_refs: Vec<&PrevalenceCondition> = conds.iter().collect();
         let rescued = filter_rescued_artifacts(vec![row], &cond_refs);
         assert_eq!(rescued.len(), 1);
-        assert_eq!(rescued[0].first_seen, "2026-07-06 10:00:00.000000");
-        assert_eq!(rescued[0].last_seen, "2026-07-06 10:05:00.000000");
+        assert_eq!(rescued[0].first_seen_us, FS_US);
+        assert_eq!(rescued[0].last_seen_us, LS_US);
 
         for attr in [RescueAttr::FirstSeen, RescueAttr::LastSeen] {
-            let sql = rescue_transform_sql("<BASE>", "ifNull(_hash_lookup, '')", &rescued, attr);
-            // Space-format literal present; no rfc3339 `T`-separator or `Z`-suffix
-            // inside the quoted timestamp (the exact CANNOT_PARSE_TEXT signature).
-            assert!(sql.contains("toDateTime64('2026-07-06 10:0"), "space-format literal expected: {sql}");
-            assert!(!sql.contains("2026-07-06T"), "no rfc3339 T-separator in the literal: {sql}");
-            assert!(!sql.contains(".000000Z"), "no rfc3339 Z-suffix in the literal: {sql}");
+            let sql = rescue_value_sql("<BASE>", "_hp_rescue_idx", &rescued, attr);
+            assert!(sql.contains("fromUnixTimestamp64Micro(arrayElement(CAST(["), "{sql}");
+            assert!(!sql.contains("toDateTime64('"), "no string timestamp literal: {sql}");
         }
     }
 
@@ -503,93 +485,98 @@ mod rescue {
     }
 
     // -----------------------------------------------------------------------
-    // transform() projection rewrite — the core of the downstream-decoration
-    // fix. A rescued key must resolve to its fresh value IN-SQL so every
-    // reference (predicate, decoration CASE, `| where host_count`) sees it.
+    // Projection rewrite — the core of the downstream-decoration fix. A
+    // rescued key must resolve to its fresh value IN-SQL so every reference
+    // (predicate, decoration CASE, `| where host_count`) sees it.
     // -----------------------------------------------------------------------
 
     #[test]
     fn empty_rescue_returns_base_expr_byte_identical() {
         // The whole-query byte-identity invariant: with no rescued artifacts the
-        // projection is the plain dict expression, unchanged.
+        // projection is the plain dict expression and no index column exists.
         let base = "if(dictGetOrDefault('d', 'last_seen', k, toDateTime64(0, 6)) >= now(), \
                     dictGetOrDefault('d', 'host_count', k, toUInt16(9999)), toUInt16(9999))";
         assert_eq!(
-            rescue_transform_sql(base, "ifNull(_hash_lookup, '')", &[], RescueAttr::HostCount),
+            rescue_value_sql(base, "_hp_rescue_idx", &[], RescueAttr::HostCount),
             base
         );
         assert_eq!(
-            rescue_transform_sql(
+            rescue_value_sql(
                 "dictGetOrDefault('d', 'first_seen', k, toDateTime64(0, 6))",
-                "ifNull(_domain_lookup, '')",
+                "_dp_rescue_idx",
                 &[],
                 RescueAttr::FirstSeen
             ),
             "dictGetOrDefault('d', 'first_seen', k, toDateTime64(0, 6))"
         );
+        assert_eq!(rescue_index_sql("ifNull(_hash_lookup, '')", &[]), None);
     }
 
     #[test]
-    fn host_count_transform_maps_rescued_key_to_uint16() {
-        let sql = rescue_transform_sql(
-            "<BASE>",
-            "ifNull(_hash_lookup, '')",
-            &[rescued("abc123", 1), rescued("def456", 3)],
-            RescueAttr::HostCount,
+    fn index_and_value_projections_have_the_exact_shape() {
+        let set = [rescued("abc123", 1), rescued("def456", 3)];
+        assert_eq!(
+            rescue_index_sql("ifNull(_hash_lookup, '')", &set).unwrap(),
+            "transform(ifNull(_hash_lookup, ''), ['abc123', 'def456'], range(1, 3), 0)"
         );
         assert_eq!(
-            sql,
-            "transform(ifNull(_hash_lookup, ''), ['abc123', 'def456'], [toUInt16(1), toUInt16(3)], <BASE>)"
-        );
-    }
-
-    #[test]
-    fn first_and_last_seen_transform_emit_datetime64_literals() {
-        let fs = rescue_transform_sql(
-            "<BASE_FS>",
-            "ifNull(_domain_lookup, '')",
-            &[rescued("evil.example.com", 2)],
-            RescueAttr::FirstSeen,
+            rescue_value_sql("<BASE>", "_hp_rescue_idx", &set, RescueAttr::HostCount),
+            "if(_hp_rescue_idx = 0, <BASE>, arrayElement(CAST([1, 3], 'Array(UInt16)'), _hp_rescue_idx))"
         );
         assert_eq!(
-            fs,
-            "transform(ifNull(_domain_lookup, ''), ['evil.example.com'], [toDateTime64('2026-07-06 10:00:00.000000', 6)], <BASE_FS>)"
-        );
-        let occ = rescue_transform_sql(
-            "<BASE_OCC>",
-            "ifNull(_hash_lookup, '')",
-            &[rescued("abc123", 1)],
-            RescueAttr::TotalOccurrences,
+            rescue_value_sql("<BASE_FS>", "_hp_rescue_idx", &set, RescueAttr::FirstSeen),
+            format!(
+                "if(_hp_rescue_idx = 0, <BASE_FS>, fromUnixTimestamp64Micro(arrayElement(CAST([{FS_US}, {FS_US}], 'Array(Int64)'), _hp_rescue_idx)))"
+            )
         );
         assert_eq!(
-            occ,
-            "transform(ifNull(_hash_lookup, ''), ['abc123'], [toUInt64(4)], <BASE_OCC>)"
+            rescue_value_sql("<BASE_OCC>", "_hp_rescue_idx", &set, RescueAttr::TotalOccurrences),
+            "if(_hp_rescue_idx = 0, <BASE_OCC>, arrayElement(CAST([4, 4], 'Array(UInt64)'), _hp_rescue_idx))"
         );
     }
 
+    /// Semantic alignment: position p of the key array and position p of
+    /// every value array describe the SAME artifact, for an unsorted set of
+    /// mixed rarity, and the index column numbers the keys 1..=n.
     #[test]
-    fn transform_default_preserves_the_base_dict_expr() {
-        // A NON-rescued key must fall through to the original dict-with-window-mask
-        // lookup (the transform default), so behavior for everything the dict
-        // already knew is unchanged.
-        let base = "if(dictGetOrDefault('d','last_seen',k,toDateTime64(0,6)) >= now(), dictGetOrDefault('d','host_count',k,toUInt16(9999)), toUInt16(9999))";
-        let sql = rescue_transform_sql(
-            base,
-            "ifNull(_hash_lookup, '')",
-            &[rescued("abc123", 1)],
-            RescueAttr::HostCount,
-        );
-        assert!(sql.ends_with(&format!("{base})")), "base expr must be the transform default: {sql}");
+    fn rescued_values_stay_aligned_with_their_keys() {
+        fn array_items(sql: &str) -> Vec<String> {
+            let open = sql.find('[').unwrap();
+            let close = sql[open..].find(']').unwrap() + open;
+            sql[open + 1..close]
+                .split(", ")
+                .map(|s| s.trim_matches('\'').to_string())
+                .collect()
+        }
+        let hashes: Vec<RescuedArtifact> = (0..300u64)
+            .map(|i| RescuedArtifact {
+                artifact: format!("{:064x}", i * 7919 + 1),
+                host_count: (i * 37) % 900 + 1,
+                first_seen_us: FS_US + i as i64,
+                last_seen_us: LS_US + 2 * i as i64,
+                total_occurrences: 1000 + i,
+            })
+            .collect();
+        let index = rescue_index_sql("k", &hashes).unwrap();
+        assert!(index.ends_with(", range(1, 301), 0)"), "{index}");
+        let keys = array_items(&index);
+        let hc = array_items(&rescue_value_sql("B", "i", &hashes, RescueAttr::HostCount));
+        let fs = array_items(&rescue_value_sql("B", "i", &hashes, RescueAttr::FirstSeen));
+        let ls = array_items(&rescue_value_sql("B", "i", &hashes, RescueAttr::LastSeen));
+        let occ = array_items(&rescue_value_sql("B", "i", &hashes, RescueAttr::TotalOccurrences));
+        assert_eq!(keys.len(), hashes.len());
+        for (p, key) in keys.iter().enumerate() {
+            let src = hashes.iter().find(|r| &r.artifact == key).unwrap();
+            assert_eq!(hc[p], src.host_count.to_string(), "host_count of {key}");
+            assert_eq!(fs[p], src.first_seen_us.to_string(), "first_seen of {key}");
+            assert_eq!(ls[p], src.last_seen_us.to_string(), "last_seen of {key}");
+            assert_eq!(occ[p], src.total_occurrences.to_string(), "occurrences of {key}");
+        }
     }
 
     #[test]
-    fn transform_keys_are_sql_escaped() {
-        let sql = rescue_transform_sql(
-            "<BASE>",
-            "ifNull(_hash_lookup, '')",
-            &[rescued("it's'); DROP--", 1)],
-            RescueAttr::HostCount,
-        );
+    fn rescue_keys_are_sql_escaped() {
+        let sql = rescue_index_sql("k", &[rescued("it's'); DROP--", 1)]).unwrap();
         assert!(
             sql.contains("['it''s''); DROP--']"),
             "single quotes must be doubled, got: {sql}"
@@ -597,11 +584,11 @@ mod rescue {
     }
 
     #[test]
-    fn transform_stays_out_of_aggregation_sniffing() {
+    fn rescue_projection_stays_out_of_aggregation_sniffing() {
         // The executor routes raw-vs-aggregation on token sniffing
         // (`is_aggregation_query` in execution/clickhouse_executor/sql_helpers.rs:
-        // GROUP BY / COUNT( / MAX( / …). The transform-wrapped projection must
-        // never introduce such a token into the MAIN query or every filter-form
+        // GROUP BY / COUNT( / MAX( / …). The rescue projection must never
+        // introduce such a token into the MAIN query or every filter-form
         // prevalence search would flip into the full-materialization count(*)
         // OVER () branch. (The probe SQL, which does aggregate, runs outside the
         // paginated executor.) Token list mirrored from is_aggregation_query.
@@ -609,26 +596,23 @@ mod rescue {
             "GROUP BY", "COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "UNIQ(", "QUANTILE(", "TOPK(",
             "ARGMAX(", "ARGMIN(",
         ];
-        // A benign base expr (no agg tokens) + a rescued list → the wrapper must
-        // add only `transform(...)`, `toUInt16(...)`, literals.
         let base = "if(dictGetOrDefault('d','last_seen',k,toDateTime64(0,6)) >= now(), dictGetOrDefault('d','host_count',k,toUInt16(9999)), toUInt16(9999))";
+        let set = [rescued("abc123", 1), rescued("def456", 3)];
+        let mut sqls = vec![rescue_index_sql("ifNull(_hash_lookup, '')", &set).unwrap()];
         for attr in [
             RescueAttr::HostCount,
             RescueAttr::FirstSeen,
             RescueAttr::LastSeen,
             RescueAttr::TotalOccurrences,
         ] {
-            let sql = rescue_transform_sql(
-                base,
-                "ifNull(_hash_lookup, '')",
-                &[rescued("abc123", 1), rescued("def456", 3)],
-                attr,
-            )
-            .to_uppercase();
+            sqls.push(rescue_value_sql(base, "_hp_rescue_idx", &set, attr));
+        }
+        for sql in sqls {
+            let upper = sql.to_uppercase();
             for token in SNIFFED_TOKENS {
                 assert!(
-                    !sql.contains(token),
-                    "transform projection must not trip aggregation sniffing on {token}: {sql}"
+                    !upper.contains(token),
+                    "rescue projection must not trip aggregation sniffing on {token}: {sql}"
                 );
             }
         }
@@ -645,6 +629,53 @@ mod rescue {
         let cond_refs: Vec<&PrevalenceCondition> = conds.iter().collect();
         let rescued = filter_rescued_artifacts(rows, &cond_refs);
         assert_eq!(rescued.len(), PREVALENCE_RESCUE_MAX_ARTIFACTS);
+    }
+
+    /// NAN-5565: past the inlined-key byte cap the LEAST-rare artifacts go,
+    /// across entity types, and the count is recorded for the PARTIAL report.
+    #[test]
+    fn key_byte_cap_drops_the_least_rare_and_records_how_many() {
+        let set = |prefix: &str, base: u64| -> Vec<RescuedArtifact> {
+            (0..100usize)
+                .map(|i| RescuedArtifact {
+                    host_count: base + (i as u64 % 7),
+                    ..rescued(&format!("{prefix}{i:060}"), 0)
+                })
+                .collect()
+        };
+        let mut rescue = PrevalenceRescue {
+            hashes: set("h", 1),
+            domains: set("d", 4),
+            ips: set("i", 1),
+            ..Default::default()
+        };
+        let original = rescue.clone();
+        let cap = rescue.key_bytes() / 2;
+        let dropped = rescue.cap_key_bytes(cap);
+        assert!(dropped > 0);
+        assert_eq!(rescue.dropped, dropped);
+        assert_eq!(rescue.len() + dropped, original.len());
+        assert!(rescue.key_bytes() <= cap);
+        let kept: Vec<&RescuedArtifact> =
+            rescue.hashes.iter().chain(&rescue.domains).chain(&rescue.ips).collect();
+        let max_kept = kept.iter().map(|r| r.host_count).max().unwrap();
+        for r in original.hashes.iter().chain(&original.domains).chain(&original.ips) {
+            if !kept.iter().any(|k| k.artifact == r.artifact) {
+                assert!(r.host_count >= max_kept, "dropped {} rarer than a kept one", r.artifact);
+            }
+        }
+        // Under the cap nothing changes.
+        let mut whole = original.clone();
+        assert_eq!(whole.cap_key_bytes(usize::MAX), 0);
+        assert_eq!(whole.len(), original.len());
+    }
+
+    /// NAN-5565: the rescued-artifact cap can never drop an artifact the probe
+    /// examined. One type's rescued set is a subset of its distinct
+    /// dict-missed keys, which the probe already bounds at the miss-key cap.
+    #[test]
+    fn rescue_cap_is_the_probe_bound_so_no_examined_artifact_is_dropped() {
+        assert_eq!(PREVALENCE_RESCUE_MAX_ARTIFACTS, PREVALENCE_RESCUE_MISS_KEY_CAP);
     }
 }
 

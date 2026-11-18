@@ -109,6 +109,8 @@ fn alert_kind_maps_to_correct_category() {
         alert_kind_to_event_type("risk_notable"),
         EVENT_TYPE_SIEM_ALERT
     );
+    // NAN-5577: a hunt finding is security content.
+    assert_eq!(alert_kind_to_event_type("hunt_finding"), EVENT_TYPE_SIEM_ALERT);
     assert_eq!(
         alert_kind_to_event_type("metric_monitor"),
         EVENT_TYPE_OBS_ALERT
@@ -253,6 +255,8 @@ fn alert_payload_carries_completeness_fields_and_omits_none() {
         health_diagnostic_context: None,
         health_remediation: None,
         idempotency_key: None,
+        summary: None,
+        details: None,
     };
 
     let v = serde_json::to_value(&payload).unwrap();
@@ -643,6 +647,8 @@ fn payload_omits_none_optional_fields() {
         health_diagnostic_context: None,
         health_remediation: None,
         idempotency_key: None,
+        summary: None,
+        details: None,
     };
     let v = serde_json::to_value(&payload).unwrap();
     let obj = v.as_object().unwrap();
@@ -783,4 +789,123 @@ fn ui_link_cannot_escape_the_configured_origin() {
         link.starts_with("https://nano.example.com/"),
         "link stays on the configured origin: {link}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Extension-registered streams (NAN-5548): the generic seam an enterprise
+// surface uses without the core naming it.
+// ---------------------------------------------------------------------------
+
+fn extension_event(stream: &'static str, severity: &str) -> ExtensionEvent {
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("Confidence".to_string(), "0.92".to_string());
+    details.insert("Item".to_string(), "item_01abc".to_string());
+    ExtensionEvent {
+        stream,
+        event_type: "ext.happened".to_string(),
+        title: "Something escalated".to_string(),
+        severity: severity.to_string(),
+        entity: Some("host srv-01".to_string()),
+        link_path: Some("things/item_01abc".to_string()),
+        summary: Some("a short bounded rationale\nwith a newline".to_string()),
+        details,
+        idempotency_key: Some("ext:item_01abc".to_string()),
+        created_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+    }
+}
+
+#[test]
+fn an_extension_stream_is_subscribable_only_once_registered() {
+    const STREAM: &str = "ext_test_stream";
+    let req = || create_req(Some(vec![STREAM.to_string()]));
+    assert!(req().validate_event_types().is_err(), "unregistered streams are refused");
+    register_extension_event_types(&[STREAM, STREAM, "Bad-Name", "siem_alert", ""]);
+    assert!(req().validate_event_types().is_ok());
+    assert!(is_subscribable_event_type(STREAM));
+    assert!(!is_subscribable_event_type("Bad-Name"), "malformed names are ignored");
+    let all = subscribable_event_types();
+    assert_eq!(all.iter().filter(|t| **t == STREAM).count(), 1, "idempotent");
+    assert_eq!(all.iter().filter(|t| **t == "siem_alert").count(), 1, "a core name is not shadowed");
+    // Core streams are unaffected and a registered stream is opt-in.
+    assert!(!default_event_types().contains(&STREAM.to_string()));
+    assert!(webhook_with(vec![STREAM.to_string()]).subscribes_to(STREAM));
+    assert!(!webhook_with(default_event_types()).subscribes_to(STREAM));
+}
+
+#[test]
+fn extension_payload_is_bounded_and_flattened() {
+    let mut event = extension_event("ext_bounds", "high");
+    event.title = "t".repeat(500);
+    event.summary = Some("s".repeat(5_000));
+    for i in 0..40 {
+        event.details.insert(format!("k{i:02}"), "v".repeat(1_000));
+    }
+    let payload = event.to_payload(Some("https://nano.example/things/x".into()));
+    assert_eq!(payload.kind.as_deref(), Some("ext_bounds"));
+    assert!(payload.rule_name.unwrap().chars().count() <= 200);
+    assert!(payload.summary.as_ref().unwrap().chars().count() <= MAX_EXTENSION_SUMMARY_CHARS);
+    let details = payload.details.unwrap();
+    assert!(details.len() <= MAX_EXTENSION_DETAILS);
+    assert!(details.values().all(|v| v.chars().count() <= MAX_EXTENSION_DETAIL_CHARS));
+    assert!(payload.matched_events.is_none(), "an extension event never carries event bodies");
+    // Control characters are flattened, so a value cannot start a new line in a card.
+    let event = extension_event("ext_bounds", "high");
+    assert!(!event.to_payload(None).summary.unwrap().contains('\n'));
+}
+
+#[test]
+fn the_severity_filter_gates_extension_events_like_alerts() {
+    let mut w = webhook_with(vec!["x".into()]);
+    assert!(super::service::passes_severity_filter(&w, "low"));
+    w.severity_filter = Some(vec!["Critical".into(), "high".into()]);
+    assert!(super::service::passes_severity_filter(&w, "high"));
+    assert!(super::service::passes_severity_filter(&w, "critical"));
+    assert!(!super::service::passes_severity_filter(&w, "medium"));
+    w.severity_filter = Some(vec![]);
+    assert!(super::service::passes_severity_filter(&w, "informational"));
+}
+
+#[test]
+fn every_channel_formatter_renders_an_extension_event() {
+    use super::channels::{build_channel_body, FormatContext};
+    let payload = extension_event("ext_fmt", "high").to_payload(Some("https://nano.example/x".into()));
+    let ctx = FormatContext { routing_key: Some("rk") };
+    // Generic: the payload itself, signed, carrying summary + details.
+    let generic = build_channel_body(ChannelType::Generic, &payload, &ctx).unwrap();
+    assert!(generic.sign_hmac);
+    let g: serde_json::Value = serde_json::from_slice(&generic.bytes).unwrap();
+    assert_eq!(g["kind"], "ext_fmt");
+    assert_eq!(g["details"]["Item"], "item_01abc");
+    assert!(g["summary"].as_str().unwrap().contains("bounded rationale"));
+    // Slack: details as fields, summary as a section.
+    let slack: serde_json::Value =
+        serde_json::from_slice(&build_channel_body(ChannelType::Slack, &payload, &ctx).unwrap().bytes).unwrap();
+    let text = slack.to_string();
+    assert!(text.contains("*Item*") && text.contains("item_01abc"));
+    assert!(text.contains("bounded rationale"));
+    // Teams: details as facts.
+    let teams: serde_json::Value =
+        serde_json::from_slice(&build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap().bytes).unwrap();
+    let facts = teams["attachments"][0]["content"]["body"][1]["facts"].as_array().unwrap();
+    assert!(facts.iter().any(|f| f["title"] == "Confidence" && f["value"] == "0.92"));
+    // PagerDuty: details in custom_details, the event's key as dedup_key.
+    let pd: serde_json::Value =
+        serde_json::from_slice(&build_channel_body(ChannelType::PagerDuty, &payload, &ctx).unwrap().bytes).unwrap();
+    assert_eq!(pd["payload"]["custom_details"]["details"]["Item"], "item_01abc");
+    assert_eq!(pd["dedup_key"], "ext:item_01abc");
+    assert_eq!(pd["payload"]["severity"], "error");
+    // Email: the formatter seam renders the facts.
+    use super::channels::ChannelFormatter;
+    let email = super::channels::EmailFormatter.format(&payload, &ctx);
+    assert!(email["text"].as_str().unwrap().contains("Item: item_01abc"));
+}
+
+#[test]
+fn existing_payloads_serialize_byte_identically_without_extension_fields() {
+    let w = extension_event("ext_bytes", "low").to_payload(None);
+    let mut alert = w.clone();
+    alert.summary = None;
+    alert.details = None;
+    let json = serde_json::to_string(&alert).unwrap();
+    assert!(!json.contains("\"summary\"") && !json.contains("\"details\""));
 }

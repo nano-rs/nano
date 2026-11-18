@@ -35,6 +35,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ComponentType,
   type ReactNode,
 } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -60,10 +61,10 @@ import {
   Route as RouteIcon,
   Rss,
   Search as SearchIcon,
-  Sparkles,
   X,
   Zap,
 } from 'lucide-react';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 
 import { Button } from '@/components/ui/button';
 import { IssueCredentialPanel } from '@/components/add-data/IssueCredentialPanel';
@@ -2912,7 +2913,7 @@ function VrlPanel(props: VrlPanelProps) {
   const tabs: Array<{
     id: 'diag' | 'tests' | 'ai';
     label: string;
-    icon: typeof AlertTriangle;
+    icon: ComponentType<{ className?: string }>;
     count: number | null;
     tone: 'good' | 'warn' | 'danger' | null;
   }> = [
@@ -2935,7 +2936,7 @@ function VrlPanel(props: VrlPanelProps) {
       tone: tests.length > 0 && tests.every((t) => t.status === 'pass') ? 'good' : tests.length > 0 ? 'danger' : null,
     },
     ...(canUseParserAi
-      ? [{ id: 'ai' as const, label: 'pivt', icon: Sparkles, count: null, tone: null }]
+      ? [{ id: 'ai' as const, label: 'pivt', icon: PivtIcon, count: null, tone: null }]
       : []),
   ];
 
@@ -2957,7 +2958,7 @@ function VrlPanel(props: VrlPanelProps) {
             onClick={onRegenerate}
             disabled={genState === 'streaming'}
           >
-            <Sparkles className="w-3 h-3" />
+            <PivtIcon className="w-3 h-3" />
             {genState === 'streaming' ? 'Generating…' : vrl.trim() ? 'Regenerate' : 'Generate with pivt'}
           </Button>
         )}
@@ -2971,7 +2972,7 @@ function VrlPanel(props: VrlPanelProps) {
       {canUseParserAi && genState === 'streaming' && (
         <div className="shrink-0 border-b border-border bg-primary/[0.04] px-3 py-2">
           <div className="flex items-center gap-2">
-            <Sparkles className="w-3 h-3 text-primary animate-pulse" />
+            <PivtIcon className="w-3 h-3 text-primary animate-pulse" />
             <span className="text-[11px] text-foreground">pivt is drafting VRL from your samples</span>
             <span className="text-[10.5px] font-mono text-muted-foreground tabular-nums">{formatElapsed(genElapsedMs)}</span>
             <div className="flex-1" />
@@ -3253,7 +3254,7 @@ function AiPane({
           </div>
         ) : (
           <div className="rounded-md bg-primary/[0.08] border border-primary/20 p-2.5 flex items-start gap-2">
-            <Sparkles className="w-3 h-3 text-primary shrink-0 mt-0.5" />
+            <PivtIcon className="w-3 h-3 text-primary shrink-0 mt-0.5" />
             <div className="text-[10.5px] text-foreground/80 leading-relaxed">
               <span className="text-foreground font-medium">Ask pivt</span> to tweak the parser — add fields, rename,
               redact, or explain.

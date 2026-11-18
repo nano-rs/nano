@@ -9,7 +9,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ArrowLeft, Save, Play, FileCode, WandSparkles, Eye, Archive, ArchiveRestore, Trash2, MoreHorizontal, Undo2, Power } from 'lucide-react';
+import { ArrowLeft, Save, Play, FileCode, Eye, Archive, ArchiveRestore, Trash2, MoreHorizontal, Undo2, Power, AlignLeft } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { Link } from 'react-router-dom';
@@ -130,7 +130,7 @@ export function DetectionEditorHeader({
           <DropdownMenuContent align="end" className="w-48">
             {onFormat && (
               <DropdownMenuItem onClick={onFormat} disabled={formatting || disableValidate}>
-                {formatting ? <LoadingIcon className="w-4 h-4 mr-2" /> : <WandSparkles className="w-4 h-4 mr-2" />}
+                {formatting ? <LoadingIcon className="w-4 h-4 mr-2" /> : <AlignLeft className="w-4 h-4 mr-2" />}
                 Format Query
               </DropdownMenuItem>
             )}

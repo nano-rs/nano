@@ -462,9 +462,8 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
     // parent's filters/limits/aggregations bound only the parent's rows, never
     // the subsearch's, so nothing from this scope may exempt it (the recursion
     // re-derives has_filter from the SUBSEARCH's own search stage).
-    // `field IN [search … | return f]` subsearches are deliberately NOT
-    // scanned: `generate_in_subsearch_filter` extracts only the search
-    // expression and return field, so commands inside them never execute.
+    // NAN-5620: `field IN [search … | <stages> | return f]` now runs its whole
+    // pipeline too, so its stages get the same scoped pass.
     for cmd in &commands {
         if let Command::Append { subsearch, .. } | Command::Join { subsearch, .. } = cmd {
             if let Some(risk) = detect_oom_risk(subsearch) {
@@ -472,8 +471,40 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
             }
         }
     }
+    let mut in_subsearches = Vec::new();
+    collect_in_subsearches_of_query(query, &mut in_subsearches);
+    in_subsearches.into_iter().find_map(detect_oom_risk)
+}
 
-    None
+/// Every `field IN [ … ]` subsearch in the query's search stage and its
+/// `where` conditions (NAN-5620).
+fn collect_in_subsearches_of_query<'a>(query: &'a Query, out: &mut Vec<&'a Query>) {
+    fn walk<'a>(expr: &'a SearchExpr, out: &mut Vec<&'a Query>) {
+        match expr {
+            SearchExpr::InSubsearch { subsearch, .. } => out.push(subsearch),
+            SearchExpr::And(l, r) | SearchExpr::Or(l, r) => {
+                walk(l, out);
+                walk(r, out);
+            }
+            SearchExpr::Not(e) | SearchExpr::Group(e) => walk(e, out),
+            _ => {}
+        }
+    }
+    match query {
+        Query::Search(expr) => walk(expr, out),
+        Query::Piped { source, command } => {
+            collect_in_subsearches_of_query(source, out);
+            match command {
+                Command::Where { condition } => walk(condition, out),
+                Command::Transaction { startswith, endswith, .. } => {
+                    startswith.iter().chain(endswith.iter()).for_each(|e| walk(e, out))
+                }
+                Command::Sequence { conditions, .. } => conditions.iter().for_each(|e| walk(e, out)),
+                Command::Funnel { steps, .. } => steps.iter().for_each(|(_, e)| walk(e, out)),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Check if the query's search expression has meaningful filters

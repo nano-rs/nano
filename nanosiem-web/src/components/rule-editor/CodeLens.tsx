@@ -16,7 +16,7 @@ import {
   TextSelect,
   Undo2,
   Redo2,
-  WandSparkles,
+  AlignLeft,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { CodeMirrorEditor, type CodeMirrorEditorRef } from '@/components/editor';
@@ -182,7 +182,7 @@ export const CodeLens = forwardRef<CodeMirrorEditorRef, CodeLensProps>(function 
             <>
               <ContextMenuSeparator />
               <ContextMenuItem onClick={onFormat} disabled={readOnly}>
-                <WandSparkles className="w-3.5 h-3.5 mr-2" strokeWidth={1.75} />
+                <AlignLeft className="w-3.5 h-3.5 mr-2" strokeWidth={1.75} />
                 Format query
               </ContextMenuItem>
             </>

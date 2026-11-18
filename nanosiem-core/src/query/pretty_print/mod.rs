@@ -8,6 +8,9 @@
 mod command;
 mod expressions;
 mod helpers;
+// NAN-5583: hunts case pivots quote values with the same literal rules.
+#[cfg(feature = "enterprise")]
+pub(crate) use helpers::npl_quoted_literal;
 mod search_expr;
 #[cfg(test)]
 mod tests;

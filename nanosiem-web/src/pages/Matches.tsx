@@ -7,6 +7,8 @@
 // DetectionMatches.tsx (kept importable for the sunset PR).
 
 import { useMemo, useState, useCallback } from 'react';
+import { usePivtPage } from '@/contexts/pivt-page';
+import { searchPivotAction } from './alerts/alertsPivt';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
@@ -151,6 +153,42 @@ export function Matches() {
     const q = ruleMatchSearchQuery(apiRule.query, view.events, view.entity, schema === 'ocsf');
     navigate(matchSearchUrl(q, view, apiRule.lookback_minutes));
   }, [apiRule, navigate, schema]);
+
+  // NAN-5588: pivt knows the rule and its recent matches (context only; rule
+  // changes and match dispositions come with the Rules adapter).
+  const pivotAction = useMemo(() => [searchPivotAction(navigate)], [navigate]);
+  usePivtPage({
+    icon: 'Shield',
+    getContext: () => ({
+      pageKey: 'matches',
+      title: `Rule matches · ${apiRule?.name ?? id ?? ''}`,
+      entity: apiRule ? { kind: 'rule', id: apiRule.id, name: apiRule.name } : undefined,
+      facts: apiRule
+        ? [
+            { label: 'mode', value: apiRule.mode },
+            { label: 'severity', value: apiRule.severity },
+            { label: 'matches', value: String(views.length) },
+            { label: 'alerts', value: String(apiAlerts?.length ?? 0) },
+          ]
+        : [],
+      selection: effectiveSelectedId ? { kind: 'match', ids: [effectiveSelectedId] } : undefined,
+      data: apiRule
+        ? {
+            rule_query: apiRule.query,
+            matches: views.slice(0, 10).map((v) => ({
+              id: v.id,
+              detected_at: v.detectedAt.toISOString(),
+              severity: v.severity,
+              status: v.status,
+              entity: v.entity,
+              alerted: alertedMatchIds.has(v.id),
+            })),
+          }
+        : undefined,
+    }),
+    actions: pivotAction,
+    suggestions: ['Summarize these matches by entity', 'Is this rule noisy?'],
+  });
 
   if (ruleLoading) {
     return (

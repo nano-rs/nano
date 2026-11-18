@@ -329,7 +329,12 @@ const OPS = {
     // refresh (the rotated refresh cookie would be lost, and the next page's
     // refresh presents a spent token -> logged out).
     const isAuth = (r) => { try { return new URL(r.url()).pathname.startsWith('/api/auth/'); } catch { return false; } };
-    page.on('request', (r) => { if (isAuth(r)) s.authInflight += 1; });
+    page.on('request', (r) => {
+      if (isAuth(r)) s.authInflight += 1;
+      // NAN-5586: the session's bearer, kept for end_session (a secret: scrubbed).
+      const h = r.headers().authorization || '';
+      if (h.startsWith('Bearer ')) { const b = h.slice(7); if (b !== s.bearer) { s.bearer = b; addSecret(b); } }
+    });
     const done = (r) => { if (isAuth(r)) s.authInflight = Math.max(0, s.authInflight - 1); };
     page.on('requestfinished', done);
     page.on('requestfailed', done);
@@ -497,6 +502,22 @@ const OPS = {
     await s.page.screenshot({ path: target, fullPage: full_page });
     return target;
   },
+  // NAN-5561: switch the app theme (`light` | `dark`) in place for paired
+  // acceptance screenshots: the same storage key and root class the app's
+  // ThemeProvider uses, then a frame for styles to apply.
+  async theme({ sid, mode }) {
+    const s = sess(sid);
+    if (mode !== 'light' && mode !== 'dark') throw new Error(`invalid theme ${JSON.stringify(mode)}`);
+    await s.page.evaluate((m) => {
+      try { localStorage.setItem('nanosiem-theme', m); } catch { /* storage may be blocked */ }
+      const root = document.documentElement;
+      root.classList.remove('light', 'dark');
+      root.classList.add(m);
+      root.style.colorScheme = m;
+    }, mode);
+    await s.page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    return mode;
+  },
   async attr({ sid, find: f, name }) {
     const { page } = sess(sid);
     const el = await find(page, f);
@@ -595,6 +616,93 @@ const OPS = {
   },
   async now() { return Date.now(); },
 
+  // ---------------------------------------------------------------- page health (NAN-5586)
+  // Resize the viewport (`height` defaults to the harness's tall one).
+  async viewport({ sid, width, height }) {
+    const s = sess(sid);
+    await s.page.setViewport({ width: Number(width) || VIEWPORT.width, height: Number(height) || VIEWPORT.height });
+    await s.page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    await sleep(250); // ResizeObserver-driven layouts settle
+    return true;
+  },
+  // Horizontal overflow at the current viewport: whether the document (or the
+  // app's main scroller) scrolls sideways, and the outermost elements that
+  // stick out past the right edge without a scrolling ancestor to clip them.
+  async overflow({ sid }) {
+    const { page } = sess(sid);
+    return page.evaluate(() => {
+      const vw = document.documentElement.clientWidth;
+      const doc = Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0);
+      const main = document.querySelector('main');
+      const mainOver = main ? main.scrollWidth - main.clientWidth : 0;
+      const clipped = (el) => {
+        for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+          const ox = getComputedStyle(p).overflowX;
+          if (ox === 'auto' || ox === 'scroll' || ox === 'hidden' || ox === 'clip') {
+            const pr = p.getBoundingClientRect();
+            if (pr.right <= vw + 1) return true;
+          }
+        }
+        return false;
+      };
+      const describe = (el) => {
+        const id = el.getAttribute('data-testid');
+        const cls = (el.getAttribute('class') || '').split(/\s+/).slice(0, 4).join('.');
+        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        return `${el.tagName.toLowerCase()}${id ? `[data-testid=${id}]` : ''}${cls ? `.${cls}` : ''} right=${Math.round(el.getBoundingClientRect().right)} "${txt}"`;
+      };
+      const offenders = [];
+      for (const el of document.querySelectorAll('body *')) {
+        const r = el.getBoundingClientRect();
+        if (!r.width || r.right <= vw + 1 || getComputedStyle(el).position === 'fixed') continue;
+        if (clipped(el)) continue;
+        if (el.parentElement && el.parentElement.getBoundingClientRect().right > vw + 1 && !clipped(el.parentElement)) continue;
+        offenders.push(describe(el));
+        if (offenders.length >= 5) break;
+      }
+      return { viewport: vw, document: doc - vw, main: mainOver, offenders };
+    });
+  },
+  // An /api request AS the logged-in browser user (the bearer the page sent),
+  // for state only that user owns (its pivt notebooks). JSON in, JSON out.
+  async session_fetch({ sid, method = 'GET', path: p, body }) {
+    const s = sess(sid);
+    if (typeof p !== 'string' || !p.startsWith('/api/')) throw new Error(`session_fetch: not an /api path: ${p}`);
+    if (!s.bearer) throw new Error('session_fetch: the page has not sent a bearer yet');
+    const out = await s.page.evaluate(async (m, u, b, auth) => {
+      const r = await fetch(u, { method: m, headers: { Authorization: auth, ...(b == null ? {} : { 'Content-Type': 'application/json' }) },
+        body: b == null ? undefined : JSON.stringify(b) });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* not JSON */ }
+      return { status: r.status, json };
+    }, method, BASE + p, body ?? null, `Bearer ${s.bearer}`);
+    return JSON.parse(scrub(JSON.stringify(out)));
+  },
+  // End THIS context's own server session, never the logout route (it ends
+  // every session of the user, NAN-5573). `is_current` from /api/sessions/me
+  // when the server sets it; otherwise the session this context's login
+  // created (the first one created at or after it). The bearer never leaves
+  // the driver.
+  async end_session({ sid }) {
+    const s = sess(sid);
+    if (!s.bearer) return { status: 0, reason: 'no bearer seen' };
+    return s.page.evaluate(async (base, loginAt, auth) => {
+      const h = { Authorization: auth };
+      const me = await fetch(`${base}/api/sessions/me`, { headers: h });
+      if (!me.ok) return { status: me.status, reason: 'could not list own sessions' };
+      const list = (await me.json()).sessions || [];
+      let pick = list.find((x) => x.is_current);
+      if (!pick && loginAt) {
+        pick = list
+          .filter((x) => Date.parse(x.created_at) >= loginAt - 2000)
+          .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))[0];
+      }
+      if (!pick) return { status: 0, reason: 'no session matches this login' };
+      const r = await fetch(`${base}/api/sessions/${encodeURIComponent(pick.id)}`, { method: 'DELETE', headers: h });
+      return { status: r.status, session: pick.id, via: pick.is_current ? 'is_current' : 'login time' };
+    }, BASE, s.loginAt || 0, `Bearer ${s.bearer}`).catch((e) => ({ status: 0, reason: String(e).slice(0, 200) }));
+  },
+
   // ---------------------------------------------------------------- exploration (NAN-5291)
   // Console errors and failed network requests (status >= 400 or no
   // response) since `since` (ms epoch), scrubbed: what a step broke.
@@ -692,6 +800,7 @@ const OPS = {
   async login({ sid, email, password }) {
     const s = sess(sid); const { page } = s;
     addSecret(password);
+    s.loginAt = Date.now(); // NAN-5586: end_session finds the session this login created
     await page.goto(`${BASE}/login`, { waitUntil: 'domcontentloaded' });
     const first = await find(page, { css: 'form input:not([disabled])' });
     await first.click(); await first.type(email);

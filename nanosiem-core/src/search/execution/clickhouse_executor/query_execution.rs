@@ -30,9 +30,7 @@ impl ClickHouseExecutor {
 
         debug!("Executing typed ClickHouse query: {}", escaped_sql);
 
-        let rows: Vec<super::types::ClickHouseLogReadRow> = self
-            .client
-            .query(&escaped_sql)
+        let rows: Vec<super::types::ClickHouseLogReadRow> = self.sized_query(&escaped_sql)
             .fetch_all()
             .await
             .map_err(|e| {
@@ -69,9 +67,7 @@ impl ClickHouseExecutor {
         );
 
         // Use fetch_bytes with JSONEachRow format for dynamic results
-        let mut cursor = self
-            .client
-            .query(&escaped_sql)
+        let mut cursor = self.sized_query(&escaped_sql)
             .fetch_bytes("JSONEachRow")
             .map_err(|e| crate::search::search_error_from_error(&e))?;
 
@@ -180,7 +176,7 @@ impl ClickHouseExecutor {
 
         let escaped_sql = escape_question_marks_in_strings(sql);
         let mut cursor =
-            super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
+            super::types::with_query_options(self.sized_query(&escaped_sql), query_id, settings)
                 .fetch_bytes("JSONEachRow")
                 .map_err(|e| crate::search::search_error_from_error(&e))?;
 
@@ -245,9 +241,7 @@ impl ClickHouseExecutor {
         );
 
         // Use with_option to set query_id via the client API (not SETTINGS clause)
-        let mut cursor = self
-            .client
-            .query(&escaped_sql)
+        let mut cursor = self.sized_query(&escaped_sql)
             .with_setting("query_id", query_id)
             .fetch_bytes("JSONEachRow")
             .map_err(|e| crate::search::search_error_from_error(&e))?;
@@ -331,9 +325,7 @@ impl ClickHouseExecutor {
             crate::text_bounds::prefix_at_most(&escaped_sql, 200)
         );
 
-        let mut query = self
-            .client
-            .query(&escaped_sql)
+        let mut query = self.sized_query(&escaped_sql)
             .with_setting("query_id", query_id)
             .with_setting(
                 "max_execution_time",
@@ -422,9 +414,7 @@ impl ClickHouseExecutor {
         preserve_columns: bool,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let escaped_sql = escape_question_marks_in_strings(sql);
-        let mut query = self
-            .client
-            .query(&escaped_sql)
+        let mut query = self.sized_query(&escaped_sql)
             .with_setting("query_id", query_id)
             .with_setting("max_result_rows", &limits.max_result_rows.to_string())
             .with_setting("max_result_bytes", &limits.max_result_bytes.to_string())

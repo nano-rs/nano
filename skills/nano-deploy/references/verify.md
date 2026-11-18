@@ -24,11 +24,46 @@ curl -fsS https://APP_FQDN/api/health          # through the LB / TLS overlay
 curl -sS -o /dev/null -w '%{http_code}\n' http://APP_FQDN/   # expect 301 to https with the overlay
 ```
 
+### Protocols: HEC and OTLP
+
+```bash
+ssh $H 'python3 -I - --app-url http://localhost --hec --otlp-all' < scripts/smoke-test.py
+```
+
+`--hec` sends one event through HEC. A single host serves HEC on Vector's
+plain-HTTP `:8088`, not through nginx: run on the host, the smoke retries on
+`http://127.0.0.1:8088` when nginx answers 404/405; elsewhere pass `--hec-url`. `--otlp-all` covers OTLP end to end:
+
+| Row | What it proves |
+|---|---|
+| `otlp` / `otlp-search` | OTLP/HTTP log record through the `/otlp` edge with the ingest token, searchable in the token's source |
+| `otlp-trace` / `otlp-spans` | one span to `/otlp/v1/traces`, found in the `spans` search dataset (`service_name="<marker>"`, table `otel_spans`) |
+| `otlp-metric` / `otlp-points` | one gauge point to `/otlp/v1/metrics`, found in the `metrics` dataset (`metric_name="<marker>"`, table `otel_metrics`) |
+| `grpc-logs` / `grpc-traces` / `grpc-metrics` | the same three over OTLP/gRPC to the raw Vector port `127.0.0.1:4317`, each answered `grpc-status 0`, then found (`grpc-lsrch`, `grpc-spans`, `grpc-points`) |
+| `otlp-auth` | the `/otlp` edge answers 401 with no token and with an invalid one (logs, traces, metrics) |
+
+Spans and metrics do not depend on the token's source, so an accepted record
+that never appears is a FAIL; an OTLP log that is accepted but not searchable
+is a WARN, like HEC. The OTLP/HTTP edge authenticates every request against a
+source-bound ingest token in both editions. The raw OTLP ports `4317`/`4318`
+have no credential gate by design and bind loopback (`NANO_OTLP_BIND_ADDRESS`
+opts in to exposing them), so the gRPC rows run from the host itself
+(`--app-url http://localhost`). Run from anywhere else, or on a role-split
+app host with no raw port, the gRPC rows are a WARN: pass
+`--otlp-grpc HOST:PORT` (`https://` for TLS) of a reachable OTLP/gRPC
+listener to test it. gRPC uses the host's curl when it has HTTP2, else a
+pinned curl image through Docker (on a Linux host), else the gRPC rows WARN
+as skipped.
+
+**Release post-build:** every release post-build (Proxmox CT 109 open
+edition, CT 122 enterprise, the cloud Helm burn) runs
+`smoke-test.py --hec --otlp-all` and must print `SMOKE PASS`.
+
 ## Kubernetes (Helm)
 
 ```bash
 python3 -I scripts/k8s-health.py --namespace nano          # read-only; exit 0 = healthy
-python3 scripts/smoke-test.py --app-url https://APP_FQDN --ingest-url https://INGEST_FQDN --creds ./admin-creds.env
+python3 scripts/smoke-test.py --app-url https://APP_FQDN --ingest-url https://INGEST_FQDN --creds ./admin-creds.env --hec --otlp-all
 ```
 
 `ingest-hz` (`GET https://INGEST_FQDN/healthz`) is a 404 on chart 2.0.9 and

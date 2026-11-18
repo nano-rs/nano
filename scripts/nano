@@ -17,6 +17,12 @@ case "${1:-}" in
         # ignores PYTHONUNBUFFERED, so the flag is the only switch.
         exec python3 -I -u "$SCRIPT_DIR/nano-upgrade.py" "$@"
         ;;
+    convert)
+        # NAN-5558: the one supported edition change, open -> enterprise
+        # (Self-run), in place: same release, same data.
+        shift
+        exec python3 -I -u "$SCRIPT_DIR/nano-convert.py" "$@"
+        ;;
     feeds)
         shift
         exec "$SCRIPT_DIR/nano-feeds" "$@"
@@ -34,6 +40,20 @@ case "${1:-}" in
         exec bash "$SCRIPT_DIR/lib/vector-native-pki.sh" client-cert \
             --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
         ;;
+    ocsf-backfill | ocsf-legacy-drop)
+        # NAN-5559: after a 0.1.x -> 2.x upgrade, copy the OCSF 1.8 history
+        # into the new layout, then (optionally) drop the legacy table.
+        ocsf_command="${1#ocsf-}"; ocsf_command="${ocsf_command#legacy-}"
+        shift
+        exec bash "$SCRIPT_DIR/lib/ocsf-legacy.sh" "$ocsf_command" \
+            --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
+        ;;
+    upgrade-readiness)
+        # NAN-5556: read-only readiness report / content export (one file).
+        shift
+        exec python3 -I "$SCRIPT_DIR/nano-upgrade-readiness.py" \
+            --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
+        ;;
     cluster-health)
         shift
         exec python3 -I "$SCRIPT_DIR/nano-cluster-health" \
@@ -48,6 +68,16 @@ case "${1:-}" in
             exit 2
         fi
         exec python3 -I "$SCRIPT_DIR/nano-tiering.py" --install-dir "$(cd "$SCRIPT_DIR/.." && pwd -P)" "$@"
+        ;;
+    cluster)
+        # NAN-5531 (enterprise): provision, install, upgrade, scale and delete a
+        # role-split cluster on GCP, AWS or Azure, from a workstation.
+        shift
+        if [[ ! -f "$SCRIPT_DIR/nano-cluster.py" ]]; then
+            echo "scripts/nano cluster: cloud cluster provisioning is an enterprise feature (not in this edition)" >&2
+            exit 2
+        fi
+        exec python3 -I "$SCRIPT_DIR/nano-cluster.py" "$@"
         ;;
     backup-schedule)
         # NAN-5204: automatic backups (the nano-backup Compose service).
@@ -88,6 +118,15 @@ LEGACY_LAYOUT_RESOLVER="$SCRIPT_DIR/lib/nano_legacy_layout.py"
 }
 # shellcheck source=scripts/lib/generated-secrets.sh
 source "$GENERATED_SECRETS_LIB"
+# NAN-5566: close, drain and stop Vector without losing acknowledged events.
+VECTOR_QUIESCE_LIB="$SCRIPT_DIR/lib/vector-quiesce.sh"
+[[ -f "$VECTOR_QUIESCE_LIB" ]] || {
+    printf 'nano: helper is missing: %s\n' "$VECTOR_QUIESCE_LIB" >&2
+    exit 1
+}
+# shellcheck source=scripts/lib/vector-quiesce.sh
+source "$VECTOR_QUIESCE_LIB"
+nano_vq_compose() { dc "$@"; }
 INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 COMMAND="${1:-}"
 [[ $# -gt 0 ]] && shift
@@ -174,7 +213,18 @@ restore_vector_native_pki() {
             bash "$SCRIPT_DIR/lib/vector-native-pki.sh" ensure --pki-dir "$INSTALL_DIR/.nano-pki/vector-native" \
             --tls-dir "$INSTALL_DIR/config/vector-native" --base-url "$(env_value "$INSTALL_DIR/.env" BASE_URL)" \
             </dev/null >/dev/null || log "warning: re-run install.sh to rebuild the Vector-native listener files"
-        dc restart vector >/dev/null 2>&1 || log "warning: restart Vector to load the restored Vector-native PKI"
+        # NAN-5566: the restore quiesced Vector already (it loads the restored
+        # PKI when the writers resume). A running Vector is closed, drained,
+        # restarted with more time than its 60 s graceful limit, and reopened.
+        if nano_vq_running vector; then
+            nano_vq_close
+            nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+            dc restart --timeout "$NANO_VQ_STOP_TIMEOUT" vector >/dev/null 2>&1 \
+                || log "warning: restart Vector to load the restored Vector-native PKI"
+            nano_vq_reopen || warn "ingest may still be closed at nginx: docker compose exec nginx rm -f /run/nano-ingest/closed"
+        else
+            log "Vector is stopped; it loads the restored Vector-native PKI when it starts"
+        fi
     fi
 }
 ok() { printf 'ok: %s\n' "$*" >&2; }
@@ -213,16 +263,30 @@ Usage:
                        [--ack-clickhouse-network-lockout]
   scripts/nano upgrade --abandon-incomplete RUN_ID --abandon-reason REASON
   scripts/nano rollback [--inventory FILE]
+  scripts/nano convert --to enterprise --package nano-compose-enterprise-<version>.tar.gz
+                       --backup-key-file KEY.pem --backup-output DIR
+                       (--license-env-file FILE | --license-file LICENSE.json)
+                       [--dry-run | --resume] [--probe-ingest] [--install-dir DIR]
+  scripts/nano convert --rollback --backup-key-file KEY.pem [--backup BACKUP_DIR]
   scripts/nano feeds <status | update [--file FILE]>
   scripts/nano backup-schedule [--status | --configure | --disable | --run-now
                                | --list | --probe | --fetch NAME|latest --to DIR]
   scripts/nano support-bundle [--since 24h] [--max-log-mb 20] [--out-dir DIR]
                               [--inventory FILE] [--local-only]
+  scripts/nano upgrade-readiness [report|export] [--output DIR] [--include-lookup-rows] [--encrypt]
+                                                 (read only; writes one file)
   scripts/nano cluster-health                    (role-split hosts)
+  scripts/nano ocsf-backfill [--order newest-first|oldest-first] [--from YYYY-MM-DD]
+                             [--to YYYY-MM-DD] [--dry-run] [--break-lock]
+                                               (after a 0.1.x upgrade: makes the OCSF
+                                                history searchable again; single host)
+  scripts/nano ocsf-legacy-drop [--confirm]    (then frees the legacy OCSF table; dry run
+                                                without --confirm)
   scripts/nano vector-client-cert <name> [--out DIR] [--days N] [--address HOST[:PORT]]
   scripts/nano vector-client-cert <name> --csr FILE | --renew <name> [--days N]
   scripts/nano vector-client-cert --list | --revoke <name>
                                                (Vector native :6000, mutual TLS)
+  scripts/nano cluster create|status|upgrade|scale|destroy ...   (enterprise; run on a workstation)
   scripts/nano tiering [status [--json] | test | apply | pause | resume [--move-factor F]
                        | disable | configure --provider s3|s3-compatible|gcs|azure
                          [--bucket B] [--region R] [--endpoint URL] [--prefix P]
@@ -378,6 +442,9 @@ cleanup() {
     if ((!(rc != 0 && MUTATION_STARTED))) && [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
         dc start "${STOPPED_SERVICES[@]}" >/dev/null 2>&1
     fi
+    # NAN-5566: never leave ingest closed at nginx (with Vector stopped it
+    # answers 502, which acknowledges nothing).
+    ((!NANO_VQ_ENGAGED)) || nano_vq_reopen 60 || warn "ingest may still be closed: docker compose exec nginx rm -f /run/nano-ingest/closed; docker compose exec vector sh /etc/vector/.nano/ingest-gate.sh open"
     [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
     [[ -z "$BUNDLE_TMP" ]] || rm -rf -- "$BUNDLE_TMP"
     exit "$rc"
@@ -1095,6 +1162,14 @@ quiesce_local_writers() {
     done
     if [[ ${#candidates[@]} -gt 0 ]]; then
         log "quiescing local writers: ${candidates[*]}"
+        if ((!LEGACY_LAYOUT)) && [[ " ${candidates[*]} " == *" vector "* ]]; then
+            # NAN-5566: close ingest, let Vector deliver what it accepted, then
+            # stop it with more time than its own graceful-shutdown limit.
+            nano_vq_close
+            nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+            STOPPED_SERVICES=(vector)
+            nano_vq_stop
+        fi
         dc stop --timeout 60 "${candidates[@]}" >/dev/null
         STOPPED_SERVICES=("${candidates[@]}")
     fi
@@ -1111,6 +1186,10 @@ resume_local_writers() {
         log "restarting local writers: ${STOPPED_SERVICES[*]}"
         dc start "${STOPPED_SERVICES[@]}" >/dev/null
         STOPPED_SERVICES=()
+    fi
+    # NAN-5566: reopen once Vector reports healthy again.
+    if ((NANO_VQ_ENGAGED)); then
+        nano_vq_reopen || warn "ingest may still be closed at nginx: docker compose exec nginx rm -f /run/nano-ingest/closed"
     fi
 }
 
@@ -3065,6 +3144,12 @@ PY
         if ((!force)) && clickhouse_nonempty; then die "refusing non-empty ClickHouse; use --force"; fi
     fi
     [[ "$M_PG" != true ]] || ensure_database_space
+    # NAN-5564: the restored data may come from another release's render;
+    # forget which pipeline identity the Vector config was rendered for, so the
+    # restarted Vector waits for the api's render instead of trusting it.
+    dc exec -T vector rm -f /etc/vector/dynamic/.nano-pipeline-identity </dev/null >/dev/null 2>&1 \
+        || dc exec -T nano-api rm -f /app/config/vector/.nano-pipeline-identity </dev/null >/dev/null 2>&1 \
+        || log "note: could not clear the Vector pipeline identity marker; the api's first render rewrites it"
     quiesce_local_writers
     if [[ "$M_PG" == true ]]; then
         pg_fence_and_counts

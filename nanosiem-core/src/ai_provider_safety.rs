@@ -167,8 +167,56 @@ fn vendor_error_message(body: &str) -> Option<String> {
 
 /// A request error as text that never carries the request URL (which may
 /// hold a key in its query string or credentials in its authority).
+///
+/// NAN-5563: reqwest's `Display` is only the error kind ("error sending
+/// request"), so the `source()` chain is appended (`tcp connect error:
+/// Connection refused (os error 111)`, `dns error: …`). No level of that
+/// chain carries the request URL; as a guard, a level whose text contains
+/// `://` (a proxy URL, say) is replaced by `<redacted>`.
 pub fn request_error(error: reqwest::Error) -> String {
-    error.without_url().to_string()
+    let error = error.without_url();
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        let level = cause.to_string();
+        text.push_str(": ");
+        text.push_str(if level.contains("://") { "<redacted>" } else { &level });
+        source = cause.source();
+    }
+    text
+}
+
+/// `raw` parsed, when it is a URL with a tuple (scheme, host, port) origin;
+/// `None` for blank, unparseable or opaque-origin input.
+fn tuple_origin_url(raw: &str) -> Option<url::Url> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    url.origin().is_tuple().then_some(url)
+}
+
+/// NAN-5563: a configured URL as `scheme://host[:port]`, for logs. The path
+/// (a Cloudflare AI Gateway URL carries the account id and gateway id there),
+/// query, fragment and userinfo are dropped. Blank input is `<unset>`; input
+/// that does not parse to a host-bearing URL is `<invalid-url>`, never echoed.
+pub fn redact_url_for_log(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return "<unset>".to_string();
+    }
+    match tuple_origin_url(raw) {
+        Some(url) => url.origin().ascii_serialization(),
+        None => "<invalid-url>".to_string(),
+    }
+}
+
+/// `host[:port]` of `raw` (port only when not the scheme default), under the
+/// same rule as [`redact_url_for_log`]; `None` where that returns a
+/// placeholder. For messages that name the target without its scheme.
+pub fn redact_url_host(raw: &str) -> Option<String> {
+    let url = tuple_origin_url(raw)?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 /// NAN-5225: the stored API key was entered for one destination. Message for
@@ -222,3 +270,7 @@ mod tests;
 #[cfg(test)]
 #[path = "ai_provider_destination_tests.rs"]
 mod destination_tests;
+
+#[cfg(test)]
+#[path = "ai_provider_log_redaction_tests.rs"]
+mod log_redaction_tests;

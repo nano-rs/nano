@@ -178,6 +178,9 @@ pub async fn run_health_check_with_trigger(
     analyzer::ensure_shard_skew_findings(&mut analysis, &metrics);
     // NAN-5450: ClickHouse, PostgreSQL or Vector buffer volume at 80 / 90 %.
     super::disk_findings::ensure_disk_findings(&mut analysis, &metrics);
+    // NAN-5567: batches ClickHouse permanently rejected, kept in Vector's
+    // dead-letter store instead of dropped.
+    super::vector_dead_letters::ensure_vector_dead_letter_findings(&mut analysis, &metrics);
     // Security review 2026-11-08: insecure-but-accepted deployment settings.
     analyzer::ensure_deployment_posture_findings(
         &mut analysis,

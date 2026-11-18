@@ -47,6 +47,44 @@ class Stack:
     ch_url: str
     ch_admin_user: str
     ch_admin_password: str
+    # "own": a throwaway stack the runner brought up. "existing": a stack it did
+    # not create (nano_e2e.target, NAN-5586): no restarts, no ClickHouse admin.
+    target: str = "own"
+
+    @classmethod
+    def existing(cls) -> Stack:
+        """The `--target existing` stack: URLs and the acting user from the
+        environment `nano_e2e.target.load_env` and the runner exported."""
+        api = os.environ.get("E2E_TARGET_API_URL", "http://localhost:3000").rstrip("/")
+        web = os.environ.get("E2E_TARGET_WEB_URL", "http://localhost:5173").rstrip("/")
+        hec = os.environ.get("E2E_TARGET_HEC_URL", "http://127.0.0.1:8088").rstrip("/")
+        run_dir = Path(_req("E2E_RUN_DIR"))
+        return cls(
+            run_id=_req("E2E_RUN_ID"),
+            project="existing",
+            edition=os.environ.get("E2E_EDITION", "enterprise"),
+            app_mode="existing",
+            api_url=api,
+            search_url=os.environ.get("E2E_TARGET_SEARCH_URL", "http://localhost:3002").rstrip("/"),
+            jobs_url="",
+            edge_url=web,
+            ingest_url=hec,
+            hec_url=hec,
+            vector_http_url="",
+            otlp_http_url="",
+            vector_metrics_url="",
+            api_key=_req("NANOSIEM_API_KEY"),
+            admin_email=_req("NANO_ADMIN_EMAIL"),
+            admin_password=_req("NANO_ADMIN_PASSWORD"),
+            run_dir=run_dir,
+            artifact_dir=Path(_req("E2E_ARTIFACT_DIR")),
+            runner=Path(os.environ.get("E2E_RUNNER", "")),
+            vector_dynamic_dir=run_dir / "no-vector-dir",
+            ch_url="",
+            ch_admin_user="",
+            ch_admin_password="",
+            target="existing",
+        )
 
     @classmethod
     def from_env(cls) -> Stack:
@@ -87,6 +125,8 @@ class Stack:
         """Restart/stop/start/kill a stack service through the runner (same seam in
         native and docker app mode). `env` adds runner knobs for this call only
         (e.g. E2E_SEARCH_CH_LAUNCH=app-user, native mode)."""
+        if self.target == "existing":
+            raise RuntimeError("E2E-INFRA: an existing target's services are not the harness's to restart")
         if action not in {"restart", "stop", "start", "kill"}:
             raise ValueError(action)
         if service not in {"api", "search", "jobs", "vector"}:

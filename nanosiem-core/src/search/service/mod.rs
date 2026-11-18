@@ -239,6 +239,103 @@ pub(super) fn is_command_page_marker(display_type: DisplayType) -> bool {
 /// accepts the literal `dataset=` token form); a false positive — e.g. the
 /// text inside a quoted string — only costs an optimization (prevalence
 /// pushdown skip / an unused risk config attach), never correctness.
+/// Does this request read the derived `signals` dataset (NAN-5612)? Decided
+/// from the request's dataset, the query's leading `dataset=` selector (as
+/// the service resolves it when the request names none), and the PARSED query:
+/// any subsearch whose own dataset is `signals`, at any depth. A field filter
+/// that merely contains the text (`event.dataset=signalsciences.waf`,
+/// `dataset=signal_sciences`) is not a dataset selector and does not count.
+/// An unparseable query falls back to a token-boundary text match (fail
+/// closed: the caller gets a parse error from the search anyway).
+pub fn touches_signals_dataset(dataset: Option<&str>, raw_query: &str) -> bool {
+    use crate::query::Dataset;
+    let explicit = dataset.map(str::trim).filter(|d| !d.is_empty());
+    if explicit.map(Dataset::from_selector) == Some(Dataset::Signals) {
+        return true;
+    }
+    if explicit.is_none() {
+        if let Ok((_, Some(d))) = crate::search::query_processing::resolve_dataset_selector(raw_query, None) {
+            if Dataset::from_selector(&d) == Dataset::Signals {
+                return true;
+            }
+        }
+    }
+    match crate::query::parse_query(raw_query) {
+        Ok(parsed) => query_selects_dataset(&parsed, Dataset::Signals),
+        Err(_) => signals_token_in_text(raw_query),
+    }
+}
+
+/// A `dataset=signal[s]` token at a token boundary (start, whitespace, `[`,
+/// `|` or `(` before it; not part of a longer word after it).
+fn signals_token_in_text(raw: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)(^|[\s\[|(])dataset=signals?($|[\s\]|)])").expect("static regex"))
+        .is_match(raw)
+}
+
+/// Does any subsearch in `query` (at any depth) select `target`?
+pub(crate) fn query_selects_dataset(query: &crate::query::Query, target: crate::query::Dataset) -> bool {
+    use crate::query::{Command, Query, SearchExpr};
+    fn expr(e: &SearchExpr, t: crate::query::Dataset) -> bool {
+        match e {
+            SearchExpr::InSubsearch { subsearch, subsearch_dataset, .. } => {
+                *subsearch_dataset == Some(t) || query_selects_dataset(subsearch, t)
+            }
+            SearchExpr::And(l, r) | SearchExpr::Or(l, r) => expr(l, t) || expr(r, t),
+            SearchExpr::Not(i) | SearchExpr::Group(i) => expr(i, t),
+            _ => false,
+        }
+    }
+    match query {
+        Query::Search(e) => expr(e, target),
+        Query::Piped { source, command } => {
+            query_selects_dataset(source, target)
+                || match command {
+                    Command::Join { subsearch, subsearch_dataset, .. } => {
+                        *subsearch_dataset == Some(target) || query_selects_dataset(subsearch, target)
+                    }
+                    Command::Append { subsearch, .. } => query_selects_dataset(subsearch, target),
+                    Command::Where { condition } => expr(condition, target),
+                    Command::Transaction { startswith, endswith, .. } => {
+                        startswith.as_ref().is_some_and(|e| expr(e, target))
+                            || endswith.as_ref().is_some_and(|e| expr(e, target))
+                    }
+                    Command::Sequence { conditions, .. } => conditions.iter().any(|c| expr(c, target)),
+                    Command::Funnel { steps, .. } => steps.iter().any(|(_, c)| expr(c, target)),
+                    _ => false,
+                }
+        }
+    }
+}
+
+/// Test-only: a `SearchService` that renders SQL but never connects (the
+/// golden-corpus constructor), for tests outside this module.
+#[cfg(test)]
+pub(crate) fn sql_only_service_for_tests(profile: &str) -> SearchService {
+    npl_golden_corpus_tests::sql_only_service(profile)
+}
+
+/// NAN-5612: THE detections-dataset permission check. Every nPL path of the
+/// search service runs it next to the source gate
+/// ([`enforce_viewer_scope`](crate::search::query_processing::enforce_viewer_scope)),
+/// so every caller (Search, dashboards, saved searches, reports, AI tools)
+/// gets it whether or not its handler checks too.
+pub fn check_dataset_access(
+    scope: &crate::auth::ScopeSet,
+    dataset: Option<&str>,
+    raw_query: &str,
+) -> Result<(), SearchError> {
+    if scope.signals_denied() && touches_signals_dataset(dataset, raw_query) {
+        return Err(SearchError::Forbidden(SIGNALS_FORBIDDEN.to_string()));
+    }
+    Ok(())
+}
+
+/// The message a caller without `detections:view` gets for `dataset=signals`.
+pub const SIGNALS_FORBIDDEN: &str =
+    "Searching dataset=signals (detections that fired) requires the detections:view permission";
+
 pub(super) fn touches_risk_dataset(dataset: Option<&str>, raw_query: &str) -> bool {
     crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) == crate::query::Dataset::Risk
         || raw_query.to_ascii_lowercase().contains("dataset=risk")
@@ -874,7 +971,8 @@ impl SearchService {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => "logs",
+            | crate::schema::SchemaId::Risk
+            | crate::schema::SchemaId::Signals => "logs",
         }
     }
 
@@ -891,7 +989,8 @@ impl SearchService {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => "entity_dimension_day_agg",
+            | crate::schema::SchemaId::Risk
+            | crate::schema::SchemaId::Signals => "entity_dimension_day_agg",
         }
     }
 
@@ -905,7 +1004,8 @@ impl SearchService {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => "udm",
+            | crate::schema::SchemaId::Risk
+            | crate::schema::SchemaId::Signals => "udm",
         }
     }
 
@@ -930,6 +1030,10 @@ impl SearchService {
             // NAN-1798 P2: the derived risk grain's 15-column profile.
             crate::query::Dataset::Risk => {
                 crate::schema::profile_for_id(crate::schema::SchemaId::Risk)
+            }
+            // NAN-5612: the derived detections source's ten columns.
+            crate::query::Dataset::Signals => {
+                crate::schema::profile_for_id(crate::schema::SchemaId::Signals)
             }
             crate::query::Dataset::Logs => self.active_profile.clone(),
         }
@@ -984,7 +1088,8 @@ impl SearchService {
             | crate::query::Dataset::Metrics
             // NAN-1798 P2: the risk dataset's columns ARE its derived
             // projection — the guaranteed-correct inventory.
-            | crate::query::Dataset::Risk => {
+            | crate::query::Dataset::Risk
+            | crate::query::Dataset::Signals => {
                 ds.columns().iter().map(|c| c.to_string()).collect()
             }
             crate::query::Dataset::Logs => [
@@ -1351,6 +1456,12 @@ mod soc_ir_corpus_tests;
 #[cfg(test)]
 #[path = "prevalence_canonical_keys_tests.rs"]
 mod prevalence_canonical_keys_tests;
+#[cfg(test)]
+#[path = "prevalence_rescue_query_size_tests.rs"]
+mod prevalence_rescue_query_size_tests;
+#[cfg(test)]
+#[path = "prevalence_decorated_field_tests.rs"]
+mod prevalence_decorated_field_tests;
 
 #[cfg(test)]
 #[path = "npl_injection_canary_tests.rs"]

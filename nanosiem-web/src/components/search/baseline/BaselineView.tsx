@@ -19,7 +19,6 @@
 
 import { useMemo } from 'react';
 import {
-  Sparkles,
   TriangleAlert,
   ShieldQuestion,
   Terminal,
@@ -30,6 +29,7 @@ import {
   Plug,
   Box,
   ArrowUpRight,
+  Activity,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
@@ -245,7 +245,7 @@ export function BaselineView({
       {/* Header */}
       <div className="flex items-center gap-2 px-3 h-8 border-b border-border text-[11px] uppercase tracking-wide text-muted-foreground shrink-0">
         <span className="flex items-center gap-1.5 shrink-0">
-          <Sparkles className="w-[12px] h-[12px] text-primary" />
+          <Activity className="w-[12px] h-[12px] text-primary" />
           <span>Baseline</span>
         </span>
         <span className="text-muted-foreground/60">·</span>

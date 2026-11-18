@@ -389,6 +389,18 @@ impl DistributedDetectionScheduler {
     }
 }
 
+/// NAN-5565: the `last_error` a SUCCESSFUL run records when it evaluated
+/// only part of its input (`None` for a failed run, which records its error).
+pub(crate) fn partial_run_error<T>(
+    result: &Result<T, crate::detection::DetectionError>,
+    notes: &[String],
+) -> Option<String> {
+    if result.is_err() {
+        return None;
+    }
+    crate::search::partial_run::partial_run_message(notes)
+}
+
 /// Back-off before a rule whose execution panicked is claimed again (NAN-3080).
 const PANIC_RETRY_BACKOFF_SECS: i64 = 300;
 
@@ -485,12 +497,16 @@ async fn execute_and_release(
     let exec_start = std::time::Instant::now();
     let timeout_duration = tokio::time::Duration::from_secs(config.execution_timeout_secs);
     let mut panicked = false;
-    let result = match tokio::time::timeout(
-        timeout_duration,
-        AssertUnwindSafe(detection_service.execute_rule(rule, Some(time_range))).catch_unwind(),
+    // NAN-5565: collect partial-evaluation notes (a prevalence rescue cut at
+    // its key-byte cap) so a run that left input out is marked PARTIAL.
+    let (outcome_of_run, partial_notes) = crate::search::partial_run::collect(
+        tokio::time::timeout(
+            timeout_duration,
+            AssertUnwindSafe(detection_service.execute_rule(rule, Some(time_range))).catch_unwind(),
+        ),
     )
-    .await
-    {
+    .await;
+    let result = match outcome_of_run {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
             panicked = true;
@@ -617,7 +633,19 @@ async fn execute_and_release(
     let error_message: Option<String> = result
         .as_ref()
         .err()
-        .map(|e| format!("[{}] {}", outcome.as_label(), e.redacted_summary()));
+        .map(|e| format!("[{}] {}", outcome.as_label(), e.redacted_summary()))
+        // NAN-5565: a successful run that left input out records a
+        // `[partial] …` last_error, which SIEM Health shows (degraded).
+        .or_else(|| partial_run_error(&result, &partial_notes));
+    if let Some(partial) = error_message.as_deref().filter(|m| m.starts_with("[partial]")) {
+        counter!("nanosiem_detection_partial_runs_total").increment(1);
+        warn!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            partial,
+            "Detection run evaluated only part of its input; recorded as PARTIAL"
+        );
+    }
     let coverage_gap = decision
         .coverage_gap
         .map(|(window_start, window_end, attempts)| DetectionCoverageGap {

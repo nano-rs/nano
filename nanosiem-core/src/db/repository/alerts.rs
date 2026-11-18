@@ -206,6 +206,20 @@ pub struct AlertInsert<'a> {
     pub match_count: Option<i64>,
 }
 
+/// NAN-5577: the `hunt_finding` kind is the evidence carrier of a case the
+/// hunts pipeline opened, not a detection that fired. Alert KPIs, counts,
+/// velocity and the alert stream leave it out unless a caller names the kind
+/// explicitly. Every alert aggregate appends this (see the pinning test in
+/// `alerts_hunt_finding_metrics_tests.rs`).
+pub const NOT_HUNT_FINDING_SQL: &str = "kind <> 'hunt_finding'";
+
+/// NAN-5577: the spine `kinds` filter over `column` with the array bound at
+/// `$param`. No filter (NULL) means every kind EXCEPT `hunt_finding`; a caller
+/// that wants hunt findings names the kind.
+pub fn kinds_filter_sql(column: &str, param: u16) -> String {
+    format!("((${param}::text[] IS NULL AND {column} <> 'hunt_finding') OR {column} = ANY(${param}))")
+}
+
 /// NAN-1541: normalize an optional kinds filter into the `Option<Vec<String>>`
 /// the queries bind. An absent filter OR an empty slice both mean "all kinds"
 /// (bound as SQL NULL so the `$N::text[] IS NULL OR ...` guard short-circuits).
@@ -440,6 +454,70 @@ impl AlertRepository {
         Ok(created_at)
     }
 
+    /// NAN-5577: the newest alert a producer raised for `source_id`, by id.
+    /// Used as the idempotency probe of producers that raise at most one alert
+    /// per source (the hunt-finding alert, one per lead).
+    pub async fn latest_alert_id_for_source(
+        &self,
+        kind: &str,
+        source_id: &str,
+    ) -> Result<Option<Uuid>, AlertRepositoryError> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM alerts WHERE kind = $1 AND source_id = $2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(kind)
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// NAN-5577: raise an alert whose `source_types` manifest is supplied by the
+    /// producer instead of derived from `matched_events`.
+    ///
+    /// For a producer whose events are a SAMPLE of a source-scoped artifact (a
+    /// hunt finding): the per-source RBAC on the alert, and on any case it is
+    /// linked to, must follow the artifact's manifest (including the
+    /// unresolved-provenance sentinel when that manifest is incomplete), not
+    /// whatever subset of sources the sampled events happen to name. The
+    /// derived types are unioned in, so the manifest can only widen toward
+    /// failure. No dedup: the caller probes [`Self::latest_alert_id_for_source`].
+    pub async fn create_alert_with_manifest(
+        &self,
+        insert: AlertInsert<'_>,
+        manifest: &[String],
+    ) -> Result<Alert, AlertRepositoryError> {
+        let match_count_col: Option<i32> = insert
+            .match_count
+            .map(|c| i32::try_from(c).unwrap_or(i32::MAX));
+        let matched_events = crate::db::pg_text::pg_safe_json(insert.matched_events);
+        let mut source_types: BTreeSet<String> = distinct_source_types(&matched_events).into_iter().collect();
+        source_types.extend(
+            manifest
+                .iter()
+                .map(|s| crate::db::pg_text::pg_safe_string(s.trim().to_lowercase()))
+                .filter(|s| !s.is_empty()),
+        );
+        let source_types: Vec<String> = source_types.into_iter().collect();
+        let alert = sqlx::query_as::<_, Alert>(
+            r#"
+            INSERT INTO alerts (rule_id, severity, matched_events, kind, source_id, matched_event_count, source_types)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING *
+            "#,
+        )
+        .bind(insert.rule_id)
+        .bind(insert.severity)
+        .bind(matched_events.as_ref())
+        .bind(insert.kind)
+        .bind(&insert.source_id)
+        .bind(match_count_col)
+        .bind(&source_types)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(alert)
+    }
+
     /// Find an alert by ID (with rule name).
     ///
     /// NAN-1800: `deny` is the viewer's per-source deny set — an alert whose
@@ -533,6 +611,7 @@ impl AlertRepository {
     ) -> Result<Vec<Alert>, AlertRepositoryError> {
         let kinds_filter = normalize_kinds(kinds);
         let (scope_sql, scope_bind) = scope_clause(deny, "a.source_types", 7);
+        let kinds_sql = kinds_filter_sql("a.kind", 6);
         let sql = format!(
             r#"
             SELECT
@@ -558,7 +637,7 @@ impl AlertRepository {
             WHERE ($1::text IS NULL OR a.status = $1)
               AND ($2::text IS NULL OR a.severity = $2)
               AND ($5::uuid IS NULL OR a.rule_id = $5)
-              AND ($6::text[] IS NULL OR a.kind = ANY($6)){scope_sql}
+              AND {kinds_sql}{scope_sql}
             ORDER BY
                 CASE a.severity
                     WHEN 'critical' THEN 1
@@ -873,9 +952,10 @@ impl AlertRepository {
     ) -> Result<Vec<(AlertStatus, i64)>, AlertRepositoryError> {
         let kinds_filter = normalize_kinds(kinds);
         let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 2);
+        let kinds_sql = kinds_filter_sql("kind", 1);
         let sql = format!(
             r#"SELECT status, COUNT(*) FROM alerts
-               WHERE ($1::text[] IS NULL OR kind = ANY($1)){scope_sql}
+               WHERE {kinds_sql}{scope_sql}
                GROUP BY status"#
         );
         let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).bind(kinds_filter);
@@ -902,9 +982,10 @@ impl AlertRepository {
     ) -> Result<Vec<(AlertStatus, i64)>, AlertRepositoryError> {
         let kinds_filter = normalize_kinds(kinds);
         let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 3);
+        let kinds_sql = kinds_filter_sql("kind", 1);
         let sql = format!(
             r#"SELECT status, COUNT(*) FROM alerts
-               WHERE ($1::text[] IS NULL OR kind = ANY($1))
+               WHERE {kinds_sql}
                  AND (rule_id IS NULL OR NOT (rule_id = ANY($2))){scope_sql}
                GROUP BY status"#
         );
@@ -942,8 +1023,11 @@ impl AlertRepository {
         after_id: Uuid,
         limit: i64,
         deny: &BTreeSet<String>,
+        include_hunt_findings: bool,
     ) -> Result<Vec<Alert>, AlertRepositoryError> {
         let cutoff = apply_safety_lag(Utc::now(), stream_safety_lag_secs());
+        // NAN-5577: hunt-finding alerts only when the consumer opts in.
+        let kind_sql = if include_hunt_findings { "" } else { "\n              AND a.kind <> 'hunt_finding'" };
         let (scope_sql, scope_bind) = scope_clause(deny, "a.source_types", 5);
         let sql = format!(
             r#"
@@ -966,7 +1050,7 @@ impl AlertRepository {
                 ORDER BY alert_id, created_at DESC
             ) t ON t.alert_id = a.id
             WHERE ((a.created_at > $1) OR (a.created_at = $1 AND a.id > $2))
-              AND a.created_at <= $4{scope_sql}
+              AND a.created_at <= $4{kind_sql}{scope_sql}
             ORDER BY a.created_at ASC, a.id ASC
             LIMIT $3
             "#
@@ -990,6 +1074,14 @@ impl AlertRepository {
 #[cfg(test)]
 #[path = "alerts_nan1747_tests.rs"]
 mod alerts_nan1747_tests;
+
+#[cfg(test)]
+#[path = "alerts_hunt_finding_metrics_tests.rs"]
+mod alerts_hunt_finding_metrics_tests;
+
+#[cfg(test)]
+#[path = "alerts_hunt_finding_scope_live_tests.rs"]
+mod alerts_hunt_finding_scope_live_tests;
 
 #[cfg(test)]
 mod tests {

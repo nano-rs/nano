@@ -106,6 +106,9 @@ pub(crate) async fn submit_job(
     scope: &ScopeSet,
     origin: JobOrigin,
 ) -> Result<SubmitOutcome, SearchError> {
+    // NAN-5612: every job submission (POST /api/search async, the jobs route,
+    // a hand-off) passes here; dataset=signals also needs detections:view.
+    super::require_dataset_access(auth, request.dataset.as_deref(), &request.query)?;
     state
         .background_jobs
         .submit(request, auth.claims.sub, scope, origin)

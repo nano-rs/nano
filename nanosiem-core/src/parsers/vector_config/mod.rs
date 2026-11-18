@@ -428,6 +428,9 @@ mod token_bound_route_tests;
 #[cfg(test)]
 #[path = "two_phase_activation_tests.rs"]
 mod two_phase_activation_tests;
+#[cfg(test)]
+#[path = "pipeline_gate_tests.rs"]
+mod pipeline_gate_tests;
 mod credentials;
 pub mod delivery;
 mod deploy;
@@ -435,6 +438,7 @@ mod fanin_slots;
 mod hec_payload;
 pub mod hec_route;
 mod parser_config;
+mod pipeline_gate;
 mod publication;
 pub mod redaction;
 pub mod remote_delivery;

@@ -2,6 +2,7 @@
 
 pub mod drive_by;
 pub mod exfil;
+pub mod hunts;
 pub mod lateral;
 pub mod persistence;
 pub mod quick;

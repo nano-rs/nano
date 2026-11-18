@@ -9,11 +9,21 @@ import type {
   NotificationConfig,
   UpdateNotificationConfigRequest,
 } from './types';
+import type { WebhookEventType } from '../webhook-event-types';
 
 export class WebhooksApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>
   ) {}
+
+  /** Every event type a channel can subscribe to: built-ins and server-registered extensions. */
+  async listEventTypes(): Promise<WebhookEventType[]> {
+    const body = await this.request<{ event_types?: unknown } | null>('/api/settings/webhooks/event-types');
+    const list = Array.isArray(body?.event_types) ? body.event_types : [];
+    return list
+      .filter((t): t is { name: string; extension?: unknown } => !!t && typeof t === 'object' && typeof (t as { name?: unknown }).name === 'string')
+      .map((t) => ({ name: t.name, extension: t.extension === true }));
+  }
 
   async listWebhooks(): Promise<WebhookConfig[]> {
     return this.request('/api/settings/webhooks');

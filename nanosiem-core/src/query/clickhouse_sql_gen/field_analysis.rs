@@ -230,6 +230,13 @@ pub(crate) fn analyze_required_fields(
                         fields.insert(f.to_string());
                     }
                 }
+                // NAN-5612: the derived detections source; also `SELECT *`.
+                crate::schema::SchemaId::Signals => {
+                    use crate::schema::SchemaProfile as _;
+                    for f in crate::schema::SignalsProfile::new().default_table_fields() {
+                        fields.insert(f.to_string());
+                    }
+                }
             }
         }
         return Some(fields);

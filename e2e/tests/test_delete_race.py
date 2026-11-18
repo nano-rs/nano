@@ -44,6 +44,7 @@ def _vector_refusals(project: str, since: str) -> list[str]:
     ]
 
 
+@pytest.mark.udm_only("parser emits no class_uid, so OCSF search never sees its events (NAN-5594)")
 def test_parser_then_source_config_delete_keeps_every_reload_accepted(
     stack: Stack, nano: Nano, token_source, mark: str, request, timeline
 ) -> None:

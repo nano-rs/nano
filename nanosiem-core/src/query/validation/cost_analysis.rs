@@ -266,8 +266,21 @@ fn analyze_search_expr(
                 ),
                 impact: None,
             });
+            analyze_subsearch_pipeline(expr, analysis);
         }
+        // NAN-5620: an IN subsearch's pipeline executes; its stages carry
+        // their own cost warnings.
+        SearchExpr::InSubsearch { .. } => analyze_subsearch_pipeline(expr, analysis),
         _ => {}
+    }
+}
+
+/// The warnings of an `IN [ ]` subsearch's own pipeline (NAN-5620).
+fn analyze_subsearch_pipeline(expr: &SearchExpr, analysis: &mut QueryCostAnalysis) {
+    if let SearchExpr::InSubsearch { subsearch, .. } = expr {
+        let mut sub = QueryCostAnalysis::default();
+        analyze_query_recursive(subsearch, &mut sub, &mut AnalysisContext::default());
+        analysis.warnings.extend(sub.warnings);
     }
 }
 
@@ -279,6 +292,7 @@ fn dataset_label(ds: crate::query::clickhouse_sql_gen::otel::Dataset) -> &'stati
         Dataset::Spans => "spans",
         Dataset::Metrics => "metrics",
         Dataset::Risk => "risk",
+        Dataset::Signals => "signals",
     }
 }
 

@@ -357,7 +357,15 @@ fn explanation_scope_fingerprint(auth: &AuthContext) -> String {
     let scope = auth.effective_viewer_scope();
     let row = encode_scope_fingerprint(scope.deny_set().iter().map(String::as_str));
     let artifact = encode_scope_fingerprint(scope.artifact_deny_set().iter().map(String::as_str));
-    format!("{}:{}{}", row.len(), row, artifact)
+    let base = format!("{}:{}{}", row.len(), row, artifact);
+    // NAN-5612: a caller denied the detections dataset never shares an entry
+    // with one that is not. Suffixed only when set, so existing keys hold
+    // (source-type names cannot contain `|`).
+    if scope.signals_denied() {
+        format!("{base}|nan5612:signals_denied")
+    } else {
+        base
+    }
 }
 
 /// Canonical, injective encoding of a set of source-type names (NAN-2049).
@@ -525,10 +533,15 @@ mod tests {
             super::explanation_scope_fingerprint(&audit_restricted),
         );
 
-        // A fully unrestricted admin still fingerprints as the empty scope.
+        // A fully unrestricted admin (audit:view + detections:view) still
+        // fingerprints as the empty scope.
+        let mut admin = auth_with(&[], true);
+        admin.claims.permissions.push(permissions::DETECTIONS_VIEW.to_string());
+        assert_eq!(super::explanation_scope_fingerprint(&admin), "0:");
+        // NAN-5612: the same scope without detections:view gets its own key.
         assert_eq!(
             super::explanation_scope_fingerprint(&auth_with(&[], true)),
-            "0:"
+            "0:|nan5612:signals_denied"
         );
     }
 }

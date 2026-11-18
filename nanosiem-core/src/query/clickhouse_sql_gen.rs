@@ -830,6 +830,12 @@ pub struct QueryOptions {
     /// truncates mid-literal (NAN-1160). User-level ordering (`| sort`) is
     /// query semantics and keeps its ORDER BY inside its own stage.
     pub unordered: bool,
+    /// Emit NO `SETTINGS` clause (NAN-5546). For callers that run the SQL as a
+    /// `readonly = 1` identity (an Agent Lane token), which refuses any
+    /// SETTINGS clause: the query then runs under that identity's own profile.
+    /// Settings that change results (`join_use_nulls`) are lost with it, so an
+    /// unmatched join side reads the type default rather than NULL there.
+    pub omit_settings: bool,
 }
 
 impl Default for QueryOptions {
@@ -841,6 +847,7 @@ impl Default for QueryOptions {
             // (explain, detection, …) without an executor-side pagination step.
             limit: Some(ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT),
             unordered: false,
+            omit_settings: false,
         }
     }
 }
@@ -1139,7 +1146,9 @@ fn strip_injected_audit_gate(query: &Query, dataset: otel::Dataset) -> Query {
 /// Unwrap the gate from one scan (only when that scan does NOT read `logs`),
 /// then recurse into any subsearches the expression carries.
 fn strip_injected_audit_gate_expr(expr: &SearchExpr, dataset: otel::Dataset) -> SearchExpr {
-    if !matches!(dataset, otel::Dataset::Logs) {
+    // NAN-5612: `signals` keeps the gate like `logs` — every detection
+    // carries its matched event's `source_type`.
+    if !dataset.is_source_scoped() {
         if let SearchExpr::And(left, right) = expr {
             if is_injected_audit_gate_filter(right) {
                 if let SearchExpr::Group(inner) = left.as_ref() {
@@ -1237,6 +1246,79 @@ fn strip_injected_audit_gate_command(command: &Command, dataset: otel::Dataset) 
         _ => {}
     }
     stripped
+}
+
+/// Collect the deny values of every injected source-scope gate in `query`
+/// (NAN-5612): the outer scan and every subsearch at any depth, walked like
+/// [`strip_injected_audit_gate`]. `enforce_source_scope` injects the SAME deny
+/// set at every scan, so this recovers the caller's scope for the derived
+/// `signals` source, whose legs filter by it. A user's own top-level
+/// `source_type NOT IN (…)` of the same shape only adds values (hides more),
+/// never fewer.
+fn collect_injected_gate_values(query: &Query, out: &mut std::collections::BTreeSet<String>) {
+    match query {
+        Query::Search(expr) => collect_gate_values_expr(expr, out),
+        Query::Piped { source, command } => {
+            collect_injected_gate_values(source, out);
+            collect_gate_values_command(command, out);
+        }
+    }
+}
+
+fn collect_gate_values_expr(expr: &SearchExpr, out: &mut std::collections::BTreeSet<String>) {
+    match expr {
+        SearchExpr::And(left, right) => {
+            if matches!(left.as_ref(), SearchExpr::Group(_)) && is_injected_audit_gate_filter(right) {
+                match right.as_ref() {
+                    SearchExpr::FieldFilter { value: Value::String(s), .. } => {
+                        out.insert(s.clone());
+                    }
+                    SearchExpr::InList { values, .. } => {
+                        for v in values {
+                            if let Value::String(s) = v {
+                                out.insert(s.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            collect_gate_values_expr(left, out);
+            collect_gate_values_expr(right, out);
+        }
+        SearchExpr::Or(left, right) => {
+            collect_gate_values_expr(left, out);
+            collect_gate_values_expr(right, out);
+        }
+        SearchExpr::Not(inner) | SearchExpr::Group(inner) => collect_gate_values_expr(inner, out),
+        SearchExpr::InSubsearch { subsearch, .. } => collect_injected_gate_values(subsearch, out),
+        _ => {}
+    }
+}
+
+fn collect_gate_values_command(command: &Command, out: &mut std::collections::BTreeSet<String>) {
+    match command {
+        Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+            collect_injected_gate_values(subsearch, out)
+        }
+        Command::Where { condition } => collect_gate_values_expr(condition, out),
+        Command::Transaction { startswith, endswith, .. } => {
+            for e in [startswith, endswith].into_iter().flatten() {
+                collect_gate_values_expr(e, out);
+            }
+        }
+        Command::Sequence { conditions, .. } => {
+            for c in conditions {
+                collect_gate_values_expr(c, out);
+            }
+        }
+        Command::Funnel { steps, .. } => {
+            for (_, c) in steps {
+                collect_gate_values_expr(c, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Default max elements for groupArray/groupUniqArray to prevent OOM from unbounded array aggregation.
@@ -1444,7 +1526,33 @@ pub struct ClickHouseSqlGenerator {
     /// so the `| identity` enrich-side gate is inert until that threading lands —
     /// tracked as a NAN-1801 follow-up. Empty default = no behavior change.
     source_scope_deny: std::collections::BTreeSet<String>,
+    /// NAN-5612: render the derived `signals` dataset's base source as this
+    /// bare name instead of the detections union. ONLY the SQL-to-nPL
+    /// comparator sets it (its proof compares pipelines over the same source,
+    /// which it names `signals`); every executing path leaves it `None`.
+    signals_source_override: Option<String>,
+    /// NAN-5628: prefix of every pipeline CTE name this generator emits
+    /// (`{prefix}stage_<i>`). Empty for a top-level query, so its SQL is
+    /// unchanged. An `IN [ … | <stages> ]` subsearch pipeline is generated by a
+    /// clone carrying `sub<n>_`, so its `WITH` never reuses an outer `stage_*`
+    /// name (ClickHouse resolved the outer `stage_1` to the inner one: Code 60
+    /// UNKNOWN_TABLE) nor another subsearch's. Config-like: carried by clone.
+    cte_prefix: String,
+    /// NAN-5628: the sequence handing each nested subsearch pipeline its
+    /// `sub<n>_` prefix. One counter per top-level generation, shared by every
+    /// clone taken during it (cross-dataset subsearch scopes and the nested
+    /// pipeline generators themselves), so `n` is unique across siblings and
+    /// nesting levels. Replaced with a fresh counter at the start of every
+    /// top-level `generate_with_options`, which keeps the SQL deterministic.
+    nested_cte_seq: RwLock<Arc<std::sync::atomic::AtomicUsize>>,
 }
+
+/// The `FROM` placeholder a `dataset=signals` scan carries until
+/// [`ClickHouseSqlGenerator::generate_with_options`] swaps in the derived,
+/// window-bound, scope-filtered detections source. Not valid SQL on its own,
+/// so a path that ever skipped the swap fails loudly instead of reading the
+/// wrong table.
+pub(crate) const SIGNALS_SOURCE_SENTINEL: &str = "__nano_signals_source__";
 
 impl Clone for ClickHouseSqlGenerator {
     fn clone(&self) -> Self {
@@ -1477,6 +1585,9 @@ impl Clone for ClickHouseSqlGenerator {
             is_clustered: self.is_clustered,
             rederive_tail_fields: self.rederive_tail_fields,
             source_scope_deny: self.source_scope_deny.clone(),
+            signals_source_override: self.signals_source_override.clone(),
+            cte_prefix: self.cte_prefix.clone(),
+            nested_cte_seq: RwLock::new(self.nested_cte_seq_handle()),
         }
     }
 }
@@ -1532,6 +1643,9 @@ impl ClickHouseSqlGenerator {
             is_clustered: false,
             rederive_tail_fields: false,
             source_scope_deny: std::collections::BTreeSet::new(),
+            signals_source_override: None,
+            cte_prefix: String::new(),
+            nested_cte_seq: RwLock::new(Arc::default()),
         }
     }
 
@@ -1567,6 +1681,9 @@ impl ClickHouseSqlGenerator {
             is_clustered: false,
             rederive_tail_fields: false,
             source_scope_deny: std::collections::BTreeSet::new(),
+            signals_source_override: None,
+            cte_prefix: String::new(),
+            nested_cte_seq: RwLock::new(Arc::default()),
         }
     }
 
@@ -1672,6 +1789,78 @@ impl ClickHouseSqlGenerator {
         format!("({})", query.to_inline_sql())
     }
 
+    /// NAN-5628: the pipeline CTE name for stage `i` (`stage_<i>` at the top
+    /// level, `sub<n>_stage_<i>` inside a nested subsearch pipeline).
+    pub(crate) fn stage_cte_name(&self, i: usize) -> String {
+        format!("{}stage_{}", self.cte_prefix, i)
+    }
+
+    fn nested_cte_seq_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        match self.nested_cte_seq.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// NAN-5628: a clone that generates a nested subsearch pipeline under the
+    /// next unique `sub<n>_` CTE prefix of this generation.
+    pub(crate) fn nested_pipeline_generator(&self) -> Self {
+        let n = self.nested_cte_seq_handle().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut nested = self.clone();
+        nested.cte_prefix = format!("sub{n}_");
+        nested
+    }
+
+    /// SQL-to-nPL comparator only (NAN-5612): name the `signals` dataset's
+    /// base source `name` instead of building the detections union.
+    pub(crate) fn with_signals_source_override(mut self, name: impl Into<String>) -> Self {
+        self.signals_source_override = Some(name.into());
+        self
+    }
+
+    /// The derived base source for the `signals` dataset (NAN-5612): every
+    /// detection that fired in `time_range`, real-time `signals` rows plus
+    /// scheduled findings rows in the tenant events table, from the shared
+    /// detections builder (the same source a hunt's `{signals}` pivot reads),
+    /// with `deny` applied inside both legs.
+    ///
+    /// The events table / schema come from the captured tenant logs binding
+    /// (`base_table`/`base_profile`) when a dataset swap happened, else from
+    /// the generator's own (a logs query whose `[dataset=signals …]`
+    /// subsearch is being rendered). The real-time table is cluster-routed
+    /// like every other dataset table.
+    fn signals_base_source(
+        &self,
+        time_range: &TimeRange,
+        deny: &std::collections::BTreeSet<String>,
+    ) -> String {
+        if let Some(name) = &self.signals_source_override {
+            return name.clone();
+        }
+        let events_table = self.base_table.clone().unwrap_or_else(|| self.table_name.clone());
+        let schema = self
+            .base_profile
+            .as_ref()
+            .unwrap_or(&self.profile)
+            .id();
+        let start = format!(
+            "'{}'",
+            crate::sql_hygiene::format_ch_bound_micros(&time_range.start)
+        );
+        let end = format!(
+            "'{}'",
+            crate::sql_hygiene::format_ch_bound_micros(&time_range.end)
+        );
+        crate::detection::detections_source::detections_source_scoped(
+            &self.route_dataset_table(otel::Dataset::Signals.table_name()),
+            &events_table,
+            schema,
+            &start,
+            &end,
+            &crate::detection::detections_source::DetectionsScope::from_denied(deny.iter()),
+        )
+    }
+
     /// Point the generator at an OTLP [`Dataset`] (NAN-1534). Builder-style; sets
     /// the storage table AND the primary time column in lock-step so the
     /// time-bound WHERE, default ORDER BY, and the `rate()` window all reference
@@ -1716,6 +1905,11 @@ impl ClickHouseSqlGenerator {
             // over the captured tenant logs table (cluster routing + OCSF
             // sentinels inherited from the shared builder), not a storage table.
             otel::Dataset::Risk => self.risk_base_source(),
+            // NAN-5612: the signals dataset's base source is the derived
+            // detections union, which needs the generation window and the
+            // caller's scope; it is swapped in for this placeholder at the end
+            // of `generate_with_options`.
+            otel::Dataset::Signals => SIGNALS_SOURCE_SENTINEL.to_string(),
             // NAN-1728 (C5): route the spans/metrics storage table to its
             // `_distributed` wrapper when clustered so the search reads all
             // shards; single-shard (default) keeps the bare literal.
@@ -1738,6 +1932,10 @@ impl ClickHouseSqlGenerator {
             // NAN-1798 P2: the derived risk grain resolves fields through its
             // own 15-column profile (no ext/Map spill on a subquery source).
             otel::Dataset::Risk => self.profile = Arc::new(crate::schema::RiskProfile::new()),
+            // NAN-5612: the detections source's ten columns (no spill tail).
+            otel::Dataset::Signals => {
+                self.profile = Arc::new(crate::schema::SignalsProfile::new())
+            }
             // NAN-1567: restore the captured tenant logs profile. For a logs-only
             // query `with_dataset` is never called, so this arm is only reached for
             // a cross-dataset subsearch INTO logs — where `base_profile` was
@@ -1971,7 +2169,7 @@ impl ClickHouseSqlGenerator {
             }
         }
         Some(SnapshotRefetch {
-            ancestor: format!("stage_{}", j),
+            ancestor: self.stage_cte_name(j),
             sid,
         })
     }
@@ -2838,6 +3036,19 @@ impl ClickHouseSqlGenerator {
         let sql = super::complexity::with_query_stack(|| {
             self.generate_with_options_unguarded(query, time_range, options)
         })?;
+        // NAN-5612: every `dataset=signals` scan (the outer query or any
+        // subsearch) carries the source placeholder; swap in the derived
+        // detections source, bounded to this generation's window and filtered
+        // by the caller's deny set, which is read from the gate
+        // `enforce_source_scope` injected at every scan (plus any explicit
+        // generator scope). Fail closed: the placeholder is not valid SQL.
+        let sql = if sql.contains(SIGNALS_SOURCE_SENTINEL) {
+            let mut deny = self.source_scope_deny.clone();
+            collect_injected_gate_values(query, &mut deny);
+            sql.replace(SIGNALS_SOURCE_SENTINEL, &self.signals_base_source(time_range, &deny))
+        } else {
+            sql
+        };
         // Security review 2026-11-08 (layer 2): log-only check of the output.
         // Never fails the query; see `generated_sql_tripwire`.
         super::generated_sql_tripwire::observe(&sql, "npl_codegen");
@@ -2868,6 +3079,15 @@ impl ClickHouseSqlGenerator {
         // query the walk is a structural no-op and the SQL stays byte-identical.
         let stripped_query = strip_injected_audit_gate(query, self.dataset);
         let query = &stripped_query;
+        // NAN-5628: a top-level generation numbers its nested subsearch
+        // pipelines from 0; a nested pipeline (non-empty prefix) keeps drawing
+        // from the sequence of the generation it belongs to.
+        if self.cte_prefix.is_empty() {
+            match self.nested_cte_seq.write() {
+                Ok(mut guard) => *guard = Arc::default(),
+                Err(poisoned) => *poisoned.into_inner() = Arc::default(),
+            }
+        }
 
         // Store time range for subsearch IN subquery generation
         // Use write_or_default to avoid panic on poisoned lock
@@ -2901,6 +3121,7 @@ impl ClickHouseSqlGenerator {
 
         let mut ctx = GeneratorContext::new(&self.table_name, &self.time_column, time_range);
         ctx.use_cache = options.use_cache;
+        ctx.omit_settings = options.omit_settings;
         // With exactly ONE resolve_identity in the pipeline, the bare
         // `identity_*` names are unambiguous — the stage emits them as extra
         // aliases of the prefixed columns (NAN-1346 #5). Two resolved entities
@@ -2930,7 +3151,7 @@ impl ClickHouseSqlGenerator {
         // entity grain — the slim/table-view projections enumerate logs-shaped
         // columns that don't exist on it. `SELECT *` is both correct and cheap
         // at this grain (entity cardinality, not event volume).
-        if matches!(self.dataset, otel::Dataset::Risk) {
+        if matches!(self.dataset, otel::Dataset::Risk | otel::Dataset::Signals) {
             ctx.required_fields = None;
         }
 
@@ -3058,7 +3279,7 @@ impl ClickHouseSqlGenerator {
             where_clause,
             order_clause,
             limit,
-            generate_settings(ctx.use_cache, selective, false),
+            ctx.settings_clause(generate_settings(ctx.use_cache, selective, false)),
         ))
     }
 
@@ -3124,7 +3345,7 @@ impl ClickHouseSqlGenerator {
                     where_clause,
                     order_clause,
                     limit_clause,
-                    generate_settings(ctx.use_cache, selective, false),
+                    ctx.settings_clause(generate_settings(ctx.use_cache, selective, false)),
                 ))
             }
             QueryStage::Command(_) => Err(SqlGenError::UnsupportedOperation(
@@ -3233,13 +3454,13 @@ impl ClickHouseSqlGenerator {
         let mut explicit_before_last: Option<String> = None;
         let mut ordinal_in_scope = false;
         for (i, stage) in stages.iter().enumerate() {
-            let cte_name = format!("stage_{}", i);
+            let cte_name = self.stage_cte_name(i);
             if let QueryStage::Command(Command::Head { count }) = stage {
                 if natural_event_order && !ctx.unordered && i > 0 {
                     cte_parts.push(format!(
-                        "{} AS (\n  SELECT * FROM stage_{}\n  ORDER BY {} DESC\n  LIMIT {}\n)",
+                        "{} AS (\n  SELECT * FROM {}\n  ORDER BY {} DESC\n  LIMIT {}\n)",
                         cte_name,
-                        i - 1,
+                        self.stage_cte_name(i - 1),
                         ctx.time_column,
                         count
                     ));
@@ -3300,7 +3521,7 @@ impl ClickHouseSqlGenerator {
                     )
                 }
                 QueryStage::Command(cmd) => {
-                    let prev_cte = format!("stage_{}", i - 1);
+                    let prev_cte = self.stage_cte_name(i - 1);
                     // Track commands that affect column availability or have their own ordering
                     match cmd {
                         Command::Sort { .. } | Command::Tail { .. } => {
@@ -3493,7 +3714,7 @@ impl ClickHouseSqlGenerator {
         let folded_projection = folds
             .then(|| cte_parts.last())
             .flatten()
-            .and_then(|cte| cte.strip_prefix(&format!("stage_{last} AS (\n"))?.strip_suffix("\n)"))
+            .and_then(|cte| cte.strip_prefix(&format!("{} AS (\n", self.stage_cte_name(last)))?.strip_suffix("\n)"))
             .map(|body| body.trim().to_string())
             .filter(|body| body.starts_with("SELECT ") && !body.contains('\n'));
         if folded_projection.is_some() {
@@ -3516,7 +3737,7 @@ impl ClickHouseSqlGenerator {
         let selective = stages.iter().any(|s| {
             matches!(s, QueryStage::Search(expr) if has_selective_indexed_eq(expr, self.profile.as_ref()))
         });
-        let last_cte = format!("stage_{}", stages.len() - 1);
+        let last_cte = self.stage_cte_name(stages.len() - 1);
         let mut settings =
             generate_settings(ctx.use_cache, selective, has_non_timechart_aggregation);
         // An append UNION can produce Variant-typed columns when the arms carry
@@ -3554,6 +3775,7 @@ impl ClickHouseSqlGenerator {
         if stages.iter().any(|s| matches!(s, QueryStage::Command(Command::Join { .. }))) {
             settings.push_str(", join_use_nulls=1");
         }
+        let settings = ctx.settings_clause(settings);
 
         // NAN-876: stage_0 preserves the physical `action` column for
         // downstream stages, so the last CTE may still carry it alongside
@@ -4169,6 +4391,7 @@ impl ClickHouseSqlGenerator {
             sub_ctx.required_fields = ctx.required_fields.clone();
             sub_ctx.ext_fields = ctx.ext_fields.clone();
             sub_ctx.use_cache = ctx.use_cache;
+            sub_ctx.omit_settings = ctx.omit_settings;
             sub_gen.generate_subsearch_sql(subsearch, &sub_ctx, sub_cap)?
         } else {
             self.generate_subsearch_sql(subsearch, ctx, sub_cap)?
@@ -4379,7 +4602,7 @@ impl ClickHouseSqlGenerator {
         // default (hash) → byte-identical. Emitted on the JOIN CTE.
         self.record_join_arrays(sub_gen, taken_from_sub.as_deref());
         let join_settings = match subsearch_dataset {
-            Some(otel::Dataset::Spans) | Some(otel::Dataset::Metrics) if cross_dataset => {
+            Some(otel::Dataset::Spans) | Some(otel::Dataset::Metrics) if cross_dataset && !ctx.omit_settings => {
                 "\n  SETTINGS join_algorithm = 'partial_merge'"
             }
             _ => "",
@@ -4539,7 +4762,7 @@ impl ClickHouseSqlGenerator {
                         }
                     }
                     // Use previous result as source, wrapped in parentheses with alias
-                    let source = format!("({}) AS stage_{}", current_sql, i - 1);
+                    let source = format!("({}) AS {}", current_sql, self.stage_cte_name(i - 1));
                     // A subsearch stage source is an inline subquery, textually
                     // duplicated by any twice-scanning rewrite — so the same
                     // row-stability rule applies as for CTE stages (NAN-2265).
@@ -5315,6 +5538,8 @@ struct GeneratorContext<'a> {
     required_fields: Option<HashSet<String>>,
     /// Enable query cache (for shared searches)
     use_cache: bool,
+    /// Emit no SETTINGS clause ([`QueryOptions::omit_settings`]).
+    omit_settings: bool,
     /// Maximum results to return as a generator-baked trailing LIMIT.
     /// `None` = emit no trailing LIMIT — the executor owns pagination (NAN-1410).
     limit: Option<usize>,
@@ -5354,6 +5579,15 @@ enum RowOrder {
 }
 
 impl<'a> GeneratorContext<'a> {
+    /// `settings`, or nothing when the caller asked for no SETTINGS clause.
+    fn settings_clause(&self, settings: String) -> String {
+        if self.omit_settings {
+            String::new()
+        } else {
+            settings
+        }
+    }
+
     fn new(table_name: &'a str, time_column: &'a str, time_range: &'a TimeRange) -> Self {
         Self {
             table_name,
@@ -5362,6 +5596,7 @@ impl<'a> GeneratorContext<'a> {
             current_stage: 0,
             required_fields: None,
             use_cache: false,
+            omit_settings: false,
             limit: Some(ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT),
             unordered: false,
             ext_fields: HashSet::new(),
@@ -5393,6 +5628,13 @@ mod npl_eval_parity_tests;
 
 #[cfg(test)]
 mod npl_batch_b_tests;
+#[cfg(test)]
+mod in_subsearch_pipeline_tests;
+#[cfg(test)]
+mod nested_subsearch_cte_names_tests;
+
+#[cfg(test)]
+mod streamstats_order_tests;
 
 #[cfg(test)]
 mod ocsf_alias_gap_tests;
@@ -5630,5 +5872,102 @@ mod source_scope_otel_strip_tests {
             "the logs subsearch of a risk query must keep exactly its own \
              deny-set gate (outer risk scan keeps none): {sql}"
         );
+    }
+    // --- NAN-5612: dataset=signals is source-scoped like the events ---
+
+    const UNRESOLVED: &str = "'__nano:unresolved_source__'";
+
+    fn signals_sql(q: &str, deny: &[&str]) -> String {
+        scoped_sql(q, deny, otel::Dataset::Signals)
+    }
+
+    /// A source-scoped reader (denied `insider`): the injected gate SURVIVES
+    /// on the outer `source_type` column (unlike spans/metrics/risk), AND both
+    /// legs of the derived detections source filter by the deny set, the
+    /// scheduled leg over the finding's FULL origin manifest. Provenance-less
+    /// detections are hidden too (fail closed).
+    #[test]
+    fn signals_dataset_keeps_the_gate_and_scopes_both_legs() {
+        for q in ["*", "severity=\"high\" | stats count by rule_name"] {
+            let sql = signals_sql(q, &["audit", "insider"]);
+            assert!(!sql.contains(SIGNALS_SOURCE_SENTINEL), "placeholder must be replaced: {sql}");
+            assert_eq!(multi_gate_count(&sql), 1, "outer gate kept for `{q}`: {sql}");
+            assert!(
+                sql.contains(&format!(
+                    "lower(trimBoth(s.source_type)) NOT IN ({UNRESOLVED}, 'audit', 'insider')"
+                )),
+                "real-time leg scoped for `{q}`: {sql}"
+            );
+            assert!(
+                sql.contains(&format!("{UNRESOLVED}, 'audit', 'insider'])")) && sql.contains("NOT hasAny("),
+                "scheduled leg scoped over origin_source_types for `{q}`: {sql}"
+            );
+            assert!(
+                sql.contains("NOT IN ('', 'unknown')") && sql.contains("notEmpty(arrayFilter("),
+                "source-scoped reader must not see provenance-less detections for `{q}`: {sql}"
+            );
+            // Review P6: `unknown` is hidden on BOTH legs (real-time column,
+            // scheduled origin manifest).
+            assert_eq!(sql.matches("NOT IN ('', 'unknown')").count(), 2, "{sql}");
+            assert!(sql.contains("FROM signals AS s") && sql.contains("UNION ALL"), "{sql}");
+            assert!(
+                sql.contains("s.timestamp >= '2024-01-01 00:00:00.000000'")
+                    && sql.contains("f.timestamp <= '2024-01-02 00:00:00.000000'"),
+                "both legs are bounded to the search window: {sql}"
+            );
+        }
+    }
+
+    /// Only the audit row gate (no per-source restriction): audit detections
+    /// are hidden, provenance-less ones stay visible (the alerts / matches
+    /// posture).
+    #[test]
+    fn signals_dataset_audit_only_gate_hides_audit_keeps_unknown() {
+        let sql = signals_sql("*", &["audit"]);
+        assert!(sql.contains("source_type) != 'audit'"), "legacy audit gate kept: {sql}");
+        assert!(sql.contains(&format!("NOT IN ({UNRESOLVED}, 'audit')")), "{sql}");
+        assert!(!sql.contains("'unknown'") && !sql.contains("notEmpty("), "{sql}");
+    }
+
+    /// Unrestricted (admin with audit:view): no gate, no scope predicates.
+    #[test]
+    fn signals_dataset_unrestricted_has_no_scope_predicates() {
+        let sql = signals_sql("*", &[]);
+        assert!(!sql.contains("NOT IN") && !sql.contains("hasAny"), "{sql}");
+        assert!(sql.contains("FROM signals AS s") && !sql.contains(SIGNALS_SOURCE_SENTINEL), "{sql}");
+    }
+
+    /// A logs query's `[dataset=signals …]` subsearch is scoped too: the
+    /// deny set is read from the gates `enforce_source_scope` injected, so
+    /// the derived source inside the subsearch filters by it.
+    #[test]
+    fn a_signals_subsearch_from_a_logs_query_is_scoped() {
+        let sql = scoped_sql(
+            r#"* | join risk_entity [dataset=signals severity="high" | stats count as fires by risk_entity]"#,
+            &["audit", "insider"],
+            otel::Dataset::Logs,
+        );
+        assert!(!sql.contains(SIGNALS_SOURCE_SENTINEL), "{sql}");
+        assert!(sql.contains(&format!("NOT IN ({UNRESOLVED}, 'audit', 'insider')")), "{sql}");
+        assert!(multi_gate_count(&sql) >= 2, "outer logs scan and signals subsearch both gated: {sql}");
+    }
+
+    /// The deny values are escaped where they land in the derived source.
+    #[test]
+    fn signals_scope_values_are_escaped() {
+        let scope = crate::detection::detections_source::DetectionsScope::from_denied(
+            [String::from("o'brien")].iter(),
+        );
+        let sql = crate::detection::detections_source::detections_source_scoped(
+            "signals",
+            "logs",
+            crate::schema::SchemaId::Udm,
+            "'a'",
+            "'b'",
+            &scope,
+        );
+        // sql_hygiene::string_literal form (`'` doubled, `\` escaped).
+        assert!(sql.contains("'o''brien'"), "{sql}");
+        assert!(!sql.contains("'o'brien'"), "{sql}");
     }
 }

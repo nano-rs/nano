@@ -61,7 +61,7 @@ vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { id: 'u1', email: 'a@b.c' }, hasPermission: () => true, isAuthenticated: true }),
 }));
 vi.mock('@/contexts/ScrollContainerContext', () => ({ useScrollContainer: () => null }));
-vi.mock('@/contexts/PageContext', () => ({ useHereCardOverride: () => {} }));
+vi.mock('@/contexts/PageContext', () => ({ useHereCardOverride: () => {}, usePageContext: () => ({ pageKey: 'search', hereCard: null, setHereCard: () => {} }) }));
 vi.mock('@/enterprise/contexts/NotebookContext', () => ({
   useNotebookCapture: () => ({ captureSearch: vi.fn(), isActive: false, addEntityToNotebook: vi.fn(), addEntitiesToNotebook: vi.fn() }),
 }));

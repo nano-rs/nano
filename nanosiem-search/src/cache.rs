@@ -484,6 +484,12 @@ impl SearchResultCache {
         }
         fold(&mut hasher, scope.deny_set());
         fold(&mut hasher, scope.artifact_deny_set());
+        // NAN-5612: a caller denied the detections dataset must never be served
+        // a signals result cached for one that is not. Folded only when set,
+        // so every existing key is unchanged.
+        if scope.signals_denied() {
+            hasher.update(b"\x00nan5612:signals_denied");
+        }
         format!("{}:{}", prefix, hex::encode(hasher.finalize()))
     }
 

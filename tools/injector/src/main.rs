@@ -12,6 +12,7 @@
 //!   injector --vector http://localhost:8080 --exfil
 //!   injector --vector http://localhost:8080 --persistence
 //!   injector --vector http://localhost:8080 --drive-by --target WS-FIN-042 --user CORP\\alice
+//!   injector --hec --vector http://localhost:8088 --token <ingest token> --hunts --hunt-tag r1
 
 mod scenarios;
 
@@ -26,7 +27,7 @@ use event_core::entity::{Entity, WorldState};
 use event_core::http::{send_batch_with_retry, Transport};
 use event_core::profiles;
 
-use scenarios::{drive_by, exfil, lateral, persistence, quick, staggered, AttackScenario};
+use scenarios::{drive_by, exfil, hunts, lateral, persistence, quick, staggered, AttackScenario};
 
 #[derive(Parser, Debug)]
 #[command(name = "injector")]
@@ -36,8 +37,9 @@ struct Args {
     #[arg(long, default_value = "http://localhost:8080")]
     vector: String,
 
-    /// Vector auth token (Bearer)
-    #[arg(long)]
+    /// Vector auth token (Bearer). Falls back to `VECTOR_AUTH_TOKEN` (keeps the
+    /// token out of argv, visible in `ps` on shared runners).
+    #[arg(long, env = "VECTOR_AUTH_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
     /// Target hostname for the attack (random if not specified)
@@ -88,6 +90,29 @@ struct Args {
     /// Drive-by download — search ad redirect, ZIP delivery, JS execution, and follow-on activity
     #[arg(long)]
     drive_by: bool,
+
+    /// Hunts v2 ground truth (NAN-5561): Office -> encoded PowerShell -> Tor C2 -> dropper,
+    /// a password spray ending in a success, SMB lateral movement, DNS tunneling, a benign
+    /// SCCM lookalike with 14 days of history, and a prompt-injection string. OCSF JSON events.
+    #[arg(long, requires = "hunt_tag")]
+    hunts: bool,
+
+    /// Suffix for every host / user / domain the --hunts scenario uses.
+    #[arg(long, value_parser = parse_hunt_tag)]
+    hunt_tag: Option<String>,
+
+    /// Send through Splunk HEC (`--vector` is then the HEC base URL, `--token` an ingest
+    /// token) instead of Vector HTTP.
+    #[arg(long)]
+    hec: bool,
+}
+
+fn parse_hunt_tag(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 24 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("hunt tag must be 1-24 letters, digits or dashes".into());
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn parse_sha256(value: &str) -> std::result::Result<String, String> {
@@ -141,6 +166,8 @@ async fn main() -> Result<()> {
         Box::new(exfil::ExfilScenario)
     } else if args.persistence {
         Box::new(persistence::PersistenceScenario)
+    } else if args.hunts {
+        Box::new(hunts::HuntsScenario { tag: args.hunt_tag.clone().unwrap_or_default() })
     } else if args.drive_by {
         Box::new(drive_by::DriveByScenario::new(
             args.sha256
@@ -151,7 +178,7 @@ async fn main() -> Result<()> {
                 .unwrap_or(drive_by::DEFAULT_SAMPLE_NAME),
         ))
     } else {
-        eprintln!("Error: specify a scenario flag: --quick, --lateral, --staggered, --exfil, --persistence, or --drive-by");
+        eprintln!("Error: specify a scenario flag: --quick, --lateral, --staggered, --exfil, --persistence, --drive-by, or --hunts");
         std::process::exit(1);
     };
 
@@ -206,9 +233,19 @@ async fn main() -> Result<()> {
         .connect_timeout(TokioDuration::from_secs(10))
         .timeout(TokioDuration::from_secs(30))
         .build()?;
-    let transport = Transport::Vector {
-        url: args.vector.clone(),
-        token: args.token.clone(),
+    let transport = if args.hec {
+        let base = args.vector.trim_end_matches('/');
+        let url = if base.ends_with("/services/collector/event") {
+            base.to_string()
+        } else {
+            format!("{base}/services/collector/event")
+        };
+        Transport::new_hec(url, args.token.clone())
+    } else {
+        Transport::Vector {
+            url: args.vector.clone(),
+            token: args.token.clone(),
+        }
     };
 
     let start = std::time::Instant::now();
@@ -252,6 +289,20 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Review N7: the ingest token can come from the environment (never argv,
+    /// visible in `ps`), and its value is never printed in `--help`.
+    #[test]
+    fn the_token_reads_vector_auth_token_from_the_env() {
+        use clap::CommandFactory;
+        let cmd = Args::command();
+        let token = cmd.get_arguments().find(|a| a.get_id() == "token").expect("--token");
+        assert_eq!(token.get_env(), Some(std::ffi::OsStr::new("VECTOR_AUTH_TOKEN")));
+        assert!(token.is_hide_env_values_set());
+        // The flag still wins when given.
+        let args = Args::try_parse_from(["injector", "--token", "t1"]).unwrap();
+        assert_eq!(args.token.as_deref(), Some("t1"));
+    }
+
     #[test]
     fn sha256_parser_normalizes_valid_input() {
         let uppercase = drive_by::DEFAULT_SAMPLE_SHA256.to_ascii_uppercase();
@@ -261,6 +312,14 @@ mod tests {
         );
         assert!(parse_sha256("abc").is_err());
         assert!(parse_sha256(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn hunt_tags_are_safe_suffixes() {
+        assert_eq!(parse_hunt_tag(" R1-ab ").unwrap(), "r1-ab");
+        for bad in ["", "a b", "a.b", "x;rm", &"a".repeat(25)] {
+            assert!(parse_hunt_tag(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

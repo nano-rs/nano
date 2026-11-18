@@ -1009,4 +1009,7 @@ impl nanosiem_enterprise::handlers::notebooks::NotebooksAppState for AppState {
     fn create_data_access_layer(&self) -> nanosiem_enterprise::melod::data_access::DataAccessLayer {
         AppState::create_data_access_layer(self)
     }
+    fn detection_service(&self) -> &nanosiem_core::detection::DetectionService {
+        &self.detection_service
+    }
 }

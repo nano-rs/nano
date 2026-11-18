@@ -730,7 +730,7 @@ pub fn create_router(
                 Method::DELETE,
                 Method::OPTIONS,
             ])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT, HeaderName::from_static("x-nano-origin")])
     } else if config.cors_origins.len() == 1 && config.cors_origins[0] == "*" {
         // Wildcard - allow all origins (NOT recommended for production)
         tracing::warn!(
@@ -745,7 +745,7 @@ pub fn create_router(
                 Method::DELETE,
                 Method::OPTIONS,
             ])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT, HeaderName::from_static("x-nano-origin")])
     } else {
         // Specific origins - parse and validate each one
         let origins: Vec<_> = config
@@ -771,7 +771,7 @@ pub fn create_router(
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT, HeaderName::from_static("x-nano-origin")])
         } else {
             tracing::info!("CORS configured for origins: {:?}", config.cors_origins);
             CorsLayer::new()
@@ -783,7 +783,7 @@ pub fn create_router(
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT, HeaderName::from_static("x-nano-origin")])
         }
     };
 
@@ -805,6 +805,9 @@ pub fn create_router(
         .route("/api/search/{request_id}", delete(handlers::cancel_search))
         .route("/api/search/sql", post(handlers::search_sql))
         .route("/api/search/explain", post(handlers::explain))
+        // NAN-5575: agent SQL → nPL (static, executes nothing).
+        .route("/api/search/sql-to-npl", post(handlers::sql_to_npl))
+        .route("/api/search/sql-to-npl/batch", post(handlers::sql_to_npl_batch))
         .route("/api/search/log", post(handlers::fetch_log))
         .route(
             "/api/search/prevalence-artifacts",

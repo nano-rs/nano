@@ -62,6 +62,30 @@ fn search_execute_gate_forbids_under_scoped_keys() {
     assert!(require_search_execute(&auth_with(&[permissions::SEARCH_EXECUTE])).is_ok());
 }
 
+/// NAN-5612: searching the detections needs `detections:view` (what a
+/// rule's stored matches need) on top of `search:execute`, whether the
+/// request names `dataset=signals` or reaches it through a subsearch.
+#[test]
+fn signals_dataset_needs_detections_view() {
+    let search_only = auth_with(&[permissions::SEARCH_EXECUTE]);
+    let both = auth_with(&[permissions::SEARCH_EXECUTE, permissions::DETECTIONS_VIEW]);
+    for (dataset, query) in [
+        (Some("signals"), "*"),
+        (Some("SIGNALS"), "rule_name=x"),
+        (None, "* | join risk_entity [dataset=signals severity=high]"),
+    ] {
+        assert!(
+            matches!(super::require_dataset_access(&search_only, dataset, query), Err(SearchError::Forbidden(_))),
+            "{dataset:?} {query}"
+        );
+        assert!(super::require_dataset_access(&both, dataset, query).is_ok());
+    }
+    // Other datasets are unaffected.
+    for dataset in [None, Some("logs"), Some("risk"), Some("spans")] {
+        assert!(super::require_dataset_access(&search_only, dataset, "status=500").is_ok());
+    }
+}
+
 /// NAN-2109: the cross-user admin surface requires BOTH capabilities.
 ///
 /// The reported repro is step 5-7: a `settings:system`-only key is refused its

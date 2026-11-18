@@ -93,10 +93,33 @@
 #   not a refusal; NANO_SKIP_TLS_PREFLIGHT=1 skips the certificate check. A
 #   re-run without NANO_COMPOSE_OVERLAYS in the environment records in .env any
 #   overlay the running stack uses that .env lacks (so HTTPS stays on).
+#   NAN-5566: when the running single-node Vector predates the ingest gate
+#   (nano 2.0.31 or older), senders that post to its ports directly (:8080,
+#   :8088, OTLP, :6000) cannot be closed before it stops: pause them first. The
+#   installer warns and, before it fetches, pulls or writes anything, asks on a
+#   terminal (type y). Unattended it refuses (exit 1, nothing changed) unless
+#   NANO_CONFIRM_SENDERS_PAUSED=1, NANO_CONFIRM_UPGRADE=1 or
+#   NANO_CONFIRM_LEGACY_UPGRADE=1 is set.
 #   NANO_CONFIRM_UPGRADE=1 answers the "Upgrade to X now? [Y/n]" question
 #   (asked on a terminal when a re-run moves to another release) with yes.
 #   Enter upgrades (NAN-5529). Declining exits 3 (answered n) or 4 (no answer:
 #   end of input); nothing is changed.
+#   NAN-5559: a 0.1.x install (.env NANO_VERSION=latest or 0.x, or no
+#   NANO_EDITION/NANO_IMAGE_PREFIX; a 0.x images.lock; a nano-api image tagged
+#   latest or 0.x) is upgraded to 2.x only on purpose, and the installer says
+#   so before it fetches or writes anything. On a terminal it asks (type y)
+#   and offers a backup (pg_dump + a copy of .env, in a new 0700 directory
+#   outside the install). Unattended it refuses unless
+#   NANO_CONFIRM_LEGACY_UPGRADE=1, and then takes that backup itself unless
+#   NANO_LEGACY_UPGRADE_SKIP_BACKUP=1. NANO_LEGACY_BACKUP_DIR picks the backup
+#   directory (default ~/nano-legacy-backup-<UTC time>).
+#   Vector-to-Vector senders (:6000 was plaintext on 0.1.x, mutual TLS on 2.x):
+#   the guard reads the running Vector's counters and peers (read only). When
+#   :6000 is in use, or NANO_VECTOR_NATIVE_SENDERS=edge-1,edge-2 names the
+#   senders (a terminal asks when it is unset), one client certificate bundle
+#   per sender is issued into <install>/vector-client-bundles/<name>/ before
+#   the stack starts, with a ready sink config (vector-sink.toml). Unattended
+#   without names it warns and says what to run; it never fails for it.
 #   Enterprise: NANO_TIERING (on | off, default off; or --tiering) and NANO_TIERING_PROVIDER (s3 |
 #   s3-compatible | gcs | azure), NANO_TIERING_BUCKET, NANO_TIERING_REGION,
 #   NANO_TIERING_ENDPOINT, NANO_TIERING_PREFIX (default nano),
@@ -122,7 +145,9 @@
 # tree's .nano-edition marker (the public repo and the open bundle say open,
 # the enterprise compose bundle says enterprise), NANO_EDITION in an existing
 # install's .env, and the NANO_EDITION environment variable. Any disagreement
-# fails closed; an install never changes edition on a re-run. Enterprise uses
+# fails closed; an install never changes edition on a re-run, except the
+# deliberate open -> enterprise conversion (`scripts/nano convert --to
+# enterprise`, NANO_CONVERT_EDITION=enterprise, NAN-5558). Enterprise uses
 # images.enterprise.lock (enterprise bundle only; needs a registry login),
 # open core uses images.lock (ghcr.io).
 # NANO_INSTALL_DIR may also be an extracted release bundle (a directory with a
@@ -203,6 +228,11 @@ cleanup_env_temp() {
     # interrupt alike. bash runs this trap on SIGINT/SIGTERM too.
     if declare -F nano_registry_cleanup >/dev/null 2>&1; then
         nano_registry_cleanup || true
+    fi
+    # NAN-5566: never leave ingest closed (nginx marker, Vector's gate) on any
+    # exit after the Vector stop below; defined only once that code ran.
+    if declare -F nano_vq_reopen >/dev/null 2>&1 && [[ "${NANO_VQ_ENGAGED:-0}" == 1 ]]; then
+        nano_vq_reopen 30 || true
     fi
 }
 trap cleanup_env_temp EXIT
@@ -318,6 +348,13 @@ fi
 case "$ENV_EDITION" in
     "" | open | enterprise) ;;
     *) printf 'NANO_EDITION must be open or enterprise (got %s)\n' "$ENV_EDITION" >&2; exit 1 ;;
+esac
+# NAN-5558: set only by `scripts/nano convert --to enterprise` (see the
+# edition checks below for the exact conditions it is honoured under).
+CONVERT_EDITION_INPUT="${NANO_CONVERT_EDITION:-}"
+case "$CONVERT_EDITION_INPUT" in
+    "" | enterprise) ;;
+    *) printf 'NANO_CONVERT_EDITION must be enterprise (got %s)\n' "$CONVERT_EDITION_INPUT" >&2; exit 1 ;;
 esac
 # All traffic goes through the nginx reverse proxy on port 80. The internal
 # nano-api / nano-search ports are not exposed to the host by default.
@@ -2676,6 +2713,527 @@ if [[ -d "$NANO_INSTALL_DIR" && "$(id -u)" != 0 ]]; then
 fi
 
 # ----------------------------------------------------------------------------
+# NAN-5559: a legacy 0.1.x install moves to 2.x only on purpose
+# ----------------------------------------------------------------------------
+# A 0.1.x open install from that era's `curl get.nano.rs | bash` is a git
+# checkout whose .env pins NANO_VERSION=latest. Re-running this installer there
+# upgrades it to 2.x, which changes the OCSF data layout (migration 180 moves
+# the 1.8 table aside as ocsf_logs_legacy_v179; history is not searchable until
+# `scripts/nano ocsf-backfill` copies it). "latest" is not a release, so the
+# release-to-release confirmation (confirm_upgrade) never fires for it. This
+# guard detects such an install BEFORE the checkout is fetched or anything is
+# written, says what the upgrade does, and proceeds only on an explicit yes:
+# typed on a terminal, or NANO_CONFIRM_LEGACY_UPGRADE=1 for an unattended run.
+# It offers (terminal) or takes (unattended) a PostgreSQL dump plus a copy of
+# .env, outside the install directory, first.
+#
+# NAN-5564: Vector can acknowledge events and still lose them while the
+# upgrade restarts the stack, so senders must stop until it is done. This one
+# constant is the only place that says so: the NAN-5564 fix empties it. When it
+# does, also change "2. Pause ingest" under "Legacy open 0.1.x (OCSF 1.8) to
+# v2" in docs/administration/upgrades.md, which tells operators the same.
+LEGACY_SENDER_STOP_NOTICE="Stop your log senders (or block the ingest ports in your firewall) now, and keep them stopped until this upgrade has finished and the API reports healthy. Events sent while the stack restarts can be acknowledged and still lost."
+LEGACY_UPGRADE=0
+LEGACY_FROM=""
+LEGACY_BACKUP_DIR=""
+# Written once the upgrade is confirmed, removed after the closing summary: a
+# re-run after a failed upgrade (by then .env may already record 2.x, so the
+# guard stays quiet) still ends with the backfill / drop steps.
+LEGACY_MARKER="$NANO_INSTALL_DIR/.nano-legacy-upgrade"
+LEGACY_SUMMARY=0
+# Vector-to-Vector (:6000) senders of the 0.1.x install (legacy_vector_native_probe),
+# and the sender names their client certificate bundles are issued for.
+LEGACY_VN_USED=0
+LEGACY_VN_EVENTS=""
+LEGACY_VN_PEERS=""
+LEGACY_VN_SENDERS=""
+
+# One value of a dotenv file (KEY=value; quotes and CR stripped, last wins).
+legacy_env_value() {
+    [[ -f "$1" ]] || return 0
+    awk -v k="$2" '
+        index($0, k "=") == 1 {
+            v = substr($0, length(k) + 2)
+            gsub(/[\r"'"'"']/, "", v)
+        }
+        END { print v }
+    ' "$1"
+}
+
+# The "# Release:" of a lock file, without the v ("" when absent).
+legacy_lock_release() {
+    [[ -f "$1" ]] || return 0
+    sed -n 's/^# Release: v\{0,1\}//p' "$1" | awk 'NR == 1 { print $1 }'
+}
+
+# The tag of a container's image ("" when there is no such container, it is
+# pinned by digest, or docker cannot tell).
+legacy_container_tag() {
+    local image
+    command -v docker >/dev/null 2>&1 || return 0
+    image=$(docker inspect --format '{{.Config.Image}}' "$1" </dev/null 2>/dev/null) || return 0
+    image=${image%%@*}
+    image=${image##*/}
+    [[ "$image" == *:* ]] && printf '%s\n' "${image##*:}"
+    return 0
+}
+
+# NAN-5559: does the running 0.1.x Vector take Vector-to-Vector traffic on
+# :6000? 0.1.x listened there in plaintext; 2.x requires mutual TLS, so every
+# such sender needs a client certificate at the cutover. Read only and best
+# effort, before anything changes, with nothing beyond bash and cat in the
+# Vector image:
+#   * the vector_native source's received-events counter, from Vector's
+#     Prometheus exporter (config/vector/92-metrics.toml, :9598 inside the
+#     container, not published), cumulative since Vector started;
+#   * the peers connected to :6000 right now (/proc/net/tcp* of the
+#     container's network namespace). A Docker gateway address there is a
+#     sender relayed by docker-proxy.
+# Sets LEGACY_VN_EVENTS, LEGACY_VN_PEERS (comma separated), LEGACY_VN_USED.
+legacy_vector_native_probe() {
+    local port=9598 metrics_port metrics tcp
+    local -a limit=()
+    command -v docker >/dev/null 2>&1 || return 0
+    # A wedged daemon must not hang the guard (the exec itself has no deadline).
+    ! command -v timeout >/dev/null 2>&1 || limit=(timeout 45)
+    [[ "$(docker inspect --format '{{.State.Running}}' nano-vector </dev/null 2>/dev/null)" == true ]] || return 0
+    if [[ -f "$NANO_INSTALL_DIR/config/vector/92-metrics.toml" ]]; then
+        metrics_port=$(awk '
+            function flush() { if (prom && addr != "") { print addr; done = 1; exit } }
+            /^[[:space:]]*\[/ { flush(); prom = 0; addr = "" }
+            /^[[:space:]]*type[[:space:]]*=[[:space:]]*"prometheus_exporter"/ { prom = 1 }
+            /^[[:space:]]*address[[:space:]]*=/ { if (match($0, /:[0-9]+"/)) addr = substr($0, RSTART + 1, RLENGTH - 2) }
+            END { if (!done) flush() }
+        ' "$NANO_INSTALL_DIR/config/vector/92-metrics.toml" 2>/dev/null) || metrics_port=""
+        [[ ! "$metrics_port" =~ ^[0-9]+$ ]] || port=$metrics_port
+    fi
+    # shellcheck disable=SC2016 # expanded inside the container
+    metrics=$(${limit[@]+"${limit[@]}"} docker exec nano-vector bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+        printf "GET /metrics HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3
+        if command -v timeout >/dev/null 2>&1; then timeout 20 cat <&3; else cat <&3; fi' _ "$port" \
+        </dev/null 2>/dev/null) || metrics=""
+    LEGACY_VN_EVENTS=$(printf '%s\n' "$metrics" | awk '
+        /^#/ { next }
+        /component_received_events_total\{/ && /component_kind="source"/ && (/component_id="vector_native"/ || /component_type="vector"/) {
+            v = $0; sub(/^.*\}[[:space:]]*/, "", v); split(v, a, /[[:space:]]+/); sum += a[1]; n++
+        }
+        END { if (n) printf "%.0f\n", sum }')
+    tcp=$(${limit[@]+"${limit[@]}"} docker exec nano-vector sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; true' </dev/null 2>/dev/null) || tcp=""
+    LEGACY_VN_PEERS=$(printf '%s\n' "$tcp" | awk -v want=6000 '
+        function hex(s,   i, n) {
+            n = 0; s = toupper(s)
+            for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789ABCDEF", substr(s, i, 1)) - 1
+            return n
+        }
+        function v4(h) { return hex(substr(h, 7, 2)) "." hex(substr(h, 5, 2)) "." hex(substr(h, 3, 2)) "." hex(substr(h, 1, 2)) }
+        function v6(h,   i, w, out) {
+            out = ""
+            for (i = 0; i < 4; i++) {
+                w = substr(h, i * 8 + 1, 8)
+                w = tolower(substr(w, 7, 2) substr(w, 5, 2) substr(w, 3, 2) substr(w, 1, 2))
+                out = out (i ? ":" : "") substr(w, 1, 4) ":" substr(w, 5, 4)
+            }
+            return out
+        }
+        $1 ~ /:$/ && $4 == "01" {
+            split($2, l, ":"); if (hex(l[2]) != want) next
+            split($3, r, ":"); a = r[1]
+            if (length(a) == 8) ip = v4(a)
+            else if (toupper(substr(a, 1, 24)) == "0000000000000000FFFF0000") ip = v4(substr(a, 25, 8))
+            else ip = v6(a)
+            if (!(ip in seen)) { seen[ip] = 1; list = list (list == "" ? "" : ",") ip }
+        }
+        END { print list }')
+    if [[ "${LEGACY_VN_EVENTS:-0}" =~ ^[1-9][0-9]*$ || -n "$LEGACY_VN_PEERS" ]]; then
+        LEGACY_VN_USED=1
+    fi
+    return 0
+}
+
+# Sender names (commas or spaces) -> one comma-separated, de-duplicated list;
+# fails on a name scripts/nano vector-client-cert would refuse.
+legacy_vector_native_names() {
+    local name out="" item
+    local -a items=()
+    read -r -a items <<< "${1//,/ }"
+    for item in "${items[@]}"; do
+        [[ "$item" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || return 1
+        for name in ${out//,/ }; do [[ "$name" != "$item" ]] || continue 2; done
+        out+="${out:+,}$item"
+    done
+    [[ -n "$out" ]] || return 1
+    printf '%s\n' "$out"
+}
+
+# The sender names for the bundles: NANO_VECTOR_NATIVE_SENDERS, else (only
+# when :6000 is in use) asked on a terminal ($1 = 1). Unattended without names
+# it warns with the exact commands; it never stops the upgrade.
+legacy_vector_native_senders() {
+    local ask="$1" reply eof list
+    if [[ -n "${NANO_VECTOR_NATIVE_SENDERS:-}" ]]; then
+        LEGACY_VN_SENDERS=$(legacy_vector_native_names "$NANO_VECTOR_NATIVE_SENDERS") \
+            || fail "NANO_VECTOR_NATIVE_SENDERS='$NANO_VECTOR_NATIVE_SENDERS' is not a list of sender names (1-63 letters, digits, dots, underscores or hyphens each, separated by commas). Nothing was changed."
+        log "Vector-to-Vector senders to issue client certificate bundles for: $LEGACY_VN_SENDERS"
+        return 0
+    fi
+    # Bundles staged on this 0.1.x host before the window (vector-native-pki.sh
+    # bundle --ensure): their senders are the list, nothing to ask.
+    list=""
+    if [[ -s "$NANO_INSTALL_DIR/.nano-pki/vector-native/clients.tsv" ]]; then
+        while IFS= read -r reply; do
+            if [[ -n "$reply" && -s "$NANO_INSTALL_DIR/vector-client-bundles/$reply/$reply.crt" ]]; then
+                list+="$reply,"
+            fi
+        done < <(awk -F '\t' '$4 == "active" { print $1 }' "$NANO_INSTALL_DIR/.nano-pki/vector-native/clients.tsv")
+    fi
+    if [[ -n "$list" ]] && list=$(legacy_vector_native_names "$list"); then
+        LEGACY_VN_SENDERS=$list
+        log "Vector-to-Vector senders with bundles staged before the upgrade: $LEGACY_VN_SENDERS (kept as they are)"
+        return 0
+    fi
+    [[ "$LEGACY_VN_USED" == 1 ]] || return 0
+    if [[ "$ask" == 1 ]]; then
+        while :; do
+            reply="" eof=0
+            printf '%s ' "Name each upstream Vector that sends to port 6000, comma separated (for example edge-1,edge-2); each gets a client certificate bundle. Enter skips:" > /dev/tty
+            IFS= read -r reply < /dev/tty || eof=1
+            [[ "$eof" == 0 ]] || printf '\n' > /dev/tty
+            [[ -n "${reply//[[:space:],]/}" ]] || break
+            if list=$(legacy_vector_native_names "$reply"); then
+                LEGACY_VN_SENDERS=$list
+                return 0
+            fi
+            warn "Sender names are 1-63 letters, digits, dots, underscores or hyphens, separated by commas." >&2
+            [[ "$eof" == 0 ]] || break
+        done
+    fi
+    warn "!! Vector-to-Vector senders were detected on port 6000, and no sender names were given, so this run issues no client certificates. Port 6000 requires mutual TLS after this upgrade: those senders are refused until each has one. After the upgrade, per sender: cd $NANO_INSTALL_DIR && scripts/nano vector-client-cert <name> --out $NANO_INSTALL_DIR/vector-client-bundles/<name> (it prints the sink config). To issue them in this run instead, stop now and re-run with NANO_VECTOR_NATIVE_SENDERS=<name>,<name>."
+}
+
+# Why the install in $1 is a 0.1.x one: one reason per line, nothing for a
+# fresh directory or a 2.x install (whose .env always records an X.Y.Z
+# NANO_VERSION). Reads files and container metadata only: no database access.
+legacy_install_signals() {
+    local dir="$1" env="$1/.env" version release tag
+    [[ -f "$env" ]] || return 0
+    version=$(legacy_env_value "$env" NANO_VERSION)
+    version=${version#v}
+    case "$version" in
+        latest) printf '%s\n' ".env has NANO_VERSION=latest (the 0.1.x installer's default)" ;;
+        0.*) printf '%s\n' ".env has NANO_VERSION=$version" ;;
+        *)
+            # A real 1.x+ release (2.x, or the 1.x lake line refused above) is
+            # never 0.1.x. Anything else (unset, a branch, a SHA, a value with a
+            # trailing comment) proves nothing either way: the other signals decide.
+            [[ "$version" =~ ^[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]] && return 0
+            ;;
+    esac
+    if [[ -z "$(legacy_env_value "$env" NANO_EDITION)$(legacy_env_value "$env" NANO_IMAGE_PREFIX)" ]]; then
+        printf '%s\n' ".env has no NANO_EDITION and no NANO_IMAGE_PREFIX (written before 2.x)"
+    fi
+    release=$(legacy_lock_release "$dir/images.lock")
+    [[ "$release" != 0.* ]] || printf '%s\n' "images.lock in $dir is for release $release"
+    tag=$(legacy_container_tag nano-api)
+    case "$tag" in
+        latest | 0.*) printf '%s\n' "the running nano-api container uses image tag $tag" ;;
+    esac
+    return 0
+}
+
+# 0 when this run will move the install in $1 onto a 2.x tree: a git checkout
+# is fetched (unless NANO_SKIP_GIT_UPDATE=1), and a tree that is already 2.x
+# (an extracted bundle, or a checkout updated by hand) starts 2.x images. A
+# tree still on 0.1.x that is not updated fails later, before anything runs.
+legacy_upgrade_applies() {
+    local dir="$1" lock
+    [[ "$RECORD_PG_HA_IDENTITY_ONLY" != 1 ]] || return 1
+    [[ -e "$dir/.git" && "${NANO_SKIP_GIT_UPDATE:-0}" != 1 ]] && return 0
+    for lock in images.lock images.enterprise.customer.lock images.enterprise.lock; do
+        is_line_release "$(legacy_lock_release "$dir/$lock")" && return 0
+    done
+    return 1
+}
+
+# The 0.1.x release the install runs, as precisely as the signals allow.
+legacy_from_version() {
+    local dir="$1" version
+    version=$(legacy_lock_release "$dir/images.lock")
+    [[ "$version" == 0.* ]] && { printf '%s' "$version"; return 0; }
+    version=$(legacy_env_value "$dir/.env" NANO_VERSION)
+    version=${version#v}
+    [[ "$version" == 0.* ]] && { printf '%s' "$version"; return 0; }
+    version=$(legacy_container_tag nano-api)
+    [[ "$version" == 0.* ]] && { printf '%s' "$version"; return 0; }
+    printf '0.1.x'
+}
+
+# The 2.x release this run installs, or a description when it is only known
+# after the fetch.
+legacy_target_release() {
+    local dir="$1" lock release
+    if [[ -n "$NANO_VERSION" ]]; then
+        printf '%s' "$NANO_VERSION"
+        return 0
+    fi
+    if [[ ! -e "$dir/.git" || "${NANO_SKIP_GIT_UPDATE:-0}" == 1 ]]; then
+        for lock in images.lock images.enterprise.customer.lock images.enterprise.lock; do
+            release=$(legacy_lock_release "$dir/$lock")
+            is_line_release "$release" && { printf '%s' "$release"; return 0; }
+        done
+    fi
+    printf '%s' "the current release on $NANO_BRANCH"
+}
+
+legacy_upgrade_announce() {
+    local signals="$1" target="$2"
+    warn "Upgrading nano 0.1.x to 2.x ($target)"
+    printf '  This install runs nano %s:\n' "$LEGACY_FROM"
+    printf '%s\n' "$signals" | sed 's/^/    - /'
+    cat <<EOF
+
+  What changes:
+    - PostgreSQL (rules, users, cases, settings) is migrated when 2.x starts.
+      Migrations can't be undone: keep a backup (this installer offers one).
+    - The OCSF data layout. Events stored before the upgrade move to a legacy
+      table and are NOT searchable until you copy them into the new layout.
+      Once the stack is up, run (it can take a while; it resumes if stopped):
+        cd $NANO_INSTALL_DIR && scripts/nano ocsf-backfill --order newest-first
+      (On an install that never stored OCSF events it reports nothing to copy.)
+    - Then, optionally, free the legacy table's disk. First a dry run, which
+      checks that every day was copied, then the drop:
+        cd $NANO_INSTALL_DIR && scripts/nano ocsf-legacy-drop
+        cd $NANO_INSTALL_DIR && scripts/nano ocsf-legacy-drop --confirm
+    - NANO_VERSION=latest in .env is replaced by the exact 2.x release, so a
+      later re-run upgrades release by release and asks first.
+EOF
+    if [[ "$LEGACY_VN_USED" == 1 ]]; then
+        printf '\n'
+        warn "Vector-to-Vector senders use port 6000 (${LEGACY_VN_EVENTS:-0} event(s) since Vector started; connected now: ${LEGACY_VN_PEERS:-none}). After the upgrade, port 6000 requires mutual TLS: each upstream Vector needs a client certificate bundle, which this upgrade issues per sender name (NANO_VECTOR_NATIVE_SENDERS, or asked on a terminal)."
+    fi
+    if [[ -n "$LEGACY_SENDER_STOP_NOTICE" ]]; then
+        printf '\n'
+        warn "$LEGACY_SENDER_STOP_NOTICE"
+    fi
+    printf '\n'
+}
+
+# The manual backup, as printed for an unattended run.
+legacy_backup_commands() {
+    local user db
+    user=$(legacy_env_value "$NANO_INSTALL_DIR/.env" POSTGRES_USER)
+    db=$(legacy_env_value "$NANO_INSTALL_DIR/.env" POSTGRES_DB)
+    cat <<EOF
+      mkdir -m 700 ~/nano-legacy-backup
+      docker exec nano-postgres pg_dump --username=${user:-nanosiem} --dbname=${db:-nanosiem} --format=custom > ~/nano-legacy-backup/postgres.dump
+      cp -p $NANO_INSTALL_DIR/.env ~/nano-legacy-backup/env
+EOF
+}
+
+# pg_dump (custom format) of the running 0.1.x PostgreSQL plus a copy of .env,
+# into a new 0700 directory outside the install directory. Fails (before
+# anything was changed) when the dump cannot be taken.
+legacy_upgrade_backup() {
+    local dir user db running install_real parent_real size
+    dir="${NANO_LEGACY_BACKUP_DIR:-$HOME/nano-legacy-backup-$(date -u +%Y%m%dT%H%M%SZ)}"
+    [[ "$dir" == /* ]] \
+        || fail "NANO_LEGACY_BACKUP_DIR must be an absolute path (got '$dir'; a quoted ~ is not expanded). Nothing was changed."
+    dir=${dir%/}
+    user=$(legacy_env_value "$NANO_INSTALL_DIR/.env" POSTGRES_USER)
+    db=$(legacy_env_value "$NANO_INSTALL_DIR/.env" POSTGRES_DB)
+    user=${user:-nanosiem} db=${db:-nanosiem}
+    [[ "$user" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ && "$db" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] \
+        || fail "POSTGRES_USER / POSTGRES_DB in $NANO_INSTALL_DIR/.env are not plain names; take the backup yourself, then re-run with NANO_LEGACY_UPGRADE_SKIP_BACKUP=1. Nothing was changed."
+    running=$(docker inspect --format '{{.State.Running}}' nano-postgres </dev/null 2>/dev/null || true)
+    [[ "$running" == true ]] \
+        || fail "Cannot take the backup: the nano-postgres container is not running. Start the install as it is first (cd $NANO_INSTALL_DIR && docker compose -f $COMPOSE_FILE up -d postgres), then re-run; or re-run with NANO_LEGACY_UPGRADE_SKIP_BACKUP=1 to upgrade without one. Nothing was changed."
+    # Outside the install directory, checked before anything is created: the
+    # parent must exist, and is compared physically (symlinks resolved).
+    [[ -d "${dir%/*}/" ]] \
+        || fail "The parent directory of the backup directory $dir does not exist; create it or choose another with NANO_LEGACY_BACKUP_DIR. Nothing was changed."
+    install_real=$(cd "$NANO_INSTALL_DIR" && pwd -P)
+    parent_real=$(cd "${dir%/*}/" && pwd -P)
+    if [[ "$parent_real/${dir##*/}" == "$install_real" || "$parent_real/" == "$install_real/"* ]]; then
+        fail "The backup directory $dir is inside the install directory; choose another with NANO_LEGACY_BACKUP_DIR. Nothing was changed."
+    fi
+    # A new or empty directory only: it is made 0700, which must never hit an
+    # existing directory full of other files (NANO_LEGACY_BACKUP_DIR=$HOME).
+    if [[ -e "$dir" || -L "$dir" ]]; then
+        [[ -d "$dir" && ! -L "$dir" && -z "$(ls -A "$dir" 2>/dev/null)" ]] \
+            || fail "Backup directory $dir already exists and is not an empty directory; choose a new one with NANO_LEGACY_BACKUP_DIR. Nothing was changed."
+    fi
+    (umask 077 && mkdir -- "$dir" 2>/dev/null) || [[ -d "$dir" ]] \
+        || fail "Could not create the backup directory $dir. Nothing was changed."
+    chmod 700 "$dir" || fail "Could not make $dir private (chmod 700). Nothing was changed."
+    log "Backing up PostgreSQL and .env to $dir"
+    if ! (umask 077 && docker exec nano-postgres pg_dump --username="$user" --dbname="$db" --format=custom \
+            </dev/null > "$dir/postgres.dump"); then
+        fail "pg_dump in nano-postgres failed (above); the backup in $dir is incomplete. Nothing was changed."
+    fi
+    [[ -s "$dir/postgres.dump" ]] || fail "pg_dump wrote an empty dump to $dir/postgres.dump. Nothing was changed."
+    (umask 077 && cp "$NANO_INSTALL_DIR/.env" "$dir/env") && chmod 600 "$dir/env" \
+        || fail "Could not copy .env to $dir/env. Nothing was changed."
+    size=$(wc -c < "$dir/postgres.dump" | tr -d ' ')
+    LEGACY_BACKUP_DIR="$dir"
+    ok "Backup written to $dir (postgres.dump: pg_dump custom format, $size bytes; env: a copy of .env, which holds secrets). Keep it until the upgrade is verified."
+}
+
+# NAN-5564 / NAN-5566: a single-node Vector from 2.0.31 or older has no ingest
+# gate, so senders that post to its published ports directly (:8080, :8088,
+# OTLP, :6000) cannot be closed before this upgrade stops it, and an event in
+# flight then can be lost. Asked BEFORE anything is fetched, pulled or written,
+# so a refusal changes nothing. Accepted: y on a terminal, or (unattended)
+# NANO_CONFIRM_SENDERS_PAUSED=1, NANO_CONFIRM_UPGRADE=1 or
+# NANO_CONFIRM_LEGACY_UPGRADE=1; the warning is printed either way. A Vector
+# with the gate (its container carries NANO_PIPELINE_IDENTITY) is not asked about.
+# BEGIN nano-senders-paused
+confirm_senders_paused_if_old_vector() {
+    local cid="" identity="" reply="" eof=0 workdir flag
+    [[ "${NANO_SENDERS_PAUSED_CHECKED:-0}" != 1 ]] || return 0
+    NANO_SENDERS_PAUSED_CHECKED=1
+    # Single node only: a role-split ingest host closes its ingest-edge instead.
+    [[ -z "${ROLE_ARG:-}" && -z "${INVENTORY_ARG:-}" && ! -f "$NANO_INSTALL_DIR/.nano-role.env" ]] || return 0
+    workdir=$(cd "$NANO_INSTALL_DIR" 2>/dev/null && pwd -P) || workdir="$NANO_INSTALL_DIR"
+    cid=$(docker ps -q --filter label=com.docker.compose.service=vector \
+        --filter "label=com.docker.compose.project.working_dir=$workdir" </dev/null 2>/dev/null | awk 'NR == 1') || cid=""
+    [[ -n "$cid" ]] || cid=$(docker ps -q --filter name='^/nano-vector$' </dev/null 2>/dev/null | awk 'NR == 1') || cid=""
+    [[ -n "$cid" ]] || return 0
+    identity=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" </dev/null 2>/dev/null \
+        | awk 'sub(/^NANO_PIPELINE_IDENTITY=/, "") && !seen++') || identity=""
+    [[ -z "$identity" ]] || return 0
+    warn "This Vector predates the ingest gate (nano 2.0.31 or older): pause every sender that posts to its ports directly (:8080, :8088, OTLP, :6000) before this upgrade stops it, or events in flight can be lost. Senders through nginx (/ingest) are closed automatically."
+    for flag in NANO_CONFIRM_SENDERS_PAUSED NANO_CONFIRM_UPGRADE NANO_CONFIRM_LEGACY_UPGRADE; do
+        if [[ "${!flag:-}" == 1 ]]; then
+            log "$flag=1: going on with the senders that post to Vector directly paused."
+            NANO_CONFIRM_SENDERS_PAUSED=1
+            export NANO_CONFIRM_SENDERS_PAUSED
+            return 0
+        fi
+    done
+    if [[ "${NANO_CHECK_ONLY:-0}" == 1 ]]; then
+        log "NANO_CHECK_ONLY=1: a real run asks for this (or needs NANO_CONFIRM_SENDERS_PAUSED=1 unattended)."
+        return 0
+    fi
+    if ! have_controlling_tty; then
+        printf '%s\n' "install.sh: not upgraded, nothing was changed. Pause the senders that post to Vector's ports directly, then re-run with NANO_CONFIRM_SENDERS_PAUSED=1 (NANO_CONFIRM_UPGRADE=1 or NANO_CONFIRM_LEGACY_UPGRADE=1 confirm it too), or run install.sh from a terminal." >&2
+        exit 1
+    fi
+    printf '%s ' "Are the senders that post to Vector directly paused? Type y to go on [y/N]:" > /dev/tty
+    IFS= read -r reply < /dev/tty || eof=1
+    if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
+        printf '\n' > /dev/tty
+        printf '%s\n' "install.sh: no answer to the senders question; nothing was changed (exit 4)." >&2
+        exit 4
+    fi
+    if [[ "$(normalize_bool "$reply")" != true ]]; then
+        printf '%s\n' "Not upgraded: nothing was changed." > /dev/tty
+        printf '%s\n' "install.sh: senders not confirmed paused; nothing was changed (exit 3). Pause them, then re-run." >&2
+        exit 3
+    fi
+    NANO_CONFIRM_SENDERS_PAUSED=1
+    export NANO_CONFIRM_SENDERS_PAUSED
+}
+# END nano-senders-paused
+
+legacy_upgrade_guard() {
+    local signals target reply eof backup=1 asked_tty=0
+    signals=$(legacy_install_signals "$NANO_INSTALL_DIR")
+    [[ -n "$signals" ]] || return 0
+    legacy_upgrade_applies "$NANO_INSTALL_DIR" || return 0
+    # The managed layout (/opt/nanosiem, IMAGE_TAG in .env, its own
+    # docker-compose.yml) has a separate, tested bridge; never take it here.
+    if [[ -n "$(legacy_env_value "$NANO_INSTALL_DIR/.env" IMAGE_TAG)" && ! -f "$NANO_INSTALL_DIR/docker-compose.opensource.yml" ]]; then
+        fail "$NANO_INSTALL_DIR is a managed 0.1.x install (IMAGE_TAG in .env, no docker-compose.opensource.yml), which this installer does not upgrade. Follow \"Managed v0.1.702 bridge\" in docs/administration/upgrades.md. Nothing was changed."
+    fi
+    LEGACY_UPGRADE=1
+    LEGACY_FROM=$(legacy_from_version "$NANO_INSTALL_DIR")
+    target=$(legacy_target_release "$NANO_INSTALL_DIR")
+    legacy_vector_native_probe
+    legacy_upgrade_announce "$signals" "$target"
+    # NANO_CHECK_ONLY=1 on a tree that is not fetched changes nothing: say it, stop there.
+    if [[ "${NANO_CHECK_ONLY:-0}" == 1 && ( ! -e "$NANO_INSTALL_DIR/.git" || "${NANO_SKIP_GIT_UPDATE:-0}" == 1 ) ]]; then
+        log "NANO_CHECK_ONLY=1: a real run asks before this upgrade (or needs NANO_CONFIRM_LEGACY_UPGRADE=1 unattended)."
+        return 0
+    fi
+    [[ "${NANO_LEGACY_UPGRADE_SKIP_BACKUP:-}" == 1 ]] && backup=0
+    if [[ "${NANO_CONFIRM_LEGACY_UPGRADE:-}" == 1 ]]; then
+        log "NANO_CONFIRM_LEGACY_UPGRADE=1: upgrading."
+    elif ! have_controlling_tty; then
+        {
+            printf '%s\n' "This run has no terminal to confirm the 0.1.x to 2.x upgrade on, and it never upgrades one silently. Nothing was changed."
+            printf '%s\n' "To upgrade unattended, re-run with NANO_CONFIRM_LEGACY_UPGRADE=1 and either:"
+            printf '%s\n' "  - let the installer take the backup (PostgreSQL dump and a copy of .env, into"
+            printf '%s\n' "    ~/nano-legacy-backup-<time>, or the absolute path in NANO_LEGACY_BACKUP_DIR) before it changes anything; or"
+            printf '%s\n' "  - take it yourself first, for example:"
+            legacy_backup_commands
+            printf '%s\n' "    and add NANO_LEGACY_UPGRADE_SKIP_BACKUP=1."
+            printf '%s\n' "Or run install.sh from a terminal: it asks, and offers the backup."
+        } >&2
+        fail "Not upgraded: set NANO_CONFIRM_LEGACY_UPGRADE=1 to upgrade this 0.1.x install to 2.x."
+    else
+        asked_tty=1
+        reply="" eof=0
+        printf '%s ' "Type y to upgrade to 2.x now (anything else stops here):" > /dev/tty
+        IFS= read -r reply < /dev/tty || eof=1
+        if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
+            printf '\n' > /dev/tty
+            printf '%s\n' "install.sh: no answer to the upgrade question; nothing was changed (exit 4)." >&2
+            exit 4
+        fi
+        if [[ "$(normalize_bool "$reply")" != true ]]; then
+            printf '%s\n' "Not upgraded: nothing was changed." > /dev/tty
+            printf '%s\n' "install.sh: upgrade not confirmed; nothing was changed (exit 3)." >&2
+            exit 3
+        fi
+        if [[ "$backup" == 1 ]]; then
+            while :; do
+                reply="" eof=0
+                printf '%s ' "Back up PostgreSQL and .env first (to a new directory outside $NANO_INSTALL_DIR)? [Y/n]:" > /dev/tty
+                IFS= read -r reply < /dev/tty || eof=1
+                if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
+                    printf '\n' > /dev/tty
+                    printf '%s\n' "install.sh: no answer to the backup question; nothing was changed (exit 4)." >&2
+                    exit 4
+                fi
+                [[ -n "${reply//[[:space:]]/}" ]] || break
+                case "$(normalize_bool "$reply")" in
+                    true) break ;;
+                    false) backup=0; break ;;
+                esac
+                warn "Answer y or n (Enter backs up)." >&2
+            done
+        fi
+    fi
+    legacy_vector_native_senders "$asked_tty"
+    confirm_senders_paused_if_old_vector
+    if [[ "$backup" == 1 ]]; then
+        legacy_upgrade_backup
+    else
+        warn "Upgrading without a backup."
+    fi
+    (umask 077 && printf 'LEGACY_FROM=%s\nLEGACY_BACKUP_DIR=%s\nLEGACY_VN_USED=%s\nLEGACY_VN_EVENTS=%s\nLEGACY_VN_PEERS=%s\nLEGACY_VN_SENDERS=%s\n' \
+        "$LEGACY_FROM" "$LEGACY_BACKUP_DIR" "$LEGACY_VN_USED" "$LEGACY_VN_EVENTS" "$LEGACY_VN_PEERS" "$LEGACY_VN_SENDERS" \
+        > "$LEGACY_MARKER") \
+        || fail "Could not write $LEGACY_MARKER. Nothing was changed."
+    # The release-to-release question (confirm_upgrade) is answered.
+    UPGRADE_CONFIRMED=1
+}
+legacy_upgrade_guard
+# A re-run after an upgrade that stopped before its summary.
+if [[ "$LEGACY_UPGRADE" != 1 && -f "$LEGACY_MARKER" && ! -L "$LEGACY_MARKER" ]]; then
+    LEGACY_SUMMARY=1
+    LEGACY_FROM=$(legacy_env_value "$LEGACY_MARKER" LEGACY_FROM)
+    LEGACY_BACKUP_DIR=$(legacy_env_value "$LEGACY_MARKER" LEGACY_BACKUP_DIR)
+    LEGACY_VN_USED=$(legacy_env_value "$LEGACY_MARKER" LEGACY_VN_USED)
+    [[ "$LEGACY_VN_USED" == 1 ]] || LEGACY_VN_USED=0
+    LEGACY_VN_EVENTS=$(legacy_env_value "$LEGACY_MARKER" LEGACY_VN_EVENTS)
+    LEGACY_VN_PEERS=$(legacy_env_value "$LEGACY_MARKER" LEGACY_VN_PEERS)
+    LEGACY_VN_SENDERS=$(legacy_env_value "$LEGACY_MARKER" LEGACY_VN_SENDERS)
+    # The marker is ours (0600); still, only valid names go to the PKI tool.
+    [[ -z "$LEGACY_VN_SENDERS" ]] || LEGACY_VN_SENDERS=$(legacy_vector_native_names "$LEGACY_VN_SENDERS") || LEGACY_VN_SENDERS=""
+    log "Finishing the upgrade from nano ${LEGACY_FROM:-0.1.x} that an earlier run started"
+fi
+
+# ----------------------------------------------------------------------------
 # 2. Clone or update the repo
 # ----------------------------------------------------------------------------
 # NAN-5471: update a get.nano.rs git checkout to the fetched release.
@@ -2705,6 +3263,8 @@ fi
 # on). A git checkout asks in update_git_checkout, before its reset.
 confirm_upgrade() {
     local from="$1" to="$2" how="$3"
+    # NAN-5559: a 0.1.x install was announced and confirmed by its own guard.
+    [[ "$LEGACY_UPGRADE" != 1 ]] || return 0
     [[ "$from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -n "$to" && "$from" != "$to" ]] || return 0
     UPGRADE_CONFIRMED=1
     warn "This upgrades nano $from → $to. Database migrations run on start and can't be undone (keep a backup: scripts/nano backup)."
@@ -2755,7 +3315,9 @@ restore_pipeline_and_exit() {
 update_git_checkout() {
     local dir="$1" branch="$2" tracked untracked conflicts pipeline="tenzir/pipeline.tql"
     local keep_pipeline="" pipeline_copy="" shipped_pipeline_changed=0 leftovers recorded target lock
-    leftovers=$(find "$dir/tenzir" -maxdepth 1 -name '.pipeline.tql.local.*' -type f 2>/dev/null | sort)
+    # A checkout without tenzir/ (find fails) has no leftovers; under pipefail
+    # that must not end the run silently.
+    leftovers=$({ find "$dir/tenzir" -maxdepth 1 -name '.pipeline.tql.local.*' -type f 2>/dev/null || true; } | sort)
     if [[ -n "$leftovers" ]]; then
         if [[ "$(printf '%s\n' "$leftovers" | wc -l)" -eq 1 ]] \
             && git -C "$dir" diff --quiet HEAD -- "$pipeline" </dev/null 2>/dev/null; then
@@ -2788,7 +3350,11 @@ update_git_checkout() {
             done
         fi
         confirm_upgrade "$recorded" "$target" "To restart without upgrading, re-run with NANO_SKIP_GIT_UPDATE=1 ./install.sh."
+        [[ "$LEGACY_UPGRADE" != 1 ]] || log "Upgrading nano $LEGACY_FROM to ${target:-the fetched release}"
     fi
+    # NAN-5566: before the reset below (whatever the recorded release), so a
+    # refusal changes nothing. Idempotent: the main flow's call then returns.
+    confirm_senders_paused_if_old_vector
     # Tracked changes (staged or not) against the checked-out release.
     tracked=$(git -C "$dir" diff --name-status --no-renames HEAD -- </dev/null) \
         || fail "Could not read the local changes in $dir (git diff)."
@@ -2854,7 +3420,10 @@ update_git_checkout() {
     fi
 }
 
-if [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
+if [[ -e "$NANO_INSTALL_DIR/.git" && "$CONVERT_EDITION_INPUT" == enterprise ]]; then
+    # NAN-5558: never fetch the open repository over a conversion.
+    fail "Refusing to convert $NANO_INSTALL_DIR to enterprise (NANO_CONVERT_EDITION=enterprise): it is still a git checkout (.git), which this installer would reset to the open repository. Nothing was changed. Use scripts/nano convert --to enterprise."
+elif [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
     if [[ "${NANO_SKIP_GIT_UPDATE:-0}" == "1" || "$RECORD_PG_HA_IDENTITY_ONLY" == "1" ]]; then
         log "Not updating the checkout (NANO_SKIP_GIT_UPDATE=1 or --record-pg-ha-identity) — installing the checkout at $NANO_INSTALL_DIR as is"
     else
@@ -2874,6 +3443,21 @@ if [[ -f "$NANO_INSTALL_DIR/.nano-test-upgrade-root" ]]; then
 fi
 
 cd "$NANO_INSTALL_DIR"
+
+# NAN-5558: while `scripts/nano convert` is unfinished, only its own installer
+# runs (it passes NANO_CONVERT_RUN, the journal's run_id) may change this
+# install. Finish it with --resume, or undo it with --rollback.
+if [[ -e .nano-convert.json || -L .nano-convert.json ]]; then
+    convert_state=$(sed -n 's/^  "state": *"\([a-z-]*\)".*/\1/p' .nano-convert.json 2>/dev/null | awk 'NR == 1')
+    convert_run=$(sed -n 's/^  "run_id": *"\([A-Za-z0-9TZ-]*\)".*/\1/p' .nano-convert.json 2>/dev/null | awk 'NR == 1')
+    case "$convert_state" in
+        verified | rolled-back) ;;
+        *)
+            [[ -n "$convert_run" && "${NANO_CONVERT_RUN:-}" == "$convert_run" ]] \
+                || fail "A conversion to enterprise is in progress here (state ${convert_state:-unknown}, .nano-convert.json). Finish it with scripts/nano convert --resume, or undo it with scripts/nano convert --rollback. Nothing was changed."
+            ;;
+    esac
+fi
 
 if [[ -e .env || -L .env ]]; then
     validate_env_file "$NANO_INSTALL_DIR/.env"
@@ -3303,6 +3887,42 @@ if [[ -f .env && -z "$RECORDED_EDITION" ]]; then
 fi
 MARKER_EDITION=""
 [[ -f .nano-edition ]] && MARKER_EDITION=$(tr -d '[:space:]' < .nano-edition)
+OPEN_IMAGE_PREFIX="ghcr.io/nano-rs/nano"
+
+# NAN-5558: the one edition change an install allows, open -> enterprise, made
+# only by `scripts/nano convert --to enterprise`. It extracts the enterprise
+# compose package over an open single-node install, then runs this installer
+# with NANO_CONVERT_EDITION=enterprise and the license. Every condition below
+# must hold; otherwise the edition and image-source guards stay as they are.
+CONVERTING_TO_ENTERPRISE=0
+if [[ "$CONVERT_EDITION_INPUT" == enterprise && "$RECORDED_EDITION" == enterprise && "$MARKER_EDITION" == enterprise ]]; then
+    # A resumed conversion: an earlier run already recorded the enterprise
+    # edition. This is an ordinary enterprise re-run.
+    log "NANO_CONVERT_EDITION=enterprise: this install already records the enterprise edition; continuing as a normal re-run"
+elif [[ "$CONVERT_EDITION_INPUT" == enterprise ]]; then
+    convert_refused() {
+        fail "Refusing to convert this install to enterprise (NANO_CONVERT_EDITION=enterprise): $1 Nothing was changed. Use scripts/nano convert --to enterprise, which checks all of this first."
+    }
+    [[ -f .env ]] || convert_refused "there is no existing install here (.env is missing); install the enterprise bundle directly instead."
+    [[ "$RECORDED_EDITION" == open ]] || convert_refused "this install's .env records edition '${RECORDED_EDITION:-none}'; only an open install converts."
+    [[ "$MARKER_EDITION" == enterprise ]] || convert_refused "the source tree's .nano-edition says '${MARKER_EDITION:-nothing}'; extract the enterprise compose package over $NANO_INSTALL_DIR first."
+    [[ -z "$ENV_EDITION" || "$ENV_EDITION" == enterprise ]] || convert_refused "NANO_EDITION=$ENV_EDITION is set in the environment."
+    [[ "$RECORDED_PREFIX" == "$OPEN_IMAGE_PREFIX" ]] || convert_refused ".env records NANO_IMAGE_PREFIX=${RECORDED_PREFIX:-none}, not the open edition's $OPEN_IMAGE_PREFIX."
+    [[ -z "$INVENTORY_ARG$ROLE_ARG" && ! -e .nano-role.env ]] || convert_refused "this is a role-split install; conversion supports single-node installs only."
+    [[ ! -e .git ]] || convert_refused "$NANO_INSTALL_DIR is still a git checkout (.git), which a re-run would reset to the open repository."
+    [[ -f images.enterprise.customer.lock ]] || convert_refused "images.enterprise.customer.lock is missing; the enterprise compose package ships it."
+    [[ -z "${NANO_IMAGES_LOCK:-}" || "$NANO_IMAGES_LOCK" == images.enterprise.customer.lock ]] \
+        || convert_refused "NANO_IMAGES_LOCK=$NANO_IMAGES_LOCK; a converted install pulls the customer images (images.enterprise.customer.lock)."
+    if [[ -n "$LICENSE_TOKEN_INPUT" && -n "$LICENSE_DEPLOYMENT_ID_INPUT" ]] \
+        || [[ "$LICENSE_MODE_INPUT" == offline || -n "$LICENSE_FILE_INPUT" ]]; then
+        :
+    else
+        convert_refused "no license was given to this run (LICENSE_TOKEN and NANO_DEPLOYMENT_ID, or NANO_LICENSE_MODE=offline with NANO_LICENSE_FILE)."
+    fi
+    CONVERTING_TO_ENTERPRISE=1
+    RECORDED_EDITION=enterprise
+    log "Converting this open install to enterprise (NANO_CONVERT_EDITION=enterprise): same release, same data"
+fi
 
 NANO_EDITION="" EDITION_FROM=""
 for src in "the source tree (.nano-edition)=$MARKER_EDITION" "this install's .env=$RECORDED_EDITION" "the NANO_EDITION environment variable=$ENV_EDITION"; do
@@ -3312,7 +3932,7 @@ for src in "the source tree (.nano-edition)=$MARKER_EDITION" "this install's .en
     if [[ -z "$NANO_EDITION" ]]; then
         NANO_EDITION="$value" EDITION_FROM="$origin"
     elif [[ "$value" != "$NANO_EDITION" ]]; then
-        fail "Edition mismatch: $EDITION_FROM says $NANO_EDITION but $origin says $value. An install never switches edition; use the bundle for this install's edition, or a new NANO_INSTALL_DIR."
+        fail "Edition mismatch: $EDITION_FROM says $NANO_EDITION but $origin says $value. An install never switches edition on a re-run; use the bundle for this install's edition, or a new NANO_INSTALL_DIR. To move an open install to enterprise (Self-run), use scripts/nano convert --to enterprise."
     fi
 done
 [[ -n "$NANO_EDITION" ]] || fail "Cannot determine the edition: $NANO_INSTALL_DIR has no .nano-edition marker and no recorded install. Set NANO_EDITION=open or NANO_EDITION=enterprise."
@@ -3411,16 +4031,26 @@ fi
 
 NANO_IMAGE_PREFIX=$(lock_image_prefix "$IMAGES_LOCK")
 [[ -n "$NANO_IMAGE_PREFIX" ]] || fail "$IMAGES_LOCK records no <prefix>-api image."
-OPEN_IMAGE_PREFIX="ghcr.io/nano-rs/nano"
-if [[ "$NANO_EDITION" == open && "$NANO_IMAGE_PREFIX" != "$OPEN_IMAGE_PREFIX" ]] \
-    || [[ "$NANO_EDITION" == enterprise && "$NANO_IMAGE_PREFIX" == "$OPEN_IMAGE_PREFIX" ]]; then
-    fail "$IMAGES_LOCK lists $NANO_IMAGE_PREFIX-* images, which are not the $NANO_EDITION edition's."
-fi
-if [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]] \
-    && [[ "$NANO_IMAGE_PREFIX" == "$CUSTOMER_PREFIX" ]] && internal_to_customer_switch_ok; then
-    log "Switching this install from nano's internal image repository ($RECORDED_PREFIX-*) to the customer repository ($NANO_IMAGE_PREFIX-*): same image digests, and nothing has run here yet"
-elif [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]]; then
-    fail "This install runs $RECORDED_PREFIX-* images but $IMAGES_LOCK lists $NANO_IMAGE_PREFIX-*. Refusing to switch image source on a re-run."
+if [[ "$CONVERTING_TO_ENTERPRISE" == 1 ]]; then
+    # NAN-5558: the open prefix in .env becomes the customer prefix, and only
+    # that: same release, customer lock.
+    [[ "$IMAGES_LOCK" == "$CUSTOMER_LOCK" && -n "$CUSTOMER_PREFIX" && "$NANO_IMAGE_PREFIX" == "$CUSTOMER_PREFIX" \
+        && "$NANO_IMAGE_PREFIX" != "$OPEN_IMAGE_PREFIX" ]] \
+        || convert_refused "the enterprise package's customer lock does not name the customer image repository."
+    [[ "$NANO_VERSION" == "$PRE_RUN_NANO_VERSION" ]] \
+        || convert_refused "this install runs release ${PRE_RUN_NANO_VERSION:-unknown} and the enterprise package is release $NANO_VERSION. Conversion never changes the release: upgrade the open install to $NANO_VERSION first (or use the $PRE_RUN_NANO_VERSION enterprise package)."
+    log "Switching the image source from $RECORDED_PREFIX-* (open) to $NANO_IMAGE_PREFIX-* (enterprise customer repository)"
+else
+    if [[ "$NANO_EDITION" == open && "$NANO_IMAGE_PREFIX" != "$OPEN_IMAGE_PREFIX" ]] \
+        || [[ "$NANO_EDITION" == enterprise && "$NANO_IMAGE_PREFIX" == "$OPEN_IMAGE_PREFIX" ]]; then
+        fail "$IMAGES_LOCK lists $NANO_IMAGE_PREFIX-* images, which are not the $NANO_EDITION edition's."
+    fi
+    if [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]] \
+        && [[ "$NANO_IMAGE_PREFIX" == "$CUSTOMER_PREFIX" ]] && internal_to_customer_switch_ok; then
+        log "Switching this install from nano's internal image repository ($RECORDED_PREFIX-*) to the customer repository ($NANO_IMAGE_PREFIX-*): same image digests, and nothing has run here yet"
+    elif [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]]; then
+        fail "This install runs $RECORDED_PREFIX-* images but $IMAGES_LOCK lists $NANO_IMAGE_PREFIX-*. Refusing to switch image source on a re-run."
+    fi
 fi
 ok "Edition $NANO_EDITION (from $EDITION_FROM), release $NANO_VERSION ($NANO_IMAGE_PREFIX-*)"
 
@@ -3460,6 +4090,9 @@ if [[ "${UPGRADE_CONFIRMED:-0}" != 1 ]]; then
         confirm_upgrade "$PRE_RUN_NANO_VERSION" "$NANO_VERSION" "To stay on $PRE_RUN_NANO_VERSION, run ./install.sh from its own bundle instead."
     fi
 fi
+# NAN-5566: before .env is written and images are pulled (a bundle install, or
+# a re-run whose checkout was already current), so a refusal changes nothing.
+confirm_senders_paused_if_old_vector
 
 validate_egress_policy_input
 if [[ -n "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" && -z "$(normalize_bool "$NANO_ALLOW_PRIVATE_AI_ENDPOINTS")" ]]; then
@@ -3513,6 +4146,18 @@ nano_host_minimums_gate "$ROLE_ARG" "$PWD"
     || fail "scripts/lib/install-preflight.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
 # shellcheck source=scripts/lib/install-preflight.sh
 . scripts/lib/install-preflight.sh
+
+# NAN-5558: record the converted edition and image source now, before any
+# helper reads .env. scripts/nano-tiering.py (and Agent Lane's renderer) take
+# the edition from .env, so with the open value still there the conversion
+# failed at the tiering step. This changes no container: Compose reads .env
+# only when the stack is (re)created further down. The same keys are written
+# again below on every run.
+if [[ "$CONVERTING_TO_ENTERPRISE" == 1 ]]; then
+    nano_env_set_keys .env "NANO_EDITION=$NANO_EDITION" "NANO_VERSION=$NANO_VERSION" "NANO_IMAGE_PREFIX=$NANO_IMAGE_PREFIX" \
+        || fail "Could not record NANO_EDITION/NANO_IMAGE_PREFIX in .env for the conversion. Nothing was changed."
+    ok "Recorded the enterprise edition and image source in .env (conversion)"
+fi
 
 # NAN-5521: a stack started before 2.0.30 with NANO_COMPOSE_OVERLAYS in the
 # environment only (the portal's TLS command) has those overlays on its running
@@ -3691,7 +4336,10 @@ record_base_url_input() {
 }
 
 if [[ -f .env ]]; then
-    if [[ "$PRE_RUN_NANO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$PRE_RUN_NANO_VERSION" != "$NANO_VERSION" ]]; then
+    if [[ "$LEGACY_UPGRADE" == 1 ]]; then
+        # NAN-5559: not "restarting": this run replaces 0.1.x with 2.x.
+        warn ".env already exists: keeping existing secrets and upgrading the stack from nano $LEGACY_FROM to $NANO_VERSION (NANO_VERSION=${PRE_RUN_NANO_VERSION:-unset} in .env becomes $NANO_VERSION)."
+    elif [[ "$PRE_RUN_NANO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$PRE_RUN_NANO_VERSION" != "$NANO_VERSION" ]]; then
         warn ".env already exists — keeping existing secrets and upgrading the stack from $PRE_RUN_NANO_VERSION to $NANO_VERSION."
     else
         warn ".env already exists — keeping existing secrets and restarting the stack on $NANO_VERSION."
@@ -4740,6 +5388,65 @@ vector_native_pki_step() {
 }
 vector_native_pki_step
 
+# NAN-5559: the legacy cutover for Vector-to-Vector senders. A 0.1.x :6000
+# listener was plaintext; from here it is mutual TLS only. When the 0.1.x
+# Vector took :6000 traffic (legacy_vector_native_probe) or the operator named
+# the senders, one client certificate bundle per sender is issued now, before
+# the stack starts (the listener then starts with every new anchor, so no
+# restart): <install>/vector-client-bundles/<name>/ (0700, files 0600) with
+# vector-sink.toml, the sender's sink config with a disk buffer. Bundles
+# staged before the window (vector-native-pki.sh bundle --ensure on the 0.1.x
+# host) are kept, not re-issued.
+#
+# HOOK (NAN-5559, pending the live check that it reproduces 0.1.702 routing):
+# 0.1.x routed every :6000 event on the source_type its sender declared; 2.x
+# routes them all to the fixed `vector_native` source unless
+# NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=true. Only a sender holding a client
+# certificate from this install can connect now, so an upgraded install with
+# :6000 senders keeps trusting the declared type and those events keep reaching
+# the parsers they reached on 0.1.x. An explicit
+# NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE already in .env is never changed;
+# NANO_LEGACY_VECTOR_NATIVE_TRUST_SOURCE_TYPE=false skips this.
+LEGACY_VN_TRUST_SOURCE_TYPE="${NANO_LEGACY_VECTOR_NATIVE_TRUST_SOURCE_TYPE:-true}"
+LEGACY_VN_TRUST_SET=0
+LEGACY_VN_BUNDLES=""
+LEGACY_VN_BUNDLE_FAILED=0
+legacy_vector_native_cutover() {
+    local senders out status=0 kind name dir
+    local -a names=()
+    [[ "$LEGACY_UPGRADE" == 1 || "$LEGACY_SUMMARY" == 1 ]] || return 0
+    [[ "$MULTI_NODE" != "1" ]] || return 0
+    senders=$LEGACY_VN_SENDERS
+    if [[ -n "${NANO_VECTOR_NATIVE_SENDERS:-}" ]]; then
+        senders=$(legacy_vector_native_names "$NANO_VECTOR_NATIVE_SENDERS") \
+            || fail "NANO_VECTOR_NATIVE_SENDERS='$NANO_VECTOR_NATIVE_SENDERS' is not a list of sender names (1-63 letters, digits, dots, underscores or hyphens each, separated by commas). Nothing was started."
+        LEGACY_VN_SENDERS=$senders
+    fi
+    [[ "$LEGACY_VN_USED" == 1 || -n "$senders" ]] || return 0
+    if [[ "$LEGACY_VN_TRUST_SOURCE_TYPE" == true ]] && ! grep -q '^NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=' .env; then
+        nano_env_set_keys .env "NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=true" \
+            || fail "Could not record NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE in .env."
+        LEGACY_VN_TRUST_SET=1
+        log "Set NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=true in .env: port 6000 now admits only senders with a client certificate from this install, so their declared source_type keeps routing their events to the same parsers as on 0.1.x."
+    fi
+    [[ -n "$senders" ]] || return 0
+    [[ -r scripts/lib/vector-native-pki.sh ]] \
+        || fail "scripts/lib/vector-native-pki.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+    read -r -a names <<< "${senders//,/ }"
+    out=$(bash scripts/lib/vector-native-pki.sh bundle --install-dir "$NANO_INSTALL_DIR" "${names[@]}" </dev/null) || status=$?
+    while read -r kind name dir; do
+        [[ "$kind" == bundle && -n "$dir" ]] || continue
+        LEGACY_VN_BUNDLES+="$name $dir"$'\n'
+        ok "Vector-native client certificate bundle for '$name': $dir (sink config: $dir/vector-sink.toml)"
+    done <<< "$out"
+    if [[ "$status" != 0 ]]; then
+        LEGACY_VN_BUNDLE_FAILED=1
+        warn "Not every Vector-native client certificate bundle could be issued (above). After the upgrade, per missing sender: cd $NANO_INSTALL_DIR && scripts/nano vector-client-cert <name> --out $NANO_INSTALL_DIR/vector-client-bundles/<name>"
+    fi
+    return 0
+}
+legacy_vector_native_cutover
+
 if [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
     ok "Prepared .env and role configuration without pulling the application stack or starting services (the pinned Vector image may be cached/pulled for the storage-capacity probe)"
     if [[ "$MULTI_NODE" == "1" ]]; then
@@ -5126,6 +5833,60 @@ if [[ "$MULTI_NODE" != "1" && -z "$METRICS_EXPOSE_OVERLAY" ]]; then
     done
 fi
 
+# NAN-5564: a Vector that keeps running while the new nano-api renders its
+# config is hot-reloaded onto it, and a change to a sink's disk buffer (every
+# 0.1.x upgrade: acks off and drop_newest before, block after) makes that
+# reload fail and Vector exit with events in flight: acknowledged events were
+# lost. So when the pipeline identity (release / ack durability / fan-in
+# slots) changes, stop Vector first. `docker stop` is Vector's graceful
+# shutdown (sources close, in-flight events reach the disk buffers, up to 60 s).
+# Its ports then refuse connections (senders retry; nothing is acknowledged)
+# until the new Vector's entrypoint sees the new api's render
+# (config/vector/.nano/vector-entrypoint.sh, pipeline gate).
+# BEGIN nano-vector-pipeline-stop
+stop_vector_for_pipeline_change() {
+    local target cid have running
+    target=$(docker compose "${COMPOSE_ARGS[@]}" config --format json </dev/null 2>/dev/null \
+        | python3 -I -c 'import json, sys
+env = json.load(sys.stdin).get("services", {}).get("vector", {}).get("environment") or {}
+print(env.get("NANO_PIPELINE_IDENTITY") or "")' 2>/dev/null) || target=""
+    [[ -n "$target" ]] || return 0
+    cid=$(docker compose "${COMPOSE_ARGS[@]}" ps -q vector </dev/null 2>/dev/null | awk 'NR == 1') || cid=""
+    # A 0.1.x install's Vector may belong to another Compose project.
+    [[ -n "$cid" ]] || cid=$(docker ps -q --filter name='^/nano-vector$' </dev/null 2>/dev/null | awk 'NR == 1') || cid=""
+    [[ -n "$cid" ]] || return 0
+    running=$(docker inspect --format '{{.State.Running}}' "$cid" </dev/null 2>/dev/null) || return 0
+    [[ "$running" == true ]] || return 0
+    have=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" </dev/null 2>/dev/null \
+        | awk 'sub(/^NANO_PIPELINE_IDENTITY=/, "") && !seen++') || have=""
+    [[ "$have" == "$target" ]] && return 0
+    log "Stopping Vector before the upgrade (pipeline ${have:-from before NAN-5564} -> $target): it drains to its disk buffers, and ingest refuses connections until the new pipeline is rendered and running"
+    # NAN-5566: a Vector without an identity predates the ingest gate (2.0.31
+    # or older): its direct senders cannot be closed, so they are paused first.
+    if [[ -z "$have" && "$(type -t nano_vq_confirm_senders_paused)" == function ]]; then
+        nano_vq_confirm_senders_paused
+    fi
+    # NAN-5566: close ingest at nginx and let Vector deliver what it accepted
+    # first (this project's Vector only; a 0.1.x one in another project is
+    # stopped as is). The stop timeout exceeds Vector's 60 s graceful limit.
+    if [[ "$(type -t nano_vq_close)" == function ]] \
+        && docker compose "${COMPOSE_ARGS[@]}" ps -q vector </dev/null 2>/dev/null | grep -x "$cid" >/dev/null; then
+        nano_vq_close
+        nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+    fi
+    docker stop --time 120 "$cid" </dev/null >/dev/null \
+        || fail "Could not stop Vector ($cid) before the upgrade (above). Stop it (docker stop --time 120 $cid) and re-run install.sh; re-runs are safe."
+}
+# END nano-vector-pipeline-stop
+if [[ "$MULTI_NODE" != "1" ]]; then
+    if [[ -r scripts/lib/vector-quiesce.sh ]]; then
+        # shellcheck source=scripts/lib/vector-quiesce.sh
+        . scripts/lib/vector-quiesce.sh
+        nano_vq_compose() { docker compose "${COMPOSE_ARGS[@]}" "$@"; }
+    fi
+    stop_vector_for_pipeline_change
+fi
+
 log "Starting services"
 compose_up_args=(up -d)
 if [[ "$MULTI_NODE" == "1" && "${ROLE_CONFIG_WAS_PUBLISHED:-0}" == "1" ]]; then
@@ -5304,6 +6065,12 @@ recreate_stale_mount_services() {
         "${containers[@]}" </dev/null || true)
     (( ${#services[@]} > 0 )) || return 0
     log "Recreating ${services[*]} to load the updated configuration files"
+    # NAN-5566: a recreate stops Vector too: close ingest, drain, long stop first.
+    if [[ " ${services[*]} " == *" vector "* && "$(type -t nano_vq_close)" == function ]] && nano_vq_running vector; then
+        nano_vq_close
+        nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+        nano_vq_stop
+    fi
     # The stack is already up: a failed recreate leaves these services on
     # their previous configuration, which is no reason to abort the install.
     docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate "${services[@]}" </dev/null \
@@ -5317,8 +6084,22 @@ recreate_stale_mount_services
 if [[ "$VECTOR_NATIVE_RESTART" == "1" ]] \
     && docker compose "${COMPOSE_ARGS[@]}" ps --status running --services 2>/dev/null </dev/null | grep -x vector >/dev/null; then
     log "Restarting Vector to load the re-issued Vector-native listener certificate"
-    docker compose "${COMPOSE_ARGS[@]}" restart vector </dev/null \
+    vector_restart_args=(restart vector)
+    if [[ "$(type -t nano_vq_close)" == function ]]; then
+        # NAN-5566: a single host closes ingest and drains first; the reopen
+        # below runs once the restarted Vector is healthy.
+        nano_vq_close
+        nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+        vector_restart_args=(restart --timeout "$NANO_VQ_STOP_TIMEOUT" vector)
+    fi
+    docker compose "${COMPOSE_ARGS[@]}" "${vector_restart_args[@]}" </dev/null \
         || warn "Could not restart Vector; it keeps the previous Vector-native certificate until it restarts. Run: docker compose ${COMPOSE_ARGS[*]} restart vector"
+fi
+
+# NAN-5566: reopen ingest (closed above while Vector drained, or left closed by
+# an earlier run that failed) once the new Vector reports healthy.
+if [[ "$(type -t nano_vq_reopen)" == function ]]; then
+    nano_vq_reopen || warn "Ingest may still be closed at nginx: docker compose exec nginx rm -f /run/nano-ingest/closed"
 fi
 
 # NAN-5404: ClickHouse cannot confine a user to a listener, so with the Agent
@@ -5711,7 +6492,11 @@ if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" && "$SHOW_INGEST_SUMMARY" == "1" 
     else
         printf "              issue a client certificate per sender: scripts/nano vector-client-cert <name>\n"
     fi
-    printf "              (prints the Vector sink config; events land as source_type=vector_native)\n"
+    if [[ "$(env_value NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE)" == true ]]; then
+        printf "              (prints the Vector sink config; events keep the source_type their sender declares)\n"
+    else
+        printf "              (prints the Vector sink config; events land as source_type=vector_native)\n"
+    fi
     # NAN-1603 / NAN-1604: direct OCSF ingestion (Tenzir / Cribl / custom) writes
     # straight into ClickHouse, bypassing Vector. Only meaningful on the OCSF profile.
     if [[ "$SCHEMA_PROFILE" == "ocsf" ]]; then
@@ -5757,11 +6542,53 @@ if [[ "$VECTOR_NATIVE_CUTOVER" == "1" ]]; then
     echo
     printf "  %b!! Vector native port 6000 now REQUIRES mutual TLS.%b\n" "$c_bold" "$c_reset"
     printf "  !! Senders without a client certificate signed by this install's Vector-native CA are refused.\n"
-    if [[ -n "$VECTOR_NATIVE_RECENT_EVENTS" ]]; then
+    # 0.1.x stored the declared source_type, so this count means nothing there;
+    # the legacy summary below reports what the 0.1.x Vector took instead.
+    if [[ -n "$VECTOR_NATIVE_RECENT_EVENTS" && "$LEGACY_UPGRADE" != 1 && "$LEGACY_SUMMARY" != 1 ]]; then
         printf "  !! In the last 24 hours this install took %s event(s) on :6000 (source_type=vector_native);\n" "$VECTOR_NATIVE_RECENT_EVENTS"
         printf "  !! senders that sent them without a client certificate are refused from now on.\n"
     fi
-    printf "  !! Issue one per sender: scripts/nano vector-client-cert <name>  (prints the Vector sink config)\n"
+    if [[ -n "${LEGACY_VN_BUNDLES:-}" ]]; then
+        printf "  !! Client certificate bundles were issued for your senders (below); others: scripts/nano vector-client-cert <name>\n"
+    else
+        printf "  !! Issue one per sender: scripts/nano vector-client-cert <name>  (prints the Vector sink config)\n"
+    fi
+fi
+# NAN-5559: what a 0.1.x install still needs after the upgrade.
+if [[ "$LEGACY_UPGRADE" == 1 || "$LEGACY_SUMMARY" == 1 ]]; then
+    echo
+    printf "  %bUpgraded from nano %s. Next:%b\n" "$c_bold" "$LEGACY_FROM" "$c_reset"
+    printf "    1. Make the OCSF history from before the upgrade searchable again:\n"
+    printf "         cd %s && scripts/nano ocsf-backfill --order newest-first\n" "$NANO_INSTALL_DIR"
+    printf "    2. Optionally, once it reports done, free the legacy table's disk (a dry run first):\n"
+    printf "         cd %s && scripts/nano ocsf-legacy-drop\n" "$NANO_INSTALL_DIR"
+    printf "         cd %s && scripts/nano ocsf-legacy-drop --confirm\n" "$NANO_INSTALL_DIR"
+    if [[ -n "$LEGACY_SENDER_STOP_NOTICE" ]]; then
+        printf "    3. Start your log senders again (or reopen the ingest ports).\n"
+    fi
+    if [[ -n "${LEGACY_VN_BUNDLES:-}" ]]; then
+        printf "  %bVector-to-Vector senders: port 6000 now requires mutual TLS.%b For each sender, copy its\n" "$c_bold" "$c_reset"
+        printf "  bundle's three certificate files to it, merge its sink config into that Vector's config and\n"
+        printf "  restart it. Then delete the bundles here (each holds the sender's private key).\n"
+        while read -r vn_name vn_dir; do
+            [[ -n "$vn_name" ]] || continue
+            printf "    %s: %s\n" "$vn_name" "$vn_dir"
+            if [[ -r "$vn_dir/vector-sink.toml" ]]; then
+                sed 's/^/      /' "$vn_dir/vector-sink.toml"
+            fi
+        done <<< "$LEGACY_VN_BUNDLES"
+    fi
+    if [[ "${LEGACY_VN_USED:-0}" == 1 && -z "${LEGACY_VN_BUNDLES:-}" ]] || [[ "${LEGACY_VN_BUNDLE_FAILED:-0}" == 1 ]]; then
+        printf "  %b!! Vector-to-Vector senders on port 6000 are refused until each has a client certificate.%b\n" "$c_bold" "$c_reset"
+        printf "  !! Per sender: cd %s && scripts/nano vector-client-cert <name> --out %s/vector-client-bundles/<name>\n" \
+            "$NANO_INSTALL_DIR" "$NANO_INSTALL_DIR"
+    fi
+    if [[ "${LEGACY_VN_TRUST_SET:-0}" == 1 ]]; then
+        printf "  NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=true is set in .env: :6000 events keep the source_type\n"
+        printf "  their sender declares (as on 0.1.x); only senders with a client certificate can connect.\n"
+    fi
+    [[ -z "$LEGACY_BACKUP_DIR" ]] || printf "  Backup:   %s (keep it until the upgrade is verified)\n" "$LEGACY_BACKUP_DIR"
+    rm -f -- "$LEGACY_MARKER"
 fi
 echo
 echo "  Logs:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} logs -f"

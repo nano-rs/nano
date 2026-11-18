@@ -75,6 +75,12 @@ where
             )),
             None => future,
         };
+    // NAN-5565: partial-evaluation notes reach the caller's collector too.
+    let future: std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> =
+        match crate::search::partial_run::current() {
+            Some(notes) => Box::pin(crate::search::partial_run::with_scope(notes, future)),
+            None => future,
+        };
     use tracing::instrument::WithSubscriber;
     use tracing::Instrument;
     let future = Box::pin(

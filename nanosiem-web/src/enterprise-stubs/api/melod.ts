@@ -78,6 +78,9 @@ export class MelodApi {
   melodBuildQuery(_request: MelodBuildQueryRequest): Promise<MelodJobStartResponse> {
     return ENTERPRISE_ONLY();
   }
+  sqlToNplAi(_request: import('@/lib/api/types').SqlToNplRequest): Promise<import('@/lib/api/types').SqlToNplResponse> {
+    return ENTERPRISE_ONLY();
+  }
   correctQuery(_request: CorrectQueryRequest): Promise<CorrectQueryResponse> {
     return ENTERPRISE_ONLY();
   }

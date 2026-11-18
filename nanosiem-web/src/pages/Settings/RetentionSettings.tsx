@@ -29,6 +29,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC } from '@/lib/date-utils';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { SettingsSubsectionShell, type SubsectionTab } from '@/components/settings/SettingsSubsectionShell';
 import { DiskUsageNotice } from '@/components/DiskSpaceBanner';
 import { StatGrid, type StatCell } from '@/components/settings/StatGrid';
@@ -60,6 +61,7 @@ export function RetentionSettings() {
   useDocumentTitle('Storage & Retention');
 
   const { toast } = useToast();
+  const { capabilities } = useCapabilities();
   const [searchParams, setSearchParams] = useSearchParams();
   const [overview, setOverview] = useState<StorageOverview | null>(null);
   const [loading, setLoading] = useState(true);
@@ -147,7 +149,8 @@ export function RetentionSettings() {
                     )
                   }
                 />
-                <StorageTieringPanel />
+                {/* Enterprise + licensed only: the open stub renders nothing (NAN-2356 gate). */}
+                {capabilities.storageTiering && <StorageTieringPanel />}
                 <HelperNote
                   icon={Archive}
                   iconColor="text-cyan-400"

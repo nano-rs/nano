@@ -645,3 +645,179 @@ fn max_result_rows_can_reach_zero_but_bytes_still_bound_the_result() {
     let time = sql.split(", ").find(|p| p.starts_with("max_execution_time = ")).unwrap();
     assert_eq!(time, "max_execution_time = 60 MIN 1 MAX 60 CHANGEABLE_IN_READONLY");
 }
+
+// =============================================================================
+// NAN-5546: the internal lane (`agentlane_internal`), added alongside
+// =============================================================================
+
+#[test]
+fn the_internal_profile_is_the_agentlane_profile_on_its_own_workload() {
+    let caps = AgentlaneSettings::default();
+    let human = profile_settings_sql(&caps);
+    let internal = profile_settings_sql_for(&caps, AGENTLANE_INTERNAL_WORKLOAD);
+    assert!(internal.contains("workload = 'agentlane_internal' CONST"), "{internal}");
+    assert!(internal.contains("readonly = 1 CONST"));
+    assert!(internal.contains("force_index_by_date = 1 CONST"));
+    // Identical apart from the workload pin.
+    assert_eq!(
+        human.replace("workload = 'agentlane' CONST", "workload = 'agentlane_internal' CONST"),
+        internal
+    );
+    let [create, alter] = internal_profile_statements("", &caps);
+    assert!(create.starts_with("CREATE SETTINGS PROFILE IF NOT EXISTS agentlane_internal SETTINGS"));
+    assert!(alter.starts_with("ALTER SETTINGS PROFILE agentlane_internal SETTINGS"));
+}
+
+#[test]
+fn the_internal_workload_sits_below_detections_and_search_with_its_own_caps() {
+    let sql = internal_workload_statement(" ON CLUSTER 'c1'", 4, 6 << 30);
+    assert!(sql.starts_with("CREATE OR REPLACE WORKLOAD agentlane_internal ON CLUSTER 'c1' IN nano"), "{sql}");
+    // Lowest weight and a priority below the default-0 siblings.
+    assert!(sql.contains("weight = 1, priority = 10"), "{sql}");
+    assert!(sql.contains("max_concurrent_threads = 4"), "{sql}");
+    assert!(sql.contains(&format!("max_memory = {}", 6u64 << 30)), "{sql}");
+}
+
+#[test]
+fn internal_lane_settings_come_from_their_own_env() {
+    let defaults = agentlane_settings_from_env(AgentlaneEnv::default()).unwrap();
+    assert_eq!(defaults.internal_max_concurrent_threads, DEFAULT_INTERNAL_MAX_CONCURRENT_THREADS);
+    assert_eq!(defaults.internal_max_concurrent_threads, 2 * DEFAULT_MAX_CONCURRENT_THREADS);
+    assert_eq!(defaults.internal_workload_max_memory, None);
+    let set = agentlane_settings_from_env(AgentlaneEnv {
+        internal_max_concurrent_threads: Some("8"),
+        internal_workload_max_memory: Some("8589934592"),
+        ..AgentlaneEnv::default()
+    })
+    .unwrap();
+    assert_eq!(set.internal_max_concurrent_threads, 8);
+    assert_eq!(set.internal_workload_max_memory, Some(8_589_934_592));
+    // The external lane is untouched by the internal variables.
+    assert_eq!(set.max_concurrent_threads, DEFAULT_MAX_CONCURRENT_THREADS);
+    for bad in ["0", "x", "100000"] {
+        let err = agentlane_settings_from_env(AgentlaneEnv {
+            internal_max_concurrent_threads: Some(bad),
+            ..AgentlaneEnv::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains(INTERNAL_MAX_CONCURRENT_THREADS_ENV), "{bad}: {err}");
+    }
+}
+
+/// Upgrade safety (NAN-5546): a v2.0.31 install already has the `agentlane`
+/// profile and workload, `agentlane_reader`, and per-token users. The plan
+/// must leave those definitions byte-identical to what v2.0.31 generates,
+/// never rename or drop them, and only ADD the internal objects.
+#[test]
+fn the_plan_keeps_the_v2_0_31_objects_byte_identical_and_only_adds_internal_ones() {
+    let caps = AgentlaneSettings { max_memory_per_token: Some(1 << 30), ..AgentlaneSettings::default() };
+    let plan = lane_object_statements(" ON CLUSTER 'c1'", " ON CLUSTER 'c1'", &caps, 2 << 30, 1 << 30);
+    let oc = " ON CLUSTER 'c1'";
+    // Golden: the v2.0.31 generators' output (base ff51a9878), verbatim.
+    let v2031 = [
+        format!(
+            "CREATE OR REPLACE WORKLOAD agentlane{oc} IN nano SETTINGS weight = 1, priority = 10, \
+             max_concurrent_threads = 2, max_memory = {}",
+            2u64 << 30
+        ),
+        format!("CREATE RESOURCE IF NOT EXISTS memory{oc} (MEMORY RESERVATION)"),
+        format!("DROP RESOURCE IF EXISTS query{oc}"),
+        format!("CREATE SETTINGS PROFILE IF NOT EXISTS agentlane{oc} SETTINGS {}", profile_settings_sql(&caps)),
+        format!("ALTER SETTINGS PROFILE agentlane{oc} SETTINGS {}", profile_settings_sql(&caps)),
+        format!("CREATE ROLE IF NOT EXISTS agentlane_reader{oc} SETTINGS PROFILE 'agentlane'"),
+        format!("ALTER ROLE agentlane_reader{oc} SETTINGS PROFILE 'agentlane'"),
+    ];
+    assert_eq!(&plan[..v2031.len()], &v2031[..], "the v2.0.31 statements changed");
+    // The external profile still pins the external workload, untouched.
+    let external = profile_settings_sql(&caps);
+    assert!(external.contains("workload = 'agentlane' CONST"));
+    assert!(!external.contains("agentlane_internal"));
+
+    // Everything after is the internal lane, added (create-if-absent or the
+    // existing OR REPLACE pattern), and only ever names the new objects.
+    let added = &plan[v2031.len()..];
+    assert_eq!(added.len(), 3);
+    assert!(added[0].starts_with("CREATE OR REPLACE WORKLOAD agentlane_internal"), "{}", added[0]);
+    assert!(added[1].starts_with("CREATE SETTINGS PROFILE IF NOT EXISTS agentlane_internal"));
+    assert!(added[2].starts_with("ALTER SETTINGS PROFILE agentlane_internal"));
+    for stmt in &plan {
+        let upper = stmt.to_uppercase();
+        assert!(!upper.contains("RENAME"), "{stmt}");
+        if upper.starts_with("DROP") {
+            assert_eq!(stmt, &format!("DROP RESOURCE IF EXISTS query{oc}"), "only v2.0.31's own drop");
+        }
+        assert!(!stmt.contains("agentlane_hunts"), "never shipped; must not appear: {stmt}");
+    }
+    for stmt in added {
+        assert!(stmt.contains("agentlane_internal"), "{stmt}");
+        assert!(!stmt.contains(" agentlane ") && !stmt.contains("agentlane_reader"), "{stmt}");
+    }
+}
+
+#[test]
+fn at_migrate_time_the_internal_lane_reserves_only_the_minimal_cap() {
+    // ClickHouse reads `max_memory = 0` as UNLIMITED, so "no memory" is the
+    // minimal cap; the runtime split is the control plane's job.
+    let defaults = agentlane_settings_from_env(AgentlaneEnv::default()).unwrap();
+    assert_eq!(defaults.internal_workload_max_memory, None);
+    assert_eq!(MIN_WORKLOAD_MAX_MEMORY, 256 << 20);
+    let stmt = internal_workload_statement("", 4, MIN_WORKLOAD_MAX_MEMORY);
+    assert!(stmt.ends_with(&format!("max_memory = {}", 256u64 << 20)), "{stmt}");
+}
+
+// =============================================================================
+// NAN-5602: the ClickHouse-side boundary under the hunts `sql` guard
+// =============================================================================
+
+/// The hunts `sql` guard (`hunts_agent::lane::guard_sql`) is the first
+/// boundary; this is the second. Whatever reaches ClickHouse as a hunts token
+/// (`agentlane_<id>`, role `agentlane_reader`, profile `agentlane_internal`):
+/// the role holds plain `SELECT` on nano's own tables only, so no table
+/// function (it needs `CREATE TEMPORARY TABLE` plus a source privilege) and no
+/// `system.*` table (`select_from_system_db_requires_grant` is on); the
+/// profile is `readonly = 1 CONST` with introspection and DDL off.
+#[test]
+fn the_hunts_token_boundary_is_enforced_by_clickhouse() {
+    for objects in [plan_objects(&single_node_ocsf()), plan_objects(&clustered_ocsf())] {
+        let grant = grant_statement("nanosiem", "", &objects).unwrap();
+        let body = grant.strip_prefix("GRANT ").unwrap().strip_suffix(" TO agentlane_reader").unwrap();
+        for privilege in body.split(", ") {
+            let table = privilege
+                .strip_prefix("SELECT ON nanosiem.")
+                .unwrap_or_else(|| panic!("only SELECT on nano tables may be granted: `{privilege}` in {grant}"));
+            assert!(
+                AGENTLANE_TABLES
+                    .iter()
+                    .any(|(base, _)| TABLE_NAME_SUFFIXES.iter().any(|s| format!("{base}{s}") == table)),
+                "`{table}` is not an Agent Lane table"
+            );
+        }
+        let upper = grant.to_ascii_uppercase();
+        for forbidden in [
+            "SYSTEM.", "INFORMATION_SCHEMA", "TEMPORARY", "SOURCES", " URL", "REMOTE", " FILE", " S3", "*.*",
+            "ALL", "INSERT", "INTROSPECTION", "DICTGET",
+        ] {
+            assert!(!upper.contains(forbidden), "`{forbidden}` in {grant}");
+        }
+    }
+    let caps = AgentlaneSettings::default();
+    for (name, profile) in [
+        (AGENTLANE_INTERNAL_PROFILE, internal_profile_statements("", &caps)),
+        (AGENTLANE_PROFILE, profile_statements("", &caps)),
+    ] {
+        for sql in profile {
+            for pinned in [
+                "readonly = 1 CONST",
+                "allow_ddl = 0 CONST",
+                "allow_introspection_functions = 0 CONST",
+                "max_rows_to_read = 500000000 CONST",
+                "max_bytes_to_read = 53687091200 CONST",
+            ] {
+                assert!(sql.contains(pinned), "{name}: `{pinned}` missing: {sql}");
+            }
+            assert!(!sql.contains("readonly CHANGEABLE"), "{name}: {sql}");
+        }
+    }
+    let [create, alter] = role_statements("");
+    assert!(create.ends_with("SETTINGS PROFILE 'agentlane'") && alter.ends_with("SETTINGS PROFILE 'agentlane'"));
+}

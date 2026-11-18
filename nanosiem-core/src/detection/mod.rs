@@ -14,6 +14,7 @@
 //! - Cumulative risk detection for meta-detections
 //! - Prevalence-based detection conditions
 
+pub mod detections_source;
 pub mod distributed_scheduler;
 pub mod error;
 pub mod event_envelope;

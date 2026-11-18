@@ -1265,3 +1265,6 @@
 {"src": "handwritten:NAN-5416", "q": "(source_type=aws_cloudtrail OR source_type=windows_event) enriched_src_asn=/.+/ | stats dc(user) as users, dc(action) as actions, dc(src_ip) as ips, count by enriched_src_asn, enriched_src_country | sort -count"}
 {"src": "handwritten:NAN-5416", "q": "src_port=/^44/ OR dest_port=/80$/ OR http_status_code=/^5[0-9]{2}$/"}
 {"src": "handwritten:NAN-5416", "q": "enriched_src_asn!=/13|15/ ext.foo!=/x.+y/"}
+{"src": "handwritten:NAN-5568", "q": "metadata.log_source=\"windows_sysmon\" | where class_uid=1007 AND activity_id=1 | prevalence process.file.hashes.value window=30d | where host_count < 5 AND prevalence_first_seen > now() - INTERVAL 24 HOUR | eval esc_very_rare_hash=(host_count < 3)"}
+{"src": "handwritten:NAN-5568", "q": "source_type=windows_sysmon | prevalence enrich=true window=30d | eval rare=is_rare, seen=total_occurrences, age=(last_seen - first_seen), score=prevalence_score | where rare AND seen < 10"}
+{"src": "handwritten:NAN-5568", "q": "source_type=windows_sysmon | prevalence enrich=true window=30d | where (host_count * 1) < 3 OR total_occurrences < tonumber(\"10\")"}

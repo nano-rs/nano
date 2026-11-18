@@ -198,9 +198,9 @@ impl Drop for MigrationLock {
 /// per server; see `AgentlaneSettings`).
 fn agentlane_settings() -> Result<nanosiem_core::db::clickhouse_migrate::AgentlaneSettings> {
     use nanosiem_core::db::clickhouse_migrate::{
-        agentlane_settings_from_env, AgentlaneEnv, MAX_BYTES_TO_READ_ENV,
-        MAX_CONCURRENT_THREADS_ENV, MAX_MEMORY_PER_TOKEN_ENV, MAX_ROWS_TO_READ_ENV,
-        WORKLOAD_MAX_MEMORY_ENV,
+        agentlane_settings_from_env, AgentlaneEnv, INTERNAL_MAX_CONCURRENT_THREADS_ENV,
+        INTERNAL_WORKLOAD_MAX_MEMORY_ENV, MAX_BYTES_TO_READ_ENV, MAX_CONCURRENT_THREADS_ENV,
+        MAX_MEMORY_PER_TOKEN_ENV, MAX_ROWS_TO_READ_ENV, WORKLOAD_MAX_MEMORY_ENV,
     };
     let var = |name: &str| std::env::var(name).ok();
     let (rows, bytes, threads, per_token, memory) = (
@@ -210,12 +210,19 @@ fn agentlane_settings() -> Result<nanosiem_core::db::clickhouse_migrate::Agentla
         var(MAX_MEMORY_PER_TOKEN_ENV),
         var(WORKLOAD_MAX_MEMORY_ENV),
     );
+    // The internal lane (`agentlane_internal`), added alongside.
+    let (internal_threads, internal_memory) = (
+        var(INTERNAL_MAX_CONCURRENT_THREADS_ENV),
+        var(INTERNAL_WORKLOAD_MAX_MEMORY_ENV),
+    );
     agentlane_settings_from_env(AgentlaneEnv {
         max_rows_to_read: rows.as_deref(),
         max_bytes_to_read: bytes.as_deref(),
         max_concurrent_threads: threads.as_deref(),
         max_memory_per_token: per_token.as_deref(),
         workload_max_memory: memory.as_deref(),
+        internal_max_concurrent_threads: internal_threads.as_deref(),
+        internal_workload_max_memory: internal_memory.as_deref(),
     })
     .context("reading the Agent Lane settings (NAN-5359)")
 }

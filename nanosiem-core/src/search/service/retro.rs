@@ -432,6 +432,8 @@ impl SearchService {
         req.time_range.validate()?;
 
         let (cleaned_query, _earliest, _latest) = super::extract_time_bounds(&req.query)?;
+        // NAN-5612: the same dataset permission check as every nPL path.
+        super::check_dataset_access(scope, None, &cleaned_query)?;
         let query = parse_query(&cleaned_query).map_err(super::convert_parse_error)?;
 
         let mut plan = extract_retro_plan(&query).ok_or_else(|| {

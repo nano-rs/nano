@@ -201,6 +201,15 @@ pub struct ScopeSet {
     /// Always a SUBSET of `denied`. Equal to it unless built by
     /// [`ScopeSet::with_row_filter_only`].
     artifact_denied: BTreeSet<String>,
+    /// NAN-5612: the caller may not read the detections dataset
+    /// (`dataset=signals`, directly or through a `[dataset=signals …]`
+    /// subsearch) because it lacks `detections:view`. `false` for every
+    /// constructor (SYSTEM callers read everything); request principals get it
+    /// from [`ScopeSet::with_signals_denied`] in the shared composers
+    /// (`AuthContext::effective_viewer_scope`, the search service's
+    /// `effective_scope`). Enforced by the search service at the same point as
+    /// the source gate (`query_processing::enforce_viewer_scope`).
+    signals_denied: bool,
 }
 
 impl ScopeSet {
@@ -219,6 +228,7 @@ impl ScopeSet {
         Self {
             artifact_denied: denied.clone(),
             denied,
+            signals_denied: false,
         }
     }
 
@@ -240,7 +250,21 @@ impl ScopeSet {
         Self {
             denied,
             artifact_denied,
+            signals_denied: false,
         }
+    }
+
+    /// NAN-5612: mark whether this caller is denied the detections dataset
+    /// (`!has_permission("detections:view")` for a request principal).
+    #[must_use]
+    pub fn with_signals_denied(mut self, denied: bool) -> Self {
+        self.signals_denied = denied;
+        self
+    }
+
+    /// NAN-5612: the caller may not read `dataset=signals`.
+    pub fn signals_denied(&self) -> bool {
+        self.signals_denied
     }
 
     /// The `source_type` values this caller must never see in LIVE data.

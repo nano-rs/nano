@@ -163,6 +163,13 @@ new trial for the same two ids and replace the file.
 - **Editions.** Enterprise-only scenarios live in `tests/enterprise/` and are
   marked `@pytest.mark.enterprise`. They skip on `EDITION=open` and are
   dropped from the open-core mirror.
+- **Schema profile.** Stacks come up OCSF (`NANO_SCHEMA_PROFILE=ocsf`), the
+  install default. Set `NANO_SCHEMA_PROFILE=udm` explicitly for the legacy UDM
+  profile. A scenario that only holds on UDM (its parser emits no `class_uid`,
+  or it hunts on UDM columns) is marked `@pytest.mark.udm_only("<reason>")` and
+  skips with that reason on OCSF. `nano_e2e.schema.is_ocsf()` is the one place
+  scenarios read the profile. Porting the remaining `udm_only` scenarios is
+  NAN-5594.
 
 ## Scenarios (phase 1)
 
@@ -170,10 +177,10 @@ new trial for the same two ids and replace the file.
 |---|---|---|
 | base | health (api, search, jobs, Vector HEC); setup is one-shot; capabilities edition; login (bad password 401); API key create, use on api and search, least privilege, delete leads to 401 | runs |
 | ingest | per-source token: HEC + HTTP land as the token's source; a spoofed sourcetype is kept only as the claim; unknown token 401; rotate (old 401, new 200); revoke 401; two sources isolated | runs |
-| onboarding | draft source ingests before its parser is published; connect status `receiving_unparsed`; publish leads to new events being parsed | runs |
-| vector_render | a draft (`http` spelling) deploys live, then a normal source, then a parser publish; a deploy Vector refuses is reported failed, rolled back, the draft disabled again, and the next deploy goes live; `${...}`/`$NAME` in parser VRL refused at save; `$` anchors, `$1` captures and the literal form run as written (NAN-4952/4953) | runs |
-| delete_race | a bound Kafka pull parser, then its source config, deleted back to back: no Vector reload refused, a later publish goes live (NAN-4956) | runs |
-| hec_ocsf_lane | the connector delivery (platform token, `sourcetype=okta`) to the published `okta_ocsf` from nano-rs/parsers: parsed as User Management 3007, `metadata.log_source = okta`, found by `metadata.log_source="okta"` and `source_type="okta"`, not by `"unknown"` (NAN-4963; needs an ocsf stack) | runs |
+| onboarding | draft source ingests before its parser is published; connect status `receiving_unparsed`; publish leads to new events being parsed | runs (udm only, NAN-5594) |
+| vector_render | a draft (`http` spelling) deploys live, then a normal source, then a parser publish; a deploy Vector refuses is reported failed, rolled back, the draft disabled again, and the next deploy goes live; `${...}`/`$NAME` in parser VRL refused at save; `$` anchors, `$1` captures and the literal form run as written (NAN-4952/4953) | runs (udm only, NAN-5594) |
+| delete_race | a bound Kafka pull parser, then its source config, deleted back to back: no Vector reload refused, a later publish goes live (NAN-4956) | runs (udm only, NAN-5594) |
+| hec_ocsf_lane | the connector delivery (platform token, `sourcetype=okta`) to the published `okta_ocsf` from nano-rs/parsers: parsed as User Management 3007, `metadata.log_source = okta`, found by `metadata.log_source="okta"` and `source_type="okta"`, not by `"unknown"` (NAN-4963) | runs |
 | detection | Alerting rule: an alert carries the event. Live rule: a match is recorded, no alert | runs |
 | search_jobs | durable job completes and its results page without loss or duplicates; `async_mode` returns a job handle; cancel | runs |
 | pull | `aws_s3` (S3 to SQS notifications), `aws_sqs` payload, `gcp_pubsub` lifecycle: create, then events land, then a Vector restart (no loss, bounded duplicates), then pause/resume, then credential rotate, then delete | real cloud; skips without credentials |
@@ -186,7 +193,7 @@ new trial for the same two ids and replace the file.
 | ui: IPinfo bundle-only (NAN-4959) | catalog entry has no credential field and the configure API refuses a BYO `download_url` (422); retired IPinfo configure / sync / auto-sync endpoints 404; the IPinfo Lite inventory drawer and the connection drawer Config tab show the bundle status (revision == platform feed status, last update, next refresh) with no inputs and no Configure / Uninstall | runs |
 | ui: edition affordances | open: every enterprise route shows the entitlement panel or redirects (5 answer "Access Denied": xfail finding), every rail link opens a page, no uncaught page errors; enterprise: none of those routes serves the open placeholder | runs |
 | enterprise ui: SOAR (NAN-4911) | switched on in Settings > SOAR (the API refuses an API key); flow run from its row (No-op + Search): run detail == run/steps API; Approval step suspends, a second user approves from Approvals, run resumes; requester cannot approve; `soar:view` cannot run | runs (jobs executor) |
-| enterprise `soar` closeout (NAN-4911) | signed catalog import and tamper refusal; real ClickHouse detection → Search → deterministic Judge → two-person Okta suspend → Mailpit STARTTLS email; case wall and secret-free run trace; `iam.suspend_user` playbook; RFC1918/analyst denial; disable cancellation fence | runs (native app + owned `soar-lab` and `ai-stub` profiles) |
+| enterprise `soar` closeout (NAN-4911) | signed catalog import and tamper refusal; real ClickHouse detection → Search → deterministic Judge → two-person Okta suspend → Mailpit STARTTLS email; case wall and secret-free run trace; `iam.suspend_user` playbook; RFC1918/analyst denial; disable cancellation fence | runs (native app + owned `soar-lab` and `ai-stub` profiles; udm only until NAN-5594: `NANO_SCHEMA_PROFILE=udm scripts/e2e.sh run soar`) |
 | enterprise ui: risk watchlists (NAN-4926) | a risk rule fires on OCSF events for a user; New watchlist (weight 0.5): rail == API; Risk index ×1.50 badge, effective and base == `/api/risk/entities`; detail sheet; `risk:view` alone sees no weight | runs |
 | content_acceptance (NAN-4955) | fresh OCSF enterprise install consumes signed parser, rule, playbook, marketplace, model, MITRE ATT&CK and SOAR channels from a loopback app publisher while a deny-all proxy sinkholes GitHub; real catalogs + browser surfaces populate; tamper retains last-good; raw air-gap import advances the channel | `scripts/e2e.sh run content_acceptance --fresh` (native only) |
 | pull | connector feeds: Okta, Google Workspace, Slack, Netskope (`saas_api`) + a rejected credential | runs with the mock-vendor profile (phase 2, below) |
@@ -287,6 +294,50 @@ $PY -m nano_e2e.explore screenshot /tmp/shot.png ; $PY -m nano_e2e.explore stop
   prints JSON with the console errors and failed requests (>= 400) since the
   previous command. `idle N --reload` checks the return-after-idle page.
 
+### Against an existing stack (`--target existing`, NAN-5586)
+
+Some walks are worth running on a stack the harness did not create (a
+developer's local tenant with real data and real AI):
+
+```bash
+E2E_TARGET_CREDS_FILE=~/.nano-e2e/local-user.txt \
+  scripts/e2e.sh run ui --target existing -- -k hunts_ui_walk
+```
+
+- Nothing is brought up, restarted or torn down. Only scenarios marked
+  `@pytest.mark.existing_target` run; every other scenario is skipped, because
+  the rest of the suite assumes a throwaway stack it may reset.
+- `E2E_TARGET_CREDS_FILE` is a `key=value` file, mode 0600, outside the repo:
+  `email`, `password` and `api_key` of a NON-admin user the scenario acts as
+  (a login as the install's admin can evict the owner's sessions), and
+  optionally `lane_token` (an HEC ingest token for scenario data). Values are
+  read in code, never printed, and scrubbed from the artifacts. The file always
+  wins over a key or password already exported in the shell; a file naming
+  the install admin (`E2E_TARGET_FORBIDDEN_EMAILS`, default `admin@nano.local`)
+  or holding a secret under 8 characters is refused.
+- `E2E_TARGET_WEB_URL` / `_API_URL` / `_SEARCH_URL` / `_HEC_URL` default to the
+  local dev stack (`:5173`, `:3000`, `:3002`, `:8088`).
+- The browser logs in through the UI and, at the end, ends only ITS OWN
+  session (`DELETE /api/sessions/{id}`), never `POST /api/auth/logout`.
+- A scenario marked `existing_target` must mutate only objects it creates, tag
+  them, and remove them at the end.
+
+### Hunts UI walk (NAN-5586)
+
+`tests/enterprise/ui/test_hunts_ui_walk.py` walks every hunts page as an
+analyst and does the work in the UI: a hunt from a template, the playbook
+edited, Run now and the sweep sheet, the findings inbox, dismiss / promote /
+acknowledge, Memory, Rulings, Campaigns, Escalations, Runners, the gate copy,
+Agent Models, and basic pivt (a question answered; a "publish X" proposal that
+changes nothing until Apply). Every page is checked for console errors, failed
+API calls (403 allowed), horizontal overflow at 1440 and 1280, and is
+photographed light and dark. Steps are soft: `walk/walk-results.json` lists
+pass / fail / skip per step and the health of each page; a step needing a
+feature the target lacks skips with the reason. Real AI spend is reported and
+asserted under `E2E_UIWALK_MAX_USD` (default 3; the sweep's investigator and
+reviewer tokens, an unpriced model charged at a conservative rate). On a
+throwaway stack the walk runs only with `E2E_UIWALK=1`.
+
 ### The browser layer
 
 - The browser is driven by `nanosiem-web/tests/e2e/ui/driver.mjs`. It uses
@@ -348,12 +399,10 @@ mints the admin key and writes it into `admin.env` and `stack.env`.
 `tests/ui/test_auth.py` asserts the outcome against the API. On a stack that was
 initialized at `up`, that one scenario skips with the reason.
 
-**Schema profile.** A stack that `run ui` brings up itself, with `ui` as the
-only suite, uses `NANO_SCHEMA_PROFILE=ocsf`, the install default for new
-installs, unless you set the profile yourself. Mixed runs (`run all`,
-`run ui base`) keep udm, because the phase-1 parsers are not OCSF-shaped. The
-OCSF sidebar scenario skips, with the reason, on a udm stack. Every other UI
-scenario runs on both profiles.
+**Schema profile.** Every stack the harness brings up uses
+`NANO_SCHEMA_PROFILE=ocsf`, the install default, for every suite (see
+Conventions). The OCSF sidebar scenario skips, with the reason, on a stack you
+pinned to udm. Every other UI scenario runs on both profiles.
 
 ### Mock vendors (`--profile mock-vendor`)
 

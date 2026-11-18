@@ -19,11 +19,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from nano_e2e import ingest
 from nano_e2e.client import Nano, expect, row_text
 from nano_e2e.runid import route_key as make_route_key
 from nano_e2e.stack import Stack
 from nano_e2e.waits import INGEST_VISIBLE, eventually
+
+# Every scenario here deploys `.message = ...` parsers (no class_uid).
+pytestmark = pytest.mark.udm_only(
+    "parser emits no class_uid, so OCSF search never sees its events (NAN-5594)"
+)
 
 
 def _create(nano: Nano, name: str, source_type: str, vrl: str, *, draft: bool, **extra: Any) -> dict[str, Any]:

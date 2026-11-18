@@ -10,6 +10,8 @@
 
 import { useEffect, useMemo } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { usePivtPage } from '@/contexts/pivt-page';
+import { alertActions, alertSummary, projectEvent, searchPivotAction } from './alerts/alertsPivt';
 import {
   Activity,
   AlertTriangle,
@@ -115,6 +117,50 @@ export function AlertDetail() {
       });
     }
   }, [alert?.id, id, recordView, alert, displayName]);
+
+  // NAN-5588: pivt knows this alert and can triage it as the analyst. The
+  // matched events are log data: they go to the model fenced, and only the
+  // first few, trimmed.
+  const pivtActions = useMemo(
+    () => [
+      // NAN-1066: triage only where the triage bar offers it (monitor alerts,
+      // or a tenant without Cases), and only in a state it fits.
+      ...alertActions(
+        {
+          visible: () => (apiAlert ? [apiAlert] : []),
+          fixed: () => apiAlert ?? null,
+          onChanged: refetchAlert,
+        },
+        { triageAllowed: !capabilities.cases || isMonitor, status: apiAlert?.status },
+      ),
+      searchPivotAction(navigate),
+    ],
+    [apiAlert, refetchAlert, navigate, capabilities.cases, isMonitor],
+  );
+  usePivtPage({
+    icon: 'AlertTriangle',
+    getContext: () =>
+      apiAlert
+        ? {
+            pageKey: 'alert',
+            title: `Alert · ${displayName || apiAlert.rule_name || apiAlert.id}`,
+            entity: { kind: 'alert', id: apiAlert.id, name: apiAlert.rule_name },
+            facts: [
+              { label: 'severity', value: apiAlert.severity },
+              { label: 'status', value: apiAlert.status + (apiAlert.disposition ? ` · ${apiAlert.disposition}` : '') },
+              { label: 'assignee', value: apiAlert.assignee_name ?? apiAlert.assigned_to ?? 'unassigned' },
+              { label: 'events', value: String(apiAlert.matched_event_count ?? matchedEvents.length) },
+            ],
+            data: {
+              alert: alertSummary(apiAlert),
+              rule_query: apiAlert.rule_query ?? null,
+              matched_events: matchedEvents.slice(0, 2).map((e) => projectEvent(e as Record<string, unknown>)),
+            },
+          }
+        : { pageKey: 'alert', title: 'Alert', facts: [{ label: 'alert', value: id ?? '' }] },
+    actions: apiAlert ? pivtActions : [],
+    suggestions: apiAlert ? ['Why did this alert fire?', 'Is this likely a false positive?'] : undefined,
+  });
 
   if (loading) {
     return (

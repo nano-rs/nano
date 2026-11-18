@@ -32,6 +32,8 @@ fn sample_alert() -> WebhookPayload {
         health_diagnostic_context: None,
         health_remediation: None,
         idempotency_key: None,
+        summary: None,
+        details: None,
     }
 }
 
@@ -60,6 +62,8 @@ fn sample_report() -> WebhookPayload {
         health_diagnostic_context: None,
         health_remediation: None,
         idempotency_key: None,
+        summary: None,
+        details: None,
     }
 }
 

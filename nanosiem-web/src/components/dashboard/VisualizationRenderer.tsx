@@ -123,6 +123,16 @@ function isMeasureKey(key: string): boolean {
   return isAggregateName(key) || MEASURE_PREFIX.test(key.toLowerCase());
 }
 
+/**
+ * Whether a chart's series need a legend: several series, or ONE series that
+ * is a split-by value (`timechart count by severity` with only `high` in the
+ * window). Without it a single split series reads as an unlabeled total
+ * (NAN-5612). A single plain aggregate (`count`) stays legend-free.
+ */
+export function seriesNeedLegend(valueKeys: string[], splitSeries: boolean): boolean {
+  return valueKeys.length > 1 || (splitSeries && valueKeys.length === 1);
+}
+
 function isTimeLikeKey(key: string): boolean {
   const k = key.toLowerCase();
   return k.includes('time') || k.includes('bucket') || k === 'ts' || k === '_time';
@@ -283,9 +293,11 @@ export function pivotSplitByData(
   isTimeSeries: boolean;
   timeKey?: string;
   spanMs?: number;
+  /** The series are split-by values (`… by severity`), not aggregates. */
+  splitSeries: boolean;
 } {
   if (!data.length) {
-    return { data: [], labelKey: '', valueKeys: [], wasPivoted: false, isTimeSeries: false };
+    return { data: [], labelKey: '', valueKeys: [], wasPivoted: false, isTimeSeries: false, splitSeries: false };
   }
 
   // NAN-4944: the server already returned a complete wide timechart. Preserve
@@ -296,10 +308,14 @@ export function pivotSplitByData(
     | undefined;
   if (serverMetadata) {
     const responseKeys = Array.from(new Set(data.flatMap(row => Object.keys(row))));
+    const serverKeys = responseKeys.filter(key => key !== 'time_bucket' && key !== '_timechart');
     return {
       data,
       labelKey: 'time_bucket',
-      valueKeys: responseKeys.filter(key => key !== 'time_bucket' && key !== '_timechart'),
+      valueKeys: serverKeys,
+      // The server's wide timechart names split series by their VALUE and an
+      // unsplit one by its aggregate (`count`, `avg_bytes`, …).
+      splitSeries: serverKeys.some(key => !isMeasureKey(key)),
       wasPivoted: false,
       isTimeSeries: true,
       timeKey: 'time_bucket',
@@ -334,7 +350,7 @@ export function pivotSplitByData(
       const fillCols = valueKeys.map(k => ({ key: k, fill: isZeroFillAgg(k) ? 0 : null }));
       out = densifyTimeBuckets(data, labelKey, spanMs, fillCols);
     }
-    return { data: out, labelKey, valueKeys, wasPivoted: false, isTimeSeries, timeKey, spanMs };
+    return { data: out, labelKey, valueKeys, wasPivoted: false, isTimeSeries, timeKey, spanMs, splitSeries: false };
   }
 
   const splitField = dimensionRest[0];
@@ -381,6 +397,7 @@ export function pivotSplitByData(
     labelKey,
     valueKeys: splitValueKeys,
     wasPivoted: true,
+    splitSeries: true,
     isTimeSeries,
     timeKey,
     spanMs,
@@ -494,7 +511,7 @@ interface ChartVisualizationProps {
 
 function BarVisualization({ data, config, onDrilldown, columnOrder }: ChartVisualizationProps) {
   // Pivot split-by data if needed (e.g., timechart count by action)
-  const { data: pivotedData, labelKey, valueKeys, isTimeSeries, timeKey, spanMs } = useMemo(
+  const { data: pivotedData, labelKey, valueKeys, isTimeSeries, timeKey, spanMs, splitSeries } = useMemo(
     () => pivotSplitByData(data, columnOrder),
     [data, columnOrder]
   );
@@ -576,7 +593,7 @@ function BarVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
               </>
             )}
             <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} cursor={false} />
-            {valueKeys.length > 1 && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
+            {seriesNeedLegend(valueKeys, splitSeries) && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
             {valueKeys.map((key, i) => (
               <Bar
                 key={key}
@@ -609,7 +626,7 @@ function BarVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
 // Line Chart Visualization
 function LineVisualization({ data, config, onDrilldown, columnOrder }: ChartVisualizationProps) {
   // Pivot split-by data if needed (e.g., timechart count by action)
-  const { data: chartData, labelKey, valueKeys, isTimeSeries, timeKey, spanMs } = useMemo(
+  const { data: chartData, labelKey, valueKeys, isTimeSeries, timeKey, spanMs, splitSeries } = useMemo(
     () => pivotSplitByData(data, columnOrder),
     [data, columnOrder]
   );
@@ -641,7 +658,7 @@ function LineVisualization({ data, config, onDrilldown, columnOrder }: ChartVisu
           width={56}
         />
         <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} />
-        {valueKeys.length > 1 && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
+        {seriesNeedLegend(valueKeys, splitSeries) && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
         {valueKeys.map((key, i) => (
           <Line
             key={key}
@@ -679,7 +696,7 @@ function LineVisualization({ data, config, onDrilldown, columnOrder }: ChartVisu
 // Area Chart Visualization
 function AreaVisualization({ data, config, onDrilldown, columnOrder }: ChartVisualizationProps) {
   // Pivot split-by data if needed (e.g., timechart count by action)
-  const { data: chartData, labelKey, valueKeys, isTimeSeries, timeKey, spanMs } = useMemo(
+  const { data: chartData, labelKey, valueKeys, isTimeSeries, timeKey, spanMs, splitSeries } = useMemo(
     () => pivotSplitByData(data, columnOrder),
     [data, columnOrder]
   );
@@ -711,7 +728,7 @@ function AreaVisualization({ data, config, onDrilldown, columnOrder }: ChartVisu
           width={56}
         />
         <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} />
-        {valueKeys.length > 1 && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
+        {seriesNeedLegend(valueKeys, splitSeries) && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
         {valueKeys.map((key, i) => (
           <Area
             key={key}

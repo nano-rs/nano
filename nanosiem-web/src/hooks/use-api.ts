@@ -823,11 +823,15 @@ export function useClearAllRiskScores() {
 
 export function useEntityRiskActivity(entities: { entity: string; entity_type: string }[]) {
   const key = entities.map(e => `${e.entity}|${e.entity_type}`).join(',');
-  return useQuery(
-    () => api.getEntityRiskActivity(entities),
+  const query = useQuery(
+    // NAN-5550: tag the response with the entity set it was fetched for, so
+    // the page can tell a stale series (previous page / filter) from the
+    // current one in the render before the refetch effect flips `loading`.
+    async () => ({ ...(await api.getEntityRiskActivity(entities)), fetchedKey: key }),
     [key],
     { skip: entities.length === 0 }
   );
+  return { ...query, isCurrent: query.data?.fetchedKey === key };
 }
 
 export function useEntityContext(entityType: string, entityValue: string, skip = false) {

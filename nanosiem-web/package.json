@@ -1,10 +1,11 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "2.0.31",
+  "version": "2.0.32",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:hunts-mock": "vite --config dev/hunts-mock/vite.hunts-mock.config.mjs",
     "test": "npm run test:vitest && npm run test:node",
     "test:vitest": "vitest run",
     "test:node": "node scripts/run-node-tests.mjs",
@@ -43,7 +44,8 @@
     "test:theme-parity": "node --test src/lib/theme-parity.test.ts",
     "test:toast-tokens": "node --test src/lib/toast-tokens.test.ts",
     "test:search-tail": "tsx --test src/pages/search-tail.test.ts",
-    "test:search-query-url": "tsx --test src/lib/search-query-url.test.ts"
+    "test:search-query-url": "tsx --test src/lib/search-query-url.test.ts",
+    "generate:hunts-wire": "node src/enterprise/api/hunts-wire.generate.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",
@@ -128,6 +130,9 @@
     "react-day-picker": {
       "react": "$react",
       "date-fns": "$date-fns"
+    },
+    "openapi-typescript": {
+      "typescript": "$typescript"
     }
   },
   "devDependencies": {
@@ -146,6 +151,7 @@
     "eslint-plugin-react-refresh": "^0.5.0",
     "globals": "^17.3.0",
     "jsdom": "^30.1.3",
+    "openapi-typescript": "7.13.0",
     "postcss": "^8.4.47",
     "puppeteer-core": "^25.3.0",
     "tailwindcss": "^4.2.0",

@@ -74,7 +74,7 @@ def main() -> int:
     ap.add_argument("--storage-class")
     ap.add_argument("--replicas", type=int, choices=[1, 2], default=1, help="2 = ClickHouse HA (~2x cost, Keeper x3)")
     # Accepted for old command lines and ignored: the chart's nano.retention.*
-    # keys were never read and are gone (NAN-5448). Hot vs cold is disk-fill
+    # keys were never read and are gone. Hot vs cold is disk-fill
     # based (clickhouse.coldStorage.moveFactor); retention is the table TTL.
     ap.add_argument("--hot-days", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--out", required=True)

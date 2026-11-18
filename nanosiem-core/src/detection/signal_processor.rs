@@ -1712,7 +1712,7 @@ impl SignalProcessor {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => "toValidUTF8(metadata) AS metadata".to_string(),
+            | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => "toValidUTF8(metadata) AS metadata".to_string(),
             crate::schema::SchemaId::Ocsf => {
                 format!("toValidUTF8(toString({})) AS metadata", profile.json_tail_column())
             }
@@ -1886,7 +1886,7 @@ impl SignalProcessor {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => "logs",
+            | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => "logs",
         };
         let logs_table = dual_pool.table_names().read(logs_table_key);
 

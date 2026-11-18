@@ -71,6 +71,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::SearchApiDoc::openapi(),
         handlers::identity::IdentityApiDoc::openapi(),
         handlers::tree_page::TreePageApiDoc::openapi(),
+        handlers::sql_to_npl::SqlToNplApiDoc::openapi(),
     ] {
         spec.paths.paths.extend(sub.paths.paths);
         if let Some(sub_components) = sub.components {
@@ -128,6 +129,8 @@ mod tests {
             "/api/search/stream",
             "/api/search/sql",
             "/api/search/explain",
+            "/api/search/sql-to-npl",
+            "/api/search/sql-to-npl/batch",
             "/api/search/log",
             "/api/search/prevalence-artifacts",
             "/api/search/field-stats",

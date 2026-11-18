@@ -484,6 +484,38 @@ impl AppState {
             .start(self.shutdown_token())
     }
 
+    /// Start the hunt retention job (NAN-5542).
+    ///
+    /// Lapses suppressions that have gone `HUNT_RETENTION_SUPPRESSION_IDLE_DAYS`
+    /// without a match and hard-deletes aged hunt history in bounded, fenced
+    /// batches (see `nanosiem_core::hunts::retention` for every rule and its
+    /// `HUNT_RETENTION_*` window). Leader-only so two replicas never race the
+    /// same batch; every batch is additionally guarded on the lease epoch.
+    /// PostgreSQL-only, so not egress-gated. Parks when disabled or when the
+    /// enterprise hunt tables are absent.
+    #[cfg(feature = "enterprise")]
+    pub fn start_hunt_retention(&self) -> tokio::task::JoinHandle<()> {
+        nanosiem_core::hunts::HuntRetention::from_env(self.pool.clone())
+            .with_fence(self.leader_fence.clone())
+            .with_audit(self.audit_emitter.clone())
+            .start(self.shutdown_token())
+    }
+
+    /// Start the weekly hunt evals (NAN-5561).
+    ///
+    /// Leader-only and fenced: creates a `scheduled` eval for each hunt with
+    /// resolved findings and no eval in the last `HUNT_EVALS_INTERVAL_DAYS`
+    /// (default 7; `HUNT_EVALS_ENABLED=false` parks it). It only freezes the
+    /// items in PostgreSQL; the jobs process's eval executor replays them.
+    /// Parks when the enterprise eval tables are absent.
+    #[cfg(feature = "enterprise")]
+    pub fn start_hunt_eval_scheduler(&self) -> tokio::task::JoinHandle<()> {
+        nanosiem_core::hunts::HuntEvalScheduler::from_env(self.pool.clone())
+            .with_fence(self.leader_fence.clone())
+            .with_audit(self.audit_emitter.clone())
+            .start(self.shutdown_token())
+    }
+
     /// Start the identity sync scheduler
     pub fn start_identity_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let scheduler = IdentitySyncScheduler::with_defaults(self.identity_service.clone());

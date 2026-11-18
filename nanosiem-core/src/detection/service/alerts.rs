@@ -940,10 +940,11 @@ impl DetectionService {
         after_id: Uuid,
         limit: i64,
         deny: &std::collections::BTreeSet<String>,
+        include_hunt_findings: bool,
     ) -> Result<Vec<Alert>, DetectionError> {
         let alerts = self
             .alert_repo
-            .list_after(after_timestamp, after_id, limit, deny)
+            .list_after(after_timestamp, after_id, limit, deny, include_hunt_findings)
             .await?;
         Ok(alerts)
     }

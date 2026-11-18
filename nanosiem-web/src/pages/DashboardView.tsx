@@ -53,6 +53,10 @@ import { formatRelativeUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import type { Dashboard, PanelConfig, LayoutItem, DashboardShareResult, UpdateDashboardRequest, TimeRange, SerializedTimeRange } from '@/lib/api';
 import { api } from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
+import { usePivtPage } from '@/contexts/pivt-page';
+import { dashboardEditActions, dashboardSummary, dashboardViewActions, summarizeRows as summarizeRowsForPivt } from './dashboards/dashboardsPivt';
+import { searchPivotAction } from './alerts/alertsPivt';
 import { isDashboardConflictError } from '@/lib/api/dashboards';
 
 type AutoRefreshInterval = '30s' | '1m' | '5m' | '15m' | 'off';
@@ -719,6 +723,77 @@ export function DashboardView() {
     });
     navigate(searchUrl);
   }, [navigate, timeRange, substituteVariables]);
+
+  // NAN-5595: pivt knows this dashboard and what its panels show now (query
+  // output: fenced server-side), can set the window / variables, and can add
+  // or change an nPL panel as the analyst, confirmed. Edits only where the
+  // server accepts them (owner, or settings:system) and never while the
+  // editor holds unsaved changes.
+  const { hasPermission } = useAuth();
+  // The values the panels run with: explicit picks, else the defaults.
+  const resolvedVariablesForPivt = (d: Dashboard, picked: Record<string, string>) => {
+    const vars = Array.isArray(d.layout?.variables) ? d.layout.variables : [];
+    return Object.fromEntries(vars.map((v) => [v.name, String(picked[v.name] ?? v.defaultValue ?? '').slice(0, 256)]));
+  };
+  const canEditDashboard = !!dashboard && !isEditMode && (!!dashboard.is_owner || hasPermission('settings:system'));
+  const dashboardRef = useRef(dashboard ?? null);
+  dashboardRef.current = dashboard ?? null;
+  const pivtActions = useMemo(
+    () => [
+      ...dashboardViewActions({
+        variables: () => {
+          const vars = dashboardRef.current?.layout?.variables;
+          return Array.isArray(vars) ? vars.map((v) => v.name) : [];
+        },
+        setPreset: (preset) => setTimeRange({ type: 'preset', preset }),
+        setVariable: (name, value) => setVariableValues((prev) => ({ ...prev, [name]: value })),
+      }),
+      ...dashboardEditActions(
+        {
+          dashboard: () => dashboardRef.current,
+          timeRange: () => toApiTimeRange(timeRangeRef.current),
+          substitute: (q) => substituteVariablesRef.current(q),
+          onChanged: refetch,
+        },
+        { canEdit: canEditDashboard },
+      ),
+      searchPivotAction(navigate),
+    ],
+    [canEditDashboard, refetch, navigate],
+  );
+  usePivtPage({
+    icon: 'Grid',
+    getContext: () =>
+      dashboard
+        ? {
+            pageKey: 'dashboard',
+            title: `Dashboard · ${dashboard.name}`,
+            entity: { kind: 'dashboard', id: dashboard.id, name: dashboard.name },
+            facts: [
+              { label: 'panels', value: String(dashboard.panels?.length ?? 0) },
+              { label: 'window', value: timeRange.type === 'preset' ? (timeRange.preset ?? '') : 'custom' },
+              { label: 'owner', value: dashboard.is_owner ? 'you' : (dashboard.owner_name ?? 'shared') },
+              ...(isEditMode ? [{ label: 'editing', value: 'yes' }] : []),
+            ],
+            data: {
+              ...dashboardSummary(dashboard, (pid) => {
+                const st = panelData.get(pid);
+                if (!st) return undefined;
+                return {
+                  status: st.status,
+                  rows: st.totalCount ?? st.data?.length,
+                  error: st.error ? st.error.slice(0, 200) : undefined,
+                  sample: st.status === 'success' ? summarizeRowsForPivt(st.data) : undefined,
+                };
+              }),
+              window: toApiTimeRange(timeRange),
+              variables: resolvedVariablesForPivt(dashboard, variableValues),
+            },
+          }
+        : { pageKey: 'dashboard', title: 'Dashboard', facts: [{ label: 'dashboard', value: id ?? '' }] },
+    actions: dashboard ? pivtActions : [],
+    suggestions: dashboard ? ['What stands out on this dashboard?', 'Add a panel of top source IPs'] : undefined,
+  });
 
   if (loading) {
     return (

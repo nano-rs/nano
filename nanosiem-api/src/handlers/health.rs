@@ -212,6 +212,22 @@ pub(crate) fn downstream_probe_urls(get: impl Fn(&str) -> Option<String>) -> Dow
     }
 }
 
+/// NAN-5564: ingest health while Vector waits for this release's pipeline.
+pub(crate) fn gated_ingest_health(health: ServiceHealth, pipeline_pending: bool) -> ServiceHealth {
+    if !pipeline_pending {
+        return health;
+    }
+    ServiceHealth {
+        status: "gated".to_string(),
+        error: Some(
+            "Vector is waiting for nano-api to render this release's pipeline; ingest refuses \
+             connections until it does (nano-api retries the render; see its logs)"
+                .to_string(),
+        ),
+        ..health
+    }
+}
+
 /// Check health of a downstream service
 /// Propagates X-Request-ID header for distributed tracing (Requirements: 7.3)
 async fn check_service_health(url: &str, request_id: Option<&str>) -> ServiceHealth {
@@ -417,6 +433,13 @@ pub async fn health_check_detailed(
         check_service_health(&search_url, rid)
     );
 
+    // NAN-5564: a single node's Vector does not start (its ports refuse
+    // connections) until this api has rendered the pipeline for this release.
+    // Say so here instead of a bare "unavailable".
+    let ingest_health = gated_ingest_health(
+        ingest_health,
+        state.parser_service.vector_config().pipeline_identity_pending().await,
+    );
     let services_health = DownstreamServicesHealth {
         ingest: ingest_health,
         search: search_health,
@@ -605,6 +628,7 @@ pub async fn get_disk_alert(
         nanosiem_core::health::disk_monitor::DiskLevel,
         nanosiem_core::health::disk_monitor::DiskComponent,
         nanosiem_core::health::disk_monitor::DiskForecast,
+        nanosiem_core::health::disk_monitor::VectorDeadLetter,
         DiskAlertResponse
     ))
 )]

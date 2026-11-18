@@ -576,6 +576,9 @@ impl ReportService {
             Ok(authorization) => match self.owner_scope(def).await {
                 Err(e) => Err(e),
                 Ok(scope) => {
+                    // NAN-5612: an owner without detections:view cannot run a
+                    // dataset=signals report (the search service refuses it).
+                    let scope = scope.with_signals_denied(authorization.signals_denied());
                     // NAN-3222: the run executes as its owner, so an owner
                     // query naming a hidden source is audited like a member
                     // search (rate limited; the run is unchanged).

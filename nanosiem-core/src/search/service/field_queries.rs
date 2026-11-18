@@ -4,7 +4,6 @@ use super::lateral::source_scope_sql_predicate;
 use super::*;
 use crate::auth::ScopeSet;
 use crate::query::escape_identifier;
-use crate::search::query_processing::enforce_source_scope;
 use crate::sql_hygiene::escape_sql_string;
 use std::collections::BTreeSet;
 // `MATERIALIZED_COLUMNS` is only referenced by the unit tests below (the UDM
@@ -141,14 +140,18 @@ impl SearchService {
         // NAN-5485: in-query `earliest=` / `latest=` set the window exactly as
         // they do for the rows search (`parse_query` drops the tokens, so the
         // stats would otherwise cover the picker's window, not the results').
-        let (query, time_range) = super::apply_query_time_bounds_at(query, time_range, chrono::Utc::now())?;
+        // NAN-5612: a leading `dataset=<name>` selects the dataset.
+        let (query, dataset_owned) = crate::search::query_processing::resolve_dataset_selector(query, dataset)?;
+        let dataset = dataset_owned.as_deref();
+        let (query, time_range) = super::apply_query_time_bounds_at(&query, time_range, chrono::Utc::now())?;
         let time_range = &time_range;
 
         // NAN-1799: inject the caller's source-scope exclusion before the
         // parse — the companion aggregates over the base search's WHERE, so
         // an ungated text here would leak denied sources' values into the
-        // field panel. Empty deny-set → text unchanged.
-        let query = enforce_source_scope(&query, scope.deny_set())?;
+        // field panel. Empty deny-set → text unchanged. NAN-5612: plus the
+        // dataset permission check.
+        let query = crate::search::query_processing::enforce_viewer_scope(&query, dataset, scope)?;
 
         // Parse and validate the query
         let parsed_query = parse_query(&query).map_err(|e| convert_parse_error(e))?;
@@ -180,7 +183,9 @@ impl SearchService {
         // `logs` inventory would wrap UDM columns around the 15-column entity
         // grain (guaranteed CH 47 per column). Its column universe IS the
         // derived projection.
-        let columns = if profile.id() == crate::schema::SchemaId::Risk {
+        // NAN-5612: the signals dataset is a derived union too (`detection_path` is
+        // not a column of any table).
+        let columns = if matches!(profile.id(), crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals) {
             Self::field_stats_fallback_columns(dataset)
         } else {
             // Enumerate the columns of the per-query DATASET's table, not a
@@ -322,7 +327,11 @@ impl SearchService {
 
         // NAN-1799: gate the drill-in the same way as the search it belongs
         // to — inject the scope exclusion into the text before the parse.
-        let query = enforce_source_scope(query, scope.deny_set())?;
+        // NAN-5612: a leading `dataset=` selects the dataset; plus the dataset
+        // permission check.
+        let (query, dataset_owned) = crate::search::query_processing::resolve_dataset_selector(query, dataset)?;
+        let dataset = dataset_owned.as_deref();
+        let query = crate::search::query_processing::enforce_viewer_scope(&query, dataset, scope)?;
 
         // Parse and validate the query
         let parsed_query = parse_query(&query).map_err(|e| convert_parse_error(e))?;

@@ -25,8 +25,8 @@ import {
   Minus,
   Plus,
   Settings2,
-  Sparkles,
   X,
+  Lightbulb,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -909,7 +909,7 @@ function SourceMappingTab({
                             onClick={() => setMapping(m, sugg)}
                             className="h-[22px] px-1.5 rounded-md border border-success/40 bg-success/10 text-[10px] font-mono text-success hover:bg-success/15 flex items-center gap-1 shrink-0"
                           >
-                            <Sparkles className="w-[10px] h-[10px]" strokeWidth={1.5} />
+                            <Lightbulb className="w-[10px] h-[10px]" strokeWidth={1.5} />
                             {sugg}
                           </button>
                         </TooltipTrigger>

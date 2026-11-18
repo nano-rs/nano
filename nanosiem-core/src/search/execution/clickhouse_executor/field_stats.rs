@@ -349,9 +349,7 @@ impl ClickHouseExecutor {
         );
 
         let escaped_sql = escape_question_marks_in_strings(&sql);
-        let mut cursor = self
-            .client
-            .query(&escaped_sql)
+        let mut cursor = self.sized_query(&escaped_sql)
             .fetch_bytes("JSONEachRow")
             .map_err(|e| crate::search::search_error_from_error(&e))?;
 
@@ -608,7 +606,7 @@ impl ClickHouseExecutor {
 
         let escaped_sql = escape_question_marks_in_strings(sql);
         let mut cursor =
-            super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
+            super::types::with_query_options(self.sized_query(&escaped_sql), query_id, settings)
                 .fetch_bytes("JSONEachRow")
                 .map_err(|e| {
                     warn!("ClickHouse field stats query failed to start: {}", e);
@@ -848,7 +846,7 @@ impl ClickHouseExecutor {
         settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let escaped_sql = escape_question_marks_in_strings(sql);
-        let mut cursor = super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
+        let mut cursor = super::types::with_query_options(self.sized_query(&escaped_sql), query_id, settings)
             .fetch_bytes("JSONEachRow")
             .map_err(|e| crate::search::search_error_from_error(&e))?;
 
@@ -969,9 +967,7 @@ impl ClickHouseExecutor {
         debug!("Executing field values query: {}", sql);
 
         let escaped_sql = escape_question_marks_in_strings(sql);
-        let mut cursor = self
-            .client
-            .query(&escaped_sql)
+        let mut cursor = self.sized_query(&escaped_sql)
             .fetch_bytes("JSONEachRow")
             .map_err(|e| {
                 warn!("ClickHouse field values query failed: {}", e);

@@ -477,12 +477,17 @@ services:
     #            the token. Silent.
     # So never drop the flag, and after any Vector bump confirm env-driven values
     # resolve at runtime (send HEC with the real token and with the literal).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.12-debian@sha256:f0b6ee0a0dd16b5e26e5f4d01134b3e66b6a4d09fc8b4a97a11d786a22ac8670
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.13-debian@sha256:6f4d8e4e61c3e957a44fd45b1835c3288fde54042eb623ee09af730c32b85d6d
     container_name: nanosiem-vector
     network_mode: "service:vector-netns"
+    # NAN-5566: Vector never cuts its own shutdown short (an in-process cancel
+    # of the in-flight batch loses it, NAN-5567); Docker's SIGKILL at this
+    # deadline leaves those events in the disk buffer for replay.
+    stop_grace_period: 120s
     security_opt:
       - no-new-privileges:true
     environment:
+      VECTOR_NO_GRACEFUL_SHUTDOWN_LIMIT: "true"
       # Authentication token for HTTP ingestion endpoint
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-}
       # NAN-4907: OTLP edge assertion key; explicit static-fallback state

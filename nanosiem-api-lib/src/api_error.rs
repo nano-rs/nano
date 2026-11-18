@@ -84,6 +84,15 @@ pub enum ApiError {
         message: String,
         details: serde_json::Value,
     },
+
+    /// A 409 with a machine-readable `code` and structured `details`
+    /// (NAN-5561: the hunts escalation gate's numbers).
+    #[error("{message}")]
+    ConflictWithDetails {
+        code: &'static str,
+        message: String,
+        details: serde_json::Value,
+    },
 }
 
 /// Error response body
@@ -122,6 +131,7 @@ impl ApiError {
             ApiError::TierLimitExceeded(_) => "TIER_LIMIT_EXCEEDED",
             ApiError::UnscopedPrevalence(_) => "UNSCOPED_PREVALENCE",
             ApiError::UnprocessableWithDetails { code, .. } => code,
+            ApiError::ConflictWithDetails { code, .. } => code,
         }
     }
 
@@ -145,6 +155,7 @@ impl ApiError {
             ApiError::TierLimitExceeded(_) => StatusCode::FORBIDDEN,
             ApiError::UnscopedPrevalence(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::UnprocessableWithDetails { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::ConflictWithDetails { .. } => StatusCode::CONFLICT,
         }
     }
 }
@@ -198,6 +209,7 @@ impl IntoResponse for ApiError {
                 "wildcard_fields": fields,
             })),
             ApiError::UnprocessableWithDetails { details, .. } => Some(details.clone()),
+            ApiError::ConflictWithDetails { details, .. } => Some(details.clone()),
             _ => None,
         };
         // NAN-712: override the default Display text with a friendly message
@@ -289,6 +301,8 @@ impl From<nanosiem_core::SearchError> for ApiError {
                 tracing::error!(error = %e, "ClickHouse unavailable in search");
                 ApiError::DatabaseError("A database error occurred".to_string())
             }
+            // NAN-5612: the caller's scope refuses what the query reads.
+            nanosiem_core::SearchError::Forbidden(msg) => ApiError::Forbidden(msg),
             nanosiem_core::SearchError::ResourceLimit(msg) => ApiError::SqlValidationError(msg),
             error @ nanosiem_core::SearchError::DataError { .. } => {
                 ApiError::SqlValidationError(error.to_string())
@@ -297,8 +311,29 @@ impl From<nanosiem_core::SearchError> for ApiError {
     }
 }
 
+/// A database rule guard refused the write (e.g. the enterprise overlay's
+/// "agent detections never alert" trigger, NAN-5581, which raises a
+/// check_violation naming `agent_detection_live_only`). Its message is
+/// written by nano itself, so it is safe to show and it says what to do.
+fn rule_guard_refusal(text: &str) -> Option<String> {
+    if !text.contains("agent detection") && !text.contains("agent_detection_live_only") {
+        return None;
+    }
+    let message = text
+        .rsplit("error returned from database: ")
+        .next()
+        .unwrap_or(text)
+        .trim();
+    // PostgreSQL appends the PL/pgSQL location ("… at line N"): not for users.
+    let message = message.split(" at line ").next().unwrap_or(message).trim();
+    Some(message.chars().take(300).collect())
+}
+
 impl From<nanosiem_core::DetectionError> for ApiError {
     fn from(err: nanosiem_core::DetectionError) -> Self {
+        if let Some(message) = rule_guard_refusal(&err.to_string()) {
+            return ApiError::Conflict(message);
+        }
         match &err {
             nanosiem_core::DetectionError::RuleNotFound(id) => {
                 ApiError::NotFound(format!("Detection rule not found: {}", id))
@@ -954,6 +989,11 @@ impl From<nanosiem_core::hunts::HuntError> for ApiError {
             HuntError::Validation(msg) => ApiError::BadRequest(msg),
             HuntError::Forbidden(msg) => ApiError::Forbidden(msg),
             HuntError::LeaseLost(msg) | HuntError::Conflict(msg) => ApiError::Conflict(msg),
+            HuntError::GateRefused { message, gate } => ApiError::ConflictWithDetails {
+                code: "ESCALATION_GATE_NOT_MET",
+                message,
+                details: serde_json::json!({ "gate": gate }),
+            },
             // NAN-2266: the 5xx variants used to flow their raw detail —
             // including sqlx's rendering of the database error — straight into
             // the response body. The detail goes to the log (with the request

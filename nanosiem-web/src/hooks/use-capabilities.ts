@@ -72,6 +72,18 @@ export interface Capabilities {
    * it; absent means off.
    */
   complianceExport?: boolean;
+  /**
+   * Hunts workspace (`/api/hunts*`, enterprise; NAN-5545). Access still needs
+   * `hunts:view`. Optional because older APIs do not publish it; absent means
+   * off.
+   */
+  hunts?: boolean;
+  /**
+   * Hot/cold storage tiering panel on Settings > Storage
+   * (`/api/settings/tiering*`, enterprise; NAN-5445). Optional because older
+   * APIs do not publish it; absent means off.
+   */
+  storageTiering?: boolean;
 }
 
 export interface CapabilitiesContextValue {

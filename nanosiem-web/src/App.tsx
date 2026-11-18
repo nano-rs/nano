@@ -182,6 +182,22 @@ const AutomationFlowsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages
 const AutomationFlowRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationFlowRoute');
 const AutomationApprovalsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationApprovalsRoute');
 const AutomationCapabilitiesRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationCapabilitiesRoute');
+// NAN-5545: Hunts workspace (enterprise); open builds resolve to the placeholder stub.
+const HuntsListRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntsListRoute');
+const HuntDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntDetailRoute');
+const HuntLeadsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntLeadsRoute');
+const HuntLeadDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntLeadDetailRoute');
+const HuntRuleIdeasRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntRuleIdeasRoute');
+const HuntKnowledgeRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntKnowledgeRoute');
+const HuntSuppressionsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntSuppressionsRoute');
+const HuntProfileRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntProfileRoute');
+const HuntRunnersRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntRunnersRoute');
+const HuntMemoryRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntMemoryRoute');
+const HuntCampaignsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignsRoute');
+const HuntCampaignCandidatesRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignCandidatesRoute');
+const HuntCampaignDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignDetailRoute');
+const HuntRulingsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntRulingsRoute');
+const HuntEscalationsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntEscalationsRoute');
 const RiskWatchlists = lazyWithRetryNamed(() => import('@/enterprise/pages/RiskWatchlists'), 'RiskWatchlists');
 const Prevalence = lazyWithRetryNamed(() => import('@/pages/Prevalence'), 'Prevalence');
 const Dashboards = lazyWithRetryNamed(() => import('@/pages/Dashboards'), 'Dashboards');
@@ -698,6 +714,35 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          {/* Hunts (enterprise, NAN-5545 / NAN-5547): library, findings,
+              campaigns, rule ideas, memory (knowledge and suppressions
+              redirect into it), rulings, profile, runners. Static paths sort
+              ahead of /hunts/:id in react-router's ranking. */}
+          {([
+            ['/hunts', HuntsListRoute],
+            ['/hunts/leads', HuntLeadsRoute],
+            ['/hunts/leads/:id', HuntLeadDetailRoute],
+            ['/hunts/rule-ideas', HuntRuleIdeasRoute],
+            ['/hunts/knowledge', HuntKnowledgeRoute],
+            ['/hunts/suppressions', HuntSuppressionsRoute],
+            ['/hunts/memory', HuntMemoryRoute],
+            ['/hunts/campaigns', HuntCampaignsRoute],
+            ['/hunts/campaigns/candidates', HuntCampaignCandidatesRoute],
+            ['/hunts/campaigns/:id', HuntCampaignDetailRoute],
+            ['/hunts/rulings', HuntRulingsRoute],
+            ['/hunts/escalations', HuntEscalationsRoute],
+            ['/hunts/profile', HuntProfileRoute],
+            ['/hunts/runners', HuntRunnersRoute],
+            ['/hunts/:id', HuntDetailRoute],
+          ] as const).map(([path, Page]) => (
+            <Route key={path} path={path} element={
+              <PermissionRoute permission="hunts:view" capability="hunts" element={
+                <Suspense fallback={<ListPageLoadingFallback />}>
+                  <Page key={resetKey} />
+                </Suspense>
+              } />
+            } />
+          ))}
           {/* Automation (enterprise, NAN-4911 / NAN-4925): runs, flows,
               approvals, capabilities. Each route renders an "off" state
               itself; open builds render the paid-plan stub. */}

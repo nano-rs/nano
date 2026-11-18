@@ -49,6 +49,7 @@ import {
   MODE_META,
   displayMode,
   folderOf,
+  folderLabel,
   folderKind,
   normalizeSeverity,
   type FolderKind,
@@ -620,7 +621,7 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
                         strokeWidth={2}
                       />
                       <FolderIcon kind={folder.kind} slug={folderSettings?.[folder.name]} />
-                      <span className="text-[12.5px] font-medium">{folder.name}</span>
+                      <span className="text-[12.5px] font-medium">{folderLabel(folder.name)}</span>
                       <span className="ml-auto text-[10px] font-mono text-muted-foreground">{folder.children.length}</span>
                     </button>
                   );

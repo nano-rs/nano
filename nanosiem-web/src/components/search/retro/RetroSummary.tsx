@@ -6,7 +6,7 @@
  * entities the indicator landed on (click to pivot to events).
  */
 
-import { Sparkles, Info, Box, ArrowUpRight } from 'lucide-react';
+import { Info, Box, ArrowUpRight, Crosshair } from 'lucide-react';
 import type { RetroIndicator } from '@/lib/api/types';
 import {
   RE_VERDICT,
@@ -73,7 +73,7 @@ export function RetroSummary({
             <div className="flex items-center gap-2 text-[11px] text-fg-3 font-mono flex-wrap">
               {d.source && (
                 <>
-                  <Sparkles className="w-[12px] h-[12px] text-brand" />
+                  <Crosshair className="w-[12px] h-[12px] text-brand" />
                   <span>
                     matched <span className="text-fg-2">{d.source}</span>
                   </span>

@@ -352,6 +352,13 @@ impl ChannelFormatter for SlackFormatter {
         if let Some(count) = payload.matched_event_count {
             fields.push(json!({ "type": "mrkdwn", "text": format!("*Events*\n`{count}`") }));
         }
+        // Extension events' facts (Slack allows at most 10 section fields).
+        for (label, value) in payload.details.iter().flatten() {
+            if fields.len() >= 10 {
+                break;
+            }
+            fields.push(json!({ "type": "mrkdwn", "text": format!("*{label}*\n`{}`", truncate(value, 300)) }));
+        }
 
         let mut blocks = vec![
             json!({
@@ -365,6 +372,12 @@ impl ChannelFormatter for SlackFormatter {
             blocks.push(json!({
                 "type": "section",
                 "text": { "type": "mrkdwn", "text": truncate(summary, 2800) }
+            }));
+        }
+        if let Some(summary) = payload.summary.as_deref().filter(|s| !s.is_empty()) {
+            blocks.push(json!({
+                "type": "section",
+                "text": { "type": "plain_text", "text": truncate(summary, 2800), "emoji": false }
             }));
         }
         if let Some(remediation) = payload
@@ -475,6 +488,9 @@ impl ChannelFormatter for TeamsFormatter {
         if let Some(count) = payload.matched_event_count {
             facts.push(json!({ "title": "Events", "value": count.to_string() }));
         }
+        for (label, value) in payload.details.iter().flatten() {
+            facts.push(json!({ "title": label, "value": truncate(value, 300) }));
+        }
         facts.push(json!({ "title": "Time", "value": payload.created_at.to_rfc3339() }));
 
         let mut body = vec![
@@ -489,6 +505,11 @@ impl ChannelFormatter for TeamsFormatter {
             json!({ "type": "FactSet", "facts": facts }),
         ];
         if let Some(summary) = payload.health_summary.as_deref().filter(|s| !s.is_empty()) {
+            body.push(json!({
+                "type": "TextBlock", "text": truncate(summary, 3000), "wrap": true
+            }));
+        }
+        if let Some(summary) = payload.summary.as_deref().filter(|s| !s.is_empty()) {
             body.push(json!({
                 "type": "TextBlock", "text": truncate(summary, 3000), "wrap": true
             }));
@@ -637,6 +658,12 @@ impl ChannelFormatter for PagerDutyFormatter {
         if let Some(remediation) = &payload.health_remediation {
             custom.insert("health_remediation".into(), json!(remediation));
         }
+        if let Some(summary) = &payload.summary {
+            custom.insert("summary".into(), json!(summary));
+        }
+        if let Some(details) = &payload.details {
+            custom.insert("details".into(), json!(details));
+        }
 
         let mut event = json!({
             "routing_key": ctx.routing_key.unwrap_or_default(),
@@ -666,6 +693,10 @@ impl ChannelFormatter for PagerDutyFormatter {
             Some(typeid::encode(typeid::alert::PREFIX, &alert_id))
         } else if payload.event_type == "webhook.test" {
             Some("nano-test".to_string())
+        } else if payload.details.is_some() {
+            // An extension event carries its own logical-delivery key (e.g.
+            // one escalation per finding): repeats collapse into one incident.
+            payload.idempotency_key.clone()
         } else {
             None
         };
@@ -758,6 +789,12 @@ impl ChannelFormatter for EmailFormatter {
         }
         if let Some(count) = payload.matched_event_count {
             lines.push(format!("Events: {count}"));
+        }
+        for (label, value) in payload.details.iter().flatten() {
+            lines.push(format!("{label}: {value}"));
+        }
+        if let Some(summary) = &payload.summary {
+            lines.push(format!("Summary: {summary}"));
         }
         lines.push(format!("Time: {}", payload.created_at.to_rfc3339()));
         if let Some(link) = &payload.link_url {

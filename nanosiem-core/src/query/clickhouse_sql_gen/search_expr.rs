@@ -3439,6 +3439,15 @@ impl ClickHouseSqlGenerator {
             ));
         }
 
+        // NAN-5620: a subsearch with stages (`stats`, `where`, `sort`, `head`,
+        // `eval`, `dedup`, …) runs its WHOLE pipeline. Only a bare search
+        // (`[search … | return f]`) keeps the single-scan form below.
+        let plan = in_subsearch_plan(&stages)?;
+        let cap = plan.cap;
+        if !plan.body.is_empty() {
+            return self.generate_in_subsearch_pipeline(field, subsearch, negated, sub_gen, return_field, &plan, time_range);
+        }
+
         // Build a single WHERE with the time range and the subsearch's search
         // expression — `optimize_move_to_prewhere` does placement (NAN-1412).
         // The time column is the SUBSEARCH dataset's (NAN-1562 fixes the
@@ -3493,7 +3502,7 @@ impl ClickHouseSqlGenerator {
                 return_field_expr,
                 sub_gen.table_name,
                 where_clause,
-                SUBSEARCH_RESULT_LIMIT,
+                cap,
             ))
         } else if self.is_plain_string_physical_column(field)
             && sub_gen.is_plain_string_physical_column(return_field)
@@ -3512,7 +3521,7 @@ impl ClickHouseSqlGenerator {
                 return_field_expr,
                 sub_gen.table_name,
                 where_clause,
-                SUBSEARCH_RESULT_LIMIT,
+                cap,
             ))
         } else {
             Ok(format!(
@@ -3522,7 +3531,213 @@ impl ClickHouseSqlGenerator {
                 return_field_expr,
                 sub_gen.table_name,
                 where_clause,
-                SUBSEARCH_RESULT_LIMIT,
+                cap,
+            ))
+        }
+    }
+}
+
+/// The column a full-pipeline IN subsearch exposes its return value as
+/// (NAN-5620). The return field is evaluated by the subsearch's own last
+/// stage, so a stats output, an eval alias or a raw column all resolve the way
+/// the pipeline names them.
+const IN_SUBSEARCH_VALUE: &str = "_nano_in_value";
+
+/// How an `IN [ ]` subsearch runs (NAN-5620).
+struct InSubsearchPlan<'a> {
+    /// The stages to compile before its `return`; empty for a bare search
+    /// (the single-scan form).
+    body: Vec<&'a Command>,
+    /// Most DISTINCT values the subquery returns: 10,000, or `return N`'s N
+    /// when smaller (`return N` means N distinct values).
+    cap: usize,
+}
+
+/// Read the subsearch's stages: `return` must be last and name one field,
+/// and any stage that cannot run inside an IN subquery is refused, never
+/// dropped.
+fn in_subsearch_plan<'a>(stages: &[super::QueryStage<'a>]) -> Result<InSubsearchPlan<'a>, SqlGenError> {
+    let refuse = |msg: String| Err(SqlGenError::UnsupportedOperation(msg));
+    let commands: Vec<&Command> = stages
+        .iter()
+        .filter_map(|s| match s {
+            super::QueryStage::Command(c) => Some(*c),
+            super::QueryStage::Search(_) => None,
+        })
+        .collect();
+    let mut cap = SUBSEARCH_RESULT_LIMIT;
+    let body = match commands.split_last() {
+        Some((Command::Return { count, fields }, body)) => {
+            if fields.len() > 1 {
+                return refuse(format!(
+                    "`return {}`: an IN [ ] subsearch matches one field; return one",
+                    fields.join(", ")
+                ));
+            }
+            // `return f` parses as count 1 and has always meant "every
+            // value"; an explicit `return N f` (N > 1) keeps N distinct values.
+            if *count > 1 {
+                cap = (*count).min(SUBSEARCH_RESULT_LIMIT);
+            }
+            body
+        }
+        _ => commands.as_slice(),
+    };
+    for c in body {
+        if matches!(c, Command::Return { .. }) {
+            return refuse("`return` must be the last stage of an IN [ ] subsearch".to_string());
+        }
+        let supported = matches!(
+            c,
+            Command::Stats { .. }
+                | Command::Where { .. }
+                | Command::Eval { .. }
+                | Command::Sort { .. }
+                | Command::Head { .. }
+                | Command::Dedup { .. }
+                | Command::Fields { .. }
+                | Command::Table { .. }
+                | Command::Rename { .. }
+        );
+        if !supported {
+            return refuse(format!(
+                "`{}` cannot run inside an IN [ ] subsearch (supported: stats, where, eval, sort, head, dedup, \
+                 fields, table, rename)",
+                command_label(c)
+            ));
+        }
+    }
+    Ok(InSubsearchPlan { body: body.to_vec(), cap })
+}
+
+/// The nPL name of a command, for an error message.
+fn command_label(c: &Command) -> String {
+    let dbg = format!("{c:?}");
+    dbg.split(|ch: char| !ch.is_alphanumeric()).next().unwrap_or("this command").to_lowercase()
+}
+
+/// `stats values(f) [by …]` as the subsearch's last stage, returning `f` or
+/// the aggregate's output name: the values it collects are the distinct
+/// non-empty `f` of the rows before it, whatever the grouping. `Some(f)`.
+fn returned_values_field<'q>(last: &'q Command, return_field: &str) -> Option<&'q str> {
+    let Command::Stats { aggregations, .. } = last else { return None };
+    let [agg] = aggregations.as_slice() else { return None };
+    if agg.func != AggFunc::Values || agg.condition.is_some() || agg.field_expr.is_some() {
+        return None;
+    }
+    let f = agg.field.as_deref()?;
+    (return_field == f || return_field == agg.output_alias()).then_some(f)
+}
+
+impl ClickHouseSqlGenerator {
+    /// `field IN [search … | <stages> | return f]` (NAN-5620): the subsearch
+    /// is compiled by the production generator as a complete query (same
+    /// dataset, same time range, same source-scope gate, which the scope
+    /// injection already placed in the subsearch's search) and the IN reads
+    /// its output: `field IN (SELECT DISTINCT v FROM (<pipeline>) LIMIT cap)`.
+    /// The cap counts DISTINCT values, outside the pipeline, exactly as the
+    /// single-scan form does; a `head` inside the pipeline is the pipeline's
+    /// own row limit.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_in_subsearch_pipeline(
+        &self,
+        field: &str,
+        subsearch: &Query,
+        negated: bool,
+        sub_gen: &ClickHouseSqlGenerator,
+        return_field: &str,
+        plan: &InSubsearchPlan<'_>,
+        time_range: &crate::query::sql_gen::TimeRange,
+    ) -> Result<String, SqlGenError> {
+        // The pipeline without its trailing `return`.
+        let mut body = match subsearch {
+            Query::Piped { source, command: Command::Return { .. } } => source.as_ref().clone(),
+            other => other.clone(),
+        };
+        let mut return_field = return_field.to_string();
+        // `stats values(f)` (one comma-joined string) returns its values:
+        // the distinct non-empty `f` of the rows feeding it.
+        let mut non_empty = false;
+        let values_of = match &body {
+            Query::Piped { source, command } => {
+                returned_values_field(command, &return_field).map(|f| (f.to_string(), source.as_ref().clone()))
+            }
+            Query::Search(_) => None,
+        };
+        if let Some((f, source)) = values_of {
+            return_field = f;
+            body = source;
+            non_empty = true;
+        }
+        // A pipeline that projects (stats, table, fields) must still output
+        // the returned field; otherwise ClickHouse fails on an unknown column
+        // deep in the query. Say which field and what the pipeline outputs.
+        let stages = self.collect_stages(&body);
+        // A projecting pipeline (stats, table, fields) outputs named columns:
+        // read the returned one by name. (An eval after it would widen the
+        // base scan and lose a UDM ext group-by key's stage_0 alias.)
+        let projected = match sub_gen.pipeline_output_shape(&stages) {
+            super::OutputShape::Columns(cols) => {
+                let want = normalize_field_name(&return_field);
+                match cols.iter().find(|c| *c == want || **c == return_field) {
+                    Some(c) => Some(escape_identifier(c)),
+                    None => {
+                        return Err(SqlGenError::UnsupportedOperation(format!(
+                            "the IN [ ] subsearch returns `{return_field}`, but its pipeline outputs only {}",
+                            cols.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ")
+                        )))
+                    }
+                }
+            }
+            _ => None,
+        };
+        // Otherwise one eval names the returned value (a raw column, an OCSF
+        // tail path or an ext field all resolve the way the pipeline reads
+        // them). Either way the rows keep the pipeline's own order: an eval
+        // passes rows through in the order of the stage before it, so
+        // `sort … | head N` keeps the top N, and the generation is not
+        // `unordered`, so a bare `head N` keeps the newest N as it does at the
+        // top level.
+        let (query, value) = match projected {
+            Some(column) => (body, column),
+            None => (
+                Query::Piped {
+                    source: Box::new(body),
+                    command: Command::Eval {
+                        assignments: vec![EvalAssignment {
+                            field: IN_SUBSEARCH_VALUE.to_string(),
+                            expression: EvalExpression::Field(return_field.clone()),
+                        }],
+                    },
+                },
+                escape_identifier(IN_SUBSEARCH_VALUE),
+            ),
+        };
+        let options = super::QueryOptions { limit: None, omit_settings: true, ..Default::default() };
+        // A fresh clone: its own generation state, the same dataset,
+        // profile, table routing and source-scope deny set, and its own
+        // `sub<n>_` CTE prefix (NAN-5628): the pipeline's `WITH` sits inside
+        // the outer `stage_0`, so reusing `stage_*` shadowed the outer CTEs.
+        let inner_sql = sub_gen.nested_pipeline_generator().generate_with_options(&query, time_range, &options)?;
+        let outer_field_expr = self.field_access_expr(field, "String");
+        let op = if negated { "NOT IN" } else { "IN" };
+        let outer_numeric = self.profile.is_numeric_field(field);
+        let return_numeric = sub_gen.profile.is_numeric_field(&return_field);
+        let inner = inner_sql.trim().replace('\n', "\n    ");
+        let filter = if non_empty { format!(" WHERE toString({value}) != ''") } else { String::new() };
+        let cap = plan.cap;
+        // The bare forms mirror the single-scan path (NAN-1562 / NAN-1634):
+        // no toString() where both sides already compare as-is, so the outer
+        // column's skip index still applies.
+        let both_plain_strings =
+            self.is_plain_string_physical_column(field) && sub_gen.is_plain_string_physical_column(&return_field);
+        if (outer_numeric && return_numeric) || both_plain_strings {
+            Ok(format!(
+                "{outer_field_expr} {op} (SELECT DISTINCT {value} FROM (\n    {inner}\n){filter} LIMIT {cap})"
+            ))
+        } else {
+            Ok(format!(
+                "toString({outer_field_expr}) {op} (SELECT DISTINCT toString({value}) FROM (\n    {inner}\n){filter} LIMIT {cap})"
             ))
         }
     }

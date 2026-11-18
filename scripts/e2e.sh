@@ -19,6 +19,13 @@
 #                          unless --allow-skips)
 #                          (reuses --run <id>, else the live stack from `up`; with
 #                          neither, or --fresh: up + run + down)
+#   scripts/e2e.sh run     <suite...> --target existing [-- <pytest args>]
+#                          against a stack this runner did NOT create (a local
+#                          tenant): no up/down/restarts; only scenarios marked
+#                          existing_target run. E2E_TARGET_CREDS_FILE (0600,
+#                          outside the repo: email/password/api_key of a NON-admin
+#                          user) is required; E2E_TARGET_{WEB,API,SEARCH,HEC}_URL
+#                          default to the local dev stack (NAN-5586)
 #   scripts/e2e.sh down    [--run <id>] [--purge]
 #   scripts/e2e.sh env     [--run <id>]          print the stack.env path
 #   scripts/e2e.sh doctor                        prerequisites + credential presence
@@ -88,7 +95,7 @@ CMD="${1:-}"; [[ $# -gt 0 ]] && shift
 if [[ -d "$ROOT/nanosiem-enterprise" ]]; then DEFAULT_EDITION=enterprise; else DEFAULT_EDITION=open; fi
 APP_MODE=""; APP_MODE_EXPLICIT=0; EDITION="${E2E_EDITION:-$DEFAULT_EDITION}"; RUN_ID=""; NEW_RUN_ID="${E2E_NEW_RUN_ID:-}"
 KEEP=0; FRESH=0; ALLOW_SKIPS="${E2E_ALLOW_SKIPS:-0}"; PURGE=0; NO_BUILD=0; RELEASE=0; GC_HOURS=6; GC_CLOUD=0; GC_ALL_LOCAL=0; INFRA_ONLY=0
-DEFER_ADMIN=0; PROFILES=()
+DEFER_ADMIN=0; PROFILES=(); TARGET=own
 POSITIONAL=(); PYTEST_EXTRA=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -109,6 +116,7 @@ while [[ $# -gt 0 ]]; do
         --profile) PROFILES+=("${2:?--profile needs a value}"); shift 2 ;;
         --profile=*) PROFILES+=("${1#*=}"); shift ;;
         --defer-admin) DEFER_ADMIN=1; shift ;;
+        --target) TARGET="${2:?--target needs a value}"; shift 2 ;;
         --) shift; PYTEST_EXTRA=("$@"); break ;;
         -*) die "unknown option: $1" ;;
         *) POSITIONAL+=("$1"); shift ;;
@@ -121,6 +129,7 @@ if [[ -z "$APP_MODE" ]]; then
     if [[ "$OS" == Darwin ]]; then APP_MODE=native; else APP_MODE=docker; fi
 fi
 [[ "$APP_MODE" =~ ^(native|docker|image:[A-Za-z0-9._-]+)$ ]] || die "--app must be native, docker or image:<tag>"
+[[ "$TARGET" =~ ^(own|existing)$ ]] || die "--target must be own or existing"
 for _p in "${PROFILES[@]}"; do
     [[ "$_p" =~ ^(mock-vendor|connector-live|ai-stub|soar-lab)$ ]] || die "unknown --profile '$_p' (known: mock-vendor, connector-live, ai-stub, soar-lab)"
 done
@@ -272,7 +281,8 @@ gen_secrets() {
             put E2E_STARTED "$(date +%s)"
             put E2E_OWNER "$ROOT"
             put CLICKHOUSE_MEM_LIMIT "${E2E_CLICKHOUSE_MEM_LIMIT:-8G}"  # 4G/6G hit 241s under the UI suite once feed bundles load (NAN-4937)
-            put NANO_SCHEMA_PROFILE "${NANO_SCHEMA_PROFILE:-udm}"
+            # OCSF is what every new install gets; legacy UDM only on request (NAN-5593).
+            put NANO_SCHEMA_PROFILE "${NANO_SCHEMA_PROFILE:-ocsf}"
             put NANOSIEM_DEV_MODE true
             put RUST_LOG "${E2E_RUST_LOG:-info}"
             # No floating tag is published: default to this checkout's release.
@@ -481,6 +491,7 @@ write_app_env() {
                 "NANO_INGEST_PUBLIC_BASE_URL=http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_EDGE_PORT)" \
                 "NANO_INGEST_HEC_PORT=$(env_get "$RUN_DIR/run.env" E2E_HEC_PORT)" \
                 NANO_PIPE_PREVIEW_ENABLED=true \
+                "NANO_PIPELINE_IDENTITY=${NANO_VERSION:?}/${NANO_INGEST_ACK_DURABILITY:-fsync}/${VECTOR_FANIN_SLOTS:-off}" \
                 "NANO_BACKUP_STATUS_TOKEN=${NANO_BACKUP_STATUS_TOKEN:-}" \
                 API_HOST=127.0.0.1 "API_PORT=$(env_get "$RUN_DIR/run.env" E2E_API_PORT)" \
                 "SEARCH_PORT=$(env_get "$RUN_DIR/run.env" E2E_SEARCH_PORT)" \
@@ -1212,7 +1223,11 @@ suite_paths() {
                 [[ -d "$PY_DIR/tests/enterprise/ui" ]] && out+=("+$PY_DIR/tests/enterprise/ui") ;;
             content_acceptance) out+=("$PY_DIR/tests/enterprise/content_acceptance") ;;
             otlp) out+=("$PY_DIR/tests/test_otlp.py" "$PY_DIR/tests/ui/test_otlp_observability.py") ;;
-            personas) out+=("$PY_DIR/tests/personas") ;;
+            personas)
+                out+=("$PY_DIR/tests/personas")
+                # Enterprise journeys (the threat hunter) live under
+                # tests/enterprise/ (the mirror strips it).
+                [[ -d "$PY_DIR/tests/enterprise/personas" ]] && out+=("$PY_DIR/tests/enterprise/personas") ;;
             soar)
                 [[ -d "$PY_DIR/tests/enterprise/soar" ]] \
                     || die "suite 'soar' needs the enterprise test tree"
@@ -1295,7 +1310,53 @@ run_exit_guard() {
     exit "$final"
 }
 
+# NAN-5586: run scenarios against a stack this runner did not create. Nothing
+# is brought up, restarted or torn down; the credentials file is read by the
+# Python side only and its values are scrubbed from the artifacts.
+cmd_run_existing() {
+    local creds="${E2E_TARGET_CREDS_FILE:-}" status=0 paths=() listing p
+    [[ -n "$creds" && -f "$creds" ]] || die "--target existing needs E2E_TARGET_CREDS_FILE (0600 file: email, password, api_key)"
+    [[ "$(stat -f '%Lp' "$creds" 2>/dev/null || stat -c '%a' "$creds")" == 600 ]] || die "E2E_TARGET_CREDS_FILE must be mode 0600"
+    (( ${#POSITIONAL[@]} )) || die "--target existing needs an explicit suite (e.g. run ui --target existing)"
+    local web="${E2E_TARGET_WEB_URL:-http://localhost:5173}" api="${E2E_TARGET_API_URL:-http://localhost:3000}"
+    curl -fsS -m 10 -o /dev/null "$api/health" || die "existing target API not healthy at $api"
+    curl -fsS -m 10 -o /dev/null "$web/api/auth/methods" || die "existing target web UI not reachable at $web"
+    RUN_ID="existing-$(id -un | tr -cd 'a-z0-9')-$(openssl rand -hex 4)"
+    RUN_DIR="$E2E_HOME/$RUN_ID"
+    mkdir -p "$RUN_DIR/artifacts"
+    chmod 700 "$RUN_DIR"
+    venv_ensure
+    ui_ensure
+    listing="$(suite_paths)"
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        paths+=("${p#+}")
+    done <<<"$listing"
+    log "running ${POSITIONAL[*]} against the EXISTING stack at $web (run $RUN_ID)"
+    (
+        cd "$PY_DIR"
+        export E2E_TARGET=existing E2E_RUN_ID="$RUN_ID" E2E_RUN_DIR="$RUN_DIR" E2E_ARTIFACT_DIR="$RUN_DIR/artifacts"
+        export E2E_RUNNER="$ROOT/scripts/e2e.sh" E2E_EDITION="$EDITION" E2E_TARGET_CREDS_FILE="$creds"
+        export E2E_TARGET_WEB_URL="$web" E2E_TARGET_API_URL="$api"
+        export NANO_SCHEMA_PROFILE="${NANO_SCHEMA_PROFILE:-ocsf}"
+        # Only existing_target scenarios run here, so a suite such as tests/ui
+        # legitimately runs none: the gate is "the selection ran something".
+        export E2E_SUITE_PATHS="$PY_DIR"
+        export E2E_ALLOW_SKIPS="$ALLOW_SKIPS"
+        "$VENV/bin/python" -m pytest "${paths[@]}" \
+            --junitxml="$RUN_DIR/artifacts/junit-$(date +%s).xml" "${PYTEST_EXTRA[@]}"
+    ) || status=$?
+    guard scrub "$RUN_DIR/artifacts" --run-dir "$RUN_DIR" --env-file "$creds" || {
+        err "E2E-SECURITY: a secret remains in $RUN_DIR/artifacts after scrubbing: do NOT upload them"
+        (( status != 0 )) || status=3
+    }
+    if (( status == 0 )); then ok "e2e passed ($RUN_ID, existing target); artifacts: $RUN_DIR/artifacts"
+    else warn "e2e FAILED (exit $status); artifacts: $RUN_DIR/artifacts"; fi
+    return "$status"
+}
+
 cmd_run() {
+    if [[ "$TARGET" == existing ]]; then cmd_run_existing; return; fi
     local own_stack=0 web_dist="" final soar_selected=0 soar_explicit=0 suite
     leak_guard_begin "scripts/e2e.sh run"
     CMD_RUN_OWNS_STACK=0
@@ -1363,12 +1424,6 @@ cmd_run() {
         if selects_suite personas && [[ "$EDITION" == enterprise ]] \
             && [[ "${E2E_PERSONA_AI_MODE:-stub}" != real ]] && ! has_profile ai-stub; then
             PROFILES+=(ai-stub)
-        fi
-        if only_suite ui || only_suite connectors || only_suite otlp || only_suite personas || only_suite content_acceptance; then
-            # The OCSF profile is what a new install gets (install.sh); a UI-only
-            # run targets it unless the caller pinned a profile. Mixed runs keep
-            # the phase-1 default (udm): their parsers are not OCSF-shaped.
-            [[ -n "${NANO_SCHEMA_PROFILE:-}" ]] || export NANO_SCHEMA_PROFILE=ocsf
         fi
         cmd_up >/dev/null
         # cmd_up owns (and clears) its bring-up EXIT trap. From this point the

@@ -146,9 +146,10 @@ export function BlankDashboardForm({
           {submitting ? (
             <LoadingIcon className="w-[12px] h-[12px]" />
           ) : (
-            // NAN-2362: a sparkle means "generated with AI". This button makes
-            // an EMPTY dashboard, and in open builds there is no AI at all —
-            // inherited by copying the wizard's JSX verbatim in NAN-2356.
+            // NAN-2362 / NAN-5541: AI-driven controls carry the pivt mark
+            // (PivtIcon); sparkle icons are not used anywhere in the app. This
+            // button makes an EMPTY dashboard, and in open builds there is no
+            // AI at all, so it gets a plain Plus, not the pivt mark.
             <Plus className="w-[12px] h-[12px]" />
           )}
           Create blank

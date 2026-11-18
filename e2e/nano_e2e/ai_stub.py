@@ -32,10 +32,144 @@ def _messages(body: dict[str, Any]) -> str:
     return "\n".join(values)
 
 
+def _last_user_message(body: dict[str, Any]) -> str:
+    for message in reversed(body.get("messages", [])):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content", "")
+            if isinstance(content, list):
+                return "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+            return str(content)
+    return ""
+
+
+def concierge_intent(message: str) -> dict[str, Any]:
+    """The pivt concierge's intent for a persona message (NAN-5574).
+
+    Only explicit verbs map to an action intent, like the real classifier's
+    "default to chat" rule; the concierge then answers with a proposal card,
+    never a change.
+    """
+    lower = message.lower()
+    if lower.startswith("create log source with transport:"):
+        return {"intent": "create_log_source"}
+    if re.search(r"\b(publish|deploy|go live)\b", lower):
+        return {"intent": "deploy_log_source"}
+    # Like real models (NAN-5597): rule requests classify as `detection` and
+    # panel requests as `dashboard`; the concierge must still route them to
+    # the page's own action when the page offers one.
+    if re.search(r"\bcreate an? \w+ rule\b|\b(promote|demote|pause|resume) (this|it|this rule)\b", lower):
+        return {"intent": "detection", "description": message.strip()[:200]}
+    if re.search(r"\badd an? \w+ panel\b", lower):
+        return {"intent": "dashboard", "description": message.strip()[:200]}
+    return {"intent": "chat"}
+
+
+_PAGE_QUERY = re.compile(r'"query":\s*"((?:[^"\\]|\\.)*)"')
+_PAGE_TOTAL = re.compile(r'"total":\s*(\d+)')
+_SAVE = re.compile(r"save this search as (.+)$", re.IGNORECASE)
+_RULE = re.compile(r"create a (critical|high|medium|low|informational) rule named (.+)$", re.IGNORECASE)
+_PIVOT = re.compile(r"pivot to search for (.+)$", re.IGNORECASE)
+_CLOSE = re.compile(r"close (?:this|it|this alert) as (false positive|true positive|benign)", re.IGNORECASE)
+_PAGE_ALERT = re.compile(r'"alert":\s*(\{[^{}]*\})', re.S)
+_LIFECYCLE = re.compile(r"\b(promote|demote|pause|resume) (?:this|it|this rule)\b", re.IGNORECASE)
+_PAGE_RULE = re.compile(r'"rule":\s*(\{[^{}]*\})', re.S)
+_ADD_PANEL = re.compile(r"add an? (table|bar|line|area|pie|single_value|ranked_bar|timeline) panel named (.+?) for (.+)$", re.IGNORECASE)
+_PAGE_DASHBOARD = re.compile(r'"dashboard":\s*(\{[^{}]*\})', re.S)
+
+
+def page_chat_reply(prompt: str, message: str) -> str:
+    """pivt on a page (NAN-5571): ground the answer in the fenced page context
+    and propose only actions the catalog lists."""
+    msg = message.strip()
+    # The analyst's message is the last "**Analyst message:**" line.
+    if "**analyst message:**" in msg.lower():
+        msg = msg.split("**Analyst message:**")[-1].strip().splitlines()[0].strip()
+    m = _SAVE.search(msg)
+    if m and "`search.save`" in prompt:
+        action = {"action": "search.save", "params": {"name": m.group(1).strip()}, "why": "The analyst asked to save it."}
+        return "I can save this search.\n\n```page_action\n" + json.dumps(action) + "\n```\n"
+    m = _RULE.search(msg)
+    if m and "`search.create_rule`" in prompt:
+        action = {
+            "action": "search.create_rule",
+            "params": {"name": m.group(2).strip(), "severity": m.group(1).lower()},
+            "why": "The analyst asked for a rule from this search.",
+        }
+        return "Here is the rule to create.\n\n```page_action\n" + json.dumps(action) + "\n```\n"
+    m = _PIVOT.search(msg)
+    if m and "`search.pivot`" in prompt:
+        action = {"action": "search.pivot", "params": {"query": m.group(1).strip()}, "why": "The analyst asked to pivot."}
+        return "Here is the pivot.\n\n```page_action\n" + json.dumps(action) + "\n```\n"
+    m = _CLOSE.search(msg)
+    if m and "`alerts.close`" in prompt:
+        disposition = m.group(1).lower().replace(" ", "_")
+        action = {"action": "alerts.close", "params": {"disposition": disposition}, "why": "The analyst asked to close it."}
+        return "I can close this alert.\n\n```page_action\n" + json.dumps(action) + "\n```\n"
+    lc = _LIFECYCLE.search(msg)
+    if lc and f"`rules.{lc.group(1).lower()}`" in prompt:
+        verb = lc.group(1).lower()
+        action = {"action": f"rules.{verb}", "params": {}, "why": f"The analyst asked to {verb} it."}
+        return f"I can {verb} this rule.\n\n```page_action\n" + json.dumps(action) + "\n```\n"
+    ap = _ADD_PANEL.search(msg)
+    if ap and "`dashboards.add_panel`" in prompt:
+        action = {
+            "action": "dashboards.add_panel",
+            "params": {"title": ap.group(2).strip(), "query": ap.group(3).strip(), "visualization": ap.group(1).lower()},
+            "why": "The analyst asked for this panel.",
+        }
+        return "Here is the panel to add.\n\n```page_action\n" + json.dumps(action) + "\n```\n"
+    if m or lc or ap or _SAVE.search(msg) or _RULE.search(msg):
+        return "That action isn't available to you on this page."
+    opening = '<untrusted_case_data source="page_context">'
+    start = prompt.rfind(opening)
+    scope = ""
+    if start >= 0:
+        rest = prompt[start + len(opening):]
+        scope = rest.split("</untrusted_case_data>", 1)[0]
+    a = _PAGE_ALERT.search(scope)
+    if a:
+        try:
+            alert = json.loads(a.group(1))
+        except ValueError:
+            alert = {}
+        if alert.get("id"):
+            return (
+                f"This is alert `{alert['id']}` from rule {alert.get('rule')}, "
+                f"severity {alert.get('severity')}, status {alert.get('status')}."
+            )
+    dsh = _PAGE_DASHBOARD.search(scope)
+    if dsh:
+        try:
+            board = json.loads(dsh.group(1))
+        except ValueError:
+            board = {}
+        if board.get("id"):
+            return f"This is dashboard {board['id']} named {board.get('name')}, with {board.get('panel_count')} panels."
+    r = _PAGE_RULE.search(scope)
+    if r:
+        try:
+            rule = json.loads(r.group(1))
+        except ValueError:
+            rule = {}
+        if rule.get("id"):
+            return f"This is rule {rule['id']} named {rule.get('name')}, in {rule.get('mode')} mode."
+    q = _PAGE_QUERY.search(scope)
+    t = _PAGE_TOTAL.search(scope)
+    query = json.loads(f'"{q.group(1)}"') if q else "(none)"
+    total = t.group(1) if t else "unknown"
+    return f"You are looking at the query `{query}`, which matched {total} events on this page."
+
+
 def deterministic_content(body: dict[str, Any]) -> tuple[str, str]:
     """Return ``(response kind, content)`` for an OpenAI request."""
     prompt = _messages(body)
     lower = prompt.lower()
+
+    if "## the analyst's current page" in lower:
+        return "page_chat", page_chat_reply(prompt, _last_user_message(body))
+
+    if "intent classifier for a siem system" in lower:
+        return "concierge_intent", json.dumps(concierge_intent(_last_user_message(body)))
     marker_match = _MARKER.search(prompt)
     marker = marker_match.group(0) if marker_match else "nano-e2e-persona"
 
@@ -154,6 +288,135 @@ def deterministic_content(body: dict[str, Any]) -> tuple[str, str]:
     return "query", (f'The query selects the deterministic persona ground truth.\n```spl\n"{marker}"\n```')
 
 
+# ---------------------------------------------------------------------------
+# Hunts v2 (NAN-5561): scripted tool calls for the hunt agents.
+#
+# The hunt investigator, reviewer, recheck and eval agents talk in TOOL CALLS,
+# so the stub answers them with OpenAI `tool_calls`, chosen from the request
+# alone (stateless): which tools are offered says which agent is asking, and
+# the tool calls already in the history say which step it is on. The script
+# follows the threat-hunter persona's seeded ground truth (`fin-ws-<tag>` is
+# the malicious chain, `sccm-<tag>` the benign lookalike).
+# ---------------------------------------------------------------------------
+
+_EVENT_ID = re.compile(r'"id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"')
+_ANY_UUID = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
+_LEAD_ID = re.compile(r"\blead_[0-9a-z]{26}\b")
+_HUNT_HOST = re.compile(r"\b(fin-ws|fin-srv|eng-ws|sccm|dc01)-[a-z0-9-]+\b")
+
+
+def _tool_names(body: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for tool in body.get("tools") or []:
+        if isinstance(tool, dict):
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            if isinstance(fn, dict) and fn.get("name"):
+                names.add(str(fn["name"]))
+    return names
+
+
+def _calls_made(body: dict[str, Any]) -> list[str]:
+    made: list[str] = []
+    for message in body.get("messages", []):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                fn = call.get("function") if isinstance(call, dict) else None
+                if isinstance(fn, dict) and fn.get("name"):
+                    made.append(str(fn["name"]))
+    return made
+
+
+def _last_tool_result(body: dict[str, Any]) -> str:
+    for message in reversed(body.get("messages", [])):
+        if isinstance(message, dict) and message.get("role") == "tool":
+            content = message.get("content")
+            return content if isinstance(content, str) else json.dumps(content)
+    return ""
+
+
+def _rows_with(prompt: str, needle: str) -> list[str]:
+    ids: list[str] = []
+    for line in prompt.splitlines():
+        if needle in line:
+            for match in _EVENT_ID.findall(line):
+                if match not in ids:
+                    ids.append(match)
+    return ids
+
+
+def _call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    digest = hashlib.sha256(f"{name}{json.dumps(arguments, sort_keys=True)}".encode()).hexdigest()[:12]
+    return {"id": f"call_{digest}", "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+
+def hunt_tool_calls(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]] | str] | None:
+    """`(kind, tool_calls | final text)` for a hunt agent's request, else None."""
+    tools = _tool_names(body)
+    prompt = _messages(body)
+    made = _calls_made(body)
+    if "record_eval_verdict" in tools:
+        benign = "sccm-" in prompt or "ccmexec" in prompt.lower()
+        return "hunt_eval", [_call("record_eval_verdict", {
+            "verdict": "benign" if benign else "escalated", "confidence": 0.9 if benign else 0.85})]
+    if "record_recheck" in tools:
+        return "hunt_recheck", [_call("record_recheck", {"verdict": "quiet", "event_ids": []})]
+    if "record_verdict" in tools:
+        # The finding under review is named after "FINDING"; other lead ids in
+        # the context are memory (recent findings, rulings).
+        named = re.search(r"FINDING (lead_[0-9a-z]{26})", prompt)
+        lead = named if named else _LEAD_ID.search(prompt)
+        entity = re.search(r"entity_value: (\S+)", prompt)
+        host = entity.group(1) if entity else ""
+        if "get_events" not in made:
+            ids = [i for i in _ANY_UUID.findall(prompt)][:10]
+            return "hunt_reviewer", [_call("get_events", {"ids": ids})]
+        last = _last_tool_result(body)
+        retry = "record_verdict" in made and last.startswith("ERROR")
+        if ("record_verdict" not in made or retry) and lead:
+            # Cite what get_events returned (any id it rendered), else the
+            # finding's own evidence pointers.
+            fetched = list(dict.fromkeys(_ANY_UUID.findall(last)))[:10] if not retry else []
+            if not fetched:
+                fetched = list(dict.fromkeys(_ANY_UUID.findall(prompt)))[:10]
+            benign = host.startswith("sccm-")
+            return "hunt_reviewer", [_call("record_verdict", {
+                "lead_id": lead.group(1) if named else lead.group(0),
+                "verdict": "benign" if benign else "escalated",
+                "confidence": 0.9,
+                "severity": "medium" if benign else "high",
+                "internet_facing": False,
+                "attack_succeeded": None if benign else True,
+                "rationale": "Deterministic e2e review: " + (
+                    "patch-management baseline with 14 days of history." if benign else
+                    "Office spawned encoded PowerShell that reached a Tor exit and dropped a binary."),
+                "benign_hypotheses": [{"hypothesis": "SCCM patch management", "status": "fits" if benign else "ruled_out",
+                                       "basis": "parent process and history"}],
+                "checks": [{"tool": "get_events", "summary": "re-read the finding's evidence", "event_ids": fetched[:5]}],
+                "cited_event_ids": fetched,
+            })]
+        return "hunt_reviewer", "Review complete."
+    if "file_finding" in tools:
+        filed = made.count("file_finding")
+        tag_hosts = {m.group(0) for m in _HUNT_HOST.finditer(prompt)}
+        fin = next((h for h in sorted(tag_hosts) if h.startswith("fin-ws-")), None)
+        sccm = next((h for h in sorted(tag_hosts) if h.startswith("sccm-")), None)
+        if filed == 0 and fin and _rows_with(prompt, fin):
+            return "hunt_investigator", [_call("file_finding", {
+                "class": "lead", "entity_type": "host", "entity_value": fin, "technique": "T1059.001",
+                "severity": "high", "confidence": 0.8, "evidence_event_ids": _rows_with(prompt, fin)[:8],
+                "benign_analysis": "Not patch management: the parent is WINWORD and the host reached a Tor exit.",
+                "narrative": "Office macro to encoded PowerShell to Tor egress to a dropper.",
+            })]
+        if filed <= 1 and sccm and _rows_with(prompt, sccm) and "sccm" not in _last_tool_result(body):
+            return "hunt_investigator", [_call("file_finding", {
+                "class": "benign", "entity_type": "host", "entity_value": sccm, "severity": "low", "confidence": 0.9,
+                "evidence_event_ids": _rows_with(prompt, sccm)[:5],
+                "benign_analysis": "SCCM ccmexec runs this encoded inventory script daily; 14 days of history.",
+            })]
+        return "hunt_investigator", [_call("finish", {"note": "Deterministic e2e investigation complete."})]
+    return None
+
+
 class AiStubServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -222,7 +485,8 @@ class AiStubHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
-            kind, content = deterministic_content(body)
+            scripted = hunt_tool_calls(body)
+            kind, content = scripted if scripted is not None else deterministic_content(body)
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"error": {"message": f"invalid request: {exc}"}})
             return
@@ -238,8 +502,12 @@ class AiStubHandler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
+                        "message": (
+                            {"role": "assistant", "content": None, "tool_calls": content}
+                            if isinstance(content, list)
+                            else {"role": "assistant", "content": content}
+                        ),
+                        "finish_reason": "tool_calls" if isinstance(content, list) else "stop",
                     }
                 ],
                 "usage": {"prompt_tokens": 64, "completion_tokens": 64, "total_tokens": 128},

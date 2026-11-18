@@ -260,6 +260,10 @@ class UiPage:
         """Save a secret-scrubbed acceptance screenshot in this scenario's UI artifacts."""
         return Path(self.op("screenshot", name=name, full_page=full_page))
 
+    def theme(self, mode: str) -> str:
+        """Switch the app theme in place (`light` | `dark`, NAN-5561)."""
+        return self.op("theme", mode=mode)
+
     def attr(self, find: dict[str, Any], name: str) -> str | None:
         return self.op("attr", find=find, name=name)
 
@@ -311,6 +315,36 @@ class UiPage:
 
     def select_native(self, find: dict[str, Any], value: str) -> None:
         self.op("select_native", find=find, value=value)
+
+    # page health (NAN-5586)
+    def events_since(self, since_ms: int = 0) -> dict[str, list[dict[str, Any]]]:
+        """Console errors and failed requests (>= 400 or no response) since `since_ms`."""
+        return self.op("events_since", since=since_ms)
+
+    def viewport(self, width: int, height: int | None = None) -> None:
+        self.op("viewport", width=width, height=height)
+
+    def overflow(self) -> dict[str, Any]:
+        """Horizontal overflow at the current viewport: `document` / `main` px past
+        the edge (0 = none) and up to five unclipped offending elements."""
+        return self.op("overflow")
+
+    def session_fetch(self, method: str, path: str, body: Any = None) -> dict[str, Any]:
+        """`{status, json}` of an /api request made AS the logged-in browser user.
+        A fetch torn down by a navigation in flight is retried."""
+        for attempt in range(3):
+            try:
+                return self.op("session_fetch", method=method, path=path, body=body)
+            except UiError as exc:
+                if "Failed to fetch" not in str(exc) or attempt == 2:
+                    raise
+                time.sleep(1.0)
+        raise AssertionError("unreachable")
+
+    def end_session(self) -> dict[str, Any]:
+        """DELETE this context's own server session (never POST /api/auth/logout,
+        which ends every session of the user, NAN-5573)."""
+        return self.op("end_session")
 
 
 def field(find: dict[str, Any], value: str, secret: bool = False) -> dict[str, Any]:

@@ -64,6 +64,7 @@ impl SearchService {
             table_view: false,
             limit: None,
             unordered: true,
+            omit_settings: false,
         }
     }
 

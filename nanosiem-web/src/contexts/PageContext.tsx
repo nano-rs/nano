@@ -16,7 +16,7 @@
 //   mount, and it clears on unmount so navigating away resets to the
 //   static default.
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { useLocation } from 'react-router-dom';
+import { matchPath, useLocation } from 'react-router-dom';
 
 /** Labelled pair rendered in the Here card meta block. */
 export interface HereCardLine {
@@ -48,33 +48,101 @@ interface PageContextValue {
 const PageContextImpl = createContext<PageContextValue | null>(null);
 
 /**
- * Map a pathname to a PIVT pageKey. Kept intentionally broad — unknown
- * routes fall through to `'home'` so the card always has something to
- * render. Tests go in `PageContext.test.ts` alongside this file if a
- * later chunk needs regression coverage.
+ * Route table → PIVT pageKey (NAN-5571). Matched with React Router's
+ * `matchPath`, so segments are exact (`/risk` no longer matches `/risky`) and
+ * a detail route gets its own key (`/alerts/:id` → `alert`). First match wins:
+ * literal routes sit above the `:param` routes at the same depth. Unknown
+ * routes fall through to `'home'` so the card always has something to render.
+ * Pages that register with `usePivtPage` may name their own key.
  */
+const PAGE_ROUTES: ReadonlyArray<readonly [pattern: string, pageKey: string]> = [
+  ['/', 'home'],
+  ['/home', 'home'],
+  ['/search', 'search'],
+  ['/trace/:traceId', 'trace'],
+  ['/observability/*', 'observability'],
+  ['/reports', 'reports'],
+  ['/getting-started', 'onboarding'],
+
+  ['/alerts', 'alerts'],
+  ['/alerts/:id', 'alert'],
+  ['/rules/:id/matches', 'matches'],
+
+  ['/rules/coverage', 'mitre-coverage'],
+  ['/rules/tuning', 'ai-tuning'],
+  ['/rules/tuning/:id', 'tuning-proposal'],
+  ['/rules/repositories', 'rule-repositories'],
+  ['/rules/editor/*', 'rule-editor'],
+  ['/rules/retro-hunt/*', 'retro-hunt'],
+  ['/rules/ioc-lists', 'ioc-lists'],
+  ['/rules/lookup-tables/*', 'lookup-tables'],
+  ['/rules', 'rules'],
+
+  ['/hunts', 'hunts'],
+  ['/hunts/leads', 'hunt-leads'],
+  ['/hunts/leads/:id', 'hunt-lead'],
+  ['/hunts/rule-ideas', 'hunt-rule-ideas'],
+  ['/hunts/memory', 'hunt-memory'],
+  // Redirects to /hunts/memory; listed so they never read as a hunt id.
+  ['/hunts/knowledge', 'hunt-memory'],
+  ['/hunts/suppressions', 'hunt-memory'],
+  ['/hunts/campaigns', 'hunt-campaigns'],
+  ['/hunts/campaigns/candidates', 'hunt-campaigns'],
+  ['/hunts/campaigns/:id', 'hunt-campaign'],
+  ['/hunts/rulings', 'hunt-rulings'],
+  ['/hunts/escalations', 'hunt-escalations'],
+  ['/hunts/profile', 'hunt-profile'],
+  ['/hunts/runners', 'hunt-runners'],
+  ['/hunts/:id', 'hunt'],
+
+  ['/inbox', 'inbox'],
+  ['/cases', 'inbox'],
+  ['/cases/search', 'case-search'],
+  ['/cases/:id', 'case'],
+
+  ['/playbooks', 'playbooks'],
+  ['/playbooks/new', 'playbook-editor'],
+  ['/playbooks/repositories', 'playbook-repositories'],
+  ['/automation/flows', 'automation-flows'],
+  ['/automation/flows/:id', 'automation-flow'],
+  ['/automation/capabilities', 'automation-capabilities'],
+  ['/automation/*', 'automation-runs'],
+
+  ['/dashboards', 'dashboards'],
+  ['/dashboards/:id', 'dashboard'],
+  ['/notebooks', 'notebooks'],
+  ['/notebooks/:id', 'notebook'],
+
+  ['/ingestion/log-sources', 'log-sources'],
+  ['/ingestion/log-sources/new', 'add-source'],
+  ['/ingestion/log-sources/onboarding', 'add-source'],
+  ['/ingestion/log-sources/wizard', 'add-source'],
+  ['/ingestion/log-sources/credentials', 'ingest-credentials'],
+  ['/ingestion/log-sources/cloud-pull', 'cloud-pull'],
+  ['/ingestion/log-sources/pull-feeds', 'pull-feeds'],
+  ['/ingestion/log-sources/repositories', 'parser-repositories'],
+  ['/ingestion/log-sources/inputs/:id', 'source-config'],
+  ['/ingestion/log-sources/:id', 'log-source'],
+  ['/ingestion/pipelines', 'pipelines'],
+  ['/ingestion/pipelines/:id', 'pipeline'],
+  ['/ingestion/*', 'log-sources'],
+  ['/integrations/custom/*', 'custom-integration'],
+
+  ['/marketplace', 'marketplace'],
+  ['/enrichments/*', 'enrichments'],
+  ['/prevalence', 'prevalence'],
+  ['/risk', 'risk'],
+  ['/risk/watchlists', 'risk-watchlists'],
+  ['/platform/health', 'health'],
+  ['/settings/*', 'settings'],
+];
+
+/** Map a pathname to a PIVT pageKey. See `PAGE_ROUTES`. */
 export function pageKeyFor(pathname: string): string {
-  if (pathname === '/' || pathname === '/home') return 'home';
-  if (pathname.startsWith('/search')) return 'search';
-  if (pathname.startsWith('/cases')) return 'case';
-  if (pathname.startsWith('/rules/coverage')) return 'mitre-coverage';
-  if (pathname.startsWith('/rules/tuning')) return 'ai-tuning';
-  if (pathname.startsWith('/rules/repositories')) return 'rule-repositories';
-  if (pathname.startsWith('/rules')) return 'rules';
-  if (pathname.startsWith('/playbooks/repositories')) return 'playbook-repositories';
-  if (pathname.startsWith('/playbooks')) return 'playbooks';
-  if (pathname.startsWith('/dashboards')) return 'dashboards';
-  if (pathname.startsWith('/notebooks')) return 'notebook';
-  if (pathname.startsWith('/prevalence')) return 'prevalence';
-  if (pathname.startsWith('/risk')) return 'risk';
-  if (pathname.startsWith('/ingestion/log-sources/inputs')) return 'source-configs';
-  if (pathname.startsWith('/ingestion/log-sources/cloud-pull')) return 'credentials';
-  if (pathname.startsWith('/ingestion/log-sources')) return 'log-sources';
-  if (pathname.startsWith('/ingestion')) return 'log-sources';
-  if (pathname.startsWith('/matches')) return 'matches';
-  if (pathname.startsWith('/settings')) return 'settings';
-  if (pathname.startsWith('/enrichments')) return 'enrichments';
-  if (pathname.startsWith('/platform/health')) return 'health';
+  const path = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
+  for (const [pattern, key] of PAGE_ROUTES) {
+    if (matchPath({ path: pattern, end: true }, path)) return key;
+  }
   return 'home';
 }
 

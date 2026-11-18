@@ -43,6 +43,11 @@ pub enum SchemaId {
     /// the logs table by the shared risk builder — injected by the SQL
     /// generator's `with_dataset(Risk)`, never by `NANO_SCHEMA_PROFILE`.
     Risk,
+    /// Detection matches (NAN-5612) — a per-QUERY dataset profile like
+    /// [`Risk`](SchemaId::Risk), NOT a tenant log schema. A DERIVED,
+    /// window-bound source: real-time `signals` rows plus scheduled findings,
+    /// injected by the SQL generator's `with_dataset(Signals)`.
+    Signals,
 }
 
 impl SchemaId {

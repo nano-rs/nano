@@ -46,8 +46,25 @@ on:
       - scripts/tests/install-errors-prereqs.test.sh
       - scripts/tests/test_nano_upgrade_license_registry_login.py
       - scripts/tests/install-rerun-upgrade.test.sh
+      - scripts/tests/install-legacy-upgrade.test.sh
+      - scripts/tests/install_legacy_upgrade.py
+      - scripts/tests/install-senders-paused.test.sh
+      - scripts/tests/install_senders_paused.py
+      - scripts/tests/install-legacy-vector-native.test.sh
+      - scripts/tests/install_legacy_vector_native.py
+      - scripts/tests/nano-ocsf-legacy.test.sh
+      - scripts/tests/test_ocsf_legacy_backfill.py
+      - scripts/ocsf-legacy-backfill.py
+      - scripts/lib/ocsf-legacy.sh
+      - scripts/lib/ocsf_contracts/**
       - scripts/tests/install-v2030-audit.test.sh
       - scripts/tests/test_nano_upgrade_v2030_audit.py
+      - scripts/nano-upgrade-readiness.py
+      - scripts/tests/test_nano_upgrade_readiness.py
+      - scripts/tests/test_nano_upgrade_readiness_encrypt.py
+      - scripts/tests/test_nano_upgrade_readiness_ingest.py
+      - scripts/tests/test_nano_upgrade_readiness_url_scrub.py
+      - nanosiem-core/src/config_secrets.rs
       - scripts/lib/install-preflight.sh
       - scripts/lib/registry-login.sh
       - scripts/lib/vector-native-pki.sh
@@ -74,6 +91,7 @@ on:
       - scripts/tests/test_nano_deploy_plan*.py
       - scripts/tests/test_nano_deploy_customer_run.py
       - scripts/tests/test_nano_deploy_health_checks.py
+      - scripts/tests/test_smoke_otlp.py
       - scripts/tests/test_nano_deploy_pg_preflight.py
       - scripts/tests/test_nano_deploy_k8s_health.py
       - scripts/tests/fixtures/nano-deploy-health/**
@@ -248,6 +266,18 @@ jobs:
             echo "install-rerun-upgrade test not in this tree (public mirror); skipping"
           fi
 
+      - name: legacy 0.1.x upgrade guard and OCSF backfill tools (NAN-5559)
+        run: |
+          if [ -f scripts/tests/install-legacy-upgrade.test.sh ]; then
+            bash scripts/tests/install-legacy-upgrade.test.sh
+            bash scripts/tests/install-legacy-vector-native.test.sh
+            bash scripts/tests/install-senders-paused.test.sh
+            bash scripts/tests/nano-ocsf-legacy.test.sh
+            python3 -I scripts/tests/test_ocsf_legacy_backfill.py
+          else
+            echo "legacy upgrade tests not in this tree (public mirror); skipping"
+          fi
+
       - name: v2.0.30 audit regressions (overlays, TLS preflight, :6000, backup)
         run: |
           if [ -f scripts/tests/install-v2030-audit.test.sh ]; then
@@ -276,6 +306,20 @@ jobs:
             bash scripts/tests/install-umask.live.sh
           else
             echo "install-umask live test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5556: the read-only upgrade readiness check and content export
+      # (secret stripping, self-scan, layout, backfill estimate, export format),
+      # and `export --encrypt` with the support-side decrypt helper.
+      - name: Upgrade readiness check unit tests
+        run: |
+          if [ -f scripts/tests/test_nano_upgrade_readiness.py ]; then
+            python3 -I scripts/tests/test_nano_upgrade_readiness.py -v
+            python3 -I scripts/tests/test_nano_upgrade_readiness_ingest.py -v
+            python3 -I scripts/tests/test_nano_upgrade_readiness_encrypt.py -v
+            python3 -I scripts/tests/test_nano_upgrade_readiness_url_scrub.py -v
+          else
+            echo "upgrade readiness tests not in this tree (public mirror); skipping"
           fi
 
       # NAN-5494: ClickHouse mounts the assembled config.d / users.d only and
@@ -316,6 +360,7 @@ jobs:
             python3 -I scripts/tests/test_nano_deploy_plan_inventory.py -v
             python3 -I scripts/tests/test_nano_deploy_customer_run.py -v
             python3 -I scripts/tests/test_nano_deploy_health_checks.py -v
+            python3 -I scripts/tests/test_smoke_otlp.py -v
             python3 -I scripts/tests/test_nano_deploy_pg_preflight.py -v
             python3 -I scripts/tests/test_nano_deploy_k8s_health.py -v
             python3 -I scripts/tests/test_otlp_edge_content_type.py -v

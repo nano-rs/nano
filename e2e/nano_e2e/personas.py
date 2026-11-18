@@ -37,6 +37,9 @@ PERSONA_AI_AGENTS = (
     "summarize",
     "shadow_hunting",
     "shadow_narrative",
+    # NAN-5574: pivt panel chat (the concierge classifies, notebook answers).
+    "concierge",
+    "notebook",
 )
 
 
@@ -165,6 +168,14 @@ class PersonaBrowser:
     def checkpoint(self, slug: str) -> Path:
         return self.page.screenshot(f"{self.name}-{slug}.png")
 
+    def checkpoint_themes(self, slug: str) -> tuple[Path, Path]:
+        """The same view in light and dark (NAN-5561), ending in dark (the default)."""
+        self.page.theme("light")
+        light = self.page.screenshot(f"{self.name}-{slug}-light.png")
+        self.page.theme("dark")
+        dark = self.page.screenshot(f"{self.name}-{slug}-dark.png")
+        return light, dark
+
 
 @contextmanager
 def login_persona(
@@ -252,6 +263,13 @@ def assert_ground_truth_ui(page: uilib.UiPage, nano: Nano, truth: GroundTruth) -
     assert all(ip in rendered for ip in truth.ips), rendered[:2000]
 
 
+def persona_ai_mode() -> str:
+    """`stub` (the deterministic ai-stub, default) or `real` (a provider)."""
+    mode = os.environ.get("E2E_PERSONA_AI_MODE", "stub").strip().lower()
+    assert mode in {"stub", "real"}, "E2E_PERSONA_AI_MODE must be stub or real"
+    return mode
+
+
 def configure_persona_ai(nano: Nano) -> str | None:
     """Configure the default stub or the explicitly requested real provider.
 
@@ -264,8 +282,7 @@ def configure_persona_ai(nano: Nano) -> str | None:
         assert capabilities.get("capabilities", {}).get("melod") is False, capabilities
         return None
 
-    mode = os.environ.get("E2E_PERSONA_AI_MODE", "stub").strip().lower()
-    assert mode in {"stub", "real"}, "E2E_PERSONA_AI_MODE must be stub or real"
+    mode = persona_ai_mode()
 
     if mode == "stub":
         profiles = os.environ.get("E2E_PROFILES", "").split()
@@ -644,3 +661,101 @@ def issue_ingest_token(page: uilib.UiPage, label: str) -> str:
     page.driver.register_secret(token)
     assert re.fullmatch(r"nit_[A-Za-z0-9_-]+", token), "unexpected ingest-token shape"
     return token
+
+
+class PersonaCleanup:
+    """Register name/route-based cleanup as soon as a browser create succeeds."""
+
+    def __init__(self, nano) -> None:
+        self.nano = nano
+        self.actions = CleanupStack()
+
+    @staticmethod
+    def _items(body, *keys: str):
+        if isinstance(body, list):
+            return body
+        for key in keys:
+            if isinstance(body.get(key), list):
+                return body[key]
+        return []
+
+    def dashboard(self, name: str) -> None:
+        def remove() -> None:
+            # filter=all: the default lists only the admin's own dashboards, so a
+            # persona-owned one was never found (NAN-5595).
+            body = expect(self.nano.api.get("/api/dashboards", params={"filter": "all"}), 200, 404)
+            if body is None:
+                return
+            for item in self._items(body, "dashboards", "items"):
+                if item.get("name") == name:
+                    expect(self.nano.api.delete(f"/api/dashboards/{item['id']}"), 200, 204, 404)
+
+        self.actions.register(f"dashboard {name}", remove)
+
+    def rule(self, name: str) -> None:
+        def remove() -> None:
+            body = expect(self.nano.api.get("/api/rules"), 200, 404)
+            if body is None:
+                return
+            for item in self._items(body, "rules", "items"):
+                if item.get("name") == name:
+                    expect(self.nano.api.delete(f"/api/rules/{item['id']}"), 200, 204, 404)
+
+        self.actions.register(f"rule {name}", remove)
+
+    def case(self, case_id: str) -> None:
+        self.actions.register_http(f"case {case_id}", lambda: self.nano.api.delete(f"/api/cases/{case_id}"))
+
+    def soar_flow(self, flow_id: str) -> None:
+        self.actions.register_http(
+            f"SOAR flow {flow_id}", lambda: self.nano.api.delete(f"/api/soar/flows/{flow_id}")
+        )
+
+    def oidc_provider(self, provider_id: str) -> None:
+        self.actions.register_http(
+            f"OIDC provider {provider_id}",
+            lambda: self.nano.api.delete(f"/api/settings/oidc/{provider_id}"),
+        )
+
+    def api_key(self, key_id: str) -> None:
+        self.actions.register_http(
+            f"API key {key_id}", lambda: self.nano.api.delete(f"/api/api-keys/{key_id}")
+        )
+
+    def role(self, name: str) -> None:
+        def remove() -> None:
+            body = expect(self.nano.api.get("/api/roles"), 200, 404)
+            if body is None:
+                return
+            for item in self._items(body, "roles", "items"):
+                if item.get("name") == name:
+                    expect(self.nano.api.delete(f"/api/roles/{item['id']}"), 200, 204, 404)
+
+        self.actions.register(f"role {name}", remove)
+
+    def source(self, route_key: str) -> None:
+        def remove() -> None:
+            body = expect(self.nano.api.get("/api/log-sources"), 200, 404)
+            if body is None:
+                return
+            for item in self._items(body, "log_sources", "items"):
+                if route_key in (item.get("match_values") or []):
+                    expect(self.nano.api.delete(f"/api/log-sources/{item['id']}"), 200, 204, 404)
+
+        self.actions.register(f"source route {route_key}", remove)
+
+    def token(self, route_key: str) -> None:
+        def remove() -> None:
+            body = expect(self.nano.api.get("/api/ingest-tokens"), 200, 404)
+            if body is None:
+                return
+            for item in self._items(body, "tokens", "credentials"):
+                if item.get("route_key") == route_key and item.get("state") != "revoked":
+                    expect(
+                        self.nano.api.post(f"/api/ingest-tokens/{item['credential_id']}/revoke"),
+                        200,
+                        204,
+                        404,
+                    )
+
+        self.actions.register(f"ingest token route {route_key}", remove)

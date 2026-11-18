@@ -244,7 +244,7 @@ def is_up(status: str) -> bool:
     return status.startswith("UP") or status == "no check"
 
 
-# NAN-5519: render-inventory.py gives a single-server ClickHouse backend an
+# render-inventory.py gives a single-server ClickHouse backend an
 # unchecked `backup` twin of the same node (always "no check"); judging it
 # would hide the real state, so only the checked server counts.
 UNCHECKED_TWIN_SUFFIX = "-unchecked"
@@ -277,7 +277,7 @@ def judge_gateway(service: str, backends: dict[str, list[tuple[str, str]]], loca
     for servers in backends.values():          # a server appears in several backends; worst state wins
         for name, st in servers:
             if name.endswith(UNCHECKED_TWIN_SUFFIX):
-                continue                       # NAN-5519: the lone node's unchecked twin; its checked server reports
+                continue                       # the lone node's unchecked twin; its checked server reports
             if not is_up(st) or name not in state:
                 state[name] = st
     down = sorted(n for n, st in state.items() if not is_up(st))
@@ -615,7 +615,7 @@ INGEST_CLOSED_STALE_SECONDS = 15 * 60
 
 
 def ingest_edge(run=docker) -> None:
-    """NAN-5488: `nano upgrade` closes the edge (503 to every ingest route) while
+    """`nano upgrade` closes the edge (503 to every ingest route) while
     Vector drains, for seconds to a few minutes. A marker left behind by an
     interrupted upgrade keeps refusing senders until removed or restarted."""
     name = service_container("ingest-edge", run)

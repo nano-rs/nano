@@ -36,7 +36,7 @@ mod outbox_tests;
 pub mod query;
 
 pub use actions::*;
-pub use context::ClientContext;
+pub use context::{ClientContext, ORIGIN_HEADER};
 pub use emitter::{AuditEmitError, AuditEmitter, DurableOutcome};
 pub use outbox::{AuditOutboxStats, SecurityAuditOutbox};
 pub use outbox_drain::{AuditOutboxDrainer, DrainOutcome};
@@ -243,6 +243,7 @@ impl AuditEvent {
             user_agent: None,
             success: true,
             details: None,
+            origin: None,
         }
     }
 
@@ -492,6 +493,8 @@ pub struct AuditEventBuilder {
     user_agent: Option<String>,
     success: bool,
     details: Option<serde_json::Value>,
+    /// NAN-5571: `X-Nano-Origin` (e.g. `pivt`), merged into `details`.
+    origin: Option<&'static str>,
 }
 
 impl AuditEventBuilder {
@@ -531,6 +534,7 @@ impl AuditEventBuilder {
     pub fn client_context(mut self, ctx: &ClientContext) -> Self {
         self.ip_address = ctx.ip_address.clone();
         self.user_agent = ctx.user_agent.clone();
+        self.origin = ctx.origin;
         self
     }
 
@@ -561,7 +565,18 @@ impl AuditEventBuilder {
             ip_address: self.ip_address,
             user_agent: self.user_agent,
             success: self.success,
-            details: self.details,
+            // NAN-5571: "via pivt" rides in details under its own key (some
+            // handlers already use `origin`); the actor is unchanged. The value
+            // is client-reported (an allowlisted header), never a privilege.
+            details: match (self.origin, self.details) {
+                (None, details) => details,
+                (Some(origin), None) => Some(serde_json::json!({ "request_origin": origin })),
+                (Some(origin), Some(serde_json::Value::Object(mut map))) => {
+                    map.insert("request_origin".to_string(), serde_json::Value::from(origin));
+                    Some(serde_json::Value::Object(map))
+                }
+                (Some(origin), Some(other)) => Some(serde_json::json!({ "request_origin": origin, "detail": other })),
+            },
             event_id: Uuid::now_v7(),
             occurred_at: Utc::now(),
         }
@@ -571,6 +586,36 @@ impl AuditEventBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-5571: an action applied through pivt is audited as the user, with
+    /// `origin: pivt` in the details.
+    #[test]
+    fn pivt_origin_is_recorded_in_details_and_the_actor_is_unchanged() {
+        let user = Uuid::now_v7();
+        let ctx = ClientContext::new(Some("203.0.113.1".into()), None).with_origin_header(Some("pivt"));
+        let with_details = AuditEvent::builder(AuditSource::Detection, "rule_created")
+            .actor(Some(user), Some("analyst".into()))
+            .client_context(&ctx)
+            .details(serde_json::json!({ "mode": "staging" }))
+            .build();
+        assert_eq!(with_details.actor_id, Some(user));
+        assert_eq!(with_details.details, Some(serde_json::json!({ "mode": "staging", "request_origin": "pivt" })));
+
+        let bare = AuditEvent::builder(AuditSource::Detection, "rule_created").client_context(&ctx).build();
+        assert_eq!(bare.details, Some(serde_json::json!({ "request_origin": "pivt" })));
+
+        // A handler's own `origin` detail is kept.
+        let own = AuditEvent::builder(AuditSource::Detection, "rule_created")
+            .client_context(&ctx)
+            .details(serde_json::json!({ "origin": "dac" }))
+            .build();
+        assert_eq!(own.details, Some(serde_json::json!({ "origin": "dac", "request_origin": "pivt" })));
+
+        let plain = AuditEvent::builder(AuditSource::Detection, "rule_created")
+            .client_context(&ClientContext::new(None, None).with_origin_header(Some("admin")))
+            .build();
+        assert_eq!(plain.details, None, "unknown origins are ignored");
+    }
 
     #[test]
     fn test_audit_event_to_parsed_log() {

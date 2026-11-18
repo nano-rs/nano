@@ -10,7 +10,7 @@ use axum::{
 use nanosiem_core::{
     NewNotification, NewSavedSearch, SavedSearch, SavedSearchWithContext, ShareSavedSearchRequest,
     UpdateSavedSearch,
-    audit::{AuditEvent, AuditSource, SAVED_SEARCH_SHARED},
+    audit::{AuditEvent, AuditSource, ClientContext, SAVED_SEARCH_CREATED, SAVED_SEARCH_SHARED},
     auth::{TokenClaims, permissions},
     models::notification::NotificationType as ModelNotificationType,
     typeid::TypeIdParam,
@@ -276,6 +276,7 @@ pub async fn get_saved_search(
 pub async fn create_saved_search(
     State(state): State<SearchState>,
     Extension(auth): Extension<crate::AuthContext>,
+    client: Option<Extension<ClientContext>>,
     Json(request): Json<NewSavedSearch>,
 ) -> Result<Json<SavedSearch>, SearchError> {
     if !auth.claims.has_permission(permissions::SEARCH_SAVE) {
@@ -296,6 +297,18 @@ pub async fn create_saved_search(
         .create(&request, user_id)
         .await
         .map_err(|e| repo_error(e, None, "Access denied"))?;
+
+    // NAN-5571: audited as the owner (the key named when one was used), with
+    // the client context, so a save applied through pivt reads "via pivt".
+    let client = client.map(|Extension(c)| c).unwrap_or_default();
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Search, SAVED_SEARCH_CREATED)
+            .actor(Some(user_id), None)
+            .api_key(auth.api_key_id, None)
+            .resource("saved_search", Some(search.id), Some(search.name.clone()))
+            .client_context(&client)
+            .build(),
+    );
 
     // Track for demo session cleanup
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {

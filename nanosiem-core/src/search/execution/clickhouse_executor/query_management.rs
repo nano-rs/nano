@@ -227,7 +227,7 @@ impl ClickHouseExecutor {
 
         let escaped_sql = escape_question_marks_in_strings(&count_sql);
         let result =
-            super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
+            super::types::with_query_options(self.sized_query(&escaped_sql), query_id, settings)
                 .fetch_one::<u64>()
                 .await
                 .map_err(|e| crate::search::search_error_from_error(&e))?;

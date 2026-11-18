@@ -960,7 +960,7 @@ impl LateralPredicateColumns {
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
-            | crate::schema::SchemaId::Risk => self.auth_where_udm(),
+            | crate::schema::SchemaId::Risk | crate::schema::SchemaId::Signals => self.auth_where_udm(),
         }
     }
 

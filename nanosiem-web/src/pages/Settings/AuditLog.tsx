@@ -27,6 +27,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { DetailSheet } from '@/components/ui/detail-sheet';
+import { SqlAsNpl } from '@/components/search/SqlAsNpl';
 import {
   Popover,
   PopoverContent,
@@ -647,6 +648,13 @@ export function AuditLogContent() {
               <div>
                 <p className="text-[11px] text-muted-foreground mb-0.5">Message</p>
                 <p className="text-[11.5px] text-foreground">{selectedLog.message}</p>
+              </div>
+            )}
+            {/* NAN-5575: an Agent Lane query reads as nPL; the SQL stays in Details. */}
+            {selectedLog.action?.startsWith('agentlane_query') && typeof selectedLog.details?.query === 'string' && (
+              <div>
+                <p className="text-[11px] text-muted-foreground mb-1">Query (nPL)</p>
+                <SqlAsNpl sql={selectedLog.details.query} />
               </div>
             )}
             {selectedLog.details && Object.keys(selectedLog.details).length > 0 && (

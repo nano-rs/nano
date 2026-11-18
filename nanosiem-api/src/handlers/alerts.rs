@@ -175,6 +175,10 @@ pub struct StreamAlertsQuery {
     pub cursor: Option<String>,
     #[serde(default = "default_stream_limit")]
     pub limit: i64,
+    /// Include `hunt_finding` alerts (the evidence carriers of cases the hunts
+    /// pipeline opened). Off by default: they are not detections (NAN-5577).
+    #[serde(default)]
+    pub include_hunt_findings: bool,
 }
 
 fn default_stream_limit() -> i64 {
@@ -386,7 +390,7 @@ pub async fn stream_alerts(
     let scope = effective_viewer_scope(&auth);
     let alerts = state
         .detection_service
-        .list_alerts_after(after_timestamp, after_id, limit, scope.deny_set())
+        .list_alerts_after(after_timestamp, after_id, limit, scope.deny_set(), query.include_hunt_findings)
         .await?;
 
     let has_more = alerts.len() == limit as usize;
@@ -1036,6 +1040,7 @@ pub async fn alert_velocity(
     } else {
         ""
     };
+    let kinds_sql = nanosiem_core::db::repository::alerts::kinds_filter_sql("kind", 3);
     let sql = format!(
         r#"
         SELECT
@@ -1050,7 +1055,7 @@ pub async fn alert_velocity(
             SELECT date_trunc('hour', created_at) AS bucket_start, COUNT(*) AS count
             FROM alerts
             WHERE created_at >= $1 AND created_at < $2
-              AND ($3::text[] IS NULL OR kind = ANY($3)){scope_sql}
+              AND {kinds_sql}{scope_sql}
             GROUP BY bucket_start
         ) c ON c.bucket_start = bucket
         ORDER BY bucket ASC

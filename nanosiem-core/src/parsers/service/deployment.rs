@@ -102,6 +102,62 @@ impl ParserService {
         Ok(())
     }
 
+    /// NAN-5564 release review (P2-2): the api's boot render, which also
+    /// releases the single-node Vector pipeline gate. One broken parser must
+    /// never leave ingest refused: when the strict render cannot run (an
+    /// orphaned fetch binding, a claim collision, a parser that fails the
+    /// guard), the tree is rendered WITHOUT the broken parsers and the
+    /// pipeline identity is recorded, and each left-out parser is logged as an
+    /// error. Returns the names of the left-out parsers.
+    pub async fn deploy_to_vector_at_boot(&self) -> Result<Vec<String>, ParserServiceError> {
+        let strict = self.deploy_to_vector().await;
+        let strict_error = match strict {
+            Ok(()) => {
+                // The tree is written: (re)write the marker for this api's
+                // identity, also when one with the same name was already there.
+                self.vector_config.rewrite_pipeline_identity().await;
+                return Ok(Vec::new());
+            }
+            Err(error) => error,
+        };
+        if !self.vector_config.pipeline_identity_pending().await {
+            // The tree and its identity were written; only the reload is in
+            // question (Vector is gated or starting). Nothing to degrade.
+            return Err(strict_error);
+        }
+        tracing::error!(error = %strict_error, "Vector pipeline render failed; rendering without the parsers that cannot be rendered so ingest is not refused");
+        let mut parsers = self.repository().list_effective_deployed().await?;
+        // Unresolvable fetch parsers keep no route and are left out of the tree.
+        crate::parsers::resolve_parser_dispatch_routes_lenient(&self.pool, &mut parsers)
+            .await
+            .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
+        let mut left_out: Vec<String> = parsers
+            .iter()
+            .filter(|p| p.enabled && p.kind != "enrichment" && p.dispatch_source_config_id.is_some() && p.dispatch_route_name.is_none())
+            .map(|p| p.name.clone())
+            .collect();
+        let (kept, skipped) = self.vector_config.renderable_subset(&parsers);
+        left_out.extend(skipped);
+        left_out.sort();
+        left_out.dedup();
+        for name in &left_out {
+            tracing::error!(parser = %name, "parser left out of the Vector config: it cannot be rendered (fix or disable it, then deploy it again)");
+        }
+        let result = self.vector_config.deploy_and_reload(&kept).await;
+        self.record_render_quarantine(&kept).await;
+        match result {
+            Ok(()) => {
+                self.vector_config.rewrite_pipeline_identity().await;
+                Ok(left_out)
+            }
+            Err(error) if !self.vector_config.pipeline_identity_pending().await => {
+                tracing::warn!(%error, "Vector pipeline rendered without the broken parsers; the reload is not confirmed yet");
+                Ok(left_out)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Deploy a single parser with full validation pipeline
     ///
     /// This method implements a safe deployment process:

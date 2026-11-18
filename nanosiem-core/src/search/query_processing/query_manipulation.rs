@@ -262,6 +262,68 @@ fn mandatory_exclusion(deny_set: &BTreeSet<String>) -> SearchExpr {
     }
 }
 
+/// NAN-5612: the caller-scope gate every nPL path of the search service runs:
+/// the detections-dataset permission check
+/// ([`check_dataset_access`](crate::search::service::check_dataset_access))
+/// and then the per-source exclusion ([`enforce_source_scope`]). One function
+/// so a path that applies the source gate cannot skip the dataset check.
+pub fn enforce_viewer_scope(
+    query: &str,
+    dataset: Option<&str>,
+    scope: &crate::auth::ScopeSet,
+) -> Result<String, crate::SearchError> {
+    crate::search::service::check_dataset_access(scope, dataset, query)?;
+    enforce_source_scope(query, scope.deny_set())
+}
+
+/// NAN-5612: a LEADING `dataset=<name>` token in the query text selects the
+/// dataset, so surfaces that carry only query text (dashboard panels, saved
+/// searches, AI-written queries, drilldown links) can target `signals`,
+/// `risk`, `spans` or `metrics`: `dataset=signals | timechart span=1h count by
+/// severity`. Only the first token, only `dataset=` with no spaces or quotes
+/// (the subsearch-bracket spelling), and only a known name; anything else is
+/// left as text. Returns `(query without the token, dataset)`.
+///
+/// The token is honored only when the request names NO dataset. A request
+/// that names the same dataset just drops the redundant token; a request that
+/// names another one (including an explicit `logs`) keeps the text unchanged,
+/// so the token stays an ordinary field filter and an explicit request never
+/// changes meaning. Detection rules always name their dataset, so a rule body
+/// can never pick a dataset with this token (the NAN-1805 loop guards key on
+/// the rule's dataset).
+pub fn resolve_dataset_selector(
+    query: &str,
+    dataset: Option<&str>,
+) -> Result<(String, Option<String>), crate::SearchError> {
+    let keep = || Ok((query.to_string(), dataset.map(str::to_string)));
+    let trimmed = query.trim_start();
+    let Some(rest) = trimmed
+        .get(..8)
+        .filter(|p| p.eq_ignore_ascii_case("dataset="))
+        .map(|_| &trimmed[8..])
+    else {
+        return keep();
+    };
+    let name_len = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(name_len);
+    if !(tail.is_empty() || tail.starts_with(char::is_whitespace) || tail.starts_with('|')) {
+        return keep();
+    }
+    let Some(selected) = crate::query::Dataset::from_selector_strict(name) else {
+        return keep();
+    };
+    let explicit = dataset
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(crate::query::Dataset::from_selector);
+    if explicit.is_some_and(|d| d != selected) {
+        return keep();
+    }
+    let tail = tail.trim();
+    let query = if tail.is_empty() { "*".to_string() } else { tail.to_string() };
+    Ok((query, Some(selected.selector().to_string())))
+}
+
 /// Parse a piped-query string, inject `source_type != "audit"` at the AST
 /// level, and serialize back to a string. Used by every authenticated
 /// search surface to gate audit-log access for users without
@@ -848,6 +910,10 @@ fn strip_ai_and_after_recursive(query: &Query, parent_found: bool) -> (Query, bo
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "query_manipulation/viewer_scope_tests.rs"]
+mod viewer_scope_tests;
 
 #[cfg(test)]
 #[path = "query_manipulation/scope_gate_spelling_tests.rs"]

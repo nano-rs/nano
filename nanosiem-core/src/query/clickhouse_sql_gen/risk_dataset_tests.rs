@@ -181,11 +181,11 @@ fn risk_base_source_is_ocsf_and_cluster_aware() {
 
     assert!(sql.contains("FROM ocsf_logs_distributed"), "{sql}");
     assert!(
-        sql.contains("JSONExtractString(toString(unmapped),'risk_entity')"),
+        sql.contains("JSONExtractString(ifNull(toJSONString(unmapped.risk_entity), 'null'))"),
         "OCSF risk-entity sentinel missing: {sql}"
     );
     assert!(
-        sql.contains("JSONExtract(toString(unmapped), 'mitre_tactics', 'Array(String)')"),
+        sql.contains("JSONExtract(ifNull(toJSONString(unmapped.mitre_tactics), 'null'), 'Array(String)')"),
         "OCSF tactics sentinel missing: {sql}"
     );
 

@@ -42,9 +42,11 @@ import {
   RotateCcw,
   Shield,
   ClipboardList,
-  Sparkles,
   X,
+  Globe,
+  ListChecks,
 } from 'lucide-react';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import type { LucideIcon } from 'lucide-react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
@@ -379,7 +381,7 @@ function buildStages(
     {
       id: 'enrichment',
       label: 'Enrichment',
-      icon: Sparkles,
+      icon: Globe,
       status: statusFromScore(report?.enrichment_score ?? null),
       headline: enr
         ? `${Math.round(enr.geoip_fill_pct)}% geo`
@@ -567,7 +569,7 @@ function Narrative({
       <div className="mb-3 flex items-center gap-2">
         <div className="flex h-6 w-6 items-center justify-center rounded-md border border-primary/40 bg-primary/15">
           {aiAuthored ? (
-            <Sparkles className="h-[12px] w-[12px] text-primary" />
+            <PivtIcon className="h-[12px] w-[12px] text-primary" />
           ) : (
             <ClipboardList className="h-[12px] w-[12px] text-primary" />
           )}
@@ -651,7 +653,7 @@ function Recommendations({
     <div className="rounded-xl border border-border bg-card">
       <div className="flex items-center gap-2 border-b border-border px-4 py-3">
         <div className="flex h-5 w-5 items-center justify-center rounded-md border border-primary/40 bg-primary/15">
-          <Sparkles className="h-[10px] w-[10px] text-primary" />
+          <ListChecks className="h-[10px] w-[10px] text-primary" />
         </div>
         <Eyebrow2>Recommended actions</Eyebrow2>
         <span className="font-mono text-[10px] text-muted-foreground/40">·</span>
@@ -661,7 +663,7 @@ function Recommendations({
       </div>
       {visibleItems.length === 0 ? (
         <div className="px-4 py-8 text-center">
-          <Sparkles className="mx-auto mb-2 h-5 w-5 text-muted-foreground/40" />
+          <ListChecks className="mx-auto mb-2 h-5 w-5 text-muted-foreground/40" />
           <p className="text-[12px] text-muted-foreground">
             No recommendations at this time.
           </p>

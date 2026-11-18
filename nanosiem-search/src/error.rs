@@ -278,6 +278,8 @@ impl From<nanosiem_core::SearchError> for SearchError {
                 tracing::error!(error = %e, "ClickHouse unavailable in search");
                 SearchError::InternalError("A database error occurred".to_string())
             }
+            // NAN-5612: the caller's scope refuses what the query reads.
+            nanosiem_core::SearchError::Forbidden(msg) => SearchError::Forbidden(msg),
             nanosiem_core::SearchError::DatabaseError(e) => {
                 tracing::error!(error = %e, "Database error in search");
                 SearchError::InternalError("A database error occurred".to_string())

@@ -21,6 +21,7 @@ mod pretty_print;
 pub(crate) mod time_modifiers;
 mod time_bins;
 mod sql_gen;
+pub mod sql_to_npl;
 pub mod validation;
 
 pub use ast::*;
@@ -57,7 +58,7 @@ pub use clickhouse_sql_gen::ioc_feed_indicator_sql;
 pub use clickhouse_sql_gen::otel::{
     metric_names_sql, metric_names_window_start, metric_timeseries_sql, METRIC_NAMES_CAP,
     METRIC_NAMES_DEFAULT_WINDOW_HOURS, METRIC_NAMES_MAX_WINDOW_HOURS, recent_traces_sql, trace_by_id_sql, Dataset,
-    MetricRollup, TraceListFilters,
+    MetricRollup, TraceListFilters, RISK_COLUMNS, SIGNALS_COLUMNS,
 };
 // Observability console (NAN-1536): services overview / service detail RED
 // timeseries + endpoints + exemplars, and SLO spans-based compute.
@@ -85,6 +86,9 @@ pub use clickhouse_sql_gen::otel::{
     valid_tag_key, MetricAgg, MetricQuery, MetricTagFilter,
 };
 pub use parser::{parse_query, ParseError};
+// NAN-5583: hunts (enterprise) case pivots quote values with the same rules.
+#[cfg(feature = "enterprise")]
+pub(crate) use pretty_print::npl_quoted_literal;
 pub(crate) use parser::extract_time_modifier_tokens;
 pub(crate) use parser::split_time_modifiers;
 // NAN-4283: the API detection stripper reuses the parser's comment rule.

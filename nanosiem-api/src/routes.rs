@@ -1367,6 +1367,11 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/melod/correct-query",
                 post(handlers::melod_correct_query::<AppState>),
             )
+            // NAN-5575: AI fallback for agent SQL → nPL (explicit click only).
+            .route(
+                "/api/melod/sql-to-npl",
+                post(handlers::melod_sql_to_npl::<AppState>),
+            )
             .route(
                 "/api/melod/review-query",
                 post(handlers::melod_review_query::<AppState>),
@@ -2074,6 +2079,11 @@ pub fn create_router(state: AppState) -> Router {
         // Webhook settings
         .route("/api/settings/webhooks", get(handlers::list_webhooks))
         .route("/api/settings/webhooks", post(handlers::create_webhook))
+        // Subscribable streams, built-in plus extension-registered (NAN-5548).
+        .route(
+            "/api/settings/webhooks/event-types",
+            get(handlers::list_webhook_event_types),
+        )
         .route("/api/settings/webhooks/{id}", get(handlers::get_webhook))
         .route("/api/settings/webhooks/{id}", put(handlers::update_webhook))
         .route(
@@ -2540,6 +2550,9 @@ pub fn create_router(state: AppState) -> Router {
     // schema, which ships only in the enterprise migration overlay.
     #[cfg(feature = "enterprise")]
     {
+        // NAN-5548: make the `hunt_escalation` webhook stream subscribable
+        // (the open-core webhooks module's generic extension seam).
+        nanosiem_core::hunts::handoff::register_webhook_stream();
         app = app
             // NAN-474: rate-limited dry-resolve sub-router
             .merge(dry_resolve_routes)
@@ -2683,6 +2696,11 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/hunts/runners/{id}/claim",
                 post(handlers::hunts::claim_sweep),
             )
+            // NAN-5546: fenced lease renewal (also marks the sweep running).
+            .route(
+                "/api/hunts/runners/{id}/sweeps/{sweep_id}/renew",
+                post(handlers::hunts::renew_sweep_lease),
+            )
             // The Antigravity sweep waiver (NAN-2264). `hunts:manage` on both
             // verbs — a runner cannot widen its own authority.
             .route(
@@ -2692,11 +2710,42 @@ pub fn create_router(state: AppState) -> Router {
             )
             .route("/api/hunts/sweeps/{id}", get(handlers::hunts::get_sweep))
             // The only endpoint `hunts:report` reaches that writes leads.
+            // NAN-5547: the desktop investigator's context (desktop runner
+            // keys only) and the run's task graph.
+            .route(
+                "/api/hunts/sweeps/{id}/context",
+                get(handlers::hunts::get_sweep_context),
+            )
+            .route(
+                "/api/hunts/sweeps/{id}/tasks",
+                get(handlers::hunts::list_sweep_tasks),
+            )
+            .route("/api/hunts/funnel", get(handlers::hunts::hunt_funnel))
+            // NAN-5547 Part F: built-in templates (hunts:view to list,
+            // hunts:manage to instantiate through the normal create path).
+            .route("/api/hunts/templates", get(handlers::hunts::list_hunt_templates))
+            // NAN-5543: authoring helpers. Validate compiles one pivot and runs
+            // nothing (hunts:manage); the source inventory is discover's result
+            // for the active profile (hunts:view, redacted when source-scoped).
+            .route("/api/hunts/pivots/validate", post(handlers::hunts::validate_pivot))
+            .route("/api/hunts/source-inventory", get(handlers::hunts::source_inventory))
+            .route(
+                "/api/hunts/templates/{id}/instantiate",
+                post(handlers::hunts::instantiate_hunt_template),
+            )
             .route(
                 "/api/hunts/sweeps/{id}/report",
                 post(handlers::hunts::report_sweep),
             )
             .route("/api/hunts/leads", get(handlers::hunts::list_leads))
+            // NAN-5561: per-class finding counts (static, before `{id}`).
+            .route("/api/hunts/leads/counts", get(handlers::hunts::lead_class_counts))
+            // NAN-5561: evals.
+            .route(
+                "/api/hunts/{id}/evals",
+                get(handlers::hunts::list_hunt_evals).post(handlers::hunts::run_hunt_eval),
+            )
+            .route("/api/hunts/evals/{eval_id}", get(handlers::hunts::get_hunt_eval))
             .route("/api/hunts/leads/{id}", get(handlers::hunts::get_lead))
             .route(
                 "/api/hunts/leads/{id}/promote",
@@ -2706,6 +2755,51 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/hunts/leads/{id}/dismiss",
                 post(handlers::hunts::dismiss_lead),
             )
+            // NAN-5548 reviewer: verdicts, re-review, rulings, escalations.
+            .route(
+                "/api/hunts/leads/{id}/reviews",
+                get(handlers::hunts::list_lead_reviews),
+            )
+            .route(
+                "/api/hunts/leads/{id}/review",
+                post(handlers::hunts::request_lead_review),
+            )
+            .route(
+                "/api/hunts/leads/{id}/rulings",
+                post(handlers::hunts::record_lead_ruling),
+            )
+            .route("/api/hunts/escalations", get(handlers::hunts::list_escalations))
+            .route(
+                "/api/hunts/escalations/{lead_id}/acknowledge",
+                post(handlers::hunts::acknowledge_escalation),
+            )
+            .route("/api/hunts/rulings", get(handlers::hunts::list_rulings))
+            // NAN-5560: campaigns and actors. View to read; manage to
+            // create / edit / delete / change status / link hunts (activation
+            // is the only way an agent-proposed campaign becomes active);
+            // triage to file a finding under one.
+            .route(
+                "/api/hunts/campaigns",
+                get(handlers::hunts::list_campaigns).post(handlers::hunts::create_campaign),
+            )
+            .route(
+                "/api/hunts/campaigns/{id}",
+                get(handlers::hunts::get_campaign)
+                    .patch(handlers::hunts::update_campaign)
+                    .delete(handlers::hunts::delete_campaign),
+            )
+            .route("/api/hunts/campaigns/{id}/activate", post(handlers::hunts::activate_campaign))
+            .route("/api/hunts/campaigns/{id}/deactivate", post(handlers::hunts::deactivate_campaign))
+            .route("/api/hunts/campaigns/{id}/close", post(handlers::hunts::close_campaign))
+            .route("/api/hunts/campaigns/{id}/hunts", post(handlers::hunts::link_campaign_hunt))
+            .route(
+                "/api/hunts/campaigns/{id}/hunts/{hunt_id}",
+                delete(handlers::hunts::unlink_campaign_hunt),
+            )
+            .route("/api/hunts/campaigns/{id}/events", get(handlers::hunts::list_campaign_events))
+            .route("/api/hunts/campaigns/{id}/rechecks", get(handlers::hunts::list_campaign_rechecks))
+            .route("/api/hunts/campaign-candidates", get(handlers::hunts::list_campaign_candidates))
+            .route("/api/hunts/leads/{id}/campaign", post(handlers::hunts::attach_finding_to_campaign))
             // NAN-2239 knowledge. Recall is `hunts:view`; recording is the one
             // write a sweep key can make besides its report; revocation is
             // `hunts:triage`. Nothing here suppresses — see handlers/hunts/knowledge.rs.
@@ -2763,6 +2857,40 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/hunts/report-branding-events",
                 post(handlers::hunts::record_hunt_report_branding),
             )
+            // NAN-5581 agent detections (static `agent-detections` beside `{id}`).
+            .route("/api/hunts/agent-detections", get(handlers::hunts::list_agent_detections))
+            .route(
+                "/api/hunts/agent-detections/settings",
+                get(handlers::hunts::get_agent_detection_settings).put(handlers::hunts::update_agent_detection_settings),
+            )
+            .route(
+                "/api/hunts/agent-detections/{id}/trips",
+                get(handlers::hunts::list_agent_detection_trips),
+            )
+            .route(
+                "/api/hunts/agent-detections/{id}/pause",
+                post(handlers::hunts::pause_agent_detection),
+            )
+            .route(
+                "/api/hunts/agent-detections/{id}/resume",
+                post(handlers::hunts::resume_agent_detection),
+            )
+            .route(
+                "/api/hunts/agent-detections/{id}/retire",
+                post(handlers::hunts::retire_agent_detection),
+            )
+            .route(
+                "/api/hunts/{id}/agent-detections",
+                get(handlers::hunts::get_hunt_agent_detections).post(handlers::hunts::set_hunt_agent_detections),
+            )
+            .route(
+                "/api/hunts/{id}/agent-detections/gate",
+                post(handlers::hunts::dry_run_agent_detection_gate),
+            )
+            .route(
+                "/api/hunts/{id}/agent-detections/create",
+                post(handlers::hunts::create_agent_detection),
+            )
             .route(
                 "/api/hunts/rule-ideas/{id}/send",
                 post(handlers::hunts::send_rule_idea),
@@ -2793,6 +2921,15 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/hunts/{id}/schedule",
                 post(handlers::hunts::set_hunt_schedule),
+            )
+            .route(
+                "/api/hunts/{id}/calibration",
+                get(handlers::hunts::hunt_calibration),
+            )
+            // Policy B's opt-in lives here, never in PATCH: `case` is gated.
+            .route(
+                "/api/hunts/{id}/escalation-mode",
+                post(handlers::hunts::set_escalation_mode),
             )
             // Playbook repositories (external sync)
             .route(
@@ -3533,6 +3670,8 @@ fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
             axum::http::header::HeaderName::from_static("prefer"),
             axum::http::header::HeaderName::from_static("x-api-key"),
             axum::http::header::HeaderName::from_static("x-request-id"),
+            // NAN-5571: marks requests a pivt action made, for the audit log.
+            axum::http::header::HeaderName::from_static("x-nano-origin"),
         ]);
 
     // Only allow wildcard CORS if explicitly configured with "*"

@@ -71,9 +71,75 @@ describe('PageContext Here card overrides', () => {
   });
 
   test('pageKeyFor maps authoring and repository routes', () => {
-    expect(pageKeyFor('/playbooks/new')).toBe('playbooks');
+    expect(pageKeyFor('/playbooks/new')).toBe('playbook-editor');
     expect(pageKeyFor('/playbooks/repositories')).toBe('playbook-repositories');
     expect(pageKeyFor('/rules/repositories')).toBe('rule-repositories');
     expect(pageKeyFor('/nowhere')).toBe('home');
+  });
+
+  // NAN-5571: segment-aware matching and the routes that used to fall
+  // through to `home` or collapse into the wrong key.
+  test.each([
+    ['/', 'home'],
+    ['/search', 'search'],
+    ['/alerts', 'alerts'],
+    ['/alerts/01890000-0000-7000-8000-000000000001', 'alert'],
+    ['/rules', 'rules'],
+    ['/rules/abc/matches', 'matches'],
+    ['/rules/editor/new', 'rule-editor'],
+    ['/rules/editor/abc', 'rule-editor'],
+    ['/rules/tuning', 'ai-tuning'],
+    ['/rules/tuning/p1', 'tuning-proposal'],
+    ['/rules/coverage', 'mitre-coverage'],
+    ['/rules/lookup-tables/geo', 'lookup-tables'],
+    ['/hunts', 'hunts'],
+    ['/hunts/h1', 'hunt'],
+    ['/hunts/leads', 'hunt-leads'],
+    ['/hunts/leads/l1', 'hunt-lead'],
+    ['/hunts/campaigns/candidates', 'hunt-campaigns'],
+    ['/hunts/campaigns/c1', 'hunt-campaign'],
+    ['/inbox', 'inbox'],
+    ['/cases/search', 'case-search'],
+    ['/cases/c1', 'case'],
+    ['/automation/runs', 'automation-runs'],
+    ['/automation/runs/r1', 'automation-runs'],
+    ['/automation/flows/f1', 'automation-flow'],
+    ['/dashboards/d1', 'dashboard'],
+    ['/notebooks', 'notebooks'],
+    ['/notebooks/n1', 'notebook'],
+    ['/ingestion/log-sources', 'log-sources'],
+    ['/ingestion/log-sources/ls1', 'log-source'],
+    ['/ingestion/log-sources/repositories', 'parser-repositories'],
+    ['/ingestion/log-sources/credentials', 'ingest-credentials'],
+    ['/ingestion/log-sources/cloud-pull', 'cloud-pull'],
+    ['/ingestion/log-sources/inputs/sc1', 'source-config'],
+    ['/ingestion/pipelines', 'pipelines'],
+    ['/ingestion/pipelines/p1', 'pipeline'],
+    ['/marketplace', 'marketplace'],
+    ['/risk', 'risk'],
+    ['/risk/watchlists', 'risk-watchlists'],
+    ['/settings', 'settings'],
+    ['/settings/cases/queues', 'settings'],
+    ['/platform/health', 'health'],
+    ['/search/', 'search'],
+  ])('pageKeyFor(%s) = %s', (path, key) => {
+    expect(pageKeyFor(path)).toBe(key);
+  });
+
+  test('prefixes need a segment boundary', () => {
+    expect(pageKeyFor('/risky')).toBe('home');
+    expect(pageKeyFor('/rulesx')).toBe('home');
+    expect(pageKeyFor('/searchable')).toBe('home');
+    expect(pageKeyFor('/matches')).toBe('home');
+  });
+
+  test('no literal route in App.tsx is read as a :param detail page', async () => {
+    const app = (await import('../App.tsx?raw')).default as string;
+    const literal = new Set<string>();
+    for (const m of app.matchAll(/path(?:=|:\s*)["'](\/[^"'*:]*)["']/g)) literal.add(m[1]);
+    // Keys that only a `:param` route produces.
+    const detailKeys = new Set(['alert', 'matches', 'tuning-proposal', 'hunt', 'hunt-lead', 'hunt-campaign', 'case', 'automation-flow', 'dashboard', 'notebook', 'source-config', 'log-source', 'pipeline']);
+    const misread = [...literal].filter((p) => detailKeys.has(pageKeyFor(p)));
+    expect(misread).toEqual([]);
   });
 });

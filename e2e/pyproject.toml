@@ -43,6 +43,8 @@ markers = [
     "config_type(name, where=...): pull scenario needs this source-config type; SKIPs when the build lacks it",
     "ui: drives the real web UI in a browser (puppeteer-core driver)",
     "mock_vendor: needs the mock-vendor profile (connector runner + vendor mock)",
+    "existing_target: safe against an existing stack (`scripts/e2e.sh run <suite> --target existing`); nothing else runs there",
+    "udm_only(reason): needs a legacy UDM stack (NANO_SCHEMA_PROFILE=udm); skipped on the OCSF default",
 ]
 
 [tool.ruff]

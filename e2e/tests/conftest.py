@@ -18,8 +18,9 @@ from typing import Any
 import pytest
 
 from nano_e2e import artifact_guard
+from nano_e2e import target as e2e_target
 
-from nano_e2e import ingest
+from nano_e2e import ingest, schema
 from nano_e2e.client import Journal, Nano
 from nano_e2e.firstrun import ensure_admin
 from nano_e2e.mockvendor import MockVendor, MockVendorServer
@@ -33,17 +34,32 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     """Record every secret this session holds (the stack's and the cloud test
     credentials `with_creds` loaded) in the run's 0600 registry, so the
     artifact guard can scrub them and fail the run if one survives."""
+    # `--target existing` (NAN-5586): the acting user's credentials come from
+    # a 0600 file into this process's env first, so they are scrubbed too.
+    e2e_target.load_env()
     artifact_guard.remember(*artifact_guard.env_secrets())
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     open_edition = os.environ.get("E2E_EDITION", "enterprise") == "open"
     skip = pytest.mark.skip(reason="enterprise-only scenario; stack runs EDITION=open")
+    existing = e2e_target.existing()
+    not_existing = pytest.mark.skip(
+        reason="--target existing runs only scenarios marked existing_target (the rest assume a throwaway stack)"
+    )
+    ocsf = schema.is_ocsf()
     for item in items:
+        if existing and not item.get_closest_marker("existing_target"):
+            item.add_marker(not_existing)
         if any(part in Path(str(item.path)).as_posix() for part in ("/ui/", "/personas/")):
             item.add_marker(pytest.mark.ui)
         if open_edition and item.get_closest_marker("enterprise"):
             item.add_marker(skip)
+        udm = item.get_closest_marker("udm_only")
+        if ocsf and udm:
+            why = udm.args[0] if udm.args else "UDM-shaped scenario"
+            reason = f"udm_only: {why}; stack is {schema.profile()}, run with NANO_SCHEMA_PROFILE=udm"
+            item.add_marker(pytest.mark.skip(reason=reason))
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -58,6 +74,8 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Itera
 @pytest.fixture(scope="session")
 def stack() -> Stack:
     try:
+        if e2e_target.existing():
+            return Stack.existing()
         # `up --defer-admin` (what `run ui` uses): first-run setup happens here,
         # in the browser when the UI build is present (nano_e2e.firstrun).
         ensure_admin()
@@ -240,6 +258,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             f"E2E: selected suite(s) executed ZERO scenarios (all skipped/deselected): {', '.join(empty)}. "
             "Fix the credentials/build, or pass --allow-skips for local exploration."
         )
+        if schema.is_ocsf():
+            msg += " A suite of @udm_only scenarios needs NANO_SCHEMA_PROFILE=udm (NAN-5594)."
         if tr:
             tr.write_line(msg, red=True, bold=True)
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
@@ -302,8 +322,8 @@ class OcsfLane:
 
 @pytest.fixture(scope="session")
 def ocsf_lane(stack: Stack) -> Iterator[OcsfLane]:
-    if not os.environ.get("NANO_SCHEMA_PROFILE", "udm").startswith("ocsf"):
-        pytest.skip("OCSF field scenarios need an ocsf stack (`scripts/e2e.sh run ui` brings one up)")
+    if not schema.is_ocsf():
+        pytest.skip("OCSF field scenarios need an ocsf stack (the scripts/e2e.sh default; this one is udm)")
     nano = Nano(stack.api_url, stack.search_url, {"X-API-Key": stack.api_key}, Journal(None))
     rk = make_route_key("ocsf-lane", "session")
     src = nano.create_draft_source(name=rk, route_key=rk, parser_vrl=OCSF_AUTH_PARSER.format(lane=rk))

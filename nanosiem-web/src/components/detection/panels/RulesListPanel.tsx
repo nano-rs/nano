@@ -29,7 +29,6 @@ import {
   Pencil,
   Trash2,
   Eye,
-  WandSparkles,
   Play,
   Archive,
   ArchiveRestore,
@@ -45,6 +44,7 @@ import {
   X,
   Power,
   CircleCheck,
+  AlignLeft,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { DEFAULT_FOLDERS, UNCATEGORIZED_FOLDER, type FolderDefinition } from '@/lib/detection-folders';
@@ -392,7 +392,7 @@ export function RulesListPanel({
         )}
         {onFormatRule && (
           <ContextMenuItem onClick={() => onFormatRule(rule.id)}>
-            <WandSparkles className="w-4 h-4 mr-2" />
+            <AlignLeft className="w-4 h-4 mr-2" />
             Format Query
           </ContextMenuItem>
         )}

@@ -34,7 +34,9 @@ address = "127.0.0.1:8686"
 # =============================================================================
 [sources.http_ingest]
 type = "http_server"
-address = "0.0.0.0:8080"
+# NAN-5566: the single-node Vector entrypoint points this at its ingest gate
+# (a hot-reloadable listen address); unset everywhere else.
+address = "${NANO_HTTP_INGEST_ADDRESS:-0.0.0.0:8080}"
 strict_path = false
 path = "/"
 # NAN-4038: capture only what the pipeline reads. Every captured header becomes

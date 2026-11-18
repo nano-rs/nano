@@ -32,8 +32,24 @@ def _failed(request: pytest.FixtureRequest) -> bool:
     return False
 
 
+class ExistingSite:
+    """`--target existing`: the stack's own web server (nothing to start)."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+
 @pytest.fixture(scope="session")
-def web(stack: Stack) -> Iterator[WebServer | EdgeSite]:
+def web(stack: Stack) -> Iterator[WebServer | EdgeSite | ExistingSite]:
+    if stack.target == "existing":
+        yield ExistingSite(stack.edge_url)
+        return
     dist = os.environ.get("E2E_WEB_DIST", "")
     if not dist:
         pytest.fail(
@@ -78,9 +94,22 @@ def page(
     try:
         uilib.login(page, stack.admin_email, stack.admin_password)
     except Exception:
+        if stack.target == "existing":
+            try:
+                page.end_session()  # a login can half-succeed: never leave a session behind
+            except Exception:  # noqa: BLE001,S110 - best effort; the failure itself is raised
+                pass
         page.finish(True)
         raise
     try:
         yield page
     finally:
+        if stack.target == "existing":
+            # Someone else's stack: end this context's own session (only it).
+            try:
+                ended = page.end_session()
+                if ended.get("status") not in (200, 204):
+                    print(f"WARNING: could not end the walk's own session on the target: {ended}")
+            except Exception as exc:  # noqa: BLE001 - best effort; the browser context closes anyway
+                print(f"WARNING: could not end the walk's own session on the target: {exc}")
         page.finish(_failed(request))

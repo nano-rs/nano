@@ -27,10 +27,13 @@ from nano_e2e.runid import route_key as make_route_key
 from nano_e2e.stack import Stack
 from nano_e2e.waits import INGEST_VISIBLE, eventually
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("NANO_E2E_TWO_PHASE") != "1",
-    reason="needs a stack with VECTOR_FANIN_SLOTS=on (NANO_E2E_TWO_PHASE=1)",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("NANO_E2E_TWO_PHASE") != "1",
+        reason="needs a stack with VECTOR_FANIN_SLOTS=on (NANO_E2E_TWO_PHASE=1)",
+    ),
+    pytest.mark.udm_only("parser emits no class_uid, so OCSF search never sees its events (NAN-5594)"),
+]
 
 PARKED = "nano-slot-parked"
 

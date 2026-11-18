@@ -162,6 +162,9 @@ impl AuthContext {
             &self.denied_sources,
             self.has_permission(nanosiem_core::auth::permissions::AUDIT_VIEW),
         )
+        // NAN-5612: the detections dataset needs `detections:view`; the search
+        // service refuses `dataset=signals` for a scope carrying this flag.
+        .with_signals_denied(!self.has_permission(nanosiem_core::auth::permissions::DETECTIONS_VIEW))
     }
 
     /// The caller as a typed case/notebook read principal (NAN-5019 / NAN-5028):

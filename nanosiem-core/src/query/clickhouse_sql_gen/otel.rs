@@ -41,6 +41,15 @@ pub enum Dataset {
     /// table; the 24h/7d score windows are FIXED trailing windows anchored at
     /// evaluation time, so the search time picker does not reshape them.
     Risk,
+    /// Detection matches (NAN-5612): a DERIVED dataset — every detection that
+    /// fired in the search window, real-time `signals` rows plus scheduled
+    /// findings rows in the events table, as ONE window-bound subquery built
+    /// by the shared detections builder
+    /// (`crate::hunts::detections::detections_source_scoped`, the same source a
+    /// hunt's `{signals}` pivot reads). Time column `timestamp`. The caller's
+    /// source scope is applied INSIDE both legs as well as on the outer
+    /// `source_type` column (see `ClickHouseSqlGenerator::signals_base_source`).
+    Signals,
 }
 
 impl Default for Dataset {
@@ -88,6 +97,7 @@ impl Dataset {
             "spans" | "span" | "traces" | "trace" => Dataset::Spans,
             "metrics" | "metric" => Dataset::Metrics,
             "risk" => Dataset::Risk,
+            "signals" | "signal" => Dataset::Signals,
             _ => Dataset::Logs,
         }
     }
@@ -103,6 +113,7 @@ impl Dataset {
             "spans" | "span" | "traces" | "trace" => Some(Dataset::Spans),
             "metrics" | "metric" => Some(Dataset::Metrics),
             "risk" => Some(Dataset::Risk),
+            "signals" | "signal" => Some(Dataset::Signals),
             _ => None,
         }
     }
@@ -119,6 +130,9 @@ impl Dataset {
             Dataset::Logs | Dataset::Risk => "logs",
             Dataset::Spans => "otel_spans",
             Dataset::Metrics => "otel_metrics",
+            // NAN-5612: the real-time half of the derived detections source;
+            // `with_dataset(Signals)` builds the full union, never this literal.
+            Dataset::Signals => "signals",
         }
     }
 
@@ -129,7 +143,7 @@ impl Dataset {
     /// fixed trailing windows the picker does not reshape).
     pub fn time_column(self) -> &'static str {
         match self {
-            Dataset::Logs | Dataset::Metrics => "timestamp",
+            Dataset::Logs | Dataset::Metrics | Dataset::Signals => "timestamp",
             Dataset::Spans => "start_time",
             Dataset::Risk => "last_finding_at",
         }
@@ -228,6 +242,28 @@ pub const RISK_NUMERIC_COLUMNS: &[&str] = &[
     "distinct_tactics_7d",
 ];
 
+/// The column universe of the derived `signals` dataset (NAN-5612): exactly
+/// the ten columns of the shared detections source
+/// (`crate::hunts::detections::detections_source_between`), so `dataset=signals`
+/// reads what a hunt's `{signals}` pivot reads. No `ext`/Map spill: an unknown
+/// field fails loudly at ClickHouse.
+pub const SIGNALS_COLUMNS: &[&str] = &[
+    "id",
+    "timestamp",
+    "rule_id",
+    "rule_name",
+    "severity",
+    "risk_score",
+    "risk_entity",
+    "matched_log_id",
+    "source_type",
+    "detection_path",
+];
+
+/// Numeric columns of the `signals` dataset (no `lower()`, string literals
+/// coerce to numbers).
+pub const SIGNALS_NUMERIC_COLUMNS: &[&str] = &["risk_score"];
+
 impl Dataset {
     /// The set of promoted columns referenceable directly in nPL for this
     /// dataset (NAN-1534). Empty for [`Dataset::Logs`] — logs field resolution is
@@ -241,6 +277,7 @@ impl Dataset {
             Dataset::Spans => SPAN_COLUMNS,
             Dataset::Metrics => METRIC_COLUMNS,
             Dataset::Risk => RISK_COLUMNS,
+            Dataset::Signals => SIGNALS_COLUMNS,
         }
     }
 
@@ -251,7 +288,29 @@ impl Dataset {
             Dataset::Logs => &[],
             Dataset::Spans | Dataset::Metrics => OTEL_NUMERIC_COLUMNS,
             Dataset::Risk => RISK_NUMERIC_COLUMNS,
+            Dataset::Signals => SIGNALS_NUMERIC_COLUMNS,
         }
+    }
+
+    /// The selector spelling of this dataset (`dataset=<name>`, the Search
+    /// `dataset` URL / request parameter).
+    pub fn selector(self) -> &'static str {
+        match self {
+            Dataset::Logs => "logs",
+            Dataset::Spans => "spans",
+            Dataset::Metrics => "metrics",
+            Dataset::Risk => "risk",
+            Dataset::Signals => "signals",
+        }
+    }
+
+    /// Does a scan of this dataset read rows that carry a per-row
+    /// `source_type` the per-source RBAC gate can bind to? `Logs` (the event
+    /// tables) and `Signals` (every detection carries its matched event's
+    /// source) do; the OTLP tables and the derived risk grain do not, so the
+    /// injected gate is stripped there (see `strip_injected_audit_gate`).
+    pub fn is_source_scoped(self) -> bool {
+        matches!(self, Dataset::Logs | Dataset::Signals)
     }
 }
 

@@ -46,6 +46,9 @@ impl DetectionService {
         risk_score: Option<i32>,
         risk_modifiers_empty: bool,
     ) -> Result<(), DetectionError> {
+        // NAN-5612: every save path runs this guard, so the signals refusal
+        // rides along (see `reject_signals_dataset_rule`).
+        Self::reject_signals_dataset_rule(dataset, query)?;
         if crate::query::Dataset::from_selector(dataset.unwrap_or("logs"))
             != crate::query::Dataset::Risk
         {
@@ -79,6 +82,29 @@ impl DetectionService {
                         .to_string(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// NAN-5612: detection rules may not read the `signals` dataset (detection
+    /// matches), neither as the rule's dataset nor through a
+    /// `[dataset=signals …]` subsearch. A detection EMITS signals and findings,
+    /// which are exactly what `dataset=signals` reads, so a signals rule would
+    /// fire on its own output (and on every other rule's), a signal-on-signal
+    /// loop with no fixed point. Correlating detections is the risk dataset's
+    /// job (`dataset=risk` rules, with their own loop guard). Refused at save
+    /// time; execution refuses it again.
+    pub(crate) fn reject_signals_dataset_rule(
+        dataset: Option<&str>,
+        query: &str,
+    ) -> Result<(), DetectionError> {
+        if crate::search::touches_signals_dataset(dataset, query) {
+            return Err(DetectionError::InvalidQuery(
+                "Detection rules cannot read dataset=signals: a rule's own matches are signals, \
+                 so the rule would fire on its own output (a signal-on-signal loop). To alert on \
+                 several detections for one entity, write a dataset=risk rule instead."
+                    .to_string(),
+            ));
         }
         Ok(())
     }

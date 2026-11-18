@@ -798,7 +798,8 @@ impl AppState {
                 nanosiem_core::schema::SchemaId::Udm
                 | nanosiem_core::schema::SchemaId::Spans
                 | nanosiem_core::schema::SchemaId::Metrics
-                | nanosiem_core::schema::SchemaId::Risk => "logs",
+                | nanosiem_core::schema::SchemaId::Risk
+                | nanosiem_core::schema::SchemaId::Signals => "logs",
             };
             let local_table = dual_pool.table_names().local(key);
             match nanosiem_core::schema::validate_active_schema_table(

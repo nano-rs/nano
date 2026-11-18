@@ -1320,7 +1320,7 @@ def host_id(cluster: str, name: str) -> str:
     return hid
 
 
-# --- Storage tiering (NAN-5445) --------------------------------------------------------
+# --- Storage tiering ---------------------------------------------------------------
 TIER_PROVIDERS = ("s3", "s3-compatible", "gcs", "azure")
 TIER_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
 TIER_SIMPLE_RE = re.compile(r"^[A-Za-z0-9._:/\[\]-]{1,256}$")
@@ -2382,7 +2382,7 @@ def parser() -> argparse.ArgumentParser:
                    help="with --hosts: plan hosts that miss the production sizing anyway, for evaluation and test "
                    "clusters only; the plan, inventory and firewall script are labelled NOT FOR PRODUCTION")
     p.add_argument("--tiering-provider", choices=TIER_PROVIDERS,
-                   help="enable ClickHouse cold-tier object storage (NAN-5445): writes the inventory tiering: block")
+                   help="enable ClickHouse cold-tier object storage: writes the inventory tiering: block")
     p.add_argument("--tiering-bucket")
     p.add_argument("--tiering-region")
     p.add_argument("--tiering-endpoint", help="https://host[:port]; required for s3-compatible")

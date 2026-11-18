@@ -136,6 +136,8 @@ impl SystemHealthDispatcher {
             } else {
                 format!("{}:{}", event.id, delivery.event_action)
             }),
+            summary: None,
+            details: None,
         };
 
         match self

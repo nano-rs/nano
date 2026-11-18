@@ -128,6 +128,22 @@ impl SearchJobRepository {
         Self { pool }
     }
 
+    /// NAN-5612: does the user hold `permission` RIGHT NOW (group -> role ->
+    /// permission)? Read at execution so a revocation after submission stops
+    /// the job. Errors fail closed (the caller treats them as "no").
+    pub async fn user_holds_permission(&self, user_id: uuid::Uuid, permission: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM user_groups ug \
+               JOIN group_roles gr ON ug.group_id = gr.group_id \
+               JOIN role_permissions rp ON gr.role_id = rp.role_id \
+              WHERE ug.user_id = $1 AND rp.permission_id = $2)",
+        )
+        .bind(user_id)
+        .bind(permission)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Attach to the owner's identical live job, or insert a new queued job
     /// if the owner is under `max_live` live jobs.
     ///

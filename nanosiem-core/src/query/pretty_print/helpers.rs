@@ -118,6 +118,7 @@ pub(crate) fn dataset_selector_str(
         Dataset::Spans => "spans",
         Dataset::Metrics => "metrics",
         Dataset::Risk => "risk",
+        Dataset::Signals => "signals",
     }
 }
 

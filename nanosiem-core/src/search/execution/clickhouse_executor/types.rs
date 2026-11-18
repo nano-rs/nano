@@ -96,14 +96,90 @@ pub(crate) const CLICKHOUSE_LOG_COLUMNS: &str = "id, toUnixTimestamp64Micro(time
 #[derive(Clone)]
 pub struct ClickHouseExecutor {
     pub(crate) client: clickhouse::Client,
+    /// NAN-5565: lift `max_query_size` for query text that needs it. Off by
+    /// default (raw SQL and every other caller keep ClickHouse's default);
+    /// on only for an executor from [`Self::for_generated_sql`].
+    lift_max_query_size: bool,
+    /// NAN-5565: the caller's answer to "is this an aggregation?" for the
+    /// paginated paths, instead of sniffing the SQL text. Generated SQL can
+    /// inline event-derived literals (prevalence rescue keys), and a literal
+    /// such as `sum(` must not flip a raw query into the full-window
+    /// `count(*) OVER ()` path.
+    aggregation_override: Option<bool>,
 }
 
 impl ClickHouseExecutor {
     /// Create a new ClickHouse executor
     pub fn new(client: clickhouse::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            lift_max_query_size: false,
+            aggregation_override: None,
+        }
+    }
+
+    /// NAN-5565: this executor for SQL the application generated itself:
+    /// `max_query_size` is lifted when the text needs it, and `aggregation`
+    /// (decided by the caller on the literal-free SQL) replaces the text
+    /// sniffing.
+    pub(crate) fn for_generated_sql(&self, aggregation: bool) -> Self {
+        Self {
+            client: self.client.clone(),
+            lift_max_query_size: true,
+            aggregation_override: Some(aggregation),
+        }
+    }
+
+    /// Whether the paginated paths treat `sql` as an aggregation.
+    pub(crate) fn is_aggregation(&self, sql: &str) -> bool {
+        self.aggregation_override
+            .unwrap_or_else(|| super::sql_helpers::is_aggregation_query(sql))
+    }
+
+    /// Start a query for `sql`. For a generated-SQL executor
+    /// ([`Self::for_generated_sql`]) whose text needs it, the query carries a
+    /// lifted `max_query_size` (NAN-5565).
+    ///
+    /// Every query the executor builds starts here (a source guard test pins
+    /// that), so the data query, its count companion, the pagination wrappers
+    /// and streaming all carry the same limit.
+    pub(crate) fn sized_query(&self, sql: &str) -> clickhouse::query::Query {
+        let query = self.client.query(sql);
+        if !self.lift_max_query_size {
+            return query;
+        }
+        match max_query_size_for(sql.len()) {
+            Some(limit) => query.with_setting("max_query_size", limit.to_string()),
+            None => query,
+        }
     }
 }
+
+/// ClickHouse's default `max_query_size`: the bytes of query TEXT its parser
+/// accepts. The deploy profiles do not override or constrain it.
+pub(crate) const CLICKHOUSE_DEFAULT_MAX_QUERY_SIZE: usize = 262_144;
+
+/// Upper bound the executor lifts `max_query_size` to (NAN-5565). Generated
+/// SQL inlines bounded literal sets (the prevalence rescue: at most
+/// `PREVALENCE_RESCUE_MAX_ARTIFACTS` keys per entity type), which measured
+/// under 20 MiB at their caps; anything larger fails with ClickHouse code 62,
+/// which `parse_clickhouse_error` classifies as a size failure.
+pub(crate) const MAX_QUERY_SIZE_CEILING: usize = 64 * 1024 * 1024;
+
+/// The `max_query_size` to send for a query of `sql_len` bytes: `None` (send
+/// nothing, the request stays byte-identical) while the text is safely under
+/// the default, otherwise the length plus 64 KiB headroom, capped at
+/// [`MAX_QUERY_SIZE_CEILING`]. `sql_len` is measured before the client crate
+/// un-escapes `??`, so it never under-counts the text sent.
+pub(crate) fn max_query_size_for(sql_len: usize) -> Option<usize> {
+    if sql_len + MAX_QUERY_SIZE_HEADROOM <= CLICKHOUSE_DEFAULT_MAX_QUERY_SIZE {
+        return None;
+    }
+    Some((sql_len + MAX_QUERY_SIZE_HEADROOM).min(MAX_QUERY_SIZE_CEILING))
+}
+
+/// Headroom the lift adds over the text length.
+pub(crate) const MAX_QUERY_SIZE_HEADROOM: usize = 64 * 1024;
 
 /// Apply an optional query_id and optional per-priority settings to a query
 /// builder (NAN-1428).

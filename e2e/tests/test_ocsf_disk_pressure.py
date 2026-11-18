@@ -32,12 +32,12 @@ stack is a fresh install (only an upgraded install has it).
 from __future__ import annotations
 
 import json
-import os
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
+from nano_e2e import schema
 from nano_e2e.client import Nano, expect
 from nano_e2e.stack import Stack
 from nano_e2e.waits import eventually
@@ -101,8 +101,8 @@ def _watermarks_with_clickhouse_filler(ch) -> dict[str, str]:
 
 
 def test_disk_pressure_evicts_the_oldest_ocsf_partitions(stack: Stack, nano: Nano, timeline) -> None:
-    if not os.environ.get("NANO_SCHEMA_PROFILE", "udm").startswith("ocsf"):
-        pytest.skip("OCSF eviction: needs an ocsf stack (`NANO_SCHEMA_PROFILE=ocsf scripts/e2e.sh up`)")
+    if not schema.is_ocsf():
+        pytest.skip("OCSF eviction: this stack is udm, not the ocsf default")
     ch = _ch(stack)
     ocsf_days = [_day(40), _day(39)]
     legacy_day, udm_day = _day(42), _day(41)

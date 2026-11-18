@@ -161,7 +161,7 @@ upgrade that leaves the token out keeps the one already installed (the chart
 reuses every key of the existing `nano-secrets`), so the guide's upgrade
 command omits it safely. Pass a new token only to replace it.
 
-**ClickHouse networks (`clickhouse.allowedNetworks`, NAN-5367/NAN-5390).** Set
+**ClickHouse networks (`clickhouse.allowedNetworks`).** Set
 it in `values-site.yaml` to the cluster's real pod CIDR (and node CIDR when an
 external LoadBalancer reaches ClickHouse), read from the cloud, never guessed:
 GKE `gcloud container clusters describe <c> --format='value(clusterIpv4Cidr)'`,

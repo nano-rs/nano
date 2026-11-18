@@ -21,6 +21,10 @@ mod sql_helpers;
 mod types;
 #[cfg(test)]
 mod utf8_response_tests;
+#[cfg(test)]
+mod max_query_size_wiring_tests;
+#[cfg(test)]
+mod max_query_size_profile_guard_tests;
 
 // Re-export all public items for backward compatibility
 pub use sql_helpers::{
@@ -29,7 +33,12 @@ pub use sql_helpers::{
 };
 pub(crate) use paginated::is_first_page;
 pub(crate) use sql_helpers::{
-    raw_sql_needs_skip_index_guard, wrap_aggregation_with_pagination, BoundedCountInput,
+    is_aggregation_query, raw_sql_needs_skip_index_guard, wrap_aggregation_with_pagination,
+    BoundedCountInput,
 };
 pub use types::{ClickHouseExecutor, ClickHouseLogReadRow};
+pub(crate) use types::{
+    max_query_size_for, CLICKHOUSE_DEFAULT_MAX_QUERY_SIZE, MAX_QUERY_SIZE_CEILING,
+    MAX_QUERY_SIZE_HEADROOM,
+};
 pub(crate) use types::with_query_options;

@@ -83,6 +83,8 @@ export interface DetailSheetProps {
   bodyClassName?: string;
   /** Force a side; defaults to right (bottom below the mobile breakpoint). */
   side?: 'right' | 'bottom';
+  /** Test hook, set on the sheet frame. */
+  'data-testid'?: string;
   children?: React.ReactNode;
 }
 
@@ -120,6 +122,7 @@ export function DetailSheet({
   className,
   bodyClassName,
   side,
+  'data-testid': testId,
   children,
 }: DetailSheetProps) {
   const isMobile = useIsMobile();
@@ -157,6 +160,7 @@ export function DetailSheet({
           overlayClassName="bg-black/40 backdrop-blur-none"
           data-detail-sheet=""
           data-size={size}
+          data-testid={testId}
           className={cn(
             'flex flex-col gap-0 bg-card p-0 text-foreground shadow-xl',
             resolvedSide === 'right'

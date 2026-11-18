@@ -104,17 +104,31 @@ impl ReportDashboardAuthorization {
 #[derive(Debug, Clone)]
 pub struct ReportExecutionAuthorization {
     dashboard: Option<ReportDashboardAuthorization>,
+    /// NAN-5612: the owner lacks `detections:view`, so the run's scope
+    /// refuses `dataset=signals` (re-resolved every run, like the rest).
+    signals_denied: bool,
 }
 
 impl ReportExecutionAuthorization {
     fn search() -> Self {
-        Self { dashboard: None }
+        Self { dashboard: None, signals_denied: true }
     }
 
     fn dashboard(authorization: ReportDashboardAuthorization) -> Self {
         Self {
             dashboard: Some(authorization),
+            signals_denied: true,
         }
+    }
+
+    fn with_owner_permissions(mut self, permissions: &[String]) -> Self {
+        self.signals_denied = !permissions.iter().any(|p| p == permissions::DETECTIONS_VIEW);
+        self
+    }
+
+    /// NAN-5612: whether the run must refuse `dataset=signals`.
+    pub fn signals_denied(&self) -> bool {
+        self.signals_denied
     }
 
     pub fn dashboard_authorization(&self) -> Option<&ReportDashboardAuthorization> {
@@ -182,7 +196,7 @@ impl ReportAuthorizer {
         }
 
         if definition.source_type == ReportSourceType::Search {
-            return Ok(ReportExecutionAuthorization::search());
+            return Ok(ReportExecutionAuthorization::search().with_owner_permissions(&current_permissions));
         }
 
         let dashboard_id = definition.source_dashboard_id.ok_or_else(|| {
@@ -204,9 +218,8 @@ impl ReportAuthorizer {
             )));
         }
 
-        Ok(ReportExecutionAuthorization::dashboard(
-            dashboard_authorization,
-        ))
+        Ok(ReportExecutionAuthorization::dashboard(dashboard_authorization)
+            .with_owner_permissions(&current_permissions))
     }
 
     /// Check current access to a dashboard object. There is intentionally no
@@ -399,5 +412,24 @@ mod tests {
             dashboard_executes_search_sql(&dashboard),
             "an executable panel inside the cap must require search:sql"
         );
+    }
+}
+
+#[cfg(test)]
+mod signals_authorization_tests {
+    use super::*;
+
+    /// NAN-5612: a report run refuses dataset=signals unless the owner holds
+    /// detections:view right now.
+    #[test]
+    fn report_runs_need_detections_view_for_signals() {
+        let without = ReportExecutionAuthorization::search()
+            .with_owner_permissions(&[permissions::SEARCH_EXECUTE.to_string()]);
+        assert!(without.signals_denied());
+        let with = ReportExecutionAuthorization::search().with_owner_permissions(&[
+            permissions::SEARCH_EXECUTE.to_string(),
+            permissions::DETECTIONS_VIEW.to_string(),
+        ]);
+        assert!(!with.signals_denied());
     }
 }

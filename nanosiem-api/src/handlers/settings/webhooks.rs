@@ -52,6 +52,48 @@ pub async fn list_webhooks(
     Ok(Json(responses))
 }
 
+/// One subscribable webhook event stream.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct WebhookEventTypeInfo {
+    /// The `event_types` value to subscribe with.
+    pub name: String,
+    /// Registered by an extension of this build rather than built in.
+    pub extension: bool,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct WebhookEventTypesResponse {
+    pub event_types: Vec<WebhookEventTypeInfo>,
+}
+
+/// List the subscribable event streams
+///
+/// The built-in streams plus any an extension of this build registered, so
+/// the notification settings can offer every stream a channel can subscribe
+/// to without hard-coding the list.
+#[utoipa::path(
+    get,
+    path = "/api/settings/webhooks/event-types",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Subscribable event streams", body = WebhookEventTypesResponse),
+        (status = 403, description = "Missing permission", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn list_webhook_event_types(
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<WebhookEventTypesResponse>, ApiError> {
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
+    let builtin = nanosiem_core::webhooks::models::VALID_EVENT_TYPES;
+    Ok(Json(WebhookEventTypesResponse {
+        event_types: nanosiem_core::webhooks::models::subscribable_event_types()
+            .into_iter()
+            .map(|name| WebhookEventTypeInfo { name: name.to_string(), extension: !builtin.contains(&name) })
+            .collect(),
+    }))
+}
+
 /// Create a new webhook
 #[utoipa::path(
     post,

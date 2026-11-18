@@ -23,7 +23,7 @@ Checks:
             hosts a second time), no read-only replicated tables, replication
             delay <= 30 s, Keeper session alive, no distributed DDL older than
             10 min still pending (an entry older than one its host already
-            finished is stale, not stuck: it only warns). NAN-5390: no
+            finished is stale, not stuck: it only warns). No
             refused logins for nano's users (codes 192-195, 516; latest within
             10 min), which catches a wrong clickhouse.allowedNetworks because
             pods log in from the pod network; and a zero-row INSERT as
@@ -161,7 +161,7 @@ CH_SQL = {
     "delay": "SELECT max(absolute_delay) FROM clusterAllReplicas('default', system.replicas) SETTINGS skip_unavailable_shards=1",
     "keeper": "SELECT count() FROM system.zookeeper_connection WHERE NOT is_expired",
     "ddl": DDL_SQL,
-    # NAN-5390: refused logins (UNKNOWN_USER, WRONG_PASSWORD, REQUIRED_PASSWORD,
+    # Refused logins (UNKNOWN_USER, WRONG_PASSWORD, REQUIRED_PASSWORD,
     # IP_ADDRESS_NOT_ALLOWED, AUTHENTICATION_FAILED) whose latest message, within
     # the last 10 minutes on this replica, names a nano user. system.errors
     # counts are cumulative since server start; the sum is reported as such.
@@ -172,7 +172,7 @@ CH_SQL = {
                 "AND match(last_error_message, '^nanosiem[a-z_]*: ')",
 }
 
-# NAN-5390: Vector's write identity, checked with a zero-row INSERT over HTTP
+# Vector's write identity, checked with a zero-row INSERT over HTTP
 # from inside the ClickHouse pod (clickhouse-client refuses an empty INSERT
 # client-side, before any grant check). Stores nothing; logs in, checks the
 # INSERT grant. ocsf_logs_raw on OCSF installs, logs_ingest on UDM. ClickHouse's

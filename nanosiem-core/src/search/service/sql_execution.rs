@@ -6,7 +6,6 @@ use crate::search::execution::clickhouse_executor::{
     raw_sql_needs_skip_index_guard, wrap_query_for_count, wrap_query_with_pagination,
     BoundedCountInput, ClickHouseExecutor,
 };
-use crate::search::query_processing::enforce_source_scope;
 
 /// NAN-2001: which raw-SQL ClickHouse identity a caller runs as. This is the ONE
 /// security decision the raw-SQL handler makes — everything else (table
@@ -150,6 +149,12 @@ impl SearchService {
         // Validate time range
         time_range.validate()?;
 
+        // NAN-5612: a leading `dataset=<name>` selects the dataset.
+        let (query, dataset_owned) =
+            crate::search::query_processing::resolve_dataset_selector(query, dataset)?;
+        let query = query.as_str();
+        let dataset = dataset_owned.as_deref();
+
         // NAN-1569: resolve the per-query dataset profile so explain matches the
         // executed path — without this, "Inspect SQL" validates against and
         // renders the logs table for a spans/metrics query (misleading FROM logs).
@@ -161,7 +166,9 @@ impl SearchService {
         // NAN-1799: same injection point as `search()` — before the parse, so
         // every explain branch below (prevalence pushdown included) renders
         // the gated query. Empty deny-set → text unchanged.
-        let cleaned_query = enforce_source_scope(&cleaned_query, scope.deny_set())?;
+        // NAN-5612: plus the dataset permission check.
+        let cleaned_query =
+            crate::search::query_processing::enforce_viewer_scope(&cleaned_query, dataset, scope)?;
 
         // Parse the cleaned query
         let parsed = parse_query(&cleaned_query).map_err(|e| convert_parse_error(e))?;
@@ -214,10 +221,9 @@ impl SearchService {
             let tr = TimeRange::new(time_range.start, time_range.end);
             // NAN-1705: explain is SQL-only (no CH execution), so it renders the
             // pushdown WITHOUT the runtime rescue probe (empty rescue → the base
-            // dict projections, byte-identical to the pre-rescue form). At execute
-            // time a non-empty rescue only rewrites the `_hp/_dp/_ip_host_count`
-            // projection aliases via `transform(...)`; the note keeps "Inspect
-            // SQL" honest about that delta.
+            // dict projections, byte-identical to the pre-rescue form). NAN-5565:
+            // the note spells out the EXACT shape and byte bound the rescue adds
+            // at execute time, so "Inspect SQL" no longer hides it.
             let (mut sql, _num_pushed) = self.generate_prevalence_pushdown_sql(
                 &parsed,
                 &prevalence_commands,
@@ -239,9 +245,7 @@ impl SearchService {
                 )
                 .is_some();
             if has_count_conditions || enrich_decorated_filter {
-                sql.push_str(
-                    "\n\n-- Note: at execute time, artifacts the prevalence dict cannot resolve (brand-new,\n-- inside the dict cache LIFETIME) are re-verified against *_prevalence_summary and, if rare,\n-- their _hp/_dp/_ip_host_count projection is transform()-rewritten to the fresh count so the\n-- filter and every decoration/`| where host_count` see the truth in-SQL (NAN-1705). The IP\n-- dimension is rescued only for the enrich+decorated-filter form; broad rules are bounded\n-- (miss-key cap) and rarest-capped with a WARN on overflow.",
-                );
+                sql.push_str(&prevalence_rescue_explain_note());
             }
             return Ok(sql);
         }
@@ -404,7 +408,66 @@ impl SearchService {
                 "ClickHouse client not configured".into(),
             ))
         })?;
+        self.dispatch_clickhouse_sql(
+            ch_executor,
+            sql,
+            limit,
+            offset,
+            query_id,
+            ch_settings,
+            bounded_count,
+            execution_limits,
+            preserve_columns,
+        )
+        .await
+    }
 
+    /// NAN-5565: execute SQL the application generated (the prevalence
+    /// pushdown): `max_query_size` is lifted when its text needs it, and
+    /// `aggregation`, decided on the literal-free rendering, replaces the
+    /// executor's text sniffing. Otherwise identical to
+    /// [`Self::execute_clickhouse_sql`].
+    pub(crate) async fn execute_generated_clickhouse_sql(
+        &self,
+        sql: &str,
+        aggregation: bool,
+        limit: usize,
+        offset: usize,
+        preserve_columns: bool,
+    ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
+        let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
+            SearchError::DatabaseError(sqlx::Error::Configuration(
+                "ClickHouse client not configured".into(),
+            ))
+        })?;
+        let generated = ch_executor.for_generated_sql(aggregation);
+        self.dispatch_clickhouse_sql(
+            &generated,
+            sql,
+            limit,
+            offset,
+            None,
+            None,
+            None,
+            None,
+            preserve_columns,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_clickhouse_sql(
+        &self,
+        ch_executor: &ClickHouseExecutor,
+        sql: &str,
+        limit: usize,
+        offset: usize,
+        query_id: Option<&str>,
+        ch_settings: Option<&super::admission::ClickHouseQuerySettings>,
+        bounded_count: Option<BoundedCountInput<'_>>,
+        execution_limits: Option<&crate::search::SearchExecutionLimits>,
+        preserve_columns: bool,
+    ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         // Resolve settings: explicit parameter > active_ch_settings on self > None
         let effective_settings = ch_settings.or(self.active_ch_settings.as_ref());
 
@@ -513,4 +576,33 @@ pub(crate) fn raw_sql_memory_settings(cap: u64) -> Vec<String> {
         format!("max_bytes_before_external_group_by = {spill}"),
         format!("max_bytes_before_external_sort = {spill}"),
     ]
+}
+
+/// NAN-5565: the "Inspect SQL" note for a prevalence pushdown whose execution
+/// carries the NAN-1705 rescue. Explain cannot run the probe (it scans the
+/// rule's whole base window), so the note states the exact SQL shape the
+/// rescue adds and the bounds that keep it under `max_query_size`.
+pub(crate) fn prevalence_rescue_explain_note() -> String {
+    use crate::search::execution::clickhouse_executor::MAX_QUERY_SIZE_CEILING;
+    use crate::search::service::prevalence_processing::{
+        CLICKHOUSE_DEFAULT_MAX_QUERY_SIZE, PREVALENCE_RESCUE_MAX_ARTIFACTS,
+    };
+    format!(
+        "\n\n-- Note: at execute time, artifacts the prevalence dict cannot resolve (brand-new,\n\
+         -- inside the dict cache LIFETIME) are re-verified against *_prevalence_summary (NAN-1705).\n\
+         -- Rescued keys are inlined ONCE per entity in logs_with_keys as\n\
+         --   transform(ifNull(_hash_lookup, ''), ['<key>', ...], range(1, n + 1), 0) AS _hp_rescue_idx   (_dp_/_ip_ likewise)\n\
+         -- and each _hp/_dp/_ip_* projection becomes\n\
+         --   if(_hp_rescue_idx = 0, <dict lookup above>, arrayElement(CAST([<fresh values>], 'Array(T)'), _hp_rescue_idx))\n\
+         -- with base_logs selecting `* EXCEPT (_*_rescue_idx)`. Every rescued artifact is inlined (at most\n\
+         -- {cap} per entity, the probe's own distinct-key bound). When that text exceeds ClickHouse's\n\
+         -- default max_query_size ({max} bytes) the query is sent with max_query_size lifted to fit\n\
+         -- (ceiling {ceiling} bytes). Inlined keys are capped at {key_cap} bytes: past it the least rare\n\
+         -- are left out, with a warning, and a scheduled rule run is marked PARTIAL. The IP dimension\n\
+         -- is rescued only for the enrich+decorated-filter form.",
+        key_cap = crate::search::service::prevalence_processing::PREVALENCE_RESCUE_KEY_BYTE_CAP,
+        cap = PREVALENCE_RESCUE_MAX_ARTIFACTS,
+        max = CLICKHOUSE_DEFAULT_MAX_QUERY_SIZE,
+        ceiling = MAX_QUERY_SIZE_CEILING,
+    )
 }

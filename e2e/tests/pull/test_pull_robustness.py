@@ -37,6 +37,7 @@ BOGUS_ADC = json.dumps(
 PARSER = '. = { "message": .message, "ext": { "e2e_parsed": "yes" } }'
 
 
+@pytest.mark.udm_only("parser emits no class_uid, so OCSF search never sees its events (NAN-5594)")
 def test_rejected_pull_credential_does_not_block_other_deploys(
     stack: Stack, nano: Nano, token_source, mark: str, timeline
 ) -> None:
@@ -222,6 +223,7 @@ ROUNDS = 8
 EVENTS_PER_ROUND = 5
 
 
+@pytest.mark.udm_only("parser emits no class_uid, so OCSF search never sees its events (NAN-5594)")
 def test_events_accepted_during_a_vector_reload_all_land(
     stack: Stack, nano: Nano, token_source, mark: str, timeline
 ) -> None:

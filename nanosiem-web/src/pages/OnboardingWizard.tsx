@@ -28,9 +28,10 @@ import {
   ArrowRight,
   SkipForward,
   Lock,
-  Sparkles,
   ArrowUpRight,
+  Flag,
 } from 'lucide-react';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import {
   useOnboardingProgress,
@@ -69,7 +70,7 @@ const STEPS: SetupStep[] = [
   {
     key: 'ai_setup',
     label: 'AI Setup',
-    icon: Sparkles,
+    icon: PivtIcon,
     description: 'Configure an LLM provider to power AI-assisted parsing, detection, and investigations.',
     href: '/settings/ai?tab=providers',
     statusKey: 'has_ai_provider',
@@ -288,7 +289,7 @@ function InstanceSetupWizard() {
       {/* HEADER CARD */}
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-3 flex items-center gap-2">
-          <Sparkles className="h-3 w-3 text-primary" />
+          <Flag className="h-3 w-3 text-primary" />
           <Eyebrow>Getting Started</Eyebrow>
         </div>
         <div className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] text-muted-foreground/70">

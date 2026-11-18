@@ -200,6 +200,9 @@ pub const CREDENTIAL_ROLLED_BACK: &str = "credential_rolled_back";
 /// Saved search sharing was updated
 pub const SAVED_SEARCH_SHARED: &str = "saved_search_shared";
 
+/// A saved search was created (NAN-5571: incl. from a pivt action)
+pub const SAVED_SEARCH_CREATED: &str = "saved_search_created";
+
 /// A single search-history entry was deleted (anti-forensics relevant)
 pub const SEARCH_HISTORY_DELETED: &str = "search_history_deleted";
 /// All of a user's search history was cleared (anti-forensics relevant)
@@ -434,6 +437,15 @@ pub const HUNT_SUPPRESSION_RECORDED: &str = "hunt_suppression_recorded";
 pub const HUNT_RULE_IDEA_SENT: &str = "hunt_rule_idea_sent";
 /// A rule idea was rejected.
 pub const HUNT_RULE_IDEA_REJECTED: &str = "hunt_rule_idea_rejected";
+/// NAN-5581: a hunt's agent detection passed the gate and went Live.
+pub const AGENT_DETECTION_CREATED: &str = "agent_detection_created";
+/// NAN-5581: an agent detection was paused, resumed or retired (by a person
+/// or its hunt), or auto-paused / retired by the server.
+pub const AGENT_DETECTION_STATE_CHANGED: &str = "agent_detection_state_changed";
+/// NAN-5581: agent detections were turned on or off for a hunt.
+pub const AGENT_DETECTIONS_TOGGLED: &str = "agent_detections_toggled";
+/// NAN-5581: the install's agent detection settings changed.
+pub const AGENT_DETECTION_SETTINGS_UPDATED: &str = "agent_detection_settings_updated";
 /// Recon ran: it read the whole estate's telemetry, sent aggregates to a model,
 /// and created draft hunts. Audited even though every draft it writes is inert,
 /// because "who pointed the profiler at production and when" is the question
@@ -482,6 +494,11 @@ pub const HUNT_REPORT_EXPORTED: &str = "hunt_report_exported";
 /// Device-local report branding changed. Only the sanitized logo hash and
 /// dimensions are recorded; the image itself never leaves the workstation.
 pub const HUNT_REPORT_BRANDING_UPDATED: &str = "hunt_report_branding_updated";
+/// The leader-only hunt retention job (NAN-5542) lapsed idle suppressions or
+/// hard-deleted aged hunt history. One event per pass that changed anything,
+/// with per-table counts and the windows in force — the only record of what a
+/// deleted row was once there for.
+pub const HUNT_RETENTION_RAN: &str = "hunt_retention_ran";
 
 // =============================================================================
 // Source Config Actions
@@ -1146,6 +1163,10 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     INGEST_TOKEN_REVOKED,
     INGEST_TOKEN_BOUND,
     INGEST_TOKEN_SETTINGS_UPDATED,
+    // Case settings (NAN-5607, release review P2-16): an admin save, rare. It
+    // can turn pivt case-action confirmation off, after which confirm-tier
+    // AI case actions apply without an analyst, so the record must survive.
+    CASE_SETTINGS_UPDATED,
     // Ingestion pause / resume (NAN-5217) — an admin action or a disk-pressure
     // transition, both rare. Durable: a lost record would hide why data
     // stopped arriving.
@@ -1272,6 +1293,17 @@ mod durable_classifier_tests {
             "scim_user_reactivated",
             "scim_user_deleted",
             "scim_group_membership_changed",
+            // NAN-5607 (release review P2-16): case settings saves. Not
+            // floodable by low-privilege users: PUT /api/settings/cases
+            // requires `settings:system` (admin) on an authenticated session or
+            // API key, and sits on the licensed surface. One row per committed
+            // settings write (validation failures return before the audit), so
+            // each durable row costs the caller a full settings UPDATE. There
+            // is no dedicated rate limiter (same footing as
+            // ingest_token_settings_updated / agentlane_enabled, also
+            // admin-only settings writes). Durable because the save can turn
+            // pivt case-action confirmation off.
+            "case_settings_updated",
         ];
         let mut actual: Vec<&str> = SECURITY_CRITICAL_ACTIONS.to_vec();
         expected.sort_unstable();

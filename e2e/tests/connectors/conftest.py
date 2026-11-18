@@ -16,7 +16,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from nano_e2e import feeds_live
+from nano_e2e import feeds_live, schema
 from nano_e2e.client import Nano
 from nano_e2e.fixtures_ui import page, ui, web  # noqa: F401 - fixtures
 from nano_e2e.stack import Stack
@@ -32,7 +32,7 @@ def live_runner(stack: Stack) -> None:
             "real-tenant connector feeds need the live runner: `scripts/e2e.sh run connectors` "
             f"(or `up --profile connector-live`); this stack runs profiles {profiles or 'none'}"
         )
-    if not os.environ.get("NANO_SCHEMA_PROFILE", "udm").startswith("ocsf"):
+    if not schema.is_ocsf():
         pytest.skip("the vendor parsers are OCSF: run on an ocsf stack (`run connectors` brings one up)")
 
 

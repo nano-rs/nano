@@ -384,6 +384,16 @@ typeid_prefix!(hunt_rule_idea, "ridea");
 // knowledge row is tenant-wide estate learning shared by every hunt, not a
 // child of the one that happened to learn it.
 typeid_prefix!(hunt_knowledge, "hknow");
+// NAN-5547 hunt pipeline: one task of a sweep's task graph.
+typeid_prefix!(hunt_task, "htask");
+// NAN-5548 hunt reviewer: one verdict row, and one analyst ruling.
+typeid_prefix!(hunt_lead_review, "lrev");
+typeid_prefix!(hunt_ruling, "hrul");
+// NAN-5560 hunt campaigns: one known actor and its trip conditions.
+typeid_prefix!(hunt_campaign, "hcmp");
+// NAN-5561 hunt evals: one blind replay, and one frozen finding in it.
+typeid_prefix!(hunt_eval, "heval");
+typeid_prefix!(hunt_eval_item, "hevi");
 // NAN-4914 connector pull feeds (`connector_feeds`, migration 294).
 typeid_prefix!(connector_feed, "cfeed");
 

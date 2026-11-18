@@ -122,6 +122,13 @@ export function folderOf(rule: Pick<DetectionRule, 'folder'>): string {
   return explicit || 'Uncategorized';
 }
 
+// Display labels for reserved folder ids (the stored value stays the id).
+// NAN-5581: hunts' agent detections live in `agent_detections`.
+const FOLDER_LABELS: Record<string, string> = { agent_detections: 'Agent detections' };
+export function folderLabel(name: string): string {
+  return FOLDER_LABELS[name.toLowerCase()] ?? name;
+}
+
 // Folder display icon kind — drives the icon in RuleRail.
 export type FolderKind = 'network' | 'identity' | 'endpoint' | 'cloud' | 'folder';
 export function folderKind(name: string): FolderKind {

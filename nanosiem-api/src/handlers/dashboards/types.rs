@@ -192,6 +192,11 @@ pub struct PanelQueryRequest {
     /// next caller. Absent/false serves from cache as before.
     #[serde(default)]
     pub bypass_cache: Option<bool>,
+    /// NAN-5612: the dataset the piped query runs on (`logs` default,
+    /// `signals`, `risk`, `spans`, `metrics`). A leading `dataset=<name>`
+    /// token in `query` selects it too, which is how stored panels carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
 }
 
 /// Response from a panel query

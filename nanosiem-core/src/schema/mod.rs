@@ -21,6 +21,7 @@ pub mod ocsf_predicates;
 pub mod ocsf_registry;
 mod profile;
 mod risk;
+mod signals;
 mod spans;
 mod types;
 mod udm;
@@ -35,6 +36,7 @@ pub use ocsf::{
 };
 pub use profile::SchemaProfile;
 pub use risk::RiskProfile;
+pub use signals::SignalsProfile;
 pub use spans::SpansProfile;
 pub(crate) use spans::canonicalize_span_field;
 pub use types::{
@@ -64,6 +66,24 @@ pub fn profile_for_id(id: SchemaId) -> Arc<dyn SchemaProfile> {
         SchemaId::Metrics => Arc::new(MetricsProfile::new()),
         // NAN-1798 P2: the derived accumulated-risk dataset, likewise per-query.
         SchemaId::Risk => Arc::new(RiskProfile::new()),
+        // NAN-5612: the derived detection-matches dataset, likewise per-query.
+        SchemaId::Signals => Arc::new(SignalsProfile::new()),
+    }
+}
+
+/// The field profile a query on `dataset` resolves against (NAN-5612): the
+/// tenant's logs profile for `Logs`, else the per-query dataset profile.
+pub fn profile_for_dataset(
+    dataset: crate::query::Dataset,
+    tenant: &Arc<dyn SchemaProfile>,
+) -> Arc<dyn SchemaProfile> {
+    use crate::query::Dataset;
+    match dataset {
+        Dataset::Logs => Arc::clone(tenant),
+        Dataset::Spans => profile_for_id(SchemaId::Spans),
+        Dataset::Metrics => profile_for_id(SchemaId::Metrics),
+        Dataset::Risk => profile_for_id(SchemaId::Risk),
+        Dataset::Signals => profile_for_id(SchemaId::Signals),
     }
 }
 
@@ -136,7 +156,7 @@ pub fn log_telemetry_profile_for(id: SchemaId) -> &'static str {
         SchemaId::Ocsf => "ocsf",
         // Spans, metrics, and risk are per-query datasets rather than tenant log
         // schemas. Keep this mapping total and aligned with `logs_table_for`.
-        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => "udm",
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk | SchemaId::Signals => "udm",
     }
 }
 
@@ -162,6 +182,9 @@ pub fn logs_table_for(id: SchemaId) -> &'static str {
         // NAN-1798 P2: the risk dataset is DERIVED from the findings stream in
         // the logs table; unreachable as a tenant schema, kept for totality.
         SchemaId::Risk => "logs",
+        // NAN-5612: the real-time half of the derived detections source;
+        // unreachable as a tenant schema, kept for totality.
+        SchemaId::Signals => "signals",
     }
 }
 
@@ -181,6 +204,8 @@ pub fn ingest_table_for(id: SchemaId) -> &'static str {
         // NAN-1798 P2: risk is derived (no ingest lane of its own); findings
         // ingest through the logs lane. Unreachable as a tenant schema.
         SchemaId::Risk => "logs",
+        // NAN-5612: derived; detections are written by the engine, never ingested.
+        SchemaId::Signals => "signals",
     }
 }
 
@@ -209,7 +234,7 @@ pub fn content_branch_for(id: SchemaId) -> &'static str {
         SchemaId::Ocsf => "main",
         // Spans / metrics / risk are per-query datasets, never a tenant log
         // schema; a deployment's profile is UDM or OCSF.
-        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => LEGACY_UDM_CONTENT_BRANCH,
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk | SchemaId::Signals => LEGACY_UDM_CONTENT_BRANCH,
     }
 }
 
@@ -320,7 +345,7 @@ pub fn repo_path_for(id: SchemaId, stored: &str) -> String {
     match id {
         // NAN-1555: spans/metrics have no parser/rule repo tree; passthrough like
         // UDM (and NAN-1798 P2: likewise the derived risk dataset).
-        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => stored.to_string(),
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk | SchemaId::Signals => stored.to_string(),
         SchemaId::Ocsf => {
             let base = stored.trim_end_matches('/');
             // NAN-2361: an EMPTY base has no directory to append `-ocsf` to.
@@ -420,7 +445,7 @@ pub fn selected_repo_path_for(id: SchemaId, stored_base: &str, selected: &str) -
     match id {
         // NAN-1555: spans/metrics have no repo tree; passthrough like UDM
         // (and NAN-1798 P2: likewise the derived risk dataset).
-        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => selected.to_string(),
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk | SchemaId::Signals => selected.to_string(),
         SchemaId::Ocsf => {
             let base = stored_base.trim_start_matches('/').trim_end_matches('/');
             let sel = selected.trim_start_matches('/').trim_end_matches('/');

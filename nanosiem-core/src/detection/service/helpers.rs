@@ -988,6 +988,10 @@ impl DetectionService {
                     dataset_profile = crate::schema::profile_for_id(crate::schema::SchemaId::Risk);
                     dataset_profile.as_ref()
                 }
+                crate::query::Dataset::Signals => {
+                    dataset_profile = crate::schema::profile_for_id(crate::schema::SchemaId::Signals);
+                    dataset_profile.as_ref()
+                }
             };
         match crate::query::validation::validate_query_fields_with_profile(&parsed, Some(profile))
             .into_iter()

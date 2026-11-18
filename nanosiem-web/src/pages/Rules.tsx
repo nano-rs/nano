@@ -34,6 +34,8 @@ import { SegmentedSev, FilterSelect, TacticChips } from '@/components/rules/Rule
 import { RuleRow, Chk } from '@/components/rules/RuleRow';
 import { BandHeader } from '@/components/rules/BandHeader';
 import { BulkActionBar } from '@/components/rules/BulkActionBar';
+import { definePivtAction, usePivtPage } from '@/contexts/pivt-page';
+import { MAX_CONTEXT_RULES, ruleLifecycleActions, ruleRow, ruleSummary } from './rules/rulesPivt';
 
 // Activity strip — 28 days of match counts from the per-rule stats endpoint.
 function buildActivity(stats: DailyStat[] | undefined, todayCount: number, days = 28): number[] {
@@ -258,6 +260,70 @@ export function Rules() {
 
   const firingCount = rules.filter((r) => bandOf(r, now) === 'firing').length;
   const needReview = silentCount;
+
+  // NAN-5592: what pivt knows and may do here (the rules on screen, the
+  // filters, the open or selected rule). Lifecycle actions run as the analyst,
+  // one confirmed server transition each.
+  const focusedRuleId = expandedId ?? (selected.size === 1 ? Array.from(selected)[0] : null);
+  const pivtActions = useMemo(
+    () => [
+      ...ruleLifecycleActions({
+        visible: () => filtered.map((v) => v.raw),
+        focused: () => focusedRuleId,
+        onChanged: refetch,
+      }),
+      definePivtAction<{ severity?: SevFilter; status?: StatusFilter; name?: string }>({
+        name: 'rules.filter',
+        description: 'Filter the rule list by severity, status and/or a name substring.',
+        params: {
+          severity: { type: 'enum', description: 'Rule severity', values: ['all', 'critical', 'high', 'medium', 'low', 'info'] },
+          status: { type: 'enum', description: 'Rule status', values: ['all', 'live', 'staging', 'disabled'] },
+          name: { type: 'string', description: 'Name contains (empty clears)', maxLength: 200 },
+        },
+        permission: 'detections:view',
+        mutates: false,
+        preview: (p) => ({
+          summary: 'Filter the list',
+          rows: [
+            ['severity', p.severity ?? sev],
+            ['status', p.status ?? status],
+            ['name', p.name ?? query],
+          ],
+        }),
+        run: async (p) => {
+          if (p.severity) setSev(p.severity);
+          if (p.status) setStatus(p.status);
+          if (p.name !== undefined) setQuery(p.name);
+          return { summary: 'Filtered' };
+        },
+      }),
+    ],
+    [filtered, focusedRuleId, refetch, sev, status, query],
+  );
+  const focusedRule = focusedRuleId ? rules.find((r) => r.id === focusedRuleId) : undefined;
+  usePivtPage({
+    icon: 'Shield',
+    getContext: () => ({
+      pageKey: 'rules',
+      title: 'Detection rules',
+      facts: [
+        { label: 'showing', value: `${filtered.length} of ${rules.length}` },
+        { label: 'filters', value: `${sev} · ${status} · ${mode} · ${tactic}${query ? ` · "${query}"` : ''}` },
+        { label: 'firing', value: String(firingCount) },
+        ...(focusedRule ? [{ label: 'open', value: focusedRule.name }] : []),
+      ],
+      entity: focusedRule ? { kind: 'rule', id: focusedRule.id, name: focusedRule.name } : undefined,
+      selection: selected.size > 0 ? { kind: 'rule', ids: Array.from(selected).slice(0, 20) } : undefined,
+      data: {
+        counts: { total: rules.length, showing: filtered.length, firing: firingCount, silent: silentCount },
+        filters: { severity: sev, status, schedule: mode, tactic, name: query },
+        open_rule: focusedRule ? { ...ruleSummary(focusedRule), query: focusedRule.query.slice(0, 500) } : null,
+        rules: filtered.slice(0, MAX_CONTEXT_RULES).map((v) => ruleRow(v.raw, v.today)),
+      },
+    }),
+    actions: pivtActions,
+    suggestions: ['Which rules are noisiest?', 'Which staging rules look ready to go live?'],
+  });
 
   return (
     <div

@@ -27,8 +27,9 @@ import {
   AlertCircle,
   Users,
   Undo2,
-  WandSparkles,
+  AlignLeft,
 } from 'lucide-react';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -572,7 +573,7 @@ export function EditorTopBar({
             )}
             {onFormat && (
               <DropdownMenuItem onClick={onFormat}>
-                <WandSparkles className="w-3.5 h-3.5" strokeWidth={1.75} />
+                <AlignLeft className="w-3.5 h-3.5" strokeWidth={1.75} />
                 Format query
               </DropdownMenuItem>
             )}
@@ -584,7 +585,7 @@ export function EditorTopBar({
             )}
             {onOpenTune && (
               <DropdownMenuItem onClick={onOpenTune}>
-                <WandSparkles className="w-3.5 h-3.5" strokeWidth={1.75} />
+                <PivtIcon className="w-3.5 h-3.5" strokeWidth={1.75} />
                 AI tune rule
               </DropdownMenuItem>
             )}

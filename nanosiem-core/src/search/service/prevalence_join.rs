@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::prevalence_processing::{rescue_transform_sql, PrevalenceRescue, RescueAttr};
+use super::prevalence_processing::{
+    rescue_index_sql, rescue_value_sql, PrevalenceRescue, RescueAttr,
+};
 use super::*;
 use crate::query::clickhouse_sql_gen::{ch_lower, ci_like, escape_like_pattern};
 use crate::sql_hygiene::escape_sql_string;
@@ -62,12 +64,13 @@ impl SearchService {
 
         // NAN-1705 (D4b): before building the pushdown SQL, re-resolve the
         // window's dict-blind artifacts (negative-cached misses / stale window
-        // masks) against the real-time summary. The rescued sets extend the
-        // filter predicates with literal IN-lists; an empty rescue (the steady
-        // state) leaves the SQL byte-identical to the rescue-free build. The
+        // masks) against the real-time summary. The rescued sets override the
+        // dict projections in-SQL (NAN-5565: keys once, every artifact); an
+        // empty rescue (the steady state) leaves the SQL byte-identical to the
+        // rescue-free build. The
         // probe fails OPEN to an empty rescue — a probe error must degrade to
         // today's behavior, never fail the search.
-        let rescue = self
+        let mut rescue = self
             .compute_prevalence_rescue(
                 query,
                 prevalence_commands,
@@ -80,20 +83,44 @@ impl SearchService {
         // JOIN) is now the shared sync `generate_prevalence_pushdown_sql`, so the
         // explain path renders byte-identical SQL. Only the async rarity_threshold
         // fetch above stays here (and the rescue probe, which explain skips — its
-        // effect is an additive IN-list in the filter predicates).
-        let (sql, num_commands_pushed) = self.generate_prevalence_pushdown_sql(
-            query,
-            prevalence_commands,
-            post_prevalence_commands,
-            time_range,
-            rarity_threshold,
-            &rescue,
+        // shape and bounds are spelled out in the explain note instead).
+        // NAN-5565: the rendered text must fit the executor's max_query_size
+        // ceiling; past it the least-rare rescued artifacts are left out.
+        let (sql, num_commands_pushed, aggregation) = render_within_query_size_ceiling(
+            &mut rescue,
+            crate::search::execution::clickhouse_executor::MAX_QUERY_SIZE_CEILING,
+            |rescue| {
+                self.generate_prevalence_pushdown_sql_with_shape(
+                    query,
+                    prevalence_commands,
+                    post_prevalence_commands,
+                    time_range,
+                    rarity_threshold,
+                    rescue,
+                )
+            },
         )?;
+        // NAN-5565: anything left out (key-byte cap or query-size ceiling) is
+        // loud: a WARN, a metric, a PARTIAL note that the scheduler records on
+        // the rule run, and a response warning (below) on the search.
+        report_partial_rescue(&rescue);
 
         tracing::debug!(
             "Generated JOIN-based prevalence SQL (length: {} chars)",
             sql.len()
         );
+        // NAN-5565: a rescued query's size is the one number that says how
+        // close it runs to ClickHouse's max_query_size; log it with the set.
+        if !rescue.is_empty() {
+            tracing::info!(
+                sql_bytes = sql.len(),
+                lifted_max_query_size = ?crate::search::execution::clickhouse_executor::max_query_size_for(sql.len()),
+                rescued_hashes = rescue.hashes.len(),
+                rescued_domains = rescue.domains.len(),
+                rescued_ips = rescue.ips.len(),
+                "Prevalence pushdown SQL carries a dict-blind rescue"
+            );
+        }
         // Log whether a WHERE clause was generated (detail at debug level)
         if let Some(where_pos) = sql.to_ascii_uppercase().rfind("\nWHERE ") {
             let where_clause = &sql[where_pos..sql.len().min(where_pos + 500)];
@@ -114,8 +141,11 @@ impl SearchService {
                 .take(num_commands_pushed)
                 .any(command_groups_rows);
         let sql_start = Instant::now();
+        // NAN-5565: generated SQL: the executor lifts `max_query_size` when the
+        // rescue needs it and takes the aggregation decision from the
+        // rescue-free rendering.
         let (mut results, total_count) = self
-            .execute_clickhouse_sql(&sql, limit, offset, grouped_output)
+            .execute_generated_clickhouse_sql(&sql, aggregation, limit, offset, grouped_output)
             .await?;
         tracing::info!(
             duration_ms = sql_start.elapsed().as_millis() as u64,
@@ -327,6 +357,17 @@ impl SearchService {
                 impact: w.impact.clone(),
             })
             .collect();
+
+        // NAN-5565: a rescue cut at the key-byte cap left artifacts out.
+        if rescue.dropped > 0 {
+            warnings_output.push(QueryWarningOutput {
+                severity: "warning".to_string(),
+                code: "PREVALENCE_RESCUE_PARTIAL".to_string(),
+                message: prevalence_rescue_partial_message(rescue.dropped),
+                suggestion: Some("Narrow the time range or the search so fewer brand-new artifacts need re-checking.".to_string()),
+                impact: Some("Results can miss rare artifacts the prevalence dictionaries have not loaded yet.".to_string()),
+            });
+        }
 
         // NAN-806: surface the implicit auto-sort decision here too — the
         // prevalence-join path bypasses the standard merge in `search()`.
@@ -664,6 +705,11 @@ impl SearchService {
                 .await;
         }
 
+        // NAN-5565: bound the inlined keys. What is left out is counted in
+        // `rescue.dropped` and reported loudly by the caller
+        // (`report_partial_rescue`).
+        rescue.cap_key_bytes(super::prevalence_processing::PREVALENCE_RESCUE_KEY_BYTE_CAP);
+
         rescue
     }
 
@@ -723,7 +769,8 @@ impl SearchService {
     /// (`SearchService::explain`) renders the SAME SQL that actually executes. Kept
     /// SYNC — the async dependencies (`rarity_threshold`, and the NAN-1705 rescue
     /// probe result) are passed in by the caller; explain passes an empty rescue
-    /// (the rescue is an additive literal IN-list, not a shape change). Returns
+    /// and appends `prevalence_rescue_explain_note` (the rescue adds per-entity
+    /// index columns and value arrays). Returns
     /// `(sql, num_commands_pushed_to_sql)`.
     pub(crate) fn generate_prevalence_pushdown_sql(
         &self,
@@ -734,18 +781,58 @@ impl SearchService {
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
     ) -> Result<(String, usize), SearchError> {
-        let (sql, pushed) = self.generate_prevalence_pushdown_sql_unobserved(
+        self.generate_prevalence_pushdown_sql_with_shape(
             query,
             prevalence_commands,
             post_prevalence_commands,
             time_range,
             rarity_threshold,
             rescue,
-        )?;
+        )
+        .map(|(sql, pushed, _)| (sql, pushed))
+    }
+
+    /// [`Self::generate_prevalence_pushdown_sql`] plus whether the SQL is an
+    /// aggregation for the executor's paginated paths.
+    ///
+    /// NAN-5565: both the tripwire and the aggregation decision look at the
+    /// RESCUE-FREE rendering. The rescue only adds escaped, event-derived
+    /// literals (keys) and integers, so the shape is identical; but a key such
+    /// as `sum(` would flip text sniffing into the full-window `count(*) OVER
+    /// ()` path, and a large rescue would push the text past the tripwire's
+    /// size limit, so it would no longer be observed at all.
+    pub(crate) fn generate_prevalence_pushdown_sql_with_shape(
+        &self,
+        query: &Query,
+        prevalence_commands: &[PrevalenceCommandInfo],
+        post_prevalence_commands: &[Command],
+        time_range: &TimeRange,
+        rarity_threshold: u64,
+        rescue: &PrevalenceRescue,
+    ) -> Result<(String, usize, bool), SearchError> {
+        let render = |rescue: &PrevalenceRescue| {
+            self.generate_prevalence_pushdown_sql_unobserved(
+                query,
+                prevalence_commands,
+                post_prevalence_commands,
+                time_range,
+                rarity_threshold,
+                rescue,
+            )
+        };
+        let (sql, pushed) = render(rescue)?;
+        let rescue_free = if rescue.is_empty() {
+            None
+        } else {
+            Some(render(&PrevalenceRescue::default())?.0)
+        };
+        let shape_sql = rescue_free.as_deref().unwrap_or(&sql);
         // Security review 2026-11-08 (layer 2): this template is a second SQL
         // generator, so its output gets the same log-only tripwire.
-        crate::query::generated_sql_tripwire::observe(&sql, "prevalence_pushdown");
-        Ok((sql, pushed))
+        crate::query::generated_sql_tripwire::observe(shape_sql, "prevalence_pushdown");
+        let aggregation =
+            crate::search::execution::clickhouse_executor::is_aggregation_query(shape_sql);
+        Ok((sql, pushed, aggregation))
     }
 
     fn generate_prevalence_pushdown_sql_unobserved(
@@ -865,6 +952,7 @@ impl SearchService {
                             &assignment.expression,
                             true,
                             &eval_field_names,
+                            rarity_threshold,
                         )?;
                     eval_expressions.push((field_name.clone(), expr_sql));
                     eval_field_names.insert(field_name);
@@ -1016,25 +1104,34 @@ impl SearchService {
             )
         };
 
+
         // NAN-1705 (D4b): build the domain/hash/IP base_logs projection aliases,
-        // each `rescue_transform_sql`-wrapped so a rescued dict-blind key
-        // resolves to its FRESH summary value IN ClickHouse. Because the alias
-        // itself now carries the truth, the pushed predicate, the decoration
-        // CASEs below, AND any downstream `| where host_count < N` all see the
+        // each `rescue_value_sql`-wrapped so a rescued dict-blind key resolves
+        // to its FRESH summary value IN ClickHouse. Because the alias itself
+        // now carries the truth, the pushed predicate, the decoration CASEs
+        // below, AND any downstream `| where host_count < N` all see the
         // rescued host_count — closing the "downstream reference re-reads 9999"
         // gap without an OR-branch or post-query patch. Empty rescue →
-        // `rescue_transform_sql` returns the base dict expression verbatim, so
-        // the whole projection (and the whole query) stays byte-identical to the
-        // pre-NAN-1705 form. IP is rescued ONLY for the `enrich=true | where
-        // host_count < N` form (residual #2) — its `rescue.ips` is empty
+        // `rescue_value_sql` returns the base dict expression verbatim and no
+        // index column is emitted, so the whole query stays byte-identical to
+        // the pre-NAN-1705 form. IP is rescued ONLY for the `enrich=true |
+        // where host_count < N` form (residual #2) — its `rescue.ips` is empty
         // otherwise, so the IP projection is byte-identical for the filter form.
+        //
+        // NAN-5565: each entity's rescued keys are written ONCE, as a
+        // `transform(key, [...], range(1, n + 1), 0)` index column in
+        // `logs_with_keys` (`_dp/_ip/_hp_rescue_idx`); the four projections read
+        // typed value arrays by that index. The index columns are dropped from
+        // `base_logs` with `* EXCEPT` so they never reach the output rows. No
+        // artifact is dropped for size: the executor lifts `max_query_size`
+        // for a query whose text needs it (`ClickHouseExecutor::sized_query`).
         //
         // Byte-for-byte reproduction of the historical inline expressions (dict
         // key differs: domain/ip use `ifNull(_x_lookup, '')`, hash uses
-        // `_hash_lookup` bare). The transform match-key always `ifNull(..)`s so
+        // `_hash_lookup` bare). The rescue match-key always `ifNull(..)`s so
         // an empty/NULL lookup can never collide with a rescued (non-empty) key.
         let build_projection =
-            |dict: &str, dict_key: &str, xform_key: &str, rescued: &[_]| {
+            |dict: &str, dict_key: &str, idx_alias: &str, rescued: &[_]| {
                 let host_count_base = format!(
                     "if(dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6)) >= {w},\n           dictGetOrDefault('{dict}', 'host_count', {dict_key}, toUInt16(9999)),\n           toUInt16(9999))",
                     w = window_cutoff_sql,
@@ -1049,12 +1146,12 @@ impl SearchService {
                     "dictGetOrDefault('{dict}', 'total_occurrences', {dict_key}, toUInt64(0))"
                 );
                 (
-                    rescue_transform_sql(&host_count_base, xform_key, rescued, RescueAttr::HostCount),
-                    rescue_transform_sql(&first_seen_base, xform_key, rescued, RescueAttr::FirstSeen),
-                    rescue_transform_sql(&last_seen_base, xform_key, rescued, RescueAttr::LastSeen),
-                    rescue_transform_sql(
+                    rescue_value_sql(&host_count_base, idx_alias, rescued, RescueAttr::HostCount),
+                    rescue_value_sql(&first_seen_base, idx_alias, rescued, RescueAttr::FirstSeen),
+                    rescue_value_sql(&last_seen_base, idx_alias, rescued, RescueAttr::LastSeen),
+                    rescue_value_sql(
                         &total_occ_base,
-                        xform_key,
+                        idx_alias,
                         rescued,
                         RescueAttr::TotalOccurrences,
                     ),
@@ -1068,7 +1165,7 @@ impl SearchService {
         ) = build_projection(
             &domain_dict,
             "ifNull(_domain_lookup, '')",
-            "ifNull(_domain_lookup, '')",
+            "_dp_rescue_idx",
             &rescue.domains,
         );
         let (
@@ -1076,23 +1173,42 @@ impl SearchService {
             hp_first_seen_expr,
             hp_last_seen_expr,
             hp_total_occurrences_expr,
-        ) = build_projection(
-            &hash_dict,
-            "_hash_lookup",
-            "ifNull(_hash_lookup, '')",
-            &rescue.hashes,
-        );
+        ) = build_projection(&hash_dict, "_hash_lookup", "_hp_rescue_idx", &rescue.hashes);
         let (
             ip_host_count_expr,
             ip_first_seen_expr,
             ip_last_seen_expr,
             ip_total_occurrences_expr,
-        ) = build_projection(
-            &ip_dict,
-            "ifNull(_ip_lookup, '')",
-            "ifNull(_ip_lookup, '')",
-            &rescue.ips,
-        );
+        ) = build_projection(&ip_dict, "ifNull(_ip_lookup, '')", "_ip_rescue_idx", &rescue.ips);
+
+        // NAN-5565: the once-per-entity rescue index columns (empty rescue →
+        // none, and `base_logs` keeps its plain `SELECT *`).
+        let rescue_index_cols: Vec<(String, &str)> = [
+            ("ifNull(_domain_lookup, '')", "_dp_rescue_idx", &rescue.domains),
+            ("ifNull(_ip_lookup, '')", "_ip_rescue_idx", &rescue.ips),
+            ("ifNull(_hash_lookup, '')", "_hp_rescue_idx", &rescue.hashes),
+        ]
+        .into_iter()
+        .filter_map(|(match_key, alias, rescued)| {
+            rescue_index_sql(match_key, rescued).map(|sql| (sql, alias))
+        })
+        .collect();
+        let rescue_index_columns: String = rescue_index_cols
+            .iter()
+            .map(|(sql, alias)| format!(",\n        {sql} AS {alias}"))
+            .collect();
+        let base_logs_star = if rescue_index_cols.is_empty() {
+            "*".to_string()
+        } else {
+            format!(
+                "* EXCEPT ({})",
+                rescue_index_cols
+                    .iter()
+                    .map(|(_, alias)| *alias)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
 
         // Build the final SQL using dictGet() against precomputed per-window prevalence dicts.
         // NAN-362: Replaces the old CTE + LEFT JOIN path which aggregated the entire
@@ -1123,11 +1239,11 @@ logs_with_keys AS (
     SELECT *,
         {domain_lookup_expr} AS _domain_lookup,
         {ip_lookup_expr} AS _ip_lookup,
-        {hash_lookup_expr} AS _hash_lookup
+        {hash_lookup_expr} AS _hash_lookup{rescue_index_columns}
     FROM raw_logs
 ),
 base_logs AS (
-    SELECT *,
+    SELECT {base_logs_star},
         {dp_host_count_expr} AS _dp_host_count,
         {dp_first_seen_expr} AS _dp_first_seen,
         {dp_last_seen_expr} AS _dp_last_seen,
@@ -1208,6 +1324,8 @@ ORDER BY l.timestamp DESC"#,
             domain_lookup_expr = domain_lookup_expr,
             ip_lookup_expr = ip_lookup_expr,
             hash_lookup_expr = hash_lookup_expr,
+            rescue_index_columns = rescue_index_columns,
+            base_logs_star = base_logs_star,
             domain_artifact_expr = domain_artifact_expr,
             ip_artifact_expr = ip_artifact_expr,
             hash_artifact_expr = hash_artifact_expr,
@@ -1240,7 +1358,11 @@ ORDER BY l.timestamp DESC"#,
             let mut current_source = "prevalence_results".to_string();
 
             for (i, cmd) in sql_pushable.iter().enumerate() {
-                let stage_name = format!("stage_{}", i);
+                // NAN-5628: not `stage_<i>`: the base pipeline nested in
+                // `raw_logs` carries its own `WITH stage_0, …`, and reusing
+                // those names here made ClickHouse resolve these outer stages
+                // against the inner CTEs (Code 60 UNKNOWN_TABLE).
+                let stage_name = format!("pv_stage_{}", i);
                 let cmd_sql = self
                     .ch_sql_generator
                     .generate_command_sql(&current_source, cmd)
@@ -1290,8 +1412,15 @@ ORDER BY l.timestamp DESC"#,
         expr: &crate::query::EvalExpression,
         in_prevalence_context: bool,
         eval_field_names: &std::collections::HashSet<String>,
+        rarity_threshold: u64,
     ) -> Result<String, SearchError> {
-        prevalence_eval_sql(&self.ch_sql_generator, expr, in_prevalence_context, eval_field_names)
+        prevalence_eval_sql(
+            &self.ch_sql_generator,
+            expr,
+            in_prevalence_context,
+            eval_field_names,
+            rarity_threshold,
+        )
     }
 }
 
@@ -1534,6 +1663,8 @@ pub(crate) fn prevalence_condition_sql(
                         "host_count" => ("CASE WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) >= 9999 THEN NULL ELSE least(_dp_host_count, _ip_host_count, _hp_host_count) END".into(), true),
                         "first_seen" | "prevalence_first_seen" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_first_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END".into(), true),
                         "last_seen" | "prevalence_last_seen" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_last_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END".into(), true),
+                        // NAN-5568: same as the plain FieldFilter arm.
+                        "total_occurrences" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_total_occurrences WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_total_occurrences WHEN _hp_host_count < 9999 THEN _hp_total_occurrences ELSE NULL END".into(), true),
                         other => (crate::sql_hygiene::qualified_column("l", other).into(), false),
                     }
                     };
@@ -1560,7 +1691,15 @@ pub(crate) fn prevalence_condition_sql(
                         // Eval-created field reference: the quoted alias (NAN-5009).
                         crate::sql_hygiene::quote_identifier(name)
                     }
-                    _ => prevalence_eval_sql(gen, function, false, &std::collections::HashSet::new())?,
+                    // NAN-5568: the function side resolves decorated
+                    // prevalence fields too (`host_count`, `first_seen`, …).
+                    _ => prevalence_eval_sql(
+                        gen,
+                        function,
+                        true,
+                        eval_field_names,
+                        rarity_threshold,
+                    )?,
                 };
 
                 if needs_null_check {
@@ -1708,14 +1847,14 @@ pub(crate) fn prevalence_condition_sql(
             // ClickHouse: the rewritten predicate parses and selects the
             // rarest artifact's timestamps.
             SearchExpr::EvalPredicate(expression) => {
-                prevalence_eval_sql(gen, expression, true, eval_field_names)
+                prevalence_eval_sql(gen, expression, true, eval_field_names, rarity_threshold)
             }
             // NAN-4943: a standalone boolean function (`like(f, "…")`,
             // `isnull(f)`, `cidrmatch(…)`) lowers through the same typed eval
             // path as the canonical generator; it failed the whole query with
             // "Unsupported expression type" after `| prevalence`.
             SearchExpr::BooleanFunction(function) => {
-                prevalence_eval_sql(gen, function, true, eval_field_names)
+                prevalence_eval_sql(gen, function, true, eval_field_names, rarity_threshold)
             }
             _ => Err(SearchError::SqlGenError(format!(
                 "Unsupported expression type: {:?}",
@@ -1752,10 +1891,8 @@ fn prevalence_eval_sql(
         expr: &crate::query::EvalExpression,
         in_prevalence_context: bool,
         eval_field_names: &std::collections::HashSet<String>,
+        rarity_threshold: u64,
     ) -> Result<String, SearchError> {
-        const FIRST_SEEN: &str = "(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_first_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END)";
-        const LAST_SEEN: &str = "(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_last_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END)";
-
         let override_field = |field: &str, _numeric_context: bool| {
             if eval_field_names.contains(field) {
                 return Some(crate::query::clickhouse_sql_gen::escape_identifier(field));
@@ -1763,11 +1900,7 @@ fn prevalence_eval_sql(
             if !in_prevalence_context {
                 return None;
             }
-            match field {
-                "first_seen" | "prevalence_first_seen" => Some(FIRST_SEEN.to_string()),
-                "last_seen" | "prevalence_last_seen" => Some(LAST_SEEN.to_string()),
-                _ => None,
-            }
+            decorated_prevalence_field_sql(field, rarity_threshold)
         };
 
         crate::query::clickhouse_sql_gen::typed_eval_expression_to_sql_with_field_override(
@@ -1778,3 +1911,104 @@ fn prevalence_eval_sql(
         .map_err(|error| SearchError::SqlGenError(error.to_string()))
     }
 
+/// NAN-5568: the SQL for a decorated `| prevalence` output field (host_count,
+/// first/last_seen, total_occurrences, is_rare, prevalence_score,
+/// prevalence_type, prevalence_artifact) when an eval
+/// or a `where` expression after `| prevalence` reads it.
+///
+/// These fields are SELECT aliases of the pushdown (`host_count`,
+/// `prevalence_first_seen`, …), not columns of the scanned table, so normal
+/// schema resolution sent them to the unmapped/`ext` fallback
+/// (`unmapped."host_count"` on OCSF), which is always empty: `eval
+/// very_rare=(host_count < 3)` was never true. Each one resolves to the same
+/// rarest-wins expression the SELECT and the `where` field filter use.
+fn decorated_prevalence_field_sql(field: &str, rarity_threshold: u64) -> Option<String> {
+    const LEAST: &str = "least(_dp_host_count, _ip_host_count, _hp_host_count)";
+    let rarest = |suffix: &str| {
+        format!(
+            "(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_{suffix} WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_{suffix} WHEN _hp_host_count < 9999 THEN _hp_{suffix} ELSE NULL END)"
+        )
+    };
+    // The winning entity's value, as the SELECT's prevalence_type /
+    // prevalence_artifact CASEs pick it.
+    let rarest_pick = |domain: &str, ip: &str, hash: &str| {
+        format!(
+            "(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN {domain} WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN {ip} WHEN _hp_host_count < 9999 THEN {hash} ELSE NULL END)"
+        )
+    };
+    let rt = rarity_threshold.max(1);
+    Some(match field {
+        "first_seen" | "prevalence_first_seen" => rarest("first_seen"),
+        "last_seen" | "prevalence_last_seen" => rarest("last_seen"),
+        "total_occurrences" => rarest("total_occurrences"),
+        "host_count" => format!("(CASE WHEN {LEAST} >= 9999 THEN NULL ELSE {LEAST} END)"),
+        "is_rare" => format!("(CASE WHEN {LEAST} < 9999 THEN {LEAST} < {rt} ELSE false END)"),
+        "prevalence_score" => format!(
+            "(CASE WHEN {m} >= 9999 THEN 0 WHEN {m} = 0 THEN 0 WHEN {m} < {t} THEN toUInt8(round(least(toFloat64({m}) / {t} * 20, 20))) WHEN {m} < {t} * 2 THEN toUInt8(round(20 + (toFloat64({m}) - {t}) / {t} * 30)) WHEN {m} < {t} * 10 THEN toUInt8(round(50 + (toFloat64({m}) - {t} * 2) / ({t} * 8) * 30)) ELSE toUInt8(round(80 + least((toFloat64({m}) - {t} * 10) / ({t} * 90) * 20, 20))) END)",
+            m = LEAST,
+            t = rt,
+        ),
+        "prevalence_type" => rarest_pick("'domain'", "'ip'", "'hash'"),
+        "prevalence_artifact" => rarest_pick("l._domain_lookup", "l._ip_lookup", "l._hash_lookup"),
+        _ => return None,
+    })
+}
+
+/// NAN-5565: what a run whose rescue was cut at the key-byte cap reports.
+pub(crate) fn prevalence_rescue_partial_message(dropped: usize) -> String {
+    format!(
+        "prevalence rescue left out {dropped} dict-blind artifact(s) (the least rare) to stay within the {} MiB inlined-key cap / {} MiB query-size ceiling; they were not evaluated",
+        super::prevalence_processing::PREVALENCE_RESCUE_KEY_BYTE_CAP / (1024 * 1024),
+        crate::search::execution::clickhouse_executor::MAX_QUERY_SIZE_CEILING / (1024 * 1024),
+    )
+}
+
+/// NAN-5565: render the pushdown so its text fits `ceiling` (the executor's
+/// `max_query_size` ceiling, less the headroom it adds). While it does not,
+/// halve the rescue's key bytes, dropping the least-rare artifacts (counted in
+/// `rescue.dropped`), and render again. A rescue-free query that still does
+/// not fit is returned as is: ClickHouse refuses it with code 62, which is
+/// classified as a size failure, so it fails loudly rather than silently.
+pub(crate) fn render_within_query_size_ceiling<F>(
+    rescue: &mut PrevalenceRescue,
+    ceiling: usize,
+    mut render: F,
+) -> Result<(String, usize, bool), SearchError>
+where
+    F: FnMut(&PrevalenceRescue) -> Result<(String, usize, bool), SearchError>,
+{
+    loop {
+        let rendered = render(rescue)?;
+        let fits = rendered.0.len()
+            + crate::search::execution::clickhouse_executor::MAX_QUERY_SIZE_HEADROOM
+            <= ceiling;
+        if fits || rescue.is_empty() {
+            return Ok(rendered);
+        }
+        let target = rescue.key_bytes() / 2;
+        if rescue.cap_key_bytes(target) == 0 {
+            // Nothing left to drop below the target: drop everything.
+            rescue.dropped += rescue.len();
+            rescue.hashes.clear();
+            rescue.domains.clear();
+            rescue.ips.clear();
+        }
+    }
+}
+
+/// NAN-5565: make a rescue that left artifacts out loud: WARN, metric, and a
+/// PARTIAL note the detection scheduler records on the rule run. (The search
+/// response carries a `PREVALENCE_RESCUE_PARTIAL` warning too.)
+pub(crate) fn report_partial_rescue(rescue: &PrevalenceRescue) {
+    if rescue.dropped == 0 {
+        return;
+    }
+    tracing::warn!(
+        dropped = rescue.dropped,
+        kept = rescue.len(),
+        "Prevalence rescue left out its least-rare dict-blind artifacts; this run evaluated only part of its input (PARTIAL)"
+    );
+    metrics::counter!("nanosiem_prevalence_rescue_dropped_artifacts_total")
+        .increment(rescue.dropped as u64);
+    crate::search::partial_run::note(prevalence_rescue_partial_message(rescue.dropped));
+}

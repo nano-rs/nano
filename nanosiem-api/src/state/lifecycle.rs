@@ -600,6 +600,11 @@ impl AppState {
         {
             handles.push(self.start_hunt_scheduler());
             tracing::info!("Hunt scheduler started (leader-only, 60s tick)");
+            handles.push(self.start_hunt_retention());
+            tracing::info!("Hunt retention job started (leader-only)");
+            // NAN-5561: the weekly hunt evals (leader-only, fenced).
+            handles.push(self.start_hunt_eval_scheduler());
+            tracing::info!("Hunt eval scheduler started (leader-only)");
         }
 
         // Cleanup tasks (leader-only to avoid duplicate work across nodes).

@@ -63,6 +63,7 @@ import type {
 } from '@/lib/api';
 
 import { openPivtPanel } from '@/enterprise/components/pivt/commands/router';
+import { usePivtPage } from '@/contexts/pivt-page';
 import { CreateDashboardDialog } from '@/components/dashboard/CreateDashboardDialog';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { WireframePreview, synthesizePreview } from '@/components/dashboard/WireframePreview';
@@ -518,6 +519,32 @@ export function Dashboards() {
     my: myQuery.data?.length ?? 0,
     all: allQuery.data?.length ?? 0,
   }), [myQuery.data, allQuery.data]);
+
+  // NAN-5595: pivt knows which dashboards the analyst is browsing (context
+  // only; opening one is a link, generating one is `@dashboard`).
+  usePivtPage({
+    icon: 'Grid',
+    getContext: () => ({
+      pageKey: 'dashboards',
+      title: 'Dashboards',
+      facts: [
+        { label: 'showing', value: `${filteredDashboards.length} (${dashboardFilter === 'my' ? 'mine' : 'all'})` },
+        ...(searchQuery.trim() ? [{ label: 'search', value: searchQuery.trim() }] : []),
+      ],
+      data: {
+        counts,
+        dashboards: filteredDashboards.slice(0, 20).map((d) => ({
+          id: d.id,
+          name: d.name.slice(0, 120),
+          panels: d.panel_count,
+          visibility: d.visibility,
+          owner: d.owner_name ?? null,
+          updated_at: d.updated_at,
+        })),
+      },
+    }),
+    suggestions: ['Which dashboard covers authentication?'],
+  });
 
   return (
     <div className="flex-1 overflow-auto p-4 flex flex-col gap-4">

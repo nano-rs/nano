@@ -16,19 +16,19 @@
  * timestamps, and rule names — it's part of the visual language.
  */
 
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useMemo, type ComponentType } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   ArrowRight,
   ArrowUpRight,
   ChevronRight,
-  Sparkles,
   Clock,
   Edit3,
   LineChart,
   GitBranch,
   BookOpen,
   ActivitySquare,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
@@ -577,10 +577,15 @@ function MyWorkColumn() {
 
 /** Map an audit log entry to a fleet-change visual kind. Best-effort pattern matching
  *  against source/action; extend as new event types land in the audit schema. */
-function fleetKindFor(a: AuditLogEntry): { icon: typeof Sparkles; tone: string } {
+function fleetKindFor(a: AuditLogEntry): { icon: ComponentType<{ className?: string }>; tone: string } {
   const action = (a.action ?? '').toLowerCase();
   const source = (a.source ?? '').toLowerCase();
-  if (source === 'detection' && action.includes('tuning')) return { icon: Sparkles, tone: 'text-primary' };
+  if (source === 'detection' && action.includes('tuning')) {
+    // AI proposes and triggers tunings (pivt mark); a human reverting or
+    // promoting one is an ordinary rule change.
+    const aiTuning = action.includes('proposal') || action.includes('triggered') || action.includes('auto');
+    return aiTuning ? { icon: PivtIcon, tone: 'text-primary' } : { icon: SlidersHorizontal, tone: 'text-muted-foreground' };
+  }
   if (action.includes('silenc') || action.includes('paus')) return { icon: Clock, tone: 'text-[var(--warning)]' };
   if (action.includes('edit') || action.includes('update')) return { icon: Edit3, tone: 'text-muted-foreground' };
   if (source === 'coverage' || action.includes('coverage')) return { icon: LineChart, tone: 'text-[var(--success)]' };

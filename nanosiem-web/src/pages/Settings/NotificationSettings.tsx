@@ -10,7 +10,7 @@
  * borders, no shadows.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -51,20 +51,11 @@ import type {
   NotificationConfig,
 } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
+import { eventTypeLabel, eventTypeOptions, type WebhookEventType } from '@/lib/webhook-event-types';
 import { formatUTC } from '@/lib/date-utils';
 
 const SEVERITY_OPTIONS = ['critical', 'high', 'medium', 'low', 'informational'];
 
-const EVENT_TYPE_OPTIONS: { value: string; label: string }[] = [
-  { value: 'siem_alert', label: 'SIEM alerts' },
-  { value: 'obs_alert', label: 'Observability alerts' },
-  { value: 'case', label: 'Cases' },
-  { value: 'report', label: 'Scheduled reports' },
-  { value: 'system_health', label: 'System health' },
-];
-const EVENT_TYPE_LABEL: Record<string, string> = Object.fromEntries(
-  EVENT_TYPE_OPTIONS.map(o => [o.value, o.label]),
-);
 const DEFAULT_EVENT_TYPES = ['siem_alert', 'obs_alert'];
 const HEALTH_CATEGORY_OPTIONS = [
   'integration', 'enrichment', 'log_source', 'ingestion', 'parser',
@@ -185,16 +176,21 @@ function NotificationSettings() {
   const [formHealthCategories, setFormHealthCategories] = useState<string[]>([]);
   const [formHealthResources, setFormHealthResources] = useState('');
   const [formEnabled, setFormEnabled] = useState(true);
+  // Event types come from the server (built-ins + registered extensions); the built-ins are the fallback.
+  const [serverEventTypes, setServerEventTypes] = useState<WebhookEventType[] | null>(null);
+  const eventTypeChoices = useMemo(() => eventTypeOptions(serverEventTypes), [serverEventTypes]);
 
   const load = useCallback(async () => {
     try {
       setLoading(true);
-      const [data, cfg] = await Promise.all([
+      const [data, cfg, types] = await Promise.all([
         api.webhooks.listWebhooks(),
         api.webhooks.getNotificationConfig().catch(() => null),
+        api.webhooks.listEventTypes().catch(() => null),
       ]);
       setChannels(data);
       setConfig(cfg);
+      setServerEventTypes(types);
     } catch {
       toast({ title: 'Error', description: 'Failed to load channels', variant: 'destructive' });
     } finally {
@@ -457,7 +453,7 @@ function NotificationSettings() {
           <h1 className="text-[18px] font-semibold tracking-tight text-foreground">Notifications</h1>
           <p className="text-[11.5px] text-muted-foreground mt-0.5">Route alerts to Slack, Teams, PagerDuty, or a signed JSON endpoint</p>
         </div>
-        <Button onClick={openCreate} size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5">
+        <Button onClick={openCreate} size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" data-testid="add-channel">
           <Plus className="w-3 h-3" />
           Add channel
         </Button>
@@ -580,7 +576,7 @@ function NotificationSettings() {
                       <div className="flex flex-wrap gap-1">
                         {c.event_types.map(t => (
                           <span key={t} className="text-[11px] text-muted-foreground border border-border rounded px-1.5 py-0.5">
-                            {EVENT_TYPE_LABEL[t] || t}
+                            {eventTypeLabel(t)}
                           </span>
                         ))}
                       </div>
@@ -783,10 +779,12 @@ function NotificationSettings() {
                 Event types <span className="text-muted-foreground/70 font-normal ml-1">(at least one)</span>
               </label>
               <div className="flex flex-wrap gap-1.5">
-                {EVENT_TYPE_OPTIONS.map(({ value, label }) => (
+                {eventTypeChoices.map(({ value, label, extension }) => (
                   <button
                     key={value}
                     type="button"
+                    title={extension ? `Registered by this install (${value})` : value}
+                    data-testid={`event-type-${value}`}
                     onClick={() => toggleEventType(value)}
                     className={cn(
                       'h-6 rounded-sm border px-2 text-[11px] font-medium transition-colors',

@@ -34,7 +34,7 @@ COMPRESSION = 5.0           # conservative ratio the Self-run guide plans with (
 MERGE_FILL = 0.75           # keep the data disk under ~75% full for merges
 OS_DISK_GB = 100            # OS + Docker images, separate disk
 EXTRA_DATA_GB = 100         # PostgreSQL, findings, small tables, Vector disk buffers
-# Vector CPU from events/s (NAN-5372): vCPU = peak factor x events/s / events per core.
+# Vector CPU from events/s: vCPU = peak factor x events/s / events per core.
 # Same constants as scripts/lib/resource-sizing.sh and the Helm chart's sizing.* (a test
 # keeps them equal). Raw: nano-measured 1,950-6,500 events/s per core over the 16 shipped
 # OCSF parsers; 1,900 sits under the slowest. Pre-shaped: half the measured ship-only 90k.

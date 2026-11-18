@@ -10,7 +10,7 @@ use tracing::debug;
 
 use super::super::traits::SqlExecutor;
 use super::sql_helpers::{
-    build_count_query, escape_question_marks_in_strings, inject_limit_offset, is_aggregation_query,
+    build_count_query, escape_question_marks_in_strings, inject_limit_offset,
     wrap_aggregation_with_pagination, wrap_query_for_count, BoundedCountInput,
 };
 use super::types::ClickHouseExecutor;
@@ -86,7 +86,7 @@ impl ClickHouseExecutor {
         preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         // Check if this is an aggregation query that needs all data
-        if is_aggregation_query(sql) {
+        if self.is_aggregation(sql) {
             debug!(
                 "Detected aggregation query with query_id {}, using full scan",
                 query_id
@@ -195,7 +195,7 @@ impl ClickHouseExecutor {
         execution_limits: Option<&crate::search::SearchExecutionLimits>,
         preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        if is_aggregation_query(sql) {
+        if self.is_aggregation(sql) {
             debug!("Detected aggregation query with settings, using full scan");
 
             let combined_sql = wrap_aggregation_with_pagination(sql, limit, offset);
@@ -304,7 +304,7 @@ impl ClickHouseExecutor {
         );
 
         // Build the query with options
-        let mut query_builder = self.client.query(&escaped_sql);
+        let mut query_builder = self.sized_query(&escaped_sql);
         query_builder = query_builder.with_setting("query_id", query_id);
 
         if let Some(settings) = settings {
@@ -467,7 +467,7 @@ impl SqlExecutor for ClickHouseExecutor {
         preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         // Check if this is an aggregation query that needs all data
-        if is_aggregation_query(sql) {
+        if self.is_aggregation(sql) {
             // For aggregation queries, use the traditional approach with count(*) OVER()
             // These need all data to produce correct results, so we can't optimize with early LIMIT
             debug!("Detected aggregation query, using full scan with count(*) OVER()");

@@ -34,8 +34,22 @@ export interface SearchRequest {
   dataset?: SearchDataset;
 }
 
-/** Dataset a search runs against (NAN-1534, NAN-1805). */
-export type SearchDataset = 'logs' | 'spans' | 'metrics' | 'risk';
+/**
+ * Dataset a search runs against (NAN-1534, NAN-1805). `signals` (NAN-5612) is
+ * the detections that fired: real-time signals plus scheduled findings.
+ */
+export type SearchDataset = 'logs' | 'spans' | 'metrics' | 'risk' | 'signals';
+
+/**
+ * The datasets a detection rule may query. Rules cannot read `signals` (a
+ * rule's own matches are signals: a signal-on-signal loop, NAN-5612).
+ */
+export type RuleDataset = Exclude<SearchDataset, 'signals'>;
+
+/** A `dataset` URL / response value as a SearchDataset; anything else is logs. */
+export function parseSearchDataset(value: string | null | undefined): SearchDataset {
+  return value === 'spans' || value === 'metrics' || value === 'risk' || value === 'signals' ? value : 'logs';
+}
 
 // ============================================================================
 // Async Search Types
@@ -1111,7 +1125,7 @@ export interface DetectionRule {
   // NAN-1561/NAN-1805: dataset this rule queries ('logs' default; non-logs
   // datasets — spans/metrics/risk — are scheduled-only). Mirrors the search
   // dataset selector.
-  dataset?: SearchDataset;
+  dataset?: RuleDataset;
   mitre_tactics: string[];
   mitre_techniques: string[];
   narrative?: string;
@@ -1228,7 +1242,7 @@ export interface CreateDetectionRequest {
   lookback_minutes?: number; // Custom lookback period in minutes
   // NAN-1561/NAN-1805: dataset this rule queries ('logs' default; non-logs
   // datasets — spans/metrics/risk — are scheduled-only).
-  dataset?: SearchDataset;
+  dataset?: RuleDataset;
   mitre_tactics?: string[];
   mitre_techniques?: string[];
   narrative?: string;
@@ -1295,7 +1309,7 @@ export interface Alert {
  * NAN-1541 alert-spine kinds. `detection` + `risk_notable` (NAN-1792) → SIEM;
  * the rest → Observability.
  */
-export type AlertKind = 'detection' | 'metric_monitor' | 'slo' | 'synthetic' | 'risk_notable';
+export type AlertKind = 'detection' | 'metric_monitor' | 'slo' | 'synthetic' | 'risk_notable' | 'hunt_finding';
 
 export interface AlertCounts {
   total: number;
@@ -2103,6 +2117,8 @@ export interface AgentModelConfig {
   temperature: number;
   timeout_seconds: number;
   enabled: boolean;
+  /** `low` | `medium` | `high`; null runs on the model's default. */
+  reasoning_effort?: string | null;
 }
 
 export interface UpdateAgentModelConfigRequest {
@@ -2111,6 +2127,8 @@ export interface UpdateAgentModelConfigRequest {
   temperature?: number;
   timeout_seconds?: number;
   enabled?: boolean;
+  /** `low` | `medium` | `high`; '' clears it back to the model's default. */
+  reasoning_effort?: string;
 }
 
 // Available Models types
@@ -2715,6 +2733,46 @@ export interface CorrectQueryRequest {
   error_message: string;
   error_code: string;
   field_suggestions?: string[];
+}
+
+/**
+ * NAN-5575: agent-written Agent Lane SQL → nPL. `window_start` / `window_end`
+ * bind the `{earliest:…}` / `{latest:…}` placeholders (the run's window).
+ */
+export interface SqlToNplRequest {
+  sql: string;
+  window_start?: string | null;
+  window_end?: string | null;
+}
+
+/** How the converted nPL departs from the SQL. `broader`: Search matches a superset. */
+export interface SqlToNplDifference {
+  kind: 'broader' | 'different';
+  detail: string;
+}
+
+export interface SqlToNplResponse {
+  /** `null` when the SQL is outside the convertible subset. */
+  npl: string | null;
+  earliest: string | null;
+  latest: string | null;
+  /** The compiled nPL provably matches the SQL. */
+  exact: boolean;
+  /** The nPL came from the AI fallback. */
+  approximate: boolean;
+  differences: SqlToNplDifference[];
+  unsupported_reason: string | null;
+  unsupported_span: { start_line: number; start_column: number; end_line: number; end_column: number } | null;
+  /**
+   * No nPL can express the SQL exactly (a table Search cannot read, or events
+   * and signals correlated in one statement): AI cannot help.
+   */
+  no_search_dataset: boolean;
+  /**
+   * The Search dataset the nPL runs on (NAN-5612): `signals` for SQL over the
+   * detections. Absent from older servers, which only convert events (logs).
+   */
+  dataset?: SearchDataset;
 }
 
 /** Response containing the AI-suggested corrected query */
@@ -4470,6 +4528,10 @@ export interface AddCaseToIncidentRequest {
 
 export interface CaseWithDetails extends Case {
   alert_count: number;
+  /** NAN-5577: events carried by the case's hunt-finding alerts, and how many
+   *  such alerts `alert_count` includes (each counts once there). */
+  hunt_event_count?: number;
+  hunt_alert_count?: number;
   entity_count: number;
   assignee_name?: string;
   assigned_group_name?: string;
@@ -4690,6 +4752,8 @@ export interface RelatedCaseSummary {
 export interface CaseAlertDetail {
   id: string;
   alert_id: string;
+  /** Absent for alerts no rule raised (e.g. a hunt-finding alert, NAN-5577). */
+  rule_id?: string;
   rule_name?: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
   status: string;
@@ -5199,6 +5263,15 @@ export interface NotebookChatRequest {
   time_range?: TimeRange;
   /** NAN-859: explicit @mention user_ids picked from the case Thread composer's popover. */
   mentioned_user_ids?: string[];
+  /** NAN-5571: what the analyst's current page shows (capped, fenced server-side). */
+  page_context?: Record<string, unknown>;
+  /** NAN-5571: actions the page offers that the analyst may use (proposals only). */
+  page_actions?: Array<{
+    name: string;
+    description: string;
+    params: Record<string, { type: string; description: string; required?: boolean; values?: string[]; max_length?: number }>;
+    mutates: boolean;
+  }>;
 }
 
 export interface NotebookChatSuggestion {

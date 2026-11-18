@@ -1598,6 +1598,7 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         SELECT severity, COUNT(*)
         FROM alerts
         WHERE created_at >= NOW() - INTERVAL '24 hours'
+          AND kind <> 'hunt_finding' -- NAN-5577: not a detection
         GROUP BY severity
         "#,
     )
@@ -1706,7 +1707,7 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
 /// because no pre-built helper exists.
 async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
     let total_alerts_24h: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM alerts WHERE created_at >= NOW() - INTERVAL '24 hours'",
+        "SELECT COUNT(*) FROM alerts WHERE created_at >= NOW() - INTERVAL '24 hours' AND kind <> 'hunt_finding'",
     )
     .fetch_one(pool)
     .await
@@ -1717,6 +1718,7 @@ async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
         SELECT COUNT(*) FROM alerts
         WHERE created_at >= NOW() - INTERVAL '48 hours'
           AND created_at <  NOW() - INTERVAL '24 hours'
+          AND kind <> 'hunt_finding'
         "#,
     )
     .fetch_one(pool)
@@ -1728,6 +1730,7 @@ async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
         SELECT status, COUNT(*)
         FROM alerts
         WHERE created_at >= NOW() - INTERVAL '24 hours'
+          AND kind <> 'hunt_finding'
         GROUP BY status
         "#,
     )
@@ -1751,6 +1754,7 @@ async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
         SELECT AVG(EXTRACT(EPOCH FROM (acknowledged_at - created_at)) / 60.0)::float8
         FROM alerts
         WHERE created_at >= NOW() - INTERVAL '24 hours'
+          AND kind <> 'hunt_finding'
           AND acknowledged_at IS NOT NULL
         "#,
     )

@@ -91,9 +91,16 @@ x-nano-egress-env: &nano-egress-env
 # failure) or page_cache (about 1.7-2.2x the request rate per Vector; a host
 # failure can lose up to ~500 ms of acknowledged events). Every ingest host
 # installs the same rendered value.
+# NAN-5564: NANO_PIPELINE_IDENTITY names what the api renders the Vector config for
+# (release / ack durability / fan-in slots). The vector service carries the SAME
+# value (keep the two strings identical; scripts/tests/test_vector_pipeline_gate.py):
+# its entrypoint does not start Vector until the api has rendered the tree for it,
+# so a Vector never takes traffic on the tree a previous release rendered, and a
+# change of any part recreates the Vector container.
 x-nano-vector-render-env: &nano-vector-render-env
   VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
   NANO_INGEST_ACK_DURABILITY: ${NANO_INGEST_ACK_DURABILITY:-fsync}
+  NANO_PIPELINE_IDENTITY: ${NANO_VERSION:?NANO_VERSION is required}/${NANO_INGEST_ACK_DURABILITY:-fsync}/${VECTOR_FANIN_SLOTS:-off}
 
 # Feed/content update and integration-egress settings read by nano-api and
 # nano-jobs. Empty keeps each built-in default (auto-update on, nano.rs URLs).
@@ -511,8 +518,11 @@ services:
         condition: service_healthy
       nano-api:
         condition: service_healthy
+      # NAN-5564: started, not healthy. A Vector that waits for nano-api's
+      # pipeline render (or a buffer-change restart) is not healthy yet, and
+      # `up` must not fail on that; the runner retries its HEC posts.
       vector:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "test -n \"$$(find /run/nano-connector -name healthy -mmin -2 -print)\""]
       interval: 30s
@@ -614,13 +624,20 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.12-debian@sha256:f0b6ee0a0dd16b5e26e5f4d01134b3e66b6a4d09fc8b4a97a11d786a22ac8670
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.13-debian@sha256:6f4d8e4e61c3e957a44fd45b1835c3288fde54042eb623ee09af730c32b85d6d
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
     # NAN-5488: room for Vector's SIGTERM drain (sources close, in-flight
     # events reach the disk buffer) before Docker's SIGKILL; the default is 10s.
-    stop_grace_period: 60s
+    # NAN-5566: every stop of Vector (backup, restore, upgrade, recreate,
+    # certificate restart) first closes ingest and drains, then gives Vector
+    # this long to finish. Vector itself never cuts its shutdown short
+    # (VECTOR_NO_GRACEFUL_SHUTDOWN_LIMIT below): a shutdown deadline cancels the
+    # sink's in-flight batch in process, which the disk buffer then treats as
+    # delivered (NAN-5567). A SIGKILL at this deadline instead leaves the
+    # buffer's read position where it was, so those events are replayed.
+    stop_grace_period: 120s
     logging: *verbose-logging
     security_opt:
       - no-new-privileges:true
@@ -664,8 +681,17 @@ services:
       # routes on a fixed `vector_native` source unless this is "true".
       NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE: ${NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE:-false}
       NANO_FUTURE_TIMESTAMP_SKEW_SECONDS: ${NANO_FUTURE_TIMESTAMP_SKEW_SECONDS:-86400}
+      # NAN-5564: the entrypoint starts Vector only once nano-api has rendered
+      # the dynamic config for this identity (same string as in
+      # x-nano-vector-render-env). Until then Vector's ports refuse connections.
+      NANO_PIPELINE_IDENTITY: ${NANO_VERSION:?NANO_VERSION is required}/${NANO_INGEST_ACK_DURABILITY:-fsync}/${VECTOR_FANIN_SLOTS:-off}
+      # NAN-5566: the published push listeners (:8080, :8088, OTLP, :6000) can be
+      # closed with a hot reload (.nano/ingest-gate.sh) before Vector is stopped.
+      NANO_VECTOR_INGEST_GATE: "on"
       VECTOR_DATA_DIR: /var/lib/vector
       VECTOR_LOG: info
+      # NAN-5566: see stop_grace_period above.
+      VECTOR_NO_GRACEFUL_SHUTDOWN_LIMIT: "true"
       VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY: ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
       # One share per rendered disk-buffer component. The installer derives
       # this from the filesystem-level total and the canonical graph inventory.
@@ -1164,6 +1190,11 @@ services:
     container_name: nano-nginx
     restart: unless-stopped
     logging: *default-logging
+    # NAN-5566: `scripts/nano` closes ingest here (/run/nano-ingest/closed: 503 +
+    # Retry-After) while it drains and stops Vector. A tmpfs, so any restart of
+    # this container reopens ingest.
+    tmpfs:
+      - /run/nano-ingest:size=64k,mode=0755
     security_opt:
       - no-new-privileges:true
     # NAN-5397: mount the config DIRECTORY and link nginx.conf into it at start.

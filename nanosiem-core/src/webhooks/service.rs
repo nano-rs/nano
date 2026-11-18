@@ -104,6 +104,15 @@ pub(crate) fn canonical_origin(raw: &str) -> Option<String> {
     Some(origin)
 }
 
+/// Whether a channel's optional severity filter admits `severity` (an unset
+/// or empty filter admits everything). Case-insensitive.
+pub fn passes_severity_filter(webhook: &Webhook, severity: &str) -> bool {
+    match &webhook.severity_filter {
+        Some(filter) if !filter.is_empty() => filter.iter().any(|s| s.eq_ignore_ascii_case(severity)),
+        _ => true,
+    }
+}
+
 /// F-40: validate a notification base URL is a *bare origin* and return its
 /// canonical `scheme://host[:port]` form. Unlike [`canonical_origin`] (which
 /// silently strips), this REJECTS (Err) a deceptive value — userinfo, a
@@ -526,6 +535,8 @@ impl WebhookService {
             health_diagnostic_context: None,
             health_remediation: None,
             idempotency_key: None,
+            summary: None,
+            details: None,
         };
 
         let severity_lower = severity.to_lowercase();
@@ -676,6 +687,8 @@ impl WebhookService {
             health_diagnostic_context: None,
             health_remediation: None,
             idempotency_key: None,
+            summary: None,
+            details: None,
         };
 
         for webhook in webhooks {
@@ -776,6 +789,8 @@ impl WebhookService {
             health_diagnostic_context: None,
             health_remediation: None,
             idempotency_key: None,
+            summary: None,
+            details: None,
         };
 
         for webhook in webhooks {
@@ -812,6 +827,65 @@ impl WebhookService {
                 svc.deliver(&webhook, &payload, None, "report_ready").await;
             });
         }
+    }
+
+    /// Fire an event of an extension-registered stream
+    /// ([`register_extension_event_types`]). Gated by that stream's
+    /// subscription AND the channel's severity filter, rendered by the same
+    /// channel formatters, delivered and logged by the same spine. The core
+    /// knows nothing about the extension's concept: it routes an
+    /// [`ExtensionEvent`]. Fire-and-forget; returns how many deliveries were
+    /// scheduled (0 when no channel subscribes, or the stream is not
+    /// registered in this build).
+    pub async fn fire_extension_event(&self, event: &ExtensionEvent) -> usize {
+        if !is_subscribable_event_type(event.stream) {
+            warn!(stream = event.stream, "Webhook extension event for an unregistered stream; dropped");
+            return 0;
+        }
+        let webhooks = match self.repo.list_enabled().await {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Failed to load webhooks: {}", e);
+                return 0;
+            }
+        };
+        let targets: Vec<_> = webhooks
+            .into_iter()
+            .filter(|w| w.subscribes_to(event.stream) && passes_severity_filter(w, &event.severity))
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+        let base = self.resolve_base_url().await;
+        let link = event.link_path.as_deref().and_then(|path| Self::ui_link(base.as_deref(), path));
+        let payload = event.to_payload(link);
+        let mut scheduled = 0usize;
+        for webhook in targets {
+            let inflight_permit = match self.inflight.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(
+                        webhook_id = %webhook.id,
+                        webhook_name = %webhook.name,
+                        stream = event.stream,
+                        "Webhook extension delivery shed: in-flight cap reached"
+                    );
+                    self.record(&webhook, None, &payload.event_type, None, None, false, Some("shed: in-flight cap"), 0)
+                        .await;
+                    continue;
+                }
+            };
+            let svc = self.clone();
+            let payload = payload.clone();
+            scheduled += 1;
+            tokio::spawn(async move {
+                let _inflight = inflight_permit;
+                let _permit = svc.semaphore.acquire().await;
+                let event_type = payload.event_type.clone();
+                svc.deliver(&webhook, &payload, None, &event_type).await;
+            });
+        }
+        scheduled
     }
 
     /// Build a request with custom headers and HMAC signature. The `client` is
@@ -1210,6 +1284,31 @@ impl WebhookService {
             .await)
     }
 
+    /// Deliver one extension event to ONE pre-selected channel and wait for
+    /// the result (the durable path: the caller owns its outbox and retry
+    /// state). The link is resolved here, the payload is the same bounded
+    /// [`ExtensionEvent::to_payload`], and the existing spine applies (SSRF
+    /// pinning, signing, provider formatter, bounded HTTP retries, delivery
+    /// log, the channel's subscription check). The channel's severity filter
+    /// is re-checked: a filter edited after the event was queued still holds.
+    pub async fn deliver_extension_event(
+        &self,
+        webhook_id: Uuid,
+        event: &ExtensionEvent,
+    ) -> Result<WebhookTestResult, String> {
+        if !is_subscribable_event_type(event.stream) {
+            return Err(format!("stream {} is not registered in this build", event.stream));
+        }
+        let webhook = self.repo.get(webhook_id).await.map_err(|e| format!("Webhook not found: {e}"))?;
+        if !passes_severity_filter(&webhook, &event.severity) {
+            return Err("the channel's severity filter no longer admits this event".to_string());
+        }
+        let base = self.resolve_base_url().await;
+        let link = event.link_path.as_deref().and_then(|path| Self::ui_link(base.as_deref(), path));
+        let payload = event.to_payload(link);
+        self.deliver_persisted(webhook_id, &payload, event.stream, &payload.event_type).await
+    }
+
     /// Persist a single delivery-log row, logging (but not propagating) a
     /// logging failure. Centralizes the `log_delivery` error handling shared by
     /// `deliver` and `send_test`.
@@ -1353,6 +1452,8 @@ impl WebhookService {
             health_diagnostic_context: None,
             health_remediation: None,
             idempotency_key: None,
+            summary: None,
+            details: None,
         };
 
         let start = Instant::now();

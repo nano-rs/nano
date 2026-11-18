@@ -208,6 +208,13 @@ pub(crate) fn client_context(request: &Request) -> nanosiem_core::audit::ClientC
             .and_then(|value| value.to_str().ok())
             .map(|value| value.chars().take(512).collect()),
     )
+    // NAN-5571: "via pivt" on search audit events too.
+    .with_origin_header(
+        request
+            .headers()
+            .get(nanosiem_core::audit::ORIGIN_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 /// NAN-5456: who a search audit event (an AI-search refusal, a lookup fetch) in this request is attributed to: the
@@ -504,6 +511,9 @@ pub async fn auth_middleware(
                 };
                 let mut auth_context = AuthContext::from_jwt(claims.clone());
                 auth_context.denied_sources = denied_sources;
+                // NAN-5571: IP, user agent and X-Nano-Origin for handler audit events.
+                let client = client_context(&request);
+                request.extensions_mut().insert(client);
                 request.extensions_mut().insert(auth_context);
                 request.extensions_mut().insert(claims);
                 return Ok(next.run(request).await);
@@ -547,6 +557,8 @@ pub async fn auth_middleware(
                     };
                     auth_context.denied_sources = denied_sources;
                     let claims = auth_context.claims.clone();
+                    let client = client_context(&request);
+                    request.extensions_mut().insert(client);
                     request.extensions_mut().insert(auth_context);
                     request.extensions_mut().insert(claims);
                     return Ok(next.run(request).await);

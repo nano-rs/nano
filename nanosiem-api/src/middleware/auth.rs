@@ -180,6 +180,14 @@ fn extract_ip_address(request: &Request, connect_info: Option<&SocketAddr>) -> O
     crate::utils::extract_client_ip(request.headers(), connect_info)
 }
 
+/// NAN-5571: the `X-Nano-Origin` header, if any (allowlisted by `ClientContext`).
+fn origin_header<B>(request: &axum::http::Request<B>) -> Option<&str> {
+    request
+        .headers()
+        .get(nanosiem_core::audit::ORIGIN_HEADER)
+        .and_then(|v| v.to_str().ok())
+}
+
 /// Extract user agent from request
 fn extract_user_agent(request: &Request) -> Option<String> {
     request
@@ -424,7 +432,8 @@ pub async fn auth_middleware(
         .map(|ci| ci.0);
     let ip_address = extract_ip_address(&request, connect_info.as_ref());
     let user_agent = extract_user_agent(&request);
-    let client_context = ClientContext::new(ip_address.clone(), user_agent.clone());
+    let client_context = ClientContext::new(ip_address.clone(), user_agent.clone())
+        .with_origin_header(origin_header(&request));
     request.extensions_mut().insert(client_context);
 
     // Skip auth for public endpoints
@@ -645,7 +654,8 @@ pub async fn optional_auth_middleware(
         .map(|ci| ci.0);
     let ip_address = extract_ip_address(&request, connect_info.as_ref());
     let user_agent = extract_user_agent(&request);
-    let client_context = ClientContext::new(ip_address, user_agent);
+    let client_context =
+        ClientContext::new(ip_address, user_agent).with_origin_header(origin_header(&request));
     request.extensions_mut().insert(client_context);
 
     // Skip auth if not enabled

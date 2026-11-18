@@ -75,6 +75,10 @@ pub enum SearchError {
     /// to work.
     #[error("Search backend unavailable: {0}")]
     Unavailable(String),
+    /// NAN-5612: the caller's scope does not allow what the query reads
+    /// (today: `dataset=signals` without `detections:view`). A 403.
+    #[error("{0}")]
+    Forbidden(String),
     /// NAN-5424: ClickHouse refused the query for its size (memory limit,
     /// too many rows / bytes), identified by the error CODE. A smaller time
     /// window can succeed.
@@ -210,6 +214,16 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
     if let Some((_, name)) = CH_DATA_CODES.iter().find(|(c, _)| *c == code) {
         return SearchError::DataError { code, name: (*name).to_string() };
     }
+    if code == 62 && is_max_query_size_exceeded(error_msg) {
+        // NAN-5565: SYNTAX_ERROR is also how ClickHouse refuses query TEXT
+        // longer than `max_query_size`. That is a size failure (generated
+        // literals grow with the window, e.g. the prevalence rescue), not a
+        // broken query: the detection scheduler must shrink the window rather
+        // than back the rule off as deterministically invalid.
+        return SearchError::ResourceLimit(
+            "Query text exceeded the ClickHouse max_query_size limit. Narrow the time range or the search so less is inlined into the query.".to_string(),
+        );
+    }
     if CH_QUERY_CODES.contains(&code) {
         return match parse_clickhouse_error_message(error_msg) {
             // A query-shape code whose text no rewrite recognised.
@@ -221,6 +235,21 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
     }
     let cleaned_msg = clean_clickhouse_error(error_msg);
     SearchError::DatabaseError(sqlx::Error::Protocol(cleaned_msg))
+}
+
+/// Whether a code-62 message is ClickHouse's `max_query_size` refusal.
+///
+/// NAN-5424 forbids classifying on text that can echo data, so only
+/// ClickHouse's OWN wording is read: everything before the first quote, where
+/// the parser excerpt (which can carry literals from the query) starts. In the
+/// observed wording (ClickHouse 26.11) the marker leads: "Max query size
+/// exceeded (can be increased …): Syntax error: failed at position N ('…')".
+fn is_max_query_size_exceeded(error_msg: &str) -> bool {
+    let own_text = error_msg
+        .split(['\'', '`', '"'])
+        .next()
+        .unwrap_or(error_msg);
+    own_text.contains("Max query size exceeded")
 }
 
 /// Message-pattern mapping for errors that carry no ClickHouse code.
@@ -468,7 +497,8 @@ pub fn client_error_message(error: &SearchError) -> String {
         | SearchError::ViewTooLarge { .. }
         | SearchError::ViewMemoryBusy { .. }
         | SearchError::ResourceLimit(_)
-        | SearchError::DataError { .. } => error.to_string(),
+        | SearchError::DataError { .. }
+        | SearchError::Forbidden(_) => error.to_string(),
         SearchError::DatabaseError(_) | SearchError::Unavailable(_) => {
             "A database error occurred".to_string()
         }
@@ -577,7 +607,12 @@ pub struct SearchRequest {
     /// source and the time-bound column (spans → `start_time`, logs/metrics →
     /// `timestamp`) in the SQL generator. `"risk"` (NAN-1798 P2) targets the
     /// DERIVED accumulated-entity-risk grain (one row per entity; fixed trailing
-    /// 24h/7d score windows the time picker does not reshape). Unknown values
+    /// 24h/7d score windows the time picker does not reshape). `"signals"`
+    /// (NAN-5612) targets the detections that fired in the window (real-time
+    /// signals plus scheduled findings; columns `id`, `timestamp`, `rule_id`,
+    /// `rule_name`, `severity`, `risk_score`, `risk_entity`, `matched_log_id`,
+    /// `source_type`, `detection_path`), scoped per source like events and
+    /// requiring `detections:view` as well as `search:execute`. Unknown values
     /// fall back to `logs` (never an error) via
     /// [`Dataset::from_selector`](crate::query::Dataset::from_selector).
     /// Omit for the default logs dataset — `with_dataset(Logs)` is byte-identical

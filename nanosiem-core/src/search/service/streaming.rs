@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::auth::ScopeSet;
-use crate::search::query_processing::enforce_source_scope;
 
 impl SearchService {
     /// Admission-gated wrapper around [`SearchService::search_streaming`]
@@ -136,7 +135,7 @@ impl SearchService {
     /// injection on either path.
     pub async fn search_streaming(
         &self,
-        request: SearchRequest,
+        mut request: SearchRequest,
         event_tx: tokio::sync::mpsc::Sender<crate::search::streaming::SearchStreamEvent>,
         queue_wait_ms: u64,
         scope: &ScopeSet,
@@ -179,6 +178,18 @@ impl SearchService {
             return;
         }
 
+        // NAN-5612: a leading `dataset=<name>` selects the dataset.
+        match crate::search::query_processing::resolve_dataset_selector(&request.query, request.dataset.as_deref()) {
+            Ok((q, d)) => {
+                request.query = q;
+                request.dataset = d;
+            }
+            Err(e) => {
+                send_event!(SearchStreamEvent::Error { code: "PARSE_ERROR".to_string(), message: e.to_string() });
+                return;
+            }
+        }
+
         // Extract time modifiers and parse query
         let (cleaned_query, earliest_bound, latest_bound) = match extract_time_bounds(&request.query) {
             Ok(bounds) => bounds,
@@ -197,8 +208,16 @@ impl SearchService {
         // returns the text unchanged (byte-identical). The buffered path
         // deliberately re-runs `search()` on the ORIGINAL request so this is
         // never a double injection.
-        let cleaned_query = match enforce_source_scope(&cleaned_query, scope.deny_set()) {
+        let cleaned_query = match crate::search::query_processing::enforce_viewer_scope(
+            &cleaned_query,
+            request.dataset.as_deref(),
+            scope,
+        ) {
             Ok(q) => q,
+            Err(e @ SearchError::Forbidden(_)) => {
+                send_event!(SearchStreamEvent::Error { code: "FORBIDDEN".to_string(), message: e.to_string() });
+                return;
+            }
             Err(e) => {
                 send_event!(SearchStreamEvent::Error {
                     code: "PARSE_ERROR".to_string(),
@@ -329,8 +348,12 @@ impl SearchService {
             // entity-cardinality, well within a single response. (A LOGS
             // stream carrying a `[dataset=risk …]` bracket chunks fine — the
             // OUTER logs bound partitions the rows.)
-            && crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs"))
-                != crate::query::Dataset::Risk;
+            && !matches!(
+                crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs")),
+                // NAN-5612: the derived signals source is window-bound per
+                // generation; keep it on the buffered path like risk.
+                crate::query::Dataset::Risk | crate::query::Dataset::Signals
+            );
 
         let display_type = determine_display_type(&query);
         let column_order = get_column_order(&query);
@@ -518,6 +541,7 @@ impl SearchService {
             table_view: request.table_view,
             limit: Some(generator_limit),
             unordered: false,
+            omit_settings: false,
         };
 
         let full_time_range =

@@ -286,6 +286,10 @@ pub struct DiskHealthReport {
     /// What could not be measured, and why.
     pub notes: Vec<String>,
     pub checked_at: DateTime<Utc>,
+    /// NAN-5567: Vector sinks holding batches ClickHouse permanently rejected
+    /// in their dead-letter store (Vector `0.61.0-nano.13` and later).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vector_dead_letters: Vec<VectorDeadLetter>,
 }
 
 impl DiskHealthReport {
@@ -299,6 +303,7 @@ impl DiskHealthReport {
             volumes,
             notes,
             checked_at: Utc::now(),
+            vector_dead_letters: Vec::new(),
         }
     }
 
@@ -895,6 +900,80 @@ pub fn parse_vector_buffers(metrics: &str) -> Vec<VectorBufferSample> {
         .collect()
 }
 
+/// NAN-5567: one Vector sink's dead-letter store, from its exporter page.
+/// Vector (`0.61.0-nano.13`+) writes a batch ClickHouse permanently rejects
+/// (a 4xx, or a non-retryable code such as 117/53) to
+/// `<data_dir>/dead_letter/<sink>/` instead of dropping it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct VectorDeadLetter {
+    pub host: Option<String>,
+    pub component_id: String,
+    /// Events written to the store since that Vector started.
+    pub dead_lettered_events: u64,
+    /// Bytes the store holds now (includes batches from earlier runs).
+    pub held_bytes: u64,
+    /// Dead-letter events discarded since that Vector started: evicted
+    /// because the store was full, too large for it, or a failed write.
+    pub discarded_events: u64,
+}
+
+impl VectorDeadLetter {
+    /// Anything to act on: batches held now, or dead-letter events lost
+    /// since Vector started. Events stored and since replayed and deleted
+    /// (held bytes back to 0) are resolved, even though the counter only
+    /// resets when Vector restarts.
+    pub fn is_active(&self) -> bool {
+        self.held_bytes > 0 || self.discarded_events > 0
+    }
+}
+
+/// Dead-letter stores on one Vector exporter page (NAN-5567). Only sinks
+/// with something to report are returned.
+pub fn parse_vector_dead_letters(metrics: &str) -> Vec<VectorDeadLetter> {
+    use std::collections::BTreeMap;
+    let mut by_sink: BTreeMap<(Option<String>, String), VectorDeadLetter> = BTreeMap::new();
+    for line in metrics.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(brace) = line.find('{') else { continue };
+        let name = &line[..brace];
+        let field = match name {
+            "nanosiem_vector_component_dead_lettered_events_total" => 0,
+            "nanosiem_vector_component_dead_letter_bytes" => 1,
+            "nanosiem_vector_component_dead_letter_discarded_events_total" => 2,
+            _ => continue,
+        };
+        let Some(close) = line.rfind('}') else { continue };
+        let labels = &line[brace + 1..close];
+        let Some(id) = label(labels, "component_id") else { continue };
+        let Some(value) = line[close + 1..]
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        else {
+            continue;
+        };
+        let host = label(labels, "host").map(str::to_string);
+        let entry = by_sink.entry((host.clone(), id.to_string())).or_insert_with(|| VectorDeadLetter {
+            host,
+            component_id: id.to_string(),
+            dead_lettered_events: 0,
+            held_bytes: 0,
+            discarded_events: 0,
+        });
+        let value = value as u64;
+        match field {
+            0 => entry.dead_lettered_events += value,
+            1 => entry.held_bytes = entry.held_bytes.max(value),
+            // One series per discard reason.
+            _ => entry.discarded_events += value,
+        }
+    }
+    by_sink.into_values().filter(VectorDeadLetter::is_active).collect()
+}
+
 /// One volume per Vector instance: totals over its disk buffers, level from
 /// the fullest buffer (a full buffer blocks that pipeline even when the
 /// others are empty).
@@ -986,20 +1065,21 @@ async fn scrape(client: &reqwest::Client, url: &str) -> Result<String, String> {
     resp.text().await.map_err(|e| e.to_string())
 }
 
-async fn read_vector_buffers(notes: &mut Vec<String>) -> Vec<DiskVolumeHealth> {
+async fn read_vector_buffers(notes: &mut Vec<String>) -> (Vec<DiskVolumeHealth>, Vec<VectorDeadLetter>) {
     let Some(plan) = vector_scrape_plan(|k| std::env::var(k).ok()) else {
         notes.push(
             "Vector runs on the ingest hosts; their disks are covered by the monitoring role's node-exporter \
-             alerts, not by this check."
+             alerts, not by this check, and their dead-letter stores (/var/lib/vector/dead_letter) are not \
+             read either."
                 .into(),
         );
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let client = match reqwest::Client::builder().timeout(SCRAPE_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
             notes.push(format!("Could not build the Vector metrics client: {e}"));
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
     let urls: Vec<(String, String)> = match plan {
@@ -1032,9 +1112,16 @@ async fn read_vector_buffers(notes: &mut Vec<String>) -> Vec<DiskVolumeHealth> {
     }))
     .await;
     let mut volumes = Vec::new();
+    let mut dead_letters = Vec::new();
     for (instance, page) in pages {
         match page {
             Ok(text) => {
+                // NAN-5567: a sink without a host label is named by the
+                // instance it was scraped from.
+                dead_letters.extend(parse_vector_dead_letters(&text).into_iter().map(|mut d| {
+                    d.host.get_or_insert_with(|| instance.clone());
+                    d
+                }));
                 let samples = parse_vector_buffers(&text);
                 if samples.is_empty() {
                     notes.push(format!("Vector at {instance} reports no disk buffers."));
@@ -1044,7 +1131,7 @@ async fn read_vector_buffers(notes: &mut Vec<String>) -> Vec<DiskVolumeHealth> {
             Err(e) => notes.push(format!("Could not read Vector metrics at {instance}: {e}")),
         }
     }
-    volumes
+    (volumes, dead_letters)
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,7 +1149,7 @@ pub async fn collect_disk_health(
     let mut ch_notes = Vec::new();
     let mut pg_notes = Vec::new();
     let mut vec_notes = Vec::new();
-    let (ch_volumes, pg_sizes, vector) = tokio::join!(
+    let (ch_volumes, pg_sizes, (vector, vector_dead_letters)) = tokio::join!(
         read_clickhouse_disks(ch, cluster, &mut ch_notes),
         read_postgres_sizes(pg, &mut pg_notes),
         read_vector_buffers(&mut vec_notes),
@@ -1082,6 +1169,7 @@ pub async fn collect_disk_health(
     notes.extend(pg_notes);
     notes.extend(vec_notes);
     let mut report = DiskHealthReport::new(volumes, notes);
+    report.vector_dead_letters = vector_dead_letters;
     // NAN-5450: growth forecast from the samples the health scheduler records.
     let samples = load_samples(pg).await;
     apply_forecasts(&mut report, &samples, &EvictorBand::from_env());

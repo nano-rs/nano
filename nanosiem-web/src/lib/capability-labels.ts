@@ -24,4 +24,6 @@ export const CAPABILITY_LABELS: Record<keyof Capabilities, string> = {
   threatIntel: 'Threat intel',
   agentLane: 'Agent Lane',
   complianceExport: 'Compliance export',
+  hunts: 'Hunts',
+  storageTiering: 'Storage tiering',
 };

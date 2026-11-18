@@ -20,6 +20,8 @@ import { Input } from '@/components/ui/input';
 import { NumberInput } from '@/components/ui/number-input';
 import { Label } from '@/components/ui/label';
 import { QueryEditor } from '@/components/editor';
+import { DatasetSelector } from '@/components/search/DatasetSelector';
+import { datasetOfQuery, withDatasetPrefix } from '@/lib/dataset-prefix';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
@@ -344,6 +346,14 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                       SQL
                     </button>
                   </div>
+                  {/* NAN-5612: the dataset a piped panel runs on, stored as the
+                      query's leading `dataset=<name>` token. */}
+                  {queryMode === 'piped' && (
+                    <DatasetSelector
+                      value={datasetOfQuery(query)}
+                      onChange={(d) => setQuery(withDatasetPrefix(query, d))}
+                    />
+                  )}
                 </div>
                 {canAskAi && (
                   <Button

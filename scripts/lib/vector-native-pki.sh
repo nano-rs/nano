@@ -63,6 +63,10 @@
 #   anchors --pki-dir P                     the bundle's active anchors, base64
 #   sans [--base-url URL] [--san NAME|IP]...
 #   events-query --profile P   SQL: events taken on :6000 in the last 24 h
+#   bundle NAME... --install-dir DIR [--address H[:P]] [--ensure]
+#       One bundle per sender in DIR/vector-client-bundles/NAME (0600 files,
+#       with vector-sink.toml). --ensure first creates the listener CA and
+#       certificate, so it also runs on a 0.1.x checkout before the upgrade.
 #
 # Private keys are written with umask 077 and chmod 0600, only ever by openssl
 # to a file path; no key material is printed or passed in argv.
@@ -759,15 +763,40 @@ USAGE
 }
 
 # compose_restart_vector <install>: restart a running Vector to load the bundle.
+#
+# NAN-5566: on a single host never a plain restart under live ingest. Close
+# ingest (Vector's published ports by its ingest gate, nginx's routes),
+# drain, restart with more time than Vector's 60 s graceful limit, reopen; the
+# EXIT trap reopens on any exit in between (scripts/lib/vector-quiesce.sh).
+# Role split: the ingest host's edge is closed by its install/upgrade flow, so
+# the restart stays as it was.
 compose_restart_vector() {
-    local install="$1" args=()
+    local install="$1" args=() rc=0
     if [[ -f "$install/.nano-role.env" ]]; then
         args=(--project-directory "$install/deploy/compose" --env-file "$install/.env"
             --env-file "$install/.nano-role.env" -f "$install/deploy/compose/docker-compose.enterprise.yml")
-    else
-        args=(--project-directory "$install" --env-file "$install/.env" -f "$install/docker-compose.opensource.yml")
+        docker compose "${args[@]}" restart vector </dev/null >/dev/null 2>&1
+        return
     fi
-    docker compose "${args[@]}" restart vector </dev/null >/dev/null 2>&1
+    args=(--project-directory "$install" --env-file "$install/.env" -f "$install/docker-compose.opensource.yml")
+    if [[ ! -r "$LIB_DIR/vector-quiesce.sh" ]]; then
+        note "!! scripts/lib/vector-quiesce.sh is missing: restarting Vector without closing ingest first"
+        docker compose "${args[@]}" restart vector </dev/null >/dev/null 2>&1
+        return
+    fi
+    # shellcheck source=scripts/lib/vector-quiesce.sh
+    . "$LIB_DIR/vector-quiesce.sh"
+    NANO_VQ_PKI_COMPOSE_ARGS=("${args[@]}")
+    nano_vq_compose() { docker compose "${NANO_VQ_PKI_COMPOSE_ARGS[@]}" "$@"; }
+    declare -F log >/dev/null || log() { note "$*"; }
+    declare -F warn >/dev/null || warn() { note "warning: $*"; }
+    trap 'cleanup_tmp; nano_vq_reopen 30 || true' EXIT
+    nano_vq_close
+    nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+    nano_vq_compose restart --timeout "$NANO_VQ_STOP_TIMEOUT" vector </dev/null >/dev/null 2>&1 || rc=$?
+    nano_vq_reopen || true
+    trap cleanup_tmp EXIT
+    return "$rc"
 }
 
 # role_split_publish <install> <pki> <what>: the shared .env carries the anchors.
@@ -902,6 +931,123 @@ cmd_client_cert() {
     esac
 }
 
+# ------------------------------------------- per-sender bundles (NAN-5559)
+# A 0.1.x install's :6000 listener was plaintext; after the upgrade it is
+# mutual TLS only. `bundle` issues one client certificate bundle per sender
+# into <install>/vector-client-bundles/<name>/ (directory 0700, every file
+# 0600): <name>.crt, <name>.key, ca.crt and vector-sink.toml, the sender's
+# sink config with a disk buffer. install.sh runs it at the legacy cutover;
+# an operator can run it BEFORE the window on the 0.1.x host (--ensure also
+# creates the listener CA and certificate there). Nothing in 0.1.x reads
+# .nano-pki/ or config/vector-native/, and the upgrade's checkout reset keeps
+# both (untracked, at paths 2.x does not ship), so 2.x finds the CA in place
+# and every staged bundle stays valid.
+#
+# Prints one line per bundle on stdout: `bundle <name> <dir>`.
+SENDER_BUFFER_BYTES=268435488   # Vector's minimum disk buffer
+SENDER_FILES_DIR=/etc/vector/nano
+
+# print_bundle_sink_config <address> <name> <dir on the sender>
+print_bundle_sink_config() {
+    printf '# nano Vector-native sink for sender "%s". Copy %s.crt, %s.key and ca.crt\n' "$2" "$2" "$2"
+    printf '# to %s on the sender (the key mode 0600), then merge this into its config.\n' "$3"
+    printf '[sinks.nano]\ntype = "vector"\ninputs = ["<your source or transform>"]\n'
+    printf 'address = "%s"\nversion = "2"\n' "$1"
+    printf 'tls.enabled = true\n'
+    printf 'tls.crt_file = "%s/%s.crt"\ntls.key_file = "%s/%s.key"\ntls.ca_file = "%s/ca.crt"\n' "$3" "$2" "$3" "$2" "$3"
+    printf '# Holds events on disk while nano is unreachable (an upgrade, a restart).\n'
+    printf 'acknowledgements.enabled = true\nbuffer.type = "disk"\nbuffer.max_size = %s\nbuffer.when_full = "block"\n' \
+        "$SENDER_BUFFER_BYTES"
+}
+
+cmd_bundle() {
+    local install="" address="" ensure=0 name env pki tls bundles out host base_url bind sans_env result err status file
+    local -a names=() failed=() ensure_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --install-dir) [[ $# -ge 2 ]] || usage_die "--install-dir needs a value"; install="$2"; shift 2 ;;
+            --address) [[ $# -ge 2 ]] || usage_die "--address needs HOST[:PORT]"; address="$2"; shift 2 ;;
+            --ensure) ensure=1; shift ;;
+            -*) usage_die "bundle: unknown option: $1" ;;
+            *) names+=("$1"); shift ;;
+        esac
+    done
+    [[ -n "$install" && -d "$install" ]] || usage_die "bundle needs --install-dir DIR (the nano install directory)"
+    ((${#names[@]} > 0)) || usage_die "bundle needs at least one sender name"
+    for name in "${names[@]}"; do
+        valid_name "$name" || usage_die "sender name must be 1-63 characters: letters, digits, dot, underscore or hyphen (got '${name}')"
+    done
+    install=$(cd "$install" && pwd -P)
+    env="$install/.env" pki="$install/.nano-pki/vector-native" tls="$install/config/vector-native"
+    bundles="$install/vector-client-bundles"
+    if ((ensure)); then
+        # The same inputs install.sh's ensure uses (BASE_URL, the bind address,
+        # NANO_VECTOR_NATIVE_SANS from .env), so the upgrade finds the listener
+        # certificate current instead of re-issuing it with other names.
+        base_url=$(env_file_value "$env" BASE_URL)
+        bind=$(env_file_value "$env" NANO_VECTOR_NATIVE_BIND_ADDRESS)
+        sans_env=${NANO_VECTOR_NATIVE_SANS:-$(env_file_value "$env" NANO_VECTOR_NATIVE_SANS)}
+        ensure_args=(--pki-dir "$pki" --tls-dir "$tls" --base-url "$base_url")
+        [[ -z "$bind" ]] || ensure_args+=(--san "$bind")
+        result=$(NANO_VECTOR_NATIVE_SANS="$sans_env" bash "${BASH_SOURCE[0]}" ensure "${ensure_args[@]}" </dev/null) \
+            || die "could not prepare the Vector-native listener in $tls (above)"
+        note "Vector-native listener: $result (its names and addresses: $tls/.sans)"
+    fi
+    [[ -s "$pki/server-ca.crt" && -s "$tls/server.crt" ]] \
+        || die "no Vector-native listener CA in $pki yet: run install.sh, or pass --ensure"
+    if [[ -z "$address" ]]; then
+        host="${NANO_VECTOR_NATIVE_PUBLIC_HOST:-$(env_file_value "$env" NANO_VECTOR_NATIVE_PUBLIC_HOST)}"
+        if [[ -z "$host" ]]; then
+            base_url=$(env_file_value "$env" BASE_URL)
+            [[ -z "$base_url" ]] || host=$(host_of_url "$base_url")
+        fi
+        case "$host" in
+            "" | localhost | 127.* | ::1)
+                note "warning: no address senders can reach is known (BASE_URL host '${host:-unset}'). Each sink config"
+                note "         says <nano host>: replace it, or set NANO_VECTOR_NATIVE_PUBLIC_HOST in .env and run this again."
+                host=""
+                ;;
+        esac
+        address="$host"
+    fi
+    address=$(with_port "$address")
+    mkdir -p "$bundles"
+    chmod 700 "$bundles"
+    for name in "${names[@]}"; do
+        out="$bundles/$name"
+        if [[ "$(index_field "$pki" "$name" 4)" == active ]]; then
+            if [[ ! -s "$out/$name.crt" ]]; then
+                note "'$name' already has an active certificate, but not in $out; skipped. If its files are lost:"
+                note "  scripts/nano vector-client-cert --revoke $name, then issue it again."
+                failed+=("$name")
+                continue
+            fi
+            note "'$name': bundle issued earlier, kept ($out)."
+            # Files may have been moved to the sender since: put back the public ca.crt.
+            [[ -s "$out/ca.crt" ]] || write_out "$pki/server-ca.crt" "$out/ca.crt"
+        else
+            status=0
+            err=$(bash "${BASH_SOURCE[0]}" issue "$name" --pki-dir "$pki" --tls-dir "$tls" --out "$out" \
+                --address "$address" 2>&1 >/dev/null </dev/null) || status=$?
+            if [[ "$status" != 0 ]]; then
+                printf '%s\n' "$err" >&2
+                failed+=("$name")
+                continue
+            fi
+            # issue's own sink config is replaced by vector-sink.toml; keep its warnings.
+            printf '%s\n' "$err" | grep -E '^ *(warning|Use one)' >&2 || true
+        fi
+        print_bundle_sink_config "$address" "$name" "$SENDER_FILES_DIR" > "$out/vector-sink.toml.tmp.$$"
+        mv -f "$out/vector-sink.toml.tmp.$$" "$out/vector-sink.toml"
+        chmod 700 "$out"
+        for file in "$out/$name.crt" "$out/$name.key" "$out/ca.crt" "$out/vector-sink.toml"; do
+            [[ ! -f "$file" ]] || chmod 600 "$file"
+        done
+        printf 'bundle %s %s\n' "$name" "$out"
+    done
+    ((${#failed[@]} == 0)) || die "no bundle for: ${failed[*]}"
+}
+
 # NAN-5523: the ClickHouse query counting events the stack took on :6000 in
 # the last 24 hours (source_type 'vector_native', set by the vector_auth
 # transform). An OCSF profile (ocsf, ocsf+tenzir) stores events in
@@ -938,8 +1084,9 @@ main() {
         anchors) cmd_anchors "$@" ;;
         revoke) cmd_revoke "$@" ;;
         client-cert) cmd_client_cert "$@" ;;
+        bundle) cmd_bundle "$@" ;;
         events-query) cmd_events_query "$@" ;;
-        *) sed -n '2,65p' "${BASH_SOURCE[0]}" >&2; exit 2 ;;
+        *) sed -n '2,72p' "${BASH_SOURCE[0]}" >&2; exit 2 ;;
     esac
 }
 
