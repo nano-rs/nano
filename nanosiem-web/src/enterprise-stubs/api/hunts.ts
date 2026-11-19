@@ -56,6 +56,13 @@ export class HuntsApi {
   triggerSweep(): Promise<never> {
     return ENTERPRISE_ONLY();
   }
+  // NAN-5648: upstream update of an imported hunt.
+  upstreamUpdate(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  applyUpstreamUpdate(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
   sweep(): Promise<never> {
     return ENTERPRISE_ONLY();
   }
@@ -116,10 +123,40 @@ export class HuntsApi {
   retireAgentDetection(): Promise<never> {
     return ENTERPRISE_ONLY();
   }
+  agentDetectionSettings(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  updateAgentDetectionSettings(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
   runners(): Promise<never> {
     return ENTERPRISE_ONLY();
   }
   setAgyWaiver(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  charter(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  saveCharter(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  charterVersions(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  defaultCharter(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  saveDefaultCharter(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  defaultCharterVersions(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  settings(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  updateSettings(): Promise<never> {
     return ENTERPRISE_ONLY();
   }
 }

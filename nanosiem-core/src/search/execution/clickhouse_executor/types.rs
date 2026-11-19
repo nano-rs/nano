@@ -130,6 +130,17 @@ impl ClickHouseExecutor {
         }
     }
 
+    /// This executor with the caller's answer to "is this an aggregation?"
+    /// (decided on the query AST) in place of sniffing the SQL text; every
+    /// other setting is kept. NAN-5634: a `join` over a `stats` subsearch
+    /// carries `count(` in its text but returns raw rows.
+    pub(crate) fn with_aggregation(&self, aggregation: bool) -> Self {
+        Self {
+            aggregation_override: Some(aggregation),
+            ..self.clone()
+        }
+    }
+
     /// Whether the paginated paths treat `sql` as an aggregation.
     pub(crate) fn is_aggregation(&self, sql: &str) -> bool {
         self.aggregation_override

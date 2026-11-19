@@ -303,6 +303,9 @@ _EVENT_ID = re.compile(r'"id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 _ANY_UUID = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
 _LEAD_ID = re.compile(r"\blead_[0-9a-z]{26}\b")
 _HUNT_HOST = re.compile(r"\b(fin-ws|fin-srv|eng-ws|sccm|dc01)-[a-z0-9-]+\b")
+# In the investigator's prompt (a hunt charter's analyst notes): file the
+# `fin-ws-*` lead at critical instead of high.
+HUNT_FILE_CRITICAL_MARKER = "e2e-file-severity-critical"
 
 
 def _tool_names(body: dict[str, Any]) -> set[str]:
@@ -367,8 +370,14 @@ def hunt_tool_calls(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]] | s
         lead = named if named else _LEAD_ID.search(prompt)
         entity = re.search(r"entity_value: (\S+)", prompt)
         host = entity.group(1) if entity else ""
+        # The finding's own evidence pointers (`<id> source_type=... at ...`
+        # lines in the claim fence): fetched first and cited first, so the
+        # verdict's citations verify (other UUIDs in the context are memory).
+        pointers = list(dict.fromkeys(
+            m.group(1) for m in re.finditer(
+                r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) source_type=", prompt, re.MULTILINE)))
         if "get_events" not in made:
-            ids = [i for i in _ANY_UUID.findall(prompt)][:10]
+            ids = (pointers + [i for i in _ANY_UUID.findall(prompt) if i not in pointers])[:10]
             return "hunt_reviewer", [_call("get_events", {"ids": ids})]
         last = _last_tool_result(body)
         retry = "record_verdict" in made and last.startswith("ERROR")
@@ -376,8 +385,11 @@ def hunt_tool_calls(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]] | s
             # Cite what get_events returned (any id it rendered), else the
             # finding's own evidence pointers.
             fetched = list(dict.fromkeys(_ANY_UUID.findall(last)))[:10] if not retry else []
+            own = [i for i in pointers if i in fetched]
+            if own:
+                fetched = own
             if not fetched:
-                fetched = list(dict.fromkeys(_ANY_UUID.findall(prompt)))[:10]
+                fetched = pointers[:10] or list(dict.fromkeys(_ANY_UUID.findall(prompt)))[:10]
             benign = host.startswith("sccm-")
             return "hunt_reviewer", [_call("record_verdict", {
                 "lead_id": lead.group(1) if named else lead.group(0),
@@ -401,9 +413,12 @@ def hunt_tool_calls(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]] | s
         fin = next((h for h in sorted(tag_hosts) if h.startswith("fin-ws-")), None)
         sccm = next((h for h in sorted(tag_hosts) if h.startswith("sccm-")), None)
         if filed == 0 and fin and _rows_with(prompt, fin):
+            # NAN-5663: a hunt charter carrying this marker files the same
+            # chain at critical (the duplicate gate's "worse" variant).
+            severity = "critical" if HUNT_FILE_CRITICAL_MARKER in prompt else "high"
             return "hunt_investigator", [_call("file_finding", {
                 "class": "lead", "entity_type": "host", "entity_value": fin, "technique": "T1059.001",
-                "severity": "high", "confidence": 0.8, "evidence_event_ids": _rows_with(prompt, fin)[:8],
+                "severity": severity, "confidence": 0.8, "evidence_event_ids": _rows_with(prompt, fin)[:8],
                 "benign_analysis": "Not patch management: the parent is WINWORD and the host reached a Tor exit.",
                 "narrative": "Office macro to encoded PowerShell to Tor egress to a dropper.",
             })]
@@ -437,6 +452,9 @@ class AiStubServer(ThreadingHTTPServer):
                 "kind": kind,
                 "model": model,
                 "body_sha256": hashlib.sha256(raw).hexdigest(),
+                # NAN-5642: whether a hunt charter block reached the prompt (a
+                # boolean marker, never prompt content).
+                "charter": b"CHARTER (this hunt's charter" in raw or b"CHARTER (the install's default charter" in raw,
             }
             self.journal.parent.mkdir(parents=True, exist_ok=True)
             with self.journal.open("a", encoding="utf-8") as handle:

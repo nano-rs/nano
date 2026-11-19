@@ -104,3 +104,6 @@ config/vector/dynamic/ingest-tokens/
 !/config/vector-native/README.md
 # NAN-5559: per-sender Vector-native client certificate bundles (private keys).
 /vector-client-bundles/
+
+# Stray build/test logs at the repo root (NAN-5656)
+/entlibe

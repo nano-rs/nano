@@ -300,6 +300,9 @@ pub enum OomRisk {
     UnboundedCollectAggregation,
     /// GROUP BY on a high-cardinality string field without filters
     HighCardinalityGroupBy { field: String },
+    /// enrich-only prevalence without filters whose pushdown sorts the newest
+    /// 1M full-width rows (no result window to push, no projection) (NAN-5660)
+    UnboundedPrevalenceScan,
 }
 
 impl OomRisk {
@@ -334,6 +337,13 @@ impl OomRisk {
                  Add search filters or use dc() (distinct count) instead."
                     .to_string()
             }
+            OomRisk::UnboundedPrevalenceScan => {
+                "prevalence on an unfiltered search that cannot stop at the page (a where, sort or \
+                 dedup after it, or a sort before it) buffers the newest events at full width and \
+                 can exhaust memory (OOM). Add a source_type filter, search terms, or a | head \
+                 before | prevalence, or end the search with | table <fields>."
+                    .to_string()
+            }
             OomRisk::HighCardinalityGroupBy { field } => {
                 format!(
                     "stats ... by {field} on an unfiltered search groups by a high-cardinality field, \
@@ -358,7 +368,73 @@ const HIGH_CARDINALITY_FIELDS: &[&str] = &[
 ];
 
 /// Detect OOM risks in a query. Returns the first risk found, or None if safe.
+///
+/// This is the STRUCTURAL candidate check (no data volume). Search does not
+/// refuse on it directly any more (NAN-5635): `oom_admission` classifies each
+/// site as spillable (ClickHouse spills or caps it, admitted) or cost-gated
+/// (admitted when a row estimate over the time window fits the install's
+/// memory budget). Callers that cannot estimate keep using it as a refusal.
 pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
+    oom_risk_sites(query).into_iter().next().map(|site| site.risk)
+}
+
+/// One structural OOM candidate: the risk, the command that raised it, the
+/// (sub)query whose search stage feeds that command, and the command's index
+/// in that (sub)query's pipeline (NAN-5635).
+#[derive(Debug, Clone)]
+pub struct OomRiskSite<'a> {
+    pub risk: OomRisk,
+    pub command: &'a Command,
+    /// The pipeline the command belongs to: the top-level query or an
+    /// append/join/IN subsearch.
+    pub scope: &'a Query,
+    /// Index of `command` in `scope`'s commands, in pipeline order.
+    pub command_index: usize,
+    /// The scope is (inside) a subsearch that reads another dataset than the
+    /// request (`[dataset=… search …]`).
+    pub foreign_dataset: bool,
+}
+
+/// NAN-5660: the structural candidate for the prevalence pushdown's newest-1M
+/// scan: the query's first `prevalence` on an unfiltered search with no
+/// `head`/`tail`/`sample` before it (the same precondition as the other
+/// sites). Not part of [`oom_risk_sites`]: only the pushdown materializes
+/// that scan, and whether it does depends on the plan the search service
+/// picks (`prevalence_scan`), so the service admits it there.
+pub fn prevalence_scan_site(query: &Query) -> Option<OomRiskSite<'_>> {
+    let mut commands = Vec::new();
+    collect_commands_in_order(query, &mut commands);
+    let index = commands
+        .iter()
+        .position(|cmd| matches!(cmd, Command::Prevalence { .. }))?;
+    let has_limit_before = commands[..index].iter().any(|cmd| {
+        matches!(cmd, Command::Head { .. } | Command::Tail { .. } | Command::Sample { .. })
+    });
+    if search_has_meaningful_filter(query) || has_limit_before {
+        return None;
+    }
+    Some(OomRiskSite {
+        risk: OomRisk::UnboundedPrevalenceScan,
+        command: commands[index],
+        scope: query,
+        command_index: index,
+        foreign_dataset: false,
+    })
+}
+
+/// Every structural OOM candidate in the query, in the order
+/// [`detect_oom_risk`] reports them (the first one is its answer).
+pub fn oom_risk_sites(query: &Query) -> Vec<OomRiskSite<'_>> {
+    let mut out = Vec::new();
+    collect_oom_risk_sites(query, false, &mut out);
+    out
+}
+
+fn collect_oom_risk_sites<'a>(
+    query: &'a Query,
+    foreign_dataset: bool,
+    out: &mut Vec<OomRiskSite<'a>>,
+) {
     let mut commands = Vec::new();
     collect_commands_in_order(query, &mut commands);
 
@@ -375,31 +451,40 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
             )
         })
     };
+    let mut push = |risk: OomRisk, command: &'a Command, command_index: usize| {
+        out.push(OomRiskSite {
+            risk,
+            command,
+            scope: query,
+            command_index,
+            foreign_dataset,
+        });
+    };
 
-    for (i, cmd) in commands.iter().enumerate() {
+    for (i, &cmd) in commands.iter().enumerate() {
         match cmd {
             // 1. eventstats/streamstats without filters (existing NAN-224 guardrail)
             Command::EventStats { .. } | Command::StreamStats { .. } => {
                 if !has_filter && !has_limit_before(i) {
-                    return Some(OomRisk::UnboundedWindowFunction);
+                    push(OomRisk::UnboundedWindowFunction, cmd, i);
                 }
             }
             // 2. dedup without filters — materializes full dataset
             Command::Dedup { .. } => {
                 if !has_filter && !has_limit_before(i) {
-                    return Some(OomRisk::UnboundedDedup);
+                    push(OomRisk::UnboundedDedup, cmd, i);
                 }
             }
             // 3. reverse without filters or preceding limit
             Command::Reverse => {
                 if !has_filter && !has_limit_before(i) {
-                    return Some(OomRisk::UnboundedReverse);
+                    push(OomRisk::UnboundedReverse, cmd, i);
                 }
             }
             // 4. transaction without filters
             Command::Transaction { .. } => {
                 if !has_filter && !has_limit_before(i) {
-                    return Some(OomRisk::UnboundedTransaction);
+                    push(OomRisk::UnboundedTransaction, cmd, i);
                 }
             }
             // 5. anomaly without filters — scores every row in the window; the
@@ -418,7 +503,7 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
                     )
                 });
                 if !has_filter && !has_limit_before(i) && !has_agg_before {
-                    return Some(OomRisk::UnboundedAnomaly);
+                    push(OomRisk::UnboundedAnomaly, cmd, i);
                 }
             }
             // 6. stats with values()/list() or high-cardinality GROUP BY without filters
@@ -431,24 +516,23 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
                 group_by,
             } => {
                 if !has_filter && !has_limit_before(i) {
-                    // Check for values()/list() aggregations
                     let has_collect = aggregations
                         .iter()
                         .any(|agg| matches!(agg.func, AggFunc::Values | AggFunc::List));
+                    let high_cardinality = group_by.iter().flatten().find(|field| {
+                        let lower = field.to_lowercase();
+                        HIGH_CARDINALITY_FIELDS.iter().any(|&hc| hc == lower)
+                    });
                     if has_collect {
-                        return Some(OomRisk::UnboundedCollectAggregation);
-                    }
-
-                    // Check for high-cardinality GROUP BY fields
-                    if let Some(group_fields) = group_by {
-                        for field in group_fields {
-                            let lower = field.to_lowercase();
-                            if HIGH_CARDINALITY_FIELDS.iter().any(|&hc| hc == lower) {
-                                return Some(OomRisk::HighCardinalityGroupBy {
-                                    field: field.clone(),
-                                });
-                            }
-                        }
+                        push(OomRisk::UnboundedCollectAggregation, cmd, i);
+                    } else if let Some(field) = high_cardinality {
+                        push(
+                            OomRisk::HighCardinalityGroupBy {
+                                field: field.clone(),
+                            },
+                            cmd,
+                            i,
+                        );
                     }
                 }
             }
@@ -464,24 +548,40 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
     // re-derives has_filter from the SUBSEARCH's own search stage).
     // NAN-5620: `field IN [search … | <stages> | return f]` now runs its whole
     // pipeline too, so its stages get the same scoped pass.
-    for cmd in &commands {
-        if let Command::Append { subsearch, .. } | Command::Join { subsearch, .. } = cmd {
-            if let Some(risk) = detect_oom_risk(subsearch) {
-                return Some(risk);
+    for &cmd in &commands {
+        match cmd {
+            Command::Append { subsearch, .. } => {
+                collect_oom_risk_sites(subsearch, foreign_dataset, out)
             }
+            Command::Join {
+                subsearch,
+                subsearch_dataset,
+                ..
+            } => collect_oom_risk_sites(
+                subsearch,
+                foreign_dataset || subsearch_dataset.is_some(),
+                out,
+            ),
+            _ => {}
         }
     }
     let mut in_subsearches = Vec::new();
     collect_in_subsearches_of_query(query, &mut in_subsearches);
-    in_subsearches.into_iter().find_map(detect_oom_risk)
+    for (subsearch, own_dataset) in in_subsearches {
+        collect_oom_risk_sites(subsearch, foreign_dataset || own_dataset, out);
+    }
 }
 
 /// Every `field IN [ … ]` subsearch in the query's search stage and its
 /// `where` conditions (NAN-5620).
-fn collect_in_subsearches_of_query<'a>(query: &'a Query, out: &mut Vec<&'a Query>) {
-    fn walk<'a>(expr: &'a SearchExpr, out: &mut Vec<&'a Query>) {
+fn collect_in_subsearches_of_query<'a>(query: &'a Query, out: &mut Vec<(&'a Query, bool)>) {
+    fn walk<'a>(expr: &'a SearchExpr, out: &mut Vec<(&'a Query, bool)>) {
         match expr {
-            SearchExpr::InSubsearch { subsearch, .. } => out.push(subsearch),
+            SearchExpr::InSubsearch {
+                subsearch,
+                subsearch_dataset,
+                ..
+            } => out.push((subsearch, subsearch_dataset.is_some())),
             SearchExpr::And(l, r) | SearchExpr::Or(l, r) => {
                 walk(l, out);
                 walk(r, out);

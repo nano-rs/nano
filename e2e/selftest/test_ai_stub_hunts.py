@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from nano_e2e.ai_stub import hunt_tool_calls
+from nano_e2e.ai_stub import HUNT_FILE_CRITICAL_MARKER, hunt_tool_calls
 
 FIN = "fin-ws-r1"
 SCCM = "sccm-r1"
@@ -50,6 +50,17 @@ def test_the_investigator_files_the_lead_then_the_benign_twin_then_finishes() ->
     body["messages"].append(assistant("file_finding", args(second)))
     body["messages"].append({"role": "tool", "content": "filed benign sccm"})
     assert names(hunt_tool_calls(body)) == ["finish"]
+
+
+def test_a_charter_marker_files_the_lead_at_critical() -> None:
+    """NAN-5663: the duplicate gate's worse variant (same chain, higher severity)."""
+    row = f'{{"id": "{E1}", "device.hostname": "{FIN}", "process.name": "powershell.exe"}}'
+    plain = {"tools": tools("file_finding", "finish"), "messages": [{"role": "user", "content": row}]}
+    assert args(hunt_tool_calls(plain))["severity"] == "high"
+    marked = {"tools": tools("file_finding", "finish"),
+              "messages": [{"role": "user", "content": f"CHARTER notes: {HUNT_FILE_CRITICAL_MARKER}\n{row}"}]}
+    first = args(hunt_tool_calls(marked))
+    assert first["severity"] == "critical" and first["entity_value"] == FIN and first["evidence_event_ids"] == [E1]
 
 
 def test_the_reviewer_reads_evidence_first_then_records_one_verdict() -> None:

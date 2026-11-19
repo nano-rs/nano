@@ -83,6 +83,7 @@ import { HelpMenu } from '@/components/support/HelpMenu';
 import { SettingsLayout } from '@/components/layout/settings/SettingsLayout';
 const CommandPalette = lazy(() => import('@/components/shared/CommandPalette').then(m => ({ default: m.CommandPalette })));
 import { Button } from '@/components/ui/button';
+import { BetaBadge } from '@/components/ui/beta-badge';
 import { StatusBar } from './StatusBar';
 import { Logo } from '@/components/ui/logo';
 import { ThemeMenu } from './ThemeMenu';
@@ -104,6 +105,7 @@ function CollapsedSectionFlyout({
   location,
   handleNavClick,
   iconSize = 'w-5 h-5',
+  beta = false,
 }: {
   icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
   label: string;
@@ -112,6 +114,8 @@ function CollapsedSectionFlyout({
   location: { pathname: string };
   handleNavClick: (e: React.MouseEvent<HTMLAnchorElement>, href: string) => void;
   iconSize?: string;
+  /** Early-access section: the flyout header carries the BETA badge (NAN-5654). */
+  beta?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ top: 0, left: 0 });
@@ -151,7 +155,10 @@ function CollapsedSectionFlyout({
           onMouseEnter={handleEnter}
           onMouseLeave={handleLeave}
         >
-          <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground">{label}</div>
+          <div className="flex items-center gap-2 px-2 py-1.5 text-xs font-semibold text-muted-foreground">
+            {label}
+            {beta && <BetaBadge />}
+          </div>
           {items.map((item) => {
             const SubIcon = item.icon;
             const matchesPath = location.pathname === item.href ||
@@ -213,6 +220,13 @@ export interface NavItem {
    * URL. (NAN-437)
    */
   activePrefixes?: string[];
+  /** Early-access surface: show the BETA badge beside the label (NAN-5654). */
+  beta?: boolean;
+}
+
+/** Accessible name / collapsed-rail tooltip for a nav item (adds "(beta)"). */
+function navItemLabel(item: NavItem): string {
+  return item.beta ? `${item.name} (beta)` : item.name;
 }
 
 /**
@@ -256,7 +270,7 @@ const casesNavigation: NavItem[] = [
  */
 const secondaryMainNavigation: NavItem[] = [
   // NAN-5545: enterprise hunts workspace; the capability is off in open builds.
-  { name: 'Hunts', href: '/hunts', icon: NavCrosshair, permissions: 'hunts:view', capability: 'hunts' },
+  { name: 'Hunts', href: '/hunts', icon: NavCrosshair, permissions: 'hunts:view', capability: 'hunts', beta: true },
   { name: 'Notebooks', href: '/notebooks', icon: NavList, permissions: 'notebooks:view', capability: 'notebooks' },
   { name: 'Prevalence', href: '/prevalence', icon: NavChart, permissions: 'prevalence:view' },
   { name: 'Risk', href: '/risk', icon: NavBars, permissions: 'risk:view', capability: 'risk' },
@@ -905,11 +919,12 @@ function MainAppShell({ children }: AppLayoutProps) {
                     : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
                   sidebarCollapsed && 'w-8 !px-0 !gap-0 mx-auto justify-center'
                 )}
-                aria-label={item.name}
-                title={sidebarCollapsed ? item.name : undefined}
+                aria-label={navItemLabel(item)}
+                title={sidebarCollapsed ? navItemLabel(item) : undefined}
               >
                 <Icon className="w-[15px] h-[15px]" />
                 {!sidebarCollapsed && item.name}
+                {!sidebarCollapsed && item.beta && <BetaBadge className="ml-auto" />}
               </Link>
             );
           })}
@@ -946,10 +961,12 @@ function MainAppShell({ children }: AppLayoutProps) {
                   location={location}
                   handleNavClick={handleNavClick}
                   iconSize="w-[15px] h-[15px]"
+                  beta
                 />
               ) : (
                 <button
                   onClick={() => toggleSection('automation')}
+                  aria-label="Automation (beta)"
                   className={cn(
                     'relative flex items-center w-full h-8 px-2 gap-2.5 rounded-md text-[12.5px] font-medium transition-colors justify-between',
                     isAutomationActive
@@ -960,6 +977,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                   <div className="flex items-center gap-3">
                     <AUTOMATION_SECTION_ICON className="w-[15px] h-[15px]" strokeWidth={1.5} />
                     Automation
+                    <BetaBadge />
                   </div>
                   <span className="flex items-center gap-1.5">
                     {automationNav.pendingApprovals && (
@@ -1340,6 +1358,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                   key={item.name}
                   to={item.href}
                   onClick={(e) => handleNavClick(e, item.href)}
+                  aria-label={navItemLabel(item)}
                   className={cn(
                     'relative flex items-center gap-2.5 h-8 px-2 rounded-md text-[12.5px] font-medium transition-colors',
                     isActive
@@ -1349,6 +1368,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                 >
                   <Icon className="w-[15px] h-[15px]" />
                   {item.name}
+                  {item.beta && <BetaBadge className="ml-auto" />}
                 </Link>
               );
             })}
@@ -1375,6 +1395,7 @@ function MainAppShell({ children }: AppLayoutProps) {
               <div className="pt-2">
                 <button
                   onClick={() => toggleSection('automation')}
+                  aria-label="Automation (beta)"
                   className={cn(
                     'relative flex items-center w-full h-8 px-2 gap-2.5 rounded-md text-[12.5px] font-medium transition-colors justify-between',
                     isAutomationActive
@@ -1385,6 +1406,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                   <div className="flex items-center gap-3">
                     <AUTOMATION_SECTION_ICON className="w-[15px] h-[15px]" strokeWidth={1.5} />
                     Automation
+                    <BetaBadge />
                   </div>
                   <ChevronDown className={cn('w-4 h-4 transition-transform', automationOpen && 'rotate-180')} />
                 </button>

@@ -10,6 +10,7 @@ use crate::parsers::types::{
     DeploymentAction, DeploymentResult, DeploymentStatus, ParserDeployment, ValidationResult,
 };
 use crate::parsers::vector_config::redact_config_snapshot;
+use crate::parsers::vector_config::VectorConfigError;
 
 impl ParserService {
     /// Render the canonical parser configuration without reloading Vector.
@@ -113,9 +114,12 @@ impl ParserService {
         let strict = self.deploy_to_vector().await;
         let strict_error = match strict {
             Ok(()) => {
-                // The tree is written: (re)write the marker for this api's
-                // identity, also when one with the same name was already there.
-                self.vector_config.rewrite_pipeline_identity().await;
+                // The tree is written: make the marker name this api's
+                // identity (NAN-5611: untouched when it already does).
+                self.vector_config
+                    .rewrite_pipeline_identity()
+                    .await
+                    .map_err(VectorConfigError::from)?;
                 return Ok(Vec::new());
             }
             Err(error) => error,
@@ -147,7 +151,10 @@ impl ParserService {
         self.record_render_quarantine(&kept).await;
         match result {
             Ok(()) => {
-                self.vector_config.rewrite_pipeline_identity().await;
+                self.vector_config
+                    .rewrite_pipeline_identity()
+                    .await
+                    .map_err(VectorConfigError::from)?;
                 Ok(left_out)
             }
             Err(error) if !self.vector_config.pipeline_identity_pending().await => {

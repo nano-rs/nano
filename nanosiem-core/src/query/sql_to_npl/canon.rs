@@ -280,12 +280,14 @@ impl Reader<'_> {
             }
             Expr::CompoundIdentifier(parts) => {
                 let names: Vec<&str> = parts.iter().map(|p| p.value.as_str()).collect();
-                let names = if names.len() > 1 && self.qualifiers.iter().any(|q| q == names[0]) {
-                    &names[1..]
-                } else {
-                    &names[..]
-                };
+                let qualified = names.len() > 1 && self.qualifiers.iter().any(|q| q == names[0]);
+                let names = if qualified { &names[1..] } else { &names[..] };
                 let name = names.join(".");
+                // `t.col` over a real table names its column, never a SELECT
+                // alias (over a CTE or a subquery it names that one's output).
+                if qualified && self.qualifiers.iter().any(|q| q == BASE_TABLE_MARK) {
+                    return Some((name, false));
+                }
                 Some((self.outputs.get(&name).cloned().unwrap_or(name), false))
             }
             Expr::Nested(e) => self.column(e),
@@ -294,29 +296,292 @@ impl Reader<'_> {
                 if is_aggregate_name(&name) {
                     return Some((self.aggregate(expr), false));
                 }
+                // nPL's values(), an aggregate under a string join.
+                if name == "arraystringconcat" {
+                    let a = self.aggregate(expr);
+                    if is_single_call(&a, "values") {
+                        return Some((a, false));
+                    }
+                }
                 match (name.as_str(), function_args(f).as_slice()) {
                     // A column the source always writes lowercase reads the
-                    // same through lower().
-                    ("lower" | "lowerutf8", [Arg::Expr(e)]) => self.column(e).map(|(c, _)| {
+                    // same through lower(); so does a value that already is
+                    // `lower(…)` (NAN-5630: an eval'd `u = lower(x)` compared
+                    // as `lower(toString(u))`).
+                    ("lower" | "lowerutf8", [Arg::Expr(e)]) => self.column(e).map(|(c, ci)| {
+                        if ci || is_single_call(&c, "lower") {
+                            return (c, ci);
+                        }
                         let ci = !self.facts.lowered(&c);
                         (c, ci)
                     }),
                     ("tostring" | "assumenotnull", [Arg::Expr(e)]) => self.column(e),
-                    // nPL eval compares numbers through a float parse; over a
-                    // never-NULL integer column that is the column's value.
-                    ("tofloat64ornull", [Arg::Expr(Expr::Function(inner))])
-                        if function_name(inner).eq_ignore_ascii_case("toString") =>
-                    {
-                        match function_args(inner).as_slice() {
-                            [Arg::Expr(e)] => self.column(e).filter(|(c, ci)| !ci && self.facts.integer(c)),
-                            _ => None,
-                        }
+                    // nPL eval reads numbers through a float parse
+                    // (`toFloat64OrNull(toString(x))`, and its
+                    // `coalesce(…, toFloat64(parseDateTime64BestEffortOrNull(…)))`
+                    // form over a computed field): `tofloat(x)`. Where it
+                    // changes nothing (a numeric value compared with a number,
+                    // or divided) the comparison and the division drop it.
+                    _ if float_parse_operand(f).is_some() => {
+                        let e = float_parse_operand(f).expect("checked");
+                        let (c, ci) = self.column(e)?;
+                        Some((format!("tofloat({})", col_text(&c, ci)), false))
                     }
-                    _ => None,
+                    // NAN-5630: any other scalar function is a computed
+                    // value, read structurally.
+                    _ => Some((self.scalar(expr), false)),
                 }
             }
+            // NAN-5630: arithmetic, CASE and array subscripts are computed
+            // values too.
+            Expr::BinaryOp {
+                op:
+                    BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo,
+                ..
+            }
+            | Expr::Case { .. }
+            | Expr::CompoundFieldAccess { .. } => Some((self.scalar(expr), false)),
             _ => None,
         }
+    }
+
+    /// Is a canonical value known to be a number? A numeric column, a
+    /// number, or a count / distinct count / sum / average / length (the
+    /// float parse of a number is the number; of anything else it is not).
+    fn numeric(&self, canon: &str) -> bool {
+        use crate::schema::SchemaProfile as _;
+        if canon.parse::<f64>().is_ok() || self.facts.integer(canon) {
+            return true;
+        }
+        let numeric_column = if self.facts.signals {
+            crate::schema::SignalsProfile.is_numeric_field(canon)
+        } else {
+            self.ctx.profile.is_numeric_field(canon)
+        };
+        if numeric_column {
+            return true;
+        }
+        const NUMERIC_CALLS: &[&str] =
+            &["count", "countIf", "dc", "dc_nonempty", "sum", "sumIf", "avg", "length", "lengthutf8"];
+        if NUMERIC_CALLS.iter().any(|n| is_single_call(canon, n)) {
+            return true;
+        }
+        // min / max of a numeric column (never of the timestamp).
+        ["min", "max"].iter().any(|n| {
+            is_single_call(canon, n)
+                && canon[n.len() + 1..canon.len() - 1] != *TIME_COLUMN
+                && self.numeric(&canon[n.len() + 1..canon.len() - 1])
+        })
+    }
+
+    /// NAN-5630: the canonical form of a VALUE (a computed column, a group
+    /// key, an aggregate argument, a sort key). Unlike [`Self::column`],
+    /// `lowerUTF8` stays distinct from `lower` here: a predicate against a
+    /// lowercase literal reads the same through either, a value does not.
+    fn value(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Nested(e) => self.value(e),
+            // As a value, `toString(x)` is a string (it sorts as one) and
+            // `assumeNotNull(x)` turns NULL into a default; a predicate reads
+            // through both, a value does not.
+            Expr::Function(f)
+                if ["lowerUTF8", "toString", "assumeNotNull"].iter().any(|n| function_name(f).eq_ignore_ascii_case(n)) =>
+            {
+                match function_args(f).as_slice() {
+                    [Arg::Expr(e)] => format!("{}({})", function_name(f).to_ascii_lowercase(), self.value(e)),
+                    _ => expr.to_string(),
+                }
+            }
+            _ => match self.column(expr) {
+                Some((c, ci)) => col_text(&c, ci),
+                None => self.scalar(expr),
+            },
+        }
+    }
+
+    /// The structural canon of a computed expression. Function names are
+    /// lowercased, CH aliases folded (`replace` / `replaceAll`, `trim` /
+    /// `trimBoth`, one-character `splitByChar` / `splitByString`), constant
+    /// integer arithmetic folded, a `multiIf` / `CASE` cut at its first
+    /// constant-true branch, and a time bucket read as its width when the
+    /// named function and `toStartOfInterval` are the same bucket. Anything
+    /// it does not model reads as its SQL text, which never matches the
+    /// other side's unless the two are the same text.
+    fn scalar(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Nested(e) => self.scalar(e),
+            Expr::Value(_) => self.literal(expr).to_string(),
+            Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => match self.literal(expr) {
+                Lit::Num(n) => n,
+                _ => format!("(-{})", self.value(inner)),
+            },
+            Expr::BinaryOp { left, op, right } => {
+                let arith = match op {
+                    BinaryOperator::Plus => "+",
+                    BinaryOperator::Minus => "-",
+                    BinaryOperator::Multiply => "*",
+                    BinaryOperator::Divide => "/",
+                    BinaryOperator::Modulo => "%",
+                    // A condition (comparison, AND / OR, …) as a value.
+                    _ => return self.predicate(expr).to_string(),
+                };
+                if let (Lit::Num(a), Lit::Num(b)) = (self.literal(left), self.literal(right)) {
+                    if let (Ok(a), Ok(b)) = (a.parse::<i64>(), b.parse::<i64>()) {
+                        let folded = match arith {
+                            "+" => a.checked_add(b),
+                            "-" => a.checked_sub(b),
+                            "*" => a.checked_mul(b),
+                            _ => None,
+                        };
+                        if let Some(v) = folded {
+                            return v.to_string();
+                        }
+                    }
+                }
+                let (l, r) = (self.value(left), self.value(right));
+                // ClickHouse divides in Float64 whatever the operand types,
+                // so nPL's float parse of a numeric operand changes nothing.
+                // (`+ - *` keep integer types in SQL; nPL computes them in
+                // Float64, which is a different value type.)
+                let (l, r) = if arith == "/" { (self.unfloat(l), self.unfloat(r)) } else { (l, r) };
+                format!("({l} {arith} {r})")
+            }
+            Expr::Case { operand: None, conditions, else_result, .. } => {
+                let mut parts = Vec::new();
+                for w in conditions {
+                    parts.push((self.value(&w.condition), self.value(&w.result)));
+                }
+                let otherwise = else_result.as_ref().map(|e| self.value(e)).unwrap_or_else(|| "NULL".into());
+                multi_if(parts, otherwise)
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let mut out = self.value(root);
+                for a in access_chain {
+                    match a {
+                        sqlparser::ast::AccessExpr::Subscript(sqlparser::ast::Subscript::Index { index }) => {
+                            out = format!("{out}[{}]", self.value(index));
+                        }
+                        _ => return expr.to_string(),
+                    }
+                }
+                out
+            }
+            Expr::Interval(i) => interval_canon(i, self).unwrap_or_else(|| expr.to_string()),
+            Expr::Function(f) => self.scalar_function(f).unwrap_or_else(|| expr.to_string()),
+            _ => expr.to_string(),
+        }
+    }
+
+    /// NAN-5630: `position(col, 'needle') > 0` (or `>= 1`, `!= 0`; `= 0`
+    /// negated) is the substring match `col LIKE '%needle%'`;
+    /// `positionCaseInsensitive` the case-insensitive one. Both fold ASCII
+    /// only, as `lower()` does, so only an ASCII needle is read this way.
+    fn position_match(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Option<Canon> {
+        let Expr::Function(f) = left else { return None };
+        let name = function_name(f).to_ascii_lowercase();
+        let ci = match name.as_str() {
+            "position" => false,
+            "positioncaseinsensitive" => true,
+            _ => return None,
+        };
+        if f.over.is_some() || !matches!(f.parameters, sqlparser::ast::FunctionArguments::None) {
+            return None;
+        }
+        let args = function_args(f);
+        let [Arg::Expr(hay), Arg::Expr(needle)] = args.as_slice() else { return None };
+        let Lit::Str(n) = self.literal(needle) else { return None };
+        if n.is_empty() || !n.is_ascii() {
+            return None;
+        }
+        let Lit::Num(k) = self.literal(right) else { return None };
+        let neg = match (op, k.as_str()) {
+            (BinaryOperator::Gt, "0") | (BinaryOperator::GtEq, "1") | (BinaryOperator::NotEq, "0") => false,
+            (BinaryOperator::Eq, "0") | (BinaryOperator::LtEq, "0") | (BinaryOperator::Lt, "1") => true,
+            _ => return None,
+        };
+        let (col, col_ci) = self.column(hay)?;
+        if col_ci && !ci && n != n.to_lowercase() {
+            // `position(lower(x), 'Abc')` never matches.
+            return None;
+        }
+        Some(like(col, ci || col_ci, neg, format!("%{}%", like_escape(&n))))
+    }
+
+    /// `tofloat(x)` → `x` when `x` is numeric.
+    fn unfloat(&self, v: String) -> String {
+        match v.strip_prefix("tofloat(").and_then(|r| r.strip_suffix(')')) {
+            Some(inner) if is_single_call(&v, "tofloat") && self.numeric(inner) => inner.to_string(),
+            _ => v,
+        }
+    }
+
+    fn scalar_function(&self, f: &sqlparser::ast::Function) -> Option<String> {
+        if f.over.is_some()
+            || f.filter.is_some()
+            || !f.within_group.is_empty()
+            || !matches!(f.parameters, sqlparser::ast::FunctionArguments::None)
+            || is_distinct_call(f)
+        {
+            return None;
+        }
+        let name = function_name(f).to_ascii_lowercase();
+        let raw_args = function_args(f);
+        let exprs: Vec<&Expr> = raw_args
+            .iter()
+            .map(|a| match a {
+                Arg::Expr(e) => Some(*e),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let args: Vec<String> = exprs.iter().map(|e| self.value(e)).collect();
+        let name = match name.as_str() {
+            // ClickHouse aliases of one function.
+            "replace" => "replaceall".to_string(),
+            "trim" => "trimboth".to_string(),
+            "lcase" => "lower".to_string(),
+            "ucase" => "upper".to_string(),
+            // `splitByChar` takes a one-character separator, on which it
+            // splits exactly as `splitByString` does.
+            "splitbychar" if matches!(exprs.first().map(|e| self.literal(e)), Some(Lit::Str(s)) if s.chars().count() == 1) => {
+                "splitbystring".to_string()
+            }
+            "multiif" if args.len() >= 3 && args.len() % 2 == 1 => {
+                let mut pairs = Vec::new();
+                for p in args[..args.len() - 1].chunks(2) {
+                    pairs.push((p[0].clone(), p[1].clone()));
+                }
+                return Some(multi_if(pairs, args[args.len() - 1].clone()));
+            }
+            "tostartofinterval" if args.len() == 2 => {
+                return Some(match bucket_seconds(&args[1]) {
+                    Some(s) => format!("bucket({}, {s})", args[0]),
+                    None => format!("tostartofinterval({}, {})", args[0], args[1]),
+                });
+            }
+            "tostartofminute" | "tostartoffiveminutes" | "tostartoftenminutes" | "tostartoffifteenminutes"
+            | "tostartofhour"
+                if args.len() == 1 =>
+            {
+                let s = match name.as_str() {
+                    "tostartofminute" => 60,
+                    "tostartoffiveminutes" => 300,
+                    "tostartoftenminutes" => 600,
+                    "tostartoffifteenminutes" => 900,
+                    _ => 3600,
+                };
+                return Some(format!("bucket({}, {s})", args[0]));
+            }
+            n if n.starts_with("tointerval") && args.len() == 1 => {
+                let unit = n.strip_prefix("tointerval")?;
+                return Some(format!("interval({}, {unit})", args[0]));
+            }
+            _ => name,
+        };
+        Some(format!("{name}({})", args.join(", ")))
     }
 
     fn literal(&self, expr: &Expr) -> Lit {
@@ -338,7 +603,10 @@ impl Reader<'_> {
     }
 
     fn is_literal(&self, expr: &Expr) -> bool {
-        sentinel_of(expr).is_some() || !matches!(self.literal(expr), Lit::Expr(_)) || self.column(expr).is_none()
+        sentinel_of(expr).is_some()
+            || !matches!(self.literal(expr), Lit::Expr(_))
+            || is_constant(expr)
+            || self.column(expr).is_none()
     }
 
     /// The canonical text of an aggregate.
@@ -348,8 +616,10 @@ impl Reader<'_> {
         let args = function_args(f);
         // A window, FILTER, parametric (`uniqUpTo(5)(x)`, `groupUniqArray(10)(x)`)
         // or DISTINCT form means something else than the plain aggregate.
+        // NAN-5630: an aggregate's argument is a value (`max(lowerUTF8(x))`
+        // is not `max(lower(x))`; `max(toString(port))` compares strings).
         let col = |a: &Arg| match a {
-            Arg::Expr(e) => self.column(e).map(|(c, ci)| col_text(&c, ci)),
+            Arg::Expr(e) => Some(self.value(e)),
             _ => None,
         };
         // `groupUniqArray(N)(x)`: kept structured so the comparison can say
@@ -450,11 +720,20 @@ impl Reader<'_> {
             }
             Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => not(self.predicate(inner)),
             Expr::BinaryOp { left, op, right } => {
+                if let Some(c) = self.position_match(left, op, right) {
+                    return c;
+                }
                 let Some(op) = op_of(op) else { return Canon::Other(expr.to_string()) };
                 let (col, lit, op) = match (self.column(left), self.column(right)) {
                     (Some(c), _) if self.is_literal(right) => (c, self.literal(right), op),
                     (_, Some(c)) if self.is_literal(left) => (c, self.literal(left), flip_op(op)),
                     _ => return Canon::Other(expr.to_string()),
+                };
+                // A float parse of a numeric value, compared with a number,
+                // compares the value.
+                let col = match (&col, &lit) {
+                    ((c, false), Lit::Num(_)) => (self.unfloat(c.clone()), false),
+                    _ => col,
                 };
                 if col.1 && has_upper(&lit) {
                     return unmatchable(expr);
@@ -601,6 +880,189 @@ fn find_group_uniq_arg(expr: &Expr) -> Option<&Expr> {
     }
 }
 
+/// In a SELECT's qualifiers: it reads a real table (not a CTE or subquery).
+const BASE_TABLE_MARK: &str = "\u{0}table";
+
+/// `GROUP BY 2` / `ORDER BY 2`: the 1-based SELECT item a bare integer
+/// names (ClickHouse's `enable_positional_arguments`, on by default).
+pub(super) fn positional(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n.parse::<usize>().ok().filter(|n| *n > 0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// NAN-5608 P2-19: a bound on `timestamp` Search can run over: a window
+/// placeholder or a literal instant (bare, or in a one-argument conversion).
+fn known_bound(v: &Lit) -> bool {
+    static CONVERTED: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?i)^(todatetime|todatetime64|parsedatetimebesteffort|parsedatetime64besteffort)\('([^'\\]*)'(, *\d+)?\)$")
+            .expect("static regex")
+    });
+    match v {
+        Lit::Str(s) => super::convert::parse_instant(s).is_some(),
+        Lit::Expr(e) => {
+            [super::convert::EARLIEST_SENTINEL, super::convert::LATEST_SENTINEL]
+                .iter()
+                .any(|s| e.strip_prefix(s).is_some_and(|pad| pad.chars().all(|c| c == '_')))
+                || CONVERTED.captures(e).is_some_and(|c| super::convert::parse_instant(&c[2]).is_some())
+        }
+        _ => false,
+    }
+}
+
+/// Is `canon` exactly one call of `name` (`name(…)` with the first `(`
+/// closing at the very end)? Quote-aware: a literal may hold parentheses.
+pub(super) fn is_single_call(canon: &str, name: &str) -> bool {
+    let Some(rest) = canon.strip_prefix(name).and_then(|r| r.strip_prefix('(')) else { return false };
+    let mut depth = 1usize;
+    let mut in_str = false;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' if in_str => {
+                chars.next();
+            }
+            '\'' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == rest.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The operand of nPL's float parse of a value: `toFloat64OrNull(toString(x))`,
+/// or its `coalesce(…, toFloat64(parseDateTime64BestEffortOrNull(toString(x), 3, 'UTC')))`
+/// form (which only differs from it where `x` is not a number).
+fn float_parse_operand(f: &sqlparser::ast::Function) -> Option<&Expr> {
+    fn to_float_of(f: &sqlparser::ast::Function) -> Option<&Expr> {
+        if !function_name(f).eq_ignore_ascii_case("toFloat64OrNull") {
+            return None;
+        }
+        let [Arg::Expr(Expr::Function(s))] = function_args(f).as_slice() else { return None };
+        if !function_name(s).eq_ignore_ascii_case("toString") {
+            return None;
+        }
+        match function_args(s).as_slice() {
+            [Arg::Expr(x)] => Some(*x),
+            _ => None,
+        }
+    }
+    let name = function_name(f).to_ascii_lowercase();
+    if name == "tofloat64ornull" {
+        return to_float_of(f);
+    }
+    if name != "coalesce" {
+        return None;
+    }
+    let [Arg::Expr(Expr::Function(first)), Arg::Expr(Expr::Function(second))] = function_args(f).as_slice() else {
+        return None;
+    };
+    let x = to_float_of(first)?;
+    // The fallback leg: toFloat64(parseDateTime64BestEffortOrNull(toString(x), 3, 'UTC')).
+    if !function_name(second).eq_ignore_ascii_case("toFloat64") {
+        return None;
+    }
+    let [Arg::Expr(Expr::Function(parse))] = function_args(second).as_slice() else { return None };
+    if !function_name(parse).eq_ignore_ascii_case("parseDateTime64BestEffortOrNull") {
+        return None;
+    }
+    match function_args(parse).as_slice() {
+        [Arg::Expr(Expr::Function(s)), _, _]
+            if function_name(s).eq_ignore_ascii_case("toString")
+                && matches!(function_args(s).as_slice(), [Arg::Expr(y)] if y.to_string() == x.to_string()) =>
+        {
+            Some(x)
+        }
+        _ => None,
+    }
+}
+
+/// An expression with no column in it (a literal, a function of literals,
+/// a window placeholder).
+fn is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(_) => true,
+        Expr::Identifier(_) => sentinel_of(expr).is_some(),
+        Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => is_constant(e),
+        Expr::BinaryOp { left, right, .. } => is_constant(left) && is_constant(right),
+        Expr::Interval(i) => is_constant(&i.value),
+        Expr::Function(f) => {
+            !is_aggregate_name(&function_name(f))
+                && function_args(f).iter().all(|a| matches!(a, Arg::Expr(e) if is_constant(e)))
+        }
+        _ => false,
+    }
+}
+
+/// `multiIf(c1, v1, …, else)`, cut at the first constant-true condition
+/// (its value is the result from there on, whatever follows).
+fn multi_if(pairs: Vec<(String, String)>, otherwise: String) -> String {
+    let mut kept = Vec::new();
+    let mut otherwise = otherwise;
+    for (c, v) in pairs {
+        if c == "1" || c == "true" {
+            otherwise = v;
+            break;
+        }
+        kept.push(format!("{c}, {v}"));
+    }
+    if kept.is_empty() {
+        return otherwise;
+    }
+    format!("multiif({}, {otherwise})", kept.join(", "))
+}
+
+/// `INTERVAL n unit` as `interval(n, unit)` (unit lowercase, singular).
+fn interval_canon(i: &sqlparser::ast::Interval, reader: &Reader) -> Option<String> {
+    let units = ["second", "minute", "hour", "day", "week", "month", "year"];
+    let norm = |u: &str| {
+        let u = u.to_ascii_lowercase();
+        let u = u.strip_suffix('s').map(str::to_string).unwrap_or(u);
+        units.contains(&u.as_str()).then_some(u)
+    };
+    if i.last_field.is_some() || i.fractional_seconds_precision.is_some() {
+        return None;
+    }
+    match (&i.leading_field, reader.literal(&i.value)) {
+        (Some(field), Lit::Num(n)) => Some(format!("interval({n}, {})", norm(&field.to_string())?)),
+        (None, Lit::Str(s)) => {
+            let (n, unit) = s.trim().split_once(char::is_whitespace)?;
+            let n: u64 = n.parse().ok()?;
+            Some(format!("interval({n}, {})", norm(unit.trim())?))
+        }
+        _ => None,
+    }
+}
+
+/// The width of a `toStartOfInterval` bucket that the named functions
+/// (`toStartOfHour`, …) and every other spelling of it compute alike: a
+/// width in seconds, minutes or hours that divides a day evenly (epoch- and
+/// day-aligned buckets then coincide on the UTC time column). Day and wider
+/// buckets are not folded (`toStartOfInterval(…, INTERVAL 1 DAY)` is a
+/// `Date`, `toStartOfDay` a `DateTime`).
+fn bucket_seconds(interval: &str) -> Option<u64> {
+    let inner = interval.strip_prefix("interval(")?.strip_suffix(')')?;
+    let (n, unit) = inner.split_once(", ")?;
+    let n: u64 = n.parse().ok()?;
+    let secs = n.checked_mul(match unit {
+        "second" => 1,
+        "minute" => 60,
+        "hour" => 3600,
+        _ => return None,
+    })?;
+    (secs > 0 && secs < 86_400 && 86_400 % secs == 0).then_some(secs)
+}
+
 fn flatten<'e>(expr: &'e Expr, op: &BinaryOperator) -> Vec<&'e Expr> {
     match expr {
         Expr::BinaryOp { left, op: o, right } if o == op => {
@@ -690,6 +1152,8 @@ pub(super) struct Signature {
     filters: Vec<Canon>,
     grouped: bool,
     keys: Vec<String>,
+    /// NAN-5630: the keys the aggregated result still shows.
+    visible_keys: BTreeSet<String>,
     aggs: Vec<String>,
     post: Vec<Canon>,
     order: Option<Vec<String>>,
@@ -714,6 +1178,15 @@ struct Walk {
     outputs: HashMap<String, String>,
     depth: usize,
     visiting: Vec<String>,
+    /// NAN-5630: the aggregated result's computed columns, by output name:
+    /// the aggregates, then any value a later stage computes from them
+    /// (`| eval ratio=f/n`), less any a later stage drops
+    /// (`SELECT * EXCEPT (…)`, nPL's `| fields - …`).
+    agg_outputs: Vec<(String, String)>,
+    /// The last SELECT's items, canonical, for a positional ORDER BY.
+    last_projection: Vec<String>,
+    /// The group keys the aggregated result shows: (output name, canon).
+    key_names: Vec<(String, String)>,
 }
 
 /// Read the subquery of an `IN (SELECT …)` filter (NAN-5614). DISTINCT is
@@ -740,8 +1213,16 @@ fn sub_canon(q: &Query, ctx: &ConvertContext) -> Result<SubCanon, String> {
             extra.push(format!("ORDER BY [{}]", order.join(", ")));
         }
     }
+    // IN compares the values, not their spelling: `toString(x)` returns
+    // what `x` does (the subsearch returns its values as strings).
     let ret = match &sig.project {
-        Some(cols) if !sig.grouped && cols.len() == 1 => Some(cols[0].clone()),
+        Some(cols) if !sig.grouped && cols.len() == 1 => {
+            let c = &cols[0];
+            Some(match c.strip_prefix("tostring(").and_then(|r| r.strip_suffix(')')) {
+                Some(inner) if is_single_call(c, "tostring") => inner.to_string(),
+                _ => c.clone(),
+            })
+        }
         _ => None,
     };
     Ok(SubCanon {
@@ -813,16 +1294,41 @@ impl Walk {
             _ => return Err("a set operation".into()),
         }
         let qualifiers: Vec<String> = Vec::new();
+        // NAN-5630: clauses that change the rows, or how the query reads
+        // (`SETTINGS prefer_column_name_to_alias = 1`), and that no nPL has.
+        if q.settings.is_some() {
+            self.sig.shape.insert("SETTINGS".into());
+        }
+        if q.fetch.is_some() || !q.locks.is_empty() || q.format_clause.is_some() || q.for_clause.is_some() {
+            self.sig.shape.insert("FETCH / FOR / FORMAT".into());
+        }
         if let Some(order) = &q.order_by {
+            if order.interpolate.is_some() {
+                self.sig.shape.insert("ORDER BY … INTERPOLATE".into());
+            }
+            match &order.kind {
+                OrderByKind::Expressions(items) => {
+                    if items.iter().any(|i| i.with_fill.is_some()) {
+                        self.sig.shape.insert("ORDER BY … WITH FILL".into());
+                    }
+                    if items.iter().any(|i| i.options.nulls_first.is_some()) {
+                        self.sig.shape.insert("ORDER BY … NULLS FIRST / LAST".into());
+                    }
+                }
+                _ => {
+                    self.sig.shape.insert("ORDER BY ALL".into());
+                }
+            }
             if let OrderByKind::Expressions(items) = &order.kind {
                 let reader = Reader { qualifiers: &qualifiers, outputs: &self.outputs, facts: self.facts(), ctx };
                 let keys = items
                     .iter()
                     .map(|i| {
-                        let name = reader
-                            .column(&i.expr)
-                            .map(|(c, ci)| col_text(&c, ci))
-                            .unwrap_or_else(|| i.expr.to_string());
+                        // `ORDER BY 2`: ClickHouse's positional arguments
+                        // (on by default) name the second SELECT item.
+                        let name = positional(&i.expr)
+                            .and_then(|n| self.last_projection.get(n - 1).cloned())
+                            .unwrap_or_else(|| reader.value(&i.expr));
                         let dir = if matches!(i.options.sort, Some(OrderBySort::Desc)) { "desc" } else { "asc" };
                         format!("{name} {dir}")
                     })
@@ -864,7 +1370,14 @@ impl Walk {
         }
         let mut qualifiers = Vec::new();
         match &from.relation {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table { name, alias, args, sample, .. } => {
+                // NAN-5608 P2-19: what no nPL does is a shape difference.
+                if sample.is_some() {
+                    self.sig.shape.insert("SAMPLE".into());
+                }
+                if args.is_some() {
+                    self.sig.shape.insert("a table function".into());
+                }
                 let base = table_base(name);
                 let cte_name = name.to_string();
                 if let Some(cte) = ctes.get(&cte_name) {
@@ -882,6 +1395,7 @@ impl Walk {
                         TableKind::Other(t) => t,
                     };
                     self.sig.table = Some(table.clone());
+                    qualifiers.push(BASE_TABLE_MARK.to_string());
                     qualifiers.push(base.clone());
                     qualifiers.push(table);
                     qualifiers.push(name.to_string());
@@ -899,11 +1413,37 @@ impl Walk {
             _ => return Err("a table function".into()),
         }
 
-        if s.distinct.is_some() {
-            self.sig.shape.insert("SELECT DISTINCT".into());
+        match &s.distinct {
+            Some(sqlparser::ast::Distinct::On(_)) => {
+                self.sig.shape.insert("SELECT DISTINCT ON".into());
+            }
+            Some(_) => {
+                self.sig.shape.insert("SELECT DISTINCT".into());
+            }
+            None => {}
+        }
+        // NAN-5630: what the converter refuses (check_select_shape) is a
+        // shape here, so nPL from elsewhere never matches it.
+        if s.top.is_some() {
+            self.sig.shape.insert("SELECT TOP".into());
+        }
+        if s.qualify.is_some() || !s.named_window.is_empty() {
+            self.sig.shape.insert("QUALIFY / WINDOW".into());
+        }
+        if !s.lateral_views.is_empty() || !s.connect_by.is_empty() || s.into.is_some() {
+            self.sig.shape.insert("LATERAL VIEW / CONNECT BY / INTO".into());
+        }
+        if !s.cluster_by.is_empty() || !s.distribute_by.is_empty() || !s.sort_by.is_empty() {
+            self.sig.shape.insert("CLUSTER / DISTRIBUTE / SORT BY".into());
         }
         let group_exprs: Vec<&Expr> = match &s.group_by {
-            GroupByExpr::Expressions(e, _) => e.iter().collect(),
+            GroupByExpr::Expressions(e, modifiers) => {
+                // NAN-5608 P2-19: ROLLUP / CUBE / TOTALS add rows no nPL adds.
+                if !modifiers.is_empty() {
+                    self.sig.shape.insert("GROUP BY … WITH ROLLUP / CUBE / TOTALS / GROUPING SETS".into());
+                }
+                e.iter().collect()
+            }
             GroupByExpr::All(_) => return Err("GROUP BY ALL".into()),
         };
         let aggregating = !group_exprs.is_empty()
@@ -912,18 +1452,85 @@ impl Walk {
                 _ => false,
             });
 
-        // Projection: aliases this stage defines.
+        // Projection: aliases this stage defines. NAN-5630: ClickHouse
+        // resolves a SELECT alias anywhere in the same SELECT (other items,
+        // WHERE, GROUP BY, HAVING), in whatever order the items come, so the
+        // computed aliases are resolved first: each sees every OTHER alias
+        // (its own name inside its definition is the column), to a fixed
+        // point.
+        let aliased: Vec<(String, &Expr)> = s
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::ExprWithAlias { expr, alias } if !contains_aggregate(expr) => {
+                    Some((alias.value.clone(), expr))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut resolved: HashMap<String, String> = HashMap::new();
+        for _ in 0..=aliased.len().min(MAX_DEPTH) {
+            let mut next = HashMap::new();
+            for (name, expr) in &aliased {
+                let mut outs = self.outputs.clone();
+                for (n, c) in &resolved {
+                    if n != name {
+                        outs.insert(n.clone(), c.clone());
+                    }
+                }
+                let c = Reader { qualifiers: &qualifiers, outputs: &outs, facts: self.facts(), ctx }.value(expr);
+                next.insert(name.clone(), c);
+            }
+            if next == resolved {
+                break;
+            }
+            resolved = next;
+        }
         let mut new_outputs = self.outputs.clone();
+        for (n, c) in &resolved {
+            if n != c {
+                new_outputs.insert(n.clone(), c.clone());
+            }
+        }
         let mut columns: Option<Vec<String>> = Some(Vec::new());
-        let mut aggs = Vec::new();
+        // (output name, canon) of the aggregates, and of the other items.
+        let mut agg_items: Vec<(String, String)> = Vec::new();
+        let mut plain_items: Vec<(String, String)> = Vec::new();
+        let mut item_canons: Vec<String> = Vec::new();
+        // Items that are a wildcard, and the names it leaves out.
+        let mut wildcard = false;
+        let mut excepted: Vec<String> = Vec::new();
         {
-            let reader = Reader { qualifiers: &qualifiers, outputs: &self.outputs, facts: self.facts(), ctx };
+            let reader = Reader { qualifiers: &qualifiers, outputs: &new_outputs, facts: self.facts(), ctx };
             for item in &s.projection {
                 let (expr, alias) = match item {
                     SelectItem::UnnamedExpr(e) => (e, None),
                     SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+                    SelectItem::Wildcard(opts) | SelectItem::QualifiedWildcard(_, opts) => {
+                        wildcard = true;
+                        if let Some(e) = &opts.opt_except {
+                            excepted.push(e.first_element.value.clone());
+                            excepted.extend(e.additional_elements.iter().map(|i| i.value.clone()));
+                        }
+                        if let Some(e) = &opts.opt_exclude {
+                            match e {
+                                sqlparser::ast::ExcludeSelectItem::Single(i) => excepted.push(i.to_string()),
+                                sqlparser::ast::ExcludeSelectItem::Multiple(v) => {
+                                    excepted.extend(v.iter().map(|i| i.to_string()))
+                                }
+                            }
+                        }
+                        if opts.opt_replace.is_some() || opts.opt_rename.is_some() || opts.opt_ilike.is_some() {
+                            self.sig.shape.insert("a `*` with REPLACE / RENAME / ILIKE".into());
+                        }
+                        columns = None;
+                        item_canons.push("*".into());
+                        continue;
+                    }
                     _ => {
                         columns = None;
+                        self.sig.shape.insert("a multi-alias SELECT item".into());
+                        item_canons.push("?".into());
                         continue;
                     }
                 };
@@ -933,37 +1540,45 @@ impl Walk {
                     }
                 }
                 if contains_aggregate(expr) {
-                    let canon = reader.aggregate(expr);
-                    if let Some(a) = &alias {
-                        new_outputs.insert(a.clone(), canon.clone());
-                    }
-                    new_outputs.insert(expr.to_string(), canon.clone());
-                    aggs.push(canon);
+                    // NAN-5630: an expression over aggregates
+                    // (`countIf(c) / count()`) reads structurally, its
+                    // aggregate calls canonical.
+                    let canon = match expr {
+                        Expr::Function(f) if is_aggregate_name(&function_name(f)) => reader.aggregate(expr),
+                        _ => reader.value(expr),
+                    };
+                    agg_items.push((alias.clone().unwrap_or_else(|| expr.to_string()), canon.clone()));
+                    item_canons.push(canon);
                     continue;
                 }
-                match reader.column(expr) {
-                    Some((c, ci)) => {
-                        let c = col_text(&c, ci);
-                        if let Some(a) = &alias {
-                            if a != &c {
-                                new_outputs.insert(a.clone(), c.clone());
-                            }
-                        }
-                        if let Some(cols) = columns.as_mut() {
-                            cols.push(c);
-                        }
+                // An aliased item is what the alias resolved to (reading it
+                // again through `new_outputs` would apply `f(x) AS x` twice).
+                let c = match &alias {
+                    Some(a) => resolved.get(a).cloned().unwrap_or_else(|| reader.value(expr)),
+                    None => reader.value(expr),
+                };
+                if let Some(cols) = columns.as_mut() {
+                    cols.push(c.clone());
+                }
+                plain_items.push((alias.clone().unwrap_or_else(|| expr.to_string()), c.clone()));
+                item_canons.push(c);
+            }
+        }
+        for item in &s.projection {
+            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                if contains_aggregate(expr) {
+                    if let Some((_, canon)) = agg_items.iter().find(|(n, _)| *n == alias.value) {
+                        new_outputs.insert(alias.value.clone(), canon.clone());
+                        new_outputs.insert(expr.to_string(), canon.clone());
                     }
-                    None => {
-                        if let Some(a) = &alias {
-                            new_outputs.insert(a.clone(), expr.to_string());
-                        }
-                        if let Some(cols) = columns.as_mut() {
-                            cols.push(alias.clone().unwrap_or_else(|| expr.to_string()));
-                        }
-                    }
+                }
+            } else if let SelectItem::UnnamedExpr(expr) = item {
+                if let Some((_, canon)) = agg_items.iter().find(|(n, _)| *n == expr.to_string()) {
+                    new_outputs.insert(expr.to_string(), canon.clone());
                 }
             }
         }
+        self.last_projection = item_canons.clone();
         // WHERE reads names of the stage below plus this SELECT's own aliases
         // (ClickHouse resolves a SELECT alias inside its WHERE); a
         // post-aggregation stage's names are the aggregate outputs.
@@ -996,24 +1611,83 @@ impl Walk {
             let reader = Reader { qualifiers: &qualifiers, outputs: &self.outputs, facts: self.facts(), ctx };
             let mut keys: Vec<String> = group_exprs
                 .iter()
-                .map(|g| reader.column(g).map(|(c, ci)| col_text(&c, ci)).unwrap_or_else(|| g.to_string()))
+                .map(|g| {
+                    positional(g)
+                        .and_then(|n| item_canons.get(n - 1).cloned())
+                        .unwrap_or_else(|| reader.value(g))
+                })
                 .collect();
             keys.sort();
             keys.dedup();
-            aggs.sort();
             self.sig.grouped = true;
+            // NAN-5630: an item computed from the keys (`lower(k)` next to
+            // `GROUP BY k`) is an output column too.
+            // The keys the result shows, by name: a later stage may drop
+            // or overwrite one.
+            self.key_names = plain_items.iter().filter(|(_, c)| keys.contains(c)).cloned().collect();
+            self.sig.visible_keys = self.key_names.iter().map(|(_, c)| c.clone()).collect();
+            let computed = plain_items.into_iter().filter(|(_, c)| !keys.contains(c));
+            self.agg_outputs = agg_items.into_iter().chain(computed).collect();
             self.sig.keys = keys;
-            self.sig.aggs = aggs;
+            let having: Vec<Canon> =
+                s.having.iter().flat_map(conjuncts).map(|c| reader.predicate(c)).collect();
+            self.sig.post.extend(having);
+            self.sync_aggs();
             self.sig.project = None;
-            if let Some(h) = &s.having {
-                self.sig.post.extend(conjuncts(h).into_iter().map(|c| reader.predicate(c)));
+        } else if self.sig.grouped {
+            // NAN-5630: a stage over the aggregated rows. A computed item
+            // adds (or replaces) an output column; `* EXCEPT (…)` drops
+            // some; an explicit column list keeps only the ones it names.
+            let named: Vec<String> = s
+                .projection
+                .iter()
+                .filter_map(|i| match i {
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => Some(id.value.clone()),
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !wildcard {
+                self.agg_outputs.retain(|(n, _)| named.contains(n));
             }
-        } else if !self.sig.grouped {
-            if let Some(cols) = columns {
-                self.sig.project = Some(cols);
+            self.agg_outputs.retain(|(n, _)| !excepted.contains(n));
+            // A key the stage leaves out, or redefines, is gone from the result.
+            let dropped: Vec<(String, String)> = self
+                .key_names
+                .iter()
+                .filter(|(n, c)| {
+                    (!wildcard && !named.contains(n))
+                        || excepted.contains(n)
+                        || plain_items.iter().any(|(pn, pc)| pn == n && pc != c)
+                })
+                .cloned()
+                .collect();
+            for (n, c) in &dropped {
+                self.key_names.retain(|(kn, _)| kn != n);
+                if !self.key_names.iter().any(|(_, kc)| kc == c) {
+                    self.sig.visible_keys.remove(c);
+                }
             }
+            for (name, canon) in plain_items {
+                let existing = self.agg_outputs.iter().any(|(n, _)| *n == name);
+                if !existing && self.sig.keys.contains(&canon) {
+                    // A group key passed through.
+                    continue;
+                }
+                self.agg_outputs.retain(|(n, _)| *n != name);
+                self.agg_outputs.push((name, canon));
+            }
+            self.sync_aggs();
+        } else if let Some(cols) = columns {
+            self.sig.project = Some(cols);
         }
         Ok(())
+    }
+
+    fn sync_aggs(&mut self) {
+        let mut aggs: Vec<String> = self.agg_outputs.iter().map(|(_, c)| c.clone()).collect();
+        aggs.sort();
+        self.sig.aggs = aggs;
     }
 }
 
@@ -1030,6 +1704,17 @@ pub(super) fn signature_of_sql(sql: &str, ctx: &ConvertContext) -> Result<Signat
     // NAN-5614: an `IN (SELECT …)` over the query's own window runs over the
     // window an nPL subsearch runs over.
     let bounds = time_bounds_of(&sig.filters);
+    // NAN-5608 P2-19: the bounds are dropped from the comparison (they are
+    // the Search time range, not a term), so one Search cannot run over
+    // (`now() - INTERVAL 1 DAY`, an epoch number) is a shape of its own.
+    for (op, v) in &bounds {
+        if !known_bound(v) {
+            sig.shape.insert(format!(
+                "a time bound `timestamp {op} {v}` that is neither the run window nor a literal instant, so \
+                 Search cannot run over it"
+            ));
+        }
+    }
     sig.filters = normalize_conjuncts(sig.filters, true).into_iter().map(|c| resolve_windows(c, &bounds)).collect();
     sig.post = normalize_conjuncts(sig.post, false).into_iter().map(|c| resolve_windows(c, &bounds)).collect();
     Ok(sig)
@@ -1271,6 +1956,13 @@ pub(super) fn compare(original: &Signature, generated: &Signature) -> Vec<Differ
             original.keys.join(", "),
             generated.keys.join(", ")
         )));
+    }
+    if original.grouped && generated.grouped {
+        for k in original.visible_keys.difference(&generated.visible_keys) {
+            out.push(Difference::different(format!(
+                "group by: the SQL returns the key `{k}`, the nPL drops or overwrites it"
+            )));
+        }
     }
     if original.aggs != generated.aggs {
         let o: BTreeSet<&String> = original.aggs.iter().collect();

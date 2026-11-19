@@ -3847,6 +3847,11 @@ report_sizing_changes() {
                 -*|+*) log "Sizing change: ClickHouse $xml_kind XML: $line" ;;
             esac
         done < <(diff -U0 "$old_xml" "$new_xml" || true)
+        # NAN-5636: server settings (e.g. max_temporary_data_on_disk_size) load
+        # only at ClickHouse start; profile settings reload live.
+        if [[ "$xml_kind" == server ]] && ! cmp -s "$old_xml" "$new_xml"; then
+            log "Sizing change: ClickHouse server settings apply when ClickHouse restarts. A single-node rerun recreates it; on a role host, restart the ClickHouse container after this rerun."
+        fi
     done
 
     if [[ -n "$reductions" ]]; then

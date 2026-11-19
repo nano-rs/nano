@@ -227,6 +227,11 @@ html {
   padding: 0;
   min-height: 100vh;
   overflow-x: hidden;
+  /* Never render operator ligatures: Geist Mono draws `!=` as one "≠" glyph
+     (and `<=`, `>=`, `==`, `=>` likewise), which misrepresents what a user
+     typed in nPL, rule text and field values. Inherited by every element,
+     and it composes with font-variant-numeric (tabular numbers). */
+  font-variant-ligatures: none;
 }
 
 body {

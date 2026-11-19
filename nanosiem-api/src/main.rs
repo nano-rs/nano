@@ -215,31 +215,42 @@ async fn async_main() -> Result<()> {
             "Vector pipeline configs deployed WITHOUT parsers that cannot be rendered; fix or disable them"
         ),
         Err(e) => tracing::warn!(
-            "Failed to deploy Vector pipeline configs: {}. Ingestion pipeline may be incomplete.",
+            "Vector pipeline boot render did not complete (the config, its reload, or the pipeline identity record): {}. Ingestion pipeline may be incomplete.",
             e
         ),
     }
     // NAN-5564 review: a gated Vector (single node) starts only once this
     // render recorded the pipeline identity. A failed boot render must not keep
-    // ingest refused: retry it in the background until it records.
+    // ingest refused: retry it in the background until it records. NAN-5611:
+    // the fast retries are bounded (BOOT_RENDER_RETRY, about 12 minutes); then
+    // one loud ERROR with the file and errno, a SIEM Health finding, and a
+    // quiet retry every 5 minutes until it is recorded.
     if state.parser_service.vector_config().pipeline_identity_pending().await {
         let parser_service = state.parser_service.clone();
         tokio::spawn(async move {
-            let mut delay = std::time::Duration::from_secs(5);
-            loop {
-                if !parser_service.vector_config().pipeline_identity_pending().await {
-                    tracing::info!("Vector pipeline rendered for this release; a gated Vector may start");
-                    break;
-                }
-                tracing::error!(
-                    retry_in_secs = delay.as_secs(),
-                    "Vector is waiting for this release's pipeline (ingest refuses connections); retrying the render"
-                );
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(std::time::Duration::from_secs(60));
-                if let Err(error) = parser_service.deploy_to_vector_at_boot().await {
-                    tracing::error!(%error, "Vector pipeline render failed; retrying");
-                }
+            use nanosiem_core::siem_health::vector_pipeline_gate as gate;
+            let config = parser_service.vector_config();
+            let pending_service = parser_service.clone();
+            let render_service = parser_service.clone();
+            let marker_path = config.pipeline_identity_path();
+            let pending = move || {
+                let service = pending_service.clone();
+                async move { service.vector_config().pipeline_identity_pending().await }
+            };
+            let render = move || {
+                let service = render_service.clone();
+                async move { service.deploy_to_vector_at_boot().await.map(|_| ()) }
+            };
+            let outcome = gate::retry_until_recorded(
+                gate::BOOT_RENDER_RETRY,
+                marker_path.clone(),
+                config.pipeline_identity().unwrap_or_default(),
+                pending.clone(),
+                render.clone(),
+            )
+            .await;
+            if matches!(outcome, gate::RetryOutcome::GaveUp(_)) {
+                gate::retry_slowly_until_recorded(gate::BOOT_RENDER_RETRY, &marker_path, pending, render).await;
             }
         });
     }

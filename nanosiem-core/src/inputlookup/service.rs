@@ -133,6 +133,35 @@ impl InputLookupService {
         self
     }
 
+    /// NAN-5634: fail fast when `url` names an internal table
+    /// (`lookup://<name>`) that does not exist, with the same message the read
+    /// would give, so a search can refuse before it scans any events. An
+    /// external URL, an unwired lookup layer, or a registry error is left to
+    /// the read itself.
+    pub async fn ensure_internal_table(&self, url: &str) -> Result<(), InputLookupError> {
+        let (Some(table_name), Some(lookup_service)) =
+            (internal_lookup_table(url), self.lookup_service.as_ref())
+        else {
+            return Ok(());
+        };
+        match lookup_service.table_exists(table_name).await {
+            Ok(false) => {
+                let available: Vec<String> = match lookup_service.list_tables().await {
+                    Ok(tables) => tables.into_iter().map(|t| t.name).collect(),
+                    Err(_) => Vec::new(),
+                };
+                Err(InputLookupError::LookupTableNotFound(
+                    missing_internal_lookup_message(table_name, &available),
+                ))
+            }
+            Ok(true) => Ok(()),
+            Err(e) => {
+                warn!("inputlookup table existence pre-check failed for '{table_name}' (deferring to the read): {e}");
+                Ok(())
+            }
+        }
+    }
+
     /// Read EVERY row of an internal lookup table as JSON search results,
     /// matching the shape the HTTP/CSV data-source path produces (user columns
     /// only; internal columns stripped by `LookupService::read_all_rows`).

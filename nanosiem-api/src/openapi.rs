@@ -311,6 +311,8 @@ fn is_desktop_wire_path(path: &str) -> bool {
             path,
             "/api/playbook-repositories"
                 | "/api/playbook-repositories/{id}/sync-and-import"
+                | "/api/playbook-imports/{playbook_id}/upstream-update"
+                | "/api/playbook-imports/{playbook_id}/upstream-update/apply"
         )
 }
 
@@ -944,8 +946,16 @@ mod tests {
         // …/gate, …/create): 743.
         // NAN-5561 adds 3 ENTERPRISE templates (/api/hunts/{id}/evals,
         // /api/hunts/evals/{eval_id}, /api/hunts/leads/counts): 746.
+        // NAN-5643 adds 5 ENTERPRISE templates (/api/hunts/{id}/escalation-scope,
+        // /api/hunts/escalations/{lead_id}/promote, …/dismiss,
+        // /api/hunts/team-channels, /api/hunts/team-channels/{group_id}): 751.
+        // NAN-5641 adds the ENTERPRISE /api/hunts/settings: 752.
+        // NAN-5642 adds 4 ENTERPRISE charter templates (/api/hunts/charter, …/versions,
+        // /api/hunts/{id}/charter, …/versions): 756.
+        // NAN-5648 adds 2 ENTERPRISE templates
+        // (/api/playbook-imports/{playbook_id}/upstream-update, …/apply): 758.
         #[cfg(feature = "enterprise")]
-        let min_paths = 746;
+        let min_paths = 758;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's

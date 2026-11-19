@@ -1726,7 +1726,8 @@ impl SourceConfigService {
                 let config_file = self.get_config_file_path(&config.config_type, &config.name);
                 let configs_dir = config_file.parent().unwrap();
                 tokio::fs::create_dir_all(configs_dir).await?;
-                tokio::fs::write(&config_file, config_content).await?;
+                // NAN-5611: atomic, and left alone when unchanged.
+                crate::parsers::vector_tree_write::write_if_changed(&config_file, config_content).await?;
             } else if config.config_type == "splunk_hec" {
                 // NAN-4902: `splunk_hec_route` is permanent (HEC parsers read
                 // it). With only default rules there is nothing to route, so
@@ -1859,7 +1860,8 @@ impl SourceConfigService {
         let config_file = self.get_config_file_path(&config.config_type, &config.name);
         let configs_dir = config_file.parent().unwrap();
         tokio::fs::create_dir_all(configs_dir).await?;
-        tokio::fs::write(&config_file, &vector_config).await?;
+        // NAN-5611: atomic, and left alone when unchanged.
+        crate::parsers::vector_tree_write::write_if_changed(&config_file, &vector_config).await?;
         self.clear_startup_quarantine(config).await;
 
         // `deployed = true` BEFORE updating the router, so the router query
@@ -2251,7 +2253,7 @@ impl SourceConfigService {
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                tokio::fs::write(path, rendered).await?;
+                crate::parsers::vector_tree_write::write_if_changed(&path, rendered).await?;
             }
         }
 

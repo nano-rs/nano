@@ -15,6 +15,9 @@
 // migration 9000096; query-audit conditions from the enterprise harvester).
 #[cfg(feature = "enterprise")]
 pub mod agentlane_findings;
+// NAN-5622: SOAR dead letters, trigger backlog and dropped events.
+#[cfg(feature = "enterprise")]
+pub mod soar_findings;
 pub mod analyzer;
 // NAN-5470: nano's ClickHouse users meeting their hourly quota.
 pub mod clickhouse_quota;
@@ -36,6 +39,7 @@ pub mod suppressions_repository;
 pub mod types;
 // NAN-5567: batches ClickHouse permanently rejected, kept by Vector.
 pub mod vector_dead_letters;
+pub mod vector_pipeline_gate;
 
 pub use repository::{SiemHealthRepository, SiemHealthRepositoryError};
 pub use suppressions_repository::{

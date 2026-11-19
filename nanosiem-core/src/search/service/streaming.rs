@@ -298,11 +298,20 @@ impl SearchService {
         // surfaces it.
         let (query, _auto_sort_decision) = apply_auto_sort(query);
 
-        // Pre-execution guardrail: reject queries that would cause unbounded memory usage (OOM)
-        if let Some(risk) = detect_oom_risk(&query) {
+        // Pre-execution guardrail against unbounded memory (OOM), cost-based
+        // like the batch path (NAN-5635).
+        if let Err(message) = self
+            .admit_oom_risks(
+                &query,
+                &adjusted_time_range,
+                crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs")),
+                &query_id,
+            )
+            .await
+        {
             send_event!(SearchStreamEvent::Error {
                 code: "VALIDATION_ERROR".to_string(),
-                message: risk.message(),
+                message,
             });
             return;
         }

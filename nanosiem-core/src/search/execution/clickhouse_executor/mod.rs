@@ -31,10 +31,10 @@ pub use sql_helpers::{
     escape_question_marks_in_strings, inject_limit_offset, wrap_query_for_count,
     wrap_query_with_pagination,
 };
-pub(crate) use paginated::is_first_page;
+pub(crate) use paginated::{is_first_page, paged_total_estimate};
 pub(crate) use sql_helpers::{
-    is_aggregation_query, raw_sql_needs_skip_index_guard, wrap_aggregation_with_pagination,
-    BoundedCountInput,
+    build_count_query, is_aggregation_query, raw_sql_needs_skip_index_guard,
+    wrap_aggregation_with_pagination, BoundedCountInput,
 };
 pub use types::{ClickHouseExecutor, ClickHouseLogReadRow};
 pub(crate) use types::{

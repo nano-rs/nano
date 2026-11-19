@@ -48,10 +48,13 @@ import { artifactCandidates } from '@/lib/prevalence/artifactFields';
 import { buildTimelinePlotData, timelinePlotDomain, timelineSeriesData, resolveBucketStart, type TimelinePlotPoint } from './timeline-fill';
 import { formatTimelineAxisLabel, formatTimelineTooltipTime, timelineAxisTicks } from './timeline-axis';
 import {
+  applyInWindowObservation,
+  baselineFromScatterPoint,
   buildObservationQueries,
   mergeObservations,
   OBSERVATION_BATCH_SIZE,
   observationPathsFor,
+  type BaselinePrevalence,
   type InWindowObservation,
 } from '@/lib/prevalence/inWindowObservation';
 
@@ -547,7 +550,7 @@ export function TimelineVisualization({
 
   const { mutate: fetchScatterData } = usePrevalenceScatterData();
   // In-window observation paths differ per schema profile (NAN-4931).
-  const { isOcsf } = useSchemaFieldMap();
+  const { isOcsf, ready: schemaReady } = useSchemaFieldMap();
   // Stable ref for fetchScatterData — useMutation returns a new function identity
   // every render (because .bind() creates a new ref), which would cascade into
   // loadScatterData getting a new identity → trigger effect re-firing → double fetch.
@@ -855,7 +858,7 @@ export function TimelineVisualization({
   // One dot per event, positioned at the event's actual timestamp.
   const buildScatterPoints = useCallback((
     occurrences: ApiArtifactOccurrence[],
-    prevalenceMap: Map<string, { hostCount: number; isRare: boolean; prevalenceScore: number; totalOccurrences: number; envFirstSeen: Date }>,
+    prevalenceMap: Map<string, BaselinePrevalence>,
     artifactType: 'hash' | 'domain',
   ): PrevalenceScatterData['hashPoints'] => {
     return occurrences
@@ -911,29 +914,22 @@ export function TimelineVisualization({
 
         // Build prevalence lookup maps from the included prevalence metadata
         // (prevalence is unfiltered — covers ALL artifacts for slider range)
-        const hashPrevalenceMap = new Map<string, {
-          hostCount: number; isRare: boolean; prevalenceScore: number;
-          totalOccurrences: number; envFirstSeen: Date;
-        }>();
-        for (const p of response.hash_prevalence) {
-          hashPrevalenceMap.set(p.artifact.toLowerCase(), {
-            hostCount: p.host_count, isRare: p.is_rare,
-            prevalenceScore: p.prevalence_score, totalOccurrences: p.total_occurrences,
-            envFirstSeen: new Date(p.first_seen),
-          });
-        }
-
-        const domainPrevalenceMap = new Map<string, {
-          hostCount: number; isRare: boolean; prevalenceScore: number;
-          totalOccurrences: number; envFirstSeen: Date;
-        }>();
-        for (const p of response.domain_prevalence) {
-          domainPrevalenceMap.set(p.artifact.toLowerCase(), {
-            hostCount: p.host_count, isRare: p.is_rare,
-            prevalenceScore: p.prevalence_score, totalOccurrences: p.total_occurrences,
-            envFirstSeen: new Date(p.first_seen),
-          });
-        }
+        // Asset mode keeps the backend's verdict verbatim: it has no in-window
+        // fallback, and its window is the asset's own (not the relative
+        // scatter window), so the search-mode miss normalization does not apply.
+        const toAssetPrevalenceMap = (points: typeof response.hash_prevalence) => {
+          const map = new Map<string, BaselinePrevalence>();
+          for (const p of points) {
+            map.set(p.artifact.toLowerCase(), {
+              hostCount: p.host_count, isRare: p.is_rare,
+              prevalenceScore: p.prevalence_score, totalOccurrences: p.total_occurrences,
+              envFirstSeen: new Date(p.first_seen),
+            });
+          }
+          return map;
+        };
+        const hashPrevalenceMap = toAssetPrevalenceMap(response.hash_prevalence);
+        const domainPrevalenceMap = toAssetPrevalenceMap(response.domain_prevalence);
 
         // Build scatter points — one dot per event at its actual timestamp
         // (occurrences are filtered by max_host_count, may be empty)
@@ -970,6 +966,11 @@ export function TimelineVisualization({
       setScatterData(null);
       return;
     }
+    // NAN-5662: the in-window fallback picks its paths and host identity from
+    // the schema profile. Until the profile is known it would query the UDM
+    // names (which match nothing on OCSF), and the dedup key below would then
+    // pin that wrong answer. Wait; this re-runs when the profile resolves.
+    if (!schemaReady) return;
 
     // Dedup: skip if we already fetched for this exact artifact set + window.
     // (NAN-1700: window MUST be in the key — the request is windowed, so a window
@@ -979,6 +980,7 @@ export function TimelineVisualization({
       hashes: extractedData.hashes,
       domains: extractedData.domains,
       window: timeWindow,
+      ocsf: isOcsf,
     });
     if (currentKey === lastFetchedKeyRef.current) {
       return;
@@ -1020,46 +1022,22 @@ export function TimelineVisualization({
         rarity_threshold: chunkResponses[0]?.rarity_threshold ?? 3,
       };
 
-      // Build lookup maps for prevalence data (host_count, is_rare, env first_seen, etc.)
-      const hashPrevalenceMap = new Map<string, {
-        hostCount: number;
-        isRare: boolean;
-        prevalenceScore: number;
-        totalOccurrences: number;
-        envFirstSeen: Date;
-      }>();
-      for (const p of response.hash_points) {
-        // host_count null = unknown (prevalence still warming / partial for
-        // this window): leave it unbaselined rather than plot a zero.
-        if (p.host_count == null) continue;
-        hashPrevalenceMap.set(p.artifact.toLowerCase(), {
-          hostCount: p.host_count,
-          isRare: p.is_rare,
-          prevalenceScore: p.prevalence_score,
-          totalOccurrences: p.total_occurrences,
-          envFirstSeen: new Date(p.first_seen),
-        });
-      }
-
-      const domainPrevalenceMap = new Map<string, {
-        hostCount: number;
-        isRare: boolean;
-        prevalenceScore: number;
-        totalOccurrences: number;
-        envFirstSeen: Date;
-      }>();
-      for (const p of response.domain_points) {
-        // host_count null = unknown (prevalence still warming / partial for
-        // this window): leave it unbaselined rather than plot a zero.
-        if (p.host_count == null) continue;
-        domainPrevalenceMap.set(p.artifact.toLowerCase(), {
-          hostCount: p.host_count,
-          isRare: p.is_rare,
-          prevalenceScore: p.prevalence_score,
-          totalOccurrences: p.total_occurrences,
-          envFirstSeen: new Date(p.first_seen),
-        });
-      }
+      // Build lookup maps for prevalence data (host_count, is_rare, env first_seen, etc.).
+      // host_count null = unknown (prevalence still warming / partial for this
+      // window): no entry, left unbaselined rather than plotted as a zero.
+      // NAN-5662: a host_count 0 MISS is normalized to not-rare with no env
+      // first-seen (the backend placeholder says is_rare + first_seen=now);
+      // only the in-window observation below may call a miss rare.
+      const toPrevalenceMap = (points: typeof response.hash_points) => {
+        const map = new Map<string, BaselinePrevalence>();
+        for (const p of points) {
+          const baseline = baselineFromScatterPoint(p);
+          if (baseline) map.set(p.artifact.toLowerCase(), baseline);
+        }
+        return map;
+      };
+      const hashPrevalenceMap = toPrevalenceMap(response.hash_points);
+      const domainPrevalenceMap = toPrevalenceMap(response.domain_points);
 
       // G22 / NAN-2361 layer 1: artifacts the baseline has nothing for get
       // their distinct-host count from the searched window instead.
@@ -1072,12 +1050,8 @@ export function TimelineVisualization({
         isOcsf,
       );
       const rarityThreshold = response.rarity_threshold;
-      const withObservation = <T extends { hostCount: number; isRare: boolean }>(artifact: string, point: T): T & { inWindow?: boolean } => {
-        if (point.hostCount > 0) return point;
-        const obs = observed.get(artifact);
-        if (!obs || obs.hosts <= 0) return point;
-        return { ...point, hostCount: obs.hosts, isRare: obs.hosts < rarityThreshold, inWindow: true };
-      };
+      const withObservation = <T extends { hostCount: number; isRare: boolean }>(artifact: string, point: T): T & { inWindow?: boolean } =>
+        applyInWindowObservation(point, observed.get(artifact), rarityThreshold);
 
       // Merge per-event timestamps (from extractedData) with environment-wide
       // prevalence stats (from API). X-axis uses event timestamps
@@ -1137,7 +1111,7 @@ export function TimelineVisualization({
     }
   // Note: fetchScatterData accessed via stable ref (fetchScatterDataRef) to avoid
   // cascading identity changes from useMutation on every render
-  }, [extractedData, hasArtifacts, timeWindow, isAssetMode, assetContext, timeRange, buildScatterPoints, assetMaxHostCount, isOcsf]);
+  }, [extractedData, hasArtifacts, timeWindow, isAssetMode, assetContext, timeRange, buildScatterPoints, assetMaxHostCount, isOcsf, schemaReady]);
 
   // NAN-1700: PREFETCH prevalence as soon as a search yields artifacts — not
   // gated on the Rarity tab being open. The agg lookup can take a while, so

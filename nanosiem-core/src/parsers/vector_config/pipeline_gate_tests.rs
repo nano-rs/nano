@@ -318,17 +318,27 @@ async fn an_orphaned_fetch_binding_is_left_out_of_the_render() {
 #[tokio::test]
 async fn the_boot_render_rewrites_a_marker_left_by_a_rollback() {
     // A rollback's older api never touches the marker; the re-upgraded api's
-    // boot render rewrites it even when the name already matches.
+    // boot render makes it say exactly this identity. NAN-5611: a marker that
+    // already says exactly that is left alone (no write on every api start).
     let tmp = TempDir::new().unwrap();
-    std::fs::write(tmp.path().join(PIPELINE_IDENTITY_FILE), "2.0.32/fsync/off\n").unwrap();
-    let before = std::fs::metadata(tmp.path().join(PIPELINE_IDENTITY_FILE)).unwrap().modified().unwrap();
+    let file = tmp.path().join(PIPELINE_IDENTITY_FILE);
+    std::fs::write(&file, "2.0.32/fsync/off\n").unwrap();
+    let before = std::fs::metadata(&file).unwrap().modified().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
-    rewrite_identity(tmp.path(), "2.0.32/fsync/off").await.unwrap();
-    let after = std::fs::metadata(tmp.path().join(PIPELINE_IDENTITY_FILE)).unwrap().modified().unwrap();
-    assert!(after > before);
-    assert_eq!(recorded_identity(tmp.path()).await.as_deref(), Some("2.0.32/fsync/off"));
+    assert!(!rewrite_identity(tmp.path(), "2.0.32/fsync/off").await.unwrap());
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), before);
+    // Same first line, other content: rewritten to exactly the identity.
+    std::fs::write(&file, "2.0.32/fsync/off\nleft by 2.0.31\n").unwrap();
+    assert!(rewrite_identity(tmp.path(), "2.0.32/fsync/off").await.unwrap());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "2.0.32/fsync/off\n");
     // Absent (cleared by the rollback): written.
     clear_identity(tmp.path()).await;
-    rewrite_identity(tmp.path(), "2.0.33/fsync/off").await.unwrap();
+    assert!(rewrite_identity(tmp.path(), "2.0.33/fsync/off").await.unwrap());
     assert_eq!(recorded_identity(tmp.path()).await.as_deref(), Some("2.0.33/fsync/off"));
+    // No temp file is left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }

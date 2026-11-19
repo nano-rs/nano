@@ -1113,12 +1113,13 @@ impl VectorConfigManager {
 
         // NAN-4953: tenant match_values and names; escaped against Vector's
         // env interpolation (see crate::vector_env).
-        fs::write(&router_path, crate::vector_env::escape_file(&config)).await?;
-        tracing::info!(
-            "Generated dynamic router config at {} with {} deployed parsers",
-            router_path.display(),
-            routed_parsers.len()
-        );
+        if super::tree_write::write_if_changed(&router_path, crate::vector_env::escape_file(&config)).await? {
+            tracing::info!(
+                "Generated dynamic router config at {} with {} deployed parsers",
+                router_path.display(),
+                routed_parsers.len()
+            );
+        }
 
         Ok(())
     }

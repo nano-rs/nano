@@ -414,6 +414,29 @@ pub const CUSTOM_INTEGRATION_CODE_GENERATED: &str = "custom_integration_code_gen
 // per lead decision would let a misbehaving runner amplify a flood into a
 // self-inflicted DoS on the audit path. These ride the bounded async path like
 // every other routine mutation.
+//
+// The exceptions (NAN-5626) are the analyst-initiated DEFINITION and
+// SCHEDULE changes that decide what an unattended agent may do:
+// `hunt_execution_policy_changed`, `hunt_archived` and the three
+// `hunt_schedule_*` actions. None is emitted by a runner, sweep or the
+// scheduler; see the durable set below for the floodability argument.
+
+/// NAN-5626: a hunt was created (API or a built-in template). Inert: a hunt
+/// is created disabled. `details` carries its execution policy.
+pub const HUNT_CREATED: &str = "hunt_created";
+/// NAN-5626: a hunt's content changed (name, prose, tags, hypothesis, ...)
+/// and nothing about how it runs. `details.changed_content` names the fields.
+pub const HUNT_UPDATED: &str = "hunt_updated";
+/// NAN-5626: a PATCH changed what the hunt's agent may do or spend: runner
+/// kind, budgets, reviewer, escalation, pivots, sweep query, lookback or
+/// schedule. `details.changed_policy` has each field's before and after.
+/// Durable.
+pub const HUNT_EXECUTION_POLICY_CHANGED: &str = "hunt_execution_policy_changed";
+/// NAN-5626: a hunt was archived (disabled, its queued and in-flight sweeps
+/// abandoned). Durable: archiving is how a detection gap is opened quietly.
+pub const HUNT_ARCHIVED: &str = "hunt_archived";
+/// NAN-5626: a person queued a manual sweep of a hunt.
+pub const HUNT_SWEEP_TRIGGERED: &str = "hunt_sweep_triggered";
 
 /// A hunt's schedule was enabled — an agent now runs unattended against the estate.
 pub const HUNT_SCHEDULE_ENABLED: &str = "hunt_schedule_enabled";
@@ -721,6 +744,15 @@ pub const PLAYBOOK_REPO_CREATED: &str = "playbook_repo_created";
 pub const PLAYBOOK_REPO_UPDATED: &str = "playbook_repo_updated";
 /// Playbook repository was synced (scheduled)
 pub const PLAYBOOK_REPO_SYNCED: &str = "playbook_repo_synced";
+/// NAN-5648: a sync refreshed a linked, uncustomized imported playbook or hunt
+/// in place to its new upstream content (pivots, hypothesis, body, ...)
+pub const PLAYBOOK_IMPORT_REFRESHED: &str = "playbook_import_refreshed";
+/// NAN-5648: an analyst applied an available upstream update to an imported
+/// playbook or hunt (overwriting their own customizations)
+pub const PLAYBOOK_IMPORT_UPDATE_APPLIED: &str = "playbook_import_update_applied";
+/// NAN-5648: re-importing a file restored its archived playbook or hunt and
+/// refreshed it to the current upstream content
+pub const PLAYBOOK_IMPORT_RESTORED: &str = "playbook_import_restored";
 
 // =============================================================================
 // Parser Repository Actions
@@ -1202,6 +1234,26 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     SOURCE_SCOPE_UNRESTRICTED,
     SOURCE_SCOPE_GRANTED,
     SOURCE_SCOPE_REVOKED,
+    // Hunt definition changes that decide what an unattended agent may do
+    // (NAN-5626, release review P2-8): a PATCH that moves a hunt to the server
+    // runner, raises its AI budget, turns its reviewer off or changes what it
+    // reads, and archiving a hunt. Analyst-initiated only (`hunts:manage` on an
+    // authenticated session or API key); no runner, sweep or scheduler path
+    // emits them, so an unattended loop cannot amplify them.
+    HUNT_EXECUTION_POLICY_CHANGED,
+    HUNT_ARCHIVED,
+    // The schedule decisions themselves (who put an agent on a cadence or
+    // turned it on), from the toggle, cadence and PATCH handlers only.
+    HUNT_SCHEDULE_ENABLED,
+    HUNT_SCHEDULE_DISABLED,
+    HUNT_SCHEDULE_SET,
+    // NAN-5648: an imported hunt's definition (its pivots, i.e. what an
+    // unattended agent reads) replaced from upstream. Same footing as
+    // HUNT_EXECUTION_POLICY_CHANGED; see the pinned-set test for the volume
+    // argument.
+    PLAYBOOK_IMPORT_REFRESHED,
+    PLAYBOOK_IMPORT_UPDATE_APPLIED,
+    PLAYBOOK_IMPORT_RESTORED,
 ];
 
 /// Returns `true` when `action` must be emitted durably (synchronous insert,
@@ -1304,6 +1356,39 @@ mod durable_classifier_tests {
             // admin-only settings writes). Durable because the save can turn
             // pivt case-action confirmation off.
             "case_settings_updated",
+            // NAN-5626 (release review P2-8): hunt definition changes that set
+            // what an unattended agent may do. Not floodable by an
+            // unauthenticated or low-privilege caller: both need `hunts:manage`
+            // on an authenticated session or API key, on the licensed hunts
+            // surface. `hunt_execution_policy_changed` is emitted only when a
+            // PATCH actually changed a policy field (a no-op or content-only
+            // PATCH stays routine), so each durable row costs the caller a
+            // committed hunt_specs UPDATE plus a pivot compile; `hunt_archived`
+            // costs a committed archive transaction. No runner, sweep,
+            // scheduler or retention path emits either, so an unattended loop
+            // cannot amplify them. No dedicated rate limiter (same footing as
+            // case_settings_updated); the durable dispatch's concurrency cap
+            // and fire-and-forget fallback bound a scripted burst.
+            "hunt_execution_policy_changed",
+            "hunt_archived",
+            // Same footing: the schedule toggle / cadence / PATCH handlers
+            // (`hunts:run` on an authenticated session or API key), one row
+            // per committed hunt_specs write; the scheduler and runners never
+            // emit them.
+            "hunt_schedule_enabled",
+            "hunt_schedule_disabled",
+            "hunt_schedule_set",
+            // NAN-5648: an imported playbook / hunt replaced from upstream.
+            // Not floodable: the automatic refresh fires once per linked,
+            // uncustomized import per upstream change of an allowlisted
+            // first-party repository (nano-rs/playbooks or a signed air-gap
+            // bundle), and clears `upstream_changed` in the same transaction,
+            // so a sync loop cannot repeat it. The applied and restored
+            // variants need `hunts:manage` / `playbooks:manage` on an
+            // authenticated session or API key, one row per committed rewrite.
+            "playbook_import_refreshed",
+            "playbook_import_update_applied",
+            "playbook_import_restored",
         ];
         let mut actual: Vec<&str> = SECURITY_CRITICAL_ACTIONS.to_vec();
         expected.sort_unstable();
@@ -1346,6 +1431,14 @@ mod durable_classifier_tests {
 
         // Routine, high-volume mutations are never durable.
         assert!(!is_security_critical(RULE_CREATED));
+        // NAN-5626: only the hunt policy change and archive are durable; the
+        // inert create, content-only edit and manual trigger stay routine.
+        assert!(is_security_critical(HUNT_EXECUTION_POLICY_CHANGED));
+        assert!(is_security_critical(HUNT_ARCHIVED));
+        assert!(is_security_critical(HUNT_SCHEDULE_ENABLED));
+        assert!(!is_security_critical(HUNT_CREATED));
+        assert!(!is_security_critical(HUNT_UPDATED));
+        assert!(!is_security_critical(HUNT_SWEEP_TRIGGERED));
         assert!(!is_security_critical(SEARCH_HISTORY_CLEARED));
         assert!(!is_security_critical(TOKEN_REFRESH));
         assert!(!is_security_critical("nonexistent_action"));

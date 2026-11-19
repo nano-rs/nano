@@ -130,9 +130,10 @@ pub struct DualHealthResponse {
     /// Downstream service health (Ingest and Search services)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<DownstreamServicesHealth>,
-    /// NAN-5424: detection execution health. `degraded` when a rule is
-    /// failing or a detection window went unevaluated in the last 24h; the
-    /// overall `status` is then `degraded` too. Only on this authenticated
+    /// NAN-5424: detection execution health. `critical` while a rule is
+    /// failing now, `degraded` when a rule failed or a detection window went
+    /// unevaluated in the last 24h but the rule runs again (NAN-5629); either
+    /// way the overall `status` is then `degraded`. Only on this authenticated
     /// endpoint: the public `/health` answers infrastructure liveness and
     /// must not tell an unauthenticated caller that detection is impaired.
     #[serde(skip_serializing_if = "Option::is_none")]

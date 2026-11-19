@@ -611,6 +611,24 @@ impl SearchService {
     #[instrument(skip(self, scope), fields(query = %request.query))]
     pub async fn search(
         &self,
+        request: SearchRequest,
+        scope: &ScopeSet,
+    ) -> Result<SearchResponse, SearchError> {
+        // The profile the search resolves fields against (a leading
+        // `dataset=` in the text selects it, as in `search_unrefined`).
+        let dataset = crate::search::query_processing::resolve_dataset_selector(
+            &request.query,
+            request.dataset.as_deref(),
+        )
+        .map_or_else(|_| request.dataset.clone(), |(_, dataset)| dataset);
+        let profile = self.dataset_profile(dataset.as_deref());
+        self.search_unrefined(request, scope)
+            .await
+            .map_err(|e| super::suggest_native_field(e, profile.as_ref()))
+    }
+
+    async fn search_unrefined(
+        &self,
         mut request: SearchRequest,
         scope: &ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
@@ -734,11 +752,18 @@ impl SearchService {
         // companion below (NAN-1429) and is reported in the response.
         let display_type = determine_display_type(&query);
 
-        // Pre-execution guardrail: reject queries that would cause unbounded memory usage (OOM)
-        // Covers: eventstats/streamstats, dedup, reverse, transaction, values()/list(), high-cardinality GROUP BY
-        if let Some(risk) = detect_oom_risk(&query) {
-            return Err(SearchError::SqlValidationError(risk.message()));
-        }
+        // Pre-execution guardrail against unbounded memory (OOM). NAN-5635:
+        // cost-based — spillable shapes run, and eventstats/streamstats,
+        // dedup, transaction and anomaly on an unfiltered search run when a
+        // row estimate over this window fits the install's memory budget.
+        self.admit_oom_risks(
+            &query,
+            &adjusted_time_range,
+            crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs")),
+            &query_id,
+        )
+        .await
+        .map_err(SearchError::SqlValidationError)?;
 
         // NAN-4944 / NAN-3106: a terminal timechart is a complete bounded
         // analyst presentation, not the storage-shaped long-form aggregation.
@@ -876,6 +901,27 @@ impl SearchService {
             extract_post_inputlookup_commands(&query)
         };
         let has_inputlookup = !inputlookup_commands.is_empty();
+        // NAN-5634: a missing internal table (`| inputlookup <name>`) is a
+        // clean 400 BEFORE anything scans, like `| lookup` (NAN-1389). It used
+        // to surface only after the full event fetch below.
+        if let Some(inputlookup_service) = self.inputlookup_service.as_ref() {
+            for cmd in inputlookup_commands.iter().filter(|cmd| cmd.key_field.is_none()) {
+                inputlookup_service
+                    .ensure_internal_table(&cmd.url.template)
+                    .await
+                    .map_err(|e| SearchError::SqlValidationError(e.to_string()))?;
+            }
+        }
+        // NAN-5634: the first inputlookup in data-source mode (no `key=`)
+        // REPLACES the rows with the table's / feed's rows, so the event fetch
+        // in front of it is thrown away. Skip it: `| inputlookup t | stats …`
+        // scanned up to the full result limit of events for nothing.
+        // Only with an inputlookup service wired: without one the enrichment
+        // step hands the events back unchanged, so they must still be fetched.
+        let inputlookup_replaces_rows = self.inputlookup_service.is_some()
+            && inputlookup_commands
+                .first()
+                .is_some_and(|cmd| cmd.key_field.is_none());
 
         // Extract prevalence commands for post-processing
         let prevalence_commands = extract_prevalence_commands(&query);
@@ -1014,6 +1060,9 @@ impl SearchService {
         // Cloud queries re-query ClickHouse for facets, resources, and paginated events
         let cloud_command = extract_cloud_command(&query);
         let is_cloud_query = cloud_command.is_some();
+        if is_cloud_query {
+            super::cloud_view_is_last(&query)?;
+        }
 
         // Check if this is a funnel query — captured early so post-processing
         // can convert the `_droppers_<field>` sample arrays emitted by
@@ -1417,6 +1466,8 @@ impl SearchService {
             && !is_asset_query
             && !is_baseline_query
             && display_type_renders_timeline(display_type)
+            // NAN-5634: the rows come from the inputlookup, not the events.
+            && !inputlookup_replaces_rows
         {
             let search_service = self.clone();
             let histogram_query = cleaned_query.clone();
@@ -1476,7 +1527,17 @@ impl SearchService {
             && request_dataset != crate::query::Dataset::Signals
             && self.ch_sql_generator.pipeline_output_is_wide(&query_for_sql);
 
-        let (mut results, total_count, server_field_stats) = {
+        // NAN-5634: a `join` whose main pipeline hands on raw event rows is not
+        // an aggregation, even though the subsearch's `stats count()` puts
+        // `count(` in the SQL text. Sniffed as one, the executor wrapped the
+        // whole joined result in `count(*) OVER ()`, which holds every wide
+        // row in memory (2.56 GiB at 1M rows); as raw rows it pages with a
+        // separate count companion like any event search.
+        let aggregation_override =
+            super::join_returns_raw_rows(&query_for_sql).then_some(false);
+        let (mut results, mut total_count, server_field_stats) = if inputlookup_replaces_rows {
+            (Vec::new(), 0, None)
+        } else {
             if should_run_server_field_stats {
                 let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
                         SearchError::DatabaseError(sqlx::Error::Configuration(
@@ -1533,15 +1594,15 @@ impl SearchService {
                     let fstats_qid = format!("{query_id}-fstats");
 
                     let (data_result, field_stats_result) = tokio::join!(
-                        self.execute_clickhouse_sql_with_query_id(
+                        self.execute_clickhouse_sql_shaped(
                             &sql,
                             sql_limit_plan.execution_limit,
                             sql_limit_plan.execution_offset,
                             Some(&query_id),
-                            None,
                             bounded_count,
                             self.active_execution_limits.as_ref(),
                             grouped_output,
+                            aggregation_override,
                         ),
                         ch_executor.execute_field_stats_query_with_presence(
                             &field_stats_sql,
@@ -1571,15 +1632,15 @@ impl SearchService {
                     (results, total_count, field_stats)
                 } else {
                     let (results, total_count) = self
-                        .execute_clickhouse_sql_with_query_id(
+                        .execute_clickhouse_sql_shaped(
                             &sql,
                             sql_limit_plan.execution_limit,
                             sql_limit_plan.execution_offset,
                             Some(&query_id),
-                            None,
                             bounded_count,
                             self.active_execution_limits.as_ref(),
                             grouped_output,
+                            aggregation_override,
                         )
                         .await?;
                 (results, total_count, None)
@@ -1649,6 +1710,11 @@ impl SearchService {
             results = pp.results;
             runtime_warnings.extend(pp.warnings);
             tracing::debug!("After post-inputlookup commands: {} results", results.len());
+        }
+        // No event fetch ran (NAN-5634): the total is what the inputlookup
+        // and the commands after it produced.
+        if inputlookup_replaces_rows {
+            total_count = results.len() as u64;
         }
 
         // NAN-1691: warn when the residual in-memory prevalence filter truncated its input.

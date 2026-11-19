@@ -2773,6 +2773,20 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/hunts/escalations/{lead_id}/acknowledge",
                 post(handlers::hunts::acknowledge_escalation),
             )
+            // NAN-5643: escalation scope and the held team / private queues.
+            .route(
+                "/api/hunts/escalations/{lead_id}/promote",
+                post(handlers::hunts::promote_escalation),
+            )
+            .route(
+                "/api/hunts/escalations/{lead_id}/dismiss",
+                post(handlers::hunts::dismiss_escalation),
+            )
+            .route("/api/hunts/team-channels", get(handlers::hunts::list_team_channels))
+            .route(
+                "/api/hunts/team-channels/{group_id}",
+                put(handlers::hunts::set_team_channel),
+            )
             .route("/api/hunts/rulings", get(handlers::hunts::list_rulings))
             // NAN-5560: campaigns and actors. View to read; manage to
             // create / edit / delete / change status / link hunts (activation
@@ -2857,6 +2871,14 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/hunts/report-branding-events",
                 post(handlers::hunts::record_hunt_report_branding),
             )
+            // NAN-5641 install hunt settings (static `settings` beside `{id}`).
+            .route(
+                "/api/hunts/settings",
+                get(handlers::hunts::get_hunt_install_settings).put(handlers::hunts::update_hunt_install_settings),
+            )
+            // NAN-5642 the install default charter (static `charter` beside `{id}`).
+            .route("/api/hunts/charter", get(handlers::hunts::get_default_charter).put(handlers::hunts::put_default_charter))
+            .route("/api/hunts/charter/versions", get(handlers::hunts::list_default_charter_versions))
             // NAN-5581 agent detections (static `agent-detections` beside `{id}`).
             .route("/api/hunts/agent-detections", get(handlers::hunts::list_agent_detections))
             .route(
@@ -2900,6 +2922,8 @@ pub fn create_router(state: AppState) -> Router {
                 post(handlers::hunts::reject_rule_idea),
             )
             .route("/api/hunts/{id}", get(handlers::hunts::get_hunt))
+            .route("/api/hunts/{id}/charter", get(handlers::hunts::get_hunt_charter).put(handlers::hunts::put_hunt_charter))
+            .route("/api/hunts/{id}/charter/versions", get(handlers::hunts::list_hunt_charter_versions))
             .route("/api/hunts/{id}", patch(handlers::hunts::update_hunt))
             .route("/api/hunts/{id}", delete(handlers::hunts::archive_hunt))
             .route(
@@ -2930,6 +2954,10 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/hunts/{id}/escalation-mode",
                 post(handlers::hunts::set_escalation_mode),
+            )
+            .route(
+                "/api/hunts/{id}/escalation-scope",
+                put(handlers::hunts::set_escalation_scope),
             )
             // Playbook repositories (external sync)
             .route(
@@ -2977,6 +3005,16 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/playbook-repositories/{id}/sync-and-import",
                 post(handlers::playbook_repositories::sync_and_import_repository),
+            )
+            // NAN-5648: review / apply an upstream update of an imported
+            // playbook or hunt (kind-scoped permissions in the handlers).
+            .route(
+                "/api/playbook-imports/{playbook_id}/upstream-update",
+                get(handlers::playbook_repositories::get_upstream_update),
+            )
+            .route(
+                "/api/playbook-imports/{playbook_id}/upstream-update/apply",
+                post(handlers::playbook_repositories::apply_upstream_update),
             )
             // NAN-453: axum requires catch-all params `{*path}` to be the last
             // segment. Matches the rule_repositories pattern at line 1537:

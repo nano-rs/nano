@@ -194,6 +194,9 @@ struct RendererRuntime {
 #[derive(Clone)]
 pub struct VectorConfigPublisher {
     pool: PgPool,
+    /// Root of `publications/` and `.publication-staging/`: the api passes
+    /// its Vector config dir, or `VECTOR_CONFIG_PUBLICATION_DIR` (NAN-5611,
+    /// see [`publication_root`]).
     config_dir: PathBuf,
     node_id: String,
     /// NAN-4973: this process's renderer epoch, allocated once from
@@ -266,6 +269,26 @@ enum PublicationDecision {
         generation: i64,
     },
     PublishNew,
+}
+
+/// NAN-5611: where generations are rendered and materialized, when not in
+/// the api's Vector config dir.
+pub const PUBLICATION_DIR_ENV: &str = "VECTOR_CONFIG_PUBLICATION_DIR";
+
+/// NAN-5611: the publication root. On a single node the api's config dir IS
+/// the volume the local Vector runs with `--watch-config` on, so every
+/// generation rendered and materialized there (each api boot, in
+/// `.publication-staging/` and `publications/`) made Vector reload. No local
+/// consumer reads publications on a single node (config delivery is off), so
+/// single-node Compose points `VECTOR_CONFIG_PUBLICATION_DIR` outside that
+/// volume. Unset or blank: the config dir, as before (Kubernetes upload
+/// sidecars read `<config dir>/publications`; role split gives the api its
+/// own volume).
+pub fn publication_root(config_dir: &Path, override_dir: Option<&str>) -> PathBuf {
+    match override_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => config_dir.to_path_buf(),
+    }
 }
 
 impl VectorConfigPublisher {
@@ -1647,7 +1670,7 @@ pub(super) fn validate_relative_path(path: &Path) -> Result<(), VectorConfigPubl
     Ok(())
 }
 
-fn normalize_generated_metadata(path: &str, bytes: Vec<u8>) -> Vec<u8> {
+pub(super) fn normalize_generated_metadata(path: &str, bytes: Vec<u8>) -> Vec<u8> {
     if !path.ends_with(".toml") {
         return bytes;
     }
@@ -2140,6 +2163,46 @@ mod tests {
             signing_key_from_optional_encoded(Some("not-base64!!")),
             Err(VectorConfigPublicationError::InvalidSigningKey(_))
         ));
+    }
+
+    #[test]
+    fn the_publication_root_can_live_outside_the_watched_config_dir() {
+        let config = Path::new("/app/config/vector");
+        assert_eq!(publication_root(config, None), config);
+        assert_eq!(publication_root(config, Some("  ")), config);
+        assert_eq!(
+            publication_root(config, Some("/app/data/vector-publications")),
+            Path::new("/app/data/vector-publications")
+        );
+    }
+
+    /// NAN-5611: with the root moved, rendering and materializing a
+    /// generation writes nothing under the api's Vector config dir (the
+    /// volume a single-node Vector watches).
+    #[tokio::test]
+    async fn a_moved_root_keeps_generations_out_of_the_config_dir() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source_dir.path().join("parsers")).unwrap();
+        std::fs::write(source_dir.path().join("parsers/example.toml"), "[x]\na = 1\n").unwrap();
+        let snapshot = build_snapshot(source_dir.path()).unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let publisher = VectorConfigPublisher {
+            pool,
+            config_dir: publication_root(config_dir.path(), elsewhere.path().to_str()),
+            node_id: "test-node".to_string(),
+            allocated_epoch: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        };
+        let render = publisher.create_render_dir().await.unwrap();
+        assert!(render.starts_with(elsewhere.path()));
+        publisher.cleanup_render_dir(&render).await;
+        publisher.materialize(3, 7, 0, &snapshot, None).await.unwrap();
+        assert!(elsewhere.path().join("publications/00000000000000000003/.ready").exists());
+        assert_eq!(publisher.publications_root(), elsewhere.path().join("publications"));
+        assert_eq!(std::fs::read_dir(config_dir.path()).unwrap().count(), 0, "nothing in the config dir");
     }
 
     #[tokio::test]

@@ -4117,17 +4117,30 @@ impl ClickHouseSqlGenerator {
                             }
                             cur
                         }
+                        // NAN-5634: rename MOVES a column (the SQL drops `from`
+                        // and `to`, then adds `to`), so the source name leaves
+                        // the shape. Keeping it made `append [… | rename
+                        // dst_endpoint.ip AS src_endpoint.ip]` select the
+                        // renamed-away column from its arm (400 "Field
+                        // 'dst_endpoint.ip' does not exist in the data").
                         Command::Rename { mappings } => {
                             let mut cur = shape;
-                            for m in mappings {
+                            for m in mappings.iter().filter(|m| m.from != m.to) {
                                 match &mut cur {
                                     OutputShape::Wide(extra) | OutputShape::WideJoined(extra) => {
+                                        extra.retain(|c| *c != m.from);
                                         if !extra.contains(&m.to) {
                                             extra.push(m.to.clone());
                                         }
                                     }
                                     OutputShape::Columns(cols) => {
-                                        if !cols.contains(&m.to) {
+                                        // The moved column keeps its position.
+                                        if cols.contains(&m.from) {
+                                            cols.retain(|c| *c != m.to);
+                                            for c in cols.iter_mut().filter(|c| **c == m.from) {
+                                                *c = m.to.clone();
+                                            }
+                                        } else if !cols.contains(&m.to) {
                                             cols.push(m.to.clone());
                                         }
                                     }
@@ -5128,6 +5141,83 @@ impl ClickHouseSqlGenerator {
         self.generate_command_sql_with_stability(source, cmd, SourceStability::default())
     }
 
+    /// NAN-5632: SQL for a CHAIN of commands run over the existing relation
+    /// `source`, one statement per command (the caller names and nests the
+    /// CTEs). `source_columns` are the non-schema columns `source` already
+    /// carries (e.g. the prevalence decorations and eval outputs). Command
+    /// `i` reads `source` (i = 0) or the stage `{stage_prefix}{i-1}`; the
+    /// result is `(stage name, SQL)` per command, in order.
+    ///
+    /// Unlike calling [`Self::generate_command_sql`] per command, every
+    /// command sees the columns produced upstream of it as plain columns: the
+    /// `time_bucket` / `count` of an aggregation, its by-field aliases, and
+    /// `source_columns`. Without that scope the schema resolver mapped them as
+    /// unknown event fields (`unmapped."time_bucket"` / `event."count"` on
+    /// OCSF), so `| prevalence … | timechart` (re-entered as `timechart |
+    /// sort time_bucket`) and `| prevalence … | stats count by f` (followed by
+    /// the implicit `sort -count`) failed with "does not exist".
+    ///
+    /// Same source-stability posture as [`Self::generate_command_sql`].
+    /// Generated on a private clone: `self`'s per-generation scope is never
+    /// read or written, so concurrent searches cannot see each other's chain.
+    pub fn generate_command_chain_sql(
+        &self,
+        source: &str,
+        commands: &[Command],
+        stage_prefix: &str,
+        source_columns: &HashSet<String>,
+    ) -> Result<Vec<(String, String)>, SqlGenError> {
+        let chain = commands.iter().cloned().fold(
+            Query::Search(SearchExpr::Keyword(String::new())),
+            |source, command| Query::Piped {
+                source: Box::new(source),
+                command,
+            },
+        );
+        let mut computed = field_analysis::collect_computed_field_names(&chain);
+        computed.extend(source_columns.iter().cloned());
+        let agg_aliases = field_analysis::collect_agg_reference_aliases(&chain, &computed);
+        // The search service shares one generator between concurrent
+        // searches, so the chain's scope lives on a private clone (`Clone`
+        // starts every per-generation field empty) and `self` is never
+        // written.
+        let gen = self.clone();
+        *gen.computed_fields.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = computed;
+        *gen
+            .agg_reference_aliases
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = agg_aliases;
+        gen.swap_upstream_computed(source_columns.clone());
+
+        let mut out = Vec::with_capacity(commands.len());
+        let mut available: Option<HashSet<String>> = None;
+        let mut aggregated = false;
+        for (i, cmd) in commands.iter().enumerate() {
+            let current = if i == 0 { source.to_string() } else { format!("{stage_prefix}{}", i - 1) };
+            let sql = gen.generate_command_sql_inner(
+                &current,
+                cmd,
+                &mut available,
+                None,
+                false,
+                aggregated,
+                false,
+                SourceStability::default(),
+            )?;
+            gen.note_upstream_computed(cmd);
+            aggregated |= matches!(
+                cmd,
+                Command::Stats { .. }
+                    | Command::Chart { .. }
+                    | Command::Timechart { .. }
+                    | Command::Top { .. }
+                    | Command::Rare { .. }
+            );
+            out.push((format!("{stage_prefix}{i}"), sql));
+        }
+        Ok(out)
+    }
+
     /// [`Self::generate_command_sql`] for callers that CAN vouch for what
     /// re-executing `source` yields (the subsearch stage chain, NAN-2265).
     fn generate_command_sql_with_stability(
@@ -5240,8 +5330,14 @@ impl ClickHouseSqlGenerator {
                 // order unless they (re)define one of its keys.
                 Command::Eval { assignments }
                     if assignments.iter().all(|a| !order_mentions(&ctx.row_order, &a.field)) => {}
-                Command::Rename { mappings }
-                    if mappings.iter().all(|m| !order_mentions(&ctx.row_order, &m.to)) => {}
+                // NAN-5634: a key the rename moves follows its column to the
+                // new name (`sort -ports | rename ports AS unique_ports` orders
+                // by `unique_ports`); keeping the old name ordered the final
+                // statement by a column the rename removed (Code 47, 400
+                // "Field 'ports' does not exist").
+                Command::Rename { mappings } => {
+                    ctx.row_order = renamed_row_order(&ctx.row_order, mappings);
+                }
                 Command::Rex { pattern, field, .. }
                     if !field.as_deref().is_some_and(|f| order_mentions(&ctx.row_order, f))
                         && !order_keys(&ctx.row_order)
@@ -5306,6 +5402,91 @@ fn order_keys(order: &RowOrder) -> Vec<String> {
     }
     push(&order[start..]);
     keys
+}
+
+/// NAN-5634: the order rows are in after `rename`, which follows the SQL it
+/// emits (commands.rs): each mapping, in sequence, drops the columns named
+/// `from` and `to` and adds `to`. A key named exactly `from` moves to `to`; a
+/// key named `to` (overwritten) or an expression key reading either name has
+/// no column to sort on any more, so the order is no longer in scope.
+fn renamed_row_order(order: &RowOrder, mappings: &[FieldRename]) -> RowOrder {
+    let RowOrder::Explicit(text) = order else {
+        return order.clone();
+    };
+    let mut items: Vec<(String, String)> = top_level_order_items(text)
+        .into_iter()
+        .map(|item| {
+            let item = item.trim();
+            let mut key = item;
+            for suffix in [" NULLS FIRST", " NULLS LAST"] {
+                key = key.strip_suffix(suffix).unwrap_or(key);
+            }
+            for suffix in [" DESC", " ASC"] {
+                key = key.strip_suffix(suffix).unwrap_or(key);
+            }
+            let key = key.trim_end();
+            (key.to_string(), item[key.len()..].to_string())
+        })
+        .collect();
+    for m in mappings.iter().filter(|m| m.from != m.to) {
+        for (key, _) in &mut items {
+            let name = key.trim_matches(|c| c == '"' || c == '`');
+            if key.contains('(') {
+                if mentions_identifier(key, &m.from) || mentions_identifier(key, &m.to) {
+                    return RowOrder::Reordered;
+                }
+            } else if name == m.from {
+                *key = helpers::escape_identifier(&m.to).to_string();
+            } else if name == m.to {
+                return RowOrder::Reordered;
+            }
+        }
+    }
+    RowOrder::Explicit(
+        items
+            .into_iter()
+            .map(|(key, suffix)| format!("{key}{suffix}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// Whether the SQL expression `expr` reads the column `name` as a whole
+/// identifier (`ip` is not read by `"src_endpoint.ip"` or `zip`).
+fn mentions_identifier(expr: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
+    let (expr, name) = (expr.to_ascii_lowercase(), name.to_ascii_lowercase());
+    expr.match_indices(&name).any(|(at, _)| {
+        let before = expr[..at].chars().next_back();
+        let after = expr[at + name.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
+/// The items of an ORDER BY list, split on top-level commas (quotes and
+/// parentheses respected).
+fn top_level_order_items(order: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let (mut depth, mut quote, mut start) = (0_i32, None::<char>, 0);
+    for (at, ch) in order.char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                items.push(&order[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&order[start..]);
+    items
 }
 
 /// Whether `name` is (or appears in) one of the explicit order's keys.

@@ -492,6 +492,15 @@ impl DetectionService {
         budget: TuningReplayBudget,
         query_id_prefix: &str,
     ) -> TuningWindowEvidence {
+        // NAN-5616: a replay runs unrestricted (system scope), so a query the
+        // rule save path refuses (dataset=signals, directly or through a
+        // subsearch) is never replayed: fail closed, nothing runs.
+        if Self::reject_signals_dataset_rule(dataset.as_deref(), query).is_err() {
+            return TuningWindowEvidence {
+                failed_windows: u32::try_from(windows.len().max(1)).unwrap_or(u32::MAX),
+                ..TuningWindowEvidence::default()
+            };
+        }
         if budget.rows == 0 || budget.bytes == 0 {
             return TuningWindowEvidence {
                 budget_exceeded: true,

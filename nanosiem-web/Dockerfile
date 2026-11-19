@@ -41,7 +41,7 @@ COPY --from=sbom-npm-deps /app/node_modules /node_modules
 # Production stage - serve with nginx. NAN-5411: the same nginx digest as the
 # edge (docker-compose.opensource.yml), so one bump covers both;
 # scripts/check-opensource-pins.sh step 7 fails on drift.
-FROM nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
+FROM nginx:alpine@sha256:1bb9390209f866c8c0bf76ba89d3f33a3f6cd6a0e6c1b457af7ee763b9579f41
 
 LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
       org.opencontainers.image.url="https://nano.rs" \

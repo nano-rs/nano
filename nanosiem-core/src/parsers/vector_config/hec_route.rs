@@ -51,10 +51,8 @@ pub fn passthrough_route_toml() -> String {
 pub fn write_passthrough_route(configs_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(configs_dir)?;
     let target = configs_dir.join(SPLUNK_HEC_ROUTE_FILE);
-    // Dotfile: Vector's `--config-dir` ignores it while it exists.
-    let tmp = configs_dir.join(format!(".{}.tmp-{}", SPLUNK_HEC_ROUTE_FILE, std::process::id()));
-    std::fs::write(&tmp, passthrough_route_toml())?;
-    std::fs::rename(&tmp, &target)
+    // Dotfile temp + rename; NAN-5611: left alone when unchanged.
+    super::tree_write::write_if_changed_sync(&target, passthrough_route_toml()).map(|_| ())
 }
 
 /// Whether any `*.toml` in `configs_dir` declares `splunk_hec_route`.

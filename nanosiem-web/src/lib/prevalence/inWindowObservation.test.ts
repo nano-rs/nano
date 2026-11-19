@@ -2,6 +2,7 @@
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -12,6 +13,10 @@ import {
   mergeDiscoveryResults,
   mergeObservations,
   OBSERVATION_BATCH_SIZE,
+  OCSF_HOST_IDENTITY_EVAL,
+  applyInWindowObservation,
+  baselineFromScatterPoint,
+  buildDiscoveryQuery,
   observationPathsFor,
 } from './inWindowObservation.ts';
 
@@ -223,19 +228,157 @@ test('discovery merge flags truncation when a path hit its limit', () => {
   assert.deepEqual(out.failedPaths, []);
 });
 
-// NAN-4931: the OCSF profile reads the OCSF hash arrays / hostnames and keys
-// hosts on device.hostname, not the UDM names (which match nothing there).
+// NAN-4931: the OCSF profile reads the OCSF hash arrays / hostnames.
+// NAN-5662: and keys hosts exactly like the OCSF prevalence MVs.
 test('observationPathsFor picks the OCSF paths and host identity under OCSF', () => {
   const ocsf = observationPathsFor(true);
   assert.deepEqual([...ocsf.hashPaths], ['file.hashes.value', 'process.file.hashes.value', 'actor.process.file.hashes.value']);
   assert.ok(ocsf.domainPaths.includes('dst_endpoint.hostname'));
-  assert.match(ocsf.hostEval, /device\.hostname/);
+  assert.equal(ocsf.hostEval, OCSF_HOST_IDENTITY_EVAL);
   const [q] = buildObservationQueries(['abc'], ocsf.hashPaths.slice(0, 1), ocsf.hostEval);
   assert.equal(
     q.npl,
-    'file.hashes.value="abc" | eval __h=if(device.hostname!="", device.hostname, if(src_endpoint.hostname!="", src_endpoint.hostname, "unknown")) | stats dc(__h) as hosts, count as events, min(timestamp) as first_in_window by file.hashes.value',
+    'file.hashes.value="abc" | eval __h=if(src_endpoint.hostname!="", src_endpoint.hostname, if(src_endpoint.ip!="", src_endpoint.ip, if(device.hostname!="", device.hostname, "unknown"))) | stats dc(__h) as hosts, count as events, min(timestamp) as first_in_window by file.hashes.value',
   );
   const udm = observationPathsFor(false);
   assert.deepEqual([...udm.hashPaths], ['file_hash', 'process_hash']);
   assert.match(udm.hostEval, /src_host/);
+});
+
+// ---------------------------------------------------------------------------
+// NAN-5662: OCSF host identity pinned to the prevalence MVs.
+// ---------------------------------------------------------------------------
+
+const repoUrl = (rel: string) => new URL(`../../../../${rel}`, import.meta.url);
+const repoFile = (rel: string) => readFileSync(repoUrl(rel), 'utf8');
+// These pins read the ClickHouse schema next to the web app; a checkout that
+// carries only nanosiem-web skips them rather than failing.
+const HAS_OCSF_SCHEMA = existsSync(repoUrl('clickhouse/ocsf/init.sql'));
+const schemaTest = HAS_OCSF_SCHEMA ? test : test.skip;
+
+/** The identity every OCSF hash/domain MV aggregates, with whitespace collapsed. */
+const MV_HOST_KEY =
+  "uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, if(src_host_unified != '', src_host_unified, 'unknown'))))";
+
+const squash = (sql: string) => sql.replace(/\s+/g, ' ').replace(/\( /g, '(').replace(/ \)/g, ')');
+
+/** Each `CREATE MATERIALIZED VIEW <name> ... ;` body in an OCSF SQL file. */
+function ocsfPrevalenceMvBodies(sql: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const re = /CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem\.(\w+)([\s\S]*?);\n/g;
+  for (const m of sql.matchAll(re)) out.set(m[1], squash(m[2]));
+  return out;
+}
+
+const OCSF_HASH_AND_DOMAIN_MVS = [
+  'ocsf_hash_prevalence_summary_file_hash_mv',
+  'ocsf_hash_prevalence_summary_process_hash_mv',
+  'ocsf_hash_prevalence_summary_actor_process_hash_mv',
+  'ocsf_domain_prevalence_summary_dest_host_mv',
+  'ocsf_domain_prevalence_summary_query_mv',
+  'ocsf_domain_prevalence_summary_url_mv',
+  'ocsf_domain_prevalence_summary_http_url_mv',
+  'hash_prevalence_source_ocsf_mv',
+  'hash_prevalence_source_ocsf_actor_process_mv',
+  'domain_prevalence_source_ocsf_mv',
+  'domain_prevalence_source_ocsf_http_url_mv',
+];
+
+schemaTest('every OCSF hash/domain prevalence MV keys hosts on the one identity the eval mirrors', () => {
+  const bodies = ocsfPrevalenceMvBodies(repoFile('clickhouse/ocsf/init.sql'));
+  for (const name of OCSF_HASH_AND_DOMAIN_MVS) {
+    const body = bodies.get(name);
+    assert.ok(body, `${name} missing from clickhouse/ocsf/init.sql`);
+    assert.ok(body.includes(MV_HOST_KEY), `${name} no longer uses the host key the eval mirrors:\n${body}`);
+  }
+  // The upgrade path: the LATEST migration statement that (re)defines each of
+  // these MVs must carry the same key, so a later MODIFY QUERY that changes
+  // the identity fails here until the eval is changed with it.
+  const names = new Set(OCSF_HASH_AND_DOMAIN_MVS);
+  const latest = new Map<string, { mig: string; stmt: string }>();
+  for (const mig of readdirSync(repoUrl('clickhouse/ocsf/migrations')).filter((f) => f.endsWith('.sql')).sort()) {
+    const sql = repoFile(`clickhouse/ocsf/migrations/${mig}`).replace(/^\s*--.*$/gm, '');
+    for (const stmt of sql.split(/;\s*\n/)) {
+      const target = stmt.match(/(?:ALTER TABLE|CREATE MATERIALIZED VIEW(?: IF NOT EXISTS)?)\s+nanosiem\.(\w+)/)?.[1];
+      if (target && names.has(target) && /uniqState/.test(stmt)) latest.set(target, { mig, stmt });
+    }
+  }
+  // 196 redefines 7 of them and 197 creates 4: the scan really ran.
+  assert.ok(latest.size >= 11, `only ${latest.size} MVs found in clickhouse/ocsf/migrations`);
+  for (const [target, { mig, stmt }] of latest) {
+    assert.ok(squash(stmt).includes(MV_HOST_KEY), `${mig}: ${target} changes the host key the eval mirrors`);
+  }
+});
+
+schemaTest('the OCSF eval is the MV key transliterated (src_host_unified == device.hostname in its branch)', () => {
+  const alias = squash(repoFile('clickhouse/ocsf/init.sql')).match(/`src_host_unified` String ALIAS ([^,]+, [^,]+, [^)]+\))/);
+  assert.ok(alias, 'src_host_unified ALIAS not found');
+  // ALIAS = if(src_endpoint.hostname non-empty, src_endpoint.hostname, device.hostname):
+  // reached only when src_endpoint.hostname is '', it IS device.hostname.
+  assert.equal(alias[1], 'if(notEmpty(`src_endpoint.hostname`), `src_endpoint.hostname`, `device.hostname`)');
+  const fromMv = MV_HOST_KEY
+    .replace(/^uniqState\(/, '')
+    .replace(/\)$/, '')
+    .replace(/`/g, '')
+    .replace(/ != ''/g, '!=""')
+    .replace(/'unknown'/g, '"unknown"')
+    .replace(/src_host_unified/g, 'device.hostname');
+  assert.equal(OCSF_HOST_IDENTITY_EVAL, `eval __h=${fromMv}`);
+});
+
+/** Evaluate the `eval __h=if(a!="", a, if(b!="", b, ... "unknown"))` chain on a row. */
+function evalHostIdentity(evalStr: string, row: Record<string, string>): string {
+  const fields = [...evalStr.matchAll(/if\(([\w.]+)!=""/g)].map((m) => m[1]);
+  const fallback = evalStr.match(/"(\w+)"\)+$/)?.[1];
+  assert.ok(fields.length > 0 && fallback, evalStr);
+  for (const f of fields) if ((row[f] ?? '') !== '') return row[f];
+  return fallback;
+}
+
+test('proxy rows carrying only src_endpoint.ip count distinct client IPs, not one host', () => {
+  // A proxy log: the client IP, the requested host, and the appliance as device.
+  const rows = Array.from({ length: 1108 }, (_, i) => ({
+    'src_endpoint.ip': `10.${(i >> 8) & 255}.${i & 255}.7`,
+    'device.hostname': 'proxy-01',
+    'dst_endpoint.hostname': 'github.com',
+  }));
+  const hosts = new Set(rows.map((r) => evalHostIdentity(OCSF_HOST_IDENTITY_EVAL, r)));
+  assert.equal(hosts.size, 1108);
+  // Endpoint rows (Sysmon) have no src_endpoint and key on device.hostname.
+  assert.equal(evalHostIdentity(OCSF_HOST_IDENTITY_EVAL, { 'device.hostname': 'ws-1' }), 'ws-1');
+  assert.equal(evalHostIdentity(OCSF_HOST_IDENTITY_EVAL, { 'src_endpoint.hostname': 'h', 'src_endpoint.ip': '1.2.3.4' }), 'h');
+  assert.equal(evalHostIdentity(OCSF_HOST_IDENTITY_EVAL, {}), 'unknown');
+});
+
+test('discovery query takes the profile host identity', () => {
+  const { npl } = buildDiscoveryQuery('dst_endpoint.hostname=*', 'dst_endpoint.hostname', OCSF_HOST_IDENTITY_EVAL);
+  assert.ok(npl.startsWith(`dst_endpoint.hostname=* | ${OCSF_HOST_IDENTITY_EVAL} | stats`), npl);
+});
+
+// ---------------------------------------------------------------------------
+// NAN-5662: a baseline miss is never "rare" on its own.
+// ---------------------------------------------------------------------------
+
+const MISS = { host_count: 0, is_rare: true, prevalence_score: 0, total_occurrences: 0, first_seen: new Date().toISOString() };
+
+test('a 0-host baseline miss is not rare and carries no env first-seen', () => {
+  const b = baselineFromScatterPoint(MISS);
+  assert.deepEqual(b, { hostCount: 0, isRare: false, prevalenceScore: 0, totalOccurrences: 0, envFirstSeen: undefined });
+  assert.equal(baselineFromScatterPoint({ ...MISS, host_count: null }), null);
+  const hit = baselineFromScatterPoint({ ...MISS, host_count: 2, is_rare: true, first_seen: '2026-11-01T00:00:00Z' });
+  assert.equal(hit?.isRare, true);
+  assert.equal(hit?.envFirstSeen?.toISOString(), '2026-11-01T00:00:00.000Z');
+});
+
+test('applyInWindowObservation decides rarity of a miss from the observation only', () => {
+  const miss = { hostCount: 0, isRare: true };
+  // No observation (fallback failed / not run): unbaselined, NOT rare.
+  assert.deepEqual(applyInWindowObservation(miss, undefined, 3), { hostCount: 0, isRare: false });
+  assert.deepEqual(applyInWindowObservation(miss, { hosts: 0, events: 0, firstInWindow: null }, 3), { hostCount: 0, isRare: false });
+  // Observed on 1108 hosts: common, not rare.
+  assert.deepEqual(applyInWindowObservation(miss, { hosts: 1108, events: 5000, firstInWindow: 1 }, 3), { hostCount: 1108, isRare: false, inWindow: true });
+  assert.deepEqual(applyInWindowObservation(miss, { hosts: 2, events: 2, firstInWindow: 1 }, 3), { hostCount: 2, isRare: true, inWindow: true });
+  // A real baseline count is never overwritten.
+  const counted = { hostCount: 5, isRare: false };
+  assert.equal(applyInWindowObservation(counted, { hosts: 1, events: 1, firstInWindow: 1 }, 3), counted);
 });

@@ -1069,6 +1069,35 @@ CLICKHOUSE_USERS_DIR = ".nano-generated/clickhouse/users.d"
 # copied in); ClickHouse mounts the two directories and nothing inside them.
 CLICKHOUSE_CONFIG_DIR = ".nano-generated/clickhouse/config.d"
 CLICKHOUSE_CONFIG_DIRS_SCRIPT = "scripts/lib/clickhouse_config_dirs.py"
+# NAN-5669: install.sh's single-node host sizing (scripts/lib/resource-sizing.sh)
+# and the installer-managed block of .env it writes the defaults into.
+RESOURCE_SIZING_SCRIPT = "scripts/lib/resource-sizing.sh"
+SIZING_BLOCK_BEGIN = "# BEGIN NANO AUTO SIZING"
+SIZING_BLOCK_END = "# END NANO AUTO SIZING"
+SIZING_DIR_DEFAULT = ".nano-generated/sizing"
+
+
+def vector_data_storage_mode(compose_model: dict[str, Any]) -> str:
+    """install.sh's vector_data_storage_mode_from_json: "named" when Vector's
+    /var/lib/vector is a plain local named volume (on the Docker root
+    filesystem the sizer probes), else "bind" (bind mount, driver options or
+    an external volume, whose capacity the probe cannot see)."""
+    services = compose_model.get("services") or {}
+    mounts = [
+        mount for mount in ((services.get("vector") or {}).get("volumes") or [])
+        if isinstance(mount, dict) and mount.get("target") == "/var/lib/vector"
+    ]
+    if len(mounts) != 1:
+        raise UpgradeError("Vector must have exactly one /var/lib/vector mount")
+    mount = mounts[0]
+    if mount.get("type") != "volume":
+        return "bind"
+    definition = (compose_model.get("volumes") or {}).get(mount.get("source"), {}) or {}
+    plain = (
+        definition.get("driver", "local") == "local"
+        and not definition.get("driver_opts") and not definition.get("external")
+    )
+    return "named" if plain else "bind"
 
 
 def check_workload_identity_passwords(env: dict[str, str], role_split: bool) -> str:
@@ -2309,6 +2338,23 @@ def set_env_keys_in_place(lines: list[str], replacements: dict[str, str]) -> lis
     return out
 
 
+def add_keys_to_managed_block(
+    lines: list[str], begin: str, end: str, additions: dict[str, str],
+) -> list[str] | None:
+    """NAN-5669: `lines` with each key of `additions` that no line assigns
+    inserted just above the `end` line of the first block opened by a line
+    starting with `begin`. None when there is no such complete block."""
+    start = next((i for i, line in enumerate(lines) if line.startswith(begin)), None)
+    if start is None:
+        return None
+    stop = next((i for i in range(start + 1, len(lines)) if lines[i].startswith(end)), None)
+    if stop is None:
+        return None
+    assigned = {match.group(1) for match in map(ENV_ASSIGNMENT.match, lines) if match}
+    new = [f"{key}={value}" for key, value in additions.items() if key not in assigned]
+    return [*lines[:stop], *new, *lines[stop:]]
+
+
 class EnvFile:
     def __init__(self, path: pathlib.Path):
         self.path = path
@@ -2359,7 +2405,28 @@ class EnvFile:
                 "Collapsed duplicate .env line(s) for "
                 f"{', '.join(collapsed)} (kept the value in effect)"
             )
-        kept = set_env_keys_in_place(collapse_env_duplicates(lines), replacements)
+        self._write_lines(set_env_keys_in_place(collapse_env_duplicates(lines), replacements))
+
+    def add_to_managed_block(self, begin: str, end: str, additions: dict[str, str]) -> bool:
+        """NAN-5669: append KEY=VALUE lines at the end of the installer-managed
+        block that starts with `begin` (before its `end` line), so a later
+        install.sh run replaces them like the rest of the block and an operator
+        line below the block still wins. Keys the file already assigns are
+        never touched. Returns False (and writes nothing) without that block."""
+        for key, value in additions.items():
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+                raise UpgradeError("unsafe environment key")
+            if "\n" in value or "\r" in value:
+                raise UpgradeError("unsafe environment value")
+        lines = secure_read_text(self.path, "environment file").splitlines()
+        merged = add_keys_to_managed_block(lines, begin, end, additions)
+        if merged is None:
+            return False
+        if merged != lines:
+            self._write_lines(merged)
+        return True
+
+    def _write_lines(self, kept: list[str]) -> None:
         descriptor, temporary = tempfile.mkstemp(prefix=".env.upgrade.", dir=self.path.parent)
         try:
             os.fchmod(descriptor, 0o600)
@@ -3043,6 +3110,167 @@ class LocalOps:
             )
         self.env = self.env_file.values()
         return [key for key in keys if self.env.get(key) != before[key]]
+
+    def _sizing_argv(self, extra: Sequence[str]) -> list[str]:
+        """install.sh's resource-sizing.sh call for a single node: the same
+        roles (Tenzir / monitoring from COMPOSE_PROFILES in .env), edition and
+        planned volume (NANO_PLANNED_GB_PER_DAY / NANO_INGEST_PATH /
+        NANO_AVG_EVENT_BYTES in .env, with install.sh's defaults)."""
+        profiles_value = self.env.get("COMPOSE_PROFILES", "")
+        profiles = {item.strip() for item in profiles_value.split(",") if item.strip()}
+        roles = "app,ingest,clickhouse,postgres"
+        # install.sh: grep '^COMPOSE_PROFILES=.*tenzir' .env
+        tenzir = "tenzir" in profiles_value
+        if tenzir:
+            roles += ",tenzir"
+        if "monitoring" in profiles:
+            roles += ",monitoring"
+        edition = getattr(self, "edition", "") or self.env.get("NANO_EDITION", "") or "open"
+        return [
+            "bash", str(self.install_dir / RESOURCE_SIZING_SCRIPT),
+            "--topology", "single", "--roles", roles, "--edition", edition, "--shards", "1",
+            "--planned-gb-per-day", self.env.get("NANO_PLANNED_GB_PER_DAY", "").strip() or "0",
+            "--ingest-path",
+            self.env.get("NANO_INGEST_PATH", "").strip() or ("preshaped" if tenzir else "raw"),
+            "--avg-event-bytes", self.env.get("NANO_AVG_EVENT_BYTES", "").strip() or "1000",
+            *extra, "--format", "env",
+        ]
+
+    @staticmethod
+    def _sizing_values(stdout: str) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for line in stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or not value \
+                    or "\r" in value:
+                raise UpgradeError("resource sizing returned an invalid line")
+            values[key] = value
+        return values
+
+    def fill_missing_sizing_keys(self) -> list[str]:
+        """NAN-5669: a single-node upgrade keeps the installed host sizing (the
+        installer-managed block of .env and the ClickHouse sizing XML), so a
+        sizing key a release introduces (v2.0.33's ClickHouse spill caps,
+        NAN-5636) never reached an upgraded install, which then ran the static
+        80 GB server cap. Fill exactly those keys, as an install.sh re-run on
+        this host writes them: install.sh's first sizing pass (host defaults,
+        the invoking environment's overrides) gives the block value of each
+        key the .env does not assign anywhere; every key it does assign (block
+        default or operator line) keeps its value, so nothing else is
+        re-sized (small installs keep their light defaults). install.sh's
+        second pass (the merged .env as overrides) then renders the ClickHouse
+        sizing XML, and the assembled config digest is recorded, so the
+        ClickHouse rollout recreates the server onto it. Canonical single node
+        only: role-split hosts re-render their sizing with
+        render-inventory.py. Best effort: any sizing failure keeps the
+        installed sizing with a warning. Returns the keys added (names only)."""
+        if getattr(self, "role_env", None) or getattr(self, "legacy_layout", None) is not None:
+            return []
+        if not (self.install_dir / RESOURCE_SIZING_SCRIPT).is_file():
+            return []
+        try:
+            missing = self._fill_missing_sizing_keys()
+        except (UpgradeError, OSError, ValueError, AttributeError) as error:
+            eprint(
+                f"warning: could not size this release's new sizing keys ({error}); ClickHouse "
+                "keeps its installed limits. Re-run install.sh on this host once that is fixed."
+            )
+            return []
+        if not missing:
+            return []
+        eprint(
+            "note: added this release's new sizing keys to the .env sizing block, sized for this "
+            "host as install.sh sizes them: "
+            + ", ".join(f"{key}={value}" for key, value in missing.items())
+            + ". Existing values were kept; ClickHouse restarts onto them in the rollout."
+        )
+        self.assemble_clickhouse_dirs()
+        return list(missing)
+
+    def _run_sizing(self, extra: Sequence[str], environment: dict[str, str]) -> tuple[dict[str, str], str]:
+        """resource-sizing.sh with install.sh's arguments: (values, stdout)."""
+        result = self.runner.run(self._sizing_argv(extra), timeout=300, check=False, env=environment)
+        if result.returncode != 0:
+            reason = (result.stderr or "").strip().splitlines()
+            raise UpgradeError(
+                "resource sizing refused this host: "
+                + (reason[-1] if reason else f"exit {result.returncode}")
+            )
+        return self._sizing_values(result.stdout), result.stdout
+
+    def _fill_missing_sizing_keys(self) -> dict[str, str]:
+        env_path = self.install_dir / ".env"
+        lines = secure_read_text(env_path, "environment file").splitlines()
+        if add_keys_to_managed_block(lines, SIZING_BLOCK_BEGIN, SIZING_BLOCK_END, {}) is None:
+            return {}  # no installer sizing block: install.sh writes it
+        assigned = {match.group(1) for match in map(ENV_ASSIGNMENT.match, lines) if match}
+        environment = dict(os.environ)
+        # The host already runs nano: an upgrade fills keys, it never
+        # refuses a running host over install-time minimums.
+        environment["NANO_SKIP_HOST_MINIMUMS"] = "1"
+        # Cheap key listing first, from the recorded host facts (no Docker
+        # probe): most upgrades add no sizing key and stop here.
+        recorded = [
+            self.env.get(key, "").strip()
+            for key in ("NANO_DETECTED_CPU_CORES", "NANO_DETECTED_MEMORY_MIB", "VECTOR_DATA_CAPACITY_BYTES")
+        ]
+        if all(value.isdigit() and int(value) > 0 for value in recorded):
+            with contextlib.suppress(UpgradeError):
+                listed, _ = self._run_sizing(
+                    ["--cpu", recorded[0], "--memory-mib", recorded[1],
+                     "--vector-data-capacity-bytes", recorded[2]],
+                    {**environment, "NANO_VECTOR_DATA_STORAGE_MODE": "named"},
+                )
+                if set(listed) <= assigned:
+                    return {}
+        model = json.loads(self.compose(["config", "--format", "json"], timeout=120).stdout)
+        storage_mode = vector_data_storage_mode(model)
+        extra: list[str] = []
+        if storage_mode == "bind" and not environment.get("NANO_VECTOR_DATA_CAPACITY_BYTES"):
+            # install.sh needs the operator's capacity here; it is recorded.
+            capacity = self.env.get("VECTOR_DATA_CAPACITY_BYTES", "").strip()
+            if capacity.isdigit():
+                extra = ["--vector-data-capacity-bytes", capacity]
+        environment["NANO_VECTOR_DATA_STORAGE_MODE"] = storage_mode
+        # install.sh pass 1: the block defaults (no .env overrides).
+        defaults, _ = self._run_sizing(extra, environment)
+        missing = {key: value for key, value in defaults.items() if key not in assigned}
+        if not missing:
+            return {}
+        merged = add_keys_to_managed_block(lines, SIZING_BLOCK_BEGIN, SIZING_BLOCK_END, missing)
+        if merged is None:
+            return {}
+        generated = self.install_dir / ".nano-generated"
+        generated.mkdir(mode=0o755, exist_ok=True)
+        stage = pathlib.Path(tempfile.mkdtemp(prefix=".sizing-fill-", dir=generated))
+        try:
+            staged_env = stage / "merged.env"
+            descriptor = os.open(staged_env, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(merged) + "\n")
+            # install.sh pass 2: the merged .env as overrides renders the XML.
+            _, rendered = self._run_sizing([
+                *extra, "--override-env", str(staged_env),
+                "--server-output", str(stage / "clickhouse-config.xml"),
+                "--users-output", str(stage / "clickhouse-users.xml"),
+            ], environment)
+            # The rendered files first, then .env: a crash in between leaves
+            # the keys missing, so a resumed prepare renders both again.
+            # install.sh always renders into .nano-generated/sizing.
+            sizing_dir = self.install_dir / SIZING_DIR_DEFAULT
+            sizing_dir.mkdir(parents=True, exist_ok=True)
+            (stage / "host.env").write_text(rendered, encoding="utf-8")
+            for name, mode in (
+                ("clickhouse-config.xml", 0o644), ("clickhouse-users.xml", 0o644), ("host.env", 0o600),
+            ):
+                (stage / name).chmod(mode)
+                os.replace(stage / name, sizing_dir / name)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        if not self.env_file.add_to_managed_block(SIZING_BLOCK_BEGIN, SIZING_BLOCK_END, missing):
+            return {}
+        self.env = self.env_file.values()
+        return missing
 
     def _render_clickhouse_networks(self, compose_subnet: str) -> str:
         """NAN-5435: render the allow-list to a private candidate, gate it
@@ -6308,6 +6536,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         # role-split host, whose cluster must share one generated value).
         rotated_install_token = False
         pinned_delivery_mode = False
+        filled_sizing_keys: list[str] = []
         if getattr(self, "role_env", None):
             pinned_delivery_mode = pin_compatible_delivery_mode(self.env_file)
             if pinned_delivery_mode:
@@ -6328,6 +6557,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 self.env[key] = self.env_file.values()[key]
                 eprint(f"note: generated {key} in .env (v2.0.28 ClickHouse workload identity).")
             eprint(f"ClickHouse workload identities: {self._render_workload_users(self.env.get('NANO_COMPOSE_SUBNET', ''))}")
+            # NAN-5669: after the bundle load (the sizer's disk probe runs the
+            # release's pinned Vector image), before the ClickHouse rollout.
+            filled_sizing_keys = self.fill_missing_sizing_keys()
             rotated_install_token = rotate_public_install_token(self.env_file)
             if rotated_install_token:
                 self.env["VECTOR_AUTH_TOKEN"] = self.env_file.values()["VECTOR_AUTH_TOKEN"]
@@ -6361,6 +6593,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             "pinned_compatible_delivery_mode": pinned_delivery_mode,
             "pinned_schema_profile": pinned_schema_profile,
             "pruned_control_pins": pruned_control_pins,
+            "filled_sizing_keys": filled_sizing_keys,
         }
 
     def _prune_legacy_control_pins(self) -> list[str]:

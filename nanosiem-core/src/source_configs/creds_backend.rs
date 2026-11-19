@@ -109,7 +109,8 @@ impl CredsBackend {
                 let filename = format!("configs__{}", key);
                 let dir = config_dir.join("sources");
                 tokio::fs::create_dir_all(&dir).await?;
-                tokio::fs::write(dir.join(&filename), content).await?;
+                // NAN-5611: atomic with the old mode, left alone when unchanged.
+                crate::parsers::vector_tree_write::write_if_changed(&dir.join(&filename), content).await?;
                 Ok(format!("{}/{}", runtime_path, filename))
             }
             Self::K8sSecret { client } => {

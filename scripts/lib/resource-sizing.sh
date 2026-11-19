@@ -78,6 +78,14 @@ OPEN_API_MIN_MIB=384
 # needs a busy API (~300 MiB) plus a 400-day pack's headroom (~239 MiB); below
 # this it cannot run, so the host is refused rather than sized.
 ENTERPRISE_API_REFUSE_MIB=640
+# NAN-5668: nano-jobs runs every leader scheduler (content channels, the MITRE
+# catalog, repository syncs, enrichment, retention). The proportional 15% share
+# gave an 8 GB single node 214 MiB (155 MiB with monitoring), below what a
+# busy jobs process plus one content apply needs, and it OOM-looped every
+# ~25 s on the 53 MB MITRE ATT&CK catalog. The apply now peaks at ~56 MiB of
+# heap (it was ~183 MiB), and jobs gets at least this much where the host can
+# fund it (see the funding order where it is applied).
+JOBS_MIN_MIB=384
 # NAN-5506: a nano-api CPU limit below a quarter core starves its start-up
 # (migration checks, cache warm-up) past the health-check window. Funded from
 # a co-located ClickHouse share above its 500m floor, then PostgreSQL above
@@ -117,6 +125,9 @@ Usage: resource-sizing.sh [options]
                                planned volume into events/s for Vector CPU
   --vector-sources COUNT       Planned deployed log sources (NANO_VECTOR_SOURCES,
                                default 16) for Vector's memory allowance
+  (NAN-5636: NANO_CLICKHOUSE_DATA_CAPACITY_BYTES / NANO_CLICKHOUSE_DATA_FREE_BYTES
+   give the ClickHouse data filesystem for the spill caps when it is not the
+   Docker root filesystem the probes measure.)
   --edition open|enterprise    Install edition (default open). Enterprise gives
                                the API at least 1 GiB for the Evidence Pack
                                where co-located roles can fund it (NAN-5433)
@@ -230,7 +241,13 @@ detect_memory_mib() {
     printf '4096\n'
 }
 
-detect_vector_data_capacity_bytes() {
+# Capacity (and free space) of the filesystem a fresh Docker named volume lands
+# on, measured from inside the daemon with the digest-pinned image of compose
+# service $1 (its images.lock repo prefix $2), mounted at $3. NAN-5636: also
+# run with ClickHouse's own image on a ClickHouse host, so a host without
+# Vector never pulls the Vector image just to measure its disk.
+detect_docker_volume_capacity_bytes() {
+    local service="$1" lock_prefix="$2" mount_path="$3"
     local docker_root="" capacity_kib="" free_kib="" probe_image="" locked_probe_image=""
     local compose_file="" images_lock=""
     command -v docker >/dev/null 2>&1 || return 1
@@ -248,10 +265,10 @@ detect_vector_data_capacity_bytes() {
     # coreutils `df`; no mutable tag is used.
     compose_file="$script_dir/../../docker-compose.opensource.yml"
     [[ -r "$compose_file" ]] || return 1
-    probe_image=$(awk '
-        /^  vector:$/ { in_vector = 1; next }
-        in_vector && /^  [^ ]/ { exit }
-        in_vector && /^[[:space:]]+image:[[:space:]]+/ {
+    probe_image=$(awk -v svc="  $service:" '
+        $0 == svc { in_svc = 1; next }
+        in_svc && /^  [^ ]/ { exit }
+        in_svc && /^[[:space:]]+image:[[:space:]]+/ {
             sub(/^[[:space:]]+image:[[:space:]]+/, "")
             print
             exit
@@ -262,8 +279,8 @@ detect_vector_data_capacity_bytes() {
         "$script_dir/../../images.lock" \
         "$script_dir/../../images.enterprise.lock"; do
         [[ -r "$images_lock" ]] || continue
-        locked_probe_image=$(awk '
-            $1 ~ /^ghcr\.io\/nano-rs\/vector:/ && $2 ~ /^sha256:[0-9a-f]+$/ {
+        locked_probe_image=$(awk -v prefix="$lock_prefix" '
+            index($1, prefix) == 1 && $2 ~ /^sha256:[0-9a-f]+$/ {
                 print $1 "@" $2
                 exit
             }
@@ -276,9 +293,9 @@ detect_vector_data_capacity_bytes() {
         --read-only \
         --cap-drop ALL \
         --security-opt no-new-privileges \
-        --mount type=volume,dst=/var/lib/vector \
+        --mount "type=volume,dst=$mount_path" \
         --entrypoint /bin/df \
-        "$probe_image" -Pk /var/lib/vector 2>/dev/null \
+        "$probe_image" -Pk "$mount_path" 2>/dev/null \
         | awk 'NR == 2 { print $2, $4 }') || return 1
     # NAN-5446: df's Available column is the free space right now; the Vector
     # budget must fit what is free today, not only the install-time capacity.
@@ -352,6 +369,7 @@ tiered=0
 [[ -n "$vector_data_capacity_bytes" ]] \
     || vector_data_capacity_bytes="${NANO_VECTOR_DATA_CAPACITY_BYTES:-}"
 vector_data_storage_mode="${NANO_VECTOR_DATA_STORAGE_MODE:-named}"
+explicit_vector_data_capacity="$vector_data_capacity_bytes"
 case "$vector_data_storage_mode" in
     named|bind) ;;
     *) fail "NANO_VECTOR_DATA_STORAGE_MODE must be named or bind" ;;
@@ -361,7 +379,7 @@ if has_role ingest; then
         fail "Vector data uses bind/external storage whose capacity differs from DockerRootDir; set NANO_VECTOR_DATA_CAPACITY_BYTES or pass --vector-data-capacity-bytes"
     fi
     if [[ -z "$vector_data_capacity_bytes" ]]; then
-        detected_vector_data=$(detect_vector_data_capacity_bytes) \
+        detected_vector_data=$(detect_docker_volume_capacity_bytes vector 'ghcr.io/nano-rs/vector:' /var/lib/vector) \
             || fail "cannot query the Docker daemon for the filesystem capacity backing Vector; set NANO_VECTOR_DATA_CAPACITY_BYTES or pass --vector-data-capacity-bytes"
         vector_data_capacity_bytes=${detected_vector_data%% *}
         if [[ -z "$vector_data_free_bytes" && "$detected_vector_data" == *" "* ]]; then
@@ -379,6 +397,31 @@ fi
 [[ -n "$vector_data_free_bytes" ]] || vector_data_free_bytes="${NANO_VECTOR_DATA_FREE_BYTES:-}"
 [[ -z "$vector_data_free_bytes" || "$vector_data_free_bytes" =~ ^[0-9]+$ ]] \
     || fail "Vector data filesystem free space must be a non-negative integer byte count"
+
+# NAN-5636: the filesystem holding ClickHouse's data (its named volume, on the
+# Docker root filesystem), for the spill caps below. Set explicitly with
+# NANO_CLICKHOUSE_DATA_CAPACITY_BYTES (and NANO_CLICKHOUSE_DATA_FREE_BYTES);
+# else the Vector measurement when Vector's named volume shares that
+# filesystem (ingest on this host, or an explicit capacity with named Vector
+# storage); else, on a ClickHouse host without ingest, a best-effort probe
+# with ClickHouse's own pinned image. Unknown keeps the caps memory-sized.
+ch_data_capacity_bytes="${NANO_CLICKHOUSE_DATA_CAPACITY_BYTES:-}"
+ch_data_free_bytes="${NANO_CLICKHOUSE_DATA_FREE_BYTES:-}"
+if has_role clickhouse && [[ -z "$ch_data_capacity_bytes" ]]; then
+    if [[ "$vector_data_storage_mode" == named ]] && { has_role ingest || [[ -n "$explicit_vector_data_capacity" ]]; }; then
+        ch_data_capacity_bytes=$vector_data_capacity_bytes
+        ch_data_free_bytes=$vector_data_free_bytes
+    elif ! has_role ingest; then
+        if detected_ch_data=$(detect_docker_volume_capacity_bytes clickhouse 'clickhouse/clickhouse-server:' /var/lib/clickhouse); then
+            ch_data_capacity_bytes=${detected_ch_data%% *}
+            [[ "$detected_ch_data" == *" "* ]] && ch_data_free_bytes=${detected_ch_data#* }
+        fi
+    fi
+fi
+[[ -z "$ch_data_capacity_bytes" || "$ch_data_capacity_bytes" =~ ^[1-9][0-9]*$ ]] \
+    || fail "NANO_CLICKHOUSE_DATA_CAPACITY_BYTES must be a positive integer byte count"
+[[ -z "$ch_data_free_bytes" || "$ch_data_free_bytes" =~ ^[0-9]+$ ]] \
+    || fail "NANO_CLICKHOUSE_DATA_FREE_BYTES must be a non-negative integer byte count"
 
 # NAN-5446: the disk-pressure pause threshold (DISK_PRESSURE_PAUSE_THRESHOLD,
 # a fraction, default 0.92) in per-mille. The invoking environment wins over
@@ -660,6 +703,29 @@ if has_role app && (( api_mib < api_min_mib )); then
     memory_excess=0
 fi
 
+# NAN-5668: nano-jobs floor (JOBS_MIN_MIB). Best effort, never a refusal,
+# funded in this order: co-located PostgreSQL down to 512 MiB, ClickHouse down
+# to its floor (as the API floor above), then Vector down to its own target
+# and nano-search down to 256 MiB. It comes AFTER the API floor so it can never
+# turn an accepted host into a refused one or shrink the API; the last two
+# sources only matter where the enterprise Evidence Pack already took
+# PostgreSQL and ClickHouse to their floors (12 GiB with monitoring, or hosts
+# below the 8 GB minimum). A host that still cannot fund it keeps the rest.
+if has_role app && (( jobs_mib < JOBS_MIN_MIB )); then
+    jobs_shortfall=$(( JOBS_MIN_MIB - jobs_mib ))
+    memory_excess=$jobs_shortfall
+    has_role postgres && reduce_memory_budget pg_mib 512
+    if has_role clickhouse; then
+        ch_floor_mib=2048
+        [[ "$topology" == single ]] && (( memory_mib >= 12288 )) && ch_floor_mib=6144
+        reduce_memory_budget ch_mib "$ch_floor_mib"
+    fi
+    has_role ingest && reduce_memory_budget ingest_mib "$ingest_target_mib"
+    reduce_memory_budget search_mib 256
+    jobs_mib=$(( jobs_mib + jobs_shortfall - memory_excess ))
+    memory_excess=0
+fi
+
 ch_cores=$(ceil_div "$ch_mcpu" 1000)
 ch_cores=$(clamp "$ch_cores" 2 64)
 if (( ch_mib <= 4096 )); then
@@ -899,6 +965,11 @@ CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER=$(bytes_from_mib "$ch_analytics_u
 CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER=$(bytes_from_mib "$ch_realtime_user_memory_mib")
 CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER=$(bytes_from_mib "$ch_ingestion_user_memory_mib")
 CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER=$(bytes_from_mib "$ch_admin_user_memory_mib")
+# NAN-5636: spill caps, derived after the overrides below (they follow an
+# overridden CLICKHOUSE_MAX_MEMORY_USAGE). Empty = not set by an override.
+CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY=""
+CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER=""
+CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE=""
 
 POSTGRES_MEM_LIMIT=$(memory_string "$pg_mib")
 POSTGRES_CPU_LIMIT=$(cpu_string "$pg_mcpu")
@@ -989,7 +1060,7 @@ NANO_DETECTED_CPU_CORES=$cpu_cores
 NANO_DETECTED_MEMORY_MIB=$memory_mib
 NANO_SIZING_TOPOLOGY=$topology
 
-SIZING_KEYS='CLICKHOUSE_MEM_LIMIT CLICKHOUSE_CPU_LIMIT CLICKHOUSE_MAX_THREADS CLICKHOUSE_ANALYTICS_MAX_THREADS CLICKHOUSE_REALTIME_MAX_THREADS CLICKHOUSE_INGEST_MAX_THREADS CLICKHOUSE_MAX_INSERT_THREADS CLICKHOUSE_BACKGROUND_POOL_SIZE CLICKHOUSE_BACKGROUND_MERGES_MUTATIONS_CONCURRENCY_RATIO CLICKHOUSE_BACKGROUND_SCHEDULE_POOL_SIZE CLICKHOUSE_BACKGROUND_FETCHES_POOL_SIZE CLICKHOUSE_BACKGROUND_MOVE_POOL_SIZE CLICKHOUSE_BACKGROUND_COMMON_POOL_SIZE CLICKHOUSE_MAX_CONCURRENT_QUERIES CLICKHOUSE_MAX_CONCURRENT_INSERT_QUERIES CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES CLICKHOUSE_ASYNC_INSERT_THREADS CLICKHOUSE_MARK_CACHE_SIZE CLICKHOUSE_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_INDEX_MARK_CACHE_SIZE CLICKHOUSE_INDEX_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_MAX_MEMORY_USAGE CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_INGEST_MAX_MEMORY_USAGE CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER POSTGRES_MEM_LIMIT POSTGRES_CPU_LIMIT POSTGRES_MAX_CONNECTIONS POSTGRES_SHARED_BUFFERS POSTGRES_EFFECTIVE_CACHE_SIZE POSTGRES_WORK_MEM PG_MAX_CONNECTIONS PG_MIN_CONNECTIONS VECTOR_MEM_LIMIT VECTOR_CPU_LIMIT VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES_PER_SHARD VECTOR_DISK_BUFFER_TOTAL_BUDGET_BYTES VECTOR_DISK_BUFFER_COUNT VECTOR_DISK_BUFFER_MAX_BYTES VECTOR_DATA_CAPACITY_BYTES VECTOR_DISK_HEADROOM_BYTES VECTOR_BATCH_MAX_BYTES VECTOR_BATCH_MAX_EVENTS VECTOR_MEMORY_BUFFER_MAX_EVENTS NANO_API_MEM_LIMIT NANO_API_CPU_LIMIT NANO_SEARCH_MEM_LIMIT NANO_SEARCH_CPU_LIMIT NANO_JOBS_MEM_LIMIT NANO_JOBS_CPU_LIMIT VALKEY_MEM_LIMIT VALKEY_CPU_LIMIT VALKEY_MAXMEMORY VALKEY_IO_THREADS NANO_WEB_MEM_LIMIT NANO_WEB_CPU_LIMIT NANO_NGINX_MEM_LIMIT NANO_NGINX_CPU_LIMIT CONNECTOR_MEM_LIMIT CONNECTOR_CPU_LIMIT NANO_MIGRATE_MEM_LIMIT NANO_MIGRATE_CPU_LIMIT NANO_VECTOR_TAP_MEM_LIMIT NANO_VECTOR_TAP_CPU_LIMIT NANO_VECTOR_CONSUMER_MEM_LIMIT NANO_VECTOR_CONSUMER_CPU_LIMIT NANO_INGEST_EDGE_MEM_LIMIT NANO_INGEST_EDGE_CPU_LIMIT NANO_CLICKHOUSE_PROXY_MEM_LIMIT NANO_CLICKHOUSE_PROXY_CPU_LIMIT KEEPER_MEM_LIMIT KEEPER_CPU_LIMIT TENZIR_MEM_LIMIT TENZIR_CPU_LIMIT NANO_SIZING_DIR NANO_DETECTED_CPU_CORES NANO_DETECTED_MEMORY_MIB NANO_SIZING_TOPOLOGY'
+SIZING_KEYS='CLICKHOUSE_MEM_LIMIT CLICKHOUSE_CPU_LIMIT CLICKHOUSE_MAX_THREADS CLICKHOUSE_ANALYTICS_MAX_THREADS CLICKHOUSE_REALTIME_MAX_THREADS CLICKHOUSE_INGEST_MAX_THREADS CLICKHOUSE_MAX_INSERT_THREADS CLICKHOUSE_BACKGROUND_POOL_SIZE CLICKHOUSE_BACKGROUND_MERGES_MUTATIONS_CONCURRENCY_RATIO CLICKHOUSE_BACKGROUND_SCHEDULE_POOL_SIZE CLICKHOUSE_BACKGROUND_FETCHES_POOL_SIZE CLICKHOUSE_BACKGROUND_MOVE_POOL_SIZE CLICKHOUSE_BACKGROUND_COMMON_POOL_SIZE CLICKHOUSE_MAX_CONCURRENT_QUERIES CLICKHOUSE_MAX_CONCURRENT_INSERT_QUERIES CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES CLICKHOUSE_ASYNC_INSERT_THREADS CLICKHOUSE_MARK_CACHE_SIZE CLICKHOUSE_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_INDEX_MARK_CACHE_SIZE CLICKHOUSE_INDEX_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_MAX_MEMORY_USAGE CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_INGEST_MAX_MEMORY_USAGE CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE POSTGRES_MEM_LIMIT POSTGRES_CPU_LIMIT POSTGRES_MAX_CONNECTIONS POSTGRES_SHARED_BUFFERS POSTGRES_EFFECTIVE_CACHE_SIZE POSTGRES_WORK_MEM PG_MAX_CONNECTIONS PG_MIN_CONNECTIONS VECTOR_MEM_LIMIT VECTOR_CPU_LIMIT VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES_PER_SHARD VECTOR_DISK_BUFFER_TOTAL_BUDGET_BYTES VECTOR_DISK_BUFFER_COUNT VECTOR_DISK_BUFFER_MAX_BYTES VECTOR_DATA_CAPACITY_BYTES VECTOR_DISK_HEADROOM_BYTES VECTOR_BATCH_MAX_BYTES VECTOR_BATCH_MAX_EVENTS VECTOR_MEMORY_BUFFER_MAX_EVENTS NANO_API_MEM_LIMIT NANO_API_CPU_LIMIT NANO_SEARCH_MEM_LIMIT NANO_SEARCH_CPU_LIMIT NANO_JOBS_MEM_LIMIT NANO_JOBS_CPU_LIMIT VALKEY_MEM_LIMIT VALKEY_CPU_LIMIT VALKEY_MAXMEMORY VALKEY_IO_THREADS NANO_WEB_MEM_LIMIT NANO_WEB_CPU_LIMIT NANO_NGINX_MEM_LIMIT NANO_NGINX_CPU_LIMIT CONNECTOR_MEM_LIMIT CONNECTOR_CPU_LIMIT NANO_MIGRATE_MEM_LIMIT NANO_MIGRATE_CPU_LIMIT NANO_VECTOR_TAP_MEM_LIMIT NANO_VECTOR_TAP_CPU_LIMIT NANO_VECTOR_CONSUMER_MEM_LIMIT NANO_VECTOR_CONSUMER_CPU_LIMIT NANO_INGEST_EDGE_MEM_LIMIT NANO_INGEST_EDGE_CPU_LIMIT NANO_CLICKHOUSE_PROXY_MEM_LIMIT NANO_CLICKHOUSE_PROXY_CPU_LIMIT KEEPER_MEM_LIMIT KEEPER_CPU_LIMIT TENZIR_MEM_LIMIT TENZIR_CPU_LIMIT NANO_SIZING_DIR NANO_DETECTED_CPU_CORES NANO_DETECTED_MEMORY_MIB NANO_SIZING_TOPOLOGY'
 
 is_sizing_key() {
     case " $SIZING_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -1165,6 +1236,56 @@ if has_role app; then
     fi
 fi
 
+# NAN-5636: temporary data on disk. A GROUP BY / ORDER BY past the spill
+# ratio (query_limits.xml) writes its overflow under /var/lib/clickhouse/tmp,
+# on the same disk as the events, and nothing bounded it: one broad hunt could
+# fill the disk and stop ingestion. A query may now spill at most 4x its memory
+# limit (the spill exists so a query can finish past its memory, not so it can
+# use the disk), all of one user's running queries twice that, and the whole
+# server twice that again. Where the ClickHouse disk is known (its named
+# volume sits on the Docker root filesystem the Vector probe measured: ingest
+# and clickhouse on this host, named Vector storage), the caps are also held
+# to 10 %, 20 % and 25 % of it. Over a cap the query fails on its own
+# (TOO_MANY_ROWS_OR_BYTES); the server and every other query keep running.
+# The server total matters: ClickHouse 26.10 counts an external ORDER BY only
+# against it, not the per-query or per-user caps (measured on 26.10.4.207: a
+# 236 MB sort spill ran past a 1 MiB per-query cap, a 3 MiB server cap
+# stopped it). The per-query and per-user caps bound GROUP BY spills.
+# Where the free space is known too (measured now, not at install), the
+# server total is also held to half of it: on a disk already well into its
+# retention, 25 % of the capacity can be more than is left. Otherwise the 25 %
+# is headroom to keep free when sizing retention. An override wins for its
+# own key; the derived keys follow it.
+CH_TEMP_DISK_FLOOR_BYTES=1073741824
+ch_temp_set_query=$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY
+ch_temp_set_user=$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER
+ch_temp_set_server=$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE
+ch_temp_query=${ch_temp_set_query:-$(( CLICKHOUSE_MAX_MEMORY_USAGE * 4 ))}
+if [[ -z "$ch_temp_set_query" && -n "$ch_data_capacity_bytes" ]]; then
+    ch_temp_query=$(min "$ch_temp_query" "$(( ch_data_capacity_bytes / 10 ))")
+fi
+ch_temp_user=${ch_temp_set_user:-$(( ch_temp_query * 2 ))}
+if [[ -z "$ch_temp_set_user" && -n "$ch_data_capacity_bytes" ]]; then
+    ch_temp_user=$(min "$ch_temp_user" "$(( ch_data_capacity_bytes / 5 ))")
+fi
+ch_temp_server=${ch_temp_set_server:-$(( ch_temp_user * 2 ))}
+if [[ -z "$ch_temp_set_server" ]]; then
+    [[ -n "$ch_data_capacity_bytes" ]] && ch_temp_server=$(min "$ch_temp_server" "$(( ch_data_capacity_bytes / 4 ))")
+    [[ -n "$ch_data_free_bytes" ]] && ch_temp_server=$(min "$ch_temp_server" "$(( ch_data_free_bytes / 2 ))")
+fi
+[[ -z "$ch_temp_set_user" ]] && ch_temp_user=$(min "$ch_temp_user" "$ch_temp_server")
+[[ -z "$ch_temp_set_query" ]] && ch_temp_query=$(min "$ch_temp_query" "$ch_temp_user")
+[[ -z "$ch_temp_set_query" ]] && ch_temp_query=$(max "$ch_temp_query" "$CH_TEMP_DISK_FLOOR_BYTES")
+[[ -z "$ch_temp_set_user" ]] && ch_temp_user=$(max "$ch_temp_user" "$ch_temp_query")
+[[ -z "$ch_temp_set_server" ]] && ch_temp_server=$(max "$ch_temp_server" "$ch_temp_user")
+CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY=$ch_temp_query
+CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER=$ch_temp_user
+CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE=$ch_temp_server
+if (( ch_temp_query > ch_temp_user || ch_temp_user > ch_temp_server )); then
+    printf 'resource sizing warning: the ClickHouse spill caps should grow per query <= per user <= server (CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY=%s, _FOR_USER=%s, CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE=%s); the smallest one applies first\n' \
+        "$ch_temp_query" "$ch_temp_user" "$ch_temp_server" >&2
+fi
+
 # ClickHouse 26.10 rejects a server configuration when its fixed MergeTree
 # admission thresholds exceed the autosized merge/mutation slot count
 # (background_pool_size * concurrency_ratio). Scale those thresholds down for
@@ -1239,6 +1360,7 @@ ${tier_merge_tree_lines}  </merge_tree>
   <max_concurrent_select_queries>$CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES</max_concurrent_select_queries>
   <concurrent_threads_scheduler>round_robin</concurrent_threads_scheduler>
   <async_insert_threads>$CLICKHOUSE_ASYNC_INSERT_THREADS</async_insert_threads>
+  <max_temporary_data_on_disk_size>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE</max_temporary_data_on_disk_size>
 </clickhouse>
 EOF
     chmod 644 "$server_output"
@@ -1256,33 +1378,51 @@ if [[ -n "$users_output" ]]; then
       <max_memory_usage_for_user>$CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
       <max_threads>$CLICKHOUSE_MAX_THREADS</max_threads>
       <max_insert_threads>$CLICKHOUSE_MAX_INSERT_THREADS</max_insert_threads>
+      <max_temporary_data_on_disk_size_for_query>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY</max_temporary_data_on_disk_size_for_query>
+      <max_temporary_data_on_disk_size_for_user>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER</max_temporary_data_on_disk_size_for_user>
     </default>
+    <dict_source>
+      <max_temporary_data_on_disk_size_for_query>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER</max_temporary_data_on_disk_size_for_query>
+    </dict_source>
+    <search>
+      <constraints><max_temporary_data_on_disk_size_for_query><min>1</min><max>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY</max></max_temporary_data_on_disk_size_for_query><max_temporary_data_on_disk_size_for_user><min>1</min><max>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER</max></max_temporary_data_on_disk_size_for_user></constraints>
+    </search>
     <analytics>
       <max_memory_usage>$CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE</max_memory_usage>
       <max_memory_usage_for_user>$CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
       <max_threads>$CLICKHOUSE_ANALYTICS_MAX_THREADS</max_threads>
+      <max_temporary_data_on_disk_size_for_query>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY</max_temporary_data_on_disk_size_for_query>
+      <max_temporary_data_on_disk_size_for_user>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER</max_temporary_data_on_disk_size_for_user>
     </analytics>
     <realtime>
       <max_memory_usage>$CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE</max_memory_usage>
       <max_memory_usage_for_user>$CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
       <max_threads>$CLICKHOUSE_REALTIME_MAX_THREADS</max_threads>
+      <max_temporary_data_on_disk_size_for_query>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY</max_temporary_data_on_disk_size_for_query>
+      <max_temporary_data_on_disk_size_for_user>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER</max_temporary_data_on_disk_size_for_user>
     </realtime>
     <ingestion>
       <max_memory_usage>$CLICKHOUSE_INGEST_MAX_MEMORY_USAGE</max_memory_usage>
       <max_memory_usage_for_user>$CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
       <max_threads>$CLICKHOUSE_INGEST_MAX_THREADS</max_threads>
       <max_insert_threads>$CLICKHOUSE_INGEST_MAX_THREADS</max_insert_threads>
+      <max_temporary_data_on_disk_size_for_query>0</max_temporary_data_on_disk_size_for_query>
+      <max_temporary_data_on_disk_size_for_user>0</max_temporary_data_on_disk_size_for_user>
 ${tier_ingestion_lines}    </ingestion>
     <admin>
       <max_memory_usage>$CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE</max_memory_usage>
       <max_memory_usage_for_user>$CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
       <max_threads>$CLICKHOUSE_ANALYTICS_MAX_THREADS</max_threads>
+      <max_temporary_data_on_disk_size_for_query>0</max_temporary_data_on_disk_size_for_query>
+      <max_temporary_data_on_disk_size_for_user>0</max_temporary_data_on_disk_size_for_user>
     </admin>
     <rawsql>
       <max_memory_usage>$CLICKHOUSE_MAX_MEMORY_USAGE</max_memory_usage>
       <max_memory_usage_for_user>$CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER</max_memory_usage_for_user>
       <max_threads>$CLICKHOUSE_MAX_THREADS</max_threads>
-      <constraints><max_threads><max>$CLICKHOUSE_MAX_THREADS</max></max_threads></constraints>
+      <max_temporary_data_on_disk_size_for_query>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY</max_temporary_data_on_disk_size_for_query>
+      <max_temporary_data_on_disk_size_for_user>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER</max_temporary_data_on_disk_size_for_user>
+      <constraints><max_threads><max>$CLICKHOUSE_MAX_THREADS</max></max_threads><max_temporary_data_on_disk_size_for_query><min>1</min><max>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY</max></max_temporary_data_on_disk_size_for_query><max_temporary_data_on_disk_size_for_user><min>1</min><max>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER</max></max_temporary_data_on_disk_size_for_user></constraints>
     </rawsql>
   </profiles>
 </clickhouse>

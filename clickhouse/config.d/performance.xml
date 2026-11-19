@@ -22,6 +22,14 @@
          At 256MB can cache ~2 billion granule entries -->
     <query_condition_cache_size>268435456</query_condition_cache_size> <!-- 256MB -->
 
+    <!-- NAN-5636: all temporary data on disk (GROUP BY / ORDER BY / JOIN spills)
+         across every running query. ClickHouse 26.10 counts an external ORDER BY
+         only against this total, not the per-query / per-user caps in
+         users.d/query_limits.xml. Over it the spilling query fails alone
+         (TOO_MANY_ROWS_OR_BYTES). A fallback: Compose installs size it per host
+         (scripts/lib/resource-sizing.sh) and the Helm chart from the volume. -->
+    <max_temporary_data_on_disk_size>80000000000</max_temporary_data_on_disk_size> <!-- 80GB -->
+
     <!-- NAN-4934: text-index caches (tier: large). Caps, not reservations (SLRU,
          filled on demand); they sit outside the per-query memory limit but inside
          max_server_memory_usage. The 26.x defaults are 1 GB / 1 GB / 2 GB. The

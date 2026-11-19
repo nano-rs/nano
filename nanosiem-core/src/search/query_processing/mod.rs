@@ -6,6 +6,7 @@ pub mod auto_sort;
 pub mod command_extraction;
 pub mod lookup_boundary;
 pub mod ocsf_action_note;
+pub mod oom_admission;
 pub mod query_manipulation;
 
 // Re-export commonly used items
@@ -21,7 +22,8 @@ pub use command_extraction::{
     has_only_simple_post_prevalence_commands, query_has_aggregation, query_has_per_row_filters,
     validate_panel_query_commands, validate_panel_query_unscoped_prevalence, AiCommandInfo,
     AssetCommandInfo, CloudCommandInfo, FunnelCommandInfo, InputLookupCommandInfo,
-    LateralCommandInfo, LookupCommandInfo, OomRisk, PanelBlockedCommand, PrevalenceCommandInfo,
+    LateralCommandInfo, LookupCommandInfo, OomRisk, OomRiskSite, PanelBlockedCommand,
+    PrevalenceCommandInfo, oom_risk_sites, prevalence_scan_site,
     TreeCommandInfo, FUNNEL_DROPPER_FIELDS, HEAVY_TIME_RANGE_DAYS,
 };
 pub use lookup_boundary::{

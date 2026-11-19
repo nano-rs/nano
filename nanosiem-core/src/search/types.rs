@@ -207,6 +207,11 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
     if let Some((_, name)) = CH_SIZE_CODES.iter().find(|(c, _)| *c == code) {
         return SearchError::ResourceLimit(if *name == "MEMORY_LIMIT_EXCEEDED" {
             "Query exceeded memory limit. Try adding more filters, reducing the time range, or using sampling.".to_string()
+        } else if code == 396 && is_temporary_data_limit_exceeded(error_msg) {
+            // NAN-5636: the spill cap (max_temporary_data_on_disk_size*), not
+            // a result-size limit: "too many rows" sent people looking for a
+            // `head` that would not help.
+            TEMPORARY_DATA_LIMIT_MESSAGE.to_string()
         } else {
             "Query returned too many rows. Add more filters or use head/limit to reduce the result size.".to_string()
         });
@@ -252,6 +257,25 @@ fn is_max_query_size_exceeded(error_msg: &str) -> bool {
     own_text.contains("Max query size exceeded")
 }
 
+/// NAN-5636: the user-facing message for a query stopped by the spill caps.
+pub(crate) const TEMPORARY_DATA_LIMIT_MESSAGE: &str = "Query needed more temporary disk space than its limit allows \
+     (a large GROUP BY or sort spills to disk once it outgrows memory). Add filters, narrow the time range, \
+     or group by fewer distinct values.";
+
+/// Whether a code-396 message is ClickHouse's temporary-data cap
+/// (`max_temporary_data_on_disk_size`, `_for_query`, `_for_user`): "Limit for
+/// temporary files size exceeded (would consume N / M bytes)" on 26.10.
+///
+/// NAN-5424: only ClickHouse's OWN wording is read, the text before the first
+/// quote, as in [`is_max_query_size_exceeded`].
+fn is_temporary_data_limit_exceeded(error_msg: &str) -> bool {
+    let own_text = error_msg
+        .split(['\'', '`', '"'])
+        .next()
+        .unwrap_or(error_msg);
+    own_text.contains("Limit for temporary files size exceeded")
+}
+
 /// Message-pattern mapping for errors that carry no ClickHouse code.
 fn parse_clickhouse_error_message(error_msg: &str) -> SearchError {
     // Pattern: Code 394 — the query was killed (search cancel / KILL QUERY).
@@ -285,28 +309,23 @@ fn parse_clickhouse_error_message(error_msg: &str) -> SearchError {
                                 .split(',')
                                 .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
                                 .filter(|s| !s.is_empty())
+                                // NAN-5634: ClickHouse can offer the unknown
+                                // name itself (a same-named column of another
+                                // scope); "Did you mean 'bytes_in'?" for
+                                // 'bytes_in' helps no one.
+                                .filter(|s| !s.eq_ignore_ascii_case(&field))
                                 .collect();
                         }
                     }
                 }
 
+                // NAN-5634: every renderer (`client_error_message`, the search
+                // service's HTTP mapping) appends ". Did you mean: …" from
+                // `suggestions`, so the message must not carry them too.
                 let message = if suggestions.is_empty() {
                     format!("Field '{}' does not exist in the data.", field)
-                } else if suggestions.len() == 1 {
-                    format!(
-                        "Field '{}' does not exist. Did you mean '{}'?",
-                        field, suggestions[0]
-                    )
                 } else {
-                    format!(
-                        "Field '{}' does not exist. Did you mean one of: {}?",
-                        field,
-                        suggestions
-                            .iter()
-                            .map(|s| format!("'{}'", s))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
+                    format!("Field '{}' does not exist", field)
                 };
 
                 return SearchError::FieldNotFound {
@@ -956,6 +975,10 @@ fn value_to_string(value: &serde_json::Value) -> String {
         _ => value.to_string(),
     }
 }
+
+#[cfg(test)]
+#[path = "temporary_data_limit_tests.rs"]
+mod temporary_data_limit_tests;
 
 #[cfg(test)]
 mod tests {

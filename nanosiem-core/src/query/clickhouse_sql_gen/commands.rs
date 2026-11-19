@@ -608,10 +608,31 @@ impl ClickHouseSqlGenerator {
 
                         let alias_name = alias.as_deref().unwrap_or(field_name);
 
+                        // NAN-5634: read the binned field through the active
+                        // profile like every other field reference (a column
+                        // an earlier stage produced stays a plain reference).
+                        // The bare name read a column OCSF does not have
+                        // (`bin bytes_in` on `ocsf_logs`, whose column is
+                        // `traffic.bytes_in`): 400 "Field 'bytes_in' does not
+                        // exist". UDM explicit columns are byte-identical.
+                        // After an aggregation the input is the aggregation's
+                        // output: a by-field passes through under its nPL
+                        // name (`stats count by bytes_in | bin bytes_in`), so
+                        // it is read as that plain column.
+                        let (source_expr, from_json) = if aggregated {
+                            (escape_identifier(field_name).to_string(), false)
+                        } else {
+                            field_to_sql_expr(field_name, self)
+                        };
+                        let source_expr = if from_json {
+                            format!("toFloat64OrNull(toString({source_expr}))")
+                        } else {
+                            source_expr
+                        };
                         // Use floor(field / bin_size) * bin_size to create bins
                         let bucket_expr = format!(
                             "floor({} / {}) * {}",
-                            escape_identifier(field_name),
+                            source_expr,
                             bin_size,
                             bin_size
                         );

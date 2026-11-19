@@ -886,7 +886,7 @@ impl VectorConfigManager {
             body.push('\n');
         }
 
-        fs::write(self.parsers_dir.join(OWNERSHIP_MANIFEST), body).await?;
+        super::tree_write::write_if_changed(&self.parsers_dir.join(OWNERSHIP_MANIFEST), body).await?;
         Ok(())
     }
 }

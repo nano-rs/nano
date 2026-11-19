@@ -318,6 +318,7 @@ fn kill_set_covers_every_derived_companion_query_id() {
         include_str!("../execution/clickhouse_executor/paginated.rs"),
         include_str!("../service/core_search.rs"),
         include_str!("../service/streaming.rs"),
+        include_str!("../service/oom_admission.rs"),
     ];
     let mut found = std::collections::BTreeSet::new();
     for src in sources {

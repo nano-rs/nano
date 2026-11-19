@@ -374,7 +374,7 @@ impl RiskFilter {
 }
 
 /// NAN-3073: map an API caller's entity type to the value the risk store
-/// classifies entities as (`ip`, `email`, `hostname`, `user`,
+/// classifies entities as (`ip`, `email`, `hostname`, `user`, `hash`,
 /// `cloud_account`; lean `part_query::risk::entity_type` and the dedicated
 /// `risk_sql` share that classification).
 ///
@@ -391,6 +391,8 @@ pub fn canonical_risk_entity_type(raw: &str) -> String {
         "ip" | "ips" | "ip_address" | "ipaddress" | "address" => "ip".to_string(),
         "user" | "users" | "username" | "user_name" | "account" => "user".to_string(),
         "email" | "mail" | "email_address" => "email".to_string(),
+        // NAN-5615: hash-typed risk entities (the write-side stamp of a hash field).
+        "hash" | "hashes" | "file_hash" | "sha256" | "sha1" | "md5" => "hash".to_string(),
         _ => value,
     }
 }

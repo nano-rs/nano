@@ -74,10 +74,35 @@ export const OCSF_DOMAIN_PATHS = [
   'dst_endpoint.hostname',
 ] as const;
 
-/** OCSF host identity: device first, then the source endpoint (main's
-    `coalesce(nullIf(device.hostname,''), nullIf(src_endpoint.hostname,''), 'unknown')`). */
+/**
+ * OCSF host identity: the SAME key every OCSF hash and domain prevalence MV
+ * puts in `uniqState(...)`, so the in-window fallback and the baseline count
+ * the same thing (NAN-5662). Source of truth, one expression for all of them:
+ *   - clickhouse/ocsf/init.sql: ocsf_hash_prevalence_summary_{file,process,
+ *     actor_process}_hash_mv, ocsf_domain_prevalence_summary_{dest_host,query,
+ *     url,http_url}_mv, hash_prevalence_source_ocsf{,_actor_process}_mv,
+ *     domain_prevalence_source_ocsf{,_http_url}_mv
+ *   - clickhouse/ocsf/migrations/196_prevalence_host_key.sql (and 197)
+ *   `if(src_endpoint.hostname != '', src_endpoint.hostname,
+ *      if(src_endpoint.ip != '', src_endpoint.ip,
+ *         if(src_host_unified != '', src_host_unified, 'unknown')))`
+ * `src_host_unified` is ALIAS `if(notEmpty(src_endpoint.hostname),
+ * src_endpoint.hostname, device.hostname)`; in the third branch
+ * src_endpoint.hostname is already '', so it is exactly `device.hostname`.
+ * The eval spells it as the raw column so it does not depend on nPL resolving
+ * an ALIAS column. Hash and domain MVs share this one key, so there is no
+ * per-artifact-type identity.
+ *
+ * Order matters: `src_endpoint.ip` comes BEFORE `device.hostname`. Proxy and
+ * firewall rows carry only the client IP (device is the reporting appliance),
+ * and the previous device-first eval collapsed every client of a proxy into
+ * one host: github.com, hit by 1,108 client IPs, counted as 1 host and
+ * plotted RARE. Pinned against the MV SQL by inWindowObservation.test.ts.
+ */
 export const OCSF_HOST_IDENTITY_EVAL =
-  'eval __h=if(device.hostname!="", device.hostname, if(src_endpoint.hostname!="", src_endpoint.hostname, "unknown"))';
+  'eval __h=if(src_endpoint.hostname!="", src_endpoint.hostname, ' +
+  'if(src_endpoint.ip!="", src_endpoint.ip, ' +
+  'if(device.hostname!="", device.hostname, "unknown")))';
 
 /**
  * Host identity, mirroring the baseline aggregates. Kept as a single exported
@@ -275,11 +300,15 @@ export function mergeObservations(
  * full distinct-artifact population for the window, because most windows
  * have vastly fewer distinct artifacts than events.
  */
-export function buildDiscoveryQuery(baseQuery: string, path: string): ObservationQuery {
+export function buildDiscoveryQuery(
+  baseQuery: string,
+  path: string,
+  hostEval: string = HOST_IDENTITY_EVAL,
+): ObservationQuery {
   const trimmed = baseQuery.trim();
   const prefix = trimmed.length > 0 ? `${trimmed} | ` : '';
   const npl =
-    `${prefix}${HOST_IDENTITY_EVAL} | ` +
+    `${prefix}${hostEval} | ` +
     `stats dc(__h) as hosts, count as events, min(${TIME_FIELD}) as first_in_window by ${path}`;
   return { path, artifacts: [], npl };
 }
@@ -287,8 +316,9 @@ export function buildDiscoveryQuery(baseQuery: string, path: string): Observatio
 export function buildDiscoveryQueries(
   baseQuery: string,
   paths: readonly string[],
+  hostEval: string = HOST_IDENTITY_EVAL,
 ): ObservationQuery[] {
-  return paths.map((path) => buildDiscoveryQuery(baseQuery, path));
+  return paths.map((path) => buildDiscoveryQuery(baseQuery, path, hostEval));
 }
 
 /** One discovery query's raw result: the rows it returned plus the true
@@ -379,4 +409,73 @@ export function mergeDiscoveryResults(results: DiscoveryQueryResult[]): Discover
     }
   }
   return { observations: merged, truncated, totalArtifacts, failedPaths };
+}
+
+/** A baseline prevalence lookup, as the rarity chart consumes it. */
+export interface BaselinePrevalence {
+  hostCount: number;
+  isRare: boolean;
+  prevalenceScore: number;
+  totalOccurrences: number;
+  /** Real environment first-seen; undefined when the baseline has none. */
+  envFirstSeen?: Date;
+}
+
+/** The fields of a `/api/prevalence/scatter` point this module reads. */
+export interface BaselineScatterPoint {
+  host_count: number | null;
+  is_rare: boolean;
+  prevalence_score: number;
+  total_occurrences: number;
+  first_seen: string;
+}
+
+/**
+ * Normalize one baseline point (NAN-5662).
+ *
+ * - `host_count: null` = coverage unknown: no entry (the caller leaves it
+ *   unbaselined).
+ * - `host_count: 0` = a baseline MISS. The backend's miss placeholder
+ *   (`PrevalenceData::empty`) says `is_rare: true, first_seen: now`; neither
+ *   is a fact. The scatter `window` is relative to NOW, so a historical search
+ *   misses the baseline for every artifact that is not still active, and a
+ *   verbatim miss painted the whole chart RARE and badged every dot "new to
+ *   env". A miss is therefore `isRare: false` with no env first-seen; only the
+ *   in-window observation ({@link applyInWindowObservation}) may call it rare.
+ */
+export function baselineFromScatterPoint(p: BaselineScatterPoint): BaselinePrevalence | null {
+  if (p.host_count == null) return null;
+  if (!(p.host_count > 0)) {
+    return {
+      hostCount: 0,
+      isRare: false,
+      prevalenceScore: 0,
+      totalOccurrences: p.total_occurrences ?? 0,
+      envFirstSeen: undefined,
+    };
+  }
+  const first = new Date(p.first_seen);
+  return {
+    hostCount: p.host_count,
+    isRare: p.is_rare,
+    prevalenceScore: p.prevalence_score,
+    totalOccurrences: p.total_occurrences,
+    envFirstSeen: Number.isFinite(first.getTime()) ? first : undefined,
+  };
+}
+
+/**
+ * Fill a baseline miss from the in-window observation. A point the baseline
+ * already counted is returned unchanged; a miss with no observation stays
+ * unbaselined (hostCount 0, not rare). Rarity of an observed point is decided
+ * here, against the in-window host count, never inherited from the miss.
+ */
+export function applyInWindowObservation<T extends { hostCount: number; isRare: boolean }>(
+  point: T,
+  obs: InWindowObservation | undefined,
+  rarityThreshold: number,
+): T & { inWindow?: boolean } {
+  if (point.hostCount > 0) return point;
+  if (!obs || obs.hosts <= 0) return { ...point, isRare: false };
+  return { ...point, hostCount: obs.hosts, isRare: obs.hosts < rarityThreshold, inWindow: true };
 }

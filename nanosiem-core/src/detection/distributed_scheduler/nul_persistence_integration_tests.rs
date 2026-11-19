@@ -604,7 +604,11 @@ async fn a_gap_recorded_from_an_error_quoting_event_bytes_is_stored_sanitized() 
     let failing = crate::detection::health::list_failing_rules(&h.pg, 500).await.unwrap();
     let listed = failing.iter().find(|r| r.rule_id == rule_id).expect("listed");
     assert!(!listed.last_error.as_deref().unwrap_or("").contains('\n'));
-    let health = crate::detection::health::read_execution_health(&h.pg).await.unwrap();
-    assert_eq!(health.status, "critical", "a recorded gap is a critical detection finding");
+    // NAN-5629: the gap's release left the rule running, so it is listed as
+    // a recent failure, not a current one (the rollup status is global, so
+    // other rules in the database may still make it critical; the mapping is
+    // pinned by `health_status_tests`).
+    assert!(!listed.failing_now, "a recorded gap on a running rule is not failing now");
+    assert_eq!(h.rule(rule_id).await.consecutive_failures, 0);
     h.teardown().await;
 }

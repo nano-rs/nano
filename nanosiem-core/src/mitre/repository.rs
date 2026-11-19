@@ -16,6 +16,11 @@ use sqlx::{Connection, PgConnection, PgPool, Postgres};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+/// `last_error` of a sync attempt whose process exited before it finished
+/// (NAN-5668). Matched exactly by `interrupted_backoff_active_on`.
+pub(crate) const INTERRUPTED_SYNC_ERROR: &str = "interrupted: the previous MITRE ATT&CK catalog sync \
+never finished (the process exited mid-sync, e.g. out of memory); retrying after the backoff";
+
 /// Repository for MITRE ATT&CK data
 pub struct MitreRepository {
     pool: PgPool,
@@ -105,6 +110,53 @@ impl MitreRepository {
         .fetch_optional(connection)
         .await
         .map(|allowed| allowed.unwrap_or(true))
+    }
+
+    /// NAN-5668: record an attempt that never finished as a failure.
+    ///
+    /// Callers hold the session-level sync advisory lock, which PostgreSQL
+    /// releases when the holder's session ends. So a `syncing` state seen
+    /// under the lock belongs to a process that died mid-sync (an OOM kill
+    /// was the crash loop that motivated this) — nothing else can be running.
+    /// Recording it through [`Self::mark_sync_failed_on`] arms the same
+    /// 300 s·2ⁿ backoff (capped at 6 h) an ordinary failure does, and leaves
+    /// the reason in `last_error` for `GET /api/mitre`.
+    pub(crate) async fn recover_interrupted_on(
+        connection: &mut PgConnection,
+    ) -> Result<bool, sqlx::Error> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM mitre_sync_state WHERE singleton = TRUE")
+                .fetch_optional(&mut *connection)
+                .await?;
+        if status.as_deref() != Some("syncing") {
+            return Ok(false);
+        }
+        Self::mark_sync_failed_on(connection, INTERRUPTED_SYNC_ERROR).await?;
+        Ok(true)
+    }
+
+    /// Is the sync inside the backoff armed by an interrupted attempt? The
+    /// content-channel apply honours only this backoff: an ordinary failure
+    /// (content not installed yet) must not delay applying a fresh bundle,
+    /// but a bundle whose apply killed the process must not be retried on
+    /// every boot.
+    pub(crate) async fn interrupted_backoff_active_on(
+        connection: &mut PgConnection,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(
+                status = 'failed' AND next_retry_at > NOW() AND last_error = $1,
+                FALSE
+            )
+            FROM mitre_sync_state
+            WHERE singleton = TRUE
+            "#,
+        )
+        .bind(INTERRUPTED_SYNC_ERROR)
+        .fetch_optional(connection)
+        .await
+        .map(|active| active.unwrap_or(false))
     }
 
     pub(crate) async fn mark_sync_started_on(

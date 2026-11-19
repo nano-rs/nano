@@ -157,11 +157,11 @@ fn out_of_subset_queries_are_refused_with_a_reason_never_guessed() {
         (format!("SELECT * FROM logs WHERE {W} AND id IN (SELECT matched_log_id FROM signals WHERE {W} GROUP BY matched_log_id HAVING count() > 1)"), "correlates events with signals"),
         (format!("SELECT * FROM system.users WHERE {W}"), "table"),
         (format!("SELECT src_host, count() OVER () FROM logs WHERE {W}"), "window function"),
-        (format!("SELECT * FROM logs WHERE {W} AND positionCaseInsensitive(command_line, 'x') > 0"), "comparison"),
+        (format!("SELECT * FROM logs WHERE {W} AND bitAnd(dest_port, 1) = 1"), "comparison"),
         (format!("SELECT DISTINCT src_host FROM logs WHERE {W}"), "DISTINCT"),
         (format!("SELECT * FROM logs WHERE {W} LIMIT 10 OFFSET 5"), "OFFSET"),
         (format!("SELECT * FROM (SELECT * FROM logs WHERE {W}) WHERE dest_port = 1"), "subquery in FROM"),
-        (format!("SELECT toStartOfHour(timestamp) AS h, count() FROM logs WHERE {W} GROUP BY h"), "computed column"),
+        (format!("SELECT arrayJoin(splitByChar(',', user)) AS u, count() FROM logs WHERE {W} GROUP BY u"), "no nPL eval form"),
         ("SELECT * FROM logs WHERE timestamp > now() - INTERVAL 1 DAY".to_string(), "time bound"),
         (format!("SELECT * FROM logs WHERE {W} AND id IN {{ids:Array(UUID)}}"), "parameter"),
     ] {
@@ -174,14 +174,14 @@ fn out_of_subset_queries_are_refused_with_a_reason_never_guessed() {
 
 #[test]
 fn unsupported_reasons_carry_a_span_where_the_parser_kept_one() {
-    let sql = format!("SELECT * FROM logs WHERE {W} AND positionCaseInsensitive(command_line, 'x') > 0");
+    let sql = format!("SELECT * FROM logs WHERE {W} AND bitAnd(dest_port, 1) = 1");
     let u = conv(&sql, &udm()).unsupported.expect("unsupported");
     let span = u.span.expect("span");
     assert_eq!(span.start_line, 1);
     // The placeholders were swapped for same-length identifiers, so columns
     // point into the ORIGINAL text.
     let col = span.start_column as usize - 1;
-    assert!(sql[col..].starts_with("positionCaseInsensitive"), "{}", &sql[col..]);
+    assert!(sql[col..].starts_with("bitAnd"), "{}", &sql[col..]);
 }
 
 #[test]
@@ -398,10 +398,16 @@ fn clauses_the_comparison_does_not_model_are_differences() {
     assert!(!compare_npl_with_sql(&sql, "* | stats dc(user) as u by src_host", &udm()).unwrap().is_empty());
 }
 
+/// ClickHouse resolves a SELECT alias inside WHERE: `user` there is the
+/// aliased `src_ip`, never the `user` column (NAN-5630: the filter now runs
+/// on the aliased column; it used to be refused).
 #[test]
-fn a_select_alias_used_in_where_is_refused() {
+fn a_select_alias_used_in_where_filters_the_aliased_column() {
     let r = conv(&format!("SELECT src_ip AS user FROM logs WHERE {W} AND user = '10.0.0.1'"), &udm());
-    assert!(r.unsupported.as_ref().is_some_and(|u| u.reason.contains("alias")), "{:?}", r);
+    let npl = r.npl.as_deref().expect("converts");
+    assert!(npl.contains("src_ip=\"10.0.0.1\""), "{npl}");
+    assert!(!npl.contains("user="), "{npl}");
+    assert!(r.exact, "{:?}", r.differences);
 }
 
 #[test]

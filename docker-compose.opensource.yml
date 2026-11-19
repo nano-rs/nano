@@ -113,6 +113,8 @@ x-nano-update-env: &nano-update-env
   CONNECTOR_EGRESS_PROXY_MODE:
   SOAR_EGRESS_PROXY_URL:
   SOAR_EGRESS_PROXY_MODE:
+  # SOAR vendor requests in flight at once per service (1-256; empty = 16).
+  SOAR_MAX_CONCURRENT_EXCHANGES: ${SOAR_MAX_CONCURRENT_EXCHANGES:-}
   # Custom enrichment / collector sandbox egress (enterprise). Unset: direct
   # and pinned; HTTPS_PROXY is never used for user-code destinations.
   ENRICHMENT_EGRESS_PROXY_URL:
@@ -591,7 +593,7 @@ services:
   # every published Vector port and the `vector` DNS alias; Vector itself can be
   # recreated independently while all clients keep the same namespace and IP.
   vector-netns:
-    image: nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
+    image: nginx:alpine@sha256:1bb9390209f866c8c0bf76ba89d3f33a3f6cd6a0e6c1b457af7ee763b9579f41
     container_name: nano-vector-netns
     entrypoint: ["/bin/sh", "-ec"]
     command: ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $$!; done"]
@@ -830,6 +832,10 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config delivery — api writes here, vector reads from same volume.
       VECTOR_CONFIG_DIR: /app/config/vector
+      # NAN-5611: config generations are rendered and kept outside that volume:
+      # Vector watches all of it (--watch-config), and nothing on a single node
+      # reads publications, so rendering them there reloaded Vector every boot.
+      VECTOR_CONFIG_PUBLICATION_DIR: /app/data/vector-publications
       # NAN-5298: reload acknowledgement. Quiet window (default 45, 0 disables
       # the check) and hard ceiling (default 600) in seconds; empty = default.
       VECTOR_RELOAD_ACK_TIMEOUT_SECS: ${VECTOR_RELOAD_ACK_TIMEOUT_SECS:-}
@@ -1186,7 +1192,7 @@ services:
   nginx:
     # Was `:alpine` (NAN-1258) — floating tag pinned to its digest. The tag is
     # kept for human readability; the @sha256 is what `docker pull` enforces.
-    image: nginx:alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
+    image: nginx:alpine@sha256:1bb9390209f866c8c0bf76ba89d3f33a3f6cd6a0e6c1b457af7ee763b9579f41
     container_name: nano-nginx
     restart: unless-stopped
     logging: *default-logging

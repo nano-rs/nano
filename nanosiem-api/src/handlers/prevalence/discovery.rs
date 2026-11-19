@@ -629,9 +629,11 @@ async fn fetch_candidates(
 pub(super) fn candidate_read_error(class: &str, raw: &str) -> (StatusCode, String) {
     use nanosiem_core::search::SearchError;
     match nanosiem_core::search::parse_clickhouse_error(raw) {
-        SearchError::FieldNotFound { message, .. } => (
+        // NAN-5634: the message no longer repeats the suggestions; the shared
+        // renderer appends them.
+        err @ SearchError::FieldNotFound { .. } => (
             StatusCode::BAD_REQUEST,
-            format!("Invalid query: {message}"),
+            format!("Invalid query: {}", nanosiem_core::search::client_error_message(&err)),
         ),
         SearchError::SqlValidationError(message) => (
             StatusCode::BAD_REQUEST,

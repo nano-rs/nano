@@ -133,7 +133,10 @@ impl AppContentApplier {
                         .map(|_| ())
                         .map_err(|e| e.to_string()),
                     #[cfg(feature = "enterprise")]
-                    Kind::Playbooks => nanosiem_core::playbook_repository::PlaybookRepositoryService::new(state.pool.clone())
+                    Kind::Playbooks => nanosiem_core::playbook_repository::PlaybookRepositoryService::new(
+                        state.pool.clone(),
+                        crate::handlers::playbook_repositories::refresh_hooks(&state),
+                    )
                         .sync_repository(id)
                         .await
                         .map(|_| ())
@@ -174,7 +177,17 @@ impl ContentApplier for AppContentApplier {
             let sync = nanosiem_core::mitre::MitreSync::new(
                 nanosiem_core::mitre::MitreRepository::new(self.state.pool.clone()),
             );
-            return match sync.sync().await {
+            // NAN-5668: parse the channel's verified copy in place; reading it
+            // back from PostgreSQL held a second 53 MB copy plus the read
+            // buffers and OOM-killed nano-jobs on 8 GB hosts.
+            let Some(body) = verified.files().get(nanosiem_core::mitre::MITRE_CONTENT_PATH) else {
+                return Err(format!(
+                    "channel {} has no {}",
+                    channel.id,
+                    nanosiem_core::mitre::MITRE_CONTENT_PATH
+                ));
+            };
+            return match sync.apply_content(body).await {
                 Ok(nanosiem_core::mitre::MitreSyncOutcome::Synced(result)) => Ok(format!(
                         "MITRE {} applied ({} tactics, {} techniques)",
                         result.release, result.tactic_count, result.technique_count
@@ -187,7 +200,9 @@ impl ContentApplier for AppContentApplier {
                         .into(),
                 ),
                 Ok(nanosiem_core::mitre::MitreSyncOutcome::RetryBackoff) => Err(
-                    "MITRE catalog apply is in retry backoff; retrying on the next channel check"
+                    "MITRE catalog apply is backing off: a previous apply never finished (the \
+                     process exited mid-apply, e.g. out of memory); retrying after the backoff, \
+                     see GET /api/mitre"
                         .into(),
                 ),
                 Err(error) => Err(error.to_string()),

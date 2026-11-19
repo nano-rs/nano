@@ -445,10 +445,12 @@ pub mod remote_delivery;
 mod router;
 mod sources;
 mod staging;
+pub(crate) mod tree_write;
 mod validation;
 
 pub use publication::{
-    PublicationOutcome, SnapshotBundle, VectorConfigPublicationError, VectorConfigPublisher,
+    publication_root, PublicationOutcome, SnapshotBundle, VectorConfigPublicationError, VectorConfigPublisher,
+    PUBLICATION_DIR_ENV,
 };
 pub use redaction::redact_config_snapshot;
 pub use backup::BackupGeneration;

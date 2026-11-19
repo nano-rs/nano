@@ -1019,3 +1019,52 @@ fn env_interpolation_is_substituted_the_way_vector_does_it() {
     // producing a different document.
     assert_eq!(substitute_env("x = ${UNCLOSED"), "x = ${UNCLOSED");
 }
+
+/// NAN-5611: Vector watches the whole dynamic volume (`--config-dir
+/// /etc/vector --watch-config`), backups included. An unchanged active tree
+/// reuses the completed backup and its generation and writes nothing, so an
+/// api restart does not make Vector reload; any change takes a new snapshot.
+#[tokio::test]
+async fn an_unchanged_tree_reuses_its_backup_without_writing() {
+    let (_tmp, manager) = manager_with_active(&coherent()).await;
+    let first = manager.backup_current().await.expect("backup");
+    let backup = manager.backup_dir();
+    let stamp = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+    let before = (
+        inode_of(&backup),
+        stamp(&backup.join(BACKUP_COMPLETE_MARKER)),
+        stamp(&backup.join("apache.toml")),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let again = manager.backup_current().await.expect("second backup");
+    assert_eq!(again, first, "same tree, same rollback target");
+    assert_eq!(
+        (
+            inode_of(&backup),
+            stamp(&backup.join(BACKUP_COMPLETE_MARKER)),
+            stamp(&backup.join("apache.toml")),
+        ),
+        before,
+        "nothing under the backup dir was rewritten"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(backup.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".backup."))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // The reused generation still restores this tree.
+    fs::write(manager.parsers_dir.join("apache.toml"), "CLOBBERED").await.unwrap();
+    manager.restore_backup(&again).await.expect("restore");
+    assert!(fs::read_to_string(manager.parsers_dir.join("apache.toml")).await.unwrap().contains("apache_parse"));
+
+    // A changed active tree (an added file, or changed bytes) is a new snapshot.
+    fs::write(manager.parsers_dir.join("extra.toml"), "# x\n").await.unwrap();
+    let changed = manager.backup_current().await.expect("changed backup");
+    assert_ne!(changed, first);
+    assert!(backup.join("extra.toml").exists());
+    manager.restore_backup(&first).await.expect_err("the old generation is retired");
+}

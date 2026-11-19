@@ -306,6 +306,10 @@ impl DetectionService {
         result_byte_limit: u64,
         query_id: String,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
+        // NAN-5616: this replay runs unrestricted (system scope); a query the
+        // rule save path refuses (dataset=signals, directly or through a
+        // subsearch) never runs here, whoever proposed it.
+        Self::reject_signals_dataset_rule(dataset.as_deref(), query)?;
         let execution_limits = SearchExecutionLimits {
             max_result_rows: u64::try_from(result_limit).unwrap_or(u64::MAX),
             max_result_bytes: result_byte_limit,

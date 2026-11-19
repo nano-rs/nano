@@ -79,8 +79,10 @@ done
 nano_owner_of() {
     stat -c '%u:%g' "$1" 2>/dev/null
 }
-# nano_own_like_dir PATH [REFERENCE_DIR]: give PATH the owner of REFERENCE_DIR (default:
-# its own directory) when that owner is not root and PATH differs. Mode is unchanged.
+# nano_own_like_dir PATH [REFERENCE_DIR [quiet]]: give PATH the owner of REFERENCE_DIR
+# (default: its own directory) when that owner is not root and PATH differs. Mode is
+# unchanged. `quiet` (NAN-5611): PATH is this script's own new temp file, so a successful
+# re-own is routine, not a heal worth logging; a failure is still a warning.
 nano_own_like_dir() {
     # Never through a symlink: nano-api (and so tenant-driven writes) can create entries
     # here, and a chown as root that followed one could re-own anything in the container.
@@ -90,6 +92,7 @@ nano_own_like_dir() {
     have=$(nano_owner_of "$1") || return 0
     [ "$have" = "$want" ] && return 0
     if chown -h "$want" "$1" 2>/dev/null; then
+        [ "${3:-}" = quiet ] && return 0
         echo "nano-vector: re-owned $1 ($have -> $want, NAN-5610): nano-api writes it" >&2
     else
         echo "nano-vector: WARNING: could not re-own $1 ($have) to $want; nano-api cannot rewrite it" >&2
@@ -284,7 +287,7 @@ migrate() {
     rm -f "$m"
     # noclobber: create it new (O_EXCL), never write through something put in its place.
     if ( umask "$mask"; set -C; { echo "$2"; awk -v mode="$3" "$ESCAPE_AWK" "$f"; } > "$m" ) && [ -s "$m" ] \
-        && nano_own_like_dir "$m" "$dir" && mv -f "$m" "$f"; then
+        && nano_own_like_dir "$m" "$dir" quiet && mv -f "$m" "$f"; then
         grep -q '\$' "$f" && echo "nano: escaped env-interpolation syntax in $f (rendered before $4)" >&2
     else
         rm -f "$m"
@@ -340,8 +343,8 @@ for f in "$sd"/*.toml; do
         src=$(sed -n 's/^\[sources\.\([A-Za-z0-9_]*\)\]$/\1/p' "$f" | head -n 1)
         # NAN-5610: staged in the root-only temp dir, owned like $Q (nano-api reads and
         # clears these), then moved in: no root write through a path in the shared volume.
-        cp "$f" "$t/q.toml" && nano_own_like_dir "$t/q.toml" "$Q" && mv -f "$t/q.toml" "$Q/$base.toml"
-        cp "$t/output" "$t/q.reason" && nano_own_like_dir "$t/q.reason" "$Q" && mv -f "$t/q.reason" "$Q/$base.reason"
+        cp "$f" "$t/q.toml" && nano_own_like_dir "$t/q.toml" "$Q" quiet && mv -f "$t/q.toml" "$Q/$base.toml"
+        cp "$t/output" "$t/q.reason" && nano_own_like_dir "$t/q.reason" "$Q" quiet && mv -f "$t/q.reason" "$Q/$base.reason"
         # Keep every component id the rest of the config names (the router and
         # parser filters read `<name>_route`): replace only the source tables
         # with an inert stand-in of the same id that emits nothing.
@@ -351,7 +354,7 @@ for f in "$sd"/*.toml; do
         # NAN-5610: mode and owner set in the root-only temp dir, before the move.
         mode=$(stat -c '%a' "$f" 2>/dev/null) || mode=""
         [ -z "$mode" ] || chmod "$mode" "$t/stub.toml" 2>/dev/null
-        nano_own_like_dir "$t/stub.toml" "$(dirname "$f")"
+        nano_own_like_dir "$t/stub.toml" "$(dirname "$f")" quiet
         mv -f "$t/stub.toml" "$f"
         echo "nano: quarantined the source in $f at startup: Vector cannot build it (reason in $Q/$base.reason)" >&2
     fi

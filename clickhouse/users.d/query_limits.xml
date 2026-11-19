@@ -54,6 +54,20 @@
             <max_bytes_ratio_before_external_group_by>0.3</max_bytes_ratio_before_external_group_by>
             <max_bytes_before_external_sort>0</max_bytes_before_external_sort>
             <max_bytes_ratio_before_external_sort>0.3</max_bytes_ratio_before_external_sort>
+            <!-- NAN-5636: what a spill may write. The overflow lands under
+                 /var/lib/clickhouse/tmp, on the events disk, and was unbounded:
+                 one broad GROUP BY / ORDER BY could fill the disk and stop
+                 ingestion. Past the cap the query alone fails
+                 (TOO_MANY_ROWS_OR_BYTES); the server and other queries keep
+                 running. ClickHouse 26.10 applies these to GROUP BY spills; an
+                 external ORDER BY counts only against the server total
+                 (max_temporary_data_on_disk_size, config.d/performance.xml).
+                 These are fallbacks: Compose installs size them per
+                 host (scripts/lib/resource-sizing.sh: 4x the per-query memory
+                 limit, held to 10 % / 20 % of the disk where known) and the
+                 Helm chart from the ClickHouse volume size. -->
+            <max_temporary_data_on_disk_size_for_query>20000000000</max_temporary_data_on_disk_size_for_query>
+            <max_temporary_data_on_disk_size_for_user>40000000000</max_temporary_data_on_disk_size_for_user>
 
             <!-- Execution Time Limits -->
             <max_execution_time>300</max_execution_time> <!-- 5 minutes -->
@@ -199,6 +213,9 @@
             <!-- External processing for large aggregations -->
             <max_bytes_before_external_group_by>20000000000</max_bytes_before_external_group_by> <!-- 20GB -->
             <max_bytes_before_external_sort>20000000000</max_bytes_before_external_sort>
+            <!-- NAN-5636: see the default profile. -->
+            <max_temporary_data_on_disk_size_for_query>20000000000</max_temporary_data_on_disk_size_for_query>
+            <max_temporary_data_on_disk_size_for_user>40000000000</max_temporary_data_on_disk_size_for_user>
 
             <!-- Logging -->
             <log_queries>1</log_queries>
@@ -228,6 +245,9 @@
             <!-- Limited memory to prevent impact on other queries -->
             <max_memory_usage>5000000000</max_memory_usage> <!-- 5GB -->
             <max_memory_usage_for_user>10000000000</max_memory_usage_for_user> <!-- 10GB -->
+            <!-- NAN-5636: see the default profile. -->
+            <max_temporary_data_on_disk_size_for_query>20000000000</max_temporary_data_on_disk_size_for_query>
+            <max_temporary_data_on_disk_size_for_user>40000000000</max_temporary_data_on_disk_size_for_user>
 
             <!-- Limited data volume -->
             <max_rows_to_read>100000000</max_rows_to_read> <!-- 100M rows -->
@@ -273,6 +293,12 @@
             <input_format_try_infer_datetimes>0</input_format_try_infer_datetimes>
             <!-- No time limit for ingestion -->
             <max_execution_time>0</max_execution_time>
+            <!-- NAN-5636: no per-query / per-user spill cap for inserts and their
+                 materialized views (unset keys would inherit the default
+                 profile's); the server total (config.d/performance.xml) still
+                 bounds them. -->
+            <max_temporary_data_on_disk_size_for_query>0</max_temporary_data_on_disk_size_for_query>
+            <max_temporary_data_on_disk_size_for_user>0</max_temporary_data_on_disk_size_for_user>
 
             <!-- Memory for insert operations -->
             <max_memory_usage>10000000000</max_memory_usage> <!-- 10GB -->
@@ -432,6 +458,17 @@
                 <max_result_rows>
                     <max>10000000</max>
                 </max_result_rows>
+                <!-- NAN-5636: a session may lower the spill caps, never lift or
+                     clear them (0 = unlimited). The sizing files restate these
+                     maxima with the per-host values. -->
+                <max_temporary_data_on_disk_size_for_query>
+                    <min>1</min>
+                    <max>20000000000</max>
+                </max_temporary_data_on_disk_size_for_query>
+                <max_temporary_data_on_disk_size_for_user>
+                    <min>1</min>
+                    <max>40000000000</max>
+                </max_temporary_data_on_disk_size_for_user>
             </constraints>
         </search>
 
@@ -444,6 +481,10 @@
              ================================================================= -->
         <dict_source>
             <profile>default</profile>
+            <!-- NAN-5636: a full-universe dictionary reload may spill up to the
+                 per-user cap, not the per-query one, so one large reload is not
+                 the first thing a busy search load starves. -->
+            <max_temporary_data_on_disk_size_for_query>40000000000</max_temporary_data_on_disk_size_for_query>
             <readonly>2</readonly>
             <allow_ddl>0</allow_ddl>
             <allow_introspection_functions>0</allow_introspection_functions>
@@ -474,6 +515,10 @@
             <!-- No limits for admin operations -->
             <max_execution_time>0</max_execution_time>
             <max_memory_usage>0</max_memory_usage>
+            <!-- NAN-5636: migrations and INSERT ... SELECT backfills spill without a
+                 per-query / per-user cap; only the server total bounds them. -->
+            <max_temporary_data_on_disk_size_for_query>0</max_temporary_data_on_disk_size_for_query>
+            <max_temporary_data_on_disk_size_for_user>0</max_temporary_data_on_disk_size_for_user>
             <max_rows_to_read>0</max_rows_to_read>
             <max_bytes_to_read>0</max_bytes_to_read>
             <max_threads>64</max_threads>
@@ -537,6 +582,9 @@
             <!-- Resource limits (defaults; app overrides within the MAX bounds below) -->
             <max_memory_usage>20000000000</max_memory_usage>
             <max_memory_usage_for_user>40000000000</max_memory_usage_for_user>
+            <!-- NAN-5636: see the default profile. -->
+            <max_temporary_data_on_disk_size_for_query>20000000000</max_temporary_data_on_disk_size_for_query>
+            <max_temporary_data_on_disk_size_for_user>40000000000</max_temporary_data_on_disk_size_for_user>
             <max_execution_time>300</max_execution_time>
             <max_rows_to_read>1000000000</max_rows_to_read>
             <max_bytes_to_read>100000000000</max_bytes_to_read>
@@ -589,6 +637,17 @@
                 <max_memory_usage>
                     <max>40000000000</max>
                 </max_memory_usage>
+                <!-- NAN-5636: a session may lower the spill caps, never lift or
+                     clear them (0 = unlimited). The sizing files restate these
+                     maxima with the per-host values. -->
+                <max_temporary_data_on_disk_size_for_query>
+                    <min>1</min>
+                    <max>20000000000</max>
+                </max_temporary_data_on_disk_size_for_query>
+                <max_temporary_data_on_disk_size_for_user>
+                    <min>1</min>
+                    <max>40000000000</max>
+                </max_temporary_data_on_disk_size_for_user>
             </constraints>
         </rawsql>
     </profiles>

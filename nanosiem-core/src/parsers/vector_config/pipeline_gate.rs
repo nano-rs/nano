@@ -69,13 +69,18 @@ pub(super) async fn record_identity(config_dir: &Path, identity: &str) -> std::i
     Ok(true)
 }
 
-/// Rewrite the identity even when it already names `identity` (the api's
-/// boot render: a marker an older release left behind after a rollback must
-/// never stand for a tree this api did not just write).
-pub(super) async fn rewrite_identity(config_dir: &Path, identity: &str) -> std::io::Result<()> {
-    let tmp = config_dir.join(format!("{PIPELINE_IDENTITY_FILE}.tmp"));
-    tokio::fs::write(&tmp, format!("{identity}\n")).await?;
-    tokio::fs::rename(&tmp, config_dir.join(PIPELINE_IDENTITY_FILE)).await
+/// The api's boot render, after it wrote the tree: make the file hold exactly
+/// `identity` (a marker an older release left behind after a rollback must
+/// never stand for a tree this api did not just write). NAN-5611: the file is
+/// left alone when it already holds exactly that (the entrypoint reads only
+/// its first line, never its age). `Ok(true)` when it was written.
+pub(super) async fn rewrite_identity(config_dir: &Path, identity: &str) -> std::io::Result<bool> {
+    super::tree_write::write_if_changed(&config_dir.join(PIPELINE_IDENTITY_FILE), format!("{identity}\n")).await
+}
+
+/// Where the identity is recorded for the tree at `config_dir`.
+pub(super) fn identity_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(PIPELINE_IDENTITY_FILE)
 }
 
 /// Forget the identity (the tree was rolled back to another identity's).

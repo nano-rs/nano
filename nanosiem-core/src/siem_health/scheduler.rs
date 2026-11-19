@@ -181,6 +181,11 @@ pub async fn run_health_check_with_trigger(
     // NAN-5567: batches ClickHouse permanently rejected, kept in Vector's
     // dead-letter store instead of dropped.
     super::vector_dead_letters::ensure_vector_dead_letter_findings(&mut analysis, &metrics);
+    // NAN-5611: the boot render gave up recording this release's pipeline.
+    super::vector_pipeline_gate::ensure_vector_pipeline_gate_findings(
+        &mut analysis,
+        super::vector_pipeline_gate::current_stall_from_env().await.as_ref(),
+    );
     // Security review 2026-11-08: insecure-but-accepted deployment settings.
     analyzer::ensure_deployment_posture_findings(
         &mut analysis,
@@ -285,6 +290,10 @@ pub async fn run_health_check_with_trigger(
     // unknown addresses. One registration for both.
     #[cfg(feature = "enterprise")]
     super::agentlane_findings::ensure_all(pool, &mut analysis, &service_events).await;
+
+    // NAN-5622: SOAR dead letters, trigger backlog and dropped events.
+    #[cfg(feature = "enterprise")]
+    super::soar_findings::ensure_all(pool, &mut analysis).await;
 
     let duration_ms = start.elapsed().as_millis() as i32;
     let status = HealthStatus::from_score(analysis.overall_score);

@@ -138,6 +138,37 @@ async fn fsync_dir(path: &Path) {
 #[cfg(not(unix))]
 async fn fsync_dir(_path: &Path) {}
 
+/// NAN-5611: every file under `root` (relative path, bytes), skipping the
+/// top-level `skip_top` entry. `None` when `root` is missing or anything
+/// cannot be read, or the tree is deeper than a config tree ever is.
+async fn tree_contents(
+    root: &Path,
+    skip_top: Option<&str>,
+) -> Option<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 8 {
+            return None;
+        }
+        let mut entries = fs::read_dir(&dir).await.ok()?;
+        while let Some(entry) = entries.next_entry().await.ok()? {
+            let path = entry.path();
+            if depth == 0 && skip_top.is_some_and(|skip| entry.file_name() == skip) {
+                continue;
+            }
+            let kind = entry.file_type().await.ok()?;
+            if kind.is_dir() {
+                stack.push((path, depth + 1));
+            } else {
+                let bytes = fs::read(&path).await.ok()?;
+                out.insert(path.strip_prefix(root).ok()?.to_path_buf(), bytes);
+            }
+        }
+    }
+    Some(out)
+}
+
 impl VectorConfigManager {
     /// Snapshot the active configuration as the rollback target.
     ///
@@ -151,6 +182,16 @@ impl VectorConfigManager {
     /// Previously this returned `Ok(())` having just deleted the old backup, so
     /// the caller believed it had a rollback target when it had none.
     pub async fn backup_current(&self) -> Result<BackupGeneration, VectorConfigError> {
+        // NAN-5611: Vector runs with `--config-dir /etc/vector --watch-config`
+        // and its watcher sees this directory too, so rewriting an identical
+        // snapshot on every api start made Vector reload twice per boot. When
+        // the completed backup already holds exactly the active tree, it IS
+        // this deploy's rollback target: reuse it (and its generation), write
+        // nothing.
+        if let Some(generation) = self.backup_matching_active_tree().await {
+            tracing::debug!("Active Vector config unchanged since the last backup; reusing it");
+            return Ok(generation);
+        }
         let generation = BackupGeneration::new();
         let staging = sibling_workspace(&self.backup_dir, "tmp");
         if fs::try_exists(&staging).await? {
@@ -214,6 +255,21 @@ impl VectorConfigManager {
             self.backup_dir.display()
         );
         Ok(generation)
+    }
+
+    /// NAN-5611: the generation of the completed backup when its files are
+    /// byte-for-byte the active `parsers_dir` (same names, same contents,
+    /// nothing more or less). `None` on any doubt: then a fresh snapshot is
+    /// taken as before.
+    async fn backup_matching_active_tree(&self) -> Option<BackupGeneration> {
+        let marker = fs::read_to_string(self.backup_dir.join(BACKUP_COMPLETE_MARKER)).await.ok()?;
+        let generation = marker.trim();
+        if generation.is_empty() {
+            return None;
+        }
+        let active = tree_contents(&self.parsers_dir, None).await?;
+        let backup = tree_contents(&self.backup_dir, Some(BACKUP_COMPLETE_MARKER)).await?;
+        (active == backup).then(|| BackupGeneration(generation.to_string()))
     }
 
     /// Make a finished snapshot the rollback target.
@@ -329,6 +385,8 @@ impl VectorConfigManager {
         // strictly worse than leaking a directory.
         let _ = fs::remove_dir_all(&staging).await;
         published?;
+        // NAN-5611: the marker no longer vouches for what Vector runs.
+        super::deploy::forget_marker_tree(&self.config_dir).await;
 
         tracing::info!(
             "Restored config from backup {} to {}",

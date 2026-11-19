@@ -6,6 +6,23 @@ use super::prevalence_processing::{
 use super::*;
 use crate::query::clickhouse_sql_gen::{ch_lower, ci_like, escape_like_pattern};
 use crate::sql_hygiene::escape_sql_string;
+use super::prevalence_scan::{
+    output_row_columns_sql, plan_prevalence_scan, PrevalenceScanPlan, ResultWindow,
+};
+
+/// The decoration columns the pushdown's `prevalence_results` CTE adds to
+/// every row (its final SELECT), which the pushed-down stages read as plain
+/// columns (NAN-5632).
+pub(super) const PREVALENCE_RESULT_COLUMNS: &[&str] = &[
+    "host_count",
+    "prevalence_first_seen",
+    "prevalence_last_seen",
+    "total_occurrences",
+    "is_rare",
+    "prevalence_score",
+    "prevalence_type",
+    "prevalence_artifact",
+];
 
 /// Schema-resolved artifact lookup-key expressions (`_domain_lookup` /
 /// `_ip_lookup` / `_hash_lookup`), shared between the pushdown SQL build and
@@ -62,6 +79,22 @@ impl SearchService {
             3 // default
         };
 
+        // NAN-5660: the caller reads `[offset, offset + limit)` of the result.
+        // When the plan cannot push that window into the base scan and keeps
+        // the newest-1M full-width sort, admit it like the other row-preserving
+        // buffers (NAN-5635) instead of letting it hit Code 241.
+        let window = ResultWindow { limit, offset };
+        let scan = self.prevalence_scan_plan(query, prevalence_commands, post_prevalence_commands, Some(window));
+        let query_id = request
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        if scan.is_wide_newest_scan() {
+            self.admit_prevalence_scan(query, adjusted_time_range, &query_id)
+                .await
+                .map_err(SearchError::SqlValidationError)?;
+        }
+
         // NAN-1705 (D4b): before building the pushdown SQL, re-resolve the
         // window's dict-blind artifacts (negative-cached misses / stale window
         // masks) against the real-time summary. The rescued sets override the
@@ -97,6 +130,7 @@ impl SearchService {
                     time_range,
                     rarity_threshold,
                     rescue,
+                    Some(window),
                 )
             },
         )?;
@@ -141,12 +175,38 @@ impl SearchService {
                 .take(num_commands_pushed)
                 .any(command_groups_rows);
         let sql_start = Instant::now();
+        // NAN-5660: with the result window pushed, the SQL holds only the rows
+        // the page reads, so its count companion would report the window, not
+        // the total. The first page counts the base instead: decoration keeps
+        // every row, so the total is the base count under the same 1M cap the
+        // unpushed `raw_logs` applied. Later pages keep the executor estimate.
+        let window_total = scan.window_pushed
+            && crate::search::execution::clickhouse_executor::is_first_page(offset);
         // NAN-5565: generated SQL: the executor lifts `max_query_size` when the
         // rescue needs it and takes the aggregation decision from the
         // rescue-free rendering.
-        let (mut results, total_count) = self
-            .execute_generated_clickhouse_sql(&sql, aggregation, limit, offset, grouped_output)
-            .await?;
+        let data = self.execute_generated_clickhouse_sql(&sql, aggregation, limit, offset, grouped_output);
+        let (mut results, total_count) = if window_total {
+            let (data, base_total) =
+                tokio::join!(data, self.prevalence_base_total(query, time_range, &query_id));
+            let (results, _window_total) = data?;
+            let total_count = match base_total {
+                Ok(total) => total.max(results.len() as u64),
+                Err(e) => {
+                    // The windowed SQL's own count is at most the window; keep
+                    // a full page signalling "more" so paging stays enabled.
+                    tracing::warn!(error = %e, "prevalence base count failed; estimating the total from the page");
+                    crate::search::execution::clickhouse_executor::paged_total_estimate(
+                        offset,
+                        results.len(),
+                        limit,
+                    )
+                }
+            };
+            (results, total_count)
+        } else {
+            data.await?
+        };
         tracing::info!(
             duration_ms = sql_start.elapsed().as_millis() as u64,
             result_count = results.len(),
@@ -489,14 +549,74 @@ impl SearchService {
         query: &Query,
         time_range: &TimeRange,
     ) -> Result<String, SearchError> {
+        self.generate_prevalence_base_sql_with_limit(query, time_range, None)
+    }
+
+    /// [`Self::generate_prevalence_base_sql`] with the generator's own result
+    /// LIMIT (NAN-5660: the pushed result window). With a limit the base keeps
+    /// its trailing `ORDER BY timestamp DESC LIMIT n` and no SETTINGS clause
+    /// (the unlimited base loses its trailing SETTINGS to the ORDER BY strip
+    /// the same way), so the top-N runs directly on the table, where
+    /// ClickHouse reads only the sort column for the rows it drops.
+    fn generate_prevalence_base_sql_with_limit(
+        &self,
+        query: &Query,
+        time_range: &TimeRange,
+        limit: Option<usize>,
+    ) -> Result<String, SearchError> {
         let base_query = strip_prevalence_and_after(query);
         let base_options = crate::query::QueryOptions {
-            limit: None,
+            limit,
+            omit_settings: limit.is_some(),
             ..Default::default()
         };
         self.ch_sql_generator
             .generate_with_options(&base_query, time_range, &base_options)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))
+    }
+
+    /// NAN-5660: total rows of an enrich-only pushdown whose result window was
+    /// pushed: the base search's count, capped at the 1M the unpushed
+    /// `raw_logs` kept. A filtered base stops counting one row past the cap; a
+    /// filter-free one is served from part metadata (NAN-1635).
+    /// The count carries the derived `{query_id}-base-count` id (cancel kills
+    /// it with the data query) and the request's ClickHouse settings.
+    async fn prevalence_base_total(
+        &self,
+        query: &Query,
+        time_range: &TimeRange,
+        query_id: &str,
+    ) -> Result<u64, SearchError> {
+        let count_sql = self.prevalence_base_count_sql(query, time_range)?;
+        let executor = self.ch_executor.as_ref().ok_or_else(|| {
+            SearchError::DatabaseError(sqlx::Error::Configuration(
+                "ClickHouse client not configured".into(),
+            ))
+        })?;
+        let count_qid = format!("{query_id}-base-count");
+        let total = executor
+            .execute_count_query_with_options(&count_sql, Some(&count_qid), self.active_ch_settings.as_ref())
+            .await?;
+        Ok(total.min(crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT as u64))
+    }
+
+    /// The count SQL behind [`Self::prevalence_base_total`].
+    pub(crate) fn prevalence_base_count_sql(&self, query: &Query, time_range: &TimeRange) -> Result<String, SearchError> {
+        use crate::search::execution::clickhouse_executor::{build_count_query, BoundedCountInput};
+        let cap = crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT;
+        let base_query = strip_prevalence_and_after(query);
+        let options = crate::query::QueryOptions {
+            limit: None,
+            unordered: true,
+            ..Default::default()
+        };
+        let sql = self
+            .ch_sql_generator
+            .generate_with_options(&base_query, time_range, &options)
+            .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+        let bounded = crate::search::query_processing::query_has_per_row_filters(&base_query)
+            .then_some(BoundedCountInput { sql: &sql, limit: cap });
+        Ok(build_count_query(&sql, bounded))
     }
 
     /// Build the schema-resolved artifact lookup-key expressions the prevalence
@@ -780,6 +900,7 @@ impl SearchService {
         time_range: &TimeRange,
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
+        window: Option<ResultWindow>,
     ) -> Result<(String, usize), SearchError> {
         self.generate_prevalence_pushdown_sql_with_shape(
             query,
@@ -788,6 +909,7 @@ impl SearchService {
             time_range,
             rarity_threshold,
             rescue,
+            window,
         )
         .map(|(sql, pushed, _)| (sql, pushed))
     }
@@ -809,6 +931,7 @@ impl SearchService {
         time_range: &TimeRange,
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
+        window: Option<ResultWindow>,
     ) -> Result<(String, usize, bool), SearchError> {
         let render = |rescue: &PrevalenceRescue| {
             self.generate_prevalence_pushdown_sql_unobserved(
@@ -818,6 +941,7 @@ impl SearchService {
                 time_range,
                 rarity_threshold,
                 rescue,
+                window,
             )
         };
         let (sql, pushed) = render(rescue)?;
@@ -843,10 +967,38 @@ impl SearchService {
         time_range: &TimeRange,
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
+        window: Option<ResultWindow>,
     ) -> Result<(String, usize), SearchError> {
         let time_window = Self::resolve_prevalence_window(prevalence_commands)?;
 
-        let base_sql = self.generate_prevalence_base_sql(query, time_range)?;
+        // NAN-5660: how much of the base `raw_logs` keeps (and which columns
+        // the final SELECT reads).
+        let scan = self.prevalence_scan_plan(query, prevalence_commands, post_prevalence_commands, window);
+        // A pushed window goes INTO the base (`… ORDER BY timestamp DESC
+        // LIMIT n`): a LIMIT on the `SELECT * FROM (<base>)` wrapper reads
+        // every column of every row before the top-N (measured: 2.6 GiB read
+        // and Code 241 at 1 GiB for 2M OCSF rows, vs 35 MiB / 41 MiB directly
+        // on the table). The plan only pushes over a base in natural time
+        // order; should the generator end it otherwise, the wrapper bound
+        // keeps the result correct.
+        let windowed_base = match (scan.window_pushed, scan.raw_logs_limit) {
+            (true, Some(n)) => {
+                let sql = self.generate_prevalence_base_sql_with_limit(query, time_range, Some(n))?;
+                let ends_in_window = sql
+                    .trim_end()
+                    .ends_with(&format!("ORDER BY timestamp DESC LIMIT {n}"));
+                if !ends_in_window {
+                    tracing::warn!("prevalence window base does not end in its top-N; bounding the wrapper");
+                }
+                ends_in_window.then_some(sql)
+            }
+            _ => None,
+        };
+        let base_windowed = windowed_base.is_some();
+        let base_sql = match windowed_base {
+            Some(sql) => sql,
+            None => self.generate_prevalence_base_sql(query, time_range)?,
+        };
 
         // NAN-362: Prior to the dict-based rewrite, this path built CTEs that aggregated the
         // full *_prevalence_agg universe and LEFT JOINed them — which OOMed ClickHouse on any
@@ -876,11 +1028,31 @@ impl SearchService {
 
         self.generate_prevalence_join_sql(
             &base_sql,
+            base_windowed,
             post_prevalence_commands,
             &filter_conditions,
             time_window,
             rarity_threshold,
             rescue,
+            &scan,
+        )
+    }
+
+    /// NAN-5660: the scan plan for this pushdown, under the tenant profile the
+    /// lookups and the base scan use.
+    pub(crate) fn prevalence_scan_plan(
+        &self,
+        query: &Query,
+        prevalence_commands: &[PrevalenceCommandInfo],
+        post_prevalence_commands: &[Command],
+        window: Option<ResultWindow>,
+    ) -> PrevalenceScanPlan {
+        plan_prevalence_scan(
+            query,
+            prevalence_commands,
+            post_prevalence_commands,
+            window,
+            self.active_profile.as_ref(),
         )
     }
 
@@ -893,11 +1065,13 @@ impl SearchService {
     fn generate_prevalence_join_sql(
         &self,
         base_sql: &str,
+        base_windowed: bool,
         post_prevalence_commands: &[Command],
         filter_conditions: &[crate::query::PrevalenceCondition],
         time_window: PrevalenceTimeWindow,
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
+        scan: &PrevalenceScanPlan,
     ) -> Result<(String, usize), SearchError> {
         tracing::debug!(
             "generate_prevalence_join_sql: {} post-prevalence commands",
@@ -1012,8 +1186,10 @@ impl SearchService {
         let base_sql_clean = base_sql.trim().trim_end_matches(';');
 
         // Remove ORDER BY clause if present (case insensitive)
-        let base_sql_no_order =
-            if let Some(order_pos) = base_sql_clean.to_ascii_lowercase().rfind(" order by ") {
+        // NAN-5660: a windowed base keeps its own `ORDER BY … LIMIT n`.
+        let base_sql_no_order = if base_windowed {
+            base_sql_clean
+        } else if let Some(order_pos) = base_sql_clean.to_ascii_lowercase().rfind(" order by ") {
                 &base_sql_clean[..order_pos]
             } else {
                 base_sql_clean
@@ -1074,36 +1250,19 @@ impl SearchService {
         // the ORDER-BY stripper cannot delete it and where the executor sees a ` LIMIT `
         // (forcing the structural pagination wrap instead of SETTINGS string-surgery).
         //
-        // When the enrich pipeline feeds a downstream aggregation (stats/top/rare/timechart,
-        // pushed to a SQL GROUP BY below) the aggregation needs its full input set, so the
-        // base stays unbounded there — exactly as before.
-        let has_downstream_aggregation = post_prevalence_commands.iter().any(|cmd| {
-            matches!(
-                cmd,
-                Command::Stats { .. }
-                    | Command::Top { .. }
-                    | Command::Rare { .. }
-                    | Command::Timechart { .. }
-            )
-        });
-        // NAN-1691 (Codex review): the FILTER form pushes a dictGet host_count
-        // predicate into the query — it must run over the FULL windowed base, not
-        // a pre-limited newest-N slice, or rare rows earlier in the window are
-        // silently missed (and total_count is capped to that slice). The dictGet
-        // predicate is cheap/streaming (measured ~41 MiB over 91M rows) and the
-        // outer LIMIT bounds the — by definition small — rare output, so no
-        // pre-limit is needed. Only the enrich-ONLY form (1:1 row decoration that
-        // returns every base row) needs the safety bound.
-        let has_prevalence_filter = !filter_conditions.is_empty();
-        let raw_logs_bound = if has_downstream_aggregation || has_prevalence_filter {
-            String::new()
-        } else {
-            format!(
-                "\n    ORDER BY timestamp DESC\n    LIMIT {}",
-                crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT
-            )
+        // A downstream aggregation (pushed to a SQL GROUP BY below) needs its full input
+        // set, and the FILTER form's dictGet predicate must run over the full window (rare
+        // rows earlier in the window must not be missed), so both stay unbounded.
+        //
+        // NAN-5660: when nothing after the prevalence stage(s) filters, reorders or
+        // aggregates, the bound is the caller's result window instead of the 1M cap, and a
+        // `table`/`fields` output names its columns instead of `l.*`; see `prevalence_scan`.
+        let raw_logs_bound = match scan.raw_logs_limit {
+            None => String::new(),
+            Some(_) if base_windowed => String::new(),
+            Some(n) => format!("\n    ORDER BY timestamp DESC\n    LIMIT {n}"),
         };
-
+        let output_row_columns = output_row_columns_sql(scan);
 
         // NAN-1705 (D4b): build the domain/hash/IP base_logs projection aliases,
         // each `rescue_value_sql`-wrapped so a rescued dict-blind key resolves
@@ -1259,7 +1418,7 @@ base_logs AS (
     FROM logs_with_keys
 )
 SELECT
-    l.*,
+    {output_row_columns},
     CASE
         WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) >= 9999 THEN NULL
         ELSE least(_dp_host_count, _ip_host_count, _hp_host_count)
@@ -1303,6 +1462,7 @@ FROM base_logs l{extra_where}
 ORDER BY l.timestamp DESC"#,
             base_sql = base_sql_no_order,
             raw_logs_bound = raw_logs_bound,
+            output_row_columns = output_row_columns,
             // NAN-1705 (D4b): all three dimensions' projections are pre-built
             // (rescue-aware); the dict names AND the window_cutoff mask are baked
             // into those exprs, so `{domain_dict}` / `{ip_dict}` / `{hash_dict}` /
@@ -1357,16 +1517,23 @@ ORDER BY l.timestamp DESC"#,
             let mut cte_sql = format!("WITH prevalence_results AS (\n{}\n)", sql);
             let mut current_source = "prevalence_results".to_string();
 
-            for (i, cmd) in sql_pushable.iter().enumerate() {
-                // NAN-5628: not `stage_<i>`: the base pipeline nested in
-                // `raw_logs` carries its own `WITH stage_0, …`, and reusing
-                // those names here made ClickHouse resolve these outer stages
-                // against the inner CTEs (Code 60 UNKNOWN_TABLE).
-                let stage_name = format!("pv_stage_{}", i);
-                let cmd_sql = self
-                    .ch_sql_generator
-                    .generate_command_sql(&current_source, cmd)
-                    .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+            // NAN-5632: the stages are generated as ONE chain so a column an
+            // earlier stage produces (`time_bucket`, `count`, a by-field
+            // alias) and the columns `prevalence_results` adds (the
+            // decorations, eval outputs) resolve as plain columns, not as
+            // unknown event fields (`unmapped."time_bucket"` on OCSF).
+            let mut source_columns: std::collections::HashSet<String> =
+                PREVALENCE_RESULT_COLUMNS.iter().map(|c| (*c).to_string()).collect();
+            source_columns.extend(eval_field_names.iter().cloned());
+            // NAN-5628: not `stage_<i>`: the base pipeline nested in
+            // `raw_logs` carries its own `WITH stage_0, …`, and reusing
+            // those names here made ClickHouse resolve these outer stages
+            // against the inner CTEs (Code 60 UNKNOWN_TABLE).
+            let stages = self
+                .ch_sql_generator
+                .generate_command_chain_sql(&current_source, &sql_pushable, "pv_stage_", &source_columns)
+                .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+            for (stage_name, cmd_sql) in stages {
                 cte_sql = format!("{},\n{} AS (\n{}\n)", cte_sql, stage_name, cmd_sql);
                 current_source = stage_name;
             }

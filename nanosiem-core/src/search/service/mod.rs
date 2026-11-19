@@ -36,7 +36,7 @@ use super::processing::{
     apply_post_prevalence_commands_with_limit, validate_lookup_tables,
 };
 use super::query_processing::{
-    apply_auto_sort, detect_oom_risk, extract_ai_command, extract_asset_command,
+    apply_auto_sort, extract_ai_command, extract_asset_command,
     extract_baseline_command, extract_asset_identifier_from_query, extract_base_query,
     extract_cloud_command,
     extract_inputlookup_commands, extract_lateral_command, extract_lookup_commands,
@@ -96,10 +96,12 @@ mod histogram_tests;
 mod ioc_lookup_resolve;
 mod lateral;
 mod metrics_routing;
+mod oom_admission;
 mod lateral_graph;
 mod otel;
 mod prevalence_join;
 mod prevalence_processing;
+mod prevalence_scan;
 mod retro;
 mod sql_execution;
 pub use sql_execution::RawSqlAuditAccess;
@@ -175,7 +177,7 @@ fn determine_display_type(query: &Query) -> DisplayType {
 /// Cancellation must kill the data query plus exactly these ids. They are
 /// always matched EXACTLY (never via `LIKE '{id}%'`) because client-provided
 /// request ids can legitimately contain `%`/`_` LIKE metacharacters.
-pub(crate) fn companion_query_ids(query_id: &str) -> [String; 6] {
+pub(crate) fn companion_query_ids(query_id: &str) -> [String; 7] {
     [
         format!("{query_id}-count"),
         format!("{query_id}-hist"),
@@ -184,13 +186,15 @@ pub(crate) fn companion_query_ids(query_id: &str) -> [String; 6] {
         // NAN-5485: the sidebar's field inventories.
         field_queries::inventory_query_id(query_id, DynamicFieldBucket::Spill),
         field_queries::inventory_query_id(query_id, DynamicFieldBucket::Extended),
+        // NAN-5635: the cost guard's row estimate.
+        format!("{query_id}-guard"),
     ]
 }
 
 /// The data query id plus all derived companion ids — the full kill set for
 /// one search request (NAN-1428).
 pub(crate) fn all_query_ids(query_id: &str) -> Vec<String> {
-    let mut ids = Vec::with_capacity(7);
+    let mut ids = Vec::with_capacity(8);
     ids.push(query_id.to_string());
     ids.extend(companion_query_ids(query_id));
     ids
@@ -383,6 +387,33 @@ pub(crate) fn validate_query_field_names(
     Ok(())
 }
 
+/// NAN-5634: an unknown-field error for a UDM-semantic name the active schema
+/// spells differently (`bytes_in` on OCSF is `traffic.bytes_in`) suggests the
+/// native name. ClickHouse reports what the generated SQL referenced, so its
+/// own suggestions (if any) never know the schema's spelling; a name the
+/// schema already spells that way, or one it has no column for, is unchanged.
+pub(crate) fn suggest_native_field(
+    error: SearchError,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> SearchError {
+    let SearchError::FieldNotFound { field, mut suggestions, message } = error else {
+        return error;
+    };
+    let native = profile
+        .display_field_name(&field)
+        .filter(|native| !native.eq_ignore_ascii_case(&field));
+    let Some(native) = native else {
+        return SearchError::FieldNotFound { field, suggestions, message };
+    };
+    suggestions.retain(|s| !s.eq_ignore_ascii_case(&native));
+    suggestions.insert(0, native);
+    let message = match message.strip_suffix(" does not exist in the data.") {
+        Some(head) => format!("{head} does not exist in the data"),
+        None => message,
+    };
+    SearchError::FieldNotFound { field, suggestions, message }
+}
+
 /// Reject non-positive `timechart` / `bin` spans and `bin` hop advances before
 /// they reach SQL generation or ClickHouse (NAN-2019). A zero span becomes
 /// `INTERVAL 0` / a divide-by-zero — a clean validation error is far better than
@@ -565,6 +596,59 @@ pub(super) fn query_produces_grouped_rows(query: &Query) -> bool {
             command_groups_rows(command) || query_produces_grouped_rows(source)
         }
     }
+}
+
+/// NAN-5634: `| cloud` builds the cloud investigation view over the events of
+/// the search in front of it, so it must end the search. A command after it
+/// (`| cloud service | stats count() by cloud_service`) became part of the
+/// view's base query, and the view then read event columns from the stats
+/// output: an opaque 400 "Field 'cloud.provider' does not exist in the data".
+pub(super) fn cloud_view_is_last(query: &Query) -> Result<(), SearchError> {
+    let Query::Piped { source, command } = query else {
+        return Ok(());
+    };
+    if matches!(command, Command::Cloud { .. }) {
+        return Ok(());
+    }
+    let mut node = source.as_ref();
+    while let Query::Piped { source, command } = node {
+        if matches!(command, Command::Cloud { .. }) {
+            return Err(SearchError::SqlValidationError(
+                "`| cloud` builds the cloud investigation view and must be the last command of \
+                 the search. Remove the commands after it, or drop `| cloud` to run them over \
+                 the events directly (for example `* | stats count() by cloud_service`)."
+                    .to_string(),
+            ));
+        }
+        node = source;
+    }
+    Ok(())
+}
+
+/// NAN-5634: whether `query` is a `join` pipeline whose main side still hands
+/// on raw event rows: a `join` plus only row filters, limits, orderings and
+/// per-row enrichers (allowlist). The subsearch may aggregate; the joined
+/// output is still one row per matching event, so the executor must page it
+/// as raw rows (see `ClickHouseExecutor::with_aggregation`).
+pub(super) fn join_returns_raw_rows(query: &Query) -> bool {
+    let mut node = query;
+    let mut has_join = false;
+    while let Query::Piped { source, command } = node {
+        match command {
+            Command::Join { .. } => has_join = true,
+            Command::Where { .. }
+            | Command::Head { .. }
+            | Command::Sort { .. }
+            | Command::Eval { .. }
+            | Command::Rename { .. }
+            | Command::Rex { .. }
+            | Command::Table { .. }
+            | Command::Fields { .. } => {}
+            _ => return false,
+        }
+        node = source;
+    }
+    has_join
 }
 
 /// Whether this single command turns rows into buckets keyed by a dimension.
@@ -1462,6 +1546,12 @@ mod prevalence_rescue_query_size_tests;
 #[cfg(test)]
 #[path = "prevalence_decorated_field_tests.rs"]
 mod prevalence_decorated_field_tests;
+#[cfg(test)]
+#[path = "prevalence_stage_alias_tests.rs"]
+mod prevalence_stage_alias_tests;
+#[cfg(test)]
+#[path = "ocsf_stage_column_tests.rs"]
+mod ocsf_stage_column_tests;
 
 #[cfg(test)]
 #[path = "npl_injection_canary_tests.rs"]
@@ -1515,7 +1605,8 @@ mod tests {
                 "req-1-fstats".to_string(),
                 "req-1-aggregate-count".to_string(),
                 "req-1-inv-spill".to_string(),
-                "req-1-inv-extended".to_string()
+                "req-1-inv-extended".to_string(),
+                "req-1-guard".to_string()
             ]
         );
         assert_eq!(
@@ -1527,7 +1618,8 @@ mod tests {
                 "req-1-fstats",
                 "req-1-aggregate-count",
                 "req-1-inv-spill",
-                "req-1-inv-extended"
+                "req-1-inv-extended",
+                "req-1-guard"
             ]
         );
         // Ids with LIKE metacharacters stay literal — derivation is plain
@@ -1540,7 +1632,8 @@ mod tests {
                 "a%b_c-fstats",
                 "a%b_c-aggregate-count",
                 "a%b_c-inv-spill",
-                "a%b_c-inv-extended"
+                "a%b_c-inv-extended",
+                "a%b_c-guard"
             ]
         );
     }

@@ -592,8 +592,15 @@ fn the_marker_file_is_a_valid_standalone_component_pair() {
     let marker = ActivationMarker {
         id: "abc".to_string(),
         path: std::path::PathBuf::from("/x/_nano_activation.toml"),
+        tree: Some("abc123".to_string()),
     };
-    let parsed: toml::Value = toml::from_str(&marker.toml()).unwrap();
+    let text = marker.toml();
+    // NAN-5611: the entrypoint's start-up migration skips a file whose first
+    // line is the env-escape mark, so it never rewrites the marker.
+    assert_eq!(text.lines().next(), Some(crate::vector_env::ENV_ESCAPED_HEADER));
+    assert!(!text.contains('$'));
+    assert_eq!(parse_marker(&text), Some(("nano_activation_abc".to_string(), Some("abc123".to_string()))));
+    let parsed: toml::Value = toml::from_str(&text).unwrap();
     assert_eq!(parsed["sources"]["nano_activation_abc"]["type"].as_str(), Some("demo_logs"));
     assert_eq!(
         parsed["sinks"]["nano_activation_abc_sink"]["inputs"][0].as_str(),
@@ -664,4 +671,98 @@ fn local_reload_switch_is_off_only_when_explicitly_off() {
     assert!(!local_reload_disabled_from(Some("")));
     assert!(!local_reload_disabled_from(Some("on")));
     assert!(!local_reload_disabled_from(Some("generation")));
+}
+
+// ---------------------------------------------------------------------------
+// NAN-5611: an unchanged tree that Vector already runs is not reloaded
+// ---------------------------------------------------------------------------
+
+async fn tree_with_marker(id: &str, record_tree: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sources/configs")).unwrap();
+    std::fs::create_dir_all(dir.path().join("sources/parsers")).unwrap();
+    std::fs::write(dir.path().join("sources/parsers/apache.toml"), "a = 1\n").unwrap();
+    let tree = if record_tree {
+        super::super::tree_write::tree_fingerprint(dir.path()).await
+    } else {
+        None
+    };
+    let marker = ActivationMarker {
+        id: id.to_string(),
+        path: dir.path().join("sources/configs").join(ACTIVATION_MARKER_FILE),
+        tree,
+    };
+    write_marker(&marker).await.unwrap();
+    dir
+}
+
+async fn fp(dir: &tempfile::TempDir) -> Option<String> {
+    super::super::tree_write::tree_fingerprint(dir.path()).await
+}
+
+async fn metrics_server(marker: Option<(&str, u64)>) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(metrics_with_marker(3, 0, marker)))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn an_unchanged_tree_whose_marker_runs_needs_no_reload() {
+    let dir = tree_with_marker("same", true).await;
+    let server = metrics_server(Some(("nano_activation_same", 4))).await;
+    assert!(vector_runs_unchanged_tree_with(dir.path(), fp(&dir).await.as_deref(), &probe_for(&server)).await);
+}
+
+#[tokio::test]
+async fn a_changed_tree_is_reloaded_even_with_its_marker_running() {
+    let dir = tree_with_marker("same", true).await;
+    let before = fp(&dir).await;
+    std::fs::write(dir.path().join("sources/parsers/apache.toml"), "a = 2\n").unwrap();
+    let server = metrics_server(Some(("nano_activation_same", 4))).await;
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), before.as_deref(), &probe_for(&server)).await);
+    // Drift on disk that this render put back is still a write (a watching
+    // Vector may have loaded the drift): reload.
+    let drifted = fp(&dir).await;
+    std::fs::write(dir.path().join("sources/parsers/apache.toml"), "a = 1\n").unwrap();
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), drifted.as_deref(), &probe_for(&server)).await);
+    // No baseline: no evidence.
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), None, &probe_for(&server)).await);
+}
+
+#[tokio::test]
+async fn a_marker_vector_is_not_running_means_reload() {
+    let dir = tree_with_marker("same", true).await;
+    // Vector runs another (older) marker, or none at all.
+    let server = metrics_server(Some(("nano_activation_older", 4))).await;
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), fp(&dir).await.as_deref(), &probe_for(&server)).await);
+    let silent = metrics_server(None).await;
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), fp(&dir).await.as_deref(), &probe_for(&silent)).await);
+    // Metrics unreadable: no evidence.
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), fp(&dir).await.as_deref(), &probe_at("http://127.0.0.1:9/metrics".to_string())).await);
+}
+
+#[tokio::test]
+async fn a_marker_from_before_nan_5611_means_reload() {
+    // No recorded fingerprint: the first deploy after the upgrade reloads.
+    let dir = tree_with_marker("old", false).await;
+    let server = metrics_server(Some(("nano_activation_old", 4))).await;
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), fp(&dir).await.as_deref(), &probe_for(&server)).await);
+}
+
+#[tokio::test]
+async fn a_restore_makes_the_next_unchanged_render_reload() {
+    // A restore without a new marker: a watching Vector may run a tree the
+    // marker never recorded, so the marker stops vouching for it.
+    let dir = tree_with_marker("same", true).await;
+    let server = metrics_server(Some(("nano_activation_same", 4))).await;
+    assert!(vector_runs_unchanged_tree_with(dir.path(), fp(&dir).await.as_deref(), &probe_for(&server)).await);
+    forget_marker_tree(dir.path()).await;
+    let marker = std::fs::read_to_string(dir.path().join("sources/configs").join(ACTIVATION_MARKER_FILE)).unwrap();
+    assert!(!marker.contains(MARKER_TREE_PREFIX), "{marker}");
+    assert!(marker.contains("[sources.nano_activation_same]"), "the component stays");
+    assert!(!vector_runs_unchanged_tree_with(dir.path(), fp(&dir).await.as_deref(), &probe_for(&server)).await);
 }

@@ -58,9 +58,14 @@ pub use vector_config::{
     local_reload_disabled as vector_config_local_reload_disabled,
 };
 pub use vector_config::remote_delivery as vector_config_remote_delivery;
+pub use vector_config::{
+    publication_root as vector_config_publication_root,
+    PUBLICATION_DIR_ENV as VECTOR_CONFIG_PUBLICATION_DIR_ENV,
+};
 #[cfg(test)]
 pub(crate) use vector_config::test_hooks as vector_config_test_hooks;
 pub(crate) use vector_config::config_lock::DeployGuard as VectorDeployGuard;
+pub(crate) use vector_config::tree_write as vector_tree_write;
 pub use vector_config::hec_route as vector_hec_route;
 pub use vrl_functions::vrl_function_catalog;
 

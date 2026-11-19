@@ -1138,21 +1138,29 @@ fn coverage_gap_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
              then replay the windows listed in detection_coverage_gaps by hand \
              (e.g. a retro hunt over each window)."
         ),
-        // NAN-5424: an unevaluated window is a detection blind spot.
-        priority: "critical".to_string(),
+        // NAN-5424: an unevaluated window is a detection blind spot. NAN-5629:
+        // but a recorded one is history (the rule has moved past it), so it is
+        // a warning; only a rule failing now is critical.
+        priority: "high".to_string(),
     }]
 }
 
 /// NAN-5424: a rule whose executions fail (for example because PostgreSQL
 /// refuses its matched events) silently stops alerting; surface it without
 /// an LLM.
+///
+/// NAN-5629: critical only while a rule is failing NOW
+/// (`currently_failing_rules_total`). Rules that failed in the last 24 hours
+/// but whose last run succeeded are a high (warning) finding.
 fn failing_rule_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
     if d.failing_rules_total <= 0 {
         return vec![];
     }
+    let failing_now = d.currently_failing_rules_total > 0;
     let examples = d
         .failing_rules
         .iter()
+        .filter(|r| !failing_now || r.failing_now)
         .take(5)
         .map(|r| {
             let error: String = r
@@ -1170,11 +1178,26 @@ fn failing_rule_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let (title, priority) = if failing_now {
+        (
+            format!(
+                "{} detection rule(s) are failing to run or to store their matches",
+                d.currently_failing_rules_total
+            ),
+            // Detection that silently stops alerting is the SIEM's core failure.
+            "critical",
+        )
+    } else {
+        (
+            format!(
+                "{} detection rule(s) failed to run or to store their matches in the last 24 hours and have since recovered",
+                d.failing_rules_total
+            ),
+            "high",
+        )
+    };
     vec![Recommendation {
-        title: format!(
-            "{} detection rule(s) failed to run or to store their matches in the last 24 hours",
-            d.failing_rules_total
-        ),
+        title,
         description: format!(
             "These rules hit execution errors: {examples}. While a rule fails, \
              its matches are not alerted. The scheduler retries each window a \
@@ -1182,8 +1205,7 @@ fn failing_rule_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
              and moves on. Check the rule's last error in the rule details and \
              replay any recorded gaps."
         ),
-        // Detection that silently stops alerting is the SIEM's core failure.
-        priority: "critical".to_string(),
+        priority: priority.to_string(),
     }]
 }
 
@@ -1245,8 +1267,16 @@ fn score_detection(m: &DetectionMetrics) -> i32 {
     let noise_penalty = (m.noisy_rules.len() as i32) * 5;
     // NAN-4910: windows a rule never evaluated are a coverage hole.
     let gap_penalty = if m.coverage_gaps_7d_total > 0 { 20 } else { 0 };
-    // NAN-5424: rules that fail to run or to store matches.
-    let failing_penalty = if m.failing_rules_total > 0 { 30 } else { 0 };
+    // NAN-5424: rules that fail to run or to store matches. NAN-5629: the
+    // full penalty only while a rule is failing now; a rule that failed in
+    // the last 24h and recovered is a light warning-level drag.
+    let failing_penalty = if m.currently_failing_rules_total > 0 {
+        30
+    } else if m.failing_rules_total > 0 {
+        10
+    } else {
+        0
+    };
     (100 - stale_penalty - noise_penalty - gap_penalty - failing_penalty).clamp(0, 100)
 }
 
@@ -1471,6 +1501,7 @@ pub(crate) mod tests {
                 coverage_gaps_7d_total: 0,
                 failing_rules: vec![],
                 failing_rules_total: 0,
+                currently_failing_rules_total: 0,
             },
             audit_durability: None,
             reserved_source_names: Default::default(),
@@ -1568,6 +1599,7 @@ pub(crate) mod tests {
             coverage_gaps_7d_total: 0,
             failing_rules: vec![],
             failing_rules_total: 0,
+            currently_failing_rules_total: 0,
         }
     }
 
@@ -1618,10 +1650,86 @@ pub(crate) mod tests {
         }];
         let recs = coverage_gap_recommendations(&gapped);
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].priority, "critical");
+        // NAN-5629: a recorded gap is history, a warning.
+        assert_eq!(recs[0].priority, "high");
         assert!(recs[0].title.starts_with("2 detection window(s)"), "{}", recs[0].title);
         assert!(recs[0].description.contains("Brute force [2026-07-05 03:00:00Z"));
         assert!(score_detection(&gapped) < score_detection(&clean));
+    }
+
+    fn failing_rule(
+        name: &str,
+        consecutive_failures: i16,
+        failing_now: bool,
+        last_error: Option<&str>,
+    ) -> crate::detection::health::FailingRuleSummary {
+        crate::detection::health::FailingRuleSummary {
+            rule_id: uuid::Uuid::new_v4(),
+            rule_name: name.to_string(),
+            consecutive_failures,
+            failing_since: None,
+            last_error: last_error.map(str::to_string),
+            last_error_at: None,
+            failing_now,
+        }
+    }
+
+    /// NAN-5629: the reported box. `unsigned_kernel_driver_load` is listed
+    /// (a coverage gap in the last 24h) but ran again: `consecutive_failures:
+    /// 0`, `last_error: null`, nothing failing now. That is a warning, never
+    /// critical, and it drags the score far less than a rule failing now.
+    #[test]
+    fn a_recovered_rule_is_a_warning_not_a_critical_failure() {
+        let mut recovered = detection_with(5, 100);
+        recovered.failing_rules_total = 1;
+        recovered.currently_failing_rules_total = 0;
+        recovered.failing_rules = vec![failing_rule("unsigned_kernel_driver_load", 0, false, None)];
+        // The listing comes from the coverage gap the rule left behind.
+        recovered.coverage_gaps_7d_total = 1;
+        recovered.coverage_gaps_7d = vec![DetectionCoverageGapSummary {
+            rule_name: "unsigned_kernel_driver_load".to_string(),
+            window_start: chrono::Utc::now() - chrono::Duration::hours(3),
+            window_end: chrono::Utc::now() - chrono::Duration::hours(3) + chrono::Duration::minutes(5),
+            recorded_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            error_message: "[data] PostgreSQL error (SQLSTATE 22P05)".to_string(),
+        }];
+        assert_eq!(coverage_gap_recommendations(&recovered)[0].priority, "high");
+        let recs = failing_rule_recommendations(&recovered);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].priority, "high", "{}", recs[0].title);
+        assert!(recs[0].title.contains("have since recovered"), "{}", recs[0].title);
+        assert!(recs[0].description.contains("unsigned_kernel_driver_load (no error recorded)"));
+
+        let mut failing = recovered.clone();
+        failing.currently_failing_rules_total = 1;
+        failing.failing_rules = vec![
+            failing_rule("unsigned_kernel_driver_load", 0, false, None),
+            failing_rule("brute_force", 3, true, Some("[data] PostgreSQL error (SQLSTATE 22P05)")),
+        ];
+        failing.failing_rules_total = 2;
+        let recs = failing_rule_recommendations(&failing);
+        assert_eq!(recs[0].priority, "critical");
+        assert!(recs[0].title.starts_with("1 detection rule(s) are failing"), "{}", recs[0].title);
+        // Only the rule failing now is named as the critical cause.
+        assert!(recs[0].description.contains("brute_force (3 failed runs in a row"));
+        assert!(!recs[0].description.contains("unsigned_kernel_driver_load"));
+
+        // A rule failing only on a pending catch-up retry (no consecutive
+        // failures) is still named as the critical cause.
+        let mut catchup = recovered.clone();
+        catchup.currently_failing_rules_total = 1;
+        catchup.failing_rules = vec![failing_rule("slow_rule", 0, true, Some("size limit"))];
+        let recs = failing_rule_recommendations(&catchup);
+        assert_eq!(recs[0].priority, "critical");
+        assert!(recs[0].description.contains("slow_rule (size limit)"), "{}", recs[0].description);
+
+        // Warning band (50..80), not critical: the gap (-20) plus the
+        // recovered failure (-10). A rule failing now drags it further.
+        let clean = detection_with(5, 100);
+        let recovered_score = score_detection(&recovered);
+        assert!(recovered_score < score_detection(&clean));
+        assert!((50..80).contains(&recovered_score), "{recovered_score}");
+        assert!(score_detection(&failing) < recovered_score);
     }
 
     /// No alerting-mode rules AND nothing matching → mild Warning, not critical.

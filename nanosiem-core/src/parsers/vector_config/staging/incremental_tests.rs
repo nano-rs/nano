@@ -157,7 +157,8 @@ async fn promotion_leaves_unchanged_files_untouched() {
         file.set_modified(old).unwrap();
     }
 
-    // Redeploying the same set rewrites nothing but the ownership manifest.
+    // Redeploying the same set rewrites nothing (NAN-5611: not even the
+    // ownership manifest).
     deploy(&manager, &all[..2]).await;
     let rewritten: Vec<String> = snapshot(&manager)
         .keys()
@@ -169,7 +170,7 @@ async fn promotion_leaves_unchanged_files_untouched() {
         })
         .cloned()
         .collect();
-    assert_eq!(rewritten, vec![".nano-generated".to_string()]);
+    assert!(rewritten.is_empty(), "{rewritten:?}");
 
     // A changed parser rewrites its own file (and nothing it does not affect).
     let mut edited = all[..2].to_vec();

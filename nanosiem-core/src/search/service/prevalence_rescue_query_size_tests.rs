@@ -78,6 +78,7 @@ fn render_rule_shape(rescue: &PrevalenceRescue) -> Result<(String, usize, bool),
         &tr,
         3,
         rescue,
+        None,
     )
 }
 

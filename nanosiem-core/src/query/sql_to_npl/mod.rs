@@ -11,6 +11,15 @@
 //! HAVING / ORDER BY / LIMIT) and never guesses. Anything outside the subset is
 //! a structured [`Unsupported`].
 //!
+//! NAN-5630: computed columns convert too. `SELECT expr AS name … GROUP BY
+//! name` becomes `| eval name=<expr> | stats … by name` (a time bucket
+//! becomes `| bin timestamp span=…`), an aggregate over a computed value
+//! reads a hidden eval, an expression over aggregates is an eval after
+//! `stats`, and a filter on a computed value is a `| where` after the evals.
+//! Only ClickHouse functions whose nPL counterpart the proof can check are
+//! translated; the proof compares computed values structurally and calls a
+//! conversion exact only when both sides compute the same thing.
+//!
 //! Every conversion is then PROVEN: the nPL is compiled with the production
 //! generator ([`ClickHouseSqlGenerator`]) and the compiled SQL is compared
 //! with the original on a normalized signature (table, predicates,
@@ -34,6 +43,8 @@ mod corpus_tests;
 mod template_sql_fixtures;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod computed_tests;
 
 use std::sync::Arc;
 
@@ -67,6 +78,10 @@ pub enum TimeBound {
     WindowEnd,
     /// A literal instant in the SQL.
     At(DateTime<Utc>),
+    /// NAN-5630: more than one bound on the same end (the window and a
+    /// literal that narrows it): the latest of them for the lower end
+    /// (`lower`), the earliest for the upper end.
+    Tightest { lower: bool, bounds: Vec<TimeBound> },
 }
 
 /// Where in the SQL a construct sits (1-based line / column, as sqlparser
@@ -201,7 +216,15 @@ pub fn convert_sql_to_npl(sql: &str, ctx: &ConvertContext) -> SqlToNpl {
 fn searchable(c: convert::Converted) -> Result<convert::Converted, Unsupported> {
     let query = crate::query::parse_query(&c.npl)
         .map_err(|e| Unsupported::new(format!("the converted nPL does not parse: {e}")))?;
-    match crate::search::query_processing::detect_oom_risk(&query) {
+    // NAN-5635: spillable shapes (values()/list(), high-cardinality group-by,
+    // reverse) always run now; the cost-gated ones run only when the window
+    // is small enough, which this converter cannot know, so they stay out.
+    use crate::search::query_processing::oom_admission::{admission_class, AdmissionClass};
+    let gated = crate::search::query_processing::oom_risk_sites(&query)
+        .into_iter()
+        .find(|site| matches!(admission_class(site), AdmissionClass::CostGated { .. }))
+        .map(|site| site.risk);
+    match gated {
         Some(risk) => Err(Unsupported::new(format!(
             "the nPL form ({}) is refused by Search's memory guard: {}",
             c.npl,
@@ -234,10 +257,23 @@ pub fn compare_npl_with_sql(sql: &str, npl: &str, ctx: &ConvertContext) -> Resul
     let dataset = if canon::reads_signals(&original) { Dataset::Signals } else { Dataset::Logs };
     let compiled = canon::compile_npl(npl, ctx, dataset)?;
     let generated = canon::signature_of_sql(&compiled, ctx)?;
-    Ok(canon::compare(&original, &generated))
+    let mut differences = canon::compare(&original, &generated);
+    // NAN-5630: `earliest=` / `latest=` in the nPL set Search's range
+    // themselves (the compiler never sees them), so the range "Open in
+    // Search" opens is no longer the SQL's.
+    let (_, modifiers, _) = crate::query::split_time_modifiers(&crate::query::strip_comments(npl));
+    if !modifiers.is_empty() {
+        differences.push(Difference {
+            kind: DifferenceKind::Different,
+            detail: "time range: the nPL sets its own (earliest= / latest=), not the SQL's".into(),
+        });
+    }
+    Ok(differences)
 }
 
-/// Bind the window placeholders to the run's window.
+/// Bind the window placeholders to the run's window. `None` when the SQL
+/// has no bound there, or one of its bounds is a placeholder with no window
+/// to bind it to.
 pub fn resolve_bound(
     bound: Option<&TimeBound>,
     window_start: Option<DateTime<Utc>>,
@@ -247,8 +283,56 @@ pub fn resolve_bound(
         Some(TimeBound::At(at)) => Some(*at),
         Some(TimeBound::WindowStart) => window_start,
         Some(TimeBound::WindowEnd) => window_end,
+        Some(TimeBound::Tightest { lower, bounds }) => {
+            let resolved = bounds
+                .iter()
+                .map(|b| resolve_bound(Some(b), window_start, window_end))
+                .collect::<Option<Vec<_>>>()?;
+            if *lower {
+                resolved.into_iter().max()
+            } else {
+                resolved.into_iter().min()
+            }
+        }
         None => None,
     }
+}
+
+/// NAN-5608 P2-18: the time range is not an nPL term, so an exact
+/// conversion is exact only over the range "Open in Search" opens. Without
+/// a lower bound Search falls back to its own default range; without a
+/// known upper bound it runs up to now. Each is a difference.
+pub fn time_range_differences(
+    earliest: Option<&TimeBound>,
+    latest: Option<&TimeBound>,
+    window_start: Option<DateTime<Utc>>,
+    window_end: Option<DateTime<Utc>>,
+) -> Vec<Difference> {
+    let mut out = Vec::new();
+    match (earliest, resolve_bound(earliest, window_start, window_end)) {
+        (None, _) => out.push(Difference {
+            kind: DifferenceKind::Different,
+            detail: "time range: the SQL has no lower bound on `timestamp`; Search always runs over a time range, \
+                     so it opens on its default range instead"
+                .into(),
+        }),
+        (Some(_), None) => out.push(Difference {
+            kind: DifferenceKind::Different,
+            detail: "time range: the SQL's lower time bound is the run window, which was not given here, so Search \
+                     opens on its default range instead"
+                .into(),
+        }),
+        _ => {}
+    }
+    if latest.is_some() && resolve_bound(latest, window_start, window_end).is_none() {
+        out.push(Difference {
+            kind: DifferenceKind::Different,
+            detail: "time range: the SQL's upper time bound is the run window, which was not given here, so Search \
+                     runs up to now instead"
+                .into(),
+        });
+    }
+    out
 }
 
 /// Most queries one batch request converts.
@@ -312,16 +396,26 @@ pub struct SqlToNplBatchResponse {
 }
 
 impl SqlToNpl {
-    /// The wire form, with the window placeholders bound.
+    /// The wire form, with the window placeholders bound. NAN-5608 P2-18: a
+    /// conversion whose time range Search cannot open is not exact.
     pub fn into_response(self, request: &SqlToNplRequest, approximate: bool) -> SqlToNplResponse {
+        let mut differences = self.differences;
+        if self.npl.is_some() {
+            differences.extend(time_range_differences(
+                self.earliest.as_ref(),
+                self.latest.as_ref(),
+                request.window_start,
+                request.window_end,
+            ));
+        }
         SqlToNplResponse {
             earliest: resolve_bound(self.earliest.as_ref(), request.window_start, request.window_end),
             latest: resolve_bound(self.latest.as_ref(), request.window_start, request.window_end),
             npl: self.npl,
             dataset: self.dataset.selector().to_string(),
-            exact: self.exact,
+            exact: self.exact && differences.is_empty(),
             approximate,
-            differences: self.differences,
+            differences,
             unsupported_reason: self.unsupported.as_ref().map(|u| u.reason.clone()),
             no_search_dataset: self.unsupported.as_ref().is_some_and(|u| u.no_search_dataset),
             unsupported_span: self.unsupported.and_then(|u| u.span),

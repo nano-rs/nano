@@ -391,6 +391,8 @@ typeid_prefix!(hunt_lead_review, "lrev");
 typeid_prefix!(hunt_ruling, "hrul");
 // NAN-5560 hunt campaigns: one known actor and its trip conditions.
 typeid_prefix!(hunt_campaign, "hcmp");
+// NAN-5642 hunt charters: one stored version of a hunt's (or the install's) charter.
+typeid_prefix!(hunt_charter, "hchr");
 // NAN-5561 hunt evals: one blind replay, and one frozen finding in it.
 typeid_prefix!(hunt_eval, "heval");
 typeid_prefix!(hunt_eval_item, "hevi");

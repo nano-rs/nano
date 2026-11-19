@@ -231,6 +231,12 @@ impl SearchService {
                 &tr,
                 rarity_threshold,
                 &crate::search::service::prevalence_processing::PrevalenceRescue::default(),
+                // NAN-5660: render the first page of a default search, so a
+                // pushed result window shows here exactly as it runs.
+                Some(super::prevalence_scan::ResultWindow {
+                    limit: self.config.default_limit.min(self.config.max_limit),
+                    offset: 0,
+                }),
             )?;
             // The rescue runs at execute time when there's a hash/domain count
             // condition OR (residual #2) an `enrich=true | where host_count < N`
@@ -415,6 +421,55 @@ impl SearchService {
             offset,
             query_id,
             ch_settings,
+            bounded_count,
+            execution_limits,
+            preserve_columns,
+        )
+        .await
+    }
+
+    /// [`Self::execute_clickhouse_sql_with_query_id`] for the main search
+    /// path, with the caller's AST answer to "is this an aggregation?" when it
+    /// has one (NAN-5634); `None` keeps the executor's text sniffing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_clickhouse_sql_shaped(
+        &self,
+        sql: &str,
+        limit: usize,
+        offset: usize,
+        query_id: Option<&str>,
+        bounded_count: Option<BoundedCountInput<'_>>,
+        execution_limits: Option<&crate::search::SearchExecutionLimits>,
+        preserve_columns: bool,
+        aggregation: Option<bool>,
+    ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
+        let Some(aggregation) = aggregation else {
+            return self
+                .execute_clickhouse_sql_with_query_id(
+                    sql,
+                    limit,
+                    offset,
+                    query_id,
+                    None,
+                    bounded_count,
+                    execution_limits,
+                    preserve_columns,
+                )
+                .await;
+        };
+        let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
+            SearchError::DatabaseError(sqlx::Error::Configuration(
+                "ClickHouse client not configured".into(),
+            ))
+        })?;
+        let shaped = ch_executor.with_aggregation(aggregation);
+        self.dispatch_clickhouse_sql(
+            &shaped,
+            sql,
+            limit,
+            offset,
+            query_id,
+            None,
             bounded_count,
             execution_limits,
             preserve_columns,

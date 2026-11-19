@@ -1186,6 +1186,8 @@ pub struct ReloadWatch {
     marker: Option<ActivationMarker>,
     /// Re-measured at [`Self::outcome`]: the change is written AFTER `begin`.
     config_dir: std::path::PathBuf,
+    /// NAN-5611: the tree's fingerprint at `begin`, before the change.
+    tree_before: Option<String>,
 }
 
 /// The per-change marker of [`ReloadWatch`]'s correlated mode.
@@ -1193,7 +1195,13 @@ pub struct ReloadWatch {
 pub(super) struct ActivationMarker {
     pub(super) id: String,
     pub(super) path: std::path::PathBuf,
+    /// NAN-5611: [`super::tree_write::tree_fingerprint`] of the tree this
+    /// marker was written with (filled in just before it is written).
+    pub(super) tree: Option<String>,
 }
+
+/// NAN-5611: the line of the marker that records its tree's fingerprint.
+const MARKER_TREE_PREFIX: &str = "# nano-tree: ";
 
 /// File (in `sources/configs`) that holds the current activation marker. One
 /// file, rewritten per change, so markers never accumulate.
@@ -1204,11 +1212,21 @@ impl ActivationMarker {
         format!("nano_activation_{}", self.id)
     }
 
+    /// NAN-5611: line 1 is the env-escape mark (the marker holds no `$`), so
+    /// the Vector entrypoint's start-up migration never rewrites it.
     pub(super) fn toml(&self) -> String {
         let id = self.component_id();
+        let header = crate::vector_env::ENV_ESCAPED_HEADER;
+        let tree = self
+            .tree
+            .as_deref()
+            .map(|tree| format!("{MARKER_TREE_PREFIX}{tree}\n"))
+            .unwrap_or_default();
         format!(
-            "# NAN-4936 activation marker: proves which change Vector has loaded.\n\
+            "{header}\n\
+             # NAN-4936 activation marker: proves which change Vector has loaded.\n\
              # Rewritten by nano-api on every source deploy; DO NOT EDIT.\n\
+             {tree}\
              [sources.{id}]\n\
              type = \"demo_logs\"\n\
              format = \"shuffle\"\n\
@@ -1219,6 +1237,91 @@ impl ActivationMarker {
              inputs = [\"{id}\"]\n\
              print_interval_secs = 0\n"
         )
+    }
+}
+
+/// NAN-5611: the component id and recorded tree fingerprint of a marker file.
+pub(super) fn parse_marker(text: &str) -> Option<(String, Option<String>)> {
+    let component = text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("[sources.")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .filter(|id| id.starts_with("nano_activation_"))
+            .map(str::to_string)
+    })?;
+    let tree = text
+        .lines()
+        .find_map(|line| line.strip_prefix(MARKER_TREE_PREFIX))
+        .map(|tree| tree.trim().to_string())
+        .filter(|tree| !tree.is_empty());
+    Some((component, tree))
+}
+
+/// NAN-5611: may a render skip the reload? Only on evidence that Vector
+/// already runs exactly this tree and the render changed nothing:
+/// * the tree's fingerprint now equals `before` (taken before the render
+///   wrote anything): no file was written or removed, so `--watch-config`
+///   saw nothing either;
+/// * the marker on disk recorded that same fingerprint when it was written
+///   (after its tree); and
+/// * that marker's component is running in Vector (its own metrics).
+///
+/// Anything else (no baseline, no marker mode, a marker from before
+/// NAN-5611, a changed tree, metrics unreadable) is `false`, and the caller
+/// reloads as before.
+pub(super) async fn vector_runs_unchanged_tree(config_dir: &std::path::Path, before: Option<&str>) -> bool {
+    if before.is_none() || !activation_marker_enabled() {
+        return false;
+    }
+    let Some(probe) = ReloadAckProbe::from_env_for(config_dir) else {
+        return false;
+    };
+    vector_runs_unchanged_tree_with(config_dir, before, &probe).await
+}
+
+pub(super) async fn vector_runs_unchanged_tree_with(
+    config_dir: &std::path::Path,
+    before: Option<&str>,
+    probe: &ReloadAckProbe,
+) -> bool {
+    let Some(before) = before else {
+        return false;
+    };
+    let path = config_dir.join("sources").join("configs").join(ACTIVATION_MARKER_FILE);
+    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+        return false;
+    };
+    let Some((component, Some(recorded))) = parse_marker(&text) else {
+        return false;
+    };
+    if recorded != before {
+        return false;
+    }
+    if super::tree_write::tree_fingerprint(config_dir).await.as_deref() != Some(before) {
+        return false;
+    }
+    probe.read_body().await.is_some_and(|body| marker_is_live(&body, &component))
+}
+
+/// NAN-5611 review: a write to the tree that sends no reload with a new
+/// marker (a restore after a failed deploy) can leave Vector on a tree the
+/// marker never recorded (a watching Vector loaded the partial write and
+/// missed the restore). Drop the marker's fingerprint, so the next render
+/// reloads instead of trusting it. Best effort.
+pub(super) async fn forget_marker_tree(config_dir: &std::path::Path) {
+    let path = config_dir.join("sources").join("configs").join(ACTIVATION_MARKER_FILE);
+    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+        return;
+    };
+    if !text.lines().any(|line| line.starts_with(MARKER_TREE_PREFIX)) {
+        return;
+    }
+    let kept: String = text
+        .split_inclusive('\n')
+        .filter(|line| !line.starts_with(MARKER_TREE_PREFIX))
+        .collect();
+    if let Err(error) = super::tree_write::replace_atomically(&path, kept.as_bytes()).await {
+        tracing::warn!(%error, path = %path.display(), "could not invalidate the activation marker's tree record; the next unchanged render may skip its reload");
     }
 }
 
@@ -1260,18 +1363,21 @@ impl ReloadWatch {
             Some(probe) => probe.read().await,
             None => None,
         };
+        let tree_before = super::tree_write::tree_fingerprint(config_dir).await;
         let marker = activation_marker_enabled().then(|| ActivationMarker {
             id: uuid::Uuid::new_v4().simple().to_string(),
             path: config_dir
                 .join("sources")
                 .join("configs")
                 .join(ACTIVATION_MARKER_FILE),
+            tree: None,
         });
         Self {
             probe,
             before,
             marker,
             config_dir: config_dir.to_path_buf(),
+            tree_before,
         }
     }
 
@@ -1293,7 +1399,15 @@ impl ReloadWatch {
         if local_reload_disabled() {
             return ActivationOutcome::Published(format!("verification disabled: {PULL_DELIVERY_NOTE}"));
         }
-        if let Some(marker) = self.marker.as_ref() {
+        // NAN-5611: nothing changed since the tree Vector is running (a
+        // redeploy of the same config): no marker rewrite, no reload signal.
+        if vector_runs_unchanged_tree(&self.config_dir, self.tree_before.as_deref()).await {
+            tracing::info!("Vector already runs this config (unchanged); no reload signal");
+            return ActivationOutcome::Accepted;
+        }
+        let mut marker = self.marker;
+        if let Some(marker) = marker.as_mut() {
+            marker.tree = super::tree_write::tree_fingerprint(&self.config_dir).await;
             if let Err(error) = write_marker(marker).await {
                 return ActivationOutcome::Unconfirmed(format!(
                     "could not write the activation marker: {error}"
@@ -1310,7 +1424,7 @@ impl ReloadWatch {
             probe.resize_for(&self.config_dir);
             probe.arm_for_delivery(delivery.is_ok(), ReloadMode::Forward);
         }
-        let ack = match (probe.as_ref(), self.before, self.marker.as_ref()) {
+        let ack = match (probe.as_ref(), self.before, marker.as_ref()) {
             (Some(probe), Some(before), Some(marker)) => {
                 probe.await_marker(before, &marker.component_id()).await
             }
@@ -2016,13 +2130,16 @@ impl VectorConfigManager {
 
                 // Write config for enabled parser
                 let config = self.guarded_parser_config(parser)?;
-                fs::write(&filepath, &config).await?;
+                // NAN-5611: unchanged files are not rewritten (no reload).
+                let written = super::tree_write::write_if_changed(&filepath, &config).await?;
                 expected_files.insert(filename);
-                tracing::info!(
-                    "Deployed parser '{}' to {}",
-                    parser.name,
-                    filepath.display()
-                );
+                if written {
+                    tracing::info!(
+                        "Deployed parser '{}' to {}",
+                        parser.name,
+                        filepath.display()
+                    );
+                }
             } else {
                 // Remove config for disabled parser if it exists
                 if filepath.exists() {
@@ -2124,12 +2241,13 @@ impl VectorConfigManager {
             Self::ocsf_sink_content(&inputs),
             &Self::clickhouse_shard_endpoints(),
         );
-        fs::write(&sink_path, content).await?;
-        tracing::info!(
-            "Wrote OCSF ingestion sink ({} parser fork(s)) to {}",
-            inputs.len(),
-            sink_path.display()
-        );
+        if super::tree_write::write_if_changed(&sink_path, content).await? {
+            tracing::info!(
+                "Wrote OCSF ingestion sink ({} parser fork(s)) to {}",
+                inputs.len(),
+                sink_path.display()
+            );
+        }
         Ok(())
     }
 
@@ -2245,7 +2363,7 @@ impl VectorConfigManager {
     ) -> Result<(), VectorConfigError> {
         let combiner_path = self.parsers_dir.join("_combiner.toml");
         let config = Self::combiner_config_content_for(parsers, Self::ocsf_mode());
-        fs::write(&combiner_path, &config).await?;
+        super::tree_write::write_if_changed(&combiner_path, &config).await?;
         Ok(())
     }
 
@@ -3225,11 +3343,12 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// so it arrives on Vector pods alongside the dynamic router and parser configs.
     pub(super) async fn write_pipeline_config(&self) -> Result<(), VectorConfigError> {
         let pipeline_path = self.parsers_dir.join("_pipeline.toml");
-        fs::write(&pipeline_path, Self::full_pipeline_config_content()).await?;
-        tracing::info!(
-            "Generated static pipeline config at {}",
-            pipeline_path.display()
-        );
+        if super::tree_write::write_if_changed(&pipeline_path, Self::full_pipeline_config_content()).await? {
+            tracing::info!(
+                "Generated static pipeline config at {}",
+                pipeline_path.display()
+            );
+        }
         Ok(())
     }
 
@@ -3269,12 +3388,13 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             content,
             &Self::clickhouse_shard_endpoints(),
         );
-        fs::write(&enrichment_path, &content).await?;
-        tracing::info!(
-            "Generated push enrichment lane config at {} ({} enrichment parser(s))",
-            enrichment_path.display(),
-            enrichment_parsers.iter().filter(|p| p.enabled).count()
-        );
+        if super::tree_write::write_if_changed(&enrichment_path, &content).await? {
+            tracing::info!(
+                "Generated push enrichment lane config at {} ({} enrichment parser(s))",
+                enrichment_path.display(),
+                enrichment_parsers.iter().filter(|p| p.enabled).count()
+            );
+        }
         Ok(())
     }
 
@@ -3726,7 +3846,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// never for a delivered reload's outcome, so a wedged Vector cannot hold
     /// the deploy lock for a second ceiling on top of the forward wait.
     pub async fn reload_vector_after_rollback(&self) -> Result<(), VectorConfigError> {
-        self.reload_vector_graded_as(ReloadMode::Rollback).await.1
+        self.reload_vector_graded_as(ReloadMode::Rollback, None).await.1
     }
 
     /// [`Self::reload_vector`] plus the raw acknowledgement, so a caller can
@@ -3743,10 +3863,17 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// the baseline is taken, so a reload the watcher already attempted on the
     /// promoted files does not count either way: only the marker's reload does.
     async fn reload_vector_graded(&self) -> (ReloadAck, Result<(), VectorConfigError>) {
-        self.reload_vector_graded_as(ReloadMode::Forward).await
+        self.reload_vector_graded_as(ReloadMode::Forward, None).await
     }
 
-    async fn reload_vector_graded_as(&self, mode: ReloadMode) -> (ReloadAck, Result<(), VectorConfigError>) {
+    /// `tree_before`: NAN-5611, the tree's fingerprint before the caller's
+    /// writes; with it, a render that changed nothing Vector already runs
+    /// sends no reload ([`vector_runs_unchanged_tree`]).
+    async fn reload_vector_graded_as(
+        &self,
+        mode: ReloadMode,
+        tree_before: Option<&str>,
+    ) -> (ReloadAck, Result<(), VectorConfigError>) {
         // NAN-5133: role split grades by the ingest hosts, never by a local
         // signal (there is no local Vector to signal or scrape).
         if let Some(publisher) = super::remote_delivery::active_publisher() {
@@ -3774,6 +3901,13 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             ReloadMode::Forward => ReloadAckProbe::from_env_for(&self.config_dir),
             ReloadMode::Rollback => ReloadAckProbe::for_rollback(),
         };
+        // NAN-5611: a render that left the tree as Vector runs it (every api
+        // restart without a config change) sends no reload. Forward only: a
+        // rollback always reloads.
+        if mode == ReloadMode::Forward && vector_runs_unchanged_tree(&self.config_dir, tree_before).await {
+            tracing::info!("Vector already runs this config (unchanged); no reload signal");
+            return (ReloadAck::Accepted, Ok(()));
+        }
         let marker = activation_marker_enabled().then(|| ActivationMarker {
             id: uuid::Uuid::new_v4().simple().to_string(),
             path: self
@@ -3781,6 +3915,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                 .join("sources")
                 .join("configs")
                 .join(ACTIVATION_MARKER_FILE),
+            tree: None,
         });
 
         // Snapshot BEFORE anything else, including the filesystem-sync sleep.
@@ -3801,13 +3936,16 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         // no counter baseline (a transient scrape failure), the marker going
         // live is proof of acceptance (NAN-5298 review).
         let marker = match (marker, probe.as_ref()) {
-            (Some(marker), Some(_)) => match write_marker(&marker).await {
-                Ok(()) => Some(marker),
-                Err(error) => {
-                    tracing::warn!(%error, "could not write the activation marker; grading this reload by the global counters");
-                    None
+            (Some(mut marker), Some(_)) => {
+                marker.tree = super::tree_write::tree_fingerprint(&self.config_dir).await;
+                match write_marker(&marker).await {
+                    Ok(()) => Some(marker),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not write the activation marker; grading this reload by the global counters");
+                        None
+                    }
                 }
-            },
+            }
             _ => None,
         };
 
@@ -3876,6 +4014,9 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         &self,
         parsers: &[Parser],
     ) -> Result<(), VectorConfigError> {
+        // NAN-5611: the tree as it was before this render (backups and
+        // staging are outside it).
+        let tree_before = super::tree_write::tree_fingerprint(&self.config_dir).await;
         let backup = match self.backup_current().await {
             Ok(generation) => Some(generation),
             Err(error) => {
@@ -3901,9 +4042,12 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         // takes before it starts Vector, delaying the reopen by the whole wait.
         if (identity_recorded || restarting) && !local_vector_running().await {
             tracing::info!("Vector is not running (gated or restarting); it starts on the config just written");
+            self.refresh_backup_after_change(tree_before.as_deref()).await;
             return Ok(());
         }
-        let (ack, result) = self.reload_vector_graded().await;
+        let (ack, result) = self
+            .reload_vector_graded_as(ReloadMode::Forward, tree_before.as_deref())
+            .await;
         if result.is_err() && ack == ReloadAck::Rejected {
             if identity_recorded {
                 // The restored tree is another identity's: gate it again.
@@ -3911,7 +4055,28 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             }
             self.restore_after_failed_deploy(backup.as_ref(), true).await;
         }
+        if result.is_ok() {
+            self.refresh_backup_after_change(tree_before.as_deref()).await;
+        }
         result
+    }
+
+    /// NAN-5611: after a deploy that CHANGED the tree went live, snapshot the
+    /// new tree now, while Vector is taking the change anyway. Vector watches
+    /// the whole dynamic volume (backups included), so leaving the snapshot one
+    /// deploy behind made the next unchanged render (the next api restart)
+    /// rewrite it and Vector reload for nothing. Only after the change is live:
+    /// until then the snapshot must stay the pre-deploy tree (the rollback
+    /// target). Best effort; the next deploy snapshots again as before.
+    async fn refresh_backup_after_change(&self, tree_before: Option<&str>) {
+        if tree_before.is_some()
+            && super::tree_write::tree_fingerprint(&self.config_dir).await.as_deref() == tree_before
+        {
+            return;
+        }
+        if let Err(error) = self.backup_current().await {
+            tracing::warn!(%error, "could not refresh the Vector config snapshot after the deploy; the next deploy takes it");
+        }
     }
 
     /// NAN-5564: the order a gated or held Vector depends on: write the tree
@@ -3967,13 +4132,33 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     }
 
     /// NAN-5564 release review: after the api's boot render wrote the tree,
-    /// rewrite the identity marker unconditionally (never before the tree).
-    pub async fn rewrite_pipeline_identity(&self) {
+    /// make the identity marker name this api's identity (never before the
+    /// tree). NAN-5611: written only when it does not already say exactly
+    /// that; a failure is returned so the boot retry can report it.
+    pub async fn rewrite_pipeline_identity(&self) -> std::io::Result<()> {
         if let Some(identity) = super::pipeline_gate::pipeline_identity() {
             if let Err(error) = super::pipeline_gate::rewrite_identity(&self.config_dir, &identity).await {
-                tracing::error!(%error, %identity, "could not rewrite the pipeline identity after the boot render");
+                tracing::error!(
+                    %error,
+                    errno = error.raw_os_error(),
+                    path = %self.pipeline_identity_path().display(),
+                    %identity,
+                    "could not rewrite the pipeline identity after the boot render"
+                );
+                return Err(error);
             }
         }
+        Ok(())
+    }
+
+    /// NAN-5611: the identity this api renders for (`NANO_PIPELINE_IDENTITY`).
+    pub fn pipeline_identity(&self) -> Option<String> {
+        super::pipeline_gate::pipeline_identity()
+    }
+
+    /// NAN-5611: the file the Vector entrypoint's pipeline gate reads.
+    pub fn pipeline_identity_path(&self) -> std::path::PathBuf {
+        super::pipeline_gate::identity_path(&self.config_dir)
     }
 
     /// NAN-5564 review: is a gated Vector still waiting for this api to render

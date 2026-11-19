@@ -26,11 +26,13 @@
 //!   match the per-rule contribution breakdown (NAN-1658 / R3).
 //! - Cleared-entity boundary via `arrayElement(?, indexOf(?, entity))`
 //!   parallel arrays with a trailing `''`/0 sentinel (R4).
-//! - Entity type inferred from the VALUE (ip/email/hostname/user) at read
-//!   time — the write-side field-name inference disagrees by design (design
-//!   doc §3) — EXCEPT `cloud_account`: since NAN-1806 the finding row carries
-//!   the write-side stamp (`risk_entity_type`) and the read side honors it for
-//!   that one type, which value inference can never produce.
+//! - Entity type: [`ENTITY_TYPE_SQL`] (NAN-5615). An `@` value is `email`;
+//!   otherwise the write-side stamp (`risk_entity_type`, NAN-1806) when it is
+//!   one of `ip` / `hostname` / `user` / `hash` / `cloud_account`; otherwise
+//!   the value inference (ip/hostname/user). That is a per-FINDING type;
+//!   the entity grain groups on the VALUE alone and resolves one type per
+//!   value with [`ENTITY_TYPE_RESOLVE_SQL`] (NAN-5659), so two rules that
+//!   stamp one value differently never split its score.
 //! - OCSF profile reads the nano risk fields from the stored `unmapped`
 //!   spill; UDM reads the real columns (NAN-1254 / NAN-1443).
 //!
@@ -44,9 +46,10 @@ use chrono::{DateTime, Duration, Utc};
 use super::types::{RiskDecayConfig, RiskTimeWindow};
 use super::score_weights::EntityScoreWeights;
 
-/// The one entity type the read-side VALUE inference can never produce
-/// (account ids are opaque strings), so it is honored from the write-side
-/// stamp instead (NAN-1806 / NAN-1798 P4). See [`ENTITY_SELECT_COLS`].
+/// An entity type the read-side VALUE inference can never produce (account
+/// ids are opaque strings); it comes from the write-side stamp (NAN-1806 /
+/// NAN-1798 P4), like every stamped type since NAN-5615. See
+/// [`ENTITY_TYPE_SQL`].
 pub const CLOUD_ACCOUNT_ENTITY_TYPE: &str = "cloud_account";
 
 // ---------------------------------------------------------------------------
@@ -91,26 +94,82 @@ const DATASET_EXTRA_SELECT_COLS: &str = r#"                    __RULE_ID__ as ru
                     __MITRE_TACTICS__ as tactics,
 "#;
 
+/// How a risk finding's entity is TYPED (NAN-5615), shared by every reader
+/// (the entity-grain score queries here and the enterprise entity
+/// suggestions): the write-side stamp (`risk_entity_type`, NAN-1806) wins
+/// whenever the finding carries one. The finding logger stamps it from the
+/// rule's `risk_entity_field` (`FindingLogger::infer_entity_type`:
+/// `device.hostname` is `hostname`, an endpoint `ip` field `ip`, a user field
+/// `user`, a hash field `hash`, cloud account ids `cloud_account`), the only
+/// place the KIND of entity is known: the value alone cannot tell a dotless
+/// hostname (`host-a-17`) from a user name, so the read-side value inference
+/// used to type every such host `user`.
+///
+/// In order:
+/// 1. a value with `@` is `email`, whatever the stamp (the logger types an
+///    email by its field, `user` for `actor.user.email_addr`, and by value
+///    tests the dot before the `@`; one email must stay one entity);
+/// 2. an allow-listed stamp (`ip`, `hostname`, `user`, `hash`,
+///    `cloud_account`) as written. `domain` is NOT honored (NAN-3226
+///    read-time contract: nothing written at detection time may pin a name
+///    to the domain type, so internal names are never read as external
+///    domains), nor is anything else;
+/// 3. the value inference, for unstamped rows (pre-NAN-1806) and the rest.
+///
+/// This types ONE finding. The entity grain never groups on it: see
+/// [`ENTITY_TYPE_RESOLVE_SQL`].
+///
+/// Still a template: `__RISK_ENTITY_TYPE__` / `__RISK_ENTITY__` are
+/// substituted by [`RiskFindingsSource::substitute`].
+pub const ENTITY_TYPE_SQL: &str = r#"multiIf(position(__RISK_ENTITY__, '@') > 0, 'email', __RISK_ENTITY_TYPE__ IN ('ip', 'hostname', 'user', 'hash', 'cloud_account'), __RISK_ENTITY_TYPE__, match(__RISK_ENTITY__, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip', position(__RISK_ENTITY__, '.') > 0, 'hostname', 'user')"#;
+
+/// The entity-type precedence (NAN-5659), most specific first: when the
+/// findings for one entity VALUE carry different types (rule A on
+/// `device.hostname` stamps `hostname`, rule B on a field with no recognised
+/// token falls back to the logger's value inference and stamps `user`), the
+/// entity takes the first type in this list that any of its findings has.
+/// `user` is last because it is the inference fallback for any dotless value,
+/// so it never outranks a real stamp (the trade-off: a genuine `user` stamp
+/// also loses to a `hostname` stamp on the same value, e.g. `admin` seen both
+/// as an account and as a host types `hostname`); `email` is first because
+/// [`ENTITY_TYPE_SQL`] derives it from the value itself. Every type
+/// [`ENTITY_TYPE_SQL`] can emit is listed.
+pub const ENTITY_TYPE_PRECEDENCE: [&str; 6] =
+    ["email", "cloud_account", "hash", "ip", "hostname", "user"];
+
+/// The aggregate that resolves ONE type per entity value (NAN-5659) from the
+/// per-finding `row_entity_type` ([`ENTITY_TYPE_SQL`]) by
+/// [`ENTITY_TYPE_PRECEDENCE`]. Every entity-grain reader groups on the value
+/// alone (`GROUP BY entity`). (Pre-NAN-5615 readers grouped on
+/// `(value, type)`, but the type was a function of the value, so in practice
+/// one row per value, except `cloud_account`.) So:
+///
+/// - one value is one entity with one combined score, whatever mix of types
+///   the rules stamped (never split across `(value, type)` keys, each half
+///   possibly under the notable threshold);
+/// - the type is deterministic: it depends only on WHICH types occur among
+///   the in-window findings, not on how often or in what order (it changes
+///   only when the last finding carrying a higher-ranked type ages out of the
+///   7d window or is cleared);
+/// - the entity set and scores are those of the pre-NAN-5615 value-typed
+///   readers (an upgrade re-labels a dotless host `user` → `hostname`; it
+///   does not re-key, reset or split anything; the notable dedup and cooldown
+///   key on the value, never the type). The one difference: an account id
+///   only some rules stamped `cloud_account`, which those readers split
+///   themselves, now merges into one entity.
+pub const ENTITY_TYPE_RESOLVE_SQL: &str = "argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type))";
+
 /// `signal_scores` SELECT columns for the entity-grain score queries.
 ///
-/// Entity type: the write-side stamp (`risk_entity_type`, NAN-1806) is honored
-/// FIRST but only for `cloud_account` — the one type the value inference can
-/// never produce (account ids are opaque digit strings that read back as
-/// 'user'), which made the cloud-overview `entity_type = 'cloud_account'`
-/// fan-out structurally empty. Every other type keeps the v1 value inference
-/// so scores/groupings are unchanged (design §3: read inference is not swapped
-/// mid-migration; findings without the stamp — pre-NAN-1806 rows — fall
-/// through to the value branches).
+/// `row_entity_type` is the PER-FINDING type ([`ENTITY_TYPE_SQL`]); the
+/// aggregated CTEs resolve the entity's one type from it with
+/// [`ENTITY_TYPE_RESOLVE_SQL`]. (Named apart from the output `entity_type` so
+/// the aggregate alias never shadows the source column.)
 const ENTITY_SELECT_COLS: &str = r#"                    __RISK_ENTITY__ as entity,
-                    -- Infer entity type from the value; honor the write-side
-                    -- stamp for cloud_account only (NAN-1806)
-                    multiIf(
-                        __RISK_ENTITY_TYPE__ = 'cloud_account', 'cloud_account',
-                        match(__RISK_ENTITY__, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip',
-                        position(__RISK_ENTITY__, '@') > 0, 'email',
-                        position(__RISK_ENTITY__, '.') > 0, 'hostname',
-                        'user'
-                    ) as entity_type,
+                    -- Per-finding type: the write-side stamp when the finding
+                    -- has one, else inferred from the value (NAN-1806,
+                    -- NAN-5615); resolved to one type per entity below (NAN-5659)
+                    multiIf(position(__RISK_ENTITY__, '@') > 0, 'email', __RISK_ENTITY_TYPE__ IN ('ip', 'hostname', 'user', 'hash', 'cloud_account'), __RISK_ENTITY_TYPE__, match(__RISK_ENTITY__, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip', position(__RISK_ENTITY__, '.') > 0, 'hostname', 'user') as row_entity_type,
                     toInt32(__RISK_SCORE__) as risk_score,
                     toUnixTimestamp64Micro(timestamp) as ts_micros,
                     __RULE_NAME__ as rule_name,
@@ -167,7 +226,8 @@ const CONTRIB_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
 const ENTITY_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 SELECT
                     entity,
-                    entity_type,
+                    -- One type per entity value, by precedence (NAN-5659)
+                    argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type)) as entity_type,
                     -- Raw scores (no decay, for backwards compatibility)
                     sumIf(risk_score, ts_micros >= ?) as risk_score_24h,
                     sum(risk_score) as risk_score_7d,
@@ -188,7 +248,7 @@ const ENTITY_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                     argMax(rule_name, ts_micros) as last_rule_name,
                     argMax(severity, ts_micros) as last_severity
                 FROM signal_scores
-                GROUP BY entity, entity_type
+                GROUP BY entity
             )
             SELECT
                 entity,
@@ -222,7 +282,8 @@ const ENTITY_AGGREGATED_SELECT: &str = r#"            aggregated AS (
 const DATASET_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 SELECT
                     entity,
-                    entity_type,
+                    -- One type per entity value, by precedence (NAN-5659)
+                    argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type)) as entity_type,
                     -- Decayed scores (primary metric) — the same expressions as
                     -- decayed_score_24h/7d in ENTITY_AGGREGATED_SELECT (NAN-1658 / R3),
                     -- weighted by the entity's read-time score weight so a
@@ -245,7 +306,7 @@ const DATASET_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                     argMax(rule_name, ts_micros) as last_rule_name,
                     argMax(severity, ts_micros) as last_severity
                 FROM signal_scores
-                GROUP BY entity, entity_type
+                GROUP BY entity
             )
             SELECT
                 entity,
@@ -372,13 +433,14 @@ const LATERAL_AGGREGATED_SELECT: &str = r#"            aggregated AS (
 /// Entity-type facet `aggregated` CTE + projection (`get_entity_types`,
 /// NAN-1798 P4): distinct entities per inferred type over the 7d findings
 /// window — the recompute-on-read equivalent of the old PG
-/// `COUNT(*) GROUP BY entity_type` over the rollup rows (one row per
-/// entity+type pair there ≙ one grouped entity here). Deterministic
+/// `COUNT(*) GROUP BY entity_type` over the rollup rows. Each entity value
+/// counts once, under its resolved type ([`ENTITY_TYPE_RESOLVE_SQL`],
+/// NAN-5659). Deterministic
 /// tie-break on the type name. No binds.
 const FACET_AGGREGATED_SELECT: &str = r#"            aggregated AS (
-                SELECT entity, entity_type
+                SELECT entity, argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type)) as entity_type
                 FROM signal_scores
-                GROUP BY entity, entity_type
+                GROUP BY entity
             )
             SELECT entity_type, count() as entity_count
             FROM aggregated

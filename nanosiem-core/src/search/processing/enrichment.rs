@@ -364,6 +364,11 @@ pub async fn apply_inputlookup_enrichment(
                 warnings.extend(outcome.warnings);
                 current_results = outcome.results;
             }
+            // NAN-5634: the missing-table message already names the table and
+            // what to do; "Verify the URL is reachable" does not apply to it.
+            Err(crate::inputlookup::InputLookupError::LookupTableNotFound(message)) => {
+                return Err(SearchError::SqlValidationError(message));
+            }
             Err(e) => {
                 tracing::error!("InputLookup failed for url='{}': {}", cmd.url.template, e);
                 return Err(SearchError::SqlValidationError(format!(

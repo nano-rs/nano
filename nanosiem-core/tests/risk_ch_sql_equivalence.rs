@@ -6,10 +6,11 @@
 //! statements against a real ClickHouse, over the same findings data and the
 //! same `now`, and asserts identical results.
 //!
-//! Lockstep evolution (NAN-1806 / P4): the entity-type inference gained a
-//! stamped `risk_entity_type = 'cloud_account'` first branch, so the entity
-//! golden carries the same branch — behavior for unstamped rows is unchanged
-//! (`''` never equals `'cloud_account'`), and the stamp behavior itself is
+//! Lockstep evolution (NAN-1806 / P4, NAN-5615, NAN-5659): the entity-type expression
+//! honors the write-side stamp (every type but `domain`) and the entity grain
+//! groups on the value with one type per value, so the entity golden carries
+//! the same SQL; behavior for unstamped rows is
+//! unchanged (`''` falls back to the value inference), and the stamp behavior itself is
 //! pinned by `risk_p4_readers_live.rs`. The threshold-view golden was removed
 //! with `EntityScoreSelection::ExceedsThresholds` (risk alerting is a
 //! `dataset=risk` rule since NAN-1805).
@@ -66,15 +67,10 @@ const OLD_TIME_WINDOWED: &str = r#"
             WITH signal_scores AS (
                 SELECT
                     risk_entity as entity,
-                    -- Infer entity type from the value; honor the write-side
-                    -- stamp for cloud_account only (NAN-1806)
-                    multiIf(
-                        JSONExtractString(metadata, 'risk_entity_type') = 'cloud_account', 'cloud_account',
-                        match(risk_entity, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip',
-                        position(risk_entity, '@') > 0, 'email',
-                        position(risk_entity, '.') > 0, 'hostname',
-                        'user'
-                    ) as entity_type,
+                    -- Per-finding type: the write-side stamp when the finding
+                    -- has one, else inferred from the value (NAN-1806,
+                    -- NAN-5615); resolved to one type per entity below (NAN-5659)
+                    multiIf(position(risk_entity, '@') > 0, 'email', JSONExtractString(metadata, 'risk_entity_type') IN ('ip', 'hostname', 'user', 'hash', 'cloud_account'), JSONExtractString(metadata, 'risk_entity_type'), match(risk_entity, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip', position(risk_entity, '.') > 0, 'hostname', 'user') as row_entity_type,
                     toInt32(risk_score) as risk_score,
                     toUnixTimestamp64Micro(timestamp) as ts_micros,
                     rule_name as rule_name,
@@ -100,7 +96,8 @@ const OLD_TIME_WINDOWED: &str = r#"
             aggregated AS (
                 SELECT
                     entity,
-                    entity_type,
+                    -- One type per entity value, by precedence (NAN-5659)
+                    argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type)) as entity_type,
                     -- Raw scores (no decay, for backwards compatibility)
                     sumIf(risk_score, ts_micros >= ?) as risk_score_24h,
                     sum(risk_score) as risk_score_7d,
@@ -115,7 +112,7 @@ const OLD_TIME_WINDOWED: &str = r#"
                     argMax(rule_name, ts_micros) as last_rule_name,
                     argMax(severity, ts_micros) as last_severity
                 FROM signal_scores
-                GROUP BY entity, entity_type
+                GROUP BY entity
             )
             SELECT
                 entity,

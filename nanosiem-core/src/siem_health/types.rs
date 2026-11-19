@@ -672,6 +672,10 @@ pub struct DetectionMetrics {
     /// NAN-5424: total failing rules (uncapped).
     #[serde(default)]
     pub failing_rules_total: i64,
+    /// NAN-5629: of `failing_rules_total`, the rules whose executions are
+    /// failing right now (the rest recovered and are a recent-failure warning).
+    #[serde(default)]
+    pub currently_failing_rules_total: i64,
 }
 
 /// A detection window recorded as not evaluated (NAN-4910).

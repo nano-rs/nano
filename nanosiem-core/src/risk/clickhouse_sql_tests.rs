@@ -6,12 +6,14 @@
 //! statements the enterprise `RiskRepository` inlined before it existed. The
 //! `ORIG_*` constants below are the pre-refactor templates copied VERBATIM
 //! from `enterprise/src/risk/repository.rs` (as of origin/main at
-//! extraction time), with ONE deliberate lockstep evolution: NAN-1806 (P4)
-//! added the stamped `risk_entity_type = 'cloud_account'` first branch to the
-//! entity-type inference (write-side stamp honored for the one type value
-//! inference can never produce), so the goldens carry the same branch — every
+//! extraction time), with ONE deliberate lockstep evolution of the
+//! entity-type expression: NAN-1806 (P4) honored the write-side stamp for
+//! `cloud_account`, and NAN-5615 honors it for every type
+//! ([`super::ENTITY_TYPE_SQL`]), so the goldens carry that expression, and
+//! NAN-5659 groups the entity grain on the value alone with one type per
+//! value ([`super::ENTITY_TYPE_RESOLVE_SQL`]); every
 //! other token remains the pre-refactor statement, and rows without the stamp
-//! are bit-identical in behavior (`''` never equals `'cloud_account'`).
+//! (`''`) keep the value inference.
 //!
 //! - entity list (`get_time_windowed_risk_scores_clickhouse`) and per-rule
 //!   contributions (`get_rule_contributions_for_entities`) must be
@@ -55,15 +57,10 @@ const ORIG_TIME_WINDOWED: &str = r#"
             WITH signal_scores AS (
                 SELECT
                     __RISK_ENTITY__ as entity,
-                    -- Infer entity type from the value; honor the write-side
-                    -- stamp for cloud_account only (NAN-1806)
-                    multiIf(
-                        __RISK_ENTITY_TYPE__ = 'cloud_account', 'cloud_account',
-                        match(__RISK_ENTITY__, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip',
-                        position(__RISK_ENTITY__, '@') > 0, 'email',
-                        position(__RISK_ENTITY__, '.') > 0, 'hostname',
-                        'user'
-                    ) as entity_type,
+                    -- Per-finding type: the write-side stamp when the finding
+                    -- has one, else inferred from the value (NAN-1806,
+                    -- NAN-5615); resolved to one type per entity below (NAN-5659)
+                    multiIf(position(__RISK_ENTITY__, '@') > 0, 'email', __RISK_ENTITY_TYPE__ IN ('ip', 'hostname', 'user', 'hash', 'cloud_account'), __RISK_ENTITY_TYPE__, match(__RISK_ENTITY__, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip', position(__RISK_ENTITY__, '.') > 0, 'hostname', 'user') as row_entity_type,
                     toInt32(__RISK_SCORE__) as risk_score,
                     toUnixTimestamp64Micro(timestamp) as ts_micros,
                     __RULE_NAME__ as rule_name,
@@ -89,7 +86,8 @@ const ORIG_TIME_WINDOWED: &str = r#"
             aggregated AS (
                 SELECT
                     entity,
-                    entity_type,
+                    -- One type per entity value, by precedence (NAN-5659)
+                    argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type)) as entity_type,
                     -- Raw scores (no decay, for backwards compatibility)
                     sumIf(risk_score, ts_micros >= ?) as risk_score_24h,
                     sum(risk_score) as risk_score_7d,
@@ -110,7 +108,7 @@ const ORIG_TIME_WINDOWED: &str = r#"
                     argMax(rule_name, ts_micros) as last_rule_name,
                     argMax(severity, ts_micros) as last_severity
                 FROM signal_scores
-                GROUP BY entity, entity_type
+                GROUP BY entity
             )
             SELECT
                 entity,
@@ -811,8 +809,11 @@ fn leaderboard_entity_type_filter_binds_after_floor() {
     assert_placeholder_bind_parity(&q);
 }
 
+/// NAN-5615: the write-side stamp wins for EVERY type when present (a
+/// `device.hostname` rule's dotless hosts are `hostname`, not `user`); an
+/// unstamped finding falls back to the value inference.
 #[test]
-fn entity_type_inference_honors_cloud_account_stamp_only() {
+fn entity_type_honors_the_stamp_then_infers_from_the_value() {
     let (cleared, _) = one_cleared_entity();
     for (ocsf, stamped_col) in [
         (false, "JSONExtractString(metadata, 'risk_entity_type')"),
@@ -833,11 +834,15 @@ fn entity_type_inference_honors_cloud_account_stamp_only() {
                 limit: 1,
             },
         );
-        let stamped_branch = format!("{stamped_col} = 'cloud_account', 'cloud_account',");
-        assert!(q.sql.contains(&stamped_branch), "{}", q.sql);
-        // Exactly one stamped-type comparison — the other types stay value-inferred.
-        assert_eq!(q.sql.matches("risk_entity_type").count(), 1, "{}", q.sql);
+        // `@` first, then the allow-listed stamp, then the value.
+        let stamped = format!("{stamped_col} IN ('ip', 'hostname', 'user', 'hash', 'cloud_account'), {stamped_col},");
+        assert!(q.sql.contains(&stamped), "{}", q.sql);
+        assert!(q.sql.contains("'@') > 0, 'email', "), "{}", q.sql);
+        assert!(!q.sql.contains("= 'cloud_account', 'cloud_account'"), "{}", q.sql);
+        assert!(!q.sql.contains("'domain'"), "a domain stamp is never honored: {}", q.sql);
         assert!(!q.sql.contains("__RISK_ENTITY_TYPE__"), "{}", q.sql);
+        // The shared expression is what the template carries.
+        assert!(q.sql.contains(&source.substitute(super::ENTITY_TYPE_SQL.to_string())), "{}", q.sql);
     }
 }
 
@@ -889,7 +894,14 @@ fn facet_query_counts_distinct_entities_per_type() {
         &decay_config(),
         &cleared,
     );
-    assert!(q.sql.contains("GROUP BY entity, entity_type"), "{}", q.sql);
+    // NAN-5659: one row per entity VALUE, its type resolved by precedence.
+    assert!(q.sql.contains("GROUP BY entity\n"), "{}", q.sql);
+    assert!(!q.sql.contains("GROUP BY entity, entity_type"), "{}", q.sql);
+    assert!(
+        q.sql.contains(&format!("SELECT entity, {} as entity_type", super::ENTITY_TYPE_RESOLVE_SQL)),
+        "{}",
+        q.sql
+    );
     assert!(
         q.sql
             .contains("SELECT entity_type, count() as entity_count"),
@@ -1133,7 +1145,7 @@ fn dataset_base_shares_the_entity_scores_scan() {
         "sum(risk_score) as raw_score_7d",
         "uniqIf(rule_id, ts_micros >= ?) as distinct_rules_24h",
         "uniqArrayIf(tactics, ts_micros >= ?) as distinct_tactics_24h",
-        "GROUP BY entity, entity_type",
+        "GROUP BY entity\n",
     ] {
         assert!(
             dataset.sql.contains(expr),
@@ -1288,14 +1300,14 @@ fn cleared_boundaries_preserves_value_and_micros() {
     assert!(bounds.entities().iter().any(|e| e.is_empty()));
 }
 
-/// NAN-3226 read-time contract: the stored `risk_entity_type` stamp is honored
-/// only for `cloud_account`; every other type comes from the value, so a
-/// stored `domain` (internal or not) reads as `hostname`. Nothing written at
-/// detection time can pin a name to the domain or host type.
+/// NAN-3226 read-time contract, kept by NAN-5615: the stored
+/// `risk_entity_type` stamp is honored for every type EXCEPT `domain`, which
+/// falls back to the value inference (a dotted name reads as `hostname`).
+/// Nothing written at detection time can pin a name to the domain type.
 #[test]
 fn risk_read_projection_never_reads_a_stored_domain_type() {
-    assert!(super::ENTITY_SELECT_COLS.contains("__RISK_ENTITY_TYPE__ = 'cloud_account', 'cloud_account'"));
-    assert!(!super::ENTITY_SELECT_COLS.contains("'domain'"));
+    assert!(super::ENTITY_SELECT_COLS.contains("__RISK_ENTITY_TYPE__ IN ('ip', 'hostname', 'user', 'hash', 'cloud_account')"));
+    assert!(!super::ENTITY_SELECT_COLS.contains("'domain'"), "domain is never honored or produced");
     assert!(super::ENTITY_SELECT_COLS.contains("position(__RISK_ENTITY__, '.') > 0, 'hostname'"));
 }
 
@@ -1565,5 +1577,102 @@ fn overview_windows_query_shares_the_single_window_ctes_and_binds() {
         assert!(!both.sql.contains("WHERE decayed_score"));
         assert!(!both.sql.contains("__"), "leaked sentinel:\n{}", both.sql);
         assert_placeholder_bind_parity(&both);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NAN-5659: one entity value is one entity (v2.0.33 release review P2-9)
+// ---------------------------------------------------------------------------
+
+/// The resolve aggregate carries exactly [`super::ENTITY_TYPE_PRECEDENCE`], and
+/// the precedence lists every type the per-finding expression can emit, so no
+/// row type falls to `indexOf = 0` (which would outrank `email`).
+#[test]
+fn entity_type_precedence_covers_every_emitted_type_in_order() {
+    let list = super::ENTITY_TYPE_PRECEDENCE
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(
+        super::ENTITY_TYPE_RESOLVE_SQL,
+        format!("argMin(row_entity_type, indexOf([{list}], row_entity_type))")
+    );
+    // Every quoted output literal of the per-finding expression (the regex is
+    // the only other quoted text) must be ranked, or it would get
+    // `indexOf = 0` and outrank `email`.
+    let literals: Vec<&str> = super::ENTITY_TYPE_SQL
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .filter(|l| l.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        .collect();
+    for emitted in ["email", "ip", "hostname", "user", "hash", "cloud_account"] {
+        assert!(literals.contains(&emitted), "{emitted} not in {literals:?}");
+    }
+    for literal in &literals {
+        assert!(
+            super::ENTITY_TYPE_PRECEDENCE.contains(literal),
+            "{literal} is emitted but unranked"
+        );
+    }
+    assert!(!super::ENTITY_TYPE_PRECEDENCE.contains(&"domain"));
+    // `user` is the inference fallback: it must never outrank a real stamp.
+    assert_eq!(super::ENTITY_TYPE_PRECEDENCE.last(), Some(&"user"));
+    let pos = |t: &str| super::ENTITY_TYPE_PRECEDENCE.iter().position(|p| *p == t).unwrap();
+    assert!(pos("hostname") < pos("user"));
+    assert!(pos("cloud_account") < pos("user"));
+    assert!(pos("ip") < pos("hostname"));
+}
+
+/// Every entity-grain reader (Risk page list, leaderboard incl. its type
+/// filter, dossier badge, entity-set scores, facet, nPL `dataset=risk` and so
+/// the `accumulated_risk_threshold_exceeded` rule) groups on the VALUE alone
+/// and resolves the type with the shared aggregate. A `(value, type)` grain
+/// would split one value's score across rows when two rules stamp it
+/// differently.
+#[test]
+fn every_entity_grain_reader_groups_on_the_value_alone() {
+    let (cleared, _) = one_cleared_entity();
+    for ocsf in [false, true] {
+        let source = RiskFindingsSource::new(ocsf, "logs");
+        let values = vec!["host-a-17".to_string()];
+        let queries = [
+            entity_scores_query(
+                &source,
+                fixed_now(),
+                &decay_config(),
+                &cleared,
+                EntityScoreSelection::MinScores { min_score_24h: 0, min_score_7d: 0, limit: 1 },
+            ),
+            risky_entities_query(
+                &source,
+                fixed_now(),
+                &decay_config(),
+                &cleared,
+                RiskTimeWindow::Last7Days,
+                Some("hostname"),
+                0,
+                None,
+                50,
+                0,
+            ),
+            risk_for_entities_query(&source, fixed_now(), &decay_config(), &cleared, &values),
+            entity_set_scores_query(&source, fixed_now(), &decay_config(), &cleared, &values, 10),
+            entity_types_query(&source, fixed_now(), &decay_config(), &cleared),
+            risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared),
+        ];
+        for q in queries {
+            assert!(!q.sql.contains("GROUP BY entity, entity_type"), "{}", q.sql);
+            assert!(q.sql.contains("GROUP BY entity\n"), "{}", q.sql);
+            assert!(
+                q.sql.contains(&format!("{} as entity_type", super::ENTITY_TYPE_RESOLVE_SQL)),
+                "{}",
+                q.sql
+            );
+            // The per-finding type never leaks out under the public name.
+            assert!(q.sql.contains("'hostname', 'user') as row_entity_type,"), "{}", q.sql);
+            assert_placeholder_bind_parity(&q);
+        }
     }
 }

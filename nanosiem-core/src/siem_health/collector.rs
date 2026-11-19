@@ -1669,6 +1669,13 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
             warn!("Failed to count failing detection rules: {}", e);
             0
         });
+    let currently_failing_rules_total =
+        crate::detection::health::count_currently_failing_rules(pool)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Failed to count currently failing detection rules: {}", e);
+                0
+            });
     let failing_rules = crate::detection::health::list_failing_rules(pool, 20)
         .await
         .unwrap_or_else(|e| {
@@ -1696,6 +1703,7 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         coverage_gaps_7d_total,
         failing_rules,
         failing_rules_total,
+        currently_failing_rules_total,
     }
 }
 

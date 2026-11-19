@@ -8,8 +8,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::content_bundle::store::ContentStore;
+use crate::content_bundle::store::{CappedFile, ContentStore};
 use crate::mitre::repository::MitreRepository;
+use crate::mitre::stix_stream::{decode_filtered_bundle, truncate_description, FilteredBundle};
 use crate::mitre::types::{
     MitreTactic, MitreTechnique, MitreTechniqueAlias, StixBundle, StixObject,
 };
@@ -17,7 +18,8 @@ use crate::mitre::types::{
 const MITRE_SYNC_LOCK_ID: i64 = 0x4d49_5452_455f_5359;
 const MITRE_RELEASE: &str = "v19.1";
 const MITRE_CHANNEL: &str = "mitre-attack.v19-1";
-const MITRE_CONTENT_PATH: &str = "enterprise-attack/enterprise-attack.json";
+/// Path of the pinned bundle inside the MITRE content channel.
+pub const MITRE_CONTENT_PATH: &str = "enterprise-attack/enterprise-attack.json";
 const MITRE_CONTENT_URL: &str =
     "nano-content://mitre-attack.v19-1/enterprise-attack/enterprise-attack.json";
 const MITRE_SHA256: &str = "bdf1ce86a4e604214c5076d37ae4dcb322678afc528df8492e6fdc1b554f5da3";
@@ -82,6 +84,14 @@ impl SyncSource {
     }
 }
 
+/// The parsed rows of a pinned ATT&CK bundle.
+#[derive(Debug, Clone)]
+pub struct MitreCatalog {
+    pub tactics: Vec<MitreTactic>,
+    pub techniques: Vec<MitreTechnique>,
+    pub aliases: Vec<MitreTechniqueAlias>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MitreSyncResult {
     pub release: String,
@@ -113,6 +123,17 @@ pub enum MitreSyncError {
     InvalidBundle(String),
     #[error("MITRE catalog database operation failed: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+#[derive(Clone, Copy)]
+enum RunMode<'a> {
+    /// Manual sync: no current check, no backoff.
+    Force,
+    /// Scheduler: skip when current or inside any retry backoff.
+    IfDue,
+    /// Content-channel apply of the verified bundle bytes: skip only inside
+    /// the backoff that follows an interrupted attempt.
+    Apply(&'a [u8]),
 }
 
 /// Service for syncing MITRE ATT&CK data.
@@ -147,16 +168,30 @@ impl MitreSync {
     /// Force a synchronization attempt, still respecting the cross-node
     /// single-flight lock.
     pub async fn sync(&self) -> Result<MitreSyncOutcome, MitreSyncError> {
-        self.run(true).await
+        self.run(RunMode::Force).await
     }
 
     /// Synchronize only when the pinned release is not already complete and
     /// the durable retry window has elapsed.
     pub async fn sync_if_due(&self) -> Result<MitreSyncOutcome, MitreSyncError> {
-        self.run(false).await
+        self.run(RunMode::IfDue).await
     }
 
-    async fn run(&self, force: bool) -> Result<MitreSyncOutcome, MitreSyncError> {
+    /// Apply the bundle a content channel just installed or re-verified.
+    ///
+    /// `body` is the channel's verified copy of the bundle, parsed in place
+    /// rather than read back from PostgreSQL (NAN-5668: a second 53 MB copy
+    /// plus the read path's buffers is what ran nano-jobs out of memory). It
+    /// is still checked against the pinned digest and identity. Like
+    /// [`Self::sync`] this skips the "already current" check and an ordinary
+    /// failure backoff, but NOT the backoff after an interrupted attempt: a
+    /// bundle whose apply killed the process must not be retried on every
+    /// boot (each content check re-applies a pending snapshot).
+    pub async fn apply_content(&self, body: &[u8]) -> Result<MitreSyncOutcome, MitreSyncError> {
+        self.run(RunMode::Apply(body)).await
+    }
+
+    async fn run(&self, mode: RunMode<'_>) -> Result<MitreSyncOutcome, MitreSyncError> {
         let Some(mut connection) = self
             .repository
             .try_acquire_sync_connection(MITRE_SYNC_LOCK_ID)
@@ -165,7 +200,7 @@ impl MitreSync {
             return Ok(MitreSyncOutcome::AlreadyRunning);
         };
 
-        let result = self.run_locked(&mut connection, force).await;
+        let result = self.run_locked(&mut connection, mode).await;
         if let Err(error) = &result {
             if let Err(state_error) =
                 MitreRepository::mark_sync_failed_on(&mut connection, &error.to_string()).await
@@ -190,20 +225,37 @@ impl MitreSync {
     async fn run_locked(
         &self,
         connection: &mut sqlx::PgConnection,
-        force: bool,
+        mode: RunMode<'_>,
     ) -> Result<MitreSyncOutcome, MitreSyncError> {
-        if !force {
-            if MitreRepository::catalog_is_current_on(
-                connection,
-                &self.source.release,
-                &self.source.sha256,
-            )
-            .await?
-            {
-                return Ok(MitreSyncOutcome::AlreadyCurrent);
+        // NAN-5668: holding the lock, a `syncing` state can only be an attempt
+        // whose process died mid-sync (OOM kill, crash, restart). Count it as a
+        // failure so the durable backoff applies instead of a crash loop.
+        if MitreRepository::recover_interrupted_on(connection).await? {
+            warn!(
+                "Previous MITRE ATT&CK catalog sync never finished (process exited mid-sync, \
+                 e.g. out of memory); recorded as a failure and backing off"
+            );
+        }
+        match mode {
+            RunMode::Force => {}
+            RunMode::Apply(_) => {
+                if MitreRepository::interrupted_backoff_active_on(connection).await? {
+                    return Ok(MitreSyncOutcome::RetryBackoff);
+                }
             }
-            if !MitreRepository::retry_allowed_on(connection).await? {
-                return Ok(MitreSyncOutcome::RetryBackoff);
+            RunMode::IfDue => {
+                if MitreRepository::catalog_is_current_on(
+                    connection,
+                    &self.source.release,
+                    &self.source.sha256,
+                )
+                .await?
+                {
+                    return Ok(MitreSyncOutcome::AlreadyCurrent);
+                }
+                if !MitreRepository::retry_allowed_on(connection).await? {
+                    return Ok(MitreSyncOutcome::RetryBackoff);
+                }
             }
         }
 
@@ -220,8 +272,18 @@ impl MitreSync {
             source = %self.source.url,
             "Reading pinned MITRE ATT&CK catalog from signed content channel"
         );
-        let bundle = self.fetch_bundle().await?;
-        let (tactics, techniques, aliases) = self.parse_catalog(&bundle)?;
+        let MitreCatalog {
+            tactics,
+            techniques,
+            aliases,
+        } = match mode {
+            RunMode::Apply(body) => {
+                let bundle = self.decode_bundle(body)?;
+                let (tactics, techniques, aliases) = self.parse_catalog(&bundle)?;
+                MitreCatalog { tactics, techniques, aliases }
+            }
+            RunMode::Force | RunMode::IfDue => self.load_pinned_catalog().await?,
+        };
 
         // NAN-1774 / NAN-1766 (D3): `replace_catalog_on` writes the catalog,
         // reconciles existing detection-rule mappings against it, and flips the
@@ -280,42 +342,87 @@ impl MitreSync {
         Ok(MitreSyncOutcome::Synced(result))
     }
 
+    /// Read the pinned bundle from the installed content channel and parse
+    /// it into the catalog rows, without writing anything.
+    pub async fn load_pinned_catalog(&self) -> Result<MitreCatalog, MitreSyncError> {
+        let bundle = self.fetch_bundle().await?;
+        let (tactics, techniques, aliases) = self.parse_catalog(&bundle)?;
+        Ok(MitreCatalog { tactics, techniques, aliases })
+    }
+
+    /// Verify and parse a pinned bundle body (digest, identity, shape)
+    /// without a database. The measurement seam for NAN-5668.
+    pub fn parse_pinned_body(body: &[u8]) -> Result<MitreCatalog, MitreSyncError> {
+        let source = SyncSource::pinned();
+        let bundle = source.decode_bundle(body)?;
+        let (tactics, techniques, aliases) = source.parse_catalog(&bundle)?;
+        Ok(MitreCatalog { tactics, techniques, aliases })
+    }
+
     async fn fetch_bundle(&self) -> Result<StixBundle, MitreSyncError> {
-        let body = self
+        // Refused by its stored size before any of it is read.
+        let body = match self
             .content
-            .read_file(MITRE_CHANNEL, MITRE_CONTENT_PATH)
+            .read_file_capped(MITRE_CHANNEL, MITRE_CONTENT_PATH, self.source.max_bytes as u64)
             .await?
-            .ok_or(MitreSyncError::ContentNotInstalled)?;
+        {
+            CappedFile::Missing => return Err(MitreSyncError::ContentNotInstalled),
+            CappedFile::TooLarge(observed) => {
+                return Err(MitreSyncError::BundleTooLarge {
+                    observed: usize::try_from(observed).unwrap_or(usize::MAX),
+                    limit: self.source.max_bytes,
+                })
+            }
+            CappedFile::Body(body) => body,
+        };
         self.decode_bundle(&body)
     }
 
     fn decode_bundle(&self, body: &[u8]) -> Result<StixBundle, MitreSyncError> {
-        if body.len() > self.source.max_bytes {
+        self.source.decode_bundle(body)
+    }
+
+    fn parse_catalog(
+        &self,
+        bundle: &StixBundle,
+    ) -> Result<(Vec<MitreTactic>, Vec<MitreTechnique>, Vec<MitreTechniqueAlias>), MitreSyncError>
+    {
+        self.source.parse_catalog(bundle)
+    }
+}
+
+impl SyncSource {
+    fn decode_bundle(&self, body: &[u8]) -> Result<StixBundle, MitreSyncError> {
+        if body.len() > self.max_bytes {
             return Err(MitreSyncError::BundleTooLarge {
                 observed: body.len(),
-                limit: self.source.max_bytes,
+                limit: self.max_bytes,
             });
         }
         let actual_digest = hex::encode(Sha256::digest(&body));
-        if actual_digest != self.source.sha256 {
+        if actual_digest != self.sha256 {
             return Err(MitreSyncError::DigestMismatch {
-                expected: self.source.sha256.clone(),
+                expected: self.sha256.clone(),
                 actual: actual_digest,
             });
         }
 
-        let bundle: StixBundle = serde_json::from_slice(&body)?;
-        if bundle.bundle_type != "bundle" || bundle.id != self.source.bundle_id {
+        // NAN-5668: stream the objects and keep only what parse_catalog reads;
+        // a full `Vec<StixObject>` of the 53 MB bundle held ~32 MiB of prose.
+        let FilteredBundle {
+            bundle,
+            object_count,
+        } = decode_filtered_bundle(body)?;
+        if bundle.bundle_type != "bundle" || bundle.id != self.bundle_id {
             return Err(MitreSyncError::InvalidBundle(format!(
                 "unexpected identity type={} id={}",
                 bundle.bundle_type, bundle.id
             )));
         }
-        if bundle.objects.len() < self.source.min_objects {
+        if object_count < self.min_objects {
             return Err(MitreSyncError::InvalidBundle(format!(
                 "only {} STIX objects (minimum {})",
-                bundle.objects.len(),
-                self.source.min_objects
+                object_count, self.min_objects
             )));
         }
         Ok(bundle)
@@ -353,11 +460,11 @@ impl MitreSync {
             }
             tactics.push(tactic);
         }
-        if tactics.len() < self.source.min_tactics {
+        if tactics.len() < self.min_tactics {
             return Err(MitreSyncError::InvalidBundle(format!(
                 "only {} active tactics (minimum {})",
                 tactics.len(),
-                self.source.min_tactics
+                self.min_tactics
             )));
         }
 
@@ -382,11 +489,11 @@ impl MitreSync {
             }
             techniques.push(technique);
         }
-        if techniques.len() < self.source.min_techniques {
+        if techniques.len() < self.min_techniques {
             return Err(MitreSyncError::InvalidBundle(format!(
                 "only {} active techniques (minimum {})",
                 techniques.len(),
-                self.source.min_techniques
+                self.min_techniques
             )));
         }
 
@@ -411,11 +518,11 @@ impl MitreSync {
         techniques.sort_by_key(|technique| (technique.is_subtechnique, technique.id.clone()));
 
         let aliases = resolve_technique_aliases(bundle, &technique_ids);
-        if aliases.len() < self.source.min_aliases {
+        if aliases.len() < self.min_aliases {
             return Err(MitreSyncError::InvalidBundle(format!(
                 "only {} technique aliases (minimum {})",
                 aliases.len(),
-                self.source.min_aliases
+                self.min_aliases
             )));
         }
         Ok((tactics, techniques, aliases))
@@ -713,17 +820,6 @@ fn required_text(
     Ok(value.to_string())
 }
 
-fn truncate_description(description: &str) -> String {
-    let first_paragraph = description.split("\n\n").next().unwrap_or(description);
-    if first_paragraph.chars().count() <= 500 {
-        return first_paragraph.to_string();
-    }
-    format!(
-        "{}...",
-        first_paragraph.chars().take(497).collect::<String>()
-    )
-}
-
 fn valid_tactic_id(id: &str) -> bool {
     id.len() == 6 && id.starts_with("TA") && id[2..].bytes().all(|byte| byte.is_ascii_digit())
 }
@@ -971,6 +1067,74 @@ mod tests {
             technique.data_sources,
             vec!["Command Execution".to_string(), "Process Creation".to_string()]
         );
+    }
+
+    /// NAN-5668: the streaming decode drops prose and citations; the catalog
+    /// parsed from it must be identical to one parsed from the full decode.
+    #[tokio::test]
+    async fn filtered_decode_parses_the_same_catalog_as_the_full_decode() {
+        let long = "word ".repeat(150);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "bundle",
+            "id": "bundle--eq",
+            "objects": [
+                {"type": "x-mitre-tactic", "id": "x-mitre-tactic--1", "name": "Execution",
+                 "x_mitre_shortname": "execution", "description": format!("{long}\n\nsecond"),
+                 "external_references": [
+                    {"source_name": "mitre-attack", "external_id": "TA0002", "url": "https://attack.mitre.org/tactics/TA0002/"}]},
+                {"type": "attack-pattern", "id": "attack-pattern--1", "name": "Cmd", "description": "Short.\n\nMore.",
+                 "x_mitre_is_subtechnique": false,
+                 "kill_chain_phases": [{"kill_chain_name": "mitre-attack", "phase_name": "execution"}],
+                 "external_references": [
+                    {"source_name": "capec", "external_id": "CAPEC-1"},
+                    {"source_name": "mitre-attack", "external_id": "T1059", "url": "https://attack.mitre.org/techniques/T1059/"},
+                    {"source_name": "Citation", "description": long}]},
+                {"type": "attack-pattern", "id": "attack-pattern--2", "name": "Sub",
+                 "x_mitre_is_subtechnique": true,
+                 "kill_chain_phases": [{"kill_chain_name": "mitre-attack", "phase_name": "execution"}],
+                 "external_references": [{"source_name": "mitre-attack", "external_id": "T1059.001"}]},
+                {"type": "attack-pattern", "id": "attack-pattern--old", "name": "Old", "revoked": true,
+                 "external_references": [{"source_name": "mitre-attack", "external_id": "T1086"}]},
+                {"type": "relationship", "id": "rel--rev", "relationship_type": "revoked-by",
+                 "source_ref": "attack-pattern--old", "target_ref": "attack-pattern--2"},
+                {"type": "x-mitre-data-component", "id": "dc--1", "name": "Process Creation", "description": long},
+                {"type": "x-mitre-analytic", "id": "an--1",
+                 "x_mitre_log_source_references": [{"x_mitre_data_component_ref": "dc--1"}]},
+                {"type": "x-mitre-detection-strategy", "id": "det--1", "x_mitre_analytic_refs": ["an--1"]},
+                {"type": "relationship", "id": "rel--det", "relationship_type": "detects",
+                 "source_ref": "det--1", "target_ref": "attack-pattern--2", "description": long},
+                {"type": "relationship", "id": "rel--uses", "relationship_type": "uses",
+                 "source_ref": "intrusion-set--1", "target_ref": "attack-pattern--1", "description": long},
+                {"type": "intrusion-set", "id": "intrusion-set--1", "name": "G", "description": long}
+            ]
+        }))
+        .unwrap();
+        let sync = test_sync(&body, "bundle--eq", 1_048_576);
+
+        let filtered = sync.decode_bundle(&body).expect("filtered decode");
+        let full: StixBundle = serde_json::from_slice(&body).expect("full decode");
+        assert!(filtered.objects.len() < full.objects.len());
+        let as_json = |bundle: &StixBundle| {
+            let (tactics, techniques, aliases) = sync.parse_catalog(bundle).expect("catalog");
+            serde_json::to_value((tactics, techniques, aliases)).unwrap()
+        };
+        let catalog = as_json(&filtered);
+        assert_eq!(catalog, as_json(&full));
+        // And it is the catalog the fixture describes.
+        assert_eq!(catalog[1][1]["data_sources"], serde_json::json!(["Process Creation"]));
+        assert_eq!(catalog[2], serde_json::json!([{"old_id": "T1086", "new_id": "T1059.001"}]));
+    }
+
+    #[tokio::test]
+    async fn min_objects_counts_dropped_objects_too() {
+        let sync = test_sync(TEST_BUNDLE.as_bytes(), "bundle--test", 16 * 1024);
+        let mut strict = test_sync(TEST_BUNDLE.as_bytes(), "bundle--test", 16 * 1024);
+        strict.source.min_objects = 3;
+        assert!(sync.decode_bundle(TEST_BUNDLE.as_bytes()).is_ok());
+        assert!(matches!(
+            strict.decode_bundle(TEST_BUNDLE.as_bytes()),
+            Err(MitreSyncError::InvalidBundle(message)) if message.contains("only 2 STIX objects")
+        ));
     }
 
     #[test]

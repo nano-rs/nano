@@ -447,9 +447,15 @@ impl AppState {
 
         // NAN-2297: taken before the struct literal below moves `parser_service`.
         let shared_vector_config = parser_service.vector_config();
+        // NAN-5611: generations outside the watched tree where Compose says so.
         let vector_config_publisher = Arc::new(nanosiem_core::VectorConfigPublisher::new(
             pg_pool.clone(),
-            &vector_config_dir,
+            nanosiem_core::parsers::vector_config_publication_root(
+                std::path::Path::new(&vector_config_dir),
+                std::env::var(nanosiem_core::parsers::VECTOR_CONFIG_PUBLICATION_DIR_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
             node_id.clone(),
         ));
 
