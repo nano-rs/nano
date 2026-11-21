@@ -20,6 +20,8 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
 import { CHART_OTHER, seriesColor as chartSeriesColor } from '@/lib/chart-colors';
+import { csvExportFilename, csvFromRows, downloadCsv } from '@/lib/csv-download';
+import { parseTimestampAsUTC } from '@/lib/parse-timestamp-utc';
 
 interface SearchResult {
   id: string;
@@ -46,13 +48,19 @@ function formatY(value: number): string {
   return Math.round(value).toString();
 }
 
-function parseTimeBucket(value: unknown): number | null {
-  if (typeof value === 'number') return value;
-  if (typeof value === 'string') {
-    const d = new Date(value);
-    if (!isNaN(d.getTime())) return d.getTime();
-  }
-  return null;
+/**
+ * A bucket's start as epoch ms, or null when it is not a usable time.
+ * ClickHouse sends naive UTC strings ("2026-11-18 06:00:00"); a bare
+ * `new Date()` reads those as browser-local time and shifts every bucket by
+ * the viewer's offset (NAN-5699), so strings go through `parseTimestampAsUTC`.
+ * Numbers must be finite and inside the Date range.
+ */
+export function parseTimeBucket(value: unknown): number | null {
+  const ms =
+    typeof value === 'number' ? value
+    : typeof value === 'string' ? parseTimestampAsUTC(value).getTime()
+    : NaN;
+  return Number.isFinite(ms) && !Number.isNaN(new Date(ms).getTime()) ? ms : null;
 }
 
 function formatBucketTime(ts: number): string {
@@ -207,6 +215,19 @@ export function transformResults(results: SearchResult[]): TransformedData {
   }
 
   return { rows, seriesKeys, seriesTotals, timeKey, otherKeys };
+}
+
+/**
+ * The timechart as CSV (NAN-5699): one row per bucket, the bucket start as an
+ * ISO-8601 UTC time, then one column per series (top 10 + `Other`, the same
+ * series the chart draws). Every series is exported, muted or not.
+ */
+export function timechartCsv({ rows, seriesKeys, timeKey }: Pick<TransformedData, 'rows' | 'seriesKeys' | 'timeKey'>): string {
+  const body = rows.map((row) => [
+    new Date(row.timestamp as number).toISOString(),
+    ...seriesKeys.map((k) => (typeof row[k] === 'number' ? row[k] : '')),
+  ]);
+  return csvFromRows([timeKey, ...seriesKeys], body);
 }
 
 // ───────────────────────────── tooltip ─────────────────────────────
@@ -574,6 +595,8 @@ export function TimechartView({
         <button
           type="button"
           title="Export"
+          aria-label="Export timechart as CSV"
+          onClick={() => downloadCsv(timechartCsv(transformed), csvExportFilename('timechart'))}
           className="text-muted-foreground hover:text-primary p-1 cursor-pointer"
         >
           <Download className="w-[12px] h-[12px]" />

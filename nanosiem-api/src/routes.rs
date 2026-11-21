@@ -23,6 +23,10 @@ const MAX_UPLOAD_SIZE: usize = 105 * 1024 * 1024;
 /// default 413 — is the authoritative rejection for oversized specimens.
 const ARTIFACT_BODY_LIMIT: usize = 12 * 1024 * 1024;
 
+/// `Cache-Control` for `GET /api/mitre/coverage` (NAN-5717): revalidate on
+/// every load so a rule mode change shows immediately.
+pub(crate) const MITRE_COVERAGE_CACHE_CONTROL: &str = "private, no-cache";
+
 /// Max size for an air-gap import bundle. The IPinfo-Lite enrichment payload is
 /// ~400MB uncompressed; the compressed `.tar.gz` is buffered before the
 /// streaming verify/parse, so the cap must comfortably exceed the 105MB upload
@@ -310,9 +314,12 @@ pub fn create_router(state: AppState) -> Router {
             HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=300"),
         ));
 
-    // Coverage includes live ingestion readiness. Keep it briefly cacheable
-    // without allowing the previous one-hour catalog cache to hide a source
-    // becoming active or stale.
+    // Coverage includes live ingestion readiness and every mapped rule's mode,
+    // so a promote / demote / pause must show on the next load. NAN-5717: the
+    // former `max-age=30, stale-while-revalidate=30` let the browser serve a
+    // response up to ~60s old after a mode change. `no-cache` makes the
+    // browser revalidate every time; the SPA's React Query cache is the only
+    // client-side cache (and it refetches on mount).
     let cached_mitre_coverage = Router::new()
         .route(
             "/api/mitre/coverage",
@@ -320,7 +327,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=30, stale-while-revalidate=30"),
+            HeaderValue::from_static(MITRE_COVERAGE_CACHE_CONTROL),
         ));
 
     // Demo routes — only registered when DEPLOYMENT_MODE=demo.
@@ -753,6 +760,11 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/cases/stats",
                 get(handlers::cases::get_case_stats::<AppState>),
             )
+            // NAN-5692: the SLA targets, readable under cases:view.
+            .route(
+                "/api/cases/sla-settings",
+                get(handlers::cases::get_case_sla_settings::<AppState>),
+            )
             // NAN-1093: Signal Inbox aggregation — per-tab counts + incident pills.
             .route(
                 "/api/cases/inbox-counts",
@@ -801,6 +813,15 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/cases/{id}/assign",
                 post(handlers::cases::assign_case::<AppState>),
+            )
+            // NAN-5675: case tags (also written by SOAR case.add_tag / case.remove_tag).
+            .route(
+                "/api/cases/{id}/tags",
+                get(handlers::cases::list_case_tags::<AppState>).post(handlers::cases::add_case_tag::<AppState>),
+            )
+            .route(
+                "/api/cases/{id}/tags/{tag}",
+                delete(handlers::cases::remove_case_tag::<AppState>),
             )
             .route(
                 "/api/cases/{id}/escalate",
@@ -882,6 +903,11 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/cases/{id}/notebook",
                 delete(handlers::cases::unlink_notebook_from_case::<AppState>),
+            )
+            // NAN-5690: explicit lazy create on the composer's first write.
+            .route(
+                "/api/cases/{id}/notebook/ensure",
+                post(handlers::cases::ensure_case_notebook::<AppState>),
             )
             .route(
                 "/api/cases/{id}/notebook/merge",
@@ -1200,6 +1226,11 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/log-sources/{id}",
             delete(handlers::log_sources::delete_log_source),
+        )
+        // NAN-5678: one render and one Vector reload for many deletes.
+        .route(
+            "/api/log-sources/bulk-delete",
+            post(handlers::log_sources::bulk_delete_log_sources),
         )
         .route(
             "/api/log-sources/{id}/toggle",
@@ -3058,6 +3089,11 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/system/config",
             get(handlers::system::get_system_config),
+        )
+        // NAN-5724: air-gap + managed flags, for pages open without settings:view.
+        .route(
+            "/api/system/deployment",
+            get(handlers::system::get_deployment_flags),
         )
         // NAN-5450: admin disk banner (settings:system).
         .route("/api/system/disk-alert", get(handlers::health::get_disk_alert))

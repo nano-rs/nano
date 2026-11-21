@@ -307,6 +307,56 @@ impl DetectionService {
         Ok(rule)
     }
 
+    /// Get a rule that has not been deleted.
+    ///
+    /// NAN-5672: `DELETE /api/rules/{id}` archives (NAN-3816), so an archived
+    /// row is a deleted rule. Every path that serves, runs or re-activates a
+    /// rule by id goes through here and sees `RuleNotFound`, the same as a
+    /// hard-deleted row. [`Self::get_rule`] stays for the explicit
+    /// archived-aware callers (unarchive, `?include_archived=true`).
+    #[instrument(skip(self))]
+    pub async fn get_active_rule(&self, id: Uuid) -> Result<DetectionRule, DetectionError> {
+        let rule = self.rule_repo.find_by_id(id).await?;
+        if rule.archived {
+            return Err(DetectionError::RuleNotFound(id));
+        }
+        Ok(rule)
+    }
+
+    /// The archive rules for a generic update (NAN-5672). Returns whether the
+    /// update unarchives the rule, normalised to land it in staging.
+    ///
+    /// - archived rule, update not unarchiving: `RuleNotFound` (deleted);
+    /// - unarchive into anything but staging: refused (promote it after);
+    /// - archiving an active rule: refused here; the API routes it through
+    ///   the delete teardown instead.
+    pub(crate) fn check_archive_transition(
+        existing: &DetectionRule,
+        update: &mut UpdateDetectionRule,
+    ) -> Result<bool, DetectionError> {
+        if existing.archived {
+            if update.archived != Some(false) {
+                return Err(DetectionError::RuleNotFound(existing.id));
+            }
+            if update.mode.is_some_and(|mode| mode != RuleMode::Staging) {
+                return Err(DetectionError::InvalidStateTransition(
+                    "An archived rule is restored to staging; promote it afterwards.".to_string(),
+                ));
+            }
+            update.mode = Some(RuleMode::Staging);
+            return Ok(true);
+        }
+        if update.archived == Some(true) {
+            return Err(DetectionError::InvalidStateTransition(
+                "Archive a rule with DELETE /api/rules/{id}, which stops it first.".to_string(),
+            ));
+        }
+        // `archived: false` on an active rule is a no-op.
+        update.archived = None;
+        Ok(false)
+    }
+
+
     /// List all detection rules
     #[instrument(skip(self))]
     pub async fn list_rules(&self) -> Result<Vec<DetectionRule>, DetectionError> {
@@ -368,6 +418,11 @@ impl DetectionService {
     ) -> Result<DetectionRule, DetectionError> {
         // Get the existing rule to check if it's archived
         let existing_rule = self.get_rule(id).await?;
+
+        // NAN-5672: a deleted (archived) rule takes no edit but the unarchive.
+        if existing_rule.archived && update.archived != Some(false) {
+            return Err(DetectionError::RuleNotFound(id));
+        }
 
         // Prevent changing mode of archived rules (except to staging)
         if existing_rule.archived {
@@ -452,7 +507,7 @@ impl DetectionService {
     pub async fn update_rule_with_mode(
         &self,
         id: Uuid,
-        update: UpdateDetectionRule,
+        mut update: UpdateDetectionRule,
         materialized_view_generator: &super::super::materialized_view::MaterializedViewGenerator,
         created_by: Option<Uuid>,
     ) -> Result<DetectionRule, DetectionError> {
@@ -467,6 +522,15 @@ impl DetectionService {
 
         // Get the existing rule to check for mode changes
         let existing_rule = self.get_rule(id).await?;
+
+        // NAN-5672: an archived rule is a deleted rule. The only edit it takes
+        // is the unarchive, which brings it back in staging; anything else is
+        // a 404, the same as GET. Archiving goes through the delete teardown
+        // (`delete_rule_with_mode`: quiesce, drop the MV, unlink imports), so
+        // a plain update must never set the flag. The caller holds the runtime
+        // lock that `delete_rule_with_mode` takes, so this check cannot race a
+        // concurrent delete.
+        let unarchiving = Self::check_archive_transition(&existing_rule, &mut update)?;
 
         // Validate the query (syntax + fields, NAN-5348) if it's being updated,
         // under the post-patch dataset.
@@ -607,7 +671,10 @@ impl DetectionService {
                     // Audit D31: the MV bakes `'<name>' AS rule_name` into its
                     // projection, so a rename must recreate it or signals keep the
                     // stale name and new cases are titled with the old one.
-                    || update.name.is_some();
+                    || update.name.is_some()
+                    // NAN-5672: the delete dropped the view; an unarchived
+                    // real-time rule needs it back or it silently never fires.
+                    || unarchiving;
                 if mv_affecting_change {
                     // Update the rule first
                     let updated_rule = self.rule_repo.update(id, &update).await?;
@@ -818,6 +885,13 @@ impl DetectionService {
     ///
     /// Deleting an already-archived rule is `RuleNotFound` and changes
     /// nothing (same as hosted), so a repeated DELETE is idempotent.
+    ///
+    /// NAN-5672: an archived rule is deleted everywhere it is served, not
+    /// merely parked: `GET /api/rules/{id}` 404s (unless the caller opts in
+    /// with `include_archived`), the lifecycle and trigger endpoints refuse
+    /// it, and a repository-imported rule loses its `rule_imports` link in
+    /// the same statement, so a repo sync never flags it for an update and a
+    /// re-import creates a fresh rule instead of rewriting the archived row.
     #[instrument(skip(self, materialized_view_generator))]
     pub async fn delete_rule_with_mode(
         &self,
@@ -1035,7 +1109,9 @@ impl DetectionService {
     pub async fn sync_next_run_at(&self, rule: &DetectionRule) {
         use crate::models::detection_rule::{DetectionMode, RuleMode};
 
-        let should_schedule = rule.detection_mode == DetectionMode::Scheduled
+        // A deleted (archived) rule never gets a schedule back (NAN-5672).
+        let should_schedule = !rule.archived
+            && rule.detection_mode == DetectionMode::Scheduled
             && rule.mode != RuleMode::Staging
             && rule.mode != RuleMode::Paused
             && rule.schedule_cron.is_some();
@@ -1059,7 +1135,8 @@ impl DetectionService {
 
         // Audit D27: a scheduled, runnable rule with NO cron is excluded from
         // both claiming and startup backfill — it silently never runs. Surface it.
-        if rule.detection_mode == DetectionMode::Scheduled
+        if !rule.archived
+            && rule.detection_mode == DetectionMode::Scheduled
             && rule.mode != RuleMode::Staging
             && rule.mode != RuleMode::Paused
             && rule.schedule_cron.is_none()

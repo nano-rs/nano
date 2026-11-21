@@ -83,12 +83,14 @@ const SEV_CHIP_BG: Record<SevKey, string> = {
   high: 'color-mix(in srgb, oklch(72% 0.18 28) 20%, transparent)',
   medium: 'color-mix(in srgb, oklch(80% 0.15 78) 20%, transparent)',
   low: 'color-mix(in srgb, oklch(68% 0.11 215) 20%, transparent)',
+  informational: 'color-mix(in srgb, var(--muted-foreground) 20%, transparent)',
 };
 const SEV_CHIP_FG: Record<SevKey, string> = {
   critical: 'oklch(62% 0.22 18)',
   high: 'oklch(72% 0.18 28)',
   medium: 'oklch(80% 0.15 78)',
   low: 'oklch(68% 0.11 215)',
+  informational: 'var(--muted-foreground)',
 };
 
 export function FormLens({ value, onChange, readOnly }: FormLensProps) {
@@ -189,7 +191,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
             <div className="pt-1">
               <FormField label="Severity" required yamlKey="severity" hint="Drives routing priority and SLA.">
                 <div className="inline-flex items-center gap-1 rounded-md border border-border p-0.5">
-                  {(['low', 'medium', 'high', 'critical'] as SevKey[]).map((s) => {
+                  {(['informational', 'low', 'medium', 'high', 'critical'] as SevKey[]).map((s) => {
                     const active = (meta.severity || 'medium') === s;
                     return (
                       <button

@@ -97,7 +97,12 @@ jobs:
           # root-owned files so the next host-side workflow can clean the
           # workspace (NAN-773 self-hosted runner discipline). Do it via a
           # throwaway container to avoid depending on host sudo.
-          docker run --rm -v "$PWD:/ws" -w /ws alpine \
+          # NAN-5733: nano-ci labels let the runner pre-job hook remove this container
+          # if the job is cancelled (scripts/ci/runner-pre-job.sh).
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm -v "$PWD:/ws" -w /ws alpine \
             chown -R "$(id -u):$(id -g)" config/vector 2>/dev/null || true
           # Restore any working-tree edits the gate's fault-injection left behind
           # (it restores _enrichment.toml itself, but be defensive).

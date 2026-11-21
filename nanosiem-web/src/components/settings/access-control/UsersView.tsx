@@ -28,6 +28,7 @@ import { useTierContext } from '@/hooks/use-tier';
 import { api, type UserDetail, type GroupDetail } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { userDrawerActions } from './user-drawer-actions';
 import { formatUTC } from '@/lib/date-utils';
 import { TierUsageBar } from '@/components/TierUsageBar';
 import { InviteUserDialog } from './InviteUserDialog';
@@ -126,6 +127,10 @@ function ChevRight({ className }: { className?: string }) {
 
 interface UserDrawerProps {
   user: UserDetail | null;
+  /** The signed-in user's id (a `user_…` TypeID, same shape as `user.id`). */
+  currentUserId: string | undefined;
+  canEdit: boolean;
+  canDelete: boolean;
   onClose: () => void;
   onEdit: (user: UserDetail) => void;
   onDisable: (user: UserDetail) => void;
@@ -134,9 +139,22 @@ interface UserDrawerProps {
   onDelete: (user: UserDetail) => void;
 }
 
-function UserDrawer({ user, onClose, onEdit, onDisable, onEnable, onUnlock, onDelete }: UserDrawerProps) {
+export function UserDrawer({
+  user,
+  currentUserId,
+  canEdit,
+  canDelete,
+  onClose,
+  onEdit,
+  onDisable,
+  onEnable,
+  onUnlock,
+  onDelete,
+}: UserDrawerProps) {
   if (!user) return null;
-  const isSelf = false; // TODO: useAuth().user?.id === user.id when ID shape stabilizes
+  const isSelf = !!currentUserId && currentUserId === user.id;
+  const actions = userDrawerActions({ status: user.status, isSelf, canEdit, canDelete });
+  const anyAction = actions.edit || actions.unlock || actions.disable || actions.enable || actions.delete;
   return (
     <aside
       className="w-[340px] border-l border-border flex flex-col shrink-0"
@@ -196,17 +214,20 @@ function UserDrawer({ user, onClose, onEdit, onDisable, onEnable, onUnlock, onDe
         </div>
       </div>
 
+      {anyAction && (
       <div className="shrink-0 border-t border-border px-3 py-2 flex items-center gap-2 flex-wrap">
-        <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={() => onEdit(user)}>
-          Edit
-        </Button>
-        {user.status === 'locked' && (
+        {actions.edit && (
+          <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={() => onEdit(user)}>
+            Edit
+          </Button>
+        )}
+        {actions.unlock && (
           <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={() => onUnlock(user)}>
             Unlock
           </Button>
         )}
         <div className="flex-1" />
-        {user.status === 'active' && !isSelf && (
+        {actions.disable && (
           <Button
             size="sm"
             variant="ghost"
@@ -216,7 +237,7 @@ function UserDrawer({ user, onClose, onEdit, onDisable, onEnable, onUnlock, onDe
             Disable
           </Button>
         )}
-        {user.status === 'disabled' && (
+        {actions.enable && (
           <Button
             size="sm"
             variant="ghost"
@@ -226,7 +247,7 @@ function UserDrawer({ user, onClose, onEdit, onDisable, onEnable, onUnlock, onDe
             Enable
           </Button>
         )}
-        {!isSelf && (
+        {actions.delete && (
           <Button
             size="sm"
             variant="ghost"
@@ -237,6 +258,7 @@ function UserDrawer({ user, onClose, onEdit, onDisable, onEnable, onUnlock, onDe
           </Button>
         )}
       </div>
+      )}
     </aside>
   );
 }
@@ -257,12 +279,13 @@ interface PendingAction {
 
 export function UsersView() {
   const { toast } = useToast();
-  const { hasPermission } = useAuth();
+  const { hasPermission, user: currentUser } = useAuth();
   const { status: tierStatus, isEnforced } = useTierContext();
 
   const canCreate = hasPermission('users:create');
   const canEdit = hasPermission('users:edit');
   const canDelete = hasPermission('users:delete');
+  const canListGroups = hasPermission('groups:view');
 
   const [users, setUsers] = useState<UserDetail[]>([]);
   const [groups, setGroups] = useState<GroupDetail[]>([]);
@@ -280,7 +303,12 @@ export function UsersView() {
     try {
       const [res, groupsRes] = await Promise.all([
         api.listUsers(),
-        api.listGroups().catch(() => ({ groups: [] as GroupDetail[], total: 0 })),
+        // NAN-5713: GET /api/groups needs groups:view; a users:view-only
+        // viewer must not draw a 403 on every load. The edit dialog keeps a
+        // user's memberships from `user.groups`, not from this list.
+        canListGroups
+          ? api.listGroups().catch(() => ({ groups: [] as GroupDetail[], total: 0 }))
+          : Promise.resolve({ groups: [] as GroupDetail[], total: 0 }),
       ]);
       setUsers(res.users);
       setGroups(groupsRes.groups);
@@ -488,12 +516,15 @@ export function UsersView() {
         {selected && (
           <UserDrawer
             user={selected}
+            currentUserId={currentUser?.id}
+            canEdit={canEdit}
+            canDelete={canDelete}
             onClose={() => setSelectedId(null)}
-            onEdit={canEdit ? handleEdit : () => {}}
+            onEdit={handleEdit}
             onDisable={(u) => setPending({ user: u, kind: 'disable' })}
             onEnable={(u) => setPending({ user: u, kind: 'enable' })}
             onUnlock={(u) => setPending({ user: u, kind: 'unlock' })}
-            onDelete={canDelete ? (u) => setPending({ user: u, kind: 'delete' }) : () => {}}
+            onDelete={(u) => setPending({ user: u, kind: 'delete' })}
           />
         )}
       </div>

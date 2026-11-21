@@ -1222,7 +1222,7 @@ export function UserSettings() {
                       <span className="text-[10px] font-mono uppercase tracking-[0.14em] text-muted-foreground">
                         secret
                       </span>
-                      <code className="font-mono text-[12px] text-[var(--str)] flex-1 truncate select-all">
+                      <code className="font-mono text-[12px] text-[var(--str)] flex-1 truncate select-all" data-testid="mfa-secret">
                         {setupData.secret}
                       </code>
                     </div>

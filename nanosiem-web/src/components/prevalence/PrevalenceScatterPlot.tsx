@@ -486,6 +486,11 @@ export function PrevalenceScatterPlot({
           return (
             <g
               key={`${d.artifactType}-${d.artifact}`}
+              data-testid="rarity-dot"
+              data-artifact={d.artifact}
+              data-artifact-type={d.artifactType}
+              data-rare={d.pending ? 'pending' : d.isRare ? 'true' : 'false'}
+              data-host-count={d.pending ? undefined : d.hostCount}
               className="cursor-pointer"
               onMouseEnter={() => handleEnter(d, cx, cy)}
               onMouseLeave={() => setTip(null)}

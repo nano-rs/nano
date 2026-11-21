@@ -203,6 +203,8 @@ impl DetectionRuleRepository {
                 failing_since = NULL,
                 failure_class = NULL,
                 catchup_size_failures = 0,
+                crash_streak = 0,
+                crash_suspect = false,
                 updated_at = NOW()
             WHERE id = $1 AND updated_at = $31
             RETURNING *
@@ -299,30 +301,48 @@ impl DetectionRuleRepository {
     /// of every time it fired. The rule is parked in staging with no schedule,
     /// so neither the scheduler nor the late-replay lane can claim it again.
     ///
+    /// The same statement drops the rule's `rule_imports` link (NAN-5672). A
+    /// deleted repository rule is then no longer "imported": a repo sync
+    /// cannot mark it as having an upstream update, and re-importing it
+    /// creates a fresh rule rather than rewriting the archived row. The
+    /// catalog entry (`repository_rules`) stays, so it can be re-imported.
+    ///
     /// Returns `false` when nothing was archived: the rule is missing, already
     /// archived, or still claimed by a scheduler node.
     pub async fn archive_for_delete(
         &self,
         id: Uuid,
     ) -> Result<bool, DetectionRuleRepositoryError> {
-        let result = sqlx::query(
+        // A data-modifying CTE always runs to completion, so the unlink and
+        // the archive commit together or not at all.
+        let archived: i64 = sqlx::query_scalar(
             r#"
-            UPDATE detection_rules
-            SET archived = TRUE,
-                mode = 'staging',
-                paused_from_mode = NULL,
-                next_run_at = NULL,
-                updated_at = NOW()
-            WHERE id = $1
-              AND archived = FALSE
-              AND claimed_by IS NULL
+            WITH archived AS (
+                UPDATE detection_rules
+                SET archived = TRUE,
+                    mode = 'staging',
+                    paused_from_mode = NULL,
+                    next_run_at = NULL,
+                    -- The view was dropped before the archive; a stale name
+                    -- would read as "provisioned" after an unarchive.
+                    materialized_view_name = NULL,
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND archived = FALSE
+                  AND claimed_by IS NULL
+                RETURNING id
+            ), unlinked AS (
+                DELETE FROM rule_imports
+                WHERE detection_rule_id IN (SELECT id FROM archived)
+            )
+            SELECT COUNT(*) FROM archived
             "#,
         )
         .bind(id)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() == 1)
+        Ok(archived == 1)
     }
 
     /// Hard-delete a detection rule row.
@@ -345,8 +365,26 @@ impl DetectionRuleRepository {
 }
 
 fn map_rule_write_error(error: sqlx::Error) -> DetectionRuleRepositoryError {
-    match crate::mitre::mapping::database_mapping_violation(&error) {
-        Some(message) => DetectionRuleRepositoryError::InvalidMitreMapping(message),
-        None => DetectionRuleRepositoryError::DatabaseError(error),
+    if let Some(message) = crate::mitre::mapping::database_mapping_violation(&error) {
+        return DetectionRuleRepositoryError::InvalidMitreMapping(message);
+    }
+    if is_unique_name_per_repo_violation(&error) {
+        return DetectionRuleRepositoryError::NameConflict(
+            "An active rule from the same repository already has this name (it was \
+             re-imported after this one was deleted). Rename or delete that rule first."
+                .to_string(),
+        );
+    }
+    DetectionRuleRepositoryError::DatabaseError(error)
+}
+
+/// SQLSTATE 23505 on the per-repository name guard (migrations 146, 287).
+fn is_unique_name_per_repo_violation(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db) => {
+            db.code().as_deref() == Some("23505")
+                && db.constraint() == Some("idx_detection_rules_unique_name_per_repo")
+        }
+        _ => false,
     }
 }

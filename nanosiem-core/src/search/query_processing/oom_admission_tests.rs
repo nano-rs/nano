@@ -40,7 +40,11 @@ fn non_spillable_state_is_cost_gated_per_command() {
     let keeps_rows = AdmissionClass::CostGated { bytes_per_row: ROW_PRESERVING_BYTES_PER_ROW };
     let collapses = AdmissionClass::CostGated { bytes_per_row: COLLAPSING_BYTES_PER_ROW };
     for (npl, want) in [
-        ("* | dedup src_endpoint.ip", collapses),
+        // NAN-5657: a dedup whose output reaches the result is buffered by
+        // the pagination wrapper (near-unique keys keep ~every row).
+        ("* | dedup src_endpoint.ip", keeps_rows),
+        ("* | dedup src_endpoint.ip | stats count", collapses),
+        ("* | dedup src_endpoint.ip | head 100", collapses),
         ("* | eventstats count() as total", keeps_rows),
         ("* | sort timestamp | streamstats count() as n", keeps_rows),
         ("* | transaction user.name maxspan=30m", collapses),

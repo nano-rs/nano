@@ -121,18 +121,22 @@ pub async fn list_detections(
 /// - detection_mode: Execution tier (real-time, scheduled)
 /// - materialized_view_name: View name for real-time rules
 ///
+/// A deleted (archived) rule is a 404 unless `include_archived=true`, the
+/// same default as `GET /api/rules` (NAN-5672).
+///
 /// Requirements: 5.5
 #[utoipa::path(
     get,
     path = "/api/rules/{id}",
     tag = "detections",
     params(
-        ("id" = String, Path, description = "Detection rule ID")
+        ("id" = String, Path, description = "Detection rule ID"),
+        GetDetectionQuery
     ),
     responses(
         (status = 200, description = "Detection rule details", body = DetectionRule),
         (status = 403, description = "Missing permission: detections:view", body = ErrorResponse),
-        (status = 404, description = "Rule not found", body = ErrorResponse),
+        (status = 404, description = "Rule not found, or deleted (archived) and include_archived not set", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -140,10 +144,15 @@ pub async fn get_detection(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
+    Query(query): Query<GetDetectionQuery>,
 ) -> Result<Json<DetectionRule>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
-    let rule = state.detection_service.get_rule(*id).await?;
+    let rule = if query.include_archived {
+        state.detection_service.get_rule(*id).await?
+    } else {
+        state.detection_service.get_active_rule(*id).await?
+    };
 
     // Demo isolation: block access to rules created by other demo users
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -340,6 +349,11 @@ pub async fn create_detection(
 /// Handles detection mode transitions and updates the appropriate execution tier.
 /// Auto-corrects real-time rules with piped commands to scheduled mode.
 ///
+/// `{"archived": true}` deletes the rule exactly like `DELETE /api/rules/{id}`
+/// and must be sent on its own. A deleted rule accepts only
+/// `{"archived": false}`, which restores it to staging (recreating a
+/// real-time rule's view). Any other update to it is a 404 (NAN-5672).
+///
 /// Requirements: 4.4, 5.5
 #[utoipa::path(
     put,
@@ -352,8 +366,9 @@ pub async fn create_detection(
     responses(
         (status = 200, description = "Detection rule updated successfully", body = DetectionResponse),
         (status = 400, description = "Validation error", body = ErrorResponse),
-        (status = 403, description = "Missing required detections edit or promote permission", body = ErrorResponse),
-        (status = 404, description = "Rule not found", body = ErrorResponse),
+        (status = 403, description = "Missing required detections edit or promote permission (archiving also needs detections:delete)", body = ErrorResponse),
+        (status = 404, description = "Rule not found, or deleted (archived) and the update does not unarchive it", body = ErrorResponse),
+        (status = 409, description = "Invalid state transition, or the unarchived rule's name is already taken by an active rule from the same repository", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -368,6 +383,31 @@ pub async fn update_detection(
 
     // Fetch current rule state for audit diff
     let old_rule = state.detection_service.get_rule(*id).await?;
+
+    // NAN-5672: archiving IS deleting (NAN-3816). `{"archived": true}` (the
+    // console's Archive action) runs the delete teardown, so the rule is
+    // stopped, its real-time view dropped and its repo import unlinked,
+    // instead of flagging a still-running row.
+    if request.archived == Some(true) && !old_rule.archived {
+        ensure_permission(&auth, permissions::DETECTIONS_DELETE)?;
+        ensure_archive_only(&request)?;
+        state
+            .detection_service
+            .delete_rule_with_mode(*id, state.materialized_view_generator.as_ref())
+            .await?;
+        state.emit_audit(rule_deleted_audit_event(
+            &auth,
+            &client,
+            *id,
+            old_rule.name.clone(),
+            Some(old_rule.mode),
+        ));
+        let rule = state.detection_service.get_rule(*id).await?;
+        return Ok(Json(DetectionResponse {
+            rule,
+            warning: None,
+        }));
+    }
 
     // Lifecycle / weakening fields require detections:promote, matching the
     // dedicated /pause, /resume, /promote, /demote, and /bulk-update endpoints.
@@ -603,17 +643,60 @@ pub async fn delete_detection(
         .await?;
 
     // Emit audit event
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::Detection, RULE_DELETED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("detection_rule", Some(*id), Some(rule_name))
-            .client_context(&client)
-            .details(serde_json::json!({"mode": rule_mode, "archived": true}))
-            .build(),
-    );
+    state.emit_audit(rule_deleted_audit_event(
+        &auth,
+        &client,
+        *id,
+        rule_name,
+        rule_mode,
+    ));
 
     Ok(Json(serde_json::json!({"deleted": true, "archived": true})))
+}
+
+/// An archive request carries nothing else, because the archive runs the
+/// delete teardown and an archived rule takes no further edits. `mode:
+/// "staging"` is tolerated, since the archive parks the rule there anyway.
+pub(super) fn ensure_archive_only(request: &UpdateDetectionRule) -> Result<(), ApiError> {
+    let value = serde_json::to_value(request)
+        .map_err(|e| ApiError::InternalError(format!("Failed to read update: {e}")))?;
+    let extra: Vec<&str> = value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, v)| {
+            !v.is_null()
+                && key.as_str() != "archived"
+                && !(key.as_str() == "mode" && v.as_str() == Some("staging"))
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+    if extra.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::ValidationError(format!(
+            "Archiving a rule deletes it; send other changes separately (got: {})",
+            extra.join(", ")
+        )))
+    }
+}
+
+/// The audit record for a rule delete (archive). Built separately so the
+/// event shape is unit-tested without a full `AppState` (NAN-5672).
+pub(super) fn rule_deleted_audit_event(
+    auth: &AuthContext,
+    client: &ClientContext,
+    rule_id: uuid::Uuid,
+    rule_name: String,
+    rule_mode: Option<RuleMode>,
+) -> AuditEvent {
+    AuditEvent::builder(AuditSource::Detection, RULE_DELETED)
+        .actor(Some(auth.user_id()), None)
+        .api_key(auth.api_key_id, auth.api_key_name.clone())
+        .resource("detection_rule", Some(rule_id), Some(rule_name))
+        .client_context(client)
+        .details(serde_json::json!({"mode": rule_mode, "archived": true}))
+        .build()
 }
 
 fn severity_rank(s: Severity) -> u8 {

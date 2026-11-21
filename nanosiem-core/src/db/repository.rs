@@ -48,7 +48,7 @@ pub use folder_settings::{FolderSetting, FolderSettingsError, FolderSettingsRepo
 #[cfg(feature = "enterprise")]
 pub use incidents::{IncidentRepository, IncidentRepositoryError};
 #[cfg(feature = "enterprise")]
-pub use notebooks::{NotebookRepository, NotebookRepositoryError};
+pub use notebooks::{CaseNotebookCreate, NotebookRepository, NotebookRepositoryError};
 pub use notifications::{NotificationError, NotificationRepository};
 pub use retro_hunt::{RetroHuntRepository, RetroHuntRepositoryError};
 pub use query_explanations::{

@@ -176,7 +176,7 @@ impl SearchService {
             crate::search::execution::clickhouse_executor::escape_question_marks_in_strings(
                 &count_sql,
             );
-        let guard_id = format!("{query_id}-guard");
+        let guard_id = crate::search::companion_query_id::CompanionQuery::Guard.query_id(query_id);
         // The estimate must stay cheap next to the search it gates: cap its
         // run time (a selective `where` over a long window reads rows).
         let mut settings = self.active_ch_settings.clone();

@@ -148,6 +148,18 @@ fn uniq_exact_reports_the_empty_value_difference() {
     assert!(r.differences.iter().any(|d| d.detail.contains("empty")), "{:?}", r.differences);
 }
 
+/// NAN-5657: an approximate distinct count converts to estdc, never to the
+/// exact dc, and is never reported exact.
+#[test]
+fn approximate_distinct_counts_convert_to_estdc() {
+    for func in ["uniq", "uniqCombined64", "uniqHLL12"] {
+        let r = conv(&format!("SELECT src_host, {func}(user) AS users FROM logs WHERE {W} GROUP BY src_host"), &udm());
+        assert_eq!(r.npl.as_deref(), Some("* | stats estdc(user) as users by src_host"), "{func}");
+        assert!(!r.exact, "{func}: empty values differ");
+        assert!(r.differences.iter().any(|d| d.detail.contains("estdc() skips")), "{func}: {:?}", r.differences);
+    }
+}
+
 #[test]
 fn out_of_subset_queries_are_refused_with_a_reason_never_guessed() {
     for (sql, why) in [

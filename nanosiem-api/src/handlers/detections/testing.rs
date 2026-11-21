@@ -121,7 +121,8 @@ pub async fn test_detection(
     let clean_query = strip_comments(&request.query);
 
     // Look up the saved rule so we can step at its actual schedule + lookback.
-    let rule = state.detection_service.get_rule(*id).await?;
+    // A deleted (archived) rule is a 404 (NAN-5672).
+    let rule = state.detection_service.get_active_rule(*id).await?;
 
     // NAN-2047: run the tester's searches under the caller's effective scope so
     // a source-restricted principal can't read denied sources through it.

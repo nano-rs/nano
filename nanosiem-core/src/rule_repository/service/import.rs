@@ -315,6 +315,11 @@ impl RuleRepositoryService {
     /// Load the detection an import would overwrite, if one already exists from
     /// this repository under the same name. Shared by the preflight and the
     /// write path so both evaluate the promotion policy against the same row.
+    ///
+    /// Archived rows are deleted rules (NAN-3816) and never a target: matching
+    /// one made a re-import rewrite the archived row in place and report
+    /// `Updated` while no rule came back (NAN-5672). Migration 287 already
+    /// scopes the per-repo name guard to non-archived rows for this reason.
     async fn find_existing_import_target(
         &self,
         name: &str,
@@ -333,7 +338,8 @@ impl RuleRepositoryService {
         let row: Option<ExistingImportTargetRow> =
             sqlx::query_as(
                 "SELECT id, dataset, risk_score, severity, schedule_cron, lookback_minutes \
-                 FROM detection_rules WHERE name = $1 AND source_repository_id = $2 LIMIT 1",
+                 FROM detection_rules \
+                 WHERE name = $1 AND source_repository_id = $2 AND archived = FALSE LIMIT 1",
             )
             .bind(name)
             .bind(repo_id)

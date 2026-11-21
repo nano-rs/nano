@@ -35,6 +35,8 @@ interface CodeLensProps {
   onChange: (v: string) => void;
   onValidationChange?: (v: ValidationState | null) => void;
   readOnly?: boolean;
+  /** NAN-5683: the rule is archived (deleted) — it neither streams nor runs on a schedule. */
+  archived?: boolean;
   /** Extracted from the YAML frontmatter; purely for the tone of the toolbar badge. */
   detectionMode?: 'realtime' | 'scheduled' | null;
   validation?: ValidationState | null;
@@ -45,7 +47,7 @@ interface CodeLensProps {
 }
 
 export const CodeLens = forwardRef<CodeMirrorEditorRef, CodeLensProps>(function CodeLens(
-  { value, onChange, onValidationChange, readOnly, detectionMode, validation, onOpenValidationDetails, onFormat },
+  { value, onChange, onValidationChange, readOnly, archived, detectionMode, validation, onOpenValidationDetails, onFormat },
   ref,
 ) {
   // Context menu actions. We defer Cut/Copy/Paste/Select All/Undo/Redo to the
@@ -60,10 +62,12 @@ export const CodeLens = forwardRef<CodeMirrorEditorRef, CodeLensProps>(function 
       // without reaching into the EditorView instance from this shell.
     }
   };
-  const modeLabel =
-    detectionMode === 'scheduled' ? 'scheduled' : detectionMode === 'realtime' ? 'real-time' : '—';
-  const modeHint =
-    detectionMode === 'scheduled'
+  const modeLabel = archived
+    ? 'archived'
+    : detectionMode === 'scheduled' ? 'scheduled' : detectionMode === 'realtime' ? 'real-time' : '—';
+  const modeHint = archived
+    ? 'not running · read-only'
+    : detectionMode === 'scheduled'
       ? 'runs on cron schedule'
       : detectionMode === 'realtime'
         ? 'streams via materialized view'
@@ -93,7 +97,9 @@ export const CodeLens = forwardRef<CodeMirrorEditorRef, CodeLensProps>(function 
           <Circle
             className={cn(
               'w-2 h-2 fill-current',
-              detectionMode === 'scheduled'
+              archived
+                ? 'text-muted-foreground'
+                : detectionMode === 'scheduled'
                 ? 'text-[var(--success)]'
                 : detectionMode === 'realtime'
                   ? 'text-[var(--primary)]'
@@ -111,6 +117,8 @@ export const CodeLens = forwardRef<CodeMirrorEditorRef, CodeLensProps>(function 
           type="button"
           onClick={onOpenValidationDetails}
           disabled={!onOpenValidationDetails}
+          data-testid="rule-validation-status"
+          data-status={valStatus}
           title={valStatus === 'invalid' ? 'Click to see why' : 'Validation details'}
           className={cn(
             'inline-flex items-center gap-1 rounded px-1 -mx-1 transition-colors',

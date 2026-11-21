@@ -104,6 +104,7 @@ pub fn has_outer_time_modifiers(query: &str) -> bool {
 pub use pretty_print::PrettyPrint;
 pub use sql_gen::{SqlGenError, TimeRange};
 pub use time_bins::{resolve_timechart_bins, round_span_for_bins};
+pub(crate) use time_bins::{bucket_count as timechart_bucket_count, bucket_starts as timechart_bucket_starts};
 pub use validation::{
     // Query cost analysis (query cost analysis)
     analyze_query_cost,

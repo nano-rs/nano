@@ -34,9 +34,10 @@ pub struct FindingSuppression {
     pub finding_signature: String,
     pub title: String,
     pub reason: String,
-    #[serde(with = "crate::typeid::user")]
-    #[schema(value_type = String)]
-    pub created_by: Uuid,
+    /// NULL once the suppressing user is deleted (NAN-5721, ON DELETE SET NULL).
+    #[serde(with = "crate::typeid::user::opt")]
+    #[schema(value_type = Option<String>)]
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub deactivated_at: Option<DateTime<Utc>>,
     #[serde(with = "crate::typeid::user::opt")]

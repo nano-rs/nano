@@ -22,9 +22,15 @@ mod per_event;
 mod provenance;
 pub(crate) mod helpers;
 mod retro_hunt;
+mod run_bound;
+pub use run_bound::{
+    configured_max_matches_per_run, COVERAGE_INCOMPLETE_MARKER, DEFAULT_MAX_MATCHES_PER_RUN,
+};
 mod rules;
 #[cfg(test)]
 mod source_stamp_tests;
+#[cfg(test)]
+mod risk_origin_stamp_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -100,6 +106,10 @@ pub struct DetectionServiceConfig {
     pub signal_logging_enabled: bool,
     /// Whether to enable prevalence-based detection conditions
     pub prevalence_enabled: bool,
+    /// Most events a raw-event rule's scheduled run fetches before it
+    /// switches to per-entity representatives (NAN-5736, see `run_bound`).
+    /// `DETECTION_MAX_MATCHES_PER_RUN`.
+    pub max_matches_per_run: usize,
 }
 
 impl Default for DetectionServiceConfig {
@@ -110,6 +120,7 @@ impl Default for DetectionServiceConfig {
             default_historical_days: 7,
             signal_logging_enabled: true,
             prevalence_enabled: true,
+            max_matches_per_run: configured_max_matches_per_run(),
         }
     }
 }
@@ -437,5 +448,14 @@ impl DetectionService {
     /// Get a reference to the score calculator
     pub fn score_calculator(&self) -> &ScoreCalculator {
         &self.score_calculator
+    }
+}
+
+impl DetectionService {
+    /// Override the per-run event bound (NAN-5736). Production reads
+    /// `DETECTION_MAX_MATCHES_PER_RUN`; tests set it here.
+    pub fn with_max_matches_per_run(mut self, cap: usize) -> Self {
+        self.config.max_matches_per_run = cap.max(1);
+        self
     }
 }

@@ -63,8 +63,40 @@ impl GroupApiError {
             GroupRepositoryError::GrantAuthorityChanged => {
                 (StatusCode::CONFLICT, "grant_authority_changed")
             }
-            GroupRepositoryError::DatabaseError(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "database_error")
+            // Never echo raw database text to the client (NAN-5742).
+            GroupRepositoryError::DatabaseError(e) => {
+                tracing::error!(error = %e, "group repository database error");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Self::new("database_error", "An error occurred"),
+                );
+            }
+            // NAN-5742: the delete is refused with a 409. A foreign-key refusal
+            // is expected; a broken NOT NULL / CHECK is a schema bug and is
+            // logged at error level. The admin sees which constraint.
+            GroupRepositoryError::DeleteBlocked(v) => {
+                if v.is_foreign_key() {
+                    tracing::warn!(constraint = %v.label(), "group delete blocked by a foreign-key reference");
+                } else {
+                    tracing::error!(
+                        sqlstate = %v.sqlstate,
+                        table = ?v.table,
+                        column = ?v.column,
+                        constraint = ?v.constraint,
+                        "group delete broke a constraint on a dependent table (schema bug)"
+                    );
+                }
+                return (
+                    StatusCode::CONFLICT,
+                    Self::new(
+                        "group_still_referenced",
+                        &format!(
+                            "This group is still referenced by other records and cannot be \
+                             deleted (constraint {}).",
+                            v.label()
+                        ),
+                    ),
+                );
             }
         };
 
@@ -341,6 +373,7 @@ pub async fn update_group(
         (status = 204, description = "Group deleted successfully"),
         (status = 403, description = "Forbidden - insufficient permissions or system group", body = GroupApiError),
         (status = 404, description = "Group not found", body = GroupApiError),
+        (status = 409, description = "Group is still referenced by other records (group_still_referenced)", body = GroupApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -372,10 +405,29 @@ pub async fn delete_group(
         .map(|g| g.name)
         .unwrap_or_else(|_| "unknown".to_string());
 
+    // NAN-5742: handoffs the delete will cancel (only target is this group),
+    // audited after commit.
+    #[cfg(feature = "enterprise")]
+    let removed = crate::handlers::case_target_removal::RemovedTarget::Group(*id);
+    #[cfg(feature = "enterprise")]
+    let canceled_candidates =
+        crate::handlers::case_target_removal::pending_sole_target(&state.pool, removed).await;
+
     state.group_repo.delete_group(*id).await.map_err(|e| {
         let (status, err) = GroupApiError::from_repo_error(&e);
         (status, Json(err))
     })?;
+
+    #[cfg(feature = "enterprise")]
+    crate::handlers::case_target_removal::audit_canceled(
+        &state,
+        &state.pool,
+        &auth.0,
+        &client.0,
+        removed,
+        &canceled_candidates,
+    )
+    .await;
 
     // Emit audit event
     state.emit_audit(
@@ -599,3 +651,7 @@ pub async fn get_group_members(
     )
 )]
 pub struct GroupsApiDoc;
+
+#[cfg(test)]
+#[path = "groups_error_tests.rs"]
+mod groups_error_tests;

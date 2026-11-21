@@ -21,6 +21,7 @@ pub mod event_envelope;
 pub(crate) mod finding_evidence;
 pub mod findings;
 pub mod health;
+pub mod match_payload;
 pub mod match_scope;
 pub mod materialized_view;
 pub mod query_enrichment;
@@ -28,6 +29,8 @@ pub mod risk;
 pub mod rule_transfer;
 #[cfg(test)]
 mod rule_transfer_tests;
+#[cfg(test)]
+mod realtime_delete_live_tests;
 pub mod schedule_lag;
 pub mod scheduler;
 pub mod service;

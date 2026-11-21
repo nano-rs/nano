@@ -50,6 +50,7 @@ import { parseValueForType } from '@/lib/lookup-utils';
 import { formatUTC } from '@/lib/date-utils';
 import { urlFirstRowIsHeader } from '@/lib/lookup-header';
 import type { FileFormat, UpsertLookupIngestionRequest } from '@/lib/api';
+import { lookupRowId } from '@/lib/api/types';
 import { SourceTag, type LookupSource } from '@/components/lookup/shared';
 import {
   useLookupTable,
@@ -294,7 +295,7 @@ export function LookupTableView() {
 
   // Delete state
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-  const [rowToDelete, setRowToDelete] = useState<number | null>(null);
+  const [rowToDelete, setRowToDelete] = useState<string | null>(null);
 
   // Paste dialog
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false);
@@ -361,7 +362,7 @@ export function LookupTableView() {
 
     const currentRow = rows[activeCell.rowIdx];
     if (!currentRow) return;
-    const rowId = currentRow._row_id as number;
+    const rowId = lookupRowId(currentRow);
 
     const fields: Record<string, unknown> = {};
     table.columns.forEach((col) => {
@@ -506,7 +507,7 @@ export function LookupTableView() {
   };
 
   // Delete handlers
-  const confirmDelete = (rowId: number) => {
+  const confirmDelete = (rowId: string) => {
     setRowToDelete(rowId);
     setDeleteDialogOpen(true);
   };
@@ -1026,7 +1027,7 @@ export function LookupTableView() {
           </thead>
           <tbody>
             {rows.map((row, rowIdx) => {
-              const rowId = row._row_id as number;
+              const rowId = lookupRowId(row);
               const rowNum = pageOffset + rowIdx + 1;
               return (
                 <tr key={rowId} className="border-b border-border/40 group/row hover:bg-foreground/[0.02]">
@@ -1046,6 +1047,7 @@ export function LookupTableView() {
                     return (
                       <td
                         key={col.name}
+                        data-testid={`lookup-cell-${rowIdx}-${col.name}`}
                         className={`border-r border-border/40 p-0 ${
                           isActive ? 'ring-2 ring-primary ring-inset bg-primary/5' : ''
                         }`}
@@ -1094,6 +1096,8 @@ export function LookupTableView() {
                       value={newRowData[col.name] || ''}
                       onChange={(e) => setNewRowData((prev) => ({ ...prev, [col.name]: e.target.value }))}
                       placeholder={col.data_type}
+                      aria-label={`New row ${col.name}`}
+                      data-testid={`lookup-new-row-${col.name}`}
                       className="w-full h-[24px] px-2.5 bg-transparent text-foreground font-mono text-[11px] outline-none placeholder:text-muted-foreground/40"
                       onKeyDown={handleNewRowKeyDown}
                       autoFocus={colIdx === 0}
@@ -1110,6 +1114,8 @@ export function LookupTableView() {
                   onClick={startAddRow}
                   className="w-full h-full flex items-center justify-center text-muted-foreground hover:text-primary transition-colors"
                   title="Add row"
+                  aria-label="Add row"
+                  data-testid="lookup-add-row"
                   disabled={addingRow}
                 >
                   <Plus className="w-3 h-3" strokeWidth={2} />

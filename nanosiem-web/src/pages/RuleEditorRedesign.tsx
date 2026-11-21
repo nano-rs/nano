@@ -86,6 +86,8 @@ import {
   InspectorDrawer,
   TestDrawer,
   ValidationDetailsDialog,
+  ArchivedRuleBanner,
+  ruleEditorActionAccess,
 
   type RuleVersionSummary,
   type ViewMode,
@@ -132,6 +134,10 @@ export function RuleEditorRedesign() {
   // The rail's Archived tab lists deleted (archived) rules (NAN-3816).
   const { data: apiRules, loading: rulesLoading, refetch: refetchRules } = useDetections({ includeArchived: true });
   const { data: apiRule, loading: ruleLoading, refetch: refetchRule } = useDetection(id);
+  // NAN-5683: an archived (deleted) rule opened by URL is read-only. It no
+  // longer runs and the API refuses every rule action but unarchive (404),
+  // so nothing that writes, tests or tunes it is offered.
+  const ruleArchived = !isNewMode && Boolean(apiRule?.archived);
   const { data: duplicateRule } = useDetection(duplicateId || undefined);
   const { mutate: updateDetection, loading: updating } = useUpdateDetection();
   const { mutate: createDetection, loading: creating } = useCreateDetection();
@@ -158,6 +164,30 @@ export function RuleEditorRedesign() {
   const editorRef = useRef<CodeMirrorEditorRef>(null);
   const [editorContent, setEditorContent] = useState(() => createDetectionTemplate(user?.name || ''));
   const [savedContent, setSavedContent] = useState<string>('');
+  // NAN-5683: every control mirrors the server check of the endpoint it calls
+  // (see rule-action-access.ts); `canWrite` gates every buffer write.
+  const ruleActions = ruleEditorActionAccess({
+    isNewMode,
+    hasRule: Boolean(id),
+    archived: ruleArchived,
+    unsavedEdits: !isNewMode && editorContent !== savedContent,
+    canView: hasPermission('detections:view'),
+    canCreate,
+    canEdit,
+    canDelete,
+    canPromote,
+    canSearch: hasPermission('search:execute'),
+    canViewAlerts: hasPermission('alerts:view'),
+    canMelodDetection: hasPermission('melod:detection'),
+  });
+  const canWrite = ruleActions.write;
+  // Defense in depth: no buffer write lands on a read-only (archived) rule,
+  // whatever the source (CodeMirror plugins, pivt, deep links).
+  const canWriteRef = useRef(canWrite);
+  canWriteRef.current = canWrite;
+  const setEditorContentIfWritable = useCallback((next: string) => {
+    if (canWriteRef.current) setEditorContent(next);
+  }, []);
   const [validation, setValidation] = useState<ValidationState | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('code');
   const [showSaveConfirm, setShowSaveConfirm] = useState(false);
@@ -307,11 +337,7 @@ export function RuleEditorRedesign() {
 
   useEffect(() => {
     if (isNewMode && duplicateRule && duplicateId) {
-      const severity = (duplicateRule.severity === 'informational' ? 'low' : duplicateRule.severity) as
-        | 'critical'
-        | 'high'
-        | 'medium'
-        | 'low';
+      const severity = duplicateRule.severity;
       const lookback = duplicateRule.lookback_minutes
         ? formatMinutesToDuration(duplicateRule.lookback_minutes)
         : '15m';
@@ -350,12 +376,11 @@ export function RuleEditorRedesign() {
   useEffect(() => {
     resetValidationCache();
     if (apiRule) {
-      const severity = (apiRule.severity === 'informational' ? 'low' : apiRule.severity) as
-        | 'critical'
-        | 'high'
-        | 'medium'
-        | 'low';
-      const lookback = apiRule.lookback_minutes ? formatMinutesToDuration(apiRule.lookback_minutes) : '15m';
+      // NAN-5716: load exactly what is stored. Coercing `informational` to
+      // `low`, or filling a NULL lookback with a synthesized `15m`, rewrote
+      // those columns on any save (a repository-linked rule then read DRIFT).
+      const severity = apiRule.severity;
+      const lookback = apiRule.lookback_minutes ? formatMinutesToDuration(apiRule.lookback_minutes) : '';
       const content = serializeDetectionMetadata(
         {
           title: apiRule.name,
@@ -418,19 +443,22 @@ export function RuleEditorRedesign() {
   // Repositories page with `?merge=upstream`. We fire once when a saved rule
   // is loaded so the modal has a concrete ID to fetch the diff against.
   useEffect(() => {
-    if (!isNewMode && id && searchParams.get('merge') === 'upstream') {
+    // NAN-5683: a merge writes the buffer, so a read-only (archived) rule
+    // ignores the link.
+    if (!isNewMode && id && apiRule?.id === id && canWrite && searchParams.get('merge') === 'upstream') {
       setUpstreamMergeOpen(true);
     }
-  }, [isNewMode, id, searchParams]);
+  }, [isNewMode, id, apiRule?.id, canWrite, searchParams]);
 
   // Auto-open the TestDrawer when arriving with `?test=1` (e.g. from the
   // Matches page's "Open test drawer" button — NAN-495). Fires once per
   // navigation; we don't strip the param so back-nav can re-open it if needed.
   useEffect(() => {
-    if (!isNewMode && id && searchParams.get('test') === '1') {
+    // NAN-5683: an archived rule has no test (404), so the link is ignored.
+    if (!isNewMode && id && apiRule?.id === id && ruleActions.test && searchParams.get('test') === '1') {
       setTestDrawerOpen(true);
     }
-  }, [isNewMode, id, searchParams]);
+  }, [isNewMode, id, apiRule?.id, ruleActions.test, searchParams]);
 
   const parsed = useMemo(() => parseDetectionMetadata(editorContent), [editorContent]);
   const metadata = parsed.metadata;
@@ -466,12 +494,12 @@ export function RuleEditorRedesign() {
   // ValidateCard) AND the dataset supports the MV path — spans/metrics are
   // scheduled-only, mirroring FormLens's lockout.
   const switchToRealtime = useCallback(() => {
-    if (!canEdit) return;
+    if (!canWrite) return;
     setEditorContent(serializeDetectionMetadata({ ...metadata, detection_mode: 'realtime' }, actualQuery));
-  }, [canEdit, metadata, actualQuery]);
+  }, [canWrite, metadata, actualQuery]);
 
   const realtimeNudgeAvailable =
-    canEdit && detectionModeLens === 'scheduled' && (metadata.dataset || 'logs') === 'logs';
+    canWrite && detectionModeLens === 'scheduled' && (metadata.dataset || 'logs') === 'logs';
 
   // Browser close / refresh guard — mirrors the legacy editor.
   useEffect(() => {
@@ -536,7 +564,7 @@ export function RuleEditorRedesign() {
   }, [metadata, actualQuery, titleValid]);
 
   const buildPayload = useCallback(() => {
-    const severity = (metadata.severity || 'medium') as 'critical' | 'high' | 'medium' | 'low';
+    const severity = metadata.severity || 'medium';
     const mode = (metadata.mode || 'staging') as 'staging' | 'live' | 'alerting';
     const detectionMode = metadata.detection_mode === 'scheduled' ? 'scheduled' : 'real-time';
     const schedule = metadata.schedule || (detectionMode === 'real-time' ? '*/30 * * * * *' : '');
@@ -864,7 +892,9 @@ export function RuleEditorRedesign() {
           toast.error('Failed to demote rule');
         }
       } : undefined,
-      onArchive: canEdit ? async (ruleId: string) => {
+      // NAN-5683: archiving IS deleting (NAN-5672), so it needs
+      // detections:delete; unarchive restores a lifecycle (edit + promote).
+      onArchive: canEdit && canDelete ? async (ruleId: string) => {
         try {
           await updateDetection({ id: ruleId, data: { archived: true } });
           toast.success('Rule archived');
@@ -874,7 +904,7 @@ export function RuleEditorRedesign() {
           toast.error('Failed to archive rule');
         }
       } : undefined,
-      onUnarchive: canEdit ? async (ruleId: string) => {
+      onUnarchive: canEdit && canPromote ? async (ruleId: string) => {
         try {
           await updateDetection({ id: ruleId, data: { archived: false, mode: 'staging' } });
           toast.success('Rule unarchived');
@@ -959,6 +989,8 @@ export function RuleEditorRedesign() {
   );
 
   const handleHintsChange = useCallback((next: AiTriageHints) => {
+    // NAN-5683: hints are part of the rule; a read-only rule takes no edit.
+    if (!canWriteRef.current) return;
     setTriageHints(next);
     setTriageHintsChanged(true);
   }, []);
@@ -968,6 +1000,8 @@ export function RuleEditorRedesign() {
   // query, triage hints) into the buffer as unsaved edits; Save then writes
   // the rule version + audit like any hand edit.
   const applyPivtEdit = useCallback((edit: PivtRuleEdit) => {
+    // NAN-5683: the bridge already refuses a read-only rule; never write past it.
+    if (!canWriteRef.current) return;
     if (edit.kind === 'query') {
       setEditorContent((prev) => serializeDetectionMetadata(parseDetectionMetadata(prev).metadata, edit.query));
     } else if (edit.kind === 'content') {
@@ -996,8 +1030,14 @@ export function RuleEditorRedesign() {
       ruleName: apiRule?.name || metadata.title || '',
       query: actualQuery,
       hints: triageHints,
-      canEdit,
-      tuneAvailable: aiTuningAvailable,
+      canEdit: canWrite,
+      // The AI side of tuning (POST /api/melod/detection/tune's permissions);
+      // edit access is `canEdit`, so pivt can say which one is missing.
+      tuneAvailable:
+        aiTuningAvailable &&
+        !ruleArchived &&
+        ['detections:view', 'search:execute', 'alerts:view', 'melod:detection'].every((p) => hasPermission(p)),
+      archived: ruleArchived,
     },
     onApply: applyPivtEdit,
     navState: location.state,
@@ -1018,12 +1058,12 @@ export function RuleEditorRedesign() {
   const editorReady = isNewMode || (!ruleLoading && apiRule?.id === id && savedContent !== '');
   const pivtActions = useMemo(
     () => [
-      ...(editorReady ? [editQueryAction({
+      ...(editorReady && !ruleArchived ? [editQueryAction({
         ruleId: () => editorRuleIdRef.current,
         currentQuery: () => bufferQueryRef.current,
         apply: (query) => applyPivtEdit({ kind: 'query', query }),
       })] : []),
-      ...(savedRule
+      ...(savedRule && !ruleArchived
         ? ruleLifecycleActions(
             {
               visible: () => [savedRule],
@@ -1038,7 +1078,7 @@ export function RuleEditorRedesign() {
         : []),
       searchPivotAction(navigate),
     ],
-    [editorReady, savedRule, applyPivtEdit, refetchRules, refetchRule, navigate],
+    [editorReady, ruleArchived, savedRule, applyPivtEdit, refetchRules, refetchRule, navigate],
   );
   usePivtPage({
     icon: 'Shield',
@@ -1135,6 +1175,8 @@ export function RuleEditorRedesign() {
           onMoveRule={
             canEdit
               ? async (ruleId, folder) => {
+                  // NAN-5683: an archived rule takes no edit (PUT is a 404).
+                  if (apiRules?.find((r) => r.id === ruleId)?.archived) return;
                   try {
                     await updateDetection({ id: ruleId, data: { folder: folder || undefined } });
                     // NAN-729: when the dragged rule is the one currently
@@ -1193,45 +1235,50 @@ export function RuleEditorRedesign() {
           viewMode={viewMode}
           onViewMode={handleViewMode}
           onBack={() => navigate(-1)}
-          onSave={handleSave}
-          onDiscard={canEdit && !isNewMode ? handleDiscard : undefined}
-          onFormat={canEdit ? handleFormat : undefined}
-          onOpenTest={handleOpenTest}
-          onViewMatches={!isNewMode && id ? () => navigate(`/rules/${id}/matches`) : undefined}
-          onDuplicate={!isNewMode && id && canCreate ? () => navigate(`/rules/editor/new?duplicate=${id}`) : undefined}
-          onTogglePause={!isNewMode && id && canPromote ? handleTogglePause : undefined}
-          onPromote={!isNewMode && id && canPromote ? handlePromote : undefined}
-          onDemote={!isNewMode && id && canPromote ? handleDemote : undefined}
+          onSave={ruleActions.save ? handleSave : undefined}
+          onDiscard={ruleActions.discard ? handleDiscard : undefined}
+          onFormat={ruleActions.format ? handleFormat : undefined}
+          onOpenTest={ruleActions.test ? handleOpenTest : undefined}
+          onViewMatches={ruleActions.viewMatches ? () => navigate(`/rules/${id}/matches`) : undefined}
+          onDuplicate={ruleActions.duplicate ? () => navigate(`/rules/editor/new?duplicate=${id}`) : undefined}
+          onTogglePause={ruleActions.lifecycle ? handleTogglePause : undefined}
+          onPromote={ruleActions.lifecycle ? handlePromote : undefined}
+          onDemote={ruleActions.lifecycle ? handleDemote : undefined}
           lifecyclePending={lifecyclePending}
-          onArchive={!isNewMode && id && canEdit ? () => setShowArchiveConfirm(true) : undefined}
-          onUnarchive={!isNewMode && id && canEdit && apiRule?.archived ? handleUnarchive : undefined}
-          onDelete={!isNewMode && id && canDelete && !apiRule?.archived ? () => setShowDeleteConfirm(true) : undefined}
-          onOpenTune={!isNewMode && id && canEdit ? handleOpenTune : undefined}
+          onArchive={ruleActions.archive ? () => setShowArchiveConfirm(true) : undefined}
+          onUnarchive={ruleActions.unarchive ? handleUnarchive : undefined}
+          onDelete={ruleActions.delete ? () => setShowDeleteConfirm(true) : undefined}
+          onOpenTune={ruleActions.tune ? handleOpenTune : undefined}
           enabledLenses={new Set<ViewMode>(['code', 'flow', 'form'])}
           availableFolders={availableFolders}
-          onFolderChange={canEdit ? handleFolderChange : undefined}
+          onFolderChange={canWrite ? handleFolderChange : undefined}
           folderSettings={folderSettings}
         />
+
+        {ruleArchived && (
+          <ArchivedRuleBanner onUnarchive={ruleActions.unarchive ? handleUnarchive : undefined} />
+        )}
 
         <div className="flex-1 min-h-0 flex">
           {viewMode === 'code' && (
             <CodeLens
               ref={editorRef}
               value={editorContent}
-              onChange={setEditorContent}
+              onChange={setEditorContentIfWritable}
               onValidationChange={setValidation}
-              readOnly={!canEdit}
+              readOnly={!canWrite}
+              archived={ruleArchived}
               detectionMode={detectionModeLens}
               validation={validation}
               onOpenValidationDetails={() => setValidationDetailsOpen(true)}
-              onFormat={canEdit ? handleFormat : undefined}
+              onFormat={ruleActions.format ? handleFormat : undefined}
             />
           )}
           {viewMode === 'flow' && (
             <FlowLens query={actualQuery} schedule={metadata.schedule} lookback={metadata.lookback} />
           )}
           {viewMode === 'form' && (
-            <FormLens value={editorContent} onChange={setEditorContent} readOnly={!canEdit} />
+            <FormLens value={editorContent} onChange={setEditorContentIfWritable} readOnly={!canWrite} />
           )}
         </div>
 
@@ -1241,10 +1288,10 @@ export function RuleEditorRedesign() {
           lastSavedLabel={lastSavedLabel}
           versions={versions}
           dailyStats={id ? detectionStats?.[id] : undefined}
-          ruleId={!isNewMode && id && canEdit ? id : undefined}
-          readOnly={!canEdit}
+          ruleId={ruleActions.tuneSettings ? id : undefined}
+          readOnly={!canWrite}
           onSwitchToRealtime={realtimeNudgeAvailable ? switchToRealtime : undefined}
-          onOpenTest={handleOpenTest}
+          onOpenTest={ruleActions.test ? handleOpenTest : undefined}
           onOpenVersion={(v) => {
             setInspectorCollapsed(false);
             setPendingVersionFocusId(v.id);
@@ -1274,7 +1321,7 @@ export function RuleEditorRedesign() {
         playbookId={playbookPickId}
         onPlaybookIdChange={handlePlaybookIdChange}
         ruleId={id}
-        readOnly={!canEdit}
+        readOnly={!canWrite}
         lastTest={lastTest}
         onRunTest={handleRunTest}
         testRunning={testRunningSaved || testRunningUnsaved}
@@ -1320,7 +1367,7 @@ export function RuleEditorRedesign() {
           panel itself slides up from the bottom of the whole row. Mirrors
           `design-ref/shadcn/editor-test-drawer.jsx`. */}
       <TestDrawer
-        open={testDrawerOpen}
+        open={testDrawerOpen && ruleActions.test}
         onClose={() => setTestDrawerOpen(false)}
         query={actualQuery}
         // NAN-5501: the saved-rule endpoint tests the PERSISTED rule, so only
@@ -1330,7 +1377,7 @@ export function RuleEditorRedesign() {
         runSavedTest={testDetectionMut}
         runUnsavedTest={testQueryMut}
         onApplyQuery={
-          canEdit
+          canWrite
             ? (nextQuery) => {
                 // Rebuild the document with the drawer's working copy as the
                 // new body. The YAML frontmatter carries over unchanged so
@@ -1373,10 +1420,10 @@ export function RuleEditorRedesign() {
         open={validationDetailsOpen}
         onOpenChange={setValidationDetailsOpen}
         validation={validation}
-        onRunTest={actualQuery.trim() ? handleOpenTest : undefined}
+        onRunTest={ruleActions.test && actualQuery.trim() ? handleOpenTest : undefined}
       />
 
-      {!isNewMode && id && (
+      {!isNewMode && id && canWrite && (
         <UpstreamMergeModal
           detectionRuleId={id}
           open={upstreamMergeOpen}
@@ -1384,7 +1431,7 @@ export function RuleEditorRedesign() {
           diffAccess={upstreamDiffAccess}
           onApplyMerge={(mergedQuery) => {
             const merged = serializeDetectionMetadata(metadata, mergedQuery);
-            setEditorContent(merged);
+            setEditorContentIfWritable(merged);
             toast.success('Upstream changes applied', {
               description: 'Review and save to persist the merge.',
             });

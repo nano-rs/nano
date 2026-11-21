@@ -60,7 +60,12 @@ jobs:
       # unlink the old tree (NAN-773).
       - name: Reclaim workspace before checkout (NAN-773)
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE:/ws" -w /ws alpine \
+          # NAN-5733: nano-ci labels let the runner pre-job hook remove this container
+          # if the job is cancelled (scripts/ci/runner-pre-job.sh).
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm -v "$GITHUB_WORKSPACE:/ws" -w /ws alpine \
             chown -R "$(id -u):$(id -g)" .
 
       - name: Checkout
@@ -68,7 +73,10 @@ jobs:
 
       - name: Start throwaway Postgres
         run: |
-          docker run -d --rm --name "$PG_CONTAINER" \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            -d --rm --name "$PG_CONTAINER" \
             -e POSTGRES_USER=nanosiem \
             -e POSTGRES_PASSWORD=nanosiem \
             -e POSTGRES_DB=nanosiem \
@@ -208,7 +216,10 @@ jobs:
           # key in-process and shares provider fixtures, so single-threaded.
           # NAN-5274: scim_provisioning_integration drives the SCIM 2.0 router
           # (Okta/Entra shapes, deprovisioning, grants, email trust, limits).
-          docker run --rm --network host \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm --network host \
             -v "$PWD":/ws -w /ws \
             -e CREDENTIAL_SUITE_ENCRYPTION_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
             -v nanosiem-pgit-cargo-registry:/usr/local/cargo/registry \
@@ -224,6 +235,9 @@ jobs:
               # feature, so the enterprise-only OpenAPI contract tests (hunts
               # recon surface, desktop wire spec) need their own run.
               cargo test -p nanosiem-api --features enterprise --lib openapi::tests
+              # NAN-5734: meloD config poller fingerprint (enterprise-only module;
+              # its DB tests skip unless NANOSIEM_TEST_DATABASE_URL is set).
+              NANOSIEM_TEST_DATABASE_URL="$DATABASE_URL" cargo test -p nanosiem-api --features enterprise --lib state::melod::config_poller_tests
               cargo test -p nanosiem-core --test migration_seed_parity -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
               cargo test -p nanosiem-core --test first_admin_claim_integration -- --ignored
@@ -266,5 +280,8 @@ jobs:
         # chown it back via a throwaway container so the next host-side workflow's
         # actions/checkout can clean the tree without EACCES.
         run: |
-          docker run --rm -v "$PWD:/ws" -w /ws alpine \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm -v "$PWD:/ws" -w /ws alpine \
             chown -R "$(id -u):$(id -g)" . 2>/dev/null || true

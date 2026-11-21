@@ -18,6 +18,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { PreviewModal } from './PreviewModal';
 import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
+import { useAirGap } from '@/hooks/use-air-gap';
 import type { CredentialFieldDef, MarketplaceCatalogEntry } from '@/lib/api/marketplace';
 import { useToast } from '@/hooks/use-toast';
 import { formatNumber, formatUTCCompact } from '@/lib/date-utils';
@@ -81,18 +82,10 @@ export function MarketplaceDrawer({
     sandboxAvailable && hasPermission('log_sources:delete') && hasPermission('enrichments:code');
   const canViewCode =
     hasPermission('enrichments:view') && hasPermission('enrichments:code');
-  // Air-gap mode — shared cache with the catalog page's query key. When the
+  // Air-gap mode — shared cache with the catalog page (useAirGap). When the
   // entry needs network, the egress "Sync now" action is replaced by an
   // import-from-file route so the drawer stays honest offline (NAN-1212).
-  const airGapQuery = useQuery({
-    queryKey: ['system', 'config'],
-    queryFn: () => api.getSystemConfig(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-    retry: 1,
-    refetchOnWindowFocus: false,
-  });
-  const airGap = airGapQuery.data?.air_gap ?? false;
+  const airGap = useAirGap();
   // NAN-4959: IPinfo Lite is served from nano's signed platform feed bundle;
   // its drawer shows the bundle status instead of credentials and sync. Same
   // query key as the catalog page and PlatformFeedsPanel (one fetch).

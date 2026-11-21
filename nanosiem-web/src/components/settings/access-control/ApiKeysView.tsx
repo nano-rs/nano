@@ -104,6 +104,8 @@ function ApiKeyListItem({ apiKey, selected, onSelect }: ApiKeyListItemProps) {
   const status = deriveStatus(apiKey);
   return (
     <button
+      data-testid="api-key-row"
+      data-key-id={apiKey.id}
       onClick={() => onSelect(apiKey.id)}
       className={cn(
         'w-full text-left px-3 py-2.5 border-b border-border/60 flex items-start gap-2.5 transition-colors',

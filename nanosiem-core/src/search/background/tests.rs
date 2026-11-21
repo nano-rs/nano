@@ -307,38 +307,8 @@ fn a_request_without_modifiers_is_left_untouched() {
     assert_eq!(frozen.time_range.start, raw.time_range.start);
 }
 
-/// Codex P2-6: cancel must KILL every companion query a search can spawn. Scan
-/// the executor sources for derived `{query_id}-<suffix>` ids and require each
-/// suffix to be in the exact kill set (a new companion without a kill-set entry
-/// fails here instead of running on after cancel).
-#[test]
-fn kill_set_covers_every_derived_companion_query_id() {
-    let kill_set = crate::search::service::all_query_ids("Q");
-    let sources = [
-        include_str!("../execution/clickhouse_executor/paginated.rs"),
-        include_str!("../service/core_search.rs"),
-        include_str!("../service/streaming.rs"),
-        include_str!("../service/oom_admission.rs"),
-    ];
-    let mut found = std::collections::BTreeSet::new();
-    for src in sources {
-        for (i, _) in src.match_indices("format!(\"{query_id}-") {
-            let rest = &src[i + "format!(\"{query_id}-".len()..];
-            let suffix: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect();
-            found.insert(suffix);
-        }
-    }
-    assert!(found.contains("aggregate-count"), "scan found: {found:?}");
-    for suffix in found {
-        assert!(
-            kill_set.contains(&format!("Q-{suffix}")),
-            "companion query id suffix `-{suffix}` is not in all_query_ids — cancel would leave it running"
-        );
-    }
-}
+// Codex P2-6 / NAN-5723: the kill-set coverage scan lives in
+// `search/companion_query_id_tests.rs` (it scans the whole crate).
 
 // ---------------------------------------------------------------------------
 // Completion write refused by PostgreSQL (NAN-5430)

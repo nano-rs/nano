@@ -5,6 +5,7 @@ use super::prevalence_processing::{
 };
 use super::*;
 use crate::query::clickhouse_sql_gen::{ch_lower, ci_like, escape_like_pattern};
+use crate::search::companion_query_id::CompanionQuery;
 use crate::sql_hygiene::escape_sql_string;
 use super::prevalence_scan::{
     output_row_columns_sql, plan_prevalence_scan, PrevalenceScanPlan, ResultWindow,
@@ -38,6 +39,8 @@ pub(crate) struct PrevalenceLookupExprs {
 /// DISTINCT over the base scan, which dict identifies the blind keys, and
 /// which summary table/columns re-resolve them.
 struct RescueProbeSpec<'a> {
+    /// NAN-5723: the probe's derived query id (cancel kills it).
+    probe_id: String,
     lookup_expr: &'a str,
     dict: &'static str,
     summary_table: String,
@@ -109,6 +112,7 @@ impl SearchService {
                 prevalence_commands,
                 post_prevalence_commands,
                 time_range,
+                &query_id,
             )
             .await;
 
@@ -185,7 +189,7 @@ impl SearchService {
         // NAN-5565: generated SQL: the executor lifts `max_query_size` when the
         // rescue needs it and takes the aggregation decision from the
         // rescue-free rendering.
-        let data = self.execute_generated_clickhouse_sql(&sql, aggregation, limit, offset, grouped_output);
+        let data = self.execute_generated_clickhouse_sql(&sql, aggregation, limit, offset, &query_id, grouped_output);
         let (mut results, total_count) = if window_total {
             let (data, base_total) =
                 tokio::join!(data, self.prevalence_base_total(query, time_range, &query_id));
@@ -219,6 +223,25 @@ impl SearchService {
         // host_count / is_rare / first_seen / … CASEs, the pushed predicate, AND
         // any downstream `| where host_count < N` all saw the real count in
         // ClickHouse. No post-query decoration patch is needed.
+
+        // NAN-5718: a plain decorating `enrich=true` has no in-SQL rescue (the
+        // NAN-1705 rescue above is driven by filter conditions), so the rows it
+        // returned are re-checked here, BEFORE the per-dimension columns are
+        // stripped: true dict misses on these rows only, one combined probe.
+        let mut page_rescue_dropped = 0usize;
+        if super::prevalence_page_rescue::page_rescue_applies(
+            prevalence_commands,
+            post_prevalence_commands,
+            &scan,
+            rarity_threshold,
+        ) {
+            let time_window = Self::resolve_prevalence_window(prevalence_commands)?;
+            // Past-the-cap misses are reported (WARN, metric, PARTIAL note)
+            // inside, and surfaced as a PREVALENCE_RESCUE_PARTIAL warning below.
+            page_rescue_dropped = self
+                .rescue_page_prevalence(&mut results, time_window, rarity_threshold, &query_id)
+                .await;
+        }
 
         // Strip internal lookup fields used for SQL JOINs (these are implementation details)
         strip_internal_lookup_fields(&mut results);
@@ -382,7 +405,7 @@ impl SearchService {
         } else {
             let histogram_start = Instant::now();
             // NAN-1428: derived companion id so cancel kills the histogram too.
-            let hist_qid = request.request_id.as_ref().map(|r| format!("{r}-hist"));
+            let hist_qid = request.request_id.as_ref().map(|r| CompanionQuery::Hist.query_id(r));
             let histogram = self
                 .generate_histogram(
                     cleaned_query,
@@ -426,6 +449,16 @@ impl SearchService {
                 message: prevalence_rescue_partial_message(rescue.dropped),
                 suggestion: Some("Narrow the time range or the search so fewer brand-new artifacts need re-checking.".to_string()),
                 impact: Some("Results can miss rare artifacts the prevalence dictionaries have not loaded yet.".to_string()),
+            });
+        }
+        // NAN-5718: dict-missed artifacts past the page rescue's cap.
+        if page_rescue_dropped > 0 {
+            warnings_output.push(QueryWarningOutput {
+                severity: "warning".to_string(),
+                code: "PREVALENCE_RESCUE_PARTIAL".to_string(),
+                message: super::prevalence_page_rescue::page_rescue_partial_message(page_rescue_dropped),
+                suggestion: Some("Narrow the time range or lower the page size so fewer brand-new artifacts need re-checking.".to_string()),
+                impact: Some("Rows can show no prevalence for artifacts the prevalence dictionaries have not loaded yet.".to_string()),
             });
         }
 
@@ -480,7 +513,7 @@ impl SearchService {
     /// at query time. We now use the single 30d dict for all windows and mask entries
     /// whose `last_seen` is older than the requested window to the 9999 sentinel. 1h is
     /// still rejected — dict refresh is 5–10 min, so sub-day granularity isn't meaningful.
-    fn prevalence_window_cutoff_sql(
+    pub(crate) fn prevalence_window_cutoff_sql(
         time_window: PrevalenceTimeWindow,
     ) -> Result<&'static str, SearchError> {
         match time_window {
@@ -593,7 +626,7 @@ impl SearchService {
                 "ClickHouse client not configured".into(),
             ))
         })?;
-        let count_qid = format!("{query_id}-base-count");
+        let count_qid = CompanionQuery::BaseCount.query_id(query_id);
         let total = executor
             .execute_count_query_with_options(&count_sql, Some(&count_qid), self.active_ch_settings.as_ref())
             .await?;
@@ -670,6 +703,7 @@ impl SearchService {
         prevalence_commands: &[PrevalenceCommandInfo],
         post_prevalence_commands: &[Command],
         time_range: &TimeRange,
+        query_id: &str,
     ) -> PrevalenceRescue {
         use crate::query::{
             PrevalenceCondition, PrevalenceField, PrevalenceOperator, PrevalenceThreshold,
@@ -774,6 +808,7 @@ impl SearchService {
                     base_no_order,
                     window_cutoff_sql,
                     RescueProbeSpec {
+                        probe_id: CompanionQuery::RescueProbeHash.query_id(query_id),
                         lookup_expr: &exprs.hash,
                         dict: "nanosiem.hash_prevalence_dict",
                         summary_table: self.table_names.read("hash_prevalence_summary"),
@@ -791,6 +826,7 @@ impl SearchService {
                     base_no_order,
                     window_cutoff_sql,
                     RescueProbeSpec {
+                        probe_id: CompanionQuery::RescueProbeDomain.query_id(query_id),
                         lookup_expr: &exprs.domain,
                         dict: "nanosiem.domain_prevalence_dict",
                         summary_table: self.table_names.read("domain_prevalence_summary"),
@@ -813,6 +849,7 @@ impl SearchService {
                     base_no_order,
                     window_cutoff_sql,
                     RescueProbeSpec {
+                        probe_id: CompanionQuery::RescueProbeIp.query_id(query_id),
                         lookup_expr: &exprs.ip,
                         dict: "nanosiem.ip_prevalence_dict",
                         summary_table: self.table_names.read("ip_prevalence_summary"),
@@ -856,7 +893,7 @@ impl SearchService {
             spec.extra_summary_filter,
         );
         let probe_start = Instant::now();
-        match ch_executor.execute_dynamic_query(&probe_sql, false).await {
+        match self.execute_companion_dynamic(ch_executor, &probe_sql, &spec.probe_id).await {
             Ok(rows) => {
                 let rescued = super::prevalence_processing::filter_rescued_artifacts(rows, conds);
                 if !rescued.is_empty() {
@@ -1229,14 +1266,18 @@ impl SearchService {
             m = min_host_count,
             rt = rt,
         );
+        // NAN-5718: `floor(0.5 + x)`, not `round(x)`: ClickHouse rounds halves
+        // to even (52.5 → 52) while the Prevalence API's
+        // `calculate_prevalence_score` rounds them away from zero (→ 53). The
+        // score is never negative, so the two agree exactly.
         let prevalence_score_sql = format!(
             r#"CASE
         WHEN {m} >= 9999 THEN 0
         WHEN {m} = 0 THEN 0
-        WHEN {m} < {t} THEN toUInt8(round(least(toFloat64({m}) / {t} * 20, 20)))
-        WHEN {m} < {t} * 2 THEN toUInt8(round(20 + (toFloat64({m}) - {t}) / {t} * 30))
-        WHEN {m} < {t} * 10 THEN toUInt8(round(50 + (toFloat64({m}) - {t} * 2) / ({t} * 8) * 30))
-        ELSE toUInt8(round(80 + least((toFloat64({m}) - {t} * 10) / ({t} * 90) * 20, 20)))
+        WHEN {m} < {t} THEN toUInt8(floor(0.5 + least(toFloat64({m}) / {t} * 20, 20)))
+        WHEN {m} < {t} * 2 THEN toUInt8(floor(0.5 + 20 + (toFloat64({m}) - {t}) / {t} * 30))
+        WHEN {m} < {t} * 10 THEN toUInt8(floor(0.5 + 50 + (toFloat64({m}) - {t} * 2) / ({t} * 8) * 30))
+        ELSE toUInt8(floor(0.5 + 80 + least((toFloat64({m}) - {t} * 10) / ({t} * 90) * 20, 20)))
     END"#,
             m = min_host_count,
             t = rt,
@@ -1643,7 +1684,7 @@ pub(crate) fn prevalence_condition_sql(
                         "prevalence_score" => {
                             let rt = rarity_threshold.max(1);
                             (format!(
-                                "CASE WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) >= 9999 THEN 0 WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) = 0 THEN 0 WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) < {t} THEN toUInt8(round(least(toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) / {t} * 20, 20))) WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) < {t} * 2 THEN toUInt8(round(20 + (toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) - {t}) / {t} * 30)) WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) < {t} * 10 THEN toUInt8(round(50 + (toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) - {t} * 2) / ({t} * 8) * 30)) ELSE toUInt8(round(80 + least((toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) - {t} * 10) / ({t} * 90) * 20, 20))) END",
+                                "CASE WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) >= 9999 THEN 0 WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) = 0 THEN 0 WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) < {t} THEN toUInt8(floor(0.5 + least(toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) / {t} * 20, 20))) WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) < {t} * 2 THEN toUInt8(floor(0.5 + 20 + (toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) - {t}) / {t} * 30)) WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) < {t} * 10 THEN toUInt8(floor(0.5 + 50 + (toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) - {t} * 2) / ({t} * 8) * 30)) ELSE toUInt8(floor(0.5 + 80 + least((toFloat64(least(_dp_host_count, _ip_host_count, _hp_host_count)) - {t} * 10) / ({t} * 90) * 20, 20))) END",
                                 t = rt,
                             ).into(), false)
                         }
@@ -2111,7 +2152,7 @@ fn decorated_prevalence_field_sql(field: &str, rarity_threshold: u64) -> Option<
         "host_count" => format!("(CASE WHEN {LEAST} >= 9999 THEN NULL ELSE {LEAST} END)"),
         "is_rare" => format!("(CASE WHEN {LEAST} < 9999 THEN {LEAST} < {rt} ELSE false END)"),
         "prevalence_score" => format!(
-            "(CASE WHEN {m} >= 9999 THEN 0 WHEN {m} = 0 THEN 0 WHEN {m} < {t} THEN toUInt8(round(least(toFloat64({m}) / {t} * 20, 20))) WHEN {m} < {t} * 2 THEN toUInt8(round(20 + (toFloat64({m}) - {t}) / {t} * 30)) WHEN {m} < {t} * 10 THEN toUInt8(round(50 + (toFloat64({m}) - {t} * 2) / ({t} * 8) * 30)) ELSE toUInt8(round(80 + least((toFloat64({m}) - {t} * 10) / ({t} * 90) * 20, 20))) END)",
+            "(CASE WHEN {m} >= 9999 THEN 0 WHEN {m} = 0 THEN 0 WHEN {m} < {t} THEN toUInt8(floor(0.5 + least(toFloat64({m}) / {t} * 20, 20))) WHEN {m} < {t} * 2 THEN toUInt8(floor(0.5 + 20 + (toFloat64({m}) - {t}) / {t} * 30)) WHEN {m} < {t} * 10 THEN toUInt8(floor(0.5 + 50 + (toFloat64({m}) - {t} * 2) / ({t} * 8) * 30)) ELSE toUInt8(floor(0.5 + 80 + least((toFloat64({m}) - {t} * 10) / ({t} * 90) * 20, 20))) END)",
             m = LEAST,
             t = rt,
         ),

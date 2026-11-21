@@ -127,6 +127,9 @@ export class NotebooksApi {
   getCaseNotebook(_caseId: string): Promise<NotebookWithOwner | null> {
     return ENTERPRISE_ONLY();
   }
+  ensureCaseNotebook(_caseId: string): Promise<NotebookWithOwner> {
+    return ENTERPRISE_ONLY();
+  }
   linkNotebookToCase(_caseId: string, _notebookId: string): Promise<Notebook> {
     return ENTERPRISE_ONLY();
   }

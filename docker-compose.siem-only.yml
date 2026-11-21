@@ -399,6 +399,9 @@ services:
       # nano-api, nano-jobs and nano-search.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
       INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
+      # NAN-5635: the search memory guard's budget (see nano-search); the api
+      # and jobs run searches too (dashboards, reports, AI, SOAR).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config staging. With no Vector to consume them, the parser-editor
       # surface still writes here harmlessly (a no-op in BYO-aggregator mode —
@@ -500,6 +503,9 @@ services:
       # NAN-5436: scheduled rules run `inputlookup` here too; same value as nano-api.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
       INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
+      # NAN-5635: the search memory guard's budget (see nano-search); the api
+      # and jobs run searches too (dashboards, reports, AI, SOAR).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       # NAN-1913: see nano-api note above.
@@ -574,6 +580,9 @@ services:
       CLICKHOUSE_USER: nanosiem
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       SEARCH_PORT: "3002"
+      # NAN-5635: memory budget (bytes) for cost-admitted unfiltered searches;
+      # unset = half the per-query ceiling, 0 = refuse them all (pre-2.0.33).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       JWT_SECRET: ${JWT_SECRET}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CORS_ORIGINS: ${BASE_URL:-http://localhost}

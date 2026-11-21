@@ -48,7 +48,7 @@ pub fn round_span_for_bins(range: &TimeRange, bins: u32) -> Duration {
 ///   aligns hour intervals to the start of the day) are DAY buckets;
 /// - `toStartOfWeek` is Sunday-aligned weeks;
 /// - month-or-longer spans are `toStartOfMonth`, i.e. calendar months.
-fn bucket_count(range: &TimeRange, span_secs: u64) -> u64 {
+pub(crate) fn bucket_count(range: &TimeRange, span_secs: u64) -> u64 {
     use chrono::Datelike;
     // DateTime64(3): the last selectable instant is one millisecond before end.
     let first = range.start;
@@ -69,6 +69,46 @@ fn bucket_count(range: &TimeRange, span_secs: u64) -> u64 {
     }
     let idx = |t: chrono::DateTime<chrono::Utc>| t.timestamp().div_euclid(span);
     (idx(last) - idx(first) + 1) as u64
+}
+
+/// The start (epoch seconds) of every bucket of `span_secs` the half-open
+/// window `[start, end)` touches, in order, with the same alignment as
+/// `generate_time_bucket` (see [`bucket_count`]): calendar months, Sunday
+/// weeks, day starts for `toStartOfDay` and multi-day hour intervals, and the
+/// clock (epoch) for sub-day spans. A `cont=true` timechart fills exactly
+/// these, so a filled empty bucket can never sit between two real ones
+/// (NAN-5701 review: epoch-stepped weeks were Thursdays between ClickHouse's
+/// Sundays, a sawtooth of fake zeros).
+pub(crate) fn bucket_starts(range: &TimeRange, span_secs: u64) -> Vec<i64> {
+    use chrono::{Datelike, TimeZone};
+    let first = range.start;
+    let last = (range.end - chrono::Duration::milliseconds(1)).max(first);
+    let span = span_secs.max(1) as i64;
+    let day = |t: chrono::DateTime<chrono::Utc>| t.timestamp().div_euclid(86_400);
+    if span >= 2_592_000 {
+        let (mut year, mut month) = (first.year(), first.month());
+        let mut out = Vec::new();
+        loop {
+            let start = chrono::Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0).unwrap();
+            if start > last {
+                break;
+            }
+            out.push(start.timestamp());
+            (year, month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+        }
+        return out;
+    }
+    let (start, step, end) = if span == 604_800 {
+        // 1970-01-01 was a Thursday: back up to the Sunday on or before.
+        let sunday = |t| day(t) - (day(t) + 4).rem_euclid(7);
+        (sunday(first) * 86_400, 604_800, sunday(last) * 86_400)
+    } else if span >= 86_400 {
+        (day(first) * 86_400, 86_400, day(last) * 86_400)
+    } else {
+        let idx = |t: chrono::DateTime<chrono::Utc>| t.timestamp().div_euclid(span);
+        (idx(first) * span, span, idx(last) * span)
+    };
+    (start..=end).step_by(step as usize).collect()
 }
 
 /// Replace every top-level `timechart bins=N` span with the span `range`

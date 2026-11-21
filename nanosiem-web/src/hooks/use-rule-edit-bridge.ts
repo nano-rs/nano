@@ -46,7 +46,15 @@ export interface PivtRuleEditorSnapshot {
   canEdit: boolean;
   /** meloD + the AI tuning entitlement are present. */
   tuneAvailable: boolean;
+  /**
+   * NAN-5683: the rule is archived (deleted). It takes no edits and is not
+   * tuned; `canEdit` and `tuneAvailable` are false too.
+   */
+  archived?: boolean;
 }
+
+/** NAN-5683: why an archived rule refuses a pivt edit or tune. */
+export const ARCHIVED_RULE_REFUSAL = 'This rule is archived (deleted). Unarchive it before editing or tuning it.';
 
 export interface PivtRuleEditorContextDetail {
   snapshot?: PivtRuleEditorSnapshot;
@@ -109,6 +117,10 @@ export function useRuleEditBridge({ ready, snapshot, onApply, navState, clearNav
       const detail = (event as CustomEvent<PivtApplyRuleEditDetail>).detail;
       const { ready: isReady, snapshot: snap, onApply: apply } = latest.current;
       if (!isReady || detail.ruleId !== snap.ruleId) return;
+      if (snap.archived) {
+        detail.error = ARCHIVED_RULE_REFUSAL;
+        return;
+      }
       if (!snap.canEdit) {
         detail.error = 'You have read-only access to this rule.';
         return;
@@ -130,7 +142,7 @@ export function useRuleEditBridge({ ready, snapshot, onApply, navState, clearNav
   clearRef.current = clearNavState;
   useEffect(() => {
     if (!pending || !ready || pending.ruleId !== snapshot.ruleId) return;
-    if (snapshot.canEdit) latest.current.onApply(pending.edit);
+    if (snapshot.canEdit && !snapshot.archived) latest.current.onApply(pending.edit);
     clearRef.current();
-  }, [pending, ready, snapshot.ruleId, snapshot.canEdit]);
+  }, [pending, ready, snapshot.ruleId, snapshot.canEdit, snapshot.archived]);
 }

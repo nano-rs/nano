@@ -10,11 +10,11 @@ const request = { query: '*', time_range: { start: '2026-09-19T00:00:00Z', end: 
 const search = new SearchApi(async () => { throw new Error('unused JSON transport'); });
 
 test('SSE reconnects with the refreshed bearer and delivers completion', { timeout: 2000 }, async t => {
-  setAccessToken('sse-old', 900);
+  setAccessToken('sse-old', 900, 'u_test');
   let refreshes = 0;
   sessionCredentials.configure(() => sessionCredentials.runRefresh(async () => {
     refreshes++;
-    setAccessToken('sse-new', 900);
+    setAccessToken('sse-new', 900, 'u_test');
     return true;
   }), null);
   const credentials: string[] = [];
@@ -37,7 +37,7 @@ test('SSE reconnects with the refreshed bearer and delivers completion', { timeo
 });
 
 test('SSE session failure uses the single auth prompt without a stream error', { timeout: 2000 }, async t => {
-  setAccessToken('sse-failed', 900);
+  setAccessToken('sse-failed', 900, 'u_test');
   let prompts = 0;
   let streamErrors = 0;
   sessionCredentials.configure(() => sessionCredentials.runRefresh(async () => false), () => { prompts++; });

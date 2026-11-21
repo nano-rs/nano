@@ -1366,6 +1366,8 @@ export interface SavedSearch {
   id: string;
   name: string;
   query: string;
+  /** NAN-5696: optional note for the team. */
+  description?: string | null;
   query_mode: 'piped' | 'sql';
   time_range?: SavedSearchTimeRange;
   created_at: string;
@@ -1389,6 +1391,8 @@ export interface SavedSearchWithContext extends SavedSearch {
 export interface CreateSavedSearchRequest {
   name: string;
   query: string;
+  /** NAN-5696: optional note for the team; blank is stored as none. */
+  description?: string;
   query_mode: 'piped' | 'sql';
   time_range?: SavedSearchTimeRange;
   visibility?: 'private' | 'public' | 'group';
@@ -1398,6 +1402,8 @@ export interface CreateSavedSearchRequest {
 export interface UpdateSavedSearchRequest {
   name?: string;
   query?: string;
+  /** NAN-5695: omitted keeps the description; an empty string clears it. */
+  description?: string;
   time_range?: SavedSearchTimeRange;
 }
 
@@ -1508,8 +1514,11 @@ export interface DetectionMatch {
   detected_at: string;
   severity: string;
   status: string;
+  /** True number of matched events; `events` may hold fewer (NAN-5736). */
   event_count: number;
   events: Record<string, unknown>[];
+  /** The stored row is bounded: fewer events than matched, or some cut down (NAN-5736). */
+  events_truncated?: boolean;
   /** Whether the match has been reviewed by an analyst (NAN-494). */
   reviewed?: boolean;
   /** When the match was last reviewed, RFC 3339 (NAN-494). */
@@ -2930,6 +2939,12 @@ export interface SystemConfig {
   air_gap: boolean;
 }
 
+/** GET /api/system/deployment: readable by any signed-in user (NAN-5724). */
+export interface DeploymentFlags {
+  air_gap: boolean;
+  managed: boolean;
+}
+
 export interface SearchSummary {
   narrative: string;
   key_findings: KeyFinding[];
@@ -3197,9 +3212,21 @@ export interface AddRowsRequest {
   rows: Record<string, unknown>[];
 }
 
+/**
+ * A lookup row's `_row_id` (NAN-5715). The API sends it as a STRING: the
+ * ClickHouse store mints 19-digit ids, above 2^53, which a JSON number rounds
+ * in the browser (an edit then wrote a new row under the rounded id).
+ */
+export type LookupRowId = string;
+
+/** The `_row_id` of a row from `GET /api/lookup-tables/:name/rows`, losslessly. */
+export function lookupRowId(row: Record<string, unknown>): LookupRowId {
+  return String(row._row_id);
+}
+
 export interface AddRowsResponse {
   inserted: number;
-  row_ids: number[];
+  row_ids: LookupRowId[];
 }
 
 export interface UpdateRowRequest {
@@ -4865,13 +4892,16 @@ export interface CaseEscalation {
   previous_assigned_group?: string | null;
   acknowledged_at?: string | null;
   acknowledged_by?: string | null;
+  /** Set when the only target user/group was deleted (NAN-5742); target_label keeps the name. */
+  target_removed_at?: string | null;
   created_at: string;
 }
 
 export interface CaseHandoff {
   id: string;
   case_id: string;
-  source_user_id: string;
+  /** null once the sender is deleted (NAN-5721); render as "deleted user". */
+  source_user_id: string | null;
   target_user_id?: string | null;
   target_group_id?: string | null;
   target_label: string;
@@ -4884,6 +4914,8 @@ export interface CaseHandoff {
   bounced_by?: string | null;
   bounce_reason?: string | null;
   canceled_at?: string | null;
+  /** Set when the only target user/group was deleted (NAN-5742); target_label keeps the name. */
+  target_removed_at?: string | null;
   created_at: string;
 }
 
@@ -5339,7 +5371,8 @@ export interface NotebookEntry {
   entry_type: NotebookEntryType;
   content: Record<string, unknown>;
   source_url?: string;
-  created_by: string;
+  /** null once the author is deleted (NAN-5721); render as "deleted user". */
+  created_by: string | null;
   created_at: string;
   /** Source of entry: 'analyst' (default) or 'shadow_investigation' */
   source?: string;
@@ -6551,7 +6584,8 @@ export type FeedbackStatus = 'open' | 'in_progress' | 'resolved' | 'closed';
 
 export interface Feedback {
   id: string;
-  user_id: string;
+  /** null once the submitter is deleted (NAN-5721). */
+  user_id: string | null;
   category: FeedbackCategory;
   title: string;
   description: string;
@@ -7056,7 +7090,7 @@ export interface GdprAnonymizationRequest {
   mutation_ids: unknown;
   justification?: string;
   error_message?: string;
-  requested_by: string;
+  requested_by: string | null;
   created_at: string;
   started_at?: string;
   completed_at?: string;
@@ -8665,4 +8699,17 @@ export interface EditTurnResult {
   facts: Array<{ label: string; value: string }>;
   carried_findings: string[];
   repaired: boolean;
+}
+
+/** NAN-5675: one tag on a case. */
+export interface CaseTag {
+  tag: string;
+  added_by?: string | null;
+  added_at: string;
+}
+
+/** NAN-5675: a case's tags after a change. */
+export interface CaseTagsResponse {
+  tags: CaseTag[];
+  changed: boolean;
 }

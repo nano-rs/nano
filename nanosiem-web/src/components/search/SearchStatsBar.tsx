@@ -22,6 +22,8 @@ interface SearchStatsBarProps {
   tailInterval?: number;
   /** NAN-3884: the run's resolved window, e.g. `7d · Oct 8 10:02 → Oct 15 10:02 EDT`. */
   timeWindow?: string;
+  /** e2e hook: increments once per run (data-run-seq on "Query complete"). */
+  runSeq?: number;
 }
 
 function Stat({ icon, children }: { icon: React.ReactNode; children: React.ReactNode }) {
@@ -53,6 +55,7 @@ export function SearchStatsBar({
   tailActive,
   tailInterval,
   timeWindow,
+  runSeq,
 }: SearchStatsBarProps) {
   const layout = useLayoutOptional();
 
@@ -127,10 +130,10 @@ export function SearchStatsBar({
       return (
         <>
           <Stat icon={<CircleCheck className="w-3 h-3" style={{ color: 'var(--success)' }} />}>
-            <span style={{ color: 'var(--success)' }}>Query complete</span>
+            <span data-testid="search-complete" data-run-seq={runSeq} style={{ color: 'var(--success)' }}>Query complete</span>
           </Stat>
           <Stat icon={<Crosshair className="w-3 h-3" />}>
-            {formatCompactNumber(totalCount)} hits
+            <span data-testid="search-hit-count" data-total={totalCount}>{formatCompactNumber(totalCount)} hits</span>
           </Stat>
           {timing?.serverWallMs != null ? (
             <>
@@ -183,6 +186,7 @@ export function SearchStatsBar({
     tailActive,
     tailInterval,
     timeWindow,
+    runSeq,
   ]);
 
   useEffect(() => {

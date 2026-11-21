@@ -22,7 +22,7 @@ import { cn } from '@/lib/utils';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
-import { useSystemConfig } from '@/hooks/use-api';
+import { useDeploymentFlags } from '@/hooks/use-air-gap';
 import { useRecentAuditChanges } from '@/hooks/use-api';
 import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
 import { auditActorLabel } from '@/lib/audit-feed';
@@ -327,8 +327,9 @@ export function SettingsLanding() {
   useDocumentTitle('Settings');
   const { hasPermission, hasAnyPermission, isDemoUser } = useAuth();
   const { capabilities, edition } = useCapabilities();
-  const { data: systemConfig } = useSystemConfig({ skip: !hasPermission(SHELL_READ_PERMISSIONS.systemConfig) });
-  const isAirGap = systemConfig?.air_gap === true;
+  // NAN-5724: any signed-in user may read the air-gap flag; a settings:system
+  // role without settings:view still gets the Air-Gap Import section.
+  const isAirGap = useDeploymentFlags().airGap === true;
 
   const visibleSections = useMemo(() => {
     return SETTINGS_SECTIONS

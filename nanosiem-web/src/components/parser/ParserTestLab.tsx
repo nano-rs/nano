@@ -484,7 +484,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
             Paste raw logs (one per line)
           </span>
           {pasteResults && pasteResults.length > 0 && (
-            <span className="font-mono text-[10px] text-muted-foreground/80">
+            <span className="font-mono text-[10px] text-muted-foreground/80" data-testid="parser-test-summary" data-passed={pastePassed} data-total={pasteResults.length}>
               <span className="text-green-400">{pastePassed}</span>
               <span className="text-muted-foreground/60"> / </span>
               <span>{pasteResults.length}</span>

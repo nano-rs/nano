@@ -617,6 +617,7 @@ export function Alerts() {
         <div className="relative">
           <SearchIcon className="absolute left-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
           <Input
+            data-testid="alerts-search"
             placeholder="Search rule or alert id…"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
@@ -624,7 +625,7 @@ export function Alerts() {
           />
         </div>
         <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
-          <SelectTrigger className="h-8 w-32 border-border bg-[var(--card-2)] text-[11.5px]">
+          <SelectTrigger data-testid="alerts-status-filter" aria-label="Status filter" className="h-8 w-32 border-border bg-[var(--card-2)] text-[11.5px]">
             <SelectValue placeholder="Status" />
           </SelectTrigger>
           <SelectContent>
@@ -635,7 +636,7 @@ export function Alerts() {
           </SelectContent>
         </Select>
         <Select value={severityFilter} onValueChange={(v) => setSeverityFilter(v as SeverityFilter)}>
-          <SelectTrigger className="h-8 w-32 border-border bg-[var(--card-2)] text-[11.5px]">
+          <SelectTrigger data-testid="alerts-severity-filter" aria-label="Severity filter" className="h-8 w-32 border-border bg-[var(--card-2)] text-[11.5px]">
             <SelectValue placeholder="Severity" />
           </SelectTrigger>
           <SelectContent>
@@ -649,6 +650,8 @@ export function Alerts() {
         </Select>
         <Select value={timeRangeFilter} onValueChange={(v) => setTimeRangeFilter(v as TimeRangeFilter)}>
           <SelectTrigger
+            data-testid="alerts-time-filter"
+            aria-label="Time range"
             className="h-8 w-32 border-border bg-[var(--card-2)] text-[11.5px]"
             title={timeRangeWindowTitle(timeRangeFilter)}
           >
@@ -663,7 +666,7 @@ export function Alerts() {
           </SelectContent>
         </Select>
         <div className="flex-1" />
-        <div className="font-mono text-[10.5px] text-muted-foreground tabular-nums">
+        <div data-testid="alerts-shown-count" className="font-mono text-[10.5px] text-muted-foreground tabular-nums">
           {filteredAlerts.length.toLocaleString()}
           {filteredAlerts.length !== alerts.length ? ` of ${alerts.length.toLocaleString()}` : ''} shown
         </div>
@@ -786,6 +789,8 @@ export function Alerts() {
                   return (
                     <TableRow
                       key={alert.id}
+                      data-testid="alert-row"
+                      data-alert-id={alert.id}
                       data-selected={isSelected}
                       className={cn(
                         'group h-9 cursor-pointer border-border transition-colors',

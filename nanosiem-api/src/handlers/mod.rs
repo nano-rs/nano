@@ -64,6 +64,8 @@ pub mod gdpr;
 // enterprise crate (OIDC group-mapping handler) can enforce the same invariant.
 // Re-exported here so in-crate call sites keep using `crate::handlers::grant_authz`.
 pub use nanosiem_api_lib::grant_authz;
+#[cfg(feature = "enterprise")]
+pub mod case_target_removal;
 pub mod groups;
 pub mod health;
 // NAN-2238 Active Hunter: hunt definitions, runners, sweeps, leads, triage.

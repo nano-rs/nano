@@ -62,8 +62,13 @@ export class DetectionsApi {
     return this.request(`/api/rules${query ? `?${query}` : ''}`);
   }
 
+  /**
+   * The API 404s a deleted (archived) rule by default (NAN-5672). The console
+   * opts in: the editor's Archived tab opens deleted rules to view or
+   * unarchive them, and alert/signal links still resolve to their rule.
+   */
   async getDetection(id: string): Promise<DetectionRule> {
-    return this.request(`/api/rules/${id}`);
+    return this.request(`/api/rules/${id}?include_archived=true`);
   }
 
   async createDetection(request: CreateDetectionRequest): Promise<DetectionResponse> {

@@ -44,6 +44,12 @@ const BLOCKED_WRITE_PATHS: &[&str] = &[
     "/api/scheduler",      // No job management
     "/api/identity",       // No identity provider management
     "/api/marketplace",    // No marketplace installs
+    // NAN-5676: deployment-wide settings that live outside /api/settings.
+    // GETs stay open (the rule editor reads the AI tuning mode to explain a
+    // disabled Tune action).
+    "/api/melod/settings",  // AI tuning mode
+    "/api/tuning/settings", // Per-rule auto-tuning / auto-apply flags
+    "/api/folder-settings", // Shared rule-folder icons
 ];
 
 /// Paths that demo users CAN write to (exceptions within blocked prefixes).
@@ -61,7 +67,10 @@ const ALLOWED_SELF_PATHS: &[&str] = &[
 /// Demo users have `settings:ai` so the search UI can detect whether meloD is
 /// configured and enable natural-language query building. Keep this list tight:
 /// read-only probes only, not general settings access.
-const ALLOWED_SAFE_PATHS: &[&str] = &["/api/settings/ai-availability"];
+///
+/// `/api/system/deployment` (NAN-5724) is two booleans (air-gap, managed);
+/// the repository and Marketplace pages demo visitors may open read them.
+const ALLOWED_SAFE_PATHS: &[&str] = &["/api/settings/ai-availability", "/api/system/deployment"];
 
 /// Middleware that blocks admin endpoints for demo users.
 ///
@@ -176,7 +185,62 @@ mod tests {
         Router::new()
             .route("/api/settings/ai-availability", get(|| async { "ok" }))
             .route("/api/settings/search", get(|| async { "ok" }))
+            .route("/api/system/deployment", get(|| async { "ok" }).post(|| async { "ok" }))
+            .route("/api/system/config", get(|| async { "ok" }))
+            .route(
+                "/api/melod/settings/ai-tuning",
+                get(|| async { "ok" }).put(|| async { "ok" }),
+            )
+            .route("/api/tuning/settings/{rule_id}", get(|| async { "ok" }).put(|| async { "ok" }))
+            .route("/api/folder-settings/{name}", axum::routing::put(|| async { "ok" }))
+            .route("/api/folder-settings", get(|| async { "ok" }))
             .layer(from_fn_with_state(DeploymentMode::Demo, demo_guard))
+    }
+
+    async fn demo_status(method: Method, uri: &str) -> StatusCode {
+        app()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .method(method)
+                    .extension(demo_auth_context())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// NAN-5676: deployment-wide settings outside `/api/settings` are
+    /// read-only for demo visitors; the reads the UI needs stay open.
+    #[tokio::test]
+    async fn demo_user_cannot_write_settings_outside_the_settings_prefix() {
+        for (method, uri) in [
+            (Method::PUT, "/api/melod/settings/ai-tuning"),
+            (Method::PUT, "/api/tuning/settings/rule-1"),
+            (Method::PUT, "/api/folder-settings/Windows"),
+        ] {
+            assert_eq!(demo_status(method.clone(), uri).await, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        for uri in [
+            "/api/melod/settings/ai-tuning",
+            "/api/tuning/settings/rule-1",
+            "/api/folder-settings",
+        ] {
+            assert_eq!(demo_status(Method::GET, uri).await, StatusCode::OK, "GET {uri}");
+        }
+    }
+
+    /// NAN-5724: the deployment flags are readable by demo visitors (the
+    /// repository and Marketplace pages they may open read it); the rest of
+    /// `/api/system` and any write stay refused.
+    #[tokio::test]
+    async fn demo_user_can_read_only_the_deployment_flags_under_system() {
+        assert_eq!(demo_status(Method::GET, "/api/system/deployment").await, StatusCode::OK);
+        assert_eq!(demo_status(Method::POST, "/api/system/deployment").await, StatusCode::FORBIDDEN);
+        assert_eq!(demo_status(Method::GET, "/api/system/config").await, StatusCode::FORBIDDEN);
+        assert!(!is_allowed_safe_path("/api/system/deployment/x", &Method::GET));
     }
 
     #[test]

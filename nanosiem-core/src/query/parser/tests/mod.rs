@@ -5,6 +5,7 @@ mod error_messages;
 mod linear_lookahead;
 mod eval_not;
 mod leading_command;
+mod lookup_output;
 mod quoting;
 mod syntax_fixes;
 mod tree_root_regex;

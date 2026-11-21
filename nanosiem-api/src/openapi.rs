@@ -954,8 +954,11 @@ mod tests {
         // /api/hunts/{id}/charter, …/versions): 756.
         // NAN-5648 adds 2 ENTERPRISE templates
         // (/api/playbook-imports/{playbook_id}/upstream-update, …/apply): 758.
+        // NAN-5675 adds 2 ENTERPRISE templates (/api/cases/{id}/tags,
+        // /api/cases/{id}/tags/{tag}): 760.
+        // NAN-5678 adds /api/log-sources/bulk-delete: 761 / 426.
         #[cfg(feature = "enterprise")]
-        let min_paths = 758;
+        let min_paths = 762;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
@@ -969,7 +972,9 @@ mod tests {
         // NAN-5450's disk-alert: 421. NAN-5485's field inventory: 422.
         // NAN-5548's webhook event-types list: 423.
         // NAN-5575's two sql-to-npl search paths: 425.
-        let min_paths = 425;
+        // NAN-5678's log-source bulk delete: 426.
+        // NAN-5724's /api/system/deployment: 427.
+        let min_paths = 427;
 
         assert!(
             path_count >= min_paths,

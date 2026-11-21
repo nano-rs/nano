@@ -526,9 +526,76 @@ pub async fn get_system_config(
     }))
 }
 
+/// Deployment facts any signed-in user may read (NAN-5724).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeploymentFlags {
+    /// True when `AIRGAP_MODE` is set: no outbound internet.
+    pub air_gap: bool,
+    /// True on a managed deployment (AI and some settings are run by nano).
+    pub managed: bool,
+}
+
+/// Get the deployment's air-gap and managed flags.
+///
+/// The repository and Marketplace pages swap their Git-sync and live-sync
+/// controls for offline bundle import when the install is air-gapped, and the
+/// AI settings page shows the managed banner on managed installs. Those pages
+/// open without `settings:view`, so they read these two booleans here instead
+/// of from `/api/system/config` (NAN-5724). They describe the deployment, not
+/// its settings, so any signed-in user may read them.
+#[utoipa::path(
+    get,
+    path = "/api/system/deployment",
+    tag = "system",
+    responses(
+        (status = 200, description = "Deployment flags", body = DeploymentFlags),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_deployment_flags(
+    State(state): State<AppState>,
+    Extension(_auth): Extension<AuthContext>,
+) -> Json<DeploymentFlags> {
+    Json(DeploymentFlags {
+        air_gap: state.config.airgap,
+        managed: state.config.deployment_mode.is_managed(),
+    })
+}
+
+/// NAN-5724: refuse a Git repository create or sync on an air-gapped install
+/// before any egress. The UI hides those controls there, but this is the
+/// authoritative check; the offline route is the signed-bundle import
+/// (`/api/airgap/*/import`).
+pub(crate) fn refuse_git_egress_when_air_gapped(state: &AppState) -> Result<(), ApiError> {
+    git_egress_allowed(state.config.airgap)
+}
+
+fn git_egress_allowed(air_gap: bool) -> Result<(), ApiError> {
+    if air_gap {
+        return Err(ApiError::Conflict(
+            "Unavailable in air-gapped mode: syncing a Git repository needs outbound internet. \
+             Import a signed bundle instead."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod deployment_flag_tests {
+    use super::*;
+
+    #[test]
+    fn git_egress_is_refused_only_when_air_gapped() {
+        assert!(git_egress_allowed(false).is_ok());
+        assert!(matches!(git_egress_allowed(true), Err(ApiError::Conflict(_))));
+    }
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(get_system_overview, get_system_config),
-    components(schemas(ActivityPoint, SystemOverview, SystemConfig))
+    paths(get_system_overview, get_system_config, get_deployment_flags),
+    components(schemas(ActivityPoint, SystemOverview, SystemConfig, DeploymentFlags))
 )]
 pub struct SystemApiDoc;

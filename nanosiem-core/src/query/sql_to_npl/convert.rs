@@ -898,9 +898,15 @@ fn agg_call(scope: &Scope, expr: &Expr) -> Result<(String, String), Unsupported>
             let f = field(a)?;
             Ok((format!("count({f})"), format!("count_{}", slug(&f))))
         }
-        ("uniq" | "uniqexact" | "uniqcombined" | "uniqcombined64" | "uniqhll12", [a]) if !is_distinct_call(f) => {
+        ("uniqexact", [a]) if !is_distinct_call(f) => {
             let f = field(a)?;
             Ok((format!("dc({f})"), format!("dc_{}", slug(&f))))
+        }
+        // NAN-5657: an approximate distinct count converts to nPL's
+        // approximate estdc, never to the exact dc.
+        ("uniq" | "uniqcombined" | "uniqcombined64" | "uniqhll12", [a]) if !is_distinct_call(f) => {
+            let f = field(a)?;
+            Ok((format!("estdc({f})"), format!("estdc_{}", slug(&f))))
         }
         ("sum" | "avg" | "min" | "max", [a]) if !is_distinct_call(f) => {
             let f = field(a)?;

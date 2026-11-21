@@ -47,7 +47,7 @@ vi.mock('@/lib/api', () => ({
       installEnrichment: vi.fn(),
     },
     listCustomEnrichments: () => listCustomEnrichments(),
-    getSystemConfig: async () => ({ air_gap: false }),
+    getDeploymentFlags: async () => ({ air_gap: false, managed: false }),
     getPlatformFeeds: async () => { if (!bundle.value) throw new Error('404'); return bundle.value; },
     listSourceConfigs: async () => [
       { id: 's1', name: 'CloudTrail', config_type: 'aws_s3', enabled: true, deployed: true },

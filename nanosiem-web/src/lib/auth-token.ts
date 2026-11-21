@@ -14,13 +14,55 @@
 
 let accessToken: string | null = null;
 let expiresAt: number = 0;
+// NAN-5729: who the in-memory token belongs to, and a generation bumped
+// synchronously whenever that owner changes (user switch, logout). Async
+// work started under one session compares the generation after each await,
+// so there is no window between installing user B's token and React
+// re-rendering with user B in which it would act with B's token.
+let tokenOwnerId: string | null = null;
+let sessionGeneration = 0;
+
+/** Called synchronously, before React re-renders, when the token's user changes. */
+export type AuthSessionChangeListener = (previousOwnerId: string | null, nextOwnerId: string | null) => void;
+const sessionListeners = new Set<AuthSessionChangeListener>();
+
+/** Subscribe to token-owner changes; returns the unsubscribe function. */
+export function onAuthSessionChange(listener: AuthSessionChangeListener): () => void {
+  sessionListeners.add(listener);
+  return () => { sessionListeners.delete(listener); };
+}
+
+function changeOwner(next: string | null): void {
+  const previous = tokenOwnerId;
+  tokenOwnerId = next;
+  sessionGeneration += 1;
+  sessionListeners.forEach(listener => {
+    try { listener(previous, next); } catch (err) { console.error('auth session listener failed', err); }
+  });
+}
 
 const DEMO_SESSION_KEY = 'nano_demo_session';
 
-/** Store a new access token with its TTL (seconds). */
-export function setAccessToken(token: string, expiresInSeconds: number): void {
+/** Store a new access token with its TTL (seconds) for the given user. */
+export function setAccessToken(token: string, expiresInSeconds: number, ownerId: string): void {
   accessToken = token;
   expiresAt = Date.now() + expiresInSeconds * 1000;
+  if (ownerId !== tokenOwnerId) changeOwner(ownerId);
+}
+
+/** Bumped whenever the token's user changes or the token is cleared. */
+export function getAuthSessionGeneration(): number {
+  return sessionGeneration;
+}
+
+/**
+ * Snapshot the current auth session; the returned check is false once the
+ * token's user changed or was cleared. Async UI work checks it after each
+ * await so it never continues with another user's token.
+ */
+export function authSessionGuard(): () => boolean {
+  const generation = sessionGeneration;
+  return () => sessionGeneration === generation;
 }
 
 /** Return the current access token, or null if absent/expired. */
@@ -37,6 +79,7 @@ export function getAccessToken(): string | null {
 export function clearAccessToken(): void {
   accessToken = null;
   expiresAt = 0;
+  if (tokenOwnerId !== null) changeOwner(null);
   try { localStorage.removeItem(DEMO_SESSION_KEY); } catch { /* noop */ }
 }
 

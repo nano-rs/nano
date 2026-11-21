@@ -93,22 +93,24 @@ pub async fn list_repository_rules(
 
     let rules = service.list_rules(*id, filter).await?;
 
-    // Get import status for all rules in this repository
-    let imports = service.get_imports_for_repository(*id).await?;
-    let import_map: std::collections::HashMap<Uuid, Uuid> = imports
+    // Get import status for all rules in this repository. A link to a deleted
+    // (archived) rule is not "imported" (NAN-5672).
+    let imports = service.get_active_imports_for_repository(*id).await?;
+    let import_map: std::collections::HashMap<Uuid, (Uuid, bool)> = imports
         .into_iter()
-        .map(|i| (i.repository_rule_id, i.detection_rule_id))
+        .map(|i| (i.repository_rule_id, (i.detection_rule_id, i.local_drift)))
         .collect();
 
     // Enrich rules with import status
     let response: Vec<RepositoryRuleResponse> = rules
         .into_iter()
         .map(|rule| {
-            let linked_detection_rule_id = import_map.get(&rule.id).copied();
+            let link = import_map.get(&rule.id).copied();
             RepositoryRuleResponse {
                 rule,
-                is_imported: linked_detection_rule_id.is_some(),
-                linked_detection_rule_id,
+                is_imported: link.is_some(),
+                linked_detection_rule_id: link.map(|(id, _)| id),
+                local_drift: link.is_some_and(|(_, drift)| drift),
             }
         })
         .collect();

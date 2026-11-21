@@ -27,7 +27,8 @@ import type { ActionAccess } from './repository-action-policy';
 
 interface HeaderProps {
   repo: RepoView | null;
-  onSyncNow: () => void;
+  /** Omitted without `rule_repositories:sync`: the button is not rendered (NAN-5709). */
+  onSyncNow?: () => void;
   onOpenHistory: () => void;
   syncing: boolean;
   /**
@@ -87,6 +88,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
               <Clock className="w-[11px] h-[11px]" strokeWidth={1.5} />
               {repo.lastSync.relative}
             </button>
+            {onSyncNow && (
             <button
               type="button"
               onClick={onSyncNow}
@@ -101,6 +103,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
               <RefreshCw className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')} strokeWidth={1.5} />
               {syncing ? 'Syncing…' : 'Sync now'}
             </button>
+            )}
           </div>
         )
       )}
@@ -332,6 +335,9 @@ function RepoRuleRow({
   return (
     <tr
       onClick={onSelect}
+      data-testid="repo-rule-row"
+      data-path={rule.raw.file_path}
+      data-status={rule.status}
       className={cn(
         'border-b border-border/60 cursor-pointer transition',
         active

@@ -4,6 +4,7 @@ import React from 'react';
 import { ArrowUp, ArrowDown, ArrowUpDown, Check, ChevronRight, Copy, Download, Table as TableIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { FieldValueMenu } from './SearchResults';
+import { completeColumnOrder } from './column-order';
 
 interface SearchResultLike {
   fields?: Record<string, unknown>;
@@ -24,7 +25,17 @@ interface StatsViewProps {
   onSetQuery?: (query: string) => void;
   notebookActive?: boolean;
   onAddToNotebook?: (entityType: string, value: string) => void;
+  /**
+   * NAN-5701: how many rows the query produced in total. The first page holds
+   * only the results page size, so a larger total must be said, never hidden.
+   */
+  totalCount?: number;
+  /** Fetch every row (up to STATS_LOAD_ALL_CAP) in one page. */
+  onLoadAll?: (count: number) => void;
 }
+
+/** Most grouped rows the Stats view loads into the browser at once. */
+export const STATS_LOAD_ALL_CAP = 10_000;
 
 interface ParsedStats {
   agg: string;
@@ -107,26 +118,43 @@ export function StatsView({
   onSetQuery,
   notebookActive,
   onAddToNotebook,
+  totalCount,
+  onLoadAll,
 }: StatsViewProps) {
   const parsed = React.useMemo(() => parseStatsCommand(query), [query]);
 
   // Derive columns from results: by-fields first (preserving query order, then columnOrder),
   // then the remaining keys as aggregation columns.
-  const { byCols, aggCols } = React.useMemo(() => {
-    const presentKeys = new Set<string>();
-    for (const r of results) {
-      if (r.fields) for (const k of Object.keys(r.fields)) presentKeys.add(k);
-    }
-    const declaredBy = (parsed?.by ?? []).filter((k) => presentKeys.has(k));
-    const byCols = declaredBy.length
-      ? declaredBy
-      : columnOrder?.filter((k) => presentKeys.has(k)).slice(0, Math.max(0, (columnOrder.length ?? 1) - 1)) ?? [];
-    const ordered = columnOrder?.filter((k) => presentKeys.has(k)) ?? Array.from(presentKeys);
+  const { byCols, aggCols, numericCols } = React.useMemo(() => {
+    const rowsFields = results.map((r) => r.fields as Record<string, unknown> | undefined);
+    // NAN-5702: every output column, including ones added after `stats`
+    // (a `join`'s fields, a `rename`), not only the ones `column_order` names.
+    const ordered = completeColumnOrder(columnOrder, rowsFields);
+    const present = new Set(ordered);
+    // A column is numeric when every value it has is a number (sort + bars).
+    const numericCols = new Set(
+      ordered.filter((k) => {
+        let seen = false;
+        for (const f of rowsFields) {
+          const v = f?.[k];
+          if (v === null || v === undefined || v === '') continue;
+          if (asNumber(v) === null) return false;
+          seen = true;
+        }
+        return seen;
+      }),
+    );
+    const declaredBy = (parsed?.by ?? []).filter((k) => present.has(k));
+    // Review P2: when the declared `by` fields are gone (renamed after
+    // `stats`), the text columns are the group keys; never guess by position,
+    // which put `count` into the keys and the renamed key into the bars.
+    const textCols = ordered.filter((k) => !numericCols.has(k));
+    const byCols = declaredBy.length ? declaredBy : textCols.length ? textCols : ordered.slice(0, 1);
     const aggCols = ordered.filter((k) => !byCols.includes(k));
-    return { byCols, aggCols };
+    return { byCols, aggCols, numericCols };
   }, [results, parsed, columnOrder]);
 
-  const primaryAgg = aggCols[0] ?? '__count';
+  const primaryAgg = aggCols.find((c) => numericCols.has(c)) ?? aggCols[0] ?? '__count';
 
   const [sortCol, setSortCol] = React.useState<string>(primaryAgg);
   const [sortDir, setSortDir] = React.useState<SortDir>('desc');
@@ -145,12 +173,14 @@ export function StatsView({
   const rows = React.useMemo(() => {
     const raw = results.map((r) => (r.fields ?? {}) as Record<string, unknown>);
     if (!sortCol) return raw;
-    const isAggSort = aggCols.includes(sortCol);
+    // Numeric order only for a numeric column: a text column surfaced after
+    // `stats` (a join's `dept`) sorts as text instead of all-NaN (no-op).
+    const isNumericSort = numericCols.has(sortCol);
     const out = [...raw];
     out.sort((a, b) => {
       const av = a[sortCol];
       const bv = b[sortCol];
-      if (isAggSort) {
+      if (isNumericSort) {
         const an = asNumber(av) ?? -Infinity;
         const bn = asNumber(bv) ?? -Infinity;
         return sortDir === 'asc' ? an - bn : bn - an;
@@ -161,7 +191,7 @@ export function StatsView({
       return sortDir === 'asc' ? r : -r;
     });
     return out;
-  }, [results, sortCol, sortDir, aggCols]);
+  }, [results, sortCol, sortDir, numericCols]);
 
   const total = rows.length;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -189,7 +219,7 @@ export function StatsView({
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
     } else {
       setSortCol(col);
-      setSortDir(aggCols.includes(col) ? 'desc' : 'asc');
+      setSortDir(numericCols.has(col) ? 'desc' : 'asc');
     }
   };
 
@@ -249,6 +279,32 @@ export function StatsView({
           </button>
         )}
       </div>
+
+      {totalCount !== undefined && totalCount > results.length && (
+        <div
+          role="status"
+          data-testid="stats-partial-notice"
+          className="px-3 py-1.5 border-b border-border flex items-center gap-2 text-[11.5px] text-foreground/80"
+        >
+          <span>
+            Showing the first <span className="font-mono tabular-nums">{results.length.toLocaleString()}</span> of{' '}
+            <span className="font-mono tabular-nums">{totalCount.toLocaleString()}</span> rows. Sorting and totals here cover only the loaded rows.
+          </span>
+          {onLoadAll && totalCount <= STATS_LOAD_ALL_CAP ? (
+            <button
+              type="button"
+              onClick={() => onLoadAll(totalCount)}
+              className="text-primary hover:underline cursor-pointer"
+            >
+              Load all {totalCount.toLocaleString()}
+            </button>
+          ) : (
+            <span className="text-muted-foreground">
+              Too many to load here; narrow the search or keep the top rows with <span className="font-mono">| sort -count | head N</span>.
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Table */}
       <div className="flex-1 overflow-auto min-h-0">

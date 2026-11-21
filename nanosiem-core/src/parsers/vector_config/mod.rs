@@ -431,6 +431,9 @@ mod two_phase_activation_tests;
 #[cfg(test)]
 #[path = "pipeline_gate_tests.rs"]
 mod pipeline_gate_tests;
+#[cfg(test)]
+#[path = "work_dir_tests.rs"]
+mod work_dir_tests;
 mod credentials;
 pub mod delivery;
 mod deploy;
@@ -455,7 +458,7 @@ pub use publication::{
 pub use redaction::redact_config_snapshot;
 pub use backup::BackupGeneration;
 pub use deploy::{
-    current_reload_wait, ActivationOutcome, ReloadWaitStatus, ReloadWatch, VerifyFailure,
+    current_reload_wait, ActivationOutcome, DeployReloadFailure, ReloadWaitStatus, ReloadWatch, VerifyFailure,
     DEFAULT_RELOAD_ACK_MAX_SECS,
 };
 
@@ -517,6 +520,10 @@ pub enum VectorConfigError {
     StagingError(String),
 }
 
+/// NAN-5678: directory for the staging and backup workspaces when they must
+/// live outside the Vector config dir ([`VectorConfigManager::with_work_dir`]).
+pub const WORK_DIR_ENV: &str = "VECTOR_CONFIG_WORK_DIR";
+
 /// Manages Vector configuration files generated from database parsers
 pub struct VectorConfigManager {
     /// Base config directory (e.g., config/vector)
@@ -563,6 +570,29 @@ impl VectorConfigManager {
             credentials_dir,
             deploy_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// NAN-5678: put the staging and backup workspaces under `work_dir`
+    /// instead of the config dir. Blank or `None` keeps the defaults.
+    ///
+    /// On a single node the config dir IS the volume the local Vector runs
+    /// `--watch-config` on, and the watcher is recursive: every staged tree
+    /// and every backup snapshot written there made Vector load and compile
+    /// the whole config again. With ~40 OCSF parsers one load is a minute or
+    /// more of single-threaded VRL compilation, so a deploy cost three loads
+    /// (the staging/backup writes, the reload signal, and the post-deploy
+    /// backup refresh) instead of the one it needs. Only `vector validate`
+    /// reads the staged tree from inside the Vector container
+    /// (`VECTOR_STAGING_PATH`), so a deployment that moves it out sets
+    /// `SKIP_VECTOR_VALIDATION=true` (single-node Compose does) or points
+    /// `VECTOR_STAGING_PATH` at the same directory as Vector sees it.
+    pub fn with_work_dir(mut self, work_dir: Option<&str>) -> Self {
+        if let Some(dir) = work_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+            let dir = PathBuf::from(dir);
+            self.staging_dir = dir.join("staging");
+            self.backup_dir = dir.join("backup");
+        }
+        self
     }
 
     /// Create with default config directory

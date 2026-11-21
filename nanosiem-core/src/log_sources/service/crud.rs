@@ -391,142 +391,276 @@ impl LogSourceService {
     ///
     /// This removes the log source from the database and cleans up the Vector config files.
     /// The combiner and router configs are also updated to remove references to the deleted log source.
+    ///
+    /// NAN-5678: batched with every other delete pending at the same time
+    /// (see [`Self::delete_many`]), so concurrent deletes cost one render and
+    /// one Vector reload, and the work runs to completion even if the caller
+    /// stops waiting.
     pub async fn delete(&self, id: Uuid) -> Result<(), LogSourceServiceError> {
-        let log_source = self.repository().find_by_id(id).await?;
-        let log_source_name = log_source.name.clone();
+        self.delete_many(vec![id])
+            .await
+            .into_iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, result)| result.map(|_deleted| ()))
+            .unwrap_or_else(|| Err(LogSourceServiceError::DeploymentFailed("the delete recorded no result".to_string())))
+    }
 
-        // NAN-2305: the active Vector tree is republished BEFORE the row goes,
-        // in one locked pass, and the parser TOML is no longer unlinked on its
-        // own.
+    /// NAN-5678: delete several log sources with ONE config render and ONE
+    /// Vector reload. Results are per id, in the order given (duplicates
+    /// collapse to the first occurrence).
+    ///
+    /// Each reload recompiles every deployed parser's VRL, so with ~40 OCSF
+    /// sources a reload takes minutes on a cloud vCPU; deleting sources one
+    /// call at a time paid that once per source. The ids are handed to the
+    /// service's [`ChangeBatcher`](crate::log_sources::change_batch::ChangeBatcher),
+    /// which also folds in any other delete pending at the same moment and
+    /// runs the batch in its own task: a client that disconnects mid-delete
+    /// no longer cancels it between the config write and the row delete.
+    ///
+    /// NAN-5683: a successful delete carries the deleted source's name
+    /// ([`DeletedLogSource`]) so the caller can audit it after the row is gone.
+    pub async fn delete_many(&self, ids: Vec<Uuid>) -> Vec<(Uuid, Result<DeletedLogSource, LogSourceServiceError>)> {
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<Uuid> = ids.into_iter().filter(|id| seen.insert(*id)).collect();
+        let service = self.clone();
+        let runner: crate::log_sources::change_batch::BatchRunner<Uuid, Result<DeletedLogSource, BatchFailure>> =
+            std::sync::Arc::new(move |batch: Vec<Uuid>| {
+                let service = service.clone();
+                Box::pin(async move { service.delete_batch(batch).await })
+            });
+        let mut results = self.delete_batcher.submit(ids.clone(), runner).await;
+        ids.into_iter()
+            .map(|id| {
+                let result = match results.remove(&id) {
+                    Some(Ok(Ok(deleted))) => Ok(deleted),
+                    Some(Ok(Err(BatchFailure::NotFound))) => Err(LogSourceServiceError::RepositoryError(
+                        crate::log_sources::LogSourceRepositoryError::NotFound(id.to_string()),
+                    )),
+                    Some(Ok(Err(BatchFailure::Database))) => Err(sanitized_database_error()),
+                    Some(Ok(Err(BatchFailure::Failed(message)))) => {
+                        Err(LogSourceServiceError::DeploymentFailed(message))
+                    }
+                    Some(Err(batch_error)) => Err(LogSourceServiceError::DeploymentFailed(batch_error.to_string())),
+                    None => Err(LogSourceServiceError::DeploymentFailed("the delete recorded no result".to_string())),
+                };
+                (id, result)
+            })
+            .collect()
+    }
+
+    /// One batch of [`Self::delete_many`]: render the tree without every
+    /// source in `ids` and reload once, deleting the rows in one statement
+    /// (after the reload on a single node, before the publish on role split).
+    async fn delete_batch(&self, ids: Vec<Uuid>) -> std::collections::HashMap<Uuid, Result<DeletedLogSource, BatchFailure>> {
+        let mut results = std::collections::HashMap::new();
+        let mut found: Vec<LogSource> = Vec::new();
+        for id in ids {
+            match self.repository().find_by_id(id).await {
+                Ok(log_source) => found.push(log_source),
+                Err(crate::log_sources::LogSourceRepositoryError::NotFound(_)) => {
+                    results.insert(id, Err(BatchFailure::NotFound));
+                }
+                Err(e) => {
+                    // NAN-2266: logged here, never handed to the client.
+                    tracing::error!(log_source_id = %id, error = %e, "could not read a log source to delete");
+                    results.insert(id, Err(BatchFailure::Database));
+                }
+            }
+        }
+        if found.is_empty() {
+            return results;
+        }
+        let doomed: std::collections::HashSet<Uuid> = found.iter().map(|s| s.id).collect();
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+
+        // NAN-2305: the active Vector tree is republished BEFORE the rows go,
+        // in one locked pass, and the parser TOML is never unlinked on its
+        // own. Unlinking first left `_combiner.toml` naming a transform whose
+        // file no longer existed, which Vector treats as fatal to the WHOLE
+        // config. Regenerating from the surviving sources prunes the orphaned
+        // parser files and rewrites the combiner and router in the same pass,
+        // so no intermediate state is ever visible on disk.
         //
-        // The old order was: delete the row, unlink the parser TOML while
-        // holding no lock, then call the self-locking redeploy. Between the
-        // unlink and the redeploy — a window that includes waiting for whatever
-        // deploy already held the mutex — `_combiner.toml` named a transform
-        // whose file no longer existed. Vector treats an input naming a missing
-        // component as fatal to the WHOLE config, so any reload in that window
-        // (a concurrent deploy's, or `--watch-config` reacting to the unlink
-        // itself) was rejected and Vector kept running the pre-delete topology.
-        // The redeploy's own failure was then only warned about and the
-        // deletion still reported success.
-        //
-        // Regenerating from the surviving sources does the removal as part of a
-        // coherent write: `deploy_parsers` prunes the orphaned parser file and
-        // rewrites the combiner and router in the same pass, so no intermediate
-        // state is ever visible on disk.
+        // NAN-2310: ALWAYS regenerate, never gate on `deployed`: `update`
+        // clears that flag while `_combiner.toml` and `_router.toml` may still
+        // name the source, so unlinking alone reproduced the NAN-2296 dangling
+        // input. For a never-deployed source this is a no-op that still
+        // prunes any stale file.
         {
             let _deploy_guard = self.vector_config.lock_deploys().await;
 
-        // Regenerate the whole tree from the surviving sources, ALWAYS.
-        //
-        // NAN-2310: this used to be gated on `was_deployed`, with the other arm
-        // just unlinking the parser file on the reasoning that a
-        // never-deployed source has no live topology referencing it. That
-        // reasoning does not survive contact with the `deployed` flag, which
-        // `update` clears whenever a deployment-affecting field changes
-        // (`repository/crud.rs`: `deployed = CASE WHEN $18 THEN false ...`).
-        //
-        // So the ordinary sequence create -> publish -> edit the VRL -> delete
-        // left `deployed = false` while `_combiner.toml` and `_router.toml`
-        // still named the source's `<name>_output`. Unlinking only the parser
-        // file produced exactly the NAN-2296 failure: a dangling input that
-        // makes the ENTIRE Vector config unloadable, so every subsequent reload
-        // is rejected and the collector is frozen on its last good config.
-        // Reproduced on a live tenant: `vector validate` failed with
-        // `Input "…_output" for transform "db_parsers_combined" doesn't match
-        // any components`, and Vector logged `reload aborted`.
-        //
-        // Regeneration is the coherent operation in both cases: for a source
-        // that was live it rewrites the combiner and router without it, and for
-        // one that never deployed it is a no-op that still prunes any stale
-        // file. There is no case where unlinking alone is more correct, so the
-        // branch is gone rather than repaired.
-        {
-            // NAN-2304 gives us the canonical effective-deployed query (it also
-            // resolves dispatch route names internally). NAN-2305's `filter` is
-            // still required and must not be dropped in a merge: the row is
-            // deleted AFTER this regeneration, inside the deploy guard, so it is
-            // still present here — regenerating without the filter would write a
-            // config that still routes the source being deleted.
-            let parsers: Vec<_> = self
-                .effective_deployed_parsers()
-                .await?
-                .into_iter()
-                .filter(|parser| parser.id != id)
-                .collect();
-
-                // Fail closed. The row is still present, so the DB and the
-                // config still agree and the operator can retry — far better
-                // than a "deleted" source that the collector keeps routing to.
-                if let Err(e) = self.vector_config.deploy_parsers(&parsers).await {
-                    tracing::error!(
-                        "Refusing to delete log source '{}': could not regenerate the Vector \
-                         config without it: {}",
-                        log_source_name,
-                        e
-                    );
-                    return Err(LogSourceServiceError::VectorConfigError(e));
+            // NAN-2305's filter must stay: the rows are deleted AFTER this
+            // regeneration on a single node, inside the guard, so they are
+            // still present here.
+            let parsers: Vec<_> = match self.effective_deployed_parsers().await {
+                Ok(parsers) => parsers.into_iter().filter(|parser| !doomed.contains(&parser.id)).collect(),
+                Err(e) => {
+                    tracing::error!(sources = ?names, error = %e, "could not list the deployed log sources for a delete");
+                    return fail_all_with(results, &doomed, BatchFailure::Database);
                 }
+            };
 
-                // Deliberately NOT fatal, unlike the write above: the on-disk
-                // tree is already correct and coherent at this point, so the
-                // worst case is that Vector keeps a now-unused route until the
-                // next reload. Blocking deletion behind a collector that is
-                // down or unreachable would be the worse failure.
-                if let Err(e) = self.vector_config.reload_vector().await {
+            if crate::parsers::VectorConfigManager::generation_delivery_active() {
+                // NAN-5678 review: role split renders the published generation
+                // from the DATABASE, so the rows must be gone before the
+                // publish, or it republishes (and grades) the pre-delete
+                // config. Same order as undeploy: database first, then one
+                // render and publish of what remains.
+                if let Err(failure) = self.delete_rows(&found, &mut results).await {
+                    return fail_all_with(results, &doomed, failure);
+                }
+                if let Err(failure) = self.vector_config.deploy_and_reload_locked_graded(&parsers).await {
                     tracing::error!(
-                        "Vector config for deleted log source '{}' was written but Vector did not \
-                         confirm the reload — it may still be routing the deleted source until it \
-                         next reloads: {}",
-                        log_source_name,
-                        e
+                        sources = ?names,
+                        "log source(s) deleted, but the ingest hosts did not confirm the new \
+                         generation; the publication reconciler retries: {}",
+                        failure.error
                     );
                 }
+            } else {
+                // Single node: config first, rows after. The deploy snapshots
+                // the active tree, skips the reload when nothing Vector runs
+                // changed (NAN-5611: deleting a never-deployed draft), and
+                // restores the snapshot when the write fails or Vector refuses
+                // the tree. In those cases the rows stay, so the database and
+                // the config still agree and the operator can retry.
+                if let Err(failure) = self.vector_config.deploy_and_reload_locked_graded(&parsers).await {
+                    if !failure.tree_kept {
+                        tracing::error!(
+                            sources = ?names,
+                            "Refusing to delete log source(s): the Vector config without them was not \
+                             applied (restored the previous one): {}",
+                            failure.error
+                        );
+                        return fail_all_with(
+                            results,
+                            &doomed,
+                            BatchFailure::Failed(LogSourceServiceError::VectorConfigError(failure.error).to_string()),
+                        );
+                    }
+                    // Deliberately NOT fatal: the tree without them is written
+                    // and coherent; Vector only did not confirm loading it (down
+                    // or slow), so the worst case is an unused route until it
+                    // next reloads. Blocking deletion behind that is worse.
+                    tracing::error!(
+                        sources = ?names,
+                        "Vector config for deleted log source(s) was written but Vector did not confirm \
+                         the reload — it may still be routing them until it next reloads: {}",
+                        failure.error
+                    );
+                }
+                // Inside the guard, with the config already republished:
+                // dropping the lock first would let a concurrent deploy read a
+                // still-present row and put the source straight back into the
+                // config. A failed row delete leaves the source out of the
+                // config but in the database, so the next deploy restores it
+                // and that delete simply did not happen.
+                if let Err(failure) = self.delete_rows(&found, &mut results).await {
+                    return fail_all_with(results, &doomed, failure);
+                }
             }
-
-            // Inside the guard, with the config already republished. Dropping
-            // the lock first would leave a window in which a concurrent deploy
-            // reads the still-present row, regenerates from it, and puts the
-            // source being deleted straight back into the config — the row then
-            // disappears underneath it and the collector is left routing a
-            // source nobody can manage.
-            //
-            // Config-before-row is also the safer order for the failure case:
-            // if this DELETE fails, the source is absent from the config but
-            // still in the database, so the next deploy restores it and the
-            // delete simply did not happen. The reverse leaves a deleted source
-            // live in the collector, which is what the old ordering did.
-            self.repository().delete(id).await?;
         }
 
-        // Clean up orphaned routing rules that targeted this log source's source_type.
-        // We only delete from the DB — no source config deploy or router update needed.
-        // The next explicit source config deploy will regenerate configs without these rules.
-        let source_type = &log_source.source_type;
-        match sqlx::query("DELETE FROM routing_rules WHERE target_source_type = $1")
-            .bind(source_type)
-            .execute(&self.pool)
-            .await
-        {
-            Ok(result) if result.rows_affected() > 0 => {
-                tracing::info!(
-                    "Removed {} orphaned routing rule(s) targeting source_type '{}'",
-                    result.rows_affected(),
-                    source_type
-                );
+        for log_source in &found {
+            if !matches!(results.get(&log_source.id), Some(Ok(_))) {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to clean up routing rules for source_type '{}': {}",
-                    source_type,
-                    e
-                );
+            // Clean up orphaned routing rules that targeted this log source's
+            // source_type. DB only: the next explicit source config deploy
+            // regenerates configs without these rules.
+            match sqlx::query("DELETE FROM routing_rules WHERE target_source_type = $1")
+                .bind(&log_source.source_type)
+                .execute(&self.pool)
+                .await
+            {
+                Ok(result) if result.rows_affected() > 0 => {
+                    tracing::info!(
+                        "Removed {} orphaned routing rule(s) targeting source_type '{}'",
+                        result.rows_affected(),
+                        log_source.source_type
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to clean up routing rules for source_type '{}': {}",
+                        log_source.source_type,
+                        e
+                    );
+                }
+                _ => {}
             }
-            _ => {}
+            tracing::info!("Deleted log source '{}' ({})", log_source.name, log_source.id);
         }
+        if found.len() > 1 {
+            tracing::info!(count = found.len(), "Deleted log sources with one Vector config render and reload");
+        }
+        results
+    }
 
-        tracing::info!("Deleted log source '{}' ({})", log_source_name, id);
-
+    /// Delete `found`'s rows in one statement and record each result. An id
+    /// the statement did not return was deleted concurrently (not found).
+    async fn delete_rows(
+        &self,
+        found: &[LogSource],
+        results: &mut std::collections::HashMap<Uuid, Result<DeletedLogSource, BatchFailure>>,
+    ) -> Result<(), BatchFailure> {
+        let ids: Vec<Uuid> = found.iter().map(|s| s.id).collect();
+        let deleted = self.repository().delete_many(&ids).await.map_err(|e| {
+            // NAN-2266: logged here, never handed to the client.
+            tracing::error!(error = %e, count = ids.len(), "could not delete log source rows");
+            BatchFailure::Database
+        })?;
+        let deleted: std::collections::HashSet<Uuid> = deleted.into_iter().collect();
+        for source in found {
+            let outcome = if deleted.contains(&source.id) {
+                Ok(DeletedLogSource { name: source.name.clone() })
+            } else {
+                Err(BatchFailure::NotFound)
+            };
+            results.insert(source.id, outcome);
+        }
         Ok(())
     }
+}
+
+/// A log source [`LogSourceService::delete_many`] deleted (NAN-5683): what
+/// the caller still needs once the row is gone, i.e. the name its audit
+/// row records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedLogSource {
+    pub name: String,
+}
+
+/// Why one source in a [`LogSourceService::delete_many`] batch was not
+/// deleted. Clonable, so one failed render can be reported to every caller
+/// whose source was in the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BatchFailure {
+    NotFound,
+    /// A database error, already logged; the caller gets the sanitized
+    /// NAN-2266 message, never the driver's text.
+    Database,
+    /// The Vector config without the source could not be applied.
+    Failed(String),
+}
+
+/// Every source in `doomed` without a result yet fails with `failure`.
+fn fail_all_with(
+    mut results: std::collections::HashMap<Uuid, Result<DeletedLogSource, BatchFailure>>,
+    doomed: &std::collections::HashSet<Uuid>,
+    failure: BatchFailure,
+) -> std::collections::HashMap<Uuid, Result<DeletedLogSource, BatchFailure>> {
+    for id in doomed {
+        results.entry(*id).or_insert_with(|| Err(failure.clone()));
+    }
+    results
+}
+
+/// NAN-2266: the error a database failure maps to, so the API answers with its
+/// sanitized "A database error occurred" (the real error is logged where it
+/// happened).
+fn sanitized_database_error() -> LogSourceServiceError {
+    LogSourceServiceError::RepositoryError(crate::log_sources::LogSourceRepositoryError::DatabaseError(
+        sqlx::Error::Protocol("a database error occurred while deleting the log source".to_string()),
+    ))
 }

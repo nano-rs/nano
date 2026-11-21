@@ -33,7 +33,7 @@ use nanosiem_core::audit::{
     LOG_SOURCE_TOGGLED, LOG_SOURCE_UNDEPLOYED, LOG_SOURCE_UPDATED,
 };
 use nanosiem_core::log_sources::{
-    LogSourceServiceError,
+    DeletedLogSource, LogSourceServiceError,
     DeploymentResult, IngestionHistoryPoint, LiveTestResult, LogSource, LogSourceDeployment,
     CollectorError, LogSourceHealth, LogSourceVersion, LogSourceWithDraftStatus, NewLogSource,
     ParserTestResult,
@@ -259,18 +259,149 @@ pub async fn delete_log_source(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_DELETE)?;
 
-    state.log_source_service.delete(*id).await?;
-
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_DELETED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("log_source", Some(*id), None::<String>)
-            .client_context(&client)
-            .build(),
-    );
+    let id = *id;
+    let outcome = delete_and_audit(&state, &auth, &client, vec![id])
+        .await?
+        .into_iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, outcome)| outcome)
+        .ok_or_else(|| ApiError::InternalError("the delete recorded no result".to_string()))?;
+    outcome?;
 
     Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+/// NAN-5678 review: run the deletes AND their `LOG_SOURCE_DELETED` audit in a
+/// task registered with graceful shutdown. A client that disconnects (or an
+/// edge that times out) drops this handler, never the task: the batch still
+/// finishes and every source it deleted is still audited.
+async fn delete_and_audit(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    ids: Vec<uuid::Uuid>,
+) -> Result<Vec<(uuid::Uuid, Result<(), LogSourceServiceError>)>, ApiError> {
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    let task_state = state.clone();
+    let auth = auth.clone();
+    let client = client.clone();
+    let started = state
+        .spawn_tracked(async move {
+            let outcomes = task_state.log_source_service.delete_many(ids).await;
+            for (id, result) in &outcomes {
+                if let Ok(deleted) = result {
+                    task_state.emit_audit(log_source_deleted_event(&auth, &client, *id, deleted));
+                }
+            }
+            let outcomes = outcomes.into_iter().map(|(id, result)| (id, result.map(|_| ()))).collect();
+            let _ = reply.send(outcomes);
+        })
+        .await;
+    if !started {
+        return Err(ApiError::ServiceUnavailable("the API is shutting down; retry the delete".to_string()));
+    }
+    outcome
+        .await
+        .map_err(|_| ApiError::InternalError("the delete task stopped before it finished".to_string()))
+}
+
+/// The `LOG_SOURCE_DELETED` audit event for one deleted source, single or
+/// bulk. NAN-5683: it names the source like `log_source_created` /
+/// `log_source_updated` do (the row is gone by now, so the name comes from the
+/// delete itself); the audit API renders `resource_id` as the `lsrc_` TypeID.
+fn log_source_deleted_event(
+    auth: &AuthContext,
+    client: &ClientContext,
+    id: uuid::Uuid,
+    deleted: &DeletedLogSource,
+) -> AuditEvent {
+    AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_DELETED)
+        .actor(Some(auth.user_id()), None)
+        .api_key(auth.api_key_id, auth.api_key_name.clone())
+        .resource("log_source", Some(id), Some(deleted.name.clone()))
+        .client_context(client)
+        .build()
+}
+
+/// Most log sources one bulk delete accepts (NAN-5678).
+pub const BULK_DELETE_MAX: usize = 500;
+
+/// Body of `POST /api/log-sources/bulk-delete`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BulkDeleteLogSourcesRequest {
+    /// Log source IDs to delete (at most 500).
+    #[schema(value_type = Vec<String>)]
+    pub ids: Vec<TypeIdParam>,
+}
+
+/// One source's outcome in a bulk delete.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct BulkDeleteItem {
+    pub id: String,
+    pub deleted: bool,
+    /// Why it was not deleted (absent when `deleted`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response of `POST /api/log-sources/bulk-delete`.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct BulkDeleteLogSourcesResponse {
+    pub deleted: usize,
+    pub failed: usize,
+    pub results: Vec<BulkDeleteItem>,
+}
+
+/// Delete several log sources with ONE Vector config render and reload
+///
+/// NAN-5678: every reload recompiles all deployed parsers, so deleting N
+/// sources one call at a time cost N reloads. This deletes them together;
+/// results are per source. The work runs to completion even if the client
+/// disconnects.
+#[utoipa::path(
+    post,
+    path = "/api/log-sources/bulk-delete",
+    tag = "log_sources",
+    request_body = BulkDeleteLogSourcesRequest,
+    responses(
+        (status = 200, description = "Per-source results", body = BulkDeleteLogSourcesResponse),
+        (status = 403, description = "Forbidden"),
+        (status = 422, description = "Empty or oversized request"),
+        (status = 503, description = "The API is shutting down"),
+    ),
+    security(("api_key" = []))
+)]
+pub async fn bulk_delete_log_sources(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
+    Json(request): Json<BulkDeleteLogSourcesRequest>,
+) -> Result<Json<BulkDeleteLogSourcesResponse>, ApiError> {
+    ensure_permission(&auth, LOG_SOURCES_DELETE)?;
+    if request.ids.is_empty() {
+        return Err(ApiError::ValidationError("ids must not be empty".to_string()));
+    }
+    if request.ids.len() > BULK_DELETE_MAX {
+        return Err(ApiError::ValidationError(format!(
+            "at most {BULK_DELETE_MAX} log sources per bulk delete"
+        )));
+    }
+    let ids: Vec<uuid::Uuid> = request.ids.into_iter().map(TypeIdParam::into_uuid).collect();
+    let outcomes = delete_and_audit(&state, &auth, &client, ids).await?;
+
+    let mut results = Vec::with_capacity(outcomes.len());
+    for (id, outcome) in outcomes {
+        // Through ApiError, so a database failure reads as its sanitized
+        // NAN-2266 message (the service logged the real one).
+        let error = outcome.err().map(|e| ApiError::from(e).to_string());
+        results.push(BulkDeleteItem {
+            id: nanosiem_core::typeid::encode(nanosiem_core::typeid::log_source::PREFIX, &id),
+            deleted: error.is_none(),
+            error,
+        });
+    }
+    let deleted = results.iter().filter(|r| r.deleted).count();
+    Ok(Json(BulkDeleteLogSourcesResponse { deleted, failed: results.len() - deleted, results }))
 }
 
 /// Toggle request
@@ -1264,6 +1395,7 @@ pub async fn get_log_source_draft_status(
         create_log_source,
         update_log_source,
         delete_log_source,
+        bulk_delete_log_sources,
         toggle_log_source,
         validate_log_source,
         deploy_log_source,
@@ -1292,6 +1424,9 @@ pub async fn get_log_source_draft_status(
         nanosiem_core::parsers::OcsfValidationResult,
         nanosiem_core::parsers::OcsfValidationDiagnostic,
         ToggleRequest,
+        BulkDeleteLogSourcesRequest,
+        BulkDeleteLogSourcesResponse,
+        BulkDeleteItem,
         ValidateVrlRequest,
         ValidateNamespaceRequest,
         ValidateNamespaceResponse,
@@ -1331,3 +1466,7 @@ impl LogSourcesApiDoc {
         vec![]
     }
 }
+
+#[cfg(test)]
+#[path = "log_sources_delete_audit_tests.rs"]
+mod delete_audit_tests;

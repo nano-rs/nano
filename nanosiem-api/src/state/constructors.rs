@@ -439,8 +439,13 @@ impl AppState {
         // read-mutate-write of `_router.toml` can interleave and the
         // later writer clobbers the earlier one's changes.
         let vector_config_dir = get_vector_config_dir();
-        let parser_service =
-            ParserService::with_vector_config_dir(pg_pool.clone(), &vector_config_dir);
+        // NAN-5678: staging and backups outside the watched tree where
+        // Compose says so (VECTOR_CONFIG_WORK_DIR).
+        let parser_service = ParserService::with_vector_config_dirs(
+            pg_pool.clone(),
+            &vector_config_dir,
+            std::env::var(nanosiem_core::parsers::VECTOR_CONFIG_WORK_DIR_ENV).ok().as_deref(),
+        );
         let source_config_service =
             SourceConfigService::with_vector_config_dir(pg_pool.clone(), &vector_config_dir)
                 .with_deploy_lock(parser_service.deploy_lock());
@@ -562,6 +567,8 @@ impl AppState {
             // Agent config registry initialized in reload_melod_service
             #[cfg(feature = "enterprise")]
             agent_config_registry,
+            #[cfg(feature = "enterprise")]
+            melod_built_fingerprint: Arc::new(RwLock::new(None)),
             // Signal processor for bridging ClickHouse signals to PostgreSQL alerts
             signal_processor,
             // Disk pressure service for automatic partition eviction

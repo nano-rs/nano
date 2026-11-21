@@ -376,10 +376,43 @@ pub fn ensure_interactive_session(auth: &AuthContext) -> Result<(), ApiError> {
     }
 }
 
+/// The synthetic role every anonymous demo session carries.
+pub const DEMO_ROLE: &str = "demo_analyst";
+
+/// Refuse anonymous demo visitors on deployment-wide settings that a
+/// permission they hold would otherwise admit (NAN-5676). Demo sessions are
+/// shared and unauthenticated, so a global toggle must never be theirs to flip,
+/// whatever `demo_guard`'s path lists say.
+pub fn ensure_not_demo_user(auth: &AuthContext) -> Result<(), ApiError> {
+    if auth.claims.roles.iter().any(|r| r == DEMO_ROLE) {
+        Err(ApiError::Forbidden(
+            "This setting is not available in demo mode.".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nanosiem_core::auth::ApiKeyInfo;
+
+    #[test]
+    fn ensure_not_demo_user_refuses_only_the_demo_role() {
+        let mut auth = AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "k".to_string(),
+            permissions: vec!["settings:ai".to_string()],
+            user_id: Some(Uuid::now_v7()),
+        });
+        assert!(ensure_not_demo_user(&auth).is_ok());
+        auth.claims.roles.push(DEMO_ROLE.to_string());
+        assert!(matches!(
+            ensure_not_demo_user(&auth),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
 
     #[test]
     fn ensure_interactive_session_rejects_api_keys() {

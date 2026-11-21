@@ -309,8 +309,8 @@ export interface FindingSuppression {
   /** Verbatim title at suppression time. Frontend filters current report by exact title match. */
   title: string;
   reason: string;
-  /** typeid form: user_<base32> */
-  created_by: string;
+  /** typeid form: user_<base32>; null once the user is deleted (NAN-5721). */
+  created_by: string | null;
   created_at: string;
   /** Null when active; non-null when undone. */
   deactivated_at: string | null;
@@ -330,8 +330,13 @@ export class SiemHealthApi {
     return this.request(`/api/siem-health/reports?limit=${limit}&offset=${offset}`);
   }
 
-  async getLatest(): Promise<SiemHealthReport> {
-    return this.request('/api/siem-health/reports/latest');
+  /**
+   * Latest report, or `null` when none has been generated yet. NAN-5683:
+   * `allow_empty=true` makes "no report yet" a 200 + `null` instead of a 404,
+   * so a fresh install doesn't log a failed request on every page.
+   */
+  async getLatest(): Promise<SiemHealthReport | null> {
+    return this.request('/api/siem-health/reports/latest?allow_empty=true');
   }
 
   async getReport(id: string): Promise<SiemHealthReport> {

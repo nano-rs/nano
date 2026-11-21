@@ -23,6 +23,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
+import { useAirGap } from '@/hooks/use-air-gap';
 import type {
   CreateRepositoryRequest,
   ImportRequest,
@@ -47,6 +48,7 @@ import {
   buildRepoView,
   buildRuleView,
   categoryCounts,
+  linkedRuleEditorPath,
   type CategoryCount,
   type RepoRuleView,
   type RepoView,
@@ -73,6 +75,12 @@ export function RuleRepositories() {
   // rules, distinct from the pull-only rule repositories on this page.
   const canViewDac = hasPermission('detection_code_targets:view');
   const canManageDac = hasPermission('detection_code_targets:manage');
+  // NAN-5709: the page opens on rule_repositories:view (every user); each write
+  // control renders only for the permission its endpoint checks.
+  const canSync = hasPermission('rule_repositories:sync');
+  const canManageRepos = hasPermission('rule_repositories:manage');
+  // Configure folders PUTs the repository (manage) and then syncs it (sync).
+  const canConfigureFolders = canManageRepos && canSync;
   const previewAccess = rulePreviewAccess(hasPermission);
   const diffAccess = ruleDiffAccess(hasPermission);
   const dismissAccess = ruleDismissAccess(hasPermission);
@@ -96,9 +104,7 @@ export function RuleRepositories() {
   // unavailable offline. The page stays usable (browse + import); the egress
   // controls (connect-repo / sync-from-Git) are swapped for an offline
   // bundle-sync control that populates the catalog in place (NAN-1226).
-  const airGap =
-    useQuery({ queryKey: ['system', 'config'], queryFn: () => api.getSystemConfig() })
-      .data?.air_gap ?? false;
+  const airGap = useAirGap();
 
   const refetchCatalog = () => {
     queryClient.invalidateQueries({ queryKey: ['rule-repositories'] });
@@ -244,7 +250,7 @@ export function RuleRepositories() {
     mode?: 'staging' | 'live' | 'alerting',
   ) => ({
     outcome:
-      rule.status === 'IMPORTED'
+      rule.status === 'IMPORTED' || rule.status === 'DRIFT'
         ? ('skip' as const)
         : rule.status === 'UPDATED'
           ? ('update' as const)
@@ -269,7 +275,10 @@ export function RuleRepositories() {
   const bulkImportAccess = ruleImportAccess(
     hasPermission,
     selectedRules
-      .filter((rule) => rule.status !== 'IMPORTED' && rule.status !== 'DELETED')
+      .filter(
+        (rule) =>
+          rule.status !== 'IMPORTED' && rule.status !== 'DRIFT' && rule.status !== 'DELETED',
+      )
       .map((rule) => importIntent(rule, 'staging')),
   );
 
@@ -428,7 +437,8 @@ export function RuleRepositories() {
   const openOrAct = (rule: RepoRuleView) => {
     const detectionRuleId = rule.raw.linked_detection_rule_id;
     if (detectionRuleId) {
-      navigate(`/rules/editor/${detectionRuleId}`);
+      // NAN-5716: Resolve on a DRIFT rule opens the upstream merge modal.
+      navigate(linkedRuleEditorPath(rule.status, detectionRuleId));
     } else {
       toast({
         title: 'Cannot open rule',
@@ -577,6 +587,7 @@ export function RuleRepositories() {
                   Detection content comes from nano&apos;s first-party catalog. Follow the official{' '}
                   <code className="font-mono text-foreground/80">nano-rs/rules</code> catalog to sync it.
                 </div>
+                {canManageRepos ? (
                 <div className="flex items-center justify-center gap-2">
                   <button
                     type="button"
@@ -601,6 +612,11 @@ export function RuleRepositories() {
                     {createMutation.isPending ? 'Adding…' : 'Add nano rules'}
                   </button>
                 </div>
+                ) : (
+                  <div className="text-[11px] text-muted-foreground">
+                    Ask an administrator to add the catalog.
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -621,7 +637,7 @@ export function RuleRepositories() {
       <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col [contain:layout]">
         <ReposHeader
         repo={activeRepo}
-        onSyncNow={() => syncMutation.mutate(activeRepo.id)}
+        onSyncNow={canSync ? () => syncMutation.mutate(activeRepo.id) : undefined}
         onOpenHistory={() => setHistoryOpen(true)}
         syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
         pushTargetsSlot={pushTargetsButton}
@@ -650,15 +666,19 @@ export function RuleRepositories() {
             setSelectedRuleId(null);
             setSelected(new Set());
           }}
-          onSyncNow={(id) => syncMutation.mutate(id)}
+          onSyncNow={canSync ? (id) => syncMutation.mutate(id) : undefined}
           onOpenHistory={(id) => {
             setActiveRepoId(id);
             setHistoryOpen(true);
           }}
-          onConfigureFolders={(id) => {
-            setActiveRepoId(id);
-            setFoldersRepoId(id);
-          }}
+          onConfigureFolders={
+            canConfigureFolders
+              ? (id) => {
+                  setActiveRepoId(id);
+                  setFoldersRepoId(id);
+                }
+              : undefined
+          }
           syncingId={syncMutation.isPending ? (syncMutation.variables as string) : null}
         />
 
@@ -747,7 +767,7 @@ export function RuleRepositories() {
         onClose={() => setHistoryOpen(false)}
         repo={activeRepo}
         syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
-        onSyncNow={(id) => syncMutation.mutate(id)}
+        onSyncNow={canSync ? (id) => syncMutation.mutate(id) : undefined}
       />
 
       <BulkImportDrawer

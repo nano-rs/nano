@@ -22,7 +22,8 @@ pub enum FeedbackError {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct Feedback {
     pub id: Uuid,
-    pub user_id: Uuid,
+    /// NULL once the submitter is deleted (NAN-5721, ON DELETE SET NULL).
+    pub user_id: Option<Uuid>,
     pub category: String,
     pub title: String,
     pub description: String,
@@ -36,7 +37,8 @@ pub struct Feedback {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct FeedbackWithUser {
     pub id: Uuid,
-    pub user_id: Uuid,
+    /// NULL once the submitter is deleted (NAN-5721, ON DELETE SET NULL).
+    pub user_id: Option<Uuid>,
     pub user_name: Option<String>,
     pub user_email: Option<String>,
     pub category: String,

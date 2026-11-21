@@ -84,7 +84,7 @@ function ForbiddenPage() {
   const { user } = useAuth();
 
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center p-4">
+    <div className="min-h-screen bg-background flex items-center justify-center p-4" data-testid="route-forbidden">
       <div className="text-center max-w-md">
         <div className="inline-flex items-center justify-center w-16 h-16 bg-red-500/10 rounded-2xl mb-6">
           <ShieldX className="w-10 h-10 text-red-500" />

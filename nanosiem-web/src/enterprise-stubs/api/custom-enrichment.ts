@@ -108,7 +108,7 @@ export interface VersionInfo {
   id: string;
   version: number;
   change_summary: string | null;
-  created_by: string;
+  created_by: string | null;
   created_at: string;
 }
 

@@ -66,6 +66,7 @@ import {
   useSharedSearches,
   useCreateSavedSearch,
   useDeleteSavedSearch,
+  useUpdateSavedSearch,
   useShareSavedSearch,
   useCreateSharedSearch,
   useGetSharedSearch,
@@ -134,6 +135,7 @@ import { useCapabilities } from '@/hooks/use-capabilities';
 import { ScheduleReportDialog, type ScheduleReportPreset } from '@/components/reports/ScheduleReportDialog';
 import { useSearchPivtPage, type SearchPivtState } from './search/useSearchPivtPage';
 import { isPageInStoredRange, jobFailureCode, jobPollPolicy, nextContinuationPage, pageableRowCount } from '@/lib/search-job';
+import { beginResultSet, createPageLoader, resetPaging, type PageLoader, type ResultSetRefs } from '@/lib/search-pages';
 import type { SearchJobSummary } from '@/lib/api';
 import { registerDynamicFields } from '@/components/editor';
 import { spillFieldName, type FieldStatsGap } from '@/components/search/field-buckets';
@@ -628,7 +630,10 @@ export function Search() {
   const { capabilities } = useCapabilities();
 
   // Pagination state
-  const [currentPage, setCurrentPage] = useState(1);
+  // NAN-5703: synchronous infinite-scroll bookkeeping (see lib/search-pages).
+  // The next page is numbered from the last page appended, so every path that
+  // replaces the result set with a new search's first page must reset it.
+  const pageLoaderRef = useRef<PageLoader>(createPageLoader());
   const [totalCount, setTotalCount] = useState(0);
   /**
    * The total every surface on the page renders (NAN-2551 / NAN-2557).
@@ -978,6 +983,12 @@ export function Search() {
   const isRestoringFromHistory = useRef(false);
   
   const abortControllerRef = useRef<AbortController | null>(null);
+  // NAN-5703 review: the refs every new result set resets together.
+  const resultSetRefs = useRef<ResultSetRefs>({
+    pageLoader: pageLoaderRef,
+    jobContinuation: jobContinuationRef,
+    abortController: abortControllerRef,
+  }).current;
   const currentRequestIdRef = useRef<string | null>(null);
   // NAN-3299: the bounds the current run resolved its time range to. Every
   // request of the run, its later pages and the URL it writes reuse them, so a
@@ -1094,7 +1105,8 @@ export function Search() {
     return () => window.removeEventListener('storage', handleStorageChange);
   }, []);
   const { mutate: createSavedSearch, loading: saving } = useCreateSavedSearch();
-  const { mutate: _deleteSavedSearch } = useDeleteSavedSearch();
+  const { mutate: deleteSavedSearch } = useDeleteSavedSearch();
+  const { mutate: updateSavedSearch } = useUpdateSavedSearch();
   const { mutate: _shareSavedSearch } = useShareSavedSearch();
   const { mutate: createSharedSearch } = useCreateSharedSearch();
   const { mutate: getSharedSearch } = useGetSharedSearch();
@@ -1422,6 +1434,9 @@ export function Search() {
         fields: (r && typeof r === 'object') ? r : {},
       }));
 
+    // NAN-5703 review: a job's first page is a new result set (callers attach
+    // the job continuation AFTER this).
+    resetPaging(resultSetRefs);
     setSearchResults(results);
     setExecutedQuery(currentQuery);
     setTotalCount(response.total_count || results.length);
@@ -1942,8 +1957,18 @@ export function Search() {
     // Every deliberate trigger runs — no fuzzy coalescing of similar inputs,
     // which could swallow a live run behind a passive cached load.
 
-    if (abortControllerRef.current) abortControllerRef.current.abort();
-    abortControllerRef.current = new AbortController();
+    // NAN-5703: this run's OWN controller. Checking the shared ref after the
+    // await read the NEXT run's (unaborted) controller, so a superseded page
+    // was still appended. A first page starts a new result set (paging and
+    // any background-job continuation reset); a later page keeps them.
+    let runController: AbortController;
+    if (append) {
+      abortControllerRef.current?.abort();
+      runController = new AbortController();
+      abortControllerRef.current = runController;
+    } else {
+      runController = beginResultSet(resultSetRefs);
+    }
     // NAN-3299: resolve the window once per run. A new run re-resolves a
     // relative pick against now; a later page reuses page 1's bounds.
     const runTimeRange = append
@@ -2018,7 +2043,6 @@ export function Search() {
       ));
       timelineIdentityRef.current = runIdentity;
       setHistogramData(PENDING_TIMELINE);
-      setCurrentPage(1);
       // Only push to history if not restoring from back/forward navigation
       if (!isRestoringFromHistory.current) {
         updateUrl(currentQuery, currentMode, urlTimeRange(currentTimeRange, runTimeRange), undefined, true, prevalenceMax, currentDataset);
@@ -2090,10 +2114,12 @@ export function Search() {
         // NAN-1645: page flips (offset > 0) skip the histogram companion — the
         // timeline is page-invariant and frozen from page 1 (mirrors the
         // existing skip_field_stats behavior; the backend offset-gates too).
-        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, request_id: requestId, dataset: currentDataset });
+        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, request_id: requestId, dataset: currentDataset, signal: runController.signal });
       }
 
-      if (abortControllerRef.current?.signal.aborted) return;
+      if (runController.signal.aborted) return;
+      // NAN-5703: a page is appended once, and only the page in flight.
+      if (append && !pageLoaderRef.current.accept(page)) return;
 
       const results: SearchResult[] = (response.results || [])
         .filter((r: unknown) => r != null && typeof r === 'object')
@@ -2134,7 +2160,6 @@ export function Search() {
         // a full raw page below pageSize while more raw pages remain.
         setTotalCount(response.total_count);
       }
-      setCurrentPage(page);
       if (response.generated_sql) setGeneratedSql(response.generated_sql);
       const timing = searchTimingBreakdown(response);
       setExecutionTimeMs(timing.displayTimeMs);
@@ -2294,12 +2319,17 @@ export function Search() {
       }
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') return;
+      // NAN-5703 review: a superseded run's failure must not overwrite the
+      // newer run's state.
+      if (runController.signal.aborted) return;
       const searchErr = handleError(err, 'Unknown error');
       setSearchError(searchErr);
       requestQueryCorrection(searchErr.code, searchErr.message, query);
     } finally {
-      // Don't clear isSearching if async polling or SSE streaming is active — their callbacks handle that
-      if (!asyncJobPollingRef.current && !sseControllerRef.current) {
+      // Don't clear isSearching if async polling or SSE streaming is active — their callbacks handle that.
+      // Only the run that still owns the controller may clear it: a superseded
+      // request finishing late must not hide a newer run's spinner.
+      if (abortControllerRef.current === runController && !asyncJobPollingRef.current && !sseControllerRef.current) {
         setIsSearching(false);
       }
       setHasSearched(true);
@@ -2657,28 +2687,40 @@ export function Search() {
 
   const loadMore = useCallback(() => {
     if (isSearching || searchResults.length >= totalCount) return;
+    // NAN-5703: the scroll handler calls this many times before a re-render,
+    // so `isSearching` / `currentPage` above can be stale. The loader admits
+    // one page at a time and numbers it from the last page appended.
+    const ticket = pageLoaderRef.current.claimNext();
+    if (!ticket) return;
     // NAN-4915: continuation — page the completed job's stored rows instead
     // of re-running a search that already needed a background job.
     const continuation = jobContinuationRef.current;
     if (continuation) {
       const next = nextContinuationPage(searchResults.length, continuation.rowCount, pageSize);
-      if (!next) return; // stored result exhausted (cap reached)
+      if (!next) { pageLoaderRef.current.release(ticket); return; } // stored result exhausted (cap reached)
       const { offset } = next;
       setIsSearching(true);
       api.getSearchJobResults(continuation.jobId, offset, next.limit)
         .then(page => {
           if (jobContinuationRef.current?.jobId !== continuation.jobId) return;
-          setSearchResults(prev => [...prev, ...jobRowsToResults(page.rows, offset)]);
+          if (!pageLoaderRef.current.accept(ticket.page)) return;
+          // Positional: a page for an offset already filled is dropped.
+          setSearchResults(prev => (prev.length === offset ? [...prev, ...jobRowsToResults(page.rows, offset)] : prev));
         })
         .catch(err => {
+          // A newer search detached from this job: its failure is not news.
+          if (jobContinuationRef.current?.jobId !== continuation.jobId) return;
           jobContinuationRef.current = null;
           setSearchError(handleError(err, 'Could not load more results from the background search'));
         })
-        .finally(() => setIsSearching(false));
+        .finally(() => {
+          pageLoaderRef.current.release(ticket);
+          if (jobContinuationRef.current?.jobId === continuation.jobId) setIsSearching(false);
+        });
       return;
     }
-    handleSearch(currentPage + 1, true);
-  }, [isSearching, searchResults.length, totalCount, currentPage, handleSearch, pageSize, jobRowsToResults]);
+    void handleSearch(ticket.page, true).finally(() => pageLoaderRef.current.release(ticket));
+  }, [isSearching, searchResults.length, totalCount, handleSearch, pageSize, jobRowsToResults]);
 
   // Handler for table pagination - fetches page from server
   const handleTablePageChange = useCallback(async (newPage: number, overrideSize?: number) => {
@@ -2727,7 +2769,8 @@ export function Search() {
 
     // For table/aggregate queries where we need more data, fetch from server
     if (abortControllerRef.current) abortControllerRef.current.abort();
-    abortControllerRef.current = new AbortController();
+    const pageController = new AbortController();
+    abortControllerRef.current = pageController;
     setIsSearching(true);
 
     try {
@@ -2747,9 +2790,9 @@ export function Search() {
         // NAN-5486: table_view like page 1 of the run, or a later page came
         // back as `SELECT *` plus every prevalence column (the server still
         // widens the projection for pipes that need every field).
-        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, dataset });
+        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, dataset, signal: pageController.signal });
 
-      if (abortControllerRef.current?.signal.aborted) return;
+      if (pageController.signal.aborted) return;
 
       const results: SearchResult[] = (response.results || [])
         .filter((r: unknown) => r != null && typeof r === 'object')
@@ -2764,10 +2807,12 @@ export function Search() {
       setTablePage(newPage);
       // Total count should remain the same from initial query
     } catch (err) {
-      if ((err as Error)?.name === 'AbortError') return;
-      console.error('Failed to fetch aggregate page:', err);
+      if ((err as Error)?.name === 'AbortError' || pageController.signal.aborted) return;
+      // NAN-5701 review: say so when a page (or Load all) fails; the rows on
+      // screen stay as they were.
+      setSearchError(handleError(err, 'Could not load these rows'));
     } finally {
-      setIsSearching(false);
+      if (abortControllerRef.current === pageController) setIsSearching(false);
     }
   }, [isAggregateQuery, displayType, executedQuery, searchResults.length, timeRange, tablePageSize, totalCount, queryMode, prevalenceMax, search, searchSql, dataset, jobRowsToResults]);
 
@@ -3021,6 +3066,8 @@ export function Search() {
         name: saveSearchName,
         query,
         query_mode: queryMode,
+        // NAN-5696: the description typed in the dialog was never sent.
+        ...(saveSearchDescription.trim() ? { description: saveSearchDescription.trim() } : {}),
         // NAN-5311: a preset is stored with the window so it reopens relative.
         time_range: savedSearchTimeRange(timeRange),
         visibility: saveSearchShared ? 'public' : 'private',
@@ -3033,7 +3080,7 @@ export function Search() {
     } catch (err) {
       setSearchError(handleError(err, 'Failed to save search'));
     }
-  }, [saveSearchName, saveSearchShared, query, queryMode, timeRange, createSavedSearch, refetchSaved]);
+  }, [saveSearchName, saveSearchDescription, saveSearchShared, query, queryMode, timeRange, createSavedSearch, refetchSaved]);
 
   // NAN-2209: one-click group-by from the field index. Keeps the analyst's
   // base filters, drops whatever pipeline followed them, and runs immediately —
@@ -3194,10 +3241,12 @@ export function Search() {
     setTimeout(() => {
       // Manually trigger search with the new query
       const runDrilldownSearch = async () => {
+        // NAN-5703 review: a drilldown replaces the result set; without this
+        // the next scroll skipped pages or paged the old background job.
+        const drillController = beginResultSet(resultSetRefs);
         setSearchError(null);
         setIsSearching(true);
         // Don't clear histogram here - keep showing previous data while loading
-        setCurrentPage(1);
 
         // Effective range for this drilldown — the override wins over the
         // (just-updated) state because React state updates are async and we
@@ -3225,7 +3274,8 @@ export function Search() {
           // follow in the background below.
           const requestId = safeRandomUUID();
           currentRequestIdRef.current = requestId;
-          const response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset: 0, skip_field_stats: true, table_view: true, request_id: requestId, dataset });
+          const response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset: 0, skip_field_stats: true, table_view: true, request_id: requestId, dataset, signal: drillController.signal });
+          if (drillController.signal.aborted) return;
           
           const results: SearchResult[] = (response.results || [])
             .filter((r: unknown) => r != null && typeof r === 'object')
@@ -3277,9 +3327,10 @@ export function Search() {
             apiTimeRange.end
           );
         } catch (err) {
+          if (drillController.signal.aborted) return;
           setSearchError(handleError(err, 'Unknown error'));
         } finally {
-          setIsSearching(false);
+          if (abortControllerRef.current === drillController) setIsSearching(false);
           setHasSearched(true);
         }
       };
@@ -3893,6 +3944,8 @@ export function Search() {
       // navigation another window performed on this tab) loads its query
       // and waits for Run; it never executes on its own.
       const urlChangeMayRun = mayRunUrlQueryAt(routerLocation, currentUrlQuery);
+      // NAN-5703 review: every branch below replaces the result set on screen.
+      beginResultSet(resultSetRefs);
       if (currentUrlQuery.trim() && currentUrlMode !== 'natural' && !urlChangeMayRun) {
         setSearchResults([]);
         setHistogramData([]);
@@ -4046,6 +4099,12 @@ export function Search() {
   // reports done (phase2 == null || loading => keep showing the spinner).
   const footerGated = displayType != null && PHASE2_REPORTING_MODES.has(displayType);
   const footerIsSearching = isSearching || (footerGated && (phase2 == null || phase2.loading));
+  // e2e hook (NAN-5684): one increment per run, so a test can wait for THIS
+  // run's completion instead of a stale "Query complete" from the last one.
+  const [runSeq, setRunSeq] = useState(0);
+  useEffect(() => {
+    if (footerIsSearching) setRunSeq((n) => n + 1);
+  }, [footerIsSearching]);
   const footerExecutionTimeMs = footerGated
     ? (phase2 && !phase2.loading ? (phase2.executionTimeMs ?? null) : null)
     : executionTimeMs;
@@ -4149,6 +4208,8 @@ export function Search() {
                 displayTitle={tailRangeLabel?.title}
               />
               <Button
+                data-testid="search-run"
+                aria-label="Run search"
                 className="search-console-action rounded-md h-[34px] w-[34px] p-0 border bg-primary hover:bg-primary/90 border-border text-primary-foreground transition-colors duration-300 ease-out"
                 onClick={() => showAiSuggestion ? handleAskMelod(query) : handleSearch()}
                 disabled={isSearching || aiLoading}
@@ -4163,7 +4224,7 @@ export function Search() {
               </Button>
             </div>
             {isSearching && (
-              <Button variant="outline" className="search-console-action border-destructive/50 text-destructive hover:bg-destructive/10 rounded-md h-[34px] w-[34px] p-0 self-start" onClick={handleStopSearch}>
+              <Button data-testid="search-stop" aria-label="Stop search" variant="outline" className="search-console-action border-destructive/50 text-destructive hover:bg-destructive/10 rounded-md h-[34px] w-[34px] p-0 self-start" onClick={handleStopSearch}>
                 <Square className="w-[13px] h-[13px]" />
               </Button>
             )}
@@ -4700,6 +4761,15 @@ export function Search() {
               }
               handleSearch(1, false, q, mode ?? queryMode, reopenRange);
             }}
+            // NAN-5695: edit and delete the analyst's own saved queries.
+            onUpdateQuery={async (id, changes) => {
+              await updateSavedSearch({ id, data: changes });
+              refetchSaved();
+            }}
+            onDeleteQuery={async (id) => {
+              await deleteSavedSearch(id);
+              refetchSaved();
+            }}
             onScheduleQuery={(q) => {
               setSavedQueriesOpen(false);
               setSchedulePreset({
@@ -4854,6 +4924,9 @@ export function Search() {
             no border line, no bold label color. Reads as "informational"
             without competing with results below. */}
         <div
+          data-testid={showErrorOrWarning ? 'search-error-drawer' : undefined}
+          data-error-code={searchError?.code}
+          data-severity={searchError ? (searchError.warningSeverity ?? 'error') : 'warning'}
           className="px-5 py-2.5 rounded-b-xl border-t border-border/40 flex items-center gap-3"
           style={{
             background: `color-mix(in srgb, ${
@@ -4929,7 +5002,7 @@ export function Search() {
                   return (
                     <>
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-sm text-muted-foreground">{searchError.message}</span>
+                        <span data-testid="search-error-message" className="text-sm text-muted-foreground">{searchError.message}</span>
                         {isLookupAllowlistRefusal(searchError.message) && (
                           <RouterLink
                             to={LOOKUP_URLS_SETTINGS_PATH}
@@ -4987,6 +5060,8 @@ export function Search() {
             )}
           </div>
           <button
+            data-testid="search-error-dismiss"
+            aria-label="Dismiss"
             onClick={() => { if (searchError) { setSearchError(null); } else { setLimitWarningDismissed(true); } }}
             className="text-muted-foreground hover:text-foreground flex-shrink-0 p-0.5 rounded hover:bg-muted/50 transition-colors"
           >
@@ -5219,6 +5294,7 @@ export function Search() {
                     currentPage={tablePage}
                     pageSize={tablePageSize}
                     onPageChange={handleTablePageChange}
+                    onLoadAllRows={(count) => { void handleTablePageChange(0, count); }}
                     onPageSizeChange={handleTablePageSizeChange}
                     notebookActive={notebookActive}
                     onAddToNotebook={addEntityToNotebook}
@@ -5312,6 +5388,7 @@ export function Search() {
         tailActive={tailActive}
         tailInterval={tailInterval}
         timeWindow={runTimeWindowLabel}
+        runSeq={runSeq}
       />
     </div>
   );

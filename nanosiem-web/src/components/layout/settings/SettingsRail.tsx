@@ -14,8 +14,7 @@ import { ChevronDown, ChevronLeft, Search as SearchIcon, Settings as SettingsIco
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
-import { useSystemConfig } from '@/hooks/use-api';
-import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
+import { useDeploymentFlags } from '@/hooks/use-air-gap';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
@@ -122,8 +121,9 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
   const location = useLocation();
   const { hasPermission, hasAnyPermission, isDemoUser, user } = useAuth();
   const { capabilities, edition } = useCapabilities();
-  const { data: systemConfig } = useSystemConfig({ skip: !hasPermission(SHELL_READ_PERMISSIONS.systemConfig) });
-  const isAirGap = systemConfig?.air_gap === true;
+  // NAN-5724: any signed-in user may read the air-gap flag; a settings:system
+  // role without settings:view still gets the Air-Gap Import section.
+  const isAirGap = useDeploymentFlags().airGap === true;
   const [query, setQuery] = useState('');
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ access: true });
   const inputRef = useRef<HTMLInputElement>(null);
@@ -204,6 +204,7 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
 
   return (
     <aside
+      data-testid="settings-rail"
       className="row-span-3 col-start-1 flex flex-col border-r border-border w-[232px] shrink-0"
       style={{ background: 'var(--background)' }}
     >

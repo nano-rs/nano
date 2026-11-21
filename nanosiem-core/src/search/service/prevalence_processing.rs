@@ -75,6 +75,7 @@ impl SearchService {
         mut results: Vec<serde_json::Value>,
         prevalence_commands: &[PrevalenceCommandInfo],
         artifact_scope: &crate::auth::ArtifactScope,
+        query_id: &str,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let prevalence_service = match &self.prevalence_service {
             Some(service) => service,
@@ -104,6 +105,7 @@ impl SearchService {
                         prevalence_service,
                         time_window,
                         artifact_scope,
+                        query_id,
                     )
                     .await?;
             }
@@ -331,6 +333,7 @@ impl SearchService {
         prevalence_service: &PrevalenceService,
         time_window: PrevalenceTimeWindow,
         artifact_scope: &crate::auth::ArtifactScope,
+        query_id: &str,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         if results.is_empty() {
             tracing::debug!("Prevalence enrichment: no results to enrich");
@@ -499,6 +502,23 @@ impl SearchService {
                     );
                 }
             }
+        }
+
+        // NAN-5718: re-check the dict's TRUE misses against the real-time
+        // summary (a brand-new artifact is negative-cached for the dict
+        // LIFETIME). Restricted lookups already read the source-attributed
+        // summary, so their misses are final.
+        if artifact_scope.is_unrestricted() {
+            self.rescue_residual_enrichment(
+                &unique_hashes,
+                &unique_domains,
+                &unique_ips,
+                [&mut hash_prevalence, &mut domain_prevalence, &mut ip_prevalence],
+                prevalence_service,
+                time_window,
+                query_id,
+            )
+            .await;
         }
 
         tracing::debug!(

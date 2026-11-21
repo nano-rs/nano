@@ -488,6 +488,7 @@ impl SearchService {
         aggregation: bool,
         limit: usize,
         offset: usize,
+        query_id: &str,
         preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
@@ -496,12 +497,14 @@ impl SearchService {
             ))
         })?;
         let generated = ch_executor.for_generated_sql(aggregation);
+        // NAN-5723: tagged with the search's id (its count companion then
+        // carries the derived `-count` id) so cancel kills it.
         self.dispatch_clickhouse_sql(
             &generated,
             sql,
             limit,
             offset,
-            None,
+            Some(query_id),
             None,
             None,
             None,

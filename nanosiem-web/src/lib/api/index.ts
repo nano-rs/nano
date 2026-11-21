@@ -736,8 +736,8 @@ class ApiClient {
   }
 
   // Search
-  async search(request: import('./types').SearchRequest): Promise<import('./types').SearchResponse> {
-    return this._search.search(request);
+  async search(request: import('./types').SearchRequest, opts?: { signal?: AbortSignal }): Promise<import('./types').SearchResponse> {
+    return this._search.search(request, opts);
   }
 
   async searchSql(request: import('./types').RawSqlRequest): Promise<import('./types').SearchResponse> {
@@ -1415,6 +1415,10 @@ class ApiClient {
     return this._core.getSystemConfig();
   }
 
+  async getDeploymentFlags(): Promise<import('./types').DeploymentFlags> {
+    return this._core.getDeploymentFlags();
+  }
+
   // Developer Settings (Scheduler Control)
   async getDeveloperSettings(): Promise<import('./types').DeveloperSettings> {
     return this._core.getDeveloperSettings();
@@ -1520,6 +1524,18 @@ class ApiClient {
 
   async assignCase(caseId: string, assignedTo: string | null, assignedGroup?: string | null): Promise<import('./types').Case> {
     return this._cases.assignCase(caseId, assignedTo, assignedGroup);
+  }
+
+  async listCaseTags(caseId: string): Promise<import('./types').CaseTag[]> {
+    return this._cases.listCaseTags(caseId);
+  }
+
+  async addCaseTag(caseId: string, tag: string): Promise<import('./types').CaseTagsResponse> {
+    return this._cases.addCaseTag(caseId, tag);
+  }
+
+  async removeCaseTag(caseId: string, tag: string): Promise<import('./types').CaseTagsResponse> {
+    return this._cases.removeCaseTag(caseId, tag);
   }
 
   async escalateCase(caseId: string, request: import('./types').EscalateCaseRequest): Promise<import('./types').Case> {
@@ -1631,6 +1647,10 @@ class ApiClient {
 
   async getCaseSettings(): Promise<import('./types').CaseSettings> {
     return this._cases.getCaseSettings();
+  }
+
+  async getCaseSlaSettings(): Promise<import('./types').SlaSettings> {
+    return this._cases.getCaseSlaSettings();
   }
 
   async updateCaseSettings(request: import('./types').UpdateCaseSettingsRequest): Promise<import('./types').CaseSettings> {
@@ -1748,6 +1768,10 @@ class ApiClient {
     return this._notebooks.getCaseNotebook(caseId);
   }
 
+  async ensureCaseNotebook(caseId: string): Promise<import('./types').NotebookWithOwner> {
+    return this._notebooks.ensureCaseNotebook(caseId);
+  }
+
   async linkNotebookToCase(caseId: string, notebookId: string): Promise<import('./types').Notebook> {
     return this._notebooks.linkNotebookToCase(caseId, notebookId);
   }
@@ -1863,6 +1887,10 @@ class ApiClient {
 
   async deleteLogSource(id: string): Promise<{ deleted: boolean }> {
     return this._logSources.deleteLogSource(id);
+  }
+
+  async bulkDeleteLogSources(ids: string[]): Promise<import('./log-sources').BulkDeleteLogSourcesResponse> {
+    return this._logSources.bulkDeleteLogSources(ids);
   }
 
   async toggleLogSource(id: string, enabled: boolean): Promise<import('./types').LogSource> {
@@ -2792,15 +2820,15 @@ class ApiClient {
     return this._lookupTables.addRows(name, rows);
   }
 
-  async updateLookupRow(name: string, rowId: number, fields: Record<string, unknown>): Promise<{ success: boolean }> {
+  async updateLookupRow(name: string, rowId: import('./types').LookupRowId, fields: Record<string, unknown>): Promise<{ success: boolean }> {
     return this._lookupTables.updateRow(name, rowId, fields);
   }
 
-  async deleteLookupRow(name: string, rowId: number): Promise<{ success: boolean }> {
+  async deleteLookupRow(name: string, rowId: import('./types').LookupRowId): Promise<{ success: boolean }> {
     return this._lookupTables.deleteRow(name, rowId);
   }
 
-  async deleteLookupRows(name: string, rowIds: number[]): Promise<{ deleted: number }> {
+  async deleteLookupRows(name: string, rowIds: import('./types').LookupRowId[]): Promise<{ deleted: number }> {
     return this._lookupTables.deleteRows(name, rowIds);
   }
 
@@ -2942,7 +2970,7 @@ class ApiClient {
     return this._siemHealth.listReports(limit, offset);
   }
 
-  async getSiemHealthLatest(): Promise<import('./siem-health').SiemHealthReport> {
+  async getSiemHealthLatest(): Promise<import('./siem-health').SiemHealthReport | null> {
     return this._siemHealth.getLatest();
   }
 

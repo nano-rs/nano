@@ -98,6 +98,29 @@ export function statusOf(mode: string): StatusKey {
   return 'disabled';
 }
 
+/**
+ * Every rule mode the coverage page asks for (NAN-5717). With no `mode` the
+ * API returns only alerting + live rules, so "In review" (staging) and
+ * "Disabled" (paused) could never show. Coverage tiers still count live rules
+ * only (`tierFor`).
+ */
+export const ALL_RULE_MODES: readonly string[] = ['alerting', 'live', 'paused', 'staging'];
+
+/** Distinct rules per status across all techniques (a rule maps to many). */
+export function countRulesByStatus(
+  techniques: readonly TechniqueCoverage[],
+): Record<StatusKey, number> {
+  const seen = new Map<string, StatusKey>();
+  techniques.forEach((technique) =>
+    (technique.rules || []).forEach((rule) => seen.set(rule.id, statusOf(rule.mode))),
+  );
+  const counts: Record<StatusKey, number> = { live: 0, review: 0, disabled: 0 };
+  seen.forEach((status) => {
+    counts[status] += 1;
+  });
+  return counts;
+}
+
 export function readinessOf(source: RequiredDataSource): DataSourceReadiness {
   if (
     source.readiness === 'active'

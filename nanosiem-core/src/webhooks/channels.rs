@@ -225,12 +225,138 @@ pub fn build_notification_body(
 // Shared display helpers
 // ---------------------------------------------------------------------------
 
+/// The card title: one line of plain text (NAN-5720). Case events carry the
+/// case title here, which can hold ingested entity values (a hostname or a
+/// user name), so CR/LF and control characters are collapsed; each channel
+/// still escapes it for its own markup.
 fn title_of(payload: &WebhookPayload) -> String {
     payload
         .rule_name
-        .clone()
-        .filter(|s| !s.trim().is_empty())
+        .as_deref()
+        .map(crate::text_bounds::single_line)
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "nano notification".to_string())
+}
+
+/// Slack's control characters, so text in a `mrkdwn` field is shown and
+/// never parsed as a link or mention (`<https://x|y>`, `<!channel>`).
+fn slack_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// A Teams Adaptive Card title. `TextBlock` text is parsed as Markdown (a
+/// title like `x](https://evil)` would render a link), so a title that holds
+/// any Markdown-significant text is a `RichTextBlock` / `TextRun`, which
+/// Adaptive Cards render as plain text (NAN-5720).
+///
+/// A title with no Markdown-significant text renders the same either way, so
+/// it keeps the original `TextBlock` shape (NAN-5737). The signed SOAR
+/// catalog replays every executable action against its recorded request
+/// bytes, and the published `microsoft_teams` `notify_event` fixture was
+/// recorded with this `TextBlock` card: changing the shape for plain titles
+/// makes that artifact fail admission, which refuses the whole catalog.
+fn teams_title_block(title: &str, color: &str) -> Value {
+    if markdown_inert(title) {
+        return json!({
+            "type": "TextBlock",
+            "text": title,
+            "weight": "Bolder",
+            "size": "Large",
+            "color": color,
+            "wrap": true
+        });
+    }
+    json!({
+        "type": "RichTextBlock",
+        "inlines": [ {
+            "type": "TextRun",
+            "text": title,
+            "weight": "Bolder",
+            "size": "Large",
+            "color": color
+        } ]
+    })
+}
+
+/// True when Adaptive Card Markdown renders `text` exactly as written. An
+/// ASCII allowlist (NAN-5737 review): letters, digits, single inner spaces,
+/// `-` (never leading) and `:` only as a `": "` label separator, so no URI
+/// scheme (`tel:`, `mailto:`, `http:`), no `//`, no dotted or `@` name, no
+/// Markdown or HTML punctuation, no non-ASCII lookalike or invisible
+/// character and no line-start block syntax can pass. Everything else takes
+/// the plain-text `RichTextBlock` path (or is escaped where a field cannot
+/// hold one). Self-contained: it does not rely on `single_line` first.
+pub(super) fn markdown_inert(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    if first == b' ' || first == b'-' || last == b' ' || text.contains("  ") {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, &b)| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b' ' | b'-' => true,
+        b':' => bytes.get(i + 1) == Some(&b' '),
+        _ => false,
+    })
+}
+
+/// A Teams body text block (summary, health text). Markdown-inert text keeps
+/// the original `TextBlock`; anything else (alert and case summaries carry
+/// ingested values) is a plain-text `RichTextBlock` / `TextRun` with the same
+/// styling (NAN-5737 review).
+fn teams_text_block(text: &str, subtle: bool) -> Value {
+    if markdown_inert(text) {
+        let mut block = json!({ "type": "TextBlock", "text": text, "wrap": true });
+        if subtle {
+            block["isSubtle"] = json!(true);
+        }
+        return block;
+    }
+    let mut run = json!({ "type": "TextRun", "text": text });
+    if subtle {
+        run["isSubtle"] = json!(true);
+    }
+    json!({ "type": "RichTextBlock", "inlines": [run] })
+}
+
+/// A number, score, ratio or plain timestamp (`0.92`, `1,234`, `87%`,
+/// `-3`, `2026-11-20`): digits with only `.`, `,`, `%`, `-`, `+`, `:`, never
+/// two separators in a row and starting and ending with a digit or `%`.
+/// Renders literally (no ordered-list marker: that needs a trailing `.`/`)`
+/// and a space), so it stays readable instead of being escaped.
+fn numeric_value(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let sep = |b: u8| matches!(b, b'.' | b',' | b'-' | b'+' | b':');
+    !bytes.is_empty()
+        && bytes.iter().all(|&b| b.is_ascii_digit() || b == b'%' || sep(b))
+        && bytes.iter().any(u8::is_ascii_digit)
+        && matches!(bytes[0], b'0'..=b'9' | b'-')
+        && matches!(bytes[bytes.len() - 1], b'0'..=b'9' | b'%')
+        && !bytes.windows(2).any(|w| sep(w[0]) && sep(w[1]))
+        && !text.contains("://")
+}
+
+/// Text for a `FactSet` title or value, which Teams parses as Markdown and
+/// which cannot hold a `TextRun`. Inert text is unchanged (byte-compatible
+/// with recorded fixtures); anything else is made one line and every ASCII
+/// punctuation character is backslash-escaped (CommonMark renders an escaped
+/// ASCII punctuation character literally), which defuses links, emphasis,
+/// HTML, line-start syntax and autolinks (`://`, `www.`, `@`, `tel:`)
+/// (NAN-5737 review).
+fn teams_fact_text(text: &str) -> String {
+    if markdown_inert(text) || numeric_value(text) {
+        return text.to_string();
+    }
+    let line = crate::text_bounds::single_line(text);
+    let mut out = String::with_capacity(line.len() + 8);
+    for c in line.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn severity_of(payload: &WebhookPayload) -> &str {
@@ -254,8 +380,9 @@ fn report_title(payload: &WebhookPayload) -> String {
     let name = payload
         .rule_name
         .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("scheduled report");
+        .map(crate::text_bounds::single_line)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "scheduled report".to_string());
     format!("Report ready: {name}")
 }
 
@@ -408,7 +535,7 @@ impl ChannelFormatter for SlackFormatter {
         }
 
         json!({
-            "text": format!("{} · {}", severity.to_uppercase(), title),
+            "text": slack_escape(&format!("{} · {}", severity.to_uppercase(), title)),
             "attachments": [ { "color": severity_hex(severity), "blocks": blocks } ]
         })
     }
@@ -456,7 +583,7 @@ fn slack_report_card(payload: &WebhookPayload) -> Value {
     }
 
     json!({
-        "text": title,
+        "text": slack_escape(&title),
         "attachments": [ { "color": report_status_hex(status), "blocks": blocks } ]
     })
 }
@@ -480,7 +607,7 @@ impl ChannelFormatter for TeamsFormatter {
 
         let mut facts = vec![json!({ "title": "Severity", "value": severity.to_uppercase() })];
         if let Some(entity) = payload.entity.as_deref().filter(|s| !s.is_empty()) {
-            facts.push(json!({ "title": "Entity", "value": entity }));
+            facts.push(json!({ "title": "Entity", "value": teams_fact_text(entity) }));
         }
         if let Some(kind) = payload.kind.as_deref().filter(|s| !s.is_empty()) {
             facts.push(json!({ "title": "Type", "value": kind }));
@@ -489,42 +616,32 @@ impl ChannelFormatter for TeamsFormatter {
             facts.push(json!({ "title": "Events", "value": count.to_string() }));
         }
         for (label, value) in payload.details.iter().flatten() {
-            facts.push(json!({ "title": label, "value": truncate(value, 300) }));
+            facts.push(json!({
+                "title": teams_fact_text(label),
+                "value": teams_fact_text(&truncate(value, 300))
+            }));
         }
         facts.push(json!({ "title": "Time", "value": payload.created_at.to_rfc3339() }));
 
         let mut body = vec![
-            json!({
-                "type": "TextBlock",
-                "text": title,
-                "weight": "Bolder",
-                "size": "Large",
-                "color": adaptive_color(severity),
-                "wrap": true
-            }),
+            teams_title_block(&title, adaptive_color(severity)),
             json!({ "type": "FactSet", "facts": facts }),
         ];
         if let Some(summary) = payload.health_summary.as_deref().filter(|s| !s.is_empty()) {
-            body.push(json!({
-                "type": "TextBlock", "text": truncate(summary, 3000), "wrap": true
-            }));
+            body.push(teams_text_block(&truncate(summary, 3000), false));
         }
         if let Some(summary) = payload.summary.as_deref().filter(|s| !s.is_empty()) {
-            body.push(json!({
-                "type": "TextBlock", "text": truncate(summary, 3000), "wrap": true
-            }));
+            body.push(teams_text_block(&truncate(summary, 3000), false));
         }
         if let Some(remediation) = payload
             .health_remediation
             .as_deref()
             .filter(|s| !s.is_empty())
         {
-            body.push(json!({
-                "type": "TextBlock",
-                "text": format!("Suggested action: {}", truncate(remediation, 2800)),
-                "wrap": true,
-                "isSubtle": true
-            }));
+            body.push(teams_text_block(
+                &format!("Suggested action: {}", truncate(remediation, 2800)),
+                true,
+            ));
         }
 
         let mut actions = Vec::new();
@@ -559,19 +676,12 @@ fn teams_report_card(payload: &WebhookPayload) -> Value {
         facts.push(json!({ "title": "Rows", "value": count.to_string() }));
     }
     if let Some(source) = payload.entity.as_deref().filter(|s| !s.is_empty()) {
-        facts.push(json!({ "title": "Source", "value": source }));
+        facts.push(json!({ "title": "Source", "value": teams_fact_text(source) }));
     }
     facts.push(json!({ "title": "Time", "value": payload.created_at.to_rfc3339() }));
 
     let body = vec![
-        json!({
-            "type": "TextBlock",
-            "text": title,
-            "weight": "Bolder",
-            "size": "Large",
-            "color": report_adaptive_color(status),
-            "wrap": true
-        }),
+        teams_title_block(&title, report_adaptive_color(status)),
         json!({ "type": "FactSet", "facts": facts }),
     ];
 

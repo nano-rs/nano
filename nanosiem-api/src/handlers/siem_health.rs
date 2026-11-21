@@ -122,6 +122,15 @@ pub struct ListReportsParams {
     pub offset: i64,
 }
 
+/// Query parameters for the latest-report endpoint (NAN-5683)
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub struct LatestReportParams {
+    /// When true, "no report generated yet" returns 200 with a `null` body
+    /// instead of 404. Defaults to false for backward compatibility.
+    #[serde(default)]
+    pub allow_empty: bool,
+}
+
 fn default_limit() -> i64 {
     20
 }
@@ -196,7 +205,10 @@ pub async fn list_reports(
 /// Get the most recent SIEM health report
 ///
 /// Returns the latest full health report including metrics, recommendations,
-/// and dimension details. Returns 404 if no reports exist yet.
+/// and dimension details. Returns 404 if no reports exist yet, unless the
+/// caller passes `allow_empty=true` (NAN-5683): then "no report yet" is a
+/// 200 with a JSON `null` body, so a fresh install's shell does not log a
+/// failed request on every page. The default stays 404 for existing clients.
 ///
 /// Requires the `settings:system` permission. Restricted viewers see the latest
 /// report with their denied `source_type` partitions pruned; the AI narrative,
@@ -209,17 +221,19 @@ pub async fn list_reports(
     get,
     path = "/api/siem-health/reports/latest",
     tag = "siem_health",
+    params(LatestReportParams),
     responses(
-        (status = 200, description = "The most recent health report", body = SiemHealthReport),
+        (status = 200, description = "The most recent health report, or `null` when none exists yet and `allow_empty=true`", body = Option<SiemHealthReport>),
         (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "No health reports exist yet"),
+        (status = 404, description = "No health reports exist yet (only without `allow_empty=true`)"),
     ),
     security(("api_key" = []))
 )]
 pub async fn get_latest_report(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-) -> Result<Json<SiemHealthReport>, ApiError> {
+    Query(params): Query<LatestReportParams>,
+) -> Result<Json<Option<SiemHealthReport>>, ApiError> {
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     let repo = SiemHealthRepository::new(state.pool.clone());
@@ -228,12 +242,27 @@ pub async fn get_latest_report(
     let mut report = repo
         .get_latest_for_scope(&artifact_scope)
         .await
-        .map_err(|e| ApiError::DatabaseError(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("No health reports exist yet".to_string()))?;
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
-    filter_report_for_viewer(&mut report, &viewer_scope);
+    if let Some(report) = report.as_mut() {
+        filter_report_for_viewer(report, &viewer_scope);
+    }
 
-    Ok(Json(report))
+    latest_report_response(report, params.allow_empty).map(Json)
+}
+
+/// NAN-5683: map "no report yet" to the response the caller asked for —
+/// 404 by default (unchanged contract), `None` (JSON `null`) with
+/// `allow_empty=true`.
+fn latest_report_response(
+    report: Option<SiemHealthReport>,
+    allow_empty: bool,
+) -> Result<Option<SiemHealthReport>, ApiError> {
+    match report {
+        Some(report) => Ok(Some(report)),
+        None if allow_empty => Ok(None),
+        None => Err(ApiError::NotFound("No health reports exist yet".to_string())),
+    }
 }
 
 /// Get a specific SIEM health report by ID
@@ -985,5 +1014,36 @@ mod tests {
                 assert!(!artifact_scope.allows(&["audit".to_string()], true));
             }
         }
+    }
+
+    /// NAN-5683: a fresh install has no report yet. Opt-in callers get a 200
+    /// with a JSON `null` body; every other caller keeps the 404 contract.
+    #[test]
+    fn latest_report_empty_state_is_opt_in() {
+        let empty = latest_report_response(None, true).expect("allow_empty=true is a 200");
+        assert!(empty.is_none());
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "null");
+
+        assert!(matches!(
+            latest_report_response(None, false),
+            Err(ApiError::NotFound(_))
+        ));
+
+        for allow_empty in [true, false] {
+            let present = latest_report_response(Some(report(metrics_fixture())), allow_empty)
+                .expect("an existing report is always a 200");
+            assert!(present.is_some());
+        }
+    }
+
+    #[test]
+    fn latest_report_params_default_to_the_404_contract() {
+        let parse = |uri: &str| {
+            Query::<LatestReportParams>::try_from_uri(&uri.parse().unwrap())
+                .unwrap()
+                .0
+        };
+        assert!(!parse("/api/siem-health/reports/latest").allow_empty);
+        assert!(parse("/api/siem-health/reports/latest?allow_empty=true").allow_empty);
     }
 }

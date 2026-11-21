@@ -38,6 +38,7 @@ import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
+import { useAirGap } from '@/hooks/use-air-gap';
 import type {
   CreateParserRepositoryRequest,
   ParserImportPreview,
@@ -110,9 +111,7 @@ export function ParserRepositories() {
   // unavailable offline. The page stays usable (browse + import); the egress
   // controls (connect-repo / sync-from-Git) are swapped for an offline
   // bundle-sync control that populates the catalog in place (NAN-1226).
-  const airGap =
-    useQuery({ queryKey: ['system', 'config'], queryFn: () => api.getSystemConfig() })
-      .data?.air_gap ?? false;
+  const airGap = useAirGap();
 
   const refetchCatalog = () => {
     queryClient.invalidateQueries({ queryKey: ['parser-repositories'] });

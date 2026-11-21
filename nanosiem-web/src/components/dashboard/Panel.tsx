@@ -257,6 +257,12 @@ export function Panel({
     <>
       <div
         ref={setPanelEl}
+        data-testid="dashboard-panel"
+        data-panel-id={config.id}
+        data-panel-title={config.title}
+        data-viz-type={config.visualizationType}
+        data-panel-status={data?.status ?? 'idle'}
+        data-row-count={data?.status === 'success' ? (data.data?.length ?? 0) : undefined}
         className="rounded-md border border-border bg-card h-full flex flex-col overflow-hidden group"
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
@@ -266,7 +272,7 @@ export function Panel({
           <span className="text-muted-foreground flex-shrink-0">
             {getVisualizationIcon(config.visualizationType)}
           </span>
-          <span className="text-[12.5px] font-semibold text-foreground truncate">
+          <span data-testid="panel-title" className="text-[12.5px] font-semibold text-foreground truncate">
             {config.title}
           </span>
           <div className="flex-1" />
@@ -296,6 +302,7 @@ export function Panel({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
+                  data-testid="panel-menu"
                   className="w-5 h-5 rounded hover:bg-foreground/[0.06] flex items-center justify-center text-muted-foreground hover:text-foreground"
                   aria-label="More actions"
                 >
@@ -716,9 +723,9 @@ function PanelContent({ data, config, hasRunOnce, children }: PanelContentProps)
     return (
       <div className="h-full flex flex-col items-center justify-center text-center px-3">
         <CircleAlert className="w-5 h-5 text-rose-400 mb-1.5" />
-        <p className="text-[12px] font-semibold text-rose-400">Failed to load data</p>
+        <p data-testid="panel-error" className="text-[12px] font-semibold text-rose-400">Failed to load data</p>
         {data.error && (
-          <p className="font-mono text-[10.5px] text-muted-foreground mt-1.5 max-w-full break-words leading-[1.45]">
+          <p data-testid="panel-error-message" className="font-mono text-[10.5px] text-muted-foreground mt-1.5 max-w-full break-words leading-[1.45]">
             {data.error}
           </p>
         )}
@@ -731,7 +738,7 @@ function PanelContent({ data, config, hasRunOnce, children }: PanelContentProps)
     return (
       <div className="h-full flex flex-col items-center justify-center text-center px-3">
         <BarChart3 className="w-5 h-5 text-muted-foreground/50 mb-1.5" />
-        <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80 font-semibold">
+        <p data-testid="panel-empty" className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80 font-semibold">
           No panel data
         </p>
         <p className="text-[11.5px] text-foreground/80 mt-1.5">No results for the current scope.</p>

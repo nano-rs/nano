@@ -610,9 +610,10 @@ pub const DEMO_PERMISSIONS: &[&str] = &[
     PLAYBOOKS_RUN,
     PLAYBOOKS_PUBLISH,
     PLAYBOOK_REPOSITORIES_VIEW,
-    // Settings — AI provider read access (needed to detect meloD availability
-    // for natural language search; write endpoints are blocked by managed mode)
-    SETTINGS_AI,
+    // NAN-5676: no SETTINGS_AI. The AI availability probe accepts any
+    // MELOD_* capability above (`AI_AVAILABILITY_READERS`), and settings:ai
+    // otherwise admits deployment-wide AI settings writes outside
+    // `demo_guard`'s `/api/settings` prefix (e.g. the AI tuning mode).
     // Settings — umbrella view for the /settings index. NAN-841: makes the
     // Settings nav entry visible to demo users so they can see the surface
     // exists; sub-page handlers stay blocked by demo_guard's BLOCKED_PREFIXES

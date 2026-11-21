@@ -357,6 +357,9 @@ impl SearchService {
             // entity-cardinality, well within a single response. (A LOGS
             // stream carrying a `[dataset=risk …]` bracket chunks fine — the
             // OUTER logs bound partitions the rows.)
+            // NAN-5701: a terminal timechart is presented by `search()` as the
+            // complete pivoted bucket set; the raw stream would page it.
+            && !crate::search::streaming::ends_in_timechart(&query)
             && !matches!(
                 crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs")),
                 // NAN-5612: the derived signals source is window-bound per
@@ -516,7 +519,9 @@ impl SearchService {
         scope: &ScopeSet,
     ) {
         use crate::query::QueryOptions;
-        use crate::search::streaming::{compute_daily_chunks, SearchStreamEvent, StreamingChunk};
+        use crate::search::streaming::{
+            chunk_plan, compute_daily_chunks, ChunkPlan, SearchStreamEvent, StreamingChunk,
+        };
 
         let ch_executor = match self.ch_executor.as_ref() {
             Some(e) => e,
@@ -533,10 +538,28 @@ impl SearchService {
 
         let is_aggregation = query_has_aggregation(query);
 
+        // NAN-5693: aggregations always run as one query over the full window;
+        // a raw pipeline is chunked by day only when that cannot change its
+        // rows (see `chunk_plan`). A global `head N` caps the rows streamed
+        // across ALL chunks, not per chunk.
+        let plan = if is_aggregation {
+            ChunkPlan::Single
+        } else {
+            // P2 (review): the time key differs per dataset (`start_time` on spans).
+            let time_column = crate::query::Dataset::from_selector(
+                request.dataset.as_deref().unwrap_or("logs"),
+            )
+            .time_column();
+            chunk_plan(query, time_column)
+        };
         let page_limit = request
             .limit
             .unwrap_or(self.config.default_limit)
             .min(self.config.max_limit);
+        let page_limit = match plan {
+            ChunkPlan::Daily { row_cap: Some(cap) } => page_limit.min(cap),
+            _ => page_limit,
+        };
         // Keep the same two-limit contract as buffered search: generated
         // aggregate SQL has an independent high-cardinality safety ceiling,
         // while request.limit is applied by an outer wrapper to the rows sent.
@@ -613,7 +636,7 @@ impl SearchService {
                 .generate_with_options(query, &full_time_range, &count_options)
                 .ok();
             let count_executor = ch_executor.clone();
-            let count_qid = format!("{query_id}-count");
+            let count_qid = crate::search::companion_query_id::CompanionQuery::Count.query_id(&query_id);
             let count_settings = self.active_ch_settings.clone();
             Some(tokio::spawn(super::super::request_actor::inherit(async move {
                 if let Some(sql) = count_sql {
@@ -640,7 +663,7 @@ impl SearchService {
             let search_service = self.clone();
             let histogram_query = cleaned_query.to_string();
             let histogram_time_range = adjusted_time_range.clone();
-            let hist_qid = format!("{query_id}-hist");
+            let hist_qid = crate::search::companion_query_id::CompanionQuery::Hist.query_id(&query_id);
             // NAN-1557: the timeline reads the same dataset as the results.
             let histogram_dataset = crate::query::Dataset::from_selector(
                 request.dataset.as_deref().unwrap_or("logs"),
@@ -671,14 +694,17 @@ impl SearchService {
         let mut aggregate_total_count: Option<u64> = None;
         let mut chunks_queried: usize = 0;
 
-        // Aggregation queries run a single query across the full time range —
-        // daily chunking would produce partial aggregates.
-        // Non-aggregate queries split into daily chunks for partition-aligned streaming.
+        // Aggregations, and raw pipelines whose rows depend on the whole window
+        // (a global sort, dedup, join, …), run a single query across the full
+        // time range — daily chunking would sort/aggregate each day on its own.
+        // Row-local pipelines split into daily chunks for partition-aligned
+        // streaming.
         let chunk_ranges: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
-            if is_aggregation {
-                vec![(adjusted_time_range.start, adjusted_time_range.end)]
-            } else {
-                compute_daily_chunks(adjusted_time_range.start, adjusted_time_range.end)
+            match plan {
+                ChunkPlan::Single => vec![(adjusted_time_range.start, adjusted_time_range.end)],
+                ChunkPlan::Daily { .. } => {
+                    compute_daily_chunks(adjusted_time_range.start, adjusted_time_range.end)
+                }
             };
 
         for (chunk_idx, (chunk_start, chunk_end)) in chunk_ranges.iter().enumerate() {
@@ -732,8 +758,11 @@ impl SearchService {
                 )
             };
 
-            // Each chunk gets a unique query_id for cancellation/progress tracking
-            let chunk_qid = format!("{}-chunk-{}", query_id, chunk_idx);
+            // NAN-5723: chunks alternate between two derived ids (they run
+            // one after another), so cancel can kill them by exact id.
+            let chunk_qid =
+                crate::search::companion_query_id::CompanionQuery::stream_chunk(chunk_idx)
+                    .query_id(query_id);
 
             // Spawn progress polling for this chunk
             let progress_handle =
@@ -776,7 +805,9 @@ impl SearchService {
                     _ = event_tx.closed() => {
                         progress_handle.abort();
                         exec_handle.abort();
-                        let _ = ch_executor.cancel_query(&chunk_qid).await;
+                        abort_companions(&count_handle, &histogram_handle);
+                        // NAN-5723: kill the chunk AND the count/hist companions.
+                        let _ = self.cancel_query(query_id).await;
                         return;
                     }
                     next = chunk_rx.recv() => match next {
@@ -804,7 +835,8 @@ impl SearchService {
                             // Client disconnected — abort
                             progress_handle.abort();
                             exec_handle.abort();
-                            let _ = ch_executor.cancel_query(&chunk_qid).await;
+                            abort_companions(&count_handle, &histogram_handle);
+                            let _ = self.cancel_query(query_id).await;
                             return;
                         }
                         batch_index += 1;
@@ -847,7 +879,8 @@ impl SearchService {
         }
 
         // Detect if we stopped early (didn't query all chunks) due to LIMIT
-        let chunks_queried_all = is_aggregation || chunks_queried >= chunk_ranges.len();
+        let chunks_queried_all =
+            plan == ChunkPlan::Single || chunks_queried >= chunk_ranges.len();
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -1185,5 +1218,19 @@ mod tests {
             validate_query_fields(&ok).is_empty(),
             "legit rex capture name must not be rejected on the streaming path"
         );
+    }
+}
+
+/// Abort the streaming path's spawned count / histogram tasks (NAN-5723).
+/// Aborting drops the client future only; the caller still KILLs the queries.
+fn abort_companions<A, B>(
+    count: &Option<tokio::task::JoinHandle<A>>,
+    hist: &Option<tokio::task::JoinHandle<B>>,
+) {
+    if let Some(h) = count {
+        h.abort();
+    }
+    if let Some(h) = hist {
+        h.abort();
     }
 }

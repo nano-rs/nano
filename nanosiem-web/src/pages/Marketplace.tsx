@@ -25,6 +25,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDownToLine, Bot, Box, Cloud, KeyRound, Package, Plus, Users } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useAirGap } from '@/hooks/use-air-gap';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
@@ -111,8 +112,7 @@ export function Marketplace() {
     void client.invalidateQueries({ queryKey: ['custom-enrichments', user?.id] });
   };
 
-  const airGapQuery = useQuery({ queryKey: ['system', 'config'], queryFn: () => api.getSystemConfig(), staleTime: Infinity, gcTime: Infinity, retry: 1, refetchOnWindowFocus: false });
-  const airGap = airGapQuery.data?.air_gap ?? false;
+  const airGap = useAirGap();
 
   const coverageKey = ['marketplace', 'coverage', user?.id] as const;
   const canViewCoverage = hasAllPermissions(['enrichments:view', 'search:execute']);

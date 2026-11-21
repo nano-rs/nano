@@ -305,7 +305,7 @@ export function EventInspectorPanel({
 
 
   return (
-    <div className="flex-shrink-0 sticky top-0 border border-border rounded-r-lg overflow-hidden" style={{ width }}>
+    <div data-testid="event-inspector" className="flex-shrink-0 sticky top-0 border border-border rounded-r-lg overflow-hidden" style={{ width }}>
     <div
       ref={panelRef}
       className="search-workspace-section relative max-h-[calc(100dvh-8rem)] overflow-y-auto"
@@ -442,6 +442,7 @@ export function EventInspectorPanel({
           {tabs.map(tab => (
             <button
               key={tab.id}
+              data-testid={`inspector-tab-${tab.id}`}
               onClick={() => setActiveTab(tab.id)}
               className={`h-auto py-0.5 px-2.5 rounded-sm text-[10.5px] font-mono tracking-[0.08em] font-semibold transition-colors inline-flex items-center gap-1 ${
                 activeTab === tab.id
@@ -566,6 +567,7 @@ export function EventInspectorPanel({
                 variant="ghost"
                 size="sm"
                 className="h-6 px-2 gap-1 text-xs"
+                data-testid="inspector-copy-raw"
                 onClick={() => copyToClipboard(rawMessage || syntheticRaw || '', '_raw')}
               >
                 {copiedField === '_raw' ? (
@@ -593,6 +595,7 @@ export function EventInspectorPanel({
                 variant="ghost"
                 size="sm"
                 className="h-6 px-2 gap-1 text-xs"
+                data-testid="inspector-copy-json"
                 onClick={() => copyToClipboard(fullJson, '_json')}
               >
                 {copiedField === '_json' ? (
@@ -602,7 +605,7 @@ export function EventInspectorPanel({
                 )}
               </Button>
             </div>
-            <pre className="text-xs font-mono text-foreground whitespace-pre-wrap break-all bg-muted/30 rounded-lg p-3 border border-border/30 max-h-[calc(100vh-300px)] overflow-y-auto">
+            <pre data-testid="inspector-json" className="text-xs font-mono text-foreground whitespace-pre-wrap break-all bg-muted/30 rounded-lg p-3 border border-border/30 max-h-[calc(100vh-300px)] overflow-y-auto">
               {fullJson}
             </pre>
           </div>

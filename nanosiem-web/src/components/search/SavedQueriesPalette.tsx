@@ -17,8 +17,9 @@
  *   - skip `folder` and `freq` in the UI for now
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { X, Search, Bookmark, User, Users, Clock, Play, Edit3, Share2, CalendarClock } from 'lucide-react';
+import { X, Search, Bookmark, User, Users, Clock, Play, Edit3, Share2, CalendarClock, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import type { SavedSearch, SavedSearchTimeRange } from '@/lib/api';
 import { extractLogSource } from './saved-query-log-source';
 
@@ -30,11 +31,27 @@ interface SavedQueriesPaletteProps {
   currentUserId?: string;
   /** NAN-5311: `timeRange` is the window the query was saved with, when it has one. */
   onSelectQuery: (query: string, mode?: 'piped' | 'sql', timeRange?: SavedSearchTimeRange) => void;
-  onEditQuery?: (id: string) => void;
+  /**
+   * NAN-5695: save an edit of one of the caller's own queries. Rejecting
+   * keeps the editor open and shows the error. Without it, no Edit action.
+   */
+  onUpdateQuery?: (id: string, changes: SavedQueryEdit) => Promise<unknown>;
   onShareQuery?: (id: string) => void;
-  onDeleteQuery?: (id: string) => void;
+  /**
+   * NAN-5695: delete one of the caller's own queries (after confirmation).
+   * Without it, no Delete action.
+   */
+  onDeleteQuery?: (id: string) => Promise<unknown>;
   /** NAN-1793: schedule this saved query as a recurring report. */
   onScheduleQuery?: (query: { id: string | number; name: string; query: string }) => void;
+}
+
+/** The fields an analyst can edit on a saved query (NAN-5695). */
+export interface SavedQueryEdit {
+  name: string;
+  query: string;
+  /** Empty string clears the description. */
+  description: string;
 }
 
 const PINNED_KEY = 'nanosiem-saved-queries-pinned';
@@ -77,6 +94,7 @@ interface EnrichedQuery {
   id: string;
   name: string;
   query: string;
+  description: string;
   queryMode: 'piped' | 'sql';
   timeRange?: SavedSearchTimeRange;
   logSource: string;
@@ -96,6 +114,7 @@ function enrich(
     id: s.id,
     name: s.name,
     query: s.query,
+    description: s.description ?? '',
     queryMode: s.query_mode,
     timeRange: s.time_range,
     logSource: extractLogSource(s.query),
@@ -156,6 +175,7 @@ function QueryRow({
   onEdit,
   onShare,
   onSchedule,
+  onDelete,
 }: {
   item: EnrichedQuery;
   selected: boolean;
@@ -165,9 +185,12 @@ function QueryRow({
   onEdit?: () => void;
   onShare?: () => void;
   onSchedule?: () => void;
+  onDelete?: () => void;
 }) {
   return (
     <div
+      data-testid="saved-query-row"
+      data-saved-query-id={item.id}
       onMouseEnter={onHover}
       onClick={onSelect}
       className={cn(
@@ -238,8 +261,24 @@ function QueryRow({
               <CalendarClock className="w-[12px] h-[12px]" />
             </button>
           )}
+          {onDelete && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onDelete(); }}
+              className="p-1 rounded hover:bg-red-500/10 text-muted-foreground hover:text-red-400"
+              title="Delete"
+              aria-label="Delete query"
+            >
+              <Trash2 className="w-[12px] h-[12px]" />
+            </button>
+          )}
         </div>
       </div>
+      {item.description && (
+        <div className="text-[11.5px] text-muted-foreground truncate mb-1 pl-[1px]" data-testid="saved-query-description">
+          {item.description}
+        </div>
+      )}
       <div className="font-mono text-[11px] text-foreground/70 truncate mb-1.5 pl-[1px]">{item.query}</div>
       <div className="flex items-center gap-2.5 text-[10.5px] text-muted-foreground font-mono">
         <span className="inline-flex items-center gap-1">
@@ -261,6 +300,106 @@ function QueryRow({
   );
 }
 
+const EDIT_LABEL_CLS = 'block font-mono text-[10px] tracking-[0.14em] uppercase text-muted-foreground font-semibold mb-1';
+const EDIT_FIELD_CLS = 'w-full px-2.5 bg-background border border-border rounded-md text-[12px] outline-none focus:border-primary/50';
+
+/** Inline editor for one saved query's name, query and description (NAN-5695). */
+function QueryEditForm({
+  item,
+  onSave,
+  onCancel,
+}: {
+  item: EnrichedQuery;
+  onSave: (changes: SavedQueryEdit) => Promise<unknown>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(item.name);
+  const [query, setQuery] = useState(item.query);
+  const [description, setDescription] = useState(item.description);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const canSave = name.trim().length > 0 && query.trim().length > 0 && !saving;
+
+  const save = async () => {
+    if (!canSave) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave({ name: name.trim(), query: query.trim(), description: description.trim() });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save the query');
+      setSaving(false);
+    }
+  };
+
+  return (
+    <form
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+      }}
+      onSubmit={(e) => { e.preventDefault(); void save(); }}
+      className="px-3 py-2.5 rounded-sm border border-primary/30 bg-primary/[0.04] space-y-2"
+      aria-label={`Edit ${item.name}`}
+      data-testid="saved-query-edit-form"
+    >
+      <div>
+        <label htmlFor={`sq-edit-name-${item.id}`} className={EDIT_LABEL_CLS}>Name</label>
+        <input
+          id={`sq-edit-name-${item.id}`}
+          autoFocus
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className={cn(EDIT_FIELD_CLS, 'h-7')}
+        />
+      </div>
+      <div>
+        <label htmlFor={`sq-edit-query-${item.id}`} className={EDIT_LABEL_CLS}>Query</label>
+        <textarea
+          id={`sq-edit-query-${item.id}`}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          rows={3}
+          spellCheck={false}
+          className={cn(EDIT_FIELD_CLS, 'py-1.5 font-mono text-[11px] resize-y')}
+        />
+      </div>
+      <div>
+        <label htmlFor={`sq-edit-desc-${item.id}`} className={EDIT_LABEL_CLS}>
+          Description <span className="text-muted-foreground/60 normal-case tracking-normal">(optional)</span>
+        </label>
+        <textarea
+          id={`sq-edit-desc-${item.id}`}
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={2}
+          placeholder="Short explanation for your team"
+          className={cn(EDIT_FIELD_CLS, 'py-1.5 resize-none')}
+        />
+      </div>
+      {error && <div role="alert" className="text-[11px] text-red-400">{error}</div>}
+      <div className="flex items-center justify-end gap-1.5">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={saving}
+          className="h-7 px-2.5 rounded-md border border-border text-[11.5px] text-muted-foreground hover:text-foreground hover:bg-foreground/5"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={!canSave}
+          className="h-7 px-2.5 rounded-md bg-primary text-primary-foreground text-[11.5px] font-medium disabled:opacity-50"
+        >
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 export function SavedQueriesPalette({
   open,
   onOpenChange,
@@ -268,12 +407,15 @@ export function SavedQueriesPalette({
   sharedSearches = [],
   currentUserId,
   onSelectQuery,
-  onEditQuery,
+  onUpdateQuery,
   onShareQuery,
-  onDeleteQuery: _onDeleteQuery,
+  onDeleteQuery,
   onScheduleQuery,
 }: SavedQueriesPaletteProps) {
   const [filter, setFilter] = useState('');
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<EnrichedQuery | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [scope, setScope] = useState<string>('all'); // 'all' | 'pinned' | 'mine' | 'shared' | 'recent' | `type:${st}`
   const [selIdx, setSelIdx] = useState(0);
   const [pinned, setPinned] = useState<Set<string>>(() => loadPinned());
@@ -321,6 +463,7 @@ export function SavedQueriesPalette({
       items = items.filter(q =>
         q.name.toLowerCase().includes(f) ||
         q.query.toLowerCase().includes(f) ||
+        q.description.toLowerCase().includes(f) ||
         q.logSource.toLowerCase().includes(f)
       );
     }
@@ -336,18 +479,43 @@ export function SavedQueriesPalette({
       setTimeout(() => inputRef.current?.focus(), 30);
       setFilter('');
       setSelIdx(0);
+      setEditingId(null);
+      setDeleteTarget(null);
+      setDeleteError(null);
     }
   }, [open]);
 
-  // Close on Escape
+  // Close on Escape — unless an edit or a delete confirmation owns the key.
   useEffect(() => {
-    if (!open) return;
+    if (!open || editingId || deleteTarget) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onOpenChange(false);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, onOpenChange]);
+  }, [open, onOpenChange, editingId, deleteTarget]);
+
+  // ConfirmDialog closes itself on confirm (the shared pattern), so a failed
+  // delete is reported in the palette, above the list.
+  const confirmDelete = async () => {
+    if (!deleteTarget || !onDeleteQuery) return;
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    setDeleteError(null);
+    try {
+      await onDeleteQuery(target.id);
+      setPinned(prev => {
+        if (!prev.has(target.id)) return prev;
+        const next = new Set(prev);
+        next.delete(target.id);
+        savePinned(next);
+        return next;
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : 'unknown error';
+      setDeleteError(`Could not delete "${target.name}": ${reason}`);
+    }
+  };
 
   const togglePin = (id: string) => {
     setPinned(prev => {
@@ -379,11 +547,18 @@ export function SavedQueriesPalette({
   const selected = filtered[selIdx];
 
   return (
+    <>
     <div
       className="fixed inset-0 z-[100] flex items-start justify-center pt-[6vh] bg-black/50 backdrop-blur-[2px]"
-      onClick={() => onOpenChange(false)}
+      // Only a click on the backdrop itself closes the palette. React bubbles
+      // clicks out of portals (the delete confirmation) through this tree, and
+      // those must not close it: a failed delete reports its error here.
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !deleteTarget) onOpenChange(false);
+      }}
     >
       <div
+        data-testid="saved-queries-palette"
         onClick={(e) => e.stopPropagation()}
         className="w-[860px] max-w-[90%] h-[540px] max-h-[85vh] bg-card border border-border rounded-xl shadow-[0_40px_100px_rgba(0,0,0,0.6)] overflow-hidden grid grid-cols-[220px_1fr]"
       >
@@ -440,6 +615,14 @@ export function SavedQueriesPalette({
             </div>
           </div>
 
+          {deleteError && (
+            <div role="alert" className="mx-2 mt-2 px-2.5 py-1.5 rounded-sm border border-red-500/30 bg-red-500/5 text-[11px] text-red-400 flex items-center gap-2">
+              <span className="flex-1 min-w-0 truncate">{deleteError}</span>
+              <button type="button" onClick={() => setDeleteError(null)} aria-label="Dismiss" className="shrink-0 hover:text-red-300">
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
           <div className="flex-1 overflow-y-auto scrollbar-thin p-2">
             {filtered.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-2 py-16 text-muted-foreground">
@@ -462,21 +645,40 @@ export function SavedQueriesPalette({
               </div>
             ) : (
               filtered.map((q, i) => (
-                <QueryRow
-                  key={q.id}
-                  item={q}
-                  selected={i === selIdx}
-                  onHover={() => setSelIdx(i)}
-                  onSelect={() => runSelected(q)}
-                  onTogglePin={() => togglePin(q.id)}
-                  onEdit={onEditQuery ? () => onEditQuery(q.id) : undefined}
-                  onShare={onShareQuery ? () => onShareQuery(q.id) : undefined}
-                  onSchedule={
-                    onScheduleQuery
-                      ? () => onScheduleQuery({ id: q.id, name: q.name, query: q.query })
-                      : undefined
-                  }
-                />
+                editingId === q.id && onUpdateQuery ? (
+                  <QueryEditForm
+                    key={q.id}
+                    item={q}
+                    onCancel={() => setEditingId(null)}
+                    onSave={async (changes) => {
+                      await onUpdateQuery(q.id, changes);
+                      setEditingId(null);
+                    }}
+                  />
+                ) : (
+                  <QueryRow
+                    key={q.id}
+                    item={q}
+                    selected={i === selIdx}
+                    onHover={() => setSelIdx(i)}
+                    onSelect={() => runSelected(q)}
+                    onTogglePin={() => togglePin(q.id)}
+                    // NAN-5695: edit and delete are owner-only server-side, so
+                    // they are offered only on the caller's own queries.
+                    onEdit={onUpdateQuery && q.isMine ? () => setEditingId(q.id) : undefined}
+                    onShare={onShareQuery ? () => onShareQuery(q.id) : undefined}
+                    onSchedule={
+                      onScheduleQuery
+                        ? () => onScheduleQuery({ id: q.id, name: q.name, query: q.query })
+                        : undefined
+                    }
+                    onDelete={
+                      onDeleteQuery && q.isMine
+                        ? () => { setDeleteError(null); setDeleteTarget(q); }
+                        : undefined
+                    }
+                  />
+                )
               ))
             )}
           </div>
@@ -512,5 +714,25 @@ export function SavedQueriesPalette({
         </button>
       </div>
     </div>
+
+      {/* NAN-5695: delete confirmation, rendered outside the backdrop so its
+          clicks never reach the backdrop's close handler. The studio layer
+          sits above this palette's z-[100] overlay. */}
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}
+        layer="studio"
+        variant="danger"
+        title="Delete saved query"
+        description={
+          <>
+            Delete <span className="text-foreground font-medium">{deleteTarget?.name}</span>? Anyone it is shared
+            with loses it too. This cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        onConfirm={() => { void confirmDelete(); }}
+      />
+    </>
   );
 }

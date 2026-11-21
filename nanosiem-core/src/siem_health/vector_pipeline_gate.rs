@@ -16,6 +16,11 @@
 //! volume at its `VECTOR_CONFIG_DIR`, so the stall is a file, not process
 //! state. The finding lasts until the identity file names the stalled
 //! identity: any later render or deploy that records it clears it.
+//!
+//! NAN-5657: the likeliest stall is that directory being root-owned, and then
+//! the stall record cannot be written beside the identity file either. It
+//! then goes to the data directory (`NANOSIEM_DATA_DIR`), which nano-api and
+//! nano-jobs also share, so SIEM Health still shows it.
 
 use std::path::{Path, PathBuf};
 
@@ -50,12 +55,19 @@ fn stall_path_for(marker_path: &Path) -> Option<PathBuf> {
     marker_path.parent().map(|dir| dir.join(STALL_FILE))
 }
 
-/// Record the stall for SIEM Health. Best effort: a failure is logged (the
-/// ERROR before it already names the file and the error).
+/// The shared data directory the stall record falls back to.
+fn fallback_dir_from_env() -> Option<PathBuf> {
+    std::env::var("NANOSIEM_DATA_DIR").ok().filter(|d| !d.trim().is_empty()).map(PathBuf::from)
+}
+
+/// Record the stall for SIEM Health, beside the identity file or else in the
+/// data directory. Best effort: a failure is logged (the ERROR before it
+/// already names the file and the error).
 pub async fn report_stall(stall: &PipelineGateStall) {
-    let Some(path) = stall_path_for(&stall.marker_path) else {
-        return;
-    };
+    report_stall_to(stall, fallback_dir_from_env().as_deref()).await;
+}
+
+async fn report_stall_to(stall: &PipelineGateStall, fallback_dir: Option<&Path>) {
     let body = match serde_json::to_vec_pretty(stall) {
         Ok(body) => body,
         Err(error) => {
@@ -63,33 +75,70 @@ pub async fn report_stall(stall: &PipelineGateStall) {
             return;
         }
     };
-    if let Err(error) = crate::parsers::vector_tree_write::write_if_changed(&path, body).await {
-        tracing::warn!(%error, path = %path.display(), "could not record the Vector pipeline stall for SIEM Health");
+    let primary = stall_path_for(&stall.marker_path);
+    let fallback = fallback_dir.map(|d| d.join(STALL_FILE));
+    if let Some(path) = &primary {
+        match crate::parsers::vector_tree_write::write_if_changed(path, body.clone()).await {
+            Ok(_) => {
+                // One live record: an older fallback one would outlive it.
+                if let Some(old) = &fallback {
+                    let _ = tokio::fs::remove_file(old).await;
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "could not record the Vector pipeline stall beside the identity file; trying the data directory");
+            }
+        }
+    }
+    if let Some(path) = &fallback {
+        if let Err(error) = crate::parsers::vector_tree_write::write_if_changed(path, body).await {
+            tracing::warn!(%error, path = %path.display(), "could not record the Vector pipeline stall for SIEM Health");
+        }
     }
 }
 
-/// The identity was recorded: remove the stall record next to `marker_path`.
+/// The identity was recorded: remove the stall record next to `marker_path`
+/// and its data-directory fallback.
 pub async fn clear_stall(marker_path: &Path) {
+    clear_stall_in(marker_path, fallback_dir_from_env().as_deref()).await;
+}
+
+async fn clear_stall_in(marker_path: &Path, fallback_dir: Option<&Path>) {
     if let Some(path) = stall_path_for(marker_path) {
         let _ = tokio::fs::remove_file(path).await;
+    }
+    if let Some(dir) = fallback_dir {
+        let _ = tokio::fs::remove_file(dir.join(STALL_FILE)).await;
     }
 }
 
 /// The stall recorded in `config_dir` (the api's and jobs'
-/// `VECTOR_CONFIG_DIR`), unless the identity file now names its identity
-/// (then the record is removed).
+/// `VECTOR_CONFIG_DIR`) or in the data-directory fallback, unless the
+/// identity file now names its identity (then the record is removed).
 pub async fn current_stall(config_dir: &Path) -> Option<PipelineGateStall> {
-    let body = tokio::fs::read(config_dir.join(STALL_FILE)).await.ok()?;
-    let stall: PipelineGateStall = serde_json::from_slice(&body).ok()?;
+    current_stall_in(config_dir, fallback_dir_from_env().as_deref()).await
+}
+
+async fn current_stall_in(config_dir: &Path, fallback_dir: Option<&Path>) -> Option<PipelineGateStall> {
     let recorded = tokio::fs::read_to_string(config_dir.join(IDENTITY_FILE))
         .await
         .ok()
         .and_then(|text| text.lines().next().map(|line| line.trim().to_string()));
-    if recorded.as_deref() == Some(stall.identity.as_str()) {
-        let _ = tokio::fs::remove_file(config_dir.join(STALL_FILE)).await;
-        return None;
+    // Every record is checked (NAN-5657 review): a resolved one is removed and
+    // skipped, so a stale primary record that cannot be removed never hides
+    // a live fallback one.
+    let mut live = None;
+    for path in std::iter::once(config_dir.join(STALL_FILE)).chain(fallback_dir.map(|d| d.join(STALL_FILE))) {
+        let Ok(body) = tokio::fs::read(&path).await else { continue };
+        let Ok(stall) = serde_json::from_slice::<PipelineGateStall>(&body) else { continue };
+        if recorded.as_deref() == Some(stall.identity.as_str()) {
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        }
+        live.get_or_insert(stall);
     }
-    Some(stall)
+    live
 }
 
 /// [`current_stall`] for this process's `VECTOR_CONFIG_DIR`.

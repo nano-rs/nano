@@ -17,6 +17,10 @@ pub struct SavedSearch {
     pub id: Uuid,
     pub name: String,
     pub query: String,
+    /// Free-text note for the team (NAN-5696).
+    #[serde(default)]
+    #[sqlx(default)]
+    pub description: Option<String>,
     pub time_range: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     #[serde(default, with = "typeid::user::opt")]
@@ -34,6 +38,9 @@ pub struct SavedSearchWithContext {
     pub id: Uuid,
     pub name: String,
     pub query: String,
+    /// Free-text note for the team (NAN-5696).
+    #[serde(default)]
+    pub description: Option<String>,
     pub time_range: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     #[serde(default, with = "typeid::user::opt")]
@@ -60,6 +67,9 @@ pub struct SharedGroup {
 pub struct NewSavedSearch {
     pub name: String,
     pub query: String,
+    /// Optional free-text note for the team (NAN-5696). Blank is stored as NULL.
+    #[serde(default)]
+    pub description: Option<String>,
     pub time_range: Option<serde_json::Value>,
     pub visibility: Option<String>,
     pub group_ids: Option<Vec<Uuid>>,
@@ -70,6 +80,10 @@ pub struct NewSavedSearch {
 pub struct UpdateSavedSearch {
     pub name: Option<String>,
     pub query: Option<String>,
+    /// Omitted leaves the description unchanged; an empty string clears it
+    /// (NAN-5695).
+    #[serde(default)]
+    pub description: Option<String>,
     pub time_range: Option<serde_json::Value>,
 }
 

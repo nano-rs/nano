@@ -144,7 +144,24 @@ impl SearchService {
             );
             return Ok(false);
         };
-        let result = executor.cancel_queries(query_ids).await;
+        // NAN-5723: replay kill sets grow with windows x companions; keep
+        // each `KILL QUERY ... IN (...)` well inside `max_query_size`.
+        const KILL_BATCH: usize = 256;
+        let mut result = Ok(false);
+        for batch in query_ids.chunks(KILL_BATCH) {
+            match executor.cancel_queries(batch).await {
+                Ok(killed) => {
+                    if let Ok(any) = result.as_mut() {
+                        *any |= killed;
+                    }
+                }
+                Err(e) => {
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
+        }
         for query_id in query_ids {
             self.query_tracker.unregister(query_id);
         }
@@ -1472,7 +1489,7 @@ impl SearchService {
             let search_service = self.clone();
             let histogram_query = cleaned_query.clone();
             let histogram_time_range = adjusted_time_range.clone();
-            let hist_qid = format!("{query_id}-hist");
+            let hist_qid = crate::search::companion_query_id::CompanionQuery::Hist.query_id(&query_id);
             // NAN-1557: the timeline reads the same dataset as the results.
             let histogram_dataset = crate::query::Dataset::from_selector(
                 request.dataset.as_deref().unwrap_or("logs"),
@@ -1591,7 +1608,7 @@ impl SearchService {
                         &presence_only,
                     );
                     debug!("Generated field stats SQL: {}", field_stats_sql);
-                    let fstats_qid = format!("{query_id}-fstats");
+                    let fstats_qid = crate::search::companion_query_id::CompanionQuery::Fstats.query_id(&query_id);
 
                     let (data_result, field_stats_result) = tokio::join!(
                         self.execute_clickhouse_sql_shaped(
@@ -1733,7 +1750,7 @@ impl SearchService {
         if !prevalence_commands.is_empty() {
             tracing::debug!("Applying {} prevalence commands", prevalence_commands.len());
             results = self
-                .apply_prevalence_processing(results, &prevalence_commands, &prevalence_scope)
+                .apply_prevalence_processing(results, &prevalence_commands, &prevalence_scope, &query_id)
                 .await?;
             tracing::debug!("After prevalence processing: {} results", results.len());
         }

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::auth::password::{hash_password, validate_password, PasswordError};
 use crate::auth::types::{
-    builtin_groups, CreateUserRequest, GroupSummary, LandingPage, QueryMode, SearchHubStyle,
+    builtin_groups, builtin_roles, CreateUserRequest, GroupSummary, LandingPage, QueryMode, SearchHubStyle,
     TimeRangePreset, UpdateUserRequest, User, UserPreferences,
 };
 
@@ -35,6 +35,35 @@ pub enum UserRepositoryError {
     ResetTokenExpired,
     #[error("grant authority changed during validation; retry the request")]
     GrantAuthorityChanged,
+    /// NAN-5707: the caller would remove their own administrator access.
+    #[error("you cannot remove your own administrator access")]
+    CannotRemoveOwnAdmin,
+    /// NAN-5707: the change would leave the tenant with no active administrator.
+    #[error("at least one active administrator is required")]
+    LastAdminRequired,
+    /// NAN-5721: the user is still referenced by a record whose foreign key
+    /// does not detach deleted users (constraint name for the operator log).
+    #[error("user is still referenced by other records ({constraint})")]
+    StillReferenced { constraint: String },
+    /// NAN-5742: detaching the user broke a NOT NULL column (23502) or a CHECK
+    /// (23514) on a dependent table: a schema bug, not a client error.
+    #[error("deleting the user would break {} (SQLSTATE {})", .0.label(), .0.sqlstate)]
+    DeleteBreaksConstraint(super::DeleteIntegrityViolation),
+}
+
+/// Map an integrity violation raised by a user delete: a foreign-key refusal
+/// (23503) to [`UserRepositoryError::StillReferenced`], a NOT NULL (23502) or
+/// CHECK (23514) a SET NULL cascade broke to
+/// [`UserRepositoryError::DeleteBreaksConstraint`] (NAN-5742). Anything else
+/// stays a database error.
+fn still_referenced_or_db_error(e: sqlx::Error) -> UserRepositoryError {
+    match super::DeleteIntegrityViolation::from_sqlx(&e) {
+        Some(v) if v.is_foreign_key() => UserRepositoryError::StillReferenced {
+            constraint: v.label(),
+        },
+        Some(v) => UserRepositoryError::DeleteBreaksConstraint(v),
+        None => UserRepositoryError::DatabaseError(e),
+    }
 }
 
 impl From<PasswordError> for UserRepositoryError {
@@ -349,6 +378,7 @@ impl UserRepository {
         request: &UpdateUserRequest,
         group_ids: Option<&[Uuid]>,
         stamp: crate::auth::GrantAuthorityStamp,
+        actor_user_id: Uuid,
     ) -> Result<User, UserRepositoryError> {
         let existing = self.get_user_by_id(id).await?;
         let password_hash = if let Some(ref new_password) = request.password {
@@ -361,13 +391,80 @@ impl UserRepository {
         if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
             return Err(UserRepositoryError::GrantAuthorityChanged);
         }
+        let was_admin = Self::is_active_admin_in(&mut tx, id).await?;
         let user =
             Self::apply_profile_update_in(&mut tx, id, &existing, request, password_hash).await?;
         if let Some(group_ids) = group_ids {
             Self::replace_user_groups_in(&mut tx, id, group_ids).await?;
         }
+        Self::ensure_admin_retained_in(&mut tx, id, actor_user_id, was_admin).await?;
         tx.commit().await?;
         Ok(user)
+    }
+
+    /// Whether `user_id` is an ACTIVE member of a group bound to the built-in
+    /// Admin role (a system role whose permissions cannot be edited).
+    pub(crate) async fn is_active_admin_in(
+        conn: &mut sqlx::PgConnection,
+        user_id: Uuid,
+    ) -> Result<bool, UserRepositoryError> {
+        Ok(sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM users u
+                JOIN user_groups ug ON ug.user_id = u.id
+                JOIN group_roles gr ON gr.group_id = ug.group_id
+                WHERE u.id = $1 AND u.status = 'active' AND gr.role_id = $2
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(builtin_roles::ADMIN_ID)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
+    /// NAN-5707: after a write that may have taken Admin away from `target`
+    /// (`was_admin` = held it before the write), refuse it when the caller is
+    /// demoting themselves, or when no active administrator would remain.
+    /// Runs inside the write transaction, which holds the grant-authority row
+    /// lock, so two concurrent demotions cannot both see "another admin left".
+    pub(crate) async fn ensure_admin_retained_in(
+        conn: &mut sqlx::PgConnection,
+        target: Uuid,
+        actor_user_id: Uuid,
+        was_admin: bool,
+    ) -> Result<(), UserRepositoryError> {
+        if !was_admin || Self::is_active_admin_in(conn, target).await? {
+            return Ok(());
+        }
+        if target == actor_user_id {
+            return Err(UserRepositoryError::CannotRemoveOwnAdmin);
+        }
+        Self::ensure_an_admin_remains_in(conn).await
+    }
+
+    /// NAN-5707: refuse a write that leaves no active administrator.
+    pub(crate) async fn ensure_an_admin_remains_in(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<(), UserRepositoryError> {
+        let remaining: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM users u
+                JOIN user_groups ug ON ug.user_id = u.id
+                JOIN group_roles gr ON gr.group_id = ug.group_id
+                WHERE u.status = 'active' AND gr.role_id = $1
+            )
+            "#,
+        )
+        .bind(builtin_roles::ADMIN_ID)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !remaining {
+            return Err(UserRepositoryError::LastAdminRequired);
+        }
+        Ok(())
     }
 
     /// Apply the profile-column update within a caller-provided transaction.
@@ -514,10 +611,15 @@ impl UserRepository {
             .await?;
         }
 
+        // NAN-5721: every user FK either cascades or is ON DELETE SET NULL
+        // (migration 396). Should a future table add a bare `REFERENCES users`,
+        // the delete fails with a foreign-key violation: report it as a
+        // conflict naming the constraint instead of a generic database error.
         let result = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)
-            .await?;
+            .await
+            .map_err(still_referenced_or_db_error)?;
 
         debug_assert_eq!(result.rows_affected(), 1);
 
@@ -540,6 +642,10 @@ impl UserRepository {
         if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
             return Err(UserRepositoryError::GrantAuthorityChanged);
         }
+        // NAN-5707: disabling or deleting the last active administrator (by a
+        // caller whose custom role covers Admin's permissions) is refused.
+        let removes_admin = matches!(action, PrincipalAction::Delete | PrincipalAction::Disable)
+            && Self::is_active_admin_in(&mut tx, id).await?;
         match action {
             PrincipalAction::Delete => Self::delete_user_in(&mut tx, id).await?,
             PrincipalAction::Disable | PrincipalAction::Enable | PrincipalAction::Unlock => {
@@ -596,6 +702,9 @@ impl UserRepository {
                 }
                 revoke_credentials_in(&mut tx, id).await?;
             }
+        }
+        if removes_admin {
+            Self::ensure_an_admin_remains_in(&mut tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -779,6 +888,7 @@ impl UserRepository {
         user_id: Uuid,
         group_ids: &[Uuid],
         stamp: crate::auth::GrantAuthorityStamp,
+        actor_user_id: Uuid,
     ) -> Result<(), UserRepositoryError> {
         let mut tx = self.pool.begin().await?;
         if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
@@ -791,7 +901,9 @@ impl UserRepository {
         if !exists {
             return Err(UserRepositoryError::NotFound(user_id));
         }
+        let was_admin = Self::is_active_admin_in(&mut tx, user_id).await?;
         Self::replace_user_groups_in(&mut tx, user_id, group_ids).await?;
+        Self::ensure_admin_retained_in(&mut tx, user_id, actor_user_id, was_admin).await?;
         tx.commit().await?;
         Ok(())
     }

@@ -278,6 +278,8 @@ export function RetroHunt() {
           <>
             <Field label="Name">
               <input
+                data-testid="retro-hunt-name"
+                aria-label="Name"
                 className={inputCls}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
@@ -286,6 +288,8 @@ export function RetroHunt() {
             </Field>
             <Field label="Description" hint="Optional">
               <input
+                data-testid="retro-hunt-description"
+                aria-label="Description"
                 className={inputCls}
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
@@ -293,6 +297,8 @@ export function RetroHunt() {
             </Field>
             <Field label="Severity">
               <select
+                data-testid="retro-hunt-severity"
+                aria-label="Severity"
                 className={inputCls}
                 value={severity}
                 onChange={(e) => setSeverity(e.target.value as typeof severity)}
@@ -308,6 +314,8 @@ export function RetroHunt() {
               hint="Live bakes in (findings, no alerts). A retro-hunt consumes indicators as it hunts them, so promote to Alerting to alert on intel landing after promotion — or create directly in Alerting to alert on the current backlog."
             >
               <select
+                data-testid="retro-hunt-mode"
+                aria-label="Mode"
                 className={inputCls}
                 value={mode}
                 onChange={(e) => setMode(e.target.value as typeof mode)}
@@ -318,6 +326,8 @@ export function RetroHunt() {
             </Field>
             <Field label="Schedule" hint="Cron. Retro hunts aren't latency-sensitive.">
               <input
+                data-testid="retro-hunt-schedule"
+                aria-label="Schedule"
                 className={`${inputCls} font-mono`}
                 value={cron}
                 onChange={(e) => setCron(e.target.value)}
@@ -347,6 +357,8 @@ export function RetroHunt() {
         <Field label="Lookback" hint={`How far back to hunt. Max ${MAX_LOOKBACK_DAYS}d (log retention).`}>
           <div className="flex items-center gap-2">
             <input
+              data-testid="retro-hunt-lookback"
+              aria-label="Lookback days"
               type="number"
               min={1}
               max={MAX_LOOKBACK_DAYS}
@@ -367,6 +379,8 @@ export function RetroHunt() {
         >
           <div className="flex items-center gap-2">
             <input
+              data-testid="retro-hunt-max-indicators"
+              aria-label="Max indicators per run"
               type="number"
               min={1}
               max={MAX_MAX_INDICATORS}

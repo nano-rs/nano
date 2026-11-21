@@ -23,7 +23,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::db::repository::detection_rules::{
-    ClaimRelease, DetectionCoverageGap, DetectionRuleRepository, RuleFailureCounters,
+    ClaimRelease, CrashRelease, DetectionCoverageGap, DetectionRuleRepository,
+    RuleFailureCounters,
 };
 use crate::models::{DetectionMode, DetectionRule};
 use crate::search::TimeRangeInput;
@@ -87,6 +88,22 @@ impl Default for DistributedSchedulerConfig {
 }
 
 impl DistributedSchedulerConfig {
+    /// Seconds after which a claim is treated as dead (its process crashed).
+    ///
+    /// Audit D21: never let another node reclaim a rule before the node
+    /// executing it can plausibly finish AND release its claim. The stale and
+    /// execution timeouts are independent knobs that both default to 300s, so
+    /// a claim could be reclaimed at exactly the execution timeout → double
+    /// execution (double-counted stats / detection_matches). Floor the stale
+    /// timeout at `execution_timeout + buffer` (the buffer covers the permit
+    /// wait + release round-trip) so reclaim only ever fires for a genuinely
+    /// dead node.
+    pub fn effective_stale_claim_timeout_secs(&self) -> i64 {
+        const STALE_CLAIM_EXEC_BUFFER_SECS: i64 = 60;
+        self.stale_claim_timeout_secs
+            .max(self.execution_timeout_secs as i64 + STALE_CLAIM_EXEC_BUFFER_SECS)
+    }
+
     /// Load configuration from environment variables with defaults
     pub fn from_env() -> Self {
         Self {
@@ -276,25 +293,16 @@ impl DistributedDetectionScheduler {
     }
 
     /// One poll cycle: claim due rules, execute them concurrently, release claims.
+    ///
+    /// NAN-5736: a process crash kills every rule running in it, so a rule
+    /// that died mid-run before (a crash suspect) never runs alongside other
+    /// rules: suspects execute one at a time, after the healthy rules of the
+    /// cycle finished. A crash during such a run is attributable.
     async fn poll_and_execute(&self, shutdown: &ShutdownToken) -> anyhow::Result<usize> {
-        // Audit D21: never let another node reclaim a rule before the node
-        // executing it can plausibly finish AND release its claim. The stale and
-        // execution timeouts are independent knobs that both default to 300s, so
-        // a claim could be reclaimed at exactly the execution timeout → double
-        // execution (double-counted stats / detection_matches). Floor the stale
-        // timeout at `execution_timeout + buffer` (the buffer covers the permit
-        // wait + release round-trip) so reclaim only ever fires for a genuinely
-        // dead node.
-        const STALE_CLAIM_EXEC_BUFFER_SECS: i64 = 60;
-        let effective_stale_timeout = self
-            .config
-            .stale_claim_timeout_secs
-            .max(self.config.execution_timeout_secs as i64 + STALE_CLAIM_EXEC_BUFFER_SECS);
-
         let claim = self.rule_repo.claim_due_rules(
             self.config.batch_size,
             &self.node_id,
-            effective_stale_timeout,
+            self.config.effective_stale_claim_timeout_secs(),
         );
         let Some(claimed) = shutdown.run_until_cancelled(claim).await else {
             return Ok(0);
@@ -312,67 +320,87 @@ impl DistributedDetectionScheduler {
             "Claimed rules for execution"
         );
 
+        // NAN-5736: read each claim's crash state while this node holds it.
+        let mut healthy = Vec::with_capacity(count);
+        let mut suspects = Vec::new();
+        for rule in claimed {
+            match self.rule_repo.get_claimed_failure_counters(rule.id, &self.node_id).await {
+                Ok(Some(counters)) if counters.crash_suspected() => suspects.push((rule, counters)),
+                Ok(Some(counters)) => healthy.push((rule, counters)),
+                Ok(None) => warn!(rule_id = %rule.id, "Claim lost before execution; skipping"),
+                Err(e) => warn!(
+                    rule_id = %rule.id,
+                    "Failed to read rule failure counters: {e}; leaving the claim to expire"
+                ),
+            }
+        }
+
         // Keep execution futures owned by the scheduler task. If shutdown aborts
         // the scheduler, dropping this stream cancels every in-flight execution
         // before the scheduler handle resolves and its claims are bulk-released.
-        stream::iter(claimed)
-            .for_each_concurrent(self.config.max_concurrent_executions.max(1), |rule| {
-                let detection_service = self.detection_service.clone();
-                let rule_repo = self.rule_repo.clone();
-                let node_id = self.node_id.clone();
-                let config = self.config.clone();
-                async move {
-                    let rule_id = rule.id;
-                    let execution = execute_and_release(
-                        &detection_service,
-                        &rule_repo,
-                        &rule,
-                        &node_id,
-                        &config,
-                    );
-                    if AssertUnwindSafe(execution).catch_unwind().await.is_err() {
-                        // NAN-3080: release panics now unwind (they used to
-                        // abort the whole jobs process), so one rule's panic
-                        // is isolated here. Release the claim with a back-off
-                        // and WITHOUT advancing last_run_at, so the window is
-                        // re-scanned instead of the rule waiting out the
-                        // stale-claim timeout.
-                        error!(%rule_id, "Rule execution task panicked; releasing claim with back-off");
-                        counter!("nanosiem_detection_execution_panics_total").increment(1);
-                        let retry_at = Utc::now() + Duration::seconds(PANIC_RETRY_BACKOFF_SECS);
-                        // A panic is not a size failure (NAN-4910): keep the
-                        // rule's current catch-up slice size unchanged. An
-                        // execution panic is caught inside
-                        // `execute_and_release` and goes through the bounded
-                        // retry (NAN-5424); this path only sees panics in the
-                        // release bookkeeping itself, so count and record it.
-                        let counters = rule_repo
-                            .get_failure_counters(rule_id)
-                            .await
-                            .unwrap_or_default();
-                        let release = ClaimRelease {
-                            next_run_at: retry_at,
-                            advance_last_run_to: None,
-                            catchup_size_failures: counters.catchup_size_failures,
-                            consecutive_failures: counters.consecutive_failures.saturating_add(1),
-                            failing_since: Some(counters.failing_since.unwrap_or_else(Utc::now)),
-                            failure_class: Some(ExecutionOutcome::OtherFailure.as_label()),
-                            error: Some("[other] Rule execution task panicked"),
-                            coverage_gap: None,
-                        };
-                        if let Err(e) = rule_repo.release_claim(rule_id, &node_id, &release).await
-                        {
-                            error!(%rule_id, "Failed to release claim after panic: {}", e);
-                        }
-                    }
-                }
+        stream::iter(healthy)
+            .for_each_concurrent(self.config.max_concurrent_executions.max(1), |(rule, counters)| {
+                self.run_claimed(rule, counters, false)
             })
             .await;
+        for (rule, counters) in suspects {
+            self.run_claimed(rule, counters, true).await;
+        }
 
         // Track how many rules were executed in this poll cycle
         counter!("nanosiem_detection_rules_executed_total").increment(count as u64);
 
         Ok(count)
+    }
+
+    /// Execute one claimed rule, isolating a panic in the release bookkeeping.
+    async fn run_claimed(&self, rule: DetectionRule, counters: RuleFailureCounters, isolated: bool) {
+        let rule_id = rule.id;
+        // Boxed: one rule's execution future is large (nested searches).
+        let execution = Box::pin(execute_and_release(
+            &self.detection_service,
+            &self.rule_repo,
+            &rule,
+            counters,
+            isolated,
+            &self.node_id,
+            &self.config,
+        ));
+        if AssertUnwindSafe(execution).catch_unwind().await.is_err() {
+            // NAN-3080: release panics now unwind (they used to
+            // abort the whole jobs process), so one rule's panic
+            // is isolated here. Release the claim with a back-off
+            // and WITHOUT advancing last_run_at, so the window is
+            // re-scanned instead of the rule waiting out the
+            // stale-claim timeout.
+            error!(%rule_id, "Rule execution task panicked; releasing claim with back-off");
+            counter!("nanosiem_detection_execution_panics_total").increment(1);
+            let retry_at = Utc::now() + Duration::seconds(PANIC_RETRY_BACKOFF_SECS);
+            // A panic is not a size failure (NAN-4910): keep the
+            // rule's current catch-up slice size unchanged. An
+            // execution panic is caught inside
+            // `execute_and_release` and goes through the bounded
+            // retry (NAN-5424); this path only sees panics in the
+            // release bookkeeping itself, so count and record it.
+            let counters = self
+                .rule_repo
+                .get_failure_counters(rule_id)
+                .await
+                .unwrap_or_default();
+            let release = ClaimRelease {
+                next_run_at: retry_at,
+                advance_last_run_to: None,
+                catchup_size_failures: counters.catchup_size_failures,
+                consecutive_failures: counters.consecutive_failures.saturating_add(1),
+                failing_since: Some(counters.failing_since.unwrap_or_else(Utc::now)),
+                failure_class: Some(ExecutionOutcome::OtherFailure.as_label()),
+                error: Some("[other] Rule execution task panicked"),
+                coverage_gap: None,
+            };
+            if let Err(e) = self.rule_repo.release_claim(rule_id, &self.node_id, &release).await {
+                error!(%rule_id, "Failed to release claim after panic: {}", e);
+            }
+        }
     }
 
     /// Release all claims held by this node (for graceful shutdown).
@@ -419,10 +447,18 @@ pub(crate) fn is_deterministic_failure<T>(result: &Result<T, crate::detection::D
 /// Execute a single claimed rule and release the claim afterward.
 ///
 /// Always releases the claim, even on execution failure (to avoid permanent stuckness).
+///
+/// NAN-5736: `counters` were read while this node held the claim. A claim
+/// whose previous claim never released records that crash and releases
+/// without running (see [`fold_crashed_attempts`]). An `isolated` run marks
+/// its claim first, so a crash during it is attributed to this rule; if the
+/// claim was lost meanwhile, nothing runs.
 async fn execute_and_release(
     detection_service: &DetectionService,
     rule_repo: &DetectionRuleRepository,
     rule: &DetectionRule,
+    counters: RuleFailureCounters,
+    isolated: bool,
     node_id: &str,
     config: &DistributedSchedulerConfig,
 ) {
@@ -435,49 +471,26 @@ async fn execute_and_release(
     // slice shrinks after consecutive size-class failures. NAN-5424: the
     // consecutive non-size failure count bounds how often one window is
     // retried.
-    let marker_driven = is_marker_driven(rule);
-    let mut counters = rule_repo
-        .get_failure_counters(rule.id)
-        .await
-        .unwrap_or_else(|e| {
-            warn!(rule_id = %rule.id, "Failed to read rule failure counters: {}", e);
-            RuleFailureCounters::default()
-        });
-    // NAN-5424: earlier claims that never released died mid-run (crash /
-    // OOM). Count each as an unclassified failed attempt at this window, so a
-    // window that kills the process cannot pin the rule either.
     if counters.crashed_attempts > 0 {
-        let other = ExecutionOutcome::OtherFailure.as_label();
-        warn!(
-            rule_id = %rule.id,
-            rule_name = %rule.name,
-            crashed_attempts = counters.crashed_attempts,
-            "Earlier executions of this rule never released their claim; counting them as failed attempts"
-        );
-        counter!("nanosiem_detection_execution_crashes_total").increment(counters.crashed_attempts as u64);
-        if counters.failure_class.as_deref() != Some(other) {
-            counters.consecutive_failures = 0;
-            counters.failing_since = None;
-        }
-        counters.consecutive_failures =
-            counters.consecutive_failures.saturating_add(counters.crashed_attempts);
-        counters.failing_since.get_or_insert_with(Utc::now);
-        counters.failure_class = Some(other.to_string());
+        release_crashed_claim(rule_repo, rule, node_id, config, &counters, Utc::now()).await;
+        return;
     }
-    let size_failures_for_chunk = if marker_driven {
-        counters.catchup_size_failures
-    } else {
-        0
-    };
-    let chunk_minutes = catchup_chunk_minutes(config.max_catchup_minutes, size_failures_for_chunk);
+    if isolated {
+        match rule_repo.mark_isolated_claim(rule.id, node_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(rule_id = %rule.id, "Claim lost before the isolated run; skipping");
+                return;
+            }
+            Err(e) => {
+                error!(rule_id = %rule.id, "Failed to mark the isolated run: {}; leaving the claim to expire", e);
+                return;
+            }
+        }
+    }
+    let marker_driven = is_marker_driven(rule);
     let now = Utc::now();
-    let end = compute_window_end(rule.lookback_minutes, rule.last_run_at, now, chunk_minutes);
-    let start = compute_window_start(
-        rule.lookback_minutes,
-        rule.last_run_at,
-        end,
-        config.default_lookback_minutes,
-    );
+    let (start, end, chunk_minutes) = attempt_window(rule, &counters, config, now);
     let time_range = TimeRangeInput::new(start, end);
 
     debug!(
@@ -713,6 +726,244 @@ async fn execute_and_release(
             "Failed to release claim: {}. Rule will be reclaimed after stale timeout.",
             e
         );
+    }
+}
+
+/// The window one attempt evaluates, and its catch-up slice size (minutes).
+fn attempt_window(
+    rule: &DetectionRule,
+    counters: &RuleFailureCounters,
+    config: &DistributedSchedulerConfig,
+    now: DateTime<Utc>,
+) -> (DateTime<Utc>, DateTime<Utc>, i64) {
+    // NAN-4910: a backlog is worked oldest-first in bounded slices; the slice
+    // shrinks after consecutive size-class failures.
+    let size_failures_for_chunk = if is_marker_driven(rule) {
+        counters.catchup_size_failures
+    } else {
+        0
+    };
+    let chunk_minutes = catchup_chunk_minutes(config.max_catchup_minutes, size_failures_for_chunk);
+    let end = compute_window_end(rule.lookback_minutes, rule.last_run_at, now, chunk_minutes);
+    let start = compute_window_start(
+        rule.lookback_minutes,
+        rule.last_run_at,
+        end,
+        config.default_lookback_minutes,
+    );
+    (start, end, chunk_minutes)
+}
+
+/// First back-off after a crash attributed to the rule (NAN-5736). Doubles
+/// per consecutive attributed crash up to [`CRASH_BACKOFF_MAX_SECS`].
+pub(crate) const CRASH_BACKOFF_BASE_SECS: i64 = 300;
+
+/// Longest back-off for a rule whose runs keep killing the process.
+pub(crate) const CRASH_BACKOFF_MAX_SECS: i64 = 6 * 3600;
+
+/// Delay before a crash suspect (it died together with other rules) runs
+/// again, in isolation (NAN-5736). Short: it is most likely innocent.
+pub(crate) const CRASH_SUSPECT_RETRY_SECS: i64 = 60;
+
+/// Spread of the per-rule jitter added to every crash back-off, so the rules
+/// one crash killed together never come back in lockstep (NAN-5736).
+pub(crate) const CRASH_JITTER_MAX_SECS: u64 = 120;
+
+/// Back-off after `crash_streak` consecutive attributed crashes (NAN-5736):
+/// 5 min, 10, 20, 40, … capped at 6 h. Jitter is added separately.
+pub(crate) fn crash_backoff(crash_streak: i16) -> Duration {
+    let doublings = u32::try_from(crash_streak.saturating_sub(1).max(0)).unwrap_or(0).min(16);
+    let secs = CRASH_BACKOFF_BASE_SECS.saturating_mul(1_i64 << doublings);
+    Duration::seconds(secs.min(CRASH_BACKOFF_MAX_SECS))
+}
+
+/// Deterministic per-rule jitter in `[0, CRASH_JITTER_MAX_SECS)` (NAN-5736).
+pub(crate) fn crash_jitter(rule_id: Uuid) -> Duration {
+    let bytes = rule_id.as_u128();
+    let mixed = (bytes ^ (bytes >> 64)) as u64;
+    Duration::seconds((mixed % CRASH_JITTER_MAX_SECS) as i64)
+}
+
+/// How a claim's crashed predecessor is handled (NAN-5736). Pure, so the
+/// decision is unit-tested without a database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrashFold {
+    /// Counters to persist; `crashed_attempts` is 0.
+    pub counters: RuleFailureCounters,
+    /// New `last_run_at` (a coverage gap or first-run bootstrap moved it).
+    pub advance_last_run_to: Option<DateTime<Utc>>,
+    /// A window recorded as not evaluated after its retry budget was spent.
+    pub coverage_gap: Option<(DateTime<Utc>, DateTime<Utc>, i32)>,
+    /// When the rule runs again (the claim is released until then).
+    pub next_run_at: DateTime<Utc>,
+    /// The crash is this rule's: it died running alone.
+    pub attributed: bool,
+}
+
+/// Decide what a claim's crashed predecessor means (NAN-5736).
+///
+/// A process crash kills every rule executing in it, so a crash is only
+/// ATTRIBUTED to a rule whose dead claim was executing in isolation
+/// (`isolated_claim`). Then each crashed attempt is decided exactly as a
+/// failed release of class `other` would have been (narrow the slice first,
+/// then the bounded retry budget, then a coverage gap), the attributed
+/// streak grows and the rule backs off exponentially.
+///
+/// Otherwise attribution is ambiguous: the rule becomes a crash SUSPECT and
+/// nothing else changes — no failure counted, no budget spent, no gap. It
+/// runs again shortly, in isolation, which settles it. `failing_since` is set
+/// so that, if the outage outlasts a sliding lookback, the interval that was
+/// truly never evaluated is recorded when the rule recovers (NAN-5424).
+pub(crate) fn fold_crashed_attempts(
+    rule: &DetectionRule,
+    prior: &RuleFailureCounters,
+    config: &DistributedSchedulerConfig,
+    now: DateTime<Utc>,
+) -> CrashFold {
+    let jitter = crash_jitter(rule.id);
+    if !prior.isolated_claim {
+        return CrashFold {
+            counters: RuleFailureCounters {
+                crashed_attempts: 0,
+                crash_suspect: true,
+                isolated_claim: false,
+                failing_since: Some(prior.failing_since.unwrap_or(now)),
+                ..prior.clone()
+            },
+            advance_last_run_to: None,
+            coverage_gap: None,
+            next_run_at: now + Duration::seconds(CRASH_SUSPECT_RETRY_SECS) + jitter,
+            attributed: false,
+        };
+    }
+    let crashes = prior.crashed_attempts.max(0);
+    let mut counters = RuleFailureCounters { crashed_attempts: 0, ..prior.clone() };
+    let mut probe = rule.clone();
+    let mut advance_last_run_to = None;
+    let mut coverage_gap = None;
+    for _ in 0..crashes {
+        let (start, end, _) = attempt_window(&probe, &counters, config, now);
+        let decision = decide_release(
+            ExecutionOutcome::OtherFailure,
+            is_marker_driven(&probe),
+            probe.last_run_at,
+            &counters,
+            start,
+            end,
+            now,
+            config.max_catchup_minutes,
+        );
+        if let Some(mark) = decision.advance_last_run_to {
+            probe.last_run_at = Some(mark);
+            advance_last_run_to = Some(mark);
+        }
+        counters = RuleFailureCounters {
+            catchup_size_failures: decision.catchup_size_failures,
+            consecutive_failures: decision.consecutive_failures,
+            failing_since: decision.failing_since,
+            failure_class: decision.failure_class.map(str::to_string),
+            ..counters
+        };
+        if decision.coverage_gap.is_some() {
+            // One gap row per release; the remaining crashes were attempts at
+            // the window just recorded.
+            coverage_gap = decision.coverage_gap;
+            break;
+        }
+    }
+    let streak = prior.crash_streak.max(0).saturating_add(crashes);
+    counters.crash_streak = streak;
+    counters.crash_suspect = true;
+    counters.isolated_claim = false;
+    CrashFold {
+        counters,
+        advance_last_run_to,
+        coverage_gap,
+        next_run_at: now + crash_backoff(streak) + jitter,
+        attributed: true,
+    }
+}
+
+/// The `last_error` a rule records when its dead claim is found (NAN-5736).
+pub(crate) fn crash_error_message(fold: &CrashFold, now: DateTime<Utc>) -> String {
+    let wait = (fold.next_run_at - now).num_minutes().max(1);
+    if fold.attributed {
+        format!(
+            "[crash] the jobs process was killed while this rule ran ALONE (most often out of memory): {} crash(es) in a row; next attempt in {wait} min",
+            fold.counters.crash_streak
+        )
+    } else {
+        format!(
+            "[crash?] the jobs process was killed while this rule ran together with other rules; it runs again in isolation in about {wait} min to find which rule causes it"
+        )
+    }
+}
+
+/// NAN-5736: a claim found its rule's previous claim never released (the
+/// process died mid-run). Record it and RELEASE the claim without running:
+/// the back-off is the new `next_run_at`, never a held claim.
+async fn release_crashed_claim(
+    rule_repo: &DetectionRuleRepository,
+    rule: &DetectionRule,
+    node_id: &str,
+    config: &DistributedSchedulerConfig,
+    counters: &RuleFailureCounters,
+    now: DateTime<Utc>,
+) {
+    let fold = fold_crashed_attempts(rule, counters, config, now);
+    let error = crash_error_message(&fold, now);
+    counter!(
+        "nanosiem_detection_execution_crashes_total",
+        "attributed" => fold.attributed.to_string()
+    )
+    .increment(counters.crashed_attempts.max(0) as u64);
+    if fold.attributed {
+        error!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            crash_streak = fold.counters.crash_streak,
+            consecutive_failures = fold.counters.consecutive_failures,
+            next_run_at = %fold.next_run_at,
+            "Detection rule's run killed the process while running alone; counted as a failure and backed off"
+        );
+    } else {
+        warn!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            next_run_at = %fold.next_run_at,
+            "Process died while this rule ran with others; rerunning it in isolation"
+        );
+    }
+    let coverage_gap = fold.coverage_gap.map(|(window_start, window_end, attempts)| {
+        counter!("nanosiem_detection_coverage_gaps_total", "class" => "crash").increment(1);
+        warn!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            window_start = %window_start,
+            window_end = %window_end,
+            attempts,
+            "Detection window kept killing the process; recorded a coverage gap and moved past it"
+        );
+        DetectionCoverageGap { window_start, window_end, attempts, error_message: error.clone() }
+    });
+    let crash = CrashRelease {
+        release: ClaimRelease {
+            next_run_at: fold.next_run_at,
+            advance_last_run_to: fold.advance_last_run_to,
+            catchup_size_failures: fold.counters.catchup_size_failures,
+            consecutive_failures: fold.counters.consecutive_failures,
+            failing_since: fold.counters.failing_since,
+            failure_class: fold.counters.failure_class.as_deref(),
+            error: Some(&error),
+            coverage_gap: coverage_gap.as_ref(),
+        },
+        crash_streak: fold.counters.crash_streak,
+        crash_suspect: fold.counters.crash_suspect,
+    };
+    match rule_repo.release_crashed_claim(rule.id, node_id, &crash).await {
+        Ok(true) => {}
+        Ok(false) => warn!(rule_id = %rule.id, "Claim lost before the crash was recorded; another node owns it"),
+        Err(e) => error!(rule_id = %rule.id, "Failed to record the crashed run: {}", e),
     }
 }
 
@@ -1116,3 +1367,6 @@ mod bounded_retry_tests;
 
 #[cfg(test)]
 mod nul_persistence_integration_tests;
+
+#[cfg(test)]
+mod crash_checkpoint_tests;

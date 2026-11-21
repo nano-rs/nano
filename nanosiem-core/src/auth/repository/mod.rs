@@ -6,14 +6,19 @@
 
 pub mod api_keys;
 pub mod groups;
+pub mod integrity;
 #[cfg(feature = "enterprise")]
 pub mod oidc;
 pub mod roles;
 pub mod sessions;
 pub mod users;
 
+#[cfg(test)]
+mod admin_retention_live_tests;
+
 pub use api_keys::{ApiKeyRepository, ApiKeyRepositoryError};
 pub use groups::{GroupRepository, GroupRepositoryError};
+pub use integrity::DeleteIntegrityViolation;
 #[cfg(feature = "enterprise")]
 pub use oidc::{
     OidcAuthTransaction, OidcProviderUpdate, OidcRepository, OidcRepositoryError,

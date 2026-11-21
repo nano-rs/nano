@@ -741,7 +741,7 @@ export function DashboardEditor({
               </span>
             </div>
 
-            <Button size="sm" className="h-[28px] gap-1.5" onClick={handleAddPanel}>
+            <Button size="sm" data-testid="editor-add-panel" className="h-[28px] gap-1.5" onClick={handleAddPanel}>
               <Plus className="w-[12px] h-[12px]" />
               Add Panel
             </Button>
@@ -784,6 +784,7 @@ export function DashboardEditor({
 
             <Button
               size="sm"
+              data-testid="editor-save"
               className="h-[28px] gap-1.5"
               onClick={handleSave}
               disabled={isSaving || !name.trim()}

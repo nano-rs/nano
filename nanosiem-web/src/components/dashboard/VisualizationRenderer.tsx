@@ -1106,7 +1106,7 @@ function SingleValueVisualization({ data, config, columnOrder }: SingleValueProp
 
   return (
     <div className="h-full flex flex-col items-center justify-center">
-      <div className={`font-mono text-4xl font-bold ${colorClass}`}>
+      <div data-testid="viz-single-value" data-value={typeof value === 'number' ? value : String(value ?? '')} className={`font-mono text-4xl font-bold ${colorClass}`}>
         {displayValue}
         {config?.unit && (
           <span className="ml-1 text-lg text-muted-foreground">{config.unit}</span>

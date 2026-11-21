@@ -170,3 +170,7 @@ impl utoipa::OpenApi for DetectionsApiDoc {
 #[cfg(test)]
 #[path = "strip_comments_save_tests.rs"]
 mod strip_comments_save_tests;
+
+#[cfg(test)]
+#[path = "delete_tests.rs"]
+mod delete_tests;

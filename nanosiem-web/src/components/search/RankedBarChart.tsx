@@ -3,6 +3,7 @@
 import React from 'react';
 import { BarChart3, ChevronRight, Download, Grid3x3, TrendingDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { csvExportFilename, csvFromRows, downloadCsv } from '@/lib/csv-download';
 
 interface SearchResult {
   id: string;
@@ -87,10 +88,12 @@ interface Transformed {
   rows: Row[];
   labelKeys: string[];
   max: number;
+  /** The result column the counts came from (`count`, `total`, …). */
+  countKey: string | null;
 }
 
-function transform(results: SearchResult[]): Transformed {
-  if (!results.length) return { rows: [], labelKeys: [], max: 0 };
+export function transform(results: SearchResult[]): Transformed {
+  if (!results.length) return { rows: [], labelKeys: [], max: 0, countKey: null };
 
   const sample = results[0]?.fields ?? {};
   const fieldNames = Object.keys(sample);
@@ -136,7 +139,17 @@ function transform(results: SearchResult[]): Transformed {
     pct: total > 0 ? (x.count / total) * 100 : 0,
   }));
 
-  return { rows, labelKeys, max };
+  return { rows, labelKeys, max, countKey };
+}
+
+/**
+ * The top/rare table as CSV (NAN-5699): the label column(s), the count, and
+ * the percent the table shows (of the values returned), in ranked order.
+ */
+export function rankedCsv({ rows, labelKeys, countKey }: Pick<Transformed, 'rows' | 'labelKeys' | 'countKey'>): string {
+  const header = [...labelKeys, countKey ?? 'count', 'percent'];
+  const body = rows.map((r) => [...r.parts, r.count, Number(r.pct.toFixed(2))]);
+  return csvFromRows(header, body);
 }
 
 // ───────────────────────────── bars ─────────────────────────────────
@@ -339,7 +352,8 @@ export function RankedBarChart({
   fieldsCount,
   onExpandFields,
 }: RankedBarChartProps) {
-  const { rows, labelKeys } = React.useMemo(() => transform(results), [results]);
+  const transformed = React.useMemo(() => transform(results), [results]);
+  const { rows, labelKeys } = transformed;
 
   const kind = detectKind(query);
   const isRare = kind === 'rare';
@@ -439,6 +453,8 @@ export function RankedBarChart({
         <button
           type="button"
           title="Export"
+          aria-label={`Export ${kind} values as CSV`}
+          onClick={() => downloadCsv(rankedCsv(transformed), csvExportFilename(kind))}
           className="text-muted-foreground hover:text-primary p-1 cursor-pointer"
         >
           <Download className="w-[12px] h-[12px]" />

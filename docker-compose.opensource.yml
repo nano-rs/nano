@@ -829,6 +829,9 @@ services:
       # nano-api, nano-jobs and nano-search.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
       INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
+      # NAN-5635: the search memory guard's budget (see nano-search); the api
+      # and jobs run searches too (dashboards, reports, AI, SOAR).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config delivery — api writes here, vector reads from same volume.
       VECTOR_CONFIG_DIR: /app/config/vector
@@ -836,6 +839,12 @@ services:
       # Vector watches all of it (--watch-config), and nothing on a single node
       # reads publications, so rendering them there reloaded Vector every boot.
       VECTOR_CONFIG_PUBLICATION_DIR: /app/data/vector-publications
+      # NAN-5678: staging and backup workspaces outside that volume too. The
+      # watcher is recursive, so each staged tree and backup snapshot written
+      # there made Vector recompile every parser (a minute or more with ~40
+      # OCSF sources). Needs SKIP_VECTOR_VALIDATION=true (set below): nothing
+      # in the Vector container reads the staged tree.
+      VECTOR_CONFIG_WORK_DIR: /app/data/vector-work
       # NAN-5298: reload acknowledgement. Quiet window (default 45, 0 disables
       # the check) and hard ceiling (default 600) in seconds; empty = default.
       VECTOR_RELOAD_ACK_TIMEOUT_SECS: ${VECTOR_RELOAD_ACK_TIMEOUT_SECS:-}
@@ -1008,8 +1017,13 @@ services:
       # NAN-5436: scheduled rules run `inputlookup` here too; same value as nano-api.
       INPUTLOOKUP_ALLOWED_DOMAINS: ${INPUTLOOKUP_ALLOWED_DOMAINS:-}
       INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED: ${INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED:-false}
+      # NAN-5635: the search memory guard's budget (see nano-search); the api
+      # and jobs run searches too (dashboards, reports, AI, SOAR).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
+      # NAN-5678: see nano-api (same shared /app/data volume).
+      VECTOR_CONFIG_WORK_DIR: /app/data/vector-work
       VECTOR_RELOAD_ACK_TIMEOUT_SECS: ${VECTOR_RELOAD_ACK_TIMEOUT_SECS:-}
       VECTOR_RELOAD_ACK_MAX_SECS: ${VECTOR_RELOAD_ACK_MAX_SECS:-}
       VECTOR_RELOAD_ACK_UNREADABLE_SECS: ${VECTOR_RELOAD_ACK_UNREADABLE_SECS:-}
@@ -1127,6 +1141,9 @@ services:
       CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       SEARCH_PORT: "3002"
+      # NAN-5635: memory budget (bytes) for cost-admitted unfiltered searches;
+      # unset = half the per-query ceiling, 0 = refuse them all (pre-2.0.33).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       # NAN-5250: bearer credential for /metrics (see nano-api).
       NANO_SERVICE_TOKEN: ${NANO_SERVICE_TOKEN:-}
       JWT_SECRET: ${JWT_SECRET}

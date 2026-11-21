@@ -559,6 +559,8 @@ export function FieldsPanel({
               return (
               <div key={stat.field}>
                 <div
+                  data-testid="field-row"
+                  data-field={stat.field}
                   className={cn(
                     'flex items-center py-1.5 px-1 font-mono text-[12px] gap-2 cursor-pointer rounded-sm transition-colors',
                     isOpen ? 'bg-primary/8 text-primary' : 'text-foreground hover:bg-foreground/[0.03]'
@@ -666,6 +668,9 @@ export function FieldsPanel({
                               >
                                 <DropdownMenuTrigger asChild>
                                   <div
+                                    data-testid="field-value-row"
+                                    data-field={stat.field}
+                                    data-value={valueInfo.value}
                                     className={cn(
                                       'grid grid-cols-[1fr_auto] gap-1.5 items-center py-[3px] px-1.5 font-mono text-[11px] cursor-pointer rounded-sm relative transition-colors isolate',
                                       openMenuKey === menuKey ? 'bg-primary/8' : 'hover:bg-foreground/5'

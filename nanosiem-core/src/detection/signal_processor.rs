@@ -1102,7 +1102,8 @@ impl SignalProcessor {
             Ok(rule) => rule,
             Err(_) => return,
         };
-        let alert_id = if matches!(rule.mode, RuleMode::Alerting) {
+        // A deleted (archived) rule never alerts (NAN-5672).
+        let alert_id = if !rule.archived && matches!(rule.mode, RuleMode::Alerting) {
             let event = serde_json::json!({
                 "id": signal.matched_log_id.to_string(),
                 "timestamp": signal.timestamp.to_rfc3339(),
@@ -1192,6 +1193,12 @@ impl SignalProcessor {
         // before the matched-log fetch so we don't pay CH cost for a no-op.
         if matches!(rule.mode, RuleMode::Staging | RuleMode::Paused) {
             return Ok(SignalOutcome::ModeSkipped);
+        }
+        // NAN-5672: an archived rule is deleted, whatever its mode says. A view
+        // still in flight (or a row archived before archives forced staging)
+        // must not page anyone.
+        if rule.archived {
+            return Ok(SignalOutcome::RuleMissing);
         }
 
         // Fetch the matched log from ClickHouse, bounded to a tight window around

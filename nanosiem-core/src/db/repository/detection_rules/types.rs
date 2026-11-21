@@ -22,6 +22,11 @@ pub enum DetectionRuleRepositoryError {
     InvalidModeTransition(Uuid, String),
     #[error("Invalid MITRE ATT&CK mapping: {0}")]
     InvalidMitreMapping(String),
+    /// The write would leave two runnable rules with the same name from one
+    /// repository (`idx_detection_rules_unique_name_per_repo`). Typical cause:
+    /// unarchiving a deleted repo rule that was re-imported since (NAN-5672).
+    #[error("{0}")]
+    NameConflict(String),
 }
 
 /// Daily stats for a detection rule

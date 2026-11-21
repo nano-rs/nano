@@ -3,6 +3,7 @@
 use super::lateral::source_scope_sql_predicate;
 use super::*;
 use crate::auth::ScopeSet;
+use crate::search::companion_query_id::CompanionQuery;
 use crate::query::escape_identifier;
 use crate::sql_hygiene::escape_sql_string;
 use std::collections::BTreeSet;
@@ -38,7 +39,7 @@ impl SearchService {
         dataset: Option<&str>,
         scope: &ScopeSet,
     ) -> Result<FieldStatsOutcome, SearchError> {
-        let derived_qid = request_id.map(|r| format!("{r}-fstats"));
+        let derived_qid = request_id.map(|r| crate::search::companion_query_id::CompanionQuery::Fstats.query_id(r));
 
         // No controller wired up → no gating, run directly (tests,
         // single-tenant deployments) — mirrors `search_with_admission`.
@@ -1043,8 +1044,8 @@ pub(crate) fn inventory_max_rows_to_read() -> u64 {
 /// (a companion id the search's cancel kills, NAN-5485).
 pub(crate) fn inventory_query_id(request_id: &str, bucket: DynamicFieldBucket) -> String {
     match bucket {
-        DynamicFieldBucket::Spill => format!("{request_id}-inv-spill"),
-        DynamicFieldBucket::Extended => format!("{request_id}-inv-extended"),
+        DynamicFieldBucket::Spill => CompanionQuery::InvSpill.query_id(request_id),
+        DynamicFieldBucket::Extended => CompanionQuery::InvExtended.query_id(request_id),
     }
 }
 

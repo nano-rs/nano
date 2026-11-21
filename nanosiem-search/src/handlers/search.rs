@@ -34,6 +34,11 @@ pub(crate) async fn reserve_query_owner(
     request_id: String,
     principal_id: uuid::Uuid,
 ) -> Result<(), SearchError> {
+    // NAN-5723: cancel authorizes on this raw id and then kills its derived
+    // companion ids, so refuse an id that could share a derived id with
+    // another principal's search (e.g. `job-count` vs `job`).
+    nanosiem_core::search::companion_query_id::validate_client_request_id(&request_id)
+        .map_err(|e| SearchError::BadRequest(e.to_string()))?;
     let in_use = || SearchError::BadRequest("request_id is already in use".to_string());
     match state.reserve_query_owner(&request_id, principal_id).await {
         // NAN-2100: the LOCAL reservation is authoritative on its own in a
@@ -536,6 +541,12 @@ pub async fn cancel_search(
     require_search_execute(&auth)?;
 
     tracing::info!("Received cancel request for request_id: {}", request_id);
+
+    // NAN-5723: no valid search can own an id that fails validation, and
+    // killing its derived ids could hit another principal's companions.
+    if nanosiem_core::search::companion_query_id::validate_client_request_id(&request_id).is_err() {
+        return Ok(Json(CancelSearchResponse { cancelled: false }));
+    }
 
     let can_admin_cancel = auth.claims.has_permission(permissions::SETTINGS_SYSTEM);
     if !can_admin_cancel {

@@ -564,7 +564,10 @@ impl LookupService {
         let page = page.max(1);
         let offset = (page - 1) * page_size;
 
-        let (rows, total) = self.consistent_rows(table_name, page_size, offset).await?;
+        let (mut rows, total) = self.consistent_rows(table_name, page_size, offset).await?;
+        // NAN-5715: `_row_id` crosses the API as a string (19-digit ids round
+        // as JSON numbers in the browser, and an edit then wrote a new row).
+        super::row_id::stringify_row_ids(&mut rows);
         let total_pages = if total == 0 {
             1
         } else {

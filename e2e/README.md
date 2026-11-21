@@ -95,7 +95,7 @@ would need its own license. Pin the identity once and one trial license serves
 every run:
 
 1. Get an identity to license. Pick two ids matching
-   `^[a-z0-9][a-z0-9_-]{0,63}$` (for example `e2e-dan-inst` and `e2e-dan-org`).
+   `^[a-z0-9][a-z0-9_-]{0,63}$` (for example `e2e-inst` and `e2e-org`).
    Or bring up a stack and read its generated ids:
    `scripts/e2e.sh up --edition enterprise`, then
    `scripts/e2e.sh license-ids [--run <id>]`. That prints `installation_id=`,
@@ -110,12 +110,24 @@ every run:
    chmod 600 ~/.nano-e2e/c05-trial.json
    ```
 
-4. Set the env vars (for example in your shell profile):
+4. Set the env vars (for example in your shell profile).
+   `NANO_E2E_INSTALLATION_ID` and `NANO_E2E_INSTALLATION_ORG_ID` must be the
+   exact ids **the license file is bound to**, not ids you picked or remember.
+   If they differ, the import fails with a binding mismatch. Read them from
+   the file's binding block. This prints only the two ids, never the
+   signature or other claims:
 
    ```bash
-   export NANO_E2E_INSTALLATION_ID=e2e-dan-inst
-   export NANO_E2E_INSTALLATION_ORG_ID=e2e-dan-org
+   jq -r '.claims.entitlement.binding | "installation_id=\(.installation_id)\norganization_id=\(.organization_id)"' \
+     ~/.nano-e2e/c05-trial.json
+   ```
+
+   Then export them, read straight from the same file:
+
+   ```bash
    export NANO_E2E_C05_LICENSE_FILE=~/.nano-e2e/c05-trial.json
+   export NANO_E2E_INSTALLATION_ID="$(jq -r '.claims.entitlement.binding.installation_id' "$NANO_E2E_C05_LICENSE_FILE")"
+   export NANO_E2E_INSTALLATION_ORG_ID="$(jq -r '.claims.entitlement.binding.organization_id' "$NANO_E2E_C05_LICENSE_FILE")"
    ```
 
 What the harness does with them (enterprise edition only; `--edition open`
@@ -146,6 +158,71 @@ ignores them with a warning):
 
 A trial expires. When it does, imports fail with "license NOT active"; issue a
 new trial for the same two ids and replace the file.
+
+## UI coverage manifest: adding coverage with a feature (NAN-5681)
+
+Every user-facing surface has an entry in `e2e/coverage/ui-surfaces.json`,
+and the release preflight refuses a release when one is missing. Surfaces
+are every route in `nanosiem-web/src/App.tsx` (redirects excepted), every
+rail nav item (`AppLayout.tsx`) and Settings section
+(`components/layout/settings/sections.ts`), plus hand-added `action:<name>`
+entries for major actions inside a page.
+
+When you build a feature with UI:
+
+1. Write its e2e scenario next to the closest existing one (`tests/ui/` for
+   open core, `tests/enterprise/ui/` for enterprise, a persona journey under
+   `tests/personas/`). Act as a throwaway `limited_user` with explicit
+   permissions, compare what the page shows with the API, register cleanup.
+2. Add or update its manifest entry. The key is the route exactly as
+   `App.tsx` spells it (`/automation/flows/:id`) or an `action:` id:
+   ```json
+   "/my/new-page": {"tests": ["tests/ui/test_my_page.py::test_it_lists_things"], "smoke": true},
+   "action:soar.case-steps": {"tests": ["tests/enterprise/ui/test_v2034_soar_case_steps.py"]}
+   ```
+   A reference is a `test_*.py` module and a `test_*` function in it.
+   `"smoke": true` puts a static page in `tests/ui/test_page_smoke.py`, which
+   visits each such page and fails on an error boundary, the client-side 404
+   page, an error toast, a console error or any failed request; cite the smoke
+   test only together with `"smoke": true`. `"edition": "enterprise"` keeps it
+   off open stacks. A surface the harness truly cannot reach gets
+   `"skip": "<why, in a sentence>"` instead of `tests`; skips are listed on
+   every check, so keep them honest.
+   A product bug found by a scenario is pinned on the failing STEP only, never
+   the whole test:
+   ```python
+   from nano_e2e.known_bugs import known_bug
+   with known_bug("NAN-5687", r"Run failed to queue"):
+       assert not failed, "Run failed to queue"
+   ```
+   The step is XFAIL while the signature matches, any other failure propagates,
+   and the test FAILS once the step passes (remove the wrapper then). The
+   signature must describe the bug's own symptom (`re.search` on the message
+   of a `raises=` type, default `AssertionError`, plus an optional `when=`
+   predicate): catch-alls (a pattern matching the empty string, a driver
+   timeout, bare assertion text, an HTTP error or a static `BUG <slug>`) and
+   `raises=Exception` are refused with `ValueError`. Keep the step's healthy
+   preconditions outside the `with` (`selftest/test_known_bugs.py`). A test
+   using `known_bug` or `xfail` never counts as covering a surface: an entry
+   whose only tests are such needs `"known_broken": "NAN-<id> ..."`.
+3. Add the release's items to `e2e/coverage/releases/v<x.y.z>.json` (the
+   sidecar of `deploy/release/notes/v<x.y.z>.json`):
+   `{"title": "...", "pr": 123, "ui": true, "surfaces": ["action:..."]}`, or
+   `"ui": false, "reason": "..."` for backend-only work. EVERY surface a UI
+   item names must have passing tests; otherwise the item carries a reasoned
+   `"gap"`, printed on every run.
+4. Check it (static, under a second, no browser):
+   ```bash
+   python3 scripts/release/check-e2e-coverage.py --release <x.y.z>
+   python3 scripts/release/check-e2e-coverage.py --suggest   # tests that already visit missing surfaces
+   ```
+   The `e2e coverage manifest` workflow runs it on every PR that touches
+   `App.tsx`, the nav files, `e2e/coverage/` or `e2e/tests/`;
+   `scripts/release/preflight.sh` runs it with `--release` for the version
+   being cut; `scripts/e2e.sh selftest` proves the gate catches each kind of
+   drift. The gate is release tooling: the open-core mirror strips it with
+   `scripts/release/` (its selftest and the release sidecars go too; the
+   manifest stays for the smoke walk).
 
 ## Harness conventions
 
@@ -189,6 +266,10 @@ new trial for the same two ids and replace the file.
 | ui: Nano Pipe (NAN-4919) | Add step > Filter, Save draft (nano-pipe-v2 plan in the API), paste sample + Run preview == `/pipe-preview`, publish twice, History > Rollback == versions API | runs (`NANO_PIPE_PREVIEW_ENABLED`) |
 | ui: audit (NAN-4930) | API-key actor label == audit API; Action filter round-trips the URL; Export CSV == rows on screen, every cell quoted, a formula-shaped name neutralized | runs |
 | ui: SSO (v2 entitlements) | login shows no SSO without providers; open build says the deployment lacks SSO; enterprise: every licensed capacity mounts the provider page, including retired tier inputs normalized to `licensed` | runs |
+| ui: RBAC persona matrix (NAN-5686) | every built-in role (from the migrations) and one custom role, as throwaway users: every top-level page opens, or shows `route-forbidden` having fetched no data first; neither rail (every group opened) shows a refused or dead item; core and enterprise API actions succeed or answer a clean 403; gated controls hide. Expectations are generated from `App.tsx`, the rails and `/api/roles` (`nano_e2e.rbac_matrix`) and cross-checked against the hand-maintained `e2e/coverage/rbac-baseline.json` (sensitive pages, APIs and never-held permissions per role), so widening access fails until the baseline is edited on purpose; unknown permission strings and an unexpected `*` fail | runs |
+| ui: source-restricted users (NAN-5686) | run-unique B data is absent for a non-granted analyst from search, stats, field values/stats, the stream, search jobs (export), dashboard panels, prevalence, risk, hunts leads, alerts (list, by rule, 404 by id) and cases (list, 404 by id, search), and from every API response the browser received; a granted analyst is the positive control on each surface | runs |
+| ui: deep detection engineering (NAN-5686) | nPL rule typed in the editor: Invalid with the reason, Test rule == test API, Create persists frontmatter; staging records nothing, live counts matches with no alert, alerting fires; matches page == matches API; MITRE coverage page; RBA entity risk; save v2 and revert to v1; "Automated" folder and the folder chip; retro-hunt form; alert cooldown round trip; repository import and Update available | runs |
+| ui: deep onboarding, lookups, IOC, admin (NAN-5686) | HTTP JSON wizard with a VRL compile error then a valid OCSF parser, published and searchable; parser editor draft, test lab, publish v2; lookup CSV upload, add row, `| lookup` in search and a rule; IOC list stamps events and fires an alert; users invite/disable/enable/delete, custom role, API key revoke, TOTP enrollment, session revoke, retention, SIEM Health, notification channel, AI provider dummy key | runs (live tap skips without a tap relay) |
 | ui: lookups (NAN-4924) | delete of a table a rule uses is refused naming the rule; Replace data swaps schema and rows (rows API + table page); delete succeeds once the rule is gone | runs |
 | ui: IPinfo bundle-only (NAN-4959) | catalog entry has no credential field and the configure API refuses a BYO `download_url` (422); retired IPinfo configure / sync / auto-sync endpoints 404; the IPinfo Lite inventory drawer and the connection drawer Config tab show the bundle status (revision == platform feed status, last update, next refresh) with no inputs and no Configure / Uninstall | runs |
 | ui: edition affordances | open: every enterprise route shows the entitlement panel or redirects (5 answer "Access Denied": xfail finding), every rail link opens a page, no uncaught page errors; enterprise: none of those routes serves the open placeholder | runs |
@@ -323,6 +404,35 @@ E2E_TARGET_CREDS_FILE=~/.nano-e2e/local-user.txt \
 - A scenario marked `existing_target` must mutate only objects it creates, tag
   them, and remove them at the end.
 
+### Deep Search, Dashboards and Notebooks workflows (NAN-5684)
+
+`tests/ui/test_deep_search.py`, `tests/ui/test_deep_dashboards.py` and
+`tests/enterprise/ui/test_deep_notebooks.py` work the product the way an
+analyst does, on a realistic dataset, and compare what the page shows with
+the API and with the seeded truth.
+
+- **Data.** The session fixture `soc` (`nano_e2e.soc_seed`,
+  `nano_e2e.fixtures_soc`) writes ~3,100 OCSF events into
+  `nanosiem.ocsf_logs_raw` (what Vector writes): four source types
+  (`deep_<tag>_auth|net|proc|dns`), 24 hosts, 15 users, 72 hours with a
+  day/night shape and a dense last 30 minutes, a brute-force burst, and values
+  seen exactly once (a service account, a binary and its SHA-256, a
+  destination, a domain). The rows are generated from a fixed seed and the
+  ground truth is computed from them. A kept stack re-run reuses the rows it
+  already has.
+- **Acting user.** One throwaway analyst per module (`deep.module_persona`):
+  every login counts against the install's login rate limit, which a
+  per-scenario login exhausts.
+- **Known bugs.** A product bug found here is pinned with
+  `known_bug("NAN-…", signature)` around the failing step, and its own
+  narrow scenario; `deep.bug_assert` photographs the page first
+  (`E2E_BUG_SCREENSHOT_DIR` collects the shots).
+- **Hooks.** The scenarios read `data-testid`s added for them (results count,
+  event rows, field values and sidebar rows, inspector tabs, time picker,
+  saved-query rows, history, rarity dots with `data-rare` and
+  `data-host-count`, dashboard panels with `data-panel-status`, notebook rows
+  and entries).
+
 ### Hunts UI walk (NAN-5586)
 
 `tests/enterprise/ui/test_hunts_ui_walk.py` walks every hunts page as an
@@ -338,6 +448,38 @@ feature the target lacks skips with the reason. Real AI spend is reported and
 asserted under `E2E_UIWALK_MAX_USD` (default 3; the sweep's investigator and
 reviewer tokens, an unpriced model charged at a conservative rate). On a
 throwaway stack the walk runs only with `E2E_UIWALK=1`.
+
+**The server hunt runner on a native stack (NAN-5732).** Native jobs reaches
+ClickHouse on 127.0.0.1, and Agent Lane refuses a loopback HOST IP. Without a
+fix the runner stays "unavailable" and every server sweep stays queued, so the
+hunter personas time out. `up` asks ClickHouse which address it sees for this
+host (the Docker bridge gateway, e.g. `172.22.0.1`) and exports it as
+`NANO_HUNTS_RUNNER_CIDR` in `app.env`. A `NANO_HUNTS_RUNNER_CIDR` already set
+in your shell wins. Docker and image app modes don't need this, because there
+the runner derives its container IP, as Compose and Helm installs do.
+
+### Deep SOC workflows (NAN-5685)
+
+`tests/enterprise/ui/test_deep_*.py` work alerts, cases, hunts and SOAR as a
+team of throwaway people (`nano_e2e.soc_team`: tier 1, tier 2, a manager;
+never an admin) over real alerts from real rules on OCSF events:
+
+```bash
+scripts/e2e.sh run soar ui --fresh --edition enterprise --keep -- -k test_deep_
+```
+
+| File | What a team does |
+|---|---|
+| `test_deep_alert_triage.py` | list search / severity / status filters and the Sev sort == API; detail tabs; acknowledge, bulk acknowledge, assign (notification), close as false positive with each refusal; Add to case; a rule's next alert grouped into its first alert's case; a risk notable's RBA breakdown |
+| `test_deep_cases_team.py` | New investigation, assign / reassign (bell, Mine), a note, v2.0.34 tags, case search, every pending kind and Resume, close (False positive, Inconclusive) and reopen, tier 1 refused close, escalation, a bounced handoff (API: no UI), workflow events and the audit trail |
+| `test_deep_hunts.py` | template -> floor, duplicate window (invalid refused), charter v1/v2 and restore, schedule, enable, Run now; seeded findings: manual ruling, dismiss with expiry, promote -> case close -> case_close ruling that follows a reclose; Main / My team / Private queues, held promote / dismiss, Mark wrong from the case |
+| `test_deep_soar.py` | a live alert flow (case steps around an approval) on a real detection: requester and tier 1 refused, tier 2 approves on the case, Automation pane, run trace; breaker banner and audited resume; live save bumps vN; pack browsing and install |
+
+Open bugs are pinned with `known_bug` on the failing step. The steps for
+NAN-5689, NAN-5690, NAN-5691, NAN-5692 (fixed in #10110), NAN-5697,
+NAN-5698, NAN-5700 (fixed in #10107) and NAN-5720 (fixed in #10117) assert
+normally. Set `E2E_BUG_SHOT_DIR` to
+collect the pinned bugs' screenshots in one place.
 
 ### The browser layer
 

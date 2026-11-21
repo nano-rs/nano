@@ -361,8 +361,8 @@ pub async fn share_dashboard(
     ),
     responses(
         (status = 200, description = "Dashboard deleted successfully"),
-        (status = 403, description = "Forbidden - not owner or missing dashboards:delete permission"),
-        (status = 404, description = "Dashboard not found"),
+        (status = 403, description = "Forbidden - missing dashboards:delete permission, or a dashboard the caller can see but does not own"),
+        (status = 404, description = "Dashboard not found, or not visible to the caller (existence is not disclosed)"),
     ),
     security(("api_key" = []))
 )]

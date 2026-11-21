@@ -61,6 +61,27 @@ pub fn compute_event_hash(matched_events: &serde_json::Value) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// [`compute_event_hash`] of `Value::Array(events)` after
+/// [`crate::db::pg_text::sanitize_json_for_pg`], computed one event at a time
+/// so a large match set is never copied whole (NAN-5736). Byte-identical to
+/// hashing the sanitized array: compact JSON of an array is `[` + elements
+/// joined by `,` + `]`.
+pub fn compute_event_hash_of(events: &[serde_json::Value]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"[");
+    for (i, event) in events.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b",");
+        }
+        let mut event = event.clone();
+        crate::db::pg_text::sanitize_json_for_pg(&mut event);
+        let clean = strip_volatile_fields(&event);
+        hasher.update(serde_json::to_string(&clean).unwrap_or_default().as_bytes());
+    }
+    hasher.update(b"]");
+    hex::encode(hasher.finalize())
+}
+
 /// Recursively strip `_nano_*` prefixed keys from JSON values; on enriched
 /// aggregate rows (both `_first_seen` and `_last_seen` present) additionally
 /// strip the drifting window fields (`_first_seen`, `count`, `percent`) while
@@ -111,6 +132,12 @@ fn strip_volatile_fields(value: &serde_json::Value) -> serde_json::Value {
 /// source_type — observability / risk-notable alerts) stamps `'{}'`, which the
 /// read-side filter treats as visible-to-everyone (back-compat).
 pub fn distinct_source_types(matched_events: &serde_json::Value) -> Vec<String> {
+    distinct_source_types_of(matched_events.as_array().map_or(&[], |a| a.as_slice()))
+}
+
+/// [`distinct_source_types`] over a slice of events (NAN-5697: the grouped
+/// alert path folds the provenance of rows dropped from the stored sample).
+pub fn distinct_source_types_of(events: &[serde_json::Value]) -> Vec<String> {
     fn insert_normalized(raw: &str, set: &mut BTreeSet<String>) {
         let norm = raw.trim().to_lowercase();
         if !norm.is_empty() {
@@ -118,7 +145,7 @@ pub fn distinct_source_types(matched_events: &serde_json::Value) -> Vec<String> 
         }
     }
     let mut set: BTreeSet<String> = BTreeSet::new();
-    if let Some(events) = matched_events.as_array() {
+    {
         for event in events {
             // NAN-2155 (codex round 3): the PER-EVENT `source_type` is
             // ingest-controlled, so a sender could name their source after the

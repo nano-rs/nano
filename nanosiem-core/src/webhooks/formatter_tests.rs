@@ -245,9 +245,12 @@ fn teams_adaptive_card_shape() {
     let content = &attachment["content"];
     assert_eq!(content["type"], "AdaptiveCard");
 
-    // Title TextBlock + severity-mapped color.
+    // A Markdown-inert title keeps the TextBlock shape (NAN-5737) +
+    // severity-mapped color.
+    assert_eq!(content["body"][0]["type"], "TextBlock");
     assert_eq!(content["body"][0]["text"], "Impossible travel");
     assert_eq!(content["body"][0]["color"], "Attention"); // high → Attention
+    assert_eq!(content["body"][0]["wrap"], true);
 
     // FactSet includes the severity fact.
     let facts = content["body"][1]["facts"].as_array().unwrap();
@@ -275,6 +278,7 @@ fn teams_report_card_is_kind_aware() {
 
     // Report-appropriate title, status-driven "Good" color (not the alert
     // severity→color enum).
+    assert_eq!(content["body"][0]["type"], "TextBlock");
     assert_eq!(content["body"][0]["text"], "Report ready: Weekly auth failures");
     assert_eq!(content["body"][0]["color"], "Good");
 
@@ -463,4 +467,272 @@ fn severity_hex_is_distinct_per_level() {
     let unique: std::collections::HashSet<_> = colors.iter().collect();
     assert_eq!(unique.len(), 5);
     assert_eq!(severity_hex("nonsense"), severity_hex("informational"));
+}
+
+// --- NAN-5720: case titles carry ingested entity values --------------------
+
+/// A case event as `fire_case_event` builds it: the case title in `rule_name`.
+fn hostile_case_title() -> WebhookPayload {
+    let mut p = sample_alert();
+    p.kind = Some("case".to_string());
+    p.rule_name = Some(
+        "Alerts on host: x](https://attacker.example) <https://evil|click> <!channel>\r\nBcc: victim@example.com"
+            .to_string(),
+    );
+    p
+}
+
+#[test]
+fn teams_title_is_plain_text_and_one_line() {
+    let ctx = FormatContext { routing_key: None };
+    let out = build_channel_body(ChannelType::Teams, &hostile_case_title(), &ctx).unwrap();
+    let v = parse(&out.bytes);
+    let title = &v["attachments"][0]["content"]["body"][0];
+    // TextRun is never parsed as Markdown, so no link can render.
+    assert_eq!(title["type"], "RichTextBlock");
+    assert_eq!(title["inlines"][0]["type"], "TextRun");
+    let text = title["inlines"][0]["text"].as_str().unwrap();
+    assert!(!text.contains('\n') && !text.contains('\r'), "{text}");
+}
+
+#[test]
+fn slack_fallback_text_escapes_links_and_mentions() {
+    let ctx = FormatContext { routing_key: None };
+    let out = build_channel_body(ChannelType::Slack, &hostile_case_title(), &ctx).unwrap();
+    let v = parse(&out.bytes);
+    let text = v["text"].as_str().unwrap();
+    assert!(!text.contains('<') && !text.contains('>'), "{text}");
+    assert!(text.contains("&lt;https://evil|click&gt; &lt;!channel&gt;"), "{text}");
+    // The header block is plain_text (never parsed) and one line.
+    let header = v["attachments"][0]["blocks"][0]["text"]["text"].as_str().unwrap();
+    assert!(!header.contains('\n'), "{header}");
+}
+
+#[test]
+fn email_subject_is_one_line() {
+    let ctx = FormatContext { routing_key: None };
+    let v = EmailFormatter.format(&hostile_case_title(), &ctx);
+    let subject = v["subject"].as_str().unwrap();
+    // No CR/LF: the title cannot inject a second header line.
+    assert!(!subject.contains('\n') && !subject.contains('\r'), "{subject}");
+    assert!(subject.ends_with("Bcc: victim@example.com"), "{subject}");
+}
+
+
+/// NAN-5737: the signed SOAR catalog's `microsoft_teams` `notify_event`
+/// fixture (soar-actions e62c5b9) recorded this exact Graph request body. The
+/// catalog replays it byte for byte at admission, so a plain title must keep
+/// rendering it unchanged or every install refuses the whole catalog.
+#[test]
+fn teams_graph_body_for_a_plain_title_matches_the_published_soar_fixture() {
+    let event = decode_notification_event(serde_json::json!({
+        "created_at": "2024-03-09T16:00:00Z",
+        "event_type": "case.created",
+        "idempotency_key": "case.created:00000000-0000-4000-8000-000000000001",
+        "kind": "case",
+        "rule_name": "Investigate sign-in",
+        "severity": "open"
+    }))
+    .unwrap();
+    let bytes = build_notification_body(NotificationTransport::TeamsGraph, &event).unwrap();
+    let expected = serde_json::json!({
+        "attachments": [{
+            "content": "{\"$schema\":\"http://adaptivecards.io/schemas/adaptive-card.json\",\"actions\":[],\"body\":[{\"color\":\"Good\",\"size\":\"Large\",\"text\":\"Investigate sign-in\",\"type\":\"TextBlock\",\"weight\":\"Bolder\",\"wrap\":true},{\"facts\":[{\"title\":\"Severity\",\"value\":\"OPEN\"},{\"title\":\"Type\",\"value\":\"case\"},{\"title\":\"Time\",\"value\":\"2024-03-09T16:00:00+00:00\"}],\"type\":\"FactSet\"}],\"type\":\"AdaptiveCard\",\"version\":\"1.4\"}",
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "id": "nano-notification"
+        }],
+        "body": {"content": "<attachment id=\"nano-notification\"></attachment>", "contentType": "html"}
+    });
+    assert_eq!(parse(&bytes), expected);
+}
+
+#[test]
+fn teams_title_with_any_markdown_text_is_a_plain_text_run() {
+    let ctx = FormatContext { routing_key: None };
+    for title in [
+        "ssh_brute_force",
+        "x](https://attacker.example)",
+        "**bold**",
+        "- list item",
+        "+ list item",
+        "1. ordered",
+        "2) ordered",
+        "# heading",
+        "> quote",
+        "a `code` span",
+        "a & b",
+        "line\\break",
+        "Alerts on host: web-01.example.com",
+        "Alerts for user: alice@example.com",
+        "see https://x",
+    ] {
+        let mut payload = sample_alert();
+        payload.rule_name = Some(title.to_string());
+        let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+        let block = &parse(&out.bytes)["attachments"][0]["content"]["body"][0];
+        assert_eq!(block["type"], "RichTextBlock", "{title}: {block}");
+        assert_eq!(block["inlines"][0]["text"], title);
+    }
+    for title in ["Impossible travel", "Alerts on host: WEB-01", "Report ready: 2026 Q3 sign-ins"] {
+        let mut payload = sample_alert();
+        payload.rule_name = Some(title.to_string());
+        let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+        let block = &parse(&out.bytes)["attachments"][0]["content"]["body"][0];
+        assert_eq!(block["type"], "TextBlock", "{title}: {block}");
+        assert_eq!(block["text"], title);
+    }
+}
+
+/// NAN-5737 review: the allowlist refuses every concrete bypass of the
+/// earlier denylist (non-`://` schemes, `//`, IDN/fullwidth dots, invisible
+/// format characters, line-start syntax behind them).
+#[test]
+fn teams_title_bypass_strings_take_the_plain_text_run() {
+    let ctx = FormatContext { routing_key: None };
+    for title in [
+        "Alerts on host: tel:+1-800-555-0199",
+        "callto:18005550199",
+        "sms:+18005550199",
+        "Alerts on host: msteams:/l/chat/0/0",
+        "sip:helpdesk",
+        "mailto:admin",
+        "http:evil",
+        "data:text/html,phish",
+        "//intranet/reset",
+        "www\u{3002}attacker\u{3002}com/login",
+        "attacker\u{FF0E}com/reset",
+        "//attacker\u{FF61}com/login",
+        "https\u{FF1A}//attacker\u{3002}com",
+        "\u{FEFF}- spoofed list",
+        "\u{FEFF}---",
+        "trailing:",
+        ":emoji:",
+    ] {
+        let mut payload = sample_alert();
+        payload.rule_name = Some(title.to_string());
+        let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+        let block = &parse(&out.bytes)["attachments"][0]["content"]["body"][0];
+        assert_eq!(block["type"], "RichTextBlock", "{title:?}: {block}");
+        let text = block["inlines"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains(['\u{FEFF}', '\u{202E}']),
+            "invisible format characters are dropped: {text:?}"
+        );
+    }
+}
+
+/// `markdown_inert` does not rely on `single_line` running first.
+#[test]
+fn markdown_inert_is_an_ascii_allowlist_on_its_own() {
+    for text in [
+        "Investigate sign-in",
+        "Impossible travel",
+        "Report ready: Weekly auth failures",
+        "Alerts on host: WEB-01",
+        "nano notification",
+    ] {
+        assert!(markdown_inert(text), "{text:?}");
+    }
+    for text in [
+        "",
+        "    indented code",
+        " lead",
+        "trail ",
+        "two  spaces",
+        "Title\u{2028}- bullet",
+        "a\nb",
+        "\u{FEFF}- list",
+        "x\u{202E}y",
+        "-lead",
+        "tel:+1",
+        "http:evil",
+        "//intranet/reset",
+        "attacker\u{FF0E}com",
+        "a.b",
+        "a@b",
+        "a_b",
+        "caf\u{E9}",
+    ] {
+        assert!(!markdown_inert(text), "{text:?}");
+    }
+}
+
+/// NAN-5737 review: bidi and invisible format characters are dropped from
+/// the title before it is classified.
+#[test]
+fn teams_title_drops_bidi_overrides() {
+    let ctx = FormatContext { routing_key: None };
+    let mut payload = sample_alert();
+    payload.rule_name = Some("Alerts on host: \u{202E}moc-live\u{202C}".to_string());
+    let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+    let block = &parse(&out.bytes)["attachments"][0]["content"]["body"][0];
+    assert_eq!(block["text"], "Alerts on host: moc-live", "{block}");
+}
+
+#[test]
+fn teams_numeric_fact_values_are_not_escaped() {
+    let ctx = FormatContext { routing_key: None };
+    let mut payload = sample_alert();
+    payload.details = Some(
+        [("Confidence", "0.92"), ("Count", "1,234"), ("Ratio", "87%"), ("Day", "2026-11-20"), ("List", "1. x"), ("Ip", "10.0.0.1")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    );
+    let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+    let facts = parse(&out.bytes)["attachments"][0]["content"]["body"][1]["facts"].clone();
+    let value = |t: &str| facts.as_array().unwrap().iter().find(|f| f["title"] == t).unwrap()["value"].clone();
+    assert_eq!(value("Confidence"), "0.92");
+    assert_eq!(value("Count"), "1,234");
+    assert_eq!(value("Ratio"), "87%");
+    assert_eq!(value("Day"), "2026-11-20");
+    assert_eq!(value("Ip"), "10.0.0.1");
+    assert_eq!(value("List"), "1\\. x");
+}
+
+/// NAN-5737 review: the summary and the FactSet's entity / details carry
+/// ingested alert and case values, so they never render Markdown either.
+#[test]
+fn teams_summary_and_facts_never_render_ingested_markdown() {
+    let ctx = FormatContext { routing_key: None };
+    let mut payload = sample_alert();
+    payload.summary = Some("[Verify account](https://attacker.example)".to_string());
+    payload.entity = Some("[Verify account](https://attacker.example)".to_string());
+    payload.details = Some(
+        [("**label**".to_string(), "<at>everyone</at> www.attacker.example".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+    let card = &parse(&out.bytes)["attachments"][0]["content"];
+    let body = card["body"].as_array().unwrap();
+    let summary = body
+        .iter()
+        .find(|b| b["inlines"][0]["text"] == "[Verify account](https://attacker.example)")
+        .expect("summary is a plain-text run");
+    assert_eq!(summary["type"], "RichTextBlock");
+    assert!(body.iter().all(|b| b["type"] != "TextBlock" || !b["text"].as_str().unwrap_or("").contains('[')));
+
+    let facts = card["body"][1]["facts"].as_array().unwrap();
+    let entity = facts.iter().find(|f| f["title"] == "Entity").unwrap();
+    assert_eq!(entity["value"], "\\[Verify account\\]\\(https\\:\\/\\/attacker\\.example\\)");
+    let detail = facts.iter().find(|f| f["title"] == "\\*\\*label\\*\\*").expect("escaped label");
+    assert_eq!(detail["value"], "\\<at\\>everyone\\<\\/at\\> www\\.attacker\\.example");
+}
+
+#[test]
+fn teams_plain_summary_and_facts_keep_their_original_shape() {
+    let ctx = FormatContext { routing_key: None };
+    let mut payload = sample_alert();
+    payload.summary = Some("Sign-in from a new country".to_string());
+    payload.entity = Some("WEB-01".to_string());
+    let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+    let card = &parse(&out.bytes)["attachments"][0]["content"];
+    assert!(card["body"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["type"] == "TextBlock" && b["text"] == "Sign-in from a new country" && b["wrap"] == true));
+    let facts = card["body"][1]["facts"].as_array().unwrap();
+    assert!(facts.iter().any(|f| f["title"] == "Entity" && f["value"] == "WEB-01"));
 }

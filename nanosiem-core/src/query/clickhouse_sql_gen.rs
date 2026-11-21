@@ -3383,6 +3383,12 @@ impl ClickHouseSqlGenerator {
         let mut cte_parts = Vec::new();
         let mut last_stage_has_ordering = false;
         let mut has_aggregate_or_projection = false;
+        // NAN-5703: `has_aggregate_or_projection` was set ONLY by column
+        // reshapes (`table`, `fields`, `rename`) that keep raw events, one per
+        // row, in their natural order, and none of them touched the time key.
+        // Such a result still ends `ORDER BY <time> DESC`; without it page 1
+        // was any N rows and OFFSET pages overlapped or skipped events.
+        let mut reshape_keeps_time_key = true;
         let mut has_non_timechart_aggregation = false;
 
         // Collect MATERIALIZED columns needed by downstream Tree commands.
@@ -3452,6 +3458,7 @@ impl ClickHouseSqlGenerator {
         // projection (folded into the final statement below), and whether the
         // projection-ordinal column is still in scope.
         let mut explicit_before_last: Option<String> = None;
+        let mut natural_before_last: Option<String> = None;
         let mut ordinal_in_scope = false;
         for (i, stage) in stages.iter().enumerate() {
             let cte_name = self.stage_cte_name(i);
@@ -3535,19 +3542,31 @@ impl ClickHouseSqlGenerator {
                                 last_stage_has_ordering = true;
                             }
                             has_aggregate_or_projection = true;
+                            reshape_keeps_time_key = false;
                         }
                         Command::Stats { .. } | Command::Chart { .. } => {
                             // Stats and Chart produce GROUP BY aggregations
                             has_aggregate_or_projection = true;
+                            reshape_keeps_time_key = false;
                             has_non_timechart_aggregation = true;
                         }
-                        Command::Table { .. } | Command::Fields { keep: true, .. } => {
+                        Command::Table { fields } => {
                             // Table and Fields (include mode) commands may not include timestamp column
+                            has_aggregate_or_projection = true;
+                            if fields.iter().any(|f| {
+                                f.alias.as_deref().is_some_and(|a| is_time_key(a, ctx.time_column))
+                                    || f.name == "*"
+                            }) {
+                                reshape_keeps_time_key = false;
+                            }
+                        }
+                        Command::Fields { keep: true, .. } => {
                             has_aggregate_or_projection = true;
                         }
                         Command::Top { .. } | Command::Rare { .. } => {
                             // Top/Rare produce GROUP BY aggregations
                             has_aggregate_or_projection = true;
+                            reshape_keeps_time_key = false;
                             has_non_timechart_aggregation = true;
                         }
                         Command::Return { .. }
@@ -3560,8 +3579,21 @@ impl ClickHouseSqlGenerator {
                         | Command::Cloud { .. } => {
                             // These commands also produce aggregated/projected results
                             has_aggregate_or_projection = true;
+                            reshape_keeps_time_key = false;
                         }
-                        Command::Rename { .. } | Command::Fields { keep: false, .. } => {
+                        Command::Rename { mappings } => {
+                            // NAN-876: see the `fields -` arm below.
+                            has_aggregate_or_projection = true;
+                            if mappings.iter().any(|m| {
+                                is_time_key(&m.from, ctx.time_column) || is_time_key(&m.to, ctx.time_column)
+                            }) {
+                                reshape_keeps_time_key = false;
+                            }
+                        }
+                        Command::Fields { keep: false, fields } => {
+                            if fields.iter().any(|f| is_time_key(f, ctx.time_column)) {
+                                reshape_keeps_time_key = false;
+                            }
                             // NAN-876: these don't aggregate, but they CAN strip
                             // `action` from the CTE schema — `rename action AS x`
                             // or `fields - action`. The flag's secondary job is
@@ -3619,6 +3651,11 @@ impl ClickHouseSqlGenerator {
                     if is_projection && i == stages.len() - 1 {
                         if let RowOrder::Explicit(order) = &ctx.row_order {
                             explicit_before_last = Some(order.clone());
+                        } else if ctx.row_order == RowOrder::Natural && !ctx.unordered {
+                            // NAN-5703: a final projection over raw events in
+                            // their natural order keeps that order (folded
+                            // below, like the NAN-4214 head fold).
+                            natural_before_last = order_before.clone();
                         }
                     }
                     let mut cte = self.generate_command_cte(
@@ -3690,7 +3727,7 @@ impl ClickHouseSqlGenerator {
         let fold_order = if ordered_head_at == Some(last.wrapping_sub(1)) {
             Some(format!("{} DESC", ctx.time_column))
         } else {
-            explicit_before_last.clone()
+            explicit_before_last.clone().or_else(|| natural_before_last.clone())
         };
         // A projection alias must not shadow a column the fold orders by.
         let fold_row_order = RowOrder::Explicit(fold_order.clone().unwrap_or_default());
@@ -3701,7 +3738,7 @@ impl ClickHouseSqlGenerator {
                 && !order_mentions(&fold_row_order, name)
         };
         let folds = !ctx.unordered
-            && last >= 2
+            && (last >= 2 || (last == 1 && natural_before_last.is_some()))
             && fold_order.is_some()
             && !ordinal_in_scope
             && match &stages[last] {
@@ -3833,7 +3870,8 @@ impl ClickHouseSqlGenerator {
             )
             .unwrap();
         } else if last_stage_has_ordering
-            || has_aggregate_or_projection
+            || (has_aggregate_or_projection
+                && !(reshape_keeps_time_key && self.natural_order_in_scope(&ctx).is_some()))
             || ctx.unordered
             || ctx.row_order != RowOrder::Natural
         {
@@ -5372,6 +5410,13 @@ impl ClickHouseSqlGenerator {
     }
 }
 
+/// Whether `name` is the time key rows are ordered by (any spelling).
+fn is_time_key(name: &str, time_column: &str) -> bool {
+    ["time", "timestamp", "_time", time_column]
+        .iter()
+        .any(|key| name.eq_ignore_ascii_case(key))
+}
+
 /// NAN-4278 review: the plain column names an explicit order sorts on
 /// (unquoted); an expression key yields its raw text.
 fn order_keys(order: &RowOrder) -> Vec<String> {
@@ -5833,6 +5878,10 @@ mod utf8_safe_eval_tests;
 mod dc_missing_value_tests;
 #[cfg(test)]
 mod table_alias_tests;
+#[cfg(test)]
+mod projection_order_tests;
+#[cfg(test)]
+mod lookup_output_tests;
 #[cfg(test)]
 mod non_throwing_conversion_tests;
 

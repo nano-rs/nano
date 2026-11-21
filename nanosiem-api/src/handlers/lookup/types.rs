@@ -153,7 +153,10 @@ pub struct AddRowsRequest {
 pub struct AddRowsResponse {
     /// Number of rows inserted
     pub inserted: usize,
-    /// Row IDs of inserted rows
+    /// Row IDs of inserted rows, as decimal strings (NAN-5715: 64-bit ids
+    /// lose precision as JSON numbers)
+    #[serde(serialize_with = "nanosiem_core::lookup::row_id::serialize_row_ids")]
+    #[schema(value_type = Vec<String>)]
     pub row_ids: Vec<i64>,
 }
 
@@ -167,7 +170,10 @@ pub struct UpdateRowRequest {
 /// Request body for bulk row deletion
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct DeleteRowsRequest {
-    /// Row IDs to delete
+    /// Row IDs to delete: decimal strings (as `GET …/rows` returns them) or
+    /// numbers (NAN-5715)
+    #[serde(deserialize_with = "nanosiem_core::lookup::row_id::deserialize_row_ids")]
+    #[schema(value_type = Vec<String>)]
     pub row_ids: Vec<i64>,
 }
 

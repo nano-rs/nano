@@ -81,6 +81,14 @@ where
             Some(notes) => Box::pin(crate::search::partial_run::with_scope(notes, future)),
             None => future,
         };
+    // NAN-5736: a caller that skips the count companion skips it in
+    // spawned search work too.
+    let future: std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> =
+        if crate::search::count_companion::skipped() {
+            Box::pin(crate::search::count_companion::skip(future))
+        } else {
+            future
+        };
     use tracing::instrument::WithSubscriber;
     use tracing::Instrument;
     let future = Box::pin(

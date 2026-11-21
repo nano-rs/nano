@@ -164,6 +164,9 @@ class PersonaBrowser:
     permissions: list[str]
     client: Nano
     cleanup: CleanupStack
+    # The API client's refresh token (NAN-5684): long scenarios refresh the
+    # 15-minute access token with it instead of logging in again.
+    refresh_token: str = field(default="", repr=False)
 
     def checkpoint(self, slug: str) -> Path:
         return self.page.screenshot(f"{self.name}-{slug}.png")
@@ -197,7 +200,11 @@ def login_persona(
         try:
             driver.register_secret(user.password)
             uilib.login(page, user.email, user.password)
-            jwt = nano.login(user.email, user.password)
+            tokens = expect(
+                nano.api.post("/api/auth/login", json={"email": user.email, "password": user.password}), 200
+            )["tokens"]
+            jwt = tokens["access_token"]
+            driver.register_secret(tokens.get("refresh_token") or jwt)
             client = Nano(
                 stack.api_url,
                 stack.search_url,
@@ -205,7 +212,10 @@ def login_persona(
                 Journal(artifact_dir / f"{name}-api.jsonl"),
             )
             failed = False
-            yield PersonaBrowser(name=name, page=page, permissions=granted, client=client, cleanup=cleanup)
+            yield PersonaBrowser(
+                name=name, page=page, permissions=granted, client=client, cleanup=cleanup,
+                refresh_token=tokens.get("refresh_token") or "",
+            )
         except Exception:
             failed = True
             raise

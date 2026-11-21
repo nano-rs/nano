@@ -41,6 +41,20 @@ describe('deploy request timeout (NAN-5131)', () => {
     for (const call of longRequest.mock.calls) expect(call[2]).toBe(DEPLOY_REQUEST_TIMEOUT_MS);
   });
 
+  // NAN-5678: a delete reloads Vector too (one reload for a bulk delete).
+  it('sends single and bulk log-source deletes through the long request', async () => {
+    const { request, longRequest, ls } = apis();
+    await ls.deleteLogSource('a');
+    await ls.bulkDeleteLogSources(['a', 'b']);
+    expect(request).not.toHaveBeenCalled();
+    expect(longRequest.mock.calls.map(([endpoint, init]) => [endpoint, init.method])).toEqual([
+      ['/api/log-sources/a', 'DELETE'],
+      ['/api/log-sources/bulk-delete', 'POST'],
+    ]);
+    expect(JSON.parse(longRequest.mock.calls[1][1].body)).toEqual({ ids: ['a', 'b'] });
+    for (const call of longRequest.mock.calls) expect(call[2]).toBe(DEPLOY_REQUEST_TIMEOUT_MS);
+  });
+
   it('keeps the default timeout for ordinary calls', async () => {
     const { request, longRequest, ls } = apis();
     await ls.listLogSources();

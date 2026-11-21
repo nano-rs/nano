@@ -903,7 +903,7 @@ struct AnonymizationRow {
     mutation_ids: serde_json::Value,
     justification: Option<String>,
     error_message: Option<String>,
-    requested_by: Uuid,
+    requested_by: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,

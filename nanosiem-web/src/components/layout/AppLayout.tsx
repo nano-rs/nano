@@ -286,7 +286,8 @@ const secondaryMainNavigation: NavItem[] = [
 const detectionNavigation: NavItem[] = [
   { name: 'All Rules', href: '/rules', icon: List, permissions: 'detections:view' },
   { name: 'Rule Editor', href: '/rules/editor', icon: PenTool, permissions: 'detections:create' },
-  { name: 'Repositories', href: '/rules/repositories', icon: FolderInput, permissions: 'detections:view' },
+  // NAN-5709: the same permission every repository read endpoint checks.
+  { name: 'Repositories', href: '/rules/repositories', icon: FolderInput, permissions: 'rule_repositories:view' },
   { name: 'Lookup Tables', href: '/rules/lookup-tables', icon: Table, permissions: 'lookup:view' },
   { name: 'IOC Lists', href: '/rules/ioc-lists', icon: ShieldCheck, permissions: 'enrichments:view', capability: 'iocLists' },
   { name: 'MITRE Coverage', href: '/rules/coverage', icon: Target, permissions: 'detections:view' },
@@ -715,6 +716,7 @@ function MainAppShell({ children }: AppLayoutProps) {
     >
       {/* Left rail — bg matches main content; 1px border separates. */}
       <aside
+        data-testid="app-rail"
         className={cn(
           'hidden md:flex flex-col transition-[width] duration-200 border-r border-border shrink-0',
           sidebarCollapsed ? 'w-11' : 'w-52',

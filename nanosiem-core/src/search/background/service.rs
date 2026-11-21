@@ -725,7 +725,18 @@ impl BackgroundSearchJobs {
                     settings,
                     inner.config.execution_limits(),
                 ),
-            ) => Some(result.unwrap_or(Err(SearchError::Timeout(backstop.as_millis() as u64)))),
+            ) => Some(match result {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    // NAN-5723: dropping the future does not stop the scan;
+                    // KILL the attempt's data query and companions.
+                    let _ = inner
+                        .search
+                        .cancel_exact_queries(&all_query_ids(&query_id))
+                        .await;
+                    Err(SearchError::Timeout(backstop.as_millis() as u64))
+                }
+            }),
             _ = lost.notified() => None,
         };
 

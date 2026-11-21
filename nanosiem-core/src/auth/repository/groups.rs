@@ -26,6 +26,11 @@ pub enum GroupRepositoryError {
     CannotDeleteSystemGroup(String),
     #[error("grant authority changed during validation; retry the request")]
     GrantAuthorityChanged,
+    /// NAN-5742: the delete raised an integrity violation (a reference that
+    /// does not detach deleted groups, or a NOT NULL / CHECK its SET NULL
+    /// cascade broke). Refused, nothing changed.
+    #[error("deleting the group would break {} (SQLSTATE {})", .0.label(), .0.sqlstate)]
+    DeleteBlocked(super::DeleteIntegrityViolation),
 }
 
 /// Repository for group operations
@@ -214,7 +219,11 @@ impl GroupRepository {
         sqlx::query("DELETE FROM groups WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
-            .await?;
+            .await
+            .map_err(|e| match super::DeleteIntegrityViolation::from_sqlx(&e) {
+                Some(v) => GroupRepositoryError::DeleteBlocked(v),
+                None => GroupRepositoryError::DatabaseError(e),
+            })?;
 
         Ok(())
     }

@@ -50,6 +50,7 @@ fn new_search(name: &str, visibility: Option<&str>, group_ids: Option<Vec<Uuid>>
     NewSavedSearch {
         name: name.to_string(),
         query: "src_ip=10.0.0.1 | stats count by user".to_string(),
+        description: None,
         time_range: None,
         visibility: visibility.map(str::to_string),
         group_ids,

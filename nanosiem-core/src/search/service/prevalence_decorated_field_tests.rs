@@ -74,7 +74,7 @@ async fn every_decorated_field_resolves_in_eval() {
             ("pfs", "prevalence_first_seen", "THEN _dp_first_seen".to_string()),
             ("occ", "total_occurrences", "THEN _dp_total_occurrences".to_string()),
             ("rare", "is_rare", format!("{LEAST} < 3 ELSE false")),
-            ("score", "prevalence_score", "toUInt8(round(".to_string()),
+            ("score", "prevalence_score", "toUInt8(floor(0.5 + ".to_string()),
             ("ptype", "prevalence_type", "THEN 'domain' WHEN".to_string()),
             ("part", "prevalence_artifact", "THEN l._domain_lookup".to_string()),
         ] {

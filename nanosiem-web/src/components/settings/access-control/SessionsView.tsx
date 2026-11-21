@@ -199,6 +199,8 @@ export function SessionsView() {
             return (
               <div
                 key={session.id}
+                data-testid="session-row"
+                data-session-id={session.id}
                 className={cn(
                   'grid grid-cols-[minmax(140px,1.2fr)_minmax(160px,1.4fr)_minmax(120px,1fr)_100px_100px_80px] gap-3 items-center px-3 h-10 border-b border-border/60 transition-colors',
                   session.is_current ? 'bg-primary/5' : 'hover:bg-foreground/[0.025]',

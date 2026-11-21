@@ -84,6 +84,21 @@ impl ParserService {
         }
     }
 
+    /// [`Self::with_vector_config_dir`] with the staging and backup
+    /// workspaces under `work_dir` when it is set (NAN-5678,
+    /// [`VectorConfigManager::with_work_dir`]).
+    pub fn with_vector_config_dirs(
+        pool: PgPool,
+        config_dir: impl AsRef<std::path::Path>,
+        work_dir: Option<&str>,
+    ) -> Self {
+        Self {
+            pool,
+            vector_config: Arc::new(VectorConfigManager::new(config_dir).with_work_dir(work_dir)),
+            vrl_validator: Arc::new(VrlValidator::new()),
+        }
+    }
+
     /// Hand out a clone of the inner `VectorConfigManager`'s deploy lock.
     /// Lets other services (e.g. `SourceConfigService`) serialize their
     /// `_router.toml` mutations against this service's parser deploys.

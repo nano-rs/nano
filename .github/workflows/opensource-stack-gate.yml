@@ -475,7 +475,12 @@ jobs:
       # new gated module fails this PR instead of reaching nano-rs/nano.
       - name: Mirror strip guard (no enterprise-only source in open core)
         run: |
-          docker run --rm \
+          # NAN-5733: nano-ci labels let the runner pre-job hook remove this container
+          # if the job is cancelled (scripts/ci/runner-pre-job.sh).
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm \
             -v "$PWD:/workspace:ro" -w /workspace \
             python:3.12-slim-bookworm \
             bash -euo pipefail -c '
@@ -494,7 +499,10 @@ jobs:
       # per-run stripped tree and cannot leave root-owned workspace files.
       - name: Open-core web build from the stripped tree
         run: |
-          docker run --rm \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm \
             -v "$PWD:/workspace:ro" -w /workspace \
             node:22.23.5-bookworm@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb \
             bash -euo pipefail -c '
@@ -517,7 +525,10 @@ jobs:
     steps:
       - name: Reclaim workspace before checkout (NAN-773)
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE:/ws" -w /ws alpine \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm -v "$GITHUB_WORKSPACE:/ws" -w /ws alpine \
             chown -R "$(id -u):$(id -g)" .
 
       - name: Checkout
@@ -525,7 +536,10 @@ jobs:
 
       - name: Start throwaway PostgreSQL 18
         run: |
-          docker run -d --rm --name "$PG_CONTAINER" \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            -d --rm --name "$PG_CONTAINER" \
             -e POSTGRES_USER=nanosiem \
             -e POSTGRES_PASSWORD=nanosiem \
             -e POSTGRES_DB=postgres \
@@ -545,7 +559,10 @@ jobs:
 
       - name: Fresh stripped open-core relation inventory
         run: |
-          docker run --rm --network host \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm --network host \
             -v "$PWD:/source:ro" \
             -v nanosiem-opencore-relations-cargo-registry:/usr/local/cargo/registry \
             -e CARGO_TARGET_DIR=/tmp/target \
@@ -574,5 +591,8 @@ jobs:
       - name: Reclaim workspace (NAN-773)
         if: always()
         run: |
-          docker run --rm -v "$PWD:/ws" -w /ws alpine \
+          docker run \
+            --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
+            --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
+            --rm -v "$PWD:/ws" -w /ws alpine \
             chown -R "$(id -u):$(id -g)" . 2>/dev/null || true

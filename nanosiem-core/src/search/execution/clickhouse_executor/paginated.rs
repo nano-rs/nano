@@ -115,7 +115,7 @@ impl ClickHouseExecutor {
                     // OFFSET is past the final group. Recount only that empty
                     // exceptional page; normal aggregate pages stay one query.
                     let count_sql = wrap_query_for_count(sql);
-                    let count_qid = format!("{query_id}-aggregate-count");
+                    let count_qid = crate::search::companion_query_id::CompanionQuery::AggregateCount.query_id(query_id);
                     self.execute_count_query_with_options(&count_sql, Some(&count_qid), None)
                         .await?
                 }
@@ -146,7 +146,8 @@ impl ClickHouseExecutor {
 
             // NAN-1645: page flips (offset > 0) skip the count companion — the
             // exact total was already delivered with page 1.
-            if !is_first_page(offset) {
+            // NAN-5736: so does a caller that never reads the total.
+            if !is_first_page(offset) || crate::search::count_companion::skipped() {
                 let results = self
                     .execute_dynamic_query_with_query_id(&paginated_sql, query_id, preserve_columns)
                     .await?;
@@ -163,7 +164,7 @@ impl ClickHouseExecutor {
             // NAN-1428: the companion carries the derived `{query_id}-count` id so
             // cancellation kills it together with the data query.
             let count_sql = build_count_query(sql, bounded_count);
-            let count_qid = format!("{query_id}-count");
+            let count_qid = crate::search::companion_query_id::CompanionQuery::Count.query_id(query_id);
             let (results, count_result) = tokio::join!(
                 self.execute_dynamic_query_with_query_id(&paginated_sql, query_id, preserve_columns),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), None)
@@ -218,7 +219,7 @@ impl ClickHouseExecutor {
                 Some(total_count) => total_count,
                 None => {
                     let count_sql = wrap_query_for_count(sql);
-                    let count_qid = format!("{query_id}-aggregate-count");
+                    let count_qid = crate::search::companion_query_id::CompanionQuery::AggregateCount.query_id(query_id);
                     self.execute_count_query_with_options(
                         &count_sql,
                         Some(&count_qid),
@@ -250,7 +251,8 @@ impl ClickHouseExecutor {
 
             // NAN-1645: page flips (offset > 0) skip the count companion — the
             // exact total was already delivered with page 1.
-            if !is_first_page(offset) {
+            // NAN-5736: so does a caller that never reads the total.
+            if !is_first_page(offset) || crate::search::count_companion::skipped() {
                 let results = self
                     .execute_dynamic_query_with_settings(&paginated_sql, query_id, settings, preserve_columns)
                     .await?;
@@ -262,7 +264,7 @@ impl ClickHouseExecutor {
             // NAN-1428: derived id + the same per-priority settings for the
             // count companion (settings change no result rows).
             let count_sql = build_count_query(sql, bounded_count);
-            let count_qid = format!("{query_id}-count");
+            let count_qid = crate::search::companion_query_id::CompanionQuery::Count.query_id(query_id);
             let (results, count_result) = tokio::join!(
                 self.execute_dynamic_query_with_settings(&paginated_sql, query_id, settings, preserve_columns),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), Some(settings))

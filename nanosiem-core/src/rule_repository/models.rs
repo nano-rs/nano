@@ -203,6 +203,18 @@ pub struct RuleImport {
     pub last_sync_commit: Option<String>,
     pub upstream_changed: bool,
     pub customizations: Option<serde_json::Value>,
+    /// `rule_import_content_hash()` of the linked detection rule when it was
+    /// imported or last synced from upstream (NAN-5716). `None` = no baseline.
+    #[serde(default, skip_serializing)]
+    #[sqlx(default)]
+    pub synced_content_hash: Option<String>,
+    /// The imported detection rule's upstream-managed content differs from what
+    /// was imported / last synced: a local edit ("DRIFT"). Linked and forked
+    /// imports alike: both take one-click upstream Updates. Only computed by
+    /// [`RuleImportsRepository::list_active_for_repository`]; `false` elsewhere.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub local_drift: bool,
 }
 
 /// Request to import a rule

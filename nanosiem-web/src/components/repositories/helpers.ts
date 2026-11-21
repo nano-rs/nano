@@ -128,6 +128,11 @@ export function buildRepoView(
 ): RepoView {
   const { slug, org, name } = deriveSlug(repo);
   const imported = rules.filter((r) => r.is_imported).length;
+  const upstreamPaths = new Set(upstream.map((u) => u.file_path));
+  // Same precedence as buildRuleView: an upstream change outranks drift.
+  const drift = rules.filter(
+    (r) => r.is_imported && r.local_drift && !upstreamPaths.has(r.file_path),
+  ).length;
   const upstreamModified = upstream.filter((u) => u.change_type === 'modified').length;
   const upstreamDeleted = upstream.filter((u) => u.change_type === 'deleted').length;
   const available = Math.max(0, rules.length - imported);
@@ -154,7 +159,7 @@ export function buildRepoView(
       available,
       imported,
       needsUpdate: upstreamModified,
-      drift: 0, // requires per-rule diff — see NAN-504 scope notes
+      drift,
       deleted: upstreamDeleted,
     },
     lastCommit: { sha: shortSha(repo.last_sync_commit) },
@@ -178,12 +183,18 @@ export function buildRuleView(
   fallbackCommit: string,
 ): RepoRuleView {
   const upstream = upstreamByPath.get(rule.file_path);
+  // An upstream change (UPDATED / DELETED) outranks local drift: it is the
+  // actionable state, and its diff already shows "your → upstream". DRIFT
+  // (NAN-5716) is a linked rule edited locally since its import / last
+  // upstream update, which the server derives from a content hash.
   const status: RepoRuleStatus = upstream
     ? upstream.change_type === 'deleted'
       ? 'DELETED'
       : 'UPDATED'
     : rule.is_imported
-      ? 'IMPORTED'
+      ? rule.local_drift
+        ? 'DRIFT'
+        : 'IMPORTED'
       : 'AVAILABLE';
   const source = rule.requires_source_types?.[0] || '—';
   const mitre: string[] = [
@@ -207,6 +218,24 @@ export function buildRuleView(
     raw: rule,
     upstream,
   };
+}
+
+/**
+ * NAN-5716: Dismiss acknowledges an UPSTREAM change, so it is offered only on
+ * UPDATED rows. A DRIFT row's change is local; dismissing would do nothing.
+ */
+export function upstreamDismissOffered(status: RepoRuleStatus): boolean {
+  return status === 'UPDATED';
+}
+
+/**
+ * Where a row's Open / Review / Resolve goes. A DRIFT row opens the upstream
+ * merge modal ("your → upstream") to keep or discard the local edits.
+ */
+export function linkedRuleEditorPath(status: RepoRuleStatus, detectionRuleId: string): string {
+  return status === 'DRIFT'
+    ? `/rules/editor/${detectionRuleId}?merge=upstream`
+    : `/rules/editor/${detectionRuleId}`;
 }
 
 export const STATUS_LABEL: Record<RepoRuleStatus, string> = {

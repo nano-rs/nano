@@ -28,8 +28,13 @@ pub(super) enum DatasetProvenance {
     NotSourceDerived,
     /// `Risk` — a derived grain aggregated from the FINDINGS stream in the logs
     /// table, so a risk row can carry entity data whose origin was restricted.
-    /// The companion cannot resolve it (the outer projection has no
-    /// `source_type`), so this genuinely is unknown provenance: fail closed.
+    /// The logs companion cannot resolve it (the outer projection has no
+    /// `source_type`). NAN-5697: the findings persist their own
+    /// `origin_source_types`, so the row's provenance is the union of its
+    /// contributing findings' origins ([`risk_origin_stamp`]).
+    RiskFindings,
+    /// `Signals` — refused at save time; no establishable provenance. Fail
+    /// closed.
     Unknowable,
 }
 
@@ -50,19 +55,105 @@ pub(super) enum DatasetProvenance {
 ///
 /// "There is no source dimension here" is the `'{}'` manifest the read side
 /// already treats as visible-to-everyone, and the value observability alerts
-/// have always carried. Risk keeps failing closed because its rows really can
-/// embed restricted-origin entities.
+/// have always carried. Risk rows really can embed restricted-origin entities,
+/// so they are never stamped empty: NAN-5697 attributes them to their
+/// contributing findings' persisted origins, and fails closed when it cannot.
 pub(super) fn dataset_provenance(dataset: Option<&str>) -> DatasetProvenance {
     match crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) {
         crate::query::Dataset::Logs => DatasetProvenance::SourceDerived,
         crate::query::Dataset::Spans | crate::query::Dataset::Metrics => {
             DatasetProvenance::NotSourceDerived
         }
-        crate::query::Dataset::Risk => DatasetProvenance::Unknowable,
+        crate::query::Dataset::Risk => DatasetProvenance::RiskFindings,
         // NAN-5612: refused at save time (signal-on-signal loop); a stored rule
         // that names it anyway has no establishable provenance.
         crate::query::Dataset::Signals => DatasetProvenance::Unknowable,
     }
+}
+
+/// NAN-5697: findings older than the risk grain's 7d horizon cannot contribute
+/// to a row; the extra hour keeps the origin read a superset of what the grain
+/// read moments earlier (over-attribution only hides, never reveals).
+pub(super) const RISK_ORIGIN_HORIZON: Duration = Duration::hours(7 * 24 + 1);
+
+/// NAN-5697: above this many distinct entities the origin read uses the
+/// whole-window form instead of an `IN` list (a superset, so still sound).
+const MAX_RISK_ORIGIN_ENTITIES: usize = 10_000;
+
+/// NAN-5697: which findings a risk-dataset rule's rows are attributed to.
+///
+/// `Some(entities)` when every row to stamp names its grain `entity` and no
+/// stage of the rule can have rewritten that column or combined rows
+/// (`entity_trusted`, from `RowProvenance::risk_rows_entity_local`): each row
+/// is then attributed to its own entity's findings. Otherwise `None`: every row is
+/// attributed to the whole findings window, a superset of any row's real
+/// contributors (fail-closed direction: hides from more restricted viewers).
+pub(super) fn risk_row_entities(
+    results: &[serde_json::Value],
+    entity_trusted: bool,
+) -> Option<Vec<String>> {
+    if !entity_trusted {
+        return None;
+    }
+    let mut entities = Vec::new();
+    for row in results.iter().filter(|r| row_lacks_source_type(r)) {
+        let entity = row.get(super::provenance::RISK_ENTITY_FIELD)?.as_str()?;
+        if entity.is_empty() {
+            return None;
+        }
+        entities.push(entity.to_string());
+    }
+    entities.sort();
+    entities.dedup();
+    (!entities.is_empty() && entities.len() <= MAX_RISK_ORIGIN_ENTITIES).then_some(entities)
+}
+
+/// NAN-5697: the `_nano_source_types` stamp for one risk row, from the origin
+/// manifest [`risk_origin_query`](crate::risk::clickhouse_sql::risk_origin_query)
+/// returned. `entity = None` takes the union of every manifest row (the
+/// whole-window form).
+///
+/// The stamp is the union of the contributing findings' persisted origins, so
+/// a viewer denied ANY contributing source is denied the row, and a viewer
+/// denied none of them sees it: the same rule the `dataset=risk` read path
+/// applies to the findings themselves. Findings with no persisted origin add
+/// the unresolved sentinel (the read path hides them from restricted viewers
+/// too). `None` means nothing could be attributed (no manifest for the
+/// entity, or no origins at all): the caller fails closed.
+pub(super) fn risk_origin_stamp(
+    manifest: &[crate::risk::clickhouse_sql::RiskOriginRow],
+    entity: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut origins: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut unresolved = 0u64;
+    let mut matched = false;
+    for row in manifest.iter().filter(|r| entity.is_none_or(|e| r.entity == e)) {
+        matched = true;
+        unresolved += row.unresolved;
+        origins.extend(
+            row.origin_source_types
+                .iter()
+                .map(|o| o.trim().to_lowercase())
+                .filter(|o| !o.is_empty()),
+        );
+    }
+    if !matched || (origins.is_empty() && unresolved == 0) {
+        return None;
+    }
+    if unresolved > 0 {
+        origins.insert(crate::auth::UNRESOLVED_SOURCE_SENTINEL.to_string());
+    }
+    Some(serde_json::Value::Array(
+        origins.into_iter().map(serde_json::Value::String).collect(),
+    ))
+}
+
+/// A row with no usable per-event `source_type` takes the engine stamp.
+fn row_lacks_source_type(event: &serde_json::Value) -> bool {
+    event
+        .get("source_type")
+        .and_then(|v| v.as_str())
+        .map_or(true, |s| s.trim().is_empty())
 }
 
 /// NAN-2155: what the `… | stats count by source_type` companion proved about a
@@ -358,14 +449,19 @@ impl DetectionService {
             || self.search_service.clone(),
             |limits| self.search_service.clone().with_execution_limits(limits),
         );
-        search_service
-            // NAN-2047: run under the caller-supplied scope. SYSTEM callers pass
-            // `ScopeSet::unrestricted()` (match across ALL sources); the Test
-            // Rule path passes the caller's effective deny set.
-            .search(request, scope)
-            .await
-            .map(|r| r.results)
-            .map_err(detection_error_from_search)
+        // NAN-5736: a detection window reads only the rows, never the total,
+        // so the parallel `count(*)` companion (a scan of up to 1M matches on
+        // a broad rule) is skipped.
+        crate::search::count_companion::skip(
+            search_service
+                // NAN-2047: run under the caller-supplied scope. SYSTEM callers pass
+                // `ScopeSet::unrestricted()` (match across ALL sources); the Test
+                // Rule path passes the caller's effective deny set.
+                .search(request, scope),
+        )
+        .await
+        .map(|r| r.results)
+        .map_err(detection_error_from_search)
     }
 
     /// NAN-1800: derive the companion query that lists the DISTINCT
@@ -444,12 +540,7 @@ impl DetectionService {
                 super::provenance::demote_rule_source_type(event);
             }
         }
-        let lacks_source_type = |event: &serde_json::Value| {
-            event
-                .get("source_type")
-                .and_then(|v| v.as_str())
-                .map_or(true, |s| s.trim().is_empty())
-        };
+        let lacks_source_type = row_lacks_source_type;
         if !results.iter().any(lacks_source_type) {
             return;
         }
@@ -541,11 +632,55 @@ impl DetectionService {
                 return;
             }
             DatasetProvenance::Unknowable => {
-                // Risk: aggregated from findings that DO have origins we cannot
-                // recover here. Genuinely unknown ⇒ fail closed.
                 debug!(rule_id = %rule.id, dataset = ?rule.dataset,
-                    "NAN-2024: risk grain cannot resolve origin; failing closed (companion skipped)");
+                    "NAN-2024: dataset cannot resolve origin; failing closed (companion skipped)");
                 apply(results, &restricted_stamp());
+                return;
+            }
+            DatasetProvenance::RiskFindings => {
+                // NAN-5697: a risk row is attributed to its contributing
+                // findings' persisted origins. Before this, every risk notable
+                // carried the fail-closed stamp, which hid it from every
+                // non-admin analyst on every deployment.
+                if provenance.has_subsearch {
+                    // A subsearch can pull rows that are not findings at all.
+                    debug!(rule_id = %rule.id,
+                        "NAN-5697: risk rule has a subsearch; failing closed with the full restricted set");
+                    apply(results, &restricted_stamp());
+                    return;
+                }
+                let entities = risk_row_entities(results, provenance.risk_rows_entity_local);
+                let horizon_start_us = (Utc::now() - RISK_ORIGIN_HORIZON).timestamp_micros();
+                match self
+                    .search_service
+                    .risk_finding_origins(horizon_start_us, entities.as_deref())
+                    .await
+                {
+                    Ok(manifest) => {
+                        for event in results.iter_mut().filter(|e| lacks_source_type(e)) {
+                            let entity = entities.as_ref().and_then(|_| {
+                                event
+                                    .get(super::provenance::RISK_ENTITY_FIELD)
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                            });
+                            let stamp = risk_origin_stamp(&manifest, entity.as_deref())
+                                .unwrap_or_else(|| {
+                                    warn!(rule_id = %rule.id, entity = ?entity,
+                                        "NAN-5697: no finding origins for risk row; failing closed with the full restricted set");
+                                    restricted_stamp()
+                                });
+                            if let Some(obj) = event.as_object_mut() {
+                                obj.insert("_nano_source_types".to_string(), stamp);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(rule_id = %rule.id, error = %e,
+                            "NAN-5697: risk finding-origin read failed; failing closed with the full restricted set");
+                        apply(results, &restricted_stamp());
+                    }
+                }
                 return;
             }
             DatasetProvenance::SourceDerived => {}
@@ -699,15 +834,11 @@ impl DetectionService {
         // Run the rule's query against this window. Shared with the historical
         // tester so test ≡ prod by construction. (`time_range` is kept for the
         // NAN-1800 source_type companion in the alerting branch below.)
-        let mut results = self
-            .evaluate_window(
-                &rule.query,
-                time_range.clone(),
-                rule.dataset.clone(),
-                // Scheduled/real-time SYSTEM execution — unrestricted (NAN-2047).
-                &crate::auth::ScopeSet::unrestricted(),
-            )
-            .await?;
+        //
+        // NAN-5736: a raw-event rule's run is bounded without dropping any
+        // entity (see `run_bound`); everything else is the full window.
+        // Scheduled/real-time SYSTEM execution — unrestricted (NAN-2047).
+        let mut results = Box::pin(self.evaluate_rule_run(rule, &time_range)).await?;
 
         // NAN-5424: ClickHouse returns event values verbatim, U+0000 included,
         // and PostgreSQL rejects that code point in jsonb (22P05) and text
@@ -1068,8 +1199,12 @@ mod tests {
         );
         assert_eq!(
             dataset_provenance(Some("risk")),
-            DatasetProvenance::Unknowable,
-            "risk aggregates findings that can carry restricted origins — must fail closed"
+            DatasetProvenance::RiskFindings,
+            "risk aggregates findings: attributed from their persisted origins (NAN-5697)"
+        );
+        assert_eq!(
+            dataset_provenance(Some("signals")),
+            DatasetProvenance::Unknowable
         );
     }
 }

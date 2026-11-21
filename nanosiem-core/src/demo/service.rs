@@ -529,6 +529,58 @@ impl DemoService {
         Ok(cleaned)
     }
 
+    /// Enterprise half of [`Self::delete_untracked_demo_writes`]: cases the
+    /// demo user created, their standalone notebooks, and their notes and
+    /// handoffs on cases and notebooks that belong to someone else.
+    #[cfg(feature = "enterprise")]
+    async fn delete_untracked_demo_case_writes(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        demo_user_id: Uuid,
+    ) -> Result<(), DemoError> {
+        for (table, sql) in [
+            ("cases", "DELETE FROM cases WHERE created_by = $1"),
+            (
+                "notebooks",
+                "DELETE FROM notebooks WHERE owner_id = $1 AND case_id IS NULL",
+            ),
+            ("notebook_entries", "DELETE FROM notebook_entries WHERE created_by = $1"),
+            ("case_handoffs", "DELETE FROM case_handoffs WHERE source_user_id = $1"),
+        ] {
+            let exists: bool =
+                sqlx::query_scalar("SELECT to_regclass('public.' || $1) IS NOT NULL")
+                    .bind(table)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            if exists {
+                sqlx::query(sql).bind(demo_user_id).execute(&mut **tx).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete everything an ephemeral demo user wrote that the tracked
+    /// resources do not cover.
+    async fn delete_untracked_demo_writes(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        demo_user_id: Uuid,
+    ) -> Result<(), DemoError> {
+        // Order matters: cases first (their notebooks, handoffs and entries go
+        // with them), then the demo user's standalone notebooks, then whatever
+        // they wrote on cases and notebooks that belong to someone else. A
+        // demo-owned notebook of a PRE-SEEDED case is left to the trigger,
+        // which hands it to the case assignee or the system AI user, so seeded
+        // demo content survives.
+        // Case and notebook tables exist only on the enterprise edition; the
+        // open build compiles no statement naming them.
+        #[cfg(feature = "enterprise")]
+        Self::delete_untracked_demo_case_writes(tx, demo_user_id).await?;
+        sqlx::query("DELETE FROM feedback WHERE user_id = $1")
+            .bind(demo_user_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Clean up a single demo session within an existing transaction.
     async fn cleanup_session_in_tx(
         &self,
@@ -568,6 +620,15 @@ impl DemoService {
                 .execute(&mut **tx)
                 .await?;
         }
+
+        // NAN-5721: author references now SET NULL and a trigger hands shared
+        // notebooks to a new owner, so deleting the user no longer sweeps up
+        // what a demo visitor wrote outside the tracked resources (notes on
+        // pre-seeded cases, handoffs, feedback, untracked notebooks and
+        // cases). Remove it explicitly. Scoped to this session's ephemeral
+        // demo user (`session.user_id` comes from demo.sessions), never a
+        // real account.
+        Self::delete_untracked_demo_writes(tx, session.user_id).await?;
 
         // Delete the user (cascades sessions, user_groups, etc.)
         sqlx::query("DELETE FROM users WHERE id = $1")

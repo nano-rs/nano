@@ -108,6 +108,11 @@ export class CoreApi {
     return this.request('/api/system/config');
   }
 
+  /** Any signed-in user; `/api/system/config` needs settings:view (NAN-5724). */
+  async getDeploymentFlags(): Promise<import('./types').DeploymentFlags> {
+    return this.request('/api/system/deployment');
+  }
+
   // Developer Settings (Scheduler Control)
   async getDeveloperSettings(): Promise<DeveloperSettings> {
     return this.request('/api/settings/developer');

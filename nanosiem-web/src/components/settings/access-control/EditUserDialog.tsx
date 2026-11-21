@@ -36,6 +36,11 @@ interface EditUserDialogProps {
   onUpdated: () => void | Promise<void>;
 }
 
+/** A group bound to the built-in (system) Admin role. */
+function grantsAdmin(group: GroupDetail): boolean {
+  return group.roles.some(r => r.is_system && r.name === 'Admin');
+}
+
 export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditUserDialogProps) {
   const { toast } = useToast();
   const [name, setName] = useState('');
@@ -67,7 +72,16 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
     return [...groups].sort((a, b) => a.name.localeCompare(b.name));
   }, [groups]);
 
+  // NAN-5707: on your own account, groups that grant the built-in Admin role
+  // stay checked (the API refuses removing your own administrator access).
+  const lockedGroupIds = useMemo(() => {
+    if (!isSelf || !user) return new Set<string>();
+    const mine = new Set(user.groups.map(g => g.id));
+    return new Set(groups.filter(g => mine.has(g.id) && grantsAdmin(g)).map(g => g.id));
+  }, [isSelf, user, groups]);
+
   const toggleGroup = (id: string) => {
+    if (lockedGroupIds.has(id)) return;
     setGroupIds(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -263,6 +277,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
                 ) : (
                   sortedGroups.map(g => {
                     const on = groupIds.has(g.id);
+                    const locked = lockedGroupIds.has(g.id);
                     return (
                       <button
                         key={g.id}
@@ -270,6 +285,8 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
                         role="checkbox"
                         aria-checked={on}
                         aria-label={g.name}
+                        disabled={locked}
+                        title={locked ? 'You cannot remove your own administrator access' : undefined}
                         onClick={() => toggleGroup(g.id)}
                         className={cn(
                           'w-full flex items-center gap-2 px-2.5 h-8 border-b border-border/50 last:border-b-0 transition-colors text-left',

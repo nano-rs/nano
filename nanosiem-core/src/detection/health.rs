@@ -5,7 +5,8 @@
 //! a rule that cannot persist its matches is never reported healthy.
 //!
 //! A rule is failing when its executions are failing now
-//! (`consecutive_failures > 0`, or a pending size-class catch-up retry), or
+//! (`consecutive_failures > 0`, a pending size-class catch-up retry, or a
+//! crash attributed to it — NAN-5736, kept across a coverage gap), or
 //! when within the last 24 hours it recorded an execution / skipped-event
 //! error or a coverage gap.
 //!
@@ -26,7 +27,7 @@ use uuid::Uuid;
 const CURRENTLY_FAILING_PREDICATE: &str = r#"
     r.archived = false
     AND r.mode IN ('live', 'alerting')
-    AND (r.consecutive_failures > 0 OR r.catchup_size_failures > 0)
+    AND (r.consecutive_failures > 0 OR r.catchup_size_failures > 0 OR r.crash_streak > 0)
 "#;
 
 /// SQL predicate over `detection_rules r` (binds nothing): failing now, or
@@ -37,6 +38,7 @@ const FAILING_PREDICATE: &str = r#"
     AND (
         r.consecutive_failures > 0
         OR r.catchup_size_failures > 0
+        OR r.crash_streak > 0
         OR r.last_error_at >= NOW() - make_interval(hours => 24)
         OR EXISTS (
             SELECT 1 FROM detection_coverage_gaps g
@@ -137,7 +139,7 @@ pub async fn list_failing_rules(pool: &PgPool, limit: i64) -> Result<Vec<Failing
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             r#"
             SELECT r.id, r.name, r.consecutive_failures, r.failing_since, r.last_error, r.last_error_at,
-                   (r.consecutive_failures > 0 OR r.catchup_size_failures > 0) AS failing_now
+                   (r.consecutive_failures > 0 OR r.catchup_size_failures > 0 OR r.crash_streak > 0) AS failing_now
             FROM detection_rules r
             WHERE {FAILING_PREDICATE}
             ORDER BY failing_now DESC, r.last_error_at DESC NULLS LAST, r.name

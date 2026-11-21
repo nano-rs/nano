@@ -122,6 +122,7 @@ import { nplQuotedBody, nplRegexBody } from '@/lib/npl-quote';
 // previously carried a quote-only copy that split inside `field=/re|gex/`.
 import { getBaseSearch, buildGroupByQuery } from '@/lib/npl-pipeline';
 import { csvCell } from '@/lib/csv-safe';
+import { csvExportFilename, downloadCsv } from '@/lib/csv-download';
 import { grantSearchAutoRun } from '@/lib/search-auto-run';
 import { assetPivotField } from '@/lib/asset-pivot';
 
@@ -155,6 +156,8 @@ interface SearchResultsProps {
   currentPage?: number;
   pageSize?: number;
   onPageChange?: (page: number) => void;
+  /** NAN-5701: load `count` rows as one page (aggregate views that render every row). */
+  onLoadAllRows?: (count: number) => void;
   onPageSizeChange?: (size: number) => void;
   // Notebook integration
   notebookActive?: boolean;
@@ -261,16 +264,7 @@ function exportToCSV(results: SearchResult[], isAggregate: boolean) {
   );
   const csv = [header, ...rows].join('\n');
 
-  // Trigger download
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `nano-export-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.csv`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
+  downloadCsv(csv, csvExportFilename());
 }
 
 // Field to entity type mapping for notebook. Schema-aware resolution (OCSF
@@ -706,6 +700,8 @@ export function FieldValueMenu({
       <span
         ref={valueRef}
         role="button"
+        data-testid="field-value"
+        data-field={fieldName}
         tabIndex={0}
         aria-haspopup="menu"
         aria-expanded={menuOpen}
@@ -904,6 +900,7 @@ export function SearchResults({
   currentPage,
   pageSize,
   onPageChange,
+  onLoadAllRows,
   onPageSizeChange,
   notebookActive,
   onAddToNotebook,
@@ -1279,7 +1276,7 @@ export function SearchResults({
                 Temporal Analysis
               </span>
             ) : (
-              <span className="text-foreground/70 text-[11px] font-medium tracking-wide">
+              <span data-testid="results-count" data-shown={results.length} data-total={totalCount ?? results.length} data-display-type={effectiveDisplayType} className="text-foreground/70 text-[11px] font-medium tracking-wide">
                 {results.length}{totalCount > results.length ? ` of ${totalCount}` : ''} {effectiveDisplayType !== 'events' ? 'rows' : 'events'}
               </span>
             )}
@@ -1289,6 +1286,8 @@ export function SearchResults({
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
+                        data-testid="export-csv"
+                        aria-label="Export to CSV"
                         variant="ghost"
                         size="sm"
                         onClick={() => exportToCSV(results, isAggregateQuery)}
@@ -1624,6 +1623,8 @@ export function SearchResults({
               results={results}
               query={executedQuery ?? query}
               columnOrder={columnOrder}
+              totalCount={totalCount}
+              onLoadAll={onLoadAllRows}
               fieldsCollapsed={fieldsCollapsed}
               fieldsCount={fieldsCount}
               onExpandFields={onExpandFields}
@@ -2064,6 +2065,7 @@ function RawView({
             }}
           >
             <div
+              data-testid="event-row"
               className={`border-b border-border cursor-pointer transition-colors ${
                 isRowOpen
                   ? 'border-l-2 border-l-primary'
@@ -2335,7 +2337,7 @@ function RawView({
         </div>
         {/* Infinite scroll loading indicator */}
         {hasMore && (
-          <div className="flex items-center justify-center py-4 text-sm text-muted-foreground">
+          <div data-testid="results-load-more" className="flex items-center justify-center py-4 text-sm text-muted-foreground">
             {isSearching ? (
               <>
                 <LoadingIcon className="w-4 h-4 mr-2" />
@@ -2347,7 +2349,7 @@ function RawView({
           </div>
         )}
         {!hasMore && results.length > 0 && totalCount !== undefined && (
-          <div className="flex items-center justify-center py-4 text-sm text-muted-foreground">
+          <div data-testid="results-all-loaded" className="flex items-center justify-center py-4 text-sm text-muted-foreground">
             All {totalCount} results loaded
           </div>
         )}

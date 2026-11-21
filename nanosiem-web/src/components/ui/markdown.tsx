@@ -55,14 +55,28 @@ export function Markdown({ children, className, onRunQuery, transformChildren }:
         p: ({ children }) => <p className="my-1 leading-relaxed">{wrap(children)}</p>,
         strong: ({ children }) => <strong className="font-semibold text-foreground">{wrap(children)}</strong>,
         a: ({ href, children }) => {
-          // Only allow relative URLs and https. Skip entity tokenization
+          // Only allow same-origin paths and https. Skip entity tokenization
           // inside the anchor body — EntityChip renders its own <a>, and
           // nesting anchors is an HTML validity error (React warns in dev).
-          if (href && (href.startsWith('/') || href.startsWith('https://'))) {
+          const kind = linkKind(href);
+          if (kind === 'internal') {
             return <a href={href} className="text-primary hover:underline">{children}</a>;
+          }
+          if (kind === 'external') {
+            // NAN-5691: leave the SIEM tab where it is and send no Referer.
+            return (
+              <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                {children}
+              </a>
+            );
           }
           return <span>{wrap(children)}</span>;
         },
+        // NAN-5691: never render an image. Markdown here is written by
+        // analysts and agents; an <img> would make every viewer's browser
+        // fire a request (same-origin ones carry the session cookie) just by
+        // opening the page. The alt text stands in.
+        img: ({ alt }) => <span>{alt ?? ''}</span>,
         ul: ({ children }) => <ul className="my-1.5 space-y-0.5">{children}</ul>,
         ol: ({ children }) => <ol className="my-1.5 space-y-0.5">{children}</ol>,
         li: ({ children }) => (
@@ -88,6 +102,19 @@ export function Markdown({ children, className, onRunQuery, transformChildren }:
     </ReactMarkdown>
     </div>
   );
+}
+
+/**
+ * NAN-5691: which links render as links. `internal` = a same-origin path
+ * (`/x`, never the protocol-relative `//host`, nor `/\host` which browsers
+ * also treat as one); `external` = https only. Anything else (http:, mailto:,
+ * javascript:, data:, relative `x/y`) renders as plain text.
+ */
+function linkKind(href: string | undefined): 'internal' | 'external' | null {
+  if (!href) return null;
+  if (href.startsWith('/') && !href.startsWith('//') && !href.startsWith('/\\')) return 'internal';
+  if (/^https:\/\/[^/\\]/i.test(href)) return 'external';
+  return null;
 }
 
 /** Code block / inline code component */

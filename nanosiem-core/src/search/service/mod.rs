@@ -100,9 +100,11 @@ mod oom_admission;
 mod lateral_graph;
 mod otel;
 mod prevalence_join;
+mod prevalence_page_rescue;
 mod prevalence_processing;
 mod prevalence_scan;
 mod retro;
+mod risk_origins;
 mod sql_execution;
 pub use sql_execution::RawSqlAuditAccess;
 #[doc(hidden)]
@@ -168,37 +170,9 @@ fn determine_display_type(query: &Query) -> DisplayType {
     }
 }
 
-/// Derived ClickHouse query_ids for the companion queries fanned out by one
-/// search request (NAN-1428): count, histogram, field-stats, and the
-/// aggregation fallback count (NAN-4915 — `paginated.rs` issues
-/// `-aggregate-count` when an aggregation returns no groups, a second full
-/// scan that cancel previously left running).
-///
-/// Cancellation must kill the data query plus exactly these ids. They are
-/// always matched EXACTLY (never via `LIKE '{id}%'`) because client-provided
-/// request ids can legitimately contain `%`/`_` LIKE metacharacters.
-pub(crate) fn companion_query_ids(query_id: &str) -> [String; 7] {
-    [
-        format!("{query_id}-count"),
-        format!("{query_id}-hist"),
-        format!("{query_id}-fstats"),
-        format!("{query_id}-aggregate-count"),
-        // NAN-5485: the sidebar's field inventories.
-        field_queries::inventory_query_id(query_id, DynamicFieldBucket::Spill),
-        field_queries::inventory_query_id(query_id, DynamicFieldBucket::Extended),
-        // NAN-5635: the cost guard's row estimate.
-        format!("{query_id}-guard"),
-    ]
-}
-
-/// The data query id plus all derived companion ids — the full kill set for
-/// one search request (NAN-1428).
-pub(crate) fn all_query_ids(query_id: &str) -> Vec<String> {
-    let mut ids = Vec::with_capacity(8);
-    ids.push(query_id.to_string());
-    ids.extend(companion_query_ids(query_id));
-    ids
-}
+/// The search kill set (NAN-1428). Every derived companion id is built from
+/// `CompanionQuery` in `search::companion_query_id` (NAN-5723).
+pub(crate) use crate::search::companion_query_id::all_query_ids;
 
 /// Whether the UI renders the histogram timeline for this display type
 /// (NAN-1429).
@@ -1547,6 +1521,9 @@ mod prevalence_rescue_query_size_tests;
 #[path = "prevalence_decorated_field_tests.rs"]
 mod prevalence_decorated_field_tests;
 #[cfg(test)]
+#[path = "prevalence_enrich_rescue_tests.rs"]
+mod prevalence_enrich_rescue_tests;
+#[cfg(test)]
 #[path = "prevalence_stage_alias_tests.rs"]
 mod prevalence_stage_alias_tests;
 #[cfg(test)]
@@ -1590,52 +1567,6 @@ mod tests {
             let parsed = parse_query(q).unwrap_or_else(|e| panic!("{q} should parse: {e:?}"));
             assert!(validate_time_spans(&parsed).is_ok(), "{q} must be allowed");
         }
-    }
-
-    /// NAN-1428: the companion id scheme is fixed — cancel derives these
-    /// exact ids; changing the suffixes breaks kill coverage for in-flight
-    /// searches during a rolling deploy.
-    #[test]
-    fn companion_ids_are_exact_derived_suffixes() {
-        assert_eq!(
-            companion_query_ids("req-1"),
-            [
-                "req-1-count".to_string(),
-                "req-1-hist".to_string(),
-                "req-1-fstats".to_string(),
-                "req-1-aggregate-count".to_string(),
-                "req-1-inv-spill".to_string(),
-                "req-1-inv-extended".to_string(),
-                "req-1-guard".to_string()
-            ]
-        );
-        assert_eq!(
-            all_query_ids("req-1"),
-            vec![
-                "req-1",
-                "req-1-count",
-                "req-1-hist",
-                "req-1-fstats",
-                "req-1-aggregate-count",
-                "req-1-inv-spill",
-                "req-1-inv-extended",
-                "req-1-guard"
-            ]
-        );
-        // Ids with LIKE metacharacters stay literal — derivation is plain
-        // concatenation, matching is exact (never LIKE).
-        assert_eq!(
-            all_query_ids("a%b_c")[1..],
-            [
-                "a%b_c-count",
-                "a%b_c-hist",
-                "a%b_c-fstats",
-                "a%b_c-aggregate-count",
-                "a%b_c-inv-spill",
-                "a%b_c-inv-extended",
-                "a%b_c-guard"
-            ]
-        );
     }
 
     /// NAN-1429: histogram companion is skipped server-side exactly for the

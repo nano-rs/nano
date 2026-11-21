@@ -9,12 +9,12 @@ import { sessionCredentials, SessionExpiredError } from './session-credentials.t
 const url = 'https://example.test/api/search';
 
 test('JSON and SSE requests wait for refresh, then fetch exactly once each', async t => {
-  setAccessToken('old', 900);
+  setAccessToken('old', 900, 'u_test');
   let release!: () => void;
   const blocked = new Promise<void>(resolve => { release = resolve; });
   const refreshing = sessionCredentials.runRefresh(async () => {
     await blocked;
-    setAccessToken('new', 900);
+    setAccessToken('new', 900, 'u_test');
     return true;
   });
   const sent: string[] = [];
@@ -32,11 +32,11 @@ test('JSON and SSE requests wait for refresh, then fetch exactly once each', asy
 });
 
 test('concurrent 401s rotate once and replay JSON and SSE once', async t => {
-  setAccessToken('rejected', 900);
+  setAccessToken('rejected', 900, 'u_test');
   let refreshes = 0;
   sessionCredentials.configure(() => sessionCredentials.runRefresh(async () => {
     refreshes++;
-    setAccessToken('replacement', 900);
+    setAccessToken('replacement', 900, 'u_test');
     return true;
   }), null);
   const sent: string[] = [];
@@ -66,17 +66,17 @@ test('refresh failure gives one prompt and zero unauthenticated fetches', async 
 });
 
 test('a second 401 expires once, while a non-auth retry error stays a normal response', async t => {
-  setAccessToken('login', 900);
+  setAccessToken('login', 900, 'u_test');
   let prompts = 0;
   sessionCredentials.configure(() => sessionCredentials.runRefresh(async () => {
-    setAccessToken('retry', 900);
+    setAccessToken('retry', 900, 'u_test');
     return true;
   }), () => { prompts++; });
   const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('{}', { status: 401 }));
   await assert.rejects(authenticatedFetch('/api/search', url), SessionExpiredError);
   assert.equal(prompts, 1);
   assert.equal(fetch.mock.callCount(), 2);
-  setAccessToken('another-login', 900);
+  setAccessToken('another-login', 900, 'u_test');
   fetch.mock.mockImplementationOnce(async () => new Response('{}', { status: 401 }));
   fetch.mock.mockImplementationOnce(async () => new Response('{}', { status: 503 }));
   assert.equal((await authenticatedFetch('/api/search', url)).status, 503);
@@ -96,7 +96,7 @@ test('a 401 from an anonymous auth route (wrong password) never refreshes or exp
 });
 
 test('cancelled requests do not send after waiting for refresh', async t => {
-  setAccessToken('cancel-login', 900);
+  setAccessToken('cancel-login', 900, 'u_test');
   const controller = new AbortController();
   controller.abort();
   const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('{}'));

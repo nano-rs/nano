@@ -13,6 +13,7 @@ pub mod generation_cleanup;
 pub mod postgres_repository;
 pub mod references;
 pub mod repository;
+pub mod row_id;
 pub mod sanitize;
 pub mod service;
 pub mod snowflake;

@@ -211,6 +211,10 @@ impl From<crate::db::repository::detection_rules::DetectionRuleRepositoryError> 
             crate::db::repository::detection_rules::DetectionRuleRepositoryError::InvalidMitreMapping(message) => {
                 DetectionError::InvalidMitreMapping(message)
             }
+            // A state conflict (409), not a server error.
+            crate::db::repository::detection_rules::DetectionRuleRepositoryError::NameConflict(message) => {
+                DetectionError::InvalidStateTransition(message)
+            }
         }
     }
 }

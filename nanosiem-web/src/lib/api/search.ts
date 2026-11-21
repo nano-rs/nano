@@ -77,10 +77,12 @@ export class SearchApi {
   ) {}
 
   // Core search endpoints
-  async search(request: SearchRequest): Promise<SearchResponse> {
+  async search(request: SearchRequest, opts?: { signal?: AbortSignal }): Promise<SearchResponse> {
     return this.request('/api/search', {
       method: 'POST',
       body: JSON.stringify(request),
+      // NAN-5703 review: a superseded page request is cancelled on the wire.
+      signal: opts?.signal,
     });
   }
 

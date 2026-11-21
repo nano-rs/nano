@@ -450,12 +450,39 @@ run_has_profile() {
 # run_has_runner: the run starts nano-connector-runner (lab or live).
 run_has_runner() { run_has_profile mock-vendor || run_has_profile connector-live; }
 
+# native_hunts_runner_cidr <ch-http-port>: the address ClickHouse sees for a
+# connection from this host (NAN-5732). The native jobs process reaches
+# ClickHouse on 127.0.0.1, so the server hunt runner derives 127.0.0.1 as its
+# own address, and Agent Lane refuses a loopback HOST IP: the runner stays
+# "unavailable" and every server sweep stays queued. ClickHouse, in Docker,
+# actually sees the bridge gateway (e.g. 172.22.0.1). That is the HOST IP the
+# hunts token needs, so ask ClickHouse rather than guess. Compose and Helm
+# installs are unaffected: there the runner derives its container / pod IP.
+# Prints nothing when the probe fails (the runner then reports why).
+native_hunts_runner_cidr() {
+    local addr
+    # The password goes in a curl config on stdin, never on argv (ps).
+    addr="$(printf 'header = "X-ClickHouse-User: nanosiem"\nheader = "X-ClickHouse-Key: %s"\n' \
+        "${CLICKHOUSE_PASSWORD}" | curl -fsS --max-time 10 -K - "http://127.0.0.1:$1/" \
+        --data-binary "SELECT toString(address) FROM system.processes WHERE query_id = queryID()" 2>/dev/null)" \
+        || return 0
+    addr="${addr//[[:space:]]/}"; addr="${addr#::ffff:}"
+    [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$addr" != 127.* ]] && printf '%s' "$addr"
+    return 0
+}
+
 write_app_env() {
     # Environment of the native api/search/jobs/migrator. Values are generated
     # hex/URLs only; written %q-quoted so the file is safe to source.
-    local f="$RUN_DIR/app.env" pg ch redis vhttp vmet
+    local f="$RUN_DIR/app.env" pg ch redis vhttp vmet hunts_cidr
     load_env_file "$RUN_DIR/compose.env"
     pg="$(env_get "$RUN_DIR/run.env" E2E_PG_PORT)"; ch="$(env_get "$RUN_DIR/run.env" E2E_CH_HTTP_PORT)"
+    hunts_cidr="${NANO_HUNTS_RUNNER_CIDR:-$(native_hunts_runner_cidr "$ch")}"
+    if [[ -n "$hunts_cidr" ]]; then
+        log "server hunt runner HOST IP: $hunts_cidr (NANO_HUNTS_RUNNER_CIDR)"
+    else
+        warn "could not read the address ClickHouse sees for this host; server hunt sweeps will stay queued"
+    fi
     redis="$(env_get "$RUN_DIR/run.env" E2E_REDIS_PORT)"
     vhttp="$(env_get "$RUN_DIR/run.env" E2E_VECTOR_HTTP_PORT)"; vmet="$(env_get "$RUN_DIR/run.env" E2E_VECTOR_METRICS_PORT)"
     (
@@ -502,6 +529,7 @@ write_app_env() {
                 CLOUDFLARE_AI_GATEWAY_URL= CF_AIG_AUTH_TOKEN= DOCS_SEARCH_TOKEN=; do
                 printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
             done
+            [[ -n "$hunts_cidr" ]] && printf 'export NANO_HUNTS_RUNNER_CIDR=%q\n' "$hunts_cidr"
             if [[ "$(env_get "$RUN_DIR/run.env" E2E_CONTENT_ACCEPTANCE)" == 1 ]]; then
                 local fixture proxy
                 fixture="http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_CONTENT_FIXTURE_PORT)"

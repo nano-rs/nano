@@ -77,7 +77,8 @@ interface EditorTopBarProps {
   viewMode: ViewMode;
   onViewMode: (v: ViewMode) => void;
   onBack: () => void;
-  onSave: () => void;
+  /** Omitted for a read-only (archived) rule: no Save button. */
+  onSave?: () => void;
   onDiscard?: () => void;
   onFormat?: () => void;
   onOpenTest?: () => void;
@@ -221,7 +222,7 @@ function FolderChip({
 
   if (!interactive) {
     return (
-      <span className="inline-flex items-center gap-1 h-6 px-1.5 rounded-[4px] text-muted-foreground whitespace-nowrap">
+      <span className="inline-flex items-center gap-1 h-6 px-1.5 rounded-[4px] text-muted-foreground whitespace-nowrap" data-testid="rule-folder-chip">
         <TriggerIcon className="w-3 h-3" strokeWidth={1.75} />
         <span className="text-[10px] font-mono uppercase tracking-[0.08em]">folder</span>
         <span className="text-[11px] font-mono text-foreground">{display}</span>
@@ -236,6 +237,7 @@ function FolderChip({
           type="button"
           className="inline-flex items-center gap-1 h-6 px-1.5 rounded-[4px] text-muted-foreground hover:text-foreground hover:bg-[color-mix(in_srgb,var(--foreground)_4%,transparent)] transition-colors whitespace-nowrap"
           title="Change folder"
+          data-testid="rule-folder-chip"
         >
           <TriggerIcon className="w-3 h-3" strokeWidth={1.75} />
           <span className="text-[10px] font-mono uppercase tracking-[0.08em]">folder</span>
@@ -486,7 +488,8 @@ export function EditorTopBar({
 
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <div className="text-[14px] font-mono font-semibold text-foreground truncate">{title}</div>
-          {!isNewMode && <ModePill mode={effectiveMode} />}
+          {/* NAN-5683: an archived rule has no running mode — the ARCHIVED chip is its state. */}
+          {!isNewMode && !archived && <ModePill mode={effectiveMode} />}
           {archived && (
             <span className="inline-flex items-center h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] uppercase bg-muted text-muted-foreground">
               ARCHIVED
@@ -639,15 +642,17 @@ export function EditorTopBar({
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <Button
-          onClick={onSave}
-          disabled={!dirty || !valid || saving}
-          className={cn('h-7 text-[11.5px] px-3 gap-1.5', !dirty && 'opacity-60')}
-        >
-          <Save className="w-3 h-3" strokeWidth={1.75} />
-          {/* NAN-5317: an unsaved new-rule draft is never "Saved". */}
-          {saving ? 'Saving…' : isNewMode ? 'Create rule' : dirty ? 'Save rule' : 'Saved'}
-        </Button>
+        {onSave && (
+          <Button
+            onClick={onSave}
+            disabled={!dirty || !valid || saving}
+            className={cn('h-7 text-[11.5px] px-3 gap-1.5', !dirty && 'opacity-60')}
+          >
+            <Save className="w-3 h-3" strokeWidth={1.75} />
+            {/* NAN-5317: an unsaved new-rule draft is never "Saved". */}
+            {saving ? 'Saving…' : isNewMode ? 'Create rule' : dirty ? 'Save rule' : 'Saved'}
+          </Button>
+        )}
       </div>
 
       <MetaChipStrip

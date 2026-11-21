@@ -21,7 +21,11 @@ mod scheduling;
 mod stats;
 mod types;
 
+#[cfg(test)]
+mod delete_archive_live_tests;
+
 pub use scheduling::{
-    rule_error_text, ClaimRelease, DetectionCoverageGap, RuleFailureCounters, MAX_RULE_ERROR_CHARS,
+    rule_error_text, ClaimRelease, CrashRelease, DetectionCoverageGap, RuleFailureCounters,
+    MAX_RULE_ERROR_CHARS,
 };
 pub use types::{DailyStat, DetectionRuleRepository, DetectionRuleRepositoryError};

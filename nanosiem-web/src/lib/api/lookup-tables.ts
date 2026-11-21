@@ -13,6 +13,7 @@ import type {
   BatchLookupResult,
   LookupRowsPage,
   AddRowsResponse,
+  LookupRowId,
   ScheduledJob,
   UpsertLookupIngestionRequest,
   ValidateCronResponse,
@@ -130,20 +131,20 @@ export class LookupTablesApi {
     });
   }
 
-  async updateRow(name: string, rowId: number, fields: Record<string, unknown>): Promise<{ success: boolean }> {
-    return this.request(`/api/lookup-tables/${encodeURIComponent(name)}/rows/${rowId}`, {
+  async updateRow(name: string, rowId: LookupRowId, fields: Record<string, unknown>): Promise<{ success: boolean }> {
+    return this.request(`/api/lookup-tables/${encodeURIComponent(name)}/rows/${encodeURIComponent(rowId)}`, {
       method: 'PUT',
       body: JSON.stringify({ fields }),
     });
   }
 
-  async deleteRow(name: string, rowId: number): Promise<{ success: boolean }> {
-    return this.request(`/api/lookup-tables/${encodeURIComponent(name)}/rows/${rowId}`, {
+  async deleteRow(name: string, rowId: LookupRowId): Promise<{ success: boolean }> {
+    return this.request(`/api/lookup-tables/${encodeURIComponent(name)}/rows/${encodeURIComponent(rowId)}`, {
       method: 'DELETE',
     });
   }
 
-  async deleteRows(name: string, rowIds: number[]): Promise<{ deleted: number }> {
+  async deleteRows(name: string, rowIds: LookupRowId[]): Promise<{ deleted: number }> {
     return this.request(`/api/lookup-tables/${encodeURIComponent(name)}/rows`, {
       method: 'DELETE',
       body: JSON.stringify({ row_ids: rowIds }),

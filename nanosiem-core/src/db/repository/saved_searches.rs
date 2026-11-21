@@ -18,6 +18,7 @@ struct SavedSearchWithOwner {
     pub id: Uuid,
     pub name: String,
     pub query: String,
+    pub description: Option<String>,
     pub time_range: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub user_id: Option<Uuid>,
@@ -58,6 +59,29 @@ pub fn validate_saved_search_visibility(visibility: &str) -> Result<(), SavedSea
     }
 }
 
+/// Longest description a saved search accepts (NAN-5696). A note for the
+/// team, not a document.
+pub const SAVED_SEARCH_DESCRIPTION_MAX_CHARS: usize = 2000;
+
+/// Trim a saved-search description; blank becomes `None` (stored as NULL) and
+/// an over-long one is rejected before it reaches the database (NAN-5696).
+pub fn normalize_saved_search_description(
+    description: Option<&str>,
+) -> Result<Option<String>, SavedSearchRepositoryError> {
+    let Some(trimmed) = description.map(str::trim) else {
+        return Ok(None);
+    };
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > SAVED_SEARCH_DESCRIPTION_MAX_CHARS {
+        return Err(SavedSearchRepositoryError::InvalidInput(format!(
+            "Description is too long: at most {SAVED_SEARCH_DESCRIPTION_MAX_CHARS} characters"
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// A group-id foreign-key violation raced past [`SavedSearchRepository::ensure_groups_exist`]
 /// (the group was deleted in between) maps to the same 400 as the up-front check.
 fn map_group_fk(e: sqlx::Error) -> SavedSearchRepositoryError {
@@ -90,6 +114,7 @@ impl SavedSearchRepository {
     ) -> Result<SavedSearch, SavedSearchRepositoryError> {
         let visibility = search.visibility.as_deref().unwrap_or("private");
         validate_saved_search_visibility(visibility)?;
+        let description = normalize_saved_search_description(search.description.as_deref())?;
         if visibility == "group" {
             if let Some(ref group_ids) = search.group_ids {
                 self.ensure_groups_exist(group_ids).await?;
@@ -98,8 +123,8 @@ impl SavedSearchRepository {
 
         let result = sqlx::query_as::<_, SavedSearch>(
             r#"
-            INSERT INTO saved_searches (name, query, time_range, user_id, visibility, updated_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
+            INSERT INTO saved_searches (name, query, time_range, user_id, visibility, description, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
             RETURNING *
             "#,
         )
@@ -108,6 +133,7 @@ impl SavedSearchRepository {
         .bind(&search.time_range)
         .bind(user_id)
         .bind(visibility)
+        .bind(&description)
         .fetch_one(&self.pool)
         .await?;
 
@@ -163,7 +189,7 @@ impl SavedSearchRepository {
         let row = sqlx::query_as::<_, SavedSearchWithOwner>(
             r#"
             SELECT
-                ss.id, ss.name, ss.query, ss.time_range, ss.created_at,
+                ss.id, ss.name, ss.query, ss.description, ss.time_range, ss.created_at,
                 ss.user_id, ss.visibility, ss.updated_at,
                 u.name as owner_name
             FROM saved_searches ss
@@ -181,6 +207,7 @@ impl SavedSearchRepository {
             id: row.id,
             name: row.name.clone(),
             query: row.query.clone(),
+            description: row.description.clone(),
             time_range: row.time_range.clone(),
             created_at: row.created_at,
             user_id: row.user_id,
@@ -201,6 +228,7 @@ impl SavedSearchRepository {
             id: row.id,
             name: row.name,
             query: row.query,
+            description: row.description,
             time_range: row.time_range,
             created_at: row.created_at,
             user_id: row.user_id,
@@ -221,7 +249,7 @@ impl SavedSearchRepository {
         let searches = sqlx::query_as::<_, SavedSearchWithOwner>(
             r#"
             SELECT DISTINCT
-                ss.id, ss.name, ss.query, ss.time_range, ss.created_at,
+                ss.id, ss.name, ss.query, ss.description, ss.time_range, ss.created_at,
                 ss.user_id, ss.visibility, ss.updated_at,
                 u.name as owner_name
             FROM saved_searches ss
@@ -246,6 +274,7 @@ impl SavedSearchRepository {
                 id: row.id,
                 name: row.name,
                 query: row.query,
+                description: row.description,
                 time_range: row.time_range,
                 created_at: row.created_at,
                 user_id: row.user_id,
@@ -268,7 +297,7 @@ impl SavedSearchRepository {
         let searches = sqlx::query_as::<_, SavedSearchWithOwner>(
             r#"
             SELECT DISTINCT
-                ss.id, ss.name, ss.query, ss.time_range, ss.created_at,
+                ss.id, ss.name, ss.query, ss.description, ss.time_range, ss.created_at,
                 ss.user_id, ss.visibility, ss.updated_at,
                 u.name as owner_name
             FROM saved_searches ss
@@ -295,6 +324,7 @@ impl SavedSearchRepository {
                 id: row.id,
                 name: row.name,
                 query: row.query,
+                description: row.description,
                 time_range: row.time_range,
                 created_at: row.created_at,
                 user_id: row.user_id,
@@ -317,7 +347,7 @@ impl SavedSearchRepository {
         let searches = sqlx::query_as::<_, SavedSearchWithOwner>(
             r#"
             SELECT
-                ss.id, ss.name, ss.query, ss.time_range, ss.created_at,
+                ss.id, ss.name, ss.query, ss.description, ss.time_range, ss.created_at,
                 ss.user_id, ss.visibility, ss.updated_at,
                 u.name as owner_name
             FROM saved_searches ss
@@ -337,6 +367,7 @@ impl SavedSearchRepository {
                 id: row.id,
                 name: row.name,
                 query: row.query,
+                description: row.description,
                 time_range: row.time_range,
                 created_at: row.created_at,
                 user_id: row.user_id,
@@ -389,6 +420,37 @@ impl SavedSearchRepository {
         Ok(results)
     }
 
+    /// Load a saved search the caller owns, for an owner-only mutation.
+    ///
+    /// A search the caller is not allowed to see is reported exactly like a
+    /// missing one, so update/delete/share never confirm that someone else's
+    /// private search exists (NAN-5711 semantics, applied here in NAN-5695):
+    /// - missing, or not visible to the caller → `NotFound` (404);
+    /// - visible (public / shared with the caller's group) but owned by
+    ///   someone else → `AccessDenied` (403).
+    async fn find_owned(&self, id: Uuid, user_id: Uuid) -> Result<SavedSearch, SavedSearchRepositoryError> {
+        let existing = self.find_by_id(id).await?;
+        if existing.user_id == Some(user_id) {
+            return Ok(existing);
+        }
+        let visible = self.check_user_access(&existing, user_id).await?;
+        Err(owned_mutation_denied_error(id, visible))
+    }
+
+    /// Why an owner-scoped write (`... WHERE id = $1 AND user_id = $2`) matched
+    /// no row: the search is gone, hidden from the caller, or someone else's.
+    /// Probed only after the write misses, so the owner's path stays one
+    /// statement and a concurrent delete reads as `NotFound`, not a 500.
+    async fn owned_write_miss(&self, id: Uuid, user_id: Uuid) -> SavedSearchRepositoryError {
+        match self.find_owned(id, user_id).await {
+            Err(e) => e,
+            // Owned now but the write missed: the row changed hands or
+            // vanished and came back between the two statements. Treat it
+            // like the delete that most likely raced us.
+            Ok(_) => SavedSearchRepositoryError::NotFound(id),
+        }
+    }
+
     /// Update a saved search (owner only)
     pub async fn update(
         &self,
@@ -396,20 +458,21 @@ impl SavedSearchRepository {
         update: &UpdateSavedSearch,
         user_id: Uuid,
     ) -> Result<SavedSearch, SavedSearchRepositoryError> {
-        // Check ownership
-        let existing = self.find_by_id(id).await?;
-        if existing.user_id != Some(user_id) {
-            return Err(SavedSearchRepositoryError::AccessDenied);
-        }
+        // NAN-5695: `None` keeps the description; `Some("")` clears it.
+        // Validated first: a 400 for bad input says nothing about the row.
+        let description_supplied = update.description.is_some();
+        let description = normalize_saved_search_description(update.description.as_deref())?;
 
+        // Ownership is part of the write (atomic); a miss is explained after.
         let result = sqlx::query_as::<_, SavedSearch>(
             r#"
             UPDATE saved_searches SET
                 name = COALESCE($2, name),
                 query = COALESCE($3, query),
                 time_range = COALESCE($4, time_range),
+                description = CASE WHEN $5 THEN $6 ELSE description END,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND user_id = $7
             RETURNING *
             "#,
         )
@@ -417,27 +480,29 @@ impl SavedSearchRepository {
         .bind(&update.name)
         .bind(&update.query)
         .bind(&update.time_range)
-        .fetch_one(&self.pool)
+        .bind(description_supplied)
+        .bind(&description)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(result)
+        match result {
+            Some(updated) => Ok(updated),
+            None => Err(self.owned_write_miss(id, user_id).await),
+        }
     }
 
     /// Delete a saved search (owner only)
     pub async fn delete(&self, id: Uuid, user_id: Uuid) -> Result<(), SavedSearchRepositoryError> {
-        // Check ownership
-        let existing = self.find_by_id(id).await?;
-        if existing.user_id != Some(user_id) {
-            return Err(SavedSearchRepositoryError::AccessDenied);
-        }
-
-        let result = sqlx::query(r#"DELETE FROM saved_searches WHERE id = $1"#)
+        // Ownership is part of the delete (atomic); a miss is explained after.
+        let result = sqlx::query(r#"DELETE FROM saved_searches WHERE id = $1 AND user_id = $2"#)
             .bind(id)
+            .bind(user_id)
             .execute(&self.pool)
             .await?;
 
         if result.rows_affected() == 0 {
-            return Err(SavedSearchRepositoryError::NotFound(id));
+            return Err(self.owned_write_miss(id, user_id).await);
         }
 
         Ok(())
@@ -451,11 +516,7 @@ impl SavedSearchRepository {
         request: &ShareSavedSearchRequest,
         user_id: Uuid,
     ) -> Result<ShareResult, SavedSearchRepositoryError> {
-        // Check ownership
-        let existing = self.find_by_id(id).await?;
-        if existing.user_id != Some(user_id) {
-            return Err(SavedSearchRepositoryError::AccessDenied);
-        }
+        self.find_owned(id, user_id).await?;
 
         // NAN-5162: validate before any write, so a bad request neither leaks
         // constraint text nor leaves the search half-updated.
@@ -635,3 +696,18 @@ impl SavedSearchRepository {
             .collect())
     }
 }
+
+/// Why a non-owner's mutation of an existing saved search is refused: 403
+/// only when the caller can already see it, otherwise 404 so existence does
+/// not leak (NAN-5695).
+fn owned_mutation_denied_error(id: Uuid, visible_to_caller: bool) -> SavedSearchRepositoryError {
+    if visible_to_caller {
+        SavedSearchRepositoryError::AccessDenied
+    } else {
+        SavedSearchRepositoryError::NotFound(id)
+    }
+}
+
+#[cfg(test)]
+#[path = "saved_searches_tests.rs"]
+mod tests;

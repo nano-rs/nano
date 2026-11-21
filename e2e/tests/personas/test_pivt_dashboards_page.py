@@ -8,7 +8,9 @@ On /dashboards/:id:
   Apply; Apply saves it through the REST API as the analyst (owner), and the
   audit event records the analyst with `request_origin: pivt`;
 - an analyst with `dashboards:edit` who does not own the dashboard is offered
-  no card, and the REST save pivt would make is refused.
+  no card (the page lists no add/edit-panel action, so the concierge keeps its
+  dashboard-builder redirect, NAN-5597), and the REST save pivt would make is
+  refused.
 OCSF only.
 """
 
@@ -20,7 +22,7 @@ import pytest
 
 from nano_e2e import ui as uilib
 from nano_e2e.client import Nano, expect
-from nano_e2e.personas import login_persona
+from nano_e2e.personas import login_persona, persona_ai_mode
 from nano_e2e.stack import Stack
 from nano_e2e.waits import eventually
 
@@ -89,7 +91,8 @@ def test_pivt_grounds_on_a_dashboard_and_adds_a_panel_as_the_analyst(
         eventually(lambda: page.count(CARD), timeout=120, interval=0.5, desc="add-panel card", ok=bool)
         assert page.attr(CARD, "data-action") == "dashboards.add_panel"
         assert page.attr(CARD, "data-mutates") == "true"
-        page.wait_text("rows in the current time range", exact=False, timeout_ms=30_000)  # the read-only preview ran
+        # "1 row" or "N rows" (pluralized; a filtered run may see one source IP).
+        page.wait_text(" in the current time range", exact=False, timeout_ms=30_000)  # the read-only preview ran
         assert expect(nano.api.get(f"/api/dashboards/{dashboard['id']}"), 200)["panels"] == [], "nothing changes before Apply"
         page.screenshot("pivt-dashboard-add-card.png")
 
@@ -118,6 +121,10 @@ def test_pivt_offers_no_panel_edit_on_a_dashboard_the_analyst_cannot_save(
 ) -> None:
     if persona_ai is None:
         pytest.skip("pivt is enterprise-only")
+    if persona_ai_mode() == "real":
+        # A real model may classify the ask as chat (prose) or dashboard (the
+        # redirect); the permission boundary is covered by the stub run.
+        pytest.skip("asserts the stub's classification")
     name = f"pivt_dash_ro_{mark[-10:].replace('-', '_')}"
     persona_cleanup.dashboard(name)
     dashboard = _create(nano, name)  # the admin's
@@ -129,7 +136,10 @@ def test_pivt_offers_no_panel_edit_on_a_dashboard_the_analyst_cannot_save(
         page = persona.page
         _open(page, dashboard)
         _ask(page, "add a table panel named Nope for class_name=\"Authentication\" | stats count")
-        page.wait_text("isn't available to you on this page", exact=False, timeout_ms=120_000)
+        # NAN-5597: the non-owner's page offers no dashboards.add_panel, so the
+        # concierge keeps its dashboard-builder redirect (the stub classifies
+        # this as `dashboard`, like real models): no card, a link only.
+        page.wait_text("take you to the dashboard builder", exact=False, timeout_ms=120_000)
         assert page.count(CARD) == 0
         page.screenshot("pivt-dashboard-not-owner-no-action.png")
         refused = persona.client.api.put(

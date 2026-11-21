@@ -909,7 +909,7 @@ export function DashboardView() {
           value={autoRefresh}
           onValueChange={v => setAutoRefresh(v as AutoRefreshInterval)}
         >
-          <SelectTrigger className="h-[28px] w-[124px] text-[12px] gap-1.5">
+          <SelectTrigger data-testid="dashboard-autorefresh" aria-label="Auto-refresh" className="h-[28px] w-[124px] text-[12px] gap-1.5">
             <Clock className="w-[12px] h-[12px] text-muted-foreground" />
             <SelectValue />
           </SelectTrigger>
@@ -926,6 +926,7 @@ export function DashboardView() {
         {/* dashboards open empty until the user explicitly fires it. */}
         {/* After the first run, falls back to the standard Refresh affordance. */}
         <Button
+          data-testid="dashboard-run"
           variant={hasRunOnce ? 'outline' : 'default'}
           size="sm"
           className="h-[28px] gap-1.5"

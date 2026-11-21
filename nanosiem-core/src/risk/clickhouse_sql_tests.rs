@@ -40,7 +40,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use super::{
     decayed_overview_query, decayed_overview_windows_query, entity_scores_query, entity_set_scores_query, entity_types_query,
     lateral_scores_query, risk_dataset_base_query, risk_for_entities_query, risky_entities_query,
-    rule_contributions_query, ClearedBoundaries, EntityScoreSelection,
+    risk_origin_query, rule_contributions_query, ClearedBoundaries, EntityScoreSelection,
     RiskChQuery, RiskFindingsSource, RiskSqlBind,
 };
 use crate::auth::{ScopeSet, UNRESOLVED_SOURCE_SENTINEL};
@@ -1675,4 +1675,54 @@ fn every_entity_grain_reader_groups_on_the_value_alone() {
             assert_placeholder_bind_parity(&q);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// NAN-5697: finding-origin manifest for risk-dataset detection rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn risk_origin_query_keyed_form_groups_by_entity_and_binds_in_order() {
+    let entities = vec!["alice".to_string(), "o'brien".to_string()];
+    let q = risk_origin_query(&RiskFindingsSource::new(false, "logs"), 1_000, Some(&entities));
+    assert_eq!(q.sql.matches('?').count(), q.binds.len());
+    assert_eq!(q.binds, vec![RiskSqlBind::I64(1_000), RiskSqlBind::StrList(entities.clone())]);
+    assert!(q.sql.contains("FROM logs"), "{}", q.sql);
+    assert!(q.sql.contains("WHERE source_type = 'findings'"), "{}", q.sql);
+    assert!(q.sql.contains("AND risk_entity IN ?"), "{}", q.sql);
+    assert!(q.sql.contains("GROUP BY entity"), "{}", q.sql);
+    assert!(q.sql.contains("JSONExtract(metadata, 'origin_source_types', 'Array(String)')"), "{}", q.sql);
+    assert!(q.sql.contains("countIf(empty(origins))"), "{}", q.sql);
+    // Review P2: the raw partition-key column is compared, never a function of
+    // it (pinned so a later edit cannot regress partition pruning).
+    assert!(q.sql.contains("AND timestamp >= fromUnixTimestamp64Micro(toInt64(?), 'UTC')"), "{}", q.sql);
+    assert!(!q.sql.contains("toUnixTimestamp64Micro(timestamp)"), "{}", q.sql);
+    let inline = q.to_inline_sql();
+    assert!(inline.contains("['alice', 'o''brien']"), "{inline}");
+}
+
+#[test]
+fn risk_origin_query_whole_window_form_is_one_row() {
+    let q = risk_origin_query(&RiskFindingsSource::new(false, "logs"), 7, None);
+    assert_eq!(q.binds, vec![RiskSqlBind::I64(7)]);
+    assert!(!q.sql.contains("GROUP BY") && !q.sql.contains(" IN ?"), "{}", q.sql);
+    assert!(q.sql.contains("'' AS entity"), "{}", q.sql);
+}
+
+/// The engine attributes as the system: a scoped source never narrows the
+/// manifest (narrowing it would UNDER-stamp, the fail-open direction).
+#[test]
+fn risk_origin_query_ignores_viewer_scope_and_is_ocsf_aware() {
+    let denied = ["insider_threat".to_string()].into_iter().collect();
+    let scoped = RiskFindingsSource::new(true, "ocsf_logs_distributed").with_source_deny(&denied);
+    let q = risk_origin_query(&scoped, 1, Some(&["alice".to_string()]));
+    assert!(!q.sql.contains("hasAny") && !q.sql.contains("notEmpty"), "{}", q.sql);
+    assert_eq!(q.binds.len(), 2);
+    assert!(q.sql.contains("FROM ocsf_logs_distributed"), "{}", q.sql);
+    assert!(
+        q.sql.contains("JSONExtract(ifNull(toJSONString(unmapped.origin_source_types), 'null'), 'Array(String)')"),
+        "{}",
+        q.sql
+    );
+    assert!(q.sql.contains("JSONExtractString(ifNull(toJSONString(unmapped.risk_entity), 'null')) IN ?"), "{}", q.sql);
 }

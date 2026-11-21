@@ -26,15 +26,10 @@ fn pipe(source: Query, command: Command) -> Query {
     }
 }
 
-fn last_bucket_start(range: &TimeRange, seconds: i64) -> i64 {
-    let last = (range.end - chrono::Duration::milliseconds(1)).max(range.start);
-    last.timestamp().div_euclid(seconds) * seconds
-}
-
+/// Buckets ClickHouse emits for this span over `range` (week / month /
+/// multi-day alignment included, see `time_bins::bucket_count`).
 fn bucket_count(range: &TimeRange, seconds: i64) -> i64 {
-    let first = range.start.timestamp().div_euclid(seconds) * seconds;
-    let last = last_bucket_start(range, seconds).max(first);
-    (last - first) / seconds + 1
+    crate::query::timechart_bucket_count(range, seconds.max(1) as u64) as i64
 }
 
 fn widened_span(span: Duration, range: &TimeRange) -> Result<Duration, SearchError> {
@@ -331,9 +326,9 @@ fn pivot(
     }
 
     if cont {
-        let start = range.start.timestamp().div_euclid(seconds) * seconds;
-        let end = last_bucket_start(range, seconds).max(start);
-        for timestamp in (start..=end).step_by(seconds as usize) {
+        // Fill exactly the buckets ClickHouse would emit (calendar months,
+        // Sunday weeks, day starts), never epoch-stepped ones in between.
+        for timestamp in crate::query::timechart_bucket_starts(range, seconds.max(1) as u64) {
             buckets.entry(timestamp).or_default();
         }
     }
@@ -747,7 +742,12 @@ impl SearchService {
             });
         if widened != span {
             let seconds = widened.as_secs();
-            let label = if seconds % 86400 == 0 {
+            // `generate_time_bucket` makes 1w calendar weeks and >= 30d calendar months.
+            let label = if seconds >= 2_592_000 {
+                "1mon".to_string()
+            } else if seconds == 604_800 {
+                "1w".to_string()
+            } else if seconds % 86400 == 0 {
                 format!("{}d", seconds / 86400)
             } else if seconds % 3600 == 0 {
                 format!("{}h", seconds / 3600)

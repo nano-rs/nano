@@ -14,7 +14,10 @@
 //!
 //! * **Spillable** — ClickHouse bounds it on its own: GROUP BY and ORDER BY
 //!   spill to disk (`max_bytes_ratio_before_external_group_by/sort` = 0.3 in
-//!   every shipped profile), `values()`/`list()` are capped at
+//!   the Compose and Helm profiles; the legacy `deploy/k8s/aws-db`,
+//!   `deploy/k8s/rackspace-db` and `ludus` shapes set absolute thresholds at
+//!   half their per-query `max_memory_usage`, which also spill before the
+//!   ceiling), `values()`/`list()` are capped at
 //!   `max_group_array_size` per group, and `reverse` is a plain ORDER BY with
 //!   the executor's top-N LIMIT (the same shape as `| sort timestamp`, which
 //!   was never guarded). Admitted with no estimate.
@@ -61,7 +64,12 @@ pub enum AdmissionClass {
 /// columns), and the executor's `count(*) OVER ()` wrapper buffers all of
 /// them: 2.5–2.8 KiB per row measured. `transaction`, `anomaly` and `dedup`
 /// collapse their output; measured 30–180 B per row, budgeted at 1 KiB for
-/// partition skew and near-unique `dedup` keys.
+/// partition skew.
+///
+/// `dedup` is the exception when its output reaches the result as is: on a
+/// near-unique key it keeps almost every row, and the `count(*) OVER ()`
+/// wrapper then buffers them all, so it is budgeted as row-preserving unless
+/// a later aggregation or `head` / `tail` bounds what it feeds (NAN-5657).
 pub(crate) const ROW_PRESERVING_BYTES_PER_ROW: u64 = 4096;
 pub(crate) const COLLAPSING_BYTES_PER_ROW: u64 = 1024;
 
@@ -76,12 +84,30 @@ pub fn admission_class(site: &OomRiskSite<'_>) -> AdmissionClass {
         (OomRisk::UnboundedWindowFunction, _) | (OomRisk::UnboundedPrevalenceScan, _) => AdmissionClass::CostGated {
             bytes_per_row: ROW_PRESERVING_BYTES_PER_ROW,
         },
+        (OomRisk::UnboundedDedup, _) if !output_is_bounded_after(site) => AdmissionClass::CostGated {
+            bytes_per_row: ROW_PRESERVING_BYTES_PER_ROW,
+        },
         (OomRisk::UnboundedDedup, _)
         | (OomRisk::UnboundedTransaction, _)
         | (OomRisk::UnboundedAnomaly, _) => AdmissionClass::CostGated {
             bytes_per_row: COLLAPSING_BYTES_PER_ROW,
         },
     }
+}
+
+/// Whether a later stage of the site's pipeline bounds the rows the site
+/// feeds to the result (an aggregation, or `head` / `tail`), so the
+/// pagination wrapper never buffers the site's whole output.
+fn output_is_bounded_after(site: &OomRiskSite<'_>) -> bool {
+    let mut commands = Vec::new();
+    split_pipeline(site.scope, &mut commands);
+    commands
+        .get(site.command_index + 1..)
+        .is_some_and(|after| {
+            after
+                .iter()
+                .any(|cmd| is_aggregation(cmd) || matches!(cmd, Command::Head { .. } | Command::Tail { .. }))
+        })
 }
 
 /// Rows a cost-gated command may see under `budget_bytes` of query memory.

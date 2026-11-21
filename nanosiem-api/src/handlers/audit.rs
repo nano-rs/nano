@@ -117,6 +117,10 @@ pub struct AuditLogEntry {
 impl From<ClickHouseAuditEntry> for AuditLogEntry {
     fn from(e: ClickHouseAuditEntry) -> Self {
         let success = e.status.as_deref() == Some("success");
+        let resource_id = match resource_typeid_prefix(e.resource_type.as_deref()) {
+            Some(prefix) => as_typeid(prefix, e.resource_id),
+            None => e.resource_id,
+        };
         Self {
             id: e.event_id,
             timestamp: e.timestamp,
@@ -125,7 +129,7 @@ impl From<ClickHouseAuditEntry> for AuditLogEntry {
             action: e.action,
             source: e.source,
             resource_type: e.resource_type,
-            resource_id: e.resource_id,
+            resource_id,
             resource_name: e.resource_name,
             ip_address: e.src_ip,
             user_agent: e.user_agent,
@@ -148,6 +152,17 @@ pub(crate) fn as_typeid(prefix: &str, raw: Option<String>) -> Option<String> {
         Ok(id) => nanosiem_core::typeid::encode(prefix, &id),
         Err(_) => s,
     })
+}
+
+/// NAN-5683: the TypeID prefix the rest of the API uses for an audited
+/// resource, so `resource_id` joins to that resource's own endpoints (the
+/// audit store keeps the raw UUID, as for actors — see [`as_typeid`]).
+/// Resource types not listed here pass through unchanged.
+fn resource_typeid_prefix(resource_type: Option<&str>) -> Option<&'static str> {
+    match resource_type? {
+        "log_source" => Some(nanosiem_core::typeid::log_source::PREFIX),
+        _ => None,
+    }
 }
 
 /// Query audit logs with filtering
@@ -606,6 +621,31 @@ mod tests {
 
         assert_eq!(mapped.api_key_id.as_deref(), Some(key_id.as_str()));
         assert_eq!(mapped.api_key_name.as_deref(), Some("ci-bot"));
+    }
+
+    /// NAN-5683: a log source audit row carries the `lsrc_` TypeID the Log
+    /// Sources API shows, not the stored UUID; other resource types pass
+    /// through unchanged.
+    #[test]
+    fn from_ch_entry_renders_log_source_resource_id_as_typeid() {
+        let id = Uuid::now_v7();
+        let mut entry = ch_entry_with_metadata(json!({}));
+        entry.resource_type = Some("log_source".to_string());
+        entry.resource_id = Some(id.to_string());
+        entry.resource_name = Some("fw-edge".to_string());
+
+        let mapped = AuditLogEntry::from(entry);
+        assert_eq!(
+            mapped.resource_id.as_deref(),
+            Some(nanosiem_core::typeid::encode(nanosiem_core::typeid::log_source::PREFIX, &id).as_str())
+        );
+        assert!(mapped.resource_id.as_deref().unwrap().starts_with("lsrc_"));
+        assert_eq!(mapped.resource_name.as_deref(), Some("fw-edge"));
+
+        let mut other = ch_entry_with_metadata(json!({}));
+        other.resource_type = Some("settings".to_string());
+        other.resource_id = Some(id.to_string());
+        assert_eq!(AuditLogEntry::from(other).resource_id, Some(id.to_string()));
     }
 
     #[test]

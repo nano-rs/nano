@@ -38,6 +38,9 @@ mod npl_parser;
 mod repository;
 mod service;
 
+#[cfg(test)]
+mod import_drift_live_tests;
+
 pub use coverage::{
     CoverageAnalyzer, CoverageAnalyzerError, LiveInventoryAccess, COVERAGE_STATUS_UNKNOWN,
 };

@@ -228,12 +228,20 @@ async function settleAfterOption(page) {
 }
 
 async function click(page, f, opts) {
-  const el = await find(page, f, opts);
-  const isOption = await page.evaluate((e) => e.getAttribute('role') === 'option', el).catch(() => false);
-  try {
-    await clickElement(page, el, f);
-  } finally {
-    if (isOption) await settleAfterOption(page);
+  // A list that re-renders between find and click detaches the handle
+  // (dashboard panels, field rows): find it again and retry (NAN-5684).
+  for (let attempt = 0; ; attempt += 1) {
+    const el = await find(page, f, opts);
+    const isOption = await page.evaluate((e) => e.getAttribute('role') === 'option', el).catch(() => false);
+    try {
+      await clickElement(page, el, f);
+      return;
+    } catch (e) {
+      if (attempt >= 2 || !/detached/i.test(String(e))) throw e;
+      await sleep(250);
+    } finally {
+      if (isOption) await settleAfterOption(page);
+    }
   }
 }
 
@@ -544,7 +552,15 @@ const OPS = {
   async editor_fill({ sid, find: f, value }) {
     const { page } = sess(sid);
     const el = await find(page, f);
-    await el.click();
+    await page.evaluate((e) => e.scrollIntoView({ block: 'center' }), el);
+    try {
+      await el.click();
+    } catch (e) {
+      // An editor inside an animating sheet has no clickable box for a few
+      // frames: focus its contenteditable directly (NAN-5684).
+      if (!/not clickable|not an Element|no bounding box/i.test(String(e))) throw e;
+      await page.evaluate((x) => x.focus(), el);
+    }
     const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
     await page.keyboard.down(modifier);
     await page.keyboard.press('KeyA');
@@ -715,6 +731,13 @@ const OPS = {
       network: s.network.filter((n) => n.t >= since && (n.failed || (n.status || 0) >= 400))
         .map((n) => ({ t: n.t, method: n.method, url: scrub(n.url), status: n.status || 0, failed: n.failed || null })),
     };
+  },
+  // Every completed /api response since `since` (any status): what a page
+  // fetched, e.g. data loaded before a permission gate rendered (NAN-5686).
+  async api_responses_since({ sid, since = 0 }) {
+    const s = sess(sid);
+    return s.network.filter((n) => n.t >= since && !n.failed && /\/api\//.test(n.url))
+      .map((n) => ({ t: n.t, method: n.method, url: scrub(n.url), status: n.status || 0 }));
   },
   // Real keystrokes into an element (fill() uses the value setter instead).
   async type_text({ sid, find: f, text, clear = false }) {
@@ -945,6 +968,121 @@ const OPS = {
       }
       return null;
     }, { desc: `values under ${field}` });
+  },
+
+  // ---------------------------------------------------------------- deep workflows (NAN-5684)
+  // Real mouse drag across an element, from/to given as fractions of its box
+  // (a chart's drag-to-zoom, a grid panel's move, a resize handle).
+  async drag({ sid, find: f, from = [0.2, 0.5], to = [0.6, 0.5], steps = 12, hover = false }) {
+    const { page } = sess(sid);
+    const el = await find(page, f);
+    await page.evaluate((e) => e.scrollIntoView({ block: 'center' }), el);
+    await sleep(150);
+    const box = await el.boundingBox();
+    if (!box) throw new Error(`no box to drag on ${JSON.stringify(f)}`);
+    const at = ([fx, fy]) => [box.x + box.width * fx, box.y + box.height * fy];
+    const [x1, y1] = at(from);
+    const [x2, y2] = at(to);
+    if (hover) { await page.mouse.move(x1 - 5, y1 - 5); await sleep(150); }
+    await page.mouse.move(x1, y1);
+    await page.mouse.down();
+    for (let i = 1; i <= steps; i += 1) {
+      await page.mouse.move(x1 + ((x2 - x1) * i) / steps, y1 + ((y2 - y1) * i) / steps);
+      await sleep(16);
+    }
+    await page.mouse.up();
+    return { x1, y1, x2, y2 };
+  },
+  // Clear this context's localStorage + sessionStorage for the current origin
+  // (UI preferences a previous scenario left; auth is a cookie, NAN-5684).
+  async storage_clear({ sid }) {
+    const { page } = sess(sid);
+    await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch { /* opaque origin */ } });
+    return true;
+  },
+  // Write page.html and network.jsonl (scrubbed) under `name`, for a
+  // scenario failing on a page that stays open (a module-shared persona).
+  async dump({ sid, name }) {
+    const s = sess(sid);
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(String(name || ''))) throw new Error(`bad dump name ${name}`);
+    await settleBodies(s);
+    await inject(s.page);
+    if ((await maskSecrets(s.page)) > 0) throw new Error('a secret is still rendered; not dumping');
+    fs.mkdirSync(s.out, { recursive: true });
+    fs.writeFileSync(path.join(s.out, `${name}.html`), scrub(await s.page.content()));
+    fs.writeFileSync(path.join(s.out, `${name}.network.jsonl`), scrub(s.network.map((n) => JSON.stringify(n)).join('\n') + '\n'));
+    return true;
+  },
+  // A keyboard chord on the focused page, e.g. ['Meta', 'k'] (command palette).
+  async chord({ sid, keys }) {
+    const { page } = sess(sid);
+    const mods = keys.slice(0, -1);
+    for (const m of mods) await page.keyboard.down(m);
+    await page.keyboard.press(keys[keys.length - 1]);
+    for (const m of mods.reverse()) await page.keyboard.up(m);
+    return true;
+  },
+  // Move the pointer over an element (reveals hover-only controls).
+  async hover({ sid, find: f }) {
+    const { page } = sess(sid);
+    const el = await find(page, f);
+    await el.hover();
+    return true;
+  },
+  // Scroll the app's scrolling container (and the document) to the bottom,
+  // the way a person scrolls a long result list. Returns the scrollTop reached.
+  async scroll_bottom({ sid }) {
+    const { page } = sess(sid);
+    return page.evaluate(() => {
+      const els = [document.scrollingElement, ...document.querySelectorAll('div')]
+        .filter((el) => el && el.scrollHeight > el.clientHeight + 20 && /(auto|scroll)/.test(getComputedStyle(el).overflowY));
+      let top = 0;
+      for (const el of els) { el.scrollTop = el.scrollHeight; top = Math.max(top, el.scrollTop); el.dispatchEvent(new Event('scroll')); }
+      window.dispatchEvent(new Event('scroll'));
+      return top;
+    });
+  },
+  // Record window.open() calls instead of opening tabs ("Open in Search" from
+  // a dashboard panel opens a new tab); `opened` returns the recorded URLs.
+  async capture_window_open({ sid }) {
+    const { page } = sess(sid);
+    await page.evaluate(() => {
+      window.__e2eOpened = [];
+      window.open = (url) => { window.__e2eOpened.push(String(url)); return null; };
+    });
+    return true;
+  },
+  async opened({ sid }) {
+    const { page } = sess(sid);
+    return page.evaluate(() => window.__e2eOpened || []);
+  },
+  // The value of the attribute `name` on EVERY match (data-* hooks on lists).
+  async attrs({ sid, find: f, name }) {
+    const { page } = sess(sid);
+    await inject(page);
+    return page.evaluate((ff, n) => window.__e2e.all(ff).map((e) => e.getAttribute(n)), f, name);
+  },
+  // Bounding boxes of every match, with a chosen attribute (grid layout checks).
+  async boxes({ sid, find: f, name }) {
+    const { page } = sess(sid);
+    await inject(page);
+    return page.evaluate((ff, n) => window.__e2e.all(ff).map((e) => {
+      const r = e.getBoundingClientRect();
+      return { key: n ? e.getAttribute(n) : null, left: r.left, top: r.top, width: r.width, height: r.height };
+    }), f, name);
+  },
+  // Text of the CodeMirror document inside `find` (the editor's model, not the
+  // rendered lines, so long queries are not cut by virtualisation).
+  async editor_text({ sid, find: f }) {
+    const { page } = sess(sid);
+    const el = await find(page, f);
+    return page.evaluate((e) => {
+      const host = e.closest('.cm-editor') || e.querySelector('.cm-editor') || e;
+      const content = host.querySelector('.cm-content') || host;
+      const view = content.cmView?.view || host.cmView?.view;
+      if (view?.state) return view.state.doc.toString();
+      return [...content.querySelectorAll('.cm-line')].map((l) => l.textContent).join('\n');
+    }, el);
   },
 
   // ---------------------------------------------------------------- ingestion

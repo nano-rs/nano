@@ -212,14 +212,21 @@ export function MatchesHero({
     }
   };
 
+  // NAN-5683: an archived (deleted) rule doesn't run and the API refuses its
+  // lifecycle actions (404) — show the state, offer no Pause/Promote.
+  const archived = Boolean(rule.archived);
   const isPaused = rule.mode === 'paused';
   const isAlerting = rule.mode === 'alerting';
-  const modeLabel = {
-    staging: 'Staging',
-    live: 'Live',
-    alerting: 'Alerting',
-    paused: 'Paused',
-  }[rule.mode];
+  const idle = isPaused || archived;
+  const lifecycle = canManageLifecycle && !archived;
+  const modeLabel = archived
+    ? 'Archived'
+    : {
+        staging: 'Staging',
+        live: 'Live',
+        alerting: 'Alerting',
+        paused: 'Paused',
+      }[rule.mode];
   const alertingAction = rule.mode === 'staging'
     ? 'Promote to live'
     : rule.mode === 'live'
@@ -244,8 +251,8 @@ export function MatchesHero({
               <span
                 className={cn(
                   'w-[6px] h-[6px] rounded-full',
-                  !isPaused && 'bg-success animate-pulse',
-                  isPaused && 'bg-muted-foreground',
+                  !idle && 'bg-success animate-pulse',
+                  idle && 'bg-muted-foreground',
                 )}
               />
               <span className="text-[11px] text-foreground">{modeLabel}</span>
@@ -304,7 +311,7 @@ export function MatchesHero({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          {canEdit && (
+          {canEdit && !archived && (
             <Link
               to={`/rules/editor/${rule.id}`}
               className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5"
@@ -313,7 +320,7 @@ export function MatchesHero({
               Edit
             </Link>
           )}
-          {canManageLifecycle && rule.mode !== 'staging' && (
+          {lifecycle && rule.mode !== 'staging' && (
             <button
               type="button"
               onClick={onTogglePause}
@@ -332,7 +339,7 @@ export function MatchesHero({
           >
             <Copy className="w-3.5 h-3.5" strokeWidth={2} />
           </button>
-          {canManageLifecycle && !isPaused && (
+          {lifecycle && !isPaused && (
             <button
               type="button"
               onClick={onToggleAlerting}
@@ -361,7 +368,7 @@ export function MatchesHero({
               Detection volume
             </div>
             <div className="mt-1.5 flex items-baseline gap-1.5">
-              <span className="text-[26px] font-semibold text-foreground tabular-nums leading-none">
+              <span className="text-[26px] font-semibold text-foreground tabular-nums leading-none" data-testid="matches-total">
                 {totalMatches.toLocaleString()}
               </span>
               <span className="text-[11px] text-muted-foreground">matches</span>
@@ -459,7 +466,7 @@ export function MatchesHero({
             <div className="mt-2 flex flex-col gap-1.5 text-[10.5px] font-mono">
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Alerts generated</span>
-                <span className="text-foreground tabular-nums">{alertsGenerated}</span>
+                <span className="text-foreground tabular-nums" data-testid="matches-alerts-generated">{alertsGenerated}</span>
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Disposition FP</span>

@@ -308,7 +308,8 @@ pub struct ColumnTypeOverride {
 /// Paginated rows result
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LookupRowsPage {
-    /// Row data (includes hidden _row_id for targeting)
+    /// Row data (includes hidden _row_id for targeting, as a decimal string:
+    /// NAN-5715, 64-bit ids lose precision as JSON numbers)
     pub rows: Vec<HashMap<String, serde_json::Value>>,
     /// Total number of rows in the table
     pub total: i64,

@@ -427,6 +427,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                 <Label className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
                   Query
                 </Label>
+                <div data-testid="panel-editor-query">
                 <QueryEditor
                   value={query}
                   onChange={setQuery}
@@ -438,6 +439,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                   maxHeight={300}
                   onSubmit={() => query.trim() && setShowTestModal(true)}
                 />
+                </div>
                 {queryMode === 'sql' && (
                   <p className="text-[10.5px] leading-relaxed text-muted-foreground">
                     Raw SQL isn't bound to the dashboard time range unless you say
@@ -497,6 +499,8 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                       <button
                         key={type.value}
                         type="button"
+                        data-testid={`viz-type-${type.value}`}
+                        aria-pressed={selected}
                         onClick={() => setVisualizationType(type.value)}
                         className={`px-2 py-2 rounded-md border transition-colors text-left ${
                           selected

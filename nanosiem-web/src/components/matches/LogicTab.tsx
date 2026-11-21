@@ -151,28 +151,31 @@ export function LogicTab({ rule, match }: LogicTabProps) {
             </ul>
           )}
         </div>
-        <div className="rounded-lg border border-border p-3 bg-card">
-          <div className="flex items-center gap-2 mb-2">
-            <span className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
-              Test against historical data
-            </span>
+        {/* NAN-5683: an archived (deleted) rule has no test (the API answers 404). */}
+        {!rule.archived && (
+          <div className="rounded-lg border border-border p-3 bg-card">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
+                Test against historical data
+              </span>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-[1.55]">
+              Run this rule's query over a historical window to estimate fire rate before changing
+              thresholds. Opens the editor's test drawer where you can pick the window, see matches,
+              and tweak the query without saving.
+            </p>
+            <div className="mt-2.5">
+              <button
+                type="button"
+                onClick={() => navigate(`/rules/editor/${rule.id}?test=1`)}
+                className="h-7 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5"
+              >
+                <FlaskConical className="w-3.5 h-3.5" strokeWidth={2} />
+                Open test drawer
+              </button>
+            </div>
           </div>
-          <p className="text-[11px] text-muted-foreground leading-[1.55]">
-            Run this rule's query over a historical window to estimate fire rate before changing
-            thresholds. Opens the editor's test drawer where you can pick the window, see matches,
-            and tweak the query without saving.
-          </p>
-          <div className="mt-2.5">
-            <button
-              type="button"
-              onClick={() => navigate(`/rules/editor/${rule.id}?test=1`)}
-              className="h-7 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5"
-            >
-              <FlaskConical className="w-3.5 h-3.5" strokeWidth={2} />
-              Open test drawer
-            </button>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

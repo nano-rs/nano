@@ -21,6 +21,9 @@ fn counters_from(d: &ReleaseDecision) -> RuleFailureCounters {
         failing_since: d.failing_since,
         failure_class: d.failure_class.map(str::to_string),
         crashed_attempts: 0,
+        crash_streak: 0,
+        crash_suspect: false,
+        isolated_claim: false,
     }
 }
 

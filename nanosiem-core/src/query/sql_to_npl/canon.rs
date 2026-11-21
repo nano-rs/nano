@@ -366,7 +366,7 @@ impl Reader<'_> {
             return true;
         }
         const NUMERIC_CALLS: &[&str] =
-            &["count", "countIf", "dc", "dc_nonempty", "sum", "sumIf", "avg", "length", "lengthutf8"];
+            &["count", "countIf", "dc", "dc_nonempty", "estdc", "estdc_nonempty", "sum", "sumIf", "avg", "length", "lengthutf8"];
         if NUMERIC_CALLS.iter().any(|n| is_single_call(canon, n)) {
             return true;
         }
@@ -647,21 +647,26 @@ impl Reader<'_> {
             ("count", []) | ("count", [Arg::Star]) => Some("count()".to_string()),
             ("count", [a]) if is_distinct_call(f) => col(a).map(|c| format!("dc({c})")),
             ("count", [a]) => col(a).map(|c| format!("count({c})")),
-            ("uniq" | "uniqexact" | "uniqcombined" | "uniqcombined64" | "uniqhll12", [a]) => {
-                col(a).map(|c| format!("dc({c})"))
-            }
-            ("uniqexactif" | "uniqif", [a, Arg::Expr(cond)]) => {
+            ("uniqexact", [a]) => col(a).map(|c| format!("dc({c})")),
+            // NAN-5657: the approximate distinct counts are nPL's estdc, not
+            // its exact dc, so an approximate count is never called exact.
+            ("uniq" | "uniqcombined" | "uniqcombined64" | "uniqhll12", [a]) => col(a).map(|c| format!("estdc({c})")),
+            (
+                func @ ("uniqexactif" | "uniqif" | "uniqcombinedif" | "uniqcombined64if" | "uniqhll12if"),
+                [a, Arg::Expr(cond)],
+            ) => {
                 let c = col(a);
+                let base = if func == "uniqexactif" { "dc" } else { "estdc" };
                 // `uniqExactIf(x, toString(x) != '')`: nPL's dc, which skips
-                // empty values.
+                // empty values (`uniqCombined64If(…)`: its estdc).
                 match (c, self.predicate(cond)) {
                     (Some(c), Canon::Cmp { col, op: "!=", val: Lit::Str(s), .. }) if s.is_empty() && col_text(&col, false) == c => {
                         // NAN-5614: a column that is never empty (a UUID, a
                         // number) loses nothing to the empty-value skip.
                         if self.facts.never_empty(&c) {
-                            Some(format!("dc({c})"))
+                            Some(format!("{base}({c})"))
                         } else {
-                            Some(format!("dc_nonempty({c})"))
+                            Some(format!("{base}_nonempty({c})"))
                         }
                     }
                     _ => None,
@@ -1969,10 +1974,13 @@ pub(super) fn compare(original: &Signature, generated: &Signature) -> Vec<Differ
         let g: BTreeSet<&String> = generated.aggs.iter().collect();
         let mut explained: BTreeSet<String> = BTreeSet::new();
         for m in o.difference(&g) {
-            let nonempty = m.strip_prefix("dc(").map(|rest| format!("dc_nonempty({rest}"));
-            if nonempty.as_ref().is_some_and(|n| g.contains(n)) {
+            let nonempty = ["dc", "estdc"].into_iter().find_map(|func| {
+                let rest = m.strip_prefix(func)?.strip_prefix('(')?;
+                Some((func, format!("{func}_nonempty({rest}")))
+            });
+            if let Some((func, _)) = nonempty.as_ref().filter(|(_, n)| g.contains(n)) {
                 out.push(Difference::different(format!(
-                    "aggregate: `{m}` in the SQL counts empty values; nPL's dc() skips them"
+                    "aggregate: `{m}` in the SQL counts empty values; nPL's {func}() skips them"
                 )));
             } else if let Some((values, detail)) = values_difference(m, &g) {
                 out.push(Difference::different(detail));
@@ -1993,7 +2001,7 @@ pub(super) fn compare(original: &Signature, generated: &Signature) -> Vec<Differ
             }
         }
         for e in g.difference(&o) {
-            if !e.starts_with("dc_nonempty(") && !explained.contains(*e) {
+            if !e.starts_with("dc_nonempty(") && !e.starts_with("estdc_nonempty(") && !explained.contains(*e) {
                 out.push(Difference::different(format!("aggregate: the nPL computes `{e}`, which the SQL does not")));
             }
         }

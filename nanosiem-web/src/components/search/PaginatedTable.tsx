@@ -9,6 +9,7 @@ import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { SEMANTIC_FIELDS, semanticFieldsFor } from '@/lib/schema-fields';
 import { cn, isClickHouseDefault } from '@/lib/utils';
 import { isPrevalenceSentinelField, prevalenceSentinelLabel } from '@/lib/prevalence-sentinels';
+import { completeColumnOrder } from './column-order';
 
 /** Try to coerce a value into a numeric array for sparkline rendering.
  *  Handles: native arrays, JSON-encoded strings like "[1,2,3]", and
@@ -403,8 +404,13 @@ export function PaginatedTable({
     });
 
     if (columnOrder && columnOrder.length > 0) {
-      // Use backend-specified order, but only include columns that exist in data
-      return columnOrder.filter(col => allColumnsSet.has(col));
+      // Backend-specified order first. NAN-5702: then any column a later
+      // command added that `column_order` does not name (a `join`'s fields,
+      // a `rename`), when it carries a value — never silently dropped.
+      const named = new Set(columnOrder);
+      return completeColumnOrder(columnOrder, flattenedResults.map(r => r.fields)).filter(col =>
+        named.has(col) || flattenedResults.some(result => !isClickHouseDefault(result.fields?.[col], col)),
+      );
     }
 
     // Fallback: extract from data, filter out empty columns

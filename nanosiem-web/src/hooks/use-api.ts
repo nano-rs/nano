@@ -6,6 +6,8 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
+import { AI_AVAILABILITY_READ_PERMISSIONS } from '@/lib/shell-permissions';
 import { meaningfulAuditEntries, RECENT_CHANGES_FETCH_LIMIT } from '@/lib/audit-feed';
 import { alertAssigneeLabel } from '@/lib/alert-assignee';
 import { 
@@ -381,7 +383,11 @@ export function useBulkAlerts() {
 
 // Search hooks
 export function useSearch() {
-  return useMutation(api.search.bind(api));
+  return useMutation(
+    // `signal` aborts a superseded request; it is not part of the request body.
+    ({ signal, ...request }: import('@/lib/api/types').SearchRequest & { signal?: AbortSignal }) =>
+      api.search(request, signal ? { signal } : undefined)
+  );
 }
 
 export function useSearchSql() {
@@ -756,8 +762,16 @@ export function useDeleteCredential() {
 }
 
 // meloD status hook — derives AI availability from provider data (no legacy endpoint)
+//
+// NAN-5724: `GET /api/settings/ai-availability` admits settings:ai or any
+// melod:* grant. The PIVT dock mounts this on every page, as do Home, Search,
+// the rule editor, log-source detail and notebooks, so the gate lives here:
+// a role holding none of them skips the read (AI reads as unavailable)
+// instead of drawing a 403 on every page load.
 export function useMelodStatus(options?: UseQueryOptions) {
-  return useQuery(() => api.getAiAvailability(), [], options);
+  const { hasPermission } = useAuth();
+  const canRead = AI_AVAILABILITY_READ_PERMISSIONS.some((p) => hasPermission(p));
+  return useQuery(() => api.getAiAvailability(), [], { ...options, skip: options?.skip || !canRead });
 }
 
 // Organizational Context hooks
@@ -770,8 +784,12 @@ export function useUpdateOrganizationalContext() {
 }
 
 // Risk Settings hooks
-export function useRiskConfig() {
-  return useQuery(() => api.getRiskConfig(), []);
+/**
+ * `GET /api/settings/risk` needs `risk:configure`. Pages any `risk:view`
+ * holder can open pass `skip` without it so they do not draw a 403 (NAN-5713).
+ */
+export function useRiskConfig(options?: UseQueryOptions) {
+  return useQuery(() => api.getRiskConfig(), [], options);
 }
 
 export function useUpdateRiskConfig() {
@@ -977,20 +995,20 @@ export function useAddLookupRows() {
 
 export function useUpdateLookupRow() {
   return useMutation(
-    ({ name, rowId, fields }: { name: string; rowId: number; fields: Record<string, unknown> }) =>
+    ({ name, rowId, fields }: { name: string; rowId: string; fields: Record<string, unknown> }) =>
       api.updateLookupRow(name, rowId, fields)
   );
 }
 
 export function useDeleteLookupRow() {
   return useMutation(
-    ({ name, rowId }: { name: string; rowId: number }) => api.deleteLookupRow(name, rowId)
+    ({ name, rowId }: { name: string; rowId: string }) => api.deleteLookupRow(name, rowId)
   );
 }
 
 export function useDeleteLookupRows() {
   return useMutation(
-    ({ name, rowIds }: { name: string; rowIds: number[] }) => api.deleteLookupRows(name, rowIds)
+    ({ name, rowIds }: { name: string; rowIds: string[] }) => api.deleteLookupRows(name, rowIds)
   );
 }
 
@@ -1229,8 +1247,12 @@ export function useAgentEnrichmentUsage() {
 // AI Provider Credentials Hooks (LiteLLM multi-provider support)
 // ============================================================================
 
+/** NAN-5724: `GET /api/settings/ai-providers` needs settings:ai_providers. The
+ *  Models tab opens for settings:agent_models alone and reads this list only
+ *  for display names, so the hook skips the read without the grant. */
 export function useAiProviders(options?: UseQueryOptions) {
-  return useQuery(() => api.listAiProviders(), [], options);
+  const canRead = useAuth().hasPermission('settings:ai_providers');
+  return useQuery(() => api.listAiProviders(), [], { ...options, skip: options?.skip || !canRead });
 }
 
 export function useAiProvider(provider: string | undefined) {

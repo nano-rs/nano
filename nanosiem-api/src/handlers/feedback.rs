@@ -81,7 +81,8 @@ fn interactive_session_only() -> (StatusCode, Json<FeedbackApiError>) {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SubmitterFeedback {
     pub id: Uuid,
-    pub user_id: Uuid,
+    /// NULL once the submitter is deleted (NAN-5721).
+    pub user_id: Option<Uuid>,
     pub category: String,
     pub title: String,
     pub description: String,

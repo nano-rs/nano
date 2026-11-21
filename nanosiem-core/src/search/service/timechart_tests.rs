@@ -370,3 +370,73 @@ fn incomplete_aggregate_is_not_plotted_as_complete() {
     response.results.push(serde_json::json!({"count": 1}));
     assert!(require_complete_buckets(&response).is_ok());
 }
+
+/// NAN-5701 review: `cont=true` fills the buckets ClickHouse emits. Weekly
+/// buckets are `toStartOfWeek` Sundays; epoch stepping put an empty Thursday
+/// between every two real Sundays (a sawtooth of fake zeros).
+#[test]
+fn pivot_cont_weeks_fill_sundays_only() {
+    // 2026-10-01 is a Thursday; the window touches the weeks of Sep 27 .. Oct 25.
+    let start: chrono::DateTime<chrono::Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+    let range = TimeRange::new(start, "2026-11-01T00:00:00Z".parse().unwrap());
+    let rows = vec![
+        serde_json::json!({"time_bucket":"2026-10-04 00:00:00","count":5}),
+        serde_json::json!({"time_bucket":"2026-10-18 00:00:00","count":4}),
+    ];
+    let aggregation = Aggregation::new(AggFunc::Count, None);
+    let chart = pivot(&rows, &[], &[], &[aggregation], Duration::from_secs(604_800), &range, true).unwrap();
+    let buckets: Vec<_> = chart.iter().map(|r| r["time_bucket"].as_str().unwrap().to_string()).collect();
+    assert_eq!(
+        buckets,
+        [
+            "2026-09-27T00:00:00+00:00",
+            "2026-10-04T00:00:00+00:00",
+            "2026-10-11T00:00:00+00:00",
+            "2026-10-18T00:00:00+00:00",
+            "2026-10-25T00:00:00+00:00",
+        ]
+    );
+    let counts: Vec<_> = chart.iter().map(|r| r["count"].as_u64().unwrap()).collect();
+    assert_eq!(counts, [0, 5, 0, 4, 0]);
+}
+
+/// Month-or-longer spans are calendar months (`toStartOfMonth`), not 30-day
+/// epoch steps.
+#[test]
+fn pivot_cont_months_fill_calendar_months() {
+    let range = TimeRange::new(
+        "2026-08-15T00:00:00Z".parse().unwrap(),
+        "2026-11-10T00:00:00Z".parse().unwrap(),
+    );
+    let rows = vec![serde_json::json!({"time_bucket":"2026-09-01 00:00:00","count":7})];
+    let aggregation = Aggregation::new(AggFunc::Count, None);
+    let chart = pivot(&rows, &[], &[], &[aggregation], Duration::from_secs(2_592_000), &range, true).unwrap();
+    let buckets: Vec<_> = chart.iter().map(|r| r["time_bucket"].as_str().unwrap().to_string()).collect();
+    assert_eq!(
+        buckets,
+        [
+            "2026-08-01T00:00:00+00:00",
+            "2026-09-01T00:00:00+00:00",
+            "2026-10-01T00:00:00+00:00",
+            "2026-11-01T00:00:00+00:00",
+        ]
+    );
+}
+
+/// A multi-day hour interval (`toStartOfInterval(.., INTERVAL 48 HOUR)`) is
+/// day-aligned in ClickHouse: one bucket per day, and the widening counts
+/// those (a 2d span over 2,000 days is 2,000 buckets, not 1,001).
+#[test]
+fn multi_day_spans_are_counted_and_filled_per_day() {
+    let start: chrono::DateTime<chrono::Utc> = "2026-10-01T06:00:00Z".parse().unwrap();
+    let range = TimeRange::new(start, start + chrono::Duration::days(3));
+    let aggregation = Aggregation::new(AggFunc::Count, None);
+    let chart = pivot(&[], &[], &[], &[aggregation], Duration::from_secs(172_800), &range, true).unwrap();
+    assert_eq!(chart.len(), 4, "Oct 1 .. Oct 4 day starts");
+    assert_eq!(chart[0]["time_bucket"], "2026-10-01T00:00:00+00:00");
+
+    let long = TimeRange::new(start, start + chrono::Duration::days(2000));
+    assert!(bucket_count(&long, 172_800) > MAX_BUCKETS);
+    let widened = widened_span(Duration::from_secs(172_800), &long).unwrap();
+    assert!(bucket_count(&long, widened.as_secs() as i64) <= MAX_BUCKETS, "{widened:?}");
+}

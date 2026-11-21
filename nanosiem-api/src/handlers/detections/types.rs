@@ -21,6 +21,15 @@ pub struct ListDetectionsQuery {
     pub include_archived: bool,
 }
 
+/// Query parameters for fetching one detection rule
+#[derive(Debug, Deserialize, Default, IntoParams)]
+pub struct GetDetectionQuery {
+    /// Return the rule even when it is archived (deleted). Default false: a
+    /// deleted rule is a 404, the same as on the list (NAN-5672).
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
 /// Request for testing a detection rule
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TestRuleRequest {
@@ -148,8 +157,14 @@ pub struct DetectionMatch {
     pub severity: String,
     /// Status of the alert
     pub status: String,
-    /// Number of events that matched
+    /// Number of events that matched (the true count, also when `events`
+    /// holds only part of them).
     pub event_count: i32,
+    /// NAN-5736: `events` holds fewer events than matched, or some were cut
+    /// down (marked `_nano_truncated`): the stored row is bounded. Absent
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub events_truncated: bool,
     /// The actual events that triggered this detection. Each event also
     /// carries a canonical envelope injected by the API (NAN-830):
     /// `_match_event_time` (RFC 3339 string, optional), `_match_event_label`

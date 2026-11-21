@@ -22,7 +22,9 @@ export interface DetectionMetadata {
   title?: string;
   description?: string;
   author?: string;
-  severity?: 'critical' | 'high' | 'medium' | 'low';
+  // `informational` is a real stored severity: keep it on a load/save
+  // round trip instead of coercing it to `low` (NAN-5716).
+  severity?: 'critical' | 'high' | 'medium' | 'low' | 'informational';
   mode?: 'staging' | 'live' | 'alerting' | 'paused';
   detection_mode?: 'realtime' | 'scheduled';
   // NAN-1561: dataset this rule queries. 'logs' (default UDM/OCSF), 'spans',
@@ -85,9 +87,12 @@ export function parseDetectionMetadata(text: string): ParsedDetection {
     const key = trimmed.substring(0, colonIndex).trim();
     let value = trimmed.substring(colonIndex + 1).trim();
     
-    // Remove quotes if present
-    if ((value.startsWith('"') && value.endsWith('"')) || 
-        (value.startsWith("'") && value.endsWith("'"))) {
+    // Remove quotes if present. A double-quoted scalar is unescaped too: the
+    // serializer escapes `\` and `"` (escapeYamlDoubleQuoted), so without the
+    // inverse every save added another layer of backslashes (NAN-5716).
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = unescapeYamlDoubleQuoted(value.slice(1, -1));
+    } else if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
       value = value.slice(1, -1);
     }
     
@@ -115,6 +120,11 @@ export function parseDetectionMetadata(text: string): ParsedDetection {
  */
 function escapeYamlDoubleQuoted(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/** Inverse of {@link escapeYamlDoubleQuoted}: `\\` → `\`, `\"` → `"`. */
+function unescapeYamlDoubleQuoted(value: string): string {
+  return value.replace(/\\(["\\])/g, '$1');
 }
 
 /**
@@ -296,8 +306,8 @@ export function validateMetadata(metadata: DetectionMetadata): string[] {
     }
   }
   
-  if (metadata.severity && !['critical', 'high', 'medium', 'low'].includes(metadata.severity)) {
-    errors.push('severity must be one of: critical, high, medium, low');
+  if (metadata.severity && !['critical', 'high', 'medium', 'low', 'informational'].includes(metadata.severity)) {
+    errors.push('severity must be one of: critical, high, medium, low, informational');
   }
   
   if (metadata.mode && !['staging', 'live', 'alerting', 'paused'].includes(metadata.mode)) {

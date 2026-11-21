@@ -103,7 +103,8 @@ interface SyncHistoryProps {
   onClose: () => void;
   repo: RepoView | null;
   syncing: boolean;
-  onSyncNow: (id: string) => void;
+  /** Omitted without `rule_repositories:sync` (NAN-5709): no Sync now. */
+  onSyncNow?: (id: string) => void;
 }
 
 export function SyncHistoryDrawer({
@@ -134,6 +135,7 @@ export function SyncHistoryDrawer({
               'auto-sync disabled'
             )}
           </div>
+          {onSyncNow && (
           <button
             type="button"
             onClick={() => onSyncNow(repo.id)}
@@ -151,6 +153,7 @@ export function SyncHistoryDrawer({
             />
             {syncing ? 'Syncing' : 'Sync now'}
           </button>
+          )}
         </div>
       }
     >
@@ -307,7 +310,7 @@ export function BulkImportDrawer({
     const init: Record<string, BulkRowConfig> = {};
     for (const r of rulesRef.current) {
       init[r.id] = {
-        selected: r.status !== 'IMPORTED' && r.status !== 'DELETED',
+        selected: r.status !== 'IMPORTED' && r.status !== 'DRIFT' && r.status !== 'DELETED',
         severity: (SEVERITIES.includes(r.severity as Severity)
           ? r.severity
           : 'medium') as Severity,

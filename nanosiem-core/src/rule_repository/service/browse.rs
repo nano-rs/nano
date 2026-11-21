@@ -36,6 +36,18 @@ impl RuleRepositoryService {
     }
 
     /// Get all imports for rules in a repository
+    /// Imports whose detection rule still exists (not archived), for showing
+    /// which repository rules are imported (NAN-5672).
+    pub async fn get_active_imports_for_repository(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<Vec<RuleImport>, RuleRepositoryError> {
+        self.imports_repository
+            .list_active_for_repository(repo_id)
+            .await
+            .map_err(|e| RuleRepositoryError::from_repo_error(e))
+    }
+
     pub async fn get_imports_for_repository(
         &self,
         repo_id: Uuid,

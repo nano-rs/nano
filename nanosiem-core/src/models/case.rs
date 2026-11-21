@@ -1464,6 +1464,11 @@ pub struct CaseEscalation {
     #[serde(default, with = "typeid::user::opt")]
     #[schema(value_type = Option<String>)]
     pub acknowledged_by: Option<Uuid>,
+    /// Set when the escalation lost its last target: its only target user or
+    /// group was deleted (NAN-5742). `target_label` still names who it was for.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub target_removed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1500,9 +1505,11 @@ pub struct CaseHandoff {
     #[serde(with = "typeid::case")]
     #[schema(value_type = String)]
     pub case_id: Uuid,
-    #[serde(with = "typeid::user")]
-    #[schema(value_type = String)]
-    pub source_user_id: Uuid,
+    /// NULL once the handing-off user is deleted: the handoff stays in the
+    /// case's audit trail (NAN-5721, ON DELETE SET NULL).
+    #[serde(default, with = "typeid::user::opt")]
+    #[schema(value_type = Option<String>)]
+    pub source_user_id: Option<Uuid>,
     #[serde(default, with = "typeid::user::opt")]
     #[schema(value_type = Option<String>)]
     pub target_user_id: Option<Uuid>,
@@ -1524,6 +1531,12 @@ pub struct CaseHandoff {
     pub bounced_by: Option<Uuid>,
     pub bounce_reason: Option<String>,
     pub canceled_at: Option<DateTime<Utc>>,
+    /// Set when the handoff lost its last target: its only target user or
+    /// group was deleted (NAN-5742). `target_label` still names who it was
+    /// for; a handoff still pending at that moment is closed as `canceled`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub target_removed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 

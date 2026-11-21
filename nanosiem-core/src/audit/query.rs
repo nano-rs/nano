@@ -149,7 +149,24 @@ pub fn normalize_audit_search(raw: Option<&str>) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+    // NAN-5683: the audit API renders ids as public TypeIDs (`lsrc_…`,
+    // `user_…`, `key_…`) but both stores keep the raw UUID, so a pasted
+    // TypeID is searched as the UUID it encodes.
+    if let Some(uuid) = typeid_needle_uuid(trimmed) {
+        return Some(uuid.to_string());
+    }
     Some(trimmed.chars().take(AUDIT_SEARCH_MAX_CHARS).collect())
+}
+
+/// The UUID a whole-needle TypeID (`<prefix>_<26-char suffix>`, prefix of
+/// lowercase letters) encodes; `None` for anything else, including a bare
+/// suffix or a plain word that merely contains `_`.
+fn typeid_needle_uuid(needle: &str) -> Option<uuid::Uuid> {
+    let (prefix, suffix) = needle.rsplit_once('_')?;
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_lowercase()) || suffix.len() != 26 {
+        return None;
+    }
+    crate::typeid::decode_suffix(suffix).ok()
 }
 
 /// ClickHouse predicate for [`ClickHouseAuditQuery::search`]. A substring

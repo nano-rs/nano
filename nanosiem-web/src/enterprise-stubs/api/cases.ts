@@ -28,9 +28,12 @@ import type {
   CreateGroupingRuleRequest,
   UpdateGroupingRuleRequest,
   CaseSettings,
+  SlaSettings,
   UpdateCaseSettingsRequest,
   ShareCaseRequest,
   CaseShareResult,
+  CaseTag,
+  CaseTagsResponse,
   CreateHandoffRequest,
   CaseHandoff,
   BounceHandoffRequest,
@@ -196,7 +199,20 @@ export class CasesApi {
   getCaseSettings(): Promise<CaseSettings> {
     return ENTERPRISE_ONLY();
   }
+  getCaseSlaSettings(): Promise<SlaSettings> {
+    return ENTERPRISE_ONLY();
+  }
   updateCaseSettings(_request: UpdateCaseSettingsRequest): Promise<CaseSettings> {
+    return ENTERPRISE_ONLY();
+  }
+  // NAN-5675: case tags.
+  listCaseTags(_caseId: string): Promise<CaseTag[]> {
+    return ENTERPRISE_ONLY();
+  }
+  addCaseTag(_caseId: string, _tag: string): Promise<CaseTagsResponse> {
+    return ENTERPRISE_ONLY();
+  }
+  removeCaseTag(_caseId: string, _tag: string): Promise<CaseTagsResponse> {
     return ENTERPRISE_ONLY();
   }
 }

@@ -321,6 +321,11 @@ class UiPage:
         """Console errors and failed requests (>= 400 or no response) since `since_ms`."""
         return self.op("events_since", since=since_ms)
 
+    def api_responses_since(self, since_ms: int = 0) -> list[dict[str, Any]]:
+        """Every completed /api response since `since_ms` (any status), as
+        {method, url, status}: what the page fetched (bodies never cross)."""
+        return self.op("api_responses_since", since=since_ms)
+
     def viewport(self, width: int, height: int | None = None) -> None:
         self.op("viewport", width=width, height=height)
 
@@ -340,6 +345,43 @@ class UiPage:
                     raise
                 time.sleep(1.0)
         raise AssertionError("unreachable")
+
+    # deep workflows (NAN-5684)
+    def drag(
+        self, find: dict[str, Any], frm: tuple[float, float], to: tuple[float, float], hover: bool = False
+    ) -> dict[str, float]:
+        """A real mouse drag across the element; points are fractions of its box."""
+        return self.op("drag", find=find, **{"from": list(frm)}, to=list(to), hover=hover)
+
+    def chord(self, *keys: str) -> None:
+        """Press a keyboard chord, e.g. chord("Meta", "k")."""
+        self.op("chord", keys=list(keys))
+
+    def hover(self, find: dict[str, Any]) -> None:
+        self.op("hover", find=find)
+
+    def scroll_bottom(self) -> int:
+        """Scroll the app's scrollers to the bottom (infinite-scroll lists)."""
+        return self.op("scroll_bottom")
+
+    def capture_window_open(self) -> None:
+        """Record window.open() URLs instead of opening tabs (see `opened`)."""
+        self.op("capture_window_open")
+
+    def opened(self) -> list[str]:
+        return self.op("opened")
+
+    def attrs(self, find: dict[str, Any], name: str) -> list[str | None]:
+        """Attribute `name` of every match."""
+        return self.op("attrs", find=find, name=name)
+
+    def boxes(self, find: dict[str, Any], name: str | None = None) -> list[dict[str, Any]]:
+        """Bounding boxes of every match, keyed by attribute `name`."""
+        return self.op("boxes", find=find, name=name)
+
+    def editor_text(self, find: dict[str, Any]) -> str:
+        """The CodeMirror document inside `find`."""
+        return self.op("editor_text", find=find)
 
     def end_session(self) -> dict[str, Any]:
         """DELETE this context's own server session (never POST /api/auth/logout,

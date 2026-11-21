@@ -39,6 +39,19 @@ impl DeploymentMode {
         matches!(self, DeploymentMode::Demo)
     }
 
+    /// Whether the platform delivers this tenant's AI (`MANAGED_AI_PROVIDER`,
+    /// `MANAGED_AI_API_KEY`, gateway URL and token) and it must be
+    /// auto-enabled and auto-provisioned at boot (NAN-5676).
+    ///
+    /// Managed and Demo tenants are both platform-operated, so both get managed
+    /// AI, metered against the hosted monthly allowance (see
+    /// [`Self::entitlement_operator`]). Deliberately narrower than
+    /// [`Self::is_managed`]: the managed-only settings locks and the
+    /// `/api/system/config` mode report keep their behavior.
+    pub fn uses_managed_ai(&self) -> bool {
+        matches!(self, DeploymentMode::Managed | DeploymentMode::Demo)
+    }
+
     /// V2 operator identity used for AI allowance semantics. Both the managed
     /// product and the shared demo are platform-operated; only BYOC installs
     /// are self-run.
@@ -291,6 +304,51 @@ mod tests {
             DeploymentMode::SelfHosted.entitlement_operator(),
             nanosiem_core::EntitlementOperator::SelfRun
         );
+    }
+
+    #[test]
+    fn managed_ai_covers_managed_and_demo_but_is_managed_stays_narrow() {
+        // NAN-5676: demo tenants get the platform's AI like managed ones.
+        assert!(DeploymentMode::Managed.uses_managed_ai());
+        assert!(DeploymentMode::Demo.uses_managed_ai());
+        assert!(!DeploymentMode::SelfHosted.uses_managed_ai());
+        // The non-AI managed-only gates keep their behavior.
+        assert!(DeploymentMode::Managed.is_managed());
+        assert!(!DeploymentMode::Demo.is_managed());
+        assert!(!DeploymentMode::SelfHosted.is_managed());
+    }
+
+    #[test]
+    fn managed_ai_is_always_metered_against_the_hosted_allowance() {
+        // NAN-5676: every mode that auto-provisions managed AI must resolve to
+        // the Hosted operator, whose licensed limits carry a finite monthly
+        // allowance (fail-closed 0 when nothing is provisioned). This is what
+        // `ensure_ai_available`, the `| ai` pipe, and the hunts runner/reviewer
+        // pre-checks enforce.
+        for mode in [
+            DeploymentMode::Managed,
+            DeploymentMode::Demo,
+            DeploymentMode::SelfHosted,
+        ] {
+            let entitlement = nanosiem_core::Entitlement {
+                edition: nanosiem_core::EntitlementEdition::Licensed,
+                operator: mode.entitlement_operator(),
+                capacity_gb_per_day: None,
+            };
+            let granted = nanosiem_core::TierLimits::for_entitlement_with_granted_ai_credits(
+                entitlement,
+                Some(5_000),
+            );
+            let unprovisioned = nanosiem_core::TierLimits::for_entitlement_unoverridden(entitlement);
+            if mode.uses_managed_ai() {
+                assert_eq!(granted.ai_credits_per_month, Some(5_000), "{mode:?}");
+                assert_eq!(unprovisioned.ai_credits_per_month, Some(0), "{mode:?}");
+            } else {
+                // Self-run is BYO AI: uncapped, unchanged.
+                assert_eq!(granted.ai_credits_per_month, None, "{mode:?}");
+                assert_eq!(unprovisioned.ai_credits_per_month, None, "{mode:?}");
+            }
+        }
     }
 
     #[test]

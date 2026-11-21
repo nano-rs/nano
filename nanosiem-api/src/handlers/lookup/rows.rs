@@ -12,6 +12,7 @@ use nanosiem_core::audit::{
     LOOKUP_ROW_UPDATED,
 };
 use nanosiem_core::auth::permissions;
+use nanosiem_core::lookup::row_id::{parse_row_id, row_id_to_wire};
 use nanosiem_core::LookupRowsPage;
 
 use super::lookup_error_to_api;
@@ -126,7 +127,7 @@ pub async fn add_lookup_rows(
     tag = "lookup",
     params(
         ("name" = String, Path, description = "Lookup table name"),
-        ("row_id" = i64, Path, description = "Row ID to update")
+        ("row_id" = String, Path, description = "Row ID to update (the `_row_id` string from `GET …/rows`)")
     ),
     request_body = UpdateRowRequest,
     responses(
@@ -141,10 +142,11 @@ pub async fn update_lookup_row(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
-    Path((name, row_id)): Path<(String, i64)>,
+    Path((name, row_id)): Path<(String, String)>,
     Json(req): Json<UpdateRowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
+    let row_id = parse_path_row_id(&row_id)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -159,7 +161,7 @@ pub async fn update_lookup_row(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("lookup_table", None, Some(name))
             .client_context(&client)
-            .details(serde_json::json!({ "row_id": row_id }))
+            .details(serde_json::json!({ "row_id": row_id_to_wire(row_id) }))
             .build(),
     );
 
@@ -173,7 +175,7 @@ pub async fn update_lookup_row(
     tag = "lookup",
     params(
         ("name" = String, Path, description = "Lookup table name"),
-        ("row_id" = i64, Path, description = "Row ID to delete")
+        ("row_id" = String, Path, description = "Row ID to delete (the `_row_id` string from `GET …/rows`)")
     ),
     responses(
         (status = 200, description = "Row deleted successfully"),
@@ -186,9 +188,10 @@ pub async fn delete_lookup_row(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
-    Path((name, row_id)): Path<(String, i64)>,
+    Path((name, row_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
+    let row_id = parse_path_row_id(&row_id)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -203,7 +206,7 @@ pub async fn delete_lookup_row(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("lookup_table", None, Some(name))
             .client_context(&client)
-            .details(serde_json::json!({ "row_id": row_id }))
+            .details(serde_json::json!({ "row_id": row_id_to_wire(row_id) }))
             .build(),
     );
 
@@ -253,4 +256,10 @@ pub async fn delete_lookup_rows(
     );
 
     Ok(Json(DeleteRowsResponse { deleted }))
+}
+
+/// A `{row_id}` path segment (NAN-5715): the `_row_id` wire string. A
+/// malformed id is a 400, never a write under some other id.
+fn parse_path_row_id(raw: &str) -> Result<i64, ApiError> {
+    parse_row_id(raw).ok_or_else(|| ApiError::BadRequest(format!("Invalid row id '{raw}'")))
 }

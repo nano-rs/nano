@@ -14,7 +14,7 @@
 
 import { useState, useEffect, useCallback, useMemo, Fragment } from 'react';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
-import type { SemanticField } from '@/lib/schema-fields';
+import { prevalenceDrilldownFragment } from '@/lib/prevalence/pivot';
 import { useNavigate } from 'react-router-dom';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
@@ -422,15 +422,11 @@ export function Prevalence() {
     (artifact: ArtifactExplorerItem) => {
       // NAN-4903: none until the schema profile is known (error toast instead).
       if (!schemaMap.ready) return schemaMap.guard(() => {})();
-      // NAN-4903: the active profile's column (`dest_ip` / `dst_endpoint.ip`, …).
-      const key: SemanticField = artifact.artifact_type.startsWith('hash')
-        ? 'fileHash'
-        : artifact.artifact_type.startsWith('ip_address')
-          ? 'destIp'
-          : 'destHost';
-      navigate(`/search#q=${encodeURIComponent(schemaMap.filter(key, artifact.artifact))}`);
+      // NAN-5704: on OCSF, every column the prevalence baseline counted this
+      // artifact from, over the page's window; legacy UDM is unchanged.
+      navigate(`/search#${prevalenceDrilldownFragment(schemaMap, artifact.artifact_type, artifact.artifact, timeWindow)}`);
     },
-    [navigate, schemaMap],
+    [navigate, schemaMap, timeWindow],
   );
 
   const toggleRow = useCallback((key: string) => {

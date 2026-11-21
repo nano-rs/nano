@@ -79,7 +79,9 @@ pub async fn batch_import_rules(
             (
                 item.path,
                 ImportRequest {
-                    import_type: nanosiem_core::ImportType::Forked,
+                    // NAN-5716: linked, like the row Import (API default).
+                    // Every rule import takes upstream updates either way.
+                    import_type: nanosiem_core::ImportType::Linked,
                     folder: None,
                     name: None,
                     severity: item.severity,
@@ -281,11 +283,15 @@ pub async fn remove_all_imported(
             .delete_rule_with_mode(import.detection_rule_id, mv_gen)
             .await
         {
-            Ok(_) => {
-                // Delete the import record
+            // The archive drops the rule's import record in the same
+            // statement (NAN-5672), so there is nothing left to unlink here.
+            Ok(_) => removed += 1,
+            // The FK cascade means a missing rule is an archived one: deleted
+            // on a build that kept its import link. Drop the stale link.
+            Err(nanosiem_core::detection::DetectionError::RuleNotFound(_)) => {
                 if let Err(e) = service.delete_import(import.id).await {
                     tracing::warn!(
-                        "Failed to delete import record {} after deleting detection rule: {}",
+                        "Failed to drop stale import record {} of a deleted rule: {}",
                         import.id,
                         e
                     );

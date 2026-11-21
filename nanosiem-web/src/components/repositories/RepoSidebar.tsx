@@ -12,9 +12,11 @@ interface SidebarProps {
   repos: RepoView[];
   activeRepoId: string | null;
   onActivate: (id: string) => void;
-  onSyncNow: (id: string) => void;
+  /** Omitted without `rule_repositories:sync` (NAN-5709): no Sync button. */
+  onSyncNow?: (id: string) => void;
   onOpenHistory: (id: string) => void;
-  onConfigureFolders: (id: string) => void;
+  /** Omitted without `rule_repositories:manage` + `:sync` (NAN-5709). */
+  onConfigureFolders?: (id: string) => void;
   syncingId: string | null;
 }
 
@@ -47,9 +49,9 @@ export function RepoSidebar({
             active={activeRepoId === r.id}
             syncing={syncingId === r.id}
             onActivate={() => onActivate(r.id)}
-            onSyncNow={() => onSyncNow(r.id)}
+            onSyncNow={onSyncNow ? () => onSyncNow(r.id) : undefined}
             onOpenHistory={() => onOpenHistory(r.id)}
-            onConfigureFolders={() => onConfigureFolders(r.id)}
+            onConfigureFolders={onConfigureFolders ? () => onConfigureFolders(r.id) : undefined}
           />
         ))}
       </div>
@@ -67,9 +69,9 @@ interface RepoCardProps {
   active: boolean;
   syncing: boolean;
   onActivate: () => void;
-  onSyncNow: () => void;
+  onSyncNow?: () => void;
   onOpenHistory: () => void;
-  onConfigureFolders: () => void;
+  onConfigureFolders?: () => void;
 }
 
 function RepoCard({
@@ -138,6 +140,7 @@ function RepoCard({
           )}
           {repo.autoSync === 'off' && <div className="truncate">manual sync</div>}
         </div>
+        {onConfigureFolders && (
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -154,6 +157,7 @@ function RepoCard({
           </TooltipTrigger>
           <TooltipContent>Configure folders</TooltipContent>
         </Tooltip>
+        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -170,6 +174,7 @@ function RepoCard({
           </TooltipTrigger>
           <TooltipContent>Sync history</TooltipContent>
         </Tooltip>
+        {onSyncNow && (
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -192,6 +197,7 @@ function RepoCard({
           </TooltipTrigger>
           <TooltipContent>{syncing ? 'Syncing…' : 'Sync now'}</TooltipContent>
         </Tooltip>
+        )}
       </div>
 
       {pendingBadge && !syncing && (

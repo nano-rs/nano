@@ -32,6 +32,7 @@ vi.mock('@/hooks/use-api', async (importOriginal) => {
     useSearchFieldValues: idle,
     useCreateSavedSearch: idle,
     useDeleteSavedSearch: idle,
+    useUpdateSavedSearch: idle,
     useShareSavedSearch: idle,
     useCreateSharedSearch: idle,
     useGetSharedSearch: idle,

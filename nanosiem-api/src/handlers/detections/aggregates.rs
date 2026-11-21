@@ -97,7 +97,7 @@ pub async fn get_detection_health_summary(
     let silent_count: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*)::bigint FROM detection_rules
-        WHERE mode IN ('live', 'alerting')
+        WHERE mode IN ('live', 'alerting') AND archived = FALSE
           AND (last_match_at IS NULL OR last_match_at < NOW() - INTERVAL '7 days')
         "#,
     )
@@ -179,7 +179,7 @@ pub async fn get_noisy_rules(
         INNER JOIN last_7d l ON dr.id = l.rule_id
         LEFT JOIN current_24h c ON dr.id = c.rule_id
         LEFT JOIN prior_24h p ON dr.id = p.rule_id
-        WHERE dr.mode IN ('live', 'alerting')
+        WHERE dr.mode IN ('live', 'alerting') AND dr.archived = FALSE
           AND l.total_matches > 0
         ORDER BY l.total_matches DESC
         LIMIT $1
@@ -263,7 +263,7 @@ pub async fn get_fleet_health(
         r#"
         WITH fleet AS (
             SELECT id, last_run_at, next_run_at,
-                   (consecutive_failures > 0 OR catchup_size_failures > 0) AS failing
+                   (consecutive_failures > 0 OR catchup_size_failures > 0 OR crash_streak > 0) AS failing
             FROM detection_rules
             WHERE archived = false
               AND mode IN ('live', 'alerting')

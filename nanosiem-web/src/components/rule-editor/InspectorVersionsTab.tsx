@@ -203,6 +203,7 @@ export function InspectorVersionsTab({
                     type="button"
                     onClick={() => setSelected(active ? null : v)}
                     aria-expanded={active}
+                    data-testid={`rule-version-v${v.version_number}`}
                     className={cn(
                       'grid grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-2.5 -mx-2 px-2 py-1.5 rounded-md text-left transition-colors cursor-pointer',
                       active ? 'bg-foreground/[0.05]' : 'hover:bg-foreground/[0.04]',

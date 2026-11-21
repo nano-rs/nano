@@ -191,7 +191,7 @@ impl FindingEvent {
     /// audit findings become KNOWN-origin and are redacted precisely (no
     /// over-redaction of non-audit aggregate findings). Mirrors
     /// `db::repository::alerts::distinct_source_types`.
-    fn origin_source_types_from(events: &[serde_json::Value]) -> Vec<String> {
+    pub(crate) fn origin_source_types_from(events: &[serde_json::Value]) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut insert_normalized = |raw: &str| {
             let normalized = raw.trim().to_lowercase();
@@ -1518,7 +1518,7 @@ mod internal_domains_tests;
 mod evidence_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::detection::risk::RiskResult;
     use crate::models::detection_rule::{AlertMode, DetectionMode};
@@ -1531,7 +1531,7 @@ mod tests {
     /// one-line fix here instead of across every test — this module sat disabled
     /// behind `#[cfg(any())]` for months precisely because inline struct literals
     /// went stale (NAN-1722).
-    pub(super) fn sample_rule() -> DetectionRule {
+    pub(crate) fn sample_rule() -> DetectionRule {
         DetectionRule {
             id: Uuid::now_v7(),
             name: "Test Rule".to_string(),

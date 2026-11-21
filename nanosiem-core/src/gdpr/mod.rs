@@ -72,7 +72,8 @@ pub struct AnonymizationRequest {
     pub mutation_ids: serde_json::Value,
     pub justification: Option<String>,
     pub error_message: Option<String>,
-    pub requested_by: Uuid,
+    /// NULL once the requesting user is deleted (NAN-5721, ON DELETE SET NULL).
+    pub requested_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,

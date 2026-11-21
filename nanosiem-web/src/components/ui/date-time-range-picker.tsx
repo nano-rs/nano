@@ -267,6 +267,7 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
       <PopoverTrigger asChild>
         <Button
           variant="outline"
+          data-testid="time-range-trigger"
           title={resolvedTitle}
           onPointerEnter={refreshTitle}
           onFocus={refreshTitle}
@@ -313,6 +314,8 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                       {category.presets.map((preset) => (
                         <button
                           key={preset.value}
+                          data-testid="time-preset"
+                          data-preset={preset.value}
                           onClick={() => handlePresetSelect(preset.value)}
                           className={cn(
                             'w-full text-left px-3 py-2.5 text-sm rounded-lg transition-colors',
@@ -521,6 +524,8 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                       return (
                         <button
                           key={preset.value}
+                          data-testid="time-preset"
+                          data-preset={preset.value}
                           onClick={() => handlePresetSelect(preset.value)}
                           title={preset.label}
                           className={cn(
@@ -734,6 +739,7 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                     Cancel
                   </button>
                   <button
+                    data-testid="time-range-apply"
                     onClick={handleApplyCustom}
                     disabled={!startDate || !endDate}
                     className={cn(
@@ -793,6 +799,7 @@ function DateTimeField({ label, date, time, onDateChange, onTimeChange }: DateTi
       <div className="flex items-center gap-1 border border-border-2 rounded-md px-1.5 py-1 bg-background focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/25">
         <input
           type="date"
+          data-testid={`time-${label.toLowerCase()}-date`}
           value={dateVal}
           onChange={(e) => {
             const [y, mo, da] = e.target.value.split('-').map(Number);
@@ -806,6 +813,7 @@ function DateTimeField({ label, date, time, onDateChange, onTimeChange }: DateTi
         <span className="w-px h-4 bg-border-2" />
         <input
           type="text"
+          data-testid={`time-${label.toLowerCase()}-time`}
           value={timeDraft}
           onChange={(e) => {
             const v = e.target.value;

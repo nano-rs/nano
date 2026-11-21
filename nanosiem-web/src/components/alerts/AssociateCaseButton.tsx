@@ -109,6 +109,7 @@ export function AssociateCaseButton({ alertId, onAssociated }: AssociateCaseButt
     <>
       <button
         type="button"
+        data-testid="add-to-case"
         onClick={() => onOpenChange(true)}
         className="h-7 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 inline-flex items-center gap-1.5"
       >
@@ -150,6 +151,8 @@ export function AssociateCaseButton({ alertId, onAssociated }: AssociateCaseButt
                 <button
                   key={c.id}
                   type="button"
+                  data-testid="add-to-case-row"
+                  data-case-id={c.id}
                   disabled={busyId != null}
                   onClick={() => associate(c)}
                   className="w-full text-left px-3 py-2 flex items-center gap-2.5 hover:bg-foreground/[0.03] disabled:opacity-50"

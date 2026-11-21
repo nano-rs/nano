@@ -334,6 +334,7 @@ function AiTab({
               ruleMetadata={ruleMeta}
               melodConnected={melodConnected}
               ruleId={ruleId ?? null}
+              disabled={readOnly}
             />
           </div>
         ) : (

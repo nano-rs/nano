@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Mode transition methods for detection rules (promote, demote, pause, resume)
+//!
+//! NAN-5672: every statement here matches `archived = FALSE`. An archived rule
+//! is a deleted rule (NAN-3816), and its mode is parked in `staging`, so
+//! without the predicate a transition racing the delete would still match it
+//! and bring back a hidden live/alerting row. Being in the same statement as
+//! the write makes the guard atomic; the diagnostic reads report it as
+//! `NotFound`, the same as the API.
 
 use uuid::Uuid;
 
@@ -28,7 +35,7 @@ impl DetectionRuleRepository {
                 mode = 'live',
                 live_match_count = 0,
                 updated_at = NOW()
-            WHERE id = $1 AND mode = 'staging'
+            WHERE id = $1 AND archived = FALSE AND mode = 'staging'
             RETURNING *
             "#,
         )
@@ -40,7 +47,7 @@ impl DetectionRuleRepository {
             Some(rule) => Ok(rule),
             None => {
                 let current_mode: Option<(String,)> =
-                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1")
+                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE")
                         .bind(id)
                         .fetch_optional(&self.pool)
                         .await?;
@@ -64,7 +71,7 @@ impl DetectionRuleRepository {
             UPDATE detection_rules SET
                 mode = 'alerting',
                 updated_at = NOW()
-            WHERE id = $1 AND mode = 'live'
+            WHERE id = $1 AND archived = FALSE AND mode = 'live'
             RETURNING *
             "#,
         )
@@ -77,7 +84,7 @@ impl DetectionRuleRepository {
             None => {
                 // Distinguish "not found" from "wrong mode"
                 let current_mode: Option<(String,)> =
-                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1")
+                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE")
                         .bind(id)
                         .fetch_optional(&self.pool)
                         .await?;
@@ -102,7 +109,7 @@ impl DetectionRuleRepository {
                 mode = 'live',
                 live_match_count = 0,
                 updated_at = NOW()
-            WHERE id = $1 AND mode = 'alerting'
+            WHERE id = $1 AND archived = FALSE AND mode = 'alerting'
             RETURNING *
             "#,
         )
@@ -115,7 +122,7 @@ impl DetectionRuleRepository {
             None => {
                 // Distinguish "not found" from "wrong mode"
                 let current_mode: Option<(String,)> =
-                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1")
+                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE")
                         .bind(id)
                         .fetch_optional(&self.pool)
                         .await?;
@@ -139,7 +146,7 @@ impl DetectionRuleRepository {
             UPDATE detection_rules SET
                 mode = 'staging',
                 updated_at = NOW()
-            WHERE id = $1 AND mode = 'live'
+            WHERE id = $1 AND archived = FALSE AND mode = 'live'
             RETURNING *
             "#,
         )
@@ -152,7 +159,7 @@ impl DetectionRuleRepository {
             None => {
                 // Distinguish "not found" from "wrong mode"
                 let current_mode: Option<(String,)> =
-                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1")
+                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE")
                         .bind(id)
                         .fetch_optional(&self.pool)
                         .await?;
@@ -178,7 +185,7 @@ impl DetectionRuleRepository {
                 paused_from_mode = mode,
                 mode = 'paused',
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND archived = FALSE
               AND mode = $2
               AND mode IN ('alerting', 'live')
             RETURNING *
@@ -193,7 +200,7 @@ impl DetectionRuleRepository {
             Some(rule) => Ok(rule),
             None => {
                 let current_mode: Option<(String,)> =
-                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1")
+                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE")
                         .bind(id)
                         .fetch_optional(&self.pool)
                         .await?;
@@ -229,7 +236,7 @@ impl DetectionRuleRepository {
                 -- counter too (single-rule demote_to_live already does).
                 live_match_count = CASE WHEN $2 = 'live' THEN 0 ELSE live_match_count END,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND archived = FALSE
             RETURNING *
             "#,
         )
@@ -254,7 +261,7 @@ impl DetectionRuleRepository {
                 mode = paused_from_mode,
                 paused_from_mode = NULL,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND archived = FALSE
               AND mode = $2
               AND mode = 'paused'
               AND paused_from_mode IN ('staging', 'live', 'alerting')
@@ -270,7 +277,7 @@ impl DetectionRuleRepository {
             Some(rule) => Ok(rule),
             None => {
                 let current_mode: Option<(String,)> =
-                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1")
+                    sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE")
                         .bind(id)
                         .fetch_optional(&self.pool)
                         .await?;
@@ -295,7 +302,7 @@ impl DetectionRuleRepository {
     ) -> Result<(Option<RuleMode>, DetectionRule), DetectionRuleRepositoryError> {
         let mut tx = self.pool.begin().await?;
         let source_mode: Option<(String,)> =
-            sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 FOR UPDATE")
+            sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE FOR UPDATE")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -306,7 +313,7 @@ impl DetectionRuleRepository {
         let source_mode = parse_rule_mode(id, &source_mode)?;
         if source_mode == RuleMode::Paused {
             let rule =
-                sqlx::query_as::<_, DetectionRule>("SELECT * FROM detection_rules WHERE id = $1")
+                sqlx::query_as::<_, DetectionRule>("SELECT * FROM detection_rules WHERE id = $1 AND archived = FALSE")
                     .bind(id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -326,7 +333,7 @@ impl DetectionRuleRepository {
                 paused_from_mode = mode,
                 mode = 'paused',
                 updated_at = NOW()
-            WHERE id = $1 AND mode = $2
+            WHERE id = $1 AND archived = FALSE AND mode = $2
             RETURNING *
             "#,
         )
@@ -350,7 +357,7 @@ impl DetectionRuleRepository {
     ) -> Result<(Option<RuleMode>, DetectionRule), DetectionRuleRepositoryError> {
         let mut tx = self.pool.begin().await?;
         let source_mode: Option<(String,)> =
-            sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 FOR UPDATE")
+            sqlx::query_as("SELECT mode::text FROM detection_rules WHERE id = $1 AND archived = FALSE FOR UPDATE")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -361,7 +368,7 @@ impl DetectionRuleRepository {
         let source_mode = parse_rule_mode(id, &source_mode)?;
         if source_mode != RuleMode::Paused {
             let rule =
-                sqlx::query_as::<_, DetectionRule>("SELECT * FROM detection_rules WHERE id = $1")
+                sqlx::query_as::<_, DetectionRule>("SELECT * FROM detection_rules WHERE id = $1 AND archived = FALSE")
                     .bind(id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -375,7 +382,7 @@ impl DetectionRuleRepository {
                 mode = paused_from_mode,
                 paused_from_mode = NULL,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND archived = FALSE
               AND mode = 'paused'
               AND paused_from_mode IN ('staging', 'live', 'alerting')
             RETURNING *
@@ -431,7 +438,7 @@ impl DetectionRuleRepository {
                        FALSE
                    )
             FROM detection_rules
-            WHERE id = $1
+            WHERE id = $1 AND archived = FALSE
             FOR UPDATE
             "#,
         )
@@ -446,7 +453,7 @@ impl DetectionRuleRepository {
 
         if within_dwell {
             let rule =
-                sqlx::query_as::<_, DetectionRule>("SELECT * FROM detection_rules WHERE id = $1")
+                sqlx::query_as::<_, DetectionRule>("SELECT * FROM detection_rules WHERE id = $1 AND archived = FALSE")
                     .bind(id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -478,7 +485,7 @@ impl DetectionRuleRepository {
                 END,
                 legacy_lifecycle_transition_at = NOW(),
                 updated_at = NOW()
-            WHERE id = $1 AND mode = $3
+            WHERE id = $1 AND archived = FALSE AND mode = $3
             RETURNING *
             "#,
         )

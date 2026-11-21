@@ -322,7 +322,7 @@ export function SearchQueryInput({
           Nested inside the relative input wrapper so `top-full` anchors
           directly under the input shell, not the outer search card. */}
       {showHistorySuggestions && (historySuggestions.length > 0 || historyFilter.length > 0) && (
-        <div className="search-console-dropdown search-console-history absolute top-full left-0 right-0 -mt-px bg-popover border border-border-2 rounded-[8px] shadow-[0_20px_60px_rgba(0,0,0,0.5)] z-[100] overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200">
+        <div data-testid="search-history-dropdown" className="search-console-dropdown search-console-history absolute top-full left-0 right-0 -mt-px bg-popover border border-border-2 rounded-[8px] shadow-[0_20px_60px_rgba(0,0,0,0.5)] z-[100] overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200">
           {/* Header: mono uppercase label + kbd hints */}
           <div className="px-3 py-2 border-b border-border font-mono text-[9.5px] tracking-[0.12em] uppercase text-muted-foreground/80 font-semibold flex items-center gap-2">
             <Clock className="w-[11px] h-[11px]" />
@@ -406,6 +406,7 @@ export function SearchQueryInput({
               return (
                 <div
                   key={`${item.type}-${item.id}`}
+                  data-testid="search-history-item"
                   className={`mx-1 px-2 py-1.5 rounded-[5px] cursor-pointer transition-colors ${
                     isSelected
                       ? 'bg-primary/10'

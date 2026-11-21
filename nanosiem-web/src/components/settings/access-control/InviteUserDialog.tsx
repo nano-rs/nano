@@ -261,7 +261,7 @@ export function InviteUserDialog({ open, groups, onClose, onCreated }: InviteUse
                       Copy this temporary password now — it won't be shown again. Share it via your usual secure channel; the user will replace it on first sign-in.
                     </div>
                     <div className="mt-2 rounded-md border border-border bg-card p-2 flex items-center gap-2 font-mono text-[11.5px] text-foreground break-all">
-                      <span className="flex-1">{success.password}</span>
+                      <span className="flex-1" data-testid="invite-temp-password">{success.password}</span>
                       <button
                         onClick={() => {
                           navigator.clipboard?.writeText(success.password);

@@ -39,6 +39,7 @@ import { SourceTypeCombobox } from './SourceTypeCombobox';
 import {
   applyMergedSourceType,
   applySourceTypeMappings,
+  upstreamDismissOffered,
   type RepoRuleView,
 } from './helpers';
 import { PermissionAction } from './PermissionAction';
@@ -203,7 +204,8 @@ export function RepoPreview({
       }
     }
     const req: ImportRequest = {
-      import_type: 'forked',
+      // NAN-5716: linked, like the row Import and Bulk import.
+      import_type: 'linked',
       severity:
         severity && preview && severity !== preview.proposed_severity ? severity : undefined,
       mode,
@@ -1089,6 +1091,10 @@ function DiffTab({
       <DiffViewer oldText={diff.current_query} newText={diff.upstream_query} />
 
       <div className="flex items-center gap-2 pt-1">
+        {/* NAN-5716: Dismiss acknowledges an UPSTREAM change. A DRIFT rule has
+            none (the change is local), so Dismiss would be a no-op behind a
+            success toast; resolve drift through the merge instead. */}
+        {upstreamDismissOffered(rule.status) && (
         <PermissionAction access={dismissAccess}>
           <button
             type="button"
@@ -1099,6 +1105,7 @@ function DiffTab({
             Dismiss
           </button>
         </PermissionAction>
+        )}
         <span className="flex-1" />
         <button
           type="button"

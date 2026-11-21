@@ -271,6 +271,7 @@ pub async fn get_parser_repository(
     responses(
         (status = 200, description = "Repository created successfully", body = ParserRepository),
         (status = 403, description = "Forbidden"),
+        (status = 409, description = "Air-gapped install: Git sync needs outbound internet"),
     ),
     security(("api_key" = []))
 )]
@@ -281,6 +282,7 @@ pub async fn create_parser_repository(
     Json(req): Json<CreateParserRepositoryRequest>,
 ) -> Result<Json<ParserRepository>, ApiError> {
     ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
+    crate::handlers::system::refuse_git_egress_when_air_gapped(&state)?;
 
     let service = get_parser_repo_service(&state);
 
@@ -427,6 +429,7 @@ pub async fn delete_parser_repository(
         (status = 200, description = "Sync started", body = ParserSyncStartResponse),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Air-gapped install: Git sync needs outbound internet"),
     ),
     security(("api_key" = []))
 )]
@@ -437,6 +440,7 @@ pub async fn sync_parser_repository(
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<ParserSyncStartResponse>, ApiError> {
     ensure_permission(&auth, permissions::PARSER_REPOSITORIES_SYNC)?;
+    crate::handlers::system::refuse_git_egress_when_air_gapped(&state)?;
 
     let service = get_parser_repo_service(&state);
     let repo = service.get_repository(*id).await?;

@@ -18,6 +18,10 @@ use super::alerts::ClaimedFinding;
 use super::DetectionError;
 use super::DetectionService;
 
+/// Rows per `detection_matched_events` INSERT (NAN-5736): 4 binds each, well
+/// under PostgreSQL's 65535-parameter limit.
+pub(super) const MATCHED_EVENTS_INSERT_BATCH: usize = 1000;
+
 /// Inject `_nano_detected_at` into each matched event so the frontend can always
 /// compute detection latency regardless of whether the event has a timestamp field.
 pub(crate) fn inject_detected_at(events: &mut [serde_json::Value], detected_at: DateTime<Utc>) {
@@ -177,9 +181,25 @@ pub(crate) async fn store_detection_match_with_pool(
     rule: &DetectionRule,
     events: &[serde_json::Value],
 ) -> Result<(), DetectionError> {
-    let event_count = events.len() as i32;
+    // `event_count` is the TRUE number of matched events; the stored array is
+    // bounded (NAN-5736), so a shorter array reads as truncated.
+    let event_count = i32::try_from(events.len()).unwrap_or(i32::MAX);
     let severity_str = format!("{:?}", rule.severity).to_lowercase();
-    let mut matched_events = serde_json::Value::Array(events.to_vec());
+    // NAN-5736: one row stored every matched event; a broad rule wrote
+    // multi-MB rows and OOM-killed PostgreSQL. Keep the newest events within
+    // the row budget and cut down oversized ones.
+    let bounded = crate::detection::match_payload::bound_match_events(events);
+    if bounded.truncated() {
+        counter!("nanosiem_detection_match_rows_truncated_total").increment(1);
+        debug!(
+            rule_id = %rule.id,
+            matched = events.len(),
+            stored = bounded.events.len(),
+            shrunk = bounded.shrunk,
+            "Bounded the detection_matches payload"
+        );
+    }
+    let mut matched_events = serde_json::Value::Array(bounded.events);
     // NAN-5424: PostgreSQL rejects U+0000 in jsonb (22P05) and text[] (22021);
     // sanitize before deriving the source_types stamp, the hash and the bind.
     crate::db::pg_text::sanitize_json_for_pg(&mut matched_events);
@@ -193,13 +213,24 @@ pub(crate) async fn store_detection_match_with_pool(
     // rows never land here as '{}' while the restricted registry is
     // non-empty. An empty stamp means non-source-derived events
     // (retro-hunt indicator summaries) = visible to everyone.
-    let source_types =
-        crate::db::repository::alerts::distinct_source_types(&matched_events);
+    //
+    // NAN-5736: derived from ALL matched events, not the bounded stored
+    // array — dropping an event must never drop its source from the stamp
+    // (that would show the row to viewers denied that source).
+    let source_types: Vec<String> =
+        crate::db::repository::alerts::distinct_source_types_of(events)
+            .into_iter()
+            .map(|st| crate::db::pg_text::pg_safe_str(&st).into_owned())
+            .collect();
 
     // Compute event hash for deduplication (`compute_event_hash` strips
     // `_nano_*` keys, so annotated and pre-annotation payloads dedup
     // against each other).
-    let event_hash = crate::db::repository::compute_event_hash(&matched_events);
+    //
+    // NAN-5736: over ALL matched events, not the bounded stored array, so
+    // two different match sets sharing a bounded prefix never collide and
+    // the second is never dropped by `ON CONFLICT DO NOTHING`.
+    let event_hash = crate::db::repository::alerts::compute_event_hash_of(events);
 
     // Try to insert, but ignore if duplicate (same rule_id + event_hash)
     // This prevents storing the same match multiple times when a rule runs
@@ -427,34 +458,38 @@ impl DetectionService {
             return Ok(());
         }
 
-        let mut query_builder = sqlx::QueryBuilder::new(
-            "INSERT INTO detection_matched_events (rule_id, kind, event_id, event_timestamp) ",
-        );
+        // NAN-5736: batched — one statement for every event of a large run
+        // exceeded PostgreSQL's 65535 bind parameters (4 per event).
+        for chunk in events.chunks(MATCHED_EVENTS_INSERT_BATCH) {
+            let mut query_builder = sqlx::QueryBuilder::new(
+                "INSERT INTO detection_matched_events (rule_id, kind, event_id, event_timestamp) ",
+            );
 
-        query_builder.push_values(events, |mut b, event| {
-            let event_id = matched_event_id(event);
-            // Extract timestamp from event
-            let timestamp = event
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(chrono::Utc::now);
+            query_builder.push_values(chunk, |mut b, event| {
+                let event_id = matched_event_id(event);
+                // Extract timestamp from event
+                let timestamp = event
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(chrono::Utc::now);
 
-            b.push_bind(rule_id)
-                .push_bind(kind.as_str())
-                // NAN-5424: the id can come from an event field.
-                .push_bind(crate::db::pg_text::pg_safe_string(event_id))
-                .push_bind(timestamp);
-        });
+                b.push_bind(rule_id)
+                    .push_bind(kind.as_str())
+                    // NAN-5424: the id can come from an event field.
+                    .push_bind(crate::db::pg_text::pg_safe_string(event_id))
+                    .push_bind(timestamp);
+            });
 
-        query_builder.push(" ON CONFLICT (rule_id, kind, event_id) DO NOTHING");
+            query_builder.push(" ON CONFLICT (rule_id, kind, event_id) DO NOTHING");
 
-        query_builder
-            .build()
-            .execute(&self.pg_pool)
-            .await
-            .map_err(DetectionError::DatabaseError)?;
+            query_builder
+                .build()
+                .execute(&self.pg_pool)
+                .await
+                .map_err(DetectionError::DatabaseError)?;
+        }
 
         Ok(())
     }

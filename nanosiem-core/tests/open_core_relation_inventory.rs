@@ -33,7 +33,7 @@ use syn::{Attribute, Expr, Item, Lit, LitStr, Meta, Token};
 
 const DB_PREFIX: &str = "nanosiem_open_relation_inventory_";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LiteralSource {
     value: String,
     path: PathBuf,
@@ -524,8 +524,112 @@ fn relation_candidates(workspace: &Path) -> BTreeSet<String> {
     relations
 }
 
-fn referenced_relations(workspace: &Path) -> BTreeMap<String, BTreeSet<PathBuf>> {
-    let candidates = relation_candidates(workspace);
+fn sql_comments() -> Regex {
+    Regex::new(r"(?ms)--[^\r\n]*|/\*.*?\*/").unwrap()
+}
+
+/// Session-local tables created at runtime, keyed by the source file whose SQL
+/// creates them.
+///
+/// Only literals handed straight to `sqlx` count (with SQL comments removed):
+/// prose such as an error message mentioning "CREATE TEMPORARY TABLE
+/// permissions" must never hide a real table. The exemption is per file, so
+/// a temp table in one module cannot mask a genuinely missing permanent table
+/// of the same name referenced from another.
+fn temporary_relations(direct_sql_literals: &[LiteralSource]) -> BTreeMap<PathBuf, BTreeSet<String>> {
+    // `CREATE [LOCAL|GLOBAL] TEMP[ORARY] TABLE [IF NOT EXISTS] [pg_temp.]name`
+    // and `CREATE TABLE [IF NOT EXISTS] pg_temp.name` both create a
+    // session-local table.
+    let temporary = Regex::new(
+        r#"(?ix)
+        \bCREATE\s+(?:
+            (?:(?:LOCAL|GLOBAL)\s+)?(?:TEMP|TEMPORARY)\s+(?:UNLOGGED\s+)?TABLE\s+
+            (?:IF\s+NOT\s+EXISTS\s+)?(?:"?pg_temp"?\s*\.\s*)?
+          | (?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?pg_temp"?\s*\.\s*
+        )
+        "?([a-z_][a-z0-9_]*)
+        "#,
+    )
+    .unwrap();
+    let comments = sql_comments();
+    let mut by_file: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    for literal in direct_sql_literals {
+        let sql = comments.replace_all(&literal.value, " ");
+        for capture in temporary.captures_iter(&sql) {
+            by_file
+                .entry(literal.path.clone())
+                .or_default()
+                .insert(capture[1].to_lowercase());
+        }
+    }
+    by_file
+}
+
+/// Normalizes a matched schema qualifier the way PostgreSQL resolves it:
+/// unquoted identifiers fold to lower case, quoted ones are exact.
+fn schema_name(raw: &str) -> String {
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.trim_matches('"').to_lowercase()
+    }
+}
+
+fn previous_words(sql_before: &str, count: usize) -> Vec<String> {
+    let mut words: Vec<String> = sql_before
+        .split_whitespace()
+        .rev()
+        .take(count)
+        .map(|word| word.to_ascii_uppercase())
+        .collect();
+    words.reverse();
+    words
+}
+
+/// True when the UPDATE that follows `sql_before` is a clause keyword rather
+/// than the start of an `UPDATE <relation>` statement.
+fn update_is_control_syntax(sql_before: &str) -> bool {
+    let words = previous_words(sql_before, 3);
+    let last = words.last().map(String::as_str);
+    matches!(last, Some("DO" | "FOR")) || words.ends_with(&["FOR".into(), "NO".into(), "KEY".into()])
+}
+
+/// True when the FROM that follows `sql_before` belongs to an expression:
+/// `IS [NOT] DISTINCT FROM`, or the `FROM` argument separator of
+/// `EXTRACT(field FROM src)`, `TRIM(... FROM src)`, `SUBSTRING(src FROM ...)`
+/// and `OVERLAY(src PLACING x FROM n)`.
+fn from_is_expression_syntax(sql_before: &str) -> bool {
+    if previous_words(sql_before, 1).first().is_some_and(|word| word == "DISTINCT") {
+        return true;
+    }
+    // Find the innermost unclosed `(` before this FROM, then the identifier
+    // immediately before it.
+    let mut depth = 0usize;
+    for (index, ch) in sql_before.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' if depth > 0 => depth -= 1,
+            '(' => {
+                let function = sql_before[..index]
+                    .trim_end()
+                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("");
+                return ["extract", "trim", "substring", "overlay"]
+                    .iter()
+                    .any(|name| function.eq_ignore_ascii_case(name));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn relation_references(
+    candidates: &BTreeSet<String>,
+    runtime_literals: Vec<LiteralSource>,
+    direct_sql_literals: Vec<LiteralSource>,
+) -> BTreeMap<String, BTreeSet<PathBuf>> {
     let relation = Regex::new(
         r#"(?ix)
         \b(?P<operation>FROM|JOIN|UPDATE|INSERT\s+INTO|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?|LOCK\s+TABLE)
@@ -535,14 +639,19 @@ fn referenced_relations(workspace: &Path) -> BTreeMap<String, BTreeSet<PathBuf>>
         "#,
     )
     .unwrap();
-    let comments = Regex::new(r"(?ms)--[^\r\n]*|/\*.*?\*/").unwrap();
-    let cte = Regex::new(r"(?i)(?:\bWITH|,)\s*([a-z_][a-z0-9_]*)\s+AS\s*\(").unwrap();
-    let temporary = Regex::new(
-        r#"(?i)\bCREATE\s+(?:TEMP|TEMPORARY)\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([a-z_][a-z0-9_]*)"#,
+    let comments = sql_comments();
+    // `WITH [RECURSIVE] name [(col, ...)] AS [[NOT] MATERIALIZED] (`, also
+    // after a comma for the second and later CTEs.
+    let cte = Regex::new(
+        r#"(?i)(?:\bWITH(?:\s+RECURSIVE)?|,)\s*"?([a-z_][a-z0-9_]*)"?(?:\s*\([^()]*\))?\s+AS\s*(?:(?:NOT\s+)?MATERIALIZED\s*)?\("#,
     )
     .unwrap();
+    // A `CREATE TEMP TABLE` is usually its own statement, so the INSERT /
+    // SELECT / TRUNCATE that use it are separate literals in the same file
+    // (for example the `ON COMMIT DROP` slice table in content_bundle/store.rs).
+    let temporary = temporary_relations(&direct_sql_literals);
+    let no_temporary = BTreeSet::new();
     let mut references: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
-    let (runtime_literals, direct_sql_literals) = runtime_literals(workspace);
 
     for (literal, allow_unknown) in runtime_literals
         .into_iter()
@@ -558,43 +667,45 @@ fn referenced_relations(workspace: &Path) -> BTreeMap<String, BTreeSet<PathBuf>>
             .captures_iter(&sql)
             .map(|capture| capture[1].to_lowercase())
             .collect();
-        let temporary: BTreeSet<String> = temporary
-            .captures_iter(&sql)
-            .map(|capture| capture[1].to_lowercase())
-            .collect();
+        let file_temporary = temporary.get(&literal.path).unwrap_or(&no_temporary);
         for capture in relation.captures_iter(&sql) {
             let matched = capture.get(0).expect("relation match has a span");
             if capture["operation"].eq_ignore_ascii_case("UPDATE")
-                && sql[..matched.start()]
-                    .split_whitespace()
-                    .next_back()
-                    .is_some_and(|word| {
-                        word.eq_ignore_ascii_case("DO") || word.eq_ignore_ascii_case("FOR")
-                    })
+                && update_is_control_syntax(&sql[..matched.start()])
             {
-                // `ON CONFLICT DO UPDATE SET` and `SELECT ... FOR UPDATE SKIP
-                // LOCKED` contain UPDATE as control syntax, not a relation.
+                // `ON CONFLICT DO UPDATE SET` and `SELECT ... FOR [NO KEY]
+                // UPDATE SKIP LOCKED` contain UPDATE as control syntax, not a
+                // relation.
                 continue;
             }
-            if capture
-                .get(0)
-                .is_some_and(|matched| sql[matched.end()..].trim_start().starts_with('('))
+            if capture["operation"].eq_ignore_ascii_case("FROM")
+                && from_is_expression_syntax(&sql[..matched.start()])
             {
+                // `IS [NOT] DISTINCT FROM col` and `EXTRACT(EPOCH FROM col)`
+                // style calls use FROM inside an expression, not a FROM clause.
+                continue;
+            }
+            let reads_rows = capture["operation"].eq_ignore_ascii_case("FROM")
+                || capture["operation"].eq_ignore_ascii_case("JOIN");
+            if reads_rows && sql[matched.end()..].trim_start().starts_with('(') {
                 // `FROM jsonb_array_elements(...)` and similar table
-                // functions do not name relations.
+                // functions do not name relations. Only FROM / JOIN take a
+                // function there: `INSERT INTO t (a, b)` is a column list and
+                // `t` must still be checked (NAN-5727).
                 continue;
             }
-            if capture
-                .name("schema")
-                .is_some_and(|schema| schema.as_str().trim_matches('"') != "public")
-            {
-                // pg_catalog and information_schema are supplied by PostgreSQL,
-                // not the open migration set.
+            let schema = capture.name("schema").map(|schema| schema_name(schema.as_str()));
+            if schema.as_deref().is_some_and(|schema| schema != "public") {
+                // pg_catalog, information_schema and pg_temp are supplied by
+                // PostgreSQL or the session, not the open migration set.
                 continue;
             }
             let name = capture["name"].to_lowercase();
+            // An explicit `public.` qualifier names a permanent relation; a
+            // temp table never lives in `public`, so it is never exempt.
+            let session_local = schema.is_none() && file_temporary.contains(&name);
             if ctes.contains(&name)
-                || temporary.contains(&name)
+                || session_local
                 || (!allow_unknown && !candidates.contains(&name))
             {
                 continue;
@@ -606,6 +717,12 @@ fn referenced_relations(workspace: &Path) -> BTreeMap<String, BTreeSet<PathBuf>>
         }
     }
     references
+}
+
+fn referenced_relations(workspace: &Path) -> BTreeMap<String, BTreeSet<PathBuf>> {
+    let candidates = relation_candidates(workspace);
+    let (runtime_literals, direct_sql_literals) = runtime_literals(workspace);
+    relation_references(&candidates, runtime_literals, direct_sql_literals)
 }
 
 fn admin_url() -> Option<String> {
@@ -723,4 +840,201 @@ async fn open_runtime_only_references_fresh_open_relations() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+// Self-tests for the reference scan (no database needed).
+
+fn sql(path: &str, value: &str) -> LiteralSource {
+    LiteralSource {
+        value: value.to_string(),
+        path: PathBuf::from(path),
+    }
+}
+
+fn scan(
+    candidates: &[&str],
+    runtime: Vec<LiteralSource>,
+    direct: Vec<LiteralSource>,
+) -> BTreeMap<String, BTreeSet<PathBuf>> {
+    let candidates = candidates.iter().map(|name| name.to_string()).collect();
+    // `runtime_literals` is a superset of the direct sqlx literals, as in
+    // `collect_items`.
+    let runtime = runtime.into_iter().chain(direct.iter().cloned()).collect();
+    relation_references(&candidates, runtime, direct)
+}
+
+#[test]
+fn temp_table_used_from_separate_literals_in_same_file_is_exempt() {
+    // The content_bundle/store.rs shape (NAN-5725).
+    let references = scan(
+        &["content_channel_files"],
+        vec![],
+        vec![
+            sql("store.rs", "CREATE TEMP TABLE content_file_slices (n integer NOT NULL, part bytea NOT NULL) ON COMMIT DROP"),
+            sql("store.rs", "INSERT INTO content_file_slices (n, part) VALUES ($1, $2)"),
+            sql("store.rs", "INSERT INTO content_channel_files (channel) SELECT string_agg(part, ''::bytea ORDER BY n) FROM content_file_slices"),
+            sql("store.rs", "TRUNCATE content_file_slices"),
+            sql("store.rs", "SELECT octet_length(content) FROM content_channel_files WHERE channel = $1"),
+        ],
+    );
+    assert!(!references.contains_key("content_file_slices"), "{references:?}");
+    assert!(references.contains_key("content_channel_files"));
+}
+
+#[test]
+fn temp_table_in_another_file_does_not_mask_a_missing_real_table() {
+    let references = scan(
+        &["staging"],
+        vec![],
+        vec![
+            sql("a.rs", "CREATE TEMP TABLE staging (id bigint) ON COMMIT DROP"),
+            sql("a.rs", "INSERT INTO staging (id) VALUES ($1)"),
+            sql("b.rs", "SELECT id FROM staging"),
+        ],
+    );
+    assert_eq!(
+        references.get("staging"),
+        Some(&BTreeSet::from([PathBuf::from("b.rs")])),
+        "the reference from b.rs must still be checked against the schema"
+    );
+}
+
+#[test]
+fn public_qualified_reference_is_never_temp_exempt() {
+    for reference in [
+        "SELECT id FROM public.staging",
+        "SELECT id FROM PUBLIC.staging",
+        "SELECT id FROM \"public\".staging",
+    ] {
+        let references = scan(
+            &["staging"],
+            vec![],
+            vec![
+                sql("a.rs", "CREATE TEMP TABLE staging (id bigint)"),
+                sql("a.rs", reference),
+            ],
+        );
+        assert!(references.contains_key("staging"), "{reference}: {references:?}");
+    }
+}
+
+#[test]
+fn quoted_non_public_schema_is_skipped() {
+    let references = scan(&["staging"], vec![], vec![sql("a.rs", "SELECT id FROM \"PUBLIC\".staging")]);
+    assert!(references.is_empty(), "{references:?}");
+}
+
+#[test]
+fn temp_table_syntax_variants_are_recognized() {
+    for create in [
+        "CREATE TEMPORARY TABLE staging (id bigint)",
+        "CREATE LOCAL TEMP TABLE staging (id bigint)",
+        "CREATE GLOBAL TEMPORARY TABLE staging (id bigint)",
+        "create temp table if not exists \"Staging\" (id bigint)",
+        "CREATE TEMP TABLE pg_temp.staging (id bigint)",
+        "CREATE TEMP TABLE \"pg_temp\".\"staging\" (id bigint)",
+        "CREATE TABLE pg_temp.staging (id bigint)",
+    ] {
+        let references = scan(
+            &[],
+            vec![],
+            vec![sql("a.rs", create), sql("a.rs", "INSERT INTO staging (id) VALUES ($1)")],
+        );
+        assert!(references.is_empty(), "{create}: {references:?}");
+    }
+}
+
+#[test]
+fn pg_temp_qualified_reference_is_skipped() {
+    let references = scan(&[], vec![], vec![sql("a.rs", "SELECT id FROM pg_temp.staging")]);
+    assert!(references.is_empty(), "{references:?}");
+}
+
+#[test]
+fn prose_and_sql_comments_do_not_create_temp_exemptions() {
+    // A non-sqlx string (an error message) and a SQL comment both mention
+    // CREATE TEMPORARY TABLE; neither may hide the real `permissions` table.
+    let references = scan(
+        &["permissions"],
+        vec![
+            sql("a.rs", "CREATE TEMPORARY TABLE permissions are denied for this role"),
+            sql("a.rs", "SELECT id FROM permissions"),
+        ],
+        vec![sql("a.rs", "-- CREATE TEMP TABLE permissions (id int)\nSELECT id FROM permissions")],
+    );
+    assert!(references.contains_key("permissions"), "{references:?}");
+}
+
+#[test]
+fn insert_with_column_list_is_checked() {
+    // NAN-5727: `name (` after INSERT INTO is a column list, not a function.
+    for statement in [
+        "INSERT INTO missing_table (a) VALUES ($1)",
+        "INSERT INTO missing_table(a, b) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        "INSERT INTO public.missing_table (a) SELECT 1",
+    ] {
+        let references = scan(&[], vec![], vec![sql("a.rs", statement)]);
+        assert_eq!(
+            references.get("missing_table"),
+            Some(&BTreeSet::from([PathBuf::from("a.rs")])),
+            "{statement}: {references:?}"
+        );
+    }
+}
+
+#[test]
+fn table_functions_after_from_or_join_are_skipped() {
+    for statement in [
+        "SELECT value FROM jsonb_array_elements($1)",
+        "SELECT * FROM t JOIN LATERAL unnest($1) (x) ON true",
+        "SELECT g FROM generate_series (1, 10) g",
+    ] {
+        let references = scan(&[], vec![], vec![sql("a.rs", statement)]);
+        assert!(
+            !references.contains_key("jsonb_array_elements")
+                && !references.contains_key("unnest")
+                && !references.contains_key("generate_series"),
+            "{statement}: {references:?}"
+        );
+    }
+}
+
+#[test]
+fn valid_postgres_syntax_does_not_invent_relations() {
+    // Each statement is valid PostgreSQL reading only `alerts`; the scan
+    // must not report a CTE, a lock clause word or a column as a relation.
+    for statement in [
+        "WITH RECURSIVE tree AS (SELECT id FROM alerts UNION ALL SELECT a.id FROM alerts a JOIN tree t ON a.id = t.id) SELECT * FROM tree",
+        "WITH sev_rank(name, weight) AS (VALUES ('high', 3)) SELECT * FROM alerts JOIN sev_rank ON true",
+        "WITH recent AS MATERIALIZED (SELECT id FROM alerts) SELECT * FROM recent",
+        "WITH recent AS NOT MATERIALIZED (SELECT id FROM alerts) SELECT * FROM recent",
+        "WITH a AS (SELECT 1), pairs (k, v) AS (SELECT id, id FROM alerts) SELECT * FROM pairs",
+        "SELECT 1 FROM alerts WHERE id = $1 FOR NO KEY UPDATE NOWAIT",
+        "SELECT 1 FROM alerts WHERE id = $1 FOR NO KEY UPDATE SKIP LOCKED",
+        "SELECT 1 FROM alerts WHERE id = $1 FOR UPDATE SKIP LOCKED",
+        "INSERT INTO alerts (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+        "UPDATE alerts SET status = $1 WHERE status IS DISTINCT FROM status_before",
+        "SELECT 1 FROM alerts WHERE status IS NOT DISTINCT FROM status_before",
+        "SELECT EXTRACT(EPOCH FROM created_at) FROM alerts",
+        "SELECT TRIM(BOTH '/' FROM path) FROM alerts",
+        "SELECT SUBSTRING(title FROM 1 FOR 3) FROM alerts",
+        "SELECT OVERLAY(title PLACING 'x' FROM 2) FROM alerts",
+    ] {
+        let references = scan(&["alerts"], vec![], vec![sql("a.rs", statement)]);
+        assert!(
+            references.keys().all(|name| name == "alerts"),
+            "{statement}: {references:?}"
+        );
+    }
+}
+
+#[test]
+fn expression_from_does_not_hide_a_real_from_clause() {
+    // The FROM after the EXTRACT call closes is a real FROM clause.
+    let references = scan(
+        &[],
+        vec![],
+        vec![sql("a.rs", "SELECT EXTRACT(EPOCH FROM created_at) FROM missing_table")],
+    );
+    assert!(references.contains_key("missing_table"), "{references:?}");
 }

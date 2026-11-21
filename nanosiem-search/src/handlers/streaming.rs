@@ -104,6 +104,12 @@ pub async fn search_stream(
         super::search::reserve_query_owner(&state, request_id, auth.credential_principal_id())
             .await?;
     }
+    // NAN-5723: a live stream always runs under an id, so dropping the SSE
+    // body can KILL its chunk and companion queries. A server-generated id
+    // needs no reservation: no client knows it.
+    if request.request_id.is_none() {
+        request.request_id = Some(uuid::Uuid::now_v7().to_string());
+    }
 
     // NAN-2039: admission keys on the USER, not the credential principal
     // reserved above. The batch path draws the same distinction — it reserves
@@ -260,7 +266,11 @@ pub async fn search_stream(
         } else {
             None
         };
-        search_task = Some(StreamSearchTask(tokio::spawn(
+        let kill_on_drop = request
+            .request_id
+            .clone()
+            .map(|id| (state.search.clone(), id));
+        search_task = Some(StreamSearchTask(kill_on_drop, tokio::spawn(
             nanosiem_core::search::request_actor::inherit(async move {
                 if let Some(marker) = tree_marker {
                     let rows = marker.results;
@@ -517,10 +527,30 @@ pub async fn search_stream(
 
 /// NAN-3077: a streaming search task that is aborted when its SSE body is
 /// dropped (the client left), so no hop keeps running for nobody.
-struct StreamSearchTask(tokio::task::JoinHandle<()>);
+///
+/// NAN-5723: aborting only drops the Rust futures; ClickHouse keeps scanning
+/// until it is told to stop, and the chunk / count / histogram queries run in
+/// detached tasks. An unfinished task therefore also KILLs every query of
+/// the request (`cancel_query` = the data id plus all derived ids).
+struct StreamSearchTask(
+    Option<(std::sync::Arc<nanosiem_core::search::SearchService>, String)>,
+    tokio::task::JoinHandle<()>,
+);
 
 impl Drop for StreamSearchTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if self.1.is_finished() {
+            return;
+        }
+        self.1.abort();
+        if let (Some((search, request_id)), Ok(rt)) =
+            (self.0.take(), tokio::runtime::Handle::try_current())
+        {
+            rt.spawn(async move {
+                if let Err(error) = search.cancel_query(&request_id).await {
+                    tracing::warn!(%error, %request_id, "Could not KILL an abandoned stream's queries");
+                }
+            });
+        }
     }
 }

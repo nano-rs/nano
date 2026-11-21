@@ -220,6 +220,10 @@ cleanup_env_temp() {
     if declare -F report_shared_env_change >/dev/null 2>&1; then
         report_shared_env_change || true
     fi
+    # NAN-5749: a secret prompt interrupted by Ctrl-C leaves echo off.
+    if declare -F tty_restore_state >/dev/null 2>&1; then
+        tty_restore_state
+    fi
     [[ -z "$ENV_TEMP_FILE" ]] || rm -f -- "$ENV_TEMP_FILE"
     [[ -z "$SETUP_HEADER_FILE" ]] || rm -f -- "$SETUP_HEADER_FILE"
     [[ -z "$SETUP_RESPONSE_FILE" ]] || rm -f -- "$SETUP_RESPONSE_FILE"
@@ -1548,6 +1552,59 @@ ANSWER_ITEMS=("admin_email admin_email admin_email Admin email"
     "retention retention retention Retention"
     "tiering tiering tier_cache Cold storage tiering")
 
+# NAN-5749: reads one line from the terminal into the variable named $1 ($2 =
+# secret reads without echo); returns read's status on end of input.
+#
+# bash 5.3 on Linux loses a SIGINT that lands after the prompt is printed but
+# before read(2) blocks: the INT trap is left pending and the read never
+# returns, so a quick Ctrl-C hung the installer. On bash 4+ the line is read in
+# 1-second slices: a timed-out slice ends the read builtin (status > 128) and
+# bash runs the pending trap before the next one. Each slice's bytes are
+# appended, so input a slice already consumed (a line flushed with one Ctrl-D,
+# or a terminal left in non-canonical mode) is kept. The gate is bash >= 4, not
+# "5.3 on Linux": it keys on what the loop needs (a timeout status distinct from
+# end of input, which bash 3.2 lacks: it returns 1 for both) and covers any
+# build with the same race. bash 3.2 (stock macOS /bin/bash) does not lose the
+# signal and keeps one blocking read.
+#
+# A secret turns echo off once with stty for the whole read, on every bash:
+# read -s per slice would turn echo back on between slices, and bash 3.2 leaves
+# it off when the INT trap exits during read -s. cleanup_env_temp restores it.
+# Without a working stty a secret is one blocking read -s: never sliced, so no
+# keystroke can echo.
+TTY_SAVED_STATE=""
+tty_read_line() {
+    local _tty_rc=0 _tty_buf="" _tty_chunk=""
+    if [[ "${2:-}" == secret ]]; then
+        if ! { TTY_SAVED_STATE=$(stty -g < /dev/tty 2>/dev/null) && [[ -n "$TTY_SAVED_STATE" ]] \
+                && stty -echo < /dev/tty 2>/dev/null; }; then
+            tty_restore_state
+            IFS= read -rs "$1" < /dev/tty
+            return
+        fi
+    fi
+    if (( BASH_VERSINFO[0] < 4 )); then
+        IFS= read -r "$1" < /dev/tty || _tty_rc=$?
+        tty_restore_state
+        return "$_tty_rc"
+    fi
+    while :; do
+        _tty_rc=0 _tty_chunk=""
+        IFS= read -r -t 1 _tty_chunk < /dev/tty || _tty_rc=$?
+        _tty_buf+="$_tty_chunk"
+        (( _tty_rc > 128 )) || break
+    done
+    tty_restore_state
+    printf -v "$1" '%s' "$_tty_buf"
+    return "$_tty_rc"
+}
+
+tty_restore_state() {
+    [[ -n "$TTY_SAVED_STATE" ]] || return 0
+    stty "$TTY_SAVED_STATE" < /dev/tty 2>/dev/null || true
+    TTY_SAVED_STATE=""
+}
+
 # Reads one answer from the terminal into ANSWER_REPLY ($2 is shown as
 # [default] and taken on Enter; $3 = secret reads without echo). Returns 2
 # when the answer is `back` or `<`. End of input stops the installer: a
@@ -1557,10 +1614,10 @@ answer_read() {
     [[ -n "$default" ]] && shown="$prompt [$default]"
     printf '%s: ' "$shown" > /dev/tty
     if [[ -n "$secret" ]]; then
-        IFS= read -rs reply < /dev/tty || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
+        tty_read_line reply secret || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
         printf '\n' > /dev/tty
     else
-        IFS= read -r reply < /dev/tty || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
+        tty_read_line reply || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
     fi
     reply=${reply%$'\r'}
     case "$(trim_space "$reply")" in

@@ -1412,6 +1412,73 @@ pub fn risk_dataset_base_query(
     }
 }
 
+/// One entity's finding-origin manifest (NAN-5697): the distinct normalized
+/// `origin_source_types` of its findings since the horizon, plus how many of
+/// those findings carry no origin at all (legacy / malformed rows).
+#[derive(Debug, Clone, PartialEq, Eq, clickhouse::Row, serde::Deserialize)]
+pub struct RiskOriginRow {
+    /// The finding's `risk_entity`, verbatim (the risk grain's `entity`).
+    /// Empty for the whole-window form of [`risk_origin_query`].
+    pub entity: String,
+    pub origin_source_types: Vec<String>,
+    pub unresolved: u64,
+}
+
+/// Origin manifest of the findings behind risk-dataset rows (NAN-5697).
+///
+/// A `dataset=risk` rule's rows are entity aggregates over the findings
+/// stream, so their provenance is the union of the contributing findings'
+/// persisted `origin_source_types`. The query is deliberately a SUPERSET of
+/// what the grain read: no cleared-entity boundary, no upper time bound and an
+/// earlier horizon than the grain's 7d. Over-attributing hides a notable from
+/// more source-restricted viewers, never fewer (the fail-closed direction).
+///
+/// `entities = Some(..)` returns one row per listed entity that has findings;
+/// `None` returns a single row (entity `''`) over every finding since the
+/// horizon, for rows that cannot be keyed to one entity.
+///
+/// The horizon compares the raw `timestamp` column (never a function of it),
+/// so the daily partitions and the `ORDER BY` timestamp prune.
+///
+/// Binds: `(horizon_start_us[, entities[]])`.
+pub fn risk_origin_query(
+    source: &RiskFindingsSource,
+    horizon_start_us: i64,
+    entities: Option<&[String]>,
+) -> RiskChQuery {
+    let (entity_select, entity_filter, group_by) = match entities {
+        Some(_) => ("entity", "\n                  AND __RISK_ENTITY__ IN ?", "\n            GROUP BY entity"),
+        None => ("'' AS entity", "", ""),
+    };
+    let sql = format!(
+        r#"
+            SELECT
+                {entity_select},
+                groupUniqArrayArray(origins) AS origin_source_types,
+                toUInt64(countIf(empty(origins))) AS unresolved
+            FROM (
+                SELECT
+                    __RISK_ENTITY__ AS entity,
+                    arrayFilter(o -> o != '', arrayMap(o -> lowerUTF8(trimBoth(o)), __ORIGIN_SOURCE_TYPES__)) AS origins
+                FROM __LOGS_TBL__
+                WHERE source_type = 'findings'
+                  AND __RISK_ENTITY__ != ''
+                  AND timestamp >= fromUnixTimestamp64Micro(toInt64(?), 'UTC'){entity_filter}
+            ){group_by}
+        "#
+    );
+    let mut binds = vec![RiskSqlBind::I64(horizon_start_us)];
+    if let Some(entities) = entities {
+        binds.push(RiskSqlBind::StrList(entities.to_vec()));
+    }
+    RiskChQuery {
+        // No `__RISK_SOURCE_SCOPE__` marker: the engine attributes as the
+        // system, over every finding, whatever scope `source` carries.
+        sql: source.substitute(sql),
+        binds,
+    }
+}
+
 /// The per-request configuration the nPL `dataset=risk` base source is built
 /// from (NAN-1798 P2): the SAME decay factors and cleared-entity boundaries
 /// the enterprise `RiskRepository` binds, plus the evaluation anchor for the

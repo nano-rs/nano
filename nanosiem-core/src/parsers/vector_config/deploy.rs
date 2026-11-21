@@ -55,6 +55,18 @@ fn sink_block<'a>(content: &'a str, name: &str) -> Option<(usize, usize, &'a str
 /// restore. The deployment history then claimed a recovery that never happened,
 /// which is the same misleading-success shape that made NAN-2296 take hours to
 /// find. The caller cannot infer this from an error string, so it is returned.
+
+/// NAN-5678: why [`VectorConfigManager::deploy_and_reload_locked_graded`]
+/// failed, and whether the tree it wrote stayed in place.
+#[derive(Debug)]
+pub struct DeployReloadFailure {
+    pub error: VectorConfigError,
+    /// The new tree is still on disk and may be live (the reload was not
+    /// confirmed). `false`: nothing changed for Vector (the write failed, or
+    /// Vector refused the tree and the snapshot was restored).
+    pub tree_kept: bool,
+}
+
 #[derive(Debug)]
 pub struct VerifyFailure {
     pub error: VectorConfigError,
@@ -4014,6 +4026,19 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         &self,
         parsers: &[Parser],
     ) -> Result<(), VectorConfigError> {
+        self.deploy_and_reload_locked_graded(parsers).await.map_err(|failure| failure.error)
+    }
+
+    /// NAN-5678: [`Self::deploy_and_reload_locked`], saying whether the new
+    /// tree stayed in place after a failure. `tree_kept: false` means this
+    /// deploy did not take effect: the write failed, or Vector refused the
+    /// tree and the snapshot was put back. `tree_kept: true` means it may well
+    /// be live (Vector down, slow, or not confirming), which a caller that
+    /// pairs the render with a database change must not treat as a refusal.
+    pub async fn deploy_and_reload_locked_graded(
+        &self,
+        parsers: &[Parser],
+    ) -> Result<(), DeployReloadFailure> {
         // NAN-5611: the tree as it was before this render (backups and
         // staging are outside it).
         let tree_before = super::tree_write::tree_fingerprint(&self.config_dir).await;
@@ -4036,7 +4061,8 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                 hold,
                 super::pipeline_gate::pipeline_identity(),
             )
-            .await?;
+            .await
+            .map_err(|error| DeployReloadFailure { error, tree_kept: false })?;
         // A gated or restarting Vector starts on this tree; there is no reload
         // to wait for. Waiting would hold the deploy lock that the entrypoint
         // takes before it starts Vector, delaying the reopen by the whole wait.
@@ -4048,7 +4074,8 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         let (ack, result) = self
             .reload_vector_graded_as(ReloadMode::Forward, tree_before.as_deref())
             .await;
-        if result.is_err() && ack == ReloadAck::Rejected {
+        let rejected = result.is_err() && ack == ReloadAck::Rejected;
+        if rejected {
             if identity_recorded {
                 // The restored tree is another identity's: gate it again.
                 super::pipeline_gate::clear_identity(&self.config_dir).await;
@@ -4058,7 +4085,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         if result.is_ok() {
             self.refresh_backup_after_change(tree_before.as_deref()).await;
         }
-        result
+        result.map_err(|error| DeployReloadFailure { error, tree_kept: !rejected })
     }
 
     /// NAN-5611: after a deploy that CHANGED the tree went live, snapshot the
@@ -4147,6 +4174,9 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                 );
                 return Err(error);
             }
+            // NAN-5657: recorded, so any stall record (beside it or in the
+            // data directory, from this or an earlier release) is resolved.
+            crate::siem_health::vector_pipeline_gate::clear_stall(&self.pipeline_identity_path()).await;
         }
         Ok(())
     }
@@ -4182,6 +4212,8 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                 if changed {
                     tracing::info!(%identity, "Vector config rendered for this pipeline identity; a gated Vector may start");
                 }
+                // NAN-5657: the identity is recorded; no stall record stands.
+                crate::siem_health::vector_pipeline_gate::clear_stall(&self.pipeline_identity_path()).await;
                 changed
             }
             Err(error) => {
@@ -4651,6 +4683,8 @@ mod responder_signal_tests;
 mod reload_window_tests;
 #[cfg(test)]
 mod reload_compile_budget_tests;
+#[cfg(test)]
+mod reload_scaling_render_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

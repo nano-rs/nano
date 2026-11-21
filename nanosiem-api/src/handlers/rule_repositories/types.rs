@@ -80,6 +80,10 @@ pub struct RepositoryRuleResponse {
     #[serde(with = "nanosiem_core::typeid::rule::opt")]
     #[schema(value_type = Option<String>)]
     pub linked_detection_rule_id: Option<Uuid>,
+    /// The imported detection rule was edited locally since it was imported or
+    /// last updated from upstream ("DRIFT", NAN-5716). Always `false` when the
+    /// rule is not imported.
+    pub local_drift: bool,
 }
 
 // =============================================================================

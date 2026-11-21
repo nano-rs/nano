@@ -564,6 +564,17 @@ impl LogSourceRepository {
         }
     }
 
+    /// NAN-5678: delete several log sources in one statement (atomic: all of
+    /// them or none). Returns the ids that existed and were deleted; an id
+    /// missing from the result was already gone.
+    pub async fn delete_many(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, LogSourceRepositoryError> {
+        let deleted: Vec<Uuid> = sqlx::query_scalar("DELETE FROM log_sources WHERE id = ANY($1) RETURNING id")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(deleted)
+    }
+
     /// Delete a log source
     pub async fn delete(&self, id: Uuid) -> Result<(), LogSourceRepositoryError> {
         let result = sqlx::query("DELETE FROM log_sources WHERE id = $1")

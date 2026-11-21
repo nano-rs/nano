@@ -29,6 +29,8 @@ import {
   type RedesignFilters,
   type StatusKey,
   type TechniqueCoverage,
+  ALL_RULE_MODES,
+  countRulesByStatus,
   summarizeTechniqueCoverage,
 } from '@/components/mitre/types';
 
@@ -147,10 +149,20 @@ interface SummaryStripProps {
   tiers: TierTotals;
   coverageGaps: TechniqueCoverage[];
   totalGapCount: number;
+  ruleStatusCounts: Record<StatusKey, number>;
   onOpenTechnique: (tacticId: string, techniqueId: string) => void;
 }
 
-function SummaryStrip({ pct, covered, total, tiers, coverageGaps, totalGapCount, onOpenTechnique }: SummaryStripProps) {
+function SummaryStrip({
+  pct,
+  covered,
+  total,
+  tiers,
+  coverageGaps,
+  totalGapCount,
+  ruleStatusCounts,
+  onOpenTechnique,
+}: SummaryStripProps) {
   return (
     <div className="shrink-0 border-b border-border bg-card/40">
       {/* Title row */}
@@ -199,7 +211,13 @@ function SummaryStrip({ pct, covered, total, tiers, coverageGaps, totalGapCount,
         <div className="col-span-12 md:col-span-4 rounded-lg border border-border bg-card p-3 flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Tier breakdown</div>
-            <div className="text-[10px] font-mono text-muted-foreground">live rules only</div>
+            <div className="text-[10px] font-mono text-muted-foreground" data-testid="mitre-rule-status-counts">
+              live rules only
+              <span className="text-muted-foreground/60 mx-1">·</span>
+              <span className="text-amber-500" data-testid="mitre-review-count">{ruleStatusCounts.review} in review</span>
+              <span className="text-muted-foreground/60 mx-1">·</span>
+              <span data-testid="mitre-disabled-count">{ruleStatusCounts.disabled} disabled</span>
+            </div>
           </div>
           <div className="flex items-center gap-1.5 flex-wrap">
             <TierPill tier="full" count={tiers.full} />
@@ -441,6 +459,10 @@ function CatalogEmptyState({ syncState }: { syncState: MitreSyncState | null }) 
 // Page.
 // ----------------------------------------------------------------------------
 
+// Stable identity so the coverage query key does not churn per render.
+// NAN-5717: request every mode so In review / Disabled rules reach the page.
+const ALL_MODES_FILTERS = { severity: [] as string[], mode: [...ALL_RULE_MODES] };
+
 export function MitreCoverage() {
   useDocumentTitle('MITRE ATT&CK Coverage');
 
@@ -457,7 +479,7 @@ export function MitreCoverage() {
   const [showIds, setShowIds] = useState(true);
   const [drawer, setDrawer] = useState<{ tacticId: string; techniqueId: string } | null>(null);
 
-  const { data, loading, error } = useMitreCoverage({ severity: [], mode: [] });
+  const { data, loading, error } = useMitreCoverage(ALL_MODES_FILTERS);
   // Only used to distinguish an empty catalog that is still syncing from a
   // genuine no-data state; the coverage endpoint itself carries no sync state.
   const { data: catalogData } = useMitreData();
@@ -491,6 +513,7 @@ export function MitreCoverage() {
   // Parents and sub-techniques are independent coverage units everywhere.
   // The backend summary carries the same explicit `technique` unit contract.
   const coverageStats = useMemo(() => summarizeTechniqueCoverage(techniques), [techniques]);
+  const ruleStatusCounts = useMemo(() => countRulesByStatus(techniques), [techniques]);
   const tiers: TierTotals = coverageStats.tiers;
   const total = data?.summary.total_techniques ?? coverageStats.total;
   const covered = coverageStats.covered;
@@ -559,6 +582,7 @@ export function MitreCoverage() {
         tiers={tiers}
         coverageGaps={coverageGaps}
         totalGapCount={allCoverageGaps.length}
+        ruleStatusCounts={ruleStatusCounts}
         onOpenTechnique={openTechnique}
       />
       <FilterRow

@@ -14,6 +14,7 @@
 //! - `helpers` — Parser conversion utilities
 
 mod crud;
+pub use crud::DeletedLogSource;
 mod deployment;
 mod health;
 mod helpers;
@@ -96,6 +97,11 @@ pub enum LogSourceServiceError {
     VersionError(#[from] LogSourceVersionError),
 }
 
+/// NAN-5678: how long a delete waits for other deletes to share its Vector
+/// reload. Short next to the reload itself (tens of seconds to minutes with
+/// many parsers deployed), long enough to catch a client deleting in parallel.
+const DELETE_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Log source service for managing log sources
 #[derive(Clone)]
 pub struct LogSourceService {
@@ -112,6 +118,9 @@ pub struct LogSourceService {
     table_names: crate::db::TableNames,
     vector_config: Arc<VectorConfigManager>,
     vrl_validator: Arc<VrlValidator>,
+    /// NAN-5678: concurrent deletes share one render and one Vector reload
+    /// (`crud.rs::delete_many`). Shared by every clone of the service.
+    delete_batcher: Arc<crate::log_sources::change_batch::ChangeBatcher<uuid::Uuid, Result<crud::DeletedLogSource, crud::BatchFailure>>>,
 }
 
 impl LogSourceService {
@@ -139,6 +148,7 @@ impl LogSourceService {
             table_names: dual_pool.table_names(),
             vector_config,
             vrl_validator: Arc::new(VrlValidator::new()),
+            delete_batcher: Arc::new(crate::log_sources::change_batch::ChangeBatcher::new(DELETE_BATCH_WINDOW)),
         }
     }
 

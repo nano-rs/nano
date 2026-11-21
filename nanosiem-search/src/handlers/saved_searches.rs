@@ -267,7 +267,7 @@ pub async fn get_saved_search(
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
         (status = 200, description = "Created saved search", body = SavedSearch),
-        (status = 400, description = "Invalid visibility or unknown group_ids", body = ErrorResponse),
+        (status = 400, description = "Invalid visibility, unknown group_ids, or a description longer than 2000 characters", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Missing permission: search:save", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
@@ -337,9 +337,10 @@ pub async fn create_saved_search(
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
         (status = 200, description = "Updated saved search", body = SavedSearch),
+        (status = 400, description = "Description longer than 2000 characters", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Only the owner can update", body = ErrorResponse),
-        (status = 404, description = "Saved search not found", body = ErrorResponse),
+        (status = 403, description = "Only the owner can update: the caller can see this saved search but does not own it", body = ErrorResponse),
+        (status = 404, description = "Saved search not found, or not visible to the caller (existence is not disclosed)", body = ErrorResponse),
     )
 )]
 pub async fn update_saved_search(
@@ -375,8 +376,8 @@ pub async fn update_saved_search(
     responses(
         (status = 200, description = "Deletion confirmation", body = serde_json::Value),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Only the owner can delete", body = ErrorResponse),
-        (status = 404, description = "Saved search not found", body = ErrorResponse),
+        (status = 403, description = "Only the owner can delete: the caller can see this saved search but does not own it", body = ErrorResponse),
+        (status = 404, description = "Saved search not found, or not visible to the caller (existence is not disclosed)", body = ErrorResponse),
     )
 )]
 pub async fn delete_saved_search(
@@ -412,8 +413,8 @@ pub async fn delete_saved_search(
         (status = 200, description = "Updated saved search with sharing context", body = SavedSearchWithContext),
         (status = 400, description = "Invalid visibility or unknown group_ids", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Only the owner can share", body = ErrorResponse),
-        (status = 404, description = "Saved search not found", body = ErrorResponse),
+        (status = 403, description = "Only the owner can share: the caller can see this saved search but does not own it", body = ErrorResponse),
+        (status = 404, description = "Saved search not found, or not visible to the caller (existence is not disclosed)", body = ErrorResponse),
     )
 )]
 pub async fn share_saved_search(

@@ -11,4 +11,5 @@ from nano_e2e.fixtures_cloud import (  # noqa: F401 - fixtures
     s3_bucket,
     sqs_queue,
 )
+from nano_e2e.fixtures_soc import soc  # noqa: F401 - fixture (NAN-5684 deep workflows)
 from nano_e2e.fixtures_ui import anon_page, page, ui, web  # noqa: F401 - fixtures

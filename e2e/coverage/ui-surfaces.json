@@ -1,0 +1,1609 @@
+{
+  "surfaces": {
+    "/": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_edition_affordances.py",
+        "tests/ui/test_log_sources_nav.py"
+      ]
+    },
+    "/alerts": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_incident_responder.py",
+        "tests/personas/test_pivt_alerts_page.py",
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_list_filters_sort_detail_and_triage",
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_to_case_and_grouping_into_the_existing_case",
+        "tests/ui/test_source_restricted_users.py"
+      ]
+    },
+    "/alerts/:id": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_list_filters_sort_detail_and_triage",
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_to_case_and_grouping_into_the_existing_case",
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_risk_notable_shows_the_rba_breakdown"
+      ]
+    },
+    "/auth/callback/:provider": {
+      "skip": "SSO callback; needs a real IdP round trip. test_sso_plan.py / test_sso_entitlement.py cover the SSO pages"
+    },
+    "/automation/approvals": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_soar.py",
+        "tests/personas/test_incident_responder.py",
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_real_alert_flow_two_person_approval_on_the_case"
+      ],
+      "edition": "enterprise"
+    },
+    "/automation/approvals/:id": {
+      "skip": "approval opened by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested",
+      "edition": "enterprise"
+    },
+    "/automation/capabilities": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_pack_browsing_and_install"
+      ],
+      "edition": "enterprise"
+    },
+    "/automation/flows": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_soar.py",
+        "tests/personas/test_incident_responder.py",
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_breaker_resume_and_live_save"
+      ],
+      "edition": "enterprise"
+    },
+    "/automation/flows/:id": {
+      "edition": "enterprise",
+      "tests": [
+        "tests/enterprise/ui/test_soar.py::test_run_flow_from_editor_matches_run_api",
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_unconnected_action_flagged_and_live_save_refused",
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_breaker_resume_and_live_save"
+      ]
+    },
+    "/automation/runs": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_soar.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/automation/runs/:id": {
+      "edition": "enterprise",
+      "tests": [
+        "tests/enterprise/ui/test_soar.py::test_approval_by_second_user_resumes_run",
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_unconnected_action_flagged_and_live_save_refused",
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_real_alert_flow_two_person_approval_on_the_case"
+      ]
+    },
+    "/cases/:id": {
+      "edition": "enterprise",
+      "tests": [
+        "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_hunts_escalation_acknowledge_and_case_close_smoke",
+        "tests/enterprise/ui/test_v2034_soar_case_steps.py::test_v2034_soar_case_steps_authored_tested_and_run_live",
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle",
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_to_case_and_grouping_into_the_existing_case",
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_real_alert_flow_two_person_approval_on_the_case",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues"
+      ]
+    },
+    "/cases/search": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ],
+      "edition": "enterprise"
+    },
+    "/d/:token": {
+      "skip": "demo claim link; only meaningful on a demo-mode deployment the harness cannot run"
+    },
+    "/dashboards": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_pivt_dashboards_page.py",
+        "tests/personas/test_soc_analyst.py",
+        "tests/ui/test_signals_risk_dashboard.py",
+        "tests/ui/test_deep_dashboards.py"
+      ]
+    },
+    "/dashboards/:id": {
+      "tests": [
+        "tests/ui/test_deep_dashboards.py::test_build_a_dashboard_from_scratch_with_every_panel_type",
+        "tests/ui/test_deep_dashboards.py::test_edit_duplicate_delete_move_and_resize_panels",
+        "tests/ui/test_deep_dashboards.py::test_time_range_refresh_autorefresh_and_drilldown",
+        "tests/ui/test_source_restricted_users.py::test_source_restricted_user_sees_only_granted_sources"
+      ]
+    },
+    "/demo": {
+      "skip": "demo-mode landing page; only mounted when DEPLOYMENT_MODE=demo, which the harness cannot run (NAN-5676 gap)"
+    },
+    "/denied": {
+      "skip": "the access-denied landing page; reached only through a refused route, which test_edition_affordances.py exercises"
+    },
+    "/enrichments/:id": {
+      "skip": "enrichment detail by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested"
+    },
+    "/enrichments/agent/:id": {
+      "skip": "agent enrichment detail by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested"
+    },
+    "/enrichments/custom/:id": {
+      "skip": "custom enrichment by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested",
+      "edition": "enterprise"
+    },
+    "/enrichments/custom/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/getting-started": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/hunts": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/personas/test_threat_hunter.py",
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/:id": {
+      "tests": [
+        "tests/enterprise/personas/test_threat_hunter.py",
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/campaigns": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/personas/test_threat_hunter.py",
+        "tests/enterprise/ui/test_hunts_ui_walk.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/campaigns/:id": {
+      "tests": [
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_agent_sql_approximate_distinct_count_reads_as_estdc"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/campaigns/candidates": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_hunts_ui_walk.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/escalations": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/knowledge": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/leads": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/personas/test_threat_hunter.py",
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/leads/:id": {
+      "edition": "enterprise",
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ]
+    },
+    "/hunts/memory": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/profile": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_hunts_ui_walk.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/rule-ideas": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_hunts_ui_walk.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/rulings": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/runners": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/personas/test_threat_hunter.py",
+        "tests/enterprise/ui/test_hunts_ui_walk.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/hunts/suppressions": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/inbox": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ],
+      "edition": "enterprise"
+    },
+    "/ingestion/connector-feeds": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/ingestion/credentials": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/ingestion/credentials/:id": {
+      "skip": "legacy credential URL (redirects into Log Sources): no scenario seeds and opens one yet; the list page it is reached from is smoke-tested"
+    },
+    "/ingestion/credentials/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/ingestion/log-sources": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/personas/test_pivt_ingestion_proposals.py",
+        "tests/ui/test_add_source.py",
+        "tests/ui/test_log_sources_nav.py"
+      ]
+    },
+    "/ingestion/log-sources/:id": {
+      "tests": [
+        "tests/ui/test_add_source.py",
+        "tests/ui/test_log_sources_nav.py",
+        "tests/ui/test_deep_data_onboarding.py::test_parser_editor_draft_publish_v2_and_health"
+      ]
+    },
+    "/ingestion/log-sources/cloud-pull": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_log_sources_nav.py"
+      ]
+    },
+    "/ingestion/log-sources/credentials": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_log_sources_nav.py"
+      ]
+    },
+    "/ingestion/log-sources/inputs/:id": {
+      "skip": "source config by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested"
+    },
+    "/ingestion/log-sources/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_add_source.py",
+        "tests/ui/test_deep_data_onboarding.py::test_wizard_http_json_bad_vrl_then_publish_and_search_ocsf"
+      ]
+    },
+    "/ingestion/log-sources/pull-feeds": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/ingestion/log-sources/repositories": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/ingestion/pipelines": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_pipelines_ui.py"
+      ]
+    },
+    "/ingestion/pipelines/:id": {
+      "skip": "pipeline by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested"
+    },
+    "/ingestion/pull-feeds": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/ingestion/source-configurations": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/ingestion/source-configurations/:id": {
+      "skip": "legacy source-configuration URL: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested"
+    },
+    "/integrations/custom/:id": {
+      "skip": "custom integration by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested",
+      "edition": "enterprise"
+    },
+    "/integrations/custom/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/login": {
+      "tests": [
+        "tests/ui/test_login_clean_load.py",
+        "tests/ui/test_sso_entitlement.py"
+      ]
+    },
+    "/marketplace": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_ioc_lists.py::test_enrichments_marketplace_lists_platform_and_custom"
+      ]
+    },
+    "/mfa-setup": {
+      "skip": "the forced MFA-setup flow needs a user with MFA required at login; TOTP enrollment itself is driven on /settings/user by test_deep_admin_settings.py::test_mfa_totp_enrollment_and_second_factor"
+    },
+    "/notebooks": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_notebooks.py::test_start_a_notebook_find_it_in_the_list_and_open_it"
+      ],
+      "edition": "enterprise"
+    },
+    "/notebooks/:id": {
+      "edition": "enterprise",
+      "tests": [
+        "tests/enterprise/ui/test_deep_notebooks.py::test_start_a_notebook_find_it_in_the_list_and_open_it",
+        "tests/enterprise/ui/test_deep_notebooks.py::test_active_notebook_captures_searches_and_exports_them"
+      ]
+    },
+    "/observability": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/observability/:tab": {
+      "tests": [
+        "tests/ui/test_otlp_observability.py"
+      ]
+    },
+    "/platform/health": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_siem_engineer.py",
+        "tests/ui/test_siem_health.py",
+        "tests/ui/test_deep_admin_settings.py::test_health_backup_and_license_pages_match_their_apis"
+      ],
+      "edition": "enterprise"
+    },
+    "/playbooks": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/playbooks/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/playbooks/repositories": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/prevalence": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_search.py::test_prevalence_page_finds_the_rare_hash_and_pivots_to_its_events"
+      ]
+    },
+    "/reports": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/risk": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_risk_watchlists.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/risk/watchlists": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_risk_watchlists.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/rules": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/personas/test_detection_engineer.py"
+      ]
+    },
+    "/rules/:id/matches": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "/rules/coverage": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "/rules/editor": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_detection_engineer.py",
+        "tests/personas/test_pivt_rules_page.py"
+      ]
+    },
+    "/rules/editor/:id": {
+      "tests": [
+        "tests/personas/test_detection_engineer.py",
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches",
+        "tests/ui/test_deep_detection_engineering.py::test_automated_folder_convention_and_move"
+      ]
+    },
+    "/rules/editor/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_detection_engineer.py",
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "/rules/ioc-lists": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_ioc_lists.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/rules/lookup-tables": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_lookups_ui.py"
+      ]
+    },
+    "/rules/lookup-tables/:name": {
+      "tests": [
+        "tests/ui/test_lookups_ui.py",
+        "tests/ui/test_deep_lookups.py::test_lookup_upload_edit_search_and_rule"
+      ]
+    },
+    "/rules/lookup-tables/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_lookups.py::test_lookup_upload_edit_search_and_rule"
+      ]
+    },
+    "/rules/repositories": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_rule_repositories.py::test_import_then_update_available_applies_upstream"
+      ]
+    },
+    "/rules/retro-hunt/:id": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_retro_hunt_rule_from_the_form"
+      ]
+    },
+    "/rules/retro-hunt/new": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_detection_engineering.py::test_retro_hunt_rule_from_the_form"
+      ]
+    },
+    "/rules/tuning": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/rules/tuning/:id": {
+      "skip": "rule tuning by rule id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested",
+      "edition": "enterprise"
+    },
+    "/search": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/personas/test_pivt_search_page.py",
+        "tests/personas/test_soc_analyst.py",
+        "tests/ui/test_auth.py",
+        "tests/ui/test_signals_risk_dashboard.py",
+        "tests/ui/test_deep_search.py",
+        "tests/ui/test_source_restricted_users.py"
+      ]
+    },
+    "/settings": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_admin_settings.py::test_health_backup_and_license_pages_match_their_apis"
+      ]
+    },
+    "/settings/access-control": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/settings/access-control?tab=api-keys": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_platform_admin.py",
+        "tests/ui/test_deep_admin_settings.py::test_api_key_create_use_revoke_delete"
+      ]
+    },
+    "/settings/access-control?tab=groups": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/settings/access-control?tab=roles": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_siem_engineer.py",
+        "tests/ui/test_deep_admin_settings.py::test_custom_role_create_assign_effective_and_delete"
+      ]
+    },
+    "/settings/access-control?tab=sessions": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_admin_settings.py::test_session_revoked_from_sessions_tab"
+      ]
+    },
+    "/settings/access-control?tab=users": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_siem_engineer.py",
+        "tests/ui/test_deep_admin_settings.py::test_users_invite_disable_enable_delete"
+      ]
+    },
+    "/settings/agentlane": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/ai": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/ai?tab=agents": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_hunts_ui_walk.py"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/ai?tab=guidance": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/ai?tab=models": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/ai?tab=monitoring": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/ai?tab=providers": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_deep_admin_enterprise.py::test_ai_provider_dummy_key_validation"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/ai?tab=usage": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/airgap-import": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/audit": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_platform_admin.py"
+      ]
+    },
+    "/settings/cases": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/cases/queues": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/cases/queues?tab=queues": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/cases/queues?tab=routing": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/cases?tab=general": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/cases?tab=grouping": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/cases?tab=sla": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/compliance/evidence-pack": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/gdpr": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/settings/license": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_platform_admin.py",
+        "tests/ui/test_deep_admin_settings.py::test_health_backup_and_license_pages_match_their_apis"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/lookup-urls": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/settings/notifications": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_admin_settings.py::test_notification_channel_validation_and_test_delivery"
+      ]
+    },
+    "/settings/oidc": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_sso_plan.py",
+        "tests/personas/test_platform_admin.py",
+        "tests/ui/test_sso_entitlement.py"
+      ]
+    },
+    "/settings/prevalence": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/personas/test_siem_engineer.py"
+      ]
+    },
+    "/settings/risk": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/search": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/settings/soar": {
+      "smoke": true,
+      "tests": [
+        "tests/enterprise/ui/test_soar.py",
+        "tests/enterprise/ui/test_v2033_soar_limits.py",
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/source-scopes": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ],
+      "edition": "enterprise"
+    },
+    "/settings/storage": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/settings/storage?tab=clickhouse": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_admin_settings.py::test_retention_raise_and_restore"
+      ]
+    },
+    "/settings/storage?tab=postgres": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/settings/user": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_deep_admin_settings.py::test_mfa_totp_enrollment_and_second_factor"
+      ]
+    },
+    "/settings/webhooks": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "/setup": {
+      "tests": [
+        "tests/ui/test_auth.py"
+      ]
+    },
+    "/trace/:traceId": {
+      "tests": [
+        "tests/ui/test_otlp_observability.py"
+      ]
+    },
+    "/upload": {
+      "smoke": true,
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+      ]
+    },
+    "action:admin.ai-provider-dummy-key": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_admin_enterprise.py::test_ai_provider_dummy_key_validation"
+      ],
+      "edition": "enterprise"
+    },
+    "action:admin.api-key-lifecycle": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_api_key_create_use_revoke_delete"
+      ]
+    },
+    "action:admin.custom-role": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_custom_role_create_assign_effective_and_delete"
+      ]
+    },
+    "action:admin.health-backup-license": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_health_backup_and_license_pages_match_their_apis"
+      ]
+    },
+    "action:admin.mfa-totp": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_mfa_totp_enrollment_and_second_factor"
+      ]
+    },
+    "action:admin.notification-channel": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_notification_channel_validation_and_test_delivery"
+      ]
+    },
+    "action:admin.retention": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_retention_raise_and_restore"
+      ]
+    },
+    "action:admin.session-revoke": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_session_revoked_from_sessions_tab"
+      ]
+    },
+    "action:admin.user-delete-after-health-check": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_delete_user_who_ran_a_health_check"
+      ]
+    },
+    "action:admin.users-drawer-gates": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_users_drawer_own_account_offers_no_disable_or_delete",
+        "tests/ui/test_deep_admin_settings.py::test_users_drawer_view_only_viewer_gets_no_actions"
+      ]
+    },
+    "action:admin.users-lifecycle": {
+      "tests": [
+        "tests/ui/test_deep_admin_settings.py::test_users_invite_disable_enable_delete"
+      ]
+    },
+    "action:ai.demo-mode-tuning-hidden": {
+      "skip": "the harness hard-codes DEPLOYMENT_MODE=selfhosted (dev/e2e/compose.e2e.yml, scripts/e2e.sh) and seeds no demo_analyst role, so a demo-mode session cannot be driven (NAN-5676)"
+    },
+    "action:alerts.add-to-case": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_to_case_and_grouping_into_the_existing_case"
+      ]
+    },
+    "action:alerts.api-triage-and-refusals": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_list_filters_sort_detail_and_triage"
+      ]
+    },
+    "action:alerts.grouped-case-title": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_grouped_case_title_names_the_host"
+      ]
+    },
+    "action:alerts.grouping-into-existing-case": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_to_case_and_grouping_into_the_existing_case"
+      ]
+    },
+    "action:alerts.list-search-filter-sort": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_list_filters_sort_detail_and_triage"
+      ]
+    },
+    "action:alerts.risk-notable-analyst-visibility": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_risk_notable_visible_to_an_analyst"
+      ]
+    },
+    "action:alerts.risk-notable-breakdown": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_alert_triage.py::test_deep_alert_risk_notable_shows_the_rba_breakdown"
+      ]
+    },
+    "action:cases.assign-reassign-inbox-notify": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.attachments": {
+      "skip": "the case page has no file or artifact upload; evidence is an @evidence notebook entry (test_incident_responder.py)"
+    },
+    "action:cases.audit-trail": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.bulk-status-assign": {
+      "skip": "the inbox bulk bar offers only Merge and Promote (TODO NAN-414); /api/cases/bulk/status and /bulk/assign have no UI"
+    },
+    "action:cases.close-reopen-dispositions": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.escalate": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.handoff-api": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.handoff-ui": {
+      "skip": "no UI sends, accepts or bounces a handoff (the enterprise/api/cases.ts handoff methods have no caller); test_deep_case_team_lifecycle drives the API and checks the thread"
+    },
+    "action:cases.header-status-close": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_header_status_menu_closes"
+      ]
+    },
+    "action:cases.header-tags": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_case_steps.py::test_v2034_soar_case_steps_authored_tested_and_run_live",
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.manual-create": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.note-markdown": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_note_markdown_renders"
+      ]
+    },
+    "action:cases.notes": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.page-load-analyst-clean": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_page_loads_without_refused_calls_for_an_analyst"
+      ]
+    },
+    "action:cases.pending-kinds-resume": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.search": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle"
+      ]
+    },
+    "action:cases.unassigned-case-notes": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_unassigned_case_takes_a_note"
+      ]
+    },
+    "action:dashboards.build-every-panel-type": {
+      "tests": [
+        "tests/ui/test_deep_dashboards.py::test_build_a_dashboard_from_scratch_with_every_panel_type"
+      ]
+    },
+    "action:dashboards.edit-layout": {
+      "tests": [
+        "tests/ui/test_deep_dashboards.py::test_edit_duplicate_delete_move_and_resize_panels"
+      ]
+    },
+    "action:dashboards.empty-error-panels": {
+      "tests": [
+        "tests/ui/test_deep_dashboards.py::test_empty_and_error_panels_render_cleanly"
+      ]
+    },
+    "action:dashboards.export-import-share-delete": {
+      "tests": [
+        "tests/ui/test_deep_dashboards.py::test_export_import_share_settings_and_delete"
+      ]
+    },
+    "action:dashboards.time-refresh-drilldown": {
+      "tests": [
+        "tests/ui/test_deep_dashboards.py::test_time_range_refresh_autorefresh_and_drilldown",
+        "tests/ui/test_deep_dashboards.py::test_panel_open_in_search_carries_the_query"
+      ]
+    },
+    "action:hunts.ai-sweep-findings": {
+      "skip": "the investigator/reviewer sweep needs the AI stub plus the hunt lane injector; covered end to end by tests/enterprise/personas/test_threat_hunter.py, not by a browser walk"
+    },
+    "action:hunts.case-banner-mark-wrong": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues"
+      ]
+    },
+    "action:hunts.charter-history-restore": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run"
+      ]
+    },
+    "action:hunts.escalation-ack-case-close": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_hunts_escalation_acknowledge_and_case_close_smoke"
+      ]
+    },
+    "action:hunts.escalation-queues": {
+      "tests": [
+        "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2033_beta_badges_and_escalation_queues"
+      ]
+    },
+    "action:hunts.floor-duplicate-charter": {
+      "tests": [
+        "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2033_floor_duplicate_window_and_charter",
+        "tests/enterprise/personas/test_hunt_gates.py",
+        "tests/enterprise/personas/test_hunt_charter.py"
+      ]
+    },
+    "action:hunts.held-escalation-promote-dismiss": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues"
+      ]
+    },
+    "action:hunts.lead-dismiss-suppress": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ]
+    },
+    "action:hunts.lead-manual-ruling": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ]
+    },
+    "action:hunts.lead-promote-case-close-ruling": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ]
+    },
+    "action:hunts.mark-wrong-preset": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_mark_wrong_opens_preset_to_wrong"
+      ]
+    },
+    "action:hunts.stock-update-available": {
+      "skip": "needs a linked hunt-repository import whose upstream changed; a throwaway stack has no content channel to sync. Server side: nanosiem-core/src/playbook_repository/service/refresh_tests.rs"
+    },
+    "action:hunts.template-configure-schedule-run": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run"
+      ]
+    },
+    "action:hunts.v2-pages": {
+      "tests": [
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/enterprise/personas/test_threat_hunter.py"
+      ]
+    },
+    "action:ioc.list-search-alert": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_ioc_lists.py::test_ioc_list_matches_in_search_and_alerts"
+      ],
+      "edition": "enterprise"
+    },
+    "action:log-sources.bulk-delete-api": {
+      "tests": [
+        "tests/ui/test_v2034_log_source_delete.py::test_bulk_delete_three_sources_one_audit_row_each"
+      ]
+    },
+    "action:log-sources.delete": {
+      "tests": [
+        "tests/ui/test_v2034_log_source_delete.py::test_delete_one_source_in_the_ui_keeps_ingest_flowing"
+      ]
+    },
+    "action:lookups.cell-edit": {
+      "tests": [
+        "tests/ui/test_deep_lookups.py::test_lookup_cell_edit_updates_in_place"
+      ]
+    },
+    "action:lookups.output-clause": {
+      "tests": [
+        "tests/ui/test_deep_lookups.py::test_lookup_output_clause_returns_the_listed_columns"
+      ]
+    },
+    "action:lookups.upload-edit-search-rule": {
+      "tests": [
+        "tests/ui/test_deep_lookups.py::test_lookup_upload_edit_search_and_rule"
+      ]
+    },
+    "action:lookups.user-primary-key": {
+      "tests": [
+        "tests/ui/test_deep_lookups.py::test_lookup_csv_with_user_primary_key_keeps_columns"
+      ]
+    },
+    "action:nav.beta-badges": {
+      "tests": [
+        "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2033_beta_badges_and_escalation_queues"
+      ]
+    },
+    "action:notebooks.case-notebook": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_notebooks.py::test_case_note_lands_in_the_case_notebook_listed_on_notebooks",
+        "tests/enterprise/ui/test_deep_notebooks.py::test_note_on_an_unassigned_case_is_not_lost"
+      ],
+      "edition": "enterprise"
+    },
+    "action:notebooks.create-open": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_notebooks.py::test_start_a_notebook_find_it_in_the_list_and_open_it"
+      ],
+      "edition": "enterprise"
+    },
+    "action:notebooks.list-refresh-after-create": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_notebooks.py::test_a_new_notebook_shows_in_the_list_without_a_reload"
+      ],
+      "edition": "enterprise"
+    },
+    "action:notebooks.palette-create": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_notebooks.py::test_command_palette_create_new_notebook_opens_the_dialog"
+      ],
+      "edition": "enterprise"
+    },
+    "action:notebooks.search-capture-export": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_notebooks.py::test_active_notebook_captures_searches_and_exports_them"
+      ],
+      "edition": "enterprise"
+    },
+    "action:onboarding.parser-editor-publish": {
+      "tests": [
+        "tests/ui/test_deep_data_onboarding.py::test_parser_editor_draft_publish_v2_and_health"
+      ]
+    },
+    "action:onboarding.pipeline-live-tap": {
+      "tests": [
+        "tests/ui/test_deep_data_onboarding.py::test_pipeline_live_tap"
+      ]
+    },
+    "action:onboarding.wizard-http-json-parse-publish": {
+      "tests": [
+        "tests/ui/test_deep_data_onboarding.py::test_wizard_http_json_bad_vrl_then_publish_and_search_ocsf"
+      ]
+    },
+    "action:pivt.here-card": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_pivt_here_card_names_detection_subpages"
+      ]
+    },
+    "action:pivt.page-awareness-actions": {
+      "tests": [
+        "tests/personas/test_pivt_alerts_page.py",
+        "tests/personas/test_pivt_dashboards_page.py",
+        "tests/personas/test_pivt_rules_page.py",
+        "tests/personas/test_pivt_search_page.py",
+        "tests/personas/test_pivt_ingestion_proposals.py"
+      ]
+    },
+    "action:prevalence.pivot-to-search": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_prevalence_page_finds_the_rare_hash_and_pivots_to_its_events"
+      ]
+    },
+    "action:rbac.allowed-pages-no-403": {
+      "tests": [
+        "tests/ui/test_rbac_persona_matrix.py::test_allowed_pages_call_apis_the_role_cannot_use"
+      ]
+    },
+    "action:rbac.persona-matrix": {
+      "tests": [
+        "tests/ui/test_rbac_persona_matrix.py::test_rbac_persona_matrix",
+        "tests/ui/test_rbac_persona_matrix.py::test_baseline_names_every_persona_and_only_known_paths"
+      ]
+    },
+    "action:rbac.repositories-page-no-403": {
+      "tests": [
+        "tests/ui/test_rbac_persona_matrix.py::test_rule_repositories_page_calls_no_refused_api"
+      ]
+    },
+    "action:rbac.source-restricted-users": {
+      "tests": [
+        "tests/ui/test_source_restricted_users.py::test_source_restricted_user_sees_only_granted_sources"
+      ]
+    },
+    "action:rules.ai-tuning-proposals": {
+      "skip": "AI tuning proposals are generated from weeks of disposition and FP-burst history; the deterministic ai-stub has no tuning response and a throwaway stack has no history. /rules/tuning is smoke-tested; NAN-5686 gap",
+      "edition": "enterprise"
+    },
+    "action:rules.alert-cooldown": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_alert_cooldown_round_trips"
+      ]
+    },
+    "action:rules.archive-unarchive": {
+      "tests": [
+        "tests/ui/test_v2034_rule_archive.py::test_archive_hides_rule_and_unarchive_restores_realtime",
+        "tests/ui/test_v2034_rule_archive.py::test_archive_without_delete_permission_is_refused"
+      ]
+    },
+    "action:rules.author-validate-test": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "action:rules.folders-automated": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_automated_folder_convention_and_move"
+      ]
+    },
+    "action:rules.lifecycle-staging-live-alerting": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "action:rules.mitre-coverage": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "action:rules.mitre-coverage-in-review": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_mitre_coverage_shows_staging_rules_in_review"
+      ]
+    },
+    "action:rules.repositories-view-permission": {
+      "tests": [
+        "tests/ui/test_deep_rule_repositories.py::test_repositories_page_works_for_detections_view"
+      ]
+    },
+    "action:rules.repository-import-update": {
+      "tests": [
+        "tests/ui/test_deep_rule_repositories.py::test_import_then_update_available_applies_upstream"
+      ]
+    },
+    "action:rules.repository-linked-drift": {
+      "tests": [
+        "tests/ui/test_deep_rule_repositories.py::test_linked_rule_local_edit_shows_drift"
+      ]
+    },
+    "action:rules.retro-hunt": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_retro_hunt_rule_from_the_form"
+      ]
+    },
+    "action:rules.risk-rba": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "action:rules.versions-revert": {
+      "tests": [
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+      ]
+    },
+    "action:search.compiled-sql": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_compiled_sql_has_one_where_and_no_explicit_prewhere"
+      ]
+    },
+    "action:search.cost-guard": {
+      "tests": [
+        "tests/ui/test_v2033_search_ui.py::test_v2033_unfiltered_eventstats_runs_and_operators_render_as_typed"
+      ]
+    },
+    "action:search.dataset-signals": {
+      "tests": [
+        "tests/ui/test_v2033_search_ui.py::test_v2032_dataset_signals_needs_detections_view",
+        "tests/ui/test_signals_risk_dashboard.py"
+      ]
+    },
+    "action:search.errors": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_bad_queries_show_a_readable_error_and_the_page_recovers"
+      ]
+    },
+    "action:search.event-inspector": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_event_inspector_fields_raw_json_and_copy"
+      ]
+    },
+    "action:search.export-csv": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_csv_export_of_events_and_stats"
+      ]
+    },
+    "action:search.field-sidebar": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_sidebar_top_values_match_truth_and_include_exclude_rewrite_the_query"
+      ]
+    },
+    "action:search.history": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_search_history_records_runs_and_recalls_a_query"
+      ]
+    },
+    "action:search.join": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_join_correlates_logons_with_launches_per_host"
+      ]
+    },
+    "action:search.lookup-output": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_lookup_output_clause_enriches_events"
+      ]
+    },
+    "action:search.npl-breadth": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_npl_command_matches_api_and_truth",
+        "tests/ui/test_deep_search.py::test_rex_extracts_named_groups",
+        "tests/ui/test_deep_search.py::test_multi_aggregate_stats_by_port",
+        "tests/ui/test_deep_search.py::test_lookup_enriches_events_from_a_lookup_table"
+      ]
+    },
+    "action:search.operators-as-typed": {
+      "tests": [
+        "tests/ui/test_v2033_search_ui.py::test_v2033_unfiltered_eventstats_runs_and_operators_render_as_typed"
+      ]
+    },
+    "action:search.pagination": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_infinite_scroll_loads_each_event_once"
+      ]
+    },
+    "action:search.prevalence-enrich": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_prevalence_filter_values_match_the_prevalence_api"
+      ]
+    },
+    "action:search.prevalence-enrich-mode": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_prevalence_enrich_true_matches_the_prevalence_api"
+      ]
+    },
+    "action:search.rarity-ocsf-rare-marking": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_rarity_marks_only_the_rare_domain_on_ocsf_dns"
+      ]
+    },
+    "action:search.rarity-view": {
+      "tests": [
+        "tests/ui/test_search_urls.py",
+        "tests/ui/test_deep_search.py::test_rarity_scatter_marks_the_rare_binary_and_clicks_through"
+      ]
+    },
+    "action:search.result-views": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_events_view_matches_api_and_shows_a_first_page",
+        "tests/ui/test_deep_search.py::test_table_command_shows_the_selected_columns",
+        "tests/ui/test_deep_search.py::test_stats_by_user_with_sort_matches_ground_truth",
+        "tests/ui/test_deep_search.py::test_timechart_renders_buckets_and_span_chip_rewrites_the_query",
+        "tests/ui/test_deep_search.py::test_event_stream_chart_types_switch_and_persist",
+        "tests/ui/test_deep_search.py::test_top_command_renders_ranked_bars"
+      ]
+    },
+    "action:search.saved-queries": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_saved_query_save_and_load"
+      ]
+    },
+    "action:search.saved-query-description": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_saved_query_keeps_its_description"
+      ]
+    },
+    "action:search.saved-query-edit-delete": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_saved_query_can_be_edited_and_deleted_in_the_ui"
+      ]
+    },
+    "action:search.sort-head": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_sort_head_returns_exactly_n_rows"
+      ]
+    },
+    "action:search.sql-to-npl": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_agent_sql_approximate_distinct_count_reads_as_estdc",
+        "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2032_legacy_sql_pivot_shows_as_npl"
+      ]
+    },
+    "action:search.time-picker": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_time_picker_preset_absolute_range_and_drag_zoom"
+      ]
+    },
+    "action:search.timechart-all-buckets": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_timechart_shows_every_bucket"
+      ]
+    },
+    "action:search.timechart-export": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_timechart_export_downloads_the_buckets"
+      ]
+    },
+    "action:search.value-pivots": {
+      "tests": [
+        "tests/ui/test_deep_search.py::test_value_menu_pivots_group_by_and_copy"
+      ]
+    },
+    "action:soar.approval-condition-validation": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_bare_approval_condition_is_refused"
+      ]
+    },
+    "action:soar.breaker-banner-resume": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_breaker_resume_and_live_save"
+      ]
+    },
+    "action:soar.case-automation-pane": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_real_alert_flow_two_person_approval_on_the_case"
+      ]
+    },
+    "action:soar.case-source-scope-refused": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_case_steps.py::test_v2034_soar_case_step_restricted_source_is_refused"
+      ]
+    },
+    "action:soar.case-step-approval-card": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_case_steps.py::test_v2034_soar_case_step_approval_card_shows_the_change"
+      ]
+    },
+    "action:soar.case-steps": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_case_steps.py::test_v2034_soar_case_steps_authored_tested_and_run_live"
+      ]
+    },
+    "action:soar.email-approval-default": {
+      "tests": [
+        "tests/enterprise/ui/test_v2033_soar_limits.py::test_v2033_new_email_step_requires_approval_by_default"
+      ]
+    },
+    "action:soar.flow-live-save-refused": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_unconnected_action_flagged_and_live_save_refused"
+      ]
+    },
+    "action:soar.flow-test-not-evaluated": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_test_run_reports_approval_branch_not_evaluated",
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_test_run_trace_shows_the_unevaluated_branch"
+      ]
+    },
+    "action:soar.flow-test-real-alert": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_editor_run_test_with_a_real_alert"
+      ]
+    },
+    "action:soar.flow-version-history": {
+      "skip": "the backend keeps one version per flow (FlowEditor.tsx); there is no history or rollback to test, only the vN counter"
+    },
+    "action:soar.live-flow-save-version": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_breaker_resume_and_live_save"
+      ]
+    },
+    "action:soar.manual-pause": {
+      "skip": "flows have no manual pause in the UI or API; only the circuit breaker pauses a flow (test_deep_soar_breaker_resume_and_live_save covers it)"
+    },
+    "action:soar.pack-browse-install": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_pack_browsing_and_install"
+      ]
+    },
+    "action:soar.real-alert-flow-two-person-approval": {
+      "tests": [
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_real_alert_flow_two_person_approval_on_the_case"
+      ]
+    },
+    "action:soar.run-cap-breaker-held-triggers": {
+      "tests": [
+        "tests/enterprise/ui/test_v2033_soar_limits.py::test_v2033_run_cap_breaker_and_held_triggers_in_the_ui",
+        "tests/enterprise/soar/test_storm.py"
+      ]
+    },
+    "action:soar.skipped-run-reason": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_unconnected_action_flagged_and_live_save_refused"
+      ]
+    }
+  }
+}

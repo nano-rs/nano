@@ -163,3 +163,13 @@ fn extension_channels_must_be_extension_kind_and_not_collide() {
     assert!(channels::register_extension_channels(&BAD_KIND).is_err());
     assert!(channels::register_extension_channels(&COLLIDE).is_err());
 }
+
+/// NAN-5724 review: on an air-gapped install the content-channel loop never
+/// reaches the network. `from_env(airgap = true)` turns auto-update off
+/// whatever `CONTENT_CHANNELS_AUTO_UPDATE` says, so `start` returns at once
+/// and `check_all` refuses. Offline import through the API still works.
+#[test]
+fn air_gapped_config_disables_the_online_check() {
+    assert!(!ContentConfig::from_env(true, SchemaId::Ocsf, false).auto_update);
+    assert!(!ContentConfig::from_env(true, SchemaId::Ocsf, true).auto_update);
+}

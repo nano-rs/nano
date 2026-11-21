@@ -101,7 +101,7 @@ interface DashCardProps {
 function DashCardGallery({ d, onDelete, canDelete }: DashCardProps) {
   const preview = useMemo(() => synthesizePreview(d.id, d.panel_count), [d.id, d.panel_count]);
   return (
-    <div className="group relative bg-card border border-border rounded-lg p-3.5 hover:border-primary/40 hover:shadow-[0_6px_20px_rgba(0,0,0,0.15)] transition-all flex flex-col gap-3">
+    <div data-testid="dashboard-card" data-dashboard-id={d.id} data-dashboard-name={d.name} data-panel-count={d.panel_count} className="group relative bg-card border border-border rounded-lg p-3.5 hover:border-primary/40 hover:shadow-[0_6px_20px_rgba(0,0,0,0.15)] transition-all flex flex-col gap-3">
       <Link to={`/dashboards/${d.id}`} className="flex items-start gap-2 min-w-0">
         <div className="w-7 h-7 rounded-md bg-primary/10 text-primary flex items-center justify-center shrink-0">
           <GridIcon className="w-[14px] h-[14px]" />
@@ -175,7 +175,7 @@ function DashCardGallery({ d, onDelete, canDelete }: DashCardProps) {
 
 function DashCardList({ d, onDelete, canDelete }: DashCardProps) {
   return (
-    <div className="group relative">
+    <div data-testid="dashboard-card" data-dashboard-id={d.id} data-dashboard-name={d.name} data-panel-count={d.panel_count} className="group relative">
       <Link
         to={`/dashboards/${d.id}`}
         className="w-full h-[52px] px-3 border-b border-border hover:bg-foreground/[0.03] transition-colors flex items-center gap-3"

@@ -95,6 +95,57 @@ impl UserApiError {
                 "grant_authority_changed",
                 "Authorization changed while the request was being validated; retry",
             ),
+            UserRepositoryError::CannotRemoveOwnAdmin => (
+                StatusCode::FORBIDDEN,
+                "cannot_modify_self",
+                "You cannot remove your own administrator access. Ask another administrator.",
+            ),
+            UserRepositoryError::LastAdminRequired => (
+                StatusCode::CONFLICT,
+                "last_admin_required",
+                "At least one active administrator is required.",
+            ),
+            // NAN-5721: a record still points at this user through a foreign
+            // key that does not detach deleted users. The constraint name goes
+            // to the server log, not the client.
+            UserRepositoryError::StillReferenced { constraint } => {
+                tracing::warn!(
+                    constraint = %constraint,
+                    "user delete blocked by a foreign-key reference"
+                );
+                (
+                    StatusCode::CONFLICT,
+                    "user_still_referenced",
+                    "This user is still referenced by other records and cannot be deleted. \
+                     Disable the account instead.",
+                )
+            }
+            // NAN-5742: detaching the user broke a NOT NULL column or a CHECK.
+            // That is a schema bug, so it is logged at error level with the
+            // constraint / column, and the admin sees which one; the client
+            // still gets a 409 (the delete is refused, nothing changed).
+            UserRepositoryError::DeleteBreaksConstraint(v) => {
+                tracing::error!(
+                    sqlstate = %v.sqlstate,
+                    table = ?v.table,
+                    column = ?v.column,
+                    constraint = ?v.constraint,
+                    "user delete broke a constraint on a dependent table (schema bug)"
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    Self::new(
+                        "user_still_referenced",
+                        &format!(
+                            "This user cannot be deleted: removing it would break {} \
+                             (SQLSTATE {}). Disable the account instead, and report this \
+                             to your nano administrator.",
+                            v.label(),
+                            v.sqlstate
+                        ),
+                    ),
+                );
+            }
             UserRepositoryError::DatabaseError(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -234,7 +285,7 @@ pub async fn get_user(
         (status = 201, description = "User created successfully", body = UserWithGroups),
         (status = 400, description = "Bad request - validation error", body = UserApiError),
         (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
-        (status = 409, description = "Email exists or grant authority changed", body = UserApiError),
+        (status = 409, description = "Email exists, grant authority changed, or the change would leave no active administrator (last_admin_required)", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -334,7 +385,7 @@ pub async fn create_user(
         (status = 400, description = "Bad request - validation error", body = UserApiError),
         (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
-        (status = 409, description = "Email exists or grant authority changed", body = UserApiError),
+        (status = 409, description = "Email exists, grant authority changed, or the change would leave no active administrator (last_admin_required)", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -393,6 +444,11 @@ pub async fn update_user(
             ));
         }
     }
+    // NAN-5707: `PUT {status: "disabled"}` on yourself is the same self-lockout
+    // as `POST /api/users/{id}/disable`.
+    if request.status.as_deref() == Some("disabled") {
+        refuse_self_lockout(auth.user_id(), *id, SelfLockoutAction::Disable)?;
+    }
 
     // NAN-5027: an SSO-linked account's email and password belong to the
     // identity provider. Writing a local password would open a side door around
@@ -439,7 +495,13 @@ pub async fn update_user(
     // membership replacement in ONE transaction, under the verified stamp.
     let user = state
         .user_repo
-        .update_user_with_groups_authorized(*id, &request, group_uuids.as_deref(), grant_stamp)
+        .update_user_with_groups_authorized(
+            *id,
+            &request,
+            group_uuids.as_deref(),
+            grant_stamp,
+            auth.user_id(),
+        )
         .await
     .map_err(|e| {
         let (status, err) = UserApiError::from_repo_error(&e);
@@ -497,6 +559,40 @@ fn update_user_fields_changed(request: &UpdateUserRequest) -> Vec<&'static str> 
     fields
 }
 
+/// What a caller must not do to the account the request acts as (NAN-5707).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfLockoutAction {
+    Disable,
+    Delete,
+}
+
+/// NAN-5707: refuse disabling or deleting your own account. A session doing it
+/// signs itself out for good (disable deletes every session), and the last
+/// administrator doing it leaves the tenant with no one able to undo it. An
+/// API key acting on its owner is refused too: the key acts AS that account,
+/// and the owner can do it from another administrator's session instead.
+pub(crate) fn refuse_self_lockout(
+    actor_user_id: Uuid,
+    target_user_id: Uuid,
+    action: SelfLockoutAction,
+) -> Result<(), (StatusCode, Json<UserApiError>)> {
+    if actor_user_id != target_user_id {
+        return Ok(());
+    }
+    let message = match action {
+        SelfLockoutAction::Disable => {
+            "You cannot disable your own account. Ask another administrator."
+        }
+        SelfLockoutAction::Delete => {
+            "You cannot delete your own account. Ask another administrator."
+        }
+    };
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(UserApiError::new("cannot_modify_self", message)),
+    ))
+}
+
 /// Delete a user
 ///
 /// DELETE /api/users/{id}
@@ -509,8 +605,9 @@ fn update_user_fields_changed(request: &UpdateUserRequest) -> Vec<&'static str> 
     ),
     responses(
         (status = 204, description = "User deleted successfully"),
-        (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
+        (status = 403, description = "Forbidden - insufficient permissions, or the target is the caller's own account (cannot_modify_self)", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
+        (status = 409, description = "Grant authority changed, the delete would leave no active administrator (last_admin_required), or the user is still referenced by other records (user_still_referenced)", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -522,6 +619,7 @@ pub async fn delete_user(
 ) -> Result<StatusCode, (StatusCode, Json<UserApiError>)> {
     check_permission(&auth, permissions::USERS_DELETE)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
+    refuse_self_lockout(auth.user_id(), *id, SelfLockoutAction::Delete)?;
 
     // Get user email for audit before deleting
     let user_email = state
@@ -542,6 +640,14 @@ pub async fn delete_user(
     .await
     .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
 
+    // NAN-5742: handoffs the delete will cancel (only target is this user),
+    // audited after commit.
+    #[cfg(feature = "enterprise")]
+    let removed = crate::handlers::case_target_removal::RemovedTarget::User(*id);
+    #[cfg(feature = "enterprise")]
+    let canceled_candidates =
+        crate::handlers::case_target_removal::pending_sole_target(&state.pool, removed).await;
+
     state
         .user_repo
         .apply_principal_action_authorized(*id, PrincipalAction::Delete, stamp)
@@ -550,6 +656,17 @@ pub async fn delete_user(
             let (status, err) = UserApiError::from_repo_error(&e);
             (status, Json(err))
         })?;
+
+    #[cfg(feature = "enterprise")]
+    crate::handlers::case_target_removal::audit_canceled(
+        &state,
+        &state.pool,
+        &auth.0,
+        &client.0,
+        removed,
+        &canceled_candidates,
+    )
+    .await;
 
     // Emit audit event
     state.emit_audit(
@@ -586,9 +703,9 @@ pub struct UpdateUserGroupsRequest {
     responses(
         (status = 200, description = "User groups updated successfully", body = UserWithGroups),
         (status = 400, description = "Bad request - unknown group id", body = UserApiError),
-        (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
+        (status = 403, description = "Forbidden - insufficient permissions, or removing your own administrator access (cannot_modify_self)", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
-        (status = 409, description = "Grant authority changed; retry the request", body = UserApiError),
+        (status = 409, description = "Grant authority changed, or the change would leave no active administrator (last_admin_required)", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -619,7 +736,7 @@ pub async fn update_user_groups(
 
     state
         .user_repo
-        .set_user_groups_authorized(*id, &request.group_ids, grant_stamp)
+        .set_user_groups_authorized(*id, &request.group_ids, grant_stamp, auth.user_id())
         .await
         .map_err(|e| {
             let (status, err) = UserApiError::from_repo_error(&e);
@@ -735,7 +852,7 @@ pub async fn unlock_user(
     ),
     responses(
         (status = 200, description = "User disabled successfully", body = UserWithGroups),
-        (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
+        (status = 403, description = "Forbidden - insufficient permissions, or the target is the caller's own account (cannot_modify_self)", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -748,6 +865,7 @@ pub async fn disable_user(
 ) -> Result<Json<UserWithGroups>, (StatusCode, Json<UserApiError>)> {
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
+    refuse_self_lockout(auth.user_id(), *id, SelfLockoutAction::Disable)?;
 
     // F-32 / NAN-5014: the disable flips the status, stamps the revocation
     // watermark and deletes every session in ONE transaction.
@@ -1010,3 +1128,7 @@ mod password_policy_tests {
         assert!(!body.message.contains("bcrypt"));
     }
 }
+
+#[cfg(test)]
+#[path = "users_self_lockout_tests.rs"]
+mod self_lockout_tests;

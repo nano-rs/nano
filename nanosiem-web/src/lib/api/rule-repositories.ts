@@ -73,6 +73,9 @@ export interface RepositoryRule {
   // Import status (from API enrichment)
   is_imported?: boolean;
   linked_detection_rule_id?: string | null;
+  // NAN-5716: the linked detection rule was edited locally since it was
+  // imported or last updated from upstream.
+  local_drift?: boolean;
   title: string | null;
   description: string | null;
   severity: string | null;

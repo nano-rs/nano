@@ -5,9 +5,33 @@ import * as TooltipPrimitive from '@radix-ui/react-tooltip';
 
 import { cn } from '@/lib/utils';
 
-const TooltipProvider = TooltipPrimitive.Provider;
+/**
+ * NAN-5698: Radix throws "`Tooltip` must be used within `TooltipProvider`"
+ * when a Tooltip renders without an ancestor provider, which takes down the
+ * whole route (the alert page crashed on every risk notable). App mounts one
+ * provider at the root; this marker lets a Tooltip rendered outside any
+ * provider (a test, a portal host mounted elsewhere) fall back to its own
+ * instead of crashing, while local providers keep their own delay settings.
+ */
+const HasTooltipProvider = React.createContext(false);
 
-const Tooltip = TooltipPrimitive.Root;
+function TooltipProvider({ children, ...props }: React.ComponentProps<typeof TooltipPrimitive.Provider>) {
+  return (
+    <TooltipPrimitive.Provider {...props}>
+      <HasTooltipProvider.Provider value={true}>{children}</HasTooltipProvider.Provider>
+    </TooltipPrimitive.Provider>
+  );
+}
+
+function Tooltip(props: React.ComponentProps<typeof TooltipPrimitive.Root>) {
+  const hasProvider = React.useContext(HasTooltipProvider);
+  if (hasProvider) return <TooltipPrimitive.Root {...props} />;
+  return (
+    <TooltipProvider>
+      <TooltipPrimitive.Root {...props} />
+    </TooltipProvider>
+  );
+}
 
 const TooltipTrigger = TooltipPrimitive.Trigger;
 

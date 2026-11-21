@@ -355,7 +355,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           { signal: AbortSignal.timeout(10_000) },
           accessToken,
         );
-        setAccessToken(accessToken, expiresIn);
+        setAccessToken(accessToken, expiresIn, userInfo.id);
 
         // Update demo session with new tokens
         if (demoRefreshToken && demoRotated) {
@@ -438,7 +438,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // Restore demo session from localStorage (survives page reloads)
       const demoSession = restoreDemoSession();
       if (demoSession) {
-        setAccessToken(demoSession.accessToken, 900); // re-set in memory
+        setAccessToken(demoSession.accessToken, 900, (demoSession.user as User).id); // re-set in memory
         setState({
           user: demoSession.user as User,
           isAuthenticated: true,
@@ -529,7 +529,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         user: User;
         tokens: { access_token: string; refresh_token: string; expires_in: number };
       };
-      setAccessToken(authResponse.tokens.access_token, authResponse.tokens.expires_in);
+      setAccessToken(authResponse.tokens.access_token, authResponse.tokens.expires_in, authResponse.user.id);
 
       setState({
         user: authResponse.user,
@@ -568,7 +568,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         body: JSON.stringify({ challenge_token: challengeToken, code }),
       });
 
-      setAccessToken(response.tokens.access_token, response.tokens.expires_in);
+      setAccessToken(response.tokens.access_token, response.tokens.expires_in, response.user.id);
       setMfaPending(false);
       setMfaSetupPending(false);
       setChallengeToken(null);
@@ -610,7 +610,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     try {
       const response = await api.demo.createSession(displayName);
 
-      setAccessToken(response.auth.access_token, response.auth.expires_in);
+      setAccessToken(response.auth.access_token, response.auth.expires_in, response.auth.user.id);
 
       const demoUser = {
         id: response.auth.user.id,
@@ -645,7 +645,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     try {
       const response = await api.demo.claimToken(token);
 
-      setAccessToken(response.auth.access_token, response.auth.expires_in);
+      setAccessToken(response.auth.access_token, response.auth.expires_in, response.auth.user.id);
 
       const demoUser = {
         id: response.auth.user.id,
@@ -754,7 +754,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       });
 
       // Access token in memory; refresh token already set as HttpOnly cookie by backend
-      setAccessToken(response.tokens.access_token, response.tokens.expires_in);
+      setAccessToken(response.tokens.access_token, response.tokens.expires_in, response.user.id);
 
       setState({
         user: response.user,

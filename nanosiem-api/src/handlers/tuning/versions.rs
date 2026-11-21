@@ -104,7 +104,9 @@ pub(crate) async fn validate_revert_target(
         return Err(ApiError::NotFound("Version not found".to_string()));
     }
 
-    let mut prospective = state.detection_service.get_rule(rule_id).await?;
+    // A deleted (archived) rule is a 404 (NAN-5672); the revert itself
+    // re-checks under the row lock.
+    let mut prospective = state.detection_service.get_active_rule(rule_id).await?;
     let parsed = nanosiem_core::parse_query(&target.query)
         .map_err(|error| ApiError::ValidationError(format!("Invalid query: {error}")))?;
     if prospective.mode == RuleMode::Alerting {

@@ -20,12 +20,12 @@
 //!   estimate apportioned from `system.parts`.
 //!
 //! KNOWN LIMITATION (foundation phase): the dedicated `key_raw`/`key_lc`
-//! columns hold the value of the FIRST registry column, so the indexed
-//! `key_lc IN (...)` read path can only match on that column. Lookups keyed on
-//! a non-first column fall back to a full-table dedup scan (still correct, just
-//! unindexed). Aligning the stored key with the registry primary key — and/or
-//! storing multiple keyed columns — is deferred to the consumer-repoint phase;
-//! the backend is opt-in (default postgres) until then.
+//! columns hold the value of ONE column (`resolve_key_field`: the registry
+//! primary key, else the first column), so the indexed `key_lc IN (...)` read
+//! path can only match on that column. Lookups keyed on any other column fall
+//! back to a full-table dedup scan that reads the key from `cols_json` (still
+//! correct, just unindexed; NAN-5694 fixed it matching the stored key's value
+//! instead). Storing multiple keyed columns is deferred.
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -200,6 +200,30 @@ impl ClickHouseLookupRepository {
         sql
     }
 
+    /// SQL counting the LIVE row `row_id` of a logical table (`?` = table name).
+    /// `row_id` is an integer literal, never user text.
+    pub(crate) fn live_row_count_sql(row_id: i64) -> String {
+        Self::deduped_read_sql("count()", Some(&format!("row_id = {}", row_id as u64)))
+    }
+
+    /// Whether `row_id` is a live row of the table. NAN-5715: update/delete
+    /// insert on top of the given id, so an id that is not there (a browser-
+    /// rounded 19-digit id) silently created a new row; Postgres answers
+    /// `RowNotFound` (UPDATE … rows_affected = 0) and so does this store now.
+    async fn ensure_live_row(&self, table_name: &str, row_id: i64) -> Result<(), LookupRepositoryError> {
+        let count: u64 = self
+            .ch
+            .query(&Self::live_row_count_sql(row_id))
+            .bind(table_name)
+            .fetch_one()
+            .await
+            .map_err(Self::ch_err)?;
+        if count == 0 {
+            return Err(LookupRepositoryError::RowNotFound(row_id));
+        }
+        Ok(())
+    }
+
     /// Read all live (deduped, non-deleted) rows for a logical table, optionally
     /// restricted to a set of key values (raw or lowercased per `case_insensitive`).
     async fn read_live_rows(
@@ -275,10 +299,22 @@ impl ClickHouseLookupRepository {
     }
 
     /// Decode a live CH row into the public HashMap shape, restricted to
-    /// `output_fields` when given and typed per the registry columns. The key
-    /// field is always reconstructed from `key_raw`.
+    /// `output_fields` when given and typed per the registry columns.
+    ///
+    /// `stored_key` is the column the row was ENCODED under (the registry
+    /// primary key, else the first column; see `resolve_key_field`): its value
+    /// is `key_raw`, every other column lives in `cols_json`. `key_field` is
+    /// the column the caller matches on. It is always present, even when
+    /// `output_fields` does not name it, because `lookup_batch` keys its result
+    /// map on it, like the Postgres path (which always selects the key column).
+    ///
+    /// NAN-5694: the key was dropped under `OUTPUT <col>`, so every match was
+    /// keyed by `""` and `lookup t f OUTPUT col` enriched nothing. Reading
+    /// `key_raw` as `key_field` also broke lookups on any column other than
+    /// the stored key (the stored key's value was matched as `key_field`).
     fn decode_row(
         live: &LiveRow,
+        stored_key: &str,
         key_field: &str,
         columns: &[LookupColumn],
         output_fields: Option<&[String]>,
@@ -287,29 +323,27 @@ impl ClickHouseLookupRepository {
             serde_json::from_str(&live.cols_json).unwrap_or_default();
 
         let type_of = |name: &str| columns.iter().find(|c| c.name == name).map(|c| c.data_type);
+        let want = |name: &str| {
+            name == key_field
+                || match output_fields {
+                    Some(fields) => fields.iter().any(|f| f == name),
+                    None => true,
+                }
+        };
 
         let mut out = HashMap::new();
-        // Reconstruct the key column.
-        let key_val = match type_of(key_field) {
-            Some(ty) => Self::coerce_to_type(serde_json::Value::String(live.key_raw.clone()), &ty),
-            None => serde_json::Value::String(live.key_raw.clone()),
-        };
-
-        let want = |name: &str| match output_fields {
-            Some(fields) => fields.iter().any(|f| f == name),
-            None => true,
-        };
-
-        if want(key_field) || output_fields.is_none() {
-            out.insert(key_field.to_string(), key_val);
+        // The stored key column, reconstructed from `key_raw`.
+        if want(stored_key) {
+            let key_val = match type_of(stored_key) {
+                Some(ty) => Self::coerce_to_type(serde_json::Value::String(live.key_raw.clone()), &ty),
+                None => serde_json::Value::String(live.key_raw.clone()),
+            };
+            out.insert(stored_key.to_string(), key_val);
         }
 
-        // Non-key columns from cols_json, null-filled and typed.
+        // Every other column from cols_json, null-filled and typed.
         for col in columns {
-            if col.name == key_field {
-                continue;
-            }
-            if !want(&col.name) {
+            if col.name == stored_key || !want(&col.name) {
                 continue;
             }
             let raw = cols
@@ -324,6 +358,56 @@ impl ClickHouseLookupRepository {
             for f in fields {
                 out.entry(f.clone()).or_insert(serde_json::Value::Null);
             }
+        }
+        out
+    }
+
+    /// A single-key lookup's row: only the `output_fields` when given (the
+    /// batch row also carries the key it was keyed on).
+    fn single_lookup_projection(
+        mut row: HashMap<String, serde_json::Value>,
+        key_field: &str,
+        output_fields: Option<&[String]>,
+    ) -> HashMap<String, serde_json::Value> {
+        if output_fields.is_some_and(|fields| !fields.iter().any(|f| f == key_field)) {
+            row.remove(key_field);
+        }
+        row
+    }
+
+    /// Key decoded live rows by their `key_field` value (the `lookup_batch`
+    /// result map). Rows read with the indexed pushdown (`key_field` is the
+    /// stored key) were already filtered by ClickHouse; otherwise only rows
+    /// whose `key_field` value is in `key_values` are kept.
+    #[allow(clippy::too_many_arguments)]
+    fn index_batch_rows(
+        rows: &[LiveRow],
+        columns: &[LookupColumn],
+        stored_key: &str,
+        key_field: &str,
+        key_values: &[serde_json::Value],
+        output_fields: Option<&[String]>,
+        case_insensitive: bool,
+    ) -> HashMap<String, HashMap<String, serde_json::Value>> {
+        let pushdown = key_field == stored_key;
+        let fold = |s: String| if case_insensitive { s.to_lowercase() } else { s };
+        // Wanted set of key strings for the non-pushdown Rust filter.
+        let wanted: HashSet<String> = key_values.iter().map(|v| fold(Self::key_to_string(v))).collect();
+
+        let mut out = HashMap::new();
+        for r in rows {
+            let decoded = Self::decode_row(r, stored_key, key_field, columns, output_fields);
+            let key_val = decoded.get(key_field).unwrap_or(&serde_json::Value::Null);
+            if key_val.is_null() {
+                continue;
+            }
+            // Key the result map by the raw lookup value, matching the Postgres
+            // path which keys on the raw matched key string.
+            let map_key = Self::key_to_string(key_val);
+            if !pushdown && !wanted.contains(&fold(map_key.clone())) {
+                continue;
+            }
+            out.insert(map_key, decoded);
         }
         out
     }
@@ -784,7 +868,13 @@ impl LookupStore for ClickHouseLookupRepository {
                 case_insensitive,
             )
             .await?;
-        Ok(results.into_values().next())
+        // The batch map always carries `key_field` (it is keyed on it). A
+        // single-key lookup returns only what OUTPUT asked for, like the
+        // Postgres path's `SELECT <output_fields>`.
+        Ok(results
+            .into_values()
+            .next()
+            .map(|row| Self::single_lookup_projection(row, key_field, output_fields)))
     }
 
     #[instrument(skip(self, key_values))]
@@ -805,7 +895,9 @@ impl LookupStore for ClickHouseLookupRepository {
         // down to ClickHouse when the requested key matches that column;
         // otherwise read all live rows and filter in Rust on the decoded field
         // (correct, unindexed) — see the KNOWN LIMITATION in the module header.
-        let stored_key = columns.first().map(|c| c.name.as_str()).unwrap_or("");
+        // The column `key_raw`/`key_lc` hold: the registry primary key, else
+        // the first column (the same resolution the write paths encode with).
+        let stored_key = self.resolve_key_field(table_name, columns).await;
         let pushdown = key_field == stored_key;
 
         let rows = if pushdown {
@@ -815,45 +907,15 @@ impl LookupStore for ClickHouseLookupRepository {
             self.read_live_rows(table_name, None, false).await?
         };
 
-        // Wanted set of key strings for keying + the non-pushdown Rust filter.
-        let wanted: Vec<String> = key_values
-            .iter()
-            .map(|v| {
-                let s = Self::key_to_string(v);
-                if case_insensitive {
-                    s.to_lowercase()
-                } else {
-                    s
-                }
-            })
-            .collect();
-
-        let mut out = HashMap::new();
-        for r in &rows {
-            let decoded = Self::decode_row(r, key_field, columns, output_fields);
-            // The lookup value of the requested key field, normalized for matching.
-            let cmp_val = decoded
-                .get(key_field)
-                .map(|v| {
-                    let s = ClickHouseLookupRepository::key_to_string(v);
-                    if case_insensitive {
-                        s.to_lowercase()
-                    } else {
-                        s
-                    }
-                })
-                .unwrap_or_default();
-            if !pushdown && !wanted.iter().any(|w| *w == cmp_val) {
-                continue;
-            }
-            // Key the result map by the raw lookup value, matching the Postgres
-            // path which keys on the raw matched key string.
-            let map_key = ClickHouseLookupRepository::key_to_string(
-                decoded.get(key_field).unwrap_or(&serde_json::Value::Null),
-            );
-            out.insert(map_key, decoded);
-        }
-        Ok(out)
+        Ok(Self::index_batch_rows(
+            &rows,
+            columns,
+            &stored_key,
+            key_field,
+            key_values,
+            output_fields,
+            case_insensitive,
+        ))
     }
 
     #[instrument(skip(self))]
@@ -863,12 +925,13 @@ impl LookupStore for ClickHouseLookupRepository {
         limit: i64,
     ) -> Result<Vec<HashMap<String, serde_json::Value>>, LookupRepositoryError> {
         let columns = self.registry.get_columns_for_physical(table_name).await?;
-        let key_field = columns.first().map(|c| c.name.clone()).unwrap_or_default();
+        // The column `key_raw` was encoded from (not blindly the first one).
+        let key_field = self.resolve_key_field(table_name, &columns).await;
         let rows = self.read_live_rows(table_name, None, false).await?;
         Ok(rows
             .iter()
             .take(limit.clamp(0, 100) as usize)
-            .map(|r| Self::decode_row(r, &key_field, &columns, None))
+            .map(|r| Self::decode_row(r, &key_field, &key_field, &columns, None))
             .collect())
     }
 
@@ -880,7 +943,8 @@ impl LookupStore for ClickHouseLookupRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<HashMap<String, serde_json::Value>>, i64), LookupRepositoryError> {
-        let key_field = columns.first().map(|c| c.name.clone()).unwrap_or_default();
+        // The column `key_raw` was encoded from (not blindly the first one).
+        let key_field = self.resolve_key_field(table_name, columns).await;
         let mut rows = self.read_live_rows(table_name, None, false).await?;
         // Stable order by the immutable surrogate, matching the PG `_row_id` order.
         rows.sort_by_key(|r| r.row_id);
@@ -890,7 +954,7 @@ impl LookupStore for ClickHouseLookupRepository {
             .skip(offset.max(0) as usize)
             .take(limit.max(0) as usize)
             .map(|r| {
-                let mut m = Self::decode_row(r, &key_field, columns, None);
+                let mut m = Self::decode_row(r, &key_field, &key_field, columns, None);
                 // Expose the surrogate as `_row_id` so edit/delete targeting works,
                 // matching the Postgres list_rows contract.
                 m.insert(
@@ -936,7 +1000,8 @@ impl LookupStore for ClickHouseLookupRepository {
     ) -> Result<(), LookupRepositoryError> {
         // Insert-on-top with the SAME row_id at a fresh version, recomputed
         // key_lc + updated cols_json. Key-mutation-safe because dedup keys on
-        // row_id, not on the key cell.
+        // row_id, not on the key cell. Only for a row that exists (NAN-5715).
+        self.ensure_live_row(table_name, row_id).await?;
         let key_field = self.resolve_key_field(table_name, columns).await;
         let (key_raw, cols) = Self::encode_record(&key_field, columns, record);
         self.insert_tuples(
@@ -953,6 +1018,7 @@ impl LookupStore for ClickHouseLookupRepository {
 
     #[instrument(skip(self))]
     async fn delete_row(&self, table_name: &str, row_id: i64) -> Result<(), LookupRepositoryError> {
+        self.ensure_live_row(table_name, row_id).await?;
         // Tombstone: same row_id, deleted = 1, fresh version. No need to read the
         // old key.
         self.insert_tuples(
@@ -1090,10 +1156,162 @@ mod tests {
             key_raw: "WS01".to_string(),
             cols_json: r#"{"owner":"alice"}"#.to_string(),
         };
-        let decoded = ClickHouseLookupRepository::decode_row(&live, "host", &cols, None);
+        let decoded = ClickHouseLookupRepository::decode_row(&live, "host", "host", &cols, None);
         assert_eq!(decoded.get("host"), Some(&serde_json::json!("WS01")));
         assert_eq!(decoded.get("owner"), Some(&serde_json::json!("alice")));
         // Missing non-key column null-fills.
         assert_eq!(decoded.get("risk"), Some(&serde_json::Value::Null));
+    }
+
+    fn owners_rows() -> (Vec<LookupColumn>, Vec<LiveRow>) {
+        let cols = vec![
+            LookupColumn::text("hostname", false),
+            LookupColumn::text("owner", true),
+            LookupColumn::text("site", true),
+        ];
+        let rows = vec![
+            LiveRow { row_id: 1, key_raw: "ws-01".into(), cols_json: r#"{"owner":"team-red","site":"a"}"#.into() },
+            LiveRow { row_id: 2, key_raw: "ws-02".into(), cols_json: r#"{"owner":"team-blue","site":"b"}"#.into() },
+        ];
+        (cols, rows)
+    }
+
+    /// NAN-5694: `OUTPUT owner` must still key the batch by the key column.
+    /// The key used to be dropped from the projection, so every row was keyed
+    /// by `""` and `lookup owners device.hostname OUTPUT owner` was all-null.
+    #[test]
+    fn output_projection_still_keys_the_batch_by_the_stored_key() {
+        let (cols, rows) = owners_rows();
+        let keys = [serde_json::json!("ws-01"), serde_json::json!("ws-02")];
+        let output = ["owner".to_string()];
+        for output_fields in [Some(&output[..]), None] {
+            let out = ClickHouseLookupRepository::index_batch_rows(
+                &rows, &cols, "hostname", "hostname", &keys, output_fields, false,
+            );
+            assert_eq!(out.len(), 2, "output={output_fields:?}");
+            assert_eq!(out["ws-01"]["owner"], serde_json::json!("team-red"));
+            assert_eq!(out["ws-02"]["owner"], serde_json::json!("team-blue"));
+            assert!(!out.contains_key(""));
+            // The projection still drops columns OUTPUT did not name.
+            assert_eq!(out["ws-01"].contains_key("site"), output_fields.is_none());
+        }
+        let output = ["owner".to_string(), "site".to_string()];
+        let out = ClickHouseLookupRepository::index_batch_rows(
+            &rows, &cols, "hostname", "hostname", &keys[..1], Some(&output), false,
+        );
+        assert_eq!(out["ws-01"]["site"], serde_json::json!("a"));
+    }
+
+    /// A lookup keyed on a column other than the stored key (`site`, while
+    /// `key_raw` holds `hostname`) reads the key from `cols_json`. It used to
+    /// match `key_raw` (the hostname) against the wanted sites: 0 matches.
+    #[test]
+    fn a_non_stored_key_column_matches_on_its_own_value() {
+        let (cols, rows) = owners_rows();
+        let keys = [serde_json::json!("B")];
+        for (output, want_hostname) in [(vec!["owner"], false), (vec!["hostname"], true), (vec![], true)] {
+            let output: Vec<String> = output.into_iter().map(String::from).collect();
+            let output_fields = (!output.is_empty()).then_some(&output[..]);
+            // Case-insensitive: the wanted `B` matches the stored `b`.
+            let out = ClickHouseLookupRepository::index_batch_rows(
+                &rows, &cols, "hostname", "site", &keys, output_fields, true,
+            );
+            assert_eq!(out.keys().collect::<Vec<_>>(), vec!["b"], "{output:?}");
+            let row = &out["b"];
+            assert_eq!(row["site"], serde_json::json!("b"), "the key is always there to key on");
+            assert_eq!(row.get("hostname").cloned(), want_hostname.then(|| serde_json::json!("ws-02")), "{output:?}");
+            if output_fields.is_none() || output.contains(&"owner".to_string()) {
+                assert_eq!(row["owner"], serde_json::json!("team-blue"));
+            }
+        }
+        // Case-sensitive: `B` does not match `b`.
+        let out = ClickHouseLookupRepository::index_batch_rows(
+            &rows, &cols, "hostname", "site", &keys, None, false,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn decode_row_keeps_the_lookup_key_under_an_output_projection() {
+        let (cols, rows) = owners_rows();
+        let output = ["owner".to_string()];
+        let decoded =
+            ClickHouseLookupRepository::decode_row(&rows[0], "hostname", "hostname", &cols, Some(&output));
+        assert_eq!(decoded.get("hostname"), Some(&serde_json::json!("ws-01")));
+        assert_eq!(decoded.get("owner"), Some(&serde_json::json!("team-red")));
+        assert!(!decoded.contains_key("site"));
+        // A non-stored lookup key comes from cols_json; the unrequested stored
+        // key is left out.
+        let decoded =
+            ClickHouseLookupRepository::decode_row(&rows[0], "hostname", "site", &cols, Some(&output));
+        assert_eq!(decoded.get("site"), Some(&serde_json::json!("a")));
+        assert!(!decoded.contains_key("hostname"));
+    }
+
+    /// A single-key API lookup (`POST /api/lookup-tables/query`) with
+    /// `output_fields: ["owner"]` returns only `owner`, like Postgres.
+    #[test]
+    fn single_lookup_returns_only_the_requested_outputs() {
+        let (cols, rows) = owners_rows();
+        let output = ["owner".to_string()];
+        let key = [serde_json::json!("ws-01")];
+        // The pushdown read returns only the matching row.
+        let batch = ClickHouseLookupRepository::index_batch_rows(
+            &rows[..1], &cols, "hostname", "hostname", &key, Some(&output), false,
+        );
+        let row = batch.into_values().next().unwrap();
+        let row = ClickHouseLookupRepository::single_lookup_projection(row, "hostname", Some(&output));
+        assert_eq!(row, HashMap::from([("owner".to_string(), serde_json::json!("team-red"))]));
+        // Asked for explicitly, or no projection: the key stays.
+        let both = ["hostname".to_string(), "owner".to_string()];
+        let row = HashMap::from([("hostname".to_string(), serde_json::json!("ws-01"))]);
+        assert!(ClickHouseLookupRepository::single_lookup_projection(row.clone(), "hostname", Some(&both))
+            .contains_key("hostname"));
+        assert!(ClickHouseLookupRepository::single_lookup_projection(row, "hostname", None).contains_key("hostname"));
+    }
+
+    /// NAN-5712: a CSV keyed on `user` (or any key that does not sort first:
+    /// `detect_column_types` orders columns by name, so `user,owner` lists
+    /// `owner` first) stored correctly but read back with the key null and its
+    /// values shifted into `owner`: list/sample decoded with `columns.first()`
+    /// instead of the column `key_raw` was encoded from. Not a quoting issue:
+    /// column names are only JSON keys in `cols_json` here, and the Postgres
+    /// store quotes every identifier. Reserved words are pinned anyway.
+    #[test]
+    fn reserved_and_non_first_key_columns_round_trip() {
+        for key in ["user", "group", "order", "key", "value", "table", "account"] {
+            let mut cols = vec![LookupColumn::text(key, false), LookupColumn::text("owner", true)];
+            cols.sort_by(|a, b| a.name.cmp(&b.name)); // the upload's column order
+            let record: HashMap<String, serde_json::Value> = HashMap::from([
+                (key.to_string(), serde_json::json!("alice")),
+                ("owner".to_string(), serde_json::json!("finance")),
+            ]);
+            let (key_raw, cols_json) = ClickHouseLookupRepository::encode_record(key, &cols, &record);
+            let live = LiveRow { row_id: 1, key_raw, cols_json: serde_json::Value::Object(cols_json).to_string() };
+            // list_rows / sample_rows decode by the stored key.
+            let decoded = ClickHouseLookupRepository::decode_row(&live, key, key, &cols, None);
+            assert_eq!(decoded, record, "{key}");
+            // And a batch lookup on it (NAN-5714 shape: OUTPUT owner) matches.
+            let out = ClickHouseLookupRepository::index_batch_rows(
+                &[live],
+                &cols,
+                key,
+                key,
+                &[serde_json::json!("alice")],
+                Some(&["owner".to_string()]),
+                false,
+            );
+            assert_eq!(out["alice"]["owner"], serde_json::json!("finance"), "{key}");
+        }
+    }
+
+    #[test]
+    fn live_row_count_sql_filters_the_unsigned_row_id_after_dedup() {
+        let sql = ClickHouseLookupRepository::live_row_count_sql(7_529_336_958_272_102_401);
+        assert!(sql.starts_with("SELECT count() FROM"), "{sql}");
+        assert!(sql.contains("WHERE d = 0 AND row_id = 7529336958272102401"), "{sql}");
+        // Bit-63 (idempotent-append) ids compare as their unsigned value.
+        let sql = ClickHouseLookupRepository::live_row_count_sql(i64::MIN);
+        assert!(sql.ends_with("row_id = 9223372036854775808"), "{sql}");
     }
 }

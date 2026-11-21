@@ -127,9 +127,25 @@ pub fn merge_lookup_batch(
 
             // Look up the enrichment data
             if let Some(lookup_fields) = matches.get(&fold(&key_str)) {
-                // Write each output under its name (or OUTPUT rename)
-                for (field_name, field_value) in lookup_fields.iter() {
-                    insert_lookup_output(obj, lookup_cmd, field_name, field_value.clone());
+                // Write each output under its name (or OUTPUT rename). With an
+                // OUTPUT list only the named columns are written: the batch
+                // also returns the key column (it is keyed on it), which must
+                // not leak into the row as an un-asked-for field (NAN-5694).
+                match &lookup_cmd.output_fields {
+                    Some(output_fields) => {
+                        for field_name in output_fields {
+                            let value = lookup_fields
+                                .get(field_name)
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            insert_lookup_output(obj, lookup_cmd, field_name, value);
+                        }
+                    }
+                    None => {
+                        for (field_name, field_value) in lookup_fields.iter() {
+                            insert_lookup_output(obj, lookup_cmd, field_name, field_value.clone());
+                        }
+                    }
                 }
             } else {
                 // No match found - add null values for output fields if specified

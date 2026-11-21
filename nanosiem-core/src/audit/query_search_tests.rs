@@ -56,3 +56,30 @@ fn search_strips_nul() {
     assert_eq!(normalize_audit_search(Some("a\0b")).as_deref(), Some("ab"));
     assert_eq!(normalize_audit_search(Some("\0")), None);
 }
+
+/// NAN-5683: the audit API shows `lsrc_` / `user_` / `key_` TypeIDs while the
+/// ClickHouse and PostgreSQL stores keep raw UUIDs. Both paths take their
+/// needle from `normalize_audit_search`, so a pasted TypeID must become the
+/// UUID it encodes or the search finds nothing.
+#[test]
+fn search_maps_a_pasted_typeid_to_its_stored_uuid() {
+    let id = uuid::Uuid::now_v7();
+    for prefix in [crate::typeid::log_source::PREFIX, crate::typeid::user::PREFIX, crate::typeid::api_key::PREFIX] {
+        let public = crate::typeid::encode(prefix, &id);
+        assert_eq!(normalize_audit_search(Some(&format!("  {public} "))), Some(id.to_string()), "{public}");
+    }
+    let q = ClickHouseAuditQuery {
+        search: Some(crate::typeid::encode(crate::typeid::log_source::PREFIX, &id)),
+        ..Default::default()
+    };
+    assert_eq!(resolve_filters(&q).search, Some(id.to_string()));
+}
+
+#[test]
+fn search_leaves_non_typeid_needles_alone() {
+    for needle in ["log_source_deleted", "fw_edge", "pa-probe-key", "lsrc_", "LSRC_01h455vb4pex5vsknk084sn02q"] {
+        assert_eq!(normalize_audit_search(Some(needle)).as_deref(), Some(needle), "{needle}");
+    }
+    let raw = uuid::Uuid::now_v7().to_string();
+    assert_eq!(normalize_audit_search(Some(&raw)), Some(raw.clone()));
+}

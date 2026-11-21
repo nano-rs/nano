@@ -40,6 +40,58 @@ pub(crate) struct ClaimedFinding {
     pub finding_hash: String,
 }
 
+/// NAN-5697: merge the provenance of the result rows that did not fit the
+/// stored alert sample into one sample row, as the engine-only
+/// `_nano_source_types` annotation (stripped from every dedup hash).
+///
+/// Everything that derives an origin from the stored sample, namely
+/// `alerts.source_types` (`distinct_source_types`) and each grouped finding's
+/// `origin_source_types` (`FindingEvent::alert`), then covers every row the
+/// alert stands for: a superset of any single row's origin, never a subset.
+/// The webhook egresses only the sample and attributes it from the rows'
+/// own fields, so this does not change what it may send.
+pub(super) fn fold_overflow_provenance(
+    sample: &mut [serde_json::Value],
+    overflow: &[serde_json::Value],
+) {
+    if overflow.is_empty() {
+        return;
+    }
+    let extra = crate::db::repository::alerts::distinct_source_types_of(overflow);
+    if extra.is_empty() {
+        return;
+    }
+    // Carry it on a row that already has provenance, so a row whose origin
+    // was unknown never turns "attributed" (the webhook would then stop
+    // redacting it). With no such row, keep it unknown: add the sentinel.
+    let has_provenance = |e: &serde_json::Value| {
+        e.get("_nano_source_types").is_some()
+            || e.get("source_type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|st| !st.trim().is_empty())
+    };
+    let target = sample.iter().position(has_provenance);
+    let Some(obj) = sample
+        .get_mut(target.unwrap_or(0))
+        .and_then(|e| e.as_object_mut())
+    else {
+        return;
+    };
+    let mut merged: std::collections::BTreeSet<String> = obj
+        .get("_nano_source_types")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if target.is_none() {
+        merged.insert(crate::auth::UNRESOLVED_SOURCE_SENTINEL.to_string());
+    }
+    merged.extend(extra);
+    obj.insert(
+        "_nano_source_types".to_string(),
+        serde_json::Value::Array(merged.into_iter().map(serde_json::Value::String).collect()),
+    );
+}
+
 impl DetectionService {
     // ========================================================================
     // Alert Generation Helpers
@@ -518,11 +570,18 @@ impl DetectionService {
         // alert row to `max_events_per_alert` so a large grouped match can't write
         // a multi-MB jsonb blob. The stored sample is the newest N (SQL orders
         // timestamp DESC); the full count lives in match_count / detection_matches.
-        let sample: Vec<serde_json::Value> = results
+        let mut sample: Vec<serde_json::Value> = results
             .iter()
             .take(self.config.max_events_per_alert)
             .cloned()
             .collect();
+        // NAN-5697: the alert's `source_types` and every finding emitted below
+        // derive their origin from this stored sample, but the alert stands for
+        // ALL `results` (and findings are emitted for entities past the cap).
+        // Carry the dropped rows' provenance into the sample so neither is
+        // under-stamped.
+        let kept = sample.len();
+        fold_overflow_provenance(&mut sample, &results[kept..]);
         let matched_events = serde_json::Value::Array(sample);
         let new_alert = NewAlert {
             rule_id: rule.id,

@@ -19,6 +19,17 @@ use super::models::{
 // public name and the variants matched in service/crud.rs and service/import.rs).
 pub use crate::db::repo_error::RepoError as RuleRepositoryRepositoryError;
 
+/// The SQL expression for the current content hash of the detection rule
+/// aliased `dr`, as `rule_import_content_hash()` (migration 395) defines it.
+/// One definition for stamping and for the drift comparison (NAN-5716).
+macro_rules! dr_content_hash {
+    () => {
+        "rule_import_content_hash(dr.query, dr.description, dr.severity, \
+         dr.mitre_tactics, dr.mitre_techniques, dr.schedule_cron, \
+         dr.lookback_minutes, dr.tags)"
+    };
+}
+
 #[derive(Clone)]
 pub struct RuleRepositoryRepository {
     pool: PgPool,
@@ -524,14 +535,22 @@ impl RuleImportsRepository {
         customizations: Option<serde_json::Value>,
     ) -> Result<RuleImport, RuleImportsRepositoryError> {
         let result = sqlx::query_as::<_, RuleImport>(
+            concat!(
             r#"
             INSERT INTO rule_imports (
                 repository_rule_id, detection_rule_id, import_type,
-                imported_by, imported_commit, last_sync_commit, customizations
+                imported_by, imported_commit, last_sync_commit, customizations,
+                synced_content_hash
             )
-            VALUES ($1, $2, $3, $4, $5, $5, $6)
+            VALUES (
+                $1, $2, $3, $4, $5, $5, $6,
+                (SELECT "#,
+            dr_content_hash!(),
+            r#" FROM detection_rules dr WHERE dr.id = $2)
+            )
             RETURNING *
-            "#,
+            "#
+        ),
         )
         .bind(repository_rule_id)
         .bind(detection_rule_id)
@@ -553,12 +572,19 @@ impl RuleImportsRepository {
         Ok(result)
     }
 
+    /// The import of a detection rule, if it still exists. A link to an
+    /// archived (deleted) rule is not an import (NAN-5672), so the upstream
+    /// diff / dismiss paths 404 for it.
     pub async fn find_by_detection_rule(
         &self,
         detection_rule_id: Uuid,
     ) -> Result<Option<RuleImport>, RuleImportsRepositoryError> {
         let import = sqlx::query_as::<_, RuleImport>(
-            "SELECT * FROM rule_imports WHERE detection_rule_id = $1",
+            r#"
+            SELECT ri.* FROM rule_imports ri
+            JOIN detection_rules dr ON dr.id = ri.detection_rule_id
+            WHERE ri.detection_rule_id = $1 AND dr.archived = FALSE
+            "#,
         )
         .bind(detection_rule_id)
         .fetch_optional(&self.pool)
@@ -567,12 +593,22 @@ impl RuleImportsRepository {
         Ok(import)
     }
 
+    /// Imports of a repository rule whose detection rule still exists.
+    ///
+    /// An import pointing at an archived (deleted) rule is not an import
+    /// (NAN-5672). Deletes now drop the link with the archive, but a rule
+    /// deleted on an older build kept it, which made the rule read as
+    /// "already imported" and blocked re-importing it.
     pub async fn find_by_repository_rule(
         &self,
         repository_rule_id: Uuid,
     ) -> Result<Vec<RuleImport>, RuleImportsRepositoryError> {
         let imports = sqlx::query_as::<_, RuleImport>(
-            "SELECT * FROM rule_imports WHERE repository_rule_id = $1",
+            r#"
+            SELECT ri.* FROM rule_imports ri
+            JOIN detection_rules dr ON dr.id = ri.detection_rule_id
+            WHERE ri.repository_rule_id = $1 AND dr.archived = FALSE
+            "#,
         )
         .bind(repository_rule_id)
         .fetch_all(&self.pool)
@@ -586,8 +622,10 @@ impl RuleImportsRepository {
     ) -> Result<Vec<RuleImport>, RuleImportsRepositoryError> {
         let imports = sqlx::query_as::<_, RuleImport>(
             r#"
-            SELECT * FROM rule_imports
-            WHERE import_type = 'linked' AND upstream_changed = TRUE
+            SELECT ri.* FROM rule_imports ri
+            JOIN detection_rules dr ON dr.id = ri.detection_rule_id
+            WHERE ri.import_type = 'linked' AND ri.upstream_changed = TRUE
+              AND dr.archived = FALSE
             "#,
         )
         .fetch_all(&self.pool)
@@ -602,8 +640,9 @@ impl RuleImportsRepository {
     ) -> Result<Vec<RuleImport>, RuleImportsRepositoryError> {
         let imports = sqlx::query_as::<_, RuleImport>(
             r#"
-            SELECT * FROM rule_imports
-            WHERE upstream_changed = TRUE
+            SELECT ri.* FROM rule_imports ri
+            JOIN detection_rules dr ON dr.id = ri.detection_rule_id
+            WHERE ri.upstream_changed = TRUE AND dr.archived = FALSE
             "#,
         )
         .fetch_all(&self.pool)
@@ -621,7 +660,9 @@ impl RuleImportsRepository {
             r#"
             SELECT ri.* FROM rule_imports ri
             JOIN repository_rules rr ON ri.repository_rule_id = rr.id
+            JOIN detection_rules dr ON dr.id = ri.detection_rule_id
             WHERE rr.repository_id = $1 AND ri.upstream_changed = TRUE
+              AND dr.archived = FALSE
             "#,
         )
         .bind(repository_id)
@@ -672,11 +713,19 @@ impl RuleImportsRepository {
         commit: &str,
     ) -> Result<(), RuleImportsRepositoryError> {
         sqlx::query(
+            concat!(
             r#"
             UPDATE rule_imports
-            SET last_sync_commit = $2, upstream_changed = FALSE
+            SET last_sync_commit = $2, upstream_changed = FALSE,
+                synced_content_hash = (
+                    SELECT "#,
+            dr_content_hash!(),
+            r#" FROM detection_rules dr
+                    WHERE dr.id = rule_imports.detection_rule_id
+                )
             WHERE id = $1
-            "#,
+            "#
+        ),
         )
         .bind(id)
         .bind(commit)
@@ -699,7 +748,40 @@ impl RuleImportsRepository {
         Ok(())
     }
 
-    /// List all imports for rules in a specific repository
+    /// Imports in a repository whose detection rule still exists: the
+    /// repository browser's "imported" state. A stale link to a rule deleted
+    /// on an older build would show the rule as imported and could shadow the
+    /// link of its re-import (NAN-5672).
+    pub async fn list_active_for_repository(
+        &self,
+        repository_id: Uuid,
+    ) -> Result<Vec<RuleImport>, RuleImportsRepositoryError> {
+        let imports = sqlx::query_as::<_, RuleImport>(
+            concat!(
+            r#"
+            SELECT ri.*,
+                (ri.synced_content_hash IS NOT NULL
+                 AND ri.synced_content_hash IS DISTINCT FROM "#,
+            dr_content_hash!(),
+            r#") AS local_drift
+            FROM rule_imports ri
+            JOIN repository_rules rr ON ri.repository_rule_id = rr.id
+            JOIN detection_rules dr ON dr.id = ri.detection_rule_id
+            WHERE rr.repository_id = $1 AND dr.archived = FALSE
+            "#
+        ),
+        )
+        .bind(repository_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(imports)
+    }
+
+    /// List all imports for rules in a specific repository.
+    ///
+    /// Deliberately unfiltered: "remove all imported" uses it and must also
+    /// see a stale link to a rule deleted on an older build, to drop it.
     pub async fn list_for_repository(
         &self,
         repository_id: Uuid,

@@ -603,7 +603,9 @@ impl DetectionService {
         }
 
         if cancel_remaining {
-            if let Err(error) = self.search_service.cancel_exact_queries(&query_ids).await {
+            // NAN-5723: each window's companions too, not just its data query.
+            let kill_set = tuning_replay_kill_set(&query_ids);
+            if let Err(error) = self.search_service.cancel_exact_queries(&kill_set).await {
                 warn!(error = %error, "Failed to cancel remaining tuning replay queries");
             }
         }
@@ -635,7 +637,9 @@ impl DetectionService {
             .iter()
             .flat_map(|prefix| tuning_replay_query_ids(prefix, window_count))
             .collect::<Vec<_>>();
-        self.search_service.cancel_exact_queries(&query_ids).await
+        self.search_service
+            .cancel_exact_queries(&tuning_replay_kill_set(&query_ids))
+            .await
     }
 
     /// Run historical analysis using a query string with explicit time range
@@ -914,6 +918,17 @@ fn autonomous_window_bytes_exceeded(byte_count: u64) -> bool {
 fn tuning_replay_query_ids(prefix: &str, window_count: usize) -> Vec<String> {
     (0..window_count)
         .map(|index| format!("{prefix}-{index}"))
+        .collect()
+}
+
+/// NAN-5723: every replay window runs a full search, which can spawn
+/// companion queries (`-count`, `-guard`, `-base-count`, ...); the kill set
+/// is each window's data id plus its derived ids.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
+fn tuning_replay_kill_set(window_query_ids: &[String]) -> Vec<String> {
+    window_query_ids
+        .iter()
+        .flat_map(|id| crate::search::companion_query_id::all_query_ids(id))
         .collect()
 }
 
@@ -1404,6 +1419,18 @@ mod tests {
             },
         )
         .is_none());
+    }
+
+    #[test]
+    fn autonomous_replay_kill_set_covers_window_companions() {
+        let ids = tuning_replay_query_ids("tuning-proof-original", 2);
+        let kill = tuning_replay_kill_set(&ids);
+        for id in &ids {
+            for derived in crate::search::companion_query_id::all_query_ids(id) {
+                assert!(kill.contains(&derived), "{derived} missing from the replay kill set");
+            }
+        }
+        assert!(kill.contains(&"tuning-proof-original-1-base-count".to_string()));
     }
 
     #[test]

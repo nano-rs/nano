@@ -1253,6 +1253,7 @@ export function TimelineVisualization({
                 <TabsList className="h-auto rounded-md p-0.5 bg-foreground/[0.03] border border-border gap-0">
                   <TabsTrigger
                     value="stream"
+                    data-testid="timeline-tab-stream"
                     className="h-auto rounded-sm py-0.5 px-2.5 text-[10.5px] tracking-[0.06em] gap-1.5 font-medium normal-case data-[state=active]:bg-primary/10 data-[state=active]:text-primary data-[state=inactive]:text-muted-foreground hover:text-foreground data-[state=active]:hover:text-primary"
                   >
                     <ChartColumn className="w-[11px] h-[11px]" />
@@ -1260,6 +1261,7 @@ export function TimelineVisualization({
                   </TabsTrigger>
                   <TabsTrigger
                     value="rarity"
+                    data-testid="timeline-tab-rarity"
                     disabled={!hasSearched && !isAssetMode}
                     title={
                       artifactFetchLoading
@@ -1318,7 +1320,7 @@ export function TimelineVisualization({
                 )}
                 {/* hl-chart: scoped target for the search-complete reveal
                     sweep (index.css, gated by .hl-wipe on the page root) */}
-                <div className="hl-chart relative">
+                <div data-testid="timeline-chart" className="hl-chart relative">
                 <ResponsiveContainer width="100%" height={180}>
                   {chartType === 'bar' ? (
                     <BarChart

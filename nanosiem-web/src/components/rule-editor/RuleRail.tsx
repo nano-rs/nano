@@ -598,6 +598,7 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
                         const ruleId = e.dataTransfer.getData('application/x-nano-rule-id');
                         if (!ruleId) return;
                         const current = rules.find((r) => r.id === ruleId);
+                        if (current?.archived) return;
                         if (current && canonicalize(folderOf(current)) === folder.name) return;
                         onMoveRule(ruleId, folder.name === 'Uncategorized' ? '' : folder.name);
                       }
@@ -701,9 +702,10 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
                         rule={rule}
                         focused={rule.id === selectedId}
                         onClick={() => onSelect(rule.id)}
-                        draggable={!!onMoveRule}
+                        // NAN-5683: an archived (deleted) rule takes no edit — no folder move.
+                        draggable={!!onMoveRule && !rule.archived}
                         onDragStart={
-                          onMoveRule
+                          onMoveRule && !rule.archived
                             ? (e) => {
                                 e.dataTransfer.effectAllowed = 'move';
                                 e.dataTransfer.setData('application/x-nano-rule-id', rule.id);
@@ -807,7 +809,7 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
       {(() => {
         const target = deleteFolderName ?? '';
         const ruleCount = rules.filter(
-          (r) => folderOf(r).toLowerCase() === target.toLowerCase(),
+          (r) => !r.archived && folderOf(r).toLowerCase() === target.toLowerCase(),
         ).length;
         return (
           <ConfirmDialog
@@ -827,8 +829,10 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
               // Each move is its own API call — small batch in the
               // common case (analysts maintain folders as they go).
               if (ruleCount > 0 && onMoveRule) {
+                // NAN-5683: archived rules can't be moved (the API answers
+                // 404); they keep their folder name in the Archived tab.
                 const targets = rules.filter(
-                  (r) => folderOf(r).toLowerCase() === name.toLowerCase(),
+                  (r) => !r.archived && folderOf(r).toLowerCase() === name.toLowerCase(),
                 );
                 await Promise.all(targets.map((r) => Promise.resolve(onMoveRule(r.id, ''))));
               }

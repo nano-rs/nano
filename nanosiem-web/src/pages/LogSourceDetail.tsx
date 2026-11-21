@@ -1210,6 +1210,8 @@ function TabNav({ active, onChange }: { active: TabId; onChange: (id: TabId) => 
         <button
           key={t.id}
           type="button"
+          data-testid={`log-source-tab-${t.id}`}
+          aria-pressed={active === t.id}
           onClick={() => onChange(t.id)}
           className={cn(
             'relative h-9 px-3 text-[10px] font-medium uppercase tracking-[0.12em] transition-colors',

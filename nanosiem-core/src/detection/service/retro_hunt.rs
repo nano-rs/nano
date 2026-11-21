@@ -595,6 +595,8 @@ impl DetectionService {
         if let Some(feeds) = update.feeds.as_deref() {
             self.validate_requested_feeds(feeds).await?;
         }
+        // A deleted (archived) rule is a 404 (NAN-5672).
+        self.get_active_rule(rule_id).await?;
         self.retro_hunt_repo()
             .update_config(rule_id, update)
             .await

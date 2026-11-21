@@ -108,8 +108,9 @@ pub async fn bulk_update_rules(
             }
         };
 
-        // Get current rule to check if already in target mode
-        let current_rule = match state.detection_service.get_rule(rule_id).await {
+        // Get current rule to check if already in target mode. A deleted
+        // (archived) rule is reported as not found, never "skipped" (NAN-5672).
+        let current_rule = match state.detection_service.get_active_rule(rule_id).await {
             Ok(rule) => rule,
             Err(e) => {
                 failed.push(BulkRuleFailure {

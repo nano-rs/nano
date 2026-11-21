@@ -419,3 +419,41 @@ fn every_handler_is_authorization_accounted_for() {
         "NON_SEARCH_EXECUTE lists handler(s) that no longer exist: {stale:?}",
     );
 }
+
+/// NAN-5723: cancel authorizes on the raw request id and then KILLs its
+/// derived companion ids, so both the reservation and the cancel must refuse
+/// ids that could share a derived id with another principal's search
+/// (`job-base-count` vs `job`). The property itself is proven in
+/// `nanosiem-core` (`distinct_valid_request_ids_never_share_a_derived_query_id`);
+/// this pins that the handlers call it, before ownership is recorded or a KILL
+/// is issued.
+#[test]
+fn request_ids_are_validated_before_reservation_and_cancel() {
+    use nanosiem_core::search::companion_query_id::validate_client_request_id;
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers/search.rs"))
+        .expect("read search.rs");
+    let body = |marker: &str| -> &str {
+        let start = src.find(marker).unwrap_or_else(|| panic!("{marker} not found"));
+        let rest = &src[start..];
+        &rest[..rest[1..].find("\npub ").map_or(rest.len(), |e| e + 1)]
+    };
+    let reserve = body("pub(crate) async fn reserve_query_owner(");
+    let v = reserve.find("validate_client_request_id").expect("reserve_query_owner validates");
+    assert!(v < reserve.find("state.reserve_query_owner").unwrap(), "validate before reserving");
+
+    let cancel = body("pub async fn cancel_search(");
+    let v = cancel.find("validate_client_request_id").expect("cancel_search validates");
+    assert!(v < cancel.find(".cancel_query(").unwrap(), "validate before KILL");
+
+    // The crafted ids from the review are refused at ingress.
+    for id in ["job-base-count", "job-count", "job-chunk-0", "job-base"] {
+        assert!(validate_client_request_id(id).is_err(), "{id}");
+    }
+    assert!(validate_client_request_id(&uuid::Uuid::now_v7().to_string()).is_ok());
+
+    // An abandoned stream KILLs its queries, not just its Rust futures.
+    let streaming = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers/streaming.rs"))
+        .expect("read streaming.rs");
+    let drop_impl = &streaming[streaming.find("impl Drop for StreamSearchTask").expect("drop impl")..];
+    assert!(drop_impl.contains(".cancel_query(&request_id)"), "stream drop must KILL the request's queries");
+}

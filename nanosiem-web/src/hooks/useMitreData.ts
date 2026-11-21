@@ -132,6 +132,12 @@ export function useMitreCoverage(filters: CoverageFilters) {
       );
     },
     enabled: isAuthenticated && !authLoading,
+    // NAN-5717: coverage follows rule promote / demote / pause, which happen
+    // on other pages that do not invalidate this query. Refetch on every mount
+    // instead of serving the 1-minute global staleTime (the response is also
+    // sent `Cache-Control: no-cache`, so the browser revalidates too).
+    staleTime: 0,
+    refetchOnMount: 'always',
   });
 
   return {

@@ -63,6 +63,8 @@ export function Rules() {
   const { toast } = useToast();
 
   const canCreate = hasPermission('detections:create');
+  // NAN-5709: the Repositories page and its API gate on rule_repositories:view.
+  const canViewRepositories = hasPermission('rule_repositories:view');
   // NAN-4595: drafting rules from a narrative runs in the pivt panel.
   const { capabilities } = useCapabilities();
   const canDraftWithPivt =
@@ -353,14 +355,16 @@ export function Rules() {
             <Download className="w-3.5 h-3.5" strokeWidth={2} />
             Import
           </button>
-          <Link
-            to="/rules/repositories"
-            className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5 @max-[900px]:hidden"
-          >
-            <Database className="w-3.5 h-3.5" strokeWidth={2} />
-            {/* NAN-957: label matches destination page title "Rule repositories". */}
-            Repositories
-          </Link>
+          {canViewRepositories && (
+            <Link
+              to="/rules/repositories"
+              className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5 @max-[900px]:hidden"
+            >
+              <Database className="w-3.5 h-3.5" strokeWidth={2} />
+              {/* NAN-957: label matches destination page title "Rule repositories". */}
+              Repositories
+            </Link>
+          )}
           {canCreate && (
             <Link
               to="/rules/retro-hunt/new"

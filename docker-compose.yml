@@ -120,6 +120,8 @@ services:
     environment:
       # Vector config directory (must match volume mount)
       VECTOR_CONFIG_DIR: /etc/vector
+      # NAN-5635: the search memory guard's budget (see nanosiem-search).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       # NAN-5132: stable fan-in slots, off by default (opt-in for installs that
       # add sources often). Every API replica must use the same value.
       VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
@@ -275,6 +277,9 @@ services:
       NANOSIEM_ALLOW_DEFAULT_KEYS: ${NANOSIEM_ALLOW_DEFAULT_KEYS:-true}
       # Search service settings
       SEARCH_PORT: 3002
+      # NAN-5635: memory budget (bytes) for cost-admitted unfiltered searches;
+      # unset = half the per-query ceiling, 0 = refuse them all (pre-2.0.33).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       # CORS: Set CORS_ORIGINS in .env for production (e.g., https://your-domain.com)
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
       RUST_LOG: ${RUST_LOG:-info}
@@ -319,6 +324,8 @@ services:
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     environment:
       DATABASE_URL: postgres://nanosiem:nanosiem@postgres:5432/nanosiem
+      # NAN-5635: the search memory guard's budget (see nanosiem-search).
+      SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem
       CLICKHOUSE_USER: nanosiem

@@ -659,6 +659,7 @@ function TestDrawerHeader({
         size="sm"
         onClick={onRerun}
         disabled={running}
+        data-testid="test-rule-run"
         className="h-6 text-[10.5px] px-2 gap-1 font-mono"
       >
         {running ? (
@@ -707,7 +708,7 @@ function TestDrawerHeader({
           </span>
         )}
         <span className="whitespace-nowrap">
-          <span className="text-[var(--destructive)] font-semibold">{matched.toLocaleString()}</span>{' '}
+          <span className="text-[var(--destructive)] font-semibold" data-testid="test-rule-matched" data-running={running ? 'true' : 'false'}>{matched.toLocaleString()}</span>{' '}
           <span className="text-muted-foreground/80">matched</span>
         </span>
         <Separator orientation="vertical" className="h-3" />

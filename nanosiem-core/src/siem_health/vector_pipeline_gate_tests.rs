@@ -180,3 +180,79 @@ fn errno_is_found_through_wrapping_errors() {
     assert_eq!(io_errno(&wrapped), Some(13));
     assert_eq!(io_errno(&std::fmt::Error), None);
 }
+
+/// NAN-5657: when the identity file's directory cannot take the stall record
+/// (the root-owned case the finding describes), the record lands in the data
+/// directory, the finding still reads it, and recording the identity clears it.
+#[tokio::test]
+async fn a_stall_that_cannot_be_written_beside_the_marker_falls_back_to_the_data_dir() {
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    // A marker whose "directory" is a regular file: every write beside it fails.
+    let blocked = config.path().join("not-a-dir");
+    std::fs::write(&blocked, "x").unwrap();
+    let marker = blocked.join(".nano-pipeline-identity");
+    let stall = PipelineGateStall {
+        marker_path: marker.clone(),
+        identity: "2.0.34/fsync/off".to_string(),
+        attempts: 15,
+        error: "Permission denied (os error 13)".to_string(),
+        errno: Some(13),
+    };
+    report_stall_to(&stall, Some(data.path())).await;
+    assert!(data.path().join(STALL_FILE).exists(), "recorded in the data directory");
+    assert_eq!(current_stall_in(config.path(), Some(data.path())).await, Some(stall.clone()));
+    assert_eq!(current_stall_in(config.path(), None).await, None, "no fallback, nothing to read");
+
+    // Recorded later: the fallback record clears too.
+    std::fs::write(config.path().join(".nano-pipeline-identity"), "2.0.34/fsync/off\n").unwrap();
+    assert_eq!(current_stall_in(config.path(), Some(data.path())).await, None);
+    assert!(!data.path().join(STALL_FILE).exists());
+
+    report_stall_to(&stall, Some(data.path())).await;
+    clear_stall_in(&marker, Some(data.path())).await;
+    assert!(!data.path().join(STALL_FILE).exists(), "clear removes the fallback record");
+}
+
+fn stall_for(marker: &Path, identity: &str) -> PipelineGateStall {
+    PipelineGateStall {
+        marker_path: marker.to_path_buf(),
+        identity: identity.to_string(),
+        attempts: 15,
+        error: "Permission denied (os error 13)".to_string(),
+        errno: Some(13),
+    }
+}
+
+/// NAN-5657 review: a resolved primary record (its identity is the recorded
+/// one) never hides a live fallback record behind it.
+#[tokio::test]
+async fn a_resolved_primary_record_does_not_hide_a_live_fallback_one() {
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let marker = config.path().join(".nano-pipeline-identity");
+    std::fs::write(&marker, "2.0.33/fsync/off\n").unwrap();
+    let old = stall_for(&marker, "2.0.33/fsync/off");
+    let live = stall_for(&marker, "2.0.34/fsync/off");
+    std::fs::write(config.path().join(STALL_FILE), serde_json::to_vec(&old).unwrap()).unwrap();
+    std::fs::write(data.path().join(STALL_FILE), serde_json::to_vec(&live).unwrap()).unwrap();
+    assert_eq!(current_stall_in(config.path(), Some(data.path())).await, Some(live));
+    assert!(!config.path().join(STALL_FILE).exists(), "the resolved record is removed");
+}
+
+/// NAN-5657 review: a new primary record replaces an older fallback one, so
+/// recovery never leaves the fallback behind to raise the finding again.
+#[tokio::test]
+async fn a_primary_record_supersedes_an_older_fallback_one() {
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let marker = config.path().join(".nano-pipeline-identity");
+    std::fs::write(data.path().join(STALL_FILE), serde_json::to_vec(&stall_for(&marker, "2.0.34/fsync/off")).unwrap())
+        .unwrap();
+    report_stall_to(&stall_for(&marker, "2.0.35/fsync/off"), Some(data.path())).await;
+    assert!(config.path().join(STALL_FILE).exists());
+    assert!(!data.path().join(STALL_FILE).exists(), "the older fallback record is gone");
+    std::fs::write(&marker, "2.0.35/fsync/off\n").unwrap();
+    assert_eq!(current_stall_in(config.path(), Some(data.path())).await, None);
+    assert_eq!(current_stall_in(config.path(), Some(data.path())).await, None, "nothing resurfaces");
+}

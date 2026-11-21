@@ -642,6 +642,15 @@ impl DashboardRepository {
     ///
     /// Legacy (owner-less) dashboards are no longer deletable by arbitrary
     /// users — they must be removed through `delete_as_admin`.
+    ///
+    /// When nothing was deleted the error says why, without revealing a
+    /// dashboard the caller cannot see (NAN-5711):
+    /// - missing → `NotFound` (404), the same answer an admin and `GET` give,
+    ///   so a retried or double-clicked delete reads as "already gone";
+    /// - exists but not visible to the caller → `NotFound` too, so a private
+    ///   dashboard's existence does not leak through the delete endpoint;
+    /// - visible but owned by someone else → `AccessDenied` (403): the caller
+    ///   can already open it, so the 403 discloses nothing new.
     pub async fn delete_owned(
         &self,
         id: Uuid,
@@ -654,7 +663,18 @@ impl DashboardRepository {
             .await?;
 
         if result.rows_affected() == 0 {
-            return Err(DashboardRepositoryError::AccessDenied(id));
+            // Probe after the delete attempt (not before) so the owner's happy
+            // path stays a single statement.
+            let existing = match self.find_by_id(id).await {
+                Ok(dashboard) => Some(dashboard),
+                Err(DashboardRepositoryError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
+            let visible = match &existing {
+                Some(dashboard) => self.check_user_access(dashboard, user_id).await?,
+                None => false,
+            };
+            return Err(owned_delete_miss_error(id, existing.is_some(), visible));
         }
 
         Ok(())
@@ -668,3 +688,20 @@ impl DashboardRepository {
         self.delete(id).await
     }
 }
+
+/// Why an owner-scoped delete removed nothing (NAN-5711).
+///
+/// A dashboard the caller cannot see is reported exactly like a missing one
+/// (404), so the delete endpoint never confirms a hidden dashboard exists.
+/// Only a dashboard the caller can already open, but does not own, is a 403.
+fn owned_delete_miss_error(id: Uuid, exists: bool, visible_to_caller: bool) -> DashboardRepositoryError {
+    if exists && visible_to_caller {
+        DashboardRepositoryError::AccessDenied(id)
+    } else {
+        DashboardRepositoryError::NotFound(id)
+    }
+}
+
+#[cfg(test)]
+#[path = "dashboards_tests.rs"]
+mod tests;

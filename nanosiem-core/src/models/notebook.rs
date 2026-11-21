@@ -241,9 +241,11 @@ pub struct NotebookEntry {
     pub entry_type: String,
     pub content: serde_json::Value,
     pub source_url: Option<String>,
-    #[serde(with = "typeid::user")]
-    #[schema(value_type = String)]
-    pub created_by: Uuid,
+    /// NULL once the author is deleted: the entry stays in the notebook
+    /// (NAN-5721, ON DELETE SET NULL). Render as "deleted user".
+    #[serde(default, with = "typeid::user::opt")]
+    #[schema(value_type = Option<String>)]
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -270,9 +272,11 @@ pub struct NotebookEntryWithCreator {
     pub entry_type: String,
     pub content: serde_json::Value,
     pub source_url: Option<String>,
-    #[serde(with = "typeid::user")]
-    #[schema(value_type = String)]
-    pub created_by: Uuid,
+    /// NULL once the author is deleted: the entry stays in the notebook
+    /// (NAN-5721, ON DELETE SET NULL). Render as "deleted user".
+    #[serde(default, with = "typeid::user::opt")]
+    #[schema(value_type = Option<String>)]
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub creator_name: Option<String>,
     #[serde(

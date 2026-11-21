@@ -51,6 +51,34 @@ pub struct RuleFailureCounters {
     /// Earlier claims of this rule that were never released: the process
     /// executing them died mid-run (NAN-5424). Excludes the current claim.
     pub crashed_attempts: i16,
+    /// Consecutive crashes attributed to this rule (it died running ALONE)
+    /// (NAN-5736). Survives a coverage gap; reset when a run completes.
+    pub crash_streak: i16,
+    /// An earlier run died together with other rules; attribution is
+    /// ambiguous, so the next run executes in isolation (NAN-5736).
+    pub crash_suspect: bool,
+    /// The last claim was executing in isolation (NAN-5736). Read together
+    /// with `crashed_attempts > 0`: that claim died ALONE.
+    pub isolated_claim: bool,
+}
+
+impl RuleFailureCounters {
+    /// The rule must run in isolation: it died mid-run before (NAN-5736).
+    pub fn crash_suspected(&self) -> bool {
+        self.crashed_attempts > 0 || self.crash_suspect || self.crash_streak > 0
+    }
+}
+
+/// What [`DetectionRuleRepository::release_crashed_claim`] writes when a claim
+/// finds an earlier claim of the rule that never released (NAN-5736).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashRelease<'a> {
+    /// Counters, error, optional gap and the back-off `next_run_at`.
+    pub release: ClaimRelease<'a>,
+    /// New attributed-crash count.
+    pub crash_streak: i16,
+    /// Whether the next run must execute in isolation.
+    pub crash_suspect: bool,
 }
 
 /// Longest `last_error` stored (characters).
@@ -82,19 +110,32 @@ impl DetectionRuleRepository {
     /// against `claim_due_rules`: a claim committed first is seen here (the
     /// locked read returns the latest row version), and a claim attempted
     /// after commit no longer matches its `mode`/`next_run_at` predicate.
+    ///
+    /// NAN-5736: a claim older than the scheduler's stale-claim timeout
+    /// belongs to a process that died mid-run (it will never release). It no
+    /// longer blocks the delete; it is cleared together with the pause.
+    /// Before, a crashed rule that was paused first could never be deleted:
+    /// a paused rule is never reclaimed, so its dead claim stayed forever.
     pub async fn quiesce_for_delete(
         &self,
         rule_id: Uuid,
     ) -> Result<bool, DetectionRuleRepositoryError> {
+        let stale_secs = crate::detection::distributed_scheduler::DistributedSchedulerConfig::from_env()
+            .effective_stale_claim_timeout_secs();
         let mut tx = self.pool.begin().await?;
         let claimed_by: Option<Option<String>> = sqlx::query_scalar(
             r#"
-            SELECT claimed_by FROM detection_rules
+            SELECT CASE
+                       WHEN claimed_at < NOW() - make_interval(secs => $2) THEN NULL
+                       ELSE claimed_by
+                   END
+            FROM detection_rules
             WHERE id = $1 AND archived = false
             FOR UPDATE
             "#,
         )
         .bind(rule_id)
+        .bind(stale_secs as f64)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -110,7 +151,11 @@ impl DetectionRuleRepository {
                             ELSE paused_from_mode
                         END,
                         mode = 'paused',
-                        next_run_at = NULL
+                        next_run_at = NULL,
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        inflight_claims = 0,
+                        isolated_claim = false
                     WHERE id = $1
                     "#,
                 )
@@ -216,6 +261,10 @@ impl DetectionRuleRepository {
                     failing_since = $12,
                     failure_class = $13,
                     inflight_claims = 0,
+                    -- NAN-5736: this run completed, so it is not crashing.
+                    crash_streak = 0,
+                    crash_suspect = false,
+                    isolated_claim = false,
                     last_error = COALESCE($11, last_error),
                     last_error_at = CASE WHEN $11::text IS NULL THEN last_error_at ELSE NOW() END
                 WHERE id = $1 AND claimed_by = $3
@@ -245,6 +294,107 @@ impl DetectionRuleRepository {
         .await?;
 
         Ok(())
+    }
+
+    /// Record a claim's crashed predecessor and RELEASE the claim without
+    /// running the rule (NAN-5736).
+    ///
+    /// A run that kills the process never reaches [`Self::release_claim`], so
+    /// folding crashed attempts into the counters only in memory (as NAN-5424
+    /// did) lost them again with the next crash: the breaker never tripped
+    /// and the rule was retried every stale-claim timeout, forever. This
+    /// writes the decided counters, error, optional coverage gap (same
+    /// statement, same rules as `release_claim`) and the back-off
+    /// `next_run_at`, and releases the claim: the back-off is the schedule,
+    /// never a held claim, so pausing or deleting the rule works meanwhile.
+    ///
+    /// Only applies while this node still holds the claim; returns whether
+    /// it did.
+    pub async fn release_crashed_claim(
+        &self,
+        rule_id: Uuid,
+        node_id: &str,
+        crash: &CrashRelease<'_>,
+    ) -> Result<bool, DetectionRuleRepositoryError> {
+        let release = &crash.release;
+        let (gap_start, gap_end, gap_attempts, gap_error) = match release.coverage_gap {
+            Some(gap) => (
+                Some(gap.window_start),
+                Some(gap.window_end),
+                Some(gap.attempts),
+                Some(rule_error_text(&gap.error_message)),
+            ),
+            None => (None, None, None, None),
+        };
+        let error = release.error.map(rule_error_text);
+        let updated: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            WITH released AS (
+                UPDATE detection_rules
+                SET claimed_by = NULL,
+                    claimed_at = NULL,
+                    last_run_at = COALESCE($4, last_run_at),
+                    next_run_at = $2,
+                    catchup_size_failures = $5,
+                    consecutive_failures = $10,
+                    failing_since = $12,
+                    failure_class = $13,
+                    inflight_claims = 0,
+                    crash_streak = $14,
+                    crash_suspect = $15,
+                    isolated_claim = false,
+                    last_error = COALESCE($11, last_error),
+                    last_error_at = CASE WHEN $11::text IS NULL THEN last_error_at ELSE NOW() END
+                WHERE id = $1 AND claimed_by = $3
+                RETURNING id
+            ),
+            gap AS (
+                INSERT INTO detection_coverage_gaps (
+                    rule_id, window_start, window_end, attempts, error_message
+                )
+                SELECT id, $6, $7, $8, $9 FROM released
+                WHERE $6::timestamptz IS NOT NULL
+            )
+            SELECT id FROM released
+            "#,
+        )
+        .bind(rule_id)
+        .bind(release.next_run_at)
+        .bind(node_id)
+        .bind(release.advance_last_run_to)
+        .bind(release.catchup_size_failures)
+        .bind(gap_start)
+        .bind(gap_end)
+        .bind(gap_attempts)
+        .bind(gap_error)
+        .bind(release.consecutive_failures)
+        .bind(error)
+        .bind(release.failing_since)
+        .bind(release.failure_class)
+        .bind(crash.crash_streak)
+        .bind(crash.crash_suspect)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(updated.is_some())
+    }
+
+    /// Mark the claim as executing in isolation, right before the run starts
+    /// (NAN-5736). If the process dies during this run, the next claim finds
+    /// the flag still set and attributes the crash to this rule. Returns
+    /// whether this node still holds the claim.
+    pub async fn mark_isolated_claim(
+        &self,
+        rule_id: Uuid,
+        node_id: &str,
+    ) -> Result<bool, DetectionRuleRepositoryError> {
+        let result = sqlx::query(
+            "UPDATE detection_rules SET isolated_claim = true WHERE id = $1 AND claimed_by = $2",
+        )
+        .bind(rule_id)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Record an error against a rule without changing its schedule or
@@ -314,29 +464,65 @@ impl DetectionRuleRepository {
         &self,
         id: Uuid,
     ) -> Result<RuleFailureCounters, DetectionRuleRepositoryError> {
+        Ok(self.read_failure_counters(id, None).await?.unwrap_or_default())
+    }
+
+    /// [`Self::get_failure_counters`], only while `node_id` holds the claim
+    /// (NAN-5736): `None` when the claim was lost (another replica reclaimed
+    /// it, or it was released), so the caller must not execute.
+    pub async fn get_claimed_failure_counters(
+        &self,
+        id: Uuid,
+        node_id: &str,
+    ) -> Result<Option<RuleFailureCounters>, DetectionRuleRepositoryError> {
+        self.read_failure_counters(id, Some(node_id)).await
+    }
+
+    async fn read_failure_counters(
+        &self,
+        id: Uuid,
+        node_id: Option<&str>,
+    ) -> Result<Option<RuleFailureCounters>, DetectionRuleRepositoryError> {
         #[allow(clippy::type_complexity)]
-        let row: Option<(i16, i16, Option<chrono::DateTime<chrono::Utc>>, Option<String>, i16)> =
-            sqlx::query_as(
-                "SELECT catchup_size_failures, consecutive_failures, failing_since, \
-                        failure_class, inflight_claims \
-                 FROM detection_rules WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row
-            .map(
-                |(catchup_size_failures, consecutive_failures, failing_since, failure_class, inflight)| {
-                    RuleFailureCounters {
-                        catchup_size_failures,
-                        consecutive_failures,
-                        failing_since,
-                        failure_class,
-                        crashed_attempts: (inflight - 1).max(0),
-                    }
-                },
-            )
-            .unwrap_or_default())
+        let row: Option<(
+            i16,
+            i16,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+            i16,
+            i16,
+            bool,
+            bool,
+        )> = sqlx::query_as(
+            "SELECT catchup_size_failures, consecutive_failures, failing_since, \
+                    failure_class, inflight_claims, crash_streak, crash_suspect, isolated_claim \
+             FROM detection_rules WHERE id = $1 AND ($2::text IS NULL OR claimed_by = $2)",
+        )
+        .bind(id)
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(
+                catchup_size_failures,
+                consecutive_failures,
+                failing_since,
+                failure_class,
+                inflight,
+                crash_streak,
+                crash_suspect,
+                isolated_claim,
+            )| RuleFailureCounters {
+                catchup_size_failures,
+                consecutive_failures,
+                failing_since,
+                failure_class,
+                crashed_attempts: (inflight - 1).max(0),
+                crash_streak,
+                crash_suspect,
+                isolated_claim,
+            },
+        ))
     }
 
     /// Current consecutive size-failure count for a rule's catch-up (NAN-4910).
@@ -379,7 +565,8 @@ impl DetectionRuleRepository {
         let result = sqlx::query(
             r#"
             UPDATE detection_rules
-            SET claimed_by = NULL, claimed_at = NULL, inflight_claims = 0
+            SET claimed_by = NULL, claimed_at = NULL, inflight_claims = 0,
+                isolated_claim = false
             WHERE claimed_by = $1
             "#,
         )
@@ -393,6 +580,10 @@ impl DetectionRuleRepository {
     /// Update the next_run_at for a rule (called by API handlers on CRUD changes).
     ///
     /// Pass None to clear next_run_at (e.g., when disabling or archiving a rule).
+    ///
+    /// NAN-5672: a schedule is never stamped onto an archived (deleted) rule,
+    /// atomically: a handler holding a pre-delete copy of the rule cannot
+    /// re-schedule it after the archive committed. Clearing always applies.
     pub async fn update_next_run_at(
         &self,
         rule_id: Uuid,
@@ -403,6 +594,7 @@ impl DetectionRuleRepository {
             UPDATE detection_rules
             SET next_run_at = $2
             WHERE id = $1
+              AND ($2::timestamptz IS NULL OR archived = FALSE)
             "#,
         )
         .bind(rule_id)

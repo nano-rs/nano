@@ -2,6 +2,7 @@
 
 import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, Link } from 'react-router-dom';
 import { PivtSessionGuard } from '@/enterprise/components/pivt/PivtSessionGuard';
+import { SessionQueryCacheGuard } from '@/components/session/SessionQueryCacheGuard';
 import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
 import { useTier, TierProvider } from '@/hooks/use-tier';
 import { useState, useEffect, lazy, Suspense, ComponentType } from 'react';
@@ -102,6 +103,7 @@ import { AppLayout } from '@/components/layout/AppLayout';
 import { RouteErrorBoundary } from '@/components/layout/RouteErrorBoundary';
 import { PageContextProvider } from '@/contexts/PageContext';
 import { Toaster } from '@/components/ui/sonner';
+import { TooltipProvider } from '@/components/ui/tooltip';
 import { SupportDialogHost } from '@/components/support/SupportDialog';
 // Loading fallbacks
 import {
@@ -510,6 +512,15 @@ function LandingPageRedirect() {
 }
 
 // Protected app routes with layout - uses useAuth so must be inside AuthProvider
+// NAN-5729: the signed-in app is one user's. Keyed by user id, an in-place
+// user swap (refreshAuth) unmounts every protected view and provider (notebook
+// context, pages, streams) and mounts fresh ones for the new user, so no
+// previous-user component state or in-flight handler survives into it.
+function UserScopedProtectedAppRoutes() {
+  const { user } = useAuth();
+  return <ProtectedAppRoutes key={user?.id ?? 'anonymous'} />;
+}
+
 function ProtectedAppRoutes() {
   const location = useLocation();
   const resetKey = (location.state as { resetKey?: number } | null)?.resetKey;
@@ -667,9 +678,10 @@ function ProtectedAppRoutes() {
             } />
           } />
 
-          {/* Rule Repositories */}
+          {/* Rule Repositories. NAN-5709: gated on the permission the
+              page's own API (`GET /api/rule-repositories`) checks. */}
           <Route path="/rules/repositories" element={
-            <PermissionRoute permission="detections:view" element={
+            <PermissionRoute permission="rule_repositories:view" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <RuleRepositories />
               </Suspense>
@@ -1338,11 +1350,15 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <ThemeProvider>
+        {/* NAN-5698: one app-wide provider so no Tooltip can crash a route. */}
+        <TooltipProvider>
         <BrowserRouter>
           <CapabilitiesProvider>
           <AuthProvider>
             {/* NAN-4606: pivt runs and action cards never outlive the session. */}
             <PivtSessionBinding />
+            {/* NAN-5706: per-user cached lists never outlive the session. */}
+            <SessionQueryCacheGuard />
             <UserPreferencesProvider>
               <SetupRedirect>
                 <Routes>
@@ -1362,7 +1378,7 @@ function App() {
                   path="/*"
                   element={
                     <ProtectedRoute>
-                      <ProtectedAppRoutes />
+                      <UserScopedProtectedAppRoutes />
                     </ProtectedRoute>
                   }
                 />
@@ -1378,6 +1394,7 @@ function App() {
           </AuthProvider>
           </CapabilitiesProvider>
         </BrowserRouter>
+        </TooltipProvider>
       </ThemeProvider>
     </QueryClientProvider>
   );

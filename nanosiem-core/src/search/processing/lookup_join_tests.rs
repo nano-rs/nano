@@ -103,3 +103,106 @@ fn case_insensitive_lookup_merges_across_spellings() {
     merge_lookup_batch(&mut rows, &c, &batch);
     assert!(rows[0]["dept"].is_null());
 }
+
+fn owners_batch(with_key: bool) -> crate::lookup::BatchLookupResult {
+    let mut batch = crate::lookup::BatchLookupResult {
+        results: Default::default(),
+        matched_count: 2,
+        total_count: 3,
+    };
+    for (host, owner) in [("ws-01", "team-red"), ("ws-02", "team-blue")] {
+        let mut fields: std::collections::HashMap<String, serde_json::Value> =
+            [("owner".to_string(), json!(owner))].into_iter().collect();
+        if with_key {
+            fields.insert("hostname".into(), json!(host));
+        }
+        batch.results.insert(host.into(), fields);
+    }
+    batch
+}
+
+/// NAN-5694: `lookup owners device.hostname OUTPUT owner` (an OCSF dotted
+/// event field, the table key `hostname`) enriches like the bare lookup, in
+/// every OUTPUT form, and writes only the named outputs.
+#[test]
+fn output_clause_enriches_from_an_ocsf_dotted_event_field() {
+    let rows = || {
+        vec![
+            json!({"device.hostname": "ws-01"}),
+            json!({"device": {"hostname": "ws-02"}}),
+            json!({"device.hostname": "ws-99"}),
+        ]
+    };
+    for (q, target) in [
+        ("* | lookup owners device.hostname", "owner"),
+        ("* | lookup owners device.hostname OUTPUT owner", "owner"),
+        ("* | lookup owners device.hostname OUTPUT owner AS team", "team"),
+        ("* | lookup owners device.hostname OUTPUTNEW owner", "owner"),
+        ("* | lookup owners device.hostname AS hostname OUTPUT owner", "owner"),
+    ] {
+        let c = command(q);
+        let mut out = rows();
+        merge_lookup_batch(&mut out, &c, &owners_batch(true));
+        assert_eq!(out[0][target], "team-red", "{q}");
+        assert_eq!(out[1][target], "team-blue", "{q}");
+        assert!(out[2].get(target).is_none_or(|v| v.is_null()), "{q}");
+        if c.output_fields.is_some() {
+            // The batch's key column is not an asked-for output.
+            assert!(out.iter().all(|r| r.get("hostname").is_none()), "{q}");
+        }
+    }
+}
+
+#[test]
+fn output_clause_null_fills_named_columns_the_match_lacks() {
+    let c = command("* | lookup owners device.hostname OUTPUT owner, site");
+    let mut out = vec![json!({"device.hostname": "ws-01"})];
+    merge_lookup_batch(&mut out, &c, &owners_batch(false));
+    assert_eq!(out[0]["owner"], "team-red");
+    assert!(out[0]["site"].is_null());
+}
+
+#[test]
+fn outputnew_keeps_existing_values_under_an_ocsf_key() {
+    let c = command("* | lookup owners device.hostname OUTPUTNEW owner");
+    let mut out = vec![
+        json!({"device.hostname": "ws-01", "owner": "kept"}),
+        json!({"device.hostname": "ws-02"}),
+    ];
+    merge_lookup_batch(&mut out, &c, &owners_batch(true));
+    assert_eq!(out[0]["owner"], "kept");
+    assert_eq!(out[1]["owner"], "team-blue");
+}
+
+/// NAN-5714: `eval x="probe-a" | lookup t x AS account OUTPUT …` (an AS-renamed
+/// key with an OUTPUT / OUTPUTNEW clause) enriches like the bare form.
+#[test]
+fn as_renamed_key_with_output_clauses_enriches() {
+    let mut batch = crate::lookup::BatchLookupResult { results: Default::default(), matched_count: 1, total_count: 1 };
+    batch.results.insert(
+        "probe-a".into(),
+        [("account", json!("probe-a")), ("owner", json!("finance")), ("dept", json!("fin"))]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    );
+    for (clause, expect) in [
+        ("", vec![("owner", "finance"), ("dept", "fin")]),
+        (" OUTPUT owner", vec![("owner", "finance")]),
+        (" OUTPUT owner AS o", vec![("o", "finance")]),
+        (" OUTPUTNEW owner", vec![("owner", "finance")]),
+        (" OUTPUT owner, dept", vec![("owner", "finance"), ("dept", "fin")]),
+    ] {
+        let c = command(&format!("* | lookup t x AS account{clause}"));
+        assert_eq!((c.event_field.as_str(), c.key_field.as_str()), ("x", "account"));
+        let mut rows = vec![json!({"x": "probe-a"})];
+        merge_lookup_batch(&mut rows, &c, &batch);
+        for (field, value) in &expect {
+            assert_eq!(rows[0][*field], *value, "{clause}");
+        }
+        if c.output_fields.is_some() {
+            let obj = rows[0].as_object().unwrap();
+            assert_eq!(obj.len(), 1 + expect.len(), "only the listed outputs{clause}: {obj:?}");
+        }
+    }
+}

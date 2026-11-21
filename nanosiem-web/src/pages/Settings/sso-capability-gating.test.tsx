@@ -44,6 +44,7 @@ vi.mock('@/hooks/use-tier', () => ({
 vi.mock('@/components/settings/LastBackupCard', () => ({ LastBackupCard: () => null }));
 vi.mock('@/hooks/use-shared-tenant', () => ({ useSharedTenant: () => false }));
 vi.mock('@/hooks/useDocumentTitle', () => ({ useDocumentTitle: vi.fn() }));
+vi.mock('@/hooks/use-air-gap', () => ({ useDeploymentFlags: () => ({ airGap: false, managed: false }) }));
 vi.mock('@/hooks/use-api', () => ({
   useSystemConfig: () => ({ data: { deployment_mode: 'standard', air_gap: false } }),
   useRecentAuditChanges: () => ({ data: { entries: [] }, loading: false }),

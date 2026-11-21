@@ -14,7 +14,7 @@ import { setAccessToken } from '@/lib/auth-token';
 afterEach(() => vi.restoreAllMocks());
 
 async function failWith(body: unknown, status: number): Promise<ApiClientError> {
-  setAccessToken('t', 900);
+  setAccessToken('t', 900, 'u_test');
   vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }));
   try {
     await api.deleteCredential('cred_1');

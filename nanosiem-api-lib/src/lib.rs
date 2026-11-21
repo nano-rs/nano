@@ -35,7 +35,7 @@ pub use api_error::{error_chain, ApiError, ErrorDetail, ErrorResponse};
 pub use audit_ext::AuditExt;
 pub use auth_context::{
     check_all_permissions, check_any_permission, check_permission, ensure_interactive_session,
-    ensure_permission, require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
+    ensure_not_demo_user, ensure_permission, require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
 };
 // NAN-5483: the refresh cookie is only exported as a pair with its
 // `nano_session` presence cookie; the bare builders stay crate-private.

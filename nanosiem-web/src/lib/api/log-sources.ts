@@ -91,6 +91,19 @@ function errorCode(status: number | null | undefined): string {
   }
 }
 
+/** One source's outcome in `POST /api/log-sources/bulk-delete` (NAN-5678). */
+export interface BulkDeleteItem {
+  id: string;
+  deleted: boolean;
+  error?: string;
+}
+
+export interface BulkDeleteLogSourcesResponse {
+  deleted: number;
+  failed: number;
+  results: BulkDeleteItem[];
+}
+
 export class LogSourcesApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
@@ -164,9 +177,22 @@ export class LogSourcesApi {
     });
   }
 
+  // NAN-5678: a delete re-renders and reloads Vector (up to the 180 s ack
+  // cap), so it gets the deploy budget, not the 60 s default.
   async deleteLogSource(id: string): Promise<{ deleted: boolean }> {
-    return this.request(`/api/log-sources/${id}`, {
+    return this.deployRequest(`/api/log-sources/${id}`, {
       method: 'DELETE',
+    });
+  }
+
+  /**
+   * NAN-5678: delete several log sources with ONE Vector config render and
+   * reload (each reload recompiles every deployed parser). Per-source results.
+   */
+  async bulkDeleteLogSources(ids: string[]): Promise<BulkDeleteLogSourcesResponse> {
+    return this.deployRequest('/api/log-sources/bulk-delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
     });
   }
 

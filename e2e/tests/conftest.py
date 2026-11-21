@@ -11,6 +11,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -320,36 +321,57 @@ class OcsfLane:
         assert r.status_code == 200, r.text
 
 
-@pytest.fixture(scope="session")
-def ocsf_lane(stack: Stack) -> Iterator[OcsfLane]:
-    if not schema.is_ocsf():
-        pytest.skip("OCSF field scenarios need an ocsf stack (the scripts/e2e.sh default; this one is udm)")
+@contextmanager
+def open_ocsf_lane(stack: Stack, label: str) -> Iterator[OcsfLane]:
+    """A token-bound source with the published OCSF auth parser (see
+    OCSF_AUTH_PARSER), ready to ingest; revoked and deleted on exit."""
     nano = Nano(stack.api_url, stack.search_url, {"X-API-Key": stack.api_key}, Journal(None))
-    rk = make_route_key("ocsf-lane", "session")
+    rk = make_route_key("ocsf-lane", label)
     src = nano.create_draft_source(name=rk, route_key=rk, parser_vrl=OCSF_AUTH_PARSER.format(lane=rk))
     cred, tok = nano.issue_token(src["id"], name=f"{rk}-tok")
     from nano_e2e.client import expect as api_expect
 
-    # NAN-5079: a custom parser's first publish needs a passing OCSF sample or
-    # an audited unattested acknowledgement. This minimal auth parser is not a
-    # complete OCSF event (no metadata.version), so acknowledge.
-    res = api_expect(
-        nano.api.post(f"/api/log-sources/{src['id']}/publish", json={"acknowledge_unattested": True}), 200
-    )
-    assert res.get("success") is True, f"publishing the OCSF lane parser failed: {res}"
-    n = {"i": 0}
-
-    def probe() -> list:
-        # Fresh probe per poll: one sent during the publish reload may strand.
-        n["i"] += 1
-        ingest.hec(stack.hec_url, tok, {"message": f"ocsf-settle {rk} {n['i']}", "user": f"settle-{rk}"})
-        return nano.rows(f'actor.user.name="settle-{rk}"', limit=5, minutes_back=15)
-
-    eventually(probe, timeout=180, interval=3, desc=f"OCSF lane {rk} parsing (actor.user.name searchable)")
-    yield OcsfLane(lane=rk, token=tok, source_id=src["id"])
     try:
-        nano.revoke_token(cred)
-    except Exception:  # noqa: BLE001,S110 - best-effort
-        pass
-    nano.delete_source(src["id"])
-    nano.close()
+        # NAN-5079: a custom parser's first publish needs a passing OCSF sample or
+        # an audited unattested acknowledgement. This minimal auth parser is not a
+        # complete OCSF event (no metadata.version), so acknowledge.
+        res = api_expect(
+            nano.api.post(f"/api/log-sources/{src['id']}/publish", json={"acknowledge_unattested": True}), 200
+        )
+        assert res.get("success") is True, f"publishing the OCSF lane parser failed: {res}"
+        n = {"i": 0}
+
+        def probe() -> list:
+            # Fresh probe per poll: one sent during the publish reload may strand.
+            n["i"] += 1
+            ingest.hec(stack.hec_url, tok, {"message": f"ocsf-settle {rk} {n['i']}", "user": f"settle-{rk}"})
+            return nano.rows(f'actor.user.name="settle-{rk}"', limit=5, minutes_back=15)
+
+        eventually(probe, timeout=180, interval=3, desc=f"OCSF lane {rk} parsing (actor.user.name searchable)")
+        yield OcsfLane(lane=rk, token=tok, source_id=src["id"])
+    finally:
+        try:
+            nano.revoke_token(cred)
+        except Exception:  # noqa: BLE001,S110 - best-effort
+            pass
+        nano.delete_source(src["id"])
+        nano.close()
+
+
+@pytest.fixture(scope="session")
+def ocsf_lane(stack: Stack) -> Iterator[OcsfLane]:
+    if not schema.is_ocsf():
+        pytest.skip("OCSF field scenarios need an ocsf stack (the scripts/e2e.sh default; this one is udm)")
+    with open_ocsf_lane(stack, "session") as lane:
+        yield lane
+
+
+@pytest.fixture
+def ocsf_lane_factory(stack: Stack) -> Iterator[Callable[[str], OcsfLane]]:
+    """Extra OCSF lanes for one scenario (e.g. two sources to scope apart)."""
+    if not schema.is_ocsf():
+        pytest.skip("OCSF field scenarios need an ocsf stack (the scripts/e2e.sh default; this one is udm)")
+    from contextlib import ExitStack
+
+    with ExitStack() as lanes:
+        yield lambda label: lanes.enter_context(open_ocsf_lane(stack, label))

@@ -314,8 +314,10 @@ impl RuleVersionManager {
         // Start a transaction
         let mut tx = self.pg_pool.begin().await?;
 
-        let locked_rule: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM detection_rules WHERE id = $1 FOR UPDATE")
+        // A deleted (archived) rule is never rewritten (NAN-5672).
+        let locked_rule: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM detection_rules WHERE id = $1 AND archived = FALSE FOR UPDATE",
+        )
                 .bind(rule_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -470,7 +472,8 @@ impl RuleVersionManager {
             r#"
             SELECT query, name, description, severity, mode, detection_mode
             FROM detection_rules
-            WHERE id = $1
+            -- A deleted (archived) rule is never rewritten (NAN-5672).
+            WHERE id = $1 AND archived = FALSE
             FOR UPDATE
             "#,
         )

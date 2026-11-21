@@ -116,7 +116,7 @@ async fn update_authorized(pool: &PgPool, id: Uuid, req: &UpdateUserRequest) {
     let repo = UserRepository::new(pool.clone());
     for _ in 0..20 {
         match repo
-            .update_user_with_groups_authorized(id, req, None, current_stamp(pool).await)
+            .update_user_with_groups_authorized(id, req, None, current_stamp(pool).await, Uuid::new_v4())
             .await
         {
             Ok(_) => return,

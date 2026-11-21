@@ -44,7 +44,7 @@ pub(super) fn effective_match_scope(auth: &AuthContext) -> MatchScope {
     responses(
         (status = 200, description = "Rule ran now: `{triggered, rule_id (TypeID), window_start, window_end}`. A manual run does not change `last_run_at` (the scheduler's coverage mark)", body = inline(Object)),
         (status = 403, description = "Missing permission: detections:promote", body = ErrorResponse),
-        (status = 404, description = "Rule not found", body = ErrorResponse),
+        (status = 404, description = "Rule not found or deleted (archived)", body = ErrorResponse),
         (status = 500, description = "Scheduler not running or failed to trigger", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -57,7 +57,8 @@ pub async fn trigger_detection(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_PROMOTE)?;
 
-    let rule = state.detection_service.get_rule(*id).await?;
+    // A deleted (archived) rule never runs again, not even by hand (NAN-5672).
+    let rule = state.detection_service.get_active_rule(*id).await?;
 
     // Calculate lookback window
     let end = chrono::Utc::now();
@@ -230,7 +231,8 @@ pub async fn get_detection_matches(
             dm.severity,
             'open' as status,
             dm.matched_events,
-            mr.reviewed_at
+            mr.reviewed_at,
+            dm.event_count
         FROM detection_matches dm
         LEFT JOIN match_reviews mr ON mr.match_id = dm.id
         WHERE dm.rule_id = $1
@@ -274,6 +276,7 @@ pub async fn get_detection_matches(
             String,
             serde_json::Value,
             Option<chrono::DateTime<chrono::Utc>>,
+            Option<i32>,
         ),
     >(sqlx::AssertSqlSafe(sql.as_str()))
     .bind(*id);
@@ -336,7 +339,7 @@ pub async fn get_detection_matches(
     let matches: Vec<DetectionMatch> = rows
         .into_iter()
         .map(
-            |(match_id, detected_at, severity, status, matched_events, reviewed_at)| {
+            |(match_id, detected_at, severity, status, matched_events, reviewed_at, stored_count)| {
                 let mut events = if let serde_json::Value::Array(arr) = matched_events {
                     arr
                 } else {
@@ -350,6 +353,14 @@ pub async fn get_detection_matches(
                 // improvements are immediate without a migration.
                 // NAN-831: normalizer lives in nanosiem-core so the
                 // test-rule analysis path can call it too.
+                // NAN-5736: the stored array is bounded; `event_count` is
+                // the true number of matched events.
+                let stored = events.len() as i32;
+                let event_count = stored_count.unwrap_or(stored).max(stored);
+                let events_truncated = event_count > stored
+                    || events.iter().any(|e| {
+                        e.get(nanosiem_core::detection::match_payload::TRUNCATED_MARKER).is_some()
+                    });
                 for event in &mut events {
                     nanosiem_core::detection::normalize_match_event(event);
                 }
@@ -359,7 +370,8 @@ pub async fn get_detection_matches(
                     detected_at,
                     severity,
                     status,
-                    event_count: events.len() as i32,
+                    event_count,
+                    events_truncated,
                     events,
                     reviewed: Some(reviewed_at.is_some()),
                     reviewed_at,

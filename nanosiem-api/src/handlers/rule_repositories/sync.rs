@@ -28,6 +28,7 @@ use crate::{error::ApiError, state::AppState};
         (status = 200, description = "Sync started", body = SyncStartResponse),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Air-gapped install: Git sync needs outbound internet"),
     ),
     security(("api_key" = []))
 )]
@@ -38,6 +39,7 @@ pub async fn sync_repository(
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<SyncStartResponse>, ApiError> {
     ensure_permission(&auth, permissions::RULE_REPOSITORIES_SYNC)?;
+    crate::handlers::system::refuse_git_egress_when_air_gapped(&state)?;
 
     let service = get_rule_repo_service(&state)?;
 

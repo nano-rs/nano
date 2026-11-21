@@ -80,6 +80,7 @@ pub async fn get_repository(
     responses(
         (status = 200, description = "Repository created successfully", body = RuleRepository),
         (status = 403, description = "Forbidden"),
+        (status = 409, description = "Air-gapped install: Git sync needs outbound internet"),
     ),
     security(("api_key" = []))
 )]
@@ -90,6 +91,7 @@ pub async fn create_repository(
     Json(req): Json<CreateRepositoryRequest>,
 ) -> Result<Json<RuleRepository>, ApiError> {
     ensure_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE)?;
+    crate::handlers::system::refuse_git_egress_when_air_gapped(&state)?;
 
     let service = get_rule_repo_service(&state)?;
 

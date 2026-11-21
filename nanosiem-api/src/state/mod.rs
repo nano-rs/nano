@@ -298,6 +298,11 @@ pub struct AppState {
     /// Agent configuration registry for per-agent model settings
     #[cfg(feature = "enterprise")]
     pub agent_config_registry: Arc<RwLock<Option<Arc<AgentConfigRegistry>>>>,
+    /// NAN-5734: the meloD config fingerprint the current `melod_service` was
+    /// built from (`None` when no service is built). The config poller
+    /// reloads whenever the database fingerprint differs from it.
+    #[cfg(feature = "enterprise")]
+    pub melod_built_fingerprint: Arc<RwLock<Option<String>>>,
     /// Signal processor for bridging ClickHouse signals to PostgreSQL alerts
     pub signal_processor: Arc<SignalProcessor>,
     /// Disk pressure service for automatic partition eviction

@@ -7,6 +7,7 @@
 
 pub mod activation;
 pub mod cadence;
+pub mod change_batch;
 #[cfg(test)]
 #[path = "cadence_tests.rs"]
 mod cadence_tests;
@@ -29,7 +30,7 @@ mod version_repository;
 pub use repository::{LogSourceRepository, LogSourceRepositoryError};
 pub use service::pipe::{pipe_route_key, pipe_tap_component, MAX_PIPE_SAMPLES};
 pub use service::{
-    LogSourceService, LogSourceServiceError, OcsfGateInput, OcsfGateOutcome, OcsfPrecheck,
+    DeletedLogSource, LogSourceService, LogSourceServiceError, OcsfGateInput, OcsfGateOutcome, OcsfPrecheck,
 };
 pub use service::ocsf_attestation::run_ocsf_samples;
 pub use tier_guard::{data_source_cap, enforce_data_source_limit, DataSourceCap};
