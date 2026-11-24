@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { SEMANTIC_FIELDS, isSchemaField } from '@/lib/schema-fields';
 import { buildSecondaryPrefs, SEQUENCE_SECONDARY_BASE } from '@/lib/secondary-identity-prefs';
+import { Term } from '@/components/ui/term';
 
 // ─────────────────────────── types ───────────────────────────
 
@@ -588,9 +589,11 @@ function SequenceEmptyState({ conditions, byKey }: { conditions: string[]; byKey
           </div>
         )}
         <div className="text-[11px] text-muted-foreground text-center max-w-[480px] leading-relaxed">
-          <span className="text-foreground/80">Sequence</span> looks for events matching stage 1, then
-          stage 2, then stage 3 — in that order — per {byKey}. Try loosening{' '}
-          <span className="font-mono text-foreground/80">maxspan</span> or broadening a stage condition.
+          Try loosening{' '}
+          <Term id="maxspan" className="font-mono text-foreground/80">
+            maxspan
+          </Term>{' '}
+          or broadening a stage condition.
         </div>
       </div>
     </div>
@@ -673,7 +676,7 @@ export function SequenceView({
       <div className="py-2 px-3 border-b border-border flex flex-wrap items-center gap-2 font-mono text-[10.5px] tracking-[0.12em] uppercase text-foreground/70 font-semibold whitespace-nowrap">
         <span className="flex items-center gap-1.5 shrink-0">
           <Zap className="w-[12px] h-[12px] text-primary" />
-          <span>Sequence</span>
+          <Term id="sequence">Sequence</Term>
           <span className="text-muted-foreground/60">·</span>
           <span className="normal-case tracking-normal text-foreground">
             by {parsed.byFields.join(', ') || '(fields)'}

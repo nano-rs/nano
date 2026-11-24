@@ -15,6 +15,22 @@ name: frontend dead-links gate
 
 on:
   pull_request:
+    # NAN-5791: on a PR, runs only while it carries the optional `ready-to-merge`
+    # opt-in label (jobs' `if:`); the heavy run is the push-to-main one below.
+    # docs-internal/ci-runner-pools.md#ready-to-merge-label-nan-5791
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "nanosiem-web/src/**"
+      - "nanosiem-web/tests/e2e/**"
+      - "nanosiem-core/src/**"
+      - "nanosiem-api/src/**"
+      - "nanosiem-enterprise/src/**"
+      - "nanosiem-search/src/**"
+      - ".github/workflows/frontend-dead-links.yml"
+  # Heavy suite on main after merges; same paths as the PR trigger.
+  # docs-internal/ci-runner-pools.md#heavy-gates-on-main
+  push:
+    branches: [main]
     paths:
       - "nanosiem-web/src/**"
       - "nanosiem-web/tests/e2e/**"
@@ -25,15 +41,26 @@ on:
       - ".github/workflows/frontend-dead-links.yml"
   workflow_dispatch:
 
+# Read-only token on every trigger: no run of this gate (PR, push to main,
+# schedule, dispatch) can push, publish, sign or release.
+permissions:
+  contents: read
+
+# NAN-5791: a labeled/unlabeled event for any other label gets its own group
+# (its jobs skip), so it never cancels a real run. A push to main joins the
+# `heavy-` group without cancel-in-progress: one run going plus at most one
+# pending, the pending one replaced by the newest merge, so a burst of merges
+# coalesces into two runs (docs-internal/ci-runner-pools.md#heavy-gates-on-main).
 concurrency:
-  group: frontend-dead-links-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && 'heavy-' || '' }}frontend-dead-links-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   dead-links:
+    if: ${{ github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge')) }}
     # Self-hosted only (repo rule — never ubuntu-latest). No Docker, no build:
     # just Node reading source files.
-    runs-on: [self-hosted, Linux, X64, nano-pr]
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
     timeout-minutes: 5
     steps:
       - name: Checkout

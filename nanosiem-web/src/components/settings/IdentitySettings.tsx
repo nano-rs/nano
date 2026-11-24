@@ -110,7 +110,7 @@ const PROVIDER_METADATA: Record<
     setupSteps: [
       'In Okta Admin Console, go to Security > API > Tokens',
       'Create a new API token (requires Super Admin or Org Admin role)',
-      'Copy the token immediately — it is only shown once',
+      'Copy the token now. It is only shown once',
       'Enter your Okta org domain (e.g. dev-12345.okta.com) and the token below',
     ],
     credentialFields: [

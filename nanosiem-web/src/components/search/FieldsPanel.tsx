@@ -28,6 +28,7 @@ import {
   type FieldStatsGap,
   type OnDemandBucket,
 } from './field-buckets';
+import { Term } from '@/components/ui/term';
 
 interface FieldValueInfo {
   value: string;
@@ -436,9 +437,8 @@ export function FieldsPanel({
                     'text-[10px] px-2 py-0.5 rounded-sm transition-all normal-case tracking-normal',
                     showBaseFields ? 'bg-primary/15 text-primary' : 'bg-foreground/5 text-muted-foreground hover:text-primary'
                   )}
-                  title="Show fields from base search"
                 >
-                  Base scan
+                  <Term id="base-scan" nested>Base scan</Term>
                 </button>
               )}
               <button
@@ -688,11 +688,10 @@ export function FieldsPanel({
                                       {(stat.field === 'source_type' || stat.field === 'sourcetype') &&
                                         restrictedSourceTypes.has(valueInfo.value) && (
                                           <span
-                                            title="Visibility-scoped source — only granted groups can see its events"
                                             className="shrink-0 inline-flex items-center gap-0.5 h-[13px] px-1 rounded-[3px] bg-amber-500/12 text-amber-500 text-[8.5px] uppercase tracking-wider"
                                           >
                                             <EyeOff className="w-[8px] h-[8px]" />
-                                            Restricted
+                                            <Term id="restricted-source" nested>Restricted</Term>
                                           </span>
                                         )}
                                     </span>
@@ -867,7 +866,7 @@ export function FieldsPanel({
                       ) : (
                         <button
                           onClick={onLoadAllFields}
-                          title="Stats currently cover the columns in your results — load stats for every table column"
+                          title="Stats now cover only the columns in your results. Load stats for every field."
                           className="inline-flex items-center gap-1.5 font-mono text-[10.5px] text-foreground bg-card border border-border-2 rounded-md px-2.5 py-1 hover:border-primary/50 hover:text-primary transition-colors"
                         >
                           <ChevronDown className="w-3 h-3" />

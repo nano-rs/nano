@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { DeveloperSettings, UpdateDeveloperSettingsRequest } from '@/lib/api/types';
+import { Term } from '@/components/ui/term';
 
 interface SchedulerRow {
   key: keyof DeveloperSettings;
@@ -211,8 +212,8 @@ export function DeveloperSettings() {
       <div className="rounded-lg border border-border overflow-hidden">
         <div className="border-b border-border px-4 py-3 flex items-center justify-between bg-card/50">
           <div>
-            <span className="text-[13px] font-semibold text-foreground">Background Schedulers</span>
-            <span className="text-[11.5px] text-muted-foreground ml-2">Disable to prevent ClickHouse Cloud from being kept alive during development</span>
+            <span className="text-[13px] font-semibold text-foreground"><Term id="background-scheduler">Background Schedulers</Term></span>
+            <span className="text-[11.5px] text-muted-foreground ml-2">Pause them so ClickHouse Cloud can go idle while you develop</span>
           </div>
           {selected.size > 0 && (
             <div className="flex items-center gap-2">
@@ -282,8 +283,8 @@ export function DeveloperSettings() {
       </div>
 
       <p className="text-[11.5px] text-muted-foreground">
-        These settings are intended for development and testing. Disabling schedulers in production
-        will stop detection execution, enrichment updates, and monitoring.
+        For development only. Disabling schedulers in production stops detections, enrichment updates and
+        monitoring.
       </p>
     </div>
   );

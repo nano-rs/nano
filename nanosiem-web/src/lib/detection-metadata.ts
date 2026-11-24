@@ -221,7 +221,10 @@ export function decodePlaybookField(raw: string | undefined | null): {
 /**
  * Create a template for a new detection rule
  */
-export function createDetectionTemplate(author: string = ''): string {
+export function createDetectionTemplate(
+  author: string = '',
+  overrides: Partial<Pick<DetectionMetadata, 'mitre_tactics' | 'mitre_techniques'>> = {},
+): string {
   const metadata: DetectionMetadata = {
     title: 'newrule',
     description: 'Describe what this detection identifies',
@@ -238,6 +241,8 @@ export function createDetectionTemplate(author: string = ''): string {
     tags: 'tag1, tag2',
     mitre_tactics: 'TA0001',
     mitre_techniques: 'T1078',
+    // NAN-5850: `?mitre=` from MITRE Coverage prefills the technique.
+    ...Object.fromEntries(Object.entries(overrides).filter(([, v]) => Boolean(v))),
   };
 
   // OCSF field names (NAN-5317): parsers emit OCSF, not UDM, so the example

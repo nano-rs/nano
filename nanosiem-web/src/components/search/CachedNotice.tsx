@@ -38,7 +38,7 @@ export function CachedNotice({ meta, onRefresh, refreshing, className }: CachedN
       type="button"
       onClick={onRefresh}
       disabled={refreshing}
-      title="Served from cache — click to refresh from server"
+title="These results were saved from an earlier run. Click to run the search again."
       className={`text-amber-500 dark:text-amber-400 text-xs hover:underline cursor-pointer disabled:opacity-60 disabled:cursor-default whitespace-nowrap ${className ?? ''}`}
     >
       cached {formatAge(meta.ageSecs)} ago · {refreshing ? 'refreshing…' : 'refresh'}

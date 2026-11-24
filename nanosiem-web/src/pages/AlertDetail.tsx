@@ -44,6 +44,7 @@ import { retroMatchOf, retroSearchUrl, type RetroMatch } from '@/components/sear
 import { RiskNotableBreakdown } from '@/enterprise/components/risk/RiskNotableBreakdown';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { riskNotableEntity } from '@/lib/risk-notable';
+import { alertAssigneeLabel } from '@/lib/alert-assignee';
 
 type TabId = 'events' | 'rule' | 'timeline';
 
@@ -148,7 +149,7 @@ export function AlertDetail() {
             facts: [
               { label: 'severity', value: apiAlert.severity },
               { label: 'status', value: apiAlert.status + (apiAlert.disposition ? ` · ${apiAlert.disposition}` : '') },
-              { label: 'assignee', value: apiAlert.assignee_name ?? apiAlert.assigned_to ?? 'unassigned' },
+              { label: 'assignee', value: alertAssigneeLabel(apiAlert) ?? 'unassigned' },
               { label: 'events', value: String(apiAlert.matched_event_count ?? matchedEvents.length) },
             ],
             data: {

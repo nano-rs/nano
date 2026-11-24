@@ -160,3 +160,41 @@ fn piped_search_keyword_projects_raw_data_on_ocsf() {
         "a base-search keyword must not add raw_data to the projection: {base_only}"
     );
 }
+
+/// NAN-5849: when one event spells a stored path twice, the ingest lane
+/// stores the flat key with its dots escaped (`a.b` -> `a~1b`). The Field
+/// Explorer's "Add to filter" emits `unmapped.a~1b="..."`: it must parse,
+/// pass field validation, and reach SQL as a quoted JSON path segment.
+#[test]
+fn an_escaped_key_from_a_path_collision_is_queryable() {
+    use crate::query::{Query, SearchExpr};
+    use crate::query::validation::validate_field_name_format;
+
+    match parse_query(r#"unmapped.a~1b="c1-flat""#).unwrap() {
+        Query::Search(SearchExpr::FieldFilter { field, .. }) => assert_eq!(field, "unmapped.a~1b"),
+        other => panic!("{other:?}"),
+    }
+    match parse_query(r#"unmapped.x~0y.a~1b~1c="v""#).unwrap() {
+        Query::Search(SearchExpr::FieldFilter { field, .. }) => assert_eq!(field, "unmapped.x~0y.a~1b~1c"),
+        other => panic!("{other:?}"),
+    }
+    // The regex operators are untouched.
+    assert!(matches!(
+        parse_query(r#"user=~"admin""#).unwrap(),
+        Query::Search(SearchExpr::FieldFilter { ref field, .. }) if field == "user"
+    ));
+    assert!(validate_field_name_format("unmapped.a~1b").is_ok());
+    assert!(validate_field_name_format("unmapped.a~0b~1c").is_ok());
+    for bad in ["unmapped.a~2b", "unmapped.a~", "unmapped.a~b", "~1a"] {
+        assert!(validate_field_name_format(bad).is_err(), "{bad}");
+    }
+    for npl in [
+        r#"unmapped.a~1b="c1-flat""#,
+        r#"* | where unmapped.a~1b="c1-flat""#,
+        "* | stats count by unmapped.a~1b",
+        "* | table unmapped.a~1b",
+    ] {
+        let sql = ocsf_sql(npl);
+        assert!(sql.contains("\"a~1b\""), "{npl}: the segment is quoted: {sql}");
+    }
+}

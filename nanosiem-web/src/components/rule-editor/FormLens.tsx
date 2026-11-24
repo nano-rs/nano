@@ -9,6 +9,9 @@
 // Severity & lifecycle / Schedule / MITRE / Routing / Query body) but
 // adapted to the real primitives + token palette.
 
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
+import { Term } from '@/components/ui/term';
+import type { GlossaryId } from '@/lib/glossary';
 import { useCallback, useMemo } from 'react';
 import { List as ListIcon, Shield, Clock, Globe, Terminal, Signature } from 'lucide-react';
 import { Input } from '@/components/ui/input';
@@ -36,12 +39,15 @@ type AlertModeKey = NonNullable<DetectionMetadata['alert_mode']>;
 
 function FormField({
   label,
+  term,
   hint,
   yamlKey,
   required,
   children,
 }: {
   label: string;
+  /** NAN-5867: the glossary entry that defines this field's label. */
+  term?: GlossaryId;
   hint?: string;
   yamlKey?: string;
   required?: boolean;
@@ -51,7 +57,7 @@ function FormField({
     <div className="grid grid-cols-[200px_1fr] gap-5 py-3 border-b border-border/60 items-start">
       <div className="pt-1.5">
         <div className="text-[12px] font-medium text-foreground">
-          {label}
+          {term ? <Term id={term}>{label}</Term> : label}
           {required && <span className="text-[var(--destructive)] ml-0.5">*</span>}
         </div>
         {hint && <div className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed">{hint}</div>}
@@ -141,14 +147,14 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
           FORM
         </span>
         <span className="text-muted-foreground/60">·</span>
-        <span className="text-muted-foreground">every field writes to YAML — switch to CODE any time</span>
+        <span className="text-muted-foreground">fields write to YAML</span>
       </div>
       <ScrollArea className="flex-1 min-h-0">
         <div className="max-w-[880px] mx-auto px-6 pb-24">
           <section>
             <SectionHead icon={<Signature className="w-3.5 h-3.5" strokeWidth={1.75} />} title="Identity" />
             <div className="pt-1">
-              <FormField label="Rule name" required yamlKey="title" hint="Used as filename and alert title. snake_case.">
+              <FormField label="Rule name" required yamlKey="title" hint="Used as the file name and the alert title. Use lowercase words joined by underscores, such as okta_mfa_fatigue.">
                 <Input
                   value={meta.title || ''}
                   onChange={(e) => setField('title', e.target.value)}
@@ -189,7 +195,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
           <section className="mt-6">
             <SectionHead icon={<Shield className="w-3.5 h-3.5" strokeWidth={1.75} />} title="Severity & lifecycle" />
             <div className="pt-1">
-              <FormField label="Severity" required yamlKey="severity" hint="Drives routing priority and SLA.">
+              <FormField label="Severity" term="rule-severity" required yamlKey="severity" hint="Sets how urgently this rule's alerts are routed and handled.">
                 <div className="inline-flex items-center gap-1 rounded-md border border-border p-0.5">
                   {(['informational', 'low', 'medium', 'high', 'critical'] as SevKey[]).map((s) => {
                     const active = (meta.severity || 'medium') === s;
@@ -215,13 +221,13 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   })}
                 </div>
               </FormField>
-              <FormField label="Mode" required yamlKey="mode" hint="Alerting emits alerts. Live counts matches without alerting. Staging evaluates silently.">
+              <FormField label="Mode" term="rule-mode" required yamlKey="mode" hint="Alerting raises alerts. Live counts matches but raises none. Staging does not run.">
                 <div className="space-y-1.5">
                   {([
-                    { k: 'staging', d: 'Evaluates but suppresses output (bake-in)' },
-                    { k: 'live', d: 'Counts matches; no alerts' },
-                    { k: 'alerting', d: 'Full production — emits alerts to routed channels' },
-                    { k: 'paused', d: 'Rule does not run' },
+                    { k: 'staging', d: 'Still being written; does not run' },
+                    { k: 'live', d: 'Runs and counts matches; no alerts yet' },
+                    { k: 'alerting', d: 'Runs and raises an alert for its matches' },
+                    { k: 'paused', d: 'Stopped; does not run' },
                   ] as Array<{ k: ModeKey; d: string }>).map((o) => (
                     <label
                       key={o.k}
@@ -239,7 +245,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                         className="accent-[var(--primary)]"
                       />
                       <div className="text-[12px] font-semibold capitalize">{o.k}</div>
-                      <div className="text-[11px] text-muted-foreground">— {o.d}</div>
+                      <div className="text-[11px] text-muted-foreground">{o.d}</div>
                     </label>
                   ))}
                 </div>
@@ -256,8 +262,9 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   below is locked to scheduled. */}
               <FormField
                 label="Dataset"
+                term="rule-dataset"
                 yamlKey="dataset"
-                hint="logs = OCSF events. spans/metrics query OTLP datasets; risk queries accumulated entity risk. Non-logs datasets run scheduled-only."
+                hint="What the rule searches: logs, trace spans, metrics, or risk scores. Only logs can run in real time."
               >
                 <div className="inline-flex rounded-md border border-border p-0.5">
                   {(['logs', 'spans', 'metrics', 'risk'] as DatasetKey[]).map((d) => {
@@ -300,13 +307,12 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                     to 0 and the backend rejects `| risk` bodies. */}
                 {(meta.dataset || 'logs') === 'risk' && (
                   <div className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
-                    Risk rules query accumulated risk — they don't add to it. Risk contribution
-                    is forced to 0, and the <span className="font-mono">| risk</span> command is
-                    not allowed in the query body.
+                    <EnterpriseTerm id="risk-rule">Risk rules</EnterpriseTerm> read risk scores but never add to them, so the score is set to 0 and{' '}
+                    <span className="font-mono">| risk</span> is not allowed.
                   </div>
                 )}
               </FormField>
-              <FormField label="Detection mode" yamlKey="detection_mode">
+              <FormField label="Detection mode" yamlKey="detection_mode" hint="Real-time checks events as they arrive. Scheduled runs the search on a timer.">
                 <div className="inline-flex rounded-md border border-border p-0.5">
                   {(['realtime', 'scheduled'] as DetectionModeKey[]).map((m) => {
                     const active = (meta.detection_mode || 'realtime') === m;
@@ -323,7 +329,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                           setField('detection_mode', m);
                         }}
                         disabled={readOnly || lockedOut}
-                        title={lockedOut ? 'non-logs datasets (spans/metrics/risk) are scheduled-only' : undefined}
+                        title={lockedOut ? 'Only logs can run in real time. Spans, metrics and risk run on a schedule.' : undefined}
                         className={cn(
                           'h-7 px-2.5 rounded text-[11px] font-mono',
                           active
@@ -339,7 +345,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                 </div>
               </FormField>
               {meta.detection_mode === 'scheduled' && (
-                <FormField label="Cron expression" yamlKey="schedule" hint="5 fields: minute hour dom month dow">
+                <FormField label="Cron expression" term="rule-cron" yamlKey="schedule" hint="Five fields: minute, hour, day of month, month, day of week.">
                   <div className="flex items-center gap-2">
                     <Input
                       value={meta.schedule || ''}
@@ -351,7 +357,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   </div>
                 </FormField>
               )}
-              <FormField label="Lookback" yamlKey="lookback" hint="Window each evaluation considers (max 7d).">
+              <FormField label="Lookback" term="rule-lookback" yamlKey="lookback" hint="How far back each run reads. The most is 7 days.">
                 <Input
                   value={meta.lookback || ''}
                   onChange={(e) => setField('lookback', e.target.value)}
@@ -360,7 +366,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   readOnly={readOnly}
                 />
               </FormField>
-              <FormField label="Alert mode" yamlKey="alert_mode" hint="How matches batch into alerts.">
+              <FormField label="Alert mode" term="rule-alert-mode" yamlKey="alert_mode" hint="Grouped (default): one alert per run. Per event: one alert per matched event.">
                 <div className="inline-flex rounded-md border border-border p-0.5">
                   {(['grouped', 'per_event'] as AlertModeKey[]).map((m) => {
                     const active = (meta.alert_mode || 'grouped') === m;
@@ -389,7 +395,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
           <section className="mt-6">
             <SectionHead icon={<Globe className="w-3.5 h-3.5" strokeWidth={1.75} />} title="MITRE mapping" />
             <div className="pt-1">
-              <FormField label="Tactics" yamlKey="mitre_tactics" hint="Comma-separated TA0000 IDs.">
+              <FormField label="Tactics" term="tactic" yamlKey="mitre_tactics" hint="ATT&CK tactic IDs, such as TA0006.">
                 <ChipEditor
                   values={tacticsArr}
                   onAdd={(v) => addChip('mitre_tactics', v)}
@@ -398,7 +404,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   readOnly={readOnly}
                 />
               </FormField>
-              <FormField label="Techniques" yamlKey="mitre_techniques" hint="Comma-separated T0000 IDs.">
+              <FormField label="Techniques" term="technique" yamlKey="mitre_techniques" hint="ATT&CK technique IDs, such as T1110.">
                 <ChipEditor
                   values={techniquesArr}
                   onAdd={(v) => addChip('mitre_techniques', v)}
@@ -407,7 +413,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   readOnly={readOnly}
                 />
               </FormField>
-              <FormField label="Reference URL" yamlKey="reference_url" hint="Link to playbook / runbook / analysis.">
+              <FormField label="Reference URL" yamlKey="reference_url" hint="A link to a runbook or write-up for this rule.">
                 <Input
                   value={meta.reference_url || ''}
                   onChange={(e) => setField('reference_url', e.target.value)}

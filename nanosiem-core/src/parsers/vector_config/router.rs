@@ -256,11 +256,14 @@ pub(super) enum Transport {
 }
 
 pub(super) fn transport_of(source_type: &str) -> Transport {
-    match source_type {
-        "splunk_hec" | "splunk" | "hec" => Transport::SplunkHec,
-        "opentelemetry" | "otlp" => Transport::Otlp,
-        "kafka" | "aws_s3" | "aws_sqs" | "crowdstrike_fdr" | "s3" | "gcp_pubsub" | "pubsub"
-        | "azure_event_hubs" => Transport::Fetch,
+    // NAN-5789: classified through the one alias table, so every accepted
+    // spelling (case, `sqs`, `fdr`, `event_hubs`, ...) takes the same lane as
+    // the write-time checks assumed; a `fdr` row is a fetch source, never
+    // silently the routed lane.
+    match crate::log_sources::ingest_transport::canonical(source_type) {
+        Some("splunk_hec") => Transport::SplunkHec,
+        Some("otlp") => Transport::Otlp,
+        Some(m) if crate::log_sources::ingest_transport::FETCH.contains(&m) => Transport::Fetch,
         // "routed", "vector", and unknown labels alike: `generate_source_config`
         // defaults unrecognized source types to the router, so they share it.
         _ => Transport::Routed,
@@ -709,7 +712,7 @@ impl VectorConfigManager {
     /// declares (on a non-comment line). A fetch parser's filter and its
     /// `<route>_unclaimed` claim read one of these; one that is not declared
     /// does not exist for Vector.
-    pub(super) async fn declared_source_config_routes(&self) -> std::collections::HashSet<String> {
+    pub(crate) async fn declared_source_config_routes(&self) -> std::collections::HashSet<String> {
         let mut routes = std::collections::HashSet::new();
         let Ok(mut entries) = fs::read_dir(self.source_configs_dir()).await else {
             return routes;
@@ -897,7 +900,7 @@ impl VectorConfigManager {
         enrichment_parsers: &[Parser],
     ) -> Result<(), VectorConfigError> {
         // Write router to parsers_dir so it gets included in the S3 config sync.
-        // In distributed deployments (Rackspace), the API sidecar syncs sources/ to S3,
+        // In distributed k8s deployments, the API sidecar syncs sources/ to S3,
         // and Vector pods pull from S3. Writing to config_dir (parent) would be outside
         // the synced directory and never reach Vector.
         // Uses underscore prefix like _combiner.toml for consistency.
@@ -1693,6 +1696,17 @@ source = ".source_type = \"foo\""
             ("s3", Fetch),
             ("gcp_pubsub", Fetch),
             ("pubsub", Fetch),
+            // NAN-5789: case-insensitive, and every alias of the one table.
+            ("sqs", Fetch),
+            ("fdr", Fetch),
+            ("event_hubs", Fetch),
+            ("eventhubs", Fetch),
+            ("azure_event_hubs", Fetch),
+            ("otel", Otlp),
+            ("http", Routed),
+            ("KAFKA", Fetch),
+            ("Aws_S3", Fetch),
+            ("Splunk_HEC", SplunkHec),
         ] {
             assert_eq!(transport_of(st), want, "transport_of({st})");
         }

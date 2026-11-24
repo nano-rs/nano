@@ -2,15 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { flattened } from '@/lib/pipeline-event-fields';
-import { ClipboardPaste, History, Info, RefreshCw } from 'lucide-react';
+import { ClipboardPaste, History, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+import { InfoTip } from '@/components/ui/info-tip';
 import type {
   PipelineLaneInput,
   PipelinePreview,
@@ -25,6 +20,7 @@ import {
 import { cn } from '@/lib/utils';
 import { DEFAULT_RECENT_EVENTS, MAX_RECENT_EVENTS } from '@/lib/api/pipelines';
 import { PREVIEW_SCOPE_DETAILS, PREVIEW_SCOPE_NOTE } from '@/lib/pipeline-model';
+import { Term } from '@/components/ui/term';
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -57,24 +53,11 @@ function PreviewScopeNote({ extra }: { extra?: string }) {
         {PREVIEW_SCOPE_NOTE}
         {extra && ` ${extra}`}
       </span>
-      <TooltipProvider delayDuration={150}>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label="What draft preview excludes"
-              className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            >
-              <Info className="h-3 w-3" strokeWidth={1.5} />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" align="start" className="max-w-80 space-y-1 text-[11px]">
-            {PREVIEW_SCOPE_DETAILS.map((line) => (
-              <p key={line}>{line}</p>
-            ))}
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <InfoTip label="What draft preview excludes" side="bottom" align="start" contentClassName="max-w-80 space-y-1">
+        {PREVIEW_SCOPE_DETAILS.map((line) => (
+          <p key={line}>{line}</p>
+        ))}
+      </InfoTip>
     </div>
   );
 }
@@ -564,13 +547,10 @@ export function PipelinePreviewPanel({
           ) : (
             <div className="space-y-3 p-3" data-testid="pipeline-preview-empty">
               <div className="space-y-1">
-                <p className="text-[12px] font-medium text-foreground">No preview input yet</p>
+                <p className="text-[12px] font-medium text-foreground">No <Term id="draft-preview">preview</Term> input yet</p>
                 <p className="text-[11.5px] text-muted-foreground">
-                  Preview runs this draft on raw events before any parsing. Load
-                  the newest events stored for this source, capture a live tap,
-                  or paste raw events (one per line, or a JSON array). Input stays
-                  in this browser and is never saved; draft preview never changes
-                  production.
+                  Load stored events, capture a <Term id="live-capture">live tap</Term>, or paste raw events. Input
+                  stays in this browser; preview never changes production.
                 </p>
               </div>
               {(onLoadRecent || onPasteSample) && (

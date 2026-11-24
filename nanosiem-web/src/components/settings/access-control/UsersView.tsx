@@ -34,6 +34,7 @@ import { TierUsageBar } from '@/components/TierUsageBar';
 import { InviteUserDialog } from './InviteUserDialog';
 import { EditUserDialog } from './EditUserDialog';
 import { MfaEnforcementPanel } from './MfaEnforcementPanel';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 // ---------- presentation helpers ----------
 
@@ -181,7 +182,7 @@ export function UserDrawer({
           <div className="flex items-center gap-2">
             <StatusPill status={user.status} />
             {user.oidc_provider && (
-              <span className="text-[10.5px] text-muted-foreground">SSO · {user.oidc_provider}</span>
+              <span className="text-[10.5px] text-muted-foreground"><EnterpriseTerm id="sso">SSO</EnterpriseTerm> · {user.oidc_provider}</span>
             )}
           </div>
         </div>

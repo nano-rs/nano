@@ -56,6 +56,7 @@ import {
 import type { CaseSummary, NotebookSummary, AuditLogEntry, NoisyRule } from '@/lib/api';
 import { HomeDemoHint } from '@/components/DemoHints';
 import { cn } from '@/lib/utils';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 // ============================================================================
 // Helpers
@@ -374,7 +375,9 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
       <div className="w-full max-w-[640px]">
         <div className="rounded-xl border border-border bg-card overflow-hidden">
           <div className="px-3 py-1.5 border-b border-border flex items-center gap-2">
-            <span className="text-[10px] uppercase tracking-[0.12em] font-medium text-primary">PIVT intake</span>
+            <span className="text-[10px] uppercase tracking-[0.12em] font-medium text-primary">
+              <EnterpriseTerm id="pivt">PIVT</EnterpriseTerm> intake
+            </span>
             <span className="text-muted-foreground/60">::</span>
             <span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">Notebook or Search</span>
             <span className="ml-auto text-[10px] font-mono text-muted-foreground/60">⌘K</span>

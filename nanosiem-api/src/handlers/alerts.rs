@@ -66,10 +66,31 @@ fn assigned_user_id(assigned_to: &str) -> Option<Uuid> {
     (prefix.is_empty() || prefix == nanosiem_core::typeid::user::PREFIX).then_some(uid)
 }
 
+/// NAN-5774: how a deleted assignee reads, matching notebooks and cases
+/// (NAN-5721). The raw `user_…` id never reaches the UI.
+pub(crate) const DELETED_USER_LABEL: &str = "deleted user";
+
+/// NAN-5774: the display name for an assignee lookup. A user row that no
+/// longer exists reads "deleted user"; any other failure (a transient
+/// database error) leaves it None, so the UI shows a neutral placeholder.
+fn assignee_label(
+    lookup: Result<nanosiem_core::auth::User, nanosiem_core::auth::UserRepositoryError>,
+) -> Option<String> {
+    use nanosiem_core::auth::UserRepositoryError;
+    match lookup {
+        Ok(u) => Some(if u.name.trim().is_empty() { u.email } else { u.name }),
+        Err(UserRepositoryError::NotFound(_)) => Some(DELETED_USER_LABEL.to_string()),
+        Err(error) => {
+            tracing::warn!(%error, "could not resolve an alert assignee's name");
+            None
+        }
+    }
+}
+
 /// NAN-5314: fill `assignee_name` from the `assigned_to` user typeid so the UI
-/// shows a person, not `user_4ckt…`. One user lookup per DISTINCT assignee; an
-/// unresolvable value (deleted user, free-text legacy assignee) leaves it None
-/// and the UI falls back to the raw value.
+/// shows a person, not `user_4ckt…`. One user lookup per DISTINCT assignee. A
+/// deleted user reads "deleted user" (NAN-5774); a free-text legacy assignee
+/// (not a user id) leaves it None and the UI shows the raw value.
 async fn resolve_assignee_names(state: &AppState, alerts: &mut [Alert]) {
     let mut names: std::collections::HashMap<Uuid, Option<String>> =
         std::collections::HashMap::new();
@@ -78,9 +99,7 @@ async fn resolve_assignee_names(state: &AppState, alerts: &mut [Alert]) {
             continue;
         };
         if !names.contains_key(&uid) {
-            let name = state.user_repo.get_user_by_id(uid).await.ok().map(|u| {
-                if u.name.trim().is_empty() { u.email } else { u.name }
-            });
+            let name = assignee_label(state.user_repo.get_user_by_id(uid).await);
             names.insert(uid, name);
         }
         alert.assignee_name = names.get(&uid).cloned().flatten();
@@ -409,7 +428,7 @@ pub async fn stream_alerts(
         .collect();
 
     // Demo isolation: hide alerts from rules created by other demo users
-    let alerts = if auth.claims.roles.contains(&"demo_analyst".to_string()) {
+    let mut alerts = if auth.claims.roles.contains(&"demo_analyst".to_string()) {
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
@@ -424,6 +443,9 @@ pub async fn stream_alerts(
     } else {
         alerts
     };
+
+    // NAN-5774: the same assignee display as list / get ("deleted user").
+    resolve_assignee_names(&state, &mut alerts).await;
 
     Ok(Json(AlertStreamResponse {
         alerts,
@@ -521,10 +543,11 @@ pub async fn acknowledge_alert(
     }
 
     let actor = resolve_actor_display(&state, auth.user_id()).await;
-    let alert = state
+    let mut alert = state
         .detection_service
         .acknowledge_alert(*id, &actor, scope.deny_set())
         .await?;
+    resolve_assignee_names(&state, std::slice::from_mut(&mut alert)).await;
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Alert, ALERT_ACKNOWLEDGED)
@@ -581,10 +604,11 @@ pub async fn close_alert(
     }
 
     let actor = resolve_actor_display(&state, auth.user_id()).await;
-    let alert = state
+    let mut alert = state
         .detection_service
         .close_alert(*id, &actor, request.disposition, scope.deny_set())
         .await?;
+    resolve_assignee_names(&state, std::slice::from_mut(&mut alert)).await;
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Alert, ALERT_CLOSED)
@@ -610,6 +634,7 @@ pub async fn close_alert(
     request_body = AssignRequest,
     responses(
         (status = 200, description = "Alert assigned", body = Alert),
+        (status = 400, description = "The assignee is a deleted or unknown user", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Alert not found", body = ErrorResponse),
     ),
@@ -641,6 +666,15 @@ pub async fn assign_alert(
             .await;
         if alert.rule_id.map_or(false, |rid| exclude_rule_ids.contains(&rid)) {
             return Err(ApiError::NotFound("Alert not found".to_string()));
+        }
+    }
+
+    // NAN-5774: never (re)assign to a user account that no longer exists.
+    if let Some(uid) = assigned_user_id(&request.assigned_to) {
+        if let Err(nanosiem_core::auth::UserRepositoryError::NotFound(_)) =
+            state.user_repo.get_user_by_id(uid).await
+        {
+            return Err(ApiError::BadRequest("Cannot assign to a deleted or unknown user".into()));
         }
     }
 

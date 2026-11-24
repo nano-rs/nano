@@ -81,22 +81,30 @@ export function importRulesBundle(file: File): Promise<AirgapRuleImportResponse>
   return postBundle<AirgapRuleImportResponse>('/api/airgap/rules/import', file);
 }
 
+/** NAN-5755: what an upload delivered from the catalog into the library. */
+export interface PlaybookDeliverySummary {
+  imported: number;
+  already_imported: number;
+  refused: number;
+  failed: { path: string; error: string }[];
+}
+
 /**
- * Response from syncing an air-gapped playbook bundle (NAN-1226).
- *
- * SYNC-ONLY: populates the playbook repository catalog (playbooks become
- * *available to import*); nothing is imported by the upload.
+ * Response from an air-gapped playbook bundle upload (NAN-1226). The bundle
+ * fills the playbook repository catalog, then (NAN-5755) the catalog is
+ * delivered into the library, each file once; hunts land disabled.
  */
 export interface AirgapPlaybookImportResponse {
   repository_id: string;
   content_version: string;
-  /** Number of catalog playbooks synced (made available to import). */
+  /** Number of catalog playbooks synced. */
   synced: number;
+  delivered: PlaybookDeliverySummary;
 }
 
 /**
- * Upload a signed, air-gapped playbook bundle (markdown/yaml). SYNC-ONLY:
- * populates the playbook repository catalog; does not import. (NAN-1226)
+ * Upload a signed, air-gapped playbook bundle (markdown/yaml): fills the
+ * catalog and delivers it into the library (NAN-1226, NAN-5755).
  */
 export function importPlaybooksBundle(file: File): Promise<AirgapPlaybookImportResponse> {
   return postBundle<AirgapPlaybookImportResponse>('/api/airgap/playbooks/import', file);

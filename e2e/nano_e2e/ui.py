@@ -14,6 +14,12 @@ page SHOWS, and the scenario compares that to the API/ClickHouse.
   were typed into before a screenshot.
 - Artifacts per scenario under `target/e2e/<run>/artifacts/scenarios/<test>/ui/`:
   `console.log` always; on failure `failure.png`, `page.html`, `network.jsonl`.
+- Layout invariants (NAN-5762): after every op `UiPage` asks the driver to
+  measure the page (no sideways overflow in the main pane, scrollers, flyouts
+  and drawers; nothing escaping its card; no link or button painted over). A
+  violation fails the scenario with `layout-<n>.png` (offenders outlined) and
+  `layout.jsonl`. `NANO_E2E_LAYOUT=report` records without failing, `off`
+  skips it; intentional exceptions go in `e2e/coverage/layout-allowlist.json`.
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Any
 
@@ -39,11 +45,50 @@ ROOT = Path(__file__).resolve().parents[2]
 WEB = ROOT / "nanosiem-web"
 DRIVER = WEB / "tests" / "e2e" / "ui" / "driver.mjs"
 OP_TIMEOUT = 300.0  # ops wait on the UI themselves (20-60 s); this only bounds a hung driver
-_SECRET_ENV = re.compile(r"(SECRET|PASSWORD|_KEY|TOKEN|SA_JSON|ADC|CONNECTION_STRING|DATABASE_URL)")
+_SECRET_ENV = re.compile(r"(SECRET|PASSWORD|_KEY|TOKEN|SA_JSON|ADC|CONNECTION_STRING|DATABASE_URL|_DSN)")
+LAYOUT_ALLOWLIST = ROOT / "e2e" / "coverage" / "layout-allowlist.json"
+# Ops after which the page cannot have changed (protocol, reads of harness
+# state, artifacts): no layout check follows them.
+_LAYOUT_QUIET_OPS = frozenset(
+    {
+        "secrets", "open", "close", "url", "now", "layout_check", "events_since", "api_responses_since",
+        "page_errors", "responses_containing", "requests_containing", "screenshot", "mask_secrets", "dump",
+        "session_fetch", "end_session", "clipboard", "page_contains", "storage_clear", "capture_window_open",
+        "opened",
+    }
+)
+
+
+def layout_mode() -> str:
+    """`enforce` (default): a layout violation fails the scenario; `report`:
+    recorded in layout.jsonl only; `off`: not measured (NAN-5762)."""
+    mode = os.environ.get("NANO_E2E_LAYOUT", "enforce").strip().lower() or "enforce"
+    if mode not in ("enforce", "report", "off"):
+        raise RuntimeError(f"NANO_E2E_LAYOUT={mode!r}: expected enforce, report or off")
+    return mode
 
 
 class UiError(AssertionError):
     """The UI did not show what a step needed (E2E-PRODUCT: a red result)."""
+
+
+class LayoutError(AssertionError):
+    """A page broke a layout invariant (NAN-5762). Deliberately NOT a UiError:
+    scenarios that catch UiError around a probing op must not swallow it."""
+
+
+def format_layout(violations: list[dict[str, Any]], after: str, screenshot: str | None) -> str:
+    lines = [f"LAYOUT (NAN-5762): {len(violations)} violation(s) after `{after}`:"]
+    for v in violations:
+        where = f" in {v['container']}" if v.get("container") else ""
+        lines.append(f"  - {v['kind']} on {v['route']}: {v['element']}{where} {json.dumps(v.get('detail'))}")
+    if screenshot:
+        lines.append(f"  screenshot (offenders outlined): {screenshot}")
+    lines.append(
+        f"  intentional? add an entry with a reason to {LAYOUT_ALLOWLIST.relative_to(ROOT)}; "
+        "a bug? fix it, or pin the step with known_bug"
+    )
+    return "\n".join(lines)
 
 
 def rx(pattern: str, flags: str = "") -> dict[str, str]:
@@ -55,6 +100,7 @@ def driver_env(base_url: str) -> dict[str, str]:
     """The driver's environment: the base URL, and NO harness secret."""
     env = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
     env["E2E_UI_BASE"] = base_url
+    env.setdefault("E2E_LAYOUT_ALLOWLIST", str(LAYOUT_ALLOWLIST))
     return env
 
 
@@ -192,6 +238,8 @@ class UiPage:
     driver: Driver
     sid: int
     out: Path
+    layout: str = dc_field(default_factory=layout_mode)
+    layout_violations: list[dict[str, Any]] = dc_field(default_factory=list)
 
     @classmethod
     def open(cls, driver: Driver, out: Path, name: str = "") -> UiPage:
@@ -200,10 +248,35 @@ class UiPage:
         return cls(driver, sid, out)
 
     def finish(self, failed: bool) -> None:
-        self.driver.call("close", sid=self.sid, failed=failed)
+        """Close the context. A layout violation that a scenario swallowed (an
+        `eventually` retry catches AssertionError) or that the final state
+        shows still fails it here, after the artifacts are written."""
+        if not failed and self.layout != "off":
+            try:
+                self.check_layout("finish", force=True, raise_=False)  # no later op re-measures
+            except (UiError, RuntimeError) as exc:  # a dead page: the close below reports it
+                print(f"WARNING: final layout check failed to run: {exc}")
+        late = bool(self.layout_violations) and self.layout == "enforce" and not failed
+        self.driver.call("close", sid=self.sid, failed=failed or late)
+        if late:
+            raise LayoutError(format_layout(self.layout_violations, "the scenario (reported at teardown)", None))
 
     def op(self, op: str, **args: Any) -> Any:
-        return self.driver.call(op, sid=self.sid, **args)
+        result = self.driver.call(op, sid=self.sid, **args)
+        if op not in _LAYOUT_QUIET_OPS and self.layout != "off":
+            self.check_layout(op)
+        return result
+
+    def check_layout(self, after: str = "explicit", *, force: bool = False, raise_: bool = True) -> list[dict[str, Any]]:
+        """Measure the layout invariants now (NAN-5762); every op already does
+        this. Returns the new violations (allowlisted ones excluded)."""
+        r = self.driver.call("layout_check", sid=self.sid, force=force, after=after) or {}
+        bad = r.get("violations") or []
+        if bad:
+            self.layout_violations.extend(bad)
+            if raise_ and self.layout == "enforce":
+                raise LayoutError(format_layout(bad, after, r.get("screenshot")))
+        return bad
 
     # navigation
     def goto(self, path: str) -> str:
@@ -333,6 +406,19 @@ class UiPage:
         """Horizontal overflow at the current viewport: `document` / `main` px past
         the edge (0 = none) and up to five unclipped offending elements."""
         return self.op("overflow")
+
+    def scroll_extent(self, find: dict[str, Any]) -> dict[str, Any]:
+        """Horizontal scroll inside one container (NAN-5758): its scroll_width /
+        client_width, descendant scrollers that scroll sideways, and up to five
+        descendants whose box ends past its right edge."""
+        return self.op("scroll_extent", find=find)
+
+    def occlusion(self, find: dict[str, Any]) -> list[dict[str, Any]]:
+        """For every match (NAN-5758): `covered` = the hit tests (centre and four
+        corners) that land on something else, `on_top` when none do; `overlaps`
+        = other text in its enclosing row (found from the parent, `scope`)
+        whose box intersects it; `opacity` down the ancestor chain; its size."""
+        return self.op("occlusion", find=find)
 
     def session_fetch(self, method: str, path: str, body: Any = None) -> dict[str, Any]:
         """`{status, json}` of an /api request made AS the logged-in browser user.

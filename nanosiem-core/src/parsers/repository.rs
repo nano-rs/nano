@@ -529,7 +529,9 @@ impl ParserRepository {
                 validated = true,
                 validation_error = NULL,
                 deployed = true,
-                deployed_at = NOW()
+                deployed_at = NOW(),
+                -- NAN-5785: stamped once, never rewritten.
+                first_deployed_at = COALESCE(first_deployed_at, CASE WHEN deployed_at IS NOT NULL THEN created_at ELSE NOW() END)
             WHERE id = $1
             RETURNING
                 id, name, description, source_type,
@@ -584,8 +586,6 @@ impl ParserRepository {
 /// NAN-928 / NAN-930: stamp `dispatch_route_name` on every parser that
 /// carries a `dispatch_source_config_id`. The Vector config generator
 /// reads `dispatch_route_name` to emit a filter on the source-config's route.
-/// Fetch parsers without a dispatch binding are rejected; parser-owned
-/// transports no longer exist.
 ///
 /// Free function (not a method) so both `ParserService::deploy_to_vector`
 /// (parser-only path that the API startup hook fires) and
@@ -593,6 +593,18 @@ impl ParserRepository {
 /// resolution — without this dedup, the two paths drifted: parser-deploy
 /// produced a parser-owned Kafka source while log-source-deploy produced the
 /// correct dispatched filter. NAN-930 follow-up.
+///
+/// NAN-5789: one fetch parser that cannot be routed (no
+/// `dispatch_source_config_id`, or one naming a deleted source configuration)
+/// never fails the resolve. It used to: one unfinished kafka draft refused
+/// every render on the install, and the next unrelated log-source delete
+/// answered `500 DATABASE_ERROR`. Such a parser keeps
+/// `dispatch_route_name = None`, so the renderer leaves it out of the Vector
+/// tree (`VectorConfigManager::without_unroutable_parsers`), never as a
+/// parser-owned source and never as a filter on a missing route. Callers
+/// report what was left out with [`crate::parsers::unrouted::report`], so a
+/// skipped source always carries a visible reason (and a live one raises a
+/// health event).
 ///
 /// `safe_name` is computed in Rust (matches `source_configs::service::
 /// safe_name`) so it stays Unicode-correct against `[^A-Za-z0-9]` regex
@@ -602,25 +614,18 @@ pub async fn resolve_parser_dispatch_routes(
     parsers: &mut [Parser],
 ) -> Result<(), sqlx::Error> {
     let name_by_id = dispatch_config_names(pool, parsers).await?;
-    apply_resolved_dispatch_routes(parsers, &name_by_id)
-        .map_err(|e| sqlx::Error::Configuration(e.into()))
-}
-
-/// NAN-4956: [`resolve_parser_dispatch_routes`] for a re-render that must not
-/// fail because ONE fetch parser lost its source configuration (the config was
-/// just deleted, or never deployed). Every resolvable parser is stamped; an
-/// unresolvable one keeps `dispatch_route_name = None`, and the renderer leaves
-/// it out of the Vector tree entirely (`VectorConfigManager::without_unroutable_parsers`),
-/// never as a parser-owned source and never as a filter on a missing route.
-pub async fn resolve_parser_dispatch_routes_lenient(
-    pool: &sqlx::PgPool,
-    parsers: &mut [Parser],
-) -> Result<(), sqlx::Error> {
-    let name_by_id = dispatch_config_names(pool, parsers).await?;
     if let Err(detail) = apply_resolved_dispatch_routes(parsers, &name_by_id) {
-        tracing::warn!(%detail, "rendering without the fetch parsers that have no source configuration");
+        tracing::warn!(%detail, "rendering without the fetch parsers that have no usable source configuration");
     }
     Ok(())
+}
+
+/// Whether a log source of this `source_type` reads through a source
+/// configuration (kafka, S3/SQS, FDR, Pub/Sub, Event Hubs) rather than a push
+/// lane. Any accepted spelling: classified through the one alias table,
+/// [`crate::log_sources::ingest_transport::canonical`] (NAN-5789).
+pub fn is_fetch_source_type(source_type: &str) -> bool {
+    crate::log_sources::ingest_transport::is_fetch(source_type)
 }
 
 async fn dispatch_config_names(
@@ -651,14 +656,16 @@ async fn dispatch_config_names(
 
 /// Pure helper for `resolve_parser_dispatch_routes`'s in-memory phase.
 ///
-/// Stamps `dispatch_route_name` on parsers whose `dispatch_source_config_id`
-/// resolves; returns `Err` when a fetch parser is unbound or orphaned.
+/// Stamps `dispatch_route_name` on EVERY parser whose
+/// `dispatch_source_config_id` resolves, and returns `Err` summarizing the
+/// fetch parsers that are unbound or orphaned (those keep no route).
 ///
 /// Pre-NAN-949 the orphan case logged a warn and fell through to the
 /// legacy parser-owned-source branch — for Kafka that emits a source
 /// pointing at `localhost:9092` with default topics, silently re-
-/// introducing the NAN-928 footgun. We now refuse the resolve so the
-/// caller can fail deploy with a clear error.
+/// introducing the NAN-928 footgun. An unrouted parser now has no route at
+/// all, and the renderer leaves it out (NAN-5789: rather than failing the
+/// whole render).
 ///
 /// Split out so the orphan detection is unit-testable without a live
 /// PG pool.
@@ -677,33 +684,21 @@ pub(crate) fn apply_resolved_dispatch_routes(
                     .to_lowercase();
                 parser.dispatch_route_name = Some(format!("{}_route", safe));
             } else {
-                tracing::error!(
+                tracing::warn!(
                     parser = %parser.name,
                     dispatch_source_config_id = %id,
-                    "dispatch source config not found; refusing to deploy parser to avoid silent fall-through to default source",
+                    "dispatch source config not found; leaving the parser out of the render (never a fall-through to a default source)",
                 );
                 invalid.push(format!(
                     "{} ({id}: source-configuration no longer exists)",
                     parser.name
                 ));
             }
-        } else if parser.kind != "enrichment"
-            && matches!(
-                parser.source_type.as_str(),
-                "kafka"
-                    | "aws_s3"
-                    | "aws_sqs"
-                    | "crowdstrike_fdr"
-                    | "s3"
-                    | "gcp_pubsub"
-                    | "pubsub"
-                    | "azure_event_hubs"
-            )
-        {
-            tracing::error!(
+        } else if parser.kind != "enrichment" && is_fetch_source_type(&parser.source_type) {
+            tracing::warn!(
                 parser = %parser.name,
                 source_type = %parser.source_type,
-                "fetch parser has no dispatch source configuration; refusing to deploy",
+                "fetch parser has no dispatch source configuration; leaving it out of the render",
             );
             invalid.push(format!(
                 "{} (missing dispatch_source_config_id for {})",
@@ -919,6 +914,16 @@ mod tests {
             parsers[0].dispatch_route_name.as_deref(),
             Some("good_route"),
         );
+    }
+
+    #[test]
+    fn every_fetch_alias_is_a_fetch_source_type() {
+        for st in ["kafka", "aws_s3", "aws_sqs", "sqs", "crowdstrike_fdr", "fdr", "s3", "gcp_pubsub", "pubsub", "azure_event_hubs", "event_hubs", "eventhubs", "KAFKA", " Aws_S3 "] {
+            assert!(is_fetch_source_type(st), "{st}");
+        }
+        for st in ["routed", "vector", "splunk_hec", "otlp", ""] {
+            assert!(!is_fetch_source_type(st), "{st}");
+        }
     }
 
     #[test]

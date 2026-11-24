@@ -68,6 +68,7 @@ import type {
   TimeRange,
   SerializedTimeRange,
 } from '@/lib/api';
+import { Term } from '@/components/ui/term';
 
 export interface PanelEditorProps {
   panel?: PanelConfig;
@@ -442,13 +443,11 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                 </div>
                 {queryMode === 'sql' && (
                   <p className="text-[10.5px] leading-relaxed text-muted-foreground">
-                    Raw SQL isn't bound to the dashboard time range unless you say
-                    so. Use{' '}
+                    Raw SQL ignores the time picker. Add{' '}
                     <code className="font-mono text-[10.5px] text-foreground">
                       $__timeFilter(timestamp)
                     </code>{' '}
-                    in a{' '}
-                    <span className="font-mono">WHERE</span> clause (or{' '}
+                    to <span className="font-mono">WHERE</span> (or{' '}
                     <code className="font-mono text-[10.5px] text-foreground">
                       $__timeFrom
                     </code>
@@ -456,7 +455,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                     <code className="font-mono text-[10.5px] text-foreground">
                       $__timeTo
                     </code>
-                    ) to scope the panel to the picker.
+                    ).
                   </p>
                 )}
               </div>
@@ -557,7 +556,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
               <div className="flex flex-col gap-1.5">
                 <div className="flex items-center justify-between">
                   <Label className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
-                    Enable drilldown
+                    Enable <Term id="drilldown">drilldown</Term>
                   </Label>
                   <Switch checked={drilldownEnabled} onCheckedChange={setDrilldownEnabled} />
                 </div>
@@ -609,7 +608,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
       onOpenChange={setShowDiscardConfirm}
       variant="danger"
       title="Discard panel changes?"
-      description="You have unsaved changes to this panel. Discard them?"
+      description="Unsaved changes will be lost."
       confirmLabel="Discard changes"
       cancelLabel="Keep editing"
       onConfirm={() => {

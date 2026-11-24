@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 from typing import Any
 
 import httpx
@@ -259,6 +260,10 @@ def test_parser_editor_draft_publish_v2_and_health(
     expect(nano.api.post(f"/api/ingest-tokens/{cred}/revoke"), 200, 409)
 
 
+# PipelineTap.tsx terminal states other than "Tap completed".
+TAP_FAILURES = ("No events during the window", "Live tap unavailable", "Tap failed")
+
+
 def test_pipeline_live_tap(stack: Stack, nano: Nano, mark: str, ocsf_lane, page: uilib.UiPage, timeline) -> None:
     caps = expect(nano.api.get(f"/api/log-sources/{ocsf_lane.source_id}/pipe-capabilities"), 200)
     if not caps.get("live_tap_enabled"):
@@ -267,8 +272,23 @@ def test_pipeline_live_tap(stack: Stack, nano: Nano, mark: str, ocsf_lane, page:
     page.goto(f"/ingestion/pipelines/{ocsf_lane.source_id}")
     page.click({"role": "tab", "name": uilib.rx("^Live tap")})
     page.click({"role": "button", "name": "Start live tap", "exact": True})
-    for i in range(5):
-        ocsf_lane.send(stack, mark, f"tap-{secrets.token_hex(2)}", "198.51.100.90", "tap", note=f"tap {i}")
-    page.wait_text("Tap completed", exact=False, timeout_ms=90_000)
+    # The running tap shows a countdown ("Capturing · Ns left"), not its title.
+    page.wait_for({"testid": "tap-remaining"}, timeout_ms=30_000)
+    # The tap only sees events that pass the source AFTER the relay's gRPC
+    # subscription attaches, and the UI gives no signal for that moment. One
+    # burst right after the click can clear Vector first and leave the window
+    # empty ("No events during the window"), so keep sending, one a second,
+    # until the tap ends; fail fast on a terminal state other than completed.
+    deadline = time.monotonic() + 90
+    sent = 0
+    while True:
+        if page.count({"text": "Tap completed", "exact": False}):
+            break
+        ended = [t for t in TAP_FAILURES if page.count({"text": t, "exact": False})]
+        assert not ended, f"live tap ended {ended[0]!r} after {sent} events sent"
+        assert time.monotonic() < deadline, f"live tap did not complete within 90 s ({sent} events sent)"
+        ocsf_lane.send(stack, mark, f"tap-{secrets.token_hex(2)}", "198.51.100.90", "tap", note=f"tap {sent}")
+        sent += 1
+        time.sleep(1)
     assert page.count({"role": "listbox", "name": "Tapped events"}) == 1
-    timeline.step("live tap", caps=caps)
+    timeline.step("live tap", caps=caps, events_sent=sent)

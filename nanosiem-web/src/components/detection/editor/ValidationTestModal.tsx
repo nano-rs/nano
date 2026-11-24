@@ -367,7 +367,7 @@ export function ValidationTestModal({
 
               {testResult.total_matches === 0 && (
                 <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 rounded-lg p-4">
-                  <p className="text-amber-800 dark:text-amber-400 text-sm">No matches found in the selected time range. Try expanding the date range or adjusting your query.</p>
+                  <p className="text-amber-800 dark:text-amber-400 text-sm">No matches in this range. Widen the range or adjust the query.</p>
                 </div>
               )}
             </div>

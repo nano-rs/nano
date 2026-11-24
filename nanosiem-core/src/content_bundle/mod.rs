@@ -15,6 +15,8 @@
 //!   routes (an enterprise build registers the source; the open edition none).
 //! - [`consumer`]: fetch → verify → accept → install → apply; leader-only
 //!   schedule, check now, air-gap import.
+//! - [`license_watch`]: re-checks the enterprise channels when the license
+//!   changes (NAN-5769).
 //!
 //! Bundles are produced by the app (app.nano.rs), not by any install.
 
@@ -25,6 +27,8 @@ pub mod consumer;
 mod content_acceptance_root;
 pub mod contract;
 pub mod credential;
+#[cfg(unix)]
+pub mod license_watch;
 pub mod source;
 pub mod store;
 pub mod tree;

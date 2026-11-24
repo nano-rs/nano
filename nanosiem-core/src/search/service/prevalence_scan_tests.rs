@@ -260,7 +260,7 @@ async fn the_pushed_total_counts_the_base_under_the_old_cap() {
     let svc = sql_only_service("ocsf");
     let start = chrono::DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z").unwrap().with_timezone(&chrono::Utc);
     let tr = crate::query::TimeRange::new(start, start + chrono::Duration::days(7));
-    let count = |q: &str| svc.prevalence_base_count_sql(&parse_query(q).unwrap(), &tr).unwrap();
+    let count = |q: &str| svc.prevalence_base_count_sql(&parse_query(q).unwrap(), &tr, crate::query::GeneratorScope::unrestricted()).unwrap();
 
     let unfiltered = count("* | prevalence src_endpoint.ip | head 10");
     assert!(unfiltered.starts_with("SELECT count(*) AS cnt FROM (SELECT"), "{unfiltered}");

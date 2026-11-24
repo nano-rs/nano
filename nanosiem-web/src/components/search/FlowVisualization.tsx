@@ -205,11 +205,6 @@ function FunnelVisualization({ results, onDrilldown }: { results: SearchResult[]
         </table>
       </div>
 
-      {onDrilldown && (
-        <p className="text-xs text-muted-foreground mt-2">
-          Click a step to drill down into events at that stage
-        </p>
-      )}
     </div>
   );
 }
@@ -470,11 +465,6 @@ function SequenceVisualization({ results, onDrilldown }: { results: SearchResult
         })}
       </div>
 
-      {onDrilldown && (
-        <p className="text-xs text-muted-foreground mt-2">
-          Click a row to expand step details, or "View event" to see full event
-        </p>
-      )}
     </div>
   );
 }

@@ -12,6 +12,7 @@ import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import type { RetroListRow } from '@/lib/api/types';
 import { RE_VERDICT, TypeChip, VerdictBadge, rePrevPos, reNum, reFmtD, reAge } from './shared';
+import { Term } from '@/components/ui/term';
 
 function SummaryStat({ n, label, of, accent, muted }: { n: number; label: string; of?: number; accent?: string; muted?: boolean }) {
   return (
@@ -82,7 +83,9 @@ export function RetroCampaign({
             </ReTh>
             <ReTh>verdict</ReTh>
             <ReTh right>hits</ReTh>
-            <ReTh>prevalence</ReTh>
+            <ReTh>
+              <Term id="prevalence">prevalence</Term>
+            </ReTh>
             <ReTh left>first seen</ReTh>
             <ReTh left>last seen</ReTh>
             <ReTh left>field</ReTh>

@@ -342,8 +342,9 @@ fn score_ingestion(m: &IngestionMetrics) -> i32 {
     if ii.stuck_async_flushes > 0 {
         integrity_penalty += 40;
     }
+    // NAN-5819: a stale latest sample is missing coverage too, never calm.
     if ii.ingest_watchdog.iter().any(|state| {
-        state.replicas.iter().any(|replica| !replica.reachable)
+        state.replicas.iter().any(|replica| !replica.reachable || replica.stale)
     }) {
         integrity_penalty += 10;
     }
@@ -606,7 +607,7 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             state
                 .replicas
                 .iter()
-                .filter(|replica| !replica.reachable)
+                .filter(|replica| !replica.reachable && !replica.stale)
                 .map(|replica| format!("{}/{} ({})", state.node, replica.replica, replica.error))
         })
         .collect::<Vec<_>>();
@@ -616,6 +617,30 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             description: format!(
                 "The watchdog cannot sample {}. Missing coverage is never counted as CALM; jobs and ingest remain up while the watchdog retries. Restore replica connectivity and confirm all targets in `nanosiem-jobs ingest-watchdog status`.",
                 unreachable.join(", ")
+            ),
+            priority: "high".to_string(),
+        });
+    }
+    // NAN-5819: a latest sample past the staleness bound is old evidence. The
+    // watchdog stopped, or its status writes fail; either way the last row
+    // (perhaps reachable and calm) says nothing about the replica now.
+    let stale = ii
+        .ingest_watchdog
+        .iter()
+        .flat_map(|state| {
+            state
+                .replicas
+                .iter()
+                .filter(|replica| replica.stale)
+                .map(|replica| format!("{}/{} (last sample {} s ago)", state.node, replica.replica, replica.sample_age_secs))
+        })
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        recs.push(Recommendation {
+            title: "Ingest watchdog replica status is stale".to_string(),
+            description: format!(
+                "No recent watchdog sample for {}. A stale sample is not counted as reachable or CALM: the watchdog may have stopped, or its status writes are failing. Check nanosiem-jobs for \"Could not persist watchdog replica status\" and run `nanosiem-jobs ingest-watchdog status`.",
+                stale.join(", ")
             ),
             priority: "high".to_string(),
         });
@@ -879,6 +904,48 @@ pub fn ensure_shard_skew_findings(analysis: &mut AnalysisResult, metrics: &Colle
         return;
     };
     for rec in super::shard_skew::shard_skew_recommendations(skew) {
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.push(rec);
+        }
+    }
+}
+
+/// NAN-5826: Live/Alerting scheduled rules stored with no schedule never
+/// run. Saves now refuse to leave a rule like that (a missing cron gets the
+/// default, and an edit that activates one is a promotion), but rows from
+/// before stay inert: surface them instead of activating them behind the
+/// operator's back.
+pub fn unscheduled_rule_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
+    if d.unscheduled_rules_total <= 0 {
+        return vec![];
+    }
+    let names = d
+        .unscheduled_rules
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![Recommendation {
+        title: format!(
+            "{} scheduled detection rule(s) have no schedule and never run",
+            d.unscheduled_rules_total
+        ),
+        description: format!(
+            "These Live or Alerting rules are scheduled but have no cron schedule, so \
+             the detection scheduler never runs them: {names}. Their events are \
+             never checked. Open each rule and set a schedule (saving it gives the \
+             default */5 * * * * when none is set); turning it on is a promotion, \
+             so it needs detections:promote."
+        ),
+        priority: "high".to_string(),
+    }]
+}
+
+/// NAN-5826: append the unscheduled-rule finding on every report path (AI,
+/// fallback, Fresh).
+pub fn ensure_unscheduled_rule_findings(analysis: &mut AnalysisResult, metrics: &CollectedMetrics) {
+    for rec in unscheduled_rule_recommendations(&metrics.detection) {
         if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
             analysis.recommendations.push(rec);
         }
@@ -1473,6 +1540,7 @@ pub(crate) mod tests {
                 total_events_24h: 0,
                 total_events_prior_24h: 0,
                 silent_sources: vec![],
+                removed_sources: vec![],
                 insert_integrity: Default::default(),
             },
             parsing: ParsingMetrics {
@@ -1502,6 +1570,8 @@ pub(crate) mod tests {
                 failing_rules: vec![],
                 failing_rules_total: 0,
                 currently_failing_rules_total: 0,
+                unscheduled_rules: vec![],
+                unscheduled_rules_total: 0,
             },
             audit_durability: None,
             reserved_source_names: Default::default(),
@@ -1600,6 +1670,8 @@ pub(crate) mod tests {
             failing_rules: vec![],
             failing_rules_total: 0,
             currently_failing_rules_total: 0,
+            unscheduled_rules: vec![],
+            unscheduled_rules_total: 0,
         }
     }
 
@@ -1631,6 +1703,22 @@ pub(crate) mod tests {
 
     /// NAN-4910: a recorded detection coverage gap is a high-priority finding
     /// and drags the detection score, without an LLM.
+    /// NAN-5826: cron-less Live/Alerting scheduled rules are surfaced, not
+    /// activated behind the operator's back.
+    #[test]
+    fn unscheduled_rules_are_a_high_finding() {
+        let clean = detection_with(1, 10);
+        assert!(unscheduled_rule_recommendations(&clean).is_empty());
+        let mut d = detection_with(1, 10);
+        d.unscheduled_rules = vec!["legacy_rule".to_string()];
+        d.unscheduled_rules_total = 1;
+        let recs = unscheduled_rule_recommendations(&d);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].priority, "high");
+        assert!(recs[0].title.contains("have no schedule and never run"), "{}", recs[0].title);
+        assert!(recs[0].description.contains("legacy_rule"));
+    }
+
     #[test]
     fn detection_coverage_gaps_recommend_and_drag_detection_score() {
         let clean = detection_with(5, 100);
@@ -1795,6 +1883,7 @@ pub(crate) mod tests {
             total_events_24h: 1_000_000,
             total_events_prior_24h: 1_000_000,
             silent_sources: vec![],
+            removed_sources: vec![],
             insert_integrity: InsertIntegrityMetrics {
                 probes_available: true,
                 ..Default::default()

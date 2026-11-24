@@ -20,23 +20,23 @@ the run scripts and the raw JSON results.
 **Topology** (a role-split Compose install on plain VMs, as a customer would
 run it):
 
-| Role | Hosts | Spot class | vCPU / RAM |
+| Role | Hosts | VM class | vCPU / RAM |
 |---|---|---|---|
-| app (UI, API, search, detections, PostgreSQL, Keeper) | 1 | gp.vs2.xlarge | 8 / 32 GB |
-| ClickHouse shard 1 (also Keeper) | 1 | gp.vs2.2xlarge | 16 / 64 GB |
-| ClickHouse shard 2 (also Keeper) | 1 | mh.vs2.xlarge | 8 / 64 GB |
-| ingest (Vector behind nginx) | 3, then 4 | ch.vs2.xlarge | 8 / 16 GB |
-| load generators (log-blaster, k6) | 2 | gp.vs2.xlarge | 8 / 32 GB |
+| app (UI, API, search, detections, PostgreSQL, Keeper) | 1 | gp.xlarge | 8 / 32 GB |
+| ClickHouse shard 1 (also Keeper) | 1 | gp.2xlarge | 16 / 64 GB |
+| ClickHouse shard 2 (also Keeper) | 1 | mh.xlarge | 8 / 64 GB |
+| ingest (Vector behind nginx) | 3, then 4 | ch.xlarge | 8 / 16 GB |
+| load generators (log-blaster, k6) | 2 | gp.xlarge | 8 / 32 GB |
 
 The load generators aren't part of the cluster and aren't in its cost. Twelve
 sender processes send straight to the ingest hosts and spread the load evenly,
 as a customer's load balancer would. All four ingest hosts are installed; in
 the 3-host runs the fourth gets no traffic and is left out of the cost.
 
-On 2026-11-16 Spot had no gp.vs2.2xlarge capacity left in us-central-dfw-2
+On 2026-11-16 the provider had no gp.2xlarge capacity left in the region
 (spot and on-demand bids both stayed unfulfilled), so the second ClickHouse
-shard ran on an mh.vs2.xlarge (8 vCPU / 64 GB). The v2.0.25 runs used two
-gp.vs2.2xlarge hosts. With 3 ingest hosts, ingest still saturated first. With
+shard ran on an mh.xlarge (8 vCPU / 64 GB). The v2.0.25 runs used two
+gp.2xlarge hosts. With 3 ingest hosts, ingest still saturated first. With
 4, the smaller shard did.
 
 **Method.** We ramp events per second in steps. Each step runs for 5 minutes,
@@ -57,7 +57,7 @@ would pass every step forever at the same real throughput.
 The **ceiling** is the highest step that meets all four. Each configuration
 is ramped three times. The first ramp uses coarse steps (6,000 events/s); the
 second and third start below it and use 2,000 events/s steps. We report the
-median, where it broke and which resource was saturated. For v2.0.29, Spot
+median, where it broke and which resource was saturated. For v2.0.29, spot
 VM freezes forced a second fresh install partway through, so the median
 pools every ramp that reached a passing step on either install: 6 with 3
 ingest hosts and 5 with 4.
@@ -87,12 +87,12 @@ bottleneck was ingest, not storage.
 
 **Topology:**
 
-| Role | Hosts | Spot class | vCPU / RAM |
+| Role | Hosts | VM class | vCPU / RAM |
 |---|---|---|---|
-| app | 1 | gp.vs2.large | 4 / 16 GB |
-| ClickHouse | 1 | mh.vs2.xlarge | 8 / 64 GB |
-| ingest | 1 | gp.vs2.xlarge | 8 / 32 GB |
-| load generator (log-blaster, k6) | 1 | ch.vs2.large | 4 / 8 GB |
+| app | 1 | gp.large | 4 / 16 GB |
+| ClickHouse | 1 | mh.xlarge | 8 / 64 GB |
+| ingest | 1 | gp.xlarge | 8 / 32 GB |
+| load generator (log-blaster, k6) | 1 | ch.large | 4 / 8 GB |
 
 This one cluster shape is run at two sizing tiers: **50 GB/day** and
 **100 GB/day**, on two identical clusters side by side. Ingest is held steady
@@ -192,20 +192,22 @@ Nothing is written directly to the database.
 - **Headroom:** CPU busy %, memory used % and disk used % on every host,
   sampled every 5 s. Headroom is 100 minus the p95 (CPU) or the max (memory,
   disk).
-- **Cost:** the Rackspace Spot market price of the nano hosts at run time.
+- **Cost:** the spot market price of the nano hosts at run time.
   Load generators are excluded. We record our bid too, which is the most we
   could have paid. Cost per GB/day is the cluster's daily cost divided by the
   GB/day it sustained.
 
 ## Infrastructure
 
-The runs use **Rackspace Spot** VMs: plain Ubuntu 24.04 machines in one region
-(us-central-dfw-2). We bid well above the market price so a run isn't
-preempted, and we record both prices.
+The runs use spot-priced cloud VMs: plain Ubuntu 24.04 machines in one US
+region. We bid well above the market price so a run isn't preempted, and we
+record both prices. VM classes are named by family and size: `gp` is general
+purpose, `mh` is memory heavy and `ch` is compute heavy. Each table gives the
+vCPU and RAM.
 
-nano needs AVX2 on every host that runs ClickHouse or Keeper. Spot's vs1
-hardware (Xeon E5 v1/v2) doesn't have it, so the benchmark uses vs2 classes.
-nano's installer checks this and refuses unsupported CPUs.
+nano needs AVX2 on every host that runs ClickHouse or Keeper. Older VM
+hardware (Xeon E5 v1/v2) doesn't have it, so the benchmark uses current
+AMD EPYC classes. nano's installer checks this and refuses unsupported CPUs.
 
 The install is what a customer runs:
 
@@ -215,13 +217,13 @@ The install is what a customer runs:
 - `install.sh` on each host for its own role.
 
 The only addition is a host firewall that admits cluster members only, because
-Spot VMs have public addresses.
+The VMs have public addresses.
 
 ## Fine print
 
 - These are synthetic but realistic workloads. Your mix of sources and queries
   will differ, so rerun the kit with your own.
-- Spot hardware varies between machines of the same class. We record the CPU
+- Cloud VM hardware varies between machines of the same class. We record the CPU
   model of every host.
 - The SOC-day detections run in alerting mode with a 30-minute cooldown per
   rule. Alert volume reflects the generated data, not a tuned production rule

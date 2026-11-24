@@ -26,7 +26,21 @@ export function cspHashSource(scriptBody: string): string {
   return `'sha256-${createHash('sha256').update(scriptBody, 'utf8').digest('base64')}'`;
 }
 
-export function buildCsp(opts: { isDev: boolean; inlineScriptHashes: string[] }): string {
+/**
+ * NAN-5798: the origin of an opt-in Sentry DSN, allowed in connect-src so the
+ * SDK can send. Empty for every build without `VITE_NANO_SENTRY_DSN`.
+ */
+export function sentryConnectOrigin(dsn: string | undefined): string[] {
+  if (!dsn) return [];
+  try {
+    const url = new URL(dsn);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? [url.origin] : [];
+  } catch {
+    return [];
+  }
+}
+
+export function buildCsp(opts: { isDev: boolean; inlineScriptHashes: string[]; connectExtra?: string[] }): string {
   // Dev needs 'unsafe-inline' for Vite HMR + React Refresh injected scripts.
   // Prod uses a hash allowlist for the inline scripts in index.html.
   const scriptSrc = opts.isDev
@@ -36,9 +50,12 @@ export function buildCsp(opts: { isDev: boolean; inlineScriptHashes: string[] })
   // Dev: allow direct localhost API access (bypass Vite proxy) for testing.
   // Prod: 'self' covers all requests (nginx proxies everything same-origin).
   // CSP3: 'self' on https pages also matches wss:// same-origin.
-  const connectSrc = opts.isDev
-    ? "'self' http://localhost:3000 http://localhost:3001 http://localhost:3002 ws://localhost:*"
-    : "'self'";
+  const connectSrc = [
+    opts.isDev
+      ? "'self' http://localhost:3000 http://localhost:3001 http://localhost:3002 ws://localhost:*"
+      : "'self'",
+    ...(opts.connectExtra ?? []),
+  ].join(' ');
 
   return [
     "default-src 'self'",
@@ -53,12 +70,12 @@ export function buildCsp(opts: { isDev: boolean; inlineScriptHashes: string[] })
 }
 
 /** Replace the `__CSP__` placeholder with a policy hashed from this HTML's inline scripts. */
-export function applyCsp(html: string, isDev: boolean): string {
+export function applyCsp(html: string, isDev: boolean, connectExtra: string[] = []): string {
   if (!html.includes('__CSP__')) {
     throw new Error('csp: index.html is missing the __CSP__ meta placeholder');
   }
   const inlineScriptHashes = extractInlineScripts(html).map(cspHashSource);
-  return html.replace('__CSP__', buildCsp({ isDev, inlineScriptHashes }));
+  return html.replace('__CSP__', buildCsp({ isDev, inlineScriptHashes, connectExtra }));
 }
 
 /** The script-src directive of the CSP meta tag in `html`, or null if absent. */

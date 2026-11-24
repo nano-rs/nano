@@ -36,6 +36,7 @@ import { formatUTC } from '@/lib/date-utils';
 import { CreateGroupDialog } from './CreateGroupDialog';
 import { useCapabilitiesOptional } from '@/hooks/use-capabilities';
 import { useScimGroupSources, type ScimGroupSource } from '@/enterprise/hooks/use-scim-group-sources';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 function SourcePill({ group, scim, size }: { group: GroupDetail; scim: ScimGroupSource[]; size: 'sm' | 'md' }) {
   const label = group.is_system ? 'System' : scim.length > 0 ? 'SCIM' : 'Local';
@@ -168,7 +169,7 @@ function GroupDetailView({ group, scim, members, membersLoading, membersUnavaila
       <div className="px-6 py-5 flex flex-col gap-6">
         {scim.length > 0 && (
           <div className="rounded-md border border-border bg-card/50 px-3 py-2 text-[11.5px] text-foreground/80">
-            Members are also provisioned over SCIM from{' '}
+            Some members are added by <EnterpriseTerm id="scim">SCIM</EnterpriseTerm> from{' '}
             {scim.map((s, i) => (
               <span key={`${s.provider_id}:${s.idp_group}`}>
                 {i > 0 && ', '}
@@ -176,7 +177,7 @@ function GroupDetailView({ group, scim, members, membersLoading, membersUnavaila
                 <span className="font-mono text-[10.5px] text-muted-foreground">{s.idp_group}</span>
               </span>
             ))}
-            . The identity provider adds and removes those members; members added here stay.
+            . The <EnterpriseTerm id="identity-provider">identity provider</EnterpriseTerm> adds and removes those members. Members you add here stay.
           </div>
         )}
         {/* Meta grid */}

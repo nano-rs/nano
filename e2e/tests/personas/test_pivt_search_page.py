@@ -104,20 +104,24 @@ def test_pivt_offers_a_viewer_no_mutating_action(
     if persona_ai is None:
         pytest.skip("pivt is enterprise-only")
     if persona_ai_mode() == "real":
-        # A real model may classify the ask as chat (prose) or detection (the
-        # redirect); the permission boundary is covered by the stub run.
-        pytest.skip("asserts the stub's classification")
+        # A real model words the refusal its own way; the permission
+        # boundary is covered by the stub run.
+        pytest.skip("asserts the stub's wording")
     rule_name = f"pivt_viewer_{mark[-8:].replace('-', '_')}"
     with login_persona(stack, nano, ui, artifact_dir, "pivt-search-viewer", VIEWER) as persona:
         page = persona.page
         page.goto("/search")
         _run_search(page, f'"{mark}"')
-        # NAN-5597: a viewer's Search offers no search.create_rule, so the
-        # concierge keeps its rule-editor redirect (the stub classifies this as
-        # `detection`, like real models): no card, a link to the editor.
+        # NAN-5637: the viewer's Search has search.create_rule but withholds
+        # it (no detections:create). The stub classifies the ask as
+        # `detection`, like real models; the concierge refuses in chat rather
+        # than redirecting to a rule editor the viewer can't save from.
         _ask(page, f"create a high rule named {rule_name}")
-        page.wait_text("take you to the rule editor", exact=False, timeout_ms=120_000)
+        page.wait_text("isn't available to you on this page", exact=False, timeout_ms=120_000)
         assert page.count(CARD) == 0
+        assert page.count({"text": "take you to the rule editor"}) == 0
+        # Nor the redirect-fallback link (a suggestion, not reply prose).
+        assert page.count({"text": "Open Rule Editor"}) == 0
         page.screenshot("pivt-search-viewer-no-action.png")
         # The REST call the action would make, marked as pivt's, is refused.
         refused = persona.client.api.post(

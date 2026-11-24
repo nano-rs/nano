@@ -50,7 +50,7 @@ export function InventoryDrawer({ item, onClose, busy, entitlement, actions }: {
           {item.sandbox.reason ?? 'It cannot run on the wasm sandbox; open the enrichment code to see why.'}
         </p>}
         {item.sandbox.compile_status === 'needs_attention' && <p className="mt-1 text-[11.5px] text-muted-foreground break-words" data-testid="inventory-sandbox-fixes">
-          Runs are refused until it is fixed; other enrichments are unaffected. Common fixes: use the vendor's https endpoint, send credentials as-is in request headers (not the URL or body), pick an auth type instead of encoding or signing a key in code, or switch to a declarative connector.
+          Runs are refused until fixed. Try the vendor&apos;s https endpoint, credentials only in request headers, an auth type instead of signing in code, or a declarative connector.
         </p>}
         {!item.sandbox.current && <p className="mt-1 text-[11.5px] text-muted-foreground">Changed since the last check; rechecking.</p>}
       </dd></>}

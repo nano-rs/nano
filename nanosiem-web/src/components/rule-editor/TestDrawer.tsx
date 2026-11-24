@@ -22,7 +22,6 @@ import {
   X,
   Terminal,
   RefreshCw,
-  Play,
   Database,
   ArrowLeft,
   Check,
@@ -448,8 +447,7 @@ export function TestDrawer({
           className="px-4 py-2 border-b border-border bg-[var(--warning)]/10 text-[12px] text-[var(--warning-fg,var(--foreground))]"
         >
           <span className="font-medium">Range too long.</span>{' '}
-          The rule tester evaluates each cron tick across the selected window, so it&apos;s
-          capped at {MAX_TEST_RANGE_DAYS} days. Pick a shorter range to run.
+          The tester is capped at {MAX_TEST_RANGE_DAYS} days. Pick a shorter range.
         </div>
       )}
 
@@ -1106,11 +1104,6 @@ function EventDetail({ event }: { event: Record<string, unknown> }) {
         </>
       )}
 
-      <div className="pt-2 border-t border-border flex items-center gap-2 text-[10px] font-mono text-muted-foreground">
-        <Play className="w-2.5 h-2.5" strokeWidth={1.75} />
-        Clause attribution lands when the backend exposes per-field match
-        context (tracked separately; not required for triage).
-      </div>
     </div>
   );
 }

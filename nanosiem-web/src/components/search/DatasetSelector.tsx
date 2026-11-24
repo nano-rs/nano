@@ -7,6 +7,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { Layers, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { SearchDataset } from '@/lib/api/types';
+import { Term } from '@/components/ui/term';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 interface DatasetSelectorProps {
   value: SearchDataset;
@@ -15,11 +17,11 @@ interface DatasetSelectorProps {
 }
 
 const OPTIONS: { value: SearchDataset; label: string; description: string }[] = [
-  { value: 'logs', label: 'Logs', description: 'OCSF events' },
-  { value: 'spans', label: 'Traces', description: 'OTLP spans' },
-  { value: 'metrics', label: 'Metrics', description: 'OTLP metrics' },
-  { value: 'risk', label: 'Risk', description: 'Accumulated entity risk' },
-  { value: 'signals', label: 'Signals', description: 'Detections that fired' },
+  { value: 'logs', label: 'Logs', description: 'events from your sources' },
+  { value: 'spans', label: 'Traces', description: 'app requests' },
+  { value: 'metrics', label: 'Metrics', description: 'app and host numbers' },
+  { value: 'risk', label: 'Risk', description: 'risk per user, host, IP' },
+  { value: 'signals', label: 'Signals', description: 'times a rule matched' },
 ];
 
 /**
@@ -71,7 +73,7 @@ export function DatasetSelector({ value, onChange, disabled }: DatasetSelectorPr
             {/* Header */}
             <div className="px-3 pt-2.5 pb-2 border-b border-border flex items-center justify-between font-mono">
               <span className="text-[10.5px] tracking-[0.12em] uppercase text-muted-foreground font-semibold">
-                Dataset
+                <Term id="dataset">Dataset</Term>
               </span>
               <span
                 className={cn(
@@ -118,39 +120,38 @@ export function DatasetSelector({ value, onChange, disabled }: DatasetSelectorPr
             <div className="border-t border-border px-3 py-2 font-mono text-[10px] text-muted-foreground/70 leading-relaxed">
               {value === 'metrics' ? (
                 <>
-                  Metric data points. The{' '}
+                  Numbers your apps and hosts report over time. The{' '}
                   <RouterLink to="/observability/metrics" className="text-primary hover:underline">
                     Metrics explorer
                   </RouterLink>{' '}
-                  is the primary surface.
+                  charts them best.
                 </>
               ) : value === 'spans' ? (
                 <>
-                  OTLP spans return as rows — see the{' '}
+                  Each row is one <Term id="span">span</Term> of a <Term id="trace">trace</Term>. The{' '}
                   <RouterLink to="/observability/traces" className="text-primary hover:underline">
                     Traces explorer
                   </RouterLink>{' '}
-                  for waterfalls.
+                  shows each trace as a timeline.
                 </>
               ) : value === 'risk' ? (
                 <>
-                  One row per scored entity — score_24h / score_7d, findings, distinct
-                  rules and tactics over fixed 24h / 7d windows.
+                  One row per user, host, IP or other entity with a <EnterpriseTerm id="risk-score">risk score</EnterpriseTerm>, for the last 24 hours and 7
+                  days.
                 </>
               ) : value === 'signals' ? (
                 <>
-                  One row per detection that fired (real-time and scheduled): rule_name,
-                  severity, risk_entity, risk_score, matched_log_id, source_type,
-                  detection_path.
+                  One row for each time a detection rule matched an event (a <Term id="signal">signal</Term>), even
+                  when it raised no alert.
                 </>
               ) : (
-                <>Normalized OCSF logs — the default search plane.</>
+                <>Events from your log sources, in standard <Term id="ocsf">OCSF</Term> fields. This is the default.</>
               )}
             </div>
           </PopoverContent>
           <TooltipContent side="bottom">
-            <p>Query dataset</p>
-            <p className="text-xs text-primary-foreground/70">Logs, OTLP traces, metrics, accumulated risk, or detections</p>
+            <p>Pick the data to search</p>
+            <p className="text-xs text-primary-foreground/70">Logs, traces, metrics, risk or signals</p>
           </TooltipContent>
         </Popover>
       </Tooltip>

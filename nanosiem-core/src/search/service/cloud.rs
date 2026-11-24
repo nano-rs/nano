@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::{source_scope_bound_predicate, SourceScopedClient};
 use crate::auth::ScopeSet;
 
 /// OCSF form of [`SearchService::cloud_enrichment_tail`]: the source endpoint's
@@ -330,6 +330,10 @@ impl SearchService {
         time_range: &TimeRange,
         scope: &ScopeSet,
     ) -> Result<String, SearchError> {
+        // NAN-5793 review: the same dataset permission check every other nPL
+        // path runs (`enforce_viewer_scope`), so a cloud request cannot reach
+        // `[dataset=signals …]` without `detections:view`.
+        super::check_dataset_access(scope, None, query_str)?;
         let base_sql = match parse_query(query_str) {
             Ok(_) => {
                 // Gate at the AST. A gate that cannot be proven fails closed.
@@ -339,8 +343,17 @@ impl SearchService {
                 )?;
                 // A clone: generation state (incl. the NAN-5628 nested-CTE
                 // sequence) is per generation, and this generator is shared.
-                match self.ch_sql_generator.clone().generate(scoped.query(), time_range) {
-                    Ok(sql) => sql,
+                // NAN-5793 review: the deny-set rides on the generator too, as
+                // on every other nPL path. The AST gate covers the `logs`
+                // scans only; the `| identity` build side and a
+                // `[dataset=risk …]` subsearch's origin gate read it here.
+                let generator = self.sql_generator(crate::query::GeneratorScope::viewer(scope));
+                match generator.generate(scoped.query(), time_range) {
+                    // NAN-5793: this CTE goes straight to `clickhouse.query`
+                    // (not the search executor, which escapes), so a `?` in a
+                    // string literal (a user term, or a denied source name
+                    // the AST gate rendered) is doubled to stay text.
+                    Ok(sql) => crate::search::execution::escape_question_marks_in_strings(&sql),
                     Err(e) => {
                         tracing::warn!("Cloud CTE SQL gen failed: {}", e);
                         return Err(SearchError::SqlGenError(e.to_string()));
@@ -358,7 +371,7 @@ impl SearchService {
                     &logs_table,
                     &crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string(),
                     &crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string(),
-                    source_scope_sql_predicate("source_type", scope.deny_set()).as_deref(),
+                    source_scope_bound_predicate("source_type", scope.deny_set()).as_deref(),
                 )
             }
         };
@@ -451,6 +464,9 @@ impl SearchService {
                 })]);
             }
         };
+        // NAN-5793: every query below reads the scoped `cloud_base` CTE; bind
+        // the caller's deny list as the server-side parameter it references.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         // Build base CTE using shared helper
         let base_cte = match self.build_cloud_base_cte(cleaned_query, time_range, scope) {
@@ -914,6 +930,9 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok((Vec::new(), 0, CloudFacets::default(), None, None)),
         };
+        // NAN-5793: every query below reads the scoped `cloud_base` CTE; bind
+        // the caller's deny list as the server-side parameter it references.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         // Build base CTE using shared helper.
         // NAN-1801 / NAN-5021: the nPL text is echoed back BY THE CLIENT, so the
@@ -1412,6 +1431,9 @@ impl SearchService {
                 ))
             }
         };
+        // NAN-5793: every query below reads the scoped `cloud_base` CTE; bind
+        // the caller's deny list as the server-side parameter it references.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         // NAN-1801: client-echoed nPL — re-run the scope injection with the
         // caller's real scope (see query_cloud_events_paginated for rationale).
@@ -1630,6 +1652,9 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok((Vec::new(), Vec::new(), json!({}))),
         };
+        // NAN-5793: every query below reads the scoped `cloud_base` CTE; bind
+        // the caller's deny list as the server-side parameter it references.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         // Validate entity type
         if !["user", "ip", "resource"].contains(&entity_type) {
@@ -2037,12 +2062,12 @@ mod source_scope_tests {
         let deny: BTreeSet<String> = ["audit".to_string(), "insider_threat".to_string()]
             .into_iter()
             .collect();
-        let pred = source_scope_sql_predicate("source_type", &deny)
+        let pred = source_scope_bound_predicate("source_type", &deny)
             .expect("nonempty deny set must render");
         assert_eq!(
             build_cloud_fallback_scan_sql("logs", "S", "E", Some(&pred)),
             "SELECT * FROM logs PREWHERE timestamp BETWEEN 'S' AND 'E' \
-             AND lower(source_type) NOT IN ('audit', 'insider_threat') \
+             AND lower(source_type) NOT IN {nano_source_deny:Array(String)} \
              ORDER BY timestamp DESC"
         );
     }
@@ -2052,7 +2077,7 @@ mod source_scope_tests {
     #[test]
     fn empty_deny_set_leaves_cloud_fallback_byte_identical() {
         assert_eq!(
-            source_scope_sql_predicate("source_type", &BTreeSet::new()),
+            source_scope_bound_predicate("source_type", &BTreeSet::new()),
             None
         );
         assert_eq!(

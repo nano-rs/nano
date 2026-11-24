@@ -27,9 +27,10 @@ import { cn } from '@/lib/utils';
 import type { PipelineLaneInput, PipelineStep, PipelineStepKind, PreviewOnlyKind } from '@/lib/pipeline-types';
 import { compileStep, type PipelineStepStatus } from '@/lib/pipeline-model';
 import { PipelineField, PipelineNotice } from './PipelineCommon';
-import { STEP_LABELS, newPipelineStep } from './pipeline-catalog';
+import { STEP_LABELS, STEP_TERMS, newPipelineStep } from './pipeline-catalog';
 import { RouteBranches } from './RouteBranches';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Term } from '@/components/ui/term';
 
 /** Auto: only the selected step is open. Explicit toggles override until the selection changes. */
 type CollapseMode = 'auto' | 'all' | 'none';
@@ -147,7 +148,7 @@ export function PipelineStepList({
       >
         {steps.length === 0 && (
           <p className="p-3 text-[11.5px] text-muted-foreground">
-            No processing steps — events pass through unchanged.
+            No steps yet. Events pass through unchanged.
           </p>
         )}
         {steps.map((step, index) => {
@@ -399,7 +400,7 @@ export function PipelineStepList({
                     onConfigure();
                   }}
                 >
-                  {label}
+                  <Term nested id={STEP_TERMS[kind]} side="right">{label}</Term>
                   {!supportedSteps.includes(kind) ? (
                     <span className="ml-auto text-[10px] text-muted-foreground">
                       unavailable
@@ -550,7 +551,7 @@ export function PipelineStepSettings({
   return (
     <div className="flex min-h-0 flex-col gap-3 p-3 text-[12px]">
       <div className="font-mono text-[10.5px] text-muted-foreground">
-        {STEP_LABELS[step.kind]}
+        <Term id={STEP_TERMS[step.kind]}>{STEP_LABELS[step.kind]}</Term>
       </div>
       {!supported && (
         <PipelineNotice title="Unavailable on this deployment" tone="warning">
@@ -593,8 +594,8 @@ export function PipelineStepSettings({
       </PipelineField>
       <div className="border-t border-border" />
       {mixedInputs && (step.kind === 'dedupe' || step.kind === 'combine') && (
-        <PipelineNotice title="Push and pull inputs keep separate state" tone="warning">
-          This lane has both push and cloud pull inputs. Pull events run these steps in the pull container&apos;s own Vector process, so {step.kind === 'dedupe' ? 'a duplicate that arrives once by push and once by pull is not removed' : 'events from push and pull inputs are never combined into the same group'}.
+        <PipelineNotice title="Pushed and pulled events are handled apart" tone="warning">
+          This source gets events both pushed to nano and fetched by <Term id="cloud-pull">cloud pull</Term>. Fetched events run this step on their own, so {step.kind === 'dedupe' ? 'a copy that arrives once each way is not removed' : 'pushed and fetched events are never combined into one group'}.
         </PipelineNotice>
       )}
       {step.kind === 'parse' && (
@@ -602,8 +603,7 @@ export function PipelineStepSettings({
           {select('format', 'Format', [['json', 'JSON']])}
           {text('field', 'Input field', 'message')}
           <p className="text-[10.5px] text-muted-foreground">
-            JSON fields merge into the event. Validate to see the exact compiled
-            VRL.
+            JSON fields merge into the event.
           </p>
         </>
       )}
@@ -672,7 +672,7 @@ export function PipelineStepSettings({
           {fields('keys', 'Group keys')}
           {text('countField', 'Count field')}
           {json('merge', 'Merge rules')}
-          <p className="text-[10.5px] text-muted-foreground">At most 64 tracked group keys. Overflow flushes the oldest key; idle expiry is capped at five seconds, including larger saved limits.</p>
+          <p className="text-[10.5px] text-muted-foreground">At most 64 tracked group keys; the oldest flushes first. Idle expiry is capped at 5 seconds.</p>
           {number('maxEvents', 'Maximum events per group')}
           {number('timeoutSec', 'Flush timeout (seconds)', 1, 5)}
           <PipelineNotice title="Stateful preview">
@@ -720,7 +720,7 @@ export function PipelineStepSettings({
         <>
           {fields('fields', 'Comparison fields')}
           {number('cacheEvents', 'Maximum cached events', 1, 5000)}
-          <p className="text-[10.5px] text-muted-foreground">LRU cache of SHA-256 signatures, capped at 5,000 entries per Vector instance. Larger saved limits are capped when compiled. State clears on restart. Push and cloud pull inputs run in separate Vector processes and dedupe separately.</p>
+          <p className="text-[10.5px] text-muted-foreground">Up to 5,000 cached signatures per Vector instance; clears on restart. Push and cloud pull inputs dedupe separately.</p>
           {'ttlSec' in config && <Button disabled={readOnly} className="h-7 text-[11px]" onClick={() => { const native = { ...config }; delete native.ttlSec; onChange({ ...step, config: native }); }}>Use native LRU cache and remove prototype TTL</Button>}
         </>
       )}
@@ -734,8 +734,8 @@ export function PipelineStepSettings({
           {text('field', 'Branch label field')}
           {select('fallback', 'Unmatched events', [['keep', 'Keep'], ['drop', 'Drop']])}
           <p className="text-[10.5px] text-muted-foreground">
-            Each kept branch is tagged and continues to storage. Fan-out produces one copy per kept matching branch; external destinations are unavailable.
-            &ldquo;Input is&rdquo; matches the input the platform recorded at ingress, not fields in the event, and must come before any Combine step.
+            Kept branches continue to storage; fan-out keeps one copy per match; no external destinations. &ldquo;Input is&rdquo; matches the ingress input
+            and must come before any Combine step.
           </p>
         </>
       )}

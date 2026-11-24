@@ -283,7 +283,7 @@ def topology_block(t: dict, h: Hosts) -> dict:
         hosts.append({"name": name, "role": role, **meta})
     counted = [x for x in hosts if x["role"] not in ("load-generator", "idle")]
     nano_cost = sum(x.get("market_usd_per_hour", 0) for x in counted)
-    return {"name": t.get("BENCH_NAME"), "provider": t.get("PROVIDER", "Rackspace Spot"),
+    return {"name": t.get("BENCH_NAME"), "provider": t.get("PROVIDER", "unspecified"),
             "region": t.get("REGION"), "hosts": hosts,
             "nano_usd_per_hour_market": round(nano_cost, 4),
             "nano_usd_per_hour_bid_ceiling": round(sum(x.get("bid_usd_per_hour", 0) for x in counted), 4),

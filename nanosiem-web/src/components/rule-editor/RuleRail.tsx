@@ -51,7 +51,11 @@ import {
   folderOf,
   folderLabel,
   folderKind,
+  activeFolderNames,
+  inRailTab,
   normalizeSeverity,
+  railTabTotal,
+  type RailTab,
   type FolderKind,
   type DisplayModeKey,
 } from './helpers';
@@ -312,7 +316,7 @@ function RuleRowWithContext({
 }
 
 export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, onCreateNew, onMoveRule, rowActions, loading, folderSettings, onSetFolderIcon }: RuleRailProps) {
-  const [tab, setTab] = useState<'active' | 'archived'>('active');
+  const [tab, setTab] = useState<RailTab>('active');
   const [q, setQ] = useState('');
   const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({});
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
@@ -332,7 +336,6 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
 
   const { folders, counts } = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    const archivedWanted = tab === 'archived';
     const byFolder = new Map<string, DetectionRule[]>();
 
     // Seed the five canonical categories from the design ref so the folder
@@ -342,8 +345,7 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
     for (const name of CANONICAL) byFolder.set(name, []);
 
     for (const rule of rules) {
-      const isArchived = Boolean(rule.archived);
-      if (isArchived !== archivedWanted) continue;
+      if (!inRailTab(rule, tab)) continue;
       if (needle && !rule.name.toLowerCase().includes(needle)) continue;
       const folder = canonicalize(folderOf(rule));
       const list = byFolder.get(folder) ?? [];
@@ -390,7 +392,8 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
         kind: folderKind(name),
         children: (byFolder.get(name) ?? []).sort((a, b) => a.name.localeCompare(b.name)),
       })),
-      counts: { total: rules.length, folders: names.length },
+      // NAN-5773: count what the selected tab lists, not archived rules too.
+      counts: { total: railTabTotal(rules, tab), folders: names.length },
     };
   }, [rules, q, tab, pendingFolders, folderSettings]);
 
@@ -421,8 +424,9 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
   // only to give instant feedback while the create API call is in flight.
   React.useEffect(() => {
     if (pendingFolders.length === 0) return;
+    // NAN-5773: a folder only deleted (archived) rules use does not exist.
     const knownLower = new Set<string>([
-      ...rules.map((r) => folderOf(r).toLowerCase()),
+      ...activeFolderNames(rules).map((n) => n.toLowerCase()),
       ...Object.keys(folderSettings ?? {}).map((n) => n.toLowerCase()),
     ]);
     const stillPending = pendingFolders.filter((n) => !knownLower.has(n.toLowerCase()));
@@ -454,10 +458,11 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
       return;
     }
     const lower = raw.toLowerCase();
-    // Reject collisions with canonical or already-known folders.
+    // Reject collisions with canonical or already-known folders. A folder only
+    // deleted (archived) rules use can be created again (NAN-5773).
     const existing = new Set([
       ...CANONICAL_FOLDERS.map((c) => c.toLowerCase()),
-      ...rules.map((r) => folderOf(r).toLowerCase()),
+      ...activeFolderNames(rules).map((n) => n.toLowerCase()),
       ...pendingFolders.map((n) => n.toLowerCase()),
     ]);
     if (existing.has(lower)) {

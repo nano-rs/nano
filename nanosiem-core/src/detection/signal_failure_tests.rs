@@ -208,3 +208,22 @@ fn dropped_signal_gap_is_redacted_to_class_and_key() {
     );
     assert!(!gap.error_message.contains('\0'));
 }
+
+/// NAN-5817 review round 2: classifying a real-time signal failure is pure.
+/// It must not report "ClickHouse rejected nano-generated search SQL" at
+/// ERROR (with the raw, possibly event-quoting text) for a data or
+/// query-shape failure; the signal processor logs its own redacted line.
+#[test]
+fn clickhouse_classification_emits_no_log_events() {
+    use crate::search::log_capture::levels_logged;
+    for (message, class) in [
+        ("Code: 6. DB::Exception: Cannot parse text 'evil\nline' (CANNOT_PARSE_TEXT)", BadData),
+        ("Code: 46. DB::Exception: Unknown function nosuchfn. (UNKNOWN_FUNCTION)", Unrecognised),
+        ("Code: 47. DB::Exception: Unknown expression identifier `srcip`. (UNKNOWN_IDENTIFIER)", Unrecognised),
+    ] {
+        let err = bad_response(message);
+        let (got, levels) = levels_logged(|| class_of(&err));
+        assert_eq!(got, class, "{message}");
+        assert!(levels.is_empty(), "{message}: classification logged {levels:?}");
+    }
+}

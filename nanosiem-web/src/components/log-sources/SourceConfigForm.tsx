@@ -10,6 +10,7 @@ import { IpAllowlistInput } from './IpAllowlistInput';
 import { TlsConfigSection } from './TlsConfigSection';
 import { CredentialPicker } from './CredentialPicker';
 import type { TlsSourceConfig } from '@/lib/api/types';
+import { Term } from '@/components/ui/term';
 
 const FIELD_LABEL =
   'text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground';
@@ -158,12 +159,10 @@ export function SourceConfigForm({
         <div className="p-4 bg-muted/30 rounded-md text-center text-muted-foreground">
           <Radio className="w-8 h-8 mx-auto mb-2 opacity-50" />
           <p className="text-[12px]">
-            OTLP sources receive OpenTelemetry logs over gRPC (:4317) and HTTP (:4318).
+            <Term id="otlp">OTLP</Term> sources receive OpenTelemetry logs over gRPC (:4317) and HTTP (:4318).
           </p>
           <p className="text-[10.5px] mt-2">
-            No additional configuration required. Logs are routed by the{' '}
-            <code className="font-mono bg-muted px-1 rounded">source_type</code> tag set by the
-            OTLP preprocessor.
+            Routed by the <code className="font-mono bg-muted px-1 rounded">source_type</code> tag.
           </p>
         </div>
       );
@@ -177,8 +176,7 @@ export function SourceConfigForm({
             HTTP sources receive logs via the ingestion endpoint.
           </p>
           <p className="text-[10.5px] mt-2">
-            No additional configuration required. Logs are routed by the{' '}
-            <code className="font-mono bg-muted px-1 rounded">X-Source-Type</code> header.
+            Routed by the <code className="font-mono bg-muted px-1 rounded">X-Source-Type</code> header.
           </p>
         </div>
       );
@@ -344,8 +342,7 @@ function SqsConfigForm({ config, onChange, credentialId, onCredentialChange, dis
           className={INPUT_MONO}
         />
         <p className={HELP_TEXT}>
-          Queue whose messages ARE the logs. If your queue instead carries S3 object
-          notifications, use the AWS S3 source type.
+          Messages must be the logs themselves. For S3 object notifications, use AWS S3.
         </p>
       </div>
 
@@ -441,9 +438,8 @@ function SqsConfigForm({ config, onChange, credentialId, onCredentialChange, dis
               className={INPUT_MONO}
             />
             <p className={HELP_TEXT}>
-              Must exceed how long a batch takes to process, or SQS redelivers messages
-              still in flight and events are duplicated. Leave blank to inherit the
-              queue's own setting.
+              Must exceed batch processing time, or SQS redelivers and events are duplicated.
+              Blank uses the queue&apos;s setting.
             </p>
           </div>
         </div>
@@ -731,9 +727,8 @@ function S3ConfigForm({ config, onChange, credentialId, onCredentialChange, disa
               className={INPUT_MONO}
             />
             <p className={HELP_TEXT}>
-              How long to wait between polls of an <em>empty</em> queue. Does not throttle
-              throughput — with a backlog, collection is continuous. Lower this only to
-              reduce how long a new object sits unnoticed on a quiet queue. Default 15.
+              Wait between polls of an <em>empty</em> queue. Does not throttle throughput.
+              Default 15.
             </p>
           </div>
 
@@ -754,9 +749,7 @@ function S3ConfigForm({ config, onChange, credentialId, onCredentialChange, disa
               className={INPUT_MONO}
             />
             <p className={HELP_TEXT}>
-              Parallel S3 object fetches. Worth raising on feeds with many small objects,
-              where per-object latency rather than bandwidth is the limit. Leave blank to
-              use Vector's default.
+              Parallel S3 fetches; raise for many small objects. Blank uses Vector&apos;s default.
             </p>
           </div>
 
@@ -778,10 +771,8 @@ function S3ConfigForm({ config, onChange, credentialId, onCredentialChange, disa
               className={INPUT_MONO}
             />
             <p className={HELP_TEXT}>
-              How long a notification stays hidden while its object is fetched. A
-              notification in flight when Vector restarts comes back after this long.
-              Must exceed the time to process one object, or it is redelivered and its
-              events duplicated. New sources start at 60; blank uses Vector's 300.
+              Must exceed the time to process one object, or events are duplicated. New sources
+              start at 60; blank uses Vector&apos;s 300.
             </p>
           </div>
         </div>
@@ -920,9 +911,8 @@ function EventHubsConfigForm({ config, onChange, credentialId, onCredentialChang
           className={INPUT_MONO}
         />
         <p className={HELP_TEXT}>
-          Namespace name or host (<span className="font-mono">acme-logs.servicebus.windows.net</span>).
-          Required with an Entra service principal or managed identity; ignored when the credential
-          carries an Event Hubs connection string.
+          Name or host (<span className="font-mono">acme-logs.servicebus.windows.net</span>). Needed for Entra
+          or managed identity, not with a connection string.
         </p>
       </div>
 
@@ -949,14 +939,12 @@ function EventHubsConfigForm({ config, onChange, credentialId, onCredentialChang
         </div>
       </div>
       <p className={HELP_TEXT}>
-        Positions are checkpointed in this existing Blob container, so a restart resumes where it
-        stopped without gaps or duplicates. The storage account is only needed when the credential
-        has no storage connection string.
+        Checkpoints go to this existing Blob container. The storage account is needed only without
+        a storage connection string.
       </p>
 
       <div className="p-2.5 bg-muted/30 border border-border rounded-md text-[11px] text-muted-foreground leading-relaxed">
-        Starts at the newest events: messages already in the hub when the source is first deployed
-        are not ingested. Azure Monitor batches (<span className="font-mono">{'{"records": [...]}'}</span>)
+        Starts at the newest events; messages already in the hub are not ingested. Azure Monitor batches (<span className="font-mono">{'{"records": [...]}'}</span>)
         are split into one event per record.
       </div>
 
@@ -980,14 +968,12 @@ function SplunkHecConfigForm() {
     <div className="p-4 bg-muted/30 rounded-md text-center text-muted-foreground">
       <Zap className="w-8 h-8 mx-auto mb-2 opacity-50" />
       <p className="text-[12px]">
-        Splunk HEC events arrive on the platform-managed listener.
+        Splunk <Term id="hec">HEC</Term> events arrive on the platform-managed listener.
       </p>
       <p className="text-[10.5px] mt-2 leading-relaxed">
-        No per-config connection settings. Events are accepted on{' '}
-        <code className="font-mono bg-muted px-1 rounded">:8088</code> with the shared{' '}
-        <code className="font-mono bg-muted px-1 rounded">VECTOR_AUTH_TOKEN</code> and routed
-        by the rules on this page based on the in-band{' '}
-        <code className="font-mono bg-muted px-1 rounded">sourcetype</code> field.
+        Accepted on <code className="font-mono bg-muted px-1 rounded">:8088</code> with the shared{' '}
+        <code className="font-mono bg-muted px-1 rounded">VECTOR_AUTH_TOKEN</code>, routed by{' '}
+        <code className="font-mono bg-muted px-1 rounded">sourcetype</code> rules on this page.
       </p>
     </div>
   );
@@ -996,10 +982,6 @@ function SplunkHecConfigForm() {
 function VectorConfigForm({ config, onChange, disabled }: FormProps) {
   return (
     <div className="space-y-3">
-      <div className="p-2.5 bg-blue-500/10 border border-blue-500/30 rounded-md text-[11px] text-blue-300 leading-relaxed">
-        Receive logs from upstream Vector instances using Vector&rsquo;s native protocol.
-        Ideal for on-premise aggregators forwarding to cloud SIEM.
-      </div>
 
       <div className="space-y-1.5">
         <Label className={FIELD_LABEL}>Listen Address</Label>

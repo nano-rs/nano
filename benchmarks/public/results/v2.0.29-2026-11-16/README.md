@@ -1,8 +1,8 @@
 # nano v2.0.29 benchmark, 2026-11-16
 
 These are the public benchmark runs for nano **v2.0.29**: a stock enterprise bundle,
-licensed and installed fresh with the kit's `run.sh` on Rackspace Spot
-(us-central-dfw-2). Every host was wiped before the install. The method is in
+licensed and installed fresh with the kit's `run.sh` on spot-priced cloud
+VMs in one US region. Every host was wiped before the install. The method is in
 [`../../METHODOLOGY.md`](../../METHODOLOGY.md). Every number here comes from
 the JSON files in this directory, which `lib/collect.py` wrote.
 
@@ -14,7 +14,7 @@ the JSON files in this directory, which `lib/collect.py` wrote.
 
 ## Headline numbers
 
-### Ceiling (role-split cluster, Spot market price $0.81/h with 3 ingest hosts, $0.89/h with 4)
+### Ceiling (role-split cluster, spot market price $0.81/h with 3 ingest hosts, $0.89/h with 4)
 
 The medians are over every ramp that reached a passing step, from both installs.
 
@@ -25,12 +25,12 @@ The medians are over every ramp that reached a passing step, from both installs.
 | Ingest lag p50 / p99 at the ceiling (median) | 4.7 s / 9.1 s | 5.2 s / 25.0 s |
 | Search p95 at peak, hunt / triage (median) | 676 ms / 245 ms | 959 ms / 513 ms |
 | What broke first | **Ingest**: Vector at 62 to 78% CPU on the ingest hosts (72 to 78% in 5 of 6 ramps); senders get backpressure and stop keeping up | **The smaller ClickHouse shard** (ch2, 8 vCPU): 86 to 95% CPU, while ingest sat at 64 to 77% |
-| Cluster cost per hour (Spot market / our bid) | $0.81 / $1.43 | $0.89 / $1.59 |
+| Cluster cost per hour (spot market / our bid) | $0.81 / $1.43 | $0.89 / $1.59 |
 | Cost per GB/day sustained | $0.0104 per GB | $0.0093 per GB |
 
 - Adding a fourth ingest host moved the ceiling about 22%. Then the
   second ClickHouse shard became the limit. That shard was an 8 vCPU
-  mh.vs2.xlarge, because Spot had no gp.vs2.2xlarge capacity that day.
+  mh.xlarge, because the provider had no gp.2xlarge capacity that day.
 - No ramp lost data. Every step that broke, broke on **keeps up** (the
   ingest tier pushing back on the senders) or on **lag**. Two steps also
   show `zero_loss: false` at the moment of the check: install B's ing3 r3 at
@@ -46,7 +46,7 @@ The medians are over every ramp that reached a passing step, from both installs.
   ch1 was lost during the 34,000 step (see below). Its JSON is built from the
   per-step SLO checks, and it has no per-host stats.
 
-### SOC day (app 4 vCPU, ClickHouse 8 vCPU / 64 GB, ingest 8 vCPU; $0.24/h at Spot market)
+### SOC day (app 4 vCPU, ClickHouse 8 vCPU / 64 GB, ingest 8 vCPU; $0.24/h at spot market)
 
 Each tier ran for 4 hours with 8 analysts replaying the 94-query IR/SOC
 corpus, 4 dashboard viewers, 2 Agent Lane agents and 200 scheduled
@@ -90,8 +90,8 @@ rules wrote 47k and 75k findings; 27 rules fired.
   - The first SOC-day attempts reached 3 h 30 min and were discarded.
     Install A's five completed ceiling ramps are kept, because they finished
     before the freeze.
-- **gp.vs2.2xlarge capacity.** No second gp.vs2.2xlarge could be had, as spot
-  or on-demand, so ClickHouse shard 2 ran on mh.vs2.xlarge (8 vCPU / 64 GB).
+- **gp.2xlarge capacity.** No second gp.2xlarge could be had, as spot
+  or on-demand, so ClickHouse shard 2 ran on mh.xlarge (8 vCPU / 64 GB).
   That shard limits the 4-ingest-host ceiling.
 - **Agent Lane token mint (NAN-5519).** On soc100, the first token mint after
   install returned 502 or 503, in both installs. The app's ClickHouse proxy

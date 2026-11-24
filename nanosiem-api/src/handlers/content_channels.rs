@@ -132,15 +132,26 @@ impl AppContentApplier {
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string()),
+                    // NAN-5755: a synced playbook catalog is then delivered
+                    // into the library. This is the only delivery on an
+                    // air-gapped install that imports `playbooks.main` as a
+                    // `.nancontent` bundle (no scheduler runs there), and it
+                    // makes an online channel update land at once.
                     #[cfg(feature = "enterprise")]
-                    Kind::Playbooks => nanosiem_core::playbook_repository::PlaybookRepositoryService::new(
-                        state.pool.clone(),
-                        crate::handlers::playbook_repositories::refresh_hooks(&state),
-                    )
-                        .sync_repository(id)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
+                    Kind::Playbooks => {
+                        let service = nanosiem_core::playbook_repository::PlaybookRepositoryService::new(
+                            state.pool.clone(),
+                            crate::handlers::playbook_repositories::refresh_hooks(&state),
+                        );
+                        match service.sync_repository(id).await {
+                            Ok(_) => nanosiem_enterprise::handlers::content_follow::deliver_after_channel_sync(
+                                &state, &service, id,
+                            )
+                            .await
+                            .map(|_| ()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
                     #[cfg(not(feature = "enterprise"))]
                     Kind::Playbooks => Ok(()),
                     Kind::MarketplaceCatalog => nanosiem_core::marketplace::MarketplaceSyncService::new(state.pool.clone())
@@ -163,6 +174,14 @@ impl AppContentApplier {
 
 #[async_trait]
 impl ContentApplier for AppContentApplier {
+    async fn needs_reapply(&self, channel: &'static Channel) -> bool {
+        channel.kind == Kind::Extension
+            && match nanosiem_core::content_bundle::consumer::extension_applier() {
+                Some(applier) => applier.needs_reapply(channel).await,
+                None => false,
+            }
+    }
+
     async fn apply(&self, channel: &'static Channel, verified: &VerifiedContent, tree_changed: bool) -> Result<String, String> {
         if channel.kind == Kind::Extension {
             return match nanosiem_core::content_bundle::consumer::extension_applier() {

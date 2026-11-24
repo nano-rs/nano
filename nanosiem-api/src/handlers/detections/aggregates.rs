@@ -49,7 +49,8 @@ const RECENT_METRICS_WINDOW_HOURS: i32 = 24;
 ///
 /// Three aggregate counts over existing tables:
 /// - `needs_tuning`: unread `tuning_notifications` rows (`read_at IS NULL`)
-/// - `noisy_count`: rules whose 7-day `match_count` sum exceeds [`NOISY_WEEKLY_THRESHOLD`]
+/// - `noisy_count`: Live/Alerting, non-archived rules whose 7-day `match_count` sum
+///   exceeds [`NOISY_WEEKLY_THRESHOLD`] (NAN-5772: a deleted rule drops out at once)
 /// - `silent_count`: rules in Live/Alerting mode with no matches in the last 7 days
 #[utoipa::path(
     get,
@@ -76,20 +77,9 @@ pub async fn get_detection_health_summary(
     #[cfg(not(feature = "enterprise"))]
     let needs_tuning: i64 = 0;
 
-    let noisy_count: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*)::bigint FROM (
-            SELECT rule_id
-            FROM detection_daily_stats
-            WHERE date >= CURRENT_DATE - 7
-            GROUP BY rule_id
-            HAVING SUM(match_count) > $1
-        ) noisy
-        "#,
-    )
-    .bind(NOISY_WEEKLY_THRESHOLD)
-    .fetch_one(&state.pool)
-    .await?;
+    // NAN-5772: only rules that still exist (not archived) and are running.
+    let noisy_count: i64 =
+        nanosiem_core::detection::health::count_noisy_rules(&state.pool, NOISY_WEEKLY_THRESHOLD).await?;
 
     // Silent = a rule that is *supposed* to be running (Live or Alerting mode) but
     // hasn't produced any matches in the last 7 days. `last_match_at IS NULL`

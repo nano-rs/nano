@@ -92,7 +92,10 @@ interface TacticChipsProps {
 
 export function TacticChips({ value, onChange }: TacticChipsProps) {
   return (
-    <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-thin pb-1 -mb-1">
+    // NAN-5783: wrap instead of a hidden-scrollbar strip. With pivt open the
+    // 15 tactics don't fit one row, and a sideways scroller left Command and
+    // Control onward unreachable with no visible cue.
+    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter by tactic">
       {TACTIC_CHIPS.map((t) => (
         <button
           key={t}

@@ -311,7 +311,7 @@ The two container columns were checked on a local Docker 2026-10 host
 (cgroup v2, builtin seccomp profile), running the binary inside the hosted
 hosted jobs image. The k8s column was simulated with
 `--user 65534 --cap-drop ALL --security-opt no-new-privileges --read-only`.
-None of this ran on live Rackspace Spot nodes.
+None of this ran on live hosted cluster nodes.
 
 | Layer | Hosted lean jobs pod (k8s, unprivileged, RuntimeDefault) | Open-core docker compose (defaults) | Bare metal / systemd `Delegate=yes` / podman |
 |---|---|---|---|

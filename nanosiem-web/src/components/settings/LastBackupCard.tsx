@@ -15,6 +15,7 @@ import type { BackupStatusResponse } from '@/lib/api/system-health';
 import { cn } from '@/lib/utils';
 import { formatBytes, formatRelativeCompact, formatUTCCompact } from '@/lib/date-utils';
 import { AUTOMATIC_BACKUPS_DOCS_URL, BACKUP_STATUS_QUERY_KEY } from '@/lib/backup-status';
+import { Term } from '@/components/ui/term';
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -67,8 +68,8 @@ function BackupDetails({ status }: { status: BackupStatusResponse }) {
       </Row>
       <Row label="Scope">
         {status.clickhouse_data === 'included'
-          ? 'PostgreSQL + ClickHouse data'
-          : 'PostgreSQL only (ClickHouse data not included)'}
+          ? 'Settings, rules, alerts and users, plus events'
+          : 'Settings, rules, alerts and users (no events)'}
       </Row>
       <Row label="Last success">
         <When at={status.last_success_at} />
@@ -116,7 +117,7 @@ export function LastBackupCard() {
   return (
     <div>
       <div className="flex items-center gap-2 mb-2">
-        <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">Last backup</span>
+        <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">Last <Term id="backup">backup</Term></span>
         {status?.configured && <StateBadge status={status} />}
         <div className="flex-1 h-px bg-border/60 mx-1" />
         <a

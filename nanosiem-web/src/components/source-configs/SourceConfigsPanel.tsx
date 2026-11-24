@@ -66,6 +66,7 @@ import { cn } from '@/lib/utils';
 import { sourceConfigPath } from '@/lib/ingestion-paths';
 import { credentialProviderFor } from '@/components/log-sources/CredentialPicker';
 import { SourceConfigForm } from '@/components/log-sources/SourceConfigForm';
+import { Term } from '@/components/ui/term';
 
 type FilterId = 'all' | 'deployed' | 'ready' | 'enabled';
 type DerivedStatus = 'deployed' | 'ready' | 'failed';
@@ -385,7 +386,7 @@ export function SourceConfigsPanel({
               </AlertDialogTitle>
               <AlertDialogDescription className="font-mono text-[11px] text-muted-foreground">
                 Push &ldquo;{deployTarget?.name}&rdquo; to Vector. Ingestion starts immediately
-                and routing rules become live.
+                and <Term id="routing-rule">routing rules</Term> become live.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter className="border-t border-border px-5 py-3">
@@ -670,7 +671,7 @@ function SourceConfigRow({
               <div className="hidden @max-[1100px]/table:flex mt-1 items-center gap-2 font-mono text-[10.5px] text-muted-foreground tabular-nums">
                 <span className="text-foreground/80">{fmtCount(config.events_24h ?? 0)}</span>
                 <span className="text-muted-foreground/60">·</span>
-                <span>{fmtCount(eps)} EPS</span>
+                <span>{fmtCount(eps)} <Term id="eps">EPS</Term></span>
               </div>
             )}
           </div>
@@ -877,9 +878,6 @@ function EmptyState({
     <div className="flex flex-col items-center justify-center py-8 px-4 text-center" data-testid="source-configs-empty">
       <Plug className="w-5 h-5 text-muted-foreground/60 mb-2" strokeWidth={1.5} />
       <div className="text-[12.5px] font-medium text-foreground">None yet</div>
-      <div className="text-[11.5px] text-muted-foreground mt-1 max-w-[420px]">
-        Each one owns routing rules that decide which log source an event goes to.
-      </div>
       {canCreate && (
         <div className="mt-3">
           <Button size="sm" className="h-7 gap-1.5 text-[11.5px]" onClick={onNew}>
@@ -1083,10 +1081,6 @@ function PickTransport({
           <div className="grid grid-cols-2 gap-2">{rest.map(renderCard)}</div>
         </div>
       )}
-      <div className="rounded-md border border-border bg-foreground/[0.02] p-3 text-[11px] text-muted-foreground leading-relaxed">
-        After creating the source, you&rsquo;ll configure connection settings (auth, endpoints,
-        topics) and routing rules in the workspace.
-      </div>
     </div>
   );
 }
@@ -1191,7 +1185,7 @@ function NameTransport({
         <Textarea
           value={description}
           onChange={(e) => onDescriptionChange(e.target.value)}
-          placeholder="Optional — what feeds flow through this transport?"
+          placeholder="Optional: which feeds use this transport?"
           className="text-[12px] bg-card min-h-[72px]"
         />
       </div>
@@ -1214,8 +1208,8 @@ function NameTransport({
         <span>
           The source will be created in <span className="font-mono">Ready</span> state.{' '}
           {credentialProvider
-            ? 'Next you pick which log source its events route to, then deploy.'
-            : 'You\u2019ll configure connection settings and routing rules on the next page, then deploy when ready.'}
+            ? 'Next, pick the log source its events route to, then deploy.'
+            : 'Configure connection and routing next, then deploy.'}
         </span>
       </div>
     </div>

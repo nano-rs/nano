@@ -33,6 +33,7 @@ import {
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api, GroupDetail, SharedGroup, DashboardVisibility, DashboardShareResult } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 interface DashboardShareDialogProps {
   open: boolean;
@@ -205,7 +206,7 @@ export function DashboardShareDialog({
             <>
               <div className="flex flex-col gap-1.5">
                 <Label className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
-                  Visibility
+                  <Term id="dashboard-visibility">Visibility</Term>
                 </Label>
                 <RadioGroup
                   value={visibility}

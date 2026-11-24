@@ -89,9 +89,12 @@ fn has_rust_only_suffix_after_aggregation(query: &Query) -> bool {
     match query {
         Query::Search(_) => false,
         Query::Piped { source, command } => {
+            // NAN-5751: `lookup` too: `stats … | lookup … | where …` must
+            // not page the SQL aggregation before the Rust lookup filters it.
             let is_rust_only = matches!(
                 command,
                 Command::Prevalence { .. }
+                    | Command::Lookup { .. }
                     | Command::InputLookup { .. }
                     | Command::Lateral { .. }
                     | Command::Ai { .. }
@@ -287,7 +290,8 @@ impl SearchService {
                     service.job_store.complete(&job_id_clone, response).await;
                 }
                 Err(e) => {
-                    tracing::error!("Async job {} failed: {}", job_id_clone, e);
+                    // NAN-5817: WARN for a query error, ERROR for an internal one.
+                    crate::search::log_search_failure!(e, job_id = %job_id_clone, "Async search job failed");
                     // NAN-5161: the job error is shown to its owner; mask it
                     // like the batch path does.
                     service
@@ -392,7 +396,8 @@ impl SearchService {
                     service.job_store.complete(&job_id_clone, response).await;
                 }
                 Err(e) => {
-                    tracing::error!("Async job {} failed: {}", job_id_clone, e);
+                    // NAN-5817: WARN for a query error, ERROR for an internal one.
+                    crate::search::log_search_failure!(e, job_id = %job_id_clone, "Async search job failed");
                     // NAN-5161: masked like the batch path (see above).
                     service
                         .job_store
@@ -778,6 +783,7 @@ impl SearchService {
             &adjusted_time_range,
             crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs")),
             &query_id,
+            scope,
         )
         .await
         .map_err(SearchError::SqlValidationError)?;
@@ -1369,15 +1375,12 @@ impl SearchService {
                 omit_settings: false,
             };
             // Apply current query safety limits to the SQL generator.
+            // NAN-2009 (F20/F21) / NAN-5793 review: resolve_identity's ASOF
+            // join to identity_observations is a SEPARATE dataset the nPL-text
+            // gate (enforce_source_scope) does not cover; the generator carries
+            // the caller's deny-set so its build side is filtered.
             let mut ch_gen = self
-                .ch_sql_generator
-                .clone()
-                // NAN-2009 (F20/F21): resolve_identity's ASOF join to
-                // identity_observations is a SEPARATE dataset the nPL-text gate
-                // (enforce_source_scope) does not cover. Carry the caller's
-                // source-scope deny-set so generate_resolve_identity_sql filters
-                // the join's build side. Empty deny-set = byte-identical SQL.
-                .with_source_scope_deny(scope.deny_set().clone())
+                .sql_generator(crate::query::GeneratorScope::viewer(scope))
                 .with_max_group_array_size(query_limits.max_group_array_size as usize)
                 .with_max_mvexpand_rows(query_limits.max_mvexpand_rows as usize);
             // NAN-1798 P2: attach the resolved risk config BEFORE any dataset
@@ -1490,6 +1493,7 @@ impl SearchService {
             let histogram_query = cleaned_query.clone();
             let histogram_time_range = adjusted_time_range.clone();
             let hist_qid = crate::search::companion_query_id::CompanionQuery::Hist.query_id(&query_id);
+            let hist_deny = scope.deny_set().clone();
             // NAN-1557: the timeline reads the same dataset as the results.
             let histogram_dataset = crate::query::Dataset::from_selector(
                 request.dataset.as_deref().unwrap_or("logs"),
@@ -1501,6 +1505,7 @@ impl SearchService {
                         &histogram_time_range,
                         Some(&hist_qid),
                         histogram_dataset,
+                        &hist_deny,
                     )
                     .await
                 {
@@ -1542,7 +1547,9 @@ impl SearchService {
             // `system.columns` inventory either; the client-side fallback
             // computes exact stats over the result set.
             && request_dataset != crate::query::Dataset::Signals
-            && self.ch_sql_generator.pipeline_output_is_wide(&query_for_sql);
+            && self
+                .sql_generator(crate::query::GeneratorScope::viewer(scope))
+                .pipeline_output_is_wide(&query_for_sql);
 
         // NAN-5634: a `join` whose main pipeline hands on raw event rows is not
         // an aggregation, even though the subsearch's `stats count()` puts
@@ -2271,6 +2278,8 @@ mod ext_remap_note_tests {
             r#"* | stats count by dest_ip | inputlookup url="https://example.com/{dest_ip}" key=dest_ip"#,
             "* | stats count by src_host | lateral entity=src_host",
             r#"* | stats count by dest_ip | ai prompt="classify""#,
+            // NAN-5751: a lookup after the aggregation filters it in Rust.
+            r#"* | stats count by dest_ip | lookup assets dest_ip AS ip OUTPUT tier | where tier="critical""#,
         ] {
             let parsed = parse_query(query)
                 .unwrap_or_else(|error| panic!("test query must parse ({query}): {error}"));

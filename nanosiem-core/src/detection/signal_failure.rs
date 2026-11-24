@@ -202,7 +202,10 @@ fn classify_clickhouse(error: &clickhouse::error::Error) -> SignalFailure {
         Ch::Custom(_) => "ch:deserialize".to_string(),
         _ => "ch:client".to_string(),
     };
-    let class = match crate::search::search_error_from_error(error) {
+    // NAN-5817: the pure classifier. `search_error_from_error` also reports
+    // a rejection of generated search SQL at ERROR, which is not what this is
+    // and would log event text the signal path deliberately keeps out.
+    let class = match crate::search::classify_clickhouse_failure(error) {
         SearchError::Unavailable(_)
         | SearchError::Timeout(_)
         | SearchError::Cancelled

@@ -52,6 +52,7 @@ import { formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import { auditCsv } from '@/lib/audit-csv';
 import { ALL_FILTER, AUDIT_SEARCH_DEBOUNCE_MS, auditActionOptions } from '@/lib/audit-actions';
+import { Term } from '@/components/ui/term';
 
 
 
@@ -76,6 +77,7 @@ const AUDIT_SOURCES = [
   { value: 'oidc', label: 'OIDC' },
   { value: 'parser_repo', label: 'Parser Repos' },
   { value: 'rule_repo', label: 'Rule Repos' },
+  { value: 'playbook', label: 'Playbooks' },
   { value: 'playbook_repo', label: 'Playbook Repos' },
   { value: 'marketplace', label: 'Marketplace' },
   { value: 'session', label: 'Sessions' },
@@ -422,7 +424,7 @@ export function AuditLogContent() {
       {degradedReason && (
         <div role="status" className="rounded border border-warning/40 bg-warning/10 px-3 py-2 text-[12px] text-foreground">
           <span className="font-medium">Partial audit view.</span>{' '}
-          ClickHouse is not answering, so only security-critical events (logins, MFA, API keys, credentials) from the PostgreSQL record are shown.
+          The event database is not answering, so only the most important events are shown: sign-ins, <Term id="mfa">MFA</Term>, API keys and credentials.
           <div className="mt-0.5 font-mono text-[10.5px] text-muted-foreground break-all">{degradedReason}</div>
         </div>
       )}
@@ -653,7 +655,7 @@ export function AuditLogContent() {
             {/* NAN-5575: an Agent Lane query reads as nPL; the SQL stays in Details. */}
             {selectedLog.action?.startsWith('agentlane_query') && typeof selectedLog.details?.query === 'string' && (
               <div>
-                <p className="text-[11px] text-muted-foreground mb-1">Query (nPL)</p>
+                <p className="text-[11px] text-muted-foreground mb-1">Query (<Term id="npl">nPL</Term>)</p>
                 <SqlAsNpl sql={selectedLog.details.query} />
               </div>
             )}
@@ -679,9 +681,9 @@ export function AuditLogPage() {
     <div className="px-6 py-5">
       <div className="flex items-center justify-between mb-5">
         <div>
-          <h1 className="text-[18px] font-semibold tracking-tight text-foreground">Audit Log</h1>
+          <h1 className="text-[18px] font-semibold tracking-tight text-foreground"><Term id="audit-log">Audit Log</Term></h1>
           <p className="text-[11.5px] text-muted-foreground mt-0.5">
-            Platform audit events — authentication, detection, configuration, management
+            Who did what in nano: sign-ins, detections, configuration and admin changes
           </p>
         </div>
       </div>

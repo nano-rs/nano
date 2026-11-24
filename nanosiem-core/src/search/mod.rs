@@ -14,6 +14,7 @@ pub mod admission;
 pub mod ai_command_policy;
 pub mod background;
 pub mod classification;
+pub mod clickhouse_rejection;
 pub mod companion_query_id;
 mod config;
 pub mod denied_source_audit;
@@ -27,6 +28,22 @@ mod execution;
 pub(crate) use execution::validation::DISALLOWED_FUNCTIONS;
 pub mod field_usage;
 pub mod field_utils;
+/// Log a search failure at the level its cause deserves (NAN-5817): WARN for
+/// a caller's query or request error, ERROR only for an internal failure (see
+/// [`SearchError::is_internal`]). A macro so the event keeps the call site's
+/// module as its target. Extra fields go before the message, as in `tracing`.
+macro_rules! log_search_failure {
+    ($err:expr, $($arg:tt)+) => {{
+        let err: &$crate::search::SearchError = &$err;
+        if err.is_internal() {
+            ::tracing::error!(error = %err, $($arg)+);
+        } else {
+            ::tracing::warn!(error = %err, $($arg)+);
+        }
+    }};
+}
+pub(crate) use log_search_failure;
+
 pub mod jobs;
 pub mod count_companion;
 pub mod partial_run;
@@ -38,6 +55,10 @@ pub mod request_actor;
 mod request_timing_tests;
 #[cfg(test)]
 mod client_error_message_tests;
+#[cfg(test)]
+pub(crate) mod log_capture;
+#[cfg(test)]
+mod clickhouse_rejection_tests;
 pub mod settled_reuse;
 pub mod service;
 pub mod streaming;
@@ -52,6 +73,9 @@ pub use config::{SearchBackend, SearchConfig};
 // NAN-2001: `inject_audit_filter` retired — the audit gate is enforced by the
 // ClickHouse `nanosiem_rawsql_noaudit` row policy, not by AST rewriting.
 pub use execution::validate_sql_query;
+/// NAN-5793: for generated SQL that goes to the driver outside the search
+/// executor (it doubles `?` in literals, quoted identifiers and comments).
+pub use execution::escape_question_marks_in_strings;
 // NAN-1389: exposed for the lookup pre-check PG integration suite
 pub use processing::validate_lookup_tables;
 // NAN-4933: the Nano-side replay and lookup merge, exposed for the real-
@@ -91,6 +115,7 @@ pub use service::prevalence_where_sql;
 pub use streaming::{is_query_streamable, SearchStreamEvent, StreamingChunk};
 pub use types::{
     client_error_message, clickhouse_error_code, parse_clickhouse_error, search_error_from_error,
+    classify_clickhouse_failure, sql_gen_message_is_user_error, sql_gen_message_is_user_facing,
     AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,
     CloudFacets, CloudUserActivity, CloudUserSessionSummary, DisplayType, EntityCrossReference,
     FieldInfo, FieldStatistics, FieldValueInfo, HistogramBucket, QueryWarningOutput, RawSqlRequest,

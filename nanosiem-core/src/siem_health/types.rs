@@ -101,6 +101,31 @@ impl SiemHealthReport {
         scope.allows(&self.source_types, self.source_types_complete)
     }
 
+    /// NAN-5760: re-apply [`CollectedMetrics::set_aside_removed_sources`] to a
+    /// stored report, so a source deleted after the report was generated
+    /// leaves its lists at once instead of at the next run (up to 12h later).
+    ///
+    /// Only the per-source metrics are reconciled. Scores and the narrative
+    /// stay as generated until the next run. A payload that does not
+    /// deserialize, or that names no removed source, is left untouched.
+    pub fn set_aside_removed_sources(
+        &mut self,
+        removed: &super::removed_sources::RemovedSourceKeys,
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+        let Ok(mut metrics) = serde_json::from_value::<CollectedMetrics>(self.metrics.clone())
+        else {
+            return;
+        };
+        if metrics.set_aside_removed_sources(removed) {
+            if let Ok(value) = serde_json::to_value(metrics) {
+                self.metrics = value;
+            }
+        }
+    }
+
     /// Reduce a stored report to what `scope` may see (NAN-2222).
     ///
     /// 1. Every `source_type`-keyed partition denied to the reader is dropped
@@ -238,6 +263,12 @@ impl CollectedMetrics {
             .map(|metric| metric.source_type.as_str())
             .chain(self.ingestion.silent_sources.iter().map(String::as_str))
             .chain(
+                self.ingestion
+                    .removed_sources
+                    .iter()
+                    .map(|metric| metric.source_type.as_str()),
+            )
+            .chain(
                 self.parsing
                     .field_coverage
                     .iter()
@@ -307,6 +338,9 @@ impl CollectedMetrics {
         self.ingestion
             .silent_sources
             .retain(|source_type| is_visible(source_type));
+        self.ingestion
+            .removed_sources
+            .retain(|metric| is_visible(&metric.source_type));
         self.ingestion.total_events_24h = self
             .ingestion
             .source_volumes
@@ -344,6 +378,104 @@ impl CollectedMetrics {
                 total.saturating_add(metric.total_events)
             });
     }
+
+    /// NAN-5760: take deleted log sources out of every per-source list.
+    ///
+    /// A `source_type` in `removed` (a tombstoned route key no live source
+    /// claims) leaves `source_volumes`, `silent_sources`, the parsing lists
+    /// and `per_source_coverage`, and is recorded once in
+    /// `ingestion.removed_sources` with its volumes. The ingestion totals are
+    /// recomputed from the remaining volumes, so deleting a large source does
+    /// not read as a fleet-wide volume drop, and `enrichment.total_events_24h`
+    /// loses the moved events. Fleet-wide enrichment ratios are left as
+    /// collected.
+    ///
+    /// Idempotent. Returns whether anything changed, so a caller re-applying
+    /// it to a stored report can keep an unaffected payload byte-identical.
+    pub fn set_aside_removed_sources(
+        &mut self,
+        removed: &super::removed_sources::RemovedSourceKeys,
+    ) -> bool {
+        if removed.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut moved_24h: u64 = 0;
+
+        let volumes = std::mem::take(&mut self.ingestion.source_volumes);
+        for volume in volumes {
+            match removed.get(&volume.source_type) {
+                Some(source) => {
+                    changed = true;
+                    let already = self
+                        .ingestion
+                        .removed_sources
+                        .iter()
+                        .any(|metric| metric.source_type == volume.source_type);
+                    if !already {
+                        moved_24h = moved_24h.saturating_add(volume.count_24h);
+                        self.ingestion.removed_sources.push(RemovedSourceMetric {
+                            source_type: volume.source_type,
+                            log_source_name: source.log_source_name.clone(),
+                            deleted_at: source.deleted_at,
+                            count_24h: volume.count_24h,
+                            count_prior_24h: volume.count_prior_24h,
+                        });
+                    }
+                }
+                None => self.ingestion.source_volumes.push(volume),
+            }
+        }
+
+        let mut retain = |kept: bool| {
+            if !kept {
+                changed = true;
+            }
+            kept
+        };
+        self.ingestion
+            .silent_sources
+            .retain(|source_type| retain(!removed.contains(source_type)));
+        self.parsing
+            .field_coverage
+            .retain(|metric| retain(!removed.contains(&metric.source_type)));
+        self.parsing
+            .high_ext_sources
+            .retain(|metric| retain(!removed.contains(&metric.source_type)));
+        self.enrichment
+            .per_source_coverage
+            .retain(|metric| retain(!removed.contains(&metric.source_type)));
+
+        if changed {
+            self.ingestion
+                .removed_sources
+                .sort_by(|a, b| {
+                    b.count_prior_24h
+                        .cmp(&a.count_prior_24h)
+                        .then_with(|| a.source_type.cmp(&b.source_type))
+                });
+            self.ingestion.total_events_24h = self
+                .ingestion
+                .source_volumes
+                .iter()
+                .fold(0_u64, |total, metric| total.saturating_add(metric.count_24h));
+            self.ingestion.total_events_prior_24h = self
+                .ingestion
+                .source_volumes
+                .iter()
+                .fold(0_u64, |total, metric| total.saturating_add(metric.count_prior_24h));
+            // `enrichment.total_events_24h` is `count()` over the same logs and
+            // window, so it loses exactly the moved events. With no source
+            // left it is zero, or `deployment_state` / `score_enrichment` would
+            // read a fleet with events where there are none (review P2).
+            self.enrichment.total_events_24h = if self.ingestion.source_volumes.is_empty() {
+                0
+            } else {
+                self.enrichment.total_events_24h.saturating_sub(moved_24h)
+            };
+        }
+        changed
+    }
 }
 
 /// Ingestion health metrics
@@ -357,6 +489,13 @@ pub struct IngestionMetrics {
     pub total_events_prior_24h: u64,
     /// Source types that had events in prior 24h but zero in last 24h
     pub silent_sources: Vec<String>,
+    /// NAN-5760: source types whose log source was deleted (and that no live
+    /// source claims) but whose events are still inside the health windows.
+    /// Informational only: never counted as silent, never scored, and not in
+    /// `source_volumes` or the totals. Empty on reports written before this
+    /// field existed.
+    #[serde(default)]
+    pub removed_sources: Vec<RemovedSourceMetric>,
     /// Insert-path integrity signals (NAN-1405). `default` so reports stored
     /// before this field existed still deserialize.
     #[serde(default)]
@@ -474,6 +613,11 @@ pub struct IngestWatchdogReplicaHealth {
     pub error: String,
     pub hot: bool,
     pub sample_age_secs: u64,
+    /// NAN-5819: the latest sample is older than
+    /// `ingest_watchdog::replica_sample_stale_after_secs()`. A stale row is
+    /// old evidence: never reachable or calm, whatever it says.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// One dictionary's resident memory (NAN-4957).
@@ -518,6 +662,17 @@ pub struct StaleDictRefresh {
     /// Seconds since the last successful refresh; 0 when the view has never
     /// succeeded (NULL last_success_time).
     pub last_success_age_secs: u64,
+}
+
+/// Data from a deleted log source still inside the health windows (NAN-5760).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemovedSourceMetric {
+    pub source_type: String,
+    /// Name of the deleted log source that claimed this source type.
+    pub log_source_name: String,
+    pub deleted_at: DateTime<Utc>,
+    pub count_24h: u64,
+    pub count_prior_24h: u64,
 }
 
 /// Volume metric for a single source type
@@ -640,7 +795,7 @@ pub struct EnrichmentCoverageMetric {
 }
 
 /// Detection health metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DetectionMetrics {
     /// Total enabled rules
     pub total_enabled_rules: i64,
@@ -676,6 +831,13 @@ pub struct DetectionMetrics {
     /// failing right now (the rest recovered and are a recent-failure warning).
     #[serde(default)]
     pub currently_failing_rules_total: i64,
+    /// NAN-5826: Live/Alerting scheduled rules with no `schedule_cron`. The
+    /// scheduler never claims them, so they never run (names, capped).
+    #[serde(default)]
+    pub unscheduled_rules: Vec<String>,
+    /// NAN-5826: total of those rules (uncapped).
+    #[serde(default)]
+    pub unscheduled_rules_total: i64,
 }
 
 /// A detection window recorded as not evaluated (NAN-4910).

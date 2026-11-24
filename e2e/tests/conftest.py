@@ -31,6 +31,13 @@ from nano_e2e.stack import Stack, StackNotConfigured
 from nano_e2e.waits import INGEST_VISIBLE, eventually
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """NAN-5869: every report (test phases and collection, passing or not) is
+    redacted before the terminal or junit sees it; a DSN with its password
+    reached the lane log."""
+    config.pluginmanager.import_plugin("nano_e2e.redact")
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
     """Record every secret this session holds (the stack's and the cloud test
     credentials `with_creds` loaded) in the run's 0600 registry, so the
@@ -61,6 +68,27 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             why = udm.args[0] if udm.args else "UDM-shaped scenario"
             reason = f"udm_only: {why}; stack is {schema.profile()}, run with NANO_SCHEMA_PROFILE=udm"
             item.add_marker(pytest.mark.skip(reason=reason))
+
+
+def _sentry_current_test(nodeid: str) -> None:
+    """NAN-5798: tell the stack's services which scenario is running, so their
+    Sentry events carry a `test` tag (they read this file when they send).
+    Only when the harness turned Sentry on; best effort."""
+    path = os.environ.get("E2E_SENTRY_CURRENT_TEST_FILE")
+    if not path:
+        return
+    try:
+        Path(path).write_text(nodeid[:200])
+    except OSError:
+        pass
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    _sentry_current_test(item.nodeid)
+
+
+def pytest_runtest_teardown(item: pytest.Item) -> None:
+    _sentry_current_test("")
 
 
 @pytest.hookimpl(hookwrapper=True)

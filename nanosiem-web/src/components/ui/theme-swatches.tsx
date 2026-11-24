@@ -14,7 +14,14 @@ import { cn } from '@/lib/utils';
  * dot. Three near-black circles would be indistinguishable otherwise, which is
  * the whole reason Matte Black and Dark need the accent half to tell them apart.
  */
-export function ThemeSwatches({ className }: { className?: string }) {
+export function ThemeSwatches({
+  className,
+  size = 'md',
+}: {
+  className?: string;
+  /** `sm` is the dense left-rail strip (16px swatches, NAN-5858); `md` is Settings > User. */
+  size?: SwatchSize;
+}) {
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -29,17 +36,30 @@ export function ThemeSwatches({ className }: { className?: string }) {
   // selection marker before then flashes the wrong swatch as selected.
   useEffect(() => setMounted(true), []);
 
-  // Show a chevron on the right edge while there is more row to scroll to.
+  // When the row overflows, a chevron slot sits on each side of the scroller
+  // (flex siblings, never absolutely positioned over it), so neither can cover
+  // a swatch. `overflows` reserves both slots; `moreLeft` / `moreRight` enable
+  // each chevron while there is more row to scroll to that way. The slots
+  // appear only when the row does not fit without them, so toggling them
+  // cannot oscillate.
+  const [overflows, setOverflows] = useState(false);
+  const [moreLeft, setMoreLeft] = useState(false);
   const [moreRight, setMoreRight] = useState(false);
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const update = () => setMoreRight(el.scrollWidth - el.clientWidth - el.scrollLeft > 2);
+    const update = () => {
+      setOverflows(el.scrollWidth - el.clientWidth > 2);
+      setMoreLeft(el.scrollLeft > 2);
+      setMoreRight(el.scrollWidth - el.clientWidth - el.scrollLeft > 2);
+    };
     update();
     el.addEventListener('scroll', update, { passive: true });
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    return () => { el.removeEventListener('scroll', update); ro.disconnect(); };
+    // Guarded: the strip now mounts in every rail (NAN-5858), including test
+    // environments without ResizeObserver; scroll events still keep it right.
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
+    ro?.observe(el);
+    return () => { el.removeEventListener('scroll', update); ro?.disconnect(); };
   }, [mounted]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -85,8 +105,16 @@ export function ThemeSwatches({ className }: { className?: string }) {
     }, 0);
   };
 
+  // Roving tabindex (NAN-5858): the strip is ONE Tab stop, on the selected
+  // swatch (the first when the theme is `system` or not yet known); arrows,
+  // Home and End move within it. Without this, the rail strip that now sits
+  // on every route would put nine swatches in every page's Tab order.
+  const selectedIndex = mounted ? THEMES.indexOf(theme as Theme) : -1;
+  const [focusIndex, setFocusIndex] = useState<number | null>(null);
+  const tabStop = focusIndex ?? (selectedIndex >= 0 ? selectedIndex : 0);
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
     const buttons = Array.from(
       containerRef.current?.querySelectorAll<HTMLButtonElement>('button') ?? []
     );
@@ -95,15 +123,20 @@ export function ThemeSwatches({ className }: { className?: string }) {
     if (activeIndex === -1) return;
 
     e.preventDefault();
+    const last = buttons.length - 1;
     const nextIndex =
-      e.key === 'ArrowRight'
-        ? (activeIndex + 1) % buttons.length
-        : (activeIndex - 1 + buttons.length) % buttons.length;
+      e.key === 'Home' ? 0
+        : e.key === 'End' ? last
+          : e.key === 'ArrowRight' ? (activeIndex + 1) % buttons.length
+            : (activeIndex - 1 + buttons.length) % buttons.length;
     buttons[nextIndex]?.focus();
   };
 
   return (
-    <div className="relative w-full min-w-0 max-w-full">
+    <div className="flex w-full min-w-0 max-w-full items-center">
+      {overflows && (
+        <ScrollArrow direction="left" enabled={moreLeft} onScroll={() => containerRef.current?.scrollBy({ left: -SCROLL_STEP, behavior: 'smooth' })} />
+      )}
     <div
       ref={containerRef}
       onPointerDown={handlePointerDown}
@@ -111,8 +144,16 @@ export function ThemeSwatches({ className }: { className?: string }) {
       onPointerUp={handlePointerUpOrCancel}
       onPointerCancel={handlePointerUpOrCancel}
       onKeyDown={handleKeyDown}
+      // Tabbing back in lands on the selected swatch again, not the last one visited.
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusIndex(null);
+      }}
       className={cn(
-        'flex max-w-full items-center gap-2.5 overflow-x-auto select-none py-2 px-2 -my-2 -mx-2',
+        'flex min-w-0 flex-1 items-center overflow-x-auto select-none py-2 px-2 -my-2',
+        size === 'sm' ? 'gap-2' : 'gap-2.5',
+        // Pull the strip left only with no left arrow: with one, the margin
+        // would slide the scroller over the arrow.
+        !overflows && '-ml-2',
         '[scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden',
         '[webkit-overflow-scrolling:touch]',
         className
@@ -124,10 +165,13 @@ export function ThemeSwatches({ className }: { className?: string }) {
       role="group"
       aria-label="Theme"
     >
-      {THEMES.map((name) => (
+      {THEMES.map((name, i) => (
         <ThemeSwatch
           key={name}
           theme={name}
+          size={size}
+          tabIndex={i === tabStop ? 0 : -1}
+          onFocus={() => setFocusIndex(i)}
           selected={mounted && theme === name}
           onSelect={() => {
             if (dragRef.current?.moved) return;
@@ -136,20 +180,53 @@ export function ThemeSwatches({ className }: { className?: string }) {
         />
       ))}
     </div>
-      {moreRight && (
-        <button
-          type="button"
-          aria-label="Scroll themes right"
-          onClick={() => containerRef.current?.scrollBy({ left: 120, behavior: 'smooth' })}
-          // Solid, bordered affordance (no fade — CLAUDE.md: no gradients).
-          className="absolute inset-y-0 -right-2 flex w-6 items-center justify-center border-l border-border bg-card text-muted-foreground hover:text-foreground"
-        >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="m9 6 6 6-6 6" />
-          </svg>
-        </button>
+      {overflows && (
+        <ScrollArrow direction="right" enabled={moreRight} onScroll={() => containerRef.current?.scrollBy({ left: SCROLL_STEP, behavior: 'smooth' })} />
       )}
     </div>
+  );
+}
+
+const SCROLL_STEP = 120;
+
+type SwatchSize = 'sm' | 'md';
+
+/**
+ * A chevron beside the swatch strip. DOM order is left arrow, swatches, right
+ * arrow, so Tab order matches what is on screen. At the end of the row it is
+ * `aria-disabled`, NOT `disabled`: a native disabled button loses focus, and
+ * a keyboard user who pressed it would be dropped to document.body. Solid and
+ * bordered (no fade: CLAUDE.md, no gradients), with a visible focus ring.
+ */
+function ScrollArrow({
+  direction,
+  enabled,
+  onScroll,
+}: {
+  direction: 'left' | 'right';
+  enabled: boolean;
+  onScroll: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={direction === 'left' ? 'Scroll themes left' : 'Scroll themes right'}
+      aria-disabled={!enabled}
+      onClick={() => {
+        if (enabled) onScroll();
+      }}
+      className={cn(
+        'flex h-6 w-6 shrink-0 items-center justify-center border-border text-muted-foreground hover:text-foreground',
+        // An outline, not a ring-* box-shadow (no shadows; see ThemeSwatch).
+        'focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-[var(--ring)]',
+        'aria-disabled:cursor-default aria-disabled:opacity-40 aria-disabled:hover:text-muted-foreground',
+        direction === 'left' ? 'border-r' : 'border-l',
+      )}
+    >
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d={direction === 'left' ? 'm15 6-6 6 6 6' : 'm9 6 6 6-6 6'} />
+      </svg>
+    </button>
   );
 }
 
@@ -203,10 +280,16 @@ export function ThemeSwatch({
   theme,
   selected,
   onSelect,
+  size = 'md',
+  tabIndex,
+  onFocus,
 }: {
   theme: Theme;
   selected: boolean;
   onSelect: () => void;
+  size?: SwatchSize;
+  tabIndex?: number;
+  onFocus?: () => void;
 }) {
   const { surface, accent } = THEME_SWATCH[theme];
   const label = THEME_LABELS[theme];
@@ -215,12 +298,15 @@ export function ThemeSwatch({
     <button
       type="button"
       onClick={onSelect}
+      onFocus={onFocus}
+      tabIndex={tabIndex}
       title={label}
       aria-label={label}
       aria-pressed={selected}
       className={cn(
-        'relative size-[20px] shrink-0 rounded-full border border-border transition-opacity',
-        'hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-[5px] focus-visible:outline-primary',
+        'relative shrink-0 rounded-full border border-border transition-opacity',
+        'hover:opacity-100 focus-visible:outline-2 focus-visible:outline-primary',
+        size === 'sm' ? 'size-4 focus-visible:outline-offset-[4px]' : 'size-[20px] focus-visible:outline-offset-[5px]',
         selected ? 'opacity-100' : 'opacity-60',
       )}
     >
@@ -228,7 +314,8 @@ export function ThemeSwatch({
       <span
         aria-hidden="true"
         className={cn(
-          'pointer-events-none absolute -inset-[4px] rounded-full border-2',
+          'pointer-events-none absolute rounded-full',
+          size === 'sm' ? '-inset-[3px] border-[1.5px]' : '-inset-[4px] border-2',
           selected ? 'border-foreground' : 'border-transparent',
         )}
       />

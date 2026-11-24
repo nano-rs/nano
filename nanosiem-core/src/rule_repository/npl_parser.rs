@@ -180,124 +180,140 @@ pub fn extract_source_types(query: &str) -> Vec<String> {
     source_types
 }
 
+/// Common UDM fields `extract_required_fields` looks for.
+const UDM_FIELDS: &[&str] = &[
+    // Core identifiers
+    "event_type",
+    "action", // legacy synonym for event_type
+    "status",
+    "result",
+    // Network
+    "src_ip",
+    "dest_ip",
+    "src_port",
+    "dest_port",
+    "src_host",
+    "dest_host",
+    "protocol",
+    "bytes_in",
+    "bytes_out",
+    "packets_in",
+    "packets_out",
+    "url",
+    "url_domain",
+    "url_path",
+    "url_query",
+    // Process
+    "process_name",
+    "process_path",
+    "process_hash",
+    "process_id",
+    "process_guid",
+    "command_line",
+    "parent_command_line",
+    "parent_process_path",
+    "parent_process_id",
+    // File
+    "file_path",
+    "file_name",
+    "file_hash",
+    "file_size",
+    "file_action",
+    // User/Auth
+    "user",
+    "user_id",
+    "user_domain",
+    "user_type",
+    "target_user",
+    "target_user_id",
+    "target_user_domain",
+    "auth_type",
+    "auth_result",
+    "logon_type",
+    // DNS
+    "query",
+    "query_type",
+    "answer",
+    "answer_type",
+    // Registry (Windows)
+    "registry_key",
+    "registry_value",
+    "registry_data",
+    // Enrichment fields
+    "enriched_src_country",
+    "enriched_dest_country",
+    "enriched_src_asn",
+    "enriched_dest_asn",
+    "enriched_src_city",
+    "enriched_dest_city",
+    // Prevalence fields
+    "prevalence_file_hash",
+    "prevalence_process_hash",
+    "prevalence_dest_domain",
+    "prevalence_dest_ip",
+    "prevalence_min",
+    // Email
+    "subject",
+    "sender",
+    "recipient",
+    "attachment_name",
+    "attachment_hash",
+    // Cloud
+    "cloud_provider",
+    "cloud_region",
+    "cloud_account_id",
+    "resource_type",
+    "resource_id",
+    "resource_name",
+    // Generic
+    "user_agent",
+    "http_method",
+    "http_status",
+    "session_id",
+    "transaction_id",
+];
+
+/// One compiled matcher per UDM field, built once (sync re-derives
+/// `requires_fields` for every unchanged rule, NAN-5869).
+///
+/// A field reference: `field=`, `field!=`, `field CONTAINS|IN|NOT|LIKE`, or a
+/// name in a `by` / `fields(...)` list. The name must start a reference: `\b`
+/// alone also matched the LAST segment of an OCSF path (`traffic.bytes_out >`,
+/// `email.subject!=`), so OCSF rules reported UDM names they never use. Nor
+/// may it be the FIRST segment of one (`by user.name`), and a `by` /
+/// `fields(...)` list ends at the next `|` or `)`.
+fn udm_field_patterns() -> &'static [(&'static str, Regex)] {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        let start = r"(?:^|[^.\w])";
+        let end = r"(?:$|[^.\w])";
+        UDM_FIELDS
+            .iter()
+            .map(|field| {
+                let f = regex::escape(field);
+                let pattern = format!(
+                    r"(?i){start}{f}\s*[=!<>]|{start}{f}\s+(?:CONTAINS|IN|NOT|LIKE)|\bby\s+(?:[^|)]*{start})?{f}{end}|fields\s*\((?:[^|)]*{start})?{f}{end}"
+                );
+                (*field, Regex::new(&pattern).expect("UDM field pattern compiles"))
+            })
+            .collect()
+    })
+}
+
 /// Extract UDM field names referenced in the query
 pub fn extract_required_fields(query: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static QUOTED: OnceLock<Regex> = OnceLock::new();
     let mut fields = Vec::new();
 
-    // Common UDM fields to look for
-    let udm_fields = [
-        // Core identifiers
-        "event_type",
-        "action", // legacy synonym for event_type
-        "status",
-        "result",
-        // Network
-        "src_ip",
-        "dest_ip",
-        "src_port",
-        "dest_port",
-        "src_host",
-        "dest_host",
-        "protocol",
-        "bytes_in",
-        "bytes_out",
-        "packets_in",
-        "packets_out",
-        "url",
-        "url_domain",
-        "url_path",
-        "url_query",
-        // Process
-        "process_name",
-        "process_path",
-        "process_hash",
-        "process_id",
-        "process_guid",
-        "command_line",
-        "parent_command_line",
-        "parent_process_path",
-        "parent_process_id",
-        // File
-        "file_path",
-        "file_name",
-        "file_hash",
-        "file_size",
-        "file_action",
-        // User/Auth
-        "user",
-        "user_id",
-        "user_domain",
-        "user_type",
-        "target_user",
-        "target_user_id",
-        "target_user_domain",
-        "auth_type",
-        "auth_result",
-        "logon_type",
-        // DNS
-        "query",
-        "query_type",
-        "answer",
-        "answer_type",
-        // Registry (Windows)
-        "registry_key",
-        "registry_value",
-        "registry_data",
-        // Enrichment fields
-        "enriched_src_country",
-        "enriched_dest_country",
-        "enriched_src_asn",
-        "enriched_dest_asn",
-        "enriched_src_city",
-        "enriched_dest_city",
-        // Prevalence fields
-        "prevalence_file_hash",
-        "prevalence_process_hash",
-        "prevalence_dest_domain",
-        "prevalence_dest_ip",
-        "prevalence_min",
-        // Email
-        "subject",
-        "sender",
-        "recipient",
-        "attachment_name",
-        "attachment_hash",
-        // Cloud
-        "cloud_provider",
-        "cloud_region",
-        "cloud_account_id",
-        "resource_type",
-        "resource_id",
-        "resource_name",
-        // Generic
-        "user_agent",
-        "http_method",
-        "http_status",
-        "session_id",
-        "transaction_id",
-    ];
+    // Quoted values are data, never field references (`CONTAINS "user=admin"`).
+    let quoted = QUOTED.get_or_init(|| Regex::new(r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#).unwrap());
+    let query_lower = quoted.replace_all(&query.to_lowercase(), "\"\"").into_owned();
 
-    let query_lower = query.to_lowercase();
-
-    for field in udm_fields {
-        // Check if field appears in query (as field reference, not just substring)
-        // Look for: field=, field!=, field CONTAINS, field IN, etc.
-        let patterns = [
-            format!(r"\b{}\s*[=!<>]", regex::escape(field)),
-            format!(r"\b{}\s+(?:CONTAINS|IN|NOT|LIKE)", regex::escape(field)),
-            format!(r"(?:by|BY)\s+.*\b{}\b", regex::escape(field)),
-            format!(r"fields\s*\(.*\b{}\b", regex::escape(field)),
-        ];
-
-        for pattern in &patterns {
-            if let Ok(re) = Regex::new(&format!("(?i){}", pattern)) {
-                if re.is_match(&query_lower) {
-                    if !fields.contains(&field.to_string()) {
-                        fields.push(field.to_string());
-                    }
-                    break;
-                }
-            }
+    for (field, re) in udm_field_patterns() {
+        if re.is_match(&query_lower) && !fields.contains(&field.to_string()) {
+            fields.push(field.to_string());
         }
     }
 
@@ -509,6 +525,40 @@ fn suggest_alternative(missing: &str, available: &[String]) -> Option<(String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocsf_path_suffixes_are_not_udm_fields() {
+        // NAN-5869: `traffic.bytes_out` / `email.subject` reported the UDM
+        // names `bytes_out` / `subject`.
+        let q = r#"class_uid=4002 | where email.subject!="" AND traffic.bytes_out > 5000000
+| stats count by email.subject"#;
+        let fields = extract_required_fields(q);
+        assert!(!fields.contains(&"bytes_out".to_string()), "{fields:?}");
+        assert!(!fields.contains(&"subject".to_string()), "{fields:?}");
+        // UDM references still count, at the start, after an operator, in
+        // `by` lists and `fields(...)`.
+        let udm = extract_required_fields("bytes_out>1 | where (subject=\"x\") | stats count by user, src_ip");
+        for f in ["bytes_out", "subject", "user", "src_ip"] {
+            assert!(udm.contains(&f.to_string()), "{f} missing from {udm:?}");
+        }
+        assert!(extract_required_fields("| table fields(src_ip)").contains(&"src_ip".to_string()));
+        // Nor the FIRST segment of an OCSF path, nor anything quoted, nor a
+        // `by` list running on past its pipe.
+        for q in [
+            "class_uid=3002 | stats count by user.name",
+            "class_uid=4003 | stats count by query.hostname, src_endpoint.ip",
+            "class_uid=4002 | stats dc(x) by url.url_string",
+            "class_uid=3002 | table fields(user.name)",
+            r#"class_uid=1007 | where process.cmd_line CONTAINS "user=admin""#,
+            r#"class_uid=1007 | stats count by device.hostname | where message CONTAINS "subject""#,
+        ] {
+            let got = extract_required_fields(q);
+            for bogus in ["user", "query", "url", "subject"] {
+                assert!(!got.contains(&bogus.to_string()), "{q}: {got:?}");
+            }
+        }
+        assert!(extract_required_fields("stats count by user | head 5").contains(&"user".to_string()));
+    }
 
     #[test]
     fn test_parse_npl_rule() {

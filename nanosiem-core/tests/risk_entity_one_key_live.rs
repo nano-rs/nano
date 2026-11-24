@@ -209,7 +209,7 @@ fn current_entity_sql(source: &RiskFindingsSource, now: DateTime<Utc>) -> (Strin
 /// The resolve line the builder emits inside the `aggregated` CTEs.
 fn resolve_line() -> String {
     format!(
-        "                    -- One type per entity value, by precedence (NAN-5659)\n                    {} as entity_type,\n",
+        "                    {} as entity_type,\n",
         nanosiem_core::risk::clickhouse_sql::ENTITY_TYPE_RESOLVE_SQL
     )
 }

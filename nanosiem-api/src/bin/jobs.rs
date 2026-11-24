@@ -85,6 +85,13 @@ where
 fn main() -> Result<()> {
     // NAN-5214: before anything can negotiate TLS with PostgreSQL.
     nanosiem_core::db::tls_provider::install_default_crypto_provider();
+    // NAN-5771: report the compiled content trust composition and exit.
+    if std::env::args().nth(1).as_deref()
+        == Some(nanosiem_core::content_bundle::contract::PRINT_TRUST_ARGUMENT)
+    {
+        println!("{}", nanosiem_core::content_bundle::contract::trust_label());
+        return Ok(());
+    }
     // NAN-5234: jobs that test parser drafts (AI parser loops) run the VRL in
     // a resource-limited worker of this executable, dispatched before
     // configuration, tracing or pools exist.

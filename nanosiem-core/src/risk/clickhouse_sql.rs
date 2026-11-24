@@ -55,11 +55,14 @@ pub const CLOUD_ACCOUNT_ENTITY_TYPE: &str = "cloud_account";
 // ---------------------------------------------------------------------------
 // SQL fragments
 //
-// These concatenate into the exact statements the repository inlined before
-// the extraction (the entity-list and rule-contribution outputs are
-// byte-identical; the threshold and overview outputs differ only in comment
-// text — asserted token-identical by the sibling tests). Do not "tidy"
-// whitespace: byte-stability is what the equivalence tests pin.
+// These concatenate into the statements the repository inlined before the
+// extraction, minus their SQL comments: the sibling tests assert every output
+// token-identical to the pre-refactor statements (equal after stripping `--`
+// comments and collapsing whitespace).
+//
+// NAN-5818: keep `--` and `/* */` comments out of the SQL text. These
+// fragments are inlined into generated nPL SQL (`dataset=risk`), where the
+// generated-SQL tripwire flags any comment. Explanations go in Rust comments.
 // ---------------------------------------------------------------------------
 
 /// Opens the `signal_scores` CTE. Followed by a per-variant SELECT column
@@ -72,22 +75,24 @@ const CTE_OPEN: &str = r#"
 /// Per-finding decay weight by age bucket.
 /// Binds: `(cutoff_24h_us, decay_0_24h, cutoff_3d_us, decay_1_3d,
 /// cutoff_5d_us, decay_3_5d, cutoff_7d_us, decay_5_7d)` — see
-/// [`decay_factor_binds`].
+/// [`decay_factor_binds`]. Branches in order: 0-24h `decay_0_24h`, 1-3d
+/// `decay_1_3d`, 3-5d `decay_3_5d`, 5-7d `decay_5_7d`; older than 7d is 0.0
+/// (excluded).
 const DECAY_FACTOR_EXPR: &str = r#"                    multiIf(
-                        toUnixTimestamp64Micro(timestamp) >= ? , ?,   -- 0-24h: decay_0_24h
-                        toUnixTimestamp64Micro(timestamp) >= ? , ?,   -- 1-3d:  decay_1_3d
-                        toUnixTimestamp64Micro(timestamp) >= ? , ?,   -- 3-5d:  decay_3_5d
-                        toUnixTimestamp64Micro(timestamp) >= ? , ?,   -- 5-7d:  decay_5_7d
-                        0.0                                           -- >7d:   excluded
+                        toUnixTimestamp64Micro(timestamp) >= ? , ?,
+                        toUnixTimestamp64Micro(timestamp) >= ? , ?,
+                        toUnixTimestamp64Micro(timestamp) >= ? , ?,
+                        toUnixTimestamp64Micro(timestamp) >= ? , ?,
+                        0.0
                     ) as decay_factor
 "#;
 
 /// Extra `signal_scores` SELECT columns for the nPL `dataset=risk` base source
 /// (NAN-1798 P2): the per-finding `rule_id` (feeds `distinct_rules_24h/7d`) and
 /// the finding's MITRE tactic list (feeds `distinct_tactics_24h/7d`). Placed
-/// BEFORE [`ENTITY_SELECT_COLS`] so the trailing decay-factor comment stays
-/// adjacent to its `multiIf`. Tactics ride the finding `metadata` JSON on UDM
-/// (`findings.rs` `to_log_json`) and the stored `unmapped` vendor extension
+/// BEFORE [`ENTITY_SELECT_COLS`] so [`DECAY_FACTOR_EXPR`] stays the last
+/// column ahead of the findings WHERE. Tactics ride the finding `metadata`
+/// JSON on UDM (`findings.rs` `to_log_json`) and the stored `unmapped` vendor extension
 /// under OCSF (`build_ocsf_finding_event`) — see
 /// [`RiskFindingsSource::tactics_col`].
 const DATASET_EXTRA_SELECT_COLS: &str = r#"                    __RULE_ID__ as rule_id,
@@ -166,15 +171,11 @@ pub const ENTITY_TYPE_RESOLVE_SQL: &str = "argMin(row_entity_type, indexOf(['ema
 /// [`ENTITY_TYPE_RESOLVE_SQL`]. (Named apart from the output `entity_type` so
 /// the aggregate alias never shadows the source column.)
 const ENTITY_SELECT_COLS: &str = r#"                    __RISK_ENTITY__ as entity,
-                    -- Per-finding type: the write-side stamp when the finding
-                    -- has one, else inferred from the value (NAN-1806,
-                    -- NAN-5615); resolved to one type per entity below (NAN-5659)
                     multiIf(position(__RISK_ENTITY__, '@') > 0, 'email', __RISK_ENTITY_TYPE__ IN ('ip', 'hostname', 'user', 'hash', 'cloud_account'), __RISK_ENTITY_TYPE__, match(__RISK_ENTITY__, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip', position(__RISK_ENTITY__, '.') > 0, 'hostname', 'user') as row_entity_type,
                     toInt32(__RISK_SCORE__) as risk_score,
                     toUnixTimestamp64Micro(timestamp) as ts_micros,
                     __RULE_NAME__ as rule_name,
                     __SEVERITY__ as severity,
-                    -- Calculate decay factor based on signal age
 "#;
 
 /// `signal_scores` SELECT columns for the overview aggregate (trimmed to what
@@ -196,14 +197,14 @@ const CONTRIB_SELECT_COLS: &str = r#"                    toInt32(__RISK_SCORE__)
 /// Findings WHERE for the entity-grain queries: excludes empty/`unknown`
 /// entities, bounds to the 7d horizon, applies the cleared-entity boundary.
 /// Binds: `(cutoff_7d_us, boundaries_micros[], entities[])`.
+/// The cleared-entity boundary: for a cleared entity keep only post-clear
+/// findings (ts > its boundary); every other entity falls through
+/// `indexOf = 0` -> `arrayElement(_, 0) = 0` -> `ts > 0` (R4).
 const ENTITY_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
                 WHERE source_type = 'findings'
                   AND __RISK_ENTITY__ != ''
                   AND __RISK_ENTITY__ != 'unknown'
                   AND toUnixTimestamp64Micro(timestamp) >= ?
-                  -- Cleared-entity boundary: for a cleared entity keep only
-                  -- post-clear findings (ts > its boundary); everything else
-                  -- falls through indexOf=0 -> arrayElement(_,0)=0 -> ts>0. (R4)
                   AND toUnixTimestamp64Micro(timestamp) > arrayElement(?, indexOf(?, __RISK_ENTITY__))__RISK_SOURCE_SCOPE__
             ),
 "#;
@@ -220,25 +221,25 @@ const CONTRIB_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
 
 /// Entity-grain `aggregated` CTE + row projection.
 /// Binds: `(cutoff_24h_us, cutoff_24h_us, cutoff_24h_us)`.
+///
+/// `entity_type` is one type per entity value, by precedence (NAN-5659).
+/// `risk_score_*` are raw (undecayed) sums, kept for backwards compatibility.
+/// The decayed scores are the primary metric; `round()` (not a truncating
+/// `toInt64`) keeps the headline equal to the per-rule contribution
+/// breakdown, which also rounds (NAN-1658 / R3). `watch_weight` is the
+/// entity value's read-time score weight (0 when none applies), so
+/// `decayed_score_*` are the EFFECTIVE (weighted) scores.
 // NAN-4926: `watch_weight` is wrapped in toFloat64 because a bound
 // sentinel-only weight array (`[0]`) types as Array(UInt8), which the Float64
 // row field rejects ("schema mismatch ... UInt8 as f64").
 const ENTITY_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 SELECT
                     entity,
-                    -- One type per entity value, by precedence (NAN-5659)
                     argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type)) as entity_type,
-                    -- Raw scores (no decay, for backwards compatibility)
                     sumIf(risk_score, ts_micros >= ?) as risk_score_24h,
                     sum(risk_score) as risk_score_7d,
-                    -- Decayed scores (primary metric). round() (not truncating
-                    -- toInt64) so the headline matches the per-rule contribution
-                    -- breakdown, which also rounds (NAN-1658 / R3).
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    -- Read-time score weight for the entity value (0 when none
-                    -- applies); the decayed scores below are the EFFECTIVE
-                    -- (weighted) scores.
                     toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,
@@ -278,22 +279,18 @@ const ENTITY_AGGREGATED_SELECT: &str = r#"            aggregated AS (
 /// shared `max(ts_micros)` to a DateTime64(6) so nPL time comparisons and the
 /// default `ORDER BY last_finding_at DESC` read naturally. No selection tail —
 /// filtering/ordering/limiting belong to the nPL pipeline composed on top.
-/// Binds: `(cutoff_24h_us ×5)`.
+/// Binds: `(cutoff_24h_us ×5)`. The read-time weight makes a weighted entity
+/// cross a notable threshold sooner; `raw_score_*` are the undecayed sums
+/// (parity with `TimeWindowedRiskScore`).
 const DATASET_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 SELECT
                     entity,
-                    -- One type per entity value, by precedence (NAN-5659)
                     argMin(row_entity_type, indexOf(['email', 'cloud_account', 'hash', 'ip', 'hostname', 'user'], row_entity_type)) as entity_type,
-                    -- Decayed scores (primary metric) — the same expressions as
-                    -- decayed_score_24h/7d in ENTITY_AGGREGATED_SELECT (NAN-1658 / R3),
-                    -- weighted by the entity's read-time score weight so a
-                    -- weighted entity crosses a notable threshold sooner.
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_score_7d,
                     toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_score_24h * (1 + watch_weight))) as score_24h,
                     toInt64(round(base_score_7d * (1 + watch_weight))) as score_7d,
-                    -- Raw (undecayed) sums — parity with TimeWindowedRiskScore.
                     sumIf(risk_score, ts_micros >= ?) as raw_score_24h,
                     sum(risk_score) as raw_score_7d,
                     countIf(ts_micros >= ?) as findings_24h,
@@ -359,15 +356,15 @@ const TAIL_TOP_BY_DECAYED_7D: &str = r#"            ORDER BY decayed_score_7d DE
 /// `entity IN` filter — the same matching the old PG reader's
 /// `entity = ANY($1)` performed. Binds: `(entities[], cutoff_7d_us,
 /// boundaries_micros[], entities[])`.
+/// The cleared-entity boundary: for a cleared entity keep only post-clear
+/// findings (ts > its boundary); every other entity falls through
+/// `indexOf = 0` -> `arrayElement(_, 0) = 0` -> `ts > 0` (R4).
 const ENTITY_FINDINGS_WHERE_IN: &str = r#"                FROM __LOGS_TBL__
                 WHERE source_type = 'findings'
                   AND __RISK_ENTITY__ != ''
                   AND __RISK_ENTITY__ != 'unknown'
                   AND __RISK_ENTITY__ IN ?
                   AND toUnixTimestamp64Micro(timestamp) >= ?
-                  -- Cleared-entity boundary: for a cleared entity keep only
-                  -- post-clear findings (ts > its boundary); everything else
-                  -- falls through indexOf=0 -> arrayElement(_,0)=0 -> ts>0. (R4)
                   AND toUnixTimestamp64Micro(timestamp) > arrayElement(?, indexOf(?, __RISK_ENTITY__))__RISK_SOURCE_SCOPE__
             ),
 "#;
@@ -398,14 +395,13 @@ const TAIL_ENTITY_SET: &str = r#"            ORDER BY decayed_score_7d DESC, ent
 /// first DNS label — the same double-match the old PG reader performed with
 /// `lower(entity) = ANY($1) OR lower(split_part(entity, '.', 1)) = ANY($1)`.
 /// Binds: `(cutoff_7d_us, boundaries_micros[], entities[], ids[], ids[])`.
+/// Applies the cleared-entity boundary (R4) as well: the persisted
+/// decayed_score this replaces was zeroed on clear.
 const LATERAL_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
                 WHERE source_type = 'findings'
                   AND __RISK_ENTITY__ != ''
                   AND __RISK_ENTITY__ != 'unknown'
                   AND toUnixTimestamp64Micro(timestamp) >= ?
-                  -- Cleared-entity boundary (R4) — the persisted decayed_score
-                  -- this replaces was zeroed on clear, so the batch honors the
-                  -- same boundary.
                   AND toUnixTimestamp64Micro(timestamp) > arrayElement(?, indexOf(?, __RISK_ENTITY__))
                   AND (
                       lower(__RISK_ENTITY__) IN ?
@@ -421,7 +417,6 @@ const LATERAL_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 SELECT
                     entity,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    -- Read-time score weight, effective score below.
                     toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d
                 FROM signal_scores
@@ -449,14 +444,14 @@ const FACET_AGGREGATED_SELECT: &str = r#"            aggregated AS (
         "#;
 
 /// Overview `aggregated` CTE: per-entity decayed scores and finding counts
-/// for BOTH windows (the band projection picks one, or both).
+/// for BOTH windows (the band projection picks one, or both). The bands
+/// count EFFECTIVE (read-time weighted) scores.
 /// Binds: `(cutoff_24h_us, weights[], entities[], cutoff_24h_us)`.
 const OVERVIEW_AGGREGATED_CTE: &str = r#"            aggregated AS (
                 SELECT
                     entity,
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    -- Read-time score weight: bands count EFFECTIVE scores.
                     toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,

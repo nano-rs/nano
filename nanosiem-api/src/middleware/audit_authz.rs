@@ -176,6 +176,7 @@ mod tests {
 
     fn api_key_auth_context(key_id: Uuid, key_owner: Uuid) -> AuthContext {
         let claims = TokenClaims {
+            sid: None,
             iss: "nanosiem".to_string(),
             aud: "nanosiem-api".to_string(),
             sub: key_owner,

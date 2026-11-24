@@ -11,6 +11,7 @@
 // Reuses the SideDrawer shell + Field helper + dense input/button styling from
 // RepoDrawers.tsx.
 
+import { Term } from '@/components/ui/term';
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -188,7 +189,7 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
         open={open}
         onClose={onClose}
         title="Detection-as-Code push targets"
-        subtitle="Open pull requests in your own repo instead of editing rules in nano"
+        subtitle="AI-tuned rules open pull requests in your repo"
         width={540}
         footer={
           canManage ? (
@@ -224,10 +225,7 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
           <div className="rounded-md border border-border bg-card/30 px-3 py-2 flex items-start gap-2">
             <GitPullRequest className="w-[13px] h-[13px] text-muted-foreground mt-0.5 shrink-0" strokeWidth={1.5} />
             <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-              A <span className="text-foreground/80">push destination</span> for AI-tuned rules —
-              not a rule source. When nano proposes a change it opens a pull request here for your
-              review; Git stays the source of truth. After you merge, your own pipeline redeploys
-              the rule to nano.
+              <Term id="push-target">Push targets</Term> are not a rule source. When nano proposes a rule change, it opens a pull request here for your review. After you merge, your own pipeline deploys the rule.
             </div>
           </div>
 
@@ -242,8 +240,7 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
               </div>
             ) : targets.length === 0 ? (
               <div className="rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] text-muted-foreground">
-                No push targets yet. Add one below to route AI-tuned rules to your repo as pull
-                requests.
+                No push targets yet.
               </div>
             ) : (
               <div className="flex flex-col gap-2">
@@ -318,8 +315,8 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
                   <Switch checked={enabled} onCheckedChange={setEnabled} className="h-4 w-7" />
                   <span className="text-[11px] text-muted-foreground">
                     {enabled
-                      ? 'AI tuning may open pull requests here'
-                      : 'Disabled — no pull requests will be opened'}
+                      ? 'nano may open pull requests here'
+                      : 'Off: no pull requests will be opened'}
                   </span>
                 </div>
               </Field>
@@ -354,11 +351,11 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
                 {editingTarget?.has_token ? (
                   <p className="mt-1 text-[10.5px] text-emerald-500 flex items-center gap-1">
                     <CircleCheck className="w-3 h-3" strokeWidth={2} />
-                    Token configured — enter a new one to replace it.
+                    Token saved. Enter a new one to replace it.
                   </p>
                 ) : (
                   <p className="mt-1 text-[10.5px] text-muted-foreground">
-                    Write-only — stored server-side and never shown again.
+                    Saved on the server and never shown again.
                     {editingId && ' Add a token, then use Test connection on the card above.'}
                   </p>
                 )}
@@ -367,9 +364,8 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
           ) : (
             <div className="border-t border-border pt-4">
               <div className="rounded-md border border-border bg-card/30 px-3 py-2 text-[10.5px] text-muted-foreground leading-relaxed">
-                You have read-only access to push targets. Managing targets requires the
-                <span className="font-mono text-foreground/70"> detection_code_targets:manage </span>
-                permission.
+                Read-only. Managing targets needs
+                <span className="font-mono text-foreground/70"> detection_code_targets:manage</span>.
               </div>
             </div>
           )}
@@ -383,7 +379,7 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
         title="Remove push target"
         description={
           <>
-            AI tuning will stop opening pull requests in{' '}
+            nano will stop opening pull requests in{' '}
             <span className="text-foreground font-medium">{targetPendingDelete?.name}</span>. The
             stored token is deleted. This does not touch any pull requests already open in the repo.
           </>

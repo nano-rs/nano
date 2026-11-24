@@ -21,6 +21,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { PULL_CONFIG_TYPES } from '@/lib/cloud-pull';
 import { CONNECTOR_CREDENTIAL_PROVIDERS } from '@/components/credentials/connector-credentials';
+import { Term } from '@/components/ui/term';
 
 export function CloudPull() {
   useDocumentTitle('Cloud pull');
@@ -39,20 +40,19 @@ export function CloudPull() {
     <LogSourcesPageShell active="cloud-pull" testId="cloud-pull-page">
       <LogSourcesPageHeader
         icon={CloudDownload}
-        title="Cloud pull"
+        title={<Term id="cloud-pull">Cloud pull</Term>}
         meta={<span>AWS S3 · SQS · GCP Pub/Sub · Azure Event Hubs · Kafka</span>}
       />
 
       <div className="px-5 py-4 space-y-4" data-testid="cloud-pull-region">
         <div className="text-[11.5px] text-muted-foreground max-w-[760px] leading-relaxed">
-          Vector reads cloud queues and brokers with credentials you own. A pull source delivers into the
-          log sources its routing rules name; deploy it to start reading.
+          A pull source reads logs from your cloud account with credentials you own. It reads nothing until you deploy it.
         </div>
         {canSources && (
           <SourceConfigsPanel
             types={PULL_CONFIG_TYPES}
             title="Pull sources"
-            description="Queues, subscriptions, hubs and topics Vector reads from. Open one to edit its connection and routing."
+            description="Queues, subscriptions, hubs and topics Vector reads from."
             addLabel="Add cloud pull"
             testId="cloud-pull-sources"
           />

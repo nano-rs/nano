@@ -22,6 +22,7 @@ import { formatUTCCompact } from '@/lib/date-utils';
 import { AllowShrinkField, hasAllowShrink, textConfigFields, withAllowShrink } from '@/components/connector-feeds/AllowShrinkField';
 import { CatalogCard, MetaBadge } from './InventoryCard';
 import { CONNECTOR_FEEDS_KEY, collectorState, isDirectoryCollector, type CollectorPermissions, type CollectorRow } from './useConnectorCollectors';
+import { Term } from '@/components/ui/term';
 
 const sectionLabel = 'font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground';
 const labelCls = 'text-[12px] font-medium';
@@ -206,8 +207,8 @@ export function CollectorCard({ spec, feeds, feedStatus, permissions }: Collecto
         <div className={sectionLabel}>Feeds · {feeds.length}</div>
         <div className="rounded border border-border">{feeds.map(feed => <FeedRow key={feed.id} feed={feed}
           onAdopt={canToggle && !adopt.isPending ? () => setAdoptTarget(feed) : undefined} />)}</div>
-        <p className="font-mono text-[10.5px] text-muted-foreground">{collectorDeliveryLabel({ slug: spec.name, name: spec.display_name })} → HEC → Vector</p>
-        <p className={helpCls}>Stream resets and run history live on <Link to="/ingestion/pull-feeds" className={textAction}>Pull feeds</Link>.</p>
+        <p className="font-mono text-[10.5px] text-muted-foreground">{collectorDeliveryLabel({ slug: spec.name, name: spec.display_name })} → <Term id="hec">HEC</Term> → <Term id="vector">Vector</Term></p>
+        <p className={helpCls}>Stream resets and run history live on <Link to="/ingestion/pull-feeds" className={textAction}><Term nested id="pull-feed">Pull feeds</Term></Link>.</p>
         {(feedStatus.isError || actionError) && <p role="alert" className="text-[11px] text-destructive">{actionError ?? 'Could not load feed status'}</p>}
       </div>
     </DetailSheet>
@@ -304,7 +305,7 @@ export function CollectorCard({ spec, feeds, feedStatus, permissions }: Collecto
     </Dialog>
     <ConfirmDialog open={!!adoptTarget} onOpenChange={open => { if (!open && !adopt.isPending) setAdoptTarget(null); }}
       title="Adopt connector spec update"
-      description={<>Move <span className="text-foreground font-medium">{adoptTarget?.name}</span> to the connector spec bundled with this build.
+      description={<>Move <span className="text-foreground font-medium">{adoptTarget?.name}</span> to the <Term id="connector-spec">connector spec</Term> bundled with this build.
         Its stream cursors are reset, so the next run starts fresh (an identity feed runs a full, shrink-guarded directory sync).</>}
       confirmLabel="Adopt" loading={adopt.isPending} onConfirm={() => { if (adoptTarget) adopt.mutate(adoptTarget); }} />
     <ConfirmDialog open={remove} onOpenChange={setRemove} title={`Uninstall ${spec.display_name}?`}

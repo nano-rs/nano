@@ -7,6 +7,7 @@
 // Logic lifted from the deleted ImportRuleModal / UpstreamDiffModal; chrome is
 // the redesign tab+drawer pattern, not Sheet/Dialog.
 
+import { Term } from '@/components/ui/term';
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import * as Diff from 'diff';
@@ -20,7 +21,6 @@ import {
   Download,
   ExternalLink,
   GitCommit,
-  HelpCircle,
   Info,
   Minus,
   Plus,
@@ -29,6 +29,7 @@ import {
   Lightbulb,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { api } from '@/lib/api';
@@ -173,8 +174,7 @@ export function RepoPreview({
           </div>
           <div className="text-[13px] font-medium text-foreground mb-1">Select a rule</div>
           <div className="text-[11.5px] text-muted-foreground max-w-[240px] leading-relaxed">
-            Click any rule to preview the YAML, diff, and import options. Bulk-select with the
-            checkboxes to import many at once.
+            Pick a rule to preview, or bulk-select to import.
           </div>
         </div>
       </div>
@@ -291,7 +291,7 @@ export function RepoPreview({
             >
               {t.label}
               {t.id === 'diff' && rule.status === 'DRIFT' && (
-                <span className="ml-1 font-mono text-[9.5px] text-destructive">DRIFT</span>
+                <span className="ml-1 font-mono text-[9.5px] text-destructive"><Term id="rule-drift" nested>DRIFT</Term></span>
               )}
             </button>
           ))}
@@ -350,7 +350,7 @@ export function RepoPreview({
         {isAvailable && preview?.already_imported && (
           <div className="flex-1 flex items-center gap-1.5 text-[10.5px] text-warning">
             <AlertTriangle className="w-[11px] h-[11px]" strokeWidth={2} />
-            Already imported — re-importing creates a fork
+            Already imported. Importing again makes a separate copy.
           </div>
         )}
         {isAvailable && !preview?.already_imported && (mergeMode ? mergedSourceType : !allMapped) && (
@@ -358,7 +358,7 @@ export function RepoPreview({
             {!allMapped ? (
               <>
                 <AlertTriangle className="w-[11px] h-[11px]" strokeWidth={2} />
-                Map missing source types in Source mapping
+                Map the missing source types in <Term id="source-mapping">Source mapping</Term>
               </>
             ) : (
               <>
@@ -460,7 +460,7 @@ function OverviewTab({
             {preview.existing_import_type
               ? ` as a ${preview.existing_import_type} import`
               : ''}
-            . Re-importing creates a fork — your existing copy is left alone.
+            . Re-importing creates a fork; your copy is kept.
           </div>
         </div>
       )}
@@ -582,8 +582,7 @@ function OverviewTab({
             Source coverage unavailable
           </div>
           <div className="text-[10.5px] text-foreground/70 leading-relaxed">
-            Your role cannot inspect the source inventory, so coverage was not evaluated.
-            This does not mean that no matching sources are ingesting.
+            Your role can't read the source inventory, so coverage wasn't checked; matching sources may still be ingesting.
           </div>
           <div className="text-[10px] text-muted-foreground mt-1">
             {inventoryAccess.reason}
@@ -595,13 +594,10 @@ function OverviewTab({
         <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2.5">
           <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-warning mb-1">
             <AlertTriangle className="w-[12px] h-[12px]" strokeWidth={2} />
-            No OCSF variant available
+            No <Term id="ocsf">OCSF</Term> version available
           </div>
           <div className="text-[10.5px] text-foreground/70 leading-relaxed">
-            This rule was synced from the repository's UDM tree because no OCSF
-            counterpart exists yet. Its field names target the UDM schema and it
-            will not match OCSF events as-is — review and adapt the query before
-            importing.
+            This rule was written for the older UDM log format. It won't match OCSF events until you update its query.
           </div>
         </div>
       )}
@@ -627,7 +623,7 @@ function OverviewTab({
             ))}
           </div>
           <div className="text-[10px] text-muted-foreground mt-1.5 leading-relaxed">
-            Use the Source mapping tab to remap or merge them onto a source type you do have.
+            Remap them in the Source mapping tab.
           </div>
         </div>
       )}
@@ -636,20 +632,9 @@ function OverviewTab({
         <div>
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 flex items-center gap-1">
             Query
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className="text-muted-foreground/70 hover:text-foreground"
-                  aria-label="What is this?"
-                >
-                  <HelpCircle className="w-3 h-3" strokeWidth={1.5} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                The rule body that will run when scheduled. Review before importing.
-              </TooltipContent>
-            </Tooltip>
+            <InfoTip label="About the query" variant="inline">
+              The search this rule runs on its schedule. Read it before you import.
+            </InfoTip>
           </div>
           <pre className="rounded-md border border-border bg-card px-2.5 py-2 text-[11px] font-mono leading-relaxed text-foreground/80 whitespace-pre-wrap break-words">
             {preview.proposed_query}
@@ -673,12 +658,9 @@ function OverviewTab({
 
       {rule.status === 'DELETED' && (
         <div className="rounded-md border border-border bg-foreground/[0.03] px-3 py-2.5">
-          <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-foreground/70 mb-1">
+          <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-foreground/70">
             <X className="w-[12px] h-[12px]" strokeWidth={2} />
             Removed upstream
-          </div>
-          <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-            This rule is no longer present in the upstream repository.
           </div>
         </div>
       )}
@@ -875,7 +857,7 @@ function SourceMappingTab({
           </div>
           {missing.length === 0 ? (
             <div className="text-[11px] text-muted-foreground italic">
-              All required source types are available — no remapping needed.
+              Every source type this rule needs is available, so no remapping is needed.
             </div>
           ) : (
             <div className="flex flex-col gap-1.5">
@@ -1147,7 +1129,7 @@ function DiffViewer({ oldText, newText }: { oldText: string; newText: string }) 
     return (
       <div className="rounded-md border border-border bg-card/30 px-3 py-3 text-center text-[11px] text-muted-foreground flex items-center justify-center gap-1.5">
         <Check className="w-[12px] h-[12px] text-success" strokeWidth={2} />
-        No differences — queries are identical
+        No differences: the queries are identical
       </div>
     );
   }

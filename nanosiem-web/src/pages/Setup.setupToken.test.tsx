@@ -57,7 +57,7 @@ describe('Setup page setup token', () => {
     renderSetup();
     const token = await screen.findByLabelText('Setup token');
     expect(token.getAttribute('type')).toBe('password');
-    expect(screen.getByText(/Printed by the installer/)).toBeTruthy();
+    expect(screen.getByText(/The installer printed this/)).toBeTruthy();
 
     fillAccount();
     fireEvent.change(token, { target: { value: '  abc123token  ' } });

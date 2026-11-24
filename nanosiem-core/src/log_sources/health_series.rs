@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::types::LogSource;
 use crate::auth::ScopeSet;
-use crate::search::service::source_scope_sql_predicate;
+use crate::search::service::{bind_source_scope, source_scope_bound_predicate};
 
 /// Same-hour look-back days the baseline draws from.
 pub const BASELINE_DAYS: i64 = 7;
@@ -282,13 +282,19 @@ pub struct HourlyCount {
 /// the rollup stores them), else its safe name. Same rule as
 /// [`super::connect::claimed_route_keys`], per source.
 pub fn source_route_keys(source: &LogSource) -> Vec<String> {
-    let mut keys: Vec<String> = match source.match_values.as_deref() {
+    route_keys_for(source.match_values.as_deref(), &source.name)
+}
+
+/// [`source_route_keys`] from a source's identity alone, for callers that only
+/// hold `(match_values, name)` (a deleted source's tombstone, NAN-5760).
+pub fn route_keys_for(match_values: Option<&[String]>, name: &str) -> Vec<String> {
+    let mut keys: Vec<String> = match match_values {
         Some(values) if !values.is_empty() => values
             .iter()
             .map(|v| v.trim().to_lowercase())
             .filter(|v| !v.is_empty())
             .collect(),
-        _ => vec![crate::vector_naming::safe_name(&source.name)],
+        _ => vec![crate::vector_naming::safe_name(name)],
     };
     keys.sort();
     keys.dedup();
@@ -427,7 +433,8 @@ pub fn hourly_sql(rollup_table: &str, profile: &str, hours: i64, scope: &ScopeSe
         .collect::<Vec<_>>()
         .join(", ");
     let scope_sql = if scope.is_restricted() {
-        let predicate = source_scope_sql_predicate("scope_source_type", scope.deny_set())
+        // NAN-5793: bound; `read` binds `scope.deny_set()`.
+        let predicate = source_scope_bound_predicate("scope_source_type", scope.deny_set())
             .expect("a restricted ScopeSet always renders a predicate");
         format!(" AND scope_source_type_complete = 1 AND {predicate}")
     } else {
@@ -516,7 +523,9 @@ impl HealthSeriesReader {
             scope,
             keys,
         );
-        let mut cursor = self.ch.query(&sql).fetch_bytes("JSONEachRow").map_err(|e| e.to_string())?;
+        let mut cursor = bind_source_scope(self.ch.query(&sql), scope.deny_set())
+            .fetch_bytes("JSONEachRow")
+            .map_err(|e| e.to_string())?;
         let mut body = Vec::new();
         while let Some(chunk) = cursor.next().await.map_err(|e| e.to_string())? {
             body.extend_from_slice(&chunk);

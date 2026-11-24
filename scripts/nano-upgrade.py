@@ -1073,6 +1073,16 @@ CLICKHOUSE_CONFIG_DIRS_SCRIPT = "scripts/lib/clickhouse_config_dirs.py"
 # and the installer-managed block of .env it writes the defaults into.
 RESOURCE_SIZING_SCRIPT = "scripts/lib/resource-sizing.sh"
 SIZING_BLOCK_BEGIN = "# BEGIN NANO AUTO SIZING"
+# NAN-5822: per-service PostgreSQL pools, sized from the PostgreSQL limit the
+# install actually runs. An upgrade fills them from the installed
+# POSTGRES_MEM_LIMIT (install.sh's second, override pass), never from a fresh
+# host sizing whose PostgreSQL budget the install does not have.
+PG_POOL_SIZING_KEYS = (
+    "NANO_API_PG_MAX_CONNECTIONS",
+    "NANO_JOBS_PG_MAX_CONNECTIONS",
+    "NANO_SEARCH_PG_MAX_CONNECTIONS",
+    "NANO_CONNECTOR_PG_MAX_CONNECTIONS",
+)
 SIZING_BLOCK_END = "# END NANO AUTO SIZING"
 SIZING_DIR_DEFAULT = ".nano-generated/sizing"
 
@@ -3232,12 +3242,16 @@ class LocalOps:
             if capacity.isdigit():
                 extra = ["--vector-data-capacity-bytes", capacity]
         environment["NANO_VECTOR_DATA_STORAGE_MODE"] = storage_mode
-        # install.sh pass 1: the block defaults (no .env overrides).
-        defaults, _ = self._run_sizing(extra, environment)
+        # install.sh pass 1: the block defaults, with the operator's own lines
+        # (outside the block) as overrides, exactly as install.sh runs it.
+        defaults, _ = self._run_sizing([*extra, "--operator-env", str(env_path)], environment)
         missing = {key: value for key, value in defaults.items() if key not in assigned}
         if not missing:
             return {}
-        merged = add_keys_to_managed_block(lines, SIZING_BLOCK_BEGIN, SIZING_BLOCK_END, missing)
+        # The pools are re-derived by pass 2 from the installed limits, so
+        # they stay out of the overrides it reads.
+        staged_keys = {key: value for key, value in missing.items() if key not in PG_POOL_SIZING_KEYS}
+        merged = add_keys_to_managed_block(lines, SIZING_BLOCK_BEGIN, SIZING_BLOCK_END, staged_keys)
         if merged is None:
             return {}
         generated = self.install_dir / ".nano-generated"
@@ -3249,11 +3263,31 @@ class LocalOps:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(merged) + "\n")
             # install.sh pass 2: the merged .env as overrides renders the XML.
-            _, rendered = self._run_sizing([
-                *extra, "--override-env", str(staged_env),
+            # NAN-5822: the PostgreSQL limit and shared_buffers the install
+            # runs (block or operator line) are passed as explicit overrides,
+            # so the pools are re-derived for them; block keys alone never
+            # count as overrides.
+            installed_pg = [
+                f"{key}={self.env[key].strip()}"
+                for key in ("POSTGRES_MEM_LIMIT", "POSTGRES_SHARED_BUFFERS")
+                if self.env.get(key, "").strip()
+            ]
+            pg_overrides = [arg for pair in installed_pg for arg in ("--override", pair)]
+            rendered_values, rendered = self._run_sizing([
+                *extra, "--override-env", str(staged_env), *pg_overrides,
                 "--server-output", str(stage / "clickhouse-config.xml"),
                 "--users-output", str(stage / "clickhouse-users.xml"),
             ], environment)
+            for key in PG_POOL_SIZING_KEYS:
+                if key in missing and key in rendered_values:
+                    missing[key] = rendered_values[key]
+            if any(key in missing and missing[key] != defaults.get(key) for key in PG_POOL_SIZING_KEYS):
+                eprint(
+                    "note: sized this install's PostgreSQL connection pools for its PostgreSQL limit "
+                    f"(POSTGRES_MEM_LIMIT={self.env.get('POSTGRES_MEM_LIMIT', '?')}), which is below what "
+                    "a fresh install on this host gets. Re-run install.sh on this host to resize "
+                    "PostgreSQL and the pools together (NAN-5822)."
+                )
             # The rendered files first, then .env: a crash in between leaves
             # the keys missing, so a resumed prepare renders both again.
             # install.sh always renders into .nano-generated/sizing.
@@ -10173,11 +10207,33 @@ def validate_manifest_ledgers(
     return checks
 
 
+def bundle_url_template() -> str:
+    """NAN-5812: there is no public bundle host, so `--version` downloads only
+    from a mirror the operator configured in NANO_BUNDLE_URL_TEMPLATE."""
+    return os.environ.get("NANO_BUNDLE_URL_TEMPLATE", "").strip()
+
+
+def missing_bundle_source_error(version: str) -> UpgradeError:
+    return UpgradeError(
+        f"--version {version} needs NANO_BUNDLE_URL_TEMPLATE (a mirror URL with {{version}} and "
+        "{edition}); nano publishes no download host for release bundles. Get the bundle and pass "
+        "it with --bundle instead. Self-run (enterprise): download "
+        f"nano-compose-enterprise-{version}.tar.gz with its .sha256 and .sha256.sig from your "
+        "deployment's page in app.nano.rs or with your license values "
+        "(https://nano.rs/docs/getting-started/install-compose/); air-gapped installs use the "
+        "offline image bundle (https://nano.rs/docs/getting-started/air-gapped/). Open: upgrade "
+        "with the get.nano.rs installer or a git checkout of the release tag of "
+        "https://github.com/nano-rs/nano"
+    )
+
+
 def bundle_for_version(args: argparse.Namespace, ops: LocalOps, runner: Runner) -> tuple[pathlib.Path, tempfile.TemporaryDirectory[str] | None]:
     if args.bundle:
         return pathlib.Path(args.bundle).expanduser().resolve(), None
     version = canonical_version(args.version)
-    template = os.environ.get("NANO_BUNDLE_URL_TEMPLATE", "https://releases.nano.rs/nano-{version}-{edition}.tar")
+    template = bundle_url_template()
+    if not template:
+        raise missing_bundle_source_error(version)
     if set(re.findall(r"{([^{}]+)}", template)) - {"version", "edition"}:
         raise UpgradeError("NANO_BUNDLE_URL_TEMPLATE contains an unsupported placeholder")
     url = template.format(version=version, edition=ops.edition)
@@ -12384,6 +12440,9 @@ def main() -> int:
             raise UpgradeError("--abandon-reason requires --abandon-incomplete")
         if not (args.bundle or args.version or args.resume):
             raise UpgradeError("upgrade requires --bundle, --version, or --resume")
+        if args.version and not bundle_url_template():
+            # NAN-5812: refuse before any journal, lock or host work.
+            raise missing_bundle_source_error(args.version)
         if args.timeout < 1:
             raise UpgradeError("--timeout must be positive")
         if args.allow_siem_health_regression is not None:

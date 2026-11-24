@@ -238,7 +238,7 @@ fn http_ingest_redaction_unchanged() {
         for ct in ["text/plain", "application/json", "application/x-ndjson", ""] {
             let event = json!({
                 "message": body, "Content-Type": ct, "source_type": "unknown",
-                "request_path": "/", "client_ip": "192.0.2.1", "auth_status": "authenticated"
+                "request_path": "/", "auth_status": "authenticated"
             });
             let meta = json!({"nano_ingest_client_ip": "192.0.2.1", "nano_ingest_peer": "192.0.2.1"});
             let a = run(&parse, &event, &meta).unwrap();

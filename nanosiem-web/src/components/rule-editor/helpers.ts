@@ -139,3 +139,59 @@ export function folderKind(name: string): FolderKind {
   if (v === 'cloud') return 'cloud';
   return 'folder';
 }
+
+// NAN-5773: the rule rail's Active / Archived tabs. Deleting a rule archives
+// it (NAN-5672) and the editor loads archived rules too, so every rail count
+// goes through this rather than `rules.length`.
+export type RailTab = 'active' | 'archived';
+
+export function inRailTab(rule: Pick<DetectionRule, 'archived'>, tab: RailTab): boolean {
+  return Boolean(rule.archived) === (tab === 'archived');
+}
+
+// The footer's rule total: the rules the selected tab lists (before the name
+// filter), never the archived + active union.
+export function railTabTotal(rules: ReadonlyArray<Pick<DetectionRule, 'archived'>>, tab: RailTab): number {
+  return rules.filter((rule) => inRailTab(rule, tab)).length;
+}
+
+// NAN-5773: the folders active (non-archived) rules use, as `folderOf` names
+// them. A folder only deleted rules use is not listed or treated as existing.
+export function activeFolderNames(rules: ReadonlyArray<Pick<DetectionRule, 'archived' | 'folder'>>): string[] {
+  return rules.filter((rule) => inRailTab(rule, 'active')).map((rule) => folderOf(rule));
+}
+
+/** One UTC calendar day of rule activity for the Impact & baseline card. */
+export interface DailyBucket {
+  /** `YYYY-MM-DD` (UTC). */
+  date: string;
+  count: number;
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * NAN-5842: `/api/rules/stats` returns only the days a rule fired (sparse,
+ * keyed by UTC date). Build `days` contiguous, zero-filled UTC buckets ending
+ * on `now`'s UTC day, so "last 7d" means the last seven calendar days rather
+ * than the last seven days that happened to have matches, and a single match
+ * still draws a line (a spike) instead of a lone, clipped point.
+ */
+export function dailyBuckets(
+  stats: ReadonlyArray<{ date: string; match_count?: number | null }> | undefined,
+  days: number,
+  now: Date = new Date(),
+): DailyBucket[] {
+  const byDate = new Map<string, number>();
+  for (const s of stats ?? []) {
+    const key = String(s.date).slice(0, 10);
+    byDate.set(key, (byDate.get(key) ?? 0) + (s.match_count || 0));
+  }
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const out: DailyBucket[] = [];
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const date = new Date(today - i * DAY_MS).toISOString().slice(0, 10);
+    out.push({ date, count: byDate.get(date) ?? 0 });
+  }
+  return out;
+}

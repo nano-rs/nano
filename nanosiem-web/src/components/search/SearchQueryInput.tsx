@@ -7,6 +7,7 @@ import { formatRelativeCompact } from '@/lib/date-utils';
 import { SearchQueryEditor, type SearchQueryEditorRef } from '@/components/editor';
 import type { EditorView } from '@codemirror/view';
 import { setAutocompleteTimeRange } from '@/lib/query-autocomplete';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 
 interface SavedSearchSuggestion {
@@ -315,7 +316,9 @@ export function SearchQueryInput({
         {aiMode && (
           <div className="absolute -top-[9px] left-3 pointer-events-none inline-flex items-center gap-1 px-1.5 py-[2px] rounded-[4px] text-[9px] font-mono font-semibold tracking-[0.1em] uppercase bg-card text-ai border border-ai-border z-10">
             <span aria-hidden className="text-[11px] leading-none font-normal -mt-px">+</span>
-            Natural language
+            <EnterpriseTerm id="natural-language-search" className="pointer-events-auto">
+              Natural language
+            </EnterpriseTerm>
           </div>
         )}
       {/* History suggestions dropdown — shadcn redesign (NAN-374).
@@ -508,8 +511,7 @@ export function SearchQueryInput({
         <div className="flex items-start gap-1.5 px-1 text-[11px] text-muted-foreground">
           <Info className="h-3 w-3 flex-shrink-0 mt-px text-brand" />
           <span>
-            <span className="text-foreground font-medium">Retro hunt</span> scans every event in the selected time range.
-            Keep the window tight (a few days) for fast results — very wide ranges may time out.
+            <span className="text-foreground font-medium">Retro hunt</span> scans every event in range. Keep it to a few days; wide ranges may time out.
           </span>
         </div>
       </div>

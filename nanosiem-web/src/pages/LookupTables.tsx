@@ -5,6 +5,7 @@
 // the pre-redesign 3-col card grid with a dense-table list + scope filters
 // + sort buttons + search-as-you-type.
 
+import { Term } from '@/components/ui/term';
 import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -131,7 +132,7 @@ export function LookupTables() {
       <div className="shrink-0 px-6 pt-6 pb-3 flex items-end gap-3 flex-wrap">
         <div className="min-w-0">
           <h1 className="text-[20px] font-semibold tracking-[-0.015em] text-foreground">
-            Lookup tables
+            <Term id="lookup-table">Lookup tables</Term>
           </h1>
           <p className="text-[11.5px] text-muted-foreground mt-0.5">
             <span className="font-mono tabular-nums">{all.length.toLocaleString()}</span>{' '}
@@ -258,7 +259,7 @@ export function LookupTables() {
         description={
           <>
             Permanently delete <span className="font-mono">{tableToDelete?.name}</span>? All rows
-            and ingestion config are removed; rules referencing it will fail until rewired.
+            and its import settings are removed, and rules that use it will fail until you point them at another table.
           </>
         }
         confirmLabel="Delete"

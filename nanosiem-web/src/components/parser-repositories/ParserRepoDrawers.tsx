@@ -11,7 +11,6 @@
 import {
   CircleAlert,
   CircleCheck,
-  Clock,
   GitCommit,
   RefreshCw,
   X,
@@ -190,19 +189,9 @@ export function SyncHistoryDrawer({
         ) : (
           <div className="rounded-md border border-border bg-card px-3 py-2.5 flex items-center gap-2 text-[11px] text-muted-foreground">
             <CircleAlert className="w-[12px] h-[12px]" strokeWidth={1.5} />
-            This repository hasn't been synced yet. Click <span className="font-mono">Sync now</span> to
-            kick off the first pull.
+            Not synced yet. Click <span className="font-mono">Sync now</span>.
           </div>
         )}
-
-        <div className="mt-4 rounded-md border border-border bg-card px-3 py-2.5 text-[10.5px] text-muted-foreground leading-relaxed">
-          <div className="flex items-center gap-1.5 text-foreground/80 font-medium mb-1">
-            <Clock className="w-[12px] h-[12px]" strokeWidth={1.5} />
-            History coming soon
-          </div>
-          Per-sync history (every pull, with diff counts and errors) will land alongside the backend
-          sync-events table. For now this drawer surfaces the most recent sync only.
-        </div>
       </div>
     </SideDrawer>
   );

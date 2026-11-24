@@ -85,7 +85,7 @@ export function LateralTopStrip({
             background: 'oklch(76% 0.15 60 / 0.1)',
             color: 'oklch(80% 0.15 60)',
           }}
-          title={`Graph pruned to keep the renderer fast. Seed and critical-path nodes always preserved; other nodes ranked by band, role, then event count.`}
+          title="Some nodes are hidden to keep the graph fast. The starting node and the main path always stay."
         >
           <span className="text-[inherit]/70">truncated</span>
           <span className="font-mono">

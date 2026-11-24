@@ -25,6 +25,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import type { LookupAllowlistSettings } from '@/lib/api/lookup-url-allowlist';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { Term } from '@/components/ui/term';
 
 interface Row {
   host: string;
@@ -111,10 +112,10 @@ export function LookupUrls() {
     <div className="h-full flex flex-col min-h-0">
       {/* Title + meta row (breadcrumb comes from the global Settings TopBar) */}
       <div className="shrink-0 px-6 pt-5 pb-3 border-b border-border">
-        <h1 className="text-[18px] font-semibold tracking-tight text-foreground">Lookup URLs</h1>
+        <h1 className="text-[18px] font-semibold tracking-tight text-foreground"><Term id="lookup-url-allowlist">Lookup URLs</Term></h1>
         <p className="text-[11.5px] text-muted-foreground mt-0.5">
-          Hosts that <span className="font-mono">inputlookup url=…</span> may fetch from. Each entry also allows its
-          subdomains.
+          Web hosts a search may download a lookup table from with{' '}
+          <span className="font-mono">inputlookup url=…</span>. Each host also allows its subdomains.
         </p>
         {settings && (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 font-mono text-[10.5px] text-muted-foreground">
@@ -138,14 +139,14 @@ export function LookupUrls() {
       <div className="flex-1 overflow-y-auto scrollbar-thin px-6 py-4 space-y-3 max-w-[880px]">
         {settings?.mode === 'any_public_host' && (
           <div className="border border-border rounded-md px-3 py-2 text-[11.5px] text-muted-foreground">
-            No hosts are listed, so lookups may reach any public host (internal and private addresses stay blocked).
-            Adding the first host restricts lookups to the listed hosts.
+            No hosts listed, so lookups may reach any public host. Internal and private addresses stay blocked.
+            Add a host to allow only the hosts on the list.
           </div>
         )}
         {settings?.locked && (
           <div className="border border-amber-500/40 rounded-md px-3 py-2 text-[11.5px] text-muted-foreground">
-            The deployment sets <span className="font-mono">INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED</span>, so only the
-            deployment list applies and this list is read-only.
+            This list is read-only. The install settings lock it (
+            <span className="font-mono">INPUTLOOKUP_ALLOWED_DOMAINS_LOCKED</span>), so only the hosts set at install apply.
           </div>
         )}
 
@@ -213,9 +214,8 @@ export function LookupUrls() {
         </div>
 
         <p className="text-[11px] text-muted-foreground">
-          Every change and every fetch is recorded in the{' '}
-          <Link to="/settings/audit" className="text-primary hover:underline">audit log</Link> with the host only, never
-          the path or query.
+          Changes and fetches go to the{' '}
+          <Link to="/settings/audit" className="text-primary hover:underline"><Term id="audit-log" nested>audit log</Term></Link>, host only.
         </p>
       </div>
 

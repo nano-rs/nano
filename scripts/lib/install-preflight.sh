@@ -147,19 +147,74 @@ nano_port_listener() {
     fi
     if command -v lsof >/dev/null 2>&1; then
         # Columns: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME (LISTEN).
+        # NAN-5799: only a NAME of <addr>:PORT is a listener. BusyBox lsof
+        # (Alpine, the docker:dind image) ignores -i/-s and lists every open
+        # file as "PID EXE FD PATH"; reading those rows as listeners made
+        # every published port look taken (by "docker-init").
         while read -r local_addr process; do
             nano_port_addr_clashes "${local_addr%:*}" "$host_ip" || continue
             found="$process"
             break
-        done < <(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $9, $1 " (pid " $2 ")" }')
+        # Real lsof always starts with its COMMAND header and prints
+        # "TCP <addr>:PORT (LISTEN)" in $8..$10; BusyBox output has no header,
+        # so it is dropped at line 1 (a spaced path could end in ":PORT").
+        done < <(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
+            | awk -v port="$port" 'NR == 1 { if ($1 != "COMMAND") exit; next }
+                NF >= 10 && $2 ~ /^[0-9]+$/ && $8 == "TCP" && $9 ~ (":" port "$") && $10 == "(LISTEN)" { print $9, $1 " (pid " $2 ")" }')
         if [[ -n "$found" ]]; then
             printf '%s\n' "$found"
             return 0
         fi
     fi
-    if (exec 3<>"/dev/tcp/$([[ "$host_ip" == "*" ]] && printf 127.0.0.1 || printf '%s' "$host_ip")/$port") 2>/dev/null; then
+    # NAN-5799: Linux without ss (Alpine/BusyBox) or a plain-user lsof that
+    # cannot see root's listeners: the kernel's own socket tables list every
+    # listener, every user, IPv4 and IPv6, and are readable without root.
+    found=$(nano_proc_net_listener "$port" "$host_ip")
+    if [[ -n "$found" ]]; then
         printf '%s\n' "$unnamed"
+        return 0
     fi
+    local probe probes=()
+    if [[ "$host_ip" == "*" ]]; then
+        probes=(127.0.0.1 ::1)
+    else
+        probe=${host_ip#[}; probes=("${probe%]}")
+    fi
+    for probe in "${probes[@]}"; do
+        if (exec 3<>"/dev/tcp/$probe/$port") 2>/dev/null; then
+            printf '%s\n' "$unnamed"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Prints the local address of the first TCP listener on PORT in
+# /proc/net/tcp{,6} (NANO_PROC_NET_DIR in tests) that clashes with HOST_IP;
+# nothing when there is none or the tables are not there (macOS).
+nano_proc_net_listener() {
+    local port="$1" host_ip="${2:-*}" dir="${NANO_PROC_NET_DIR:-/proc/net}" addr table tables=()
+    for table in "$dir/tcp" "$dir/tcp6"; do
+        [[ -r "$table" ]] && tables+=("$table")
+    done
+    (( ${#tables[@]} )) || return 0
+    while read -r addr; do
+        nano_port_addr_clashes "$addr" "$host_ip" || continue
+        printf '%s\n' "$addr"
+        return 0
+    done < <(awk -v port="$port" '
+        function hex(s,   i, n) { n = 0; s = toupper(s)
+            for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789ABCDEF", substr(s, i, 1)) - 1
+            return n }
+        # st 0A = LISTEN; local_address is HEXADDR:HEXPORT, IPv4 bytes reversed.
+        FNR > 1 && $4 == "0A" { split($2, a, ":"); if (hex(a[2]) != port) next
+            h = a[1]
+            if (length(h) == 8) { print hex(substr(h, 7, 2)) "." hex(substr(h, 5, 2)) "." hex(substr(h, 3, 2)) "." hex(substr(h, 1, 2)); next }
+            if (h == "00000000000000000000000000000000") print "[::]"
+            else if (h == "00000000000000000000000001000000") print "[::1]"
+            else if (substr(h, 1, 24) == "0000000000000000FFFF0000") print hex(substr(h, 31, 2)) "." hex(substr(h, 29, 2)) "." hex(substr(h, 27, 2)) "." hex(substr(h, 25, 2))
+            else print "[" h "]"
+        }' "${tables[@]}" 2>/dev/null)
     return 0
 }
 

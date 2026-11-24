@@ -14,6 +14,7 @@ import { Check, AlertTriangle, ShieldQuestion } from 'lucide-react';
 import { Textarea } from '@/components/ui/textarea';
 import { Checkbox } from '@/components/ui/checkbox';
 import type { OcsfAttestationStatus, OcsfGateRequest, OcsfValidationResult } from '@/lib/api/types';
+import { Term } from '@/components/ui/term';
 
 export interface OcsfGateDraft {
   sample: string;
@@ -52,8 +53,7 @@ export function OcsfGateFields({
   return (
     <div className="space-y-2">
       <div className="text-[11px] text-muted-foreground leading-relaxed">
-        OCSF check: this parser has no passing sample. Paste one or more raw events (one per line). Each must parse
-        and validate against OCSF before it goes live.
+        No passing <Term id="ocsf-sample-check">sample check</Term>. Paste raw events, one per line. Each must fit <Term id="ocsf">OCSF</Term> before the parser can go live.
       </div>
       <Textarea
         value={draft.sample}
@@ -98,7 +98,7 @@ export function OcsfAttestationBadge({ attestation }: { attestation: OcsfAttesta
   }
   if (attestation.status === 'stale') {
     return (
-      <span className={`${base} text-amber-500 bg-amber-500/15`} title="The parser changed since its last passing OCSF sample">
+      <span className={`${base} text-amber-500 bg-amber-500/15`} title="The parser changed after its last passing sample check. Test a sample again before you publish.">
         <AlertTriangle className="w-3 h-3" /> OCSF stale
       </span>
     );
@@ -106,7 +106,7 @@ export function OcsfAttestationBadge({ attestation }: { attestation: OcsfAttesta
   return (
     <span
       className={`${base} text-foreground/80 bg-foreground/[0.03] border border-border`}
-      title="No passing OCSF sample on record for this parser"
+      title="This parser has never passed an OCSF sample check."
     >
       <ShieldQuestion className="w-3 h-3" /> OCSF unattested
     </span>

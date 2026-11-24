@@ -10,7 +10,7 @@
  * Also adds a hover crosshair + tooltip snapped to the nearest bucket, and a
  * legend whose items toggle series on/off (persisted per-browser).
  */
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useLayoutEffect, useMemo, useState } from 'react';
 import type { KeyboardEvent, MouseEvent } from 'react';
 import { Rss } from 'lucide-react';
 
@@ -69,11 +69,15 @@ function writeHidden(hidden: Set<string>) {
   }
 }
 
-function useMeasuredWidth(fallback: number): [React.RefObject<HTMLDivElement | null>, number] {
-  const ref = useRef<HTMLDivElement>(null);
+// NAN-5780: a callback ref, not a mount-time effect. The plot div only mounts
+// once history has loaded, so an effect keyed on mount found no element, never
+// attached the ResizeObserver, and the SVG stayed at FALLBACK_W, wider than the
+// card (clipping the "now" label). Re-measuring whenever the element appears
+// keeps the SVG sized to the card's content box.
+function useMeasuredWidth(fallback: number): [(node: HTMLDivElement | null) => void, number] {
+  const [el, setEl] = useState<HTMLDivElement | null>(null);
   const [w, setW] = useState(fallback);
   useLayoutEffect(() => {
-    const el = ref.current;
     if (!el) return;
     const initial = el.getBoundingClientRect().width;
     if (initial > 0) setW(Math.round(initial));
@@ -84,8 +88,8 @@ function useMeasuredWidth(fallback: number): [React.RefObject<HTMLDivElement | n
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
-  return [ref, w];
+  }, [el]);
+  return [setEl, w];
 }
 
 export function IngestionActivityChart({ history }: { history: IngestionPoint[] }) {
@@ -242,7 +246,7 @@ export function IngestionActivityChart({ history }: { history: IngestionPoint[] 
           </div>
         )}
       </div>
-      <div className="p-2">
+      <div className="p-2 min-w-0">
         {series.length === 0 ? (
           <div className="h-[150px] flex items-center justify-center text-[11px] text-muted-foreground">
             No ingestion activity in the last 24 hours.

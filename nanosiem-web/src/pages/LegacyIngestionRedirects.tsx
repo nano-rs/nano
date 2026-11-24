@@ -21,6 +21,7 @@ import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Button } from '@/components/ui/button';
 import { api, ApiClientError } from '@/lib/api';
 import { CLOUD_PULL_PATH, PULL_FEEDS_PATH, credentialTarget, sourceConfigPath } from '@/lib/ingestion-paths';
+import { Term } from '@/components/ui/term';
 
 export function LegacySourceConfigRedirect() {
   const { id } = useParams<{ id?: string }>();
@@ -76,10 +77,10 @@ export function LegacyCredentialRedirect({ adding = false }: { adding?: boolean 
             </Button>
           )}
           <Button asChild size="sm" variant="outline" className="h-7 text-[11.5px]">
-            <Link to={CLOUD_PULL_PATH}>Cloud pull</Link>
+            <Link to={CLOUD_PULL_PATH}><Term nested id="cloud-pull">Cloud pull</Term></Link>
           </Button>
           <Button asChild size="sm" variant="outline" className="h-7 text-[11.5px]">
-            <Link to={PULL_FEEDS_PATH}>Pull feeds</Link>
+            <Link to={PULL_FEEDS_PATH}><Term nested id="pull-feed">Pull feeds</Term></Link>
           </Button>
         </div>
       </div>

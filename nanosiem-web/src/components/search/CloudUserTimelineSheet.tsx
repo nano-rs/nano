@@ -20,6 +20,7 @@ import {
 import { formatUTCShort } from '@/lib/date-utils';
 import { CopyableValue } from './CopyableValue';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { Term } from '@/components/ui/term';
 
 // ============================================================================
 // Types
@@ -82,7 +83,7 @@ function IocBadge({ threatType, malware, confidence }: { threatType: string; mal
   return (
     <Badge variant="outline" className="text-[10px] bg-red-500/20 text-red-700 dark:text-red-400 border-red-500/40">
       <ShieldAlert className="h-2.5 w-2.5 mr-1" />
-      IOC {label}{confidence ? ` (${confidence}%)` : ''}
+      <Term id="ioc">IOC</Term> {label}{confidence ? ` (${confidence}%)` : ''}
     </Badge>
   );
 }

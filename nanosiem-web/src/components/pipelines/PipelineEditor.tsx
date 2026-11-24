@@ -26,6 +26,7 @@ import type {
 import { planJson, stepPreviewStatus } from '@/lib/pipeline-model';
 import { previewOnlyInUse } from '@/hooks/use-pipeline-workspace-core';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 /** Editor-surface operations; publish and rollback report in their own sheets. */
 const EDITOR_ERROR_TITLES: Partial<Record<PipelineOperation, string>> = {
@@ -126,7 +127,7 @@ function PipelineConflictNotice({
         open={confirm === 'reload'}
         onOpenChange={(open) => !open && setConfirm(null)}
         title="Discard your unsaved edits?"
-        description="Reload latest replaces this editor with the draft currently saved on the server. Copy your plan JSON first if you want to keep it."
+        description="Replaces this editor with the draft saved on the server. Copy your plan JSON first to keep it."
         confirmLabel="Discard and reload"
         variant="warning"
         onConfirm={() => {
@@ -138,7 +139,7 @@ function PipelineConflictNotice({
         open={confirm === 'discard'}
         onOpenChange={(open) => !open && setConfirm(null)}
         title="Discard the saved draft?"
-        description="This resets the pipeline to the active published version. Saved changes that have not been published, including any made by other editors, and your unsaved edits are discarded. Production is not changed."
+        description="Resets to the active published version. Unpublished saved changes, including other editors', and your unsaved edits are lost. Production is not changed."
         confirmLabel="Discard draft"
         variant="danger"
         onConfirm={() => {
@@ -394,7 +395,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
             </span>
             <span>{pipeline.sourceType}</span>
             <span>{draft.steps.length}/{capabilities.maxSteps} steps</span>
-            <span>Saving does not publish</span>
+            <span>Saving does not <Term id="publish">publish</Term></span>
           </>
         }
         actions={
@@ -463,7 +464,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
         <span className="text-muted-foreground">→</span>
         <span className="rounded-sm border border-primary/30 bg-primary/5 px-2 py-0.5">Steps · {draft.steps.length}</span>
         <span className="text-muted-foreground">→</span>
-        <span className="rounded-sm border border-border px-2 py-0.5 text-muted-foreground">Extension · if enabled</span>
+        <span className="rounded-sm border border-border px-2 py-0.5 text-muted-foreground"><Term id="parser-extension">Extension</Term> · if enabled</span>
         <span className="text-muted-foreground">→</span>
         <span>ClickHouse</span>
       </div>
@@ -471,7 +472,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
         <div className="max-h-[35%] shrink-0 space-y-2 overflow-y-auto border-b border-border px-4 py-2">
           {imported && (
             <PipelineNotice title="Imported from plain VRL">
-              This source&apos;s parser is plain VRL, shown as one Advanced VRL
+              This source&apos;s parser is plain <Term id="vrl">VRL</Term>, shown as one Advanced VRL
               step. Add steps around it; saving stores the parser as a step
               plan. Nothing changes until you save.
             </PipelineNotice>
@@ -513,8 +514,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
             >
               <p>{capabilitiesError}</p>
               <p>
-                Preview and live tap stay off until they load. Editing, saving,
-                and publishing still work.
+                Preview and <Term id="live-capture">live tap</Term> are off; editing, saving and publishing still work.
               </p>
               {onRetryCapabilities && (
                 <Button

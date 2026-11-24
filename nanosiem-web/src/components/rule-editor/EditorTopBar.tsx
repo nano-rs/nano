@@ -5,6 +5,7 @@
 // underneath in read-only mode for this first PR (popover-driven editing comes
 // in PR 2).
 
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 import { useRef, useState } from 'react';
 import {
   ArrowLeft,
@@ -34,6 +35,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Separator } from '@/components/ui/separator';
+import { TruncatedText } from '@/components/ui/truncated-text';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -352,7 +354,7 @@ function FolderChip({
   );
 }
 
-function MetaChipStrip({
+export function MetaChipStrip({
   metadata,
   availableFolders,
   onFolderChange,
@@ -369,7 +371,12 @@ function MetaChipStrip({
   const sched = cronHuman(metadata.schedule);
 
   return (
-    <div className="h-9 flex items-center px-4 gap-2 border-t border-border/40 bg-background/60 overflow-x-auto">
+    // NAN-5783: wrap onto a second row rather than scroll sideways behind a
+    // hidden scrollbar (tags were cut off at "#" with pivt open).
+    <div
+      className="min-h-9 flex flex-wrap items-center px-4 py-1.5 gap-x-2 gap-y-1 border-t border-border/40 bg-background/60"
+      data-testid="rule-editor-meta-strip"
+    >
       <span className="text-[9.5px] font-mono text-muted-foreground uppercase tracking-[0.12em] pr-1">Meta</span>
 
       <span className="inline-flex items-center gap-1 h-6 px-1.5 rounded-[4px] text-muted-foreground whitespace-nowrap">
@@ -421,17 +428,43 @@ function MetaChipStrip({
       <div className="flex-1 min-w-0" />
 
       {tags.length > 0 && (
-        <div className="flex items-center gap-1 shrink-0">
+        // NAN-5783: tags wrap with the strip; a long tag ellipsizes at 160px
+        // with the full tag in a focusable tooltip, and the tags past the
+        // first three are a "+N" disclosure listing every one of them.
+        <div className="flex flex-wrap items-center gap-1 min-w-0 max-w-full" data-testid="rule-editor-meta-tags">
           {tags.slice(0, 3).map((t) => (
             <span
               key={t}
-              className="font-mono text-[10px] text-muted-foreground px-1.5 h-5 rounded-[3px]"
+              data-testid="rule-editor-meta-tag"
+              className="inline-flex items-center min-w-0 max-w-[160px] h-5 px-1.5 rounded-[3px]"
               style={{ background: 'color-mix(in srgb, var(--foreground) 4%, transparent)' }}
             >
-              #{t}
+              <TruncatedText text={`#${t}`} className="font-mono text-[10px] leading-5 text-muted-foreground" />
             </span>
           ))}
-          {tags.length > 3 && <span className="font-mono text-[10px] text-muted-foreground">+{tags.length - 3}</span>}
+          {tags.length > 3 && (
+            <Popover>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  data-testid="rule-editor-meta-more-tags"
+                  aria-label={`Show ${tags.length - 3} more tags`}
+                  className="font-mono text-[10px] text-muted-foreground hover:text-foreground h-5 px-1 rounded-[3px] whitespace-nowrap cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                >
+                  +{tags.length - 3}
+                </button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-auto max-w-[320px] p-2" data-testid="rule-editor-meta-more-tags-list">
+                <ul className="flex flex-col gap-0.5" aria-label="More tags">
+                  {tags.slice(3).map((t) => (
+                    <li key={t} className="font-mono text-[10.5px] text-foreground/80 [overflow-wrap:anywhere]">
+                      #{t}
+                    </li>
+                  ))}
+                </ul>
+              </PopoverContent>
+            </Popover>
+          )}
         </div>
       )}
     </div>
@@ -481,23 +514,32 @@ export function EditorTopBar({
 
   return (
     <div className="border-b border-border bg-background shrink-0">
-      <div className="h-12 flex items-center px-4 gap-3">
+      {/* NAN-5783: the row wraps. In a narrow editor column (pivt open at
+          1280) the title block squeezed to nothing, the mode pill was drawn
+          over the CODE/FLOW/FORM switch and Test rule ran under the inspector
+          rail. Now the title keeps a 160px basis and the controls move to a
+          second row together. */}
+      <div className="min-h-12 py-2 flex flex-wrap items-center px-4 gap-x-3 gap-y-2" data-testid="rule-editor-top-row">
         <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={onBack} aria-label="Back">
           <ArrowLeft className="w-3.5 h-3.5" strokeWidth={1.75} />
         </Button>
 
-        <div className="flex items-center gap-2 min-w-0 flex-1">
-          <div className="text-[14px] font-mono font-semibold text-foreground truncate">{title}</div>
+        <div className="flex items-center gap-2 min-w-0 flex-1 basis-[160px]">
+          <TruncatedText text={title} className="text-[14px] font-mono font-semibold text-foreground" />
           {/* NAN-5683: an archived rule has no running mode — the ARCHIVED chip is its state. */}
-          {!isNewMode && !archived && <ModePill mode={effectiveMode} />}
+          {!isNewMode && !archived && (
+            <span className="shrink-0">
+              <ModePill mode={effectiveMode} />
+            </span>
+          )}
           {archived && (
-            <span className="inline-flex items-center h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] uppercase bg-muted text-muted-foreground">
+            <span className="shrink-0 inline-flex items-center h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] uppercase bg-muted text-muted-foreground">
               ARCHIVED
             </span>
           )}
           {dirty && (
             <span
-              className="inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--warning)]"
+              className="shrink-0 inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--warning)]"
               style={{ background: 'color-mix(in srgb, var(--warning) 15%, transparent)' }}
             >
               <span className="w-1.5 h-1.5 rounded-full bg-[var(--warning)]" />
@@ -506,7 +548,7 @@ export function EditorTopBar({
           )}
           {isNewMode && (
             <span
-              className="inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--primary)]"
+              className="shrink-0 inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--primary)]"
               style={{ background: 'color-mix(in srgb, var(--primary) 15%, transparent)' }}
             >
               DRAFT
@@ -514,145 +556,153 @@ export function EditorTopBar({
           )}
         </div>
 
-        <div
-          className="inline-flex items-center rounded-md border border-border p-0.5 text-muted-foreground shrink-0"
-          style={{ background: 'color-mix(in srgb, var(--foreground) 4%, transparent)' }}
-        >
-          {(['code', 'flow', 'form'] as ViewMode[]).map((m) => {
-            const enabled = lenses.has(m);
-            const active = viewMode === m;
-            const Icon = m === 'code' ? Terminal : m === 'flow' ? Share2 : ListIcon;
-            return (
-              <button
-                key={m}
-                type="button"
-                onClick={() => enabled && onViewMode(m)}
-                disabled={!enabled}
-                className={cn(
-                  'h-6 px-2 rounded-[3px] text-[10.5px] font-mono font-semibold tracking-[0.08em] uppercase transition-colors inline-flex items-center gap-1',
-                  active
-                    ? 'bg-[color-mix(in_srgb,var(--primary)_18%,transparent)] text-[var(--primary)]'
-                    : enabled
-                      ? 'hover:text-foreground'
-                      : 'opacity-40 cursor-not-allowed',
-                )}
-                title={!enabled ? `${m.toUpperCase()} view coming soon` : undefined}
-              >
-                <Icon className={cn('w-3 h-3', m === 'flow' && 'rotate-90')} strokeWidth={1.75} />
-                {m}
-              </button>
-            );
-          })}
-        </div>
-
-        <Separator orientation="vertical" className="h-6" />
-
-        {onViewMatches && (
-          <Button variant="outline" size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" onClick={onViewMatches}>
-            <Focus className="w-3 h-3" strokeWidth={1.75} />
-            Matches
-          </Button>
-        )}
-        {onOpenTest && (
-          <Button variant="outline" size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" onClick={onOpenTest}>
-            <Play className="w-3 h-3" strokeWidth={1.75} />
-            Test rule
-          </Button>
-        )}
-
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Rule actions">
-              <MoreHorizontal className="w-3.5 h-3.5" strokeWidth={1.75} />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-[200px]">
-            <DropdownMenuLabel>Rule actions</DropdownMenuLabel>
-            {onDuplicate && (
-              <DropdownMenuItem onClick={onDuplicate}>
-                <Copy className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Duplicate rule
-              </DropdownMenuItem>
-            )}
-            {onFormat && (
-              <DropdownMenuItem onClick={onFormat}>
-                <AlignLeft className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Format query
-              </DropdownMenuItem>
-            )}
-            {onDiscard && (
-              <DropdownMenuItem onClick={onDiscard} disabled={!dirty}>
-                <Undo2 className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Discard changes
-              </DropdownMenuItem>
-            )}
-            {onOpenTune && (
-              <DropdownMenuItem onClick={onOpenTune}>
-                <PivtIcon className="w-3.5 h-3.5" strokeWidth={1.75} />
-                AI tune rule
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>Lifecycle</DropdownMenuLabel>
-            {onPromote && promotable && (
-              <DropdownMenuItem onClick={onPromote} disabled={lifecyclePending}>
-                <ArrowUp className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Promote to {promoteTarget}
-              </DropdownMenuItem>
-            )}
-            {onDemote && demotable && (
-              <DropdownMenuItem onClick={onDemote} disabled={lifecyclePending}>
-                <ArrowDown className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Demote to {demoteTarget}
-              </DropdownMenuItem>
-            )}
-            {onTogglePause && (
-              <DropdownMenuItem onClick={onTogglePause} disabled={lifecyclePending}>
-                {paused ? (
-                  <>
-                    <KeyRound className="w-3.5 h-3.5" strokeWidth={1.75} />
-                    Resume rule
-                  </>
-                ) : (
-                  <>
-                    <Clock className="w-3.5 h-3.5" strokeWidth={1.75} />
-                    Pause rule
-                  </>
-                )}
-              </DropdownMenuItem>
-            )}
-            {onArchive && !archived && (
-              <DropdownMenuItem onClick={onArchive} className="text-[var(--destructive,_#F87171)]">
-                <X className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Archive rule
-              </DropdownMenuItem>
-            )}
-            {onUnarchive && archived && (
-              <DropdownMenuItem onClick={onUnarchive}>
-                <Users className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Unarchive rule
-              </DropdownMenuItem>
-            )}
-            {onDelete && (
-              <DropdownMenuItem onClick={onDelete} className="text-[var(--destructive,_#F87171)]">
-                <AlertCircle className="w-3.5 h-3.5" strokeWidth={1.75} />
-                Delete forever
-              </DropdownMenuItem>
-            )}
-          </DropdownMenuContent>
-        </DropdownMenu>
-
-        {onSave && (
-          <Button
-            onClick={onSave}
-            disabled={!dirty || !valid || saving}
-            className={cn('h-7 text-[11.5px] px-3 gap-1.5', !dirty && 'opacity-60')}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 ml-auto" data-testid="rule-editor-top-actions">
+          <div
+            className="inline-flex items-center rounded-md border border-border p-0.5 text-muted-foreground shrink-0"
+            style={{ background: 'color-mix(in srgb, var(--foreground) 4%, transparent)' }}
           >
-            <Save className="w-3 h-3" strokeWidth={1.75} />
-            {/* NAN-5317: an unsaved new-rule draft is never "Saved". */}
-            {saving ? 'Saving…' : isNewMode ? 'Create rule' : dirty ? 'Save rule' : 'Saved'}
-          </Button>
-        )}
+            {(['code', 'flow', 'form'] as ViewMode[]).map((m) => {
+              const enabled = lenses.has(m);
+              const active = viewMode === m;
+              const Icon = m === 'code' ? Terminal : m === 'flow' ? Share2 : ListIcon;
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => enabled && onViewMode(m)}
+                  disabled={!enabled}
+                  className={cn(
+                    'h-6 px-2 rounded-[3px] text-[10.5px] font-mono font-semibold tracking-[0.08em] uppercase transition-colors inline-flex items-center gap-1',
+                    active
+                      ? 'bg-[color-mix(in_srgb,var(--primary)_18%,transparent)] text-[var(--primary)]'
+                      : enabled
+                        ? 'hover:text-foreground'
+                        : 'opacity-40 cursor-not-allowed',
+                  )}
+                  title={!enabled ? `${m.toUpperCase()} view coming soon` : undefined}
+                >
+                  <Icon className={cn('w-3 h-3', m === 'flow' && 'rotate-90')} strokeWidth={1.75} />
+                  {m}
+                </button>
+              );
+            })}
+          </div>
+
+          <Separator orientation="vertical" className="h-6" />
+
+          {onViewMatches && (
+            <Button variant="outline" size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" onClick={onViewMatches}>
+              <Focus className="w-3 h-3" strokeWidth={1.75} />
+              Matches
+            </Button>
+          )}
+          {onOpenTest && (
+            <Button variant="outline" size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" onClick={onOpenTest}>
+              <Play className="w-3 h-3" strokeWidth={1.75} />
+              Test rule
+            </Button>
+          )}
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Rule actions">
+                <MoreHorizontal className="w-3.5 h-3.5" strokeWidth={1.75} />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-[200px]">
+              <DropdownMenuLabel density="compact">Rule actions</DropdownMenuLabel>
+              {onDuplicate && (
+                <DropdownMenuItem density="compact" onClick={onDuplicate}>
+                  <Copy strokeWidth={1.5} />
+                  Duplicate rule
+                </DropdownMenuItem>
+              )}
+              {onFormat && (
+                <DropdownMenuItem density="compact" onClick={onFormat}>
+                  <AlignLeft strokeWidth={1.5} />
+                  Format query
+                </DropdownMenuItem>
+              )}
+              {onDiscard && (
+                <DropdownMenuItem density="compact" onClick={onDiscard} disabled={!dirty}>
+                  <Undo2 strokeWidth={1.5} />
+                  Discard changes
+                </DropdownMenuItem>
+              )}
+              {onOpenTune && (
+                <DropdownMenuItem density="compact" onClick={onOpenTune}>
+                  <PivtIcon strokeWidth={1.5} />
+                  <EnterpriseTerm id="ai-tuning" nested>AI tune</EnterpriseTerm> rule
+                </DropdownMenuItem>
+              )}
+              {/* bg-border: the shared separator's bg-muted is invisible on the dark popover. */}
+              <DropdownMenuSeparator className="bg-border" />
+              <DropdownMenuLabel density="compact">Lifecycle</DropdownMenuLabel>
+              {onPromote && promotable && (
+                <DropdownMenuItem density="compact" onClick={onPromote} disabled={lifecyclePending}>
+                  <ArrowUp strokeWidth={1.5} />
+                  Promote to {promoteTarget}
+                </DropdownMenuItem>
+              )}
+              {onDemote && demotable && (
+                <DropdownMenuItem density="compact" onClick={onDemote} disabled={lifecyclePending}>
+                  <ArrowDown strokeWidth={1.5} />
+                  Demote to {demoteTarget}
+                </DropdownMenuItem>
+              )}
+              {onTogglePause && (
+                <DropdownMenuItem density="compact" onClick={onTogglePause} disabled={lifecyclePending}>
+                  {paused ? (
+                    <>
+                      <KeyRound strokeWidth={1.5} />
+                      Resume rule
+                    </>
+                  ) : (
+                    <>
+                      <Clock strokeWidth={1.5} />
+                      Pause rule
+                    </>
+                  )}
+                </DropdownMenuItem>
+              )}
+              {onArchive && !archived && (
+                <DropdownMenuItem density="compact" onClick={onArchive} variant="destructive">
+                  <X strokeWidth={1.5} />
+                  Archive rule
+                </DropdownMenuItem>
+              )}
+              {onUnarchive && archived && (
+                <DropdownMenuItem density="compact" onClick={onUnarchive}>
+                  <Users strokeWidth={1.5} />
+                  Unarchive rule
+                </DropdownMenuItem>
+              )}
+              {onDelete && (
+                <DropdownMenuItem density="compact" onClick={onDelete} variant="destructive">
+                  <AlertCircle strokeWidth={1.5} />
+                  Delete forever
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {/* NAN-5842: the rule actions group (Matches, Test rule, overflow)
+              ends here; the 1px divider sets it apart from Save, the same
+              divider the lens switch uses above. */}
+          {onSave && <Separator orientation="vertical" className="h-6" data-testid="rule-editor-actions-divider" />}
+
+          {onSave && (
+            <Button
+              onClick={onSave}
+              disabled={!dirty || !valid || saving}
+              className={cn('h-7 text-[11.5px] px-3 gap-1.5', !dirty && 'opacity-60')}
+            >
+              <Save className="w-3 h-3" strokeWidth={1.75} />
+              {/* NAN-5317: an unsaved new-rule draft is never "Saved". */}
+              {saving ? 'Saving…' : isNewMode ? 'Create rule' : dirty ? 'Save rule' : 'Saved'}
+            </Button>
+          )}
+        </div>
       </div>
 
       <MetaChipStrip

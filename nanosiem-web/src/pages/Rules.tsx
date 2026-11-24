@@ -6,6 +6,8 @@
 // the live detection API. The old visuals lived at Detections.tsx (kept in-tree
 // under a legacy export until a sunset PR).
 
+import { Term } from '@/components/ui/term';
+import { InfoTip } from '@/components/ui/info-tip';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Download, Plus, RefreshCw, Search as SearchIcon, Database, ShieldAlert, History, X } from 'lucide-react';
@@ -344,13 +346,16 @@ export function Rules() {
             <span className="text-foreground">{firingCount} firing now</span>
             <span className="text-muted-foreground/60 mx-1.5">·</span>
             <span className="text-warning">{needReview} need review</span>
+            <InfoTip label="About need review" variant="inline">
+              Rules that need review are silent: they are running but have not matched anything in over 30 days, or ever.
+            </InfoTip>
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5 @max-[900px]:hidden"
-            title="Import (not yet wired)"
+            title="Import is not available yet"
           >
             <Download className="w-3.5 h-3.5" strokeWidth={2} />
             Import
@@ -369,10 +374,9 @@ export function Rules() {
             <Link
               to="/rules/retro-hunt/new"
               className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5 @max-[900px]:hidden"
-              title="Auto retro-hunt: match newly-published threat intel against historical logs"
             >
               <History className="w-3.5 h-3.5" strokeWidth={2} />
-              Retro-hunt
+              <Term id="retro-hunt" nested>Retro-hunt</Term>
             </Link>
           )}
           {canDraftWithPivt && (
@@ -521,10 +525,10 @@ export function Rules() {
                 Last match
               </th>
               <th className="h-8 px-0 text-left font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
-                Severity
+                <Term id="rule-severity">Severity</Term>
               </th>
               <th className="h-8 px-0 text-left font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold @max-[960px]:hidden">
-                Mode
+                <Term id="rule-mode">Mode</Term>
               </th>
               <th className="h-8 px-0 text-left font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
                 Status
@@ -562,7 +566,7 @@ export function Rules() {
                       No rules match your filters
                     </div>
                     <div className="text-[10.5px] text-muted-foreground">
-                      Try a different severity, mode, tactic — or clear your search.
+                      Adjust the filters or clear the search.
                     </div>
                   </div>
                 </td>

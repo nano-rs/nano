@@ -126,6 +126,10 @@ import {
 } from '@/lib/log-source-pivt-context';
 import { useQuery } from '@tanstack/react-query';
 import { descriptionSummary } from '@/lib/description-summary';
+import { vrlErrorToastDescription } from '@/lib/vrl-error-toast';
+import { TimezonePicker } from '@/components/log-sources/TimezonePicker';
+import { DEFAULT_SOURCE_TIMEZONE, SOURCE_TIMEZONE_HELP, timezoneDisplay } from '@/lib/source-timezones';
+import { Term } from '@/components/ui/term';
 
 const CONFIG_TYPE_TO_SOURCE_TYPE: Record<string, string> = {
   http: 'routed',
@@ -481,6 +485,7 @@ export function LogSourceDetail() {
       stale_threshold_minutes: logSource.stale_threshold_minutes,
       sampling_ratio: logSource.sampling_ratio,
       sampling_exclude_condition: logSource.sampling_exclude_condition,
+      timezone: logSource.timezone || DEFAULT_SOURCE_TIMEZONE,
     });
     setIsEditingConfig(true);
   };
@@ -502,6 +507,12 @@ export function LogSourceDetail() {
         changed.sampling_ratio = formData.sampling_ratio;
       if (formData.sampling_exclude_condition !== logSource.sampling_exclude_condition)
         changed.sampling_exclude_condition = formData.sampling_exclude_condition;
+      // NAN-5839: offset-less timestamps are read in this zone.
+      if (
+        formData.timezone !== undefined &&
+        formData.timezone !== (logSource.timezone || DEFAULT_SOURCE_TIMEZONE)
+      )
+        changed.timezone = formData.timezone;
 
       if (Object.keys(changed).length === 0) {
         toast({ title: 'No changes', description: 'Nothing was modified.' });
@@ -545,7 +556,7 @@ export function LogSourceDetail() {
       if (!syntaxResult.valid) {
         setValidationResult(syntaxResult);
         setSidePanelTab('diag');
-        toast({ title: 'VRL invalid', description: syntaxResult.errors.join(', '), variant: 'destructive' });
+        toast({ title: 'VRL invalid', description: vrlErrorToastDescription(syntaxResult.errors), variant: 'destructive' });
         return;
       }
       // For the deployed VRL (no edits) we also persist validated=true on the row
@@ -556,7 +567,7 @@ export function LogSourceDetail() {
           toast({ title: 'VRL validated', description: 'Validation status saved.' });
           setValidatedJustNow(true);
         } else {
-          toast({ title: 'VRL invalid', description: result.errors.join(', '), variant: 'destructive' });
+          toast({ title: 'VRL invalid', description: vrlErrorToastDescription(result.errors), variant: 'destructive' });
         }
         refetch();
       } else {
@@ -707,7 +718,7 @@ export function LogSourceDetail() {
             data-testid="vrl-draft-restore"
           >
             <span className="text-[11.5px] text-foreground">
-              <span className="font-medium">Unsaved VRL edits</span>
+              <span className="font-medium">Unsaved <Term id="vrl">VRL</Term> edits</span>
               <span className="text-muted-foreground ml-2">from earlier in this tab were kept.</span>
             </span>
             <div className="flex items-center gap-2 shrink-0">
@@ -846,7 +857,7 @@ export function LogSourceDetail() {
           open={saveVrlDialogOpen}
           onOpenChange={setSaveVrlDialogOpen}
           title="Save VRL changes?"
-          description={`Save your VRL changes to "${logSource.name}". You'll need to deploy the log source for changes to take effect on incoming logs.`}
+          description={`Save VRL changes to "${logSource.name}". Deploy the log source to apply them to incoming logs.`}
           confirmLabel={updating ? 'Saving…' : 'Save changes'}
           confirmIcon={updating ? <LoadingIcon className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
           onConfirm={handleSaveVrlConfirmed}
@@ -856,7 +867,7 @@ export function LogSourceDetail() {
           open={publishDialogOpen}
           onOpenChange={setPublishDialogOpen}
           title="Publish log source?"
-          description="Create a new version from your current draft and deploy it to Vector. The previous active version is preserved in history."
+          description="Creates a version from the draft and deploys it to Vector. The previous version stays in history."
           confirmLabel={publishing ? 'Publishing…' : 'Publish'}
           confirmIcon={publishing ? <LoadingIcon className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
           onConfirm={handlePublish}
@@ -881,7 +892,7 @@ export function LogSourceDetail() {
           open={acceptDiffDialogOpen}
           onOpenChange={setAcceptDiffDialogOpen}
           title="Save parser changes?"
-          description="Save your AI-edited parser as a draft. You can review and publish it when ready."
+          description="Saves the AI-edited parser as a draft to review and publish."
           confirmLabel={updating ? 'Saving…' : 'Save draft'}
           confirmIcon={updating ? <LoadingIcon className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
           onConfirm={handleAcceptDiffConfirmed}
@@ -1161,10 +1172,10 @@ function DraftBanner({
       <div className="flex items-start gap-2 min-w-0">
         <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
         <div className="text-[11.5px] text-amber-600 dark:text-amber-400 leading-snug">
-          <span className="font-medium">Unpublished changes</span>
+          <span className="font-medium"><Term id="publish">Unpublished</Term> changes</span>
           <span className="text-amber-600/80 dark:text-amber-400/80 ml-2">
-            Working copy differs from deployed version
-            {activeVersion ? ` (v${activeVersion})` : ''}. Changes won't affect live parsing until published.
+            Differs from deployed version
+            {activeVersion ? ` (v${activeVersion})` : ''}; not live until published.
           </span>
         </div>
       </div>
@@ -1385,7 +1396,7 @@ function OverviewTab({
             {collectorFailing ? (
               <span className="inline-flex items-center gap-1.5 text-red-500">
                 <XCircle className="w-3.5 h-3.5" />
-                <span className="text-[12px]">Collector failing — not receiving data</span>
+                <span className="text-[12px]">Collector failing: not receiving data</span>
               </span>
             ) : health?.health_status === 'error' ? (
               <span className="inline-flex items-center gap-1.5 text-red-500">
@@ -1405,10 +1416,10 @@ function OverviewTab({
             ) : health?.health_status === 'stale' ? (
               <span className="inline-flex items-center gap-1.5 text-amber-500">
                 <AlertTriangle className="w-3.5 h-3.5" />
-                <span className="text-[12px]">Stale — no recent events</span>
+                <span className="text-[12px]">Stale: no recent events</span>
               </span>
             ) : !source.deployed ? (
-              <span className="text-foreground/80 text-[12px]">Ready to deploy</span>
+              <span className="text-foreground/80 text-[12px]">Ready to <Term id="deploy">deploy</Term></span>
             ) : (
               <span className="text-muted-foreground text-[12px]">No data yet</span>
             )}
@@ -1481,16 +1492,15 @@ function OverviewTab({
           </LSRow>
           {fallbackWarning && parseFallbackRate != null && (
             <div className="px-4 py-2.5 text-[11.5px] leading-relaxed text-amber-600 dark:text-amber-500 border-b border-border">
-              {formatShare(parseFallbackRate)} of events in the last 24h were not fully parsed: the parser fell back
-              (<code className="font-mono">unmapped.parse_fallback</code>). The input likely
-              doesn&apos;t match what this parser expects, for example a JSON envelope around the raw log line. Compare a stored event&apos;s{' '}
-              <code className="font-mono">raw_data</code> with the parser&apos;s samples.
+              {formatShare(parseFallbackRate)} of events in the last 24h fell back
+              (<code className="font-mono">unmapped.parse_fallback</code>); the input likely doesn&apos;t match this parser,
+              for example a JSON envelope. Compare a stored event&apos;s <code className="font-mono">raw_data</code> with the
+              parser&apos;s samples.
             </div>
           )}
           <div className="px-4 py-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
-            Runtime failures are preserved as searchable events in{' '}
-            <code className="font-mono text-foreground/70">metadata.parse_error</code>. Parse success counts only fully
-            parsed events: fallbacks are excluded. Static VRL validation is not included.
+            Failures are searchable in <code className="font-mono text-foreground/70">metadata.parse_error</code>. Success
+            excludes fallbacks.
           </div>
         </LSCard>
       </div>
@@ -1518,13 +1528,13 @@ function OverviewTab({
           <div className="px-4 py-3 text-[11.5px] leading-relaxed text-foreground/80 border-b border-border">
             {collectorRecovered ? (
               <>
-                The collector reported these errors, then resumed — data has arrived since the
-                most recent one. Shown because a recovered feed may still have a gap.
+                The collector reported these errors, then recovered. Data has arrived since the last
+                one. They stay here because a recovered feed may still have a gap.
               </>
             ) : (
               <>
-                These are reported by the collector itself, not by the parser. They mean data is
-                not arriving — distinct from data arriving and failing to parse.
+                The collector reported these, not the parser. They mean data is not arriving, which
+                is different from data that arrives but fails to parse.
               </>
             )}
           </div>
@@ -1821,6 +1831,28 @@ function ConfigurationTab({
         </LSRow>
       </LSCard>
 
+      <LSCard eyebrow="Time" title="Source timezone">
+        <div className="flex items-start gap-4 px-4 py-3">
+          <div className="flex-1 min-w-0">
+            <div className="text-[12px] text-foreground"><Term id="source-timezone">Time zone</Term> of the device clock</div>
+            <div className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed max-w-[560px]">
+              {SOURCE_TIMEZONE_HELP} Events are always stored in UTC. A change takes effect for events
+              ingested after the next deploy.
+            </div>
+          </div>
+          {isEditing ? (
+            <TimezonePicker
+              value={formData.timezone ?? source.timezone ?? DEFAULT_SOURCE_TIMEZONE}
+              onChange={(tz) => setFormData({ ...formData, timezone: tz })}
+            />
+          ) : (
+            <span className="font-mono text-[12px] text-foreground" data-testid="log-source-timezone">
+              {timezoneDisplay(source.timezone)}
+            </span>
+          )}
+        </div>
+      </LSCard>
+
       <LSCard
         eyebrow="Alerting"
         title="Staleness monitoring"
@@ -1839,10 +1871,9 @@ function ConfigurationTab({
       >
         <div className="flex items-start gap-4 px-4 py-3 border-b border-border">
           <div className="flex-1 min-w-0">
-            <div className="text-[12px] text-foreground">Alert when this feed goes stale</div>
+            <div className="text-[12px] text-foreground">Alert when this feed goes <Term id="stale-source">stale</Term></div>
             <div className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed max-w-[560px]">
-              Fires a platform alert when no events arrive within the threshold window. Recommended for production
-              sources.
+              Platform alert when no events arrive within the threshold.
             </div>
           </div>
           {isEditing ? (
@@ -1901,10 +1932,9 @@ function ConfigurationTab({
       >
         <div className="flex items-start gap-4 px-4 py-3 border-b border-border">
           <div className="flex-1 min-w-0">
-            <div className="text-[12px] text-foreground">Sample a percentage of incoming events</div>
+            <div className="text-[12px] text-foreground"><Term id="source-sampling">Sample</Term> a percentage of incoming events</div>
             <div className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed max-w-[560px]">
-              Reduces ingest cost by randomly dropping events before they hit the repository. Avoid on
-              high-fidelity sources like audit logs — sampling is lossy and cannot be reversed.
+              Randomly drops events before storage. Lossy and irreversible; avoid on audit logs.
             </div>
           </div>
           {isEditing ? (
@@ -2197,7 +2227,7 @@ function DiagnosticsPanel({ result }: { result: ValidationResult }) {
         <div className="rounded-md bg-foreground/[0.03] border border-border p-3">
           <div className="text-[11.5px] text-foreground">No diagnostics yet</div>
           <div className="text-[10.5px] text-muted-foreground mt-1 leading-relaxed">
-            Run <span className="font-mono">Validate</span> from the toolbar to see VRL diagnostics here.
+            Run <span className="font-mono">Validate</span> to see diagnostics.
           </div>
         </div>
       </div>
@@ -2211,9 +2241,6 @@ function DiagnosticsPanel({ result }: { result: ValidationResult }) {
             <Check className="w-3.5 h-3.5 text-emerald-500 shrink-0 mt-0.5" />
             <div className="text-[11.5px] text-emerald-600 dark:text-emerald-400">
               <div className="font-medium">All validator checks passed.</div>
-              <div className="text-[10.5px] text-emerald-600/80 dark:text-emerald-400/80 mt-1">
-                VRL parses cleanly with no errors or warnings.
-              </div>
             </div>
           </div>
         </div>
@@ -2936,7 +2963,7 @@ function LogSourceAiPanel({
         <PivtIcon className="w-6 h-6 text-muted-foreground mb-2" />
         <div className="text-[12px] text-foreground">pivt not configured</div>
         <div className="text-[10.5px] text-muted-foreground mt-1 max-w-[280px]">
-          Configure pivt in Settings to enable AI-powered parser editing.
+          Configure pivt in Settings.
         </div>
       </div>
     );
@@ -2961,19 +2988,19 @@ function LogSourceAiPanel({
           <div className="text-[11px] text-foreground/80 leading-relaxed">
             {mode === 'extension' ? (
               <>
-                <span className="font-medium text-foreground">pivt is editing your extension overlay</span> —{' '}
-                <span className="font-mono text-[10.5px]">{lineCount}</span> lines. The OOTB parser is in pivt's
-                context as read-only reference; edits here only touch the extension.
+                <span className="font-medium text-foreground">pivt is editing your <Term id="parser-extension">parser extension</Term></span>:{' '}
+                <span className="font-mono text-[10.5px]">{lineCount}</span> lines. pivt can read the built-in parser
+                but only changes the extension.
               </>
             ) : rawPassThrough ? (
               <>
-                <span className="font-medium text-foreground">pivt recognizes this raw pass-through</span> —{' '}
+                <span className="font-medium text-foreground">pivt sees this source is <Term id="raw-passthrough">not parsed</Term> yet</span>:{' '}
                 <span className="font-mono text-[10.5px]">{sourceField}={sourceType}</span>. Recent events are fetched
                 automatically when you ask it to build the parser.
               </>
             ) : (
               <>
-                <span className="font-medium text-foreground">pivt has full context of this parser</span> —{' '}
+                <span className="font-medium text-foreground">pivt can read this whole parser</span>:{' '}
                 <span className="font-mono text-[10.5px]">{lineCount}</span> lines. Ask for edits, explanations, or
                 test cases.
               </>
@@ -3108,7 +3135,7 @@ function AiMessage({ message }: { message: AiChatMessage }) {
         </div>
         {message.hasChanges && (
           <div className="mt-1.5 inline-flex items-center gap-1 text-[10px] font-mono text-emerald-500 bg-emerald-500/15 rounded px-1.5 py-0.5">
-            <Check className="w-3 h-3" /> Changes applied — see diff in editor
+            <Check className="w-3 h-3" /> Changes applied. See the diff in the editor.
           </div>
         )}
         {message.validation && (
@@ -3258,7 +3285,7 @@ function ExtensionTab({
       toast({
         title: 'Extension saved',
         description:
-          'Draft updated. Publish a new version and redeploy to push the extension to Vector.',
+          'Draft updated. Publish to deploy the extension.',
       });
     } catch (err) {
       toast({
@@ -3283,7 +3310,7 @@ function ExtensionTab({
           </span>
           {isStub && (
             <span className="font-mono text-[10px] text-muted-foreground/80">
-              (stub — extension IS the parser)
+              (stub: the extension is the parser)
             </span>
           )}
           {dirty && (

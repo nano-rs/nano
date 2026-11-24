@@ -15,6 +15,7 @@ mod service;
 mod types;
 pub mod pipe;
 pub mod test_sandbox;
+pub mod unrouted;
 mod validator;
 mod vector_config;
 pub mod vrl_diagnostics;
@@ -32,11 +33,11 @@ pub use ocsf_validation::{
     OcsfValidationDiagnostic, OcsfValidationResult,
 };
 pub use repository::{
-    list_effective_deployed_parsers, resolve_parser_dispatch_routes,
-    resolve_parser_dispatch_routes_lenient, ParserRepository,
-    ParserRepositoryError,
+    is_fetch_source_type, list_effective_deployed_parsers, resolve_parser_dispatch_routes,
+    ParserRepository, ParserRepositoryError,
 };
 pub use service::{ParserService, ParserServiceError};
+pub use unrouted::{UnroutableParser, SOURCE_CONFIG_NOTE_PREFIX};
 pub use types::*;
 pub use validator::exec_bounds::{
     MAX_TEST_SAMPLES, MAX_TEST_SAMPLE_BYTES, MAX_TEST_TOTAL_SAMPLE_BYTES, TEST_EXECUTION_BUDGET,

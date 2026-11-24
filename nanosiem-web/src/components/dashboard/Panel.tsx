@@ -56,6 +56,7 @@ import {
 import { formatRelativeUTC } from '@/lib/date-utils';
 import type { PanelConfig, VisualizationType } from '@/lib/api';
 import type { TimeRangeValue } from '@/hooks/use-api';
+import { Term } from '@/components/ui/term';
 
 // Panel data state interface
 export interface PanelDataState {
@@ -370,7 +371,7 @@ export function Panel({
               <button
                 type="button"
                 onClick={() => onRefresh(true)}
-                title="Served from cache — click to refresh from server"
+                title="These results were saved from an earlier run. Click to run the search again."
                 className="normal-case tracking-normal text-amber-500 dark:text-amber-400 hover:underline cursor-pointer"
               >
                 cached {formatCacheAge(cacheAgeSecs)} ago · refresh
@@ -521,7 +522,7 @@ export function Panel({
                   <button
                     type="button"
                     onClick={() => onRefresh(true)}
-                    title="Served from cache — click to refresh from server"
+                    title="These results were saved from an earlier run. Click to run the search again."
                     className="text-amber-400 hover:underline cursor-pointer"
                   >
                     cached {formatCacheAge(cacheAgeSecs)} ago · refresh
@@ -536,7 +537,9 @@ export function Panel({
               )}
               <span className="flex-1" />
               {config.drilldownEnabled !== false && (
-                <span className="text-emerald-400">click data points to drill down</span>
+                <span className="text-emerald-400">
+                  click data points to <Term id="drilldown">drill down</Term>
+                </span>
               )}
             </div>
           )}
@@ -700,8 +703,7 @@ function PanelContent({ data, config, hasRunOnce, children }: PanelContentProps)
         <Search className="w-5 h-5 text-amber-400 mb-0.5" />
         <p className="text-[12px] font-semibold text-foreground">Apply a filter to load this panel</p>
         <p className="text-[11px] text-muted-foreground max-w-md leading-[1.45]">
-          This panel uses <span className="font-mono text-foreground">| prevalence</span> and won't
-          run unscoped — that would scan every event for rarity. Set{' '}
+          <code className="font-mono text-foreground">| prevalence</code> needs a scope. Set{' '}
           {wildcardFields.length > 0 ? (
             <>
               <span className="font-mono text-foreground">
@@ -741,8 +743,7 @@ function PanelContent({ data, config, hasRunOnce, children }: PanelContentProps)
         <p data-testid="panel-empty" className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80 font-semibold">
           No panel data
         </p>
-        <p className="text-[11.5px] text-foreground/80 mt-1.5">No results for the current scope.</p>
-        <p className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground/60 mt-0.5">
+        <p className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground/60 mt-1">
           Adjust time range or refine query
         </p>
       </div>
@@ -801,8 +802,7 @@ function FullscreenPanelContent({ data, config, hasRunOnce, children }: Fullscre
           Apply a filter to load this panel
         </p>
         <p className="text-[12px] text-muted-foreground max-w-md leading-[1.5]">
-          This panel uses <span className="font-mono text-foreground">| prevalence</span> and won't
-          run unscoped — that would scan every event for rarity. Set{' '}
+          <code className="font-mono text-foreground">| prevalence</code> needs a scope. Set{' '}
           {wildcardFields.length > 0 ? (
             <>
               <span className="font-mono text-foreground">{wildcardFields.join(', ')}</span> to a
@@ -838,8 +838,7 @@ function FullscreenPanelContent({ data, config, hasRunOnce, children }: Fullscre
         <p className="font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground/80 font-semibold">
           No panel data
         </p>
-        <p className="text-[13px] text-foreground/80 mt-2">No results returned for the current scope.</p>
-        <p className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-muted-foreground/60 mt-1">
+        <p className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-muted-foreground/60 mt-1.5">
           Adjust time range or refine query
         </p>
       </div>

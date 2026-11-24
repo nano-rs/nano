@@ -6,7 +6,7 @@ import react from '@vitejs/plugin-react';
 /// <reference types="vitest/config" />
 import { defineConfig, loadEnv, Plugin } from 'vite';
 import { configDefaults } from 'vitest/config';
-import { applyCsp, assertInlineScriptsAllowed } from './csp';
+import { applyCsp, assertInlineScriptsAllowed, sentryConnectOrigin } from './csp';
 import { nodeTestFiles } from './scripts/node-test-files.mjs';
 
 // Stamp the package.json version into the bundle as `__APP_VERSION__` so
@@ -28,13 +28,13 @@ function resolveEdition(env: Record<string, string>): 'open' | 'enterprise' {
 // CSP for index.html. Production hashes are derived from the inline scripts at
 // build time (see csp.ts); the build re-checks the emitted HTML and fails if an
 // inline script is not covered, so the policy can't drift from the script.
-function cspPlugin(): Plugin {
+function cspPlugin(connectExtra: string[]): Plugin {
   return {
     name: 'csp',
     transformIndexHtml: {
       order: 'pre',
       handler(html, ctx) {
-        return applyCsp(html, !!ctx.server);
+        return applyCsp(html, !!ctx.server, connectExtra);
       },
     },
   };
@@ -111,8 +111,15 @@ export default defineConfig(({ mode }) => {
     edition === 'enterprise' ? './src/enterprise' : './src/enterprise-stubs',
   );
 
+  // NAN-5798: opt-in Sentry (local/e2e builds). The DSN's origin joins
+  // connect-src; NANO_SENTRY_SOURCEMAPS=1 emits HIDDEN source maps (no
+  // sourceMappingURL) that scripts/sentry-sourcemaps.sh uploads and then
+  // removes from the output, so .map files are never served.
+  const sentryOrigins = sentryConnectOrigin(env.VITE_NANO_SENTRY_DSN);
+  const hiddenSourcemaps = env.NANO_SENTRY_SOURCEMAPS === '1';
+
   return {
-  plugins: [cspPlugin(), tailwindcss(), react(), {
+  plugins: [cspPlugin(sentryOrigins), tailwindcss(), react(), {
     name: 'build-id',
     apply: 'build',
     transformIndexHtml: {
@@ -164,6 +171,7 @@ export default defineConfig(({ mode }) => {
     },
   },
   build: {
+    sourcemap: hiddenSourcemaps ? 'hidden' : false,
     rollupOptions: {
       output: {
         // Vite 8 ships rolldown, whose manualChunks only accepts a function

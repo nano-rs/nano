@@ -128,9 +128,12 @@ impl ImportLifecycle {
 
         let (detection_mode, schedule_cron, lookback_minutes) = if let Some(npl) = npl {
             let det_mode = parse_rule_file_detection_mode(npl.detection_mode.as_deref());
+            // NAN-5826: a blank `schedule:` is a missing one, never an
+            // empty cron written to the rule (which the scheduler cannot parse).
             let schedule = npl
                 .schedule
                 .clone()
+                .filter(|s| !s.trim().is_empty())
                 .or_else(|| Some("*/30 * * * *".to_string()));
             let lookback = npl
                 .lookback
@@ -597,6 +600,12 @@ impl RuleRepositoryService {
             detection_service
                 .validate_rule_query(&new_rule.query, existing_dataset.as_deref())
                 .map_err(|e| RuleRepositoryError::ConversionFailed(e.to_string()))?;
+            // NAN-5826: this UPDATE writes schedule_cron directly too, so run
+            // the save-time cron check the API save paths run.
+            if let Some(cron) = new_rule.schedule_cron.as_deref() {
+                crate::detection::scheduler::validate_cron_expression(cron)
+                    .map_err(|e| RuleRepositoryError::ConversionFailed(e.to_string()))?;
+            }
 
             // Update the existing rule's query, severity, and metadata
             sqlx::query(

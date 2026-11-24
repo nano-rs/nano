@@ -11,7 +11,7 @@
 //! `fetch_rows` JSONEachRow helper. The typed `fetch_one::<Row>()` binary
 //! format silently fails on multi-column LowCardinality SELECTs.
 
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::{source_scope_bound_predicate, SourceScopedClient};
 use super::SearchService;
 use crate::auth::ScopeSet;
 use crate::query::TimeRange;
@@ -522,7 +522,7 @@ impl SearchService {
     /// (it does NOT go through the nPL source-scope injection), so the
     /// caller's `ScopeSet` is threaded down here and its deny-set exclusion
     /// is ANDed into EVERY subquery's scan (see
-    /// [`source_scope_sql_predicate`]). An empty deny set emits nothing —
+    /// [`source_scope_bound_predicate`]). An empty deny set emits nothing —
     /// byte-identical SQL to the pre-scoping form.
     pub async fn query_cloud_dossier(
         &self,
@@ -537,6 +537,9 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok(CloudDossier::default()),
         };
+        // NAN-5793: every subquery binds the caller's deny list as the
+        // server-side parameter `scope_and` references.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start);
         let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end);
@@ -691,11 +694,12 @@ impl SearchService {
         // every hand-built logs scan below — all 12 subqueries including each
         // per-dimension facet leg of the UNION-ALL facets query and the
         // account-wide posture scan (which drops the principal narrowing but
-        // still reads logs). No bind values — the predicate is rendered
-        // inline — so `extra_bind` / `bind_facets_query` placeholder
-        // accounting is untouched. `None` (unrestricted) splices an empty
+        // still reads logs). NAN-5793: the deny list is a server-side
+        // parameter (bound by the scoped client), not a `?` bind, so
+        // `extra_bind` / `bind_facets_query` placeholder accounting is
+        // untouched. `None` (unrestricted) splices an empty
         // string: byte-identical SQL to the pre-scoping form.
-        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+        let scope_and = source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|pred| format!("\n              AND {pred}"))
             .unwrap_or_default();
         let scope_and = scope_and.as_str();

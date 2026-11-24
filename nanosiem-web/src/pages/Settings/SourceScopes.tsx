@@ -30,7 +30,6 @@ import {
   Globe,
   AlertCircle,
   Trash2,
-  Info,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
@@ -62,36 +61,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+import { InfoTip } from '@/components/ui/info-tip';
+import { TooltipProvider } from '@/components/ui/tooltip';
 import { formatUTC } from '@/lib/date-utils';
+import { Term } from '@/components/ui/term';
 
 function isEveryone(groupId: string): boolean {
   return groupId === EVERYONE_GROUP_ID;
-}
-
-/** Small mono help affordance — replaces inline "coming soon"/roadmap prose. */
-function HelpDot({ text }: { text: React.ReactNode }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          className="inline-flex items-center justify-center text-muted-foreground/60 hover:text-muted-foreground transition-colors"
-          aria-label="Help"
-        >
-          <Info className="w-[12px] h-[12px]" />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom" className="max-w-[280px] text-[11px] leading-relaxed">
-        {text}
-      </TooltipContent>
-    </Tooltip>
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -215,18 +191,16 @@ function GrantsDetail({
           <div className="rounded-md border border-emerald-500/25 bg-emerald-500/5 p-3 flex items-start gap-2.5">
             <Globe className="w-[14px] h-[14px] text-emerald-500 shrink-0 mt-0.5" />
             <div className="text-[11.5px] text-foreground/80 leading-relaxed">
-              This source is granted to the{' '}
-              <span className="text-foreground font-medium">Everyone</span> group, so it is{' '}
-              <span className="text-emerald-500 font-medium">effectively un-restricted</span> — every
-              user can see its events. Revoke the Everyone grant to re-restrict it to the specific
-              groups below.
+              Granted to <span className="text-foreground font-medium">Everyone</span>, so it is{' '}
+              <span className="text-emerald-500 font-medium">effectively un-restricted</span>. Revoke the
+              Everyone grant to restrict it to the groups below.
             </div>
           </div>
         ) : (
           <div className="rounded-md border border-amber-500/25 bg-amber-500/5 p-3 flex items-start gap-2.5">
             <EyeOff className="w-[14px] h-[14px] text-amber-500 shrink-0 mt-0.5" />
             <div className="text-[11.5px] text-foreground/80 leading-relaxed">
-              Invisible by default. Only members of the{' '}
+              Hidden by default. Only members of the{' '}
               <span className="text-foreground font-medium">{grants.length}</span> granted group
               {grants.length === 1 ? '' : 's'} below can see events from this source.
             </div>
@@ -282,7 +256,7 @@ function GrantsDetail({
               </div>
             ) : grants.length === 0 ? (
               <div className="px-4 py-6 text-center text-[11.5px] text-muted-foreground">
-                No groups granted yet — nobody can see this source.
+                No groups granted yet, so nobody can see this source.
               </div>
             ) : (
               grants.map((g) => {
@@ -402,8 +376,8 @@ function AddRestrictedDialog({
             Restrict a source
           </SheetTitle>
           <SheetDescription className="text-[11.5px] leading-relaxed text-muted-foreground">
-            Listing a <span className="font-mono text-foreground/80">source_type</span> hides its
-            events from everyone by default. You then grant the groups that should see it.
+            Hides a <span className="font-mono text-foreground/80">source_type</span> from everyone
+            until you grant groups.
           </SheetDescription>
         </SheetHeader>
 
@@ -431,7 +405,7 @@ function AddRestrictedDialog({
               </div>
             ) : (
               <div className="text-[10.5px] text-muted-foreground/70 mt-1">
-                Pick an ingested source type or type any value — the raw string is stored.
+                Pick an ingested source type or type any value.
               </div>
             )}
           </div>
@@ -572,7 +546,7 @@ function AddGrantDialog({
               <Globe className="w-[13px] h-[13px] text-emerald-500 shrink-0 mt-0.5" />
               <span>
                 Granting <span className="font-medium text-foreground">Everyone</span> un-restricts
-                this source — every user will see its events again.
+                this source: every user sees its events again.
               </span>
             </div>
           )}
@@ -823,10 +797,9 @@ export function SourceScopes() {
 
   const modelHelp = (
     <>
-      An <span className="font-medium">empty</span> registry means every source is visible to
-      everyone (allow-all). Listing a source_type hides it by default; it is then visible only to
-      the groups you grant. Granting the <span className="font-medium">Everyone</span> group
-      re-opens it for all users.
+      By default everyone sees every source. Once you restrict a source, only the groups you grant
+      can see its events. Grant the <span className="font-medium">Everyone</span> group to open it
+      to all users again.
     </>
   );
 
@@ -837,13 +810,12 @@ export function SourceScopes() {
         <div className="shrink-0 px-6 pt-5 pb-4 border-b border-border">
           <div className="flex items-center gap-2">
             <h1 className="text-[18px] font-semibold tracking-tight text-foreground">
-              Source Visibility
+              <Term id="source-visibility">Source Visibility</Term>
             </h1>
-            <HelpDot text={modelHelp} />
+            <InfoTip label="About source visibility" side="bottom">{modelHelp}</InfoTip>
           </div>
           <p className="text-[11.5px] text-muted-foreground mt-0.5">
-            Restrict which analyst groups can see events from a{' '}
-            <span className="font-mono">source_type</span>. Empty registry = visible to everyone.
+            Choose which groups can see events from each <Term id="source-type">source type</Term>.
           </p>
         </div>
 
@@ -925,8 +897,7 @@ export function SourceScopes() {
                   <Globe className="w-9 h-9 text-emerald-500/50 mx-auto mb-3" />
                   <div className="text-[13px] font-medium text-foreground">Allow-all</div>
                   <div className="text-[11.5px] text-muted-foreground mt-1 leading-relaxed">
-                    No sources are restricted, so every user sees events from every source. Restrict
-                    a source to begin scoping visibility to specific groups.
+                    No sources are restricted. Every user sees every source.
                   </div>
                   {canManage && (
                     <Button

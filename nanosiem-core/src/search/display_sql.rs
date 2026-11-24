@@ -98,7 +98,7 @@ static STRING_LITERAL: LazyLock<regex::Regex> =
 /// The pure redaction (see [`DisplaySql::for_scope`]).
 ///
 /// 1. A `NOT IN ( … )` list made ONLY of deny values (the injected gate, in
-///    either the nPL InList or the hand-built `source_scope_sql_predicate`
+///    either the nPL InList or the literal `source_scope_literal_predicate`
 ///    form) becomes `NOT IN (/* source scope */)`.
 /// 2. Any remaining string literal equal to a restricted deny value (the
 ///    single-value `!= 'x'` form, or a deny value inside a mixed list) becomes

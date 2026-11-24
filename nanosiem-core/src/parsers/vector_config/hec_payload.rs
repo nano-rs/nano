@@ -51,12 +51,21 @@ if is_object(nano_hec_event) {
     del(%nano_hec_event)
 }"#;
 
-/// Keys an HEC sibling never writes into `unmapped` / `ext`: the parsed line
-/// itself, the parser-health markers, and the protected identity fields the
-/// prepare steps restore from metadata. Spelled out in `OCSF_PREPARE_VRL` and
-/// the UDM `_output`; a test keeps both copies equal to this.
+/// Keys an HEC sibling never writes into OCSF `unmapped`: the parsed line
+/// itself and the parser-health markers. Spelled out in `OCSF_PREPARE_VRL`; a
+/// test keeps the copy equal to this. A sibling named `client_ip` is vendor
+/// data and is kept (NAN-5846): nano's ingest provenance lives under
+/// `unmapped.nano`, which the prepare step removes in every spelling (nested,
+/// dotted, mixed) and rewrites after this merge (`ingest_provenance_vrl!`).
 #[cfg(test)]
-pub(super) const HEC_SIBLING_SKIP_KEYS: &str = r#"["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type", "client_ip", "ingest_client_ip", "ingest_peer"]"#;
+pub(super) const HEC_SIBLING_SKIP_KEYS_OCSF: &str =
+    r#"["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type"]"#;
+
+/// The legacy UDM `_output` copy: also the identity fields that lane still
+/// restores into `ext` from metadata. Spelled out in the UDM `_output`; a test
+/// keeps the copy equal to this.
+#[cfg(test)]
+pub(super) const HEC_SIBLING_SKIP_KEYS_UDM: &str = r#"["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type", "client_ip", "ingest_client_ip", "ingest_peer"]"#;
 
 /// Structural decoders: the first one a parser applies tells what its input is.
 /// Field-level helpers (`parse_timestamp`, `parse_int`, `parse_url`, ...) are

@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useDeploymentFlags } from '@/hooks/use-air-gap';
+import { RailThemeStrip } from '../RailThemeSwitcher';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
@@ -281,6 +282,9 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
 
       {/* User footer */}
       <div className="shrink-0 border-t border-border px-2.5 py-2">
+        {/* NAN-5858: the Settings shell's light/dark toggle and theme strip
+            live here, matching the app rail (the topbar copy is gone). */}
+        <RailThemeStrip className="mb-1.5 px-0.5" testId="settings-rail-theme" />
         <div className="w-full h-10 px-1.5 rounded-md flex items-center gap-2.5">
           <div className="w-7 h-7 rounded-full bg-primary/15 text-primary flex items-center justify-center font-mono font-semibold text-[10.5px] shrink-0">
             {initials}

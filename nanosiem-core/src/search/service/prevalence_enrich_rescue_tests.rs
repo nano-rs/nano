@@ -141,7 +141,7 @@ fn a_rare_key_survives_past_the_cap() {
         })
         .collect();
     rows.push(row(miss(), miss(), miss(), [None, None, Some(SHA)]));
-    let misses = collect_miss_keys(&rows, 50_000);
+    let misses = collect_miss_keys(&rows, 50_000, None);
     assert_eq!(misses.keys, vec![(MissKind::Hash, SHA.to_string())]);
     assert_eq!(misses.dropped, 0);
 }
@@ -153,7 +153,7 @@ async fn misses_past_the_cap_flag_the_run_partial() {
     let rows: Vec<Value> = (0..5)
         .map(|i| row(miss(), miss(), miss(), [None, None, Some(&format!("{:064x}", i + 1))]))
         .collect();
-    let misses = collect_miss_keys(&rows, 3);
+    let misses = collect_miss_keys(&rows, 3, None);
     assert_eq!(misses.keys.len(), 3);
     assert_eq!(misses.dropped, 2);
     // The overflow path is live: it records the PARTIAL note the scheduler
@@ -209,7 +209,7 @@ fn one_probe_for_every_kind() {
     let guarded = build_miss_probe_sql(&keys[..1], |k| k.summary_table().to_string(), "toDateTime64(0, 6)", true)
         .expect("probe");
     assert!(guarded.contains(
-        "file_hash IN ('5f0c0d1e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5') AND dictGetOrDefault('nanosiem.hash_prevalence_dict', 'last_seen', file_hash, toDateTime64(0, 6)) = toDateTime64(0, 6) GROUP BY"
+        "file_hash IN ('5f0c0d1e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5') AND (dictGetOrDefault('nanosiem.hash_prevalence_dict', 'last_seen', file_hash, toDateTime64(0, 6)) = toDateTime64(0, 6) OR dictGetOrDefault('nanosiem.hash_prevalence_dict', 'last_seen', file_hash, toDateTime64(0, 6)) < toDateTime64(0, 6)) GROUP BY"
     ), "{guarded}");
     assert!(!guarded.contains("UNION ALL"));
     assert!(build_miss_probe_sql(&[], |k| k.summary_table().to_string(), "x", false).is_none());

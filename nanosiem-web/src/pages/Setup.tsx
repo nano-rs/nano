@@ -22,6 +22,7 @@ import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Logo } from '@/components/ui/logo';
 import { PASSWORD_MAX_BYTES, PASSWORD_MIN_BYTES, unmetPasswordRequirements } from '@/lib/password';
+import { Term } from '@/components/ui/term';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -226,7 +227,7 @@ export function Setup() {
                   />
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Printed by the installer; also in <span className="font-mono">NANO_SETUP_TOKEN</span> in the install directory's <span className="font-mono">.env</span>
+                  The installer printed this <Term id="setup-token">setup token</Term>. It is also saved as <span className="font-mono">NANO_SETUP_TOKEN</span> in the <span className="font-mono">.env</span> file in the install folder.
                 </p>
               </div>
             )}

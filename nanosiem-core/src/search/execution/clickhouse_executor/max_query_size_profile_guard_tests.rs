@@ -131,7 +131,7 @@ fn legacy_k8s_manifests_do_not_cap_max_query_size() {
     for rel in [
         "deploy/k8s/clickhouse/clickhouse.yaml",
         "deploy/k8s/aws-db/clickhouse.yaml.tpl",
-        "deploy/k8s/rackspace-db/clickhouse.yaml.tpl",
+        "deploy/k8s/self-managed-db/clickhouse.yaml.tpl",
     ] {
         assert!(!read(rel).contains("max_query_size"), "{rel} pins or caps max_query_size");
     }

@@ -29,14 +29,13 @@ export function InventoryEntitlement({ requirement, edition, canManageLicence = 
     </dl>
     {licence
       ? <p className="text-[11px] leading-[1.45] text-muted-foreground">
-          Licensed features are unavailable on this deployment, so this integration cannot be installed or run until a license is active.{' '}
+          This integration needs an active license to install or run.{' '}
           {canManageLicence
             ? <Link to="/settings/license" className="text-primary hover:underline">Install or renew it in Settings › License</Link>
             : 'Ask an administrator to install or renew it.'}
         </p>
       : <p className="text-[11px] leading-[1.45] text-muted-foreground">
-          This edition does not include the runtime this integration executes on, so it cannot be installed here.
-          It installs and runs unchanged on an enterprise deployment.
+          This edition lacks the runtime this integration needs. It runs on an enterprise deployment.
         </p>}
   </section>;
 }

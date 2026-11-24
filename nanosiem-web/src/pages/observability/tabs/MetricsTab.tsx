@@ -87,8 +87,7 @@ export function MetricsTab({ apiTimeRange }: ObservabilityTabProps) {
 
       {catalogStatus.status === 'loading' && (
         <div role="status" className="flex items-center gap-2 text-[11px] text-fg-3">
-          <LoadingIcon className="w-3.5 h-3.5" /> Loading metric catalog… You can type a metric
-          name in the picker meanwhile.
+          <LoadingIcon className="w-3.5 h-3.5" /> Loading metric catalog…
         </div>
       )}
       {catalog.isError && (
@@ -110,8 +109,7 @@ export function MetricsTab({ apiTimeRange }: ObservabilityTabProps) {
       {catalog.isSuccess && capped && metricNames.length > 0 && (
         <div className="text-[11px] text-fg-3">
           The catalog is capped at the first{' '}
-          <span className="font-mono">{metricNames.length.toLocaleString()}</span> metric names
-          (alphabetical). Type a name in the picker to chart one that is not listed.
+          <span className="font-mono">{metricNames.length.toLocaleString()}</span> names. Type a name in the picker for others.
         </div>
       )}
       {catalog.isSuccess && metricNames.length === 0 && (

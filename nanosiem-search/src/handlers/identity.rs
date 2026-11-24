@@ -8,7 +8,7 @@
 
 use axum::{Json, extract::State};
 use nanosiem_core::auth::permissions;
-use nanosiem_core::search::service::source_scope_sql_predicate;
+use nanosiem_core::search::service::{bind_source_scope, source_scope_bound_predicate};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorResponse;
@@ -126,7 +126,8 @@ pub async fn resolve_identity(
     // silently fail OPEN (unknown column never matches the deny predicate).
     // Empty deny-set → None → byte-identical SQL (back-compat).
     let scope = crate::handlers::search::effective_scope(&auth);
-    let scope_predicate = source_scope_sql_predicate("source", scope.deny_set())
+    // NAN-5793: bound — the query below binds `scope.deny_set()`.
+    let scope_predicate = source_scope_bound_predicate("source", scope.deny_set())
         .map(|pred| format!("\n    AND ({pred})"))
         .unwrap_or_default();
 
@@ -159,8 +160,7 @@ LIMIT 1"#,
     );
 
     let ch_client = state.dual_pool.clickhouse();
-    let mut cursor = ch_client
-        .query(&sql)
+    let mut cursor = bind_source_scope(ch_client.query(&sql), scope.deny_set())
         .fetch_bytes("JSONEachRow")
         .map_err(|e| {
             tracing::error!(error = %e, ip = %ip, "Identity resolution ClickHouse query error");

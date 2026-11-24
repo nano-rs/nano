@@ -736,3 +736,64 @@ fn teams_plain_summary_and_facts_keep_their_original_shape() {
     let facts = card["body"][1]["facts"].as_array().unwrap();
     assert!(facts.iter().any(|f| f["title"] == "Entity" && f["value"] == "WEB-01"));
 }
+
+/// NAN-5738: a backslash escapes ASCII punctuation only, so non-ASCII
+/// lookalike dots, colons, slashes and at-signs in a FactSet value are folded
+/// to ASCII first and then escaped like any other punctuation. Nothing a
+/// client could normalize into a link survives unescaped.
+#[test]
+fn teams_facts_fold_and_escape_lookalike_punctuation() {
+    let ctx = FormatContext { routing_key: None };
+    let cases: [(&str, &str); 9] = [
+        // Fullwidth full stop (NFKC).
+        ("attacker\u{FF0E}com", "attacker\\.com"),
+        // Ideographic full stop and halfwidth ideographic full stop: IDNA
+        // label separators NFKC does not fold.
+        ("attacker\u{3002}com", "attacker\\.com"),
+        ("attacker\u{FF61}com", "attacker\\.com"),
+        // Fullwidth colon and solidus: a whole lookalike scheme.
+        ("https\u{FF1A}\u{FF0F}\u{FF0F}attacker\u{FF0E}com", "https\\:\\/\\/attacker\\.com"),
+        // Ratio colon and division slash (not NFKC-folded).
+        ("https\u{2236}\u{2215}\u{2215}evil\u{2024}io", "https\\:\\/\\/evil\\.io"),
+        // Fullwidth and small commercial at.
+        ("admin\u{FF20}evil\u{FE52}com", "admin\\@evil\\.com"),
+        ("admin\u{FE6B}evil\u{3002}com", "admin\\@evil\\.com"),
+        // Fullwidth letters fold too, so `ｗｗｗ．` cannot hide an autolink.
+        ("\u{FF57}\u{FF57}\u{FF57}\u{FF0E}evil\u{FF0E}com", "www\\.evil\\.com"),
+        // Other non-ASCII text is kept as written.
+        ("Zürich 東京 файл", "Zürich 東京 файл"),
+    ];
+    for (input, expected) in cases {
+        let mut payload = sample_alert();
+        payload.entity = Some(input.to_string());
+        payload.details = Some([(input.to_string(), input.to_string())].into_iter().collect());
+        let out = build_channel_body(ChannelType::Teams, &payload, &ctx).unwrap();
+        let facts = parse(&out.bytes)["attachments"][0]["content"]["body"][1]["facts"].clone();
+        let facts = facts.as_array().unwrap();
+        let entity = facts.iter().find(|f| f["title"] == "Entity").unwrap();
+        assert_eq!(entity["value"], expected, "entity {input:?}");
+        let detail = facts.iter().find(|f| f["title"] == expected).unwrap_or_else(|| panic!("label {input:?}: {facts:?}"));
+        assert_eq!(detail["value"], expected, "detail {input:?}");
+    }
+}
+
+/// NAN-5738: the fold maps only to ASCII, never drops a character, and
+/// leaves ASCII alone (so inert and recorded-fixture text is unchanged).
+#[test]
+fn fold_lookalike_maps_only_non_ascii_to_ascii() {
+    for c in (0u8..=127).map(char::from) {
+        assert_eq!(fold_lookalike(c), None, "{c:?}");
+    }
+    for c in ['\u{FF0E}', '\u{3002}', '\u{FF61}', '\u{FE12}', '\u{00B7}', '\u{30FB}'] {
+        assert_eq!(fold_lookalike(c).as_deref(), Some("."), "{c:?}");
+    }
+    for c in ['\u{FF1A}', '\u{FE13}', '\u{FE55}', '\u{2236}', '\u{A789}', '\u{0589}'] {
+        assert_eq!(fold_lookalike(c).as_deref(), Some(":"), "{c:?}");
+    }
+    for c in ['\u{FF0F}', '\u{2044}', '\u{2215}', '\u{29F8}'] {
+        assert_eq!(fold_lookalike(c).as_deref(), Some("/"), "{c:?}");
+    }
+    for c in ['é', '東', 'ф', '\u{1F600}'] {
+        assert_eq!(fold_lookalike(c), None, "{c:?}");
+    }
+}

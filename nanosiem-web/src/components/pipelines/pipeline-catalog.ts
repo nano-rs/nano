@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { GlossaryId } from '@/lib/glossary';
 import type { PipelineStep, PipelineStepKind } from '@/lib/pipeline-types';
 import { safeRandomUUID } from '@/lib/uuid';
 
@@ -19,6 +20,25 @@ export const STEP_LABELS: Record<PipelineStepKind, string> = {
   dedupe: 'Dedupe',
   route: 'Route',
   vrl: 'Advanced VRL',
+};
+
+/** The glossary entry that explains each step kind (legacy kinds share their successor's). */
+export const STEP_TERMS: Record<PipelineStepKind, GlossaryId> = {
+  rename: 'step-fields',
+  remove: 'step-fields',
+  set: 'step-fields',
+  redact: 'step-mask',
+  parse: 'step-parse',
+  fields: 'step-fields',
+  mask: 'step-mask',
+  split: 'step-split',
+  combine: 'step-combine',
+  filter: 'step-filter',
+  sample: 'step-sample',
+  lookup: 'step-lookup',
+  dedupe: 'step-dedupe',
+  route: 'step-route',
+  vrl: 'step-vrl',
 };
 
 const DEFAULT_CONFIG: Record<PipelineStepKind, Record<string, unknown>> = {

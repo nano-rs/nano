@@ -37,7 +37,7 @@ pub mod source_scope;
 pub use alerts::{compute_event_hash, AlertInsert, AlertRepository, AlertRepositoryError};
 pub use artifacts::{ArtifactRepository, ArtifactRepositoryError};
 #[cfg(feature = "enterprise")]
-pub use cases::{CaseRepository, CaseRepositoryError, CaseWorkflowRepository};
+pub use cases::{CaseRepository, CaseRepositoryError, CaseWorkflowRepository, DeletedCase};
 pub use dashboards::{DashboardRepository, DashboardRepositoryError};
 pub use detection_rules::{DailyStat, DetectionRuleRepository};
 pub use feedback::{

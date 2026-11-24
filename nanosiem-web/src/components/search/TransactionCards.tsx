@@ -10,8 +10,10 @@ import {
   Search as SearchIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { TruncatedText } from '@/components/ui/truncated-text';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { buildSecondaryPrefs, TRANSACTION_SECONDARY_BASE } from '@/lib/secondary-identity-prefs';
+import { Term } from '@/components/ui/term';
 
 interface SearchResult {
   id: string;
@@ -236,6 +238,26 @@ function bucketEvents(count: number, n = 24): number[] {
   return buckets;
 }
 
+/** "maxspan exceeded": a correctness signal, so it is never dropped at any width (NAN-5777). */
+function MaxspanBadge({ className }: { className?: string }) {
+  return (
+    <span
+      data-testid="tx-maxspan-exceeded"
+      className={cn(
+        'inline-flex items-center gap-1 px-1.5 py-[1px] rounded text-[9.5px] font-mono whitespace-nowrap font-semibold',
+        className,
+      )}
+      style={{
+        color: NOTABLE_RED,
+        background: 'oklch(62% 0.18 28 / 0.12)',
+        border: '1px solid oklch(62% 0.18 28 / 0.3)',
+      }}
+    >
+      maxspan exceeded
+    </span>
+  );
+}
+
 function TransactionCardRow({ tx, maxDurationSec, maxSpanMs, isExpanded, onToggle }: CardProps) {
   const durationPct = maxDurationSec > 0 ? Math.min(100, (tx.duration / maxDurationSec) * 100) : 0;
   const exceedsSpan = maxSpanMs != null && tx.duration * 1000 > maxSpanMs;
@@ -252,15 +274,30 @@ function TransactionCardRow({ tx, maxDurationSec, maxSpanMs, isExpanded, onToggl
         isExpanded && 'bg-muted/40',
       )}
     >
-      {/* summary row */}
+      {/* summary row (mouse: the whole row toggles; keyboard: the chevron button) */}
       <div
+        data-testid="tx-row"
         onClick={onToggle}
-        className="grid items-center gap-3 px-3 py-2 cursor-pointer hover:bg-foreground/[0.03] rounded-md transition-colors"
-        style={{ gridTemplateColumns: '16px 220px 1fr 120px 68px' }}
+        // NAN-5777: the row sizes to its list container (@container/tx), not a
+        // fixed 472px grid, so it never scrolls sideways in a dashboard panel:
+        //   >= 36rem  actor | duration bar + sparkline | duration | count
+        //   >= 24rem  the bar and sparkline drop out; the actor truncates
+        //   <  24rem  duration, start time and any maxspan badge move to a
+        //             second line that wraps, so even "123h 45m" fits
+        className="grid items-center gap-x-3 gap-y-0.5 px-3 py-2 cursor-pointer hover:bg-foreground/[0.03] rounded-md transition-colors grid-cols-[16px_minmax(0,1fr)_auto] @[24rem]/tx:grid-cols-[16px_minmax(0,1fr)_auto_auto] @[36rem]/tx:grid-cols-[16px_minmax(0,220px)_minmax(0,1fr)_120px_68px]"
       >
-        <ChevronRight
-          className={cn('w-[13px] h-[13px] text-muted-foreground transition-transform', isExpanded && 'rotate-90')}
-        />
+        <button
+          type="button"
+          aria-expanded={isExpanded}
+          aria-label={`${isExpanded ? 'Collapse' : 'Expand'} transaction ${tx.groupValue}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle();
+          }}
+          className="flex items-center justify-center w-4 h-4 rounded-sm text-muted-foreground outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          <ChevronRight className={cn('w-[13px] h-[13px] transition-transform', isExpanded && 'rotate-90')} />
+        </button>
         {/* actor */}
         <div className="flex items-center gap-2 min-w-0">
           <span
@@ -268,14 +305,14 @@ function TransactionCardRow({ tx, maxDurationSec, maxSpanMs, isExpanded, onToggl
             style={{ background: notable ? NOTABLE_RED : 'color-mix(in oklab, var(--primary) 60%, transparent)' }}
           />
           <div className="flex flex-col min-w-0">
-            <span className="font-mono text-[12px] text-foreground truncate">{tx.groupValue}</span>
+            <TruncatedText text={tx.groupValue} testId="tx-group" className="font-mono text-[12px] text-foreground" />
             {tx.secondary && (
-              <span className="font-mono text-[10px] text-muted-foreground truncate">{tx.secondary}</span>
+              <TruncatedText text={tx.secondary} className="font-mono text-[10px] text-muted-foreground" />
             )}
           </div>
         </div>
         {/* duration bar + sparkline */}
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="hidden @[36rem]/tx:flex items-center gap-3 min-w-0">
           <div className="flex-1 min-w-0 flex flex-col gap-1">
             <div className="relative h-1 rounded-full bg-foreground/10 overflow-hidden">
               <div
@@ -301,39 +338,35 @@ function TransactionCardRow({ tx, maxDurationSec, maxSpanMs, isExpanded, onToggl
               <span className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded text-[9.5px] font-mono whitespace-nowrap text-primary bg-primary/10 border border-primary/25">
                 {tx.eventCount}
               </span>
-              {exceedsSpan && (
-                <span
-                  className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded text-[9.5px] font-mono whitespace-nowrap font-semibold"
-                  style={{
-                    color: NOTABLE_RED,
-                    background: 'oklch(62% 0.18 28 / 0.12)',
-                    border: '1px solid oklch(62% 0.18 28 / 0.3)',
-                  }}
-                >
-                  maxspan exceeded
-                </span>
-              )}
+              {exceedsSpan && <MaxspanBadge />}
             </div>
           </div>
           <Sparkline buckets={buckets} notable={notable} />
         </div>
         {/* duration text */}
-        <div className="flex flex-col items-end">
+        <div
+          data-testid="tx-duration"
+          className="col-start-2 col-span-2 row-start-2 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 min-w-0 @[24rem]/tx:col-start-auto @[24rem]/tx:col-span-1 @[24rem]/tx:row-start-auto @[24rem]/tx:flex-col @[24rem]/tx:flex-nowrap @[24rem]/tx:items-end @[24rem]/tx:gap-0"
+        >
           <span
             className={cn(
-              'font-mono text-[12px] tabular-nums',
+              'font-mono text-[12px] tabular-nums whitespace-nowrap',
               exceedsSpan ? 'font-semibold' : 'text-foreground',
             )}
             style={exceedsSpan ? { color: NOTABLE_RED } : undefined}
           >
             {formatDuration(tx.duration)}
           </span>
-          <span className="font-mono text-[9.5px] text-muted-foreground">
+          <span className="font-mono text-[9.5px] text-muted-foreground whitespace-nowrap">
             {tx.start != null ? formatDate(tx.start) : '—'}
           </span>
+          {/* The last event's time is on screen only in the expanded detail. */}
+          {tx.end != null && <span className="sr-only">{`to ${formatDate(tx.end)} UTC`}</span>}
+          {/* Below 36rem the bar column (and its badge) is hidden: show it here. */}
+          {exceedsSpan && <MaxspanBadge className="@[36rem]/tx:hidden" />}
         </div>
         {/* event count */}
-        <div className="flex flex-col items-end">
+        <div className="col-start-3 row-start-1 flex flex-col items-end whitespace-nowrap @[24rem]/tx:col-start-auto @[24rem]/tx:row-start-auto">
           <span className="font-mono text-[12px] tabular-nums text-foreground font-semibold">
             {tx.eventCount}
           </span>
@@ -447,7 +480,7 @@ function TransactionDetail({ tx }: { tx: Transaction }) {
                     'relative grid gap-3 py-1.5 pl-7 pr-2 rounded-md transition-colors',
                     isHover ? 'bg-primary/8' : 'hover:bg-foreground/[0.03]',
                   )}
-                  style={{ gridTemplateColumns: 'auto 44px 1fr' }}
+                  style={{ gridTemplateColumns: 'auto 44px minmax(0, 1fr)' }}
                 >
                   <span
                     className="absolute left-[4px] top-1/2 -translate-y-1/2 rounded-full flex items-center justify-center"
@@ -462,18 +495,15 @@ function TransactionDetail({ tx }: { tx: Transaction }) {
                     #{String(i + 1).padStart(2, '0')}
                   </span>
                   <span />
-                  <span
-                    className="font-mono text-[11px] text-foreground truncate col-start-3"
-                    title={msg}
-                  >
-                    {msg}
+                  <span className="col-start-3 min-w-0">
+                    <TruncatedText text={msg} className="font-mono text-[11px] text-foreground" />
                   </span>
                 </div>
               );
             })}
             {tx.rawEvents.length === 0 && (
               <div className="pl-7 py-3 font-mono text-[11px] text-muted-foreground">
-                No sample events returned — backend truncated this transaction.
+                No sample events: the backend truncated this transaction.
               </div>
             )}
           </div>
@@ -561,7 +591,7 @@ export function TransactionCards({
           <span>Transactions</span>
         </div>
         <div className="p-8 text-center text-muted-foreground text-sm">
-          No transactions returned — relax the grouping window (maxspan), add another field, or broaden the base query.
+          No transactions. Relax maxspan, add a field, or broaden the query.
         </div>
       </div>
     );
@@ -571,17 +601,22 @@ export function TransactionCards({
     <div className="flex flex-col min-h-0 overflow-hidden">
       {/* header */}
       <div className="py-2 px-3 border-b border-border flex flex-wrap items-center gap-2 font-mono text-[10.5px] tracking-[0.12em] uppercase text-foreground/70 font-semibold">
-        <span className="flex items-center gap-1.5 shrink-0">
-          <Layers className="w-[12px] h-[12px] text-primary" />
-          <span>Transactions</span>
-          <span className="text-muted-foreground/60">·</span>
-          <span className="normal-case tracking-normal text-foreground">
-            by {parsed.fields.join(', ') || '(fields)'}
-          </span>
+        <span className="flex items-center gap-1.5 min-w-0 max-w-full">
+          <Layers className="w-[12px] h-[12px] text-primary shrink-0" />
+          <Term id="transaction" className="shrink-0">
+            Transactions
+          </Term>
+          <span className="text-muted-foreground/60 shrink-0">·</span>
+          <TruncatedText
+            text={`by ${parsed.fields.join(', ') || '(fields)'}`}
+            className="normal-case tracking-normal text-foreground"
+          />
         </span>
         {parsed.maxspan && (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-border text-[10px] normal-case tracking-normal font-semibold text-foreground">
-            <span className="text-muted-foreground">maxspan</span>
+            <Term id="maxspan" className="text-muted-foreground">
+              maxspan
+            </Term>
             <span className="text-primary font-mono">{parsed.maxspan.n}{parsed.maxspan.unit}</span>
           </span>
         )}
@@ -642,14 +677,14 @@ export function TransactionCards({
       </div>
 
       {/* toolbar */}
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-muted/30">
-        <div className="relative">
+      <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 border-b border-border bg-muted/30">
+        <div className="relative min-w-0 flex-1 max-w-[220px] basis-[140px]">
           <SearchIcon className="w-[11px] h-[11px] absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
           <input
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter by user or host"
-            className="bg-transparent outline-none text-[11px] pl-7 pr-2 py-1 rounded border border-border focus:border-primary/60 placeholder:text-muted-foreground w-[220px]"
+            className="bg-transparent outline-none text-[11px] pl-7 pr-2 py-1 rounded border border-border focus:border-primary/60 placeholder:text-muted-foreground w-full"
           />
         </div>
         <button
@@ -658,7 +693,7 @@ export function TransactionCards({
           disabled={maxSpanMs == null}
           title={maxSpanMs == null ? 'Set maxspan= in the query to flag notable transactions' : undefined}
           className={cn(
-            'inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[10.5px] transition-colors',
+            'inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[10.5px] whitespace-nowrap shrink-0 transition-colors',
             notableOnly
               ? 'border-primary/40 text-primary bg-primary/10'
               : maxSpanMs == null
@@ -670,35 +705,37 @@ export function TransactionCards({
           Notable only
         </button>
         <span className="flex-1" aria-hidden />
-        <span className="text-muted-foreground font-mono text-[10px] uppercase tracking-[0.12em]">
-          sort
+        <span className="inline-flex flex-wrap items-center gap-2 min-w-0">
+          <span className="text-muted-foreground font-mono text-[10px] uppercase tracking-[0.12em]">
+            sort
+          </span>
+          {(
+            [
+              ['duration', 'Duration'],
+              ['events', 'Events'],
+              ['time', 'Recent'],
+            ] as Array<[SortKey, string]>
+          ).map(([k, lbl]) => (
+            <button
+              key={k}
+              type="button"
+              onClick={() => setSort(k)}
+              className={cn(
+                'inline-flex items-center px-2 py-1 rounded-md text-[10.5px] transition-colors',
+                sort === k
+                  ? 'bg-primary/12 text-primary'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {lbl}
+            </button>
+          ))}
         </span>
-        {(
-          [
-            ['duration', 'Duration'],
-            ['events', 'Events'],
-            ['time', 'Recent'],
-          ] as Array<[SortKey, string]>
-        ).map(([k, lbl]) => (
-          <button
-            key={k}
-            type="button"
-            onClick={() => setSort(k)}
-            className={cn(
-              'inline-flex items-center px-2 py-1 rounded-md text-[10.5px] transition-colors',
-              sort === k
-                ? 'bg-primary/12 text-primary'
-                : 'text-muted-foreground hover:text-foreground',
-            )}
-          >
-            {lbl}
-          </button>
-        ))}
       </div>
 
       {/* list */}
       <div className="flex-1 min-h-0 overflow-auto">
-        <div className="p-3 flex flex-col gap-1.5">
+        <div className="@container/tx p-3 flex flex-col gap-1.5">
           {filtered.map((tx) => (
             <TransactionCardRow
               key={tx.id}

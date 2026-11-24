@@ -511,7 +511,7 @@ async fn staging_carries_the_source_configs_its_router_depends_on() {
 }
 
 /// `--config-dir` on a path that does not exist is itself a Vector error, and
-/// layouts differ per deployment (compose ships `sinks/`, the Rackspace
+/// layouts differ per deployment (compose ships `sinks/`, the self-managed k8s
 /// manifests do not). Staging creates the whole set unconditionally so the
 /// validated directory list can be the same one Vector is launched with.
 #[tokio::test]

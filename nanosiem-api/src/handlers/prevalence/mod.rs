@@ -145,6 +145,7 @@ mod scope_tests {
 
     fn session(permissions: &[&str], denied_sources: &[&str]) -> AuthContext {
         let mut auth = AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),

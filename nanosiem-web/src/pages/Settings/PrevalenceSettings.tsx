@@ -16,6 +16,7 @@ import {
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { usePrevalenceSettings, useUpdatePrevalenceSettings } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
+import { Term } from '@/components/ui/term';
 
 const DEFAULTS = {
   rarity_threshold: 3,
@@ -162,9 +163,9 @@ export function PrevalenceSettings() {
   return (
     <div className="px-6 py-5 space-y-7">
       <div>
-        <h1 className="text-[18px] font-semibold tracking-tight text-foreground">Rarity Thresholds</h1>
+        <h1 className="text-[18px] font-semibold tracking-tight text-foreground"><Term id="rarity-threshold">Rarity Thresholds</Term></h1>
         <p className="text-[11.5px] text-muted-foreground mt-0.5">
-          Artifact prevalence, rarity policy, tracking scope
+          How nano decides what is rare (<Term id="prevalence">prevalence</Term>) and what it tracks
         </p>
       </div>
 
@@ -172,9 +173,6 @@ export function PrevalenceSettings() {
         <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
           Rarity policy
         </div>
-        <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          An artifact seen on fewer hosts than this threshold is flagged as <em>rare</em>. Lower values mean stricter rarity detection.
-        </p>
 
         <div className="flex flex-col">
           <div className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
@@ -183,7 +181,7 @@ export function PrevalenceSettings() {
                 Host count threshold
               </label>
               <div id={rarityDescId} className="text-[11px] text-muted-foreground mt-0.5">
-                Recommended 3–5 for most environments. Increase for larger fleets.
+                Anything seen on fewer hosts than this counts as <em>rare</em>. 3 to 5 suits most networks.
               </div>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -207,7 +205,7 @@ export function PrevalenceSettings() {
           Tracking scope
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Choose which artifact families participate in prevalence aggregation. Disabling a category stops tracking and frees ClickHouse capacity.
+          Turning off a category stops tracking it and frees up database space.
         </p>
 
         <div className="flex flex-col">
@@ -241,9 +239,6 @@ export function PrevalenceSettings() {
         <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
           Retention & performance
         </div>
-        <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Controls how long prevalence aggregates are kept and how aggressively their lookups are cached.
-        </p>
 
         <div className="flex flex-col">
           <div className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
@@ -252,7 +247,7 @@ export function PrevalenceSettings() {
                 Data retention period
               </label>
               <div id={retentionDescId} className="text-[11px] text-muted-foreground mt-0.5">
-                Aggregates older than this are dropped. (1–365 days)
+                Counts older than this are deleted. (1–365 days)
               </div>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -275,7 +270,7 @@ export function PrevalenceSettings() {
                 Cache TTL
               </label>
               <div id={cacheDescId} className="text-[11px] text-muted-foreground mt-0.5">
-                How long prevalence query results stay cached. Set to 0 to disable caching. (0–3600 s)
+                How long a lookup answer is reused (<Term id="cache-ttl">TTL</Term>). 0 turns the cache off. (0–3600 s)
               </div>
             </div>
             <div className="flex items-center gap-2 shrink-0">

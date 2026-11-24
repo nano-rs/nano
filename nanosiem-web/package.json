@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "2.0.34",
+  "version": "2.0.35",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -94,6 +94,7 @@
     "@radix-ui/react-toggle": "^1.2.1",
     "@radix-ui/react-toggle-group": "^1.2.1",
     "@radix-ui/react-tooltip": "^1.4.1",
+    "@sentry/react": "11.10.0",
     "@supabase/supabase-js": "^2.58.0",
     "@tanstack/react-query": "^5.107.1",
     "@tanstack/react-virtual": "^3.14.26",

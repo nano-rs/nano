@@ -76,7 +76,7 @@ impl SearchService {
     /// against the logs table that do NOT inherit the base query's injected
     /// source-scope gate, so the caller's `ScopeSet` is threaded down here and
     /// its deny-set exclusion is appended to every secondary query's WHERE
-    /// (see [`source_scope_sql_predicate`]). An empty deny set emits nothing
+    /// (see [`source_scope_bound_predicate`]). An empty deny set emits nothing
     /// (byte-identical SQL to the pre-scoping form).
     pub(crate) async fn build_lateral_view(
         &self,
@@ -151,9 +151,9 @@ impl SearchService {
         let cols = LateralPredicateColumns::resolve(profile);
 
         // NAN-1797: render the caller's deny-set once; appended to every
-        // secondary hop query's WHERE below. `None` (unrestricted) emits
+        // secondary hop query's WHERE below (NAN-5793: bound, never inline). `None` (unrestricted) emits
         // byte-identical SQL to the pre-scoping form.
-        let scope_predicate = source_scope_sql_predicate(&cols.source_type, scope.deny_set());
+        let scope_predicate = source_scope_bound_predicate(&cols.source_type, scope.deny_set());
 
         // Step 2: BFS hop expansion
         let mut all_edges: Vec<LateralEdge> = Vec::new();
@@ -215,7 +215,7 @@ impl SearchService {
                 );
 
                 let events = self
-                    .execute_lateral_query(clickhouse, &auth_sql, &base_binds)
+                    .execute_lateral_query(clickhouse, &auth_sql, &base_binds, scope.deny_set())
                     .await?;
                 for event in events {
                     if let Some(edge) = extract_edge(&event, hop, "auth") {
@@ -268,7 +268,7 @@ impl SearchService {
                 );
 
                 let events = self
-                    .execute_lateral_query(clickhouse, &network_sql, &network_binds)
+                    .execute_lateral_query(clickhouse, &network_sql, &network_binds, scope.deny_set())
                     .await?;
                 for event in events {
                     if let Some(edge) = extract_edge(&event, hop, "network") {
@@ -294,7 +294,7 @@ impl SearchService {
                     );
 
                     let events = self
-                        .execute_lateral_query(clickhouse, &process_sql, &base_binds)
+                        .execute_lateral_query(clickhouse, &process_sql, &base_binds, scope.deny_set())
                         .await?;
                     for event in events {
                         if let Some(edge) = extract_edge(&event, hop, "process") {
@@ -606,8 +606,10 @@ impl SearchService {
         clickhouse: &clickhouse::Client,
         sql: &str,
         bind_values: &[String],
+        deny_set: &BTreeSet<String>,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
-        let mut query = clickhouse.query(sql);
+        // NAN-5793: the scope predicate references the bound deny parameter.
+        let mut query = bind_source_scope(clickhouse.query(sql), deny_set);
         for val in bind_values {
             query = query.bind(val);
         }
@@ -677,7 +679,7 @@ impl SearchService {
         // Hostname resolution is best-effort enrichment — degrade gracefully
         // on error (already logged inside execute_lateral_query).
         let rows = self
-            .execute_lateral_query(clickhouse, &sql, &ip_vec)
+            .execute_lateral_query(clickhouse, &sql, &ip_vec, scope.deny_set())
             .await
             .unwrap_or_default();
         for row in rows {
@@ -1173,7 +1175,7 @@ fn lateral_hostname_resolution_sql(
     placeholders: &str,
     deny_set: &BTreeSet<String>,
 ) -> String {
-    let scope_and = source_scope_sql_predicate("source", deny_set)
+    let scope_and = source_scope_bound_predicate("source", deny_set)
         .map(|pred| format!(" AND {pred}"))
         .unwrap_or_default();
     format!(
@@ -1188,28 +1190,103 @@ fn lateral_hostname_resolution_sql(
     )
 }
 
-/// Render a caller's source-scope deny-set as a ClickHouse WHERE predicate over
-/// `column_expr` (NAN-1797/NAN-1799).
+/// Server-side ClickHouse query parameter that carries a source-scope deny
+/// list as `Array(String)` (NAN-5722 review). The denied names never enter
+/// the SQL text,
+/// so a `?`, `?fields` or quote in a name cannot be read as a client-side bind
+/// or break the statement.
+pub const SOURCE_SCOPE_DENY_PARAM: &str = "nano_source_deny";
+
+/// `lower(<column_expr>) NOT IN {nano_source_deny:Array(String)}`. Pair it
+/// with [`source_scope_param_values`] bound via `Query::param`.
+pub fn source_scope_param_predicate(column_expr: &str) -> String {
+    format!("lower({column_expr}) NOT IN {{{SOURCE_SCOPE_DENY_PARAM}:Array(String)}}")
+}
+
+/// The lowercased deny values for [`SOURCE_SCOPE_DENY_PARAM`] (the same
+/// lowercase normalization as the nPL injector), or `None` when nothing
+/// is denied and no predicate should be emitted.
+pub fn source_scope_param_values(deny_set: &BTreeSet<String>) -> Option<Vec<String>> {
+    (!deny_set.is_empty()).then(|| deny_set.iter().map(|v| v.to_lowercase()).collect())
+}
+
+/// NAN-5793: the ClickHouse source-scope predicate over `column_expr` for a
+/// caller's deny-set, in its BOUND form: `None` for an empty deny-set (an
+/// unrestricted caller pays nothing), else
+/// `lower(<column_expr>) NOT IN {nano_source_deny:Array(String)}`.
 ///
-/// - Empty deny set → `None` (unrestricted callers pay nothing; callers must
-///   emit byte-identical SQL to the pre-scoping form).
-/// - Single member → `lower(col) != 'x'` — byte-identical to the legacy audit
-///   gate string for `{"audit"}` (see `build_fetch_log_sql`, NAN-694).
-/// - Multiple members → `lower(col) NOT IN ('a', 'b', …)` in BTreeSet
-///   (lexicographic) order — mirrors how the nPL injector's negated `InList`
-///   conjunct renders, and is case-safe on OCSF via the `lower()` wrap.
-///
-/// Values are lowercased and single-quote/backslash-escaped. Shared by the
-/// hand-built SQL paths in this service (lateral hops, `fetch_log_by_id`,
-/// `get_ext_field_names`, `query_udm_field`); nPL paths go through
+/// The denied names never enter the SQL text, so a `?` in one cannot be read
+/// by the driver as a client-side bind (failing the query, or shifting every
+/// later bind), and `?fields` cannot be rewritten. Every query whose SQL
+/// carries this predicate MUST go through [`bind_source_scope`] with the same
+/// deny-set. This is the ONE builder for hand-built ClickHouse side-door SQL
+/// (identity, asset, cloud, telemetry, health, AI, …); nPL paths go through
 /// `enforce_source_scope` instead — never both (no double gating).
+pub fn source_scope_bound_predicate(
+    column_expr: &str,
+    deny_set: &BTreeSet<String>,
+) -> Option<String> {
+    (!deny_set.is_empty()).then(|| source_scope_param_predicate(column_expr))
+}
+
+/// NAN-5793: bind a caller's deny-set as the server-side
+/// [`SOURCE_SCOPE_DENY_PARAM`] parameter that [`source_scope_bound_predicate`]
+/// references. An empty deny-set binds nothing (that SQL never references the
+/// parameter). ClickHouse ignores a bound parameter the SQL does not use, so
+/// binding every query of a scoped read is safe.
+pub fn bind_source_scope(
+    query: clickhouse::query::Query,
+    deny_set: &BTreeSet<String>,
+) -> clickhouse::query::Query {
+    match source_scope_param_values(deny_set) {
+        Some(values) => query.param(SOURCE_SCOPE_DENY_PARAM, values),
+        None => query,
+    }
+}
+
+/// NAN-5793: a ClickHouse client view whose every query binds a caller's
+/// deny-set (see [`bind_source_scope`]). For a read whose many sub-queries
+/// all carry [`source_scope_bound_predicate`], shadow the client once
+/// (`let clickhouse = SourceScopedClient::new(ch, scope.deny_set());`) so no
+/// sub-query can miss the binding.
+#[derive(Clone, Copy)]
+pub struct SourceScopedClient<'a> {
+    client: &'a clickhouse::Client,
+    deny_set: &'a BTreeSet<String>,
+}
+
+impl<'a> SourceScopedClient<'a> {
+    pub fn new(client: &'a clickhouse::Client, deny_set: &'a BTreeSet<String>) -> Self {
+        Self { client, deny_set }
+    }
+
+    /// `client.query(sql)` with the deny-set bound.
+    pub fn query(&self, sql: &str) -> clickhouse::query::Query {
+        bind_source_scope(self.client.query(sql), self.deny_set)
+    }
+}
+
+/// Render a caller's source-scope deny-set as a LITERAL predicate. Allowed
+/// only where a `?` in a literal is inert (NAN-5793):
 ///
-/// Crate-public (NAN-1801, P3): the "side-door" hand-built SQL paths in other
-/// crates (identity API, prevalence, telemetry, AI) reuse THIS single canonical
-/// builder rather than re-deriving the predicate shape — any divergence from the
-/// nPL injector's negated-`InList` rendering is the correctness risk. Re-exported
-/// as `nanosiem_core::search::service::source_scope_sql_predicate`.
-pub fn source_scope_sql_predicate(
+/// - **PostgreSQL** queries (the AI data-access fallbacks that read the PG
+///   event mirror): sqlx's PostgreSQL placeholders are `$n`.
+/// - **nPL-generated** SQL (`ClickHouseSqlGenerator`): its output carries
+///   user literals too, and every executor of it doubles `?` inside string
+///   literals (`escape_question_marks_in_strings`).
+///
+/// NEVER use this for hand-built ClickHouse SQL: the `clickhouse` driver
+/// parses `?` inside string literals as a bind, so a denied name with `?`
+/// fails the query or shifts later binds, and `?fields` is rewritten. Use
+/// [`source_scope_bound_predicate`] + [`bind_source_scope`] there. The
+/// `source_scope_inline_guard` test pins the callers of this function.
+///
+/// - Empty deny set → `None`.
+/// - Single member → `lower(col) != 'x'`.
+/// - Multiple members → `lower(col) NOT IN ('a', 'b', …)` in BTreeSet order.
+///
+/// Values are lowercased and single-quote/backslash-escaped.
+pub fn source_scope_literal_predicate(
     column_expr: &str,
     deny_set: &BTreeSet<String>,
 ) -> Option<String> {
@@ -1335,20 +1412,19 @@ mod source_scope_tests {
     /// they are fresh scans that do not inherit the base query's injection.
     #[test]
     fn nonempty_deny_set_gates_all_three_secondary_queries() {
-        let pred = source_scope_sql_predicate(
+        let pred = source_scope_bound_predicate(
             "source_type",
             &deny(&["audit", "windows_sysmon"]),
         )
         .expect("nonempty deny set must render");
-        assert_eq!(
-            pred,
-            "lower(source_type) NOT IN ('audit', 'windows_sysmon')"
-        );
+        assert_eq!(pred, "lower(source_type) NOT IN {nano_source_deny:Array(String)}");
         for sql in secondary_sqls(Some(&pred)) {
             assert!(
-                sql.contains("lower(source_type) NOT IN ('audit', 'windows_sysmon')"),
+                sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
                 "secondary query missing scope gate: {sql}"
             );
+            // NAN-5793: the denied names travel as a bound parameter.
+            assert!(!sql.contains("windows_sysmon"), "deny name inlined: {sql}");
             // The method WHERE is an OR-chain (auth) — the gate must be ANDed
             // against the PARENTHESIZED method predicate, not the last OR term.
             assert!(
@@ -1363,9 +1439,10 @@ mod source_scope_tests {
     #[test]
     fn empty_deny_set_emits_no_gate_in_any_secondary_query() {
         assert_eq!(
-            source_scope_sql_predicate("source_type", &BTreeSet::new()),
+            source_scope_bound_predicate("source_type", &BTreeSet::new()),
             None
         );
+        assert_eq!(source_scope_param_values(&BTreeSet::new()), None);
         for sql in secondary_sqls(None) {
             assert!(
                 !sql.contains("NOT IN") && !sql.to_lowercase().contains("lower(source_type) !="),
@@ -1374,24 +1451,37 @@ mod source_scope_tests {
         }
     }
 
-    /// Single-member deny set renders the `!=` form — byte-identical to the
-    /// legacy audit gate for `{"audit"}`.
+    /// NAN-5793: a single-member deny set renders the same bound form; the
+    /// name itself never reaches the SQL text.
     #[test]
-    fn single_member_deny_set_renders_inequality() {
+    fn single_member_deny_set_renders_the_bound_form() {
         assert_eq!(
-            source_scope_sql_predicate("source_type", &deny(&["audit"])).as_deref(),
-            Some("lower(source_type) != 'audit'")
+            source_scope_bound_predicate("source_type", &deny(&["audit"])).as_deref(),
+            Some("lower(source_type) NOT IN {nano_source_deny:Array(String)}")
         );
     }
 
-    /// Values are lowercased and escaped so the predicate is case-safe on OCSF
-    /// and injection-safe on hostile source_type names.
+    /// Bound values are lowercased (case-safe on OCSF) and otherwise verbatim:
+    /// a quote or `?` is data in the parameter, not SQL.
     #[test]
-    fn deny_values_are_lowercased_and_escaped() {
+    fn bound_deny_values_are_lowercased_and_verbatim() {
         assert_eq!(
-            source_scope_sql_predicate("source_type", &deny(&["Weird'Name", "OTEL_TRACES"]))
+            source_scope_param_values(&deny(&["Weird'Name?", "OTEL_TRACES"])),
+            Some(vec!["otel_traces".to_string(), "weird'name?".to_string()])
+        );
+    }
+
+    /// The PostgreSQL-only literal form keeps its escaping.
+    #[test]
+    fn pg_literal_deny_values_are_lowercased_and_escaped() {
+        assert_eq!(
+            source_scope_literal_predicate("source_type", &deny(&["Weird'Name", "OTEL_TRACES"]))
                 .as_deref(),
             Some("lower(source_type) NOT IN ('otel_traces', 'weird''name')")
+        );
+        assert_eq!(
+            source_scope_literal_predicate("source_type", &deny(&["audit"])).as_deref(),
+            Some("lower(source_type) != 'audit'")
         );
     }
 
@@ -1406,7 +1496,9 @@ mod source_scope_tests {
             &deny(&["windows_dns"]),
         );
         assert!(
-            scoped.contains("AND hostname != '' AND lower(source) != 'windows_dns'"),
+            scoped.contains(
+                "AND hostname != '' AND lower(source) NOT IN {nano_source_deny:Array(String)}"
+            ) && !scoped.contains("windows_dns"),
             "scoped hostname resolution must gate on the source column:\n{scoped}"
         );
 
@@ -1432,9 +1524,9 @@ mod source_scope_tests {
     fn ocsf_scope_gate_uses_operational_source_type_not_class_uid() {
         let profile = crate::schema::OcsfProfile::new();
         let cols = LateralPredicateColumns::resolve(&profile);
-        let pred = source_scope_sql_predicate(&cols.source_type, &deny(&["audit"]))
+        let pred = source_scope_bound_predicate(&cols.source_type, &deny(&["audit"]))
             .expect("nonempty deny set must render");
-        assert_eq!(pred, "lower(source_type) != 'audit'");
+        assert_eq!(pred, "lower(source_type) NOT IN {nano_source_deny:Array(String)}");
         assert!(
             !pred.contains("class_uid"),
             "OCSF scope gate must not reference the class_uid UInt32 column: {pred}"

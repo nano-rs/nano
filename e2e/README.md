@@ -24,8 +24,48 @@ scripts/e2e.sh down --run <runid> [--purge]
 Suites map to `e2e/tests`: `base`, `ingest`, `onboarding`, `detection`,
 `search_jobs`, `pull` (the directory), `ui` (browser, phase 2), `enterprise`,
 `content_acceptance` (NAN-4955's signed local publisher + GitHub sinkhole),
-or `all` / `fast`.
+`zero_clicks` (NAN-5763, below), or `all` / `fast`.
 Anything after `--` goes to pytest.
+
+### Trust config: release by default (NAN-5771)
+
+A bare `up` builds what a release build trusts: production content and
+catalog keys only. The non-shippable test-key composition
+(`--cfg nano_content_acceptance` with `NANO_NON_RELEASE_BUILD=1`) is opt-in.
+It needs a native enterprise stack, and you get it from any of these:
+
+- `up --acceptance-trust`
+- `up --profile soar-lab` (the SOAR lab transport exists only under the cfg)
+- `run content_acceptance`, `run soar`, `run all`, or a bare `run`. These
+  suites set it themselves.
+
+The trust config is printed at bring-up, with a loud `TEST BUILD` banner for
+test trust. It is recorded as `E2E_TRUST` (`production` or
+`production+acceptance`) in `run.env` and `stack.env`, and shown by `status`.
+
+Every check fails closed:
+
+- The build never takes trust from the caller's environment. A `RUSTFLAGS`,
+  `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or
+  `CARGO_TARGET_*_RUSTFLAGS` carrying the cfg is refused, and an inherited
+  `NANO_NON_RELEASE_BUILD` is stripped.
+- `nanosiem-api` and `nanosiem-jobs` print their compiled trust with
+  `--print-content-trust`. The harness checks both after the build and before
+  every native start (`up`, `run` reuse, `svc start|restart`), so a stale
+  `--no-build` binary is refused.
+- After the admin bootstrap, `GET /api/content/channels` must report
+  `E2E_TRUST`. A 500, 401/403, network error or bad body fails like a
+  mismatch. The only exception is a 404 on a published image
+  (`--app image:<tag>`), which predates the endpoint: that prints a warning.
+  On `--defer-admin` stacks, `nano_e2e.firstrun` runs the same check
+  (`nano_e2e.trust`) once it mints the key.
+- A reused stack must match what the run asked for: `--acceptance-trust` or
+  `--profile soar-lab` never reuse a production stack.
+- Test trust with `--release`, a non-native app mode, `--edition open` or
+  `--target existing` is refused. A set-but-empty `CARGO_ENCODED_RUSTFLAGS`
+  counts as set.
+
+Use a default `up` for any fresh-install or trust check.
 
 ### What `up` does
 
@@ -224,6 +264,64 @@ When you build a feature with UI:
    `scripts/release/` (its selftest and the release sidecars go too; the
    manifest stays for the smoke walk).
 
+## Layout invariants on every page (NAN-5762)
+
+Every browser scenario measures the layout of every state it reaches. There is
+nothing to call: `UiPage.op` (`nano_e2e/ui.py`) runs the driver's
+`layout_check` after each op, and the driver scans the page whenever its
+fingerprint changes (route and query string, viewport width, theme, open
+panels, selected / active / expanded controls, DOM size, loading state). The scan is `nanosiem-web/tests/e2e/ui/layout.mjs`:
+
+| check | fails when |
+|---|---|
+| `overflow` | a scroll container scrolls sideways (`scrollWidth > clientWidth + 1`), or an element sticks out past the right edge of the main pane or a flyout / drawer / dialog. The app shell clips horizontal overflow at the document, so `document.scrollWidth` proves nothing; the main pane and each container are measured instead |
+| `escape` | a visible element leaves its nearest card or panel by more than 2 px (8 px for absolutely positioned badges); text spilling out of its own box counts |
+| `clipped` | the same inside a card that hides overflow: the part past the edge is cut off |
+| `overdrawn` | a sampled link or button is not what `elementFromPoint` hits at its centre: a sibling is painted over it. Sticky headers, floating buttons, toasts and tooltips are ignored; under a modal only the modal's controls are sampled |
+
+**Cards and panels.** The shared `<Card>` sets `data-layout-card`; sheets,
+dialogs and drawers set `data-layout-panel`. Hand-rolled cards are detected
+too: any box at least 120x32 px with a border on all four sides and rounded
+corners that is not itself a control. `data-layout-card="off"` opts a box out.
+
+**A failure** names the check, the route, the offending element and its card
+or container (nearest `data-testid` first), writes `layout-<n>.png` with the
+offenders outlined in magenta and appends
+`layout.jsonl` in the scenario's `ui/` artifacts. A violation is confirmed by
+a second scan 450 ms later (an animating sheet is not a bug), is never dropped
+once confirmed, and is reported once per scenario. The final check at teardown
+is forced.
+
+**Secrets fail closed.** No screenshot is taken, and no element text goes into
+`layout.jsonl`, while the page has a password field (even an empty one), a
+known reveal-once element (API key, ingest token, invite password, MFA secret
+or QR code, backup codes), a field a secret was typed into, or a registered
+secret in the DOM, rendered text or a field value. Pending API bodies are read
+first, so issued keys are known. Element text that is written is scrubbed of
+registered secrets and of token-shaped strings (JWTs, key prefixes, long
+mixed-case base64 runs). A violation a scenario swallowed (an `eventually` retry catches
+`AssertionError`) still fails it at teardown.
+
+**Intentional exceptions** go in `e2e/coverage/layout-allowlist.json`, each
+with a reason: wide data tables and code blocks scroll sideways by design. A
+bug that is being fixed can be allowlisted while its PR is open with
+`"temporary": true, "issue": "NAN-<id>"`; the coverage gate lists every
+temporary entry on each run, so remove it when the fix merges. A product bug
+with no fix in flight is pinned like any other (`known_bug` on the step).
+
+```bash
+NANO_E2E_LAYOUT=report scripts/e2e.sh run ui ...   # record only (calibration); layout.jsonl per scenario
+NANO_E2E_LAYOUT=off    scripts/e2e.sh run ui ...   # skip the scan
+```
+
+The coverage gate (`scripts/release/check-e2e-coverage.py`) fails when the
+hook is gone from `UiPage.op`, when a covered surface has no covering test that
+opens a browser page (so nothing measures it; an `action:` with nothing to
+render, such as zero-click install content, says so in `"no_layout": "<why>"`), or when an allowlist entry has
+no reason, no matcher, an unknown check, a surface that is not in the
+manifest, or (temporary) no issue. `selftest/test_layout_invariants.py` proves
+each check fires on the bug shape it exists for.
+
 ## Harness conventions
 
 - **Run markers.** Every event carries `nano-e2e-<runid>-<hash(test)>`, and
@@ -278,8 +376,42 @@ When you build a feature with UI:
 | enterprise `soar` storm (NAN-5618) | 5,000 alerts against a live alert flow: the hourly cap admits 60, records 540 as skipped, the spike breaker pauses the flow and counts the rest; a second flow runs its 60 to completion while the shared Okta connection stays at or under 30 calls per minute; a failing flow pauses after 5 failed runs; audit rows, SIEM Health finding, audited resume (`-- -k storm`) | runs (native app + `soar-lab`; OCSF) |
 | enterprise ui: risk watchlists (NAN-4926) | a risk rule fires on OCSF events for a user; New watchlist (weight 0.5): rail == API; Risk index ×1.50 badge, effective and base == `/api/risk/entities`; detail sheet; `risk:view` alone sees no weight | runs |
 | content_acceptance (NAN-4955) | fresh OCSF enterprise install consumes signed parser, rule, playbook, marketplace, model, MITRE ATT&CK and SOAR channels from a loopback app publisher while a deny-all proxy sinkholes GitHub; real catalogs + browser surfaces populate; tamper retains last-good; raw air-gap import advances the channel | `scripts/e2e.sh run content_acceptance --fresh` (native only) |
+| zero_clicks (NAN-5763) | fresh install, data flowing, NOTHING clicked: open channels (parsers, rules, enrichments, MITRE ATT&CK) install and apply, official rules + parsers sync, the MITRE catalog comes from its channel; enterprise adds the playbooks / integrations / models channels, the SOAR catalog applied, official playbooks and hunts in the library, scheduled recon's profile + capability binding for the flowing source, hunt templates; the audit log holds no sync / import / check / recon action by a user or API key | `scripts/e2e.sh run zero_clicks [--edition open]` (runs alone on a stack it creates; skips anywhere else). Adds `--profile recon-fast` itself (scheduled recon is on in real installs, off on other e2e stacks). Every step is a plain assertion (guards NAN-5755, NAN-5757, NAN-5768, NAN-5769) |
 | pull | connector feeds: Okta, Google Workspace, Slack, Netskope (`saas_api`) + a rejected credential | runs with the mock-vendor profile (phase 2, below) |
 | enterprise | Nano Pipe pipelines (5 stubs) | skips: lands with NAN-4919 |
+
+### Zero clicks (NAN-5763)
+
+NAN-5755 (playbooks never reached the library) and NAN-5757 (recon never ran)
+shipped because every scenario that looked at that content called the sync or
+recon endpoint first. `zero_clicks` checks the install itself. It brings up a
+fresh stack. First-run setup and the C05 license import run as an operator
+would do them. Then it starts one log source with its own token, sending OCSF
+Authentication events for the whole session, and only reads from then on.
+
+- It must run alone, on a stack it creates: `run zero_clicks` refuses `--run`
+  and other suites, and only then exports `E2E_ZERO_CLICKS=1`. Under `run all`
+  or on a reused stack the scenarios skip.
+- One budget for every wait (`E2E_ZERO_CLICKS_BUDGET_S`, default 900 s), so
+  the run stays bounded however much is missing. A wait that runs out fails
+  with the symptom (counts, channel status), which is what `known_bug`
+  signatures match. The SOAR catalog wait runs last, on its own bounded
+  slice: 360 s after the license import finished (`up` records the import
+  window as `E2E_LICENSE_IMPORT_STARTED_AT` / `_FINISHED_AT`). An active
+  license is asserted first. An enterprise `run zero_clicks` without the C05
+  license env is refused.
+- Two guards hold the no-clicks premise. In-process, every non-GET API
+  request outside `ALLOWED_WRITES` (the data-flow source) is refused. Each
+  module's last scenario asserts that the audit log (not degraded, fully
+  paged, with this run's own setup rows present) holds none of
+  `nano_e2e.zero_clicks.FORBIDDEN_ACTIONS` from a user or API key. That
+  includes the manual playbook sync and import endpoints, which audit their
+  caller (NAN-5784).
+- It runs against the real content channels (`api.nano.rs`; enterprise
+  channels use the imported license). Shared helpers are in
+  `nano_e2e/zero_clicks.py`. The open-core module is `tests/zero_clicks/`; the
+  enterprise companion is `tests/enterprise/zero_clicks/`, which the mirror
+  strips.
 
 ## Phase 2: UI scenarios and the mock-vendor profile (NAN-4937)
 
@@ -291,6 +423,21 @@ E2E_UI_HEADED=1 scripts/e2e.sh run ui ... # watch the browser
 scripts/e2e.sh run personas              # all five role-based journeys
 scripts/e2e.sh run personas --edition open # core paths + explicit AI boundary
 ```
+
+On `--edition open`, the scenarios expect what the open build really shows
+(NAN-5747):
+
+- A capability-gated route renders the license panel ("<Feature> is not
+  licensed", testid `licensed-feature-unavailable`).
+- An `@/enterprise` stub without a capability gate renders "Available in nano
+  paid plans".
+- Persona and role permission sets are narrowed to the build's
+  `GET /api/permissions`, through `nano_e2e.rbac.edition_permissions`. On
+  enterprise a missing permission fails instead.
+
+The panel copy lives in `nano_e2e/edition.py`. The release preflight runs
+`python3 -I e2e/nano_e2e/edition.py` and stops when the web UI no longer
+contains it.
 
 ### Persona journeys and deterministic AI
 
@@ -433,6 +580,93 @@ the API and with the seeded truth.
   `data-host-count`, dashboard panels with `data-panel-status`, notebook rows
   and entries).
 
+### Realistic seed profile (NAN-5764)
+
+Layout bugs such as NAN-5758 and NAN-5759 only show up with real-world volume
+and string lengths, and the default e2e stack is nearly empty. The realistic
+profile seeds a lived-in install before the first UI scenario:
+
+```bash
+scripts/e2e.sh run ui --seed realistic             # or E2E_SEED_PROFILE=realistic
+e2e/.venv/bin/python -m nano_e2e.realistic_seed --run <id>   # by hand, on a kept stack
+```
+
+- **Content** (`nano_e2e.realistic_plan`, pure and deterministic, seed 5764):
+  ~1,400 OCSF events (Authentication, Network and Process Activity) from 441
+  hosts and 339 users, including unicode, apostrophes, a one-character user
+  and 80+ character UPNs and FQDNs. It also holds 14 log sources: the
+  publishing OCSF lane, four each of the push methods (`routed`,
+  `splunk_hec`, `vector`) with long and unicode names, and one deleted. Fetch
+  methods are left out: without a bound source configuration with real cloud
+  credentials they break every Vector render (NAN-5789). There
+  are 38 detection rules with snake_case names in the `Automated` folder, in
+  every mode, with up to 18 tags; some are archived, two were imported and
+  then deleted, and six fire real alerts. There are 30 cases with long
+  unicode titles, in every status, one at the 32-tag limit, one untagged and
+  two deleted. Six hunts have long titles and many tags; one is archived and
+  three carry findings with long narratives. There are two profile drafts
+  and three dashboards with long names. SOAR has every catalog pack
+  installed and four manual flows whose runs leave 24 pending approvals, 10
+  of them case-linked.
+- **API only.** Events arrive through Vector HEC with the seed source's own
+  ingest token. Everything else is created, archived, deleted, run or
+  installed through the API. Hunt findings come from a registered desktop
+  runner that claims a sweep and files a report whose evidence is the seeded
+  events' ids. SOAR is switched on, and the flows are saved and run, by the
+  stack admin's own interactive session, which is ended afterwards. Nothing
+  writes to PostgreSQL or ClickHouse directly.
+- **Idempotent.** Every name carries the stable `rs5764` key (no run id), so
+  each step lists what is there and adds only what is missing. Events are
+  matched by `metadata.uid`. Objects the plan deletes are found in the audit
+  log, and pending approvals are topped up to 24 (they expire after at most
+  24 h). A second run on the same stack creates nothing. On a fresh local
+  enterprise stack the first run takes about 3.5 minutes (mostly the case
+  tags and the 24 approval runs) and a re-run about 4 seconds.
+- **Opt-in.** The autouse fixture `nano_e2e.fixtures_seed` does nothing
+  unless the profile is selected, so the default UI run keeps its speed.
+- **Throwaway stacks only, with no override** (`realistic_seed.check_target`).
+  Before the first request, the seed checks every one of these:
+  - the run dir is this checkout's `target/e2e/<run id>/`, and its
+    `compose.env` marker names the project `nanoe2e-<run id>`, this checkout
+    as owner, and the OCSF profile;
+  - the stack's containers carry the harness's `nano.e2e.project` and
+    `nano.e2e.owner` labels;
+  - the API, search and HEC URLs are loopback on ephemeral ports.
+
+  It refuses `--target existing`, the UDM profile, Dan's dev ports
+  (3000/3002/5173), any `*.nano.rs` host and any non-loopback host. The CLI
+  exits 2 on a refusal, and the runner rejects `--seed` with
+  `--target existing`, with `zero_clicks`, or with an unknown profile.
+- **Resumable.** Each item is checked on its own, so an interrupted run is
+  finished by the next one:
+  - a source left as a draft is published;
+  - a source, case or imported rule the plan deletes is deleted if it still
+    exists;
+  - hunt findings go only onto their own hunt's sweep. A claim that returns
+    another hunt's sweep is never reported on, and a sweep that an
+    interrupted run still holds is reported under its fence;
+  - pending approvals are counted as the seeded flows' unfinished runs.
+- **Secrets.** The session's access and refresh tokens and each ingest token
+  are registered with the artifact guard and the API journal. Ingest tokens
+  are revoked once the events are in, and the CLI scrubs the run's
+  artifacts before it exits.
+- **Gaps.** A step the stack cannot do is recorded as a gap, not a failure,
+  for example when the SOAR catalog channel has not applied within
+  `E2E_SEED_CATALOG_WAIT_S` (default 420 s) or on the open edition (no
+  cases, hunts or SOAR). Gaps are printed and written to
+  `<artifacts>/realistic-seed.json` with the per-step counts and timings.
+  `E2E_SEED_STRICT=1` makes any gap a failure.
+- **Selftests:**
+  - `selftest/test_realistic_seed.py` keeps the plan from shrinking back: the
+    issue's minimums, unicode and long strings, dead objects, snake_case
+    rules in `Automated`, OCSF only, and determinism.
+  - `test_realistic_seed_apply.py` runs `apply()` against an in-memory API
+    (`selftest/fake_nano_api.py`). A re-run creates nothing and lists flows
+    once. The seed is interrupted at nine risky steps and must resume
+    without duplicates, a foreign sweep must never be reported on, and the
+    test checks token revocation and secret scrubbing.
+  - `test_realistic_seed_guard.py` covers every refusal.
+
 ### Hunts UI walk (NAN-5586)
 
 `tests/enterprise/ui/test_hunts_ui_walk.py` walks every hunts page as an
@@ -511,6 +745,7 @@ collect the pinned bugs' screenshots in one place.
 - **Artifacts,** under `artifacts/scenarios/<test>/ui/`:
   - always: `console.log` (including accepted dialogs);
   - on failure: `failure.png`, `page.html` and `network.jsonl`.
+  - on a layout violation (NAN-5762): `layout-<n>.png` and `layout.jsonl`.
 - **Logins.** The driver waits for in-flight `/api/auth/*` requests before it
   navigates. Navigating away mid-refresh loses the rotated refresh cookie, and
   the next page is then logged out (finding below).
@@ -953,6 +1188,14 @@ SP roles, scoped to the namespace and storage account only:
     (for nano). *Data Owner* covers both.
 - **Storage account:** *Storage Blob Data Contributor*, for the checkpoint
   container (create and delete, plus nano's checkpoint writes).
+
+## Sentry error tracking (NAN-5798, report only)
+
+For nano's own runs: `NANO_E2E_SENTRY=1 scripts/e2e.sh run personas` runs the
+stack with Sentry on (environment `e2e`, tagged with the run id and the
+running test; see `scripts/lib/e2e-sentry.sh`). At `down` the run's issues
+land in `artifacts/sentry/summary.txt` and `issues.json`; the run never fails
+because of them. Without the flag nothing changes.
 
 ## Legacy lanes
 

@@ -472,7 +472,7 @@ export function MetricsExplorer({
           </div>
         ) : series.length === 0 || series.every((s) => s.points.length === 0) ? (
           <div className="py-12 text-center text-[12px] text-fg-3">
-            No samples for this metric in the selected range and filters. A catalog entry can outlive its latest samples.
+            No samples for this metric in the selected range.
             <TelemetrySetupHint />
           </div>
         ) : (

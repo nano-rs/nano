@@ -105,18 +105,28 @@ def _panel(pid: str, title: str, query: str, viz: str) -> dict[str, Any]:
     }
 
 
-PANELS = [
-    _panel("sig_time", "Detections over time", "dataset=signals | timechart span=1h count by severity", "line"),
-    _panel("sig_rules", "Top firing rules", "dataset=signals | stats count by rule_name | sort -count | head 10", "table"),
-    _panel("sig_total", "Detections", "dataset=signals | stats count", "single_value"),
-    _panel(
-        "risk_top",
-        "Riskiest entities",
-        "dataset=risk | sort -score_24h | head 10 | table entity, entity_type, score_24h, findings_24h, last_rule_name",
-        "table",
-    ),
-    _panel("risk_types", "Risky entities by type", "dataset=risk | stats count by entity_type", "bar"),
-]
+def _panels(tag: str, host_a: str, host_b: str) -> list[dict[str, Any]]:
+    """The dashboard's panels, each filtered to THIS scenario's rules or
+    entities (NAN-5835). The shapes are the real ones (timechart, top 10,
+    single value, bar), but unfiltered `head 10` panels are order-dependent:
+    risk and signals left by earlier tests in the same stack outrank this
+    scenario's (host-a scores 40; leftovers scored 75 to 225 on RC1), so
+    host-a never rendered. The filter adds no visibility: source scoping is
+    applied on top of it, so a source-B row can still only be hidden by RBAC."""
+    sig = f'dataset=signals rule_name="e2e_nan5612_*_{tag}"'
+    risk = f'dataset=risk entity IN ("{host_a}", "{host_b}")'
+    return [
+        _panel("sig_time", "Detections over time", f"{sig} | timechart span=1h count by severity", "line"),
+        _panel("sig_rules", "Top firing rules", f"{sig} | stats count by rule_name | sort -count | head 10", "table"),
+        _panel("sig_total", "Detections", f"{sig} | stats count", "single_value"),
+        _panel(
+            "risk_top",
+            "Riskiest entities",
+            f"{risk} | sort -score_24h | head 10 | table entity, entity_type, score_24h, findings_24h, last_rule_name",
+            "table",
+        ),
+        _panel("risk_types", "Risky entities by type", f"{risk} | stats count by entity_type", "bar"),
+    ]
 
 
 def _panel_rows(client: Nano, query: str) -> tuple[int, Any]:
@@ -220,6 +230,7 @@ def test_signals_and_risk_dashboard_is_scoped_and_renders(
             ok=lambda r: r[0] == 200 and len(r[1]["results"]) == 2,
         )[1]
         timeline.step("admin risk", rows=admin_risk["results"])
+        panels = _panels(tag, host_a, host_b)
 
         dashboard = expect(
             nano.api.post(
@@ -241,7 +252,7 @@ def test_signals_and_risk_dashboard_is_scoped_and_renders(
                             {"i": "risk_types", "x": 0, "y": 8, "w": 6, "h": 4},
                         ],
                     },
-                    "panels": PANELS,
+                    "panels": panels,
                 },
             ),
             200,
@@ -250,13 +261,22 @@ def test_signals_and_risk_dashboard_is_scoped_and_renders(
         cleanup.append(lambda: nano.api.delete(f"/api/dashboards/{dashboard['id']}"))
 
         # Restrict source B; the viewer persona has no grant for it.
+        #
+        # Source A is never restricted, and neither is any source another test
+        # left in the stack, so the scoped viewer sees all of them. That is the
+        # per-source RBAC model, not a leak: default allow-all, deny-by-omission,
+        # "a user's visibility = all unrestricted sources + sources granted to
+        # any of their groups" (docs-internal/working-notes/
+        # RBAC_SOURCE_SCOPING_DESIGN.md, NAN-1789; denied = restricted -
+        # grants, nanosiem-core/src/auth/source_scope_resolver.rs). Only the
+        # restricted source B must disappear, which is what is asserted below.
         expect(nano.api.post("/api/source-scopes/restricted", json={"source_type": b_st, "description": "nan-5612 e2e"}), 200, 201)
         cleanup.append(lambda: nano.api.delete(f"/api/source-scopes/restricted/{b_st}"))
 
         # Numbers, per panel, admin vs scoped viewer.
         table: list[dict[str, Any]] = []
         with login_persona(stack, nano, ui, artifact_dir, "nan5612-scoped-viewer", VIEWER) as viewer:
-            for q, label in [(rules_q, "signals by rule"), (risk_q, "risk entities")] + [(p["query"], p["title"]) for p in PANELS]:
+            for q, label in [(rules_q, "signals by rule"), (risk_q, "risk entities")] + [(p["query"], p["title"]) for p in panels]:
                 s_admin, b_admin = _panel_rows(nano, q)
                 s_view, b_view = _panel_rows(viewer.client, q)
                 assert s_admin == 200 and s_view == 200, (q, b_admin, b_view)
@@ -267,6 +287,23 @@ def test_signals_and_risk_dashboard_is_scoped_and_renders(
             assert {r["rule_name"] for r in table[0]["admin"]} == {rule_a["name"], rule_b["name"], rt_a, rt_b}, table[0]
             assert {r["entity"] for r in table[1]["scoped"]} == {host_a}, table[1]
             assert {r["entity"] for r in table[1]["admin"]} == {host_a, host_b}, table[1]
+            # Every dashboard panel, admin vs scoped (the panels carry only
+            # this scenario's data, so each one is checked exactly).
+            by = {t["panel"]: t for t in table[2:]}
+            denied_sev = ("critical", "medium")  # source B's severities only
+            for row in by["Detections over time"]["scoped"]:
+                assert not any(row.get(k) for k in denied_sev), by["Detections over time"]
+            assert any(row.get("high") for row in by["Detections over time"]["scoped"]), by["Detections over time"]
+            assert any(row.get(k) for row in by["Detections over time"]["admin"] for k in denied_sev), by["Detections over time"]
+            assert {r["rule_name"] for r in by["Top firing rules"]["scoped"]} == {rule_a["name"], rt_a}, by["Top firing rules"]
+            assert {r["rule_name"] for r in by["Top firing rules"]["admin"]} == {rule_a["name"], rule_b["name"], rt_a, rt_b}, by["Top firing rules"]
+            scoped_n = by["Detections"]["scoped"][0]["count"]
+            admin_n = by["Detections"]["admin"][0]["count"]
+            assert 0 < scoped_n < admin_n, by["Detections"]
+            assert {r["entity"] for r in by["Riskiest entities"]["scoped"]} == {host_a}, by["Riskiest entities"]
+            assert {r["entity"] for r in by["Riskiest entities"]["admin"]} == {host_a, host_b}, by["Riskiest entities"]
+            assert by["Risky entities by type"]["scoped"] == [{"count": 1, "entity_type": "hostname"}], by["Risky entities by type"]
+            assert by["Risky entities by type"]["admin"] == [{"count": 2, "entity_type": "hostname"}], by["Risky entities by type"]
 
             # A full-page capture resizes the viewport, which re-renders the
             # responsive charts and restarts their animation (the captured bar
@@ -315,9 +352,9 @@ def test_signals_and_risk_dashboard_is_scoped_and_renders(
         assert raw, sorted(key)
         no_det = Nano(stack.api_url, stack.search_url, {"X-API-Key": raw}, Journal(None))
         if True:
-            s, b = _panel_rows(no_det, PANELS[2]["query"])
+            s, b = _panel_rows(no_det, panels[2]["query"])
             assert s == 403 and "detections:view" in str(b), (s, b)
-            s, b = _panel_rows(no_det, PANELS[3]["query"])
+            s, b = _panel_rows(no_det, panels[3]["query"])
             assert s == 200, (s, b)
             timeline.step("no detections:view", signals_status=403, risk_status=200)
     finally:

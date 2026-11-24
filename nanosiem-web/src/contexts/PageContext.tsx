@@ -71,6 +71,7 @@ const PAGE_ROUTES: ReadonlyArray<readonly [pattern: string, pageKey: string]> = 
   ['/rules/coverage', 'mitre-coverage'],
   ['/rules/tuning', 'ai-tuning'],
   ['/rules/tuning/:id', 'tuning-proposal'],
+  ['/rules/ideas', 'rule-ideas'],
   ['/rules/repositories', 'rule-repositories'],
   ['/rules/editor/*', 'rule-editor'],
   ['/rules/retro-hunt/*', 'retro-hunt'],
@@ -80,19 +81,21 @@ const PAGE_ROUTES: ReadonlyArray<readonly [pattern: string, pageKey: string]> = 
 
   ['/hunts', 'hunts'],
   ['/hunts/leads', 'hunt-leads'],
+  ['/hunts/leads/decisions', 'hunt-decisions'],
   ['/hunts/leads/:id', 'hunt-lead'],
-  ['/hunts/rule-ideas', 'hunt-rule-ideas'],
-  ['/hunts/memory', 'hunt-memory'],
-  // Redirects to /hunts/memory; listed so they never read as a hunt id.
-  ['/hunts/knowledge', 'hunt-memory'],
-  ['/hunts/suppressions', 'hunt-memory'],
+  ['/hunts/knowledge', 'hunt-knowledge'],
+  // NAN-5850: old hunt settings routes that redirect to their new homes;
+  // listed so they never read as a hunt id.
+  ['/hunts/memory', 'hunt-knowledge'],
+  ['/hunts/suppressions', 'hunt-knowledge'],
+  ['/hunts/rulings', 'hunt-decisions'],
+  ['/hunts/runners', 'settings-hunts'],
+  ['/hunts/rule-ideas', 'rule-ideas'],
   ['/hunts/campaigns', 'hunt-campaigns'],
   ['/hunts/campaigns/candidates', 'hunt-campaigns'],
   ['/hunts/campaigns/:id', 'hunt-campaign'],
-  ['/hunts/rulings', 'hunt-rulings'],
   ['/hunts/escalations', 'hunt-escalations'],
   ['/hunts/profile', 'hunt-profile'],
-  ['/hunts/runners', 'hunt-runners'],
   ['/hunts/:id', 'hunt'],
 
   ['/inbox', 'inbox'],
@@ -134,6 +137,7 @@ const PAGE_ROUTES: ReadonlyArray<readonly [pattern: string, pageKey: string]> = 
   ['/risk', 'risk'],
   ['/risk/watchlists', 'risk-watchlists'],
   ['/platform/health', 'health'],
+  ['/settings/hunts/*', 'settings-hunts'],
   ['/settings/*', 'settings'],
 ];
 

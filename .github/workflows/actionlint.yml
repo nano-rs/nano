@@ -107,6 +107,29 @@ jobs:
             echo "check-runner-pools.sh not in this tree (public mirror); skipping"
           fi
 
+      # NAN-5806: every Rust job container forwards the host Cargo job cap
+      # (-e CARGO_BUILD_JOBS), so co-located builds stay within the host's cores.
+      - name: Cargo job cap
+        run: |
+          if [ -f scripts/ci/check-cargo-jobs.sh ]; then
+            bash scripts/ci/check-cargo-jobs.sh
+            bash scripts/tests/ci-cargo-jobs.sh
+          else
+            echo "check-cargo-jobs.sh not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5791: every pull_request workflow except this one runs only while
+      # the PR carries `ready-to-merge`, so a new workflow cannot forget it.
+      - name: Ready-to-merge gate
+        run: |
+          if [ -f scripts/ci/check-pr-merge-gate.sh ]; then
+            bash scripts/ci/check-pr-merge-gate.sh
+            bash scripts/tests/ci-pr-merge-gate.sh
+            bash scripts/tests/ci-pr-merge-when-green.sh
+          else
+            echo "check-pr-merge-gate.sh not in this tree (public mirror); skipping"
+          fi
+
       - name: Run actionlint
         run: |
           set -euo pipefail

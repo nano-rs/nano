@@ -97,7 +97,7 @@ function DiffView({ original, current }: { original: string; current: string }) 
         </span>
         <span className="ml-auto">selected vs current</span>
       </div>
-      <div className="max-h-60 overflow-auto py-1 text-[11px] font-mono leading-[16px]">
+      <div data-code-block="" className="max-h-60 overflow-auto py-1 text-[11px] font-mono leading-[16px]">
         {changes.length === 0 && (
           <div className="px-2 py-1 text-muted-foreground">No differences.</div>
         )}
@@ -278,8 +278,7 @@ export function InspectorVersionsTab({
                 Revert to v{confirming?.version_number}?
               </AlertDialogTitle>
               <AlertDialogDescription className="font-mono text-[11px] text-muted-foreground leading-relaxed">
-                Replaces the current rule body with the selected version. A new version entry
-                records the revert so you can walk back if needed.
+                Replaces the current rule body. The revert is recorded as a new version.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter className="border-t border-border px-5 py-3">

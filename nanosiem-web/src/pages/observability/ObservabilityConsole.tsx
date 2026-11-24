@@ -28,8 +28,10 @@ import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { cn } from '@/lib/utils';
+import type { GlossaryId } from '@/lib/glossary';
 import type { ObservabilityTab, ObservabilityTabProps } from './types';
 import { ServiceDetail } from './ServiceDetail';
+import { Term } from '@/components/ui/term';
 
 // Lazy tab bodies — surface agents fill these; the shell only wires them.
 const ServicesTab = lazy(() => import('./tabs/ServicesTab'));
@@ -41,15 +43,15 @@ const SyntheticsTab = lazy(() => import('./tabs/SyntheticsTab'));
 const AlertsTab = lazy(() => import('./tabs/AlertsTab'));
 const SlosTab = lazy(() => import('./tabs/SlosTab'));
 
-const TABS: Array<{ id: ObservabilityTab; label: string; icon: typeof Box }> = [
+const TABS: Array<{ id: ObservabilityTab; label: string; icon: typeof Box; term?: GlossaryId }> = [
   { id: 'services', label: 'Services', icon: Box },
-  { id: 'traces', label: 'Traces', icon: GitBranch },
+  { id: 'traces', label: 'Traces', icon: GitBranch, term: 'trace' },
   { id: 'metrics', label: 'Metrics', icon: LineChart },
   { id: 'infrastructure', label: 'Infrastructure', icon: Server },
-  { id: 'rum', label: 'RUM', icon: MonitorSmartphone },
-  { id: 'synthetics', label: 'Synthetics', icon: Radar },
+  { id: 'rum', label: 'RUM', icon: MonitorSmartphone, term: 'rum' },
+  { id: 'synthetics', label: 'Synthetics', icon: Radar, term: 'synthetic-check' },
   { id: 'alerts', label: 'Alerts', icon: Bell },
-  { id: 'slos', label: 'SLOs', icon: Target },
+  { id: 'slos', label: 'SLOs', icon: Target, term: 'slo' },
 ];
 
 const VALID_TABS = new Set<string>(TABS.map((t) => t.id));
@@ -146,7 +148,7 @@ export function ObservabilityConsole() {
       {/* Meta row: tab bar + time range. The global TopBar owns the breadcrumb. */}
       <div className="flex items-center gap-3 border-b border-border pb-2.5 mb-3">
         <div className="flex items-center gap-0.5 overflow-x-auto scrollbar-thin">
-          {TABS.map(({ id, label, icon: Icon }) => {
+          {TABS.map(({ id, label, icon: Icon, term }) => {
             const active = tab === id;
             return (
               <button
@@ -160,7 +162,13 @@ export function ObservabilityConsole() {
                 )}
               >
                 <Icon className="w-[14px] h-[14px]" />
-                {label}
+                {term ? (
+                  <Term id={term} nested>
+                    {label}
+                  </Term>
+                ) : (
+                  label
+                )}
               </button>
             );
           })}

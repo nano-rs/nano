@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import type { SavedSearch, SavedSearchTimeRange } from '@/lib/api';
 import { extractLogSource } from './saved-query-log-source';
+import { Term } from '@/components/ui/term';
 
 interface SavedQueriesPaletteProps {
   open: boolean;
@@ -560,7 +561,7 @@ export function SavedQueriesPalette({
       <div
         data-testid="saved-queries-palette"
         onClick={(e) => e.stopPropagation()}
-        className="w-[860px] max-w-[90%] h-[540px] max-h-[85vh] bg-card border border-border rounded-xl shadow-[0_40px_100px_rgba(0,0,0,0.6)] overflow-hidden grid grid-cols-[220px_1fr]"
+        className="relative w-[860px] max-w-[90%] h-[540px] max-h-[85vh] bg-card border border-border rounded-xl shadow-[0_40px_100px_rgba(0,0,0,0.6)] overflow-hidden grid grid-cols-[220px_1fr]"
       >
         {/* Sidebar */}
         <div
@@ -569,7 +570,7 @@ export function SavedQueriesPalette({
         >
           <div className="px-3 pt-3 pb-2 border-b border-border">
             <div className="font-mono text-[10px] tracking-[0.16em] uppercase text-muted-foreground font-semibold mb-1">
-              Saved queries
+              <Term id="saved-query">Saved queries</Term>
             </div>
             <div className="text-[10.5px] text-muted-foreground/70">{all.length} total</div>
           </div>
@@ -608,10 +609,20 @@ export function SavedQueriesPalette({
               onChange={(e) => setFilter(e.target.value)}
               onKeyDown={onInputKey}
               placeholder="Search saved queries by name, syntax, or log source…"
-              className="w-full h-12 pl-10 pr-20 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground/70"
+              className="w-full h-12 pl-10 pr-24 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground/70"
             />
             <div className="absolute right-3.5 top-1/2 -translate-y-1/2 font-mono text-[10px] text-muted-foreground flex items-center gap-1.5">
               <kbd className="px-1.5 py-0.5 rounded border border-border bg-foreground/5 text-muted-foreground">esc</kbd>
+              {/* NAN-5778: the close lives in the header row, next to its esc hint,
+                  so it can neither escape the palette nor paint over the hint. */}
+              <button
+                type="button"
+                onClick={() => onOpenChange(false)}
+                className="w-6 h-6 flex items-center justify-center rounded-md text-muted-foreground hover:bg-foreground/5 hover:text-foreground transition-colors"
+                aria-label="Close"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 
@@ -703,15 +714,6 @@ export function SavedQueriesPalette({
           </div>
         </div>
 
-        {/* Close button — floating top-right */}
-        <button
-          type="button"
-          onClick={() => onOpenChange(false)}
-          className="absolute top-3 right-3 w-6 h-6 flex items-center justify-center rounded-md text-muted-foreground hover:bg-foreground/5 hover:text-foreground transition-colors"
-          aria-label="Close"
-        >
-          <X className="w-3.5 h-3.5" />
-        </button>
       </div>
     </div>
 

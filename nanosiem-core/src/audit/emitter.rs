@@ -270,6 +270,43 @@ impl AuditEmitter {
         }
     }
 
+    /// NAN-5785: the durable path for MANY events at once (a bulk delete's
+    /// audit rows). One batched outbox insert under ONE
+    /// `OUTBOX_WRITE_TIMEOUT`, then the drainer delivers them (no per-event
+    /// inline ClickHouse write, no per-event task). If PostgreSQL cannot take
+    /// the batch, ONE bounded ClickHouse insert of the whole batch is the
+    /// fallback, so an outbox stall costs a fixed budget, never N of them.
+    /// Never falls back to fire-and-forget: the error names every event lost.
+    pub async fn emit_durable_batch(&self, events: &[AuditEvent]) -> Result<DurableOutcome, AuditEmitError> {
+        if events.is_empty() {
+            return Ok(DurableOutcome::Delivered);
+        }
+        let record_error =
+            match tokio::time::timeout(OUTBOX_WRITE_TIMEOUT, self.outbox.enqueue_batch(events)).await {
+                Ok(Ok(())) => {
+                    tracing::debug!(count = events.len(), "Recorded a batch of security-critical audit events");
+                    // Recorded (cannot be lost); ClickHouse delivery is the drainer's.
+                    return Ok(DurableOutcome::Deferred {
+                        clickhouse_error: "batch queued for the outbox drainer".to_string(),
+                    });
+                }
+                Ok(Err(e)) => format!("audit outbox batch write failed: {e}"),
+                Err(_) => "audit outbox batch write timed out".to_string(),
+            };
+        match self.bounded_insert(events, true).await {
+            Ok(()) => {
+                tracing::warn!(count = events.len(), error = %record_error,
+                    "Security-critical audit batch written to ClickHouse but its PostgreSQL record failed");
+                Ok(DurableOutcome::DeliveredWithoutRecord { record_error })
+            }
+            Err(failure) => {
+                metrics::counter!("nanosiem_audit_security_events_lost_total", "action" => "batch")
+                    .increment(events.len() as u64);
+                Err(AuditEmitError::NotDurable { record_error, clickhouse_error: failure.to_string() })
+            }
+        }
+    }
+
     /// Step 1 of the durable path: record the event in the PostgreSQL outbox
     /// (bounded in time). Once this returns `Ok`, the event can no longer be
     /// lost — the drainer delivers it even if this process dies (NAN-4954).

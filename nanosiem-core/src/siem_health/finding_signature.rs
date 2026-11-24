@@ -23,6 +23,22 @@
 //! NAN-615.
 use sha2::{Digest, Sha256};
 
+/// NAN-5738: the SOAR pack verification finding (an installed pack keeps
+/// running while its release failed signed catalog verification). It stays
+/// visible while the condition holds: it cannot be suppressed.
+pub const SOAR_PACK_VERIFICATION_TITLE: &str = "SOAR installed packs failed signed catalog verification";
+
+/// Findings that must stay visible while their condition holds: creating a
+/// suppression for one is refused, and the UI never hides one.
+pub const NON_SUPPRESSIBLE_TITLES: &[&str] = &[SOAR_PACK_VERIFICATION_TITLE];
+
+/// True when `title` names a finding that cannot be suppressed (compared by
+/// suppression signature, so number or spacing changes do not slip past).
+pub fn is_non_suppressible(title: &str) -> bool {
+    let signature = signature_for_title(title);
+    NON_SUPPRESSIBLE_TITLES.iter().any(|t| signature_for_title(t) == signature)
+}
+
 /// Compute the stable suppression signature for a recommendation title.
 pub fn signature_for_title(title: &str) -> String {
     let normalized = normalize_title(title);
@@ -109,5 +125,13 @@ mod tests {
             sig.chars().all(|c| c.is_ascii_hexdigit()),
             "signature must be hex"
         );
+    }
+
+    /// NAN-5738 review r5: the pack verification finding cannot be suppressed.
+    #[test]
+    fn the_pack_verification_finding_is_not_suppressible() {
+        assert!(super::is_non_suppressible(super::SOAR_PACK_VERIFICATION_TITLE));
+        assert!(super::is_non_suppressible("  SOAR installed packs failed signed catalog verification "));
+        assert!(!super::is_non_suppressible("Fix src_ip extraction for windows_sysmon (7.7% fill rate)"));
     }
 }

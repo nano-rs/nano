@@ -32,6 +32,7 @@ import { WebVital } from '@/components/observability/web-vital';
 import { fmtNum, fmtMs } from '@/components/observability/format';
 import type { RumResponse, RumRecentError } from '@/lib/api/observability';
 import type { ObservabilityTabProps } from '../types';
+import { Term } from '@/components/ui/term';
 
 // NAN-1553: enterprise RUM→investigation pivot. Each non-empty entity on an
 // error span (user / client IP / session) links to the unified search, tying a
@@ -128,7 +129,9 @@ function TopPages({ rum, onPickPage }: { rum: RumResponse; onPickPage: (page: st
       >
         <span>Path</span>
         <span className="text-right">Views</span>
-        <span className="text-right">LCP p75</span>
+        <span className="text-right">
+          <Term id="lcp">LCP</Term> <Term id="p75">p75</Term>
+        </span>
       </div>
       {rum.top_pages.length === 0 ? (
         <div className="px-3.5 py-6 text-center text-[11.5px] text-fg-3">No page views in range.</div>
@@ -345,7 +348,7 @@ export function RumTab({ timeRange }: ObservabilityTabProps) {
       <div className="flex flex-col gap-3.5">
         {filterBar}
         <div className="rounded-lg border border-danger/30 bg-danger/5 px-4 py-6 text-[12.5px] text-danger">
-          Failed to load RUM data: {error}
+          Failed to load <Term id="rum">RUM</Term> data: {error}
         </div>
       </div>
     );

@@ -19,14 +19,53 @@
 //! The drain is granted only when another ingest host is ready to take the
 //! traffic. A lone ingest host, or one whose peers are down, installs in place
 //! as before: a short stall beats refusing every event.
+//!
+//! NAN-5874: only a Vector that keeps acknowledged events across a re-pointing
+//! reload installs. Vector up to `0.61.0-nano.13` dropped, as delivered, every
+//! event an unchanged input took in while a reload that re-pointed it built
+//! (v2.0.35 puts `<parser>_source_tz` in front of every `_parse`, so the
+//! upgrade's first generation is such a reload). A consumer reports the
+//! release its Vector runs (`vector_release`, from Vector's `build_info`
+//! gauge); a consumer that does not (one from before v2.0.35, beside a
+//! nano.13 Vector) or a Vector older than [`MIN_VECTOR_RELEASE`] is told to
+//! wait ([`VECTOR_UPGRADE_HOLDER`]) and keeps serving its installed
+//! generation until the rollout replaces its pod. An API from before v2.0.35
+//! would still grant such a consumer the lease during a rolling upgrade, and
+//! it serves the new generation from the same database, so the lease moved to
+//! a new scope ([`LEASE_SCOPE`]) and this API holds the old one
+//! ([`fence_legacy_scope`]): an old API then answers every request "busy".
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-/// The one lease every ingest consumer competes for.
-pub const LEASE_SCOPE: &str = "ingest";
+/// The one lease every ingest consumer competes for (NAN-5874: `ingest`
+/// before v2.0.35).
+pub const LEASE_SCOPE: &str = "ingest-v2";
+/// The scope APIs before v2.0.35 grant. This API holds it (see
+/// [`fence_legacy_scope`]) so they never grant a consumer an install.
+pub const LEGACY_LEASE_SCOPE: &str = "ingest";
+/// The holder of the fenced legacy scope; an old API reports it as the host
+/// that is installing.
+pub const LEGACY_FENCE_HOLDER: &str = "nano-2.0.35-upgrade";
+/// How long the fence outlives the last API that refreshed it. Every v2.0.35+
+/// API refreshes it on each publication reconcile tick (5 s by default) and
+/// on every lease request, so it holds while any such API runs. After a
+/// rollback to a version before v2.0.35 the old APIs grant the legacy scope
+/// again within this long (well inside the consumer's and the Compose
+/// healthcheck's budgets).
+pub const LEGACY_FENCE_TTL_SECS: u64 = 60;
+/// The first Vector release that keeps acknowledged events across a
+/// re-pointing reload (nano-rs/vector NAN-5874), as (major, minor, patch, nano).
+pub const MIN_VECTOR_RELEASE: (u32, u32, u32, u32) = (0, 61, 0, 14);
+/// The holder named in a busy answer to a consumer whose Vector must be
+/// upgraded first (a consumer from before v2.0.35 logs it as the installing
+/// host).
+pub const VECTOR_UPGRADE_HOLDER: &str = "vector-0.61.0-nano.14-required";
+/// The holder named in a busy answer on the legacy path to a consumer that reports its Vector
+/// release (a v2.0.35+ consumer that fell back there): it takes the lease on `/install-lease/v2`.
+pub const LEASE_V2_HOLDER: &str = "install-lease-v2-required";
 /// Bounds on the lease a consumer may ask for. The consumer asks for its ack
 /// wait plus the drain and rejoin windows; the bound keeps a bad request from
 /// blocking every other host for long.
@@ -161,17 +200,106 @@ pub async fn ready_hosts(urls: &[String]) -> usize {
         .count()
 }
 
-/// The full lease decision: take the lease, and on success decide the drain
-/// from the configured ingest hosts' live readiness.
+/// The `X.Y.Z-nano.N` release in a Vector `build_info` revision label (the fork
+/// image sets `nano 0.61.0-nano.14 <sha>`); `None` when the label names none.
+pub fn parse_vector_release(label: &str) -> Option<(u32, u32, u32, u32)> {
+    label.split_whitespace().find_map(|word| {
+        let (version, nano) = word.split_once("-nano.")?;
+        let mut parts = version.split('.').map(|p| p.parse::<u32>().ok());
+        let (major, minor, patch) = (parts.next()??, parts.next()??, parts.next()??);
+        if parts.next().is_some() {
+            return None;
+        }
+        let nano = nano.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()?;
+        Some((major, minor, patch, nano))
+    })
+}
+
+/// Whether a consumer whose Vector reports `reported` may install. Unreported
+/// (a consumer from before v2.0.35, or Vector's metrics not up yet) or an
+/// older fork release waits. A label with no `-nano.` release (a custom build)
+/// is the operator's own Vector and is allowed.
+pub fn vector_release_allows_install(reported: Option<&str>) -> bool {
+    match reported.map(str::trim) {
+        None | Some("") => false,
+        Some(label) => parse_vector_release(label).is_none_or(|release| release >= MIN_VECTOR_RELEASE),
+    }
+}
+
+/// Hold the scope APIs before v2.0.35 grant, so none of them lets a consumer
+/// install while this version's generations are published (see the module
+/// docs). Unconditional: a consumer that held it is mid-install of a
+/// generation it already downloaded and finishes; its release then removes
+/// nothing.
+pub async fn fence_legacy_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO vector_config_install_leases \
+             (scope, holder, generation, acquired_at, expires_at) \
+         VALUES ($1, $2, 0, now(), now() + make_interval(secs => $3)) \
+         ON CONFLICT (scope) DO UPDATE SET \
+             holder = EXCLUDED.holder, generation = 0, \
+             acquired_at = now(), expires_at = EXCLUDED.expires_at",
+    )
+    .bind(LEGACY_LEASE_SCOPE)
+    .bind(LEGACY_FENCE_HOLDER)
+    .bind(LEGACY_FENCE_TTL_SECS as f64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The legacy path (`/install-lease`) on a v2.0.35+ API never grants (NAN-5874 review): a grant
+/// there would be an `ingest-v2` lease the consumer files as a legacy one and releases on the
+/// legacy path, where an older replica answers 204 without releasing it. A consumer from before
+/// v2.0.35 is told to wait for a new Vector, one that reports its release to retry on `/v2`.
+pub async fn request_on_legacy_path(
+    pool: &PgPool,
+    holder: &str,
+    generation: i64,
+    vector_release: Option<&str>,
+) -> Result<LeaseOutcome, LeaseError> {
+    validate_holder(holder).map_err(LeaseError::Request)?;
+    if generation <= 0 {
+        return Err(LeaseError::Request(LeaseRequestError::InvalidGeneration));
+    }
+    fence_legacy_scope(pool).await?;
+    let holder_named = if vector_release.is_some() { LEASE_V2_HOLDER } else { VECTOR_UPGRADE_HOLDER };
+    Ok(LeaseOutcome::Busy {
+        holder: holder_named.to_string(),
+        generation,
+        expires_in_secs: 0,
+    })
+}
+
+/// The full lease decision: refuse a Vector that loses events on a
+/// re-pointing reload, take the lease, and on success decide the drain from
+/// the configured ingest hosts' live readiness.
 pub async fn request(
     pool: &PgPool,
     holder: &str,
     generation: i64,
     requested_ttl_secs: Option<u64>,
+    vector_release: Option<&str>,
 ) -> Result<LeaseOutcome, LeaseError> {
     validate_holder(holder).map_err(LeaseError::Request)?;
     if generation <= 0 {
         return Err(LeaseError::Request(LeaseRequestError::InvalidGeneration));
+    }
+    fence_legacy_scope(pool).await?;
+    if !vector_release_allows_install(vector_release) {
+        tracing::warn!(
+            holder,
+            generation,
+            vector_release = vector_release.unwrap_or("not reported"),
+            "Vector config install refused: this ingest host's Vector predates 0.61.0-nano.14 \
+             and would drop acknowledged events on the reload; it keeps its installed \
+             generation until its pod runs the new image"
+        );
+        return Ok(LeaseOutcome::Busy {
+            holder: VECTOR_UPGRADE_HOLDER.to_string(),
+            generation,
+            expires_in_secs: 0,
+        });
     }
     let ttl_secs = clamp_ttl(requested_ttl_secs);
     match acquire(pool, holder, generation, ttl_secs).await? {

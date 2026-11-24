@@ -5304,6 +5304,8 @@ export interface NotebookChatRequest {
     params: Record<string, { type: string; description: string; required?: boolean; values?: string[]; max_length?: number }>;
     mutates: boolean;
   }>;
+  /** NAN-5637: actions the page has but withholds from the analyst (names only; refused, never proposed). */
+  page_withheld_actions?: string[];
 }
 
 export interface NotebookChatSuggestion {
@@ -5563,7 +5565,11 @@ export interface LogSource {
   description?: string;
   /** Network namespace for identity resolution (e.g., "aws:123456789012:vpc-abc", "onprem:dc-east") */
   namespace: string;
-  /** IANA timezone name for timestamps without offset info (e.g., "America/New_York") */
+  /**
+   * NAN-5839: timezone of the device clock, applied only to timestamps without
+   * an offset: an IANA name ("America/New_York") or a fixed offset ("-05:00").
+   * "UTC" is the default.
+   */
   timezone: string;
   source_type: string;
   /**
@@ -5622,7 +5628,7 @@ export interface NewLogSource {
   description?: string;
   /** Network namespace for identity resolution (e.g., "aws:123456789012:vpc-abc", "onprem:dc-east") */
   namespace?: string;
-  /** IANA timezone for timestamps without offset info. Defaults to "UTC". */
+  /** NAN-5839: IANA name or fixed offset for timestamps without an offset. Defaults to "UTC". */
   timezone?: string;
   source_type: string;
   /**
@@ -5656,7 +5662,7 @@ export interface UpdateLogSource {
   description?: string;
   /** Network namespace for identity resolution */
   namespace?: string;
-  /** IANA timezone for timestamps without offset info */
+  /** NAN-5839: IANA name or fixed offset for timestamps without an offset; "UTC" resets it. */
   timezone?: string;
   source_type?: string;
   /** NAN-928/NAN-1906 dispatch link — see NewLogSource. */

@@ -58,10 +58,10 @@ impl VectorConfigManager {
                 // only consumes its already-routed output.
                 let filter_name = format!("{}_filter", safe_name);
                 let Some(route_name) = parser.dispatch_route_name.as_deref() else {
-                    // All deployment entry points call
-                    // resolve_parser_dispatch_routes first, which rejects this
-                    // state. Keep direct config-string generation non-secret
-                    // and source-free as a defense-in-depth fallback.
+                    // The render leaves an unrouted fetch parser out
+                    // (`without_unroutable_parsers`, NAN-5789), so this is
+                    // reached only by direct config-string generation. Keep it
+                    // non-secret and source-free as a defense-in-depth fallback.
                     tracing::error!(
                         parser = %parser.name,
                         source_type = %parser.source_type,

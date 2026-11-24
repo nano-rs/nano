@@ -148,6 +148,8 @@ import { nplQuotedBody } from '@/lib/npl-quote';
 import { getBaseSearch, getPipeCommands, buildGroupByQuery } from '@/lib/npl-pipeline';
 import { Checkbox } from '@/components/ui/checkbox';
 import { resultRowKeyFields, resultRowSource } from '@/lib/result-row-source';
+import { Term } from '@/components/ui/term';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 interface SearchResult {
   id: string;
@@ -4140,7 +4142,7 @@ export function Search() {
             <span className="text-muted-foreground">Search Console</span>
             <span className="text-muted-foreground/40">›</span>
             <span className="text-primary search-console-mode">
-              {queryMode === 'sql' ? 'SQL' : <span className="normal-case">nPL</span>} Pipeline
+              {queryMode === 'sql' ? 'SQL' : <Term id="npl" className="normal-case">nPL</Term>} Pipeline
             </span>
             <span className="text-muted-foreground/40 hidden md:inline">›</span>
             <span className="hidden md:inline text-muted-foreground search-console-time">UTC {new Date().toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false })}</span>
@@ -4278,7 +4280,8 @@ export function Search() {
                     <div className="space-y-2 pt-2">
                       <div className="text-xs text-foreground/70 space-y-1">
                         <div className="flex items-center gap-2">
-                          <span className="text-ai">→</span> Parsing natural language query
+                          <span className="text-ai">→</span> Parsing{' '}
+                          <EnterpriseTerm id="natural-language-search">natural language</EnterpriseTerm> query
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="text-ai">→</span> Searching for matching data sources
@@ -4367,7 +4370,9 @@ export function Search() {
                               <div className="flex items-center justify-between mb-2">
                                 <div className="flex items-center gap-2 text-xs text-ai">
                                   <Code className="w-3 h-3" />
-                                  <span className="font-medium">Generated SQL</span>
+                                  <span className="font-medium">
+                                    <Term id="generated-sql">Generated SQL</Term>
+                                  </span>
                                 </div>
                                 <button
                                   onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(aiGeneratedSql); }}
@@ -4439,7 +4444,9 @@ export function Search() {
               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-border bg-foreground/[0.02] text-muted-foreground hover:border-border/80 hover:text-foreground transition-colors whitespace-nowrap shrink-0"
             >
               <LayoutGrid className="w-[11px] h-[11px]" />
-              Saved queries
+              <Term id="saved-query" nested>
+                Saved queries
+              </Term>
             </button>
 
             {/* Tail -f with interval dropdown */}
@@ -4464,7 +4471,9 @@ export function Search() {
                   ) : (
                     <Menu className="w-[11px] h-[11px]" />
                   )}
-                  <span>tail -f</span>
+                  <Term id="tail" nested>
+                    tail -f
+                  </Term>
                   <span
                     className={`font-mono tabular-nums text-[10.5px] tracking-tight rounded-sm px-1 py-px ${
                       tailActive ? 'bg-emerald-700/15 text-emerald-900 dark:bg-emerald-400/15 dark:text-emerald-300' : 'text-muted-foreground/70'
@@ -4990,7 +4999,7 @@ export function Search() {
                           <Badge
                             variant="outline"
                             className="px-1.5 py-0 text-[10px] font-mono uppercase tracking-wide text-amber-400 border-amber-500/40"
-                            title="This correction could not be validated against the schema — review before running."
+                            title="nano could not check this fix against your fields. Read it before you run it."
                           >
                             unverified
                           </Badge>
@@ -5048,12 +5057,12 @@ export function Search() {
             ) : isAggregateQuery ? (
               <span className="text-sm text-muted-foreground">
                 <span className="text-amber-400 font-medium">{peakRowsScanned.toLocaleString()}+ rows scanned</span>
-                {' '}&mdash; consider narrowing your time range or adding filters before the aggregate.
+                {'. '}Narrow the time range or filter before the aggregate.
               </span>
             ) : (
               <span className="text-sm text-muted-foreground">
                 <span className="text-amber-400 font-medium">{displayTotalCount.toLocaleString()}+ hits</span>
-                {' '}&mdash; consider narrowing your time range, adding filters, or using{' '}
+                {'. '}Narrow the time range, filter, or use{' '}
                 <code className="text-xs font-mono text-emerald-400 bg-muted/50 px-1 py-0.5 rounded">| stats count by field</code>
                 {' '}to aggregate.
               </span>

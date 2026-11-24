@@ -122,9 +122,6 @@ export function QuickPivotIntake() {
 
   return (
     <div className="flex flex-col items-center gap-2 py-4">
-      <div className="text-[12.5px] text-muted-foreground">
-        Pivot from an IOC into search.
-      </div>
       <div className="w-full max-w-[640px]">
         <div className="rounded-md border border-border bg-card overflow-hidden">
           <div className="px-3 py-1.5 border-b border-border flex items-center gap-2">
@@ -142,7 +139,7 @@ export function QuickPivotIntake() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
-              placeholder="Paste an IP, domain, hash, user, or URL — or type a search term"
+              placeholder="Paste an IP, domain, hash, user or URL, or type a search term"
               rows={1}
               className="flex-1 bg-transparent text-foreground text-[13.5px] placeholder:text-muted-foreground/60 resize-none outline-none min-h-[20px] max-h-[120px] leading-5"
               style={{ fieldSizing: 'content' } as React.CSSProperties}

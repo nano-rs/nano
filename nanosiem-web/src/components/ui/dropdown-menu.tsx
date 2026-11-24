@@ -91,20 +91,47 @@ function DropdownMenuContent({
   );
 }
 
+/**
+ * Menu density (NAN-5842). `default` keeps the original shadcn sizing every
+ * existing caller was tuned against (callers space their own icons). `compact`
+ * is the dense app-standard row: 12px Geist, 28px tall, a fixed 8px icon gap
+ * and 16px icons, so callers pass a bare icon + label and nothing else.
+ */
+type DropdownMenuDensity = 'default' | 'compact';
+
+const ITEM_DENSITY: Record<DropdownMenuDensity, string> = {
+  default: 'px-2 py-1.5 text-sm',
+  compact: 'h-7 gap-2 px-2 text-[12px] [&>svg]:size-4 [&>svg]:shrink-0',
+};
+
+/** `destructive`: the standard red treatment for delete / archive items. */
+type DropdownMenuItemVariant = 'default' | 'destructive';
+
+const ITEM_VARIANT: Record<DropdownMenuItemVariant, string> = {
+  default: 'focus:bg-accent focus:text-accent-foreground',
+  destructive: 'text-destructive focus:bg-destructive/10 focus:text-destructive',
+};
+
 function DropdownMenuItem({
   className,
   inset,
+  density = 'default',
+  variant = 'default',
   ref,
   ...props
 }: React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & {
   inset?: boolean;
+  density?: DropdownMenuDensity;
+  variant?: DropdownMenuItemVariant;
   ref?: React.Ref<React.ComponentRef<typeof DropdownMenuPrimitive.Item>>;
 }) {
   return (
     <DropdownMenuPrimitive.Item
       ref={ref}
       className={cn(
-        'relative flex cursor-default select-none items-center rounded-[4px] px-2 py-1.5 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
+        'relative flex cursor-default select-none items-center rounded-[4px] outline-none transition-colors data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
+        ITEM_DENSITY[density],
+        ITEM_VARIANT[variant],
         inset && 'pl-8',
         className
       )}
@@ -169,20 +196,28 @@ function DropdownMenuRadioItem({
   );
 }
 
+const LABEL_DENSITY: Record<DropdownMenuDensity, string> = {
+  default: 'px-2 py-1.5 text-sm font-semibold',
+  // Section header in the mono meta style (10px uppercase, muted).
+  compact: 'px-2 pb-1 pt-1.5 font-mono text-[10px] font-medium uppercase tracking-[0.1em] text-muted-foreground',
+};
+
 function DropdownMenuLabel({
   className,
   inset,
+  density = 'default',
   ref,
   ...props
 }: React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Label> & {
   inset?: boolean;
+  density?: DropdownMenuDensity;
   ref?: React.Ref<React.ComponentRef<typeof DropdownMenuPrimitive.Label>>;
 }) {
   return (
     <DropdownMenuPrimitive.Label
       ref={ref}
       className={cn(
-        'px-2 py-1.5 text-sm font-semibold',
+        LABEL_DENSITY[density],
         inset && 'pl-8',
         className
       )}
@@ -218,6 +253,8 @@ const DropdownMenuShortcut = ({
     />
   );
 };
+
+export type { DropdownMenuDensity, DropdownMenuItemVariant };
 
 export {
   DropdownMenu,

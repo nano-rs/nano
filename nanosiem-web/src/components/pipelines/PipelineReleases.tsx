@@ -12,6 +12,7 @@ import { PipelineLoading, PipelineNotice, PipelineStateBadge } from './PipelineC
 import type { PipelineReleaseHistoryProps, PipelineReleaseReviewProps } from './types';
 import { cn } from '@/lib/utils';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Term } from '@/components/ui/term';
 
 /**
  * The frozen release snapshot: the saved parser, extension and `updated_at`
@@ -30,7 +31,7 @@ export function PipelineReleaseReview({ open, plan, canPublish, pending, stale, 
       size="xl"
       title="Review release"
       breadcrumb={['Pipelines', 'Release review']}
-      description="Publishing makes this saved draft the active version and deploys it to Vector. Only the snapshot below is published."
+      description="Makes the snapshot below the active version and deploys it to Vector."
       meta={
         plan && snapshot && (
           <>
@@ -76,7 +77,7 @@ export function PipelineReleaseReview({ open, plan, canPublish, pending, stale, 
               {previewOnly.map((entry) => (
                 <p key={entry.kind}><span className="font-mono">{entry.kind}</span>: {entry.reason}</p>
               ))}
-              <p>Publishing will be refused while these steps are enabled. Disable or remove them, or publish to see the server&apos;s answer.</p>
+              <p>Publishing is refused while these steps are enabled; disable or remove them.</p>
               <label className="mt-1 flex items-center gap-1.5 text-foreground">
                 <Checkbox aria-label="Acknowledge preview-only steps" className="h-3.5 w-3.5" checked={acknowledged === plan} disabled={!!pending} onCheckedChange={(checked) => setAcknowledged(checked === true ? plan : null)} />
                 I understand
@@ -103,12 +104,12 @@ export function PipelineReleaseReview({ open, plan, canPublish, pending, stale, 
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
             <ConfigPane title={`Active${plan.activeVersion === null ? '' : ` · v${plan.activeVersion}`}`} code={plan.activeVrl} />
             <ConfigPane
-              title="Publishing (saved parser_vrl)"
+              title="Publishing (saved parser)"
               code={[snapshot.parserVrl, ...(snapshot.extensionVrl && snapshot.extensionEnabled ? ['# Source extension (separate program)', snapshot.extensionVrl] : [])].join('\n\n')}
             />
           </div>
           <PipelineNotice title="Configuration changes affect future events only">
-            Dropping, sampling and deduplicating can permanently omit events. Rollback restores configuration and does not reverse events already processed.
+            Events that are dropped, sampled out or deduped are gone for good. Rolling back restores the settings, not events already stored.
           </PipelineNotice>
         </div>
       )}
@@ -143,7 +144,7 @@ export function PipelineReleaseHistory({
         size="lg"
         title="Version history"
         breadcrumb={['Pipelines', pipelineName]}
-        description="Published versions of this source's parser. Rollback makes the selected version active again, resets the draft to it, and deploys it."
+        description="Rollback makes a version active again and deploys it."
         meta={<span>{releases.length} versions</span>}
         bodyClassName="p-0"
       >
@@ -154,7 +155,7 @@ export function PipelineReleaseHistory({
           </div>
         )}
         {releases.length === 0 ? (
-          <p className="p-4 text-[11.5px] text-muted-foreground">No published versions yet.</p>
+          <p className="p-4 text-[11.5px] text-muted-foreground">No <Term id="pipeline-release">published versions</Term> yet.</p>
         ) : (
           <table className="w-full text-left text-[11.5px]">
             <thead className="font-mono text-[10px] uppercase text-muted-foreground">
@@ -198,7 +199,7 @@ export function PipelineReleaseHistory({
         open={open && !!rollback}
         onOpenChange={(next) => { if (!next) setRollback(null); }}
         title={`Roll back to version ${rollback?.revision ?? ''}?`}
-        description="This records the selected version's parser and extension as a new active version, resets the draft to it, and deploys it to Vector. It does not restore events previously filtered, sampled or deduplicated."
+        description="Records this version as the new active version, resets the draft and deploys it. Events already filtered, sampled or deduplicated are not restored."
         confirmLabel={replaced.length ? 'Replace and roll back' : 'Roll back'}
         variant="warning"
         loading={pending}

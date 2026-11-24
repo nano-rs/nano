@@ -61,7 +61,7 @@ export function TlsConfigSection({ value, onChange, disabled }: TlsConfigSection
       {expanded && value?.enabled && (
         <div className="p-4 space-y-4 border-t border-border">
           <p className="text-xs text-muted-foreground">
-            Upload or paste certificate contents. Certificates will be securely stored and deployed to the Vector server.
+            Certificates are stored securely and deployed to the Vector server.
           </p>
 
           <CertificateInput

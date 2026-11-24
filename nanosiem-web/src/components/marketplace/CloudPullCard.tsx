@@ -27,7 +27,7 @@ export function CloudPullCard({ sources }: { sources: Pick<SourceConfiguration, 
       id="cloud-pull"
       name={CLOUD_PULL_NAME}
       meta={<><MetaBadge>pull</MetaBadge> · {health(sources)}</>}
-      body="Read events from your S3 bucket notifications, SQS queue, Pub/Sub subscription, Azure event hub or Kafka topic. Vector pulls with a role, service account or credential you grant."
+      body="Vector pulls from your queues and topics with a credential you grant."
       footerLabel="sqs · pub/sub · event hubs · kafka → vector"
       footerAction={<span className="text-primary">{sources.length > 0 ? `${sources.length} source${sources.length === 1 ? '' : 's'} · Manage` : 'Set up'}</span>}
       onOpen={() => navigate(CLOUD_PULL_PATH)}

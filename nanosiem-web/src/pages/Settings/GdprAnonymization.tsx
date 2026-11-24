@@ -41,6 +41,7 @@ import type {
   GdprAnonymizationPreview,
 } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
+import { Term } from '@/components/ui/term';
 
 const IDENTIFIER_TYPES: { value: GdprIdentifierType; label: string }[] = [
   { value: 'username', label: 'Username' },
@@ -179,7 +180,7 @@ export function GdprAnonymizationPage() {
           GDPR &amp; Compliance
         </h1>
         <p className="text-[11.5px] text-muted-foreground mt-0.5">
-          Submit and manage data-subject anonymization requests.
+          Remove a person's details from nano when they ask (<Term id="gdpr-anonymization">anonymization</Term> requests).
         </p>
       </div>
 
@@ -192,9 +193,9 @@ export function GdprAnonymizationPage() {
           </div>
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Anonymize all PII matching an identifier across logs, identity observations, cloud
-          activity, and the user registry. The original value is hashed immediately and never
-          stored.
+          Removes or scrambles the records that match one username, email or IP address in logs, identity
+          observations, cloud activity and the user directory. Matching <Term id="ocsf">OCSF</Term> event rows are deleted, not edited.
+          nano scrambles the value you enter right away and never stores it.
         </p>
 
         <div className="flex flex-col">
@@ -204,7 +205,7 @@ export function GdprAnonymizationPage() {
                 Identifier type
               </label>
               <div className="text-[11px] text-muted-foreground mt-0.5">
-                Determines which UDM columns and tables are scanned for matches.
+                The kind of value, which decides where nano looks for it.
               </div>
             </div>
             <Select
@@ -233,7 +234,7 @@ export function GdprAnonymizationPage() {
                 Identifier value
               </label>
               <div className="text-[11px] text-muted-foreground mt-0.5">
-                Hashed immediately; never stored in plain text.
+                Scrambled right away and never stored as you typed it.
               </div>
             </div>
             <Input
@@ -251,7 +252,7 @@ export function GdprAnonymizationPage() {
                 Justification (optional)
               </label>
               <div className="text-[11px] text-muted-foreground mt-0.5">
-                Free-text reason — recorded on the audit trail. Useful for ticket references.
+                Recorded on the audit trail, e.g. a ticket reference.
               </div>
             </div>
             <Textarea
@@ -291,8 +292,7 @@ export function GdprAnonymizationPage() {
           </div>
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Submitted anonymization requests. Pending requests can be executed once you've confirmed
-          the preview counts.
+          Check how many rows each request will change, then run it.
         </p>
 
         {loading && requests.length === 0 ? (

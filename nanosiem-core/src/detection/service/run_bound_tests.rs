@@ -75,3 +75,49 @@ fn the_coverage_incomplete_row_is_stable_per_window_and_loud() {
     assert!(a.get("source_type").is_none(), "stamped by the window's companion, fail-closed");
     assert!(message.starts_with("DETECTION COVERAGE INCOMPLETE"));
 }
+
+fn reduction(q: &str) -> bool {
+    is_bounded_reduction_query(&parse_query(q).expect("parse"))
+}
+
+/// NAN-5751: which rules read at most `cap + 1` result rows.
+#[test]
+fn reductions_are_bounded_on_their_output() {
+    for q in [
+        "process_name=cmd.exe | stats count by user",
+        "process_name=cmd.exe | stats count by src_ip | where count > 5",
+        "process_name=cmd.exe | timechart span=1h count",
+        "process_name=cmd.exe | top user",
+        "process_name=cmd.exe | rare user",
+        "process_name=cmd.exe | dedup user",
+        "x | lookup assets src_ip AS ip OUTPUT owner | stats count by owner",
+        // Aggregations read their whole input even behind a Nano-side stage.
+        "x | prevalence enrich=true | stats count by file_hash",
+    ] {
+        assert!(reduction(q), "{q}");
+        assert!(!boundable(q), "{q}: one bound per rule");
+    }
+    for q in [
+        "process_name=cmd.exe",
+        "process_name=cmd.exe | table user, host",
+        "process_name=cmd.exe | streamstats count by user | where count > 3",
+        "process_name=cmd.exe | sort -user",
+        // A dedup behind a Nano-side stage reads a page-limited fetch.
+        "x | lookup assets src_ip AS ip OUTPUT owner | dedup owner",
+        "x | prevalence enrich=true | dedup file_hash",
+        // NAN-5751 review 9: risk-scored and per-row-computed rows.
+        "process_name=cmd.exe | stats count by user | risk score=50 entity=user",
+        "process_name=cmd.exe | dedup user | risk score=10 entity=user",
+        "process_name=cmd.exe | stats count by user | streamstats count as n",
+        "process_name=cmd.exe | eventstats count by user | stats count by user",
+    ] {
+        assert!(!reduction(q), "{q}");
+    }
+}
+
+#[test]
+fn the_reduction_overflow_message_is_loud() {
+    let message = reduction_capped_message(50);
+    assert!(message.starts_with("DETECTION COVERAGE INCOMPLETE"), "{message}");
+    assert!(message.contains("more than 50 result rows"), "{message}");
+}

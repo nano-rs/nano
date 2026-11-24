@@ -344,7 +344,7 @@ fn every_shipped_vector_pin_names_one_image() {
         "images.lock",
         "deploy/release/images.enterprise.lock",
         "deploy/k8s/vector/vector.yaml",
-        "deploy/k8s/rackspace/vector.yaml",
+        "deploy/k8s/self-managed/vector.yaml",
         "deploy/templates/vector-s3-sync.docker-compose.yml",
     ] {
         let Some(text) = repo_file(path) else { continue };

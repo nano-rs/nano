@@ -34,6 +34,7 @@ fn caller_denied(scope: &MatchScope) -> Vec<String> {
 
 fn claims(permissions: &[&str]) -> TokenClaims {
     TokenClaims {
+        sid: None,
         iss: DEFAULT_TOKEN_ISSUER.to_string(),
         aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
         sub: Uuid::now_v7(),

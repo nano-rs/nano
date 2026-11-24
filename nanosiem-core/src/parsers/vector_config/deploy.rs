@@ -3154,10 +3154,10 @@ source = '''
 "#,
         credential_field_redaction_vrl!(),
         ingest_transport_strip_vrl!(),
-        r#"raw_record = .
-raw_record = remove!(raw_record, ["client_ip"])
-raw_record = remove!(raw_record, ["ingest_client_ip"])
-raw_record = remove!(raw_record, ["ingest_peer"])
+        r#"# NAN-5846: every root key is the sender's record. nano's ingest addresses
+# never reach the root (they stay in metadata) and are written below under
+# unmapped.nano.ingest, so a body `client_ip` is kept verbatim.
+raw_record = .
 src_type = downcase(to_string(.metadata.original_source_type) ?? to_string(.source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
 "#,
@@ -3168,14 +3168,9 @@ if msg == "" { msg = encode_json(raw_record) }
 # `unmapped` (queried as `unmapped.<key>` or the bare key) so arbitrary keys
 # never spend the `event` column's dynamic-path budget.
 ocsf_event = { "class_uid": 0, "category_uid": 0, "message": msg, "metadata": { "log_source": src_type }, "unmapped": raw_record }
-nano_ingest_client_ip = to_string(%nano_ingest_client_ip) ?? ""
-nano_ingest_peer = to_string(%nano_ingest_peer) ?? ""
-if nano_ingest_client_ip != "" {
-    ocsf_event.unmapped.client_ip = nano_ingest_client_ip
-    ocsf_event.unmapped.ingest_client_ip = nano_ingest_client_ip
-}
-if nano_ingest_peer != "" { ocsf_event.unmapped.ingest_peer = nano_ingest_peer }
-# NAN-5346: a source-flagged parse failure (generic_parser set
+"#,
+        ingest_provenance_vrl!(),
+        r#"# NAN-5346: a source-flagged parse failure (generic_parser set
 # metadata.parse_error) is findable as `unmapped.parse_error`, like a parser's.
 nano_generic_error = to_string(.metadata.parse_error) ?? ""
 if nano_generic_error != "" { ocsf_event.unmapped.parse_error = nano_generic_error }
@@ -3212,6 +3207,7 @@ if otlp_time != "" {
 }
 "#,
         nesting_depth_limit_vrl!("ocsf_event", r#"["unmapped", "nano_nesting_truncated"]"#),
+        json_path_collision_vrl!("ocsf_event"),
         r#"
 skew_seconds = to_int(get_env_var("NANO_FUTURE_TIMESTAMP_SKEW_SECONDS") ?? "86400") ?? 86400
 if skew_seconds < 0 { skew_seconds = 86400 }
@@ -3368,7 +3364,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// transforms + dedicated ClickHouse sinks consuming the
     /// `enrichment_router.<kind>` outputs. Single source of truth is the
     /// committed `_enrichment.toml`, embedded via `include_str!` so it ships in
-    /// the binary and reaches every deployment (dev/compose mounted, Rackspace
+    /// the binary and reaches every deployment (dev/compose mounted, self-managed k8s
     /// GCS-synced, SaaS dynamic ConfigMap) through the same path as
     /// `_pipeline.toml`. No drift: the const IS the file.
     pub(super) fn enrichment_lane_content() -> &'static str {
@@ -4693,6 +4689,8 @@ mod credential_header_tests;
 mod raw_data_credential_tests;
 #[cfg(test)]
 mod transport_header_tests;
+#[cfg(test)]
+mod ingest_provenance_tests;
 #[cfg(test)]
 mod render_contract_tests;
 #[cfg(test)]

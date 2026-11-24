@@ -146,7 +146,7 @@ pub fn classify_search_error(error: &SearchError) -> (JobErrorKind, String) {
         SearchError::SqlGenError(msg) => {
             // Same rule as the HTTP mapping (NAN-1339): guardrail messages are
             // written for the user; other generation failures stay masked.
-            if msg.starts_with("Invalid query:") || msg.starts_with("Unsupported operation:") {
+            if crate::search::sql_gen_message_is_user_facing(msg) {
                 (JobErrorKind::InvalidQuery, msg.clone())
             } else {
                 (JobErrorKind::InvalidQuery, "Query processing failed".to_string())

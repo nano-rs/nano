@@ -57,3 +57,59 @@ fn refuses_injection_and_unknown_methods() {
     let message = unsupported_message("ingestion_method", "a\"\nb");
     assert!(!message.contains('\n'), "control characters must be escaped: {message}");
 }
+
+/// NAN-5789: a fetch method pairs only with a configuration of its own type,
+/// whatever the spelling on either side.
+#[test]
+fn dispatch_compatible_pairs_each_fetch_method_with_its_own_type_only() {
+    let fetch = ["kafka", "aws_s3", "aws_sqs", "crowdstrike_fdr", "gcp_pubsub", "azure_event_hubs"];
+    for method in fetch {
+        for config in fetch.iter().chain(["http", "splunk_hec", "otlp", "vector"].iter()) {
+            assert_eq!(dispatch_compatible(config, method), *config == method, "{config} feeding {method}");
+        }
+    }
+    // Aliases and case on both sides.
+    assert!(dispatch_compatible("S3", "aws_s3"));
+    assert!(dispatch_compatible("aws_s3", "S3"));
+    assert!(dispatch_compatible("pubsub", "PubSub"));
+    assert!(dispatch_compatible("fdr", "crowdstrike_fdr"));
+    assert!(dispatch_compatible("KAFKA", "Kafka"));
+    assert!(dispatch_compatible("http", "HTTP"));
+    assert!(dispatch_compatible("hec", "splunk"));
+    // Unknown on either side fails closed.
+    assert!(!dispatch_compatible("rabbitmq", "kafka"));
+    assert!(!dispatch_compatible("kafka", "rabbitmq"));
+}
+
+/// NAN-5789 round 2: every alias any vocabulary accepts (`SourceConfigType`,
+/// `parsers::types::SourceType`) is in the one table, and every classifier
+/// built on it agrees.
+#[test]
+fn the_one_alias_table_covers_every_vocabulary() {
+    for (alias, want) in [
+        ("sqs", "aws_sqs"),
+        ("fdr", "crowdstrike_fdr"),
+        ("event_hubs", "azure_event_hubs"),
+        ("eventhubs", "azure_event_hubs"),
+        ("EventHubs", "azure_event_hubs"),
+    ] {
+        assert_eq!(canonical(alias), Some(want), "{alias}");
+        assert!(is_fetch(alias), "{alias}");
+        assert!(crate::parsers::is_fetch_source_type(alias), "{alias}");
+        assert!(dispatch_compatible(alias, want), "{alias} config feeding {want}");
+        assert!(dispatch_compatible(want, alias), "{want} config feeding {alias}");
+    }
+    // Every config type SourceConfigType accepts canonicalizes to its as_str().
+    for alias in ["http", "kafka", "s3", "sqs", "fdr", "pubsub", "event_hubs", "eventhubs", "splunk", "hec", "vector", "otel", "opentelemetry"] {
+        let parsed = crate::source_configs::SourceConfigType::from_str(alias).unwrap();
+        assert_eq!(canonical_config_type(alias), Some(parsed.as_str()), "{alias}");
+    }
+    // Every fetch type the parser vocabulary accepts is a fetch here too.
+    for alias in ["kafka", "aws_s3", "s3", "aws_sqs", "sqs", "crowdstrike_fdr", "fdr", "gcp_pubsub", "pubsub", "azure_event_hubs"] {
+        assert!(crate::parsers::SourceType::from_str(alias).is_some(), "{alias}");
+        assert!(is_fetch(alias), "{alias}");
+    }
+    for push in ["routed", "http", "vector", "otlp", "splunk_hec", "file", "syslog", "stdin", "nonsense"] {
+        assert!(!is_fetch(push), "{push}");
+    }
+}

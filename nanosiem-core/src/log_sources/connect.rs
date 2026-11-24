@@ -38,7 +38,7 @@ use crate::auth::ScopeSet;
 use crate::ingest_tokens::{
     is_push_capable, route_key, IngestToken, IngestTokenService, IngestTokenServiceError,
 };
-use crate::search::service::source_scope_sql_predicate;
+use crate::search::service::{bind_source_scope, source_scope_bound_predicate};
 
 /// The window every connect read model covers.
 pub const ACTIVITY_WINDOW_HOURS: i64 = 24;
@@ -252,6 +252,91 @@ pub fn unassigned_sources(
     out
 }
 
+/// A route key a recently DELETED log source produced, set aside from the
+/// unassigned list (NAN-5770): the key is the source's old stream winding
+/// down, not a new sender to convert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemovedUnassignedSource {
+    pub route_key: String,
+    /// The deleted source's name.
+    pub log_source_name: String,
+    pub deleted_at: DateTime<Utc>,
+    pub events_24h: u64,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+/// NAN-5770: the rollup activity as the evidence SIEM Health's removed-source
+/// rule needs (oldest and newest event per key). A key with no first or last
+/// event time has no evidence, so it can never be set aside.
+pub fn activity_evidence(
+    activity: &[SourceActivity],
+) -> HashMap<String, crate::siem_health::removed_sources::KeyEvidence> {
+    activity
+        .iter()
+        .filter_map(|a| {
+            let (first, last) = (a.first_seen?, a.last_seen?);
+            Some((
+                a.route_key.clone(),
+                crate::siem_health::removed_sources::KeyEvidence {
+                    first_event: first.timestamp(),
+                    last_event: last.timestamp(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// NAN-5770: the deleted sources' route keys to set aside from the unassigned
+/// list: the NAN-5760 tombstone candidates (PostgreSQL) confirmed against the
+/// same rollup activity the list was built from. A failed read degrades to
+/// "nothing removed": it must never hide a stream, only leave the old list.
+pub async fn removed_unassigned_keys(
+    pool: &PgPool,
+    activity: &[SourceActivity],
+) -> crate::siem_health::removed_sources::RemovedSourceKeys {
+    use crate::siem_health::removed_sources::RemovedSourceKeys;
+    match RemovedSourceKeys::load_candidates(pool).await {
+        Ok(mut keys) => {
+            keys.retain_evidenced(&activity_evidence(activity));
+            keys
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not read deleted log sources for the unassigned list");
+            RemovedSourceKeys::default()
+        }
+    }
+}
+
+/// NAN-5770: split the unassigned keys into the ones still offered and the
+/// ones a recently deleted source produced. `removed` must already be
+/// evidenced ([`crate::siem_health::removed_sources::RemovedSourceKeys::retain_evidenced`]),
+/// so only deployed or token-bound sources' literal, non-reserved route keys
+/// whose events stopped by the delete are set aside (the NAN-5760 rules). A
+/// key that keeps arriving after the delete stays an ordinary unassigned key.
+pub fn set_aside_removed(
+    unassigned: Vec<UnassignedSource>,
+    removed: &crate::siem_health::removed_sources::RemovedSourceKeys,
+) -> (Vec<UnassignedSource>, Vec<RemovedUnassignedSource>) {
+    if removed.is_empty() {
+        return (unassigned, Vec::new());
+    }
+    let mut offered = Vec::with_capacity(unassigned.len());
+    let mut set_aside = Vec::new();
+    for source in unassigned {
+        match removed.get(&source.route_key) {
+            Some(gone) => set_aside.push(RemovedUnassignedSource {
+                route_key: source.route_key,
+                log_source_name: gone.log_source_name.clone(),
+                deleted_at: gone.deleted_at,
+                events_24h: source.events_24h,
+                last_seen: source.last_seen,
+            }),
+            None => offered.push(source),
+        }
+    }
+    (offered, set_aside)
+}
+
 /// Reads per-route-key ingest from the profile-aware `logs_per_source_5m_v2`
 /// rollup (7-day TTL): one aggregate scan, no raw-table read.
 #[derive(Clone)]
@@ -287,7 +372,8 @@ pub fn activity_sql(
         None => (String::new(), format!(" LIMIT {ACTIVITY_ROW_LIMIT}")),
     };
     let scope_sql = if scope.is_restricted() {
-        let predicate = source_scope_sql_predicate("scope_source_type", scope.deny_set())
+        // NAN-5793: bound; `read` binds `scope.deny_set()`.
+        let predicate = source_scope_bound_predicate("scope_source_type", scope.deny_set())
             .expect("a restricted ScopeSet always renders a predicate");
         format!(" AND scope_source_type_complete = 1 AND {predicate}")
     } else {
@@ -375,9 +461,7 @@ impl SourceActivityReader {
             scope,
             keys,
         );
-        let mut cursor = self
-            .ch
-            .query(&sql)
+        let mut cursor = bind_source_scope(self.ch.query(&sql), scope.deny_set())
             .fetch_bytes("JSONEachRow")
             .map_err(|e| e.to_string())?;
         let mut body = Vec::new();

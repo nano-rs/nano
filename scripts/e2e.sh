@@ -8,13 +8,21 @@
 #
 #   scripts/e2e.sh up      [--app native|docker|image:<tag>] [--edition enterprise|open]
 #                          [--release] [--no-build] [--infra-only]
-#                          [--profile mock-vendor|connector-live|ai-stub] [--defer-admin]
+#                          [--profile mock-vendor|connector-live|ai-stub|soar-lab|recon-fast] [--defer-admin]
+#                          [--acceptance-trust]
+#                          (a bare `up` builds the RELEASE trust config: production
+#                          content/catalog keys only (NAN-5771). --acceptance-trust, or
+#                          --profile soar-lab, adds the non-shippable test-key cfg
+#                          `nano_content_acceptance` (native enterprise only); `run soar`,
+#                          `run content_acceptance` and `run all` set it themselves.
+#                          The trust is printed at bring-up and recorded as E2E_TRUST.)
 #                          (mock-vendor: nano-connector-runner in lab mode pointed at
 #                          the harness's vendor mock; connector-live: the runner with
 #                          NO test seam, polling the real vendor tenants (NAN-4961);
 #                          defer-admin: leave first-run setup to the scenarios, the
 #                          UI suite does it in a browser)
-#   scripts/e2e.sh run     [suite...|all|fast|ui|otlp|personas|soar|content_acceptance] [--run <id>] [--fresh] [--keep] [--allow-skips]
+#   scripts/e2e.sh run     [suite...|all|fast|ui|otlp|personas|soar|content_acceptance|zero_clicks] [--run <id>] [--fresh] [--keep] [--allow-skips]
+#                          [--seed realistic]  (NAN-5764: seed a lived-in stack first)
 #                          [-- <pytest args>]  (a selected suite that executes nothing FAILS
 #                          unless --allow-skips)
 #                          (reuses --run <id>, else the live stack from `up`; with
@@ -40,6 +48,11 @@
 #   scripts/e2e.sh license-ids [--run <id>]      installation_id + organization_id of a
 #                                                kept enterprise stack (to issue a C05 trial)
 #   scripts/e2e.sh selftest                      harness safety selftests (no stack, no cloud)
+#   scripts/e2e.sh sentry-report [--run <id>]    re-pull the run's Sentry issues (NAN-5798)
+#
+# Sentry (NAN-5798, report only, nano's own runs): NANO_E2E_SENTRY=1 runs the
+# stack with error tracking on (see scripts/lib/e2e-sentry.sh); `down` writes
+# the run's issues to artifacts/sentry/.
 #
 # Suites are the files/dirs under e2e/tests: `base` = e2e/tests/test_base.py,
 # `pull` = e2e/tests/pull/, `ui` = e2e/tests/ui/ (real Chrome via puppeteer-core),
@@ -67,6 +80,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/lib/generated-secrets.sh"
 # shellcheck source=scripts/tests/lib/leak-guard.sh
 . "$ROOT/scripts/tests/lib/leak-guard.sh"
+# NAN-5798: opt-in Sentry for nano's own e2e runs. The open-core mirror
+# strips the helper, so the hooks below become no-ops there.
+if [[ -f "$ROOT/scripts/lib/e2e-sentry.sh" ]]; then
+    # shellcheck source=scripts/lib/e2e-sentry.sh
+    . "$ROOT/scripts/lib/e2e-sentry.sh"
+else
+    sentry_resolve() { :; }; sentry_run_env() { :; }; sentry_compose_env() { :; }
+    sentry_app_env() { :; }; sentry_stack_env() { :; }; sentry_web_cache_suffix() { :; }
+    sentry_web_build_env() { :; }; sentry_web_postbuild() { :; }; sentry_report() { :; }
+fi
 E2E_HOME="$ROOT/target/e2e"
 COMPOSE_BASE="$ROOT/docker-compose.opensource.yml"
 COMPOSE_E2E="$ROOT/dev/e2e/compose.e2e.yml"
@@ -95,7 +118,7 @@ CMD="${1:-}"; [[ $# -gt 0 ]] && shift
 if [[ -d "$ROOT/nanosiem-enterprise" ]]; then DEFAULT_EDITION=enterprise; else DEFAULT_EDITION=open; fi
 APP_MODE=""; APP_MODE_EXPLICIT=0; EDITION="${E2E_EDITION:-$DEFAULT_EDITION}"; RUN_ID=""; NEW_RUN_ID="${E2E_NEW_RUN_ID:-}"
 KEEP=0; FRESH=0; ALLOW_SKIPS="${E2E_ALLOW_SKIPS:-0}"; PURGE=0; NO_BUILD=0; RELEASE=0; GC_HOURS=6; GC_CLOUD=0; GC_ALL_LOCAL=0; INFRA_ONLY=0
-DEFER_ADMIN=0; PROFILES=(); TARGET=own
+DEFER_ADMIN=0; PROFILES=(); TARGET=own; ACCEPTANCE_TRUST=0; SEED_PROFILE="${E2E_SEED_PROFILE:-}"
 POSITIONAL=(); PYTEST_EXTRA=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -116,7 +139,10 @@ while [[ $# -gt 0 ]]; do
         --profile) PROFILES+=("${2:?--profile needs a value}"); shift 2 ;;
         --profile=*) PROFILES+=("${1#*=}"); shift ;;
         --defer-admin) DEFER_ADMIN=1; shift ;;
+        --acceptance-trust) ACCEPTANCE_TRUST=1; shift ;;
         --target) TARGET="${2:?--target needs a value}"; shift 2 ;;
+        --seed) SEED_PROFILE="${2:?--seed needs a value}"; shift 2 ;;
+        --seed=*) SEED_PROFILE="${1#*=}"; shift ;;
         --) shift; PYTEST_EXTRA=("$@"); break ;;
         -*) die "unknown option: $1" ;;
         *) POSITIONAL+=("$1"); shift ;;
@@ -130,8 +156,17 @@ if [[ -z "$APP_MODE" ]]; then
 fi
 [[ "$APP_MODE" =~ ^(native|docker|image:[A-Za-z0-9._-]+)$ ]] || die "--app must be native, docker or image:<tag>"
 [[ "$TARGET" =~ ^(own|existing)$ ]] || die "--target must be own or existing"
+# NAN-5764: --seed realistic applies nano_e2e.realistic_seed once per session
+# before the first UI scenario (a lived-in stack: long names, many objects).
+[[ -z "$SEED_PROFILE" || "$SEED_PROFILE" == realistic ]] || die "unknown --seed '$SEED_PROFILE' (known: realistic)"
+[[ -z "$SEED_PROFILE" || "$TARGET" == own ]] || die "--seed writes to the stack: never with --target existing"
+if [[ -n "$SEED_PROFILE" ]]; then
+    for _s in "${POSITIONAL[@]}"; do
+        [[ "$_s" != zero_clicks ]] || die "--seed cannot run with zero_clicks (it asserts nothing was clicked)"
+    done
+fi
 for _p in "${PROFILES[@]}"; do
-    [[ "$_p" =~ ^(mock-vendor|connector-live|ai-stub|soar-lab)$ ]] || die "unknown --profile '$_p' (known: mock-vendor, connector-live, ai-stub, soar-lab)"
+    [[ "$_p" =~ ^(mock-vendor|connector-live|ai-stub|soar-lab|recon-fast)$ ]] || die "unknown --profile '$_p' (known: mock-vendor, connector-live, ai-stub, soar-lab, recon-fast)"
 done
 has_profile() { local p; for p in "${PROFILES[@]}"; do [[ "$p" == "$1" ]] && return 0; done; return 1; }
 if has_profile mock-vendor && has_profile connector-live; then
@@ -281,6 +316,11 @@ gen_secrets() {
             put E2E_STARTED "$(date +%s)"
             put E2E_OWNER "$ROOT"
             put CLICKHOUSE_MEM_LIMIT "${E2E_CLICKHOUSE_MEM_LIMIT:-8G}"  # 4G/6G hit 241s under the UI suite once feed bundles load (NAN-4937)
+            # NAN-5822: PostgreSQL and its pools from the installer's budget
+            # plan. The Compose default (1G) OOM-killed a 512M PostgreSQL under
+            # the persona suites with 20-wide pools; 2G holds full pools.
+            "$ROOT/scripts/lib/resource-sizing.sh" --pg-pool-plan "${E2E_POSTGRES_MEM_MIB:-2048}" \
+                | grep -v '^NANO_PG_' || die "PostgreSQL pool sizing failed"
             # OCSF is what every new install gets; legacy UDM only on request (NAN-5593).
             put NANO_SCHEMA_PROFILE "${NANO_SCHEMA_PROFILE:-ocsf}"
             put NANOSIEM_DEV_MODE true
@@ -422,9 +462,17 @@ native_build() {
     local features=() mode=() acceptance_env=() cargo
     cargo="$(cargo_bin)"
     [[ "$EDITION" == enterprise ]] && features=(--features enterprise)
+    # NAN-5771: the trust composition comes from the harness flags only, never
+    # from the caller's environment. A shell left with RUSTFLAGS="--cfg
+    # nano_content_acceptance" or NANO_NON_RELEASE_BUILD=1 must not turn a
+    # production `up` into a test build (and CARGO_ENCODED_RUSTFLAGS, which
+    # Cargo prefers over RUSTFLAGS, must not drop the cfg from a test build).
+    check_inherited_build_env
     if test_trust_composition_selected; then
         features=(--features enterprise)
         acceptance_env=(env NANO_NON_RELEASE_BUILD=1 "RUSTFLAGS=${RUSTFLAGS:-} --cfg nano_content_acceptance")
+    else
+        acceptance_env=(env -u NANO_NON_RELEASE_BUILD)
     fi
     (( RELEASE )) && mode=(--release)
     log "cargo build ($EDITION, $(profile_dir)); log: $RUN_DIR/artifacts/build.log"
@@ -439,7 +487,59 @@ native_build() {
             >> "$RUN_DIR/artifacts/build.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/build.log" >&2; die "cargo build (nano-connector-runner) failed"; }
     fi
+    # Assert the result, not the flags: every trust-verifying binary must
+    # report the composition this run records (catches .cargo/config or
+    # CARGO_TARGET_*_RUSTFLAGS injection too).
+    local svc
+    for svc in api jobs; do verify_binary_trust "$svc"; done
     ok "build complete"
+}
+
+# NAN-5771: refuse caller build env that would change the trust composition
+# behind the harness's back.
+check_inherited_build_env() {
+    local var val
+    for var in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS $(compgen -e | grep -E '^CARGO_TARGET_.*_RUSTFLAGS$' || true); do
+        val="${!var:-}"
+        [[ "$val" == *nano_content_acceptance* ]] \
+            && die "$var carries nano_content_acceptance: test trust is chosen with --acceptance-trust, not the environment (unset $var)"
+    done
+    # Cargo tests CARGO_ENCODED_RUSTFLAGS for presence: set-but-empty still
+    # makes it ignore RUSTFLAGS (and so drop the cfg).
+    if test_trust_composition_selected && [[ "${CARGO_ENCODED_RUSTFLAGS+set}" == set ]]; then
+        die "CARGO_ENCODED_RUSTFLAGS is set (even empty): Cargo would ignore the test-trust RUSTFLAGS (unset it)"
+    fi
+    return 0
+}
+
+# trust_bin <svc>: the native binary that carries a trust composition.
+trust_bin() {
+    case "$1" in
+        api) printf '%s/%s/nanosiem-api' "$(target_dir)" "$(env_get "$RUN_DIR/run.env" E2E_PROFILE_DIR)" ;;
+        jobs) printf '%s/%s/nanosiem-jobs' "$(target_dir)" "$(env_get "$RUN_DIR/run.env" E2E_PROFILE_DIR)" ;;
+        *) return 1 ;;
+    esac
+}
+
+# verify_binary_trust <svc>: the binary on disk reports (--print-content-trust)
+# the trust this run records. Fails closed: a binary that cannot answer (one
+# built before the flag existed, or a crash) is refused like a mismatch.
+verify_binary_trust() {
+    local svc="$1" want exe got
+    want="$(env_get "$RUN_DIR/run.env" E2E_TRUST)"
+    [[ -n "$want" ]] || die "run $RUN_ID records no E2E_TRUST (created before NAN-5771): use --fresh"
+    exe="$(trust_bin "$svc")" || die "no trust binary for $svc"
+    [[ -x "$exe" ]] || die "$exe missing (build first, or drop --no-build)"
+    # Empty environment + hard timeout: a binary from before the flag ignores
+    # it and boots the service instead; without config it must not hang here
+    # (and it gets no secrets either).
+    got="$(env -i PATH="/usr/bin:/bin" HOME="${HOME:-/tmp}" \
+        perl -e 'alarm shift; exec @ARGV or exit 127' 20 "$exe" --print-content-trust \
+        2>/dev/null </dev/null | head -n1)" || got=""
+    [[ "$got" =~ ^production(\+acceptance)?$ ]] \
+        || die "nanosiem-$svc did not report its trust (stale binary? rebuild, or drop --no-build)"
+    [[ "$got" == "$want" ]] \
+        || die "nanosiem-$svc trust mismatch: binary is '$got', run expects '$want' (stale --no-build binary?)"
 }
 
 # run_has_profile <name>: the profile is on for the run (recorded in run.env).
@@ -518,6 +618,10 @@ write_app_env() {
                 "NANO_INGEST_PUBLIC_BASE_URL=http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_EDGE_PORT)" \
                 "NANO_INGEST_HEC_PORT=$(env_get "$RUN_DIR/run.env" E2E_HEC_PORT)" \
                 NANO_PIPE_PREVIEW_ENABLED=true \
+                "HUNT_RECON_SCHEDULE_ENABLED=$(env_get "$RUN_DIR/compose.env" E2E_HUNT_RECON_SCHEDULE_ENABLED)" \
+                "HUNT_RECON_FIRST_RUN_DELAY_SECS=$(env_get "$RUN_DIR/compose.env" E2E_HUNT_RECON_FIRST_RUN_DELAY_SECS)" \
+                "HUNT_RECON_TICK_SECS=$(env_get "$RUN_DIR/compose.env" E2E_HUNT_RECON_TICK_SECS)" \
+                "HUNT_RECON_NEW_SOURCE_MIN_GAP_SECS=$(env_get "$RUN_DIR/compose.env" E2E_HUNT_RECON_NEW_SOURCE_MIN_GAP_SECS)" \
                 "NANO_PIPELINE_IDENTITY=${NANO_VERSION:?}/${NANO_INGEST_ACK_DURABILITY:-fsync}/${VECTOR_FANIN_SLOTS:-off}" \
                 "NANO_BACKUP_STATUS_TOKEN=${NANO_BACKUP_STATUS_TOKEN:-}" \
                 API_HOST=127.0.0.1 "API_PORT=$(env_get "$RUN_DIR/run.env" E2E_API_PORT)" \
@@ -526,6 +630,11 @@ write_app_env() {
                 "SEARCH_SERVICE_URL=http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_SEARCH_PORT)/health" \
                 LEADER_ELECTION_ENABLED=true CORS_ORIGINS=http://localhost \
                 "RUST_LOG=$RUST_LOG" NANOSIEM_INVESTIGATION_TOOL_LOOP=false \
+                "PG_MAX_CONNECTIONS=${PG_MAX_CONNECTIONS:-14}" "PG_MIN_CONNECTIONS=${PG_MIN_CONNECTIONS:-2}" \
+                "NANO_API_PG_MAX_CONNECTIONS=${NANO_API_PG_MAX_CONNECTIONS:-14}" \
+                "NANO_JOBS_PG_MAX_CONNECTIONS=${NANO_JOBS_PG_MAX_CONNECTIONS:-16}" \
+                "NANO_SEARCH_PG_MAX_CONNECTIONS=${NANO_SEARCH_PG_MAX_CONNECTIONS:-11}" \
+                "NANO_CONNECTOR_PG_MAX_CONNECTIONS=${NANO_CONNECTOR_PG_MAX_CONNECTIONS:-4}" \
                 CLOUDFLARE_AI_GATEWAY_URL= CF_AIG_AUTH_TOKEN= DOCS_SEARCH_TOKEN=; do
                 printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
             done
@@ -558,6 +667,10 @@ write_app_env() {
                     printf 'export %s=%q\n' "${line%%=*}" "${line#*=}"
                 done < "$E2E_APP_ENV_EXTRA"
             fi
+            # NAN-5798: opt-in Sentry (nothing when no DSN was found).
+            while IFS= read -r kv; do
+                [[ -n "$kv" ]] && printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
+            done < <(sentry_app_env)
             if run_has_profile soar-lab; then
                 for kv in \
                     SOAR_E2E_LAB=1 \
@@ -672,13 +785,31 @@ native_start() {
     local exe; exe="$(target_dir)/$(env_get "$RUN_DIR/run.env" E2E_PROFILE_DIR)/$bin"
     [[ -x "$exe" ]] || die "$exe missing (build first, or drop --no-build)"
     pid_alive "$RUN_DIR/pids/$svc.pid" && { ok "$svc already running"; return 0; }
+    # NAN-5771: every start (up, run reuse, svc restart) checks the binary.
+    if [[ "$svc" == api || "$svc" == jobs ]]; then
+        verify_binary_trust "$svc"
+        env_get "$RUN_DIR/run.env" E2E_TRUST > "$RUN_DIR/pids/$svc.trust"
+    fi
     local token pid start
     token="$(openssl rand -hex 16)"
+    local -a app_keys; svc_app_env_keys app_keys
     (
+        # NAN-5878: a scenario's `svc ... env=` settings win over app.env, as
+        # the compose override does in docker/image mode: keep them, re-apply.
+        declare -A caller=(); local k
+        for k in "${app_keys[@]}"; do [[ -v "$k" ]] && caller[$k]="${!k}"; done
         # shellcheck disable=SC1091
         . "$RUN_DIR/app.env"
         # shellcheck disable=SC1091
         [[ "$svc" == connector ]] && . "$RUN_DIR/connector.env"
+        # NAN-5822: each process takes its own pool size, as Compose sets it.
+        case "$svc" in
+            api) export PG_MAX_CONNECTIONS="$NANO_API_PG_MAX_CONNECTIONS" ;;
+            jobs) export PG_MAX_CONNECTIONS="$NANO_JOBS_PG_MAX_CONNECTIONS" ;;
+            search) export PG_MAX_CONNECTIONS="$NANO_SEARCH_PG_MAX_CONNECTIONS" ;;
+            connector) export PG_MAX_CONNECTIONS="$NANO_CONNECTOR_PG_MAX_CONNECTIONS" ;;
+        esac
+        for k in "${!caller[@]}"; do export "$k=${caller[$k]}"; done
         # NAN-5470: nano-search runs as the interactive search identity, as
         # docker-compose.opensource.yml configures it.
         # Production-faithful: like the compose service, it holds no admin,
@@ -838,9 +969,13 @@ import_c05_license() {
         ok "C05 license import deferred to first-run setup (--defer-admin)"
         return 0
     fi
+    # zero_clicks (NAN-5763) compares the import window with the first
+    # content check (sub-second: the race is seconds wide).
+    put E2E_LICENSE_IMPORT_STARTED_AT "$(python3 -c 'import time; print(f"{time.time():.3f}")')" >> "$RUN_DIR/run.env"
     E2E_API_URL="http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_API_PORT)" \
     E2E_ADMIN_ENV="$RUN_DIR/admin.env" \
         license_py import --repo-root "$ROOT" || die "C05 license import failed (file contents not shown)"
+    put E2E_LICENSE_IMPORT_FINISHED_AT "$(python3 -c 'import time; print(f"{time.time():.3f}")')" >> "$RUN_DIR/run.env"
     ok "C05 license imported and active"
 }
 
@@ -855,25 +990,40 @@ cmd_license_ids() {
 }
 
 # ---------------------------------------------------------------- up
+# NAN-5748: on Linux the app images run as uid 999 and bind mounts keep host
+# ownership, so a run dir owned by the CI user is read-only to nano-api (EACCES
+# on the Vector config-dir lock, then "Vector HEC not healthy"). Docker Desktop
+# on macOS maps ownership and hides this. The dirs the containers write are
+# opened to every uid; $RUN_DIR itself stays 0700, so other host users still
+# cannot reach them. Native mode writes them as the host user: nothing to do.
+share_container_dirs() {
+    [[ "$OS" == Linux && "$APP_MODE" != native ]] || return 0
+    find "$RUN_DIR/vector-dynamic" "$RUN_DIR/vector-validation" -type d -exec chmod 0777 {} +
+}
+
 cmd_up() {
     command -v docker >/dev/null || die "docker not found"
     docker info >/dev/null 2>&1 || die "docker daemon not reachable"
+    sentry_resolve  # NAN-5798: once, in this shell (no-op without DSNs)
     RUN_ID="${NEW_RUN_ID:-$(new_run_id)}"
     validate_run_id "$RUN_ID"
     RUN_DIR="$E2E_HOME/$RUN_ID"; PROJECT="nanoe2e-$RUN_ID"
     [[ "$PROJECT" != nanoch* ]] || die "refusing project name $PROJECT"
     [[ ! -e "$RUN_DIR" ]] || die "run dir $RUN_DIR already exists"
     license_env_check
+    check_trust_request
     mkdir -p "$RUN_DIR"/{artifacts,pids,data,clickhouse} \
         "$RUN_DIR"/vector-dynamic/{sources/parsers,sources/configs,ingest-tokens} "$RUN_DIR"/vector-validation
     chmod 700 "$RUN_DIR"
+    share_container_dirs
     initialize_e2e_clickhouse_config
     ln -sfn "$RUN_ID" "$E2E_HOME/current"
     # A failed bring-up must not leave containers or processes behind
     # (unless --keep, for debugging). Artifacts are kept either way.
     UP_DONE=0
     trap 'up_exit_guard' EXIT
-    log "e2e run $RUN_ID (project $PROJECT, app $APP_MODE, edition $EDITION, profiles: ${PROFILES[*]:-none})"
+    log "e2e run $RUN_ID (project $PROJECT, app $APP_MODE, edition $EDITION, profiles: ${PROFILES[*]:-none}, trust: $(expected_trust))"
+    trust_banner "$(expected_trust)"
 
     log "run dir: $RUN_DIR"
 
@@ -887,13 +1037,32 @@ cmd_up() {
         put E2E_PERSONA_AI_MODE "${E2E_PERSONA_AI_MODE:-stub}"
         put E2E_PROFILES "${PROFILES[*]}"; put E2E_ADMIN_DEFERRED "$DEFER_ADMIN"
         if content_acceptance_selected; then put E2E_CONTENT_ACCEPTANCE 1; else put E2E_CONTENT_ACCEPTANCE 0; fi
+        put E2E_TRUST "$(expected_trust)"
+        sentry_run_env
     } > "$RUN_DIR/run.env"
+    sentry_compose_env >> "$RUN_DIR/compose.env"
     # Host ports are chosen here (free 127.0.0.1 ports) and published
     # explicitly: compose's ephemeral `127.0.0.1::<port>` would hand out NEW
     # ports on every container restart, and scenarios restart Vector.
     allocate_ports >> "$RUN_DIR/run.env"
     grep -E '^E2E_[A-Z_]*_PORT=' "$RUN_DIR/run.env" >> "$RUN_DIR/compose.env"
     generate_soar_lab_pki
+    # NAN-5757: scheduled hunt recon creates disabled draft hunts and (with a
+    # real AI provider) makes a metered fingerprint call. Off on e2e stacks so
+    # unrelated scenarios see neither; `--profile recon-fast` turns it on with
+    # a fast first run, tick and new-source gap for the recon scenarios.
+    # Native (app.env) and docker/image (compose.e2e.yml nano-jobs) read these.
+    if run_has_profile recon-fast; then
+        {
+            put E2E_HUNT_RECON_SCHEDULE_ENABLED true; put E2E_HUNT_RECON_FIRST_RUN_DELAY_SECS 0
+            put E2E_HUNT_RECON_TICK_SECS 10; put E2E_HUNT_RECON_NEW_SOURCE_MIN_GAP_SECS 120
+        } >> "$RUN_DIR/compose.env"
+    else
+        {
+            put E2E_HUNT_RECON_SCHEDULE_ENABLED false; put E2E_HUNT_RECON_FIRST_RUN_DELAY_SECS ""
+            put E2E_HUNT_RECON_TICK_SECS ""; put E2E_HUNT_RECON_NEW_SOURCE_MIN_GAP_SECS ""
+        } >> "$RUN_DIR/compose.env"
+    fi
     if run_has_profile ai-stub; then
         put E2E_ALLOW_PRIVATE_AI_ENDPOINTS true >> "$RUN_DIR/compose.env"
     else
@@ -962,7 +1131,7 @@ cmd_up() {
         dc run --rm clickhouse-migrate > "$RUN_DIR/artifacts/migrator.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/migrator.log" >&2; die "migrator failed"; }
         seed_installation_identity
-        dc up -d vector nano-search nano-jobs nano-api >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
+        dc up -d vector vector-tap nano-search nano-jobs nano-api >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/compose-up.log" >&2; die "compose up (app) failed"; }
         local p
         for p in API SEARCH JOBS; do
@@ -980,8 +1149,10 @@ cmd_up() {
     fi
     import_c05_license
     write_stack_env
+    verify_stack_trust
     UP_DONE=1; trap - EXIT
-    ok "stack up: $RUN_ID"
+    ok "stack up: $RUN_ID (trust: $(env_get "$RUN_DIR/run.env" E2E_TRUST))"
+    trust_banner "$(env_get "$RUN_DIR/run.env" E2E_TRUST)"
     printf '%s\n' "$RUN_DIR/stack.env"
 }
 
@@ -1070,6 +1241,10 @@ write_stack_env() {
             put E2E_ADMIN_DEFERRED "$(env_get "$r" E2E_ADMIN_DEFERRED)"
             put E2E_PERSONA_AI_MODE "$(env_get "$r" E2E_PERSONA_AI_MODE)"
             put E2E_PROFILES "$(env_get "$r" E2E_PROFILES)"
+            # NAN-5771: production, or production+acceptance (test keys trusted).
+            put E2E_TRUST "$(env_get "$r" E2E_TRUST)"
+            put E2E_LICENSE_IMPORT_STARTED_AT "$(env_get "$r" E2E_LICENSE_IMPORT_STARTED_AT)"
+            put E2E_LICENSE_IMPORT_FINISHED_AT "$(env_get "$r" E2E_LICENSE_IMPORT_FINISHED_AT)"
             put E2E_MOCK_VENDOR_PORT "$(env_get "$r" E2E_MOCK_VENDOR_PORT)"
             put E2E_AI_STUB_URL "http://127.0.0.1:$ai_stub"
             if [[ "$(env_get "$r" E2E_CONTENT_ACCEPTANCE)" == 1 ]]; then
@@ -1082,6 +1257,7 @@ write_stack_env() {
                 put E2E_AI_PROVIDER_BASE_URL "http://ai-stub:8080/v1"
             fi
             put NANOSIEM_EDGE_URL "http://127.0.0.1:$(env_get "$r" E2E_EDGE_PORT)"
+            sentry_stack_env
             put E2E_SOAR_VENDOR_PORT "$(env_get "$r" E2E_SOAR_VENDOR_PORT)"
             put E2E_SOAR_SMTP_PORT "$(env_get "$r" E2E_SOAR_SMTP_PORT)"
             put E2E_SOAR_MAILPIT_API_URL "http://127.0.0.1:$(env_get "$r" E2E_SOAR_MAILPIT_API_PORT)"
@@ -1208,6 +1384,13 @@ stop_content_fixture() {
 }
 
 # ---------------------------------------------------------------- creds
+# file_mode <path>: octal permission bits (e.g. 600). GNU `stat -c` first: on
+# GNU coreutils `stat -f` means --file-system and "succeeds" with filesystem
+# info, so a BSD-first chain never reached its fallback on Linux (NAN-5748).
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
 # Prints the credential source: doppler | file | none. Never prints values.
 creds_source() {
     if [[ "${NANO_E2E_NO_DOPPLER:-0}" != 1 ]] && command -v doppler >/dev/null 2>&1 \
@@ -1215,7 +1398,7 @@ creds_source() {
         echo doppler; return
     fi
     if [[ -f "$CREDS_FILE" ]]; then
-        local mode; mode="$(stat -f '%Lp' "$CREDS_FILE" 2>/dev/null || stat -c '%a' "$CREDS_FILE")"
+        local mode; mode="$(file_mode "$CREDS_FILE")"
         [[ "$mode" == 600 || "$mode" == 400 ]] || die "$CREDS_FILE must be mode 0600 (is $mode)"
         echo file; return
     fi
@@ -1250,6 +1433,15 @@ suite_paths() {
                 # is not coverage-gated on its own: today it is placeholders.
                 [[ -d "$PY_DIR/tests/enterprise/ui" ]] && out+=("+$PY_DIR/tests/enterprise/ui") ;;
             content_acceptance) out+=("$PY_DIR/tests/enterprise/content_acceptance") ;;
+            zero_clicks)
+                # NAN-5763: open-core content on every edition; the enterprise
+                # companion (the mirror strips it) adds playbooks, SOAR, recon
+                # and hunts.
+                out+=("$PY_DIR/tests/zero_clicks")
+                # Gated like the open module: an enterprise run whose six
+                # scenarios all skip must fail (absent on open).
+                [[ "$EDITION" == enterprise && -d "$PY_DIR/tests/enterprise/zero_clicks" ]] \
+                    && out+=("$PY_DIR/tests/enterprise/zero_clicks") ;;
             otlp) out+=("$PY_DIR/tests/test_otlp.py" "$PY_DIR/tests/ui/test_otlp_observability.py") ;;
             personas)
                 out+=("$PY_DIR/tests/personas")
@@ -1317,8 +1509,114 @@ soar_lab_selected() {
         && selects_suite soar
 }
 
+# zero_clicks (NAN-5763) asserts content arrived with NO user action, so it
+# must be the first and only thing that ever ran against its stack: it runs
+# alone, on a stack this run creates, and only then is E2E_ZERO_CLICKS=1
+# exported (elsewhere, e.g. `run all`, its scenarios skip).
+zero_clicks_selected() {
+    local s
+    for s in "${POSITIONAL[@]}"; do [[ "$s" == zero_clicks ]] && return 0; done
+    return 1
+}
+
+# NAN-5771: the test-key composition (`--cfg nano_content_acceptance` +
+# NANO_NON_RELEASE_BUILD=1) is opt-in. A bare `up` (no suite, which
+# selects_suite reads as "every suite") must build what a release build trusts,
+# or a manual check silently runs against test keys (the NAN-5768 false alarm).
+# Opt-in is: --acceptance-trust, the soar-lab profile (its loopback lab
+# transport exists only under the cfg), naming content_acceptance, or a `run`
+# whose suites include soar (`run soar`, `run all`).
 test_trust_composition_selected() {
-    content_acceptance_selected || soar_lab_selected
+    (( ACCEPTANCE_TRUST )) && return 0
+    has_profile soar-lab && return 0
+    content_acceptance_selected && return 0
+    [[ "$CMD" == run ]] && soar_lab_selected
+}
+
+# The trust label the stack is built for; the same strings the API reports in
+# GET /api/content/channels `trust` (content_bundle::contract::trust_label).
+# Docker and image app modes build release-like images: always production.
+expected_trust() {
+    if [[ "$APP_MODE" == native ]] && test_trust_composition_selected; then
+        printf 'production+acceptance'
+    else
+        printf 'production'
+    fi
+}
+
+# Refuse a test-trust request the harness cannot honour, instead of quietly
+# building production trust.
+check_trust_request() {
+    test_trust_composition_selected || return 0
+    [[ "$APP_MODE" == native ]] \
+        || die "test trust (--acceptance-trust / soar-lab / content_acceptance) needs --app native"
+    [[ "$EDITION" == enterprise ]] \
+        || die "test trust (--acceptance-trust / soar-lab / content_acceptance) needs --edition enterprise"
+    (( ! RELEASE )) \
+        || die "test trust (--acceptance-trust / soar-lab / content_acceptance) is debug-only: drop --release"
+}
+
+trust_banner() {
+    local trust="$1"
+    if [[ "$trust" == production ]]; then
+        ok "trust: production (release config; test content keys NOT trusted)"
+    else
+        warn "################################################################"
+        warn "TRUST: $trust -- TEST BUILD (--cfg nano_content_acceptance)"
+        warn "this stack also trusts TEST content/catalog keys; it is NOT what a"
+        warn "release ships. Do not use it for fresh-install / trust checks."
+        warn "################################################################"
+    fi
+}
+
+# verify_stack_trust: ask the running API which trust it was compiled with.
+# The decision lives in nano_e2e.trust, which nano_e2e.firstrun also uses for
+# --defer-admin stacks, so the two cannot drift. It fails closed: an API
+# error (500, 401/403, network, bad body), a reply without `trust` or a
+# mismatch fails the command. The one exception is HTTP 404 on a published
+# image (--app image:<tag>), which predates the endpoint: a warning. Without an
+# admin key yet (--defer-admin) the native binaries were already checked at
+# start, and nano_e2e.firstrun runs this check once it mints the key.
+verify_stack_trust() {
+    local want rc=0 out
+    want="$(env_get "$RUN_DIR/run.env" E2E_TRUST)"
+    [[ -n "$want" ]] || die "run $RUN_ID records no E2E_TRUST (created before NAN-5771): use --fresh"
+    if [[ -z "$(env_get "$RUN_DIR/admin.env" NANOSIEM_API_KEY)" ]]; then
+        log "trust: API check deferred to first-run setup (no admin key yet); binaries report $want"
+        return 0
+    fi
+    out="$(trust_py --api "http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_API_PORT)" \
+        --admin-env "$RUN_DIR/admin.env" --want "$want" \
+        --app-mode "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" \
+        --attempts "${E2E_TRUST_PROBE_ATTEMPTS:-5}")" || rc=$?
+    case "$rc" in
+        0) ok "trust verified via API: $out" ;;
+        2) warn "$out" ;;
+        *) die "trust check failed (see above); expected $want" ;;
+    esac
+}
+
+trust_py() { (cd "$PY_DIR" && python3 -m nano_e2e.trust "$@"); }
+
+# check_reuse_trust: a reused stack (`run --run <id>` or the live `up` stack)
+# must match what this run asked for, and its running api/jobs processes must
+# have been started (and checked) for that trust.
+check_reuse_trust() {
+    local have svc
+    have="$(env_get "$RUN_DIR/run.env" E2E_TRUST)"
+    [[ -n "$have" ]] || die "run $RUN_ID records no E2E_TRUST (created before NAN-5771): use --fresh"
+    if test_trust_composition_selected && [[ "$have" != production+acceptance ]]; then
+        die "test trust was requested but run $RUN_ID is '$have': use --fresh"
+    fi
+    if has_profile soar-lab && ! run_has_profile soar-lab; then
+        die "--profile soar-lab was requested but run $RUN_ID has no soar-lab profile: use --fresh"
+    fi
+    [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" == native ]] || return 0
+    for svc in api jobs; do
+        pid_alive "$RUN_DIR/pids/$svc.pid" || continue
+        [[ "$(cat "$RUN_DIR/pids/$svc.trust" 2>/dev/null)" == "$have" ]] \
+            || die "running nanosiem-$svc of run $RUN_ID was not started for trust '$have': restart it (svc restart $svc) or --fresh"
+    done
 }
 
 CMD_RUN_OWNS_STACK=0
@@ -1344,7 +1642,7 @@ run_exit_guard() {
 cmd_run_existing() {
     local creds="${E2E_TARGET_CREDS_FILE:-}" status=0 paths=() listing p
     [[ -n "$creds" && -f "$creds" ]] || die "--target existing needs E2E_TARGET_CREDS_FILE (0600 file: email, password, api_key)"
-    [[ "$(stat -f '%Lp' "$creds" 2>/dev/null || stat -c '%a' "$creds")" == 600 ]] || die "E2E_TARGET_CREDS_FILE must be mode 0600"
+    [[ "$(file_mode "$creds")" == 600 ]] || die "E2E_TARGET_CREDS_FILE must be mode 0600"
     (( ${#POSITIONAL[@]} )) || die "--target existing needs an explicit suite (e.g. run ui --target existing)"
     local web="${E2E_TARGET_WEB_URL:-http://localhost:5173}" api="${E2E_TARGET_API_URL:-http://localhost:3000}"
     curl -fsS -m 10 -o /dev/null "$api/health" || die "existing target API not healthy at $api"
@@ -1384,8 +1682,16 @@ cmd_run_existing() {
 }
 
 cmd_run() {
-    if [[ "$TARGET" == existing ]]; then cmd_run_existing; return; fi
+    if [[ "$TARGET" == existing ]]; then
+        # NAN-5771: the runner neither builds nor checks an existing stack, so
+        # a test-trust request cannot be honoured there: refuse it.
+        if (( ACCEPTANCE_TRUST )) || has_profile soar-lab || content_acceptance_selected; then
+            die "test trust (--acceptance-trust / soar-lab / content_acceptance) applies only to stacks this runner builds, never --target existing"
+        fi
+        cmd_run_existing; return
+    fi
     local own_stack=0 web_dist="" final soar_selected=0 soar_explicit=0 suite
+    sentry_resolve  # NAN-5798: before the web build (no-op without DSNs)
     leak_guard_begin "scripts/e2e.sh run"
     CMD_RUN_OWNS_STACK=0
     CMD_RUN_FINISHED=0
@@ -1396,6 +1702,17 @@ cmd_run() {
         [[ "$APP_MODE" == native ]] || die "content_acceptance needs --app native"
         [[ "$EDITION" == enterprise ]] || die "content_acceptance needs --edition enterprise"
         [[ -n "$RUN_ID" ]] || FRESH=1
+    fi
+    if zero_clicks_selected; then
+        only_suite zero_clicks || die "zero_clicks runs alone (other suites would touch its stack first)"
+        [[ -z "$RUN_ID" ]] || die "zero_clicks needs a stack nothing has touched: drop --run (it owns a fresh one)"
+        FRESH=1
+        if [[ "$EDITION" == enterprise && -z "${NANO_E2E_C05_LICENSE_FILE:-}" ]]; then
+            die "zero_clicks --edition enterprise needs the C05 license env (NANO_E2E_C05_LICENSE_FILE + installation ids; e2e/README.md)"
+        fi
+        # A real install runs scheduled recon (NAN-5757); e2e stacks turn it
+        # off unless recon-fast is on, so the fresh-install check needs it.
+        has_profile recon-fast || PROFILES+=(recon-fast)
     fi
     for suite in "${POSITIONAL[@]}"; do
         [[ "$suite" == soar ]] && soar_explicit=1
@@ -1416,12 +1733,19 @@ cmd_run() {
         # explicit --run reuse is allowed only after the checks below.
         [[ -n "$RUN_ID" ]] || FRESH=1
     fi
+    # NAN-5771: refuse a test-trust request the stack cannot honour, and never
+    # hand it the live production stack from a bare `up`.
+    check_trust_request
+    if test_trust_composition_selected; then [[ -n "$RUN_ID" ]] || FRESH=1; fi
     # The web build and browser come first: a failure here must not leave a
     # stack behind (cmd_up has already disarmed its own cleanup when it returns).
     # enterprise carries browser scenarios (tests/enterprise/ui, content_acceptance)
     # that need the edition's web build too (NAN-5333).
     if selects_suite ui connectors otlp personas enterprise || content_acceptance_selected; then
         venv_ensure
+        # The hunter personas drive log-blaster and the injector (debug
+        # builds). Build them when missing instead of failing the scenarios.
+        if selects_suite personas enterprise; then tool_bins_ensure; fi
         # E2E_WEB_DIST: drive a prebuilt UI instead (e.g. another branch's
         # build against this stack); it must contain index.html.
         if [[ -n "${E2E_WEB_DIST:-}" ]]; then
@@ -1471,7 +1795,8 @@ cmd_run() {
             run_has_profile soar-lab && run_has_profile ai-stub \
                 || die "the soar suite needs a stack with soar-lab and ai-stub profiles"
         fi
-        log "using live stack $RUN_ID"
+        check_reuse_trust
+        log "using live stack $RUN_ID (trust: $(env_get "$RUN_DIR/run.env" E2E_TRUST))"
         # A kept native stack can outlive one or more app processes (a local
         # crash, laptop sleep, or the parent terminal closing).  `--run`
         # promises to reuse that owned stack, so restore any missing native
@@ -1483,6 +1808,7 @@ cmd_run() {
                 wait_http "$(native_health_url "$svc")" "nano-$svc" 150 "$RUN_DIR/pids/$svc.pid"
             done
         fi
+        verify_stack_trust
     fi
     venv_ensure
     if { selects_suite ui connectors otlp personas || content_acceptance_selected; } \
@@ -1506,6 +1832,8 @@ cmd_run() {
         export E2E_SUITE_PATHS; E2E_SUITE_PATHS="$(IFS=:; echo "${gated[*]}")"
         export E2E_ALLOW_SKIPS="$ALLOW_SKIPS"
         [[ -n "$web_dist" ]] && export E2E_WEB_DIST="$web_dist"
+        if zero_clicks_selected && (( own_stack )); then export E2E_ZERO_CLICKS=1; fi
+        if [[ -n "$SEED_PROFILE" ]]; then export E2E_SEED_PROFILE="$SEED_PROFILE"; fi
         with_creds "$VENV/bin/python" -m pytest "${paths[@]}" \
             --junitxml="$RUN_DIR/artifacts/junit-$(date +%s).xml" "${PYTEST_EXTRA[@]}"
     ) || status=$?
@@ -1534,6 +1862,24 @@ cmd_run() {
     return "$final"
 }
 
+# tool_bins_ensure: the persona scenarios' load tools (log-blaster, injector),
+# built in debug where the scenarios look for them unless E2E_*_BIN says
+# otherwise. Only when one is missing; cheap once built.
+tool_bins_ensure() {
+    local dir; dir="$(target_dir)/debug"
+    if [[ -x "${E2E_LOG_BLASTER_BIN:-$dir/log-blaster}" && -x "${E2E_INJECTOR_BIN:-$dir/injector}" ]]; then
+        export E2E_LOG_BLASTER_BIN="${E2E_LOG_BLASTER_BIN:-$dir/log-blaster}" E2E_INJECTOR_BIN="${E2E_INJECTOR_BIN:-$dir/injector}"
+        return 0
+    fi
+    local cargo log="$E2E_HOME/tool-bins.log"
+    cargo="$(cargo_bin)"
+    mkdir -p "$E2E_HOME"
+    log "cargo build -p log-blaster -p injector (debug); log: $log"
+    (cd "$ROOT" && PATH="$(dirname "$cargo"):$PATH" nice -n 10 "$cargo" build -p log-blaster -p injector) > "$log" 2>&1 \
+        || { tail -n 30 "$log" >&2; die "cargo build (log-blaster, injector) failed"; }
+    export E2E_LOG_BLASTER_BIN="$dir/log-blaster" E2E_INJECTOR_BIN="$dir/injector"
+}
+
 # ---------------------------------------------------------------- web UI
 # web_build <edition>: build nanosiem-web for the edition once per source tree
 # state; prints the dist dir. Cached under target/e2e/web/ by the tree hash of
@@ -1546,7 +1892,7 @@ web_build() {
     key="$( { git -C "$ROOT" rev-parse HEAD:nanosiem-web; git -C "$ROOT" diff HEAD -- nanosiem-web;
               git -C "$ROOT" ls-files -o --exclude-standard -- nanosiem-web | sort \
                   | while IFS= read -r f; do printf '%s\n' "$f"; cat "$ROOT/$f" 2>/dev/null || true; done
-            } | "${sha[@]}" | cut -c1-16)"
+            } | "${sha[@]}" | cut -c1-16)$(sentry_web_cache_suffix)"
     dist="$E2E_HOME/web/$edition-$key"
     log="$E2E_HOME/web/$edition-$key.log"
     if [[ -f "$dist/index.html" ]]; then ok "web UI ($edition) cached: $dist"; printf '%s' "$dist"; return 0; fi
@@ -1558,8 +1904,13 @@ web_build() {
         # node_modules a running dev server (:5173) may be using. The build
         # uses the committed src/lib/udm-fields.ts; the generator is skipped
         # because it also writes outside nanosiem-web (docs/, sibling repos).
-        [[ -d node_modules ]] || npm ci --no-audit --no-fund
+        # (NAN-5798: also when it predates @sentry/react, which the build resolves.)
+        [[ -d node_modules/@sentry/react ]] || npm ci --no-audit --no-fund
+        sentry_web_build_env
         VITE_EDITION="$edition" npx --no-install vite build --outDir "$dist.tmp" --emptyOutDir
+        # Hidden source maps (Sentry builds only): uploaded, then moved out of
+        # the served dist.
+        sentry_web_postbuild "$dist.tmp" "$dist.sourcemaps"
     ) > "$log" 2>&1 || { tail -n 30 "$log" >&2; rm -rf "$dist.tmp"; die "web build failed"; }
     rm -rf "$dist"; mv "$dist.tmp" "$dist" 2>/dev/null || [[ -f "$dist/index.html" ]]
     ok "web UI built: $dist"
@@ -1586,7 +1937,7 @@ ui_ensure() {
 collect_artifacts() {
     local a="$RUN_DIR/artifacts" svc
     mkdir -p "$a/logs"
-    for svc in postgres clickhouse dragonfly vector nano-api nano-search nano-jobs ai-stub soar-mailpit edge; do
+    for svc in postgres clickhouse dragonfly vector vector-tap nano-api nano-search nano-jobs ai-stub soar-mailpit edge; do
         dc logs --no-color "$svc" > "$a/logs/$svc.log" 2>/dev/null || rm -f "$a/logs/$svc.log"
     done
     for svc in api search jobs connector content-fixture; do
@@ -1662,19 +2013,87 @@ cmd_down() {
     # Files written by containers can be root-owned on Linux.
     rm -rf "$RUN_DIR/vector-dynamic" "$RUN_DIR/vector-validation" "$RUN_DIR/data" "$RUN_DIR/clickhouse" "$RUN_DIR/soar-lab" 2>/dev/null \
         || docker run --rm -v "$RUN_DIR:/w" --entrypoint sh alpine:3.20 -c 'rm -rf /w/vector-dynamic /w/vector-validation /w/data /w/clickhouse /w/soar-lab' >/dev/null 2>&1 || true
+    # NAN-5798: the run's Sentry issues, after the services stopped (and
+    # flushed) and BEFORE the secret files go: the artifact guard scrubs the
+    # report like every other artifact. Report only.
+    if sentry_report && [[ -d "$RUN_DIR/artifacts/sentry" ]]; then
+        local src=0; scrub_artifacts >/dev/null 2>&1 || src=$?
+        if (( src == 3 )); then
+            rm -rf "$RUN_DIR/artifacts/sentry"
+            err "E2E-SECURITY: a secret appeared in the Sentry report; artifacts/sentry removed"
+        fi
+    fi
     rm -f "$RUN_DIR/compose.env" "$RUN_DIR/app.env" "$RUN_DIR/admin.env" "$RUN_DIR/stack.env" "$RUN_DIR/ch-admin.curlrc" \
         "$RUN_DIR/connector.env" "$RUN_DIR/pids/connector.health" "$RUN_DIR/content-acceptance-license" "$RUN_DIR/.secrets.jsonl"
+    rm -rf "$RUN_DIR/svc-env"  # NAN-5878: per-call `svc` env overrides
     [[ "$(readlink "$E2E_HOME/current" 2>/dev/null)" == "$RUN_ID" ]] && rm -f "$E2E_HOME/current"
     if (( PURGE )); then rm -rf "$RUN_DIR"; ok "purged $RUN_DIR"; else ok "down; artifacts kept in $RUN_DIR/artifacts"; fi
 }
 
 # ---------------------------------------------------------------- svc
+svc_app_env_keys() {
+    # svc_app_env_keys <array name>: the validated names in E2E_SVC_APP_ENV.
+    # Split on spaces with read (no pathname expansion); every name must be a
+    # plain identifier, so a glob or embedded whitespace is refused, not expanded.
+    local -n _out="$1"; local _k
+    _out=()
+    [[ "${E2E_SVC_APP_ENV:-}" =~ ^[A-Za-z0-9_\ ]*$ ]] || die "svc: E2E_SVC_APP_ENV must be space-separated plain names"
+    IFS=' ' read -r -a _out <<< "${E2E_SVC_APP_ENV:-}"
+    for _k in "${_out[@]}"; do
+        [[ "$_k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "svc: bad env name '$_k' in E2E_SVC_APP_ENV"
+    done
+}
+
+# docker_svc_up <restart|start> <svc> <compose service>: `svc restart|start`
+# in docker/image app mode (NAN-5878). E2E_SVC_APP_ENV names the variables a
+# scenario set for this one call (nano_e2e.stack.Stack.svc `env=`); native gets them by inheritance,
+# a container only on (re)create, so they go into a per-service compose
+# override and the container is recreated. A later call without them recreates
+# it from the plain template, as a native restart drops them. With neither,
+# a plain restart. The caller waits for health either way.
+docker_svc_up() {
+    local action="$1" svc="$2" csvc="$3" dir="$RUN_DIR/svc-env" override="$RUN_DIR/svc-env/$2.yml" k v tmp
+    local -a keys
+    svc_app_env_keys keys
+    if (( ${#keys[@]} )); then
+        # 0700 dir / 0600 file like the run's other env files; written to a
+        # temp file and renamed so a failure never leaves a partial override.
+        ( umask 077; mkdir -p "$dir" ) || die "svc $svc: cannot create $dir"
+        tmp="$(umask 077; mktemp "$dir/.$svc.yml.XXXXXX")" || die "svc $svc: cannot create a temp override"
+        if ! {
+            printf 'services:\n  %s:\n    environment:\n' "$csvc"
+            for k in "${keys[@]}"; do
+                v="${!k-}"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//\$/\$\$}"
+                v="${v//$'\n'/\\n}"; v="${v//$'\r'/\\r}"
+                printf '      %s: "%s"\n' "$k" "$v"
+            done
+        } > "$tmp" || ! mv -f "$tmp" "$override"; then
+            rm -f "$tmp"; die "svc $svc: cannot write $override"
+        fi
+        dc -f "$override" up -d --no-deps --force-recreate "$csvc" >/dev/null 2>&1 \
+            || die "svc $svc: recreate with ${keys[*]} failed"
+    elif [[ -f "$override" ]]; then
+        # Drop the override only once the plain container is up; on failure it
+        # stays, so the next call retries the recreate instead of a restart.
+        dc up -d --no-deps --force-recreate "$csvc" >/dev/null 2>&1 || die "svc $svc: recreate failed"
+        rm -f "$override"
+    else
+        dc "$action" "$csvc" >/dev/null 2>&1 || die "svc $action $svc failed"
+    fi
+}
+
 cmd_svc() {
     local action="${POSITIONAL[0]:-}" svc="${POSITIONAL[1]:-}"
     [[ "$action" =~ ^(restart|stop|start|kill)$ ]] || die "usage: svc <restart|stop|start|kill> <api|search|jobs|connector|vector>"
     resolve_run
     if [[ "$svc" == vector || "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" != native ]]; then
         local csvc="$svc"; [[ "$svc" != vector ]] && csvc="nano-$svc"
+        if [[ "$svc" =~ ^(api|search|jobs)$ && "$action" =~ ^(restart|start)$ ]]; then
+            docker_svc_up "$action" "$svc" "$csvc"
+            # 120 x 2s stays inside Stack.svc's 300 s subprocess timeout.
+            wait_http "$(native_health_url "$svc")" "nano-$svc" 120
+            return 0
+        fi
         case "$action" in
             restart) dc restart "$csvc" ;; stop) dc stop "$csvc" ;; start) dc start "$csvc" ;;
             kill) dc kill -s KILL "$csvc" ;;
@@ -1696,6 +2115,7 @@ cmd_svc() {
             else
                 native_start "$svc"
                 wait_http "$(native_health_url "$svc")" "nano-$svc" 150 "$RUN_DIR/pids/$svc.pid"
+                if [[ "$svc" == api ]]; then verify_stack_trust; fi
             fi ;;
     esac
 }
@@ -1714,6 +2134,7 @@ cmd_status() {
             else warn "$svc not running"; fi
         fi
     done
+    printf 'trust: %s\n' "$(env_get "$RUN_DIR/run.env" E2E_TRUST)"
     printf 'stack.env: %s\n' "$RUN_DIR/stack.env"
 }
 
@@ -1741,6 +2162,8 @@ cmd_doctor() {
     if command -v shellcheck >/dev/null 2>&1; then ok "shellcheck (optional) found"; else ok "shellcheck not found (optional)"; fi
     check "node + npm (ui suite builds nanosiem-web, runs its puppeteer driver)" "command -v node && command -v npm" "install Node.js 20+"
     check "Chrome/Chromium for the ui suite" "[[ -x \"\${CHROME_PATH:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}\" ]] || command -v google-chrome || command -v chromium" "install Chrome or set CHROME_PATH"
+    # NAN-5748: several deep and persona scenarios shell out to psql.
+    check "psql (deep + persona scenarios)" "command -v psql" "install postgresql-client"
     if [[ "$APP_MODE" == native ]]; then ok "mock-vendor profile available (native app mode)"
     else ok "mock-vendor profile: native app mode only (connector feed scenarios will SKIP)"; fi
     local free_gb; free_gb="$(df -Pk "$ROOT" | awk 'NR==2 {print int($4/1024/1024)}')"
@@ -1936,6 +2359,7 @@ case "$CMD" in
     gc) cmd_gc ;;
     svc) cmd_svc ;;
     license-ids) cmd_license_ids ;;
+    sentry-report) resolve_run; sentry_report ;;
     selftest)
         # Harness safety properties; no stack and no cloud credentials needed.
         venv_ensure

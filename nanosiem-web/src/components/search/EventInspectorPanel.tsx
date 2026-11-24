@@ -20,6 +20,7 @@ import {
 } from './event-flatten';
 import { resolveRawView } from './event-raw-text';
 import { keywordsForField, type HighlightTerms } from './keyword-highlight';
+import { Term } from '@/components/ui/term';
 
 // ============================================================================
 // Types
@@ -579,7 +580,7 @@ export function EventInspectorPanel({
             </div>
             {!rawMessage && syntheticRaw && (
               <div className="text-[10.5px] text-muted-foreground italic mb-1">
-                structured record (OTLP — no raw text)
+                Structured record from <Term id="otlp">OTLP</Term>. It has no raw text.
               </div>
             )}
             <pre className="text-xs font-mono text-foreground whitespace-pre-wrap break-all bg-muted/30 rounded-lg p-3 border border-border/30">

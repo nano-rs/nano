@@ -27,8 +27,7 @@ export function EnterprisePagePlaceholder(_props?: Record<string, unknown>) {
         Available in nano paid plans
       </h1>
       <p className="text-[12.5px] text-muted-foreground mb-1 max-w-md">
-        This surface ships with paid nano editions. The open-core build
-        you're running doesn't include it.
+        The open-core build doesn't include this page.
       </p>
       <code className="text-[10.5px] text-muted-foreground/60 font-mono mb-6">
         {location.pathname}

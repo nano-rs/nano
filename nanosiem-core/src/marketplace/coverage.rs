@@ -28,7 +28,7 @@ use tracing::{info, instrument, warn};
 use crate::marketplace::cache::MarketplaceCoverageCache;
 use crate::marketplace::error::MarketplaceError;
 use crate::schema::{SchemaId, SchemaProfile};
-use crate::search::service::source_scope_sql_predicate;
+use crate::search::service::{bind_source_scope, source_scope_bound_predicate};
 
 // ============================================================================
 // Recommended-provider map
@@ -151,7 +151,7 @@ pub struct MarketplaceCoverage {
 /// Raw row returned by the coverage SQL — 12 fields (denominator + numerator
 /// per artifact).
 #[derive(Debug, Default, Deserialize, clickhouse::Row)]
-struct CoverageCounts {
+pub(crate) struct CoverageCounts {
     ip_total: u64,
     ip_enriched: u64,
     domain_total: u64,
@@ -465,7 +465,8 @@ fn coverage_sql(
     // (the OCSF taxonomy mapping of the UDM concept to `class_uid` is not the
     // authorization dimension). An empty effective deny-set preserves the
     // long-lived UDM query byte-for-byte.
-    let Some(predicate) = source_scope_sql_predicate("source_type", denied_sources) else {
+    // NAN-5793: bound — `fetch_counts` binds `denied_sources`.
+    let Some(predicate) = source_scope_bound_predicate("source_type", denied_sources) else {
         return base;
     };
     let time_gate = "WHERE timestamp >= now() - INTERVAL 24 HOUR";
@@ -476,13 +477,16 @@ fn coverage_sql(
     base.replacen(time_gate, &format!("{time_gate} AND {predicate}"), 1)
 }
 
-async fn fetch_counts(
+pub(crate) async fn fetch_counts(
     ch: &ChClient,
     profile: &dyn SchemaProfile,
     denied_sources: &BTreeSet<String>,
 ) -> Option<CoverageCounts> {
     let sql = coverage_sql(profile, coverage_is_clustered(), denied_sources);
-    match ch.query(&sql).fetch_one::<CoverageCounts>().await {
+    match bind_source_scope(ch.query(&sql), denied_sources)
+        .fetch_one::<CoverageCounts>()
+        .await
+    {
         Ok(row) => Some(row),
         Err(e) => {
             warn!(error = %e, "marketplace_coverage: ClickHouse aggregate failed; rows are unmeasured");
@@ -781,7 +785,7 @@ mod tests {
         assert!(
             sql.contains(
                 "WHERE timestamp >= now() - INTERVAL 24 HOUR \
-                 AND lower(source_type) NOT IN ('audit', 'windows_sysmon')"
+                 AND lower(source_type) NOT IN {nano_source_deny:Array(String)}"
             ),
             "coverage aggregate must gate every counted row with the canonical predicate:\n{sql}"
         );
@@ -793,7 +797,7 @@ mod tests {
         let sql = coverage_sql(&crate::schema::OcsfProfile::new(), false, &denied);
 
         assert!(
-            sql.contains("AND lower(source_type) != 'audit'"),
+            sql.contains("AND lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
             "OCSF coverage must scope on the operational source_type String:\n{sql}"
         );
         assert!(
@@ -803,15 +807,16 @@ mod tests {
     }
 
     #[test]
-    fn source_scope_values_are_escaped_by_canonical_builder() {
-        let denied = ["audit", "weird'name"]
+    fn source_scope_values_are_bound_not_inlined() {
+        // NAN-5793: hostile names travel as the bound parameter.
+        let denied = ["audit", "weird'name?"]
             .into_iter()
             .map(str::to_string)
             .collect();
         let sql = coverage_sql(&crate::schema::UdmProfile::new(), false, &denied);
         assert!(
-            sql.contains("NOT IN ('audit', 'weird''name')"),
-            "scope values must be SQL-escaped:\n{sql}"
+            sql.contains("NOT IN {nano_source_deny:Array(String)}") && !sql.contains("weird"),
+            "scope values must be bound, not SQL text:\n{sql}"
         );
     }
 }

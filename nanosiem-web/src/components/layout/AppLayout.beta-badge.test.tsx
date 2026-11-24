@@ -2,8 +2,8 @@
 // @vitest-environment jsdom
 //
 // NAN-5654: Hunts and Automation are early access, so their rail entries carry
-// the BETA badge (beside the label when expanded, in the Automation flyout when
-// collapsed). Everything else in the rail stays unbadged, and with the hunts
+// the BETA badge (beside the section label when expanded, in the section
+// flyout when collapsed; Hunts is a rail group since NAN-5844). Everything else in the rail stays unbadged, and with the hunts
 // capability off and automation disabled (the open-core shape) no badge renders.
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -41,6 +41,7 @@ vi.mock('@/enterprise/pages/Automation/automation-nav', () => ({
   AUTOMATION_SECTION_ICON: Workflow,
   useAutomationNav: () => ({ items: mock.automationItems, pendingApprovals: null }),
 }));
+vi.mock('@/enterprise/hooks/use-hunts-nav-counts', () => ({ useHuntsNavCounts: () => ({}) }));
 vi.mock('@/enterprise/pages/Automation/ApprovalsBell', () => ({ ApprovalsBell: Nothing }));
 vi.mock('@/enterprise/components/pivt/PivtSummon', () => ({ PivtSummon: Nothing }));
 vi.mock('@/enterprise/components/pivt/PivtShellOverlay', () => ({ PivtShellOverlay: Nothing }));
@@ -57,7 +58,7 @@ vi.mock('@/components/layout/AppBreadcrumbs', () => ({ AppBreadcrumbs: Nothing, 
 vi.mock('@/components/layout/settings/SettingsLayout', () => ({ SettingsLayout: Nothing }));
 vi.mock('@/components/shared/CommandPalette', () => ({ CommandPalette: Nothing }));
 vi.mock('./StatusBar', () => ({ StatusBar: Nothing }));
-vi.mock('./ThemeMenu', () => ({ ThemeMenu: Nothing }));
+vi.mock('./RailThemeSwitcher', () => ({ RailThemeStrip: Nothing, RailThemeFlyout: Nothing }));
 
 import { AppLayout } from './AppLayout';
 import { BETA_BADGE_DESCRIPTION } from '@/components/ui/beta-badge';
@@ -81,9 +82,9 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('BETA badge in the left rail (NAN-5654)', () => {
-  test('expanded rail: Hunts link and Automation header carry the badge, nothing else does', () => {
+  test('expanded rail: Hunts and Automation section headers carry the badge, nothing else does', () => {
     renderShell();
-    const hunts = screen.getByRole('link', { name: 'Hunts (beta)' });
+    const hunts = screen.getByRole('button', { name: 'Hunts (beta)' });
     expect(within(hunts).getByTestId('beta-badge')).toBeTruthy();
     expect(within(hunts).getByTestId('beta-badge').textContent).toContain('BETA');
 
@@ -109,18 +110,21 @@ describe('BETA badge in the left rail (NAN-5654)', () => {
     expect(screen.getByRole('button', { name: 'Automation (beta)' })).toBeTruthy();
   });
 
-  test('collapsed rail: Hunts tooltip says beta, Automation flyout header shows the badge', () => {
+  test('collapsed rail: the Hunts and Automation flyout headers show the badge', () => {
     localStorage.setItem('nanosiem-sidebar-collapsed', 'true');
     renderShell();
-    const hunts = screen.getByRole('link', { name: 'Hunts (beta)' });
-    expect(hunts.getAttribute('title')).toBe('Hunts (beta)');
     // Collapsed: no inline badges in the rail itself.
     expect(screen.queryAllByTestId('beta-badge')).toHaveLength(0);
 
+    fireEvent.mouseEnter(screen.getByTestId('nav-hunts-trigger'));
+    const huntsBadge = within(screen.getByTestId('nav-hunts-trigger-flyout')).getByTestId('beta-badge');
+    expect(huntsBadge.parentElement?.textContent).toContain('Hunts');
+    fireEvent.mouseLeave(screen.getByTestId('nav-hunts-trigger'));
+
     const trigger = screen.getByTestId('nav-automation').firstElementChild as HTMLElement;
     fireEvent.mouseEnter(trigger);
-    const flyoutBadge = screen.getByTestId('beta-badge');
-    expect(flyoutBadge.parentElement?.textContent).toContain('Automation');
+    const flyoutBadge = screen.getAllByTestId('beta-badge').find((b) => b.parentElement?.textContent?.includes('Automation'));
+    expect(flyoutBadge).toBeTruthy();
   });
 
   test('open-core shape (hunts off, automation disabled): no badge, no dead entry', () => {
@@ -128,6 +132,9 @@ describe('BETA badge in the left rail (NAN-5654)', () => {
     mock.automationItems = [];
     renderShell();
     expect(screen.queryByRole('link', { name: /Hunts/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Hunts/ })).toBeNull();
+    expect(screen.queryByTestId('nav-hunts')).toBeNull();
+    expect(screen.queryByRole('link', { name: /Findings|Escalations|Campaigns|Knowledge|Rule ideas/ })).toBeNull();
     expect(screen.queryByTestId('nav-automation')).toBeNull();
     expect(screen.queryAllByTestId('beta-badge')).toHaveLength(0);
   });

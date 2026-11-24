@@ -35,6 +35,7 @@ import type { LiveTestResult, OcsfValidationResult } from '@/lib/api/types';
 import { OcsfValidationErrors } from '@/components/log-sources/OcsfGate';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { readSchemaFieldEntry, type SemanticField } from '@/lib/schema-fields';
+import { Term } from '@/components/ui/term';
 
 interface ParserTestLabProps {
   vrlCode: string;
@@ -151,7 +152,7 @@ function FieldGrid({
       {extUnchanged.length > 0 && (
         <>
           <div className="px-3 pt-2 pb-1">
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground/60 font-medium">Unmapped Fields</span>
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground/60 font-medium"><Term id="unmapped-field">Unmapped Fields</Term></span>
           </div>
           <div>
             {extUnchanged.map(renderFieldRow)}
@@ -325,7 +326,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border shrink-0">
         <div className="flex items-center gap-2">
           <FlaskConical className="w-3.5 h-3.5 text-muted-foreground" />
-          <span className="text-[11.5px] font-medium text-foreground">Test Lab</span>
+          <span className="text-[11.5px] font-medium text-foreground"><Term id="test-lab">Test Lab</Term></span>
           {liveResults && (
             <div className="flex items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground">
               <span className="text-green-400">{livePassed}</span>
@@ -347,7 +348,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
             disabled={liveLoading || !!extensionVrl}
             title={
               extensionVrl
-                ? 'Live test against deployed events is not yet supported for parser extensions — use paste mode'
+                ? 'Live test is not supported for parser extensions; use paste mode'
                 : undefined
             }
             className="h-7 text-[11.5px] rounded-md border-border gap-1"

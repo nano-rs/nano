@@ -393,3 +393,31 @@ fn the_fallback_summary_drops_event_derived_field_stats() {
     assert_eq!(warnings[0].code, "field_stats_not_saved");
     assert_eq!(response.total_count, 2);
 }
+
+/// NAN-5817 review P1: the durable worker logs by `is_internal`, not by the
+/// job error kind: a timeout and an internal generation failure are ERRORs.
+#[test]
+fn background_attempt_failure_log_level_follows_is_internal() {
+    use crate::search::log_capture::levels_logged;
+    use tracing::Level;
+    let level_of = |e: SearchError| {
+        let (kind, _) = classify_search_error(&e);
+        let (_, levels) =
+            levels_logged(|| super::service::log_attempt_failure(&"job", 1, kind, &e));
+        levels
+    };
+    assert_eq!(level_of(SearchError::Timeout(30_000)), vec![Level::ERROR]);
+    assert_eq!(
+        level_of(SearchError::SqlGenError("Internal error: stage map lost".into())),
+        vec![Level::ERROR]
+    );
+    assert_eq!(
+        level_of(SearchError::DatabaseError(sqlx::Error::Protocol("boom".into()))),
+        vec![Level::ERROR]
+    );
+    assert_eq!(
+        level_of(SearchError::SqlGenError("Invalid query: Unknown eval function 'nosuchfn'".into())),
+        vec![Level::INFO]
+    );
+    assert_eq!(level_of(SearchError::ParseError("unexpected token".into())), vec![Level::INFO]);
+}

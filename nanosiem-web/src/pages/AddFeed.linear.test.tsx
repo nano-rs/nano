@@ -20,6 +20,7 @@ vi.mock('@/lib/clipboard', () => ({ copyText: vi.fn().mockResolvedValue(true) })
 const mocks = vi.hoisted(() => ({
   createLogSource: vi.fn(), updateLogSource: vi.fn(), deployLogSource: vi.fn(), importParser: vi.fn(),
   getLogSource: vi.fn(), createToken: vi.fn(), getStatus: vi.fn(), listLogSources: vi.fn(), listStatus: vi.fn(),
+  validateLogSourceVrl: vi.fn(),
 }));
 const access = vi.hoisted(() => ({ melod: false, permissions: new Set<string>() }));
 vi.mock('@/contexts/AuthContext', () => ({
@@ -52,7 +53,7 @@ vi.mock('@/lib/api', () => ({
     updateLogSource: mocks.updateLogSource,
     deployLogSource: mocks.deployLogSource,
     validateNamespace: async () => ({ valid: true }),
-    validateLogSourceVrl: async () => ({ valid: true, errors: [], diagnostics: [] }),
+    validateLogSourceVrl: mocks.validateLogSourceVrl,
     testLogSourceVrl: async () => ({ success: true, output: {} }),
     search: async () => ({ results: [] }),
     getSourceTypes: async () => [],
@@ -104,6 +105,8 @@ beforeEach(() => {
   mocks.createToken.mockReset().mockResolvedValue({ token: 'nit_TOKENVALUE', credential: { credential_id: 'cred-1', name: 'vercel-hec',
     token_prefix: 'nit_TOKENVA', state: 'active', route_key: 'vercel', created_at: '', revocable: true } });
   mocks.getLogSource.mockReset();
+  mocks.validateLogSourceVrl.mockReset().mockResolvedValue({ valid: true, errors: [], diagnostics: [] });
+  localStorage.removeItem('add-feed-side-pane-collapsed');
 });
 afterEach(cleanup);
 
@@ -203,4 +206,27 @@ it('resumes ?source=<route key> on Connect for that source', async () => {
   await waitFor(() => expect(screen.getByTestId('location').textContent).toContain('source_id=lsrc_pa'));
   await waitFor(() => expect(mocks.getLogSource).toHaveBeenCalledWith('lsrc_pa'));
   expect(await screen.findByRole('button', { name: /Issue token/ })).toBeTruthy();
+});
+
+// NAN-5834: the "VRL invalid" toast only summarizes ("N errors. See
+// Diagnostics"), so a failed Validate must show Diagnostics: switch to it and
+// expand a collapsed side pane.
+it('a failed Validate opens the Diagnostics pane, even from a collapsed pane on another tab', async () => {
+  localStorage.setItem('add-feed-side-pane-collapsed', '1');
+  await reachCustomParser();
+  // Collapsed rail: pick Tests, then collapse again.
+  fireEvent.click(screen.getByTitle('Tests'));
+  fireEvent.click(await screen.findByTitle('Collapse panel'));
+  expect(screen.getByTitle('Expand panel')).toBeTruthy();
+  mocks.validateLogSourceVrl.mockResolvedValue({
+    valid: false,
+    errors: ['error[E103]: unhandled fallible assignment'],
+    diagnostics: [{ severity: 'error', message: 'error[E103]: unhandled fallible assignment' }],
+  });
+  fireEvent.change(screen.getByLabelText('VRL'), { target: { value: '.a = upcase(.b)' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Validate' }));
+  await waitFor(() => expect(screen.queryByTitle('Expand panel')).toBeNull());
+  const diag = screen.getByRole('button', { name: /Diagnostics/ });
+  expect(diag.className).toContain('bg-muted');
+  expect(screen.getByRole('button', { name: /Tests/ }).className).not.toContain('bg-muted');
 });

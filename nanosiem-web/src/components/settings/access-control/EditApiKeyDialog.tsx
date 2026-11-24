@@ -140,8 +140,7 @@ export function EditApiKeyDialog({ open, apiKey, permissions, onClose, onSaved }
           </div>
 
           <div className="text-[10.5px] text-muted-foreground/70">
-            Scope changes take effect immediately. Expiry and rate limit are unchanged here — rotate or recreate the
-            key to adjust those.
+            Scope changes apply at once. Rotate or recreate the key to change expiry or rate limit.
           </div>
         </div>
 

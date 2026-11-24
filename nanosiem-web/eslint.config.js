@@ -4,6 +4,8 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
 import tseslint from 'typescript-eslint';
 
+import infoTipPlugin from './eslint-rules/info-tip.mjs';
+
 export default tseslint.config(
   { ignores: ['dist'] },
   {
@@ -43,6 +45,16 @@ export default tseslint.config(
             'Native checkboxes render with the OS style. Use <Checkbox> from @/components/ui/checkbox.',
         },
       ],
+    },
+  },
+  {
+    // NAN-5796: help tips go through the shared <InfoTip>, and an InfoTip
+    // never sits inside a heading or label. See eslint-rules/info-tip.mjs.
+    files: ['src/**/*.tsx'],
+    ignores: ['src/components/ui/info-tip.tsx'],
+    plugins: { nano: infoTipPlugin },
+    rules: {
+      'nano/no-hand-built-info-tip': 'error',
     },
   }
 );

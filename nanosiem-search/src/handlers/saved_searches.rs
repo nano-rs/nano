@@ -533,6 +533,7 @@ mod tests {
 
     fn claims_with(perms: &[&str]) -> TokenClaims {
         TokenClaims {
+            sid: None,
             iss: "test".to_string(),
             aud: "test".to_string(),
             sub: Uuid::nil(),

@@ -41,7 +41,7 @@ import pytest
 from nano_e2e import rbac_matrix as rm
 from nano_e2e import ui as uilib
 from nano_e2e.client import Journal, Nano, expect, time_range
-from nano_e2e.rbac import role_browser, role_user, typeid_uuid
+from nano_e2e.rbac import edition_permissions, role_browser, role_user, typeid_uuid
 from nano_e2e.stack import Stack
 from nano_e2e.waits import eventually
 
@@ -191,7 +191,8 @@ def test_users_drawer_view_only_viewer_gets_no_actions(
 def test_custom_role_create_assign_effective_and_delete(stack: Stack, nano: Nano, admin, ui: uilib.Driver, artifact_dir, timeline) -> None:
     page, client, _ = admin
     name = f"e2e Threat Hunter {secrets.token_hex(2)}"
-    chosen = ["hunts:view", "search:execute", "lookup:create"]
+    # `hunts:view` is enterprise-only: an open build has no checkbox for it.
+    chosen = edition_permissions(nano.api, ["hunts:view", "search:execute", "lookup:create"], stack.edition)
     page.goto("/settings/access-control?tab=roles")
     page.click({"css": 'button[title="New role"]'})
     page.fill(uilib.field({"placeholder": "e.g. Threat Hunter"}, name),
@@ -234,7 +235,8 @@ def test_api_key_create_use_revoke_delete(stack: Stack, nano: Nano, admin, ui: u
     page.click({"role": "checkbox", "name": uilib.rx(r"^search:view\b")})
     page.click({"role": "checkbox", "name": uilib.rx(r"^search:execute\b")})
     page.click({"role": "button", "name": "Create key", "exact": True})
-    page.wait_text("New API key — copy it now", exact=True)
+    # The reveal-once card, by test id (its copy changes with the glossary).
+    page.wait_for({"testid": "api-key-reveal-card"})
     key = page.texts({"testid": "api-key-reveal"})[0].strip()
     ui.register_secret(key)
     keys = expect(client.api.get("/api/api-keys"), 200)
@@ -288,7 +290,16 @@ def test_mfa_totp_enrollment_and_second_factor(stack: Stack, ui: uilib.Driver, a
             page.wait_text(uilib.rx("backup codes"), exact=False, timeout_ms=30_000)
             page.click({"text": uilib.rx("^I have saved these backup codes")})
             page.click({"role": "button", "name": "Done", "exact": True})
-            page.wait_text("MFA enabled", exact=False, timeout_ms=30_000)
+            # NAN-5827: assert the durable state, not the "MFA enabled" toast.
+            # The toast lives 4 s and the per-op layout check (NAN-5762) can
+            # outlast it before this wait starts. A reload proves the server,
+            # not just local state, reports MFA on.
+            disable = {"role": "button", "name": "Disable MFA", "exact": True}
+            page.wait_for(disable, timeout_ms=30_000)
+            page.reload()
+            page.wait_for(disable, timeout_ms=30_000)
+            enable = {"role": "button", "name": "Enable two-factor authentication", "exact": True}
+            assert not page.count(enable)
             status = page.session_fetch("GET", "/api/auth/mfa/status")
             assert status["json"]["mfa_enabled"] is True, status
             timeline.step("mfa enrolled")
@@ -386,7 +397,11 @@ def test_health_backup_and_license_pages_match_their_apis(stack: Stack, nano: Na
     score = report.get("overall_score")
     page.wait_text(uilib.rx(r"^Pipeline is"), exact=False, timeout_ms=60_000)
     headline = " ".join(page.texts({"role": "heading", "name": uilib.rx(r"^Pipeline is")}))
-    page.wait_text(uilib.rx(rf"^Score\s*{score}$"), exact=False, timeout_ms=30_000)
+    # The "Score" label is a glossary <Term> (its own element), so read the
+    # number by test id and compare it with the API's overall_score.
+    shown = eventually(lambda: page.texts({"testid": "siem-health-overall-score"}), timeout=30, interval=0.5,
+                       desc="the shown health score", ok=lambda v: len(v) == 1 and v[0].strip() == str(score))
+    assert shown[0].strip() == str(score), (shown, score)
     timeline.step("siem health", status=status, score=score, headline=headline)
 
     backup = client.api.get("/api/system/backup-status")

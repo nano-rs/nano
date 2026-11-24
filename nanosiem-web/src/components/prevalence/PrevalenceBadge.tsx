@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/tooltip';
 import { Activity, AlertTriangle, Eye } from 'lucide-react';
 import { formatUTCCompact } from '@/lib/date-utils';
+import { Term } from '@/components/ui/term';
 
 export interface PrevalenceData {
   artifact: string;
@@ -157,7 +158,7 @@ export function PrevalenceBadge({
               <div className="border-t border-border pt-2">
                 <div className="flex items-center gap-1 text-red-400">
                   <AlertTriangle className="w-3 h-3" />
-                  <span className="text-xs">Below rarity threshold - potentially suspicious</span>
+                  <span className="text-xs">Below <Term id="rarity-threshold">rarity threshold</Term> - potentially suspicious</span>
                 </div>
               </div>
             )}

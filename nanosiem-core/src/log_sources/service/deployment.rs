@@ -42,6 +42,21 @@ impl LogSourceService {
         progress.phase(DeployPhase::Validating);
 
         let log_source = self.repository().find_by_id(id).await?;
+        // NAN-5789: a fetch source with no usable source configuration
+        // (unbound, deleted, or of another type) is refused before it is
+        // enabled: it cannot render, and enabling it first would make it read
+        // as live. An undeployed configuration is reported below, once the
+        // render shows its route missing.
+        crate::log_sources::source_binding::ensure_binding(
+            &self.pool,
+            &log_source.kind,
+            &log_source.source_type,
+            log_source.dispatch_source_config_id,
+            false,
+        )
+        .await
+        .map_err(crate::log_sources::LogSourceRepositoryError::from)?
+        .map_err(|e| LogSourceServiceError::MissingSourceConfiguration { field: e.field, message: e.message })?;
         // NAN-5132: a hold on this source can only be left by an earlier
         // deploy of it that died between its phases (deploys hold the lock).
         release_leftover_holds(&self.pool, id).await;
@@ -206,12 +221,19 @@ impl LogSourceService {
         // reporting a deploy that put nothing live.
         if let Some(target) = parsers.iter().find(|p| p.id == id) {
             if self.vector_config.is_unroutable(target).await {
-                let error_msg = format!(
-                    "Log source '{}' reads from source configuration route '{}', which is not \
-                     deployed. Deploy the source configuration first; the parser goes live with it.",
-                    log_source.name,
-                    target.dispatch_route_name.as_deref().unwrap_or("<none>")
-                );
+                let error_msg = match target.dispatch_route_name.as_deref() {
+                    Some(route) => format!(
+                        "Log source '{}' reads from source configuration route '{}', which is not \
+                         deployed. Deploy the source configuration first; the parser goes live with it.",
+                        log_source.name, route
+                    ),
+                    // NAN-5789: unbound, or bound to a deleted configuration.
+                    None => format!(
+                        "Log source '{}' is a {} source with no usable source configuration. Bind \
+                         it to a {} source configuration, then deploy it again.",
+                        log_source.name, target.source_type, target.source_type
+                    ),
+                };
                 let _ = self
                     .repository()
                     .record_deployment(

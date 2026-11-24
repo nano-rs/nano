@@ -8,6 +8,7 @@ function Card({ className, ref, ...props }: React.HTMLAttributes<HTMLDivElement>
   return (
     <div
       ref={ref}
+      data-layout-card=""
       className={cn(
         'rounded-lg border bg-card text-card-foreground',
         className

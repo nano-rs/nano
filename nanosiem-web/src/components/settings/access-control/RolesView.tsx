@@ -40,6 +40,7 @@ import { CreateRoleDialog } from './CreateRoleDialog';
 import { CANONICAL_ACTIONS, buildMatrix, type MatrixRow } from './role-matrix';
 import { categoryDisplayName } from '@/lib/permissions';
 import { UNGRANTABLE_HINT } from '@/lib/grantable-permissions';
+import { Term } from '@/components/ui/term';
 
 function rolePermCount(role: RoleDetail): number {
   return role.permissions.length;
@@ -65,7 +66,7 @@ function PermCell({ allowed, locked, onToggle, label, ungrantable = false }: {
             ? 'bg-primary/12 border-primary/25 text-primary/70 cursor-default'
             : 'bg-primary/15 border-primary/40 text-primary hover:bg-primary/20',
         )}
-        title={locked ? 'System role — cannot be modified' : `${label} allowed (click to revoke)`}
+        title={locked ? 'System role: it cannot be changed' : `${label} allowed (click to revoke)`}
       >
         <Check className="w-[12px] h-[12px]" />
       </button>
@@ -82,7 +83,7 @@ function PermCell({ allowed, locked, onToggle, label, ungrantable = false }: {
         blocked ? 'cursor-default' : 'hover:bg-foreground/[0.04]',
         !locked && ungrantable && 'opacity-45',
       )}
-      title={locked ? 'System role — cannot be modified' : ungrantable ? UNGRANTABLE_HINT : `${label} not allowed (click to grant)`}
+      title={locked ? 'System role: it cannot be changed' : ungrantable ? UNGRANTABLE_HINT : `${label} not allowed (click to grant)`}
     >
       <span className="w-[4px] h-[4px] rounded-full bg-muted-foreground/40" />
     </button>
@@ -250,7 +251,7 @@ function RoleDetailView({
           <div className="rounded-md border border-primary/25 bg-primary/5 p-3 flex items-center gap-3">
             <Shield className="w-[13px] h-[13px] text-primary shrink-0" />
             <div className="flex-1 text-[11.5px] text-foreground/80">
-              This is a system role used by internal services. Permissions are fixed and cannot be edited.
+              System role for internal services. Permissions cannot be edited.
             </div>
           </div>
         )}
@@ -264,7 +265,7 @@ function RoleDetailView({
             </div>
             {members.length === 0 ? (
               <div className="text-[11.5px] text-muted-foreground italic">
-                No direct members — usually assigned via group.
+                No direct members. Roles are usually given through a group.
               </div>
             ) : (
               <div className="flex items-center gap-2 flex-wrap">
@@ -290,7 +291,7 @@ function RoleDetailView({
         {/* Permission matrix */}
         <div>
           <div className="flex items-center gap-2 mb-2">
-            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">Permissions</div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium"><Term id="permission">Permissions</Term></div>
             <span className="text-[11px] text-muted-foreground">
               {locked ? 'read-only' : canEdit ? 'click to toggle' : 'view only'}
             </span>

@@ -104,7 +104,10 @@ pub(crate) struct DeployAudit {
 }
 
 impl DeployAudit {
-    fn emit(&self, state: &AppState, log_source_id: Option<Uuid>, details: Option<serde_json::Value>) {
+    /// NAN-5785: through the durable path, so a security-critical action
+    /// (`log_source_undeployed` disables the source) is recorded before the
+    /// job reports done; routine actions fall back to fire-and-forget.
+    async fn emit(&self, state: &AppState, log_source_id: Option<Uuid>, details: Option<serde_json::Value>) {
         let mut event = AuditEvent::builder(AuditSource::LogSource, self.action)
             .actor(Some(self.auth.user_id()), None)
             .api_key(self.auth.api_key_id, self.auth.api_key_name.clone())
@@ -123,7 +126,7 @@ impl DeployAudit {
         if let Some(details) = details {
             event = event.details(details);
         }
-        state.emit_audit(event.build());
+        state.emit_audit_durable(event.build()).await;
     }
 }
 
@@ -169,12 +172,16 @@ where
                 async move {
                     let outcome = work(job_state.clone(), progress).await;
                     match &outcome {
-                        Ok(DeployOk::Result(result)) => job_audit.emit(
-                            &job_state,
-                            log_source_id,
-                            Some(serde_json::json!({ "success": result.success })),
-                        ),
-                        Ok(DeployOk::Done(..)) => job_audit.emit(&job_state, log_source_id, None),
+                        Ok(DeployOk::Result(result)) => {
+                            job_audit
+                                .emit(
+                                    &job_state,
+                                    log_source_id,
+                                    Some(serde_json::json!({ "success": result.success })),
+                                )
+                                .await
+                        }
+                        Ok(DeployOk::Done(..)) => job_audit.emit(&job_state, log_source_id, None).await,
                         Err(_) => {}
                     }
                     let recorded = match &outcome {
@@ -203,7 +210,8 @@ where
             Some(serde_json::json!({
                 "coalesced_into": typeid::encode(typeid::deploy_job::PREFIX, &submitted.job.id),
             })),
-        );
+        )
+        .await;
     }
     if !wait {
         return Ok((StatusCode::ACCEPTED, Json(submitted.job)).into_response());

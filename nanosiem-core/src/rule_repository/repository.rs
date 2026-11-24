@@ -288,6 +288,39 @@ impl RepositoryRulesRepository {
         Ok(result)
     }
 
+    /// Re-derived `requires_fields` for an unchanged rule file (NAN-5869):
+    /// the extractor improved but the file SHA did not, so sync would keep
+    /// the old list forever. Updates the repository rule and the detection
+    /// rules imported from it; no-op (and no `updated_at` bump) when equal.
+    pub async fn refresh_requires_fields(
+        &self,
+        repository_id: Uuid,
+        file_path: &str,
+        requires_fields: Option<&[String]>,
+    ) -> Result<(), RepositoryRulesRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE repository_rules SET requires_fields = $3 \
+             WHERE repository_id = $1 AND file_path = $2 AND requires_fields IS DISTINCT FROM $3",
+        )
+        .bind(repository_id)
+        .bind(file_path)
+        .bind(requires_fields)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE detection_rules SET requires_fields = $3 \
+             WHERE source_repository_id = $1 AND source_rule_path = $2 AND requires_fields IS DISTINCT FROM $3",
+        )
+        .bind(repository_id)
+        .bind(file_path)
+        .bind(requires_fields)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn find_by_path(
         &self,
         repository_id: Uuid,

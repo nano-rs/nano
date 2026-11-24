@@ -28,22 +28,32 @@ feature-depth = 1
 # an exception below needs a reason and the plan that removes it.
 unmaintained = "all"
 yanked = "warn"
+#
+# Ignore entries carry a "review by" date in their reason. cargo-deny has no expiry
+# field, so the date is a reminder: past it, re-check the advisory and the plan.
+# An ignore that no longer matches anything shows as warning[advisory-not-detected];
+# delete it then (the zip 3.x and paste entries went that way in NAN-5753).
 ignore = [
-    # zip 3.0.0: Critical/High path-traversal and extraction bugs, all in
-    # ZipArchive::extract(). zip is compiled ONLY into the app.nano.rs platform
-    # publishers (`--features platform`, platform/feed/adapters/convert.rs), which
-    # read entries with ZipArchive::new + by_index and never call extract(). Never in
-    # a customer image. Removed by the zip 3 -> 9 major (audit item M8).
-    { id = "RUSTSEC-2026-0369", reason = "zip extract() only; platform publisher, never called (M8)" },
-    { id = "RUSTSEC-2026-0429", reason = "zip extract() only; platform publisher, never called (M8)" },
-    { id = "RUSTSEC-2026-0367", reason = "zip extract() only; platform publisher, never called (M8)" },
-    { id = "RUSTSEC-2026-0368", reason = "zip extract() only; platform publisher, never called (M8)" },
-    # Unmaintained, no vulnerability. paste is a proc-macro reached only through
-    # clickhouse 0.14 -> polonius-the-crab -> higher-kinded-types (compile time).
-    # unsafe-libyaml comes with serde_yaml 0.9 (deprecated; connector specs, Sigma
-    # import). Revisit with the clickhouse 0.15 major and a serde_yaml replacement.
-    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro via clickhouse 0.14; no vuln" },
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, via serde_yaml 0.9; no vuln" },
+    # Unmaintained, no vulnerability. unsafe-libyaml comes with serde_yaml 0.9
+    # (deprecated; connector specs, Sigma import). Removed with a serde_yaml
+    # replacement.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, via serde_yaml 0.9; no vuln. Review by 2027-02-20" },
+    # NAN-5753: chrono and chrono-tz were declared unmaintained (chronotope/chrono#1768),
+    # and humantime with them because it wraps chrono. No vulnerability, no fixed
+    # version. None of the three can be removed by replacing our own use:
+    #   chrono     workspace-wide (every crate's timestamps, sqlx chrono feature) and
+    #              also reached through vrl, sqlx-core/postgres, cron, object_store,
+    #              syslog_loose. Moving to jiff/time is a cross-crate migration that
+    #              also needs those upstreams to move.
+    #   chrono-tz  direct in nanosiem-core (2 files), but vrl 0.38 depends on it too,
+    #              so dropping ours leaves it in the graph.
+    #   humantime  not a direct dependency; only object_store 0.14 (enterprise
+    #              archive tier) pulls it.
+    # Plan: track upstream (vrl, sqlx, object_store, cron) moving off chrono, then
+    # migrate our code to jiff in one pass. Re-check at every quarterly review.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no vuln; pervasive + via vrl/sqlx/cron/object_store (NAN-5753). Review by 2027-02-20" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained, no vuln; also via vrl 0.38 (NAN-5753). Review by 2027-02-20" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained (wraps chrono), no vuln; via object_store 0.14 only (NAN-5753). Review by 2027-02-20" },
 ]
 
 # --------------------------------------------------------------------------------

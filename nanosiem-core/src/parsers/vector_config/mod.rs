@@ -224,6 +224,169 @@ if nano_transport_ct != "" {
     };
 }
 
+/// NAN-5839: storage-boundary strip of the injected source timezone.
+///
+/// The `<name>_source_tz` step sets `.nano.source_timezone` for the parser and
+/// records the same value in `%nano_source_timezone`. A parsers#87 parser
+/// reads and removes it first; a custom parser that keeps the root and never
+/// reads it would otherwise store it as an OCSF root `nano` object. At every
+/// block that shapes a stored row the field is dropped when it still holds the
+/// injected value (and `.nano` with it when nothing else is left). A body field
+/// of the same name with its own value is sender data and stays.
+macro_rules! source_timezone_strip_vrl {
+    () => {
+        r#"# NAN-5839: the injected source timezone is ingest metadata; see
+# source_timezone_strip_vrl! in vector_config/mod.rs.
+nano_injected_tz = to_string(%nano_source_timezone) ?? ""
+if nano_injected_tz != "" && is_object(.nano) {
+    if (to_string(.nano.source_timezone) ?? "") == nano_injected_tz { del(.nano.source_timezone) }
+    if is_empty(object!(.nano)) { del(.nano) }
+}
+"#
+    };
+}
+
+/// NAN-5846: nano's ingest provenance on a stored OCSF event, under its own
+/// namespace `unmapped.nano.ingest`.
+///
+/// - `client_ip`: the trusted client address (the TCP peer, or the trusted
+///   proxy's `X-Real-IP`, or the role-split edge's assertion), from the
+///   protected metadata `%nano_ingest_client_ip`.
+/// - `peer`: the TCP peer (`%nano_ingest_peer`), written ONLY when it differs
+///   from `client_ip` (a trusted proxy or edge resolved the client), since it
+///   carries no information otherwise.
+///
+/// nano owns the `unmapped.nano` namespace. ClickHouse's `JSON` column reads
+/// a `.` inside a key as a path separator, so a vendor key can spell nano's
+/// path as the nested object (`{"nano": {"ingest": {...}}}`), a flat dotted
+/// key (`"nano.ingest.client_ip"`, which every shipped OCSF parser's residual
+/// spill emits for a nested source key), a mix of the two, or, for a custom
+/// parser that keeps the event root, a dotted key at the event root
+/// (`"unmapped.nano.ingest.client_ip"`). Left in place, such a key would
+/// either forge provenance or meet nano's nested write as a second spelling
+/// of one path, which ClickHouse refuses with Code 117 (duplicate path): a
+/// non-retryable error that drops the whole sink batch.
+///
+/// Vendor data is never dropped or masked, so those keys are MOVED, whole and
+/// unmodified, into ONE JSON string: every top-level `unmapped` key that is
+/// `nano` or starts with `nano.`, and every event-root key `unmapped.nano` /
+/// `unmapped.nano.*` (plus a sender's flat root `nano.source_timezone`, which
+/// `source_timezone_vrl` stashes in `%nano_reserved_spill` as
+/// `root:nano.source_timezone`), become one object, encoded once with
+/// `encode_json` and stored as `unmapped.source_nano_json`. Its keys are the
+/// original names and are distinct by construction (`unmapped` keys start
+/// with `nano`, root keys with `unmapped.nano`, stashed ones with `root:`),
+/// so no value overwrites another. A single string leaf is
+/// lossless (duplicates, empty objects and every value survive in the text),
+/// cannot collide with any path, and costs O(size). If that name is already
+/// used (`unmapped.source_nano_json`, or the root key
+/// `unmapped.source_nano_json` of a root-keeping parser), `_2` ... `_10` are
+/// tried, then a UUID suffix.
+///
+/// Events without such a key are not touched. Every other key stays as it is
+/// (the `nano_*` parser markers and `source_nano*` included): a vendor field
+/// that spills as `unmapped.client_ip` (microsoft_365 `ClientIP`,
+/// json_generic) is stored unchanged. Before NAN-5846 this step deleted
+/// `unmapped.client_ip` and wrote the ingest IP there (plus
+/// `ingest_client_ip` / `ingest_peer`). A non-object `unmapped` (malformed
+/// OCSF) is kept as `unmapped.value` when provenance is written.
+///
+/// Cost: every VRL read of a path deep-clones its value, so the common path
+/// reads no event field. It gates on one regex over `nano_cred_text`, the
+/// event's JSON text that [`credential_field_redaction_vrl!`] already built
+/// earlier in the same program (every block that splices this macro splices
+/// that one first; an undefined variable would fail the VRL compile test).
+/// The regex anchors on a KEY (`"nano":`, `"nano.<rest>":`, with an optional
+/// `unmapped.` prefix); in compact JSON a string value is never followed by
+/// `:`, so a value such as `"vendor_name":"nano"` does not match. The text
+/// holds every key, so the gate cannot miss one. A normal event then does at
+/// most one write (`unmapped.nano.ingest`). The moved path is strictly
+/// linear: a fixed number of `filter` / `map_*` / `merge` passes (no `set!`
+/// in a loop, no nested loops), one `encode_json`, and at most 10 lookups in
+/// a map of at most 10 taken names. The event root is scanned only when the
+/// text holds an `"unmapped.nano` / `"unmapped.source_nano_json` key.
+macro_rules! ingest_provenance_vrl {
+    () => {
+        r#"# NAN-5846: nano owns unmapped.nano; vendor keys spelling it are moved,
+# whole, into one JSON string (unmapped.source_nano_json), never dropped. See
+# ingest_provenance_vrl! in vector_config/mod.rs.
+nano_ingest_client = to_string(%nano_ingest_client_ip) ?? ""
+nano_ingest_peer = to_string(%nano_ingest_peer) ?? ""
+nano_ingest = {}
+if nano_ingest_client != "" { nano_ingest.client_ip = nano_ingest_client }
+if nano_ingest_peer != "" && nano_ingest_peer != nano_ingest_client { nano_ingest.peer = nano_ingest_peer }
+# A root control key the timezone step moved aside (`root:nano.<field>`).
+nano_stash = object(%nano_reserved_spill) ?? {}
+if match(nano_cred_text, r'"(?:unmapped\.)?nano(?:\.(?:[^"\\]|\\.)*)?":') || !is_empty(nano_stash) {
+    # Every step below is one linear pass. The collected object's keys are
+    # distinct by construction: `unmapped` keys start with `nano`, root keys
+    # with `unmapped.nano`, stashed ones with `root:`, so nothing overwrites.
+    nano_names = ["source_nano_json", "source_nano_json_2", "source_nano_json_3", "source_nano_json_4", "source_nano_json_5", "source_nano_json_6", "source_nano_json_7", "source_nano_json_8", "source_nano_json_9", "source_nano_json_10"]
+    nano_root_names = ["unmapped.source_nano_json", "unmapped.source_nano_json_2", "unmapped.source_nano_json_3", "unmapped.source_nano_json_4", "unmapped.source_nano_json_5", "unmapped.source_nano_json_6", "unmapped.source_nano_json_7", "unmapped.source_nano_json_8", "unmapped.source_nano_json_9", "unmapped.source_nano_json_10"]
+    nano_unmapped = ocsf_event.unmapped
+    nano_is_object = is_object(nano_unmapped)
+    nano_spill = nano_stash
+    nano_taken = {}
+    if nano_is_object {
+        nano_hits = filter(object!(nano_unmapped)) -> |nano_key, _nano_value| {
+            nano_key == "nano" || starts_with(nano_key, "nano.") || includes(nano_names, nano_key)
+        }
+        if !is_empty(nano_hits) {
+            nano_taken = map_values(filter(nano_hits) -> |nano_key, _nano_value| { includes(nano_names, nano_key) }) -> |_nano_value| { true }
+            nano_spill = merge(nano_spill, filter(nano_hits) -> |nano_key, _nano_value| { !includes(nano_names, nano_key) })
+        }
+    }
+    # The event root (a root-keeping parser), only when its text has such a key.
+    if contains(nano_cred_text, "\"unmapped.nano") || contains(nano_cred_text, "\"unmapped.source_nano_json") {
+        nano_root_hits = filter(ocsf_event) -> |nano_key, _nano_value| {
+            nano_key == "unmapped.nano" || starts_with(nano_key, "unmapped.nano.") || includes(nano_root_names, nano_key)
+        }
+        if !is_empty(nano_root_hits) {
+            nano_root_taken = map_values(filter(nano_root_hits) -> |nano_key, _nano_value| { includes(nano_root_names, nano_key) }) -> |_nano_value| { true }
+            nano_taken = merge(nano_taken, map_keys(nano_root_taken) -> |nano_key| { slice!(nano_key, 9) })
+            nano_root_spill = filter(nano_root_hits) -> |nano_key, _nano_value| { !includes(nano_root_names, nano_key) }
+            if !is_empty(nano_root_spill) {
+                ocsf_event = filter(ocsf_event) -> |nano_key, _nano_value| {
+                    nano_key != "unmapped.nano" && !starts_with(nano_key, "unmapped.nano.")
+                }
+                nano_spill = merge(nano_spill, nano_root_spill)
+            }
+        }
+    }
+    if !is_empty(nano_spill) {
+        nano_rest = {}
+        if nano_is_object {
+            nano_rest = filter(object!(nano_unmapped)) -> |nano_key, _nano_value| {
+                nano_key != "nano" && !starts_with(nano_key, "nano.")
+            }
+        } else if nano_unmapped != null {
+            # A non-object `unmapped` (malformed OCSF) is kept as `value`.
+            nano_rest = { "value": nano_unmapped }
+        }
+        nano_target = ""
+        for_each(nano_names) -> |_nano_i, nano_name| {
+            if nano_target == "" && (get(nano_taken, [nano_name]) ?? null) == null { nano_target = nano_name }
+        }
+        if nano_target == "" { nano_target = "source_nano_json_" + uuid_v4() }
+        ocsf_event.unmapped = set!(nano_rest, [nano_target], encode_json(nano_spill))
+    }
+}
+if !is_empty(nano_ingest) {
+    # A non-object `unmapped` (malformed OCSF) is kept, never overwritten.
+    if match(nano_cred_text, r'"unmapped":[^{n]') {
+        nano_unmapped = ocsf_event.unmapped
+        if nano_unmapped != null && !is_object(nano_unmapped) { ocsf_event.unmapped = { "value": nano_unmapped } }
+    }
+    ocsf_event.unmapped.nano = { "ingest": nano_ingest }
+}
+"#
+    };
+}
+
+/// The provenance step as text, for tests that time or run it alone.
+#[cfg(test)]
+pub(crate) const INGEST_PROVENANCE_VRL: &str = ingest_provenance_vrl!();
+
 /// NAN-5431: the deepest container level kept in a stored object (the OCSF
 /// `event`, the UDM `ext`). A container nested deeper is stored as its JSON
 /// text instead.
@@ -282,7 +445,8 @@ macro_rules! nesting_depth_limit_vrl {
         concat!(
             "# NAN-5431: containers nested deeper than 24 levels are stored as JSON text;\n",
             "# see nesting_depth_limit_vrl! in vector_config/mod.rs.\n",
-            "if match(encode_json(", $var, "), r'^(?:[^\\[{]*[\\[{]){25}') {\n",
+            "nano_depth_json = encode_json(", $var, ")\n",
+            "if match(nano_depth_json, r'^(?:[^\\[{]*[\\[{]){25}') {\n",
             "    nano_depth_frontier = [[]]\n",
             nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
             nesting_depth_level_vrl!($var), nesting_depth_level_vrl!($var),
@@ -417,6 +581,9 @@ mod reserved_source_type_guard_tests;
 #[path = "ocsf_lane_stamp_tests.rs"]
 mod ocsf_lane_stamp_tests;
 #[cfg(test)]
+#[path = "source_timezone_tests.rs"]
+mod source_timezone_tests;
+#[cfg(test)]
 #[path = "ocsf_parser_health_tests.rs"]
 mod ocsf_parser_health_tests;
 #[cfg(test)]
@@ -432,8 +599,17 @@ mod two_phase_activation_tests;
 #[path = "pipeline_gate_tests.rs"]
 mod pipeline_gate_tests;
 #[cfg(test)]
+#[path = "reload_acked_loss_fixtures.rs"]
+mod reload_acked_loss_fixtures;
+#[cfg(test)]
 #[path = "work_dir_tests.rs"]
 mod work_dir_tests;
+#[cfg(test)]
+#[path = "json_path_collision_tests.rs"]
+mod json_path_collision_tests;
+// NAN-5849: `json_path_collision_vrl!`, used by `deploy` and `parser_config`.
+#[macro_use]
+mod json_path_collision;
 mod credentials;
 pub mod delivery;
 mod deploy;

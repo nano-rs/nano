@@ -33,6 +33,7 @@ import {
 } from '@/components/ui/sheet';
 import { ScopeSelector } from './ScopeSelector';
 import { useAuth } from '@/contexts/AuthContext';
+import { Term } from '@/components/ui/term';
 
 interface CreateApiKeyDialogProps {
   open: boolean;
@@ -110,7 +111,7 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
           <div className="flex-1 min-w-0">
             <SheetTitle className="text-[14px] font-semibold leading-none">New API key</SheetTitle>
             <SheetDescription className="text-[11px] text-muted-foreground mt-1">
-              You'll see the secret once on the next screen — copy it before dismissing.
+              The secret is shown once on the next screen.
             </SheetDescription>
           </div>
         </SheetHeader>
@@ -140,7 +141,7 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
           </div>
 
           <div>
-            <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">Scopes</label>
+            <label className="block text-[11px] font-medium text-foreground/80 mb-1.5"><Term id="api-key-scope" nested>Scopes</Term></label>
             <ScopeSelector
               key={open ? 'open' : 'closed'}
               permissions={permissions}
@@ -179,7 +180,7 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
             </div>
             <div>
               <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">
-                Rate limit <span className="text-muted-foreground/70 font-normal ml-1">(req/min, optional)</span>
+                <Term id="rate-limit" nested>Rate limit</Term> <span className="text-muted-foreground/70 font-normal ml-1">(req/min, optional)</span>
               </label>
               <input
                 type="number"
@@ -195,7 +196,7 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
 
         <SheetFooter className="border-t border-border px-5 py-3 flex flex-row items-center gap-2 sm:justify-end space-x-0">
           <div className="text-[10.5px] text-muted-foreground mr-auto">
-            Treat the secret like a password — it grants whatever this key's scopes allow.
+            Treat the secret like a password: it grants whatever this key's scopes allow.
           </div>
           <Button variant="ghost" size="sm" onClick={onClose} className="h-7 text-[11.5px]" disabled={saving}>
             Cancel

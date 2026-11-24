@@ -15,7 +15,7 @@
  */
 
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, KeyRound, Radio } from 'lucide-react';
 
@@ -31,6 +31,7 @@ import {
   UNASSIGNED_SOURCES_QUERY_KEY,
   type UnassignedSource,
 } from '@/lib/api/log-source-connect';
+import { Term } from '@/components/ui/term';
 
 /** Mirrors nanosiem-api-lib SOURCE_INVENTORY_CAPS (live source inventory admission). */
 const INVENTORY_CAPS = ['search:execute', 'log_sources:create', 'detections:view', 'source_scopes:view'];
@@ -51,6 +52,16 @@ function compact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
+}
+
+/**
+ * An unbound token with sampled traffic (requests counted or a last use seen).
+ * The sample is approximate (one Vector scrape every 30 s, accepted requests
+ * only), so a token WITHOUT sampled traffic may still be live: it is collapsed
+ * into a visible disclosure row, never dropped.
+ */
+export function isUsedToken(t: Pick<IngestToken, 'request_count' | 'last_used_at'>): boolean {
+  return (t.request_count ?? 0) > 0 || Boolean(t.last_used_at);
 }
 
 type Target = { kind: 'key'; source: UnassignedSource } | { kind: 'token'; token: IngestToken };
@@ -104,7 +115,7 @@ function ConvertDialog({ target, onClose }: { target: Target | null; onClose: ()
         </DialogHeader>
         <div className="space-y-3">
           <label className="block space-y-1">
-            <span className="text-[10.5px] font-medium text-foreground/80">Source key</span>
+            <span className="text-[10.5px] font-medium text-foreground/80"><Term nested id="source-key">Source key</Term></span>
             <Input
               value={key}
               disabled={target.kind === 'key'}
@@ -147,6 +158,7 @@ export function UnassignedSources() {
   // principals holding one of the inventory capabilities (as /api/source-types).
   const canSeeInventory = INVENTORY_CAPS.some((cap) => hasPermission(cap));
   const [target, setTarget] = useState<Target | null>(null);
+  const [showQuiet, setShowQuiet] = useState(false);
   const query = useQuery({
     queryKey: UNASSIGNED_SOURCES_QUERY_KEY,
     queryFn: () => api.logSourceConnect.listUnassigned(),
@@ -167,20 +179,35 @@ export function UnassignedSources() {
     );
   }
   const data = query.data;
-  if (!data || (data.sources.length === 0 && data.unbound_tokens.length === 0)) return null;
+  if (!data) return null;
+  // NAN-5770: unbound tokens with sampled traffic are listed and flagged
+  // (traffic without a bound source: Vector refuses it). Tokens with no
+  // sampled traffic are collapsed into one disclosure row, never hidden: the
+  // usage sample misses refused requests and scrape gaps.
+  const tokens = data.unbound_tokens.filter(isUsedToken);
+  const quiet = data.unbound_tokens.filter((t) => !isUsedToken(t));
+  const removed = data.removed_sources ?? [];
+  if (data.sources.length === 0 && data.unbound_tokens.length === 0 && removed.length === 0) return null;
+  const tokenRows = showQuiet ? [...tokens, ...quiet] : tokens;
 
   return (
     <section className="border-b border-border" data-testid="unassigned-sources">
       <div className="flex items-center gap-2 px-4 h-8 border-b border-border bg-card/40">
         <span className="text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground">
-          Unassigned · {data.window_hours}h
+          <Term id="unassigned-source">Unassigned</Term> · {data.window_hours}h
         </span>
         <span className="font-mono text-[10.5px] text-muted-foreground tabular-nums">
           {data.sources.length + data.unbound_tokens.length}
         </span>
+        {removed.length > 0 && (
+          <span className="font-mono text-[10.5px] text-muted-foreground tabular-nums" data-testid="unassigned-removed-count">
+            · {removed.length} removed
+          </span>
+        )}
         {data.install_token_mode === 'legacy_multiplex' && (
           <span className="text-[10.5px] text-muted-foreground truncate">
-            · the install token is in legacy multiplex mode: senders choose their source key. Creating a source keeps them working.
+            · the <Term id="install-token">install token</Term> is in <Term id="legacy-multiplex">legacy multiplex</Term> mode;
+            creating a source keeps its senders working.
           </span>
         )}
       </div>
@@ -199,7 +226,7 @@ export function UnassignedSources() {
               <td className="py-1.5 w-[90px] font-mono text-[10.5px] text-muted-foreground">{relative(s.last_seen)}</td>
               <td className="py-1.5 pr-3 w-[150px] text-right">
                 {!s.convertible ? (
-                  <span className="inline-flex items-center gap-1 text-[10.5px] text-amber-500" title="Contains characters a source key cannot carry; fix the type at the sender">
+                  <span className="inline-flex items-center gap-1 text-[10.5px] text-amber-500" title="This name has characters a source key can't use. Fix the source type on the sender.">
                     <AlertTriangle className="w-3 h-3" strokeWidth={1.5} /> fix at sender
                   </span>
                 ) : (
@@ -212,7 +239,26 @@ export function UnassignedSources() {
               </td>
             </tr>
           ))}
-          {data.unbound_tokens.map((t) => (
+          {removed.map((r) => (
+            <tr
+              key={`removed:${r.route_key}`}
+              className="border-b border-border last:border-b-0 h-7 text-muted-foreground"
+              data-testid="unassigned-removed"
+              title={`Its source ${r.log_source_name} was deleted ${relative(r.deleted_at)}; no events since`}
+            >
+              <td className="pl-4 pr-2 w-[24px]">
+                <Radio className="w-3 h-3 text-muted-foreground/60" strokeWidth={1.5} />
+              </td>
+              <td className="py-1.5">
+                <span className="font-mono text-[11.5px]">{r.route_key}</span>
+                <span className="ml-2 text-[10.5px]">removed · source deleted {relative(r.deleted_at)}</span>
+              </td>
+              <td className="py-1.5 w-[110px] font-mono text-[10.5px] tabular-nums">{compact(r.events_24h)} / 24h</td>
+              <td className="py-1.5 w-[90px] font-mono text-[10.5px]">{relative(r.last_seen)}</td>
+              <td className="py-1.5 pr-3 w-[150px]" />
+            </tr>
+          ))}
+          {tokenRows.map((t) => (
             <tr key={`token:${t.credential_id}`} className="border-b border-border last:border-b-0 h-7" data-testid="unassigned-token">
               <td className="pl-4 pr-2 w-[24px]">
                 <KeyRound className="w-3 h-3 text-muted-foreground" strokeWidth={1.5} />
@@ -220,7 +266,9 @@ export function UnassignedSources() {
               <td className="py-1.5">
                 <span className="text-[11.5px] text-foreground">{t.name}</span>
                 <span className="ml-2 font-mono text-[10.5px] text-muted-foreground">{t.token_prefix}…</span>
-                <span className="ml-2 text-[10.5px] text-amber-500">refused · source deleted</span>
+                <span className="ml-2 text-[10.5px] text-amber-500">
+                  refused · source deleted{isUsedToken(t) ? ' · traffic without a bound source' : ' · no sampled traffic'}
+                </span>
               </td>
               <td className="py-1.5 w-[110px] font-mono text-[10.5px] text-muted-foreground tabular-nums">
                 {compact(t.request_count ?? 0)} req
@@ -235,6 +283,29 @@ export function UnassignedSources() {
               </td>
             </tr>
           ))}
+          {quiet.length > 0 && (
+            <tr className="border-b border-border last:border-b-0 h-7" data-testid="unassigned-quiet-tokens">
+              <td className="pl-4 pr-2 w-[24px]">
+                <KeyRound className="w-3 h-3 text-muted-foreground/60" strokeWidth={1.5} />
+              </td>
+              <td className="py-1.5 text-[10.5px] text-muted-foreground" colSpan={3}>
+                <button
+                  type="button"
+                  className="text-primary hover:underline"
+                  aria-expanded={showQuiet}
+                  onClick={() => setShowQuiet((v) => !v)}
+                  data-testid="unassigned-quiet-toggle"
+                >
+                  {showQuiet ? 'Hide' : 'Show'} {quiet.length} unbound token{quiet.length === 1 ? '' : 's'} with no sampled traffic
+                </button>
+                <span className="ml-2">· the sample can miss refused requests;</span>{' '}
+                <Link to="/ingestion/log-sources/credentials" className="text-primary hover:underline">
+                  <Term nested id="ingest-credential">Ingest tokens</Term>
+                </Link>
+              </td>
+              <td className="py-1.5 pr-3 w-[150px]" />
+            </tr>
+          )}
         </tbody>
       </table>
       <ConvertDialog key={target ? (target.kind === 'key' ? target.source.route_key : target.token.credential_id) : 'none'} target={target} onClose={() => setTarget(null)} />

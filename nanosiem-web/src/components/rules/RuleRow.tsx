@@ -3,6 +3,7 @@
 // NAN-482 — single rule row + its expanded body.
 // Port of design-ref/shadcn/rules-row.jsx against the real DetectionRule model.
 
+import { Term } from '@/components/ui/term';
 import { useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
@@ -247,7 +248,7 @@ function RuleRowExpanded({ rule }: { rule: RuleView }) {
             Rule logic
           </span>
           <div className="flex-1" />
-          <span className="font-mono text-[10px] text-muted-foreground/60">nPL</span>
+          <span className="font-mono text-[10px] text-muted-foreground/60"><Term id="npl">nPL</Term></span>
         </div>
         <div className="p-3 font-mono text-[11.5px] overflow-x-auto max-h-[240px]">
           {logicLines.map((l) => (
@@ -307,9 +308,6 @@ function RuleRowExpanded({ rule }: { rule: RuleView }) {
           <div className="p-6 flex flex-col items-center justify-center text-center gap-1.5">
             <Clock className="w-4 h-4 text-muted-foreground/60" strokeWidth={1.5} />
             <div className="text-[11.5px] text-foreground font-medium">No recent matches</div>
-            <div className="text-[10.5px] text-muted-foreground">
-              This rule may be tuned well — or quietly broken.
-            </div>
           </div>
         ) : (
           <div className="flex flex-col">
@@ -442,9 +440,9 @@ export function RuleRow({ rule, expanded, onToggle, selected, onSelect, onSetMod
               {rule.kind === 'retro_hunt' && (
                 <span
                   className="shrink-0 h-[15px] px-1 rounded border border-border text-[9.5px] font-mono uppercase tracking-wide text-muted-foreground leading-[13px]"
-                  title="Auto retro-hunt: matches newly-published threat intel against historical logs"
+                  onClick={(e) => e.stopPropagation()}
                 >
-                  retro
+                  <Term id="retro-hunt">retro</Term>
                 </span>
               )}
             </div>

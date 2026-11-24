@@ -48,9 +48,23 @@ export interface UnassignedSource {
   convertible: boolean;
 }
 
+/**
+ * NAN-5770: a recently deleted source's route key whose events stopped by the
+ * delete. Not a new stream: shown as "removed", never offered for conversion.
+ */
+export interface RemovedUnassignedSource {
+  route_key: string;
+  log_source_name: string;
+  deleted_at: string;
+  events_24h: number;
+  last_seen?: string | null;
+}
+
 export interface UnassignedSourcesResponse {
   window_hours: number;
   sources: UnassignedSource[];
+  /** Deleted sources' quiet keys (NAN-5770). Absent on older servers. */
+  removed_sources?: RemovedUnassignedSource[];
   /** Tokens whose source was deleted; Vector refuses them until bound. */
   unbound_tokens: IngestToken[];
   install_token_mode: InstallTokenMode;

@@ -52,3 +52,23 @@ class CleanupStack:
                 failures.append(RuntimeError(f"cleanup {action.label!r} raised {type(exc).__name__}: {exc}"))
         if failures:
             raise ExceptionGroup("one or more scenario cleanup actions failed", failures)
+
+
+def after_body(label: str, call: Callable[[], object], *, body_passed: bool) -> None:
+    """Run one cleanup from a scenario's `finally:` without masking its
+    result (NAN-5869). A cleanup failure fails the scenario only when the body
+    passed; after a body failure it is printed and the body's error stands.
+
+        passed = False
+        try:
+            ...
+            passed = True
+        finally:
+            after_body("lane source", lambda: delete(...), body_passed=passed)
+    """
+    try:
+        call()
+    except Exception as exc:  # noqa: BLE001 - reported or re-raised below
+        if body_passed:
+            raise
+        print(f"WARNING: cleanup {label!r} failed after the scenario failed: {type(exc).__name__}: {exc}")

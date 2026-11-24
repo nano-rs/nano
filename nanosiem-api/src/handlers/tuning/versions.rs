@@ -497,6 +497,7 @@ mod tests {
 
     fn auth_with_permissions(values: &[&str]) -> AuthContext {
         AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),

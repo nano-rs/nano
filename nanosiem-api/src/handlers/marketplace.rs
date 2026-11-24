@@ -1013,6 +1013,7 @@ mod coverage_authz_tests {
 
     fn jwt_auth(values: &[&str]) -> AuthContext {
         AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),
@@ -1104,6 +1105,7 @@ mod tests {
 
     fn jwt_auth(permissions: &[&str]) -> AuthContext {
         AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: "test".to_string(),
             aud: "test".to_string(),
             sub: uuid::Uuid::nil(),

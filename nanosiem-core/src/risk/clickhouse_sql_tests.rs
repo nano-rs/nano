@@ -15,13 +15,13 @@
 //! other token remains the pre-refactor statement, and rows without the stamp
 //! (`''`) keep the value inference.
 //!
-//! - entity list (`get_time_windowed_risk_scores_clickhouse`) and per-rule
-//!   contributions (`get_rule_contributions_for_entities`) must be
-//!   **byte-identical**;
-//! - decayed overview (`get_decayed_overview_clickhouse`) shared the CTE with
-//!   different comment text — asserted **token-identical** (equal after
-//!   stripping `--` comments and collapsing whitespace), which ClickHouse
-//!   treats as the same statement.
+//! - entity list (`get_time_windowed_risk_scores_clickhouse`), per-rule
+//!   contributions (`get_rule_contributions_for_entities`) and the decayed
+//!   overview (`get_decayed_overview_clickhouse`) must be **token-identical**
+//!   (equal after stripping `--` comments and collapsing whitespace), which
+//!   ClickHouse treats as the same statement. They were byte-identical until
+//!   NAN-5818 removed the builder's SQL comments (generated nPL SQL must
+//!   carry none).
 //!
 //! (The pre-refactor threshold view golden was removed with
 //! `EntityScoreSelection::ExceedsThresholds` in NAN-1806 — risk alerting is a
@@ -345,7 +345,7 @@ fn expected_decay_binds() -> Vec<RiskSqlBind> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn entity_list_sql_is_byte_identical_to_pre_refactor_query() {
+fn entity_list_sql_is_token_identical_to_pre_refactor_query() {
     for (ocsf, table) in [
         (false, "logs"),
         (false, "logs_distributed"),
@@ -367,15 +367,16 @@ fn entity_list_sql_is_byte_identical_to_pre_refactor_query() {
         );
         let expected = substitute_original(ORIG_TIME_WINDOWED, ocsf, table);
         assert_eq!(
-            query.sql, expected,
-            "entity-list SQL must be byte-identical (ocsf={ocsf}, table={table})"
+            normalize_sql(&query.sql),
+            normalize_sql(&expected),
+            "entity-list SQL must be token-identical (ocsf={ocsf}, table={table})"
         );
         assert_placeholder_bind_parity(&query);
     }
 }
 
 #[test]
-fn contributions_sql_is_byte_identical_to_pre_refactor_query() {
+fn contributions_sql_is_token_identical_to_pre_refactor_query() {
     for (ocsf, table) in [(false, "logs"), (true, "ocsf_logs_distributed")] {
         let source = RiskFindingsSource::new(ocsf, table);
         let query = rule_contributions_query(
@@ -386,8 +387,9 @@ fn contributions_sql_is_byte_identical_to_pre_refactor_query() {
         );
         let expected = substitute_original(ORIG_CONTRIBUTIONS, ocsf, table);
         assert_eq!(
-            query.sql, expected,
-            "contributions SQL must be byte-identical (ocsf={ocsf}, table={table})"
+            normalize_sql(&query.sql),
+            normalize_sql(&expected),
+            "contributions SQL must be token-identical (ocsf={ocsf}, table={table})"
         );
         assert_placeholder_bind_parity(&query);
     }

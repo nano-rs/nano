@@ -6,6 +6,8 @@
 //! query/cron validation, and version management.
 
 use chrono::{DateTime, Utc};
+
+use super::run_bound::COVERAGE_INCOMPLETE_MARKER as COVERAGE_INCOMPLETE_FIELD;
 use metrics::counter;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
@@ -829,10 +831,21 @@ impl DetectionService {
 
         let mut grouped: HashMap<(String, String), Vec<serde_json::Value>> = HashMap::new();
 
+        // NAN-5751: a coverage-incomplete row (a bounded run that could not
+        // evaluate everything) is its own finding, keyed by its per-window
+        // id: it never joins the "unknown" bucket of ordinary unattributed
+        // rows, so their finding identity (`_last_seen`) and alert cooldown
+        // can never absorb or suppress it. The overflow stays loud.
+        let is_marker = super::run_bound::is_coverage_incomplete_row;
+        for marker in events.iter().filter(|e| is_marker(e)) {
+            let key = (matched_event_id(marker), COVERAGE_INCOMPLETE_FIELD.to_string());
+            grouped.entry(key).or_default().push(marker.clone());
+        }
+
         match entity_field {
             Some(field) => {
                 // Specific field: group by that field only
-                for event in events {
+                for event in events.iter().filter(|e| !is_marker(e)) {
                     // NAN-5271 C: a UDM-named field on an OCSF row (or vice
                     // versa) resolves through its entity concept.
                     let entity = Self::get_string_field_from_event(event, field)
@@ -854,7 +867,7 @@ impl DetectionService {
                 // physical fields (`src_endpoint.ip`, `user.name`, …).
                 let order = self.active_profile.entity_extraction_order();
 
-                for event in events {
+                for event in events.iter().filter(|e| !is_marker(e)) {
                     let mut found_any = false;
 
                     // Extract ALL entity values from this event

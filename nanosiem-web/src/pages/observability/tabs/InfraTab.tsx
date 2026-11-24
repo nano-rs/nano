@@ -47,16 +47,13 @@ const STATUS_FILTERS: Array<{ key: HostStatus | 'all'; label: string }> = [
 // detail panel — latest snapshot for the selected host
 // ---------------------------------------------------------------------------
 
-function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMetric }) {
+function HostDetail({ host }: { host: InfraHost | null }) {
   const fieldMap = useSchemaFieldMap();
   if (!host) {
     return (
       <div className="rounded-lg border border-border bg-card p-5 flex flex-col items-center justify-center text-center min-h-[220px]">
         <Box className="w-6 h-6 text-fg-4 mb-2" />
         <div className="text-[12.5px] text-fg-2">Select a host</div>
-        <div className="text-[11px] text-fg-4 mt-1 max-w-[200px]">
-          Each tile is one host, shaded by {metric.label.toLowerCase()}. Click to inspect.
-        </div>
       </div>
     );
   }
@@ -485,7 +482,7 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
             onSelect={(h) => setSelected(h.host)}
           />
           <div className="flex flex-col gap-2.5">
-            <HostDetail host={selectedHost} metric={metric} />
+            <HostDetail host={selectedHost} />
             <HottestList hosts={rows} metric={metric} scaleMax={scaleMax} onSelect={(h) => setSelected(h.host)} />
           </div>
         </div>

@@ -126,7 +126,7 @@ async fn the_chain_scope_stays_off_the_shared_generator() {
     )
     .await;
     assert!(s.contains("ORDER BY count DESC"), "{s}");
-    let gen = &svc.ch_sql_generator;
+    let gen = &svc.ch_sql_generator_base;
     for name in ["count", "host_count", "risky"] {
         assert!(!gen.is_computed_field(name), "{name} left in computed_fields");
         assert!(!gen.is_upstream_computed_field(name), "{name} left in the upstream scope");

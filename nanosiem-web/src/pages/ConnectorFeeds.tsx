@@ -27,6 +27,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
+import { InfoTip } from '@/components/ui/info-tip';
 import {
   Sheet,
   SheetContent,
@@ -52,6 +53,7 @@ import {
   textConfigFields as textFieldsOf,
   withAllowShrink,
 } from '@/components/connector-feeds/AllowShrinkField';
+import { Term } from '@/components/ui/term';
 
 const FIELD_LABEL = 'text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground';
 const HELP_TEXT = 'text-[10.5px] text-muted-foreground leading-relaxed';
@@ -178,7 +180,7 @@ export function ConnectorFeeds() {
     <LogSourcesPageShell active="pull-feeds" testId="pull-feeds-page">
       <LogSourcesPageHeader
         icon={CloudDownload}
-        title="Pull feeds"
+        title={<Term id="pull-feed">Pull feeds</Term>}
         actions={canViewFeeds ? <>
           <Button size="sm" variant="outline" className="h-7 gap-1.5 text-[11.5px]" onClick={() => feedsQuery.refetch()}>
             <RefreshCw className="h-3 w-3" strokeWidth={1.5} /> Refresh
@@ -192,14 +194,14 @@ export function ConnectorFeeds() {
         meta={canViewFeeds ? <>
           <span>{feeds.length} feeds</span>
           <span className={cn(failing > 0 && 'text-red-600')}>{failing} failing</span>
+          <InfoTip label="About pull feeds" side="bottom" contentClassName="max-w-[300px]">
+            Each feed fetches one SaaS app&apos;s audit logs on a schedule. A new feed starts at current activity, and it
+            only moves forward once nano has safely received the events.
+          </InfoTip>
         </> : undefined}
       />
 
       <div className="px-5 py-4 space-y-4">
-      <div className="text-[11.5px] text-muted-foreground leading-relaxed max-w-[740px]">
-        SaaS audit logs pulled on a schedule by the connector runner and delivered through HEC. A new
-        feed starts at current activity; its cursor moves only after Vector acknowledged the events.
-      </div>
       {canViewFeeds && (
       <div className="rounded-md border border-border bg-card overflow-x-auto" data-testid="pull-feeds-region">
 
@@ -209,7 +211,7 @@ export function ConnectorFeeds() {
           <div className="p-5 text-[12px] text-red-600">{errorText(feedsQuery.error)}</div>
         ) : feeds.length === 0 ? (
           <div className="p-5 text-[12px] text-muted-foreground">
-            No pull feeds yet. Deploy the HEC log source for the vendor first, then add a feed.
+            No pull feeds yet. Deploy the vendor&apos;s <Term id="hec">HEC</Term> log source first.
           </div>
         ) : (
           <table className="w-full text-[12px]">
@@ -230,7 +232,7 @@ export function ConnectorFeeds() {
                         <span
                           className="ml-2 rounded-sm border border-amber-500/40 px-1 font-mono text-[10px] text-amber-600 dark:text-amber-400"
                           data-testid="feed-spec-update"
-                          title="This build bundles a newer connector spec. Adopting it resets the feed's cursors."
+                          title="This version of nano has a newer recipe for this feed. Adopting it resets where the feed left off."
                         >
                           update available
                         </span>
@@ -303,7 +305,7 @@ export function ConnectorFeeds() {
         <CredentialsManager
           providers={CONNECTOR_CREDENTIAL_PROVIDERS}
           title="Connector credentials"
-          description="Vendor secrets for pull feeds. Entered with the feed, encrypted at rest and never returned by the API. Rotate to replace one; prior versions stay for rollback."
+          description="Encrypted at rest and never returned by the API. Rotation keeps prior versions."
         />
       )}
       </div>
@@ -350,7 +352,7 @@ export function ConnectorFeeds() {
         title="Adopt connector spec update"
         description={
           <>
-            Move <span className="text-foreground font-medium">{adoptTarget?.name}</span> to the connector spec bundled
+            Move <span className="text-foreground font-medium">{adoptTarget?.name}</span> to the <Term id="connector-spec">connector spec</Term> bundled
             with this build. Its stream cursors are reset, so the next run starts fresh (an identity feed runs a full,
             shrink-guarded directory sync).
           </>
@@ -391,7 +393,7 @@ function ResetDialog({
       open
       onOpenChange={(open) => !open && onClose()}
       title="Re-anchor a stream"
-      description="The stream resumes five minutes before now. A reset never reads older history. Only time-window streams can be reset."
+      description="Resumes five minutes before now; older history is never read. Time-window streams only."
       confirmLabel="Reset"
       variant="warning"
       loading={loading}
@@ -589,7 +591,7 @@ function CreateFeedSheet({
                       />
                     </div>
                   ))}
-                <p className={HELP_TEXT}>Stored encrypted under Connector credentials, with versions and rotation. Never shown again.</p>
+                <p className={HELP_TEXT}>Stored encrypted under Connector credentials. Never shown again.</p>
               </div>
             )}
             {hasShrinkGuard && (

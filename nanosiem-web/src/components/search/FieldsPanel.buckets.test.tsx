@@ -5,6 +5,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ComponentProps } from 'react';
 import { FieldsPanel, type FieldStat } from './FieldsPanel';
+import { FIELD_BUCKET_TOOLTIPS } from './field-buckets';
+import { GLOSSARY } from '@/lib/glossary';
 
 // NAN-5265: the sidebar's on-demand sections mirror the event inspector —
 // Extended (UDM ext.* / valid non-promoted OCSF attributes) and Unmapped (the
@@ -72,10 +74,10 @@ describe('OCSF', () => {
   it('renders Extended and Unmapped sections with the inspector labels and tooltips', async () => {
     render(panel(props()));
     await waitFor(() => expect(header('Extended')).toBeTruthy());
-    expect(header('Extended').getAttribute('title')).toBe('Valid OCSF fields stored in the event JSON');
-    expect(header('Unmapped').getAttribute('title')).toBe("Source fields the parser didn't map to OCSF");
+    expect(header('Extended').getAttribute('title')).toBe(GLOSSARY['extended-field'].short);
+    expect(header('Unmapped').getAttribute('title')).toBe(GLOSSARY['unmapped-field'].short);
     for (const core of ['Selected', 'Available']) {
-      expect(screen.getByText(core).closest('[title]')?.getAttribute('title')).toBe('Indexed columns');
+      expect(screen.getByText(core).closest('[title]')?.getAttribute('title')).toBe(GLOSSARY['core-field'].short);
     }
     expect(header('Extended').textContent).toMatch(/3$/);
     expect(header('Unmapped').textContent).toMatch(/3$/);
@@ -199,7 +201,7 @@ describe('UDM', () => {
   it('keeps ext.* under Extended, with no Unmapped section and no extended fetch', async () => {
     render(panel(props({ fieldStats: [{ field: 'src_ip', count: 1, uniqueCount: 1, topValues: [] }] })));
     await waitFor(() => expect(header('Extended')).toBeTruthy());
-    expect(header('Extended').getAttribute('title')).toBe('Non-indexed fields stored in the ext JSON');
+    expect(header('Extended').getAttribute('title')).toBe(FIELD_BUCKET_TOOLTIPS.extendedUdm);
     fireEvent.click(header('Extended'));
     expect(screen.getByText('ext.custom_key')).toBeTruthy();
     expect(screen.queryByText(/^Unmapped/)).toBeNull();

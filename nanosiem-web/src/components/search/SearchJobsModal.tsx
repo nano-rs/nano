@@ -15,6 +15,7 @@ import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type { SearchJobSummary } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 interface SearchJobsModalProps {
   open: boolean;
@@ -152,7 +153,7 @@ export function SearchJobsModal({ open, onOpenChange, onLoadJob, onCancelJob }: 
         {/* Header */}
         <div className="px-4 py-3 border-b border-border flex items-center gap-2">
           <div className="font-mono text-[10px] tracking-[0.16em] uppercase text-muted-foreground font-semibold">
-            Search jobs
+            <Term id="search-job">Search jobs</Term>
           </div>
           {active.length > 0 && (
             <span className="rounded-sm bg-primary/15 text-primary text-[9.5px] px-1 font-semibold tabular-nums">
@@ -175,9 +176,6 @@ export function SearchJobsModal({ open, onOpenChange, onLoadJob, onCancelJob }: 
             <div className="flex flex-col items-center justify-center gap-2 py-12 text-muted-foreground">
               <Clock className="w-5 h-5 opacity-40" />
               <div className="text-[12px] font-medium text-foreground/70">No recent jobs</div>
-              <div className="text-[10.5px] text-muted-foreground/70">
-                Long-running searches show up here so you can monitor or cancel them.
-              </div>
             </div>
           ) : (
             <>

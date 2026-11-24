@@ -1,6 +1,8 @@
 """SSO visibility by edition (NAN-4930, on clickhouse/dev).
 
-- open edition: Settings > SSO says the deployment does not include SSO, and
+- open edition: Settings > SSO refuses with the v2 license panel ("Single
+  sign-on is not licensed": the `sso` capability gate in App.tsx renders
+  `LicensedFeatureUnavailable` before `SsoRouteGate`, NAN-5310/NAN-5747), and
   the providers API lists none;
 - enterprise: every licensed entitlement includes SSO (the compatibility check
   is tests/enterprise/ui/test_sso_plan.py).
@@ -13,9 +15,8 @@ from __future__ import annotations
 
 from nano_e2e import ui as uilib
 from nano_e2e.client import Nano
+from nano_e2e.edition import SSO_PANEL, UNLICENSED, UNLICENSED_TESTID, wait_unlicensed
 from nano_e2e.stack import Stack
-
-UNAVAILABLE = "Single sign-on is not available"
 
 
 def _providers(nano: Nano) -> list:
@@ -34,11 +35,14 @@ def test_build_capability_gates_sso(stack: Stack, nano: Nano, page: uilib.UiPage
     """Open: the build has no SSO. Enterprise: the build is never the reason."""
     page.goto("/settings/oidc")
     if stack.edition == "open":
-        page.wait_text(UNAVAILABLE, timeout_ms=30_000)
-        page.wait_text("This deployment does not include", exact=False)
+        wait_unlicensed(page, "Single sign-on")
+        license_link = {"css": f'[data-testid="{UNLICENSED_TESTID}"] a[href="/settings/license"]'}
+        assert page.count(license_link) == 0, "open build links to a license it cannot install"
         assert _providers(nano) == []
         timeline.step("open: SSO not in this build")
         return
     page.wait_for({"role": "heading"}, timeout_ms=30_000)
+    assert page.count(UNLICENSED) == 0, "enterprise build shows the license panel for SSO"
     assert not page.contains("This deployment does not include"), "enterprise build reports no SSO"
+    assert not page.contains(SSO_PANEL), "enterprise build shows the SSO not-available notice"
     timeline.step("enterprise: build includes SSO")

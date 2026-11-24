@@ -345,7 +345,7 @@ export function Marketplace() {
         onConfirm={() => { if (confirm) mutation.mutate(confirm); setConfirm(null); }} loading={mutation.isPending} />
     </>}
   >
-    {reposQuery.isError && <p role="alert" className="mt-4 text-[12px] text-destructive">Could not load catalog sources; repository provenance is unknown until they load. <button className="underline" onClick={() => { void reposQuery.refetch(); }}>Retry</button></p>}
+    {reposQuery.isError && <p role="alert" className="mt-4 text-[12px] text-destructive">Could not load catalog sources, so provenance is unknown. <button className="underline" onClick={() => { void reposQuery.refetch(); }}>Retry</button></p>}
     {catalog.isError && visibleCount > 0 && <p role="alert" className="mt-4 text-[12px] text-destructive">Could not load the catalog. <button className="underline" onClick={() => { void catalog.refetch(); }}>Retry</button></p>}
     {mutation.isError && <p role="alert" className="mt-4 text-[12px] text-destructive">{mutation.error.message} Reloaded current provider state.</p>}
     {unavailable && <p className="mt-4 text-[12px] text-muted-foreground">That integration isn't available on this deployment.</p>}

@@ -12,7 +12,7 @@
 //! come from the existing `asset-artifacts` endpoint — so this module focuses purely
 //! on what can be derived from the UDM event stream in ClickHouse.
 
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::{source_scope_bound_predicate, SourceScopedClient};
 use super::SearchService;
 use crate::auth::ScopeSet;
 use crate::query::TimeRange;
@@ -242,6 +242,9 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok(AssetDossier::default()),
         };
+        // NAN-5793: every section query binds the caller's deny list as the
+        // server-side parameter the scope predicate references.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         let (ips, hostnames, users) =
             Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
@@ -264,7 +267,7 @@ impl SearchService {
         // them. Without it, `query_log_sources` alone would enumerate exactly
         // the caller's hidden sources. `None` (unrestricted) leaves every SQL
         // string byte-identical to the pre-scoping form.
-        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+        let scope_predicate = source_scope_bound_predicate("source_type", scope.deny_set());
         let identity_clause = match &scope_predicate {
             Some(pred) => format!("({identity_clause}) AND {pred}"),
             None => identity_clause,
@@ -466,7 +469,7 @@ async fn fetch_rows(
 }
 
 async fn query_identity(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
@@ -532,7 +535,7 @@ async fn query_identity(
 }
 
 async fn query_log_sources(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     logs: &str,
     ident: &str,
     binds: &[String],
@@ -571,7 +574,7 @@ async fn query_log_sources(
 use crate::search::classification::{auth_predicate, file_predicate, lane_sql};
 
 async fn query_timeline(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
@@ -657,12 +660,12 @@ async fn query_timeline(
 /// column or the query fails, so downstream division never hits zero.
 ///
 /// NAN-1801: `scope_predicate` is the caller's rendered source-scope exclusion
-/// (from [`source_scope_sql_predicate`]). This is the one dossier scan with no
+/// (from [`source_scope_bound_predicate`]; the scoped client binds it). This is the one dossier scan with no
 /// identity clause to fold it into, so it is ANDed in directly — a fleet-wide
 /// `uniq(host)` would otherwise count hosts that appear only in the caller's
 /// hidden sources. `None` (unrestricted) keeps the SQL byte-identical.
 async fn query_fleet_size(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     scope_predicate: Option<&str>,
@@ -694,7 +697,7 @@ async fn query_fleet_size(
 }
 
 async fn query_processes(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
@@ -862,7 +865,7 @@ async fn query_processes(
 }
 
 async fn query_network(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
@@ -1034,7 +1037,7 @@ async fn query_network(
 }
 
 async fn query_auth(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
@@ -1237,7 +1240,7 @@ async fn query_auth(
 }
 
 async fn query_files(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
@@ -1376,7 +1379,7 @@ pub(crate) fn dns_nx_expr(profile: &dyn SchemaProfile) -> String {
 }
 
 async fn query_dns(
-    ch: &clickhouse::Client,
+    ch: SourceScopedClient<'_>,
     profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,

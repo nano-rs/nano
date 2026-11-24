@@ -720,7 +720,12 @@ pub async fn explain(
     record_search_query("explain", duration_ms, result.is_ok());
 
     let sql = result.map_err(|e| {
-        tracing::error!(error = %e, "Query explain failed");
+        // NAN-5817: a user's query mistake logs at WARN, not as a Sentry error.
+        if e.is_internal() {
+            tracing::error!(error = %e, "Query explain failed");
+        } else {
+            tracing::warn!(error = %e, "Query explain failed");
+        }
         // Surface user-actionable generation guardrails (see the SqlGenError
         // mapping in error.rs); mask internal failures.
         // FieldNotFound is the input-side field-validation rejection (NAN-1354)
@@ -744,9 +749,7 @@ pub async fn explain(
             return e.into();
         }
         if let nanosiem_core::SearchError::SqlGenError(ref msg) = e {
-            if msg.starts_with("Invalid query:")
-                || msg.starts_with("Unsupported operation:")
-            {
+            if nanosiem_core::search::sql_gen_message_is_user_facing(msg) {
                 return SearchError::QueryError(msg.clone());
             }
         }
@@ -901,7 +904,7 @@ pub async fn prevalence_artifacts(
 
     match &result {
         Ok(_) => tracing::info!("Prevalence artifacts completed in {:.2}ms", duration_ms),
-        Err(e) => tracing::error!("Prevalence artifacts failed: {:?}", e),
+        Err(e) => log_prevalence_artifacts_failure(e),
     }
 
     let response = result?;
@@ -1454,6 +1457,7 @@ mod effective_scope_split_tests {
 
     fn jwt_auth(permissions: &[&str]) -> crate::AuthContext {
         crate::AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: "test".to_string(),
             aud: "test".to_string(),
             sub: Uuid::now_v7(),
@@ -1557,3 +1561,17 @@ mod effective_scope_split_tests {
         }
     }
 }
+
+/// NAN-5817: a mistyped query lands on the prevalence-artifacts call on every
+/// search page load; only an internal failure is a Sentry error.
+fn log_prevalence_artifacts_failure(e: &nanosiem_core::SearchError) {
+    if e.is_internal() {
+        tracing::error!(error = ?e, "Prevalence artifacts failed");
+    } else {
+        tracing::warn!(error = ?e, "Prevalence artifacts failed");
+    }
+}
+
+#[cfg(test)]
+#[path = "search_log_level_tests.rs"]
+mod search_log_level_tests;

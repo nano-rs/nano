@@ -39,7 +39,7 @@ SENSITIVE_KEY = re.compile(
     r"(secret|passw|token|api_?key|access_?key|private_?key|account_?key|sas|connection_?string|credential|auth)",
     re.I,
 )
-SECRET_ENV = re.compile(r"(SECRET|PASSWORD|_KEY|TOKEN|SA_JSON|ADC|CONNECTION_STRING|DATABASE_URL)")
+SECRET_ENV = re.compile(r"(SECRET|PASSWORD|_KEY|TOKEN|SA_JSON|ADC|CONNECTION_STRING|DATABASE_URL|_DSN)")
 INLINE = re.compile(r"((?:SharedAccessKey|AccountKey|SharedAccessSignature|sig)=)([^;&\"'\s]+)", re.I)
 
 

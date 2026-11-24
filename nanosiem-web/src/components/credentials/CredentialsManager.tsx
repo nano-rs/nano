@@ -61,6 +61,7 @@ import {
 } from '@/components/credentials/connector-credentials';
 import { Checkbox } from '@/components/ui/checkbox';
 import { DatePicker } from '@/components/ui/date-picker';
+import { Term } from '@/components/ui/term';
 
 type Provider = 'aws_s3' | 'gcp_pubsub' | 'kafka' | 'azure_event_hubs';
 /** How an AWS credential authenticates — see `AwsS3Credentials` (NAN-2186). */
@@ -149,7 +150,7 @@ const KAFKA_PRESETS: KafkaPreset[] = [
     tls: true,
     usernamePlaceholder: 'msk-scram-user',
     passwordPlaceholder: 'SCRAM password from AWS Secrets Manager',
-    hint: 'SCRAM-SHA-512 over SASL_SSL. MSK IAM auth is not yet supported — use SCRAM at MSK cluster creation.',
+    hint: 'SCRAM-SHA-512 over SASL_SSL. MSK IAM auth is not supported yet; enable SCRAM on the cluster.',
   },
   {
     id: 'self_hosted',
@@ -280,8 +281,7 @@ const PROVIDERS: ProviderSpec[] = [
     short: 'GCP',
     icon: Server,
     iconClass: 'text-sky-400',
-    description:
-      'Google credentials JSON (service account key, gcloud ADC or workload identity federation) for pulling from subscriptions.',
+    description: 'Google credentials JSON for pulling from Pub/Sub subscriptions.',
   },
   {
     value: 'kafka',
@@ -674,7 +674,7 @@ export function CredentialInspectorSheet({
       >
         <SheetContent side="right" className="w-[520px] sm:max-w-[520px] gap-0 p-0 bg-card border-l border-border text-foreground flex flex-col">
           <VisuallyHidden>
-            <SheetTitle>Rotate credential{cred ? ` — ${cred.name}` : ''}</SheetTitle>
+            <SheetTitle>Rotate credential{cred ? `: ${cred.name}` : ''}</SheetTitle>
             <SheetDescription>Replace the secret material. The previous version stays retained for rollback.</SheetDescription>
           </VisuallyHidden>
           {cred && (
@@ -1681,8 +1681,7 @@ function OverviewTab({
                 className="h-8 text-[12px] bg-card font-mono text-muted-foreground"
               />
               <p className="text-[10.5px] text-muted-foreground leading-snug">
-                This credential assumes a role rather than storing a key. The account
-                owner's trust policy must require this value via{' '}
+                The account owner&apos;s role trust policy must require this as{' '}
                 <span className="font-mono">sts:ExternalId</span>.
               </p>
             </div>
@@ -1728,9 +1727,8 @@ function OverviewTab({
       <div className="rounded-md border border-border bg-foreground/[0.02] px-3 py-2.5 text-[11px] text-muted-foreground leading-relaxed flex items-start gap-2">
         <Lock className="w-3 h-3 mt-0.5 shrink-0" />
         <span>
-          Secret values are encrypted with AES-256-GCM at rest and never returned by the API. To
-          replace the secret material, use <strong className="text-foreground">Rotate</strong> in
-          the footer below — it preserves the prior version for rollback.
+          Encrypted with AES-256-GCM, never returned by the API. Use{' '}
+          <strong className="text-foreground">Rotate</strong> to replace it; the prior version is kept.
         </span>
       </div>
     </div>
@@ -1776,7 +1774,7 @@ function VersionsTab({
   if (error) {
     return (
       <div className="p-4 text-[12px] text-red-500">
-        Failed to load versions — {String(error)}
+        Failed to load versions: {String(error)}
       </div>
     );
   }
@@ -1795,8 +1793,7 @@ function VersionsTab({
       <div>
         <SectionLabel>Version history</SectionLabel>
         <div className="text-[11px] text-muted-foreground leading-relaxed">
-          Every rotation creates a new version with its own encrypted secret. Roll back to a prior
-          version to swap source configs over to its secret material at the next deploy.
+          Rolling back swaps source configs to that version&apos;s secret at the next deploy.
         </div>
       </div>
 
@@ -1885,12 +1882,12 @@ function UsageTab({ usage }: { usage: CredentialUsage[] }) {
       <div className="p-4 text-center">
         <Plug className="w-6 h-6 text-muted-foreground/60 mx-auto mb-2" />
         <div className="text-[12px] text-foreground/80">
-          No source or pull feed references this credential yet.
+          No source or <Term id="pull-feed">pull feed</Term> references this credential yet.
         </div>
         <div className="text-[10.5px] text-muted-foreground mt-1">
           Safe to delete, or attach it from{' '}
           <Link to={CLOUD_PULL_PATH} className="text-primary hover:underline">
-            Cloud pull
+            <Term nested id="cloud-pull">Cloud pull</Term>
           </Link>
           .
         </div>
@@ -2181,7 +2178,7 @@ function AddCredentialForm({
           <Input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="e.g., AWS Prod — CloudTrail"
+            placeholder="AWS Prod CloudTrail"
             className="h-8 text-[12px] bg-card"
             autoFocus
           />
@@ -2192,7 +2189,7 @@ function AddCredentialForm({
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             rows={2}
-            placeholder="Optional — what this credential is used for"
+            placeholder="Optional: what this credential is used for"
             className="text-[12px] bg-card resize-y min-h-[60px]"
           />
         </FieldRow>
@@ -2271,16 +2268,15 @@ function AddCredentialForm({
                         className="h-8 text-[12px] bg-card font-mono text-muted-foreground"
                       />
                       <p className="text-[10.5px] text-muted-foreground leading-snug">
-                        Give this to the account owner — their role's trust policy must
-                        require it via <span className="font-mono">sts:ExternalId</span>.
-                        Generated per credential so it cannot be guessed.
+                        Give this to the account owner; their role trust policy must require it as{' '}
+                        <span className="font-mono">sts:ExternalId</span>. Generated per credential, so it
+                        cannot be guessed.
                       </p>
                     </div>
                   </FieldRow>
                   <p className="text-[10.5px] text-muted-foreground leading-snug">
-                    Nothing long-lived is stored. This deployment's own identity (instance
-                    profile / IRSA) assumes the role, so the account owner never issues an
-                    access key and can revoke by deleting the role.
+                    No key is stored: this deployment's own identity (instance profile or IRSA) assumes the
+                    role. Revoke by deleting the role.
                   </p>
                 </>
               ) : (
@@ -2568,7 +2564,7 @@ export function RotateCredentialForm({
         </div>
         <div className="flex-1 min-w-0">
           <div className="text-[14px] font-semibold text-foreground leading-tight truncate">
-            Rotate — {cred.name}
+            Rotate: {cred.name}
           </div>
           <div className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground mt-0.5">
             Currently active: v{cred.active_version} → next: v{cred.active_version + 1}
@@ -2581,9 +2577,8 @@ export function RotateCredentialForm({
         <div className="rounded-md border border-border bg-foreground/[0.02] px-3 py-2.5 text-[11px] text-muted-foreground leading-relaxed flex items-start gap-2">
           <History className="w-3 h-3 mt-0.5 shrink-0" />
           <span>
-            Paste the new secret material. The previous version stays retained for rollback at any
-            time. Deployed source configs get the new secret right away (unless they have undeployed
-            edits); pull feeds use it on their next run.
+            The previous version is kept for rollback. Deployed source configs get the new secret now
+            (unless they have undeployed edits); pull feeds on their next run.
           </span>
         </div>
 
@@ -2638,16 +2633,15 @@ export function RotateCredentialForm({
                         className="h-8 text-[12px] bg-card font-mono text-muted-foreground"
                       />
                       <p className="text-[10.5px] text-muted-foreground leading-snug">
-                        Give this to the account owner — their role's trust policy must
-                        require it via <span className="font-mono">sts:ExternalId</span>.
-                        Generated per credential so it cannot be guessed.
+                        Give this to the account owner; their role trust policy must require it as{' '}
+                        <span className="font-mono">sts:ExternalId</span>. Generated per credential, so it
+                        cannot be guessed.
                       </p>
                     </div>
                   </FieldRow>
                   <p className="text-[10.5px] text-muted-foreground leading-snug">
-                    Nothing long-lived is stored. This deployment's own identity (instance
-                    profile / IRSA) assumes the role, so the account owner never issues an
-                    access key and can revoke by deleting the role.
+                    No key is stored: this deployment's own identity (instance profile or IRSA) assumes the
+                    role. Revoke by deleting the role.
                   </p>
                 </>
               ) : (
@@ -2753,7 +2747,7 @@ export function RotateCredentialForm({
           <Input
             value={note}
             onChange={(e) => setNote(e.target.value)}
-            placeholder="Optional — e.g. quarterly rotation, suspected leak"
+            placeholder="Optional, such as quarterly rotation or a suspected leak"
             className="h-8 text-[12px] bg-card"
           />
         </FieldRow>
@@ -2834,12 +2828,9 @@ function MetaCell({
 function GcpCredentialsHint() {
   return (
     <p className="text-[11px] text-muted-foreground leading-snug mt-1">
-      Paste a service-account key, the <span className="font-mono">authorized_user</span> file
-      from <span className="font-mono">gcloud auth application-default login</span>, an{' '}
-      <span className="font-mono">external_account</span> file (workload identity federation,
-      file or url source) or an <span className="font-mono">impersonated_service_account</span>{' '}
-      file. No key is needed when your org blocks service-account keys. The project ID comes
-      from the source configuration.
+      A service-account key, or an <span className="font-mono">authorized_user</span> (gcloud ADC),{' '}
+      <span className="font-mono">external_account</span> (workload identity federation) or{' '}
+      <span className="font-mono">impersonated_service_account</span> file. The project comes from the source.
     </p>
   );
 }

@@ -60,6 +60,7 @@ import {
 } from '@/components/alerts/monitorAlert';
 import { SegmentedSev, FilterSelect } from '@/components/rules/RulesToolbarChips';
 import { normalizeSeverity } from '@/components/matches/helpers';
+import { Term } from '@/components/ui/term';
 
 // ---------------------------------------------------------------------------
 // adapter — alert → monitor
@@ -602,7 +603,7 @@ export function AlertsMonitors() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 py-2">
-            <Label htmlFor="mon-close-disposition" className="text-[11.5px]">Disposition</Label>
+            <Label htmlFor="mon-close-disposition" className="text-[11.5px]"><Term id="disposition">Disposition</Term></Label>
             <Select value={closeDisposition} onValueChange={(v) => setCloseDisposition(v as Disposition)}>
               <SelectTrigger id="mon-close-disposition" className="h-8 text-[11.5px]">
                 <SelectValue />

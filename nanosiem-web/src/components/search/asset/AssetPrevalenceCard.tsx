@@ -8,6 +8,7 @@ import {
   type PrevalenceScatterData,
   type PrevalenceScatterPoint,
 } from '@/components/prevalence/PrevalenceScatterPlot';
+import { Term } from '@/components/ui/term';
 
 interface AssetPrevalenceCardProps {
   identifierField: string;
@@ -128,7 +129,7 @@ export function AssetPrevalenceCard({
     <div className="bg-card border border-border rounded-lg overflow-hidden">
       <div className="px-4 py-2.5 border-b border-border flex items-baseline gap-2">
         <span className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70 font-semibold">
-          Prevalence
+          <Term id="prevalence">Prevalence</Term>
         </span>
         <span className="text-[11px] text-muted-foreground/70">
           indicators observed on{' '}

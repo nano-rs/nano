@@ -234,7 +234,7 @@ impl CoverageAnalyzer {
     ///
     /// The deny set is normalized (`trim().to_lowercase()`) by
     /// `SourceScopeResolver`, and every SQL-side gate compares
-    /// `lower(source_type)` (see `source_scope_sql_predicate`). The cached value
+    /// `lower(source_type)` (see `source_scope_bound_predicate`). The cached value
     /// comes straight out of ClickHouse and may be mixed-case — notably under
     /// the OCSF profile — so it must be normalized the same way before the
     /// membership test, or `Insider_Threat` would slip past a deny entry of

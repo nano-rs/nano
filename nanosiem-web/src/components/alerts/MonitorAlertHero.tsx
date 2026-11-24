@@ -27,6 +27,8 @@ import {
   monitorScope,
   type MonitorAlertView,
 } from '@/components/alerts/monitorAlert';
+import { Term } from '@/components/ui/term';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 interface MonitorHeroAlert {
   id: string;
@@ -249,7 +251,7 @@ export function MonitorAlertHero({ alert, monitor }: MonitorAlertHeroProps) {
 
             {alert.triageVerdict && (
               <div className="mt-2 flex items-center gap-2 text-[10.5px]">
-                <span className="text-muted-foreground">AI verdict</span>
+                <span className="text-muted-foreground"><EnterpriseTerm id="ai-verdict">AI verdict</EnterpriseTerm></span>
                 <span
                   className="font-mono uppercase tracking-[0.08em] text-[9.5px] font-semibold px-1.5 py-[1px] rounded-sm"
                   style={{
@@ -293,7 +295,7 @@ export function MonitorAlertHero({ alert, monitor }: MonitorAlertHeroProps) {
               )}
               {isClosed && alert.disposition && (
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-muted-foreground">disposition</span>
+                  <span className="text-muted-foreground"><Term id="disposition">disposition</Term></span>
                   <span className="text-foreground">
                     {DISPOSITION_LABEL[alert.disposition] ?? alert.disposition}
                   </span>

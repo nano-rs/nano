@@ -4,6 +4,7 @@ import { inventoryAction, inventoryReason, inventorySandboxLabel, type Inventory
 import { AirgapBadge } from './IntegrationCard';
 import { MonoSwatch } from './MonoSwatch';
 import { executionStageLabel, humanizeEnum, inventoryHealthLabel } from '@/lib/marketplace-labels';
+import { Term } from '@/components/ui/term';
 
 export interface CatalogCardProps {
   /** Stable id, exposed as `data-mp-slug`. */
@@ -54,7 +55,7 @@ export function InventoryCard({ item, onOpen, airGap = false }: { item: Inventor
   // reason takes over the body.
   const body = item.reason && item.reason !== 'not_installed' ? inventoryReason(item) : item.description || inventoryReason(item);
   return <CatalogCard id={item.id} name={item.name} onOpen={onOpen}
-    meta={<>{item.provided_by_bundle ? <><MetaBadge>nano feed bundle</MetaBadge> · {item.provided_by_bundle.revision !== null && <span data-testid="inventory-card-bundle-rev">rev {item.provided_by_bundle.revision} · </span>}</> : null}{item.kind} · {humanizeEnum(item.category)} · {inventoryHealthLabel(item.effective_health)}{item.sandbox && <> · <SandboxBadge item={item} /></>}</>}
+    meta={<>{item.provided_by_bundle ? <><MetaBadge>nano <Term nested id="feed-bundle">feed bundle</Term></MetaBadge> · {item.provided_by_bundle.revision !== null && <span data-testid="inventory-card-bundle-rev">rev {item.provided_by_bundle.revision} · </span>}</> : null}{item.kind} · {humanizeEnum(item.category)} · {inventoryHealthLabel(item.effective_health)}{item.sandbox && <> · <SandboxBadge item={item} /></>}</>}
     body={body}
     footerLabel={executionStageLabel(item.execution_stage)}
     footerAction={<span className={item.requirement || item.provided_by_bundle ? 'text-muted-foreground' : 'text-primary'}>{inventoryAction(item)}</span>}

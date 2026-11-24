@@ -588,7 +588,7 @@ pub async fn resolve_identity_ip(
     // `source` is the identity_observations source_type column.
     let deny_set = auth.effective_source_deny_set();
     let scope_clause =
-        nanosiem_core::search::service::source_scope_sql_predicate("source", &deny_set)
+        nanosiem_core::search::service::source_scope_bound_predicate("source", &deny_set)
             .map(|pred| format!("\n              AND ({pred})"))
             .unwrap_or_default();
 
@@ -615,9 +615,11 @@ pub async fn resolve_identity_ip(
     );
 
     // NAN-5470: an event-data lookup on a user's behalf: the search identity.
-    let row = match dual_pool
-        .clickhouse_search()
-        .query(&sql)
+    // NAN-5793: the scope clause references the bound deny parameter.
+    let row = match nanosiem_core::search::service::bind_source_scope(
+        dual_pool.clickhouse_search().query(&sql),
+        &deny_set,
+    )
         .bind(&ip)
         .bind(reference_time.to_rfc3339())
         .fetch_all::<(String, String, String, String, String)>()

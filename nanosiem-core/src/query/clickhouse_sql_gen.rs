@@ -1592,6 +1592,39 @@ impl Clone for ClickHouseSqlGenerator {
     }
 }
 
+/// NAN-5793 review: the source-scope decision a generator is built under.
+///
+/// Every production generator is built with one ([`ClickHouseSqlGenerator::scoped`]
+/// / [`ClickHouseSqlGenerator::scoped_with_table`]): the viewer's deny-set for
+/// a request, or an explicit [`GeneratorScope::unrestricted`] for a system path
+/// (detection rules, offline tools). The deny-set gates the reads the nPL
+/// AST gate cannot reach: the `| resolve_identity` build side over
+/// `identity_observations` and a `[dataset=risk …]` subsearch's
+/// finding-origin manifest. The unscoped constructors are test-only.
+#[derive(Clone, Copy, Debug)]
+pub struct GeneratorScope<'a> {
+    deny: Option<&'a std::collections::BTreeSet<String>>,
+}
+
+impl<'a> GeneratorScope<'a> {
+    /// A request's viewer scope.
+    pub fn viewer(scope: &'a crate::auth::ScopeSet) -> Self {
+        Self { deny: Some(scope.deny_set()) }
+    }
+
+    /// A request's resolved source-scope deny-set.
+    pub fn deny_set(deny: &'a std::collections::BTreeSet<String>) -> Self {
+        Self { deny: Some(deny) }
+    }
+
+    /// A system or admin path with no viewer: nothing is excluded. Every call
+    /// site is pinned (with its reason) by `generator_scope_guard_tests`.
+    pub fn unrestricted() -> GeneratorScope<'static> {
+        GeneratorScope { deny: None }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl Default for ClickHouseSqlGenerator {
     fn default() -> Self {
         Self::new()
@@ -1611,47 +1644,40 @@ impl ClickHouseSqlGenerator {
         self.profile.is_numeric_field(field)
     }
 
+    /// A generator over the default `logs` table (UDM profile) built under
+    /// `scope` (NAN-5793 review): the only production constructor besides
+    /// [`Self::scoped_with_table`].
+    pub fn scoped(scope: GeneratorScope<'_>) -> Self {
+        Self::unscoped("logs").apply_scope(scope)
+    }
+
+    /// [`Self::scoped`] over a custom table.
+    pub fn scoped_with_table(table_name: impl Into<String>, scope: GeneratorScope<'_>) -> Self {
+        Self::unscoped(table_name).apply_scope(scope)
+    }
+
+    /// Take `scope`'s decision (a deny-set replaces any carried one).
+    pub(crate) fn apply_scope(self, scope: GeneratorScope<'_>) -> Self {
+        self.with_source_scope_deny(scope.deny.cloned().unwrap_or_default())
+    }
+
     /// Create a new ClickHouse SQL generator with default table name "logs"
-    /// and the UDM schema profile (today's behavior, unchanged).
+    /// and the UDM schema profile, with NO scope decision. Test-only
+    /// (NAN-5793 review): production code calls [`Self::scoped`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> Self {
-        Self {
-            table_name: "logs".to_string(),
-            time_column: "timestamp".to_string(),
-            dataset_columns: HashSet::new(),
-            dataset_numeric_columns: HashSet::new(),
-            max_group_array_size: DEFAULT_MAX_GROUP_ARRAY_SIZE,
-            max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
-            generation_time_range: RwLock::new(None),
-            upstream_timestamp_rewritten: RwLock::new(false),
-            upstream_projected: RwLock::new(false),
-            upstream_time_alias: RwLock::new(None),
-            stage_tail_aliases: RwLock::new(std::collections::HashMap::new()),
-            computed_fields: RwLock::new(HashSet::new()),
-            upstream_computed_fields: RwLock::new(HashSet::new()),
-            upstream_string_fields: RwLock::new(HashSet::new()),
-            upstream_mvexpanded: RwLock::new(HashSet::new()),
-            upstream_eval_arrays: RwLock::new(HashSet::new()),
-            upstream_arrays: RwLock::new(Default::default()),
-            subsearch_arrays: RwLock::new(Default::default()),
-            pending_subsearch_arrays: RwLock::new(None),
-            agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
-            profile: Arc::new(UdmProfile::new()),
-            base_profile: None,
-            base_table: None,
-            dataset: otel::Dataset::Logs,
-            risk_config: None,
-            is_clustered: false,
-            rederive_tail_fields: false,
-            source_scope_deny: std::collections::BTreeSet::new(),
-            signals_source_override: None,
-            cte_prefix: String::new(),
-            nested_cte_seq: RwLock::new(Arc::default()),
-        }
+        Self::unscoped("logs")
     }
 
     /// Create a new ClickHouse SQL generator with a custom table name
-    /// (UDM schema profile).
+    /// (UDM schema profile), with NO scope decision. Test-only (NAN-5793
+    /// review): production code calls [`Self::scoped_with_table`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_table(table_name: impl Into<String>) -> Self {
+        Self::unscoped(table_name)
+    }
+
+    fn unscoped(table_name: impl Into<String>) -> Self {
         Self {
             table_name: table_name.into(),
             time_column: "timestamp".to_string(),

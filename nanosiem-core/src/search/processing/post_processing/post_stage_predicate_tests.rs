@@ -278,3 +278,34 @@ fn wrong_arity_is_a_query_error_positive_negated_and_on_an_empty_page() {
     }
     assert!(checked >= 12, "only {checked} arity cases reached the validator");
 }
+
+/// NAN-5817: the errors post-processing raises for the caller's own query
+/// (unknown function, wrong arity, bad regex / CIDR literal, bad `rex`
+/// pattern) are user errors: they log at WARN, not as Sentry errors. Built
+/// from the real producers so a reworded message is caught here.
+#[test]
+fn post_stage_query_errors_are_not_internal() {
+    let rows = vec![json!({"row_id": 1, "message": "a"})];
+    for predicate in [
+        "nosuchfn(message) == 1",
+        "len(message, message, message) == 1",
+        "match(message, \"(\")",
+        "cidr_match(message, \"nope\")",
+    ] {
+        let err = apply_post_prevalence_commands(
+            rows.clone(),
+            &[Command::Where { condition: condition(predicate) }],
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{predicate}: expected a query error"));
+        assert!(!err.is_internal(), "{predicate}: classified internal: {err:?}");
+    }
+    let rex = super::rex::apply_rex_post_processing(
+        rows,
+        None,
+        "(",
+        &crate::query::RexMode::Extract,
+    )
+    .expect_err("invalid rex pattern");
+    assert!(!rex.is_internal(), "rex: {rex:?}");
+}

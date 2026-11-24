@@ -72,7 +72,7 @@
         },
         "nano_usd_per_hour_market": {
           "type": "number",
-          "description": "Sum of Spot market prices of the nano hosts (load generators excluded)."
+          "description": "Sum of spot market prices of the nano hosts (load generators excluded)."
         },
         "nano_usd_per_hour_bid_ceiling": {
           "type": "number"

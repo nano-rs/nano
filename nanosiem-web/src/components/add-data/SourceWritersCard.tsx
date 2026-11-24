@@ -28,6 +28,7 @@ import { DIRECT_PROTOCOLS, INGEST_ENDPOINT_QUERY_KEY, issuableSlugs, type AddDat
 import { formatRelativeCompact, formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import { IssueCredentialPanel, ISSUE_TOKEN_PERMISSION } from './IssueCredentialPanel';
+import { Term } from '@/components/ui/term';
 
 const STATE_TONE: Record<IngestToken['state'], string> = {
   active: 'text-emerald-500 border-emerald-500/40',
@@ -130,7 +131,7 @@ export function SourceWritersCard({
       {issuing && source && (
         <div className="border-b border-border px-4 py-3 space-y-2" data-testid="source-writers-issue-panel">
           <div className="flex items-center gap-2">
-            <span className="text-[12px] font-medium text-foreground">Issue an ingest token for this source</span>
+            <span className="text-[12px] font-medium text-foreground">Issue an <Term id="ingest-credential">ingest token</Term> for this source</span>
             <span className="flex-1" />
             <Button variant="ghost" size="sm" className="h-6 px-1.5" aria-label="Close" onClick={() => setIssuing(false)}>
               <X className="w-3.5 h-3.5" strokeWidth={1.5} />
@@ -139,7 +140,7 @@ export function SourceWritersCard({
           {endpoint.data ? (
             <IssueCredentialPanel endpoint={endpoint.data} source={source} logSourceId={logSourceId} searchField={searchField} />
           ) : endpoint.error ? (
-            <div className="text-[11.5px] text-red-500" role="alert">Could not load the ingest endpoint: {endpoint.error.message}</div>
+            <div className="text-[11.5px] text-red-500" role="alert">Could not load the <Term id="ingest-endpoint">ingest endpoint</Term>: {endpoint.error.message}</div>
           ) : (
             <div className="flex items-center gap-2 text-[11.5px] text-muted-foreground"><LoadingIcon className="w-3.5 h-3.5" /> Loading your ingest endpoint…</div>
           )}

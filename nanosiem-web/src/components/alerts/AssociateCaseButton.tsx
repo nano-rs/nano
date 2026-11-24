@@ -122,8 +122,7 @@ export function AssociateCaseButton({ alertId, onAssociated }: AssociateCaseButt
           <DialogHeader>
             <DialogTitle className="text-[14px]">Add alert to case</DialogTitle>
             <DialogDescription className="text-[11.5px]">
-              Link this alert to an existing investigation. It stays a plain link — no
-              auto-investigation is triggered.
+              Links only; no auto-investigation runs.
             </DialogDescription>
           </DialogHeader>
 

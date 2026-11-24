@@ -55,3 +55,21 @@ async fn a_refused_gate_serves_its_numbers_as_fields() {
     assert_eq!(body["error"]["details"]["gate"]["min_sample"], 20);
     assert_eq!(body["error"]["details"]["gate"]["passes"], false);
 }
+
+/// NAN-5789: a fetch source saved without its source configuration is a 400
+/// naming the field, not a 422 or a 500.
+#[tokio::test]
+async fn a_missing_source_configuration_is_a_400_with_a_field_error() {
+    let err: ApiError = nanosiem_core::LogSourceServiceError::MissingSourceConfiguration {
+        field: "dispatch_source_config_id",
+        message: "a Kafka log source needs a source configuration".into(),
+    }
+    .into();
+    let response = err.into_response();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "SOURCE_CONFIGURATION_REQUIRED");
+    assert_eq!(body["error"]["details"]["field_errors"][0]["field"], "dispatch_source_config_id");
+    assert!(body["error"]["details"]["field_errors"][0]["message"].as_str().unwrap().contains("Kafka"));
+}

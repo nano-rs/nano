@@ -1,9 +1,14 @@
 name: release preflight
 
-# Fast check of release packaging tooling on every PR that touches it, so a broken
-# release script fails here instead of at the end of a 45-minute build-and-push.
+# Fast check of release packaging tooling on every main merge that touches it (and on
+# a PR that opts in with `ready-to-merge`), so a broken release script fails here
+# instead of at the end of a 45-minute build-and-push.
 on:
   pull_request:
+    # NAN-5791: on a PR, runs only while it carries the optional `ready-to-merge`
+    # opt-in label (jobs' `if:`); the heavy run is the push-to-main one below.
+    # docs-internal/ci-runner-pools.md#ready-to-merge-label-nan-5791
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - "scripts/release/**"
       - "scripts/tests/customer-images.test.sh"
@@ -41,20 +46,97 @@ on:
       - ".github/workflows/release-sbom.yml"
       - "scripts/tests/sbom.test.sh"
       - "scripts/tests/publish-github-release.test.sh"
+      # NAN-5797: release-sbom's resolve and release-bundle's SBOM asset check.
+      - "scripts/tests/resolve-release-sbom.test.sh"
+      - "scripts/tests/check-release-sbom.test.sh"
+      # NAN-5797: repo-making tests never reach a real repository via GIT_DIR.
+      - "scripts/tests/git-env-isolation.test.sh"
       - "Cargo.lock"
       - "nanosiem-web/package-lock.json"
       - "nanosiem-enterprise/sandbox-compiler/package-lock.json"
       # NAN-5412: preflight check 14 runs cargo-deny against this policy.
       - "deny.toml"
       - "scripts/ci/cargo-deny.sh"
+  # Heavy suite on main after merges; same paths as the PR trigger.
+  # docs-internal/ci-runner-pools.md#heavy-gates-on-main
+  push:
+    branches: [main]
+    paths:
+      - "scripts/release/**"
+      - "scripts/tests/customer-images.test.sh"
+      - "scripts/tests/helm-chart-package.test.sh"
+      - "scripts/tests/lock-provenance.test.sh"
+      - "scripts/tests/release-notes-preflight.test.sh"
+      - "scripts/tests/check-mirror-includes.test.sh"
+      # NAN-5440: awk portability across every shipped shell script, under Debian 12's mawk.
+      - "scripts/tests/awk-portability.test.sh"
+      # NAN-5495: every interactive install prompt on a real pty, and shellcheck of shipped scripts.
+      - "scripts/tests/install-tty-prompts.test.sh"
+      - "scripts/tests/install_tty_prompts.py"
+      - "config/**"
+      - "deploy/helm/nano/**"
+      - "deploy/release/**"
+      - ".github/workflows/build-and-push.yml"
+      - ".github/workflows/publish-customer-images.yml"
+      - ".github/workflows/release-notify.yml"
+      - ".github/workflows/release-bundle.yml"
+      - ".github/workflows/release-preflight.yml"
+      # NAN-5196: the compose bundle allowlist is checked against what these reference.
+      - "install.sh"
+      - "docker-compose*.yml"
+      - "scripts/nano"
+      - "scripts/nano-*"
+      - "scripts/lib/**"
+      - "deploy/compose/**"
+      - "tools/sync-to-nano-mirror.sh"
+      # NAN-5330: preflight runs the strip, the credential scan and the include guard.
+      - "tools/check-mirror-enterprise-strip.py"
+      - "tools/scan-mirror-secrets.sh"
+      - ".github/workflows/sync-mirror.yml"
+      # NAN-5409: preflight generates both editions' SBOMs and checks every shipped
+      # dependency's license, so a dependency change is checked here too.
+      - ".github/workflows/release-sbom.yml"
+      - "scripts/tests/sbom.test.sh"
+      - "scripts/tests/publish-github-release.test.sh"
+      # NAN-5797: release-sbom's resolve and release-bundle's SBOM asset check.
+      - "scripts/tests/resolve-release-sbom.test.sh"
+      - "scripts/tests/check-release-sbom.test.sh"
+      # NAN-5797: repo-making tests never reach a real repository via GIT_DIR.
+      - "scripts/tests/git-env-isolation.test.sh"
+      - "Cargo.lock"
+      - "nanosiem-web/package-lock.json"
+      - "nanosiem-enterprise/sandbox-compiler/package-lock.json"
+      # NAN-5412: preflight check 14 runs cargo-deny against this policy.
+      - "deny.toml"
+      - "scripts/ci/cargo-deny.sh"
+  # A manual run picks the mode; pr is the default, like a push to main.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "pr skips the checks that need the next release's cut artifacts; release requires them"
+        type: choice
+        options: [pr, release]
+        default: pr
 
 permissions:
   contents: read
 
+# NAN-5791: a labeled/unlabeled event for any other label gets its own group
+# (its jobs skip), so it never cancels a real run. A push to main joins the
+# `heavy-` group without cancel-in-progress: one run going plus at most one
+# pending, the pending one replaced by the newest merge, so a burst of merges
+# coalesces into two runs (docs-internal/ci-runner-pools.md#heavy-gates-on-main).
+concurrency:
+  group: ${{ github.event_name == 'push' && 'heavy-' || '' }}release-preflight-${{ github.event.pull_request.number || github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
 jobs:
   preflight:
-    runs-on: [self-hosted, Linux, X64, nano-pr]
-    timeout-minutes: 15
+    if: ${{ github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge')) }}
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
+    # Preflight takes ~7 min and the mutation test runs it twice more (~14 min): ~22 min of
+    # steps on run 44916305183, so 40 leaves headroom and still bounds a hung run.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # NAN-5409: preflight check 13 (scripts/release/check-sbom.sh) runs cargo tree
@@ -72,10 +154,26 @@ jobs:
         with:
           version: v4.3.1
 
+      # On a PR and on a push to main, --pr reports the checks that need the next release's
+      # cut artifacts (its upgrade-policy entry and notes file) as skip; whatever policy and
+      # notes the tree has, including any the change adds or edits, stay strict. Main between
+      # releases has no next-version notes yet, so release mode would fail every merge there.
+      # Release runs (build-and-push, rc/*) call preflight without the flag and require them;
+      # a manual run here does too when dispatched with mode=release. Either mode is read-only:
+      # no secrets, no tag, no image push, no release.
       - name: Release preflight
-        run: bash scripts/release/preflight.sh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$DISPATCH_MODE" = release ]; then
+            bash scripts/release/preflight.sh
+          else
+            bash scripts/release/preflight.sh --pr
+          fi
 
-      # Preflight check 5b: remove the next version's notes file and preflight must fail.
+      # Preflight check 5b: remove the next version's notes file and preflight must fail
+      # (release mode), and the release-cut checks in both modes.
       - name: Release notes gate (mutation test)
         if: ${{ !cancelled() }}
         run: bash scripts/tests/release-notes-preflight.test.sh

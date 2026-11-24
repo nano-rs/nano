@@ -1539,58 +1539,103 @@ async fn persist_replica_status(
     else {
         return;
     };
+    // NAN-5819: one synchronous multi-row INSERT per pass. It commits in
+    // milliseconds (no async-insert flush window to wait out against
+    // IO_TIMEOUT), writes one part per pass however many replicas the node
+    // has, and a failure is returned here and logged.
+    let sql = replica_status_insert_sql(observations.len());
+    let mut query = replica_status_client(&writer.client).query(&sql);
     for observation in observations {
         let sample = observation.sample.clone().unwrap_or_default();
-        let result = tokio::time::timeout(
-            IO_TIMEOUT,
-            writer
-                .client
-                .query(
-                    "INSERT INTO nanosiem.ingest_watchdog_replica_status \
-                 (observed_at, node, replica, endpoint, reachable, error, hot, \
-                  pending_async_inserts, oldest_flush_age_seconds, running_queries, \
-                  memory_usage_bytes, memory_limit_bytes, refreshes_running, disabled_views) \
-                 VALUES (now64(3), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&node.name)
-                .bind(&observation.replica)
-                .bind(&observation.endpoint)
-                .bind(observation.reachable())
-                .bind(observation.error.as_deref().unwrap_or(""))
-                .bind(
-                    observation
-                        .sample
-                        .as_ref()
-                        .is_some_and(|sample| !sample.hot_reasons(config).is_empty()),
-                )
-                .bind(sample.pending_async_inserts)
-                .bind(sample.oldest_flush_age_seconds)
-                .bind(sample.running_queries)
-                .bind(sample.memory_usage_bytes)
-                .bind(sample.memory_limit_bytes)
-                .bind(sample.refreshes_running)
-                .bind(&sample.disabled_views)
-                .execute(),
-        )
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(node = %node.name, replica = %observation.replica, %error,
-                    "Could not persist watchdog replica status");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    node = %node.name,
-                    replica = %observation.replica,
-                    timeout_seconds = IO_TIMEOUT.as_secs(),
-                    "Persisting watchdog replica status timed out"
-                );
-                return;
-            }
+        query = query
+            .bind(&node.name)
+            .bind(&observation.replica)
+            .bind(&observation.endpoint)
+            .bind(observation.reachable())
+            .bind(observation.error.as_deref().unwrap_or(""))
+            .bind(
+                observation
+                    .sample
+                    .as_ref()
+                    .is_some_and(|sample| !sample.hot_reasons(config).is_empty()),
+            )
+            .bind(sample.pending_async_inserts)
+            .bind(sample.oldest_flush_age_seconds)
+            .bind(sample.running_queries)
+            .bind(sample.memory_usage_bytes)
+            .bind(sample.memory_limit_bytes)
+            .bind(sample.refreshes_running)
+            .bind(sample.disabled_views.clone());
+    }
+    match tokio::time::timeout(IO_TIMEOUT, query.execute()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(node = %node.name, replicas = observations.len(), %error,
+                "Could not persist watchdog replica status");
+        }
+        Err(_) => {
+            tracing::warn!(
+                node = %node.name,
+                replicas = observations.len(),
+                timeout_seconds = IO_TIMEOUT.as_secs(),
+                "Persisting watchdog replica status timed out"
+            );
         }
     }
+}
+
+/// The replica-status INSERT for `rows` observations (one VALUES tuple each).
+fn replica_status_insert_sql(rows: usize) -> String {
+    let tuple = "(now64(3), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    format!(
+        "INSERT INTO nanosiem.ingest_watchdog_replica_status \
+         (observed_at, node, replica, endpoint, reachable, error, hot, \
+          pending_async_inserts, oldest_flush_age_seconds, running_queries, \
+          memory_usage_bytes, memory_limit_bytes, refreshes_running, disabled_views) \
+         VALUES {}",
+        vec![tuple; rows.max(1)].join(", ")
+    )
+}
+
+/// Client for the replica-status rows (NAN-5819).
+///
+/// The default profile runs inserts with `async_insert=1` and
+/// `wait_for_async_insert=1` under an adaptive flush window of 2 to 10 s that
+/// grows toward 10 s on a lightly loaded node, so a waiting INSERT met
+/// [`IO_TIMEOUT`] (also 10 s) and timed out on quiet nodes. Not waiting would
+/// hide a failed flush, leaving the last good row to look current, so the
+/// write is synchronous instead, like the journal write: it returns once the
+/// part is committed, or with the error.
+fn replica_status_client(client: &Client) -> Client {
+    client
+        .clone()
+        .with_setting("async_insert", "0")
+        .with_setting("wait_end_of_query", "1")
+}
+
+/// Watchdog passes a replica's latest status sample may miss before SIEM
+/// Health treats it as stale (NAN-5819).
+pub const REPLICA_SAMPLE_STALE_PASSES: u64 = 4;
+/// Lower bound of the staleness bound, whatever the interval.
+pub const REPLICA_SAMPLE_STALE_MIN_SECS: u64 = 120;
+
+/// Seconds after which a replica's latest status sample is stale: four
+/// watchdog intervals (`NANO_INGEST_WATCHDOG_INTERVAL_SECS`, default 30 s),
+/// at least two minutes. A stale row is old evidence and never counts as
+/// reachable or calm: the watchdog has stopped, or its status writes fail.
+pub fn replica_sample_stale_after_secs() -> u64 {
+    let interval = std::env::var("NANO_INGEST_WATCHDOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or_else(|| IngestWatchdogConfig::default().interval.as_secs());
+    stale_after_for_interval(interval)
+}
+
+fn stale_after_for_interval(interval_secs: u64) -> u64 {
+    interval_secs
+        .saturating_mul(REPLICA_SAMPLE_STALE_PASSES)
+        .max(REPLICA_SAMPLE_STALE_MIN_SECS)
 }
 
 fn ch_error(error: clickhouse::error::Error) -> IngestWatchdogError {
@@ -1600,6 +1645,38 @@ fn ch_error(error: clickhouse::error::Error) -> IngestWatchdogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-5819: the replica-status write is synchronous: never queued behind
+    /// the async-insert flush window (which can reach the full `IO_TIMEOUT`),
+    /// and never acknowledged before it is committed.
+    #[test]
+    fn replica_status_insert_is_synchronous() {
+        let base = Client::default().with_setting("wait_for_async_insert", "1");
+        let client = replica_status_client(&base);
+        assert_eq!(client.get_setting("async_insert"), Some("0"));
+        assert_eq!(client.get_setting("wait_end_of_query"), Some("1"));
+        // The caller's client is left as it was.
+        assert_eq!(base.get_setting("wait_for_async_insert"), Some("1"));
+        assert_eq!(base.get_setting("async_insert"), None);
+    }
+
+    /// NAN-5819: one INSERT carries every replica of the node, one tuple and
+    /// 13 binds each.
+    #[test]
+    fn replica_status_insert_batches_every_replica() {
+        let sql = replica_status_insert_sql(3);
+        assert_eq!(sql.matches("(now64(3),").count(), 3);
+        assert_eq!(sql.matches('?').count(), 3 * 13);
+        assert_eq!(replica_status_insert_sql(0).matches("(now64(3),").count(), 1);
+    }
+
+    #[test]
+    fn replica_samples_go_stale_after_four_passes_and_at_least_two_minutes() {
+        assert_eq!(stale_after_for_interval(30), 120);
+        assert_eq!(stale_after_for_interval(5), 120);
+        assert_eq!(stale_after_for_interval(60), 240);
+        assert_eq!(stale_after_for_interval(u64::MAX), u64::MAX);
+    }
 
     /// NAN-5461: `load_state_row` must decode against a real server with
     /// RowBinary validation on (the default). Before the fix every pass failed

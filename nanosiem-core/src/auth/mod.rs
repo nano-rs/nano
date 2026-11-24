@@ -53,6 +53,8 @@ mod first_admin_tests;
 mod group_membership_tests;
 #[cfg(test)]
 mod service_credential_tests;
+#[cfg(test)]
+mod session_binding_tests;
 #[cfg(all(test, feature = "enterprise"))]
 mod sso_admission_tests;
 #[cfg(all(test, feature = "enterprise"))]

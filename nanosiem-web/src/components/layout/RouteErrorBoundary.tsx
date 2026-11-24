@@ -2,6 +2,7 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 import { isStaleBuildError, tryStaleBuildReload } from '@/lib/stale-build';
 import { redactText } from '@/lib/support-diagnostics';
+import { reportBoundaryError } from '@/lib/error-tracking/reporter';
 
 interface Props {
   /** The boundary clears its error when this changes (the route pathname). */
@@ -37,6 +38,9 @@ export class RouteErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: unknown, info: ErrorInfo): void {
     console.error('Route failed to render:', error, info.componentStack ?? '');
+    // NAN-5798: a no-op unless opt-in error tracking started. A stale build
+    // is not a bug: it reloads below.
+    if (!isStaleBuildError(error)) reportBoundaryError(error, info.componentStack ?? '');
     if (isStaleBuildError(error) && (this.props.attemptReload ?? tryStaleBuildReload)()) {
       this.setState({ reloading: true });
     }

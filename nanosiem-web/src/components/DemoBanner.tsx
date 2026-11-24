@@ -52,7 +52,7 @@ export function DemoBanner() {
           <span className="font-medium">{timeText}</span>
         </div>
         <span className="text-blue-700 dark:text-blue-300">
-          You're exploring a demo instance with sample data. Create rules, investigate cases, and try AI-powered analysis.
+          Demo instance with sample data.
         </span>
       </div>
       <div className="flex items-center gap-2 shrink-0">

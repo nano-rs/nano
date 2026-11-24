@@ -290,7 +290,7 @@ let isValidationStale = false; // Set true when doc changes, false when validati
 function shortenInfoMessage(message: string): string {
   // Map common verbose messages to shorter versions
   if (message.includes('simple filter query will create a ClickHouse materialized view')) {
-    return 'Creates MV for fast alerting';
+    return 'Runs in real time for fast alerts';
   }
   if (message.includes('piped commands') && message.includes('not supported in real-time')) {
     return 'Pipes require scheduled mode';
@@ -305,7 +305,7 @@ function shortenInfoMessage(message: string): string {
     return 'Runs on cron schedule';
   }
   if (message.includes('Real-time mode') && message.includes('materialized view')) {
-    return 'Creates MV for real-time';
+    return 'Runs in real time';
   }
   // Return original if no match (truncated if too long)
   return message.length > 40 ? message.substring(0, 37) + '...' : message;

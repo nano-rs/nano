@@ -6,6 +6,7 @@
 // state so the lens matches `design-ref/shadcn/editor-flow.jsx` while
 // re-using the real parser instead of the mock's `parsePipeline` hack.
 
+import { Term } from '@/components/ui/term';
 import { lazy, Suspense } from 'react';
 import { Share2 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
@@ -28,7 +29,7 @@ export function FlowLens({ query, schedule, lookback }: FlowLensProps) {
           FLOW
         </span>
         <span className="text-muted-foreground/60">·</span>
-        <span className="text-muted-foreground">auto-generated from query — edits land in CODE</span>
+        <span className="text-muted-foreground">built from the query; edit it in CODE</span>
         <div className="flex-1" />
         {(schedule || lookback) && (
           <span className="inline-flex items-center gap-1.5 text-muted-foreground">
@@ -40,7 +41,7 @@ export function FlowLens({ query, schedule, lookback }: FlowLensProps) {
             {lookback && (
               <>
                 <span className="text-muted-foreground/60">·</span>
-                lookback <span className="text-foreground">{lookback}</span>
+                <Term id="rule-lookback">lookback</Term> <span className="text-foreground">{lookback}</span>
               </>
             )}
           </span>

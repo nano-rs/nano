@@ -64,6 +64,8 @@ struct FlakyApplier {
     fail: AtomicBool,
     calls: AtomicUsize,
     forced: Mutex<Vec<bool>>,
+    /// NAN-5738: the applier asks for a re-apply of an applied, unchanged snapshot.
+    reapply: AtomicBool,
 }
 
 #[async_trait]
@@ -76,6 +78,10 @@ impl ContentApplier for FlakyApplier {
         } else {
             Ok("applied".into())
         }
+    }
+
+    async fn needs_reapply(&self, _ch: &'static Channel) -> bool {
+        self.reapply.load(Ordering::SeqCst)
     }
 }
 
@@ -149,4 +155,27 @@ async fn failed_apply_is_retried_on_reimport_and_never_reported_current() {
     assert_eq!(*applier.forced.lock().unwrap().last().unwrap(), true, "pending apply forces the applier on an unchanged tree");
     let row = c.store().get("playbooks.main").await.unwrap().unwrap();
     assert!(row.apply_error.is_none());
+}
+
+/// NAN-5738 review: an applier that asks for it (the SOAR catalog while a
+/// release is quarantined) gets an applied, unchanged snapshot again on a
+/// re-import of the same bundle, as a success; once it stops asking, the
+/// same bundle is just current.
+#[tokio::test]
+#[ignore = "needs NANOSIEM_TEST_DATABASE_URL (disposable PostgreSQL)"]
+async fn an_applier_that_needs_a_reapply_gets_it_on_reimport_as_a_success() {
+    let pool = fresh_pg().await;
+    let applier = Arc::new(FlakyApplier::default());
+    let c = consumer(&pool, applier.clone());
+    let b1 = bundle("playbooks.main", 200, &files("v1"));
+    c.import_bytes(b1.clone()).await.unwrap();
+    assert_eq!(applier.calls.load(Ordering::SeqCst), 1);
+    applier.reapply.store(true, Ordering::SeqCst);
+    assert_eq!(c.import_bytes(b1.clone()).await.unwrap(), ChannelOutcome::Reapplied { sequence: 200 });
+    assert_eq!(applier.calls.load(Ordering::SeqCst), 2);
+    let row = c.store().get("playbooks.main").await.unwrap().unwrap();
+    assert_eq!(row.apply_error, None);
+    applier.reapply.store(false, Ordering::SeqCst);
+    assert_eq!(c.import_bytes(b1).await.unwrap(), ChannelOutcome::Current { sequence: 200 });
+    assert_eq!(applier.calls.load(Ordering::SeqCst), 2);
 }

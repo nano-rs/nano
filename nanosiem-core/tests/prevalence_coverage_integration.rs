@@ -65,6 +65,10 @@ async fn misses_are_unknown_until_prevalence_covers_the_window() {
         "hash_prevalence_source_agg",
         "domain_prevalence_source_agg",
         "ip_prevalence_source_agg",
+        // NAN-5722: the lookups read the per-entity summaries (fed by MV).
+        "hash_prevalence_summary",
+        "domain_prevalence_summary",
+        "ip_prevalence_summary",
         "logs",
     ] {
         execute(&client, &format!("TRUNCATE TABLE nanosiem.{table}")).await;
@@ -183,6 +187,10 @@ async fn client_from_env() -> clickhouse::Client {
         "hash_prevalence_source_agg",
         "domain_prevalence_source_agg",
         "ip_prevalence_source_agg",
+        // NAN-5722: the lookups read the per-entity summaries (fed by MV).
+        "hash_prevalence_summary",
+        "domain_prevalence_summary",
+        "ip_prevalence_summary",
         "logs",
     ] {
         execute(&client, &format!("TRUNCATE TABLE nanosiem.{table}")).await;

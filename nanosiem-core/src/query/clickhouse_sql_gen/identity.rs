@@ -100,7 +100,10 @@ impl ClickHouseSqlGenerator {
     /// nPL-text deny gate (`enforce_source_scope`) does not cover. The empty
     /// set (the default on every existing construction site) renders nothing,
     /// keeping every emitted statement byte-identical.
-    pub fn with_source_scope_deny(
+    /// NAN-5793 review: module-private. Production code takes its scope at
+    /// construction (`ClickHouseSqlGenerator::scoped*`) and can never re-scope
+    /// (or un-scope) a generator.
+    pub(super) fn with_source_scope_deny(
         mut self,
         deny: std::collections::BTreeSet<String>,
     ) -> Self {
@@ -432,7 +435,9 @@ impl ClickHouseSqlGenerator {
         // source_type). Empty deny set → `None` → both branches below emit
         // byte-identical SQL to the pre-scoping form.
         let scope_predicate =
-            crate::search::service::source_scope_sql_predicate("source", self.source_scope_deny());
+            // NAN-5793: nPL-generated SQL, executed through the `?`-escaping search
+            // executor like every other nPL literal, so the literal form is used.
+            crate::search::service::source_scope_literal_predicate("source", self.source_scope_deny());
         let bounded_scope_and = scope_predicate
             .as_deref()
             .map(|pred| format!("\n      AND ({pred})"))

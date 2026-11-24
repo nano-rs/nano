@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { CoverageFilters, MitreCoverageResponse, TechniqueCoverage } from '@/components/mitre/types';
 
 const coverageCalls: CoverageFilters[] = [];
@@ -46,34 +47,41 @@ vi.mock('@/hooks/useMitreData', () => ({
   useMitreQuarantine: () => ({ mappings: [], unrepairedCount: 0, loading: false, error: null }),
 }));
 vi.mock('@/hooks/useDocumentTitle', () => ({ useDocumentTitle: () => undefined }));
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ hasPermission: () => true }) }));
+vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: { hunts: false, melod: false } }) }));
 
 import { MitreCoverage } from './MitreCoverage';
 import { countRulesByStatus } from '@/components/mitre/types';
 
 afterEach(cleanup);
 
-describe('MITRE coverage modes (NAN-5717)', () => {
-  it('requests staging and paused rules, not only the API default (alerting, live)', () => {
-    render(
+function renderPage() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
       <MemoryRouter>
         <MitreCoverage />
-      </MemoryRouter>,
-    );
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+describe('MITRE coverage modes (NAN-5717)', () => {
+  it('requests staging and paused rules, not only the API default (alerting, live)', () => {
+    renderPage();
     expect(coverageCalls.length).toBeGreaterThan(0);
     const modes = coverageCalls[coverageCalls.length - 1].mode;
     expect([...modes].sort()).toEqual(['alerting', 'live', 'paused', 'staging']);
   });
 
   it('shows the in-review and disabled rule counts, and covers on live rules only', () => {
-    render(
-      <MemoryRouter>
-        <MitreCoverage />
-      </MemoryRouter>,
-    );
+    renderPage();
     expect(screen.getByTestId('mitre-review-count').textContent).toBe('1 in review');
     expect(screen.getByTestId('mitre-disabled-count').textContent).toBe('1 disabled');
     // T1201 has only a review + a disabled rule: still a gap, not covered.
-    expect(screen.getByText(/1 technique uncovered/)).toBeTruthy();
+    expect(screen.getByTestId('coverage-pct').textContent).toBe('50%');
+    expect(screen.getByTestId('coverage-cell-T1201').getAttribute('data-d')).toBe('review');
+    expect(screen.getByTestId('coverage-cell-T1110').getAttribute('data-class')).toBe('detected');
   });
 
   it('counts each rule once even when it maps to several techniques', () => {

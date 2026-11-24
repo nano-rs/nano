@@ -7,10 +7,10 @@ On /dashboards/:id:
   nPL and a read-only preview of the query; the dashboard is unchanged until
   Apply; Apply saves it through the REST API as the analyst (owner), and the
   audit event records the analyst with `request_origin: pivt`;
-- an analyst with `dashboards:edit` who does not own the dashboard is offered
-  no card (the page lists no add/edit-panel action, so the concierge keeps its
-  dashboard-builder redirect, NAN-5597), and the REST save pivt would make is
-  refused.
+- an analyst with `dashboards:edit` who does not own the dashboard sees no
+  Edit, is offered no card, and "add a panel" is refused in chat, not
+  redirected to the builder (the page withholds the panel actions, NAN-5637);
+  the REST save pivt would make is refused (403).
 OCSF only.
 """
 
@@ -122,9 +122,9 @@ def test_pivt_offers_no_panel_edit_on_a_dashboard_the_analyst_cannot_save(
     if persona_ai is None:
         pytest.skip("pivt is enterprise-only")
     if persona_ai_mode() == "real":
-        # A real model may classify the ask as chat (prose) or dashboard (the
-        # redirect); the permission boundary is covered by the stub run.
-        pytest.skip("asserts the stub's classification")
+        # A real model words the refusal its own way; the permission
+        # boundary is covered by the stub run.
+        pytest.skip("asserts the stub's wording")
     name = f"pivt_dash_ro_{mark[-10:].replace('-', '_')}"
     persona_cleanup.dashboard(name)
     dashboard = _create(nano, name)  # the admin's
@@ -135,18 +135,36 @@ def test_pivt_offers_no_panel_edit_on_a_dashboard_the_analyst_cannot_save(
     with login_persona(stack, nano, ui, artifact_dir, "pivt-dash-not-owner", NOT_OWNER) as persona:
         page = persona.page
         _open(page, dashboard)
+        # NAN-5637: no Edit for a non-owner (the server would refuse the save).
+        assert page.count({"role": "button", "name": "Edit", "exact": True}) == 0
         _ask(page, "add a table panel named Nope for class_name=\"Authentication\" | stats count")
-        # NAN-5597: the non-owner's page offers no dashboards.add_panel, so the
-        # concierge keeps its dashboard-builder redirect (the stub classifies
-        # this as `dashboard`, like real models): no card, a link only.
-        page.wait_text("take you to the dashboard builder", exact=False, timeout_ms=120_000)
+        # The page withholds dashboards.add_panel from the non-owner. The stub
+        # classifies this as `dashboard`, like real models; the concierge
+        # refuses in chat instead of redirecting to the builder.
+        page.wait_text("isn't available to you on this page", exact=False, timeout_ms=120_000)
         assert page.count(CARD) == 0
+        assert page.count({"text": "take you to the dashboard builder"}) == 0
+        # Nor the redirect-fallback link (a suggestion, not reply prose).
+        assert page.count({"text": "Open Dashboards"}) == 0
         page.screenshot("pivt-dashboard-not-owner-no-action.png")
         refused = persona.client.api.put(
             f"/api/dashboards/{dashboard['id']}",
-            json={"panels": [], "expected_updated_at": dashboard["updated_at"]},
+            # A real change (one panel), so "panels still empty" proves nothing was written.
+            json={
+                "panels": [
+                    {
+                        "id": "panel-nope",
+                        "title": "Nope",
+                        "query": 'class_name="Authentication" | stats count',
+                        "queryMode": "piped",
+                        "visualizationType": "table",
+                        "visualizationConfig": {},
+                    }
+                ],
+                "expected_updated_at": dashboard["updated_at"],
+            },
             headers={"X-Nano-Origin": "pivt"},
         )
-        assert refused.status_code in (403, 404), refused.text[:500]
+        assert refused.status_code == 403, refused.text[:500]
         assert expect(nano.api.get(f"/api/dashboards/{dashboard['id']}"), 200)["panels"] == []
         timeline.step("non-owner offered no panel edit; REST refused", dashboard=dashboard["id"])

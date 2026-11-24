@@ -98,6 +98,7 @@ async fn agent_credentials_are_always_the_agent_class() {
     // A session (JWT) is never an agent credential.
     assert!(
         !AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: "t".into(),
             aud: "t".into(),
             sub: Uuid::now_v7(),
@@ -146,6 +147,7 @@ fn admission_keys_on_the_owning_user() {
         Err(crate::SearchError::Forbidden(_))
     ));
     let session = AuthContext::from_jwt(TokenClaims {
+        sid: None,
         iss: "t".into(),
         aud: "t".into(),
         sub: owner,

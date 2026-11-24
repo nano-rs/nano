@@ -139,7 +139,7 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && ! id -nG "$SUDO_USER" 
   # OS Login users come from NSS, not /etc/passwd: gpasswd handles both.
   gpasswd -a "$SUDO_USER" docker >/dev/null
 fi
-# A large blank disk (cloud data disk, Spot local disk) holds Docker's data root.
+# A large blank disk (cloud data disk, local instance disk) holds Docker's data root.
 if ! mountpoint -q /var/lib/docker; then
   disk=$(lsblk -dnpo NAME,SIZE,TYPE | awk '$3=="disk"{print $1}' | while read -r d; do
     # Only a blank disk: unmounted, no partitions, no filesystem signature.
@@ -155,7 +155,7 @@ if ! mountpoint -q /var/lib/docker; then
   fi
 fi
 if [ "$firewall" = 1 ]; then
-# Host firewall: hosts sit on public addresses (Spot has no private network), so
+# Host firewall: hosts sit on public addresses (some clouds give VMs no private network), so
 # everything inbound is limited to the cluster members and the operator. Docker
 # published ports bypass INPUT, so the same list guards DOCKER-USER.
 iptables -N NANO-BENCH 2>/dev/null || iptables -F NANO-BENCH

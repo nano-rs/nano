@@ -108,7 +108,7 @@ fn unrestricted_filtered_refresh_keeps_legacy_aggregate_sql_byte_for_byte() {
 #[test]
 fn nonempty_scope_uses_raw_scoped_cte_and_udm_mv_equivalent_counters() {
     let scope = denied(&["audit", "hidden_cloud"]);
-    let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set())
+    let scope_predicate = source_scope_bound_predicate("source_type", scope.deny_set())
         .expect("nonempty scope renders");
     let base_scan = build_cloud_fallback_scan_sql(
         "nanosiem.logs",
@@ -130,7 +130,8 @@ fn nonempty_scope_uses_raw_scoped_cte_and_udm_mv_equivalent_counters() {
 
     assert!(sql.contains("FROM cloud_base"));
     assert!(!sql.contains("cloud_user_activity_agg"));
-    assert!(sql.contains("lower(source_type) NOT IN ('audit', 'hidden_cloud')"));
+    assert!(sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"));
+    assert!(!sql.contains("hidden_cloud"), "deny names must be bound, not inlined");
     assert!(sql.contains("count() AS event_count"));
     assert!(sql.contains("uniq(cloud_service) AS distinct_services"));
     assert!(sql.contains("uniq(cloud_region) AS distinct_regions"));
@@ -146,7 +147,7 @@ fn nonempty_scope_uses_raw_scoped_cte_and_udm_mv_equivalent_counters() {
 fn restricted_ocsf_raw_query_matches_ocsf_mv_counter_semantics() {
     let sql = build_cloud_user_activity_sql(
         &OcsfProfile::new(),
-        "WITH cloud_base AS (SELECT * FROM nanosiem.ocsf_logs WHERE lower(source_type) != 'hidden_cloud')",
+        "WITH cloud_base AS (SELECT * FROM nanosiem.ocsf_logs WHERE lower(source_type) NOT IN {nano_source_deny:Array(String)})",
         "cloud_base",
         "nanosiem.cloud_user_activity_agg",
         &range(),
@@ -261,7 +262,7 @@ mod live {
             .expect("seed mixed-source cloud activity");
 
         let scope = denied(&["hidden_cloud"]);
-        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set())
+        let scope_predicate = source_scope_bound_predicate("source_type", scope.deny_set())
             .expect("restricted scope predicate");
         let base_scan = build_cloud_fallback_scan_sql(
             &table,
@@ -280,8 +281,7 @@ mod live {
             "",
         )
         .expect("build restricted production query");
-        let rows = client
-            .query(&sql)
+        let rows = bind_source_scope(client.query(&sql), scope.deny_set())
             .fetch_all::<UserActivityRow>()
             .await
             .expect("execute restricted production query");

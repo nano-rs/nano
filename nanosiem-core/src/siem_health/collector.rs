@@ -6,13 +6,13 @@
 
 use chrono::{DateTime, Utc};
 use clickhouse::Client as ClickHouseClient;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tracing::{info, warn};
 
 use super::types::*;
 use crate::auth::ScopeSet;
 use crate::db::TableNames;
-use crate::search::service::source_scope_sql_predicate;
+use crate::search::service::{bind_source_scope, source_scope_bound_predicate};
 
 #[derive(Debug, clickhouse::Row, serde::Deserialize)]
 pub(crate) struct WatchdogHealthRow {
@@ -25,14 +25,32 @@ pub(crate) struct WatchdogHealthRow {
 }
 
 #[derive(Debug, clickhouse::Row, serde::Deserialize)]
-struct WatchdogReplicaHealthRow {
-    node: String,
-    replica: String,
-    endpoint: String,
-    reachable: bool,
-    error: String,
-    hot: bool,
-    age: u64,
+pub(crate) struct WatchdogReplicaHealthRow {
+    pub(crate) node: String,
+    pub(crate) replica: String,
+    pub(crate) endpoint: String,
+    pub(crate) reachable: bool,
+    pub(crate) error: String,
+    pub(crate) hot: bool,
+    pub(crate) age: u64,
+}
+
+/// NAN-5819: one replica's latest status row. A row older than `stale_after`
+/// seconds is stale (the watchdog stopped or its status writes failed), so it
+/// is reported as such and never as reachable or calm.
+pub(crate) fn replica_health_from_row(
+    row: WatchdogReplicaHealthRow,
+    stale_after: u64,
+) -> IngestWatchdogReplicaHealth {
+    IngestWatchdogReplicaHealth {
+        replica: row.replica,
+        endpoint: row.endpoint,
+        reachable: row.reachable,
+        error: row.error,
+        hot: row.hot,
+        sample_age_secs: row.age,
+        stale: row.age > stale_after,
+    }
 }
 
 pub(crate) fn watchdog_health_from_row(row: WatchdogHealthRow) -> IngestWatchdogHealth {
@@ -90,7 +108,7 @@ pub async fn collect_metrics(
         .await,
     );
 
-    CollectedMetrics {
+    let mut metrics = CollectedMetrics {
         ingestion,
         parsing,
         enrichment,
@@ -101,7 +119,22 @@ pub async fn collect_metrics(
         shard_skew,
         disk,
         collected_at: Utc::now(),
+    };
+    // NAN-5760: the per-source lists above are keyed by ClickHouse
+    // `source_type`, and a deleted source's events stay in `logs`. Set aside
+    // every key a deleted source owned (and no live source claims) BEFORE
+    // either analyzer scores the report, so it is never "silent".
+    let logs_table = TableNames::new(is_clustered).read(crate::schema::active_logs_table());
+    let removed =
+        super::removed_sources::RemovedSourceKeys::load_or_empty(pool, ch_client, &logs_table)
+            .await;
+    if metrics.set_aside_removed_sources(&removed) {
+        info!(
+            removed_sources = ?removed.keys().collect::<Vec<_>>(),
+            "Set aside source types of deleted log sources"
+        );
     }
+    metrics
 }
 
 /// NAN-5032: configured log sources whose route key (the value their events
@@ -164,13 +197,14 @@ async fn collect_audit_durability(pool: &PgPool) -> Option<crate::audit::AuditOu
 /// Canonical logs-row predicate shared by every source-derived health scan.
 ///
 /// Empty source identities are never useful health partitions. The viewer deny
-/// set is rendered by the same builder used by interactive search and every
-/// other hand-built ClickHouse side door. An unrestricted scope adds no
+/// set is rendered by the same builder used by every other hand-built
+/// ClickHouse side door, as the bound `nano_source_deny` parameter (NAN-5793):
+/// every query carrying this predicate binds `scope.deny_set()`. An unrestricted scope adds no
 /// source-scope predicate at all; in particular, the scheduled SYSTEM path is
 /// not silently downgraded to the historical hard-coded `audit` exclusion.
-fn source_rows_predicate(scope: &ScopeSet) -> String {
+pub(crate) fn source_rows_predicate(scope: &ScopeSet) -> String {
     let mut predicate = "source_type != ''".to_string();
-    if let Some(scope_predicate) = source_scope_sql_predicate("source_type", scope.deny_set()) {
+    if let Some(scope_predicate) = source_scope_bound_predicate("source_type", scope.deny_set()) {
         predicate.push_str("\n          AND ");
         predicate.push_str(&scope_predicate);
     }
@@ -195,7 +229,7 @@ fn build_ingestion_sql(logs_table: &str, scope: &ScopeSet) -> String {
 }
 
 /// Collect ingestion health metrics from ClickHouse
-async fn collect_ingestion_metrics(
+pub(crate) async fn collect_ingestion_metrics(
     ch: &ClickHouseClient,
     system_probe_client: &ClickHouseClient,
     is_clustered: bool,
@@ -210,7 +244,7 @@ async fn collect_ingestion_metrics(
     let mut total_prior_24h: u64 = 0;
     let mut silent_sources: Vec<String> = Vec::new();
 
-    match ch.query(&sql).fetch_all::<(String, u64, u64)>().await {
+    match bind_source_scope(ch.query(&sql), scope.deny_set()).fetch_all::<(String, u64, u64)>().await {
         Ok(rows) => {
             for (source_type, count_24h, count_prior_24h) in rows {
                 total_24h += count_24h;
@@ -256,6 +290,7 @@ async fn collect_ingestion_metrics(
         total_events_24h: total_24h,
         total_events_prior_24h: total_prior_24h,
         silent_sources,
+        removed_sources: Vec::new(),
         insert_integrity,
     }
 }
@@ -827,24 +862,19 @@ async fn collect_insert_integrity(
     match ch.query(&sql).fetch_all::<WatchdogReplicaHealthRow>().await {
         Ok(rows) => {
             m.probes_available = true;
+            let stale_after = crate::ingest_watchdog::replica_sample_stale_after_secs();
             for row in rows {
-                let replica = IngestWatchdogReplicaHealth {
-                    replica: row.replica,
-                    endpoint: row.endpoint,
-                    reachable: row.reachable,
-                    error: row.error,
-                    hot: row.hot,
-                    sample_age_secs: row.age,
-                };
+                let node_name = row.node.clone();
+                let replica = replica_health_from_row(row, stale_after);
                 if let Some(node) = m
                     .ingest_watchdog
                     .iter_mut()
-                    .find(|node| node.node == row.node)
+                    .find(|node| node.node == node_name)
                 {
                     node.replicas.push(replica);
                 } else {
                     m.ingest_watchdog.push(IngestWatchdogHealth {
-                        node: row.node,
+                        node: node_name,
                         action: "none".into(),
                         mode: "auto".into(),
                         reason: "no transition recorded".into(),
@@ -987,7 +1017,7 @@ fn dict_is_unhealthy(status: &str, last_exception: &str) -> bool {
 }
 
 /// Collect parsing health metrics from ClickHouse
-async fn collect_parsing_metrics(
+pub(crate) async fn collect_parsing_metrics(
     ch: &ClickHouseClient,
     is_clustered: bool,
     scope: &ScopeSet,
@@ -1003,8 +1033,7 @@ async fn collect_parsing_metrics(
     let coverage_sql = build_field_coverage_sql(&logs_table, ocsf, scope);
 
     let mut field_coverage: Vec<FieldCoverageMetric> = Vec::new();
-    match ch
-        .query(&coverage_sql)
+    match bind_source_scope(ch.query(&coverage_sql), scope.deny_set())
         .fetch_all::<(String, u64, f64, f64, f64, f64)>()
         .await
     {
@@ -1030,7 +1059,7 @@ async fn collect_parsing_metrics(
     let ext_sql = build_ext_usage_sql(&logs_table, ocsf, scope);
 
     let mut high_ext_sources: Vec<ExtUsageMetric> = Vec::new();
-    match ch.query(&ext_sql).fetch_all::<(String, u64, f64)>().await {
+    match bind_source_scope(ch.query(&ext_sql), scope.deny_set()).fetch_all::<(String, u64, f64)>().await {
         Ok(rows) => {
             for (source_type, total_events, ext_pct) in rows {
                 high_ext_sources.push(ExtUsageMetric {
@@ -1086,7 +1115,7 @@ async fn collect_lowercase_invariant_violations(
     scope: &ScopeSet,
 ) -> Vec<LowercaseInvariantViolation> {
     let sql = build_lowercase_invariant_sql(logs_table, scope);
-    match ch.query(&sql).fetch_all::<(String, u64)>().await {
+    match bind_source_scope(ch.query(&sql), scope.deny_set()).fetch_all::<(String, u64)>().await {
         Ok(rows) => rows
             .into_iter()
             .map(|(column, violation_count)| LowercaseInvariantViolation {
@@ -1252,8 +1281,7 @@ async fn collect_enrichment_metrics(
     );
 
     let mut rollup = empty.clone();
-    match ch
-        .query(&rollup_sql)
+    match bind_source_scope(ch.query(&rollup_sql), scope.deny_set())
         .fetch_one::<(u64, f64, f64, f64, f64)>()
         .await
     {
@@ -1300,8 +1328,7 @@ async fn collect_enrichment_metrics(
     );
 
     let mut per_source: Vec<EnrichmentCoverageMetric> = Vec::new();
-    match ch
-        .query(&per_source_sql)
+    match bind_source_scope(ch.query(&per_source_sql), scope.deny_set())
         .fetch_all::<(String, u64, f64, f64, f64)>()
         .await
     {
@@ -1339,7 +1366,7 @@ async fn collect_enrichment_metrics(
           AND {source_rows}
         "#
         );
-        match ch.query(&identity_prior_sql).fetch_one::<f64>().await {
+        match bind_source_scope(ch.query(&identity_prior_sql), scope.deny_set()).fetch_one::<f64>().await {
             Ok(prior) => rollup.identity_fill_prior_pct = prior,
             Err(e) => warn!("Failed to collect prior-window identity fill: {}", e),
         }
@@ -1492,12 +1519,27 @@ async fn collect_enrichment_providers(pool: &PgPool) -> Vec<EnrichmentProviderSt
 
 /// Collect detection health metrics from PostgreSQL
 async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
-    // Total enabled rules
-    let total_enabled: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM detection_rules WHERE mode != 'paused'")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    match pool.acquire().await {
+        Ok(mut conn) => collect_detection_metrics_on(&mut conn).await,
+        Err(e) => {
+            warn!("Failed to acquire a connection for detection metrics: {}", e);
+            DetectionMetrics::default()
+        }
+    }
+}
+
+/// [`collect_detection_metrics`] on one connection, so a test can run it in a
+/// transaction that sees only its own rules.
+async fn collect_detection_metrics_on(conn: &mut PgConnection) -> DetectionMetrics {
+    // Total enabled rules. NAN-5772: every rule count / list below excludes
+    // archived rules: deleting a rule archives it and resets it to `staging`,
+    // so `mode != 'paused'` alone kept counting deleted rules.
+    let total_enabled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM detection_rules WHERE mode != 'paused' AND archived = FALSE",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or(0);
 
     // Total detection matches today. Distinguishes a detections-only
     // deployment that is actively firing (Live-mode rules counting matches)
@@ -1507,15 +1549,16 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         "SELECT COALESCE(SUM(match_count), 0)::bigint \
          FROM detection_daily_stats WHERE date = CURRENT_DATE",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .unwrap_or(0);
 
     // Rules by mode
     let rules_by_mode: Vec<RulesByMode> = match sqlx::query_as::<_, (String, i64)>(
-        "SELECT mode, COUNT(*) FROM detection_rules WHERE mode != 'paused' GROUP BY mode",
+        "SELECT mode, COUNT(*) FROM detection_rules \
+         WHERE mode != 'paused' AND archived = FALSE GROUP BY mode",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     {
         Ok(rows) => rows
@@ -1534,13 +1577,13 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
             r#"
         SELECT name, last_match_at
         FROM detection_rules
-        WHERE mode = 'alerting'
+        WHERE mode = 'alerting' AND archived = FALSE
           AND (last_match_at IS NULL OR last_match_at < NOW() - INTERVAL '30 days')
-        ORDER BY last_match_at ASC NULLS FIRST
+        ORDER BY last_match_at ASC NULLS FIRST, name
         LIMIT 50
         "#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         {
             Ok(rows) => rows
@@ -1563,19 +1606,23 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
             }
         };
 
-    // Noisy rules: rules with high match counts in last 24h
+    // Noisy rules: running (live / alerting, not archived) rules with high
+    // match counts today. Staging rules do not execute, so a rule demoted to
+    // staging while it is tuned is no longer "firing heavily" (NAN-5772).
     let noisy_rules: Vec<NoisyRule> = match sqlx::query_as::<_, (String, i64, String)>(
         r#"
-        SELECT dr.name, COALESCE(ds.match_count, 0) AS matches, dr.severity
-        FROM detection_rules dr
-        LEFT JOIN detection_daily_stats ds ON dr.id = ds.rule_id AND ds.date = CURRENT_DATE
-        WHERE dr.mode != 'paused'
-          AND COALESCE(ds.match_count, 0) > 1000
-        ORDER BY matches DESC
+        SELECT dr.name, ds.match_count AS matches, dr.severity
+        FROM detection_daily_stats ds
+        JOIN detection_rules dr ON dr.id = ds.rule_id
+        WHERE ds.date = CURRENT_DATE
+          AND ds.match_count > 1000
+          AND dr.archived = FALSE
+          AND dr.mode IN ('live', 'alerting')
+        ORDER BY matches DESC, dr.name
         LIMIT 20
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     {
         Ok(rows) => rows
@@ -1602,7 +1649,7 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         GROUP BY severity
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     {
         Ok(rows) => rows
@@ -1618,10 +1665,11 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
     // NAN-4910: detection windows the scheduler gave up on (minimum catch-up
     // slice kept failing for a size reason) — coverage that was NOT evaluated.
     let coverage_gaps_7d_total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM detection_coverage_gaps \
-         WHERE recorded_at >= NOW() - INTERVAL '7 days'",
+        "SELECT COUNT(*) FROM detection_coverage_gaps g \
+         JOIN detection_rules dr ON dr.id = g.rule_id \
+         WHERE g.recorded_at >= NOW() - INTERVAL '7 days' AND dr.archived = FALSE",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .unwrap_or_else(|e| {
         warn!("Failed to count detection coverage gaps: {}", e);
@@ -1633,12 +1681,12 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         SELECT dr.name, g.window_start, g.window_end, g.recorded_at, g.error_message
         FROM detection_coverage_gaps g
         JOIN detection_rules dr ON dr.id = g.rule_id
-        WHERE g.recorded_at >= NOW() - INTERVAL '7 days'
+        WHERE g.recorded_at >= NOW() - INTERVAL '7 days' AND dr.archived = FALSE
         ORDER BY g.recorded_at DESC
         LIMIT 50
         "#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         {
             Ok(rows) => rows
@@ -1663,25 +1711,57 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
 
     // NAN-5424: rules whose executions fail (e.g. matched events PostgreSQL
     // refuses) — the same predicate as the rule-health API.
-    let failing_rules_total = crate::detection::health::count_failing_rules(pool)
+    let failing_rules_total = crate::detection::health::count_failing_rules(&mut *conn)
         .await
         .unwrap_or_else(|e| {
             warn!("Failed to count failing detection rules: {}", e);
             0
         });
     let currently_failing_rules_total =
-        crate::detection::health::count_currently_failing_rules(pool)
+        crate::detection::health::count_currently_failing_rules(&mut *conn)
             .await
             .unwrap_or_else(|e| {
                 warn!("Failed to count currently failing detection rules: {}", e);
                 0
             });
-    let failing_rules = crate::detection::health::list_failing_rules(pool, 20)
+    let failing_rules = crate::detection::health::list_failing_rules(&mut *conn, 20)
         .await
         .unwrap_or_else(|e| {
             warn!("Failed to list failing detection rules: {}", e);
             vec![]
         });
+
+    // NAN-5826: Live/Alerting scheduled rules with no cron. The scheduler's
+    // claim requires one, so they never run.
+    let unscheduled_rules_total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM detection_rules \
+         WHERE archived = FALSE AND detection_mode = 'scheduled' \
+           AND mode IN ('live', 'alerting') \
+           AND (schedule_cron IS NULL OR btrim(schedule_cron) = '')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or_else(|e| {
+        warn!("Failed to count unscheduled detection rules: {}", e);
+        0
+    });
+    let unscheduled_rules: Vec<String> = if unscheduled_rules_total > 0 {
+        sqlx::query_scalar(
+            "SELECT name FROM detection_rules \
+             WHERE archived = FALSE AND detection_mode = 'scheduled' \
+               AND mode IN ('live', 'alerting') \
+               AND (schedule_cron IS NULL OR btrim(schedule_cron) = '') \
+             ORDER BY name LIMIT 20",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to list unscheduled detection rules: {}", e);
+            vec![]
+        })
+    } else {
+        vec![]
+    };
 
     info!(
         "Collected detection metrics: {} enabled rules, {} stale, {} noisy, {} coverage gaps (7d), {} failing",
@@ -1704,6 +1784,8 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         failing_rules,
         failing_rules_total,
         currently_failing_rules_total,
+        unscheduled_rules,
+        unscheduled_rules_total,
     }
 }
 
@@ -2002,6 +2084,10 @@ fn build_ext_usage_sql(logs_table: &str, ocsf: bool, scope: &ScopeSet) -> String
 mod migration_refresh_tests;
 
 #[cfg(test)]
+#[path = "detection_metrics_archived_tests.rs"]
+mod detection_metrics_archived_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2114,7 +2200,7 @@ mod tests {
     #[test]
     fn every_extracted_logs_scan_uses_the_canonical_scope_predicate() {
         let restricted = scope(&["Insider_Threat", "audit"]);
-        let expected = source_scope_sql_predicate("source_type", restricted.deny_set()).unwrap();
+        let expected = source_scope_bound_predicate("source_type", restricted.deny_set()).unwrap();
 
         for (name, sql) in [
             ("ingestion", build_ingestion_sql("logs", &restricted)),
@@ -2141,7 +2227,7 @@ mod tests {
         ] {
             assert!(
                 sql.contains(&expected),
-                "{name} must use canonical source_scope_sql_predicate, got:\n{sql}"
+                "{name} must use the canonical bound scope predicate, got:\n{sql}"
             );
             assert!(
                 sql.contains("source_type != ''"),
@@ -2203,8 +2289,7 @@ mod tests {
         .expect("seed allowed, denied, audit, and unresolved partitions");
 
         let restricted = scope(&["insider_threat", "audit"]);
-        let result = ch
-            .query(&build_ingestion_sql(&table, &restricted))
+        let result = bind_source_scope(ch.query(&build_ingestion_sql(&table, &restricted)), restricted.deny_set())
             .fetch_all::<(String, u64, u64)>()
             .await
             .expect("execute production ingestion query");

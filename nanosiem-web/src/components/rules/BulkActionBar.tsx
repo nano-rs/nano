@@ -3,6 +3,7 @@
 // NAN-482 — floating pill shown when rows are selected.
 
 import { CheckCircle2, MinusCircle, Tag, Download, Trash2, X } from 'lucide-react';
+import { useLiftToasts } from '@/lib/toast-lift';
 
 interface BulkActionBarProps {
   count: number;
@@ -25,6 +26,8 @@ export function BulkActionBar({
   onClear,
   disabled,
 }: BulkActionBarProps) {
+  // NAN-5834: bottom-center toasts move above this bar while it is up.
+  useLiftToasts();
   return (
     <div
       role="toolbar"

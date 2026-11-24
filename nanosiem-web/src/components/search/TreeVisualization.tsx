@@ -25,6 +25,7 @@ import {
 import { cn } from '@/lib/utils';
 import { SEMANTIC_FIELDS } from '@/lib/schema-fields';
 import { parseTimestampAsUTC } from '@/lib/parse-timestamp-utc';
+import { Term } from '@/components/ui/term';
 
 // ─────────────────────────── public types ───────────────────────────
 
@@ -519,7 +520,7 @@ function TreeRow({
               className="inline-flex items-center px-1 rounded text-[9.5px] font-semibold uppercase tracking-wide"
               style={{ color: AMBER, background: 'oklch(72% 0.14 80 / 0.10)' }}
             >
-              lolbin
+              <Term id="lolbin">lolbin</Term>
             </span>
           )}
           {isUnsigned && (
@@ -661,7 +662,7 @@ function TreeDetail({
                       : undefined
                   }
                 >
-                  prevalence <span className="tabular-nums">{display.prevHostCount}</span>{' '}
+                  <Term id="prevalence">prevalence</Term> <span className="tabular-nums">{display.prevHostCount}</span>{' '}
                   {display.prevHostCount === 1 ? 'host' : 'hosts'}
                 </span>
               )}

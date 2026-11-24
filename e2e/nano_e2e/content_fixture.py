@@ -200,7 +200,22 @@ tags:
 # Validate signed content delivery
 
 /query: source_type = 'nan4955_fixture'
-"""
+""",
+            # NAN-5755: a hunt too, so the acceptance suite can prove hunts reach
+            # the library on their own and land disabled.
+            "hunts/nan5755_fixture_hunt.md": b"""---
+kind: hunt
+title: NAN-5755 Signed Content Fixture Hunt
+category: network
+tags:
+  - nan5755
+---
+# NAN-5755 Signed Content Fixture Hunt
+
+/query: per parent domain: distinct names
+  from: dns_logs
+  window: 24h
+""",
         }
     if channel == "enrichments.main":
         return {

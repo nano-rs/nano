@@ -116,6 +116,9 @@ pub enum AuditSource {
     /// Playbook repository events (first-party registration, scheduled sync)
     /// — NAN-4947.
     PlaybookRepo,
+    /// Response playbook library events (create, edit, archive, delete, fork,
+    /// review, promote, per-role ACL) — NAN-5786.
+    Playbook,
     /// System settings events (melod, retention, risk, tiering, AI providers)
     Settings,
     /// Risk score events (clear entity, clear all)
@@ -172,6 +175,7 @@ impl std::fmt::Display for AuditSource {
             Self::ParserRepo => write!(f, "parser_repo"),
             Self::RuleRepo => write!(f, "rule_repo"),
             Self::PlaybookRepo => write!(f, "playbook_repo"),
+            Self::Playbook => write!(f, "playbook"),
             Self::Settings => write!(f, "settings"),
             Self::Risk => write!(f, "risk"),
             Self::Lookup => write!(f, "lookup"),

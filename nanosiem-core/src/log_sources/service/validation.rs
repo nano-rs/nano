@@ -78,7 +78,8 @@ fn build_live_sample_sql(
         )
     };
     let scope_and =
-        crate::search::service::source_scope_sql_predicate("source_type", scope.deny_set())
+        // NAN-5793: bound; the live-sample read binds `scope.deny_set()`.
+        crate::search::service::source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|p| format!(" AND {p}"))
             .unwrap_or_default();
     format!(
@@ -446,7 +447,7 @@ impl LogSourceService {
             sample: String,
         }
 
-        let query = ch_client.query(&sql).with_setting(
+        let query = crate::search::service::bind_source_scope(ch_client.query(&sql), scope.deny_set()).with_setting(
             "max_execution_time",
             LIVE_SAMPLE_MAX_EXECUTION_TIME_SECS.to_string(),
         );
@@ -548,7 +549,7 @@ mod tests {
         // ordinary "no events found for this source" error, indistinguishable
         // from an allowed-but-idle source (no existence oracle).
         let sql = build_live_sample_sql(Udm, "nanosiem.logs", "audit", 10, &deny(&["audit"]));
-        assert!(sql.contains("lower(source_type) != 'audit'"), "got: {sql}");
+        assert!(sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"), "got: {sql}");
         // The requested source is still bound literally — the deny predicate is
         // ANDed on top rather than replacing the caller's filter.
         assert!(sql.contains("source_type = 'audit'"), "got: {sql}");
@@ -609,7 +610,7 @@ mod tests {
             "SELECT if(raw_data != '', raw_data, message) AS sample FROM ocsf_logs \
              WHERE lower(source_type) = 'windows_sysmon' \
              AND timestamp >= now() - INTERVAL 24 HOUR AND (raw_data != '' OR message != '') \
-             AND lower(source_type) != 'audit' ORDER BY timestamp DESC LIMIT 10"
+             AND lower(source_type) NOT IN {nano_source_deny:Array(String)} ORDER BY timestamp DESC LIMIT 10"
         );
         assert!(!sql.to_uppercase().contains("PREWHERE"), "{sql}");
         let evil = build_live_sample_sql(Ocsf, "ocsf_logs", "a'b", 1, &ScopeSet::unrestricted());
@@ -693,7 +694,11 @@ mod tests {
             10,
             &deny(&[&source]),
         );
-        let rows: Vec<SampleRow> = client.query(&denied).fetch_all().await.expect("scoped read");
+        let rows: Vec<SampleRow> =
+            crate::search::service::bind_source_scope(client.query(&denied), deny(&[&source]).deny_set())
+                .fetch_all()
+                .await
+                .expect("scoped read");
         assert!(rows.is_empty(), "a denied source returned raw samples");
     }
 

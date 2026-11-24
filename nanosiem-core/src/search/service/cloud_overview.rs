@@ -13,7 +13,7 @@
 //! UI's empty-state fallbacks don't mask real failures in log dashboards —
 //! same rule we learned porting NAN-393.
 
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::{source_scope_bound_predicate, SourceScopedClient};
 use super::SearchService;
 use crate::auth::ScopeSet;
 use crate::extensions::CloudRiskProvider;
@@ -368,7 +368,7 @@ impl SearchService {
     /// `signals` (it does NOT go through the nPL source-scope injection), so
     /// the caller's `ScopeSet` is threaded down here and its deny-set
     /// exclusion is ANDed into EVERY subquery's scan (see
-    /// [`source_scope_sql_predicate`]). An empty deny set emits nothing —
+    /// [`source_scope_bound_predicate`]). An empty deny set emits nothing —
     /// byte-identical SQL to the pre-scoping form.
     pub async fn query_cloud_overview(
         &self,
@@ -397,6 +397,9 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok(CloudOverview::default()),
         };
+        // NAN-5793: every query binds the caller's deny list as the
+        // server-side parameter `scope_and` references.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start);
         let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end);
@@ -483,14 +486,14 @@ impl SearchService {
         // every hand-built logs scan below (both the mapped and the zero-row
         // fallback query shapes, so a future schema change can't silently drop
         // the gate). The anomalies join reads logs through the `l` alias, so
-        // it gets its own alias-qualified rendering. No bind values — the
-        // predicate is rendered inline — so `extra_bind`'s placeholder
-        // accounting is untouched. `None` (unrestricted) splices an empty
+        // it gets its own alias-qualified rendering. NAN-5793: the deny list
+        // is a server-side parameter (bound by the scoped client), not a `?`
+        // bind, so `extra_bind`'s placeholder accounting is untouched. `None` (unrestricted) splices an empty
         // string: byte-identical SQL to the pre-scoping form.
-        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+        let scope_and = source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|pred| format!("\n              AND {pred}"))
             .unwrap_or_default();
-        let anomaly_scope_and = source_scope_sql_predicate("l.source_type", scope.deny_set())
+        let anomaly_scope_and = source_scope_bound_predicate("l.source_type", scope.deny_set())
             .map(|pred| format!("\n              AND {pred}"))
             .unwrap_or_default();
 

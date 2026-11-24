@@ -66,7 +66,14 @@ describe('dashboard edit actions', () => {
       ['dashboards.add_panel', ['dashboards:edit', 'search:execute'], true],
       ['dashboards.edit_panel', ['dashboards:edit', 'search:execute'], true],
     ]);
-    expect(dashboardEditActions(target(), { canEdit: false })).toEqual([]);
+    expect(all.every((a) => a.available?.() === true)).toBe(true);
+    // NAN-5637: a non-owner's page still registers them, withheld, so pivt
+    // refuses "add a panel" instead of redirecting to the builder.
+    const withheld = dashboardEditActions(target(), { canEdit: false });
+    expect(withheld.map((a) => [a.name, a.available?.()])).toEqual([
+      ['dashboards.add_panel', false],
+      ['dashboards.edit_panel', false],
+    ]);
   });
 
   it('add_panel binds the dashboard version, previews the query read-only, then saves with expected_updated_at', async () => {

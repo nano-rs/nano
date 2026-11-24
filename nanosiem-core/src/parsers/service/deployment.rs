@@ -91,36 +91,46 @@ impl ParserService {
     /// NAN-2304: same effective-deployed set as `render_to_vector_config` and
     /// as `LogSourceService`, so boot, enable/disable, and publication all
     /// generate identical config from identical inputs.
-    pub async fn deploy_to_vector(&self) -> Result<(), ParserServiceError> {
+    pub async fn deploy_to_vector(&self) -> Result<Vec<crate::parsers::UnroutableParser>, ParserServiceError> {
         let mut parsers = self.repository().list_effective_deployed().await?;
         // NAN-2126: resolve every fetch parser to its source-configuration.
-        // Missing/orphaned bindings fail closed before config generation.
+        // NAN-5789: a missing/orphaned binding leaves THAT parser out of the
+        // render, never the whole render; it is reported (note on the source,
+        // High health condition when it is enabled) and returned.
         crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut parsers)
             .await
             .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
         self.vector_config.deploy_and_reload(&parsers).await?;
         self.record_render_quarantine(&parsers).await;
-        Ok(())
+        Ok(crate::parsers::unrouted::report(
+            &self.pool,
+            &self.vector_config,
+            &parsers,
+            crate::parsers::unrouted::ReportMode::BINDINGS,
+        )
+        .await)
     }
 
     /// NAN-5564 release review (P2-2): the api's boot render, which also
     /// releases the single-node Vector pipeline gate. One broken parser must
-    /// never leave ingest refused: when the strict render cannot run (an
-    /// orphaned fetch binding, a claim collision, a parser that fails the
-    /// guard), the tree is rendered WITHOUT the broken parsers and the
-    /// pipeline identity is recorded, and each left-out parser is logged as an
-    /// error. Returns the names of the left-out parsers.
+    /// never leave ingest refused: when the strict render cannot run (a claim
+    /// collision, a parser that fails the guard), the tree is rendered WITHOUT
+    /// the broken parsers and the pipeline identity is recorded, and each
+    /// left-out parser is logged as an error. Returns the names of the
+    /// left-out parsers. NAN-5789: that includes every ENABLED fetch source
+    /// left out for want of a source configuration, on the happy path too
+    /// (those no longer fail the render).
     pub async fn deploy_to_vector_at_boot(&self) -> Result<Vec<String>, ParserServiceError> {
         let strict = self.deploy_to_vector().await;
         let strict_error = match strict {
-            Ok(()) => {
+            Ok(unrouted) => {
                 // The tree is written: make the marker name this api's
                 // identity (NAN-5611: untouched when it already does).
                 self.vector_config
                     .rewrite_pipeline_identity()
                     .await
                     .map_err(VectorConfigError::from)?;
-                return Ok(Vec::new());
+                return Ok(live_names(&unrouted));
             }
             Err(error) => error,
         };
@@ -132,23 +142,26 @@ impl ParserService {
         tracing::error!(error = %strict_error, "Vector pipeline render failed; rendering without the parsers that cannot be rendered so ingest is not refused");
         let mut parsers = self.repository().list_effective_deployed().await?;
         // Unresolvable fetch parsers keep no route and are left out of the tree.
-        crate::parsers::resolve_parser_dispatch_routes_lenient(&self.pool, &mut parsers)
+        crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut parsers)
             .await
             .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
-        let mut left_out: Vec<String> = parsers
-            .iter()
-            .filter(|p| p.enabled && p.kind != "enrichment" && p.dispatch_source_config_id.is_some() && p.dispatch_route_name.is_none())
-            .map(|p| p.name.clone())
-            .collect();
         let (kept, skipped) = self.vector_config.renderable_subset(&parsers);
-        left_out.extend(skipped);
-        left_out.sort();
-        left_out.dedup();
-        for name in &left_out {
+        for name in &skipped {
             tracing::error!(parser = %name, "parser left out of the Vector config: it cannot be rendered (fix or disable it, then deploy it again)");
         }
         let result = self.vector_config.deploy_and_reload(&kept).await;
         self.record_render_quarantine(&kept).await;
+        let unrouted = crate::parsers::unrouted::report(
+            &self.pool,
+            &self.vector_config,
+            &parsers,
+            crate::parsers::unrouted::ReportMode::BINDINGS,
+        )
+        .await;
+        let mut left_out = live_names(&unrouted);
+        left_out.extend(skipped);
+        left_out.sort();
+        left_out.dedup();
         match result {
             Ok(()) => {
                 self.vector_config
@@ -186,6 +199,11 @@ impl ParserService {
         let _deploy_guard = self.vector_config.lock_deploys().await;
 
         let parser = self.repository().find_by_id(parser_id).await?;
+        // NAN-5789: the same binding check as a log-source deploy (exists,
+        // same type). A route that is not deployed yet is reported below,
+        // from the tree.
+        self.ensure_binding(&parser.kind, &parser.source_type, parser.dispatch_source_config_id, false)
+            .await?;
         // Redact secrets at the source — `config_snapshot` is persisted to
         // `log_source_deployments` and returned by GET /api/log-sources/{id}/deployments
         // (gated only on `log_sources:view`). The on-disk Vector TOML written
@@ -273,9 +291,36 @@ impl ParserService {
         }
 
         // Stamp dispatch_route_name on every parser bound to a source-config.
+        // NAN-5789: another source without a usable binding is left out of
+        // the render; THIS one is refused, since deploying it would put
+        // nothing live.
         crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut all_parsers)
             .await
             .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
+        let declared = self.vector_config.declared_source_config_routes().await;
+        let unroutable = crate::parsers::unrouted::classify(&all_parsers, Some(&declared));
+        if let Some(target) = unroutable.iter().find(|u| u.id == parser_id) {
+            let error_msg = target.note.clone();
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Deploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    Some(&config_snapshot),
+                )
+                .await;
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: error_msg,
+                validation_result: None,
+                deployment_id: None,
+                delivery: None,
+            });
+        }
 
         // Stage all enabled parsers including this one
         if let Err(e) = self.vector_config.stage_parsers(&all_parsers).await {
@@ -565,4 +610,12 @@ impl ParserService {
             .get_deployment_history(parser_id, limit)
             .await?)
     }
+}
+
+/// The names of the ENABLED sources in `unrouted` (the ones whose ingest
+/// stopped), sorted.
+fn live_names(unrouted: &[crate::parsers::UnroutableParser]) -> Vec<String> {
+    let mut names: Vec<String> = unrouted.iter().filter(|u| u.enabled).map(|u| u.name.clone()).collect();
+    names.sort();
+    names
 }

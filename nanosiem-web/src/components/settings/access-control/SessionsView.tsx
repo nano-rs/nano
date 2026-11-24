@@ -156,7 +156,7 @@ export function SessionsView() {
             />
           </div>
           <div className="text-[12.5px] text-muted-foreground ml-2">
-            Active sessions across users and API clients. Revoking ends a session immediately.
+            Revoking ends a session immediately.
           </div>
           <div className="flex-1" />
           {canRevoke && (

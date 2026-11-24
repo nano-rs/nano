@@ -62,6 +62,21 @@ fn env_num<T: FromStr>(name: &str, default: T) -> Result<T, String> {
     }
 }
 
+/// PostgreSQL pool size and the feed concurrency it supports (NAN-5822).
+///
+/// Each running feed holds one connection and the runner needs two more for
+/// claims and bookkeeping, capped at 32. `PG_MAX_CONNECTIONS` (sized from the
+/// PostgreSQL memory budget) caps the pool too, and the concurrency comes
+/// down with it so runs never wait on connections the cap took away.
+fn connector_pool_size(requested_concurrent: usize, pg_cap: Option<u32>) -> (u32, usize) {
+    let wanted = (requested_concurrent.max(1) as u32 + 2).min(32);
+    let pool = match pg_cap {
+        Some(cap) => wanted.min(cap.max(3)),
+        None => wanted,
+    };
+    (pool, requested_concurrent.max(1).min(pool as usize - 2))
+}
+
 fn main() -> ExitCode {
     // NAN-5214: one rustls provider for PostgreSQL TLS (see tls_provider).
     nanosiem_core::db::tls_provider::install_default_crypto_provider();
@@ -166,10 +181,22 @@ async fn serve() -> Result<(), String> {
         tracing::info!(seccomp = %report.seccomp, cgroup = %report.cgroup, "VRL sandbox self-test passed");
     }
 
-    let max_concurrent: usize = env_num("CONNECTOR_MAX_CONCURRENT", 4usize)?.max(1);
+    let requested_concurrent: usize = env_num("CONNECTOR_MAX_CONCURRENT", 4usize)?.max(1);
+    let pg_cap: Option<u32> = env("PG_MAX_CONNECTIONS")
+        .map(|v| v.trim().parse::<u32>().map_err(|_| "PG_MAX_CONNECTIONS is invalid".to_string()))
+        .transpose()?;
+    let (pool_size, max_concurrent) = connector_pool_size(requested_concurrent, pg_cap);
+    if max_concurrent < requested_concurrent {
+        tracing::warn!(
+            requested = requested_concurrent,
+            max_concurrent,
+            pool_size,
+            "CONNECTOR_MAX_CONCURRENT exceeds what PG_MAX_CONNECTIONS allows; running fewer feeds at once"
+        );
+    }
     let pool = PgPoolOptions::new()
         .min_connections(0)
-        .max_connections((max_concurrent as u32 + 2).min(32))
+        .max_connections(pool_size)
         .acquire_timeout(Duration::from_secs(30))
         .connect(&database_url)
         .await
@@ -228,4 +255,22 @@ async fn serve() -> Result<(), String> {
     };
     runner.run_until(shutdown).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod pool_size_tests {
+    use super::connector_pool_size;
+
+    #[test]
+    fn pg_max_connections_caps_the_pool_and_the_concurrency() {
+        // No cap: concurrency + 2, at most 32.
+        assert_eq!(connector_pool_size(2, None), (4, 2));
+        assert_eq!(connector_pool_size(64, None), (32, 30));
+        // The sized cap wins over a raised CONNECTOR_MAX_CONCURRENT.
+        assert_eq!(connector_pool_size(30, Some(4)), (4, 2));
+        assert_eq!(connector_pool_size(2, Some(20)), (4, 2));
+        // A cap too small for one run still leaves one run and its two extras.
+        assert_eq!(connector_pool_size(8, Some(1)), (3, 1));
+        assert_eq!(connector_pool_size(0, Some(2)), (3, 1));
+    }
 }

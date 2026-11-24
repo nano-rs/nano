@@ -5,6 +5,7 @@
 // don't yet expose from the API render a visible "STUB" marker so they surface
 // in review — see PR body for the list of unwired pieces.
 
+import { Term } from '@/components/ui/term';
 import { useMemo } from 'react';
 import { readSchemaFieldString } from '@/lib/schema-fields';
 import { Link } from 'react-router-dom';
@@ -299,7 +300,7 @@ export function MatchesHero({
               <>
                 <span className="text-muted-foreground/60">·</span>
                 <span>
-                  lookback: <span className="text-foreground">{rule.lookback_minutes}m</span>
+                  <Term id="rule-lookback">lookback</Term>: <span className="text-foreground">{rule.lookback_minutes}m</span>
                 </span>
               </>
             )}
@@ -385,7 +386,7 @@ export function MatchesHero({
                           ? 'var(--success)'
                           : 'var(--muted-foreground)',
                   }}
-                  title={`Today vs avg of last 14 days (${baselineDelta.pct >= 0 ? '+' : ''}${baselineDelta.pct.toFixed(0)}%)`}
+                  title={`Today compared with the daily average of the last 14 days (${baselineDelta.pct >= 0 ? '+' : ''}${baselineDelta.pct.toFixed(0)}%)`}
                 >
                   {baselineDelta.direction === 'up' && <ArrowUpRight className="w-3 h-3" strokeWidth={2} />}
                   {baselineDelta.direction === 'down' && <ArrowDownRight className="w-3 h-3" strokeWidth={2} />}
@@ -397,7 +398,7 @@ export function MatchesHero({
               ) : (
                 <span className="text-muted-foreground/60">—</span>
               )}
-              <span>vs 14-day baseline · last 28 days</span>
+              <span>vs 14-day <Term id="match-baseline">baseline</Term> · last 28 days</span>
             </div>
             <div className="mt-2.5 flex items-end gap-2">
               <HeatStrip28 data={activity28d} height={18} />
@@ -461,7 +462,7 @@ export function MatchesHero({
               <span className="text-[26px] font-semibold text-foreground tabular-nums leading-none">
                 {alertRate}
               </span>
-              <span className="text-[11px] text-muted-foreground">% alert rate</span>
+              <span className="text-[11px] text-muted-foreground">% <Term id="alert-rate">alert rate</Term></span>
             </div>
             <div className="mt-2 flex flex-col gap-1.5 text-[10.5px] font-mono">
               <div className="flex items-center justify-between">
@@ -469,9 +470,9 @@ export function MatchesHero({
                 <span className="text-foreground tabular-nums" data-testid="matches-alerts-generated">{alertsGenerated}</span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">Disposition FP</span>
+                <span className="text-muted-foreground"><Term id="fp-disposition">Disposition FP</Term></span>
                 {fpDisplay ? (
-                  <span className="text-foreground tabular-nums" title="False positives over the last 28 days">
+                  <span className="text-foreground tabular-nums" title="Matches marked false positive in the last 28 days">
                     {fpDisplay.count}
                     {fpDisplay.pct !== null && (
                       <span className="text-muted-foreground"> ({fpDisplay.pct}%)</span>
@@ -482,7 +483,7 @@ export function MatchesHero({
                 )}
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">Mean time to detect</span>
+                <span className="text-muted-foreground"><Term id="mttd">Mean time to detect</Term></span>
                 {mttd ? (
                   <LatencyPill latency={mttd} />
                 ) : (

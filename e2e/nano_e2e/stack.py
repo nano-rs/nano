@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -37,16 +38,16 @@ class Stack:
     vector_http_url: str
     otlp_http_url: str
     vector_metrics_url: str
-    api_key: str
+    api_key: str = field(repr=False)
     admin_email: str
-    admin_password: str
+    admin_password: str = field(repr=False)
     run_dir: Path
     artifact_dir: Path
     runner: Path
     vector_dynamic_dir: Path
     ch_url: str
     ch_admin_user: str
-    ch_admin_password: str
+    ch_admin_password: str = field(repr=False)
     # "own": a throwaway stack the runner brought up. "existing": a stack it did
     # not create (nano_e2e.target, NAN-5586): no restarts, no ClickHouse admin.
     target: str = "own"
@@ -123,21 +124,33 @@ class Stack:
         self, action: str, service: str, timeout: float = 300, env: dict[str, str] | None = None
     ) -> None:
         """Restart/stop/start/kill a stack service through the runner (same seam in
-        native and docker app mode). `env` adds runner knobs for this call only
-        (e.g. E2E_SEARCH_CH_LAUNCH=app-user, native mode)."""
+        native and docker app mode). `env` applies for this call only: runner
+        knobs (E2E_*, e.g. E2E_SEARCH_CH_LAUNCH=app-user, native mode) and app
+        settings. Native processes inherit app settings; in docker/image mode
+        the runner recreates the container with them (E2E_SVC_APP_ENV names
+        them, NAN-5878), and a later call without them restores the template.
+        Returns once the service answers its health check."""
         if self.target == "existing":
             raise RuntimeError("E2E-INFRA: an existing target's services are not the harness's to restart")
         if action not in {"restart", "stop", "start", "kill"}:
             raise ValueError(action)
         if service not in {"api", "search", "jobs", "vector"}:
             raise ValueError(service)
+        app_keys = [k for k in (env or {}) if not k.startswith("E2E_")]
+        for k in app_keys:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+                raise ValueError(f"svc env name {k!r} is not a plain identifier")
         proc = subprocess.run(  # noqa: S603 - fixed argv, validated values
             [str(self.runner), "svc", action, service, "--run", self.run_id],
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
-            env={**os.environ, **(env or {})},
+            env={
+                **os.environ,
+                **(env or {}),
+                "E2E_SVC_APP_ENV": " ".join(app_keys),
+            },
         )
         if proc.returncode != 0:
             raise RuntimeError(

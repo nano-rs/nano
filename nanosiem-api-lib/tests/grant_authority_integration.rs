@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 fn stale_auth(user_id: Uuid) -> AuthContext {
     let claims = TokenClaims {
+        sid: None,
         iss: DEFAULT_TOKEN_ISSUER.to_string(),
         aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
         sub: user_id,
@@ -347,6 +348,7 @@ async fn insert_api_key(pool: &PgPool, id: Uuid, owner: Uuid, suffix: Uuid, perm
 /// the key OWNER (for FK/audit attribution) and `api_key_id` is the key itself.
 fn api_key_auth(owner: Uuid, api_key_id: Uuid, perms: &[&str]) -> AuthContext {
     let claims = TokenClaims {
+        sid: None,
         iss: DEFAULT_TOKEN_ISSUER.to_string(),
         aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
         sub: owner,

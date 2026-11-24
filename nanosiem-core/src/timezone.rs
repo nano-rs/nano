@@ -488,6 +488,125 @@ fn parse_offset_to_hours(offset: &str) -> f64 {
     sign * (hours + minutes / 60.0)
 }
 
+/// NAN-5839: the longest log-source timezone accepted (the longest IANA name
+/// is 32 characters).
+pub const SOURCE_TIMEZONE_MAX_LEN: usize = 64;
+
+/// NAN-5839: fixed offsets that are not a whole hour: every one a real zone
+/// uses (standard or daylight time). The parsers (parsers#87 `source_tz.vrl`)
+/// apply any `±HH:MM` as a millisecond shift; this list keeps the setting to
+/// offsets a device can actually run at. Kept in step with the web picker
+/// (`nanosiem-web/src/lib/source-timezones.ts`).
+pub const FRACTIONAL_SOURCE_OFFSETS: &[&str] = &[
+    "-09:30", "-03:30", "-02:30", "+03:30", "+04:30", "+05:30", "+05:45", "+06:30", "+08:45",
+    "+09:30", "+10:30", "+12:45", "+13:45",
+];
+
+/// NAN-5839: validate and normalize a log source's timezone setting.
+///
+/// The value reaches every event of the source as `.nano.source_timezone`
+/// and the parsers use it only for a timestamp that carries no offset or zone
+/// of its own. Accepted forms:
+///
+/// * empty or `UTC` (any case): the default, stored as `"UTC"`;
+/// * an IANA zone name known to chrono-tz (the zone database VRL uses), any
+///   case, stored in its canonical spelling (`america/new_york` →
+///   `America/New_York`);
+/// * a fixed offset `±HH:MM` or `±HHMM`, stored as `±HH:MM`: a whole hour
+///   from `-12:00` to `+14:00`, or one of [`FRACTIONAL_SOURCE_OFFSETS`].
+///   `+00:00` is stored as `"UTC"`.
+///
+/// The error is a message for the operator.
+pub fn normalize_source_timezone(input: &str) -> Result<String, String> {
+    let value = input.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("UTC") {
+        return Ok("UTC".to_string());
+    }
+    if value.len() > SOURCE_TIMEZONE_MAX_LEN {
+        return Err(format!(
+            "Invalid timezone: longer than {SOURCE_TIMEZONE_MAX_LEN} characters"
+        ));
+    }
+    if let Some(offset) = normalize_fixed_offset(value)? {
+        return Ok(offset);
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
+    {
+        return Err(format!(
+            "Invalid timezone '{value}': use an IANA name such as America/New_York or an offset such as -05:00"
+        ));
+    }
+    if let Ok(tz) = value.parse::<chrono_tz::Tz>() {
+        return Ok(tz.name().to_string());
+    }
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .find(|tz| tz.name().eq_ignore_ascii_case(value))
+        .map(|tz| tz.name().to_string())
+        .ok_or_else(|| {
+            format!(
+                "Invalid timezone '{value}': not an IANA timezone name (for example America/New_York) or an offset (for example -05:00)"
+            )
+        })
+}
+
+/// `Ok(None)` when `value` is not shaped like an offset at all.
+fn normalize_fixed_offset(value: &str) -> Result<Option<String>, String> {
+    let bytes = value.as_bytes();
+    let sign = match bytes.first() {
+        Some(b'+') => '+',
+        Some(b'-') => '-',
+        _ => return Ok(None),
+    };
+    let digits: String = value[1..].chars().filter(|c| *c != ':').collect();
+    let shaped = digits.len() == 4
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && (value.len() == 5 || (value.len() == 6 && bytes[3] == b':'));
+    if !shaped {
+        // `+foo` / `-1` are not zone names either.
+        return Err(format!(
+            "Invalid timezone offset '{value}': use ±HH:MM, for example -05:00 or +05:30"
+        ));
+    }
+    let hours: u32 = digits[..2].parse().unwrap_or(99);
+    let minutes: u32 = digits[2..].parse().unwrap_or(99);
+    if hours == 0 && minutes == 0 {
+        return Ok(Some("UTC".to_string()));
+    }
+    let normalized = format!("{sign}{hours:02}:{minutes:02}");
+    let max_hours = if sign == '+' { 14 } else { 12 };
+    let valid = if minutes == 0 {
+        hours <= max_hours
+    } else {
+        FRACTIONAL_SOURCE_OFFSETS.contains(&normalized.as_str())
+    };
+    if valid {
+        Ok(Some(normalized))
+    } else if minutes == 0 {
+        Err(format!(
+            "Invalid timezone offset '{value}': whole-hour offsets run from -12:00 to +14:00"
+        ))
+    } else {
+        Err(format!(
+            "Invalid timezone offset '{value}': no zone uses it; the fractional offsets are {}, or use the IANA zone name",
+            FRACTIONAL_SOURCE_OFFSETS.join(", ")
+        ))
+    }
+}
+
+/// NAN-5839: the value the generated Vector config injects as
+/// `.nano.source_timezone`, or `None` when nothing is injected: the default
+/// (UTC, where the parsers already fall back) or a stored value that does not
+/// validate (a row written before validation, or around it). An unvalidated
+/// value never reaches the generated config.
+pub fn source_timezone_for_injection(stored: &str) -> Option<String> {
+    normalize_source_timezone(stored)
+        .ok()
+        .filter(|tz| tz != "UTC")
+}
+
 /// Get all timezone options grouped by region for the UI
 pub fn get_timezone_options() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
     let mut regions: std::collections::BTreeMap<&str, Vec<(&str, &str)>> =
@@ -566,5 +685,87 @@ mod tests {
         assert!((parse_offset_to_hours("+0530") - 5.5).abs() < 0.01);
         assert!((parse_offset_to_hours("+0000") - 0.0).abs() < 0.01);
         assert!((parse_offset_to_hours("+1300") - 13.0).abs() < 0.01);
+    }
+
+    // NAN-5839: the log-source timezone setting.
+    #[test]
+    fn source_timezone_default_and_utc_spellings() {
+        for v in ["", "  ", "UTC", "utc", "+00:00", "-0000", "+0000"] {
+            assert_eq!(normalize_source_timezone(v).as_deref(), Ok("UTC"), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn source_timezone_iana_names_are_canonicalized() {
+        assert_eq!(normalize_source_timezone("America/New_York").unwrap(), "America/New_York");
+        assert_eq!(normalize_source_timezone(" america/new_york ").unwrap(), "America/New_York");
+        assert_eq!(normalize_source_timezone("Asia/Kolkata").unwrap(), "Asia/Kolkata");
+        // Every zone chrono-tz (and so VRL) knows is accepted, not only the
+        // legacy short list.
+        assert_eq!(
+            normalize_source_timezone("America/Argentina/Buenos_Aires").unwrap(),
+            "America/Argentina/Buenos_Aires"
+        );
+        assert_eq!(normalize_source_timezone("Etc/GMT+5").unwrap(), "Etc/GMT+5");
+    }
+
+    #[test]
+    fn source_timezone_fixed_offsets() {
+        assert_eq!(normalize_source_timezone("-05:00").unwrap(), "-05:00");
+        assert_eq!(normalize_source_timezone("-0500").unwrap(), "-05:00");
+        assert_eq!(normalize_source_timezone("+14:00").unwrap(), "+14:00");
+        assert_eq!(normalize_source_timezone("-12:00").unwrap(), "-12:00");
+        for v in FRACTIONAL_SOURCE_OFFSETS {
+            assert_eq!(normalize_source_timezone(v).unwrap(), *v);
+        }
+        assert_eq!(normalize_source_timezone("+0545").unwrap(), "+05:45");
+    }
+
+    #[test]
+    fn source_timezone_rejects_what_the_parsers_cannot_convert() {
+        for v in [
+            "Mars/Olympus_Mons",
+            "-13:00",
+            "+15:00",
+            "+01:30", // no zone runs at it
+            "+05:15",
+            "+5",
+            "+05:3",
+            "+05-30",
+            "America/New York",
+            "America/New_York'''",
+            "${CLICKHOUSE_PASSWORD}",
+            "UTC\n[sinks.x]",
+        ] {
+            assert!(normalize_source_timezone(v).is_err(), "{v:?} must be refused");
+        }
+        assert!(normalize_source_timezone(&"A".repeat(65)).is_err());
+    }
+
+    /// The web picker always offers these (current IANA spellings that
+    /// browsers list under a legacy alias); the server must accept them, and
+    /// the aliases browsers list too.
+    #[test]
+    fn source_timezone_accepts_the_picker_spellings() {
+        for zone in [
+            "Asia/Ho_Chi_Minh", "Asia/Yangon", "Europe/Kyiv", "America/Argentina/Buenos_Aires",
+            "Atlantic/Faroe", "Pacific/Chuuk", "Pacific/Pohnpei", "Pacific/Kanton", "America/Nuuk",
+            "Asia/Kathmandu", "Asia/Kolkata", "Asia/Calcutta", "Asia/Katmandu", "Asia/Saigon",
+            "Europe/Kiev", "Asia/Tehran",
+        ] {
+            assert_eq!(normalize_source_timezone(zone).as_deref(), Ok(zone), "{zone}");
+        }
+    }
+
+    #[test]
+    fn source_timezone_injection_skips_default_and_invalid() {
+        assert_eq!(source_timezone_for_injection("UTC"), None);
+        assert_eq!(source_timezone_for_injection(""), None);
+        assert_eq!(source_timezone_for_injection("Bogus/Zone"), None);
+        assert_eq!(
+            source_timezone_for_injection("america/new_york").as_deref(),
+            Some("America/New_York")
+        );
+        assert_eq!(source_timezone_for_injection("+0530").as_deref(), Some("+05:30"));
     }
 }

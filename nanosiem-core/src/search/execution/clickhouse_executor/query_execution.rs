@@ -39,7 +39,9 @@ impl ClickHouseExecutor {
                     "Typed query failed: {} - falling back to dynamic",
                     error_str
                 );
-                crate::search::search_error_from_error(&e)
+                // NAN-5817: expected and recovered from (the caller falls
+                // back to the dynamic decoder); not a rejection to report.
+                crate::search::classify_clickhouse_failure(&e)
             })?;
 
         debug!("Successfully fetched {} rows from ClickHouse", rows.len());
@@ -94,9 +96,9 @@ impl ClickHouseExecutor {
                     break;
                 }
                 Err(e) => {
-                    let error_str = e.to_string();
-                    tracing::error!("Error reading ClickHouse response chunk: {}", error_str);
-                    return Err(crate::search::search_error_from_error(&e));
+                    let parsed = crate::search::search_error_from_error(&e);
+                    log_chunk_read_failure(&parsed, &e);
+                    return Err(parsed);
                 }
             }
         }
@@ -257,9 +259,9 @@ impl ClickHouseExecutor {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    let error_str = e.to_string();
-                    tracing::error!("Error reading ClickHouse response chunk: {}", error_str);
-                    return Err(crate::search::search_error_from_error(&e));
+                    let parsed = crate::search::search_error_from_error(&e);
+                    log_chunk_read_failure(&parsed, &e);
+                    return Err(parsed);
                 }
             }
         }
@@ -355,9 +357,9 @@ impl ClickHouseExecutor {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    let error_str = e.to_string();
-                    tracing::error!("Error reading ClickHouse response chunk: {}", error_str);
-                    return Err(crate::search::search_error_from_error(&e));
+                    let parsed = crate::search::search_error_from_error(&e);
+                    log_chunk_read_failure(&parsed, &e);
+                    return Err(parsed);
                 }
             }
         }
@@ -518,5 +520,17 @@ impl ClickHouseExecutor {
         }
 
         Some(json)
+    }
+}
+
+/// NAN-5817: an internal chunk-read failure logs at ERROR with the raw text. A
+/// query rejection was already reported by `search_error_from_error` (ERROR
+/// for generated SQL, nothing for the caller's own); the caller logs it again
+/// with context, so it stays at DEBUG here.
+pub(super) fn log_chunk_read_failure(parsed: &SearchError, raw: &dyn std::fmt::Display) {
+    if parsed.is_internal() {
+        tracing::error!(error = %parsed, raw = %raw, "Error reading ClickHouse response chunk");
+    } else {
+        tracing::debug!(error = %parsed, raw = %raw, "Error reading ClickHouse response chunk");
     }
 }

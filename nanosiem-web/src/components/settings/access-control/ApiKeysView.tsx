@@ -55,6 +55,7 @@ import { formatUTC, formatRelativeCompact } from '@/lib/date-utils';
 import { CreateApiKeyDialog } from './CreateApiKeyDialog';
 import { EditApiKeyDialog } from './EditApiKeyDialog';
 import { CallVolumeChart } from './CallVolumeChart';
+import { Term } from '@/components/ui/term';
 
 type DerivedStatus = 'active' | 'expiring' | 'unused' | 'revoked';
 
@@ -241,11 +242,11 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
         {/* Scopes */}
         <div>
           <div className="flex items-center gap-2 mb-2">
-            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">Scopes</div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium"><Term id="api-key-scope">Scopes</Term></div>
             <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums">{apiKey.permissions.length}</span>
           </div>
           {apiKey.permissions.length === 0 ? (
-            <div className="text-[11.5px] text-muted-foreground">No scopes — this key cannot call any APIs.</div>
+            <div className="text-[11.5px] text-muted-foreground">No scopes, so this key cannot call anything.</div>
           ) : (
             <div className="flex flex-wrap gap-1.5">
               {apiKey.permissions.map(p => {
@@ -274,9 +275,8 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
           <div className="rounded-md border border-yellow-500/25 bg-yellow-500/5 p-3 flex items-center gap-3">
             <AlertCircle className="w-[13px] h-[13px] text-yellow-500 shrink-0" />
             <div className="flex-1 text-[11.5px] text-foreground/80">
-              Legacy key with no owner. Its scopes cannot follow an owner&apos;s role changes, and
-              ownerless keys stop working in v2.1. Replace it with a key created by the account that
-              should own it.
+              This older key has no owner, so its scopes do not change when roles change. Keys with no owner
+              stop working in v2.1. Replace it with a key made by the person who should own it.
             </div>
           </div>
         )}
@@ -286,7 +286,7 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
           <div className="rounded-md border border-yellow-500/25 bg-yellow-500/5 p-3 flex items-center gap-3">
             <AlertCircle className="w-[13px] h-[13px] text-yellow-500 shrink-0" />
             <div className="flex-1 text-[11.5px] text-foreground/80">
-              This key has never been used. Consider revoking it to reduce attack surface.
+              Never used. Consider revoking it.
             </div>
           </div>
         )}
@@ -354,8 +354,8 @@ function OwnerClampNotice({ withheld }: { withheld: string[] }) {
       <div className="flex-1 min-w-0 text-[11.5px] text-foreground/80">
         <div>
           {withheld.length} scope{withheld.length === 1 ? '' : 's'}{' '}
-          {enforced ? 'withheld' : 'not held by the owner (audit mode — still granted)'}: the key&apos;s
-          owner no longer holds {withheld.length === 1 ? 'it' : 'them'}.
+          {enforced ? 'turned off' : 'still allowed for now (audit mode)'}: the key&apos;s owner no longer
+          has {withheld.length === 1 ? 'that permission' : 'those permissions'}.
         </div>
         <div className="mt-1.5 flex flex-wrap gap-1.5">
           {withheld.map(p => (
@@ -369,7 +369,7 @@ function OwnerClampNotice({ withheld }: { withheld: string[] }) {
         </div>
         {canSwitch && mode && (
           <div className="mt-2 flex items-center gap-2 text-[10.5px] text-muted-foreground">
-            <span className="font-mono">owner clamp: {mode}</span>
+            <span className="font-mono" title="A key never gets more than its owner has. Audit mode only logs it.">owner limit: {mode}</span>
             <button
               type="button"
               onClick={toggle}
@@ -393,13 +393,13 @@ interface RevealOnceCardProps {
 function RevealOnceCard({ secret, onDismiss }: RevealOnceCardProps) {
   const [copied, setCopied] = useState(false);
   return (
-    <div className="m-5 rounded-md border border-yellow-500/40 bg-yellow-500/5 p-4">
+    <div className="m-5 rounded-md border border-yellow-500/40 bg-yellow-500/5 p-4" data-testid="api-key-reveal-card">
       <div className="flex items-start gap-3">
         <AlertCircle className="w-[14px] h-[14px] text-yellow-500 shrink-0 mt-0.5" />
         <div className="flex-1">
-          <div className="text-[13px] font-medium text-foreground">New API key — copy it now</div>
+          <div className="text-[13px] font-medium text-foreground">New API key: copy it now</div>
           <div className="text-[11.5px] text-muted-foreground mt-1">
-            This is the only time you'll see the full key. Store it somewhere safe; we don't keep a copy.
+            Shown only once. Store it somewhere safe; nano keeps no copy.
           </div>
           <div className="mt-3 rounded-md border border-border bg-card p-2 flex items-center gap-2 font-mono text-[11.5px] text-foreground break-all">
             <span className="flex-1" data-testid="api-key-reveal">{secret.key}</span>
@@ -678,7 +678,7 @@ export function ApiKeysView() {
         description={
           <>
             Revoke <span className="text-foreground font-medium">{pendingRevoke?.name}</span>? This
-            is reversible — you can re-enable the key from its detail panel.
+            can be undone: turn the key back on from its detail panel.
           </>
         }
         confirmLabel="Revoke"
@@ -721,7 +721,7 @@ export function ApiKeysView() {
           <div className="px-5 py-4 text-[11.5px] text-foreground/80 leading-relaxed">
             A new secret will be issued for{' '}
             <span className="text-foreground font-medium">{pendingRotate?.name}</span>.
-            {' '}The old secret stops working immediately. You'll see the new secret once — copy it before dismissing.
+            {' '}The old secret stops working immediately. The new one is shown once; copy it before dismissing.
           </div>
           <AlertDialogFooter className="border-t border-border px-5 py-3 flex flex-row items-center gap-2 sm:justify-end space-x-0">
             <AlertDialogCancel className="h-7 text-[11.5px] mt-0">Cancel</AlertDialogCancel>

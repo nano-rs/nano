@@ -106,6 +106,11 @@ pub struct ClickHouseExecutor {
     /// such as `sum(` must not flip a raw query into the full-window
     /// `count(*) OVER ()` path.
     aggregation_override: Option<bool>,
+    /// NAN-5793: the caller's lowercased source-scope deny list, bound on
+    /// every query as the server-side `nano_source_deny` parameter that
+    /// hand-built SQL from `source_scope_bound_predicate` references. `None`
+    /// (the default) binds nothing.
+    source_deny: Option<Vec<String>>,
 }
 
 impl ClickHouseExecutor {
@@ -115,6 +120,7 @@ impl ClickHouseExecutor {
             client,
             lift_max_query_size: false,
             aggregation_override: None,
+            source_deny: None,
         }
     }
 
@@ -127,6 +133,17 @@ impl ClickHouseExecutor {
             client: self.client.clone(),
             lift_max_query_size: true,
             aggregation_override: Some(aggregation),
+            source_deny: self.source_deny.clone(),
+        }
+    }
+
+    /// NAN-5793: this executor binding `deny_set` as the source-scope
+    /// parameter on every query, for hand-built SQL carrying
+    /// `source_scope_bound_predicate`. An empty set binds nothing.
+    pub(crate) fn with_source_scope(&self, deny_set: &std::collections::BTreeSet<String>) -> Self {
+        Self {
+            source_deny: crate::search::service::source_scope_param_values(deny_set),
+            ..self.clone()
         }
     }
 
@@ -155,7 +172,10 @@ impl ClickHouseExecutor {
     /// that), so the data query, its count companion, the pagination wrappers
     /// and streaming all carry the same limit.
     pub(crate) fn sized_query(&self, sql: &str) -> clickhouse::query::Query {
-        let query = self.client.query(sql);
+        let mut query = self.client.query(sql);
+        if let Some(deny) = &self.source_deny {
+            query = query.param(crate::search::service::SOURCE_SCOPE_DENY_PARAM, deny);
+        }
         if !self.lift_max_query_size {
             return query;
         }

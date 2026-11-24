@@ -46,7 +46,7 @@ export function LogSourcesPageHeader({
   children,
 }: {
   icon: ComponentType<{ className?: string; strokeWidth?: number }>;
-  title: string;
+  title: ReactNode;
   actions?: ReactNode;
   meta?: ReactNode;
   children?: ReactNode;

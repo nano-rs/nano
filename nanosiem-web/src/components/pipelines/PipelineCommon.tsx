@@ -98,7 +98,7 @@ export function PipelinePageHeader({
   meta,
   actions,
 }: {
-  title: string;
+  title: ReactNode;
   meta?: ReactNode;
   actions?: ReactNode;
 }) {

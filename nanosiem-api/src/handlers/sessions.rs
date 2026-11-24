@@ -113,7 +113,7 @@ pub async fn list_all_sessions(
 
     let sessions = state
         .session_service
-        .get_all_sessions(limit, offset)
+        .get_all_sessions(limit, offset, auth.claims.sid)
         .await
         .map_err(|e| {
             let (status, err) = SessionApiError::from_service_error(&e);
@@ -133,6 +133,9 @@ pub async fn list_all_sessions(
 }
 
 /// List current user's sessions
+///
+/// The caller's own session is flagged `is_current: true`; its `id` can be
+/// passed to `DELETE /api/sessions/{id}` to end just that session.
 ///
 /// Requirements: 7.4 - Allow users to view and terminate their own sessions
 ///
@@ -161,8 +164,10 @@ pub async fn list_my_sessions(
     // Users can always view their own sessions, no permission check needed
     let user_id = auth.user_id();
 
-    // Get the current session ID from the JWT claims (jti)
-    let current_session_id = Some(auth.claims.jti);
+    // NAN-5578: the caller's session is the access token's `sid` claim. `jti`
+    // is per access token and never matches a session id. A token minted
+    // before `sid` existed marks no session as current until it refreshes.
+    let current_session_id = auth.claims.sid;
 
     let sessions = state
         .session_service
@@ -221,7 +226,7 @@ pub async fn get_session(
         ));
     }
 
-    let is_current = auth.claims.jti == *id;
+    let is_current = auth.claims.sid == Some(*id);
 
     Ok(Json(SessionResponse {
         session,

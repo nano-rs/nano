@@ -34,6 +34,7 @@ import { SettingsSubsectionShell, type SubsectionTab } from '@/components/settin
 import { DiskUsageNotice } from '@/components/DiskSpaceBanner';
 import { StatGrid, type StatCell } from '@/components/settings/StatGrid';
 import { StorageTieringPanel } from '@/enterprise/components/settings/StorageTieringPanel';
+import { Term } from '@/components/ui/term';
 
 type StorageTabId = 'clickhouse' | 'postgres';
 const TAB_IDS: StorageTabId[] = ['clickhouse', 'postgres'];
@@ -47,7 +48,7 @@ const TABS: SubsectionTab<StorageTabId>[] = [
     id: 'clickhouse',
     label: 'ClickHouse · Logs',
     icon: Zap,
-    desc: 'Time-series log storage. Daily partitions; retention set below or with NANO_RETENTION_DAYS; optional hot/cold tiering to object storage.',
+    desc: 'Where events are stored, how long they are kept, and optional cold storage.',
   },
   {
     id: 'postgres',
@@ -155,7 +156,7 @@ export function RetentionSettings() {
                   icon={Archive}
                   iconColor="text-cyan-400"
                   title="How retention works"
-                  body="Events are partitioned by day. ClickHouse deletes whole days once they are older than the retention above. The disk still caps it: when ClickHouse passes the high watermark and no cold tier is configured, the oldest days are dropped first, whatever the retention. With a cold tier, older parts move to object storage and the retention applies there too. A deployment can also set retention with NANO_RETENTION_DAYS (.env) or nano.retention.days (Helm); a new value there replaces the one set here on the next deploy."
+                  body="nano deletes each whole day of events once it is older than the retention, in the cold tier too. If the disk gets too full and there is no cold tier, the oldest days go first. A value set at install (NANO_RETENTION_DAYS or nano.retention.days) replaces this one on the next deploy."
                 />
               </>
             ) : overview?.clickhouse_enabled ? (
@@ -163,14 +164,14 @@ export function RetentionSettings() {
                 icon={Database}
                 iconColor="text-yellow-400"
                 title="No log data yet"
-                body="ClickHouse is enabled but no log data has been ingested yet. Start sending logs to see storage statistics here."
+                body="No logs ingested yet."
               />
             ) : (
               <HelperNote
                 icon={Database}
                 iconColor="text-muted-foreground"
                 title="ClickHouse not configured"
-                body="ClickHouse is not enabled for this deployment. Log storage is using PostgreSQL."
+                body="Log storage is using PostgreSQL."
               />
             )}
           </div>
@@ -182,7 +183,7 @@ export function RetentionSettings() {
               icon={Database}
               iconColor="text-primary"
               title="Metadata storage"
-              body="PostgreSQL stores metadata: detection rules, alerts, dashboards, saved searches, parser configurations, and AI settings. Log telemetry lives in ClickHouse for query performance."
+              body="Rules, alerts, dashboards, saved searches, parsers and AI settings. Logs live in ClickHouse."
             />
           </div>
         </div>
@@ -276,7 +277,7 @@ export function RetentionPanel({
           <Clock className="w-4 h-4 text-cyan-400 shrink-0" />
           <div className="min-w-0">
             <p className="text-[12.5px] font-medium text-foreground">
-              Event retention{' '}
+              <Term id="event-retention">Event retention</Term>{' '}
               <span className="font-mono" data-testid="retention-current">
                 {current != null ? `${current} days` : 'unknown'}
               </span>
@@ -420,7 +421,7 @@ function DiskPressurePanel({ status }: { status: DiskPressureStatus }) {
         <div className="flex items-center gap-2.5 min-w-0">
           <Gauge className={`w-4 h-4 ${level.text} shrink-0`} />
           <div className="min-w-0">
-            <p className="text-[12.5px] font-medium text-foreground">Disk pressure</p>
+            <p className="text-[12.5px] font-medium text-foreground"><Term id="disk-pressure">Disk pressure</Term></p>
             <p className="font-mono text-[10.5px] text-muted-foreground mt-0.5">
               {formatBytes(status.used_bytes)} of {formatBytes(status.total_bytes)} used ({usagePct}%)
             </p>
@@ -603,10 +604,8 @@ function IngestionPausePanel({
         title="Pause ingestion?"
         description={
           <>
-            Every ingest path stops within seconds. HTTP, HEC and OTLP senders get{' '}
-            <span className="text-foreground font-medium font-mono">503</span> with Retry-After and keep their
-            data; Vector holds what it already accepted; pull feeds stop pulling. Nothing is written until you
-            resume.
+            nano stops taking in events within seconds. Senders are told to retry later and keep their data,
+            and pull feeds stop pulling. Nothing is stored until you resume.
           </>
         }
         confirmLabel="Pause ingestion"
@@ -628,8 +627,8 @@ function IngestionPausePanel({
         title="Resume ingestion?"
         description={
           status.source === 'manual'
-            ? 'Senders retrying their refused requests and buffered events are delivered.'
-            : 'This lifts an automatic disk-pressure pause. If disk usage is still at the emergency level, it pauses again on the next check.'
+            ? 'Senders resend the events they held back, and nano stores them.'
+            : 'nano paused intake because the disk was almost full. If it is still that full, intake pauses again at the next check.'
         }
         confirmLabel="Resume ingestion"
         loading={busy}

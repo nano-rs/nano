@@ -566,9 +566,6 @@ export function Dashboards() {
             </span>
           </div>
           <div className="text-[22px] font-semibold text-foreground tracking-[-0.01em]">Dashboards</div>
-          <div className="text-[12.5px] text-muted-foreground mt-1">
-            Browse, open, and create monitoring dashboards across your stack.
-          </div>
         </div>
         <div className="flex items-center gap-2 pt-1">
           <Button variant="outline" size="sm" className="h-[30px]" onClick={() => refetch()}>
@@ -738,7 +735,7 @@ export function Dashboards() {
           <DialogHeader>
             <DialogTitle>Delete dashboard</DialogTitle>
             <DialogDescription className="text-muted-foreground">
-              Are you sure you want to delete &ldquo;{dashboardToDelete?.name}&rdquo;? This action cannot be undone.
+              Delete &ldquo;{dashboardToDelete?.name}&rdquo;? This cannot be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -805,9 +802,6 @@ function EmptyState({
       <div className="text-center">
         <LayoutDashboard className="w-10 h-10 mx-auto text-muted-foreground/40 mb-3" />
         <div className="text-[13px] text-foreground font-medium">No dashboards yet</div>
-        <div className="text-[11.5px] text-muted-foreground mt-1">
-          Create a dashboard to visualize your security data.
-        </div>
       </div>
       {canCreate && (
         <div
@@ -825,9 +819,6 @@ function EmptyState({
               <Plus className="w-[16px] h-[16px]" />
             </div>
             <div className="text-[13px] font-semibold text-foreground">Blank canvas</div>
-            <div className="text-[11px] text-muted-foreground text-center">
-              Start with an empty dashboard and add panels manually.
-            </div>
           </button>
           {showAi && (
             <button
@@ -839,9 +830,6 @@ function EmptyState({
                 <PivtIcon className="w-[16px] h-[16px]" />
               </div>
               <div className="text-[13px] font-semibold text-foreground">Generate with pivt</div>
-              <div className="text-[11px] text-muted-foreground text-center">
-                Describe what you need; pivt builds the panels for you.
-              </div>
             </button>
           )}
         </div>

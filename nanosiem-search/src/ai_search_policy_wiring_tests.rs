@@ -169,6 +169,7 @@ async fn refusal_is_attributed_to_the_member_and_client_ip() {
 
     let member = Uuid::now_v7();
     let session = AuthContext::from_jwt(TokenClaims {
+        sid: None,
         iss: "t".into(),
         aud: "t".into(),
         sub: member,

@@ -10,14 +10,19 @@
  * browser on its own: the user copies, downloads or emails the report. With
  * the air-gap toggle on (default on air-gapped installs) only copy and
  * download are offered.
+ *
+ * NAN-5857: renders as a right-side flyout (DetailSheet) with no scrim, so the
+ * page being reported on stays in view. The context is snapshotted when the
+ * flyout opens (the host unmounts it on close), so it always describes the
+ * page the user opened it from.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Bug, Check, Copy, Download, ExternalLink, LifeBuoy, Mail } from 'lucide-react';
 import { toast } from 'sonner';
 
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
+import { DetailSheet } from '@/components/ui/detail-sheet';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
@@ -172,167 +177,41 @@ export function SupportDialog({
   };
 
   const canSend = whatHappened.trim().length > 0;
+  const whatHappenedRef = useRef<HTMLTextAreaElement>(null);
+
+  const title = kind === 'bug' ? 'Report a bug' : 'Get support';
 
   return (
-    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="flex max-h-[90vh] w-[calc(100vw-32px)] max-w-[680px] flex-col gap-0 overflow-hidden p-0">
-        <div className="border-b border-border px-4 py-3">
-          <DialogTitle className="text-[13px] font-semibold">
-            {kind === 'bug' ? 'Report a bug' : 'Get support'}
-          </DialogTitle>
-          <DialogDescription className="mt-0.5 text-[11.5px] text-muted-foreground">
-            {airgap
-              ? 'Nothing is sent automatically. Review the report, then copy or download it.'
-              : 'Nothing is sent automatically. Review it here, then submit it on app.nano.rs (or copy, download or email it).'}
-          </DialogDescription>
-          <div className="mt-2 inline-flex rounded-md border border-border p-0.5" role="tablist" aria-label="Request type">
-            {(['bug', 'support'] as const).map((k) => (
-              <button
-                key={k}
-                role="tab"
-                aria-selected={kind === k}
-                onClick={() => onKindChange(k)}
-                className={cn(
-                  'flex h-6 items-center gap-1.5 rounded px-2 text-[11.5px]',
-                  kind === k ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground',
-                )}
-              >
-                {k === 'bug' ? <Bug className={ICON} strokeWidth={1.5} /> : <LifeBuoy className={ICON} strokeWidth={1.5} />}
-                {k === 'bug' ? 'Report a bug' : 'Get support'}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
-          {kind === 'support' && (
-            <div className="space-y-1">
-              <span className={LABEL}>Severity</span>
-              <div className="flex flex-wrap gap-1" role="radiogroup" aria-label="Severity">
-                {SUPPORT_SEVERITIES.map((s) => (
-                  <button
-                    key={s.value}
-                    role="radio"
-                    aria-checked={severity === s.value}
-                    onClick={() => setSeverity(s.value)}
-                    className={cn(
-                      'flex h-6 items-center gap-1.5 rounded-md border px-2 text-[11.5px]',
-                      severity === s.value
-                        ? 'border-foreground/30 bg-accent text-foreground'
-                        : 'border-border text-muted-foreground hover:text-foreground',
-                    )}
-                  >
-                    <span className="font-mono text-[10.5px]">{s.value}</span>
-                    {s.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          <label className="block space-y-1">
-            <span className={LABEL}>What happened <span className="text-destructive">*</span></span>
-            <Textarea
-              autoFocus
-              rows={3}
-              className={FIELD}
-              value={whatHappened}
-              onChange={(e) => setWhatHappened(e.target.value)}
-              placeholder={kind === 'bug'
-                ? 'Steps, and the exact error or status code you saw'
-                : 'What you are trying to do, and where you are stuck'}
-            />
-          </label>
-          <label className="block space-y-1">
-            <span className={LABEL}>{kind === 'bug' ? 'What did you expect' : 'What do you need'}</span>
-            <Textarea rows={2} className={FIELD} value={expected} onChange={(e) => setExpected(e.target.value)} />
-          </label>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <label className="block space-y-1">
-              <span className={LABEL}>When (with timezone; still happening?)</span>
-              <Input className="h-7 font-mono text-[11.5px]" value={when} onChange={(e) => setWhen(e.target.value)} />
-            </label>
-            <label className="block space-y-1">
-              <span className={LABEL}>Affected objects (exact names)</span>
-              <Input
-                className="h-7 font-mono text-[11.5px]"
-                value={affected}
-                onChange={(e) => setAffected(e.target.value)}
-                placeholder="rule: …, log source: …, dashboard: …"
-              />
-            </label>
-          </div>
-
-          <details className="rounded-md border border-border">
-            <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[11.5px] text-muted-foreground">
-              Attached context
-              <span className="ml-2 font-mono text-[10.5px]">
-                v{fullContext.appVersion} · {fullContext.edition} · {fullContext.failedCalls.length} failed calls ·{' '}
-                {fullContext.consoleErrors.length} console errors
-              </span>
-            </summary>
-            <div className="space-y-2 border-t border-border px-2.5 py-2">
-              <dl className="grid grid-cols-[96px_1fr] gap-x-2 gap-y-0.5 font-mono text-[10.5px]">
-                <dt className="text-muted-foreground">page</dt><dd className="break-all">{fullContext.route}</dd>
-                <dt className="text-muted-foreground">browser</dt><dd className="break-all">{fullContext.userAgent}</dd>
-                <dt className="text-muted-foreground">timezone</dt><dd>{fullContext.timezone}</dd>
-                <dt className="text-muted-foreground">collected</dt><dd>{fullContext.collectedAt}</dd>
-                {fullContext.installationId && (
-                  <><dt className="text-muted-foreground">installation</dt><dd>{fullContext.installationId}</dd></>
-                )}
-              </dl>
-              {fullContext.failedCalls.length > 0 && (
-                <table className="w-full font-mono text-[10.5px]">
-                  <thead className="text-left text-muted-foreground">
-                    <tr><th className="pr-2 font-normal">time</th><th className="pr-2 font-normal">status</th>
-                      <th className="pr-2 font-normal">endpoint</th><th className="font-normal">request id</th></tr>
-                  </thead>
-                  <tbody>
-                    {fullContext.failedCalls.slice().reverse().map((f, i) => (
-                      <tr key={`${f.at}-${i}`} className="h-5 align-top">
-                        <td className="whitespace-nowrap pr-2">{f.at.slice(11, 19)}</td>
-                        <td className={cn('pr-2', f.status >= 500 || f.status === 0 ? 'text-destructive' : '')}>
-                          {f.status || 'net'}
-                        </td>
-                        <td className="break-all pr-2">{f.method} {f.path}</td>
-                        <td className="break-all">{f.requestId ?? '–'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-              {fullContext.consoleErrors.length > 0 && (
-                <ul className="space-y-0.5 font-mono text-[10.5px]">
-                  {fullContext.consoleErrors.slice(-5).map((e, i) => (
-                    <li key={`${e.at}-${i}`} className="break-all"><span className="text-muted-foreground">{e.at.slice(11, 19)}</span> {e.message}</li>
-                  ))}
-                </ul>
-              )}
-              <p className="text-[11px] text-muted-foreground">
-                No request bodies, query strings, search results or event data are included.
-              </p>
-            </div>
-          </details>
-
-          <div className="space-y-1.5 rounded-md border border-border px-2.5 py-2">
-            <p className="text-[11.5px]">
-              Install, ingestion or performance problem? Run this on any host of the install and attach the
-              archive it prints (redacted, no event data; review it before sending):
-            </p>
-            {(['compose', 'helm'] as const).map((key) => (
-              <div key={key} className="flex items-center gap-2">
-                <span className="w-[72px] shrink-0 text-[11px] text-muted-foreground">{key === 'compose' ? 'Compose' : 'Kubernetes'}</span>
-                <code className="min-w-0 flex-1 truncate rounded border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10.5px]">
-                  {SUPPORT_BUNDLE_COMMANDS[key]}
-                </code>
-                <Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`Copy ${key} command`} onClick={() => void copyCommand(key)}>
-                  {copied === key ? <Check className={ICON} strokeWidth={1.5} /> : <Copy className={ICON} strokeWidth={1.5} />}
-                </Button>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2 border-t border-border px-4 py-2.5">
+    <DetailSheet
+      open
+      onOpenChange={(open) => { if (!open) onClose(); }}
+      size="md"
+      // The report is about the page behind it: keep that page in view.
+      scrim="none"
+      // A visible page invites clicks: only Esc and the X close it, so a stray
+      // click never throws the typed report away.
+      dismissOnOutsideClick={false}
+      // Start in "What happened", never on the header X: opened from the Help
+      // menu, the menu's focus scope defeats autoFocus and Radix would pick the
+      // first tabbable (Close), so Space or Enter would dismiss the flyout.
+      onOpenAutoFocus={(e) => { e.preventDefault(); whatHappenedRef.current?.focus(); }}
+      breadcrumb={['Help', title]}
+      icon={kind === 'bug' ? <Bug className={ICON} strokeWidth={1.5} /> : <LifeBuoy className={ICON} strokeWidth={1.5} />}
+      title={title}
+      description={airgap
+        ? 'Nothing is sent automatically. Review the report, then copy or download it.'
+        : 'Nothing is sent automatically. Review it here, then submit it on app.nano.rs (or copy, download or email it).'}
+      meta={
+        <>
+          <span>v{fullContext.appVersion}</span>
+          <span>{fullContext.edition}</span>
+          <span className="min-w-0 truncate" title={fullContext.route}>{fullContext.route}</span>
+        </>
+      }
+      data-testid="support-flyout"
+      bodyClassName="space-y-3"
+      footer={
+        <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
           <label className="mr-auto flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
             <Checkbox
               className="h-3.5 w-3.5"
@@ -362,14 +241,156 @@ export function SupportDialog({
               </Button>
             </>
           )}
+          {!airgap && feedback.truncated && (
+            <p className="basis-full text-right text-[11px] text-muted-foreground">
+              The app.nano.rs link carries a shortened report. Download the full report and attach it there.
+            </p>
+          )}
         </div>
-        {!airgap && feedback.truncated && (
-          <p className="border-t border-border px-4 py-1.5 text-[11px] text-muted-foreground">
-            The app.nano.rs link carries a shortened report (older errors dropped to fit a URL). Download the full
-            report and attach it there.
+      }
+    >
+      <div className="inline-flex rounded-md border border-border p-0.5" role="tablist" aria-label="Request type">
+        {(['bug', 'support'] as const).map((k) => (
+          <button
+            key={k}
+            role="tab"
+            aria-selected={kind === k}
+            onClick={() => onKindChange(k)}
+            className={cn(
+              'flex h-6 items-center gap-1.5 rounded px-2 text-[11.5px]',
+              kind === k ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {k === 'bug' ? <Bug className={ICON} strokeWidth={1.5} /> : <LifeBuoy className={ICON} strokeWidth={1.5} />}
+            {k === 'bug' ? 'Report a bug' : 'Get support'}
+          </button>
+        ))}
+      </div>
+      {kind === 'support' && (
+        <div className="space-y-1">
+          <span className={LABEL}>Severity</span>
+          <div className="flex flex-wrap gap-1" role="radiogroup" aria-label="Severity">
+            {SUPPORT_SEVERITIES.map((s) => (
+              <button
+                key={s.value}
+                role="radio"
+                aria-checked={severity === s.value}
+                onClick={() => setSeverity(s.value)}
+                className={cn(
+                  'flex h-6 items-center gap-1.5 rounded-md border px-2 text-[11.5px]',
+                  severity === s.value
+                    ? 'border-foreground/30 bg-accent text-foreground'
+                    : 'border-border text-muted-foreground hover:text-foreground',
+                )}
+              >
+                <span className="font-mono text-[10.5px]">{s.value}</span>
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <label className="block space-y-1">
+        <span className={LABEL}>What happened <span className="text-destructive">*</span></span>
+        <Textarea
+          ref={whatHappenedRef}
+          rows={3}
+          className={FIELD}
+          value={whatHappened}
+          onChange={(e) => setWhatHappened(e.target.value)}
+          placeholder={kind === 'bug'
+            ? 'Steps, and the exact error or status code you saw'
+            : 'What you are trying to do, and where you are stuck'}
+        />
+      </label>
+      <label className="block space-y-1">
+        <span className={LABEL}>{kind === 'bug' ? 'What did you expect' : 'What do you need'}</span>
+        <Textarea rows={2} className={FIELD} value={expected} onChange={(e) => setExpected(e.target.value)} />
+      </label>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <label className="block space-y-1">
+          <span className={LABEL}>When (with timezone; still happening?)</span>
+          <Input className="h-7 font-mono text-[11.5px]" value={when} onChange={(e) => setWhen(e.target.value)} />
+        </label>
+        <label className="block space-y-1">
+          <span className={LABEL}>Affected objects (exact names)</span>
+          <Input
+            className="h-7 font-mono text-[11.5px]"
+            value={affected}
+            onChange={(e) => setAffected(e.target.value)}
+            placeholder="rule: …, log source: …, dashboard: …"
+          />
+        </label>
+      </div>
+
+      <details className="rounded-md border border-border">
+        <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[11.5px] text-muted-foreground">
+          Attached context
+          <span className="ml-2 font-mono text-[10.5px]">
+            v{fullContext.appVersion} · {fullContext.edition} · {fullContext.failedCalls.length} failed calls ·{' '}
+            {fullContext.consoleErrors.length} console errors
+          </span>
+        </summary>
+        <div className="space-y-2 border-t border-border px-2.5 py-2">
+          <dl className="grid grid-cols-[96px_1fr] gap-x-2 gap-y-0.5 font-mono text-[10.5px]">
+            <dt className="text-muted-foreground">page</dt><dd className="break-all">{fullContext.route}</dd>
+            <dt className="text-muted-foreground">browser</dt><dd className="break-all">{fullContext.userAgent}</dd>
+            <dt className="text-muted-foreground">timezone</dt><dd>{fullContext.timezone}</dd>
+            <dt className="text-muted-foreground">collected</dt><dd>{fullContext.collectedAt}</dd>
+            {fullContext.installationId && (
+              <><dt className="text-muted-foreground">installation</dt><dd>{fullContext.installationId}</dd></>
+            )}
+          </dl>
+          {fullContext.failedCalls.length > 0 && (
+            <table className="w-full font-mono text-[10.5px]">
+              <thead className="text-left text-muted-foreground">
+                <tr><th className="pr-2 font-normal">time</th><th className="pr-2 font-normal">status</th>
+                  <th className="pr-2 font-normal">endpoint</th><th className="font-normal">request id</th></tr>
+              </thead>
+              <tbody>
+                {fullContext.failedCalls.slice().reverse().map((f, i) => (
+                  <tr key={`${f.at}-${i}`} className="h-5 align-top">
+                    <td className="whitespace-nowrap pr-2">{f.at.slice(11, 19)}</td>
+                    <td className={cn('pr-2', f.status >= 500 || f.status === 0 ? 'text-destructive' : '')}>
+                      {f.status || 'net'}
+                    </td>
+                    <td className="break-all pr-2">{f.method} {f.path}</td>
+                    <td className="break-all">{f.requestId ?? '–'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {fullContext.consoleErrors.length > 0 && (
+            <ul className="space-y-0.5 font-mono text-[10.5px]">
+              {fullContext.consoleErrors.slice(-5).map((e, i) => (
+                <li key={`${e.at}-${i}`} className="break-all"><span className="text-muted-foreground">{e.at.slice(11, 19)}</span> {e.message}</li>
+              ))}
+            </ul>
+          )}
+          <p className="text-[11px] text-muted-foreground">
+            No request bodies, query strings, search results or event data are included.
           </p>
-        )}
-      </DialogContent>
-    </Dialog>
+        </div>
+      </details>
+
+      <div className="space-y-1.5 rounded-md border border-border px-2.5 py-2">
+        <p className="text-[11.5px]">
+          Install, ingest or performance problem? Run this on any install host and attach the archive it
+          prints (redacted, no event data; review it before sending):
+        </p>
+        {(['compose', 'helm'] as const).map((key) => (
+          <div key={key} className="flex items-center gap-2">
+            <span className="w-[72px] shrink-0 text-[11px] text-muted-foreground">{key === 'compose' ? 'Compose' : 'Kubernetes'}</span>
+            <code className="min-w-0 flex-1 truncate rounded border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10.5px]">
+              {SUPPORT_BUNDLE_COMMANDS[key]}
+            </code>
+            <Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`Copy ${key} command`} onClick={() => void copyCommand(key)}>
+              {copied === key ? <Check className={ICON} strokeWidth={1.5} /> : <Copy className={ICON} strokeWidth={1.5} />}
+            </Button>
+          </div>
+        ))}
+      </div>
+    </DetailSheet>
   );
 }

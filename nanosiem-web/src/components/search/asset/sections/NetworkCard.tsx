@@ -77,7 +77,7 @@ export function NetworkCard({ network, onOpenTopDestinations, onStatClick }: Net
             value={0}
             label="LATERAL"
             disabled
-            title="Lateral-movement detection not yet wired"
+            title="Lateral movement count: coming soon"
           />
         </div>
 

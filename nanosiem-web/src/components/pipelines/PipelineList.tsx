@@ -8,6 +8,7 @@ import { formatUTC, formatUTCShort } from '@/lib/date-utils';
 import { PipelineLoading, PipelineNotice, PipelinePageHeader, PipelineStateBadge } from './PipelineCommon';
 import type { PipelineListProps } from './types';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 type Filter = 'all' | 'drafts' | 'steps' | 'vrl';
 const FILTER_LABELS: Record<Filter, string> = { all: 'All', drafts: 'Unpublished drafts', steps: 'Step plans', vrl: 'Plain VRL' };
@@ -24,12 +25,12 @@ export function PipelineList({ pipelines, loading, error, canCreate, onCreate, o
   return (
     <section className="flex h-full min-h-0 flex-col text-foreground">
       <PipelinePageHeader
-        title="Pipelines"
+        title={<Term id="pipeline">Pipelines</Term>}
         meta={
           <>
             <span>{pipelines.length} sources</span>
             <span>{pipelines.filter((pipeline) => pipeline.stepPlan).length} step plans</span>
-            <span>{pipelines.filter((pipeline) => pipeline.hasDraft).length} unpublished drafts</span>
+            <span>{pipelines.filter((pipeline) => pipeline.hasDraft).length} unpublished <Term id="source-draft">drafts</Term></span>
           </>
         }
         actions={
@@ -78,7 +79,7 @@ export function PipelineList({ pipelines, loading, error, canCreate, onCreate, o
         <div className="flex flex-col items-center justify-center gap-2 px-4 py-16 text-center">
           <p className="text-[13px] font-medium">No log sources yet</p>
           <p className="max-w-md text-[11.5px] text-muted-foreground">
-            Every log source has a pipeline: its parser as ordered steps. Onboard a source to start.
+            Each log source gets a pipeline.
           </p>
           {canCreate && <Button className="mt-2" onClick={onCreate}>Add source</Button>}
         </div>
@@ -118,7 +119,7 @@ export function PipelineList({ pipelines, loading, error, canCreate, onCreate, o
                   </td>
                   <td className="truncate px-2 font-mono text-[10.5px]">{pipeline.sourceType}</td>
                   <td className="px-2 font-mono text-[10.5px]">
-                    {pipeline.stepPlan ? <span>{pipeline.stepCount} step{pipeline.stepCount === 1 ? '' : 's'}</span> : <span className="text-muted-foreground">plain VRL</span>}
+                    {pipeline.stepPlan ? <span>{pipeline.stepCount} step{pipeline.stepCount === 1 ? '' : 's'}</span> : <span className="text-muted-foreground">plain <Term id="vrl">VRL</Term></span>}
                   </td>
                   <td className="px-2">
                     <PipelineStateBadge state={!pipeline.enabled ? 'disabled' : pipeline.deployed ? 'live' : 'not_deployed'} />

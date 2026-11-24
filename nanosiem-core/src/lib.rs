@@ -105,6 +105,8 @@ pub mod sql_hygiene;
 mod sql_interpolation_lint_tests;
 pub mod system_health;
 pub mod telemetry;
+// NAN-5798: opt-in Sentry error tracking (inert without a DSN).
+pub mod error_tracking;
 pub mod text_bounds;
 pub mod timezone;
 pub mod tuning;

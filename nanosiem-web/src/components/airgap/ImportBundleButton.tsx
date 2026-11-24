@@ -26,9 +26,11 @@ interface SyncResult {
   synced: number;
 }
 
-interface ImportBundleButtonProps {
+interface ImportBundleButtonProps<T extends SyncResult> {
   /** Uploads the bundle and resolves to the sync result. */
-  onUpload: (file: File) => Promise<SyncResult>;
+  onUpload: (file: File) => Promise<T>;
+  /** Success toast text; defaults to "N <noun> now available to import". */
+  describe?: (result: T) => string;
   /** What kind of items the bundle carries — used in copy ("12 parsers synced"). */
   noun: string;
   /** Called after a successful sync so the page can refetch its catalog query. */
@@ -36,12 +38,13 @@ interface ImportBundleButtonProps {
   className?: string;
 }
 
-export function ImportBundleButton({
+export function ImportBundleButton<T extends SyncResult>({
   onUpload,
+  describe,
   noun,
   onSynced,
   className,
-}: ImportBundleButtonProps) {
+}: ImportBundleButtonProps<T>) {
   const { toast } = useToast();
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -53,7 +56,9 @@ export function ImportBundleButton({
       const res = await onUpload(file);
       toast({
         title: 'Bundle synced',
-        description: `${res.synced} ${noun} now available to import (v${res.content_version}).`,
+        description: describe
+          ? describe(res)
+          : `${res.synced} ${noun} now available to import (v${res.content_version}).`,
       });
       onSynced();
     } catch (err) {

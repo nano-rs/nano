@@ -39,7 +39,7 @@ fn bearer() -> String {
     let auth = AuthState::from_jwt_secret(SECRET);
     let token = auth
         .token_service
-        .create_access_token(uuid::Uuid::now_v7(), vec!["Admin".into()])
+        .create_access_token_for_session(uuid::Uuid::now_v7(), vec!["Admin".into()], uuid::Uuid::now_v7())
         .expect("token");
     format!("Bearer {token}")
 }

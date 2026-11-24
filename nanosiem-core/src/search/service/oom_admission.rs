@@ -31,9 +31,10 @@ impl SearchService {
         time_range: &TimeRangeInput,
         dataset: crate::query::Dataset,
         query_id: &str,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<(), String> {
         let sites = oom_risk_sites(query);
-        self.admit_cost_gated_sites(&sites, time_range, dataset, query_id)
+        self.admit_cost_gated_sites(&sites, time_range, dataset, query_id, scope)
             .await
     }
 
@@ -48,6 +49,7 @@ impl SearchService {
         query: &Query,
         time_range: &TimeRangeInput,
         query_id: &str,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<(), String> {
         let Some(site) = prevalence_scan_site(query) else {
             return Ok(());
@@ -57,6 +59,7 @@ impl SearchService {
             time_range,
             crate::query::Dataset::Logs,
             query_id,
+            scope,
         )
         .await
     }
@@ -70,6 +73,7 @@ impl SearchService {
         time_range: &TimeRangeInput,
         dataset: crate::query::Dataset,
         query_id: &str,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<(), String> {
         let gated: Vec<_> = sites
             .iter()
@@ -114,7 +118,7 @@ impl SearchService {
                 Some((_, counted)) => *counted,
                 None => {
                     let counted = self
-                        .count_estimate_rows(executor, &estimate, &range, bounded, budget_rows, query_id)
+                        .count_estimate_rows(executor, &estimate, &range, bounded, budget_rows, query_id, scope)
                         .await
                         .map_err(|e| {
                             tracing::warn!(
@@ -142,6 +146,27 @@ impl SearchService {
         Ok(())
     }
 
+    /// The estimate's base SQL. NAN-5793 review: the estimate EXECUTES the
+    /// search's own subsearches (a `[dataset=risk …]` one reads findings), so
+    /// it is generated under the caller's deny-set like the search itself.
+    pub(super) fn estimate_sql(
+        &self,
+        estimate: &Query,
+        range: &TimeRange,
+        scope: &crate::auth::ScopeSet,
+    ) -> Result<String, String> {
+        let options = QueryOptions {
+            use_cache: false,
+            table_view: true,
+            limit: None,
+            unordered: true,
+            omit_settings: false,
+        };
+        self.sql_generator(crate::query::GeneratorScope::viewer(scope))
+            .generate_with_options(estimate, range, &options)
+            .map_err(|e| e.to_string())
+    }
+
     async fn count_estimate_rows(
         &self,
         executor: &crate::search::execution::ClickHouseExecutor,
@@ -150,18 +175,9 @@ impl SearchService {
         bounded: bool,
         budget_rows: u64,
         query_id: &str,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<u64, String> {
-        let options = QueryOptions {
-            use_cache: false,
-            table_view: true,
-            limit: None,
-            unordered: true,
-            omit_settings: false,
-        };
-        let sql = self
-            .ch_sql_generator
-            .generate_with_options(estimate, range, &options)
-            .map_err(|e| e.to_string())?;
+        let sql = self.estimate_sql(estimate, range, scope)?;
         // Bounded: stop reading one past the budget (NAN-1635's SELECT 1
         // wrap); unbounded: a filter-free count served from part metadata.
         let count_sql = if bounded {

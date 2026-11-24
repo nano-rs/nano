@@ -51,16 +51,25 @@ impl SourceType {
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "routed" | "http" => Some(Self::Routed),
+        // NAN-5789: the one alias table (`ingest_transport::canonical`).
+        // Push-only legacy labels (otlp, file, syslog, stdin) are not log
+        // source transports.
+        match crate::log_sources::ingest_transport::canonical(s)? {
+            "routed" => Some(Self::Routed),
             "kafka" => Some(Self::Kafka),
-            "aws_s3" | "aws_sqs" | "crowdstrike_fdr" | "s3" => Some(Self::AwsS3),
-            "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
+            "aws_s3" | "aws_sqs" | "crowdstrike_fdr" => Some(Self::AwsS3),
+            "gcp_pubsub" => Some(Self::GcpPubSub),
             "azure_event_hubs" => Some(Self::AzureEventHubs),
-            "splunk_hec" | "splunk" | "hec" => Some(Self::SplunkHec),
+            "splunk_hec" => Some(Self::SplunkHec),
             "vector" => Some(Self::Vector),
             _ => None,
         }
+    }
+
+    /// NAN-5789: a source of this type reads through a source configuration
+    /// (`dispatch_source_config_id`) and cannot render without one.
+    pub fn requires_source_configuration(&self) -> bool {
+        matches!(self, Self::Kafka | Self::AwsS3 | Self::GcpPubSub | Self::AzureEventHubs)
     }
 
     /// Get display label for UI
@@ -188,8 +197,14 @@ pub struct LogSource {
     #[serde(default = "default_namespace")]
     pub namespace: String,
 
-    /// IANA timezone for timestamps without offset info (e.g., "America/New_York")
+    /// NAN-5839: the timezone the source's device clock runs in, applied
+    /// ONLY to timestamps that carry no offset or zone of their own (an
+    /// inline offset always wins). An IANA name (`America/New_York`) or a
+    /// fixed offset (`-05:00`); `UTC` is the default. Injected at ingest as
+    /// `.nano.source_timezone` for the parser, so events are stored in true
+    /// UTC even when the device logs local time.
     #[serde(default = "default_utc")]
+    #[schema(example = "America/New_York")]
     pub timezone: String,
 
     // Parser routing
@@ -311,8 +326,14 @@ pub struct NewLogSource {
     /// Network namespace for identity resolution (e.g., "aws:123456789012:vpc-abc", "onprem:dc-east")
     #[serde(default = "default_namespace")]
     pub namespace: String,
-    /// IANA timezone for timestamps without offset info (e.g., "America/New_York")
+    /// NAN-5839: the timezone the source's device clock runs in, applied
+    /// ONLY to timestamps that carry no offset or zone of their own (an
+    /// inline offset always wins). An IANA name (`America/New_York`) or a
+    /// fixed offset (`-05:00`); `UTC` is the default. Injected at ingest as
+    /// `.nano.source_timezone` for the parser, so events are stored in true
+    /// UTC even when the device logs local time.
     #[serde(default = "default_utc")]
+    #[schema(example = "America/New_York")]
     pub timezone: String,
     pub source_type: String,
     pub parser_vrl: String,
@@ -366,7 +387,10 @@ pub struct UpdateLogSource {
     pub description: Option<String>,
     /// Network namespace for identity resolution
     pub namespace: Option<String>,
-    /// IANA timezone for timestamps without offset info
+    /// NAN-5839: the source's timezone for timestamps without an offset: an
+    /// IANA name or a fixed offset `±HH:MM`; `UTC` (or empty) resets it to the
+    /// default. Omit to leave it unchanged. Stored canonical.
+    #[schema(example = "America/New_York")]
     pub timezone: Option<String>,
     pub source_type: Option<String>,
     pub parser_vrl: Option<String>,

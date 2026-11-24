@@ -168,7 +168,8 @@ fn activity_sql_is_a_single_where_with_scope_on_the_raw_key() {
     let denied: BTreeSet<String> = ["secret_src".to_string()].into();
     let scoped = activity_sql("logs_per_source_5m_v2", "udm", 24, &ScopeSet::from_denied(denied), None);
     assert!(scoped.contains("scope_source_type_complete = 1"));
-    assert!(scoped.contains("secret_src"));
+    // NAN-5793: bound, never inlined.
+    assert!(!scoped.contains("secret_src") && scoped.contains("{nano_source_deny:Array(String)}"));
 }
 
 #[test]

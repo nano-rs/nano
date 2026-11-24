@@ -30,8 +30,10 @@ use nanosiem_core::audit::{
     LOG_SOURCE_DEPLOYED, LOG_SOURCE_DEPLOY_ALL, LOG_SOURCE_OCSF_UNATTESTED_PUBLISH,
     LOG_SOURCE_OCSF_UNATTESTED_SYSTEM_INSTALL,
     LOG_SOURCE_PUBLISHED, LOG_SOURCE_REVERTED,
-    LOG_SOURCE_TOGGLED, LOG_SOURCE_UNDEPLOYED, LOG_SOURCE_UPDATED,
+    LOG_SOURCE_MONITORING_CHANGED, LOG_SOURCE_TOGGLED, LOG_SOURCE_UNDEPLOYED, LOG_SOURCE_UPDATED,
 };
+use nanosiem_core::health::deleted_sources::{self, SourceRemoval};
+use nanosiem_core::system_health::SystemHealthEvent;
 use nanosiem_core::log_sources::{
     DeletedLogSource, LogSourceServiceError,
     DeploymentResult, IngestionHistoryPoint, LiveTestResult, LogSource, LogSourceDeployment,
@@ -117,8 +119,8 @@ pub async fn get_log_source(
     responses(
         (status = 200, description = "Log source created", body = LogSource),
         (status = 403, description = "Forbidden"),
-        (status = 400, description = "Bad request"),
-        (status = 422, description = "Validation failed — invalid timezone, namespace, source type, or match_field (NAN-2158: match_field names a SQL column and must contain only letters, digits, '_' and '.')"),
+        (status = 400, description = "Bad request. NAN-5789: a kafka, aws_s3, gcp_pubsub or azure_event_hubs source (drafts included) without an existing source configuration of its own type is refused with code SOURCE_CONFIGURATION_REQUIRED and `details.field_errors` naming `dispatch_source_config_id`", body = crate::error::ErrorResponse),
+        (status = 422, description = "Validation failed — invalid timezone (NAN-5839: an IANA name such as America/New_York, or a fixed offset ±HH:MM: whole hours -12:00 to +14:00, or a fractional offset a real zone uses such as +05:30 or -03:30), namespace, source type, or match_field (NAN-2158: match_field names a SQL column and must contain only letters, digits, '_' and '.')"),
     ),
     security(("api_key" = []))
 )]
@@ -137,13 +139,8 @@ pub async fn create_log_source(
         enforce_data_source_limit(&state).await?;
     }
 
-    // Validate timezone
-    if !nanosiem_core::timezone::is_valid_timezone(&request.timezone) {
-        return Err(ApiError::BadRequest(format!(
-            "Invalid timezone: {}",
-            request.timezone
-        )));
-    }
+    // NAN-5839: the timezone is validated and normalized by the service
+    // (IANA name or fixed offset), for every writer, not only this handler.
 
     // Validate namespace format
     if !nanosiem_core::namespace::is_valid_namespace(&request.namespace) {
@@ -197,8 +194,9 @@ async fn enforce_data_source_limit(state: &AppState) -> Result<(), ApiError> {
         (status = 200, description = "Log source updated", body = LogSource),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 400, description = "NAN-5789: the update would leave a kafka, aws_s3, gcp_pubsub or azure_event_hubs source without an existing source configuration of its own type, or a live one bound to an undeployed one (code SOURCE_CONFIGURATION_REQUIRED, `details.field_errors` names `dispatch_source_config_id`)", body = crate::error::ErrorResponse),
         (status = 409, description = "expected_updated_at is stale; reload before retrying"),
-        (status = 422, description = "Validation failed — invalid timezone, source type, normalize_vrl, or match_field (NAN-2158: match_field names a SQL column and must contain only letters, digits, '_' and '.')"),
+        (status = 422, description = "Validation failed — invalid timezone (NAN-5839: an IANA name or a fixed offset ±HH:MM, see create), source type, normalize_vrl, or match_field (NAN-2158: match_field names a SQL column and must contain only letters, digits, '_' and '.')"),
     ),
     security(("api_key" = []))
 )]
@@ -211,15 +209,42 @@ pub async fn update_log_source(
 ) -> Result<Json<LogSource>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_EDIT)?;
 
-    // Validate timezone if provided
-    if let Some(ref tz) = request.timezone {
-        if !nanosiem_core::timezone::is_valid_timezone(tz) {
-            return Err(ApiError::BadRequest(format!("Invalid timezone: {}", tz)));
-        }
-    }
+    // NAN-5839: a provided timezone is validated and normalized by the service.
 
+    // NAN-5785: judged on the actual transition (the stored state before vs
+    // after), so a no-op or repeated update flags and audits nothing, and one
+    // request flags at most once (disabling wins over stale alerting off).
+    let before = state.log_source_service.get(*id).await?;
     let log_source = state.log_source_service.update(*id, request).await?;
-
+    let monitoring = monitoring_changes(monitoring_state(&before), monitoring_state(&log_source));
+    let removal = deleted_sources::removal_for_transition(
+        (before.enabled, before.stale_alert_enabled),
+        (log_source.enabled, log_source.stale_alert_enabled),
+    );
+    let flagged: Vec<uuid::Uuid> = match removal {
+        Some(removal) => flag_and_audit_removed_health(&state, &auth, &client, &[log_source.id], removal)
+            .await
+            .into_iter()
+            .map(|event| event.id)
+            .collect(),
+        None => Vec::new(),
+    };
+    if monitoring.as_object().is_some_and(|changes| !changes.is_empty()) {
+        state
+            .emit_audit_durable(
+                AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_MONITORING_CHANGED)
+                    .actor(Some(auth.user_id()), None)
+                    .api_key(auth.api_key_id, auth.api_key_name.clone())
+                    .resource("log_source", Some(log_source.id), Some(log_source.name.clone()))
+                    .client_context(&client)
+                    .details(serde_json::json!({
+                        "changes": monitoring,
+                        "health_alerts_left_open": flagged,
+                    }))
+                    .build(),
+            )
+            .await;
+    }
     state.emit_audit(
         AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_UPDATED)
             .actor(Some(auth.user_id()), None)
@@ -230,6 +255,10 @@ pub async fn update_log_source(
                 Some(log_source.name.clone()),
             )
             .client_context(&client)
+            .details(serde_json::json!({
+                "monitoring": monitoring,
+                "health_alerts_left_open": flagged,
+            }))
             .build(),
     );
 
@@ -288,11 +317,36 @@ async fn delete_and_audit(
     let started = state
         .spawn_tracked(async move {
             let outcomes = task_state.log_source_service.delete_many(ids).await;
+            // NAN-5760: a tombstone lets SIEM Health set the source's route
+            // keys aside, so whether one was recorded (and for which keys) is
+            // part of the delete's audit trail.
+            let deleted_ids: Vec<uuid::Uuid> =
+                outcomes.iter().filter(|(_, r)| r.is_ok()).map(|(id, _)| *id).collect();
+            let tombstones =
+                nanosiem_core::siem_health::removed_sources::tombstoned_route_keys(&task_state.pool, &deleted_ids)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "could not read health tombstones for the delete audit");
+                        Default::default()
+                    });
+            // NAN-5785: a deleted source's live alert is flagged (attributed,
+            // left open), never resolved.
+            // NAN-5785 review: every audit row of the batch (the flagged
+            // alerts' and each delete's) goes into ONE bounded, batched
+            // durable write: a 500-source delete costs one outbox insert, not
+            // 1,000 serial ones, and an outbox stall cannot hold this task (or
+            // shutdown) longer than one timeout.
+            let (flagged, mut audits) =
+                flag_removed_health(&task_state, &auth, &client, &deleted_ids, SourceRemoval::Deleted).await;
+            let flagged_by_source = flagged_alerts_by_source(&flagged);
             for (id, result) in &outcomes {
                 if let Ok(deleted) = result {
-                    task_state.emit_audit(log_source_deleted_event(&auth, &client, *id, deleted));
+                    let tombstone = tombstones.get(id).map(Vec::as_slice);
+                    let alerts = flagged_by_source.get(id).cloned().unwrap_or_default();
+                    audits.push(log_source_deleted_event(&auth, &client, *id, deleted, tombstone, &alerts));
                 }
             }
+            task_state.emit_batch_audited(audits).await;
             let outcomes = outcomes.into_iter().map(|(id, result)| (id, result.map(|_| ()))).collect();
             let _ = reply.send(outcomes);
         })
@@ -314,13 +368,99 @@ fn log_source_deleted_event(
     client: &ClientContext,
     id: uuid::Uuid,
     deleted: &DeletedLogSource,
+    health_tombstone: Option<&[String]>,
+    health_alerts_left_open: &[uuid::Uuid],
 ) -> AuditEvent {
     AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_DELETED)
         .actor(Some(auth.user_id()), None)
         .api_key(auth.api_key_id, auth.api_key_name.clone())
         .resource("log_source", Some(id), Some(deleted.name.clone()))
         .client_context(client)
+        .details(serde_json::json!({
+            "health_tombstone": {
+                "recorded": health_tombstone.is_some(),
+                "route_keys": health_tombstone.unwrap_or_default(),
+            },
+            "health_alerts_left_open": health_alerts_left_open,
+        }))
         .build()
+}
+
+/// `(enabled, stale_alert_enabled, stale_threshold_minutes)` of a source.
+fn monitoring_state(source: &LogSource) -> (bool, bool, i32) {
+    (source.enabled, source.stale_alert_enabled, source.stale_threshold_minutes)
+}
+
+/// NAN-5785: the monitoring fields an update actually changed, each as
+/// `{"from": .., "to": ..}`. Empty when nothing about monitoring changed.
+fn monitoring_changes(before: (bool, bool, i32), after: (bool, bool, i32)) -> serde_json::Value {
+    let mut changes = serde_json::Map::new();
+    if before.0 != after.0 {
+        changes.insert("enabled".into(), serde_json::json!({"from": before.0, "to": after.0}));
+    }
+    if before.1 != after.1 {
+        changes.insert("stale_alert_enabled".into(), serde_json::json!({"from": before.1, "to": after.1}));
+    }
+    if before.2 != after.2 {
+        changes.insert("stale_threshold_minutes".into(), serde_json::json!({"from": before.2, "to": after.2}));
+    }
+    serde_json::Value::Object(changes)
+}
+
+/// NAN-5785: flag the active health alerts of removed sources with who removed
+/// them (the alerts stay open). Returns the flagged alerts and one
+/// `system_health_source_removed` audit event per alert, NOT yet emitted: the
+/// caller writes them in one batch with its own audit rows.
+async fn flag_removed_health(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    source_ids: &[uuid::Uuid],
+    removal: SourceRemoval,
+) -> (Vec<SystemHealthEvent>, Vec<AuditEvent>) {
+    if source_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let by = deleted_sources::actor_label(&state.pool, Some(auth.user_id()), auth.api_key_name.as_deref()).await;
+    let flagged = deleted_sources::flag_removed_source_health(&state.pool, source_ids, removal, &by).await;
+    let audits = flagged
+        .iter()
+        .map(|event| {
+            deleted_sources::source_removed_audit(event, removal, &by)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .client_context(client)
+                .build()
+        })
+        .collect();
+    (flagged, audits)
+}
+
+/// [`flag_removed_health`] for one request's own sources, with its audit rows
+/// written at once (one bounded batch). Returns the flagged alerts.
+async fn flag_and_audit_removed_health(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    source_ids: &[uuid::Uuid],
+    removal: SourceRemoval,
+) -> Vec<SystemHealthEvent> {
+    let (flagged, audits) = flag_removed_health(state, auth, client, source_ids, removal).await;
+    state.emit_batch_audited(audits).await;
+    flagged
+}
+
+/// The flagged alert ids of each source, for its own audit row.
+fn flagged_alerts_by_source(
+    flagged: &[SystemHealthEvent],
+) -> std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> {
+    let mut by_source: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> = Default::default();
+    for event in flagged {
+        if let Some(source) = event.resource_id.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            by_source.entry(source).or_default().push(event.id);
+        }
+    }
+    by_source
 }
 
 /// Most log sources one bulk delete accepts (NAN-5678).
@@ -421,6 +561,7 @@ pub struct ToggleRequest {
     request_body = ToggleRequest,
     responses(
         (status = 200, description = "Log source toggled", body = LogSource),
+        (status = 400, description = "NAN-5789: enabling a kafka, aws_s3, gcp_pubsub or azure_event_hubs source that has no deployed source configuration of its own type (code SOURCE_CONFIGURATION_REQUIRED, `details.field_errors` names `dispatch_source_config_id`)", body = crate::error::ErrorResponse),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -435,12 +576,25 @@ pub async fn toggle_log_source(
 ) -> Result<Json<LogSource>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_EDIT)?;
 
+    let before = state.log_source_service.get(*id).await?;
     let log_source = state
         .log_source_service
         .toggle(*id, request.enabled)
         .await?;
+    // NAN-5785: only a real enabled -> disabled transition flags.
+    let flagged: Vec<uuid::Uuid> = match deleted_sources::removal_for_transition(
+        (before.enabled, before.stale_alert_enabled),
+        (log_source.enabled, log_source.stale_alert_enabled),
+    ) {
+        Some(removal) => flag_and_audit_removed_health(&state, &auth, &client, &[log_source.id], removal)
+            .await
+            .into_iter()
+            .map(|event| event.id)
+            .collect(),
+        None => Vec::new(),
+    };
 
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_TOGGLED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
@@ -452,9 +606,10 @@ pub async fn toggle_log_source(
             .client_context(&client)
             .details(serde_json::json!({
                 "enabled": request.enabled,
+                "health_alerts_left_open": flagged,
             }))
             .build(),
-    );
+    ).await;
 
     Ok(Json(log_source))
 }
@@ -502,6 +657,7 @@ pub async fn validate_log_source(
     responses(
         (status = 200, description = "Deployment result (wait=true)", body = DeploymentResult),
         (status = 202, description = "Deploy job accepted (wait=false, or wait=true still running after 270 s)", body = DeployJob),
+        (status = 400, description = "NAN-5789 (wait=true): a fetch source with no existing source configuration of its own type is refused before it is enabled (code SOURCE_CONFIGURATION_REQUIRED)", body = crate::error::ErrorResponse),
         (status = 422, description = "OCSF validation failed, or no OCSF receipt for a first go-live (checked before any job is created)"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
@@ -596,12 +752,20 @@ pub async fn undeploy_log_source(
     state.log_source_service.get(*id).await?;
 
     let id = *id;
+    let flag_auth = auth.clone();
+    let flag_client = client.clone();
     let audit = DeployAudit { action: LOG_SOURCE_UNDEPLOYED, auth: auth.clone(), client, extra: None };
     run_deploy_job(&state, audit, DeployJobKind::Undeploy, Some(id), wait.wait, request_started, move |state, progress| async move {
         let result = state
             .log_source_service
             .undeploy_with_progress(id, progress.as_ref())
             .await?;
+        // NAN-5785: undeploying disables the source; its live stale alert is
+        // flagged (attributed, left open) like any other disable. The flag only
+        // escalates, so undeploying an already-disabled source sends nothing.
+        if result.success {
+            flag_and_audit_removed_health(&state, &flag_auth, &flag_client, &[id], SourceRemoval::Disabled).await;
+        }
         Ok(DeployOk::Result(result))
     })
     .await

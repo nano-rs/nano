@@ -78,6 +78,10 @@ def test_lookup_delete_in_use_refused_and_replace(
         201,
     )
     try:
+        # NAN-5826: a scheduled rule saved without a cron gets the default one,
+        # instead of being stored unrunnable (and logging an ERROR every sync).
+        saved = api_expect(nano.api.get(f"/api/rules/{rule['id']}"), 200)
+        assert saved.get("schedule_cron"), f"scheduled rule saved without a cron: {saved.get('schedule_cron')!r}"
         _delete_from_list(page, table)
         page.wait_text("Failed to delete", exact=False, timeout_ms=30_000)
         page.wait_text(rule_name, exact=False)

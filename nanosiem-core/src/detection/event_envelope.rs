@@ -420,6 +420,14 @@ fn aggregate_measure_label(obj: &Map<String, Value>) -> Option<String> {
 }
 
 fn semantic_raw_label(obj: &Map<String, Value>) -> Option<String> {
+    semantic_raw_label_core(obj).or_else(|| {
+        first_str(obj, &["source_type"])
+            .map(|source| format!("{} event", source.replace(['_', '-'], " ")))
+    })
+}
+
+/// [`semantic_raw_label`] without the `<source> event` last resort.
+fn semantic_raw_label_core(obj: &Map<String, Value>) -> Option<String> {
     if let Some(process) = first_str(obj, &["process_name", "process.name", "actor.process.name"]) {
         return Some(process.to_string());
     }
@@ -482,11 +490,229 @@ fn semantic_raw_label(obj: &Map<String, Value>) -> Option<String> {
     if let Some(message) = first_str(obj, &["message", "signature", "alert_name"]) {
         return Some(truncate(message, 96));
     }
-    if let Some(risk) = risk_row_label(obj) {
-        return Some(risk);
+    risk_row_label(obj)
+}
+
+/// Longest command line kept in an [`event_summary`]; the rest is elided.
+const SUMMARY_CMD_CHARS: usize = 240;
+/// Longest file / registry path or URL kept in an [`event_summary`].
+const SUMMARY_PATH_CHARS: usize = 160;
+/// Longest name, host, action or other short field kept in an [`event_summary`].
+const SUMMARY_FIELD_CHARS: usize = 96;
+/// Longest message fallback kept in an [`event_summary`].
+const SUMMARY_MESSAGE_CHARS: usize = 400;
+/// Cap on a whole [`event_summary`]. Every part is bounded first, so the
+/// process, command line and destination all fit under it; this is the
+/// backstop. Below the 512-char evidence column cap.
+pub const EVENT_SUMMARY_MAX_CHARS: usize = 480;
+
+/// One-line summary of a raw event for evidence lists (NAN-5756): what ran
+/// and where it went, `parent → process command line → file / destination`,
+/// the way an analyst reads a process, file or network row. Rows with none of
+/// those read their API call, authentication, registry key, message or
+/// activity. `None` when the row carries none of these (the bare
+/// `<source> event` label says nothing a list's source column does not).
+///
+/// OCSF columns first (flat `process.cmd_line` or nested); the legacy UDM
+/// names resolve where they cost nothing.
+///
+/// The text is log data (attacker-authored) and is stored past event
+/// retention, so every part is made one plain line (control, BiDi and
+/// zero-width characters dropped, [`single_line`]), bounded on its own, and
+/// URLs lose their userinfo, query and fragment. Callers still render it as
+/// text only.
+///
+/// [`single_line`]: crate::text_bounds::single_line
+pub fn event_summary(event: &Value) -> Option<String> {
+    let obj = event.as_object()?;
+    let mut parts: Vec<String> = Vec::new();
+
+    let mut name = summary_field(obj, &["process.name", "process_name"], SUMMARY_FIELD_CHARS);
+    let mut cmd = summary_cmd(obj, &["process.cmd_line", "command_line"]);
+    // OCSF network / file / DNS activity: the process that acted is the
+    // actor (on process activity the actor is the parent, handled below).
+    let actor_is_process = name.is_none() && cmd.is_none();
+    if actor_is_process {
+        name = summary_field(obj, &["actor.process.name"], SUMMARY_FIELD_CHARS);
+        cmd = summary_cmd(obj, &["actor.process.cmd_line"]);
     }
-    first_str(obj, &["source_type"])
-        .map(|source| format!("{} event", source.replace(['_', '-'], " ")))
+    let process = match (&name, &cmd) {
+        // A command line normally starts with the image; only name it when not.
+        (Some(n), Some(c)) if !c.to_lowercase().contains(&n.to_lowercase()) => Some(format!("{n}: {c}")),
+        (_, Some(c)) => Some(c.clone()),
+        (Some(n), None) => Some(n.clone()),
+        (None, None) => None,
+    };
+    if let Some(process) = process {
+        let parent_keys: &[&str] = if actor_is_process {
+            &["actor.process.parent_process.name"]
+        } else {
+            &["process.parent_process.name", "actor.process.name", "parent_process_name"]
+        };
+        let parent = summary_field(obj, parent_keys, SUMMARY_FIELD_CHARS).map(|p| basename(&p).to_string());
+        if let Some(parent) = parent.filter(|p| Some(p) != name.as_ref()) {
+            parts.push(parent);
+        }
+        parts.push(process);
+    }
+
+    // File activity: the action and the path, also when a process (the
+    // actor) is named, unless the command line already carries the path.
+    if let Some(path) = summary_field(obj, &["file.path", "file_path"], SUMMARY_PATH_CHARS) {
+        let in_cmd = cmd.as_ref().is_some_and(|c| c.to_lowercase().contains(&path.to_lowercase()));
+        if !in_cmd {
+            let action = summary_field(obj, &["activity_name", "file_action"], SUMMARY_FIELD_CHARS);
+            parts.push(match action {
+                Some(a) => format!("{a} {path}"),
+                None => path,
+            });
+        }
+    }
+
+    if let Some(destination) = summary_destination(obj) {
+        parts.push(destination);
+    }
+
+    if !parts.is_empty() {
+        return Some(finish_summary(parts.join(" → ")));
+    }
+    summary_fallback(obj).map(finish_summary)
+}
+
+/// Where the row went: `ip:port` / `host:port`, else a redacted URL, else a
+/// DNS question.
+fn summary_destination(obj: &Map<String, Value>) -> Option<String> {
+    let host = summary_field(obj, &["dst_endpoint.ip", "dest_ip"], SUMMARY_FIELD_CHARS)
+        .or_else(|| summary_field(obj, &["dst_endpoint.hostname", "dest_host"], SUMMARY_FIELD_CHARS));
+    let port = ["dst_endpoint.port", "dest_port"].iter().find_map(|k| match value_field(obj, k)? {
+        Value::Number(n) if n.as_u64().is_some_and(|p| p > 0) => Some(n.to_string()),
+        Value::String(s) => clean_summary_part(s, 8).filter(|p| p != "0"),
+        _ => None,
+    });
+    if let Some(host) = host {
+        return Some(match port {
+            Some(p) => format!("{host}:{p}"),
+            None => host,
+        });
+    }
+    if let Some(url) = first_str(obj, &["url.url_string", "http_request.url.url_string", "url"]) {
+        if let Some(url) = clean_summary_part(&redact_summary_url(url), SUMMARY_PATH_CHARS) {
+            return Some(url);
+        }
+    }
+    // OCSF `query.hostname`; the flat UDM `query` column (a nested OCSF
+    // `query` object is not a string and is skipped).
+    summary_field(obj, &["query.hostname", "query", "dns_query"], SUMMARY_FIELD_CHARS).map(|q| format!("dns {q}"))
+}
+
+/// A row with no process, file or destination: its API call, its
+/// authentication, its registry key, its message, its activity, else the
+/// alert label heuristic.
+fn summary_fallback(obj: &Map<String, Value>) -> Option<String> {
+    let user = summary_field(obj, &["user.name", "actor.user.name", "user"], SUMMARY_FIELD_CHARS);
+    let with_user = |s: String| match &user {
+        Some(u) => format!("{s} · {u}"),
+        None => s,
+    };
+
+    // OCSF API activity (CloudTrail, Okta, Entra): `service operation`.
+    if let Some(op) = summary_field(obj, &["api.operation", "eventName"], SUMMARY_FIELD_CHARS) {
+        let service = summary_field(obj, &["api.service.name", "eventSource"], SUMMARY_FIELD_CHARS);
+        let call = match service {
+            Some(s) => format!("{s} {op}"),
+            None => op,
+        };
+        return Some(with_user(call));
+    }
+
+    // OCSF authentication: `status protocol authentication`.
+    let protocol = summary_field(obj, &["auth_protocol", "auth_type", "authentication_method"], SUMMARY_FIELD_CHARS);
+    if let Some(protocol) = protocol {
+        let status = summary_field(obj, &["status", "auth_result"], SUMMARY_FIELD_CHARS);
+        let auth = match status {
+            Some(s) => format!("{s} {protocol} authentication"),
+            None => format!("{protocol} authentication"),
+        };
+        return Some(with_user(auth));
+    }
+
+    // OCSF registry activity: `activity key[\value]`.
+    if let Some(path) = summary_field(
+        obj,
+        &["reg_value.path", "reg_key.path", "registry_key_name", "registry_path", "registry_value_name"],
+        SUMMARY_PATH_CHARS,
+    ) {
+        return Some(match summary_field(obj, &["activity_name"], SUMMARY_FIELD_CHARS) {
+            Some(a) => format!("{a} {path}"),
+            None => format!("Registry · {path}"),
+        });
+    }
+
+    if let Some(message) = summary_field(obj, &["message"], SUMMARY_MESSAGE_CHARS) {
+        return Some(message);
+    }
+    if let Some(activity) = summary_field(obj, &["activity_name", "action", "event_type", "activity"], SUMMARY_FIELD_CHARS) {
+        return Some(with_user(activity));
+    }
+    semantic_raw_label_core(obj).and_then(|l| clean_summary_part(&l, SUMMARY_FIELD_CHARS))
+}
+
+/// The first present field of `keys`, made one plain line and bounded.
+fn summary_field(obj: &Map<String, Value>, keys: &[&str], max_chars: usize) -> Option<String> {
+    keys.iter().find_map(|k| str_field(obj, k).and_then(|s| clean_summary_part(s, max_chars)))
+}
+
+/// A command line, one plain line, with every URL argument redacted.
+fn summary_cmd(obj: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    let raw = keys.iter().find_map(|k| str_field(obj, k))?;
+    // Bound the work before cleaning: never walk a multi-megabyte value.
+    let line = crate::text_bounds::single_line(crate::text_bounds::prefix_at_most(raw, SUMMARY_CMD_CHARS * 8));
+    let redacted = line
+        .split(' ')
+        .map(|tok| if tok.contains("://") { redact_summary_url(tok) } else { tok.to_string() })
+        .collect::<Vec<_>>()
+        .join(" ");
+    clean_summary_part(&redacted, SUMMARY_CMD_CHARS)
+}
+
+/// One plain line (control, BiDi and zero-width characters dropped), at most
+/// `max_chars` characters with `…`; `None` when nothing visible is left.
+fn clean_summary_part(raw: &str, max_chars: usize) -> Option<String> {
+    let bounded = crate::text_bounds::prefix_at_most(raw, max_chars * 8);
+    let line = crate::text_bounds::single_line(bounded);
+    if line.is_empty() {
+        return None;
+    }
+    Some(crate::text_bounds::truncate_chars_ellipsis(&line, max_chars))
+}
+
+fn finish_summary(s: String) -> String {
+    crate::text_bounds::truncate_chars_ellipsis(&s, EVENT_SUMMARY_MAX_CHARS)
+}
+
+/// A URL without its userinfo, query and fragment (they carry credentials and
+/// tokens), as audit records keep it. Text that does not parse as a URL gets
+/// the same cut by hand.
+fn redact_summary_url(raw: &str) -> String {
+    // Only a host-bearing URL takes the parsed path: `u:p@host/x` parses as
+    // an opaque `u:` URL and would keep its userinfo.
+    if url::Url::parse(raw).is_ok_and(|u| u.has_host()) {
+        return crate::scheduler::secrets::redact_url_for_audit(raw);
+    }
+    let cut = raw.split(['?', '#']).next().unwrap_or_default();
+    let (scheme, rest) = match cut.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, cut),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host}{path}"),
+        None => format!("{host}{path}"),
+    }
 }
 
 fn first_str<'a>(obj: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {

@@ -260,6 +260,7 @@ impl SourceConfigService {
         watch: ReloadWatch,
         rendered: &str,
         vector_built: bool,
+        report: crate::parsers::unrouted::ReportMode,
     ) -> Result<Settlement, SourceConfigServiceError> {
         let row = &config.config;
         match watch.outcome().await {
@@ -274,6 +275,7 @@ impl SourceConfigService {
                     &fresh,
                     "Vector refused to build this source when it was activated (its                      configuration_failed counter moved); see the Vector log for the component error",
                     Some(rendered),
+                    report,
                 )
                 .await
                 .map(Settlement::Final)
@@ -318,6 +320,9 @@ impl SourceConfigService {
     /// failure the caller hands straight back to the API (HTTP 200,
     /// `success: false`): the request was valid, the source is not.
     ///
+    /// `report`: what the router re-render may vouch for (NAN-5789, as for
+    /// `deploy_with`).
+    ///
     /// `enabled` is left alone on purpose: the boot-time `deploy_all` retries
     /// every enabled config, so a source quarantined for a reason that later
     /// clears (a credential fixed in the cloud console) comes back on its own.
@@ -326,6 +331,7 @@ impl SourceConfigService {
         config: &SourceConfigurationWithRules,
         reason: &str,
         rendered: Option<&str>,
+        report: crate::parsers::unrouted::ReportMode,
     ) -> Result<DeploymentResult, SourceConfigServiceError> {
         let row = &config.config;
         tracing::warn!(
@@ -381,7 +387,9 @@ impl SourceConfigService {
             self.repository.mark_undeployed(row.id).await?;
         }
         // Callers hold the deploy lock (deploy_with).
-        self.update_dynamic_router_locked().await?;
+        // NAN-5789: inside a boot / deploy-all batch this is notes only; the
+        // batch reports FULL once every configuration is on disk.
+        self.update_dynamic_router_locked_with(report).await?;
 
         let (status, recorded_reason, removal_note) = match watch {
             None => (QUARANTINED_STATUS, reason.to_string(), String::new()),

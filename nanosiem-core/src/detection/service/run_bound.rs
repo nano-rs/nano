@@ -26,11 +26,23 @@
 //! severity, and the PARTIAL note says coverage is incomplete.
 //!
 //! Only rules whose rows are events of the base search are bounded this way
-//! (a search, optionally followed by `where` / `eval` / `rex`). Aggregations,
-//! `| risk`, prevalence and every other command keep the full fetch: their
-//! output depends on every input row, and truncating it would change what
-//! they detect. If any expansion query fails, the run falls back to the full
-//! fetch as well: detection correctness first.
+//! (a search, optionally followed by `where` / `eval` / `rex`). If any
+//! expansion query fails, the run falls back to the full fetch: detection
+//! correctness first.
+//!
+//! NAN-5751: a rule whose rows are the OUTPUT of a reduction (`stats`,
+//! `timechart`, `top`, `rare`, `dedup`) is bounded on that output. Its input
+//! is never truncated (that would change the counts): the reduction reads the
+//! whole window (in ClickHouse, or in Rust after a Nano-side stage such as
+//! `| lookup`), and the run reads at most `max_matches_per_run + 1` result
+//! rows. More than `max_matches_per_run` rows (groups) is reported LOUDLY, as
+//! for incomplete entity coverage: a coverage-incomplete row raises an alert
+//! at the rule's severity and the run is PARTIAL. Under the bound the rows are
+//! exactly the unbounded run's.
+//!
+//! `| risk`, prevalence, `streamstats`, `anomaly` and every other command
+//! keep the full fetch: their rows are events whose output depends on every
+//! input row.
 
 use std::collections::HashSet;
 
@@ -76,6 +88,64 @@ pub(crate) fn is_boundable_raw_query(query: &Query) -> bool {
             ) && is_boundable_raw_query(source)
         }
     }
+}
+
+/// NAN-5751: whether a rule's rows are the output of a reduction computed
+/// over the whole window (see the module docs), so a run reads at most
+/// `cap + 1` of them.
+///
+/// `stats` / `timechart` / `top` / `rare` always read their whole input (the
+/// search service fetches the full window for an aggregation it cannot run in
+/// SQL), so their result rows can be bounded on any pipeline. `dedup` is not
+/// an aggregation to the search service: after a Nano-side stage (`lookup`,
+/// prevalence, …) its input fetch would follow the limit, so it counts only
+/// on a pipeline ClickHouse runs end to end.
+pub(crate) fn is_bounded_reduction_query(query: &Query) -> bool {
+    let mut commands = Vec::new();
+    let mut node = query;
+    while let Query::Piped { source, command } = node {
+        commands.push(command);
+        node = source;
+    }
+    let aggregates = commands.iter().any(|c| {
+        matches!(
+            c,
+            Command::Stats { .. } | Command::Timechart { .. } | Command::Top { .. } | Command::Rare { .. }
+        )
+    });
+    let nano_side = commands.iter().any(|c| {
+        matches!(
+            c,
+            Command::Lookup { .. }
+                | Command::InputLookup { .. }
+                | Command::Prevalence { .. }
+                | Command::Lateral { .. }
+                | Command::Ai { .. }
+                | Command::Tree { .. }
+                | Command::Asset { .. }
+                | Command::Cloud { .. }
+                | Command::Baseline { .. }
+        )
+    });
+    // `risk` / `streamstats` / `eventstats` / `anomaly` rows are scored or
+    // computed per row from the whole input: never bounded (and a
+    // coverage-incomplete row carries no risk score, so grouped risk alerting
+    // would drop it).
+    let per_row = commands.iter().any(|c| {
+        matches!(
+            c,
+            Command::Risk { .. } | Command::StreamStats { .. } | Command::EventStats { .. } | Command::Anomaly { .. }
+        )
+    });
+    !per_row && (aggregates || (!nano_side && commands.iter().any(|c| matches!(c, Command::Dedup { .. }))))
+}
+
+/// The PARTIAL note (and alert text) of a reduction that produced more rows
+/// than one run evaluates.
+pub(crate) fn reduction_capped_message(cap: usize) -> String {
+    format!(
+        "DETECTION COVERAGE INCOMPLETE: the rule's aggregation produced more than {cap} result rows in one run; rows beyond the first {cap} were NOT evaluated. Narrow the rule or group by fewer values (DETECTION_MAX_MATCHES_PER_RUN)"
+    )
 }
 
 /// Distinct values fetched per entity field when a run overflows.
@@ -143,6 +213,11 @@ pub(crate) fn coverage_incomplete_row(rule: &DetectionRule, window_end: chrono::
     })
 }
 
+/// Whether `event` is a coverage-incomplete row.
+pub(crate) fn is_coverage_incomplete_row(event: &Value) -> bool {
+    event.get(COVERAGE_INCOMPLETE_MARKER).and_then(Value::as_bool) == Some(true)
+}
+
 /// Append to `kept` every event of `extra` not already there (by
 /// `matched_event_id`). Returns how many were added.
 pub(crate) fn merge_unique(kept: &mut Vec<Value>, seen: &mut HashSet<String>, extra: Vec<Value>) -> usize {
@@ -182,8 +257,12 @@ impl DetectionService {
     ) -> Result<Vec<Value>, DetectionError> {
         let scope = crate::auth::ScopeSet::unrestricted();
         let cap = self.config.max_matches_per_run.max(1);
-        let boundable = parse_query(&rule.query).map(|q| is_boundable_raw_query(&q)).unwrap_or(false);
+        let parsed = parse_query(&rule.query).ok();
+        let boundable = parsed.as_ref().is_some_and(is_boundable_raw_query);
         if !boundable {
+            if parsed.as_ref().is_some_and(is_bounded_reduction_query) {
+                return Box::pin(self.evaluate_reduction_run(rule, time_range, cap)).await;
+            }
             return Box::pin(self.evaluate_window(
                 &rule.query,
                 time_range.clone(),
@@ -234,6 +313,36 @@ impl DetectionService {
                     .await
             }
         }
+    }
+
+    /// NAN-5751: a reduction rule's run reads at most `cap + 1` result rows
+    /// (see the module docs); more than `cap` is reported loudly.
+    async fn evaluate_reduction_run(
+        &self,
+        rule: &DetectionRule,
+        time_range: &TimeRangeInput,
+        cap: usize,
+    ) -> Result<Vec<Value>, DetectionError> {
+        let scope = crate::auth::ScopeSet::unrestricted();
+        let mut rows = Box::pin(self.evaluate_window_with_limit(
+            &rule.query,
+            time_range.clone(),
+            rule.dataset.clone(),
+            cap + 1,
+            &scope,
+        ))
+        .await?;
+        if rows.len() <= cap {
+            return Ok(rows);
+        }
+        rows.truncate(cap);
+        metrics::counter!("nanosiem_detection_runs_bounded_total").increment(1);
+        metrics::counter!("nanosiem_detection_runs_coverage_incomplete_total").increment(1);
+        let message = reduction_capped_message(cap);
+        warn!(rule_id = %rule.id, rule_name = %rule.name, "{message}");
+        rows.insert(0, coverage_incomplete_row(rule, time_range.end, &message));
+        crate::search::partial_run::note(message);
+        Ok(rows)
     }
 
     /// Add the newest event of every distinct entity value (and one event
@@ -303,3 +412,7 @@ impl DetectionService {
 #[cfg(test)]
 #[path = "run_bound_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reduction_bound_live_tests.rs"]
+mod reduction_bound_live_tests;

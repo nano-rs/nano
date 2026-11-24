@@ -26,6 +26,7 @@ import {
 import { cn } from '@/lib/utils';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { OtelSpan } from '@/lib/api/types';
+import { Term } from '@/components/ui/term';
 
 // Padding added either side of the trace's own [start,end] when pivoting to the
 // correlated logs (NAN-1721 / O34). Without a window the /search lands in its
@@ -359,7 +360,9 @@ export function TraceWaterfall({ traceId, spans, onBack, backLabel = 'Traces', c
           <ArrowLeft className="w-[13px] h-[13px]" /> {backLabel}
         </button>
         <GitBranch className="w-[15px] h-[15px] text-brand" />
-        <h2 className="text-[15px] font-semibold text-foreground">Distributed trace</h2>
+        <h2 className="text-[15px] font-semibold text-foreground">
+          Distributed <Term id="trace">trace</Term>
+        </h2>
         <span className="font-mono text-[11.5px] text-fg-3 truncate">{traceId}</span>
         <span className="flex-1" aria-hidden />
         {cacheNotice}
@@ -402,7 +405,9 @@ export function TraceWaterfall({ traceId, spans, onBack, backLabel = 'Traces', c
       <div className="rounded-lg border border-border bg-card overflow-hidden flex min-h-0">
         <div className="flex-1 min-w-0 flex flex-col">
           <div className="grid grid-cols-[280px_1fr] gap-0 px-3.5 py-2 border-b border-border font-mono text-[9.5px] uppercase tracking-[0.1em] text-fg-4">
-            <span>Span</span>
+            <span>
+              <Term id="span">Span</Term>
+            </span>
             <span>Timeline · {fmtMs(durMs)}</span>
           </div>
           {rows.length === 0 ? (

@@ -23,7 +23,9 @@ For each persona:
   group's. Every expectation below is computed from that EXPECTED set, never
   from what the server says, and a wildcard `*` is legal only where the
   baseline says so. Any permission string (a grant, a gate, an action) that
-  is not in `GET /api/permissions` fails the test: it cannot be classified;
+  is not in `GET /api/permissions` fails the test: it cannot be classified
+  (on open, a gate behind a capability that is off is skipped: an open build
+  does not define its enterprise permission);
 - every page the persona may open renders (no Access Denied, no error
   boundary, no /login bounce, content, no 5xx, no unexpected 403); every page
   it may not open shows `route-forbidden` (or the licensed-feature panel when
@@ -53,7 +55,8 @@ import httpx
 import pytest
 from nano_e2e import rbac_matrix as rm
 from nano_e2e import ui as uilib
-from nano_e2e.client import Journal, Nano, expect, time_range
+from nano_e2e.client import Journal, Nano, expect, jwt_claims, time_range
+from nano_e2e.edition import UNLICENSED
 from nano_e2e.rbac import role_browser, role_user
 from nano_e2e.stack import Stack
 from nano_e2e.waits import eventually
@@ -77,7 +80,6 @@ PERSONAS = [*BUILTIN, CUSTOM]
 
 ROUTE_ERROR = {"testid": "route-error"}
 DENIED = {"testid": "route-forbidden"}
-UNLICENSED = {"testid": "licensed-feature-unavailable"}
 STACK_TRACE = re.compile(r"(\n\s+at \S+ \(|stack backtrace|panicked at|Traceback \(most recent)")
 # Pages the matrix does not walk: flows that need state (`/upload` takes a file).
 EXCLUDE = ("/upload",)
@@ -397,9 +399,25 @@ def _rail_problems(shown: set[str], items: list[rm.NavItem], container: str, per
 
 @pytest.fixture(scope="module")
 def matrix_admin(stack: Stack) -> Any:
-    jwt = Nano(stack.api_url, stack.search_url, {}, Journal(None)).login(stack.admin_email, stack.admin_password)
-    client = Nano(stack.api_url, stack.search_url, {"Authorization": f"Bearer {jwt}"},
+    def bearer() -> dict[str, str]:
+        login = Nano(stack.api_url, stack.search_url, {}, Journal(None))
+        try:
+            jwt = login.login(stack.admin_email, stack.admin_password)
+        finally:
+            login.close()
+        # A shortened access TTL must fail here, not hide behind re-logins.
+        claims = jwt_claims(jwt) or {}
+        life = claims.get("exp", 0) - claims.get("iat", 0)
+        assert life >= 600, f"the admin access token lives {life}s"
+        return {"Authorization": f"Bearer {jwt}"}
+
+    client = Nano(stack.api_url, stack.search_url, bearer(),
                   Journal(stack.artifact_dir / "rbac-matrix-admin.jsonl"))
+    # The module walks every persona (about 5 min each) and outlives the 15 min
+    # access token; an expired one ended the last persona's cleanup in 401s
+    # (NAN-5827). Log in again on a 401 for an expired token only (Http.reauth).
+    client.api.reauth = bearer
+    client.search_http.reauth = bearer
     yield client
     client.close()
 
@@ -457,7 +475,11 @@ def test_rbac_persona_matrix(
     expected = persona.granted | everyone
     if "*" in expected and not base.get("wildcard", False):
         problems.append("the role is granted the wildcard '*', which the baseline does not allow")
-    unknown = sorted((expected | rm.all_gate_permissions() | {a.perm for a in actions}) - catalog - {"*"})
+    # Open only: an open build does not define the permissions of gates behind
+    # an off capability. Enterprise defines every permission, licensed or not.
+    gate_perms = rm.all_gate_permissions(None if enterprise else capabilities)
+    classify = expected | gate_perms | {a.perm for a in actions}
+    unknown = sorted(classify - catalog - {"*"})
     if unknown:
         problems.append(f"permission strings not in /api/permissions (cannot be classified): {unknown}")
     held_forbidden = sorted(p for p in base["never_holds"] if p in expected or "*" in expected)
@@ -612,22 +634,48 @@ def test_rbac_persona_matrix(
 
 def test_allowed_pages_call_apis_the_role_cannot_use(stack: Stack, ui: uilib.Driver, artifact_dir: Path, timeline) -> None:
     """NAN-5713: as the built-in ReadOnly role, the pages it may open must
-    not call APIs it is refused. Self-contained (no state from the matrix)."""
+    not call APIs it is refused. Self-contained (no state from the matrix).
+
+    Enterprise: the real pages mount (no license panel, Access Denied or
+    error boundary) and call no API that answers 403. Open (NAN-5747): both
+    routes are capability-off, so the license panel renders, and it calls no
+    API that answers 403 or 404 and fetches nothing beyond the app shell."""
     gates = rm.route_gates()
+    open_build = stack.edition == "open"
     with role_browser(stack, ui, artifact_dir, "rbac-readonly-403", [BUILTIN["ReadOnly"]]) as (page, client, _):
         me = expect(client.api.get("/api/auth/me"), 200)
         perms = set(me["permissions"])
         caps = expect(client.api.get("/api/capabilities"), 200).get("capabilities", {})
+        shell = _shell_endpoints(page) if open_build else set()
         found = []
         for path in ("/inbox", "/risk"):
-            assert gates[path].allows(perms, caps), f"ReadOnly may no longer open {path}: update this test"
+            g = gates[path]
+            if open_build:
+                assert rm.holds(perms, g.permission, g.any_permission), (
+                    f"ReadOnly may no longer open {path}: update this test")
+                assert g.capability and not caps.get(g.capability, False), (
+                    f"open build: {path} expected capability-off, capabilities={caps}")
+            else:
+                assert g.allows(perms, caps), f"ReadOnly may no longer open {path}: update this test"
             since = page.now_ms()
             page.goto(path)
             _settle(page)
-            found += sorted({f"{path}→{_api_path(r['url'])}" for r in page.api_responses_since(since) if r["status"] == 403})
-        timeline.step("403s on allowed pages", found=found)
+            if open_build:
+                assert page.count(UNLICENSED) > 0, f"open build: {path} does not show the license panel"
+            else:
+                blocked = page.count(UNLICENSED) + page.count(DENIED) + page.count(ROUTE_ERROR)
+                assert blocked == 0, f"{path}: the real page did not mount: {page.main_text()[:200]}"
+            responses = [r for r in page.api_responses_since(since)
+                         if not any(r["status"] == code and frag in r["url"] for code, frag in KNOWN)]
+            refused = (403, 404) if open_build else (403,)
+            found += sorted({f"{path}→{r['status']} {_api_path(r['url'])}"
+                             for r in responses if r["status"] in refused})
+            if open_build:
+                fetched = {_api_path(r["url"]) for r in responses if 200 <= r["status"] < 300}
+                found += sorted(f"{path}→2xx {api}" for api in fetched - shell)
+        timeline.step("refused or unexpected API calls on allowed pages", found=found)
         page.screenshot("rbac-readonly-inbox-403s.png", full_page=False)
-        assert not found, "403s on allowed pages: " + ", ".join(found)
+        assert not found, "refused or unexpected API calls on allowed pages: " + ", ".join(found)
 
 
 def test_rule_repositories_page_calls_no_refused_api(stack: Stack, ui: uilib.Driver, artifact_dir: Path, timeline) -> None:

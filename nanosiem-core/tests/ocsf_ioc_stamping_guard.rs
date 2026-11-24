@@ -308,7 +308,7 @@ fn direct_ocsf_writers_can_read_the_custom_ioc_dictionary() {
     assert!(ingest.contains("<query>GRANT dictGet ON nanosiem.custom_ioc_enrichment_dict</query>"));
     let helm = deploy_file("deploy/helm/nano/files/clickhouse/users.json");
     let k8s = deploy_file("deploy/k8s/clickhouse/clickhouse.yaml");
-    let templates: Vec<String> = ["deploy/k8s/aws-db/clickhouse.yaml.tpl", "deploy/k8s/rackspace-db/clickhouse.yaml.tpl"]
+    let templates: Vec<String> = ["deploy/k8s/aws-db/clickhouse.yaml.tpl", "deploy/k8s/self-managed-db/clickhouse.yaml.tpl"]
         .into_iter()
         .filter_map(deploy_file)
         .collect();

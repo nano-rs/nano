@@ -70,7 +70,7 @@ export const CodeLens = forwardRef<CodeMirrorEditorRef, CodeLensProps>(function 
     : detectionMode === 'scheduled'
       ? 'runs on cron schedule'
       : detectionMode === 'realtime'
-        ? 'streams via materialized view'
+        ? 'checks events as they arrive'
         : 'detection mode not set';
 
   const valStatus: 'valid' | 'invalid' | 'unchecked' = validation

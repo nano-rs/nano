@@ -167,6 +167,46 @@ impl SessionRepository {
         Ok(())
     }
 
+    /// Delete one of `user_id`'s sessions by id (NAN-5573 single-session
+    /// logout). The `user_id` predicate scopes the delete to the caller, so a
+    /// session id alone can never end another user's session. Returns whether
+    /// a row was deleted.
+    pub async fn delete_user_session(
+        &self,
+        user_id: Uuid,
+        id: Uuid,
+    ) -> Result<bool, SessionRepositoryError> {
+        let result = sqlx::query("DELETE FROM sessions WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete one of `user_id`'s sessions by refresh-token hash (NAN-5573
+    /// logout fallback for access tokens minted without a `sid` claim).
+    ///
+    /// Matches the session's current OR immediately previous refresh token,
+    /// so a token that was already rotated (a second tab, or a thief who
+    /// refreshed first) still ends the whole session it belongs to: the row
+    /// is the refresh-token family. Returns the ended session's id.
+    pub async fn delete_user_session_by_token_hash(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+    ) -> Result<Option<Uuid>, SessionRepositoryError> {
+        Ok(sqlx::query_scalar(
+            "DELETE FROM sessions WHERE user_id = $2 \
+             AND (refresh_token_hash = $1 OR previous_refresh_token_hash = $1) \
+             RETURNING id",
+        )
+        .bind(token_hash)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// Delete all sessions for a user (force logout from all devices)
     pub async fn delete_user_sessions(&self, user_id: Uuid) -> Result<u64, SessionRepositoryError> {
         let result = sqlx::query("DELETE FROM sessions WHERE user_id = $1")

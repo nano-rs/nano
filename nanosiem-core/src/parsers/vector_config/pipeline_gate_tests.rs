@@ -316,6 +316,31 @@ async fn an_orphaned_fetch_binding_is_left_out_of_the_render() {
 }
 
 #[tokio::test]
+async fn an_unbound_fetch_draft_is_left_out_and_every_other_source_renders() {
+    // NAN-5789: a kafka draft saved with no source configuration used to fail
+    // the whole render. Resolved, it keeps no route; the render leaves only it
+    // out and writes every other source.
+    let mut draft = log_parser("kafka_draft", &["kafka_draft"]);
+    draft.source_type = "kafka".to_string();
+    draft.dispatch_source_config_id = None;
+    let mut parsers = vec![log_parser("good_one", &["good_one"]), draft, log_parser("good_two", &["good_two"])];
+    let _ = crate::parsers::repository::apply_resolved_dispatch_routes(
+        &mut parsers, &std::collections::HashMap::new(),
+    );
+    let unroutable = crate::parsers::unrouted::classify(&parsers, None);
+    assert_eq!(unroutable.len(), 1);
+    assert_eq!(unroutable[0].name, "kafka_draft");
+    let tmp = TempDir::new().unwrap();
+    let manager = VectorConfigManager::new(tmp.path());
+    manager.deploy_parsers(&parsers).await.unwrap();
+    assert!(tmp.path().join("sources/parsers/good_one.toml").exists());
+    assert!(tmp.path().join("sources/parsers/good_two.toml").exists());
+    assert!(!tmp.path().join("sources/parsers/kafka_draft.toml").exists());
+    let combiner = std::fs::read_to_string(tmp.path().join("sources/parsers/_combiner.toml")).unwrap_or_default();
+    assert!(!combiner.contains("kafka_draft"), "the draft must not be wired anywhere: {combiner}");
+}
+
+#[tokio::test]
 async fn the_boot_render_rewrites_a_marker_left_by_a_rollback() {
     // A rollback's older api never touches the marker; the re-upgraded api's
     // boot render makes it say exactly this identity. NAN-5611: a marker that

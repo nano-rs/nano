@@ -14,6 +14,7 @@ impl SearchService {
         time_range: &TimeRangeInput,
         query_id: Option<&str>,
         dataset: crate::query::Dataset,
+        deny_set: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         // NAN-1798 P2: the risk dataset has no meaningful time axis at entity
         // grain (one row per entity; fixed trailing 24h/7d windows) — an empty
@@ -42,7 +43,7 @@ impl SearchService {
         // Calculate appropriate bucket interval based on time range
         let duration_secs = (time_range.end - time_range.start).num_seconds();
 
-        self.generate_clickhouse_histogram(&parsed, &tr, duration_secs, query_id, dataset)
+        self.generate_clickhouse_histogram(&parsed, &tr, duration_secs, query_id, dataset, deny_set)
             .await
     }
 
@@ -68,6 +69,26 @@ impl SearchService {
         }
     }
 
+    /// The histogram's base SQL: the search expression on `dataset`, generated
+    /// with the caller's deny-set on the generator (NAN-5793 review).
+    pub(crate) fn histogram_base_sql(
+        &self,
+        query: &Query,
+        time_range: &TimeRange,
+        dataset: crate::query::Dataset,
+        deny_set: &std::collections::BTreeSet<String>,
+    ) -> Result<String, SearchError> {
+        let base_gen = self.sql_generator(crate::query::GeneratorScope::deny_set(deny_set));
+        let base_gen = if dataset == crate::query::Dataset::Logs {
+            base_gen
+        } else {
+            base_gen.with_dataset(dataset)
+        };
+        base_gen
+            .generate_with_options(query, time_range, &Self::histogram_base_options())
+            .map_err(|e| SearchError::SqlGenError(e.to_string()))
+    }
+
     /// Generate histogram for ClickHouse backend
     async fn generate_clickhouse_histogram(
         &self,
@@ -76,6 +97,7 @@ impl SearchService {
         duration_secs: i64,
         query_id: Option<&str>,
         dataset: crate::query::Dataset,
+        deny_set: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         // Verify ClickHouse client is configured
         if self.ch_client.is_none() {
@@ -88,14 +110,12 @@ impl SearchService {
         // observability dataset so the timeline reads `otel_spans`/`otel_metrics`
         // (not `logs`) and buckets on the dataset's own time column (`start_time`
         // for spans). `Dataset::Logs` leaves the generator untouched (byte-identical).
-        let base_gen = if dataset == crate::query::Dataset::Logs {
-            self.ch_sql_generator.clone()
-        } else {
-            self.ch_sql_generator.clone().with_dataset(dataset)
-        };
-        let base_sql = base_gen
-            .generate_with_options(query, time_range, &Self::histogram_base_options())
-            .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+        //
+        // NAN-5793 review: the caller's deny-set rides on the generator, like
+        // every other nPL path, so a `[dataset=risk …]` subsearch (whose AST
+        // gate is stripped in favour of the origin-manifest gate) and an
+        // `| identity` build side stay scoped. Empty = byte-identical SQL.
+        let base_sql = self.histogram_base_sql(query, time_range, dataset, deny_set)?;
 
         // The histogram buckets the BASE query's output, which carries the
         // dataset's time column (spans → `start_time`).
@@ -222,8 +242,14 @@ impl SearchService {
         settings: crate::search::admission::ClickHouseQuerySettings,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         self.active_ch_settings = Some(settings);
-        self.generate_histogram(query, time_range, None, crate::query::Dataset::Logs)
-            .await
+        self.generate_histogram(
+            query,
+            time_range,
+            None,
+            crate::query::Dataset::Logs,
+            &std::collections::BTreeSet::new(),
+        )
+        .await
     }
 
     /// Generate histogram for a time range (used for raw SQL queries)

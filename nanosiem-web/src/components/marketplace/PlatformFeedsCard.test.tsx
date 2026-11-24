@@ -40,6 +40,13 @@ const base: PlatformFeedsStatus = {
 };
 
 /** Radix tooltips open on focus; the text renders in the content and an a11y copy. */
+/** Text a reader sees: glossary Terms keep their definition in a hidden span. */
+function visibleText(el: HTMLElement): string {
+  const copy = el.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll('[hidden]').forEach((n) => n.remove());
+  return copy.textContent ?? '';
+}
+
 function tooltipText(trigger: HTMLElement): string {
   act(() => { fireEvent.focus(trigger); });
   return screen.getAllByRole('tooltip').map(t => t.textContent ?? '').join(' ');
@@ -94,10 +101,10 @@ it('the full bundle NOTICE stays reachable verbatim from the header', () => {
 
 it('explanations live in header tooltips', () => {
   render(<PlatformFeedsCard status={base} />);
-  expect(tooltipText(screen.getByLabelText('About hard expiry'))).toMatch(/stops stamping new events; values already stamped stay searchable/);
+  expect(tooltipText(screen.getByText('Hard expiry'))).toMatch(/stops adding a feed's data to new events/);
   cleanup();
   render(<PlatformFeedsCard status={base} />);
-  expect(tooltipText(screen.getByLabelText('About feed state'))).toMatch(/stale after 7 days/);
+  expect(tooltipText(screen.getByLabelText('About feed state'))).toMatch(/more than 7 days old/);
 });
 
 it('an inactive, unexpired feed says why it is not stamping', () => {
@@ -134,7 +141,7 @@ it('check and import call back; checking disables them; air-gap hides check', ()
 
 it('no installed bundle says so; unavailable renders nothing', () => {
   const { getByTestId } = render(<PlatformFeedsCard status={{ ...base, installed: false, feeds: [], notice: null, bundle_sha256: null }} />);
-  expect(getByTestId('platform-feeds-card').textContent).toMatch(/No feed bundle installed/);
+  expect(visibleText(getByTestId('platform-feeds-card'))).toMatch(/No feed bundle installed/);
   expect(getByTestId('platform-feeds-state').textContent).toBe('not installed');
   cleanup();
   const { container } = render(<PlatformFeedsCard status={{ ...base, available: false }} />);

@@ -216,6 +216,10 @@ pub async fn list_reports(
 /// provenance proves the report disjoint from their deny set. A 404 therefore
 /// means what it says: no report has ever been generated.
 ///
+/// Source types of log sources deleted since the report was generated are
+/// moved from the per-source lists to `metrics.ingestion.removed_sources`
+/// (NAN-5760), so the latest report follows the live source registry.
+///
 /// GET /api/siem-health/reports/latest
 #[utoipa::path(
     get,
@@ -245,6 +249,18 @@ pub async fn get_latest_report(
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
     if let Some(report) = report.as_mut() {
+        // NAN-5760: a source deleted since this report was generated leaves
+        // its per-source lists now, not at the next scheduled run.
+        let pool = state.dual_pool();
+        let logs_table =
+            pool.table_names().read(nanosiem_core::schema::active_logs_table());
+        let removed = nanosiem_core::siem_health::removed_sources::RemovedSourceKeys::load_or_empty(
+            &state.pool,
+            pool.clickhouse(),
+            &logs_table,
+        )
+        .await;
+        report.set_aside_removed_sources(&removed);
         filter_report_for_viewer(report, &viewer_scope);
     }
 
@@ -435,6 +451,7 @@ mod tests {
 
     fn jwt_auth(denied: &[&str]) -> AuthContext {
         let mut auth = AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),
@@ -906,6 +923,7 @@ mod tests {
     /// credential from NAN-2222, and the population NAN-2219 is about.
     fn jwt_auth_without_audit_view(denied: &[&str]) -> AuthContext {
         let mut auth = AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),

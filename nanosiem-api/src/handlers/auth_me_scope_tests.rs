@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 fn ctx(perms: &[&str], denied: &[&str]) -> AuthContext {
     let claims = TokenClaims {
+        sid: None,
         iss: "t".into(),
         aud: "t".into(),
         sub: Uuid::now_v7(),

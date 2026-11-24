@@ -19,6 +19,17 @@
 //!   sentinel AND the dict's `last_seen` is the epoch-0 default. A common
 //!   (>= 1000 hosts) artifact is cached in the dict with its real `last_seen`,
 //!   so it is never probed and no `uniqMerge` runs over it.
+//! - NAN-5722: or a STALE dict entry the row itself disproves. The dict caches
+//!   a key with the `last_seen` it had at load time; for a 24h/7d window an
+//!   entry whose cached `last_seen` fell OUT of the window is masked to the
+//!   sentinel until the cell expires, even when the artifact came back. A row
+//!   whose own event `timestamp` is inside the window while the cached
+//!   `last_seen` is before it proves the cache is stale, so it is re-checked.
+//!   A sentinel with a cached `last_seen` INSIDE the window was not masked:
+//!   it is a common artifact and is never probed (the steady state of every
+//!   busy hash, domain and IP). Stale re-checks have their own cap
+//!   ([`PREVALENCE_STALE_RECHECK_CAP`]) inside the page's one probe. The
+//!   filter form already re-checks every masked key (NAN-1705).
 //! - One combined probe (a `UNION ALL` over the three summaries' primary
 //!   keys), carrying the request's derived query id and ClickHouse settings.
 //! - Misses beyond [`PREVALENCE_RESCUE_MISS_KEY_CAP`] are counted, never
@@ -201,32 +212,103 @@ fn is_epoch_zero(v: Option<&serde_json::Value>) -> bool {
     }
 }
 
-/// The row's normalized key for `kind` when its dict lookup was a TRUE miss
-/// (sentinel host count and epoch-0 `last_seen`).
-fn missed_key(row: &serde_json::Map<String, serde_json::Value>, kind: MissKind) -> Option<String> {
+/// A ClickHouse DateTime / DateTime64 as the row carries it (`YYYY-MM-DD
+/// HH:MM:SS[.f]`, RFC 3339, or epoch microseconds), in epoch microseconds.
+/// Zone-less text is UTC, the server zone every deployment runs.
+pub(crate) fn row_time_us(v: Option<&serde_json::Value>) -> Option<i64> {
+    match v? {
+        serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.timestamp_micros())
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                    .ok()
+                    .map(|dt| dt.and_utc().timestamp_micros())
+            }),
+        serde_json::Value::Number(n) => n.as_i64(),
+        _ => None,
+    }
+}
+
+/// Start of the prevalence window in epoch microseconds, `None` for 30d (the
+/// dict mask's 30d cutoff is epoch 0, so no cached entry is ever masked
+/// stale). Mirrors `SearchService::prevalence_window_cutoff_sql`.
+pub(crate) fn window_start_us(time_window: PrevalenceTimeWindow) -> Option<i64> {
+    let days = match time_window {
+        PrevalenceTimeWindow::OneHour | PrevalenceTimeWindow::TwentyFourHours => 1,
+        PrevalenceTimeWindow::SevenDays => 7,
+        PrevalenceTimeWindow::ThirtyDays => return None,
+    };
+    Some((chrono::Utc::now() - chrono::Duration::days(days)).timestamp_micros())
+}
+
+/// Most STALE dict cells (NAN-5722) one page re-checks, inside the page's
+/// single probe. Stale cells are rare (an artifact quiet for longer than the
+/// window that came back within one dict LIFETIME); the cap keeps a
+/// pathological page bounded. Past it, keys are counted as dropped (PARTIAL).
+pub(crate) const PREVALENCE_STALE_RECHECK_CAP: usize = 256;
+
+/// Why a row's dict projection counts as a miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissReason {
+    /// Not in the dict at all (epoch-0 `last_seen`).
+    Absent,
+    /// Cached with a `last_seen` before the window while the row's own event
+    /// is inside it: the window masked a stale cell.
+    Stale,
+}
+
+/// The row's normalized key for `kind` and why it is a miss: the sentinel
+/// host count AND either the epoch-0 `last_seen` (not in the dict) or, with
+/// a sub-30d window (`window_start_us`), a cached `last_seen` BEFORE the
+/// window while the row's own event `timestamp` is inside it (NAN-5722).
+/// A sentinel whose cached `last_seen` is inside the window was not masked:
+/// the artifact is common and is not a miss.
+fn missed_key(
+    row: &serde_json::Map<String, serde_json::Value>,
+    kind: MissKind,
+    window_start_us: Option<i64>,
+) -> Option<(String, MissReason)> {
     let p = kind.prefix();
     if as_u64(row.get(&format!("{p}_host_count"))) != Some(9999) {
         return None;
     }
-    if !is_epoch_zero(row.get(&format!("{p}_last_seen"))) {
-        return None;
-    }
-    kind.rescuable_key(row.get(kind.lookup_col())?.as_str()?)
+    let dict_last_seen = row.get(&format!("{p}_last_seen"));
+    let reason = if is_epoch_zero(dict_last_seen) {
+        MissReason::Absent
+    } else {
+        let start = window_start_us?;
+        let cached = row_time_us(dict_last_seen)?;
+        let event = row_time_us(row.get("timestamp"))?;
+        if !(cached < start && event >= start) {
+            return None;
+        }
+        MissReason::Stale
+    };
+    Some((kind.rescuable_key(row.get(kind.lookup_col())?.as_str()?)?, reason))
 }
 
-/// Collect the page's TRUE dict misses FIRST, then cap. Dict hits, common
+/// Collect the page's dict misses FIRST, then cap. Dict hits, common
 /// artifacts and keys a dimension can never hold never count against the cap.
-pub(crate) fn collect_miss_keys(rows: &[serde_json::Value], cap: usize) -> MissKeys {
+/// Stale cells also stop at [`PREVALENCE_STALE_RECHECK_CAP`].
+pub(crate) fn collect_miss_keys(
+    rows: &[serde_json::Value],
+    cap: usize,
+    window_start_us: Option<i64>,
+) -> MissKeys {
     let mut seen: HashSet<(MissKind, String)> = HashSet::new();
     let mut out = MissKeys::default();
+    let mut stale = 0usize;
     for row in rows {
         let Some(obj) = row.as_object() else { continue };
         for kind in MissKind::ALL {
-            let Some(key) = missed_key(obj, kind) else { continue };
+            let Some((key, reason)) = missed_key(obj, kind, window_start_us) else { continue };
             if !seen.insert((kind, key.clone())) {
                 continue;
             }
-            if out.keys.len() < cap {
+            let stale_full = reason == MissReason::Stale && stale >= PREVALENCE_STALE_RECHECK_CAP;
+            if out.keys.len() < cap && !stale_full {
+                stale += usize::from(reason == MissReason::Stale);
                 out.keys.push((kind, key));
             } else {
                 out.dropped += 1;
@@ -260,9 +342,14 @@ pub(crate) fn build_miss_probe_sql(
                 return None;
             }
             let (key_col, state_col, extra) = kind.summary_columns();
+            // NAN-5722: not in the dict (epoch-0 default) OR cached with a
+            // `last_seen` the window masks (a stale cell). At 30d the cutoff is
+            // epoch 0, so this is the epoch-0 test alone. A dict-cached common
+            // artifact seen inside the window never reaches `uniqMerge`.
             let guard = if dict_miss_guard {
                 format!(
-                    " AND dictGetOrDefault('{dict}', 'last_seen', {key_col}, toDateTime64(0, 6)) = toDateTime64(0, 6)",
+                    " AND (dictGetOrDefault('{dict}', 'last_seen', {key_col}, toDateTime64(0, 6)) = toDateTime64(0, 6) \
+OR dictGetOrDefault('{dict}', 'last_seen', {key_col}, toDateTime64(0, 6)) < {window_cutoff_sql})",
                     dict = kind.dict()
                 )
             } else {
@@ -323,6 +410,12 @@ fn ch_datetime64(us: i64) -> serde_json::Value {
 /// recompute the decorations EXACTLY as the pushdown SELECT does (rarest
 /// wins, ties domain → ip → hash; score as the Prevalence API computes it).
 /// Returns the number of rows changed.
+///
+/// Per ARTIFACT, not per row (NAN-5722): every row whose dimension reads the
+/// sentinel for a rescued key gets the truth, including older rows of the
+/// same artifact that did not themselves prove the cache stale. Every key in
+/// `found` was probed and verified rare and inside the window, which is what
+/// a refreshed dict would decorate every one of those rows with.
 pub(crate) fn apply_page_rescue(
     rows: &mut [serde_json::Value],
     found: &HashMap<(MissKind, String), RescuedArtifact>,
@@ -336,9 +429,18 @@ pub(crate) fn apply_page_rescue(
         let Some(obj) = row.as_object_mut() else { continue };
         let mut touched = false;
         for kind in MissKind::ALL {
-            let Some(key) = missed_key(obj, kind) else { continue };
-            let Some(r) = found.get(&(kind, key)) else { continue };
             let p = kind.prefix();
+            if as_u64(obj.get(&format!("{p}_host_count"))) != Some(9999) {
+                continue;
+            }
+            let Some(key) = obj
+                .get(kind.lookup_col())
+                .and_then(|v| v.as_str())
+                .and_then(|raw| kind.rescuable_key(raw))
+            else {
+                continue;
+            };
+            let Some(r) = found.get(&(kind, key)) else { continue };
             obj.insert(format!("{p}_host_count"), serde_json::json!(r.host_count));
             obj.insert(format!("{p}_first_seen"), ch_datetime64(r.first_seen_us));
             obj.insert(format!("{p}_last_seen"), ch_datetime64(r.last_seen_us));
@@ -425,7 +527,8 @@ impl SearchService {
         rarity_threshold: u64,
         query_id: &str,
     ) -> usize {
-        let misses = collect_miss_keys(rows, PREVALENCE_RESCUE_MISS_KEY_CAP);
+        let window_start = window_start_us(time_window);
+        let misses = collect_miss_keys(rows, PREVALENCE_RESCUE_MISS_KEY_CAP, window_start);
         if misses.dropped > 0 {
             report_page_rescue_overflow(misses.dropped);
         }

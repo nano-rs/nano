@@ -27,6 +27,7 @@ import { SloEditorDialog } from '@/components/observability/SloEditorDialog';
 import { cn } from '@/lib/utils';
 import { fmtAgo } from '@/components/observability/format';
 import type { ObservabilityTabProps } from '../types';
+import { Term } from '@/components/ui/term';
 
 // O17 (NAN-1721): the backend now returns a distinct "no_data" status when a
 // SLO'd service has zero traffic in the window (a hard-down service must NOT
@@ -119,17 +120,19 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
     <div className="flex flex-col gap-3.5">
       {slos.some((s) => s.status === 'no_data' || s.status === 'partial') && (
         <div className="border border-border px-3 py-2 text-[11px] text-fg-3">
-          No data means no matching service spans were evaluated. Partial means the full SLO window is not covered yet.
+          No data means no matching spans arrived yet. Partial means the SLO window is not full yet.
           <TelemetrySetupHint />
         </div>
       )}
       {/* header / meta row */}
       <div className="flex items-center gap-2">
         <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-fg-3">
-          {slos.length} {slos.length === 1 ? 'SLO' : 'SLOs'}
+          {slos.length} <Term id="slo">{slos.length === 1 ? 'SLO' : 'SLOs'}</Term>
         </span>
         {burning > 0 && (
-          <span className="font-mono text-[11px] text-warn">{burning} burning budget</span>
+          <span className="font-mono text-[11px] text-warn">
+            {burning} <Term id="burn-rate">burning budget</Term>
+          </span>
         )}
         <span className="text-[11px] text-fg-4">· sorted by budget consumed</span>
         <div className="flex-1" />
@@ -268,7 +271,9 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
                 {/* error budget bar */}
                 <div>
                   <div className="mb-1 flex items-center justify-between font-mono text-[9.5px] text-fg-4">
-                    <span>error budget consumed</span>
+                    <span>
+                      <Term id="error-budget">error budget</Term> consumed
+                    </span>
                     <span
                       className={cn(
                         noData

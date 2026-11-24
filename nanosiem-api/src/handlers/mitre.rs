@@ -269,6 +269,9 @@ pub async fn get_mitre_coverage(
             format!("Failed to get configured telemetry sources: {}", e),
         )
     })?;
+    // NAN-1801 / NAN-5850: the viewer's effective deny set scopes both the
+    // readiness probe and the mapped `source_types` each data source lists.
+    let deny_set = auth.effective_source_deny_set();
     let telemetry = if configured_source_types.is_empty() {
         TelemetryReadinessSnapshot::observed(
             configured_source_types,
@@ -284,7 +287,6 @@ pub async fn get_mitre_coverage(
         // timestamp here. Denied sources fall out of the stats map and
         // render as "unknown" readiness; an empty deny set (unrestricted
         // viewer) emits byte-identical SQL.
-        let deny_set = auth.effective_source_deny_set();
         let stats = match tokio::time::timeout(
             TELEMETRY_READINESS_QUERY_TIMEOUT,
             state
@@ -336,7 +338,8 @@ pub async fn get_mitre_coverage(
                 TelemetryReadinessSnapshot::unavailable(configured_source_types, chrono::Utc::now())
             }
         }
-    };
+    }
+    .with_denied_source_types(&deny_set);
 
     // Parse comma-separated filter values
     let severity_filter: Option<Vec<String>> = params.severity.map(|s| {
@@ -486,6 +489,7 @@ mod tests {
             readiness: DataSourceReadiness::Active,
             last_seen_at: Some(chrono::DateTime::UNIX_EPOCH),
             connected: true,
+            source_types: vec!["windows_sysmon".to_string()],
         };
         let stale = DataSource {
             readiness: DataSourceReadiness::Stale,
@@ -514,5 +518,7 @@ mod tests {
         assert_eq!(stale_json["connected"], false);
         assert_eq!(unknown_json["readiness"], "unknown");
         assert_eq!(unknown_json["connected"], false);
+        // NAN-5850: the mapped source types ride along on every source.
+        assert_eq!(active_json["source_types"], serde_json::json!(["windows_sysmon"]));
     }
 }

@@ -15,6 +15,8 @@ import {
   useUpdateSearchQueryLimits,
 } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
+import { Term } from '@/components/ui/term';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 type Priority = 'realtime' | 'interactive' | 'analytics';
 
@@ -23,9 +25,9 @@ const AI_RESTRICTED_COMMANDS: { name: string; label: string; hint: string }[] = 
   {
     name: 'inputlookup',
     label: 'inputlookup url=',
-    hint: 'Fetches an external URL from inside the search. Lookups of internal tables are always allowed.',
+    hint: 'Fetches an external URL. Internal table lookups are always allowed.',
   },
-  { name: 'ai', label: 'ai', hint: 'Sends result rows to the AI provider.' },
+  { name: 'ai', label: 'ai', hint: 'Sends result rows to your AI provider.' },
   { name: 'output', label: 'output', hint: 'Writes results to a destination.' },
 ];
 
@@ -220,7 +222,7 @@ export function SearchSettings() {
       <div>
         <h1 className="text-[18px] font-semibold tracking-tight text-foreground">Search</h1>
         <p className="text-[11.5px] text-muted-foreground mt-0.5">
-          Admission control, query limits, resource policy
+          <Term id="admission-control">Admission control</Term>, query limits and resource limits
         </p>
       </div>
 
@@ -230,7 +232,7 @@ export function SearchSettings() {
           Concurrency limits
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Caps how many ad-hoc search queries can run simultaneously across the platform. Detection rules bypass these limits.
+          How many searches people can run at the same time. Detection rules are not limited.
         </p>
 
         <div className="flex flex-col">
@@ -238,7 +240,7 @@ export function SearchSettings() {
             {
               key: 'global',
               label: 'Global ad-hoc limit',
-              hint: 'Maximum ad-hoc queries (Interactive + Analytics) running concurrently across all users. (1–500)',
+              hint: 'Searches running at once across all users. (1–500)',
               value: globalAdHocLimit,
               onChange: setGlobalAdHocLimit,
               min: 1,
@@ -248,7 +250,7 @@ export function SearchSettings() {
             {
               key: 'per-user',
               label: 'Per-user limit',
-              hint: 'Maximum concurrent searches per individual user. Must not exceed the global limit. (1–50)',
+              hint: 'Searches one person can run at once. No more than the total. (1–50)',
               value: perUserLimit,
               onChange: setPerUserLimit,
               min: 1,
@@ -258,7 +260,7 @@ export function SearchSettings() {
             {
               key: 'queue-depth',
               label: 'Max queue depth',
-              hint: 'How many searches can wait in the queue before new ones are rejected. (10–1,000)',
+              hint: 'Searches that can wait in line. Past this, new ones are turned away. (10–1,000)',
               value: maxQueueDepth,
               onChange: setMaxQueueDepth,
               min: 10,
@@ -268,7 +270,7 @@ export function SearchSettings() {
             {
               key: 'queue-timeout',
               label: 'Queue timeout',
-              hint: 'How long a search waits in the queue before timing out. (10–600 sec)',
+              hint: 'How long a search waits in line before it gives up. (10–600 sec)',
               value: queueTimeoutSeconds,
               onChange: setQueueTimeoutSeconds,
               min: 10,
@@ -313,7 +315,7 @@ export function SearchSettings() {
           Resource budgets
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Per-query execution time and memory caps sent to ClickHouse for each priority tier.
+          The most time and memory one search may use, by <Term id="priority-tier">priority tier</Term>.
         </p>
 
         <div className="flex flex-col">
@@ -402,7 +404,7 @@ export function SearchSettings() {
           Query safety
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Bounds for memory-intensive query operations — prevents OOM from unbounded array aggregation, expansion, or post-processing.
+          Limits on steps that use a lot of memory, so one search cannot run the server out of memory.
         </p>
 
         <div className="flex flex-col">
@@ -410,7 +412,7 @@ export function SearchSettings() {
             {
               key: 'group-array',
               label: 'Max array aggregation size',
-              hint: 'Max elements per group in groupArray / values() / list(). Arrays are truncated beyond this. (100–1,000,000)',
+              hint: 'Most values kept per group by values() and list(). Extra values are cut. (100–1,000,000)',
               value: maxGroupArraySize,
               onChange: setMaxGroupArraySize,
               min: 100,
@@ -420,7 +422,7 @@ export function SearchSettings() {
             {
               key: 'mvexpand',
               label: 'Max mvexpand rows',
-              hint: 'Default row cap for mvexpand when the query doesn’t specify one. Array expansion runs before LIMIT. (1,000–10,000,000)',
+              hint: 'Most rows mvexpand can produce when the command sets no limit of its own. (1,000–10,000,000)',
               value: maxMvexpandRows,
               onChange: setMaxMvexpandRows,
               min: 1000,
@@ -430,7 +432,7 @@ export function SearchSettings() {
             {
               key: 'post-groups',
               label: 'Max post-processing groups',
-              hint: 'Max groups in Rust-side post-processing (stats, top, rare). Excess dropped. Only applies to commands that can’t run in ClickHouse. (10,000–10,000,000)',
+              hint: 'Most groups stats, top and rare can build when they run outside the database. Extra groups are dropped. (10,000–10,000,000)',
               value: maxPostProcessingGroups,
               onChange: setMaxPostProcessingGroups,
               min: 10000,
@@ -440,7 +442,7 @@ export function SearchSettings() {
             {
               key: 'cache-rows',
               label: 'Max streaming cache rows',
-              hint: 'Max rows buffered for the streaming result cache. Beyond this, results still stream to the client but aren’t cached for re-display. (1,000–1,000,000)',
+              hint: 'Rows past this still show but are not kept in the cache. (1,000–1,000,000)',
               value: maxStreamingCacheRows,
               onChange: setMaxStreamingCacheRows,
               min: 1000,
@@ -481,7 +483,7 @@ export function SearchSettings() {
                 Block queries with cost-analysis errors
               </label>
               <div className="text-[11px] text-muted-foreground mt-0.5">
-                Reject queries that trigger Error-severity cost warnings (unbounded dedup, unbounded transaction, etc.) instead of just warning. Recommended for shared environments.
+                Stop a search that the <Term id="cost-guard">cost check</Term> says is too expensive, instead of only warning. Best when many people share nano.
               </div>
             </div>
             <Switch
@@ -495,7 +497,7 @@ export function SearchSettings() {
           <div className="pt-3 pb-1">
             <div className="text-[12.5px] font-medium text-foreground">Commands allowed in AI searches</div>
             <div className="text-[11px] text-muted-foreground mt-0.5">
-              Searches written by pivt, the nano MCP and Desktop agents cannot run these commands unless allowed here. Analysts' own searches are not affected.
+              Searches written by AI (<EnterpriseTerm id="pivt">pivt</EnterpriseTerm>, the nano MCP and Desktop agents) cannot run these commands unless you allow them here. People's own searches are not affected.
             </div>
           </div>
           {AI_RESTRICTED_COMMANDS.map((cmd) => (

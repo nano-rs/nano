@@ -436,15 +436,45 @@ impl TokenService {
     /// # Returns
     /// * `Ok(String)` - The encoded JWT access token
     /// * `Err(TokenError)` - If token creation fails
+    ///
+    /// Test-only (NAN-5573 review): a production access token must be bound
+    /// to its session, so sign-in paths use
+    /// [`Self::create_access_token_for_session`] and cannot mint a
+    /// sessionless token by accident.
+    #[cfg(test)]
     pub fn create_access_token(
         &self,
         user_id: Uuid,
         roles: Vec<String>,
     ) -> Result<String, TokenError> {
+        self.mint_access_token(user_id, roles, None)
+    }
+
+    /// Create an access token bound to a login session (NAN-5573).
+    ///
+    /// The token carries `sid = session_id`, so logout can end exactly this
+    /// session and `GET /api/sessions/me` can mark it as current. Every
+    /// interactive sign-in and refresh mints its access token through here.
+    pub fn create_access_token_for_session(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        session_id: Uuid,
+    ) -> Result<String, TokenError> {
+        self.mint_access_token(user_id, roles, Some(session_id))
+    }
+
+    fn mint_access_token(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        sid: Option<Uuid>,
+    ) -> Result<String, TokenError> {
         let now = Utc::now();
         let exp = now + Duration::seconds(self.config.access_token_ttl);
 
         let claims = TokenClaims {
+            sid,
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
             sub: user_id,
@@ -469,6 +499,7 @@ impl TokenService {
         let exp = now + Duration::seconds(300); // 5 minutes
 
         let claims = TokenClaims {
+            sid: None,
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
             sub: user_id,
@@ -540,12 +571,34 @@ impl TokenService {
     /// # Returns
     /// * `Ok(TokenPair)` - Both access and refresh tokens
     /// * `Err(TokenError)` - If token creation fails
+    ///
+    /// Test-only, like [`Self::create_access_token`].
+    #[cfg(test)]
     pub fn create_token_pair(
         &self,
         user_id: Uuid,
         roles: Vec<String>,
     ) -> Result<TokenPair, TokenError> {
         let access_token = self.create_access_token(user_id, roles)?;
+        let refresh_token = self.create_refresh_token(user_id)?;
+
+        Ok(TokenPair::new(
+            access_token,
+            refresh_token,
+            self.config.access_token_ttl,
+        ))
+    }
+
+    /// Create a token pair for an existing session: a rotated refresh token
+    /// plus an access token bound to `session_id` (see
+    /// [`Self::create_access_token_for_session`]).
+    pub fn create_token_pair_for_session(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        session_id: Uuid,
+    ) -> Result<TokenPair, TokenError> {
+        let access_token = self.create_access_token_for_session(user_id, roles, session_id)?;
         let refresh_token = self.create_refresh_token(user_id)?;
 
         Ok(TokenPair::new(
@@ -1157,6 +1210,7 @@ mod tests {
     #[test]
     fn test_token_claims_has_permission() {
         let claims = TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),

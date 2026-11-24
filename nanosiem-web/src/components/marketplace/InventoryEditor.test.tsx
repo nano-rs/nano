@@ -109,13 +109,13 @@ describe('InventoryEntitlement', () => {
   it('open build names the Enterprise edition', () => {
     render(<MemoryRouter><InventoryEntitlement requirement={{ capability: 'customEnrichment', cause: 'edition', label: 'Enterprise edition' }} edition="open" /></MemoryRouter>);
     expect(screen.getByRole('status').textContent).toBe('Requires the Enterprise edition');
-    expect(screen.getByText(/installs and runs unchanged on an enterprise deployment/)).toBeTruthy();
+    expect(screen.getByText(/runs on an enterprise deployment/)).toBeTruthy();
   });
 
   it('enterprise without a license names the license and links Settings › License', () => {
     render(<MemoryRouter><InventoryEntitlement requirement={{ capability: 'customEnrichment', cause: 'licence', label: 'Active license' }} edition="enterprise" canManageLicence /></MemoryRouter>);
     expect(screen.getByRole('status').textContent).toBe('Requires an active license');
-    expect(screen.queryByText(/Enterprise edition|unchanged on an enterprise deployment/)).toBeNull();
+    expect(screen.queryByText(/Enterprise edition|on an enterprise deployment/)).toBeNull();
     expect(screen.getByRole('link', { name: /Settings › License/ }).getAttribute('href')).toBe('/settings/license');
   });
 

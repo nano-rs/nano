@@ -45,8 +45,9 @@ fn rollup_sql_scopes_restricted_readers_on_the_raw_scope_key() {
         20,
     );
     assert!(sql.contains("scope_source_type_complete = 1"), "{sql}");
-    assert!(sql.contains("scope_source_type"), "{sql}");
-    assert!(sql.contains("'audit'"), "{sql}");
+    assert!(sql.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"), "{sql}");
+    // NAN-5793: the deny list is bound, never SQL text.
+    assert!(!sql.contains("'audit'"), "{sql}");
 }
 
 #[test]
@@ -65,7 +66,8 @@ fn raw_fallback_counts_the_logs_table_with_scope_on_source_type() {
         "{sql}"
     );
     assert!(sql.contains("count() AS events"), "{sql}");
-    assert!(sql.contains("'audit'"), "{sql}");
+    assert!(sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"), "{sql}");
+    assert!(!sql.contains("'audit'"), "{sql}");
     assert!(!sql.contains("PREWHERE"), "{sql}");
 }
 

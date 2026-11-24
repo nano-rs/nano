@@ -71,7 +71,7 @@ export function AirgapBadge({ requiresNetwork }: { requiresNetwork: boolean }) {
   if (requiresNetwork) {
     return (
       <span
-        title="This integration's live sync needs outbound internet. In air-gapped mode, import a signed data bundle instead."
+        title="Live sync needs internet access. On an air-gapped install, import a signed data bundle instead."
         className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[9.5px] uppercase tracking-[0.1em] border whitespace-nowrap bg-muted/40 border-border text-muted-foreground"
       >
         <WifiOff className="w-[10px] h-[10px]" />
@@ -81,7 +81,7 @@ export function AirgapBadge({ requiresNetwork }: { requiresNetwork: boolean }) {
   }
   return (
     <span
-      title="Runs without outbound internet — works in air-gapped mode."
+      title="Runs without internet access, so it works on an air-gapped install."
       className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[9.5px] uppercase tracking-[0.1em] border whitespace-nowrap bg-emerald-500/10 border-emerald-500/30 text-emerald-500"
     >
       <Wifi className="w-[10px] h-[10px]" />

@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from nano_e2e import feeds
 from nano_e2e.client import Nano, expect
 from nano_e2e.waits import eventually
 
@@ -90,6 +91,9 @@ def ensure_vendor_parser(nano: Nano, parser: VendorParser) -> str:
     src = expect(nano.api.get(f"/api/log-sources/{source_id}"), 200)
     missing = [lane for lane in parser.lanes if lane not in (src.get("match_values") or [])]
     assert not missing, f"imported {parser.name} does not claim lanes {missing}: {src.get('match_values')}"
+    # A harness lane parser another scenario left on these lanes would claim
+    # the same source_type, and deploy refuses duplicates.
+    feeds.release_lane_sources(nano, parser.lanes, keep=str(source_id))
     if not (src.get("deployed") and src.get("enabled")):
         res = expect(nano.api.post(f"/api/log-sources/{source_id}/publish", json={"acknowledge_unattested": True}), 200)
         assert res.get("success") is True, f"publishing {parser.name} failed: {res}"

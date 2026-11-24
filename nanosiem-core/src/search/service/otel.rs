@@ -21,7 +21,7 @@
 //! AND-s the deny-set exclusion onto both its signals reads.
 
 use super::*;
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::source_scope_bound_predicate;
 use crate::auth::ScopeSet;
 use crate::query::{
     infra_hosts_sql, metric_names_sql, metric_names_window_start, metric_scalar_sql, metric_tag_keys_sql,
@@ -1012,7 +1012,9 @@ impl SearchService {
         // both the sample read below and the count companion, which must stay
         // predicate-identical. `None` (unrestricted) leaves both reads
         // byte-identical to the pre-scoping form.
-        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+        // NAN-5793: bound, never inline; `scoped_executor` binds the deny list.
+        let scope_predicate = source_scope_bound_predicate("source_type", scope.deny_set());
+        let scoped_executor = ch_executor.with_source_scope(scope.deny_set());
 
         // 2) Find detection signals against those entities.
         let mut signals_sql = security_signals_for_entities_sql(
@@ -1039,7 +1041,7 @@ impl SearchService {
             }
         }
         debug!("OTEL service-security-signals SQL: {}", signals_sql);
-        let signal_rows = ch_executor.execute_sql_to_json(&signals_sql).await?;
+        let signal_rows = scoped_executor.execute_sql_to_json(&signals_sql).await?;
 
         let signals: Vec<serde_json::Value> = signal_rows
             .iter()
@@ -1104,7 +1106,7 @@ impl SearchService {
             end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
         );
         debug!("OTEL service-security-signals count SQL: {}", count_sql);
-        let count_rows = ch_executor.execute_sql_to_json(&count_sql).await?;
+        let count_rows = scoped_executor.execute_sql_to_json(&count_sql).await?;
         let signal_total = count_rows
             .first()
             .map(|r| json_f64(r, "signal_total") as u64)

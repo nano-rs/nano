@@ -23,12 +23,35 @@ OTELCOL_IMAGE = (
 )
 
 
-def _container_ingest_endpoint(url: str) -> str:
-    """Translate a host-loopback e2e URL into the sender container's view."""
+# The edge's compose service and its container port (dev/e2e/compose.e2e.yml).
+EDGE_IN_NETWORK = "edge:80"
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def _container_ingest_endpoint(url: str, edge_url: str = "") -> str:
+    """Translate a host-loopback e2e URL into the sender container's view.
+
+    The sender joins the stack's compose network, so the edge's own published
+    port is reached as the `edge` service there (NAN-5878): on Linux the edge
+    publishes on host 127.0.0.1 only, which `host.docker.internal`
+    (host-gateway, 172.17.0.1) cannot reach; Docker Desktop hid this. Same
+    nginx, same authenticated public path, both platforms. Any other loopback
+    URL still goes through the host gateway."""
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError(f"invalid OTLP ingest URL: {url}")
-    if parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+    edge = urlsplit(edge_url) if edge_url else None
+    if (
+        edge is not None
+        and parsed.scheme == "http"
+        and edge.scheme == "http"
+        and parsed.hostname in _LOOPBACK
+        and edge.hostname in _LOOPBACK
+        and parsed.port is not None
+        and parsed.port == edge.port
+    ):
+        parsed = parsed._replace(netloc=EDGE_IN_NETWORK)
+    elif parsed.hostname in _LOOPBACK:
         host = "host.docker.internal"
         if parsed.port is not None:
             host = f"{host}:{parsed.port}"
@@ -257,6 +280,14 @@ def post_protobuf_probe(
     )
 
 
+def collector_user() -> str:
+    """The uid:gid the sender collector runs as (NAN-5832): the harness user,
+    who owns the 0600 config it mounts. Root with every capability dropped has
+    no CAP_DAC_OVERRIDE, so on a native Linux bind mount it cannot read a 0600
+    file another uid owns (Docker Desktop on macOS hides this)."""
+    return f"{os.getuid()}:{os.getgid()}"
+
+
 class CollectorSender:
     """Pinned Collector: receives local JSON and exports real OTLP to nano."""
 
@@ -274,7 +305,7 @@ class CollectorSender:
         self.stack = stack
         self.token = token or ""
         self.protocol = protocol
-        self.ingest_endpoint = _container_ingest_endpoint(stack.ingest_url)
+        self.ingest_endpoint = _container_ingest_endpoint(stack.ingest_url, getattr(stack, "edge_url", ""))
         self.out = out
         safe = "".join(c for c in label.lower() if c.isalnum())[-10:] or "sender"
         self.name = f"{stack.project}-otelcol-{safe}"
@@ -321,7 +352,7 @@ class CollectorSender:
                 "--name",
                 self.name,
                 "--user",
-                "0:0",
+                collector_user(),
                 "--read-only",
                 "--cap-drop",
                 "ALL",

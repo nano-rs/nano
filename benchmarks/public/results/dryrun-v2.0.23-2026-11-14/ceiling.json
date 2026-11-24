@@ -7,13 +7,13 @@
   "schema_profile": "ocsf",
   "topology": {
     "name": "bench-dryrun",
-    "provider": "Rackspace Spot",
-    "region": "us-central-dfw-2",
+    "provider": "cloud spot VMs",
+    "region": "us-central",
     "hosts": [
       {
         "name": "app1",
         "role": "app",
-        "server_class": "gp.vs2.large-dfw2",
+        "server_class": "gp.large",
         "vcpu": 4,
         "mem_gb": 16,
         "market_usd_per_hour": 0.04,
@@ -23,7 +23,7 @@
       {
         "name": "ch1",
         "role": "clickhouse",
-        "server_class": "gp.vs2.xlarge-dfw2",
+        "server_class": "gp.xlarge",
         "vcpu": 8,
         "mem_gb": 32,
         "market_usd_per_hour": 0.08,
@@ -33,7 +33,7 @@
       {
         "name": "ing1",
         "role": "ingest",
-        "server_class": "ch.vs2.xlarge-dfw2",
+        "server_class": "ch.xlarge",
         "vcpu": 8,
         "mem_gb": 16,
         "market_usd_per_hour": 0.06,
@@ -43,7 +43,7 @@
       {
         "name": "blaster1",
         "role": "load-generator",
-        "server_class": "ch.vs2.large-dfw2",
+        "server_class": "ch.large",
         "vcpu": 4,
         "mem_gb": 8,
         "market_usd_per_hour": 0.04,

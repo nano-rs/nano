@@ -116,23 +116,23 @@ const COVERAGE: Record<
     dot: 'bg-emerald-500',
     text: 'text-emerald-600 dark:text-emerald-400',
     hint: 'Enough history to trust a "never seen before" call.',
-    body: 'enough prior activity to trust these as genuine first sightings.',
+    body: 'enough history to trust these as first sightings.',
   },
   thin: {
     label: 'thin',
     cls: 'text-amber-600 dark:text-amber-400 border-amber-500/40 bg-amber-500/10',
     dot: 'bg-amber-500',
     text: 'text-amber-600 dark:text-amber-400',
-    hint: 'Limited history — treat new values as leads, not verdicts.',
-    body: 'limited prior activity to judge against — treat these as leads to verify, not verdicts.',
+    hint: 'Limited history: treat new values as leads, not verdicts.',
+    body: 'limited history; treat these as leads, not verdicts.',
   },
   no_history: {
     label: 'no history',
     cls: 'text-muted-foreground border-border bg-muted/40',
     dot: 'bg-muted-foreground',
     text: 'text-muted-foreground',
-    hint: 'No prior activity — cannot judge what is new for this entity.',
-    body: 'no prior activity — "new" cannot be judged for this entity.',
+    hint: 'No prior activity: cannot judge what is new for this entity.',
+    body: 'no prior activity; "new" cannot be judged.',
   },
 };
 
@@ -262,7 +262,7 @@ export function BaselineView({
         {anyUnknown && (
           <span
             className="flex items-center gap-1 text-amber-600 dark:text-amber-400 normal-case tracking-normal"
-            title="The lookback filled entirely with new values, so a baseline could not be established — these are unconfirmed, not proven first-sightings."
+            title="Every value in the lookback was new, so there is no normal to compare with. These may not really be first sightings."
           >
             <TriangleAlert className="w-[11px] h-[11px]" />
             <span className="text-[10px]">baseline unknown</span>
@@ -313,9 +313,8 @@ export function BaselineView({
             </div>
             <div className="flex flex-col gap-1 min-w-0 flex-1">
               <div className="text-[12px] text-foreground leading-snug">
-                Values that appeared for <span className="font-mono">{entity || 'this entity'}</span> in
-                your search window but were <span className="font-medium">absent from its recent history</span>
-                {' — '}
+                New for <span className="font-mono">{entity || 'this entity'}</span> vs its recent history
+                {' · '}
                 <span className="font-mono text-[11px]">
                   {groups.map((g, i) => (
                     <span key={g.dim}>
@@ -332,7 +331,7 @@ export function BaselineView({
                 <span className={cn('w-[6px] h-[6px] rounded-full shrink-0', cov.dot)} aria-hidden />
                 <span>
                   <span className={cn('font-medium', cov.text)}>{BAND_LABEL[coverage] ?? cov.label}</span>
-                  <span className="text-muted-foreground"> — {cov.body}</span>
+                  <span className="text-muted-foreground">: {cov.body}</span>
                 </span>
               </div>
               {anyUnknown && (
@@ -340,7 +339,7 @@ export function BaselineView({
                   <TriangleAlert className="w-[11px] h-[11px] text-amber-500 shrink-0" />
                   <span className="text-muted-foreground">
                     <span className="font-medium text-amber-600 dark:text-amber-400">baseline incomplete</span>
-                    {' — the comparison cap filled entirely with new values, so some items may not be true first sightings.'}
+                    {': the comparison cap filled with new values; some may not be first sightings.'}
                   </span>
                 </div>
               )}

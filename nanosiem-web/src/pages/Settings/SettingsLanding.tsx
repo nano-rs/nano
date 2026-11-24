@@ -103,7 +103,7 @@ function LandingSearch({ visibleSections }: { visibleSections: SettingsSection[]
             value={q}
             onChange={e => setQ(e.target.value)}
             onKeyDown={handleKey}
-            placeholder="Search all settings — e.g. session timeout, SSO, storage retention…"
+            placeholder="Search all settings: session timeout, SSO, storage retention…"
             className="flex-1 bg-transparent outline-none text-[14px] text-foreground placeholder:text-muted-foreground"
           />
           <span className="font-mono text-[10.5px] text-muted-foreground/70 tracking-wide">⌘K</span>
@@ -348,8 +348,8 @@ export function SettingsLanding() {
       <div className="max-w-[1040px] mx-auto px-8 py-10 flex flex-col gap-8">
         <div className="flex flex-col items-center gap-2 text-center pt-4">
           <div className="text-[22px] font-semibold tracking-tight text-foreground leading-none">Settings</div>
-          <div className="text-[12.5px] text-muted-foreground">
-            {visibleSections.length} sections. Search anything, or jump to what needs attention.
+          <div className="font-mono text-[10.5px] text-muted-foreground">
+            {visibleSections.length} sections
           </div>
         </div>
 

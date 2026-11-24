@@ -35,20 +35,25 @@
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
         "tests/enterprise/ui/test_soar.py",
         "tests/personas/test_incident_responder.py",
-        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_real_alert_flow_two_person_approval_on_the_case"
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_real_alert_flow_two_person_approval_on_the_case",
+        "tests/enterprise/ui/test_v2034_soar_approvals_layout.py"
       ],
       "edition": "enterprise"
     },
     "/automation/approvals/:id": {
-      "skip": "approval opened by id: no scenario seeds and opens one yet; the list page it is reached from is smoke-tested",
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_approvals_layout.py"
+      ],
       "edition": "enterprise"
     },
     "/automation/capabilities": {
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_pack_browsing_and_install"
+        "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_pack_browsing_and_install",
+        "tests/enterprise/ui/test_soar_capabilities_layout.py::test_capability_cells_keep_their_chips_inside"
       ],
+      "note": "test_deep_soar_pack_browsing_and_install and test_capability_cells_keep_their_chips_inside (NAN-5759 crowded-catalog layout) need the soar-lab catalog signer: they run under `scripts/e2e.sh run soar ui` and SKIP on a plain `run ui` / `run enterprise` stack. Only the page smoke covers this route there.",
       "edition": "enterprise"
     },
     "/automation/flows": {
@@ -64,6 +69,7 @@
     "/automation/flows/:id": {
       "edition": "enterprise",
       "tests": [
+        "tests/enterprise/ui/test_v2035_pane_overflow_layout.py::test_v2035_case_thread_and_flow_inspector_never_scroll_sideways",
         "tests/enterprise/ui/test_soar.py::test_run_flow_from_editor_matches_run_api",
         "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_unconnected_action_flagged_and_live_save_refused",
         "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_breaker_resume_and_live_save"
@@ -88,6 +94,7 @@
     "/cases/:id": {
       "edition": "enterprise",
       "tests": [
+        "tests/enterprise/ui/test_v2035_pane_overflow_layout.py::test_v2035_case_thread_and_flow_inspector_never_scroll_sideways",
         "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_hunts_escalation_acknowledge_and_case_close_smoke",
         "tests/enterprise/ui/test_v2034_soar_case_steps.py::test_v2034_soar_case_steps_authored_tested_and_run_live",
         "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_team_lifecycle",
@@ -120,6 +127,7 @@
     },
     "/dashboards/:id": {
       "tests": [
+        "tests/enterprise/ui/test_v2035_layout_batch_a.py::test_v2035_transactions_panel_and_rules_strips_fit_at_every_width",
         "tests/ui/test_deep_dashboards.py::test_build_a_dashboard_from_scratch_with_every_panel_type",
         "tests/ui/test_deep_dashboards.py::test_edit_duplicate_delete_move_and_resize_panels",
         "tests/ui/test_deep_dashboards.py::test_time_range_refresh_autorefresh_and_drilldown",
@@ -161,7 +169,8 @@
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
         "tests/enterprise/personas/test_threat_hunter.py",
         "tests/enterprise/ui/test_hunts_ui_walk.py",
-        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run"
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ],
       "edition": "enterprise"
     },
@@ -169,7 +178,9 @@
       "tests": [
         "tests/enterprise/personas/test_threat_hunter.py",
         "tests/enterprise/ui/test_hunts_ui_walk.py",
-        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run"
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/enterprise/ui/test_v2035_hunt_telemetry_messages.py::test_v2035_hunt_telemetry_messages_are_plain_and_link_to_the_fix"
       ],
       "edition": "enterprise"
     },
@@ -178,14 +189,16 @@
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
         "tests/enterprise/personas/test_threat_hunter.py",
-        "tests/enterprise/ui/test_hunts_ui_walk.py"
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ],
       "edition": "enterprise"
     },
     "/hunts/campaigns/:id": {
       "tests": [
         "tests/enterprise/ui/test_hunts_ui_walk.py",
-        "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_agent_sql_approximate_distinct_count_reads_as_estdc"
+        "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_agent_sql_approximate_distinct_count_reads_as_estdc",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ],
       "edition": "enterprise"
     },
@@ -193,7 +206,8 @@
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_hunts_ui_walk.py"
+        "tests/enterprise/ui/test_hunts_ui_walk.py",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ],
       "edition": "enterprise"
     },
@@ -201,14 +215,18 @@
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues"
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ],
       "edition": "enterprise"
     },
     "/hunts/knowledge": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/ui/test_v2035_hunts_knowledge_flyout.py::test_v2035_knowledge_row_opens_full_content_flyout_and_revokes"
       ],
       "edition": "enterprise"
     },
@@ -218,62 +236,73 @@
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
         "tests/enterprise/personas/test_threat_hunter.py",
         "tests/enterprise/ui/test_hunts_ui_walk.py",
-        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ],
       "edition": "enterprise"
     },
     "/hunts/leads/:id": {
       "edition": "enterprise",
       "tests": [
-        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close",
+        "tests/enterprise/ui/test_deep_hunts.py::test_finding_page_layout",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ]
     },
     "/hunts/memory": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5850: redirects to /hunts/knowledge, query kept"
     },
     "/hunts/profile": {
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_hunts_ui_walk.py"
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/personas/test_hunt_recon_web.py::test_coverage_telemetry_runs_recon_for_the_recon_scope_only"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5850: redirects to /rules/coverage?view=hunts&tab=telemetry (the recon profile lives on the Coverage Telemetry tab)"
     },
     "/hunts/rule-ideas": {
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_hunts_ui_walk.py"
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5850: redirects to /rules/ideas, query kept"
     },
     "/hunts/rulings": {
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5850: redirects to /hunts/leads/decisions, query kept"
     },
     "/hunts/runners": {
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/personas/test_threat_hunter.py",
-        "tests/enterprise/ui/test_hunts_ui_walk.py"
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5850: redirects to /settings/hunts, query dropped"
     },
     "/hunts/suppressions": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5850: redirects to /hunts/knowledge?tab=suppressions, query merged"
     },
     "/inbox": {
       "smoke": true,
@@ -449,7 +478,8 @@
     "/playbooks": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/content_acceptance/test_playbook_library_autodelivery.py::test_official_playbooks_reach_the_library_without_a_click"
       ],
       "edition": "enterprise"
     },
@@ -463,7 +493,8 @@
     "/playbooks/repositories": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/content_acceptance/test_playbook_library_autodelivery.py::test_official_playbooks_reach_the_library_without_a_click"
       ],
       "edition": "enterprise"
     },
@@ -499,6 +530,7 @@
     "/rules": {
       "smoke": true,
       "tests": [
+        "tests/enterprise/ui/test_v2035_layout_batch_a.py::test_v2035_transactions_panel_and_rules_strips_fit_at_every_width",
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
         "tests/enterprise/ui/test_hunts_ui_walk.py",
         "tests/personas/test_detection_engineer.py"
@@ -513,7 +545,10 @@
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
+        "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches",
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel",
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_rbac",
+        "tests/ui/test_v2035_mitre_coverage_open_core.py::test_v2035_mitre_coverage_without_the_hunt_layer"
       ]
     },
     "/rules/editor": {
@@ -526,9 +561,12 @@
     },
     "/rules/editor/:id": {
       "tests": [
+        "tests/enterprise/ui/test_v2035_layout_batch_a.py::test_v2035_transactions_panel_and_rules_strips_fit_at_every_width",
         "tests/personas/test_detection_engineer.py",
         "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches",
-        "tests/ui/test_deep_detection_engineering.py::test_automated_folder_convention_and_move"
+        "tests/ui/test_deep_detection_engineering.py::test_automated_folder_convention_and_move",
+        "tests/ui/test_v2035_rule_editor_menu_impact.py::test_v2035_rule_editor_overflow_menu_and_actions_divider",
+        "tests/ui/test_v2035_rule_editor_menu_impact.py::test_v2035_impact_card_seven_day_trend"
       ]
     },
     "/rules/editor/new": {
@@ -589,7 +627,8 @@
     "/rules/tuning": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_ai_tuning_rows.py::test_v2035_ai_tuning_rows_align_expand_and_placeholder"
       ],
       "edition": "enterprise"
     },
@@ -953,7 +992,8 @@
     "action:admin.user-delete-after-health-check": {
       "tests": [
         "tests/ui/test_deep_admin_settings.py::test_delete_user_who_ran_a_health_check"
-      ]
+      ],
+      "no_layout": "API behavior: deleting a user who ran a health check is asserted over the API, nothing renders"
     },
     "action:admin.users-drawer-gates": {
       "tests": [
@@ -1113,6 +1153,10 @@
     "action:hunts.ai-sweep-findings": {
       "skip": "the investigator/reviewer sweep needs the AI stub plus the hunt lane injector; covered end to end by tests/enterprise/personas/test_threat_hunter.py, not by a browser walk"
     },
+    "action:hunts.binding-override": {
+      "skip": "Map / Ignore / Reset call the existing source-capability-bindings PUT/reset API; covered by the web vitest coverage-recon.test.tsx (enterprise/components/coverage) and the API audit tests, not yet by a browser walk",
+      "edition": "enterprise"
+    },
     "action:hunts.case-banner-mark-wrong": {
       "tests": [
         "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues"
@@ -1145,6 +1189,13 @@
         "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_escalation_queues"
       ]
     },
+    "action:hunts.knowledge-detail-flyout": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_hunts_knowledge_flyout.py::test_v2035_knowledge_row_opens_full_content_flyout_and_revokes",
+        "tests/enterprise/ui/test_v2035_hunts_knowledge_flyout.py::test_v2035_knowledge_flyout_is_read_only_for_a_viewer"
+      ],
+      "edition": "enterprise"
+    },
     "action:hunts.lead-dismiss-suppress": {
       "tests": [
         "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
@@ -1165,6 +1216,26 @@
         "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_mark_wrong_opens_preset_to_wrong"
       ]
     },
+    "action:hunts.escalation-readout": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_escalation_readout.py::test_v2035_escalation_readout_in_list_finding_and_case"
+      ],
+      "edition": "enterprise"
+    },
+    "action:hunts.profile-run-recon": {
+      "tests": [
+        "tests/enterprise/personas/test_hunt_recon_web.py::test_coverage_telemetry_runs_recon_for_the_recon_scope_only"
+      ],
+      "edition": "enterprise"
+    },
+    "action:hunts.scheduled-recon": {
+      "tests": [
+        "tests/enterprise/personas/test_hunt_recon_web.py::test_scheduled_recon_binds_a_new_source_and_unblocks_a_hunt"
+      ],
+      "edition": "enterprise",
+      "note": "the jobs leader runs recon on its own; needs `scripts/e2e.sh up --profile recon-fast` (scheduled recon is off on other e2e stacks)",
+      "no_layout": "background job: the jobs leader runs recon on its own; the outcome is asserted over the API"
+    },
     "action:hunts.stock-update-available": {
       "skip": "needs a linked hunt-repository import whose upstream changed; a throwaway stack has no content channel to sync. Server side: nanosiem-core/src/playbook_repository/service/refresh_tests.rs"
     },
@@ -1179,16 +1250,165 @@
         "tests/enterprise/personas/test_threat_hunter.py"
       ]
     },
+    "action:install.zero-clicks-enterprise-content": {
+      "tests": [
+        "tests/enterprise/zero_clicks/test_fresh_install_enterprise_content.py::test_enterprise_content_channels_install_and_apply_on_their_own",
+        "tests/enterprise/zero_clicks/test_fresh_install_enterprise_content.py::test_hunt_templates_listed"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5763: licensed fresh install, nothing clicked: enterprise channels (playbooks, integrations, models) applied, hunt templates listed",
+      "no_layout": "install-time behavior with no page of its own: content applied with zero clicks is asserted through the API"
+    },
+    "action:install.zero-clicks-open-content": {
+      "tests": [
+        "tests/zero_clicks/test_fresh_install_content.py::test_open_content_channels_install_and_apply_on_their_own",
+        "tests/zero_clicks/test_fresh_install_content.py::test_official_repository_synced_without_a_click",
+        "tests/zero_clicks/test_fresh_install_content.py::test_mitre_catalog_populated_without_a_click"
+      ],
+      "note": "NAN-5763: fresh install, nothing clicked: open channels, official rules + parsers, MITRE ATT&CK arrive on their own (scripts/e2e.sh run zero_clicks)",
+      "no_layout": "install-time behavior with no page of its own: content applied with zero clicks is asserted through the API"
+    },
+    "action:install.zero-clicks-playbook-library": {
+      "tests": [
+        "tests/enterprise/zero_clicks/test_fresh_install_enterprise_content.py::test_official_playbooks_synced_and_in_the_library"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5763 / NAN-5755: official playbooks and hunts reach the library with no click",
+      "no_layout": "install-time behavior with no page of its own: content applied with zero clicks is asserted through the API"
+    },
+    "action:install.zero-clicks-scheduled-recon": {
+      "tests": [
+        "tests/enterprise/zero_clicks/test_fresh_install_enterprise_content.py::test_scheduled_recon_profiles_and_binds_the_flowing_source"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5763 / NAN-5757: the jobs leader runs recon on its own once data flows; profile + capability binding for the flowing source",
+      "no_layout": "install-time behavior with no page of its own: content applied with zero clicks is asserted through the API"
+    },
+    "action:install.zero-clicks-soar-catalog": {
+      "tests": [
+        "tests/enterprise/zero_clicks/test_fresh_install_enterprise_content.py::test_soar_catalog_applied_without_a_click"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5763 / NAN-5769: the SOAR catalog channel applies right after the license import, no click",
+      "no_layout": "install-time behavior with no page of its own: content applied with zero clicks is asserted through the API"
+    },
     "action:ioc.list-search-alert": {
       "tests": [
         "tests/enterprise/ui/test_deep_ioc_lists.py::test_ioc_list_matches_in_search_and_alerts"
       ],
       "edition": "enterprise"
     },
+    "action:lifecycle.hunt-delete-summaries": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_hunt.py::test_hunts_list_and_counts_drop_deleted_hunts",
+        "tests/enterprise/ui/test_lifecycle_hunt.py::test_bench_keeps_an_archived_hunts_findings_quietly"
+      ],
+      "note": "NAN-5765",
+      "edition": "enterprise"
+    },
+    "action:lifecycle.hunt-profile-drafts": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_hunt.py::test_a_deleted_draft_does_not_block_its_technique"
+      ],
+      "note": "NAN-5765; NAN-5776 fixed",
+      "edition": "enterprise"
+    },
+    "action:lifecycle.log-source-delete-summaries": {
+      "tests": [
+        "tests/ui/test_lifecycle_log_source.py::test_log_source_health_drops_deleted_sources",
+        "tests/ui/test_lifecycle_log_source.py::test_search_keeps_deleted_sources_events_as_history",
+        "tests/ui/test_lifecycle_log_source.py::test_home_and_onboarding_follow_the_registry"
+      ],
+      "note": "NAN-5765: single + bulk log-source delete, then every summarizing page"
+    },
+    "action:lifecycle.log-source-siem-health": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_log_source_health.py::test_siem_health_shows_deleted_sources_as_removed"
+      ],
+      "note": "NAN-5765 / NAN-5760: deleted sources are a quiet removed_sources list",
+      "edition": "enterprise"
+    },
+    "action:lifecycle.log-source-stale-event": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_log_source_health.py::test_stale_feed_alert_survives_the_source_delete_flagged"
+      ],
+      "edition": "enterprise",
+      "no_layout": "API behavior: the stale-feed alert surviving a source delete is asserted over the system health API, nothing renders"
+    },
+    "action:lifecycle.log-source-unassigned": {
+      "tests": [
+        "tests/ui/test_lifecycle_log_source.py::test_unassigned_list_does_not_offer_deleted_sources"
+      ],
+      "note": "NAN-5765 / NAN-5770: deleted sources' quiet keys are removed_sources, never offered as unassigned"
+    },
+    "action:lifecycle.official-playbook-stays-deleted": {
+      "tests": [
+        "tests/enterprise/content_acceptance/test_playbook_library_redelivery.py::test_a_deleted_official_playbook_stays_deleted"
+      ],
+      "note": "NAN-5765 / NAN-5755: needs the signed fixture channel (`scripts/e2e.sh run content_acceptance --fresh`); skips elsewhere",
+      "edition": "enterprise"
+    },
+    "action:lifecycle.playbook-delete-summaries": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_playbook.py::test_deleted_flow_leaves_the_flows_list",
+        "tests/enterprise/ui/test_lifecycle_playbook.py::test_capabilities_map_is_unaffected_by_a_deleted_flow",
+        "tests/enterprise/ui/test_lifecycle_playbook.py::test_library_marks_archived_and_drops_deleted_playbooks"
+      ],
+      "note": "NAN-5765",
+      "edition": "enterprise"
+    },
+    "action:lifecycle.playbook-runs-history": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_playbook.py::test_runs_of_a_deleted_flow_stay_under_its_name"
+      ],
+      "note": "NAN-5765 / NAN-5775: runs of an archived flow keep its name",
+      "edition": "enterprise"
+    },
+    "action:lifecycle.rule-delete-summaries": {
+      "tests": [
+        "tests/ui/test_lifecycle_rule.py::test_mitre_coverage_drops_deleted_rules",
+        "tests/ui/test_lifecycle_rule.py::test_alerts_keep_deleted_rules_history"
+      ],
+      "note": "NAN-5765: row-menu + bulk-bar rule delete, then every summarizing page"
+    },
+    "action:lifecycle.rule-detection-health": {
+      "tests": [
+        "tests/ui/test_lifecycle_rule.py::test_detection_health_counts_only_existing_rules"
+      ]
+    },
+    "action:lifecycle.rule-folders": {
+      "tests": [
+        "tests/ui/test_lifecycle_rule.py::test_rule_rail_folders_after_delete"
+      ]
+    },
+    "action:lifecycle.rule-siem-health-detection": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_rule_siem_health.py::test_siem_health_detection_metrics_drop_deleted_rules"
+      ],
+      "edition": "enterprise"
+    },
+    "action:lifecycle.user-alert-assignee": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_user.py::test_alert_assigned_to_the_deleted_user_reads_as_deleted"
+      ],
+      "note": "NAN-5765 / NAN-5774: a deleted assignee reads 'deleted user'",
+      "edition": "enterprise"
+    },
+    "action:lifecycle.user-delete-summaries": {
+      "tests": [
+        "tests/enterprise/ui/test_lifecycle_user.py::test_assignee_pickers_drop_the_deleted_user",
+        "tests/enterprise/ui/test_lifecycle_user.py::test_cases_survive_the_deleted_user",
+        "tests/enterprise/ui/test_lifecycle_user.py::test_notebooks_pass_on_and_read_deleted_user",
+        "tests/enterprise/ui/test_lifecycle_user.py::test_soar_approval_by_the_deleted_user_stays_quietly"
+      ],
+      "note": "NAN-5765 (NAN-5721/NAN-5742 semantics)",
+      "edition": "enterprise"
+    },
     "action:log-sources.bulk-delete-api": {
       "tests": [
         "tests/ui/test_v2034_log_source_delete.py::test_bulk_delete_three_sources_one_audit_row_each"
-      ]
+      ],
+      "no_layout": "the bulk delete API and its audit rows, asserted over the API (the UI delete is covered by its sibling test)"
     },
     "action:log-sources.delete": {
       "tests": [
@@ -1203,7 +1423,8 @@
     "action:lookups.output-clause": {
       "tests": [
         "tests/ui/test_deep_lookups.py::test_lookup_output_clause_returns_the_listed_columns"
-      ]
+      ],
+      "no_layout": "an nPL lookup OUTPUT clause, asserted through the search API"
     },
     "action:lookups.upload-edit-search-rule": {
       "tests": [
@@ -1213,11 +1434,13 @@
     "action:lookups.user-primary-key": {
       "tests": [
         "tests/ui/test_deep_lookups.py::test_lookup_csv_with_user_primary_key_keeps_columns"
-      ]
+      ],
+      "no_layout": "lookup CSV import with a user primary key, asserted over the API"
     },
     "action:nav.beta-badges": {
       "tests": [
-        "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2033_beta_badges_and_escalation_queues"
+        "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2033_beta_badges_and_escalation_queues",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ]
     },
     "action:notebooks.case-notebook": {
@@ -1310,10 +1533,17 @@
       "skip": "AI tuning proposals are generated from weeks of disposition and FP-burst history; the deterministic ai-stub has no tuning response and a throwaway stack has no history. /rules/tuning is smoke-tested; NAN-5686 gap",
       "edition": "enterprise"
     },
+    "action:rules.ai-tuning-queue-rows": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_ai_tuning_rows.py::test_v2035_ai_tuning_rows_align_expand_and_placeholder"
+      ],
+      "edition": "enterprise"
+    },
     "action:rules.alert-cooldown": {
       "tests": [
         "tests/ui/test_deep_detection_engineering.py::test_alert_cooldown_round_trips"
-      ]
+      ],
+      "no_layout": "alert cooldown round trip on the rules API; nothing renders"
     },
     "action:rules.archive-unarchive": {
       "tests": [
@@ -1326,9 +1556,19 @@
         "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
       ]
     },
+    "action:rules.editor-overflow-menu": {
+      "tests": [
+        "tests/ui/test_v2035_rule_editor_menu_impact.py::test_v2035_rule_editor_overflow_menu_and_actions_divider"
+      ]
+    },
     "action:rules.folders-automated": {
       "tests": [
         "tests/ui/test_deep_detection_engineering.py::test_automated_folder_convention_and_move"
+      ]
+    },
+    "action:rules.impact-baseline": {
+      "tests": [
+        "tests/ui/test_v2035_rule_editor_menu_impact.py::test_v2035_impact_card_seven_day_trend"
       ]
     },
     "action:rules.lifecycle-staging-live-alerting": {
@@ -1527,6 +1767,12 @@
         "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_bare_approval_condition_is_refused"
       ]
     },
+    "action:soar.approvals-flyout-layout": {
+      "tests": [
+        "tests/enterprise/ui/test_v2034_soar_approvals_layout.py::test_v2034_soar_approvals_page_and_flyout_layout"
+      ],
+      "edition": "enterprise"
+    },
     "action:soar.breaker-banner-resume": {
       "tests": [
         "tests/enterprise/ui/test_deep_soar.py::test_deep_soar_breaker_resume_and_live_save"
@@ -1603,6 +1849,115 @@
     "action:soar.skipped-run-reason": {
       "tests": [
         "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_unconnected_action_flagged_and_live_save_refused"
+      ]
+    },
+    "action:nav.hunts-rail-group": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/ui/test_v2035_hunts_rail_open_core.py::test_v2035_hunts_rail_group_only_with_the_hunts_capability"
+      ]
+    },
+    "/hunts/leads/decisions": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Findings > Decisions (was Rulings)"
+    },
+    "/rules/ideas": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Rule ideas under Detections (was /hunts/rule-ideas)"
+    },
+    "/settings/hunts": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/personas/test_threat_hunter.py"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Settings > Hunting > Runners (was /hunts/runners)"
+    },
+    "/settings/hunts/charter": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Settings > Hunting > Charter & defaults"
+    },
+    "action:coverage.view-switch": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel",
+        "tests/ui/test_v2035_mitre_coverage_open_core.py::test_v2035_mitre_coverage_without_the_hunt_layer"
+      ],
+      "note": "NAN-5850: Detections / Hunts / Both / Gaps segments, URL view param, legend"
+    },
+    "action:coverage.filters": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "note": "NAN-5850: mode, source, tactic, hunted window, legend class, search; every one in the URL and kept on reload"
+    },
+    "action:coverage.drilldown": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel",
+        "tests/ui/test_v2035_mitre_coverage_open_core.py::test_v2035_mitre_coverage_without_the_hunt_layer"
+      ],
+      "note": "NAN-5850: the technique panel from ?tech=, its layers and next-step actions"
+    },
+    "action:coverage.gap-to-rule-idea": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "note": "NAN-5850: Gaps view chips and tab; Review rule idea and Draft rule from a gap"
+    },
+    "action:coverage.rbac": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_rbac"
+      ],
+      "note": "NAN-5850: no hunt layer without hunts:view; no Coverage link without detections:view"
+    },
+    "action:hunts.coverage-deep-link": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5850: Hunts header Coverage link to /rules/coverage?view=hunts"
+    },
+    "action:hunts.run-recon-from-list": {
+      "tests": [
+        "tests/enterprise/personas/test_hunt_recon_web.py::test_coverage_telemetry_runs_recon_for_the_recon_scope_only",
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5850: Run recon on the Hunts list (shown for hunts:profile_write only)"
+    },
+    "action:help.report-a-bug-flyout": {
+      "tests": [
+        "tests/ui/test_v2035_support_flyout.py::test_v2035_support_flyout_report_a_bug_and_get_support"
+      ],
+      "note": "Help > Report a bug (NAN-5253) as a right-side flyout without a scrim (NAN-5857): context (version, edition, sanitized route, failed call request IDs), copy, download, air-gap toggle."
+    },
+    "action:nav.rail-theme-switcher": {
+      "tests": [
+        "tests/ui/test_v2035_rail_theme_switcher.py::test_v2035_rail_theme_strip_flyout_and_single_toggle"
+      ]
+    },
+    "action:help.get-support-flyout": {
+      "tests": [
+        "tests/ui/test_v2035_support_flyout.py::test_v2035_support_flyout_report_a_bug_and_get_support"
       ]
     }
   }

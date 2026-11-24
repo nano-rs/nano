@@ -135,10 +135,22 @@ def rule_alerts(nano: Nano, rule_id: str) -> list[dict[str, Any]]:
     return body if isinstance(body, list) else body.get("alerts", [])
 
 
-def retrigger(stack: Stack, nano: Nano, lane: Any, mark: str, rule: dict[str, Any], name: str, n: int) -> None:
-    """More events for an existing rule, then force it again."""
+def retrigger(
+    stack: Stack,
+    nano: Nano,
+    lane: Any,
+    mark: str,
+    rule: dict[str, Any],
+    name: str,
+    n: int,
+    *,
+    host: str = "deep-host",
+    ip: str = "203.0.113.50",
+) -> None:
+    """More events for an existing rule, then force it again. `host`/`ip`
+    must match what `fire_rule` sent when the scenario depends on grouping."""
     for i in range(n):
-        lane.send(stack, mark, f"{name}-user", "203.0.113.50", "deep-host", note=f"{name} again={i}")
+        lane.send(stack, mark, f"{name}-user", ip, host, note=f"{name} again={i}")
     eventually(
         lambda: nano.search(f'"{mark}" "{name}" "again"')["total_count"],
         timeout=INGEST_VISIBLE,

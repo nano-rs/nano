@@ -516,6 +516,33 @@ impl AppState {
             .start(self.shutdown_token())
     }
 
+    /// Start scheduled hunt recon (NAN-5757).
+    ///
+    /// Without it a web-only install never got a profile or source capability
+    /// bindings, and every hunt with capability requirements was held. Runs
+    /// once ingest has data (`HUNT_RECON_FIRST_RUN_DELAY_SECS` after this node
+    /// became leader), then every `HUNT_RECON_INTERVAL_HOURS` with
+    /// `HUNT_RECON_JITTER_MINUTES` of jitter, and early when a new source type
+    /// shows up. Leader-only and fenced; the claim row in
+    /// `hunt_recon_schedule` keeps it from overlapping the Profile page's
+    /// button or Desktop. PostgreSQL plus local ClickHouse, so NOT
+    /// egress-gated: it runs air-gapped. `HUNT_RECON_SCHEDULE_ENABLED=false`
+    /// parks it. See `nanosiem_core::hunts::recon_schedule`.
+    #[cfg(feature = "enterprise")]
+    pub fn start_hunt_recon_scheduler(&self) -> tokio::task::JoinHandle<()> {
+        let factory = Arc::new(crate::handlers::hunts::recon::AppReconServiceFactory::new(self.clone()));
+        nanosiem_core::hunts::ReconScheduler::new(
+            self.pool.clone(),
+            self.dual_pool().clickhouse_search().clone(),
+            self.dual_pool().table_names(),
+            factory,
+            nanosiem_core::hunts::ReconScheduleConfig::from_env(),
+        )
+        .with_fence(self.leader_fence.clone())
+        .with_audit(self.audit_emitter.clone())
+        .start(self.shutdown_token())
+    }
+
     /// Start the identity sync scheduler
     pub fn start_identity_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let scheduler = IdentitySyncScheduler::with_defaults(self.identity_service.clone());

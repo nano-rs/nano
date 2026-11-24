@@ -108,6 +108,13 @@ Before pushing, run `cargo fmt`, `cargo clippy --all-targets --workspace`,
 and `cargo test`. The CI will, but doing it locally is faster than a round
 trip.
 
+### CI and the `ready-to-merge` label
+
+Most PR checks run once, at merge time, rather than on every push. A
+maintainer adds the `ready-to-merge` label when the PR is reviewed; that runs
+every relevant gate, and any later push reruns them. Without the label only
+workflow lint runs. See `docs-internal/ci-runner-pools.md` for the details.
+
 ## Reporting bugs / requesting features
 
 Use the [issue templates](./.github/ISSUE_TEMPLATE/). For security issues,

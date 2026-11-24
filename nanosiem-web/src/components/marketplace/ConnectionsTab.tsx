@@ -268,7 +268,7 @@ function InstanceDialog({
       size="md"
       breadcrumb={['Marketplace', 'Connections']}
       title={`${isEdit ? 'Edit' : 'Connect'} ${integration.name}`}
-      description="One instance per vendor tenant. Credentials are encrypted at rest and never returned by the API."
+      description="One per vendor tenant. Credentials are encrypted at rest and never returned by the API."
       meta={instance ? <span>{instance.id}</span> : <span>{integration.slug}</span>}
       guardDirty={dirty && !save.isPending}
       onSubmit={() => save.mutate()}
@@ -282,7 +282,7 @@ function InstanceDialog({
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="Netskope — EU production"
+              placeholder="Netskope EU production"
               className="h-8 text-[12px]"
             />
           </div>
@@ -331,7 +331,7 @@ function InstanceDialog({
                 Credentials
                 {isEdit && instance?.has_credentials && (
                   <span className="ml-2 normal-case tracking-normal text-muted-foreground/80">
-                    · stored — leave blank to keep
+                    · stored; leave blank to keep
                   </span>
                 )}
               </div>
@@ -456,7 +456,7 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
             <span className="font-mono text-foreground">{p.source_type}</span>
             {p.status === 'no_parser' && p.declared_parser && (
               <>
-                {' — needs parser '}
+                {': needs parser '}
                 <span className="font-mono text-foreground">{p.declared_parser}</span>
                 {', which no synced repository provides. Events will arrive unparsed. '}
                 <Link to="/ingestion/log-sources/repositories" className="text-primary hover:underline">
@@ -466,7 +466,7 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
             )}
             {p.status === 'no_parser' && !p.declared_parser && (
               <>
-                {' — no parser claims this source type. Events will arrive unparsed. '}
+                {': no parser reads this source type, so events will arrive unparsed. '}
                 <Link to="/ingestion/log-sources/repositories" className="text-primary hover:underline">
                   Import one
                 </Link>
@@ -474,7 +474,7 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
             )}
             {p.status === 'not_permitted' && (
               <>
-                {' — '}
+                {': '}
                 {p.missing.startsWith('Missing permission')
                   ? p.missing
                   : `Missing permission: ${p.missing}`}
@@ -487,7 +487,7 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
                 the whole remedy, so link straight at it. */}
             {p.status === 'linked' && (
               <>
-                {' — log source created but not deployed, so Vector is not routing it. '}
+                {': the log source exists but is not deployed, so its events have nowhere to go. '}
                 {'Events are being collected and discarded. '}
                 <Link
                   to={`/ingestion/log-sources/${p.log_source_id}`}
@@ -497,8 +497,8 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
                 </Link>
               </>
             )}
-            {p.status === 'limit_exceeded' && <> — {p.message}</>}
-            {p.status === 'failed' && <> — {p.error}</>}
+            {p.status === 'limit_exceeded' && <>: {p.message}</>}
+            {p.status === 'failed' && <>: {p.error}</>}
           </li>
         ))}
       </ul>
@@ -608,7 +608,7 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
         <div className="mx-3 mb-2 rounded border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
           Scheduled API lane: up to {(manifest.maxEventsPerRun ?? 25_000).toLocaleString()} events
           and {Math.round((manifest.maxBytesPerRun ?? 64 * 1024 * 1024) / 1024 / 1024)} MiB per run,
-          with a minimum 15-minute interval. Bulk and firehose data belong on a dedicated ingestion source.
+          at most every 15 minutes. Send bulk data through a dedicated ingestion source.
         </div>
       )}
 
@@ -616,8 +616,7 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
 
       {!entry.installed && instances.length > 0 && (
         <div className="mx-3 mb-2 rounded border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-[11px] text-muted-foreground">
-          This integration is uninstalled. Its connections are retained but disabled; delete them
-          here before permanently deleting the integration.
+          Uninstalled: these connections are disabled. Delete them before permanently deleting the integration.
         </div>
       )}
 
@@ -764,7 +763,7 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
         description={
           <>
             <span className="font-medium text-foreground">{deleteTarget?.name}</span> stops
-            collecting and its cursors are discarded. Its log sources are kept — reconnecting
+            collecting and its cursors are discarded. Its log sources are kept, and reconnecting
             starts from now, so anything the vendor drops in between is lost.
           </>
         }

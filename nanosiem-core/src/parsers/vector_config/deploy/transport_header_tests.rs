@@ -9,10 +9,12 @@
 //! - `X-Source-Type`, `path` and the forwarding headers are dropped right after
 //!   they are read, before `parse_content` merges the JSON body, so a body
 //!   field of the same name is the sender's and stays.
-//! - `client_ip` (the throttle key) is the TCP peer, or `X-Real-IP` when that
-//!   peer is a trusted proxy (the nginx edge overwrites it). `X-Forwarded-For`
-//!   is never believed. `ingest_client_ip` / `ingest_peer` are restored after
-//!   the body merge, so a body cannot overwrite them.
+//! - The ingest client address is the TCP peer, or `X-Real-IP` when that peer
+//!   is a trusted proxy (the nginx edge overwrites it). `X-Forwarded-For` is
+//!   never believed. It lives only in protected event metadata
+//!   (`%nano_ingest_client_ip` / `%nano_ingest_peer`) and is stored as
+//!   `unmapped.nano.ingest.client_ip` (+ `.peer` when it differs, NAN-5846),
+//!   so a body can neither overwrite it nor lose its own `client_ip`.
 //! - `Content-Type` stays on the event through the parsers and is dropped at the
 //!   storage boundary (`ingest_transport_strip_vrl!`) when it still holds the
 //!   header value.
@@ -28,7 +30,7 @@ use super::VectorConfigManager;
 const EDGE_PEER: &str = "172.18.0.5";
 const HEC: &str = include_str!("../../../../../config/vector/02-hec-source.toml");
 
-fn http_request(body: &str, content_type: Option<&str>, peer: &str, real_ip: Option<&str>) -> Value {
+pub(super) fn http_request(body: &str, content_type: Option<&str>, peer: &str, real_ip: Option<&str>) -> Value {
     let mut event = serde_json::json!({
         "message": body,
         "path": "/ingest",
@@ -82,7 +84,7 @@ fn generic_parser() -> String {
 }
 
 /// The base chain, then the generic OCSF lane an unparsed (draft) source takes.
-fn store_generic(event: Value) -> Value {
+pub(super) fn store_generic(event: Value) -> Value {
     let mut chain = base_chain();
     chain.push(("generic_parser", generic_parser()));
     chain.push((
@@ -102,6 +104,24 @@ fn s(stored: &Value, path: &[&str]) -> Option<String> {
 
 fn unmapped(stored: &Value, key: &str) -> Option<String> {
     s(stored, &["event", "unmapped", key])
+}
+
+/// NAN-5846: nano's ingest provenance, `unmapped.nano.ingest.<key>`.
+fn ingest(stored: &Value, key: &str) -> Option<String> {
+    s(stored, &["event", "unmapped", "nano", "ingest", key])
+}
+
+/// No pre-NAN-5846 ingest key is written: `client_ip` here is vendor data only.
+fn assert_no_legacy_ingest_keys(stored: &Value) {
+    for key in ["ingest_client_ip", "ingest_peer"] {
+        assert_eq!(unmapped(stored, key), None, "legacy `{key}` written: {stored}");
+    }
+}
+
+/// Copies the protected ingest metadata onto the event so a prep-only chain
+/// can assert it (the chain runner returns only the event).
+fn probe_metadata() -> (&'static str, String) {
+    ("probe", ".probe_client = %nano_ingest_client_ip\n.probe_peer = %nano_ingest_peer".to_string())
 }
 
 #[test]
@@ -150,10 +170,12 @@ fn a_spoofed_forwarded_for_never_becomes_the_client_ip() {
         EDGE_PEER,
         Some("203.0.113.9"),
     ));
-    assert_eq!(unmapped(&stored, "client_ip").as_deref(), Some("203.0.113.9"));
-    assert_eq!(unmapped(&stored, "ingest_client_ip").as_deref(), Some("203.0.113.9"));
-    assert_eq!(unmapped(&stored, "ingest_peer").as_deref(), Some(EDGE_PEER));
-    assert_ne!(unmapped(&stored, "client_ip").as_deref(), Some("198.51.100.1"));
+    assert_eq!(ingest(&stored, "client_ip").as_deref(), Some("203.0.113.9"));
+    // The proxy resolved the client, so the differing TCP peer is kept too.
+    assert_eq!(ingest(&stored, "peer").as_deref(), Some(EDGE_PEER));
+    assert_eq!(unmapped(&stored, "client_ip"), None, "nano never writes a bare client_ip: {stored}");
+    assert_no_legacy_ingest_keys(&stored);
+    assert!(!stored.to_string().contains("198.51.100.1"), "{stored}");
 }
 
 /// A sender that reaches Vector directly cannot claim another address with
@@ -176,22 +198,20 @@ fn a_direct_sender_cannot_forge_x_real_ip() {
         .as_object_mut()
         .expect("event object")
         .insert("X-Nano-Edge-Client-IP".into(), "203.0.113.250".into());
-    let forged_prep = run_chain(forged, &direct_base_chain()[..2]);
-    assert_eq!(s(&forged_prep, &["client_ip"]).as_deref(), Some("172.19.0.77"));
+    let mut prep_chain = direct_base_chain()[..2].to_vec();
+    prep_chain.push(probe_metadata());
+    let forged_prep = run_chain(forged, &prep_chain);
+    assert_eq!(s(&forged_prep, &["probe_client"]).as_deref(), Some("172.19.0.77"));
+    assert_eq!(s(&forged_prep, &["client_ip"]), None, "the ingest address never reaches the root");
     assert_eq!(s(&forged_prep, &["X-Nano-Edge-Client-IP"]), None);
     let stored = run_chain(
         http_request(r#"{"message":"m"}"#, Some("application/json"), "172.19.0.77", Some("10.9.9.9")),
         &chain,
     );
-    assert_eq!(unmapped(&stored, "client_ip").as_deref(), Some("172.19.0.77"));
-    assert_eq!(unmapped(&stored, "ingest_peer").as_deref(), Some("172.19.0.77"));
-
-    // The throttle key is set before the body merge: it is the trusted value.
-    let prepped = run_chain(
-        http_request(r#"{"message":"m"}"#, None, "172.19.0.77", Some("10.9.9.9")),
-        &direct_base_chain()[..2],
-    );
-    assert_eq!(s(&prepped, &["client_ip"]).as_deref(), Some("172.19.0.77"));
+    assert_eq!(ingest(&stored, "client_ip").as_deref(), Some("172.19.0.77"));
+    // The peer equals the client address, so it is not written twice.
+    assert_eq!(ingest(&stored, "peer"), None, "{stored}");
+    assert_no_legacy_ingest_keys(&stored);
 }
 
 #[test]
@@ -207,23 +227,48 @@ fn role_split_edge_private_identity_survives_without_private_range_trust() {
     );
     let prepped = run_chain(
         event,
-        &[("auth_check", transform_source("auth_check")), ("rate_limit_prep", prep)],
+        &[("auth_check", transform_source("auth_check")), ("rate_limit_prep", prep), probe_metadata()],
     );
-    assert_eq!(s(&prepped, &["client_ip"]).as_deref(), Some("203.0.113.44"));
+    assert_eq!(s(&prepped, &["probe_client"]).as_deref(), Some("203.0.113.44"));
+    assert_eq!(s(&prepped, &["probe_peer"]).as_deref(), Some(EDGE_PEER));
     assert_eq!(s(&prepped, &["X-Nano-Edge-Client-IP"]), None);
 }
 
-/// The body is sender data: it cannot overwrite the recorded ingest addresses.
+/// The body is sender data: it cannot overwrite the recorded ingest addresses,
+/// and its own fields of the old names (vendor data) are kept verbatim.
 #[test]
 fn a_body_cannot_overwrite_the_ingest_addresses() {
     let stored = store_generic(http_request(
-        r#"{"message":"m","ingest_client_ip":"1.2.3.4","ingest_peer":"1.2.3.4"}"#,
+        r#"{"message":"m","client_ip":"5.6.7.8","ingest_client_ip":"1.2.3.4","ingest_peer":"1.2.3.4","nano":{"ingest":{"client_ip":"6.6.6.6","peer":"6.6.6.6"},"keep":1}}"#,
         Some("application/json"),
         EDGE_PEER,
         Some("203.0.113.9"),
     ));
-    assert_eq!(unmapped(&stored, "ingest_client_ip").as_deref(), Some("203.0.113.9"));
-    assert_eq!(unmapped(&stored, "ingest_peer").as_deref(), Some(EDGE_PEER));
+    assert_eq!(ingest(&stored, "client_ip").as_deref(), Some("203.0.113.9"), "{stored}");
+    assert_eq!(ingest(&stored, "peer").as_deref(), Some(EDGE_PEER), "{stored}");
+    let stored_json = serde_json::to_value(&stored).expect("event serializes");
+    // The forged values are gone from the namespace (the raw `message` text
+    // still holds the sender's bytes, as for any field).
+    assert_eq!(
+        stored_json["event"]["unmapped"]["nano"]["ingest"],
+        serde_json::json!({ "client_ip": "203.0.113.9", "peer": EDGE_PEER }),
+        "forged provenance stored: {stored}"
+    );
+    // nano owns unmapped.nano; the sender's keys there are moved, whole, into
+    // one JSON string, never dropped (NAN-5846).
+    assert!(stored_json["event"]["unmapped"]["nano"].get("keep").is_none(), "{stored}");
+    let moved: serde_json::Value = serde_json::from_str(
+        stored_json["event"]["unmapped"]["source_nano_json"].as_str().expect("one string leaf"),
+    )
+    .unwrap();
+    assert_eq!(
+        moved,
+        serde_json::json!({ "nano": { "ingest": { "client_ip": "6.6.6.6", "peer": "6.6.6.6" }, "keep": 1 } }),
+        "{stored}"
+    );
+    assert_eq!(unmapped(&stored, "client_ip").as_deref(), Some("5.6.7.8"), "vendor client_ip kept: {stored}");
+    assert_eq!(unmapped(&stored, "ingest_client_ip").as_deref(), Some("1.2.3.4"));
+    assert_eq!(unmapped(&stored, "ingest_peer").as_deref(), Some("1.2.3.4"));
 }
 
 #[test]
@@ -269,9 +314,12 @@ fn hec_edge_identity_survives_envelope_host_and_parser_replacement() {
             ("ocsf_prepare", super::super::parser_config::OCSF_PREPARE_VRL.to_string()),
         ],
     );
-    assert_eq!(unmapped(&stored, "client_ip").as_deref(), Some("203.0.113.44"));
-    assert_eq!(unmapped(&stored, "ingest_client_ip").as_deref(), Some("203.0.113.44"));
-    assert_ne!(unmapped(&stored, "client_ip").as_deref(), Some("sender-controlled-host"));
+    assert_eq!(ingest(&stored, "client_ip").as_deref(), Some("203.0.113.44"));
+    // HEC has no TCP-peer stamp: only the edge client is recorded.
+    assert_eq!(ingest(&stored, "peer"), None, "{stored}");
+    // The parser's own `unmapped.client_ip` (vendor data) is never replaced.
+    assert_eq!(unmapped(&stored, "client_ip").as_deref(), Some("5.6.7.8"), "{stored}");
+    assert_no_legacy_ingest_keys(&stored);
 }
 
 #[test]
@@ -288,8 +336,10 @@ fn direct_hec_sender_cannot_forge_the_private_edge_suffix() {
             ("ocsf_prepare", super::super::parser_config::OCSF_PREPARE_VRL.to_string()),
         ],
     );
+    let stored_json = serde_json::to_value(&stored).expect("event serializes");
+    assert!(stored_json["event"]["unmapped"].get("nano").is_none(), "no ingest IP, no provenance: {stored}");
     assert_eq!(unmapped(&stored, "client_ip"), None);
-    assert_eq!(unmapped(&stored, "ingest_client_ip"), None);
+    assert_no_legacy_ingest_keys(&stored);
 }
 
 /// Web and proxy logs carry `path` (and sometimes `Content-Type`) as their own
@@ -358,7 +408,8 @@ if starts_with(ct, "application/xml") {
             None,
             "{ct}: the transport Content-Type must not be stored: {stored}"
         );
-        assert_eq!(unmapped(&stored, "client_ip").as_deref(), Some("203.0.113.9"));
-        assert_eq!(unmapped(&stored, "ingest_peer").as_deref(), Some(EDGE_PEER));
+        assert_eq!(ingest(&stored, "client_ip").as_deref(), Some("203.0.113.9"));
+        assert_eq!(ingest(&stored, "peer").as_deref(), Some(EDGE_PEER));
+        assert_no_legacy_ingest_keys(&stored);
     }
 }

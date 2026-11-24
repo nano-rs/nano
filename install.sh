@@ -7,8 +7,9 @@
 #   curl -fsSL https://get.nano.rs | bash
 #
 # What it does:
-#   1. Validates prerequisites (docker, docker compose v2, openssl, curl,
-#      python3; git only for a git checkout)
+#   1. Validates prerequisites (bash 4.4+, docker, docker compose v2, openssl,
+#      curl, python3; git only for a git checkout). On macOS, stock /bin/bash
+#      is 3.2: brew install bash and run the installer with that bash.
 #   2. Clones (or pulls) nano-rs/nano into $NANO_INSTALL_DIR (default ~/nano)
 #   3. Prompts for admin email / password / public BASE_URL and the storage
 #      schema profile (UDM or OCSF) (reads /dev/tty even when stdin is piped
@@ -30,6 +31,12 @@
 # A re-run that moves to a newer release says so and asks first.
 #
 # Non-interactive use: set the prompt values as env vars before running.
+#   --non-interactive (or --yes, or NANO_NONINTERACTIVE=1) never reads the
+#   terminal even when one is attached; every question takes its variable or
+#   default, a missing required value stops the run before any change (all
+#   named at once), and a destructive confirmation needs its NANO_CONFIRM_*
+#   variable. NANO_PROMPT_TIMEOUT=<seconds> bounds the time to answer each prompt. See
+#   --help and docs/getting-started/non-interactive-install.md.
 #   NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL
 #   NANO_HTTPS_PROXY (http://host:port), NANO_PROXY_USERNAME / NANO_PROXY_PASSWORD
 #   (raw; the installer percent-encodes them) and NANO_NO_PROXY — outbound proxy for
@@ -78,6 +85,10 @@
 #   checks the disk against it (plan.py's model, scripts/lib/retention-sizing.sh):
 #   it warns when the disk holds fewer days, and a fresh install refuses a
 #   disk that holds under 7 days unless NANO_ALLOW_UNDERSIZED_DISK=true.
+#   DETECTION_MAX_MATCHES_PER_RUN (1-999999; unset keeps the binary default of
+#   2000) - maximum events a raw-event detection rule fetches in one run before
+#   switching to per-entity representatives (NAN-5736 / NAN-5746). Recorded in
+#   .env when given; never asked.
 #   Host size (NAN-5506, scripts/lib/host-minimums.sh): before any prompt the
 #   installer refuses a host under 2 vCPU, 8 GB RAM (16 GB with the enrichment
 #   feeds on; PLATFORM_FEEDS_AUTO_UPDATE=false for a lab install) or 40 GB free
@@ -171,6 +182,24 @@
 # NANO_VECTOR_NATIVE_PUBLIC_HOST is the address printed in sender configs.
 
 main() {
+# NAN-5750: bash 4.4 or newer, checked before anything is read, written or
+# pulled. Older bash (stock macOS /bin/bash is 3.2) treats an empty array
+# expanded under `set -u` as unbound, and scripts/nano, which this install runs
+# for automatic backups and which every later upgrade, backup and restore uses,
+# needs bash 4 (mapfile, coproc, named file descriptors).
+# NANO_INSTALLER_TEST_BASH_VERSION (installer tests only) stands in for it.
+local bash_major="${BASH_VERSINFO[0]:-0}" bash_minor="${BASH_VERSINFO[1]:-0}" bash_shown="${BASH_VERSION:-unknown}"
+if [[ "${NANO_INSTALLER_TEST_MODE:-0}" == 1 && "${NANO_INSTALLER_TEST_BASH_VERSION:-}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+    bash_shown=$NANO_INSTALLER_TEST_BASH_VERSION
+    bash_major=${bash_shown%%.*} bash_minor=${bash_shown#*.}
+    bash_minor=${bash_minor%%.*}
+fi
+if (( bash_major < 4 || (bash_major == 4 && bash_minor < 4) )); then
+    # shellcheck disable=SC2016 # the $(brew --prefix) is for the user to run
+    printf 'nano install needs bash 4.4+ (this is bash %s); on macOS: brew install bash, then run the installer with it: curl -fsSL https://get.nano.rs | "$(brew --prefix)/bin/bash" (or "$(brew --prefix)/bin/bash" ./install.sh). Nothing was changed.\n' "$bash_shown" >&2
+    exit 1
+fi
+unset bash_major bash_minor bash_shown
 set -euo pipefail
 # The checkout and generated runtime configuration are bind-mounted into
 # containers that intentionally run as non-root.  Keep those non-secret paths
@@ -253,6 +282,10 @@ while [[ $# -gt 0 ]]; do
             TOPOLOGY_MIGRATION_SHA="$2"; shift 2 ;;
         --record-pg-ha-identity)
             RECORD_PG_HA_IDENTITY_ONLY=1; shift ;;
+        # Never read the terminal: env vars and defaults answer every
+        # question, and a missing required value fails before any change.
+        --non-interactive|--yes)
+            NANO_NONINTERACTIVE=1; shift ;;
         # NAN-5445 (enterprise): storage tiering, single host. Each flag sets
         # the matching NANO_TIERING* key (kept in .env). Secrets are never
         # flags: pass NANO_TIERING_ACCESS_KEY_ID / _SECRET_ACCESS_KEY (or
@@ -277,7 +310,8 @@ while [[ $# -gt 0 ]]; do
             export NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS=true; shift ;;
         -h|--help)
             cat <<'EOF'
-Usage: install.sh [--role app,ingest,clickhouse,keeper,postgres,monitoring --inventory inventory.yaml]
+Usage: install.sh [--non-interactive | --yes]
+                  [--role app,ingest,clickhouse,keeper,postgres,monitoring --inventory inventory.yaml]
                   [--accept-topology-migration CURRENT_IDENTITY_SHA256]
                   [--tiering off|s3|s3-compatible|gcs|azure [--tiering-bucket B] [--tiering-region R]
                    [--tiering-endpoint URL] [--tiering-prefix P] [--tiering-move-factor F]
@@ -302,6 +336,48 @@ docs/administration/storage-tiering.md.
 --record-pg-ha-identity (first postgres host of a PostgreSQL HA cluster, after
 the other postgres hosts are installed) only records the cluster's identity
 (NANO_PG_HA_SYSTEM_ID) in .env. It renders, pulls and restarts nothing.
+
+Non-interactive installs
+------------------------
+--non-interactive (alias --yes), or NANO_NONINTERACTIVE=1: never read the
+terminal, even when one is attached (ssh -t, expect, a CI pty). Every question
+takes its environment variable, or its default below. Values with no safe
+default are required: a run without them stops before it changes anything and
+names every missing one at once. A run with no terminal at all behaves the
+same way, except that it still takes a release-to-release upgrade by default.
+
+Every prompt first logs "waiting for input: <question> (set VAR to skip)" on
+stderr. NANO_PROMPT_TIMEOUT=<seconds> stops a prompt that is not answered
+(Enter pressed) within that long (exit 4). It is off by default.
+
+  Question                          Variable                          Default
+  Admin email                       NANO_ADMIN_EMAIL                  REQUIRED (first install)
+  Admin display name                NANO_ADMIN_NAME                   Admin
+  Admin password                    NANO_ADMIN_PASSWORD               REQUIRED (first install; not with
+                                                                      NANO_PREPARE_ONLY=1)
+  Public base URL                   NANO_BASE_URL                     REQUIRED (first install)
+  Schema profile                    NANO_SCHEMA_PROFILE               ocsf
+  License (enterprise)              LICENSE_TOKEN + NANO_DEPLOYMENT_ID REQUIRED (first install), or
+                                    (LICENSE_URL optional)            NANO_LICENSE_MODE=offline
+                                                                      [NANO_LICENSE_FILE] or AIRGAP_MODE=true
+  Outbound proxy                    NANO_HTTPS_PROXY, NANO_NO_PROXY,  no proxy
+                                    NANO_PROXY_USERNAME/_PASSWORD
+  AI on your own network            NANO_ALLOW_PRIVATE_AI_ENDPOINTS   false
+  Automatic backups                 NANO_BACKUP_ENABLED (+ NANO_BACKUP_*) off
+  Planned log volume (GB/day)       NANO_PLANNED_GB_PER_DAY           not declared (host-sized)
+  Raw or pre-shaped events          NANO_INGEST_PATH                  raw
+  Event retention (days)            NANO_RETENTION_DAYS               365
+  Cold storage tiering (enterprise) NANO_TIERING / --tiering          off
+  Vector senders on :6000 (0.1.x)   NANO_VECTOR_NATIVE_SENDERS        none (warns with the commands)
+
+  Confirmation                      Variable                          Without it (non-interactive)
+  Upgrade to another release        NANO_CONFIRM_UPGRADE=1            DESTRUCTIVE: refuses
+  Upgrade a 0.1.x install to 2.x    NANO_CONFIRM_LEGACY_UPGRADE=1     DESTRUCTIVE: refuses
+  Senders to Vector paused (<=2.0.31) NANO_CONFIRM_SENDERS_PAUSED=1   DESTRUCTIVE: refuses
+  Back up before the 0.1.x upgrade  NANO_LEGACY_UPGRADE_SKIP_BACKUP=1 backs up (the safe default)
+
+The full table, with every NANO_BACKUP_* and NANO_TIERING_* setting:
+docs/getting-started/non-interactive-install.md
 EOF
             exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -324,6 +400,24 @@ if [[ -n "$TOPOLOGY_MIGRATION_SHA" && ! "$TOPOLOGY_MIGRATION_SHA" =~ ^[0-9a-f]{6
     exit 2
 fi
 ROLE_ARG=$(printf '%s' "$ROLE_ARG" | tr -d '[:space:]')
+# Non-interactive mode (--non-interactive / --yes / NANO_NONINTERACTIVE=1):
+# install.sh never reads /dev/tty, even with a terminal attached (ssh -t,
+# expect, a CI pty). Exported so the helpers it runs (nano-tiering.py,
+# nano-backup-scheduler.py, vector-quiesce.sh) never prompt either.
+case "$(printf '%s' "${NANO_NONINTERACTIVE:-}" | tr '[:upper:]' '[:lower:]')" in
+    "" | 0 | false | no | off) NANO_NONINTERACTIVE=0 ;;
+    1 | true | yes | on) NANO_NONINTERACTIVE=1 ;;
+    *) printf 'NANO_NONINTERACTIVE must be 1 or 0 (got %s)\n' "$NANO_NONINTERACTIVE" >&2; exit 2 ;;
+esac
+export NANO_NONINTERACTIVE
+# git (a checkout update) must not ask for credentials on the terminal either.
+[[ "$NANO_NONINTERACTIVE" != 1 ]] || export GIT_TERMINAL_PROMPT=0
+# NANO_PROMPT_TIMEOUT (seconds, off by default): a prompt left unanswered
+# that long stops the installer instead of waiting forever.
+if [[ -n "${NANO_PROMPT_TIMEOUT:-}" && ! "$NANO_PROMPT_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]]; then
+    printf 'NANO_PROMPT_TIMEOUT must be a whole number of seconds from 1 to 999999 (got %s)\n' "$NANO_PROMPT_TIMEOUT" >&2
+    exit 2
+fi
 # NAN-5172: license inputs from the invoking environment, captured before
 # anything else can reuse these names. The role-split renderer later exports
 # NANO_DEPLOYMENT_ID as cluster.deployment_id (volume/project identity); the
@@ -454,31 +548,55 @@ require_cmd() {
 }
 
 prompt_tty() {
-    # $1 = prompt, $2 = default value (optional), $3 = "secret" to suppress echo
-    local prompt="$1" default="${2:-}" secret="${3:-}" answer=""
+    # $1 = prompt, $2 = default value (optional), $3 = "secret" to suppress
+    # echo, $4 = the environment variable that answers it (for the messages)
+    local prompt="$1" default="${2:-}" secret="${3:-}" skip="${4:-}" answer="" rc=0
     local display_prompt="$prompt"
     [[ -n "$default" ]] && display_prompt="$prompt [$default]"
 
     if ! have_controlling_tty; then
         # `/dev/tty` commonly exists in noninteractive services but open(2)
         # returns ENXIO because the process has no controlling terminal.
-        fail "No TTY available for interactive prompts. Set NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL via env and re-run."
+        # Unattended runs check every required value up front
+        # (unattended_inputs_check); this is the backstop.
+        fail "Cannot ask '$prompt' ($(noninteractive_reason)). Set ${skip:-the value via its environment variable} and re-run; see install.sh --help."
     fi
 
+    prompt_wait_log "$prompt" "$skip"
+    printf "%s: " "$display_prompt" > /dev/tty
     if [[ -n "$secret" ]]; then
-        printf "%s: " "$display_prompt" > /dev/tty
-        IFS= read -rs answer < /dev/tty || true
+        # read -s, not tty_read_line: this runs in $(...), where a Ctrl-C
+        # would leave tty_read_line's stty -echo behind.
+        IFS= read -rs ${NANO_PROMPT_TIMEOUT:+-t "$NANO_PROMPT_TIMEOUT"} answer < /dev/tty || rc=$?
         printf "\n" > /dev/tty
+        (( rc <= 128 )) || prompt_timed_out
     else
-        printf "%s: " "$display_prompt" > /dev/tty
-        IFS= read -r answer < /dev/tty || true
+        tty_read_line answer || rc=$?
+    fi
+    # End of input (a closed terminal, Ctrl-D) is no answer: never a blank
+    # one (that would autogenerate a password) and never asked again forever.
+    if (( rc != 0 )); then
+        printf '\n' > /dev/tty 2>/dev/null || true
+        printf 'install.sh: input ended at: %s. Stopped (exit 4).\n' "$prompt" >&2
+        exit 4
     fi
     [[ -z "$answer" && -n "$default" ]] && answer="$default"
     printf "%s" "$answer"
 }
 
+# A terminal this run may read: never in non-interactive mode.
 have_controlling_tty() {
+    [[ "${NANO_NONINTERACTIVE:-0}" != 1 ]] || return 1
     (exec 9<>/dev/tty) 2>/dev/null
+}
+
+# Why nothing is asked, for the messages.
+noninteractive_reason() {
+    if [[ "${NANO_NONINTERACTIVE:-0}" == 1 ]]; then
+        printf '%s' "non-interactive mode: --non-interactive or NANO_NONINTERACTIVE=1"
+    else
+        printf '%s' "no terminal to ask on"
+    fi
 }
 
 # Yes/no answer -> true/false; empty output for anything else.
@@ -863,6 +981,42 @@ configure_retention_days() {
         log "Recorded NANO_RETENTION_DAYS=$input in .env"
     fi
     RETENTION_DAYS="${recorded:-365}"
+}
+
+# NAN-5736 / NAN-5746: per-run match cap for raw-event detection rules
+# (DETECTION_MAX_MATCHES_PER_RUN, 1-999999; unset keeps the binary default of
+# 2000). Never asked interactively; recorded in .env when supplied so it
+# survives restarts and upgrades.
+valid_detection_max_matches_per_run() {
+    [[ "${1:-}" =~ ^[0-9]{1,6}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 999999 ))
+}
+
+validate_detection_max_matches_input() {
+    local input="${DETECTION_MAX_MATCHES_PER_RUN:-}" recorded
+    if [[ -n "$input" ]] && ! valid_detection_max_matches_per_run "$input"; then
+        fail "DETECTION_MAX_MATCHES_PER_RUN must be a whole number between 1 and 999999 (got '$input')."
+    fi
+    recorded=$(env_value DETECTION_MAX_MATCHES_PER_RUN)
+    if [[ -n "$recorded" ]] && ! valid_detection_max_matches_per_run "$recorded"; then
+        fail "DETECTION_MAX_MATCHES_PER_RUN in .env must be a whole number between 1 and 999999 (got '$recorded'). Fix .env and re-run."
+    fi
+    return 0
+}
+
+configure_detection_max_matches() {
+    local input="${DETECTION_MAX_MATCHES_PER_RUN:-}" recorded
+    validate_detection_max_matches_input
+    recorded=$(env_value DETECTION_MAX_MATCHES_PER_RUN)
+    [[ -n "$input" ]] && input=$(( 10#$input ))
+    if [[ "${MULTI_NODE:-0}" == "1" && ",${ROLE_ARG:-}," != *,app,* \
+        && -n "$input" && "$input" != "$recorded" ]]; then
+        fail "DETECTION_MAX_MATCHES_PER_RUN differs from this host's .env. Set it in the app host's .env, copy that .env to every host, then re-run install.sh here."
+    fi
+    if [[ -n "$input" && "$input" != "$recorded" ]]; then
+        nano_env_set_keys .env "DETECTION_MAX_MATCHES_PER_RUN=$input" \
+            || fail "Could not record DETECTION_MAX_MATCHES_PER_RUN in .env."
+        log "Recorded DETECTION_MAX_MATCHES_PER_RUN=$input in .env"
+    fi
 }
 
 # NAN-5449: compare the planned volume x retention with this host's disk,
@@ -1410,9 +1564,9 @@ validate_admin_password() {
 prompt_admin_password() {
     local answer
     while :; do
-        # `|| exit 1`: prompt_tty's no-TTY failure ends only its subshell; a
+        # `|| exit` (its status: 4 on NANO_PROMPT_TIMEOUT): prompt_tty's no-TTY failure ends only its subshell; a
         # caller in a condition (set -e off) would otherwise re-ask forever.
-        answer=$(prompt_tty "Admin password (blank = autogenerate)" "" secret) || exit 1
+        answer=$(prompt_tty "Admin password (blank = autogenerate)" "" secret NANO_ADMIN_PASSWORD) || exit
         if [[ -z "$answer" ]]; then
             ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
             GENERATED_PASSWORD=1
@@ -1432,7 +1586,7 @@ valid_admin_email() {
 prompt_admin_email() {
     local answer
     while :; do
-        answer=$(prompt_tty "Admin email") || exit 1
+        answer=$(prompt_tty "Admin email" "" "" NANO_ADMIN_EMAIL) || exit
         # Trim the ends only: "john smith@x" is refused, never "johnsmith@x".
         answer=$(trim_space "$answer")
         valid_admin_email "$answer" && { ADMIN_EMAIL=$answer; return 0; }
@@ -1471,7 +1625,7 @@ normalize_base_url() {
 prompt_base_url() {
     local answer url
     while :; do
-        answer=$(prompt_tty "Public base URL" "$1") || exit 1
+        answer=$(prompt_tty "Public base URL" "$1" "" NANO_BASE_URL) || exit
         answer=$(trim_space "$answer")
         url=$(normalize_base_url "$answer") && { BASE_URL=$url; return 0; }
         warn "Enter the URL users open nano at, as http(s)://host[:port] (for example https://nano.example.com)."
@@ -1527,7 +1681,7 @@ revalidate_recorded_base_url() {
 # 2 (back) or 3 (go to ANSWER_JUMP). The answers live in ANS_* variables,
 # which the configure_* functions and the first-install .env writer read.
 # ----------------------------------------------------------------------------
-ANSWER_REPLY="" ANSWER_JUMP="" ANSWER_TIERING_INTRO=0
+ANSWER_REPLY="" ANSWER_JUMP="" ANSWER_TIERING_INTRO=0 ANSWER_ENV_HINT=""
 ANSWER_STEPS=(admin_email admin_name admin_password base_url schema
     lic_mode lic_url lic_token lic_id lic_file
     proxy proxy_url proxy_auth proxy_user proxy_pass no_proxy
@@ -1572,20 +1726,29 @@ ANSWER_ITEMS=("admin_email admin_email admin_email Admin email"
 # it off when the INT trap exits during read -s. cleanup_env_temp restores it.
 # Without a working stty a secret is one blocking read -s: never sliced, so no
 # keystroke can echo.
+#
+# NANO_PROMPT_TIMEOUT (seconds) is the time allowed to answer each prompt
+# (press Enter): past it the installer stops (prompt_timed_out). The terminal
+# is line-buffered, so typing without Enter does not extend it. Unset, a
+# prompt waits for as long as the person at the terminal needs.
 TTY_SAVED_STATE=""
 tty_read_line() {
-    local _tty_rc=0 _tty_buf="" _tty_chunk=""
+    local _tty_rc=0 _tty_buf="" _tty_chunk="" _tty_since=$SECONDS
     if [[ "${2:-}" == secret ]]; then
         if ! { TTY_SAVED_STATE=$(stty -g < /dev/tty 2>/dev/null) && [[ -n "$TTY_SAVED_STATE" ]] \
                 && stty -echo < /dev/tty 2>/dev/null; }; then
             tty_restore_state
-            IFS= read -rs "$1" < /dev/tty
-            return
+            IFS= read -rs ${NANO_PROMPT_TIMEOUT:+-t "$NANO_PROMPT_TIMEOUT"} "$1" < /dev/tty || _tty_rc=$?
+            (( _tty_rc <= 128 )) || prompt_timed_out
+            return "$_tty_rc"
         fi
     fi
     if (( BASH_VERSINFO[0] < 4 )); then
-        IFS= read -r "$1" < /dev/tty || _tty_rc=$?
+        IFS= read -r ${NANO_PROMPT_TIMEOUT:+-t "$NANO_PROMPT_TIMEOUT"} "$1" < /dev/tty || _tty_rc=$?
         tty_restore_state
+        # bash 3.2 returns 1 for a timeout and for end of input alike.
+        [[ -z "${NANO_PROMPT_TIMEOUT:-}" ]] || (( _tty_rc == 0 || SECONDS - _tty_since < NANO_PROMPT_TIMEOUT )) \
+            || prompt_timed_out
         return "$_tty_rc"
     fi
     while :; do
@@ -1593,6 +1756,10 @@ tty_read_line() {
         IFS= read -r -t 1 _tty_chunk < /dev/tty || _tty_rc=$?
         _tty_buf+="$_tty_chunk"
         (( _tty_rc > 128 )) || break
+        if [[ -n "${NANO_PROMPT_TIMEOUT:-}" ]] && (( SECONDS - _tty_since >= NANO_PROMPT_TIMEOUT )); then
+            tty_restore_state
+            prompt_timed_out
+        fi
     done
     tty_restore_state
     printf -v "$1" '%s' "$_tty_buf"
@@ -1605,6 +1772,31 @@ tty_restore_state() {
     TTY_SAVED_STATE=""
 }
 
+# Every prompt says what it waits for before it waits, on stderr (a captured
+# log shows it even when the terminal output is not kept), and how to answer
+# it without a terminal: $1 = the question, $2 = the environment variable
+# (or VAR=value) that answers it, if any.
+PROMPT_WAIT_LABEL="" PROMPT_WAIT_SKIP=""
+prompt_wait_log() {
+    PROMPT_WAIT_LABEL="$1" PROMPT_WAIT_SKIP="${2:-}"
+    printf '==> waiting for input: %s (%s)\n' "$PROMPT_WAIT_LABEL" "$(prompt_skip_hint)" >&2
+}
+prompt_skip_hint() {
+    if [[ -n "$PROMPT_WAIT_SKIP" ]]; then
+        printf 'set %s to skip' "$PROMPT_WAIT_SKIP"
+    else
+        printf '%s' "run with --non-interactive to skip"
+    fi
+}
+# NANO_PROMPT_TIMEOUT ran out at the prompt prompt_wait_log last announced.
+# Exit 4, like the other "no answer" stops.
+prompt_timed_out() {
+    printf '\n' > /dev/tty 2>/dev/null || true
+    printf 'install.sh: no answer within NANO_PROMPT_TIMEOUT=%ss to: %s (%s). Stopped.\n' \
+        "$NANO_PROMPT_TIMEOUT" "${PROMPT_WAIT_LABEL:-a prompt}" "$(prompt_skip_hint)" >&2
+    exit 4
+}
+
 # Reads one answer from the terminal into ANSWER_REPLY ($2 is shown as
 # [default] and taken on Enter; $3 = secret reads without echo). Returns 2
 # when the answer is `back` or `<`. End of input stops the installer: a
@@ -1612,12 +1804,13 @@ tty_restore_state() {
 answer_read() {
     local prompt="$1" default="${2:-}" secret="${3:-}" shown="$1" reply=""
     [[ -n "$default" ]] && shown="$prompt [$default]"
+    prompt_wait_log "$prompt" "${ANSWER_ENV_HINT:-}"
     printf '%s: ' "$shown" > /dev/tty
     if [[ -n "$secret" ]]; then
-        tty_read_line reply secret || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
+        tty_read_line reply secret || answer_input_ended
         printf '\n' > /dev/tty
     else
-        tty_read_line reply || { printf '\n' > /dev/tty; fail "Input ended before the questions were answered. Nothing was written."; }
+        tty_read_line reply || answer_input_ended
     fi
     reply=${reply%$'\r'}
     case "$(trim_space "$reply")" in
@@ -1626,6 +1819,13 @@ answer_read() {
     [[ -z "$reply" && -n "$default" ]] && reply="$default"
     ANSWER_REPLY="$reply"
     return 0
+}
+
+# End of input at a question: no answer, exit 4 (like the other "no answer" stops).
+answer_input_ended() {
+    printf '\n' > /dev/tty
+    printf '%b✗ %s%b\n' "$c_red$c_bold" "Input ended before the questions were answered. Nothing was written." "$c_reset" >&2
+    exit 4
 }
 
 # Yes/no into ANSWER_REPLY (true/false); $2 is the current answer or default.
@@ -2074,6 +2274,57 @@ answer_step_index() {
     return 1
 }
 
+# The environment variable that answers step $1 without a terminal (shown in
+# the "waiting for input" line; the full table is in --help and the docs).
+answer_step_env() {
+    case "$1" in
+        admin_email) printf NANO_ADMIN_EMAIL ;;
+        admin_name) printf NANO_ADMIN_NAME ;;
+        admin_password) printf NANO_ADMIN_PASSWORD ;;
+        base_url) printf NANO_BASE_URL ;;
+        schema) printf NANO_SCHEMA_PROFILE ;;
+        lic_mode) printf 'LICENSE_TOKEN or NANO_LICENSE_MODE' ;;
+        lic_url) printf LICENSE_URL ;;
+        lic_token) printf LICENSE_TOKEN ;;
+        lic_id) printf NANO_DEPLOYMENT_ID ;;
+        lic_file) printf NANO_LICENSE_FILE ;;
+        proxy|proxy_url) printf NANO_HTTPS_PROXY ;;
+        proxy_auth|proxy_user) printf NANO_PROXY_USERNAME ;;
+        proxy_pass) printf NANO_PROXY_PASSWORD ;;
+        no_proxy) printf NANO_NO_PROXY ;;
+        ai) printf NANO_ALLOW_PRIVATE_AI_ENDPOINTS ;;
+        backup) printf NANO_BACKUP_ENABLED ;;
+        backup_dest) printf NANO_BACKUP_DESTINATION ;;
+        backup_path) printf NANO_BACKUP_PATH ;;
+        backup_s3_endpoint) printf NANO_BACKUP_S3_ENDPOINT ;;
+        backup_s3_bucket) printf NANO_BACKUP_S3_BUCKET ;;
+        backup_s3_region) printf NANO_BACKUP_S3_REGION ;;
+        backup_s3_prefix) printf NANO_BACKUP_S3_PREFIX ;;
+        backup_s3_access) printf NANO_BACKUP_S3_ACCESS_KEY ;;
+        backup_s3_secret) printf NANO_BACKUP_S3_SECRET_KEY ;;
+        backup_schedule) printf NANO_BACKUP_SCHEDULE ;;
+        backup_keep) printf NANO_BACKUP_KEEP ;;
+        volume) printf NANO_PLANNED_GB_PER_DAY ;;
+        ingest_path) printf NANO_INGEST_PATH ;;
+        retention) printf NANO_RETENTION_DAYS ;;
+        tiering) printf NANO_TIERING ;;
+        tier_provider) printf NANO_TIERING_PROVIDER ;;
+        tier_azure_url) printf NANO_TIERING_AZURE_ACCOUNT_URL ;;
+        tier_azure_name) printf NANO_TIERING_AZURE_ACCOUNT_NAME ;;
+        tier_azure_container) printf NANO_TIERING_AZURE_CONTAINER ;;
+        tier_azure_key) printf NANO_TIERING_AZURE_ACCOUNT_KEY ;;
+        tier_bucket) printf NANO_TIERING_BUCKET ;;
+        tier_endpoint) printf NANO_TIERING_ENDPOINT ;;
+        tier_region) printf NANO_TIERING_REGION ;;
+        tier_prefix) printf NANO_TIERING_PREFIX ;;
+        tier_env_creds) printf NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS ;;
+        tier_access) printf NANO_TIERING_ACCESS_KEY_ID ;;
+        tier_secret) printf NANO_TIERING_SECRET_ACCESS_KEY ;;
+        tier_move) printf NANO_TIERING_MOVE_FACTOR ;;
+        tier_cache) printf NANO_TIERING_CACHE_SIZE ;;
+    esac
+}
+
 # Runs steps $1..$2 (indexes into ANSWER_STEPS). `back` moves to the previous
 # step asked in this range; at its first step it asks that step again.
 answer_run_steps() {
@@ -2084,7 +2335,9 @@ answer_run_steps() {
             continue
         fi
         rc=0
+        ANSWER_ENV_HINT=$(answer_step_env "${ANSWER_STEPS[i]}")
         answer_ask_step "${ANSWER_STEPS[i]}" || rc=$?
+        ANSWER_ENV_HINT=""
         case "$rc" in
             0) i=$((i + 1)) ;;
             2)
@@ -2166,6 +2419,7 @@ answer_review() {
             printf '  %2d  %-22s %s\n' "${#review_items[@]}" "$label" "$(answer_item_value "$item")" > /dev/tty
         done
         printf '\n' > /dev/tty
+        ANSWER_ENV_HINT=""
         if ! answer_read "Enter to install, a number to change that answer, or q to quit (nothing written yet)"; then
             # `back` here is not a confirmation: show the review again.
             warn "Type the number of the answer to change, or press Enter to install."
@@ -2194,7 +2448,10 @@ answer_review() {
 # shellcheck disable=SC2034  # WANT_* are read through answer_wanted.
 collect_answers() {
     local first_install="$1" recorded_mode wanted=0 name
-    have_controlling_tty || return 0
+    if ! have_controlling_tty; then
+        unattended_inputs_check "$first_install" "$NANO_EDITION"
+        return 0
+    fi
     WANT_admin_email=0 WANT_admin_name=0 WANT_admin_password=0 WANT_base_url=0 WANT_schema=0
     WANT_license=0 WANT_proxy=0 WANT_ai=0 WANT_backup=0 WANT_volume=0 WANT_ingest_path=0
     WANT_retention=0 WANT_tiering=0
@@ -2307,6 +2564,100 @@ base_url_reask_default() {
         normalize_base_url "https://$recorded"
     fi
     return 0
+}
+
+# Unattended runs (non-interactive mode, or no controlling terminal): every
+# question takes its environment variable or its default, except the values
+# below, which have no safe default. All of them are named in one message,
+# before anything is written: collect_answers calls this at the point an
+# interactive run asks its questions (after the host, port and certificate
+# checks, before .env, a secret or a container). $1 = 1 on a first install
+# (no .env), $2 = the edition. Prints "VARIABLE<TAB>what it is" lines.
+unattended_missing_inputs() {
+    local first_install="$1" edition="${2:-}"
+    # A role-split host without the app role never creates the admin or .env.
+    [[ -z "${ROLE_ARG:-}" || ",${ROLE_ARG}," == *,app,* ]] || return 0
+    if [[ "$first_install" == 1 ]]; then
+        valid_admin_email "$(trim_space "${NANO_ADMIN_EMAIL:-}")" \
+            || printf '%s\t%s\n' NANO_ADMIN_EMAIL "the first admin's email address (name@domain)$( [[ -z "${NANO_ADMIN_EMAIL:-}" ]] || printf '; the value given is not one')"
+        [[ -n "${NANO_ADMIN_PASSWORD:-}" || "${NANO_PREPARE_ONLY:-0}" == 1 ]] \
+            || printf '%s\t%s\n' NANO_ADMIN_PASSWORD "the first admin's password: 12+ bytes with upper and lower case, a digit and a special character"
+        [[ -n "${NANO_BASE_URL:-}" ]] \
+            || printf '%s\t%s\n' NANO_BASE_URL "the URL users open nano at, as http(s)://host[:port] (for example https://nano.example.com)"
+    fi
+    unattended_feature_inputs "$edition"
+    # Enterprise license (resolve_license fails closed without one).
+    [[ "$edition" == enterprise && "${NANO_PREPARE_ONLY:-0}" != 1 ]] || return 0
+    [[ -z "$LICENSE_TOKEN_INPUT" && -z "$LICENSE_FILE_INPUT" && "$LICENSE_MODE_INPUT" != offline ]] || return 0
+    ! is_truthy "${AIRGAP_MODE:-}" || return 0
+    if [[ "$first_install" != 1 ]]; then
+        # A re-run fails only when .env records a mode without its values
+        # (pending); a pre-2.0.5 install without one keeps its offline license.
+        license_question_applies 0 || return 0
+        [[ -n "$(env_value NANO_LICENSE_MODE)" ]] || return 0
+    fi
+    printf '%s\t%s\n' "LICENSE_TOKEN + NANO_DEPLOYMENT_ID" \
+        "the license values from the deployment page in app.nano.rs (LICENSE_URL defaults to $LICENSE_DEFAULT_URL); or NANO_LICENSE_MODE=offline (import the file after install) or AIRGAP_MODE=true"
+}
+
+# Automatic backups and storage tiering asked for in the environment: the
+# values they need, checked here so a gap stops the run before .env exists
+# (configure_automatic_backups / configure_storage_tiering run after it).
+# Same conditions as those functions; tiering uses nano-tiering.py's own
+# check (nothing written, secrets through the environment).
+unattended_feature_inputs() {
+    local edition="$1" kind out
+    if [[ -z "${ROLE_ARG:-}" && "$(normalize_bool "${NANO_BACKUP_ENABLED:-}")" == true \
+        && "$(env_value NANO_BACKUP_ASKED)" != true && -f scripts/nano-backup-scheduler.py ]]; then
+        kind=$(trim_space "${NANO_BACKUP_DESTINATION:-}")
+        case "$kind" in
+            path)
+                [[ "$(trim_space "${NANO_BACKUP_PATH:-}")" == /* ]] \
+                    || printf '%s\t%s\n' NANO_BACKUP_PATH "the absolute backup directory (NANO_BACKUP_DESTINATION=path)" ;;
+            s3)
+                local var
+                for var in NANO_BACKUP_S3_ENDPOINT NANO_BACKUP_S3_BUCKET NANO_BACKUP_S3_ACCESS_KEY NANO_BACKUP_S3_SECRET_KEY; do
+                    [[ -n "$(trim_space "${!var:-}")" ]] \
+                        || printf '%s\t%s\n' "$var" "needed for NANO_BACKUP_DESTINATION=s3"
+                done ;;
+            *) printf '%s\t%s\n' NANO_BACKUP_DESTINATION "path or s3 (NANO_BACKUP_ENABLED=true)" ;;
+        esac
+    fi
+    [[ -z "${ROLE_ARG:-}" ]] || return 0
+    case "$(printf '%s' "${NANO_TIERING:-}" | tr '[:upper:]' '[:lower:]')" in
+        on|true|yes|1) ;;
+        *) [[ -n "${NANO_TIERING_PROVIDER:-}" && -z "${NANO_TIERING:-}" ]] || return 0 ;;
+    esac
+    if [[ "$edition" != enterprise || ! -f scripts/nano-tiering.py || ! -f scripts/lib/clickhouse_tiering.py ]]; then
+        printf '%s\t%s\n' NANO_TIERING "storage tiering is an enterprise feature: remove NANO_TIERING / --tiering"
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    if ! out=$(python3 -I scripts/nano-tiering.py --install-dir "$PWD" configure --from-installer --check </dev/null 2>&1); then
+        out=$(printf '%s' "$out" | tr '\n' ' ')
+        printf '%s\t%s\n' "NANO_TIERING_*" "$(trim_space "${out#nano }")"
+    fi
+}
+
+# Stops with every missing value in one message. $1 = unattended_missing_inputs
+# lines, $2 = what the run has (not) done so far.
+fail_missing_inputs() {
+    local var what
+    {
+        printf '%b✗ Missing or invalid values (%s). Set each one below and re-run. %s%b\n' \
+            "$c_red$c_bold" "$(noninteractive_reason)" "$2" "$c_reset"
+        while IFS=$'\t' read -r var what; do
+            [[ -n "$var" ]] && printf '    %-36s %s\n' "$var" "$what"
+        done <<< "$1"
+        printf '%s\n' "  Every other question takes its environment variable or its default: see install.sh --help and docs/getting-started/non-interactive-install.md."
+    } >&2
+    exit 1
+}
+
+unattended_inputs_check() {
+    local missing
+    missing=$(unattended_missing_inputs "$@")
+    [[ -z "$missing" ]] || fail_missing_inputs "$missing" "Nothing was changed."
 }
 # <<< interactive answers (NAN-5508) <<<
 # NAN-4957: enrichment (the IPinfo, Tor, ThreatFox platform feeds) REQUIRES a
@@ -2952,8 +3303,9 @@ legacy_vector_native_senders() {
     if [[ "$ask" == 1 ]]; then
         while :; do
             reply="" eof=0
+            prompt_wait_log "the names of the Vector senders on port 6000" NANO_VECTOR_NATIVE_SENDERS
             printf '%s ' "Name each upstream Vector that sends to port 6000, comma separated (for example edge-1,edge-2); each gets a client certificate bundle. Enter skips:" > /dev/tty
-            IFS= read -r reply < /dev/tty || eof=1
+            tty_read_line reply || eof=1
             [[ "$eof" == 0 ]] || printf '\n' > /dev/tty
             [[ -n "${reply//[[:space:],]/}" ]] || break
             if list=$(legacy_vector_native_names "$reply"); then
@@ -3174,8 +3526,9 @@ confirm_senders_paused_if_old_vector() {
         printf '%s\n' "install.sh: not upgraded, nothing was changed. Pause the senders that post to Vector's ports directly, then re-run with NANO_CONFIRM_SENDERS_PAUSED=1 (NANO_CONFIRM_UPGRADE=1 or NANO_CONFIRM_LEGACY_UPGRADE=1 confirm it too), or run install.sh from a terminal." >&2
         exit 1
     fi
+    prompt_wait_log "are the senders that post to Vector directly paused?" NANO_CONFIRM_SENDERS_PAUSED=1
     printf '%s ' "Are the senders that post to Vector directly paused? Type y to go on [y/N]:" > /dev/tty
-    IFS= read -r reply < /dev/tty || eof=1
+    tty_read_line reply || eof=1
     if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
         printf '\n' > /dev/tty
         printf '%s\n' "install.sh: no answer to the senders question; nothing was changed (exit 4)." >&2
@@ -3229,8 +3582,9 @@ legacy_upgrade_guard() {
     else
         asked_tty=1
         reply="" eof=0
+        prompt_wait_log "upgrade this 0.1.x install to 2.x?" NANO_CONFIRM_LEGACY_UPGRADE=1
         printf '%s ' "Type y to upgrade to 2.x now (anything else stops here):" > /dev/tty
-        IFS= read -r reply < /dev/tty || eof=1
+        tty_read_line reply || eof=1
         if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
             printf '\n' > /dev/tty
             printf '%s\n' "install.sh: no answer to the upgrade question; nothing was changed (exit 4)." >&2
@@ -3244,8 +3598,9 @@ legacy_upgrade_guard() {
         if [[ "$backup" == 1 ]]; then
             while :; do
                 reply="" eof=0
+                prompt_wait_log "back up PostgreSQL and .env before the upgrade?" "NANO_CONFIRM_LEGACY_UPGRADE=1 (backs up; NANO_LEGACY_UPGRADE_SKIP_BACKUP=1 skips it)"
                 printf '%s ' "Back up PostgreSQL and .env first (to a new directory outside $NANO_INSTALL_DIR)? [Y/n]:" > /dev/tty
-                IFS= read -r reply < /dev/tty || eof=1
+                tty_read_line reply || eof=1
                 if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
                     printf '\n' > /dev/tty
                     printf '%s\n' "install.sh: no answer to the backup question; nothing was changed (exit 4)." >&2
@@ -3319,7 +3674,9 @@ fi
 # anything changes, and asks on a terminal (unattended runs print it and go
 # on). A git checkout asks in update_git_checkout, before its reset.
 confirm_upgrade() {
-    local from="$1" to="$2" how="$3"
+    # $4 = check-only-ok where NANO_CHECK_ONLY=1 changes nothing after this
+    # (the tree is already fetched): the question is then only reported.
+    local from="$1" to="$2" how="$3" check_only_ok="${4:-}"
     # NAN-5559: a 0.1.x install was announced and confirmed by its own guard.
     [[ "$LEGACY_UPGRADE" != 1 ]] || return 0
     [[ "$from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -n "$to" && "$from" != "$to" ]] || return 0
@@ -3330,7 +3687,18 @@ confirm_upgrade() {
         log "NANO_CONFIRM_UPGRADE=1: upgrading. $how"
         return 0
     fi
+    if [[ "$check_only_ok" == check-only-ok && "${NANO_CHECK_ONLY:-0}" == 1 ]]; then
+        log "NANO_CHECK_ONLY=1: a real run asks before this upgrade (or needs NANO_CONFIRM_UPGRADE=1 with --non-interactive)."
+        return 0
+    fi
     if ! have_controlling_tty; then
+        # Explicit non-interactive mode never takes this irreversible step by
+        # default (migrations can't be undone); a run with no terminal at all
+        # keeps upgrading, as every unattended upgrade always has.
+        if [[ "${NANO_NONINTERACTIVE:-0}" == 1 ]]; then
+            fail_missing_inputs "$(printf '%s\t%s\n' NANO_CONFIRM_UPGRADE=1 \
+                "confirms the upgrade from nano $from to $to (database migrations can't be undone)")" "Nothing was changed."
+        fi
         log "Unattended run: upgrading. $how"
         return 0
     fi
@@ -3342,8 +3710,9 @@ confirm_upgrade() {
     local reply eof
     while :; do
         reply="" eof=0
+        prompt_wait_log "upgrade to $to now?" NANO_CONFIRM_UPGRADE=1
         printf '%s ' "Upgrade to $to now? [Y/n]:" > /dev/tty
-        IFS= read -r reply < /dev/tty || eof=1
+        tty_read_line reply || eof=1
         if [[ "$eof" == 1 && -z "${reply//[[:space:]]/}" ]]; then
             printf '\n' > /dev/tty
             printf '%s\n' "Not upgraded: nothing was changed." > /dev/tty
@@ -4147,9 +4516,9 @@ check_required_stops
 
 if [[ "${UPGRADE_CONFIRMED:-0}" != 1 ]]; then
     if [[ -e .git ]]; then
-        confirm_upgrade "$PRE_RUN_NANO_VERSION" "$NANO_VERSION" "To restart without upgrading, re-run with NANO_SKIP_GIT_UPDATE=1 ./install.sh."
+        confirm_upgrade "$PRE_RUN_NANO_VERSION" "$NANO_VERSION" "To restart without upgrading, re-run with NANO_SKIP_GIT_UPDATE=1 ./install.sh." check-only-ok
     else
-        confirm_upgrade "$PRE_RUN_NANO_VERSION" "$NANO_VERSION" "To stay on $PRE_RUN_NANO_VERSION, run ./install.sh from its own bundle instead."
+        confirm_upgrade "$PRE_RUN_NANO_VERSION" "$NANO_VERSION" "To stay on $PRE_RUN_NANO_VERSION, run ./install.sh from its own bundle instead." check-only-ok
     fi
 fi
 # NAN-5566: before .env is written and images are pulled (a bundle install, or
@@ -4182,6 +4551,7 @@ validate_license_inputs
 validate_ingest_ack_durability_input
 validate_planned_volume_input
 validate_retention_input
+validate_detection_max_matches_input
 if [[ -n "${NANO_BASE_URL:-}" ]]; then
     # A value pasted with a trailing space or saved with CRLF endings is
     # trimmed first, the same as a typed answer.
@@ -4554,7 +4924,12 @@ else
     [[ -z "$ADMIN_EMAIL" ]]    && prompt_admin_email
     [[ -z "$ADMIN_EMAIL" ]]    && fail "Admin email is required."
 
-    [[ -z "$ADMIN_NAME" ]]     && ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
+    # Unattended, the display name takes its default (the prompt's).
+    if [[ -z "$ADMIN_NAME" ]] && ! have_controlling_tty; then
+        ADMIN_NAME=Admin
+    elif [[ -z "$ADMIN_NAME" ]]; then
+        ADMIN_NAME=$(prompt_tty "Admin display name" "Admin" "" NANO_ADMIN_NAME) || exit
+    fi
     [[ -z "$ADMIN_NAME" ]]     && fail "Admin name is required."
 
     if [[ -z "$ADMIN_PASSWORD" && "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
@@ -4606,7 +4981,7 @@ else
     elif [[ -z "$SCHEMA_PROFILE" ]]; then
         while :; do
             SCHEMA_PROFILE=$(prompt_tty \
-                "Schema profile — 'ocsf' (recommended), 'ocsf+tenzir' (OCSF + a bundled Tenzir node for direct ingestion), or 'udm' (legacy CIM-style)" "ocsf")
+                "Schema profile — 'ocsf' (recommended), 'ocsf+tenzir' (OCSF + a bundled Tenzir node for direct ingestion), or 'udm' (legacy CIM-style)" "ocsf" "" NANO_SCHEMA_PROFILE) || exit
             SCHEMA_PROFILE=$(printf '%s' "$SCHEMA_PROFILE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
             case "$SCHEMA_PROFILE" in
                 ""|ocsf)     SCHEMA_PROFILE=ocsf; break ;;
@@ -4706,6 +5081,7 @@ if [[ "${PLATFORM_FEEDS_AUTO_UPDATE:-}" =~ ^[A-Za-z0-9]+$ && "${MULTI_NODE:-0}" 
     log "Recorded PLATFORM_FEEDS_AUTO_UPDATE=$PLATFORM_FEEDS_AUTO_UPDATE in .env"
 fi
 configure_retention_days
+configure_detection_max_matches
 configure_storage_tiering
 
 # ----------------------------------------------------------------------------
@@ -4957,6 +5333,12 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     # the budget the nano services share.
     [[ ",$(env_value COMPOSE_PROFILES)," == *,monitoring,* ]] && sizing_roles+=,monitoring
     sizing_defaults=$(mktemp .nano-sizing.defaults.XXXXXX)
+    # NAN-5822: the operator's own lines (below the managed block) count in
+    # this pass, so a value derived from an overridden key (PostgreSQL's
+    # shared_buffers, max_connections and pools from POSTGRES_MEM_LIMIT) is
+    # written into the block Docker Compose reads, matching that override.
+    sizing_operator_env=()
+    [[ -f .env ]] && sizing_operator_env=(--operator-env .env)
     "$RESOURCE_SIZING" \
         --topology single \
         --roles "$sizing_roles" \
@@ -4965,6 +5347,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         --planned-gb-per-day "$PLANNED_GB_PER_DAY" \
         --ingest-path "$PLANNED_INGEST_PATH" \
         --avg-event-bytes "$PLANNED_AVG_EVENT_BYTES" \
+        ${sizing_operator_env[@]+"${sizing_operator_env[@]}"} \
         --format env </dev/null > "$sizing_defaults" \
         || { rm -f "$sizing_defaults"; fail "Resource sizing refused this host (the reason is above). Nothing was started."; }
 
@@ -6379,11 +6762,24 @@ else
             # NAN-5172: email/name come from .env (kept by the first run) or
             # the environment; with a TTY anything still missing is asked.
             # The password is never in .env unless it was autogenerated.
-            not_initialized="This install has no admin account yet. Set NANO_ADMIN_EMAIL, NANO_ADMIN_NAME and NANO_ADMIN_PASSWORD, or run ./install.sh in a terminal to be asked, then re-run"
-            [[ "$MULTI_NODE" == "1" ]] && not_initialized+=" the app role"
-            not_initialized+="."
+            if [[ -z "$ADMIN_PASSWORD" ]]; then
+                ADMIN_PASSWORD=$(env_value INITIAL_ADMIN_PASSWORD)
+                [[ -n "$ADMIN_PASSWORD" ]] && GENERATED_PASSWORD=1
+            fi
+            # Unattended: the name takes its default and every other missing
+            # value is named in one message (the stack is up; no admin yet).
+            if ! have_controlling_tty; then
+                [[ -n "$ADMIN_NAME" ]] || ADMIN_NAME=Admin
+                missing=""
+                [[ -n "$ADMIN_EMAIL" ]] || missing+=$'NANO_ADMIN_EMAIL\tthe first admin\'s email address (name@domain)\n'
+                [[ -n "$ADMIN_PASSWORD" ]] || missing+=$'NANO_ADMIN_PASSWORD\tthe first admin\'s password: 12+ bytes with upper and lower case, a digit and a special character\n'
+                if [[ -n "$missing" ]]; then
+                    not_initialized="This install has no admin account yet (nano is running)"
+                    [[ "$MULTI_NODE" == "1" ]] && not_initialized+="; re-run on the app role host"
+                    fail_missing_inputs "$missing" "$not_initialized. Or run install.sh in a terminal to be asked."
+                fi
+            fi
             if [[ -z "$ADMIN_EMAIL" ]]; then
-                have_controlling_tty || fail "$not_initialized"
                 prompt_admin_email
                 [[ -n "$ADMIN_EMAIL" ]] || fail "Admin email is required."
                 if persistable_env_value "$ADMIN_EMAIL"; then
@@ -6391,19 +6787,13 @@ else
                 fi
             fi
             if [[ -z "$ADMIN_NAME" ]]; then
-                have_controlling_tty || fail "$not_initialized"
-                ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
+                ADMIN_NAME=$(prompt_tty "Admin display name" "Admin" "" NANO_ADMIN_NAME) || exit
                 [[ -n "$ADMIN_NAME" ]] || fail "Admin name is required."
                 if persistable_env_value "$ADMIN_NAME"; then
                     nano_env_set_keys .env "NANO_ADMIN_NAME='$ADMIN_NAME'" || fail "Could not record NANO_ADMIN_NAME in .env."
                 fi
             fi
             if [[ -z "$ADMIN_PASSWORD" ]]; then
-                ADMIN_PASSWORD=$(env_value INITIAL_ADMIN_PASSWORD)
-                [[ -n "$ADMIN_PASSWORD" ]] && GENERATED_PASSWORD=1
-            fi
-            if [[ -z "$ADMIN_PASSWORD" ]]; then
-                have_controlling_tty || fail "$not_initialized"
                 GENERATED_PASSWORD=0
                 prompt_admin_password
                 if [[ "$GENERATED_PASSWORD" == 1 ]]; then

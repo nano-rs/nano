@@ -145,7 +145,7 @@ describe('Marketplace inventory', () => {
     };
     mount();
     await waitFor(() => expect(within(card('tor-exit-nodes')!).getByText('Feed bundle')).toBeTruthy());
-    expect(within(card('tor-exit-nodes')!).getByText('nano feed bundle')).toBeTruthy();
+    expect(card('tor-exit-nodes')!.textContent).toContain('nano feed bundle');
     expect(screen.getByTestId('platform-feeds-card')).toBeTruthy();
     expect(within(card('acme-intel')!).queryByText('Feed bundle')).toBeNull();
   });

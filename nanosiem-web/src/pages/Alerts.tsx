@@ -72,10 +72,11 @@ import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { Alert as ApiAlert, AlertCounts, UserDetail } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
-import { alertAssigneeLabel } from '@/lib/alert-assignee';
+import { alertAssigneeLabel, pickableAssignee } from '@/lib/alert-assignee';
 import { trailingWindowTitle } from '@/lib/time-range';
 import { definePivtAction, usePivtPage } from '@/contexts/pivt-page';
 import { alertActions, alertSummary } from './alerts/alertsPivt';
+import { Term } from '@/components/ui/term';
 
 type StatusFilter = 'all' | 'new' | 'acknowledged' | 'closed';
 type SeverityFilter = 'all' | 'critical' | 'high' | 'medium' | 'low' | 'informational';
@@ -433,20 +434,24 @@ export function Alerts() {
     );
   }, [closeDialog, closeDisposition, runOnIds, selected]);
 
+  // NAN-5774: the picker lists active users only. A current assignee who is
+  // not among them (a deleted user) is never preselected, shown raw, or
+  // re-submitted: the dialog starts empty instead.
+  const pickedAssignee = pickableAssignee(users, assignTo);
   const submitAssign = useCallback(async () => {
     const target = assignDialog;
-    if (!target || !assignTo) {
+    if (!target || !pickedAssignee) {
       setAssignDialog(null);
       setAssignTo('');
       return;
     }
-    const assignee = users.find((u) => u.id === assignTo);
-    const displayName = assignee?.name ?? assignTo;
+    const assignee = users.find((u) => u.id === pickedAssignee);
+    const displayName = assignee?.name ?? 'the analyst';
     setAssignDialog(null);
     setAssignTo('');
     setActionBusy(true);
     try {
-      await api.assignAlert(target.id, assignTo);
+      await api.assignAlert(target.id, pickedAssignee);
       toast({ title: `Assigned to ${displayName}` });
       refetch();
     } catch (err) {
@@ -456,7 +461,7 @@ export function Alerts() {
     } finally {
       setActionBusy(false);
     }
-  }, [assignDialog, assignTo, refetch, toast, users]);
+  }, [assignDialog, pickedAssignee, refetch, toast, users]);
 
   const selectionCount = selected.size;
 
@@ -751,7 +756,9 @@ export function Alerts() {
                   Sev
                 </SortHeader>
                 <SortHeader field="status" current={sortField} dir={sortDirection} onSort={handleSort} className="w-[96px]">
-                  Status
+                  <Term id="alert-status" nested>
+                    Status
+                  </Term>
                 </SortHeader>
                 <TableHead className="w-[140px] font-mono text-[10.5px] uppercase tracking-[0.1em] text-muted-foreground">
                   Alert
@@ -948,7 +955,7 @@ export function Alerts() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 py-2">
-            <Label htmlFor="close-disposition" className="text-[11.5px]">Disposition</Label>
+            <Label htmlFor="close-disposition" className="text-[11.5px]"><Term id="disposition">Disposition</Term></Label>
             <Select
               value={closeDisposition}
               onValueChange={(v) => setCloseDisposition(v as Disposition)}
@@ -989,7 +996,7 @@ export function Alerts() {
           </DialogHeader>
           <div className="space-y-2 py-2">
             <Label htmlFor="assign-to" className="text-[11.5px]">Assignee</Label>
-            <Select value={assignTo} onValueChange={setAssignTo}>
+            <Select value={pickedAssignee} onValueChange={setAssignTo}>
               <SelectTrigger id="assign-to" className="h-8 text-[11.5px]">
                 <SelectValue placeholder={users.length === 0 ? 'Loading users…' : 'Select an analyst'} />
               </SelectTrigger>
@@ -1009,7 +1016,7 @@ export function Alerts() {
             <Button variant="ghost" size="sm" onClick={() => setAssignDialog(null)} className="h-8 text-[11.5px]">
               Cancel
             </Button>
-            <Button size="sm" onClick={submitAssign} className="h-8 text-[11.5px]" disabled={actionBusy || !assignTo}>
+            <Button size="sm" onClick={submitAssign} className="h-8 text-[11.5px]" disabled={actionBusy || !pickedAssignee}>
               Assign
             </Button>
           </DialogFooter>

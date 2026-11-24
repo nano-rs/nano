@@ -22,7 +22,7 @@ mod stats;
 mod types;
 
 #[cfg(test)]
-mod delete_archive_live_tests;
+pub(crate) mod delete_archive_live_tests;
 
 pub use scheduling::{
     rule_error_text, ClaimRelease, CrashRelease, DetectionCoverageGap, RuleFailureCounters,

@@ -53,6 +53,7 @@ import type {
 import { cn } from '@/lib/utils';
 import { eventTypeLabel, eventTypeOptions, type WebhookEventType } from '@/lib/webhook-event-types';
 import { formatUTC } from '@/lib/date-utils';
+import { Term } from '@/components/ui/term';
 
 const SEVERITY_OPTIONS = ['critical', 'high', 'medium', 'low', 'informational'];
 
@@ -442,7 +443,7 @@ function NotificationSettings() {
 
   const showUrlField = usesUrl(formType);
   const showSecretField = formType === 'generic' || formType === 'pagerduty';
-  const secretLabel = formType === 'pagerduty' ? 'Routing key' : 'HMAC secret';
+  const secretLabel = formType === 'pagerduty' ? 'Routing key' : 'Signing secret';
   const secretRequired = formType === 'pagerduty' && !editing;
 
   return (
@@ -451,7 +452,7 @@ function NotificationSettings() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-[18px] font-semibold tracking-tight text-foreground">Notifications</h1>
-          <p className="text-[11.5px] text-muted-foreground mt-0.5">Route alerts to Slack, Teams, PagerDuty, or a signed JSON endpoint</p>
+          <p className="text-[11.5px] text-muted-foreground mt-0.5">Send alerts to Slack, Teams, PagerDuty or your own web address through <Term id="notification-channel">notification channels</Term></p>
         </div>
         <Button onClick={openCreate} size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" data-testid="add-channel">
           <Plus className="w-3 h-3" />
@@ -465,9 +466,9 @@ function NotificationSettings() {
           <div className="flex items-center gap-2 min-w-0">
             <Link2 className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
             <div className="min-w-0">
-              <div className="text-[11.5px] font-medium text-foreground">Deep link base URL</div>
+              <div className="text-[11.5px] font-medium text-foreground"><Term id="deep-link-base-url">Deep link base URL</Term></div>
               <div className="text-[10.5px] text-muted-foreground mt-0.5">
-                Prepended to alert links in every notification.
+                The address of nano. Alert links in every notification start with it.
               </div>
             </div>
           </div>
@@ -507,7 +508,6 @@ function NotificationSettings() {
         <div className="rounded-md border border-border bg-card/40 px-4 py-10 text-center">
           <Bell className="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
           <p className="text-[12.5px] text-foreground font-medium">No notification channels</p>
-          <p className="text-[11.5px] text-muted-foreground mt-1">Add a channel to route alerts to Slack, Teams, PagerDuty, or a custom endpoint.</p>
           <Button onClick={openCreate} size="sm" className="h-7 text-[11.5px] px-2.5 mt-4 gap-1.5">
             <Plus className="w-3 h-3" />
             Add channel
@@ -654,7 +654,7 @@ function NotificationSettings() {
               {editing ? 'Edit channel' : 'New channel'}
             </SheetTitle>
             <SheetDescription className="text-[11px] text-muted-foreground mt-1">
-              Provider-formatted delivery on the shared spine: SSRF-guarded, retried, and logged.
+              nano formats each message for the service, retries failed sends and logs every attempt.
             </SheetDescription>
           </SheetHeader>
 
@@ -705,7 +705,7 @@ function NotificationSettings() {
                 <Input
                   value={formUrl}
                   onChange={e => setFormUrl(e.target.value)}
-                  placeholder={editing ? '(configured — enter new to replace)' : urlPlaceholder(formType)}
+                  placeholder={editing ? '(set: enter a new one to replace it)' : urlPlaceholder(formType)}
                   className="h-8 text-[12px] font-mono"
                 />
                 {editing && (
@@ -718,7 +718,7 @@ function NotificationSettings() {
 
             {formType === 'pagerduty' && (
               <p className="text-[10.5px] text-muted-foreground -mt-1">
-                Events are enqueued to <span className="font-mono">events.pagerduty.com/v2/enqueue</span> with dedup key = alert id.
+                Sent to <span className="font-mono">events.pagerduty.com</span>. Repeats of the same alert are grouped into one incident.
               </p>
             )}
 
@@ -761,12 +761,12 @@ function NotificationSettings() {
                   type="password"
                   value={formSecret}
                   onChange={e => setFormSecret(e.target.value)}
-                  placeholder={editing?.has_secret ? '(configured — enter new to replace)' : (formType === 'pagerduty' ? 'Integration routing key' : 'Signing secret')}
+                  placeholder={editing?.has_secret ? '(set: enter a new one to replace it)' : (formType === 'pagerduty' ? 'Integration routing key' : 'Signing secret')}
                   className="h-8 text-[12px] font-mono"
                 />
                 {formType === 'generic' && (
                   <p className="text-[10.5px] text-muted-foreground mt-1">
-                    Signs the body with an <span className="font-mono">X-NanoSIEM-Signature</span> header.
+                    A <Term id="signing-secret">signing secret</Term> lets the receiver check each message came from nano. It goes in the <span className="font-mono">X-NanoSIEM-Signature</span> header.
                   </p>
                 )}
               </div>
@@ -834,7 +834,7 @@ function NotificationSettings() {
                     className="h-8 text-[11.5px] font-mono"
                   />
                   <p className="text-[10.5px] text-muted-foreground mt-1">
-                    Route only matching resource types. Leave empty to receive every selected health category.
+                    Leave empty to get every selected health category.
                   </p>
                 </div>
               </div>
@@ -873,9 +873,6 @@ function NotificationSettings() {
                 placeholder="rule_… ids, comma-separated (empty = all rules)"
                 className="h-8 text-[11.5px] font-mono"
               />
-              <p className="text-[10.5px] text-muted-foreground mt-1">
-                Restrict this channel to alerts from specific detection rules.
-              </p>
             </div>
 
             <div className="flex items-center justify-between gap-3 pt-1">
@@ -906,7 +903,7 @@ function NotificationSettings() {
               <FileText className="w-[14px] h-[14px] text-primary" />
               Delivery log
             </SheetTitle>
-            <SheetDescription className="text-[11px] text-muted-foreground mt-1">Last 20 outbound delivery attempts — newest first.</SheetDescription>
+            <SheetDescription className="text-[11px] text-muted-foreground mt-1">The last 20 send attempts, newest first.</SheetDescription>
           </SheetHeader>
           {loadingDeliveries ? (
             <div className="flex items-center justify-center py-12">
@@ -916,7 +913,6 @@ function NotificationSettings() {
             <div className="px-5 py-12 text-center">
               <FileText className="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
               <p className="text-[12.5px] text-foreground font-medium">No deliveries yet</p>
-              <p className="text-[11.5px] text-muted-foreground mt-1">The first attempt will appear here within seconds.</p>
             </div>
           ) : (
             <div className="flex flex-col">
@@ -956,7 +952,7 @@ function NotificationSettings() {
           <AlertDialogHeader className="border-b border-border px-5 py-4">
             <AlertDialogTitle className="text-[14px] font-semibold text-foreground tracking-tight">Delete channel</AlertDialogTitle>
             <AlertDialogDescription className="text-[11.5px] text-muted-foreground mt-1">
-              Are you sure you want to delete this channel? This action cannot be undone.
+              Delete this channel? This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="border-t border-border px-5 py-3">

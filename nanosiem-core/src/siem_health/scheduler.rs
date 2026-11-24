@@ -172,6 +172,8 @@ pub async fn run_health_check_with_trigger(
     };
     // NAN-4954: audit-trail holes surface on every path (AI, fallback, Fresh).
     analyzer::ensure_audit_durability_findings(&mut analysis, &metrics);
+    // NAN-5826: Live/Alerting scheduled rules with no schedule never run.
+    analyzer::ensure_unscheduled_rule_findings(&mut analysis, &metrics);
     // NAN-5032: sources stored under a platform-owned source type.
     analyzer::ensure_reserved_source_name_findings(&mut analysis, &metrics);
     // NAN-5342: one shard taking more writes / parts / merges than the rest.
@@ -224,6 +226,21 @@ pub async fn run_health_check_with_trigger(
     match super::pipeline_drops::pipeline_drops(ch_client, is_clustered).await {
         Ok(rows) => super::pipeline_drops::ensure_pipeline_drop_findings(&mut analysis, &rows),
         Err(e) => warn!("Failed to read Vector drop reports: {}", e),
+    }
+    // NAN-5839: a source whose offset-less clock looks a whole timezone off
+    // (the parser marker lives only in `ocsf_logs`).
+    let ocsf = crate::schema::active_profile_from_env()
+        .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+        .unwrap_or(false);
+    if ocsf {
+        match super::source_clock_skew::source_clock_skew(ch_client, is_clustered, scope).await {
+            Ok(rows) if !rows.is_empty() => {
+                let names = super::source_clock_skew::load_source_names(pool).await;
+                super::source_clock_skew::ensure_clock_skew_findings(&mut analysis, &rows, &names);
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Failed to read source clock skew: {}", e),
+        }
     }
     // NAN-5204: automatic backups enabled but none succeeded in 36 hours.
     match crate::backup_status::BackupStatusRepository::new(pool.clone()).get().await {

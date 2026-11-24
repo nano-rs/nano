@@ -13,7 +13,7 @@
   which is what stops Geist Mono drawing `!=` as one "≠" glyph. (A ligature is
   a font rendering, so the DOM text alone cannot prove it; the CSS rule can.)
 - **`dataset=signals` (v2.0.32).** The Dataset selector offers Signals
-  ("Detections that fired") and a person with `detections:view` searches it.
+  ("times a rule matched") and a person with `detections:view` searches it.
   The refusal without `detections:view` is not provable in the browser here:
   every user belongs to the built-in Everyone group, whose role already grants
   `detections:view`, so a session can never lack it without editing that
@@ -97,7 +97,7 @@ def test_v2032_dataset_signals_needs_detections_view(
     with _logged_in(stack, ui, artifact_dir, "signals32", SEARCHER) as p:
         p.goto("/search")
         p.click({"role": "button", "name": uilib.rx(r"^Dataset")}, timeout_ms=30_000)
-        option = {"role": "button", "name": uilib.rx(r"^Signals\s*Detections that fired")}
+        option = {"role": "button", "name": uilib.rx(r"^Signals\s*times a rule matched")}
         p.wait_for(option)
         p.click(option)
         p.wait_for({"role": "button", "name": uilib.rx(r"^Dataset\s*Signals")})

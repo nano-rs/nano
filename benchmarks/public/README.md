@@ -32,7 +32,7 @@ benchmarks/public/
   detections/build_rules.py     generates detections/rules.json (200 scheduled rules)
   dashboards/soc-overview.json  the panels a SOC wall display refreshes
   k6/soc_mix.js                 analysts + dashboards + Agent Lane agents, one k6 run
-  topology/*.hosts.env.example  dry run, SOC day and ceiling topologies (Rackspace Spot vs2 classes)
+  topology/*.hosts.env.example  dry run, SOC day and ceiling topologies (VM classes and sizes)
   schema/results.schema.json    the results format
   results/                      raw JSON results of published runs
 ```
@@ -73,28 +73,25 @@ size floor (2 vCPU, 8 GB RAM, 40 GB free for ClickHouse hosts); the benchmark
 topologies are far above it.
 
 - **CPU:** every nano host needs AVX2. ClickHouse 26.6+ and Keeper require it,
-  and `install.sh` refuses hosts without it. On Rackspace Spot, use **vs2**
-  server classes. The vs1 classes run on Xeon E5 v1/v2 and have no AVX2.
+  and `install.sh` refuses hosts without it. Older VM classes on Xeon E5
+  v1/v2 hardware have no AVX2, so check the CPU before you pick a class.
 - **Disk:** if a VM has a large unformatted disk, `prep` puts Docker's data
   root on it.
 
-### Provisioning on Rackspace Spot
+### Provisioning
 
-1. Create a VM cloudspace named `bench-*` in a region with vs2 classes
-   (us-central-dfw-2), with your SSH key.
-2. Create one VM pool per role: Ubuntu 24.04, bid well above market, and
-   record both prices in a `PRICING_FILE` next to your topology.
-   - If the tool you use sends a null `vmCloudSpaceRef` (HTTP 422), use
-     [`lib/spot_pool.sh`](lib/spot_pool.sh). It POSTs the `VMPool` with the
-     reference set, using a refresh token kept in a 0600 file that is never
-     printed.
-   - Pool user data that installs Docker and touches
-     `/var/lib/nano-bench-ready` is what `prep` waits for:
-     results README for the exact script.
-3. In the dry run, vs2 pools got servers in about 2.5 minutes.
-4. **Tear down when you're done.** Delete the cloudspace, which also deletes
-   its pools. Then confirm that the cloudspace and pool lists no longer show
-   anything named `bench-`.
+Any cloud or on-prem hypervisor works. The kit needs plain VMs and SSH, nothing
+provider-specific.
+
+1. Create one Ubuntu 24.04 VM per role, sized as in the topology file, in one
+   region, with your SSH key. If you use spot or preemptible pricing, bid well
+   above market and record both prices in a `PRICING_FILE` next to your
+   topology.
+2. Use user data (cloud-init) that installs Docker and touches
+   `/var/lib/nano-bench-ready`. That file is what `prep` waits for;
+   [`topology/spot-userdata.sh`](topology/spot-userdata.sh) does both.
+3. **Tear down when you're done.** Delete every VM you created, then confirm
+   that nothing named `bench-` is left.
 
 The VMs share a private 10/8 network. The inventory, TLS certificate and
 senders use the private addresses; SSH uses the public ones.
@@ -146,7 +143,7 @@ Results never contain host addresses.
 
 ### Network exposure
 
-Spot VMs have public addresses only. `prep` installs a host firewall
+The benchmark VMs have public addresses only. `prep` installs a host firewall
 (`NANO-BENCH` chain on INPUT and DOCKER-USER) that admits the cluster members
 and the operator's address only. Cluster traffic uses the installer's default
 private TLS.

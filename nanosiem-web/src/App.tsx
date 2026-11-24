@@ -10,6 +10,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ThemeProvider } from '@/components/theme-provider';
 import { sourceOnboardingPermission } from '@/lib/add-data-sources';
 import { reloadRouteChunk } from '@/lib/reload-route-chunk';
+import { QueryPreservingRedirect } from '@/components/routing/QueryPreservingRedirect';
 
 // Helper to handle chunk load failures after deployments
 // When a new version is deployed, old chunk files may no longer exist
@@ -101,6 +102,7 @@ import { CapabilitiesProvider } from '@/contexts/CapabilitiesProvider';
 import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { RouteErrorBoundary } from '@/components/layout/RouteErrorBoundary';
+import { SENTRY_TEST_PATH, SENTRY_TEST_TRIGGER, SentryTestThrow } from '@/lib/error-tracking';
 import { PageContextProvider } from '@/contexts/PageContext';
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -191,14 +193,15 @@ const HuntLeadsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts
 const HuntLeadDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntLeadDetailRoute');
 const HuntRuleIdeasRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntRuleIdeasRoute');
 const HuntKnowledgeRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntKnowledgeRoute');
-const HuntSuppressionsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntSuppressionsRoute');
 const HuntProfileRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntProfileRoute');
-const HuntRunnersRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntRunnersRoute');
-const HuntMemoryRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntMemoryRoute');
 const HuntCampaignsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignsRoute');
 const HuntCampaignCandidatesRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignCandidatesRoute');
 const HuntCampaignDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignDetailRoute');
-const HuntRulingsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntRulingsRoute');
+// NAN-5850: Rulings became the Decisions tab of Findings; runners, install
+// settings and the default charter moved to Settings > Hunting.
+const HuntDecisionsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntDecisionsRoute');
+const HuntSettingsRunnersRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntSettingsRunnersRoute');
+const HuntSettingsCharterRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntSettingsCharterRoute');
 const HuntEscalationsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntEscalationsRoute');
 const RiskWatchlists = lazyWithRetryNamed(() => import('@/enterprise/pages/RiskWatchlists'), 'RiskWatchlists');
 const Prevalence = lazyWithRetryNamed(() => import('@/pages/Prevalence'), 'Prevalence');
@@ -717,6 +720,16 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          {/* NAN-5850: Rule ideas live under Detections, next to AI Tuning
+              (enterprise; the hunts capability gates it, open builds render
+              the paid-plan stub). */}
+          <Route path="/rules/ideas" element={
+            <PermissionRoute permission="hunts:view" capability="hunts" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <HuntRuleIdeasRoute key={resetKey} />
+              </Suspense>
+            } />
+          } />
 
           {/* Risk */}
           <Route path="/risk" element={
@@ -726,25 +739,21 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-          {/* Hunts (enterprise, NAN-5545 / NAN-5547): library, findings,
-              campaigns, rule ideas, memory (knowledge and suppressions
-              redirect into it), rulings, profile, runners. Static paths sort
-              ahead of /hunts/:id in react-router's ranking. */}
+          {/* Hunts (enterprise, NAN-5545 / NAN-5547 / NAN-5850): library,
+              findings (Inbox and Decisions tabs), escalations, campaigns,
+              knowledge, profile. Static paths sort ahead of /hunts/:id and
+              /hunts/leads/:id in react-router's ranking. */}
           {([
             ['/hunts', HuntsListRoute],
             ['/hunts/leads', HuntLeadsRoute],
+            ['/hunts/leads/decisions', HuntDecisionsRoute],
             ['/hunts/leads/:id', HuntLeadDetailRoute],
-            ['/hunts/rule-ideas', HuntRuleIdeasRoute],
             ['/hunts/knowledge', HuntKnowledgeRoute],
-            ['/hunts/suppressions', HuntSuppressionsRoute],
-            ['/hunts/memory', HuntMemoryRoute],
             ['/hunts/campaigns', HuntCampaignsRoute],
             ['/hunts/campaigns/candidates', HuntCampaignCandidatesRoute],
             ['/hunts/campaigns/:id', HuntCampaignDetailRoute],
-            ['/hunts/rulings', HuntRulingsRoute],
             ['/hunts/escalations', HuntEscalationsRoute],
             ['/hunts/profile', HuntProfileRoute],
-            ['/hunts/runners', HuntRunnersRoute],
             ['/hunts/:id', HuntDetailRoute],
           ] as const).map(([path, Page]) => (
             <Route key={path} path={path} element={
@@ -755,6 +764,31 @@ function ProtectedAppRoutes() {
               } />
             } />
           ))}
+          {/* NAN-5850: Settings > Workspace > Hunting (enterprise). */}
+          {([
+            ['/settings/hunts', HuntSettingsRunnersRoute],
+            ['/settings/hunts/charter', HuntSettingsCharterRoute],
+          ] as const).map(([path, Page]) => (
+            <Route key={path} path={path} element={
+              <PermissionRoute permission="hunts:view" capability="hunts" element={
+                <Suspense fallback={<SettingsLoadingFallback />}>
+                  <Page key={resetKey} />
+                </Suspense>
+              } />
+            } />
+          ))}
+          {/* NAN-5850: the old hunt settings routes stay registered forever and
+              land on their new homes in one hop, query string kept (Runners
+              drops it). The target route carries the permission gate. Kept
+              in step with LEGACY_HUNT_REDIRECTS (components/routing/redirects.ts)
+              by redirects.test.tsx; /hunts/profile turns into a redirect in
+              its own page (PR C). They sit after the tuple-mapped routes so the
+              e2e gate parser (nano_e2e/rbac_matrix.py) reads each as a redirect. */}
+          <Route path="/hunts/memory" element={<QueryPreservingRedirect to="/hunts/knowledge" />} />
+          <Route path="/hunts/suppressions" element={<QueryPreservingRedirect to="/hunts/knowledge?tab=suppressions" />} />
+          <Route path="/hunts/rulings" element={<QueryPreservingRedirect to="/hunts/leads/decisions" />} />
+          <Route path="/hunts/runners" element={<QueryPreservingRedirect to="/settings/hunts" query="drop" />} />
+          <Route path="/hunts/rule-ideas" element={<QueryPreservingRedirect to="/rules/ideas" />} />
           {/* Automation (enterprise, NAN-4911 / NAN-4925): runs, flows,
               approvals, capabilities. Each route renders an "off" state
               itself; open builds render the paid-plan stub. */}
@@ -1111,6 +1145,10 @@ function ProtectedAppRoutes() {
 
           {/* Settings — landing page for the dedicated /settings shell (NAN-537).
               Visible to anyone with at least one settings:* permission. */}
+          {/* The landing's gate. Kept equal to SETTINGS_LANDING_PERMISSIONS
+              (settings/sections.ts) by hunting-section.test.ts; a role that
+              holds none of these (e.g. hunts:view only, NAN-5850) enters the
+              Settings shell at its first visible section instead. */}
           <Route path="/settings" element={
             <PermissionRoute anyPermission={['settings:view', 'settings:system', 'settings:ai', 'settings:ai_providers', 'settings:agent_models', 'settings:retention', 'settings:webhooks', 'users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view']} element={
               <Suspense fallback={<SettingsLoadingFallback />}>
@@ -1328,6 +1366,8 @@ function ProtectedAppRoutes() {
               the global 404 catch-all handles stale bookmarks. */}
 
           {/* 404 catch-all */}
+          {/* NAN-5798: e2e/dev builds with a DSN and the test trigger only (build-time; absent otherwise). */}
+          {SENTRY_TEST_TRIGGER && <Route path={SENTRY_TEST_PATH} element={<SentryTestThrow />} />}
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
         </RouteErrorBoundary>

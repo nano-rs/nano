@@ -5,6 +5,7 @@
 // synthetic data (predicate breakdown, entity MFA/dept metadata, "recent
 // activity for this entity") render "STUB" chips so they surface in review.
 
+import { Term } from '@/components/ui/term';
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowRight, Check, ListFilter, Search, FileText } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -635,7 +636,7 @@ function RuleConditionsCard({ data }: { data: import('@/lib/api/types').RulePred
           <span className="font-mono text-[11px] text-foreground font-semibold">Rule conditions</span>
           <span className="ml-auto font-mono text-[10.5px] text-muted-foreground">parsing…</span>
         </div>
-        <div className="p-3 text-[11px] text-muted-foreground/70">Loading predicates…</div>
+        <div className="p-3 text-[11px] text-muted-foreground/70">Loading conditions…</div>
       </div>
     );
   }
@@ -667,9 +668,9 @@ function RuleConditionsCard({ data }: { data: import('@/lib/api/types').RulePred
     <div className="rounded-lg border border-border overflow-hidden bg-card">
       <div className="px-3 py-2 flex items-center gap-2 border-b border-border">
         <Check className="w-3.5 h-3.5 text-success" strokeWidth={2} />
-        <span className="font-mono text-[11px] text-foreground font-semibold">Rule conditions</span>
+        <span className="font-mono text-[11px] text-foreground font-semibold"><Term id="rule-condition">Rule conditions</Term></span>
         <span className="ml-auto font-mono text-[10.5px] text-muted-foreground">
-          {data.predicates.length} predicate{data.predicates.length !== 1 ? 's' : ''}
+          {data.predicates.length} condition{data.predicates.length !== 1 ? 's' : ''}
           {data.pipe_stages.length > 0 && (
             <> · {data.pipe_stages.length} stage{data.pipe_stages.length !== 1 ? 's' : ''}</>
           )}
@@ -677,7 +678,7 @@ function RuleConditionsCard({ data }: { data: import('@/lib/api/types').RulePred
       </div>
       {data.predicates.length === 0 ? (
         <div className="p-3 text-[11px] text-muted-foreground">
-          No predicates parsed — rule may match everything before the first pipe.
+          No conditions found before the first pipe, so the rule may match every event it reads.
         </div>
       ) : (
         <div className="px-3 py-2 flex flex-col gap-1">
@@ -802,9 +803,6 @@ export function MatchesDetail({
       <div className="py-16 px-6 flex flex-col items-center gap-2 text-center">
         <ListFilter className="w-6 h-6 text-muted-foreground/60" strokeWidth={1.5} />
         <div className="text-[12px] text-foreground font-medium">Select a match</div>
-        <div className="text-[10.5px] text-muted-foreground max-w-[360px]">
-          Pick a match from the list on the left to see its timeline, entity, and contributing events.
-        </div>
       </div>
     );
   }
@@ -835,7 +833,7 @@ export function MatchesDetail({
             </div>
             <h2 className="mt-2 text-[17px] font-semibold text-foreground tracking-[-0.01em] leading-[1.25]">
               {view.isAggregate ? (
-                <>Aggregate match against <span className="font-mono text-primary">{view.entity.label}</span></>
+                <><Term id="aggregate-match">Aggregate match</Term> against <span className="font-mono text-primary">{view.entity.label}</span></>
               ) : hasMultipleEvents ? (
                 <>Detection fired against <span className="font-mono text-primary">{view.entity.label}</span></>
               ) : (
@@ -860,8 +858,8 @@ export function MatchesDetail({
               ) : hasMultipleEvents ? (
                 <>
                   This entity generated{' '}
-                  <span className="text-foreground font-medium">{view.events.length}</span> contributing
-                  events across{' '}
+                  <span className="text-foreground font-medium">{view.events.length}</span>{' '}
+                  <Term id="contributing-events">contributing events</Term> across{' '}
                   <span className="text-foreground font-medium">{view.uniqueIps}</span> source IP
                   {view.uniqueIps !== 1 ? 's' : ''} over a{' '}
                   <span className="text-foreground font-medium">
@@ -942,7 +940,7 @@ export function MatchesDetail({
                   </div>
                 ) : (
                   <div className="px-2 py-2 text-[10.5px] text-muted-foreground leading-[1.5]">
-                    No linked alerts or cases. This match didn't trip any alert thresholds.
+                    No linked alerts or cases.
                   </div>
                 )}
               </div>

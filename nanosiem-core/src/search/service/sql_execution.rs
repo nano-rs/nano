@@ -193,7 +193,7 @@ impl SearchService {
         // executes. Routed through the SAME gate (`prevalence_join_applies`) and the SAME
         // builder (`generate_prevalence_pushdown_sql`) as the execute path so the two can
         // never diverge. Prevalence is logs-only, so this deliberately uses the tenant
-        // logs generator (`ch_sql_generator`), matching the execute path — not the
+        // logs generator (`sql_generator`), matching the execute path — not the
         // dataset generator.
         let prevalence_commands = extract_prevalence_commands(&parsed);
         if crate::search::query_processing::command_extraction::prevalence_join_applies(
@@ -237,6 +237,8 @@ impl SearchService {
                     limit: self.config.default_limit.min(self.config.max_limit),
                     offset: 0,
                 }),
+                // NAN-5793 review: the same deny-set the execute path uses.
+                crate::query::GeneratorScope::viewer(scope),
             )?;
             // The rescue runs at execute time when there's a hash/domain count
             // condition OR (residual #2) an `enrich=true | where host_count < N`
@@ -369,25 +371,26 @@ impl SearchService {
         Ok(sql)
     }
 
-    /// Execute SQL against ClickHouse and return results with total count
+    /// Execute hand-built SQL against ClickHouse and return results with total
+    /// count. NAN-5793: every query of the read (rows and count companion)
+    /// binds `deny_set` for SQL carrying the bound source-scope predicate; an
+    /// empty set binds nothing.
     pub(crate) async fn execute_clickhouse_sql(
         &self,
         sql: &str,
         limit: usize,
         offset: usize,
         preserve_columns: bool,
+        deny_set: &std::collections::BTreeSet<String>,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        self.execute_clickhouse_sql_with_query_id(
-            sql,
-            limit,
-            offset,
-            None,
-            None,
-            None,
-            None,
-            preserve_columns,
-        )
-        .await
+        let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
+            SearchError::DatabaseError(sqlx::Error::Configuration(
+                "ClickHouse client not configured".into(),
+            ))
+        })?;
+        let scoped = ch_executor.with_source_scope(deny_set);
+        self.dispatch_clickhouse_sql(&scoped, sql, limit, offset, None, None, None, None, preserve_columns)
+            .await
     }
 
     /// Execute SQL against ClickHouse with optional query_id and per-query settings.
@@ -604,10 +607,15 @@ impl SearchService {
 
         // NAN-2001: main query + count companion both run on the selected
         // raw-SQL identity so neither the rows nor the total leak audit data.
-        let (results, total_count) = tokio::join!(
-            executor.execute_sql_to_json(&paginated_sql),
-            executor.execute_count_query(&count_sql)
-        );
+        // NAN-5817: the caller wrote this SQL, so a ClickHouse rejection of it
+        // is their mistake, not a generator bug to report at ERROR.
+        let (results, total_count) = crate::search::clickhouse_rejection::user_authored(async {
+            tokio::join!(
+                executor.execute_sql_to_json(&paginated_sql),
+                executor.execute_count_query(&count_sql)
+            )
+        })
+        .await;
 
         Ok((results?, total_count?))
     }

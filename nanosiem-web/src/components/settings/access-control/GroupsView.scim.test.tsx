@@ -38,7 +38,7 @@ test('groups with no SCIM source stay Local and show no SCIM banner', async () =
   render(<GroupsView />);
   expect((await screen.findAllByText('Local')).length).toBeGreaterThan(0);
   expect(screen.queryByText('SCIM')).toBeNull();
-  expect(screen.queryByText(/provisioned over SCIM/)).toBeNull();
+  expect(screen.queryByText(/Some members are added by/)).toBeNull();
 });
 
 test('a group fed by a SCIM-provisioned IdP group shows the pill and banner', async () => {
@@ -46,7 +46,8 @@ test('a group fed by a SCIM-provisioned IdP group shows the pill and banner', as
     ['group_1', [{ group_id: 'group_1', provider_id: 'oidc_1', provider_name: 'Okta', idp_group: 'siem-admins' }]],
   ]);
   render(<GroupsView />);
-  expect((await screen.findAllByText('SCIM')).length).toBe(2);
-  expect(screen.getByText(/provisioned over SCIM from/)).toBeTruthy();
+  // Two pills (list row and detail header) plus the glossary term in the banner.
+  expect((await screen.findAllByText('SCIM')).length).toBe(3);
+  expect(screen.getByText(/Some members are added by/)).toBeTruthy();
   expect(screen.getByText('siem-admins')).toBeTruthy();
 });

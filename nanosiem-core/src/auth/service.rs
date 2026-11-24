@@ -14,6 +14,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::password::{validate_password, verify_password, PasswordError};
 use super::repository::{
@@ -39,6 +40,30 @@ pub(crate) const DUMMY_BCRYPT_HASH_FOR_TESTS: &str = DUMMY_BCRYPT_HASH;
 /// NAN-2453: how long the immediately previous refresh token stays usable
 /// after a rotation (concurrent tabs presenting the same cookie).
 pub const REFRESH_GRACE_SECS: i64 = 20;
+
+/// Result of [`AuthService::logout_current_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentSessionLogout {
+    /// The caller's session was found and deleted.
+    Ended(Uuid),
+    /// The access token names a session (`sid`) that no longer exists:
+    /// a repeat logout, or a session already revoked. Idempotent success.
+    AlreadyEnded(Uuid),
+    /// The access token predates `sid` and no presented refresh token matched
+    /// a live session of the caller, so the session to end is unknown.
+    /// Nothing was deleted.
+    NotIdentified,
+}
+
+impl CurrentSessionLogout {
+    /// The session this logout is about, when known (audit `resource_id`).
+    pub fn session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Ended(id) | Self::AlreadyEnded(id) => Some(*id),
+            Self::NotIdentified => None,
+        }
+    }
+}
 
 /// Result of [`AuthService::refresh_token`].
 #[derive(Debug, Clone)]
@@ -353,17 +378,6 @@ impl AuthService {
         let roles = self.group_repo.get_user_roles(user.id).await?;
         let permissions = self.group_repo.get_user_permissions(user.id).await?;
 
-        // Create tokens (Requirement 1.2)
-        // Permissions are NOT embedded in the JWT — they are resolved server-side
-        // by the auth middleware via PermissionResolver.
-        let token_pair = self
-            .token_service
-            .create_token_pair(user.id, roles.clone())?;
-
-        // Create session with hashed refresh token
-        let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
-
         // M6: Enforce per-user session limit (max 10) — evict oldest sessions
         const MAX_SESSIONS_PER_USER: i64 = 10;
         let current_count = self
@@ -383,14 +397,11 @@ impl AuthService {
             }
         }
 
-        self.session_repo
-            .create_session(
-                user.id,
-                &refresh_token_hash,
-                ip_address,
-                user_agent,
-                expires_at,
-            )
+        // Create the session and its tokens (Requirement 1.2). Permissions are
+        // NOT embedded in the JWT — they are resolved server-side by the auth
+        // middleware via PermissionResolver.
+        let token_pair = self
+            .open_session(user.id, roles.clone(), ip_address, user_agent)
             .await?;
 
         // Parse query mode preference (default to Standard if not set)
@@ -579,13 +590,6 @@ impl AuthService {
         // MFA verified — now complete login (same flow as non-MFA)
         let roles = self.group_repo.get_user_roles(user_id).await?;
         let permissions = self.group_repo.get_user_permissions(user_id).await?;
-        let token_pair = self
-            .token_service
-            .create_token_pair(user_id, roles.clone())?;
-
-        let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
-
         const MAX_SESSIONS_PER_USER: i64 = 10;
         let current_count = self
             .session_repo
@@ -600,14 +604,8 @@ impl AuthService {
                 .await;
         }
 
-        self.session_repo
-            .create_session(
-                user_id,
-                &refresh_token_hash,
-                ip_address,
-                user_agent,
-                expires_at,
-            )
+        let token_pair = self
+            .open_session(user_id, roles.clone(), ip_address, user_agent)
             .await?;
 
         let preferred_query_mode = user
@@ -642,27 +640,6 @@ impl AuthService {
                 tokens: token_pair,
             },
         })
-    }
-
-    /// Logout and invalidate session
-    ///
-    /// Requirements: 2.6 - Invalidate the refresh token on logout
-    pub async fn logout(
-        &self,
-        refresh_token: &str,
-        _ip_address: Option<&str>,
-        _user_agent: Option<&str>,
-    ) -> Result<(), AuthError> {
-        let refresh_token_hash = hash_token(refresh_token);
-
-        // Delete the session. Even if the session wasn't found, we consider
-        // logout successful (the token might have already expired).
-        let _ = self
-            .session_repo
-            .delete_session_by_token_hash(&refresh_token_hash)
-            .await;
-
-        Ok(())
     }
 
     /// Refresh access token using refresh token
@@ -744,7 +721,9 @@ impl AuthService {
         }
 
         if grace {
-            let access_token = self.token_service.create_access_token(user.id, roles)?;
+            let access_token =
+                self.token_service
+                    .create_access_token_for_session(user.id, roles, session.id)?;
             return Ok(RefreshOutcome {
                 tokens: TokenPair::new(access_token, String::new(), self.token_service.access_token_ttl()),
                 rotated: false,
@@ -753,7 +732,9 @@ impl AuthService {
 
         // Create new token pair (Requirement 2.4 - rotation)
         // Permissions are NOT embedded in the JWT — resolved server-side.
-        let new_token_pair = self.token_service.create_token_pair(user.id, roles.clone())?;
+        let new_token_pair =
+            self.token_service
+                .create_token_pair_for_session(user.id, roles.clone(), session.id)?;
 
         // Rotate the refresh token in the session
         let new_refresh_token_hash = hash_token(&new_token_pair.refresh_token);
@@ -782,7 +763,9 @@ impl AuthService {
                     .await?
                     .filter(|s| s.id == session.id)
                     .ok_or(AuthError::SessionNotFound)?;
-                let access_token = self.token_service.create_access_token(lost.user_id, roles)?;
+                let access_token = self
+                    .token_service
+                    .create_access_token_for_session(lost.user_id, roles, lost.id)?;
                 Ok(RefreshOutcome {
                     tokens: TokenPair::new(access_token, String::new(), self.token_service.access_token_ttl()),
                     rotated: false,
@@ -1121,26 +1104,83 @@ impl AuthService {
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<TokenPair, AuthError> {
-        // Create tokens — permissions are NOT embedded in the JWT
-        let token_pair = self
-            .token_service
-            .create_token_pair(user.id, roles.to_vec())?;
+        // Create the session and its tokens — permissions are NOT embedded in the JWT
+        self.open_session(user.id, roles.to_vec(), ip_address, user_agent)
+            .await
+    }
 
-        // Create session with hashed refresh token
-        let refresh_token_hash = hash_token(&token_pair.refresh_token);
+    /// Open a login session and mint its tokens (NAN-5573).
+    ///
+    /// The refresh token is minted first so the session row can be keyed by
+    /// its hash; the access token is then bound to the new session (`sid`),
+    /// which is what lets logout end only this session and lets
+    /// `GET /api/sessions/me` mark it as current.
+    async fn open_session(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<TokenPair, AuthError> {
+        let refresh_token = self.token_service.create_refresh_token(user_id)?;
         let expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
-
-        self.session_repo
+        let session = self
+            .session_repo
             .create_session(
-                user.id,
-                &refresh_token_hash,
+                user_id,
+                &hash_token(&refresh_token),
                 ip_address,
                 user_agent,
                 expires_at,
             )
             .await?;
+        let access_token =
+            self.token_service
+                .create_access_token_for_session(user_id, roles, session.id)?;
+        Ok(TokenPair::new(
+            access_token,
+            refresh_token,
+            self.token_service.access_token_ttl(),
+        ))
+    }
 
-        Ok(token_pair)
+    /// End the caller's current session only (NAN-5573).
+    ///
+    /// The session is identified by the access token's `sid` claim. Access
+    /// tokens minted before that claim existed carry no `sid`; for those the
+    /// refresh token (request body or cookie) identifies the session instead,
+    /// matching its current or immediately previous (rotated) hash. The
+    /// user's other sessions are left alone: signing out everywhere is the
+    /// explicit `DELETE /api/sessions/user/{user_id}`.
+    ///
+    /// A database error is returned, never swallowed: the caller must not
+    /// report a logout whose session may still be live.
+    pub async fn logout_current_session(
+        &self,
+        user_id: Uuid,
+        session_id: Option<Uuid>,
+        refresh_token: Option<&str>,
+    ) -> Result<CurrentSessionLogout, AuthError> {
+        if let Some(session_id) = session_id {
+            // Scoped to the caller: a sid never ends another user's session.
+            let ended = self
+                .session_repo
+                .delete_user_session(user_id, session_id)
+                .await?;
+            return Ok(if ended {
+                CurrentSessionLogout::Ended(session_id)
+            } else {
+                CurrentSessionLogout::AlreadyEnded(session_id)
+            });
+        }
+        let Some(token) = refresh_token else {
+            return Ok(CurrentSessionLogout::NotIdentified);
+        };
+        Ok(self
+            .session_repo
+            .delete_user_session_by_token_hash(user_id, &hash_token(token))
+            .await?
+            .map_or(CurrentSessionLogout::NotIdentified, CurrentSessionLogout::Ended))
     }
 }
 

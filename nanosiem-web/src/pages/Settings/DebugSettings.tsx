@@ -106,7 +106,7 @@ export function DebugSettings() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-[18px] font-semibold tracking-tight text-foreground">AI Debug</h1>
-          <p className="text-[11.5px] text-muted-foreground mt-0.5">View AI query generation failures for debugging and improvement</p>
+          <p className="text-[11.5px] text-muted-foreground mt-0.5">AI query generation failures</p>
         </div>
         <Button
           onClick={fetchFailures}

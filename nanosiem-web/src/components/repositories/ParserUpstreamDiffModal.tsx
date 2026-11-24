@@ -319,9 +319,9 @@ export function ParserUpstreamDiffModal({
         <div className="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
           <Rocket className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-500" />
           <div className="text-[12px]">
-            <p className="font-medium text-amber-700 dark:text-amber-400">Parser updated — deploy to apply changes</p>
+            <p className="font-medium text-amber-700 dark:text-amber-400">Parser updated. Deploy it to apply the changes.</p>
             <p className="mt-1 text-amber-600/90 dark:text-amber-400/80">
-              The VRL has been saved but the pipeline is still running the previous version. Deploy now to push changes to Vector, or deploy later from the source detail page.
+              Saved. Vector still runs the previous version until you deploy.
             </p>
           </div>
         </div>

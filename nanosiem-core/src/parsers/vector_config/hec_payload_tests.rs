@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::hec_payload::{vrl_reads_json_object, HEC_SIBLING_SKIP_KEYS};
+use super::hec_payload::{vrl_reads_json_object, HEC_SIBLING_SKIP_KEYS_OCSF, HEC_SIBLING_SKIP_KEYS_UDM};
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
 
@@ -222,7 +222,13 @@ fn only_json_input_parsers_get_the_payload_step_before_the_parser() {
     let manager = VectorConfigManager::new("/tmp/nanosiem-test");
     for ocsf in [true, false] {
         let config = manager.generate_parser_config_for(&parser("jg", JSON_GENERIC_OCSF), ocsf);
-        assert_eq!(transform_inputs(&config, "jg_parse"), vec!["jg_hec_payload".to_string()]);
+        // NAN-5839: under OCSF the control-field step sits between them.
+        if ocsf {
+            assert_eq!(transform_inputs(&config, "jg_parse"), vec!["jg_source_tz".to_string()]);
+            assert_eq!(transform_inputs(&config, "jg_source_tz"), vec!["jg_hec_payload".to_string()]);
+        } else {
+            assert_eq!(transform_inputs(&config, "jg_parse"), vec!["jg_hec_payload".to_string()]);
+        }
         let upstream = if ocsf { "jg_source_lane" } else { "source_router.jg" };
         assert_eq!(transform_inputs(&config, "jg_hec_payload"), vec![upstream.to_string()], "{config}");
 
@@ -234,7 +240,8 @@ fn only_json_input_parsers_get_the_payload_step_before_the_parser() {
     stub.extension_vrl = Some(JSON_UDM.into());
     stub.extension_enabled = true;
     let config = manager.generate_parser_config_for(&stub, true);
-    assert_eq!(transform_inputs(&config, "stub_extension"), vec!["stub_hec_payload".to_string()]);
+    assert_eq!(transform_inputs(&config, "stub_extension"), vec!["stub_source_tz".to_string()]);
+    assert_eq!(transform_inputs(&config, "stub_source_tz"), vec!["stub_hec_payload".to_string()]);
 }
 
 #[test]
@@ -333,7 +340,9 @@ fn ocsf_text_parser_parses_as_before_and_keeps_the_siblings_in_unmapped() {
     assert_eq!(event["unmapped"]["labels"]["env"], "prod", "{row}");
     assert!(event["unmapped"].get("message").is_none(), "{row}");
     assert!(event["unmapped"].get("parse_fallback").is_none(), "health markers are not sender-settable: {row}");
-    assert!(event["unmapped"].get("client_ip").is_none(), "protected identity is not sender-settable: {row}");
+    // NAN-5846: a `client_ip` sibling is vendor data and is kept verbatim;
+    // nano's ingest provenance lives under `unmapped.nano.ingest` instead.
+    assert_eq!(event["unmapped"]["client_ip"], "203.0.113.9", "{row}");
     assert_eq!(row["_nano_parser_fallback"], false);
 
     // Without siblings the row is exactly what the parser produced.
@@ -347,6 +356,39 @@ fn ocsf_text_parser_parses_as_before_and_keeps_the_siblings_in_unmapped() {
     keys.sort_unstable();
     // `claimed_source_type`: the envelope's `_json` sourcetype (NAN-4912).
     assert_eq!(keys, ["appname", "claimed_source_type"], "{row}");
+}
+
+/// NAN-5846: HEC siblings merged into `unmapped` for a text parser cannot
+/// carry nano's provenance namespace in any spelling (nested, flat dotted,
+/// mixed). Direct HEC has no ingest address, so nothing under `nano` remains;
+/// every sender key is kept, whole, in the one string `source_nano_json`.
+#[test]
+fn ocsf_text_parser_siblings_cannot_spell_the_nano_namespace() {
+    let event = hec_object(json!({
+        "message": SYSLOG_LINE,
+        "nano": { "ingest": { "client_ip": "6.6.6.6" }, "ingest.peer": "6.6.6.6" },
+        "nano.ingest": { "peer": "6.6.6.6" },
+        "nano.ingest.client_ip": "6.6.6.6",
+        "client_ip": "203.0.113.9",
+    }));
+    let row = through_parser(&parser("syslog", SYSLOG_OCSF), true, event);
+    let unmapped = row["event"]["unmapped"].as_object().unwrap();
+    assert!(
+        unmapped.keys().all(|k| k != "nano" && !k.starts_with("nano.")),
+        "a sender spelled the nano namespace: {row}"
+    );
+    assert_eq!(unmapped["client_ip"], "203.0.113.9", "vendor sibling kept: {row}");
+    let moved: serde_json::Value =
+        serde_json::from_str(unmapped["source_nano_json"].as_str().expect("one string leaf")).unwrap();
+    assert_eq!(
+        moved,
+        json!({
+            "nano": { "ingest": { "client_ip": "6.6.6.6" }, "ingest.peer": "6.6.6.6" },
+            "nano.ingest": { "peer": "6.6.6.6" },
+            "nano.ingest.client_ip": "6.6.6.6",
+        }),
+        "every sender key kept whole: {row}"
+    );
 }
 
 #[test]
@@ -371,11 +413,11 @@ fn sibling_skip_keys_match_in_every_merge_site() {
     let manager = VectorConfigManager::new("/tmp/nanosiem-test");
     let ocsf = manager.generate_parser_config_for(&parser("syslog", SYSLOG_OCSF), true);
     let udm = manager.generate_parser_config_for(&parser("syslog", SYSLOG_UDM), false);
-    for (label, vrl) in [
-        ("ocsf_prepare", transform_source(&ocsf, "syslog_ocsf_prepare")),
-        ("udm_output", transform_source(&udm, "syslog_output")),
+    for (label, vrl, keys) in [
+        ("ocsf_prepare", transform_source(&ocsf, "syslog_ocsf_prepare"), HEC_SIBLING_SKIP_KEYS_OCSF),
+        ("udm_output", transform_source(&udm, "syslog_output"), HEC_SIBLING_SKIP_KEYS_UDM),
     ] {
-        assert!(vrl.contains(&format!("!includes({HEC_SIBLING_SKIP_KEYS}, nano_key)")), "{label}");
+        assert!(vrl.contains(&format!("!includes({keys}, nano_key)")), "{label}");
     }
 }
 

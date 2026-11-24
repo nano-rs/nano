@@ -15,6 +15,25 @@ use super::DetectionService;
 
 const RUNTIME_DDL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Cron a scheduled rule gets when it is saved without one (NAN-5826). The
+/// scheduler only claims rules with a cron, so a scheduled rule saved with
+/// none would silently never run. Matches the documented API default.
+pub(crate) const DEFAULT_SCHEDULE_CRON: &str = "*/5 * * * *";
+
+/// The cron a scheduled rule needs when the save leaves it with none
+/// (NAN-5826). `effective_mode` and `effective_cron` describe the rule as it
+/// will be stored. Returns `None` when nothing has to change: the rule is
+/// real-time, or it already has a cron.
+pub(crate) fn missing_schedule_cron(
+    effective_mode: crate::models::detection_rule::DetectionMode,
+    effective_cron: Option<&str>,
+) -> Option<String> {
+    use crate::models::detection_rule::DetectionMode;
+    let has_cron = effective_cron.is_some_and(|c| !c.trim().is_empty());
+    (effective_mode == DetectionMode::Scheduled && !has_cron)
+        .then(|| DEFAULT_SCHEDULE_CRON.to_string())
+}
+
 impl DetectionService {
     // ========================================================================
     // Detection Rule CRUD Operations
@@ -114,10 +133,12 @@ impl DetectionService {
     #[instrument(skip(self, rule), fields(rule_name = %rule.name))]
     pub async fn create_rule(
         &self,
-        rule: NewDetectionRule,
+        mut rule: NewDetectionRule,
     ) -> Result<DetectionRule, DetectionError> {
         // Validate the query syntax and its fields (NAN-5348)
         self.validate_rule_query(&rule.query, rule.dataset.as_deref())?;
+
+        Self::default_new_rule_cron(&mut rule);
 
         // Validate cron expression if provided
         if let Some(ref cron) = rule.schedule_cron {
@@ -185,6 +206,84 @@ impl DetectionService {
         self.create_version_entry(rule, None, &reason, None).await;
     }
 
+    /// NAN-5826: a scheduled rule created without a cron gets
+    /// [`DEFAULT_SCHEDULE_CRON`] instead of being stored unrunnable.
+    pub(super) fn default_new_rule_cron(rule: &mut NewDetectionRule) {
+        use crate::models::detection_rule::DetectionMode;
+        let mode = rule.detection_mode.unwrap_or(DetectionMode::Scheduled);
+        if let Some(cron) = missing_schedule_cron(mode, rule.schedule_cron.as_deref()) {
+            info!(
+                "Scheduled rule '{}' saved without a schedule_cron; defaulting to '{}'",
+                rule.name, cron
+            );
+            rule.schedule_cron = Some(cron);
+        }
+    }
+
+    /// NAN-5826: a blank `schedule_cron` in an update (`""`, whitespace)
+    /// means "keep the stored cron". It never clobbers an existing schedule.
+    pub(super) fn normalize_blank_update_cron(update: &mut UpdateDetectionRule) {
+        if update
+            .schedule_cron
+            .as_deref()
+            .is_some_and(|c| c.trim().is_empty())
+        {
+            update.schedule_cron = None;
+        }
+    }
+
+    /// NAN-5826: whether this update gives a stored cron-less rule its first
+    /// schedule (a schedule activation): the stored rule has no cron and the
+    /// rule as it will be stored is scheduled, so it gets one (the caller's or
+    /// [`DEFAULT_SCHEDULE_CRON`]) and starts running in its mode.
+    ///
+    /// For a Live or Alerting rule this is a promotion: the API gates it on
+    /// `detections:promote` ([`Self::update_activation_needs_promote`]).
+    pub fn update_activates_schedule(existing: &DetectionRule, update: &UpdateDetectionRule) -> bool {
+        use crate::models::detection_rule::DetectionMode;
+        let stored_has_cron = existing
+            .schedule_cron
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty());
+        let mode = update.detection_mode.unwrap_or(existing.detection_mode);
+        !existing.archived && !stored_has_cron && mode == DetectionMode::Scheduled
+    }
+
+    /// NAN-5826: the activation ([`Self::update_activates_schedule`]) of a rule
+    /// that will be Live or Alerting starts it running (and, in Alerting,
+    /// alerting) on the spot, so it needs `detections:promote` exactly like a
+    /// promotion. A Staging or Paused rule stays inert until promoted.
+    pub fn update_activation_needs_promote(
+        existing: &DetectionRule,
+        update: &UpdateDetectionRule,
+    ) -> bool {
+        let mode = update.mode.unwrap_or(existing.mode);
+        Self::update_activates_schedule(existing, update)
+            && matches!(mode, RuleMode::Live | RuleMode::Alerting)
+    }
+
+    /// NAN-5826: an update that leaves a scheduled rule with no cron (the
+    /// patch omits it, or sends a blank one, and the stored rule has none,
+    /// e.g. a real-time rule switched to scheduled) sets
+    /// [`DEFAULT_SCHEDULE_CRON`]. A blank cron keeps the stored one. Callers
+    /// that act for a user gate the activation first
+    /// ([`Self::update_activation_needs_promote`]).
+    pub(super) fn default_updated_rule_cron(existing: &DetectionRule, update: &mut UpdateDetectionRule) {
+        Self::normalize_blank_update_cron(update);
+        let mode = update.detection_mode.unwrap_or(existing.detection_mode);
+        let cron = update
+            .schedule_cron
+            .as_deref()
+            .or(existing.schedule_cron.as_deref());
+        if let Some(cron) = missing_schedule_cron(mode, cron) {
+            info!(
+                "Scheduled rule '{}' has no schedule_cron after this update; defaulting to '{}'",
+                existing.name, cron
+            );
+            update.schedule_cron = Some(cron);
+        }
+    }
+
     /// Create a new detection rule with mode-based routing
     ///
     /// This method validates the rule based on its detection mode and routes it to the
@@ -197,13 +296,15 @@ impl DetectionService {
     #[instrument(skip(self, rule, materialized_view_generator), fields(rule_name = %rule.name, detection_mode = ?rule.detection_mode))]
     pub async fn create_rule_with_mode(
         &self,
-        rule: NewDetectionRule,
+        mut rule: NewDetectionRule,
         materialized_view_generator: &super::super::materialized_view::MaterializedViewGenerator,
     ) -> Result<DetectionRule, DetectionError> {
         use crate::models::detection_rule::DetectionMode;
 
         // Validate the query syntax and its fields (NAN-5348)
         self.validate_rule_query(&rule.query, rule.dataset.as_deref())?;
+
+        Self::default_new_rule_cron(&mut rule);
 
         // Validate cron expression if provided
         if let Some(ref cron) = rule.schedule_cron {
@@ -414,10 +515,11 @@ impl DetectionService {
     pub async fn update_rule(
         &self,
         id: Uuid,
-        update: UpdateDetectionRule,
+        mut update: UpdateDetectionRule,
     ) -> Result<DetectionRule, DetectionError> {
         // Get the existing rule to check if it's archived
         let existing_rule = self.get_rule(id).await?;
+        Self::default_updated_rule_cron(&existing_rule, &mut update);
 
         // NAN-5672: a deleted (archived) rule takes no edit but the unarchive.
         if existing_rule.archived && update.archived != Some(false) {
@@ -515,11 +617,6 @@ impl DetectionService {
 
         let _runtime_lock = self.acquire_rule_runtime_lock(id).await?;
 
-        // Validate cron expression if it's being updated
-        if let Some(ref cron) = update.schedule_cron {
-            self.validate_cron(cron)?;
-        }
-
         // Get the existing rule to check for mode changes
         let existing_rule = self.get_rule(id).await?;
 
@@ -531,6 +628,13 @@ impl DetectionService {
         // lock that `delete_rule_with_mode` takes, so this check cannot race a
         // concurrent delete.
         let unarchiving = Self::check_archive_transition(&existing_rule, &mut update)?;
+        Self::default_updated_rule_cron(&existing_rule, &mut update);
+
+        // Validate the cron the rule will be stored with (after the blank /
+        // missing cron was resolved above, like every other save path).
+        if let Some(ref cron) = update.schedule_cron {
+            self.validate_cron(cron)?;
+        }
 
         // Validate the query (syntax + fields, NAN-5348) if it's being updated,
         // under the post-patch dataset.
@@ -1141,9 +1245,11 @@ impl DetectionService {
             && rule.mode != RuleMode::Paused
             && rule.schedule_cron.is_none()
         {
-            tracing::error!(
+            // NAN-5826: every save path now defaults the cron, so this only
+            // catches rows written before that (or by raw SQL). Defensive warn.
+            tracing::warn!(
                 rule_id = %rule.id,
-                "Scheduled rule '{}' has no schedule_cron — it will never run; set a cron expression",
+                "Scheduled rule '{}' has no schedule_cron, so it will never run; set a cron expression",
                 rule.name
             );
         }

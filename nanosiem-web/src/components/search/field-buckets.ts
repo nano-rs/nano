@@ -10,6 +10,8 @@
 // Extended inventory (`module.file.company_name`). The spill namespace is added
 // here exactly once.
 
+import { GLOSSARY } from '@/lib/glossary';
+
 /** On-demand sidebar buckets (the promoted columns are Selected / Available). */
 export type OnDemandBucket = 'extended' | 'unmapped';
 
@@ -19,13 +21,14 @@ export const FIELD_BUCKET_LABELS = {
   unmapped: 'Unmapped',
 } as const;
 
-const UDM_EXTENDED_TOOLTIP = 'Non-indexed fields stored in the ext JSON';
+const UDM_EXTENDED_TOOLTIP = 'Extra fields kept in the ext field instead of their own column. Searches on them are slower.';
 
+/** NAN-5867: the same words as the glossary (core-field, extended-field, unmapped-field). */
 export const FIELD_BUCKET_TOOLTIPS = {
-  core: 'Indexed columns',
-  extendedOcsf: 'Valid OCSF fields stored in the event JSON',
+  core: GLOSSARY['core-field'].short,
+  extendedOcsf: GLOSSARY['extended-field'].short,
   extendedUdm: UDM_EXTENDED_TOOLTIP,
-  unmapped: "Source fields the parser didn't map to OCSF",
+  unmapped: GLOSSARY['unmapped-field'].short,
 } as const;
 
 export function extendedTooltip(isOcsf: boolean): string {

@@ -144,6 +144,59 @@ impl SecurityAuditOutbox {
         Ok(())
     }
 
+    /// NAN-5785: record many security-critical events in ONE statement (a
+    /// bulk delete's audit rows). Atomic, so a cancelled or timed-out call
+    /// never leaves half a batch; due now, because the batch gets no inline
+    /// ClickHouse attempt and the drainer delivers it. Idempotent on
+    /// `event_id`.
+    pub async fn enqueue_batch(&self, events: &[AuditEvent]) -> Result<(), sqlx::Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut ids = Vec::with_capacity(events.len());
+        let mut occurred = Vec::with_capacity(events.len());
+        let mut sources = Vec::with_capacity(events.len());
+        let mut actions = Vec::with_capacity(events.len());
+        let mut actors = Vec::with_capacity(events.len());
+        let mut resource_types = Vec::with_capacity(events.len());
+        let mut successes = Vec::with_capacity(events.len());
+        let mut bodies = Vec::with_capacity(events.len());
+        for event in events {
+            ids.push(event.event_id);
+            occurred.push(event.occurred_at);
+            sources.push(event.source.to_string());
+            actions.push(event.action.clone());
+            actors.push(event.actor_id);
+            resource_types.push(event.resource_type.clone());
+            successes.push(event.success);
+            bodies.push(serde_json::to_value(event).map_err(|e| sqlx::Error::Encode(Box::new(e)))?);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO security_audit_events
+                (event_id, occurred_at, source, action, actor_id, resource_type, success,
+                 event, next_attempt_at)
+            SELECT u.event_id, u.occurred_at, u.source, u.action, u.actor_id, u.resource_type,
+                   u.success, u.event, NOW()
+            FROM UNNEST($1::uuid[], $2::timestamptz[], $3::text[], $4::text[], $5::uuid[],
+                        $6::text[], $7::bool[], $8::jsonb[])
+                 AS u(event_id, occurred_at, source, action, actor_id, resource_type, success, event)
+            ON CONFLICT (event_id) DO NOTHING
+            "#,
+        )
+        .bind(&ids)
+        .bind(&occurred)
+        .bind(&sources)
+        .bind(&actions)
+        .bind(&actors)
+        .bind(&resource_types)
+        .bind(&successes)
+        .bind(&bodies)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Record a security-critical event inside the caller's transaction, so the
     /// audit record commits atomically with the state change it describes
     /// (NAN-4954). Leaves the inline grace window in place: the caller hands

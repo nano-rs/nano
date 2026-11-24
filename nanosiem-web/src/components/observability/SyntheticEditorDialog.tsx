@@ -132,8 +132,7 @@ export function SyntheticEditorDialog({
         <SheetHeader className="space-y-1.5 border-b border-border px-5 py-4 text-left">
           <SheetTitle>{editing ? 'Edit check' : 'New synthetic check'}</SheetTitle>
           <SheetDescription>
-            An HTTP GET probe run on a schedule from the platform. Uptime and
-            latency are computed from recorded runs.
+            An HTTP GET probe run on a schedule.
           </SheetDescription>
         </SheetHeader>
 

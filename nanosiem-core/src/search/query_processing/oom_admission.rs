@@ -15,7 +15,7 @@
 //! * **Spillable** — ClickHouse bounds it on its own: GROUP BY and ORDER BY
 //!   spill to disk (`max_bytes_ratio_before_external_group_by/sort` = 0.3 in
 //!   the Compose and Helm profiles; the legacy `deploy/k8s/aws-db`,
-//!   `deploy/k8s/rackspace-db` and `ludus` shapes set absolute thresholds at
+//!   `deploy/k8s/self-managed-db` and `ludus` shapes set absolute thresholds at
 //!   half their per-query `max_memory_usage`, which also spill before the
 //!   ceiling), `values()`/`list()` are capped at
 //!   `max_group_array_size` per group, and `reverse` is a plain ORDER BY with

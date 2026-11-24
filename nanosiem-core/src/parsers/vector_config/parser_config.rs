@@ -69,7 +69,7 @@ nano_hec_event = %nano_hec_event
 if is_object(nano_hec_event) && (is_object(.unmapped) || .unmapped == null) {
     nano_unmapped = object(.unmapped) ?? {}
     for_each(object!(nano_hec_event)) -> |nano_key, nano_value| {
-        if !includes(["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type", "client_ip", "ingest_client_ip", "ingest_peer"], nano_key) && (get(nano_unmapped, [nano_key]) ?? null) == null {
+        if !includes(["message", "parse_error", "parse_fallback", "parse_failure", "claimed_source_type"], nano_key) && (get(nano_unmapped, [nano_key]) ?? null) == null {
             nano_unmapped = set!(nano_unmapped, [nano_key], nano_value)
         }
     }
@@ -78,6 +78,7 @@ if is_object(nano_hec_event) && (is_object(.unmapped) || .unmapped == null) {
 "#,
     credential_field_redaction_vrl!(),
     ingest_transport_strip_vrl!(),
+    source_timezone_strip_vrl!(),
     r#"ocsf_event = .
 time_ms = to_int(.time) ?? 0
 skew_seconds = to_int(get_env_var("NANO_FUTURE_TIMESTAMP_SKEW_SECONDS") ?? "86400") ?? 86400
@@ -100,27 +101,12 @@ if is_object(ocsf_event) && (to_string(ocsf_event.metadata.log_source) ?? "") ==
 # ingest lanes) survives the parser's root replacement under `unmapped`.
 claimed = to_string(%nano_claimed_source_type) ?? ""
 if claimed != "" && is_object(ocsf_event) { ocsf_event.unmapped.claimed_source_type = claimed }
-# The client address is protected event metadata set by an authenticated edge.
-# Delete parser/sender copies and restore the canonical value after any parser
-# root replacement.
-nano_client_ip = to_string(%nano_ingest_client_ip) ?? ""
-nano_ingest_peer = to_string(%nano_ingest_peer) ?? ""
-if is_object(ocsf_event) {
-    if is_object(ocsf_event.unmapped) {
-        del(ocsf_event.unmapped.client_ip)
-        del(ocsf_event.unmapped.ingest_client_ip)
-        del(ocsf_event.unmapped.ingest_peer)
-    } else if nano_client_ip != "" || nano_ingest_peer != "" {
-        ocsf_event.unmapped = {}
-    }
-    if nano_client_ip != "" {
-        ocsf_event.unmapped.client_ip = nano_client_ip
-        ocsf_event.unmapped.ingest_client_ip = nano_client_ip
-    }
-    if nano_ingest_peer != "" { ocsf_event.unmapped.ingest_peer = nano_ingest_peer }
-}
 "#,
+    // NAN-5846: after the HEC sibling merge above, so a sibling cannot forge it.
+    ingest_provenance_vrl!(),
     nesting_depth_limit_vrl!("ocsf_event", r#"["unmapped", "nano_nesting_truncated"]"#),
+    // NAN-5849: HEC siblings and parser output can spell one path twice.
+    json_path_collision_vrl!("ocsf_event"),
     r#". = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type, "future_timestamp_skew_seconds": skew_seconds }"#
 );
 
@@ -157,6 +143,8 @@ pub(super) const OCSF_FAILURE_SUFFIX: &str = "_ocsf_failure";
 /// snapshot it here, before `_ocsf_prepare` could redact the copy.
 pub(super) const OCSF_PARSE_FAILURE_RECORD_VRL: &str = concat!(
     credential_field_redaction_vrl!(),
+    // NAN-5839: before `raw_data` / `parser_output` snapshot the event.
+    source_timezone_strip_vrl!(),
     r#"nano_error = ""
 nano_stage = "parser"
 nano_output = null
@@ -241,6 +229,90 @@ pub(super) const OCSF_LANE_STAMP_SUFFIX: &str = "_source_lane";
 pub(super) const OCSF_LANE_STAMP_VRL: &str = r#"# NAN-4963: record the lane this event was claimed on for _ocsf_prepare.
 nano_lane = downcase(to_string(.source_type) ?? "")
 if nano_lane != "" && nano_lane != "unknown" { %source_type = nano_lane }"#;
+
+/// NAN-5839: the per-source timezone step, `<name>_source_tz`.
+pub(super) const SOURCE_TIMEZONE_SUFFIX: &str = "_source_tz";
+
+/// NAN-5839: the `.nano.*` control fields a parser reads (parsers#87). nano
+/// owns them: the `<name>_source_tz` step deletes any a sender supplied
+/// before setting its own, on every OCSF source and lane.
+pub(super) const NANO_CONTROL_FIELDS: &[&str] = &["source_timezone"];
+
+/// NAN-5839: the `unmapped.nano_*` markers only a parser may set (parsers#87:
+/// the zone it read an offset-less clock in, and its provenance markers).
+/// SIEM Health trusts `nano_time_assumed_tz`, so a sender must never supply
+/// one: the step deletes them from the event root, from a root `unmapped`
+/// object, and from the HEC sibling stash `_ocsf_prepare` merges into
+/// `unmapped` (`%nano_hec_event`).
+pub(super) const NANO_PARSER_MARKERS: &[&str] =
+    &["nano_time_assumed_tz", "nano_time_source", "nano_operational"];
+
+/// NAN-5839: the `<name>_source_tz` step. Rendered on EVERY OCSF source (the
+/// default UTC included), immediately before the parser.
+///
+/// 1. Deletes every sender-supplied control field ([`NANO_CONTROL_FIELDS`])
+///    and an emptied `.nano`, plus the `%nano_source_timezone` twin: an
+///    untrusted HTTP / HEC / OTLP / syslog / Vector payload can never choose
+///    the zone its own offset-less clock is read in.
+/// 2. Deletes every sender-supplied parser marker ([`NANO_PARSER_MARKERS`]).
+/// 3. When the source has a non-default, validated timezone
+///    ([`crate::timezone::source_timezone_for_injection`]), sets
+///    `.nano.source_timezone` for the parser (an IANA name or `±HH:MM`; the
+///    parser reads and removes it before anything else) and records it in
+///    `%nano_source_timezone` so the storage boundary can strip it from a
+///    parser that never read it (`source_timezone_strip_vrl!`). A non-object
+///    `.nano` (a sender's string, array or number) is replaced first, so it
+///    cannot defeat the setting. The value is a validated zone name or
+///    offset, JSON-escaped anyway.
+///
+/// With no setting, a non-object `.nano` is left alone (the parser ignores
+/// it and reads the clock as UTC).
+pub(super) fn source_timezone_vrl(timezone: Option<&str>) -> String {
+    let mut vrl = String::from(
+        "# NAN-5839: nano owns the parser control fields; a sender cannot set them.\n\
+         if is_object(.nano) {\n",
+    );
+    for field in NANO_CONTROL_FIELDS {
+        vrl.push_str(&format!("    del(.nano.{field})\n"));
+    }
+    vrl.push_str(
+        "    if is_empty(object!(.nano)) { del(.nano) }\n\
+         }\n",
+    );
+    // NAN-5846: the flat dotted spelling of the same stored path. A parser
+    // reads only the nested field, but a root-keeping parser would store both
+    // spellings, which ClickHouse refuses (Code 117, the whole batch). It is
+    // the sender's data, so it is moved, never dropped: stashed in metadata,
+    // and the storage boundary keeps it in `unmapped.source_nano_json`
+    // (`ingest_provenance_vrl!`).
+    vrl.push_str("%nano_reserved_spill = null\n");
+    for field in NANO_CONTROL_FIELDS {
+        vrl.push_str(&format!(
+            "if exists(.\"nano.{field}\") {{\n    nano_flat_control = del(.\"nano.{field}\")\n    %nano_reserved_spill = set!(object(%nano_reserved_spill) ?? {{}}, [\"root:nano.{field}\"], nano_flat_control)\n}}\n"
+        ));
+    }
+    vrl.push_str(
+        "%nano_source_timezone = null\n\
+         # NAN-5839: only the parser sets its unmapped.nano_* markers.\n",
+    );
+    for marker in NANO_PARSER_MARKERS {
+        vrl.push_str(&format!(
+            "del(.{marker})\n\
+             if is_object(.unmapped) {{ del(.unmapped.{marker}) }}\n\
+             if is_object(%nano_hec_event) {{ del(%nano_hec_event.{marker}) }}\n"
+        ));
+    }
+    if let Some(timezone) = timezone {
+        let literal = serde_json::to_string(timezone).unwrap_or_else(|_| "\"UTC\"".into());
+        vrl.push_str(&format!(
+            "# NAN-5839: the log source's timezone, for timestamps without an offset.\n\
+             if !is_object(.nano) {{ .nano = {{}} }}\n\
+             .nano.source_timezone = {literal}\n\
+             %nano_source_timezone = {literal}"
+        ));
+    }
+    vrl.trim_end().to_string()
+}
 
 impl VectorConfigManager {
     /// Generate Vector TOML config for a single parser (returns string)
@@ -331,6 +403,29 @@ impl VectorConfigManager {
             } else {
                 source_name
             };
+
+        // NAN-5839: under OCSF, every source owns its parser control fields
+        // (a sender-supplied `.nano.source_timezone` is deleted) and hands a
+        // configured timezone to the parser. After the HEC payload step (which
+        // replaces the root for a JSON-input parser) and immediately before
+        // `_parse` (or the extension, for a stub), so every lane and parser
+        // shape goes through it.
+        let source_name = if ocsf {
+            let timezone = crate::timezone::source_timezone_for_injection(&parser.timezone);
+            let tz_name = format!("{safe_name}{SOURCE_TIMEZONE_SUFFIX}");
+            source_config.push_str(&format!(
+                "\n[transforms.{tz_name}]\n\
+                 type = \"remap\"\n\
+                 inputs = [\"{source_name}\"]\n\
+                 source = '''\n\
+                 {}\n\
+                 '''\n",
+                source_timezone_vrl(timezone.as_deref())
+            ));
+            tz_name
+        } else {
+            source_name
+        };
 
         // NAN-4919: a processing plan with native steps renders as a chain of
         // generated transforms in the parser slot (after the source router,

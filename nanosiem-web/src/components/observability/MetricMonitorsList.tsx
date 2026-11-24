@@ -18,6 +18,7 @@ import { TelemetrySetupHint } from './TelemetrySetupHint';
 import { fmtAgo } from './format';
 import type { MetricMonitorEvaluationSummary, MetricMonitor, MetricMonitorRequest } from '@/lib/api/types';
 import { MetricMonitorDialog } from './MetricMonitorDialog';
+import { Term } from '@/components/ui/term';
 
 const COMPARATOR_SYMBOL: Record<string, string> = { gt: '>', gte: '≥', lt: '<', lte: '≤' };
 
@@ -107,7 +108,7 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
       <div className="px-3 py-2 border-b border-border flex items-center gap-2">
         <Bell className="w-[12px] h-[12px] text-fg-3" />
         <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-fg-3">
-          Metric monitors
+          Metric <Term id="metric-monitor">monitors</Term>
         </span>
         <div className="flex-1" />
         {loading ? (
@@ -127,14 +128,13 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
 
       {!loading && monitors.length === 0 && !error && (
         <div className="px-3 py-4 text-[11.5px] text-fg-3">
-          No monitors yet. Build a query above and click{' '}
-          <span className="text-fg-2">Create monitor</span> to alert on it.
+          No monitors yet. Use <span className="text-fg-2">Create monitor</span> on a query above.
         </div>
       )}
 
       {summaries?.length === 0 && monitors.some((m) => m.enabled) && (
         <div className="px-3 py-2 text-[11px] text-fg-3">
-          No recent monitor evaluations. Check that scheduled evaluation is enabled and metric delivery is current.
+          No recent monitor evaluations. Check scheduled evaluation and metric delivery.
           <TelemetrySetupHint />
         </div>
       )}

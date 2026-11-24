@@ -418,6 +418,13 @@ pub struct InstallLeaseRequest {
     pub generation: i64,
     /// Requested lease length; clamped to 30..=600 s.
     pub ttl_secs: Option<u64>,
+    /// NAN-5874: the release the host's Vector runs (its `build_info`
+    /// revision label, e.g. `nano 0.61.0-nano.14 <sha>`). Absent, empty or
+    /// older than `0.61.0-nano.14`: the answer is busy (holder
+    /// `vector-0.61.0-nano.14-required`) and the host keeps its installed
+    /// generation.
+    #[serde(default)]
+    pub vector_release: Option<String>,
 }
 
 /// Releasing the install lease (NAN-5285).
@@ -426,16 +433,17 @@ pub struct InstallLeaseRelease {
     pub holder: String,
 }
 
-/// Take the ingest install lease before reloading Vector (NAN-5285, v2.0.13
-/// retest F3): one ingest host installs a generation at a time, drained from
-/// the load balancer when another host is ready to take its traffic.
+/// The install lease path consumers before v2.0.35 use (NAN-5285). On this
+/// version it never grants (NAN-5874): such a consumer is told to wait for its
+/// pod's new Vector, and a v2.0.35+ consumer that fell back here retries on
+/// `/install-lease/v2`, which grants.
 #[utoipa::path(
     post,
     path = "/api/internal/vector-config/install-lease",
     tag = "vector-config-delivery",
     request_body = InstallLeaseRequest,
     responses(
-        (status = 200, description = "Granted (install now; `drain` says whether to withdraw readiness first) or busy (another host is installing; retry on the next poll)", body = install_lease::LeaseOutcome),
+        (status = 200, description = "Always busy on this version: holder `vector-0.61.0-nano.14-required` for a consumer that reports no Vector release, `install-lease-v2-required` for one that does (it takes the lease on `/install-lease/v2`)", body = install_lease::LeaseOutcome),
         (status = 400, description = "Invalid holder or generation"),
         (status = 401, description = "Missing or invalid delivery bearer"),
         (status = 404, description = "Delivery disabled"),
@@ -457,10 +465,16 @@ pub async fn post_install_lease(
     )
     .await
     .map_err(|status| (status, String::new()))?;
-    install_lease::request(&state.pool, &request.holder, request.generation, request.ttl_secs)
-        .await
-        .map(axum::Json)
-        .map_err(lease_error_response)
+    // NAN-5874: never grants on this path (see `install_lease::request_on_legacy_path`).
+    install_lease::request_on_legacy_path(
+        &state.pool,
+        &request.holder,
+        request.generation,
+        request.vector_release.as_deref(),
+    )
+    .await
+    .map(axum::Json)
+    .map_err(lease_error_response)
 }
 
 /// Release the ingest install lease after the install and rejoin (NAN-5285).
@@ -500,6 +514,75 @@ pub async fn delete_install_lease(
         .map_err(|e| lease_error_response(install_lease::LeaseError::Database(e)))
 }
 
+/// NAN-5874: the install lease on a path an api from before v2.0.35 does not
+/// serve. Same contract as `POST /api/internal/vector-config/install-lease`; a
+/// consumer that gets 404 here retries on another replica, so its request never
+/// lands on an old api (which grants a different scope and answers a release
+/// it cannot perform with 204).
+#[utoipa::path(
+    post,
+    path = "/api/internal/vector-config/install-lease/v2",
+    tag = "vector-config-delivery",
+    request_body = InstallLeaseRequest,
+    responses(
+        (status = 200, description = "Granted (install now; `drain` says whether to withdraw readiness first) or busy (another host is installing, or this host's Vector predates 0.61.0-nano.14; retry on the next poll)", body = install_lease::LeaseOutcome),
+        (status = 400, description = "Invalid holder or generation"),
+        (status = 401, description = "Missing or invalid delivery bearer"),
+        (status = 404, description = "Delivery disabled"),
+        (status = 503, description = "The lease store (PostgreSQL) is unavailable; do not install this poll"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn post_install_lease_v2(
+    State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<InstallLeaseRequest>,
+) -> Result<axum::Json<install_lease::LeaseOutcome>, (StatusCode, String)> {
+    authorize(
+        &state,
+        &headers,
+        peer.as_ref().map(|Extension(ConnectInfo(addr))| addr),
+        DeliveryResource::Config,
+    )
+    .await
+    .map_err(|status| (status, String::new()))?;
+    install_lease::request(
+        &state.pool,
+        &request.holder,
+        request.generation,
+        request.ttl_secs,
+        request.vector_release.as_deref(),
+    )
+    .await
+    .map(axum::Json)
+    .map_err(lease_error_response)
+}
+
+/// NAN-5874: release the install lease taken on the v2 path.
+#[utoipa::path(
+    delete,
+    path = "/api/internal/vector-config/install-lease/v2",
+    tag = "vector-config-delivery",
+    request_body = InstallLeaseRelease,
+    responses(
+        (status = 204, description = "Released, or not held by this holder"),
+        (status = 400, description = "Invalid holder"),
+        (status = 401, description = "Missing or invalid delivery bearer"),
+        (status = 404, description = "Delivery disabled"),
+        (status = 503, description = "The lease store (PostgreSQL) is unavailable; the lease expires on its own"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_install_lease_v2(
+    state: State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    request: axum::Json<InstallLeaseRelease>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    delete_install_lease(state, peer, headers, request).await
+}
+
 fn lease_error_response(error: install_lease::LeaseError) -> (StatusCode, String) {
     match error {
         install_lease::LeaseError::Request(e) => (StatusCode::BAD_REQUEST, e.to_string()),
@@ -520,7 +603,9 @@ fn lease_error_response(error: install_lease::LeaseError) -> (StatusCode, String
         get_generation_file,
         get_ingest_tokens_file,
         post_install_lease,
-        delete_install_lease
+        delete_install_lease,
+        post_install_lease_v2,
+        delete_install_lease_v2
     ),
     components(schemas(InstallLeaseRequest, InstallLeaseRelease, install_lease::LeaseOutcome))
 )]

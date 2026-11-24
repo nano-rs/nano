@@ -130,6 +130,17 @@ export function RuleEditorRedesign() {
   const initialTactics = searchParams.get('mitre_tactics')?.split(',').filter(Boolean) || [];
   const initialTechniques = searchParams.get('mitre_techniques')?.split(',').filter(Boolean) || [];
   const initialTags = searchParams.get('tags') || '';
+  // NAN-5850: "Draft rule" on MITRE Coverage opens `/rules/editor/new?mitre=T1059.001`
+  // (plus `mitre_tactics=`); the blank template is seeded with that mapping.
+  // Only well-formed ATT&CK ids reach the buffer, so a crafted link cannot
+  // smuggle extra metadata lines into the new rule.
+  const mitreParam = searchParams.get('mitre')?.trim().toUpperCase() || '';
+  const initialMitre = /^T\d{4}(\.\d{3})?$/.test(mitreParam) ? mitreParam : '';
+  const initialMitreTactics = (searchParams.get('mitre_tactics') || '')
+    .split(',')
+    .map((t) => t.trim().toUpperCase())
+    .filter((t) => /^TA\d{4}$/.test(t))
+    .join(',');
 
   // The rail's Archived tab lists deleted (archived) rules (NAN-3816).
   const { data: apiRules, loading: rulesLoading, refetch: refetchRules } = useDetections({ includeArchived: true });
@@ -433,11 +444,14 @@ export function RuleEditorRedesign() {
   // Reset draft when entering /new without any seed params.
   useEffect(() => {
     if (isNewMode && !duplicateId && !initialQuery && !initialContent) {
-      const tpl = createDetectionTemplate(user?.name || '');
+      const tpl = createDetectionTemplate(user?.name || '', initialMitre ? {
+        mitre_techniques: initialMitre,
+        mitre_tactics: initialMitreTactics.split(',').map((t) => t.trim()).filter(Boolean).join(', '),
+      } : {});
       setEditorContent(tpl);
       setSavedContent(tpl);
     }
-  }, [isNewMode, duplicateId, initialQuery, initialContent, user?.name]);
+  }, [isNewMode, duplicateId, initialQuery, initialContent, initialMitre, initialMitreTactics, user?.name]);
 
   // Open the upstream-merge modal when the analyst arrives from the Rule
   // Repositories page with `?merge=upstream`. We fire once when a saved rule
@@ -737,6 +751,8 @@ export function RuleEditorRedesign() {
     const seen = new Set<string>();
     const out: string[] = [];
     for (const r of apiRules || []) {
+      // NAN-5773: deleted (archived) rules don't keep their folder listed.
+      if (r.archived) continue;
       const f = (r.folder || '').trim();
       if (!f) continue;
       const lower = f.toLowerCase();
@@ -1287,7 +1303,9 @@ export function RuleEditorRedesign() {
           matchCount={apiRule?.match_count}
           lastSavedLabel={lastSavedLabel}
           versions={versions}
-          dailyStats={id ? detectionStats?.[id] : undefined}
+          // NAN-5842: a rule that never fired has no key in the stats map; once
+          // the map has loaded that means zero matches, not "no data".
+          dailyStats={id && detectionStats ? (detectionStats[id] ?? []) : undefined}
           ruleId={ruleActions.tuneSettings ? id : undefined}
           readOnly={!canWrite}
           onSwitchToRealtime={realtimeNudgeAvailable ? switchToRealtime : undefined}
@@ -1451,7 +1469,7 @@ export function RuleEditorRedesign() {
               Discard unsaved changes?
             </AlertDialogTitle>
             <AlertDialogDescription className="font-mono text-[11px] text-muted-foreground leading-relaxed">
-              You have unsaved edits on this rule. Leaving the editor now will lose them.
+              Leaving now loses your unsaved edits.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="border-t border-border px-5 py-3">

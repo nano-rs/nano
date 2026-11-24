@@ -117,12 +117,12 @@ export function ValidationDetailsDialog({
             )}
             <span className="font-mono">
               {validation.detectionMode === 'realtime'
-                ? 'Real-time — streams via materialized view'
-                : 'Scheduled — runs on cron'}
+                ? 'Real-time: checks events as they arrive'
+                : 'Scheduled: runs on its cron schedule'}
             </span>
             {validation.createsMaterializedView && (
               <span className="font-mono text-[10.5px] text-[var(--primary)]">
-                creates materialized view
+                sets up a real-time check in the database
               </span>
             )}
           </section>
@@ -139,8 +139,7 @@ export function ValidationDetailsDialog({
         )}
         {!validation && (
           <div className="text-[11.5px] text-muted-foreground leading-relaxed">
-            No validation result yet. The linter runs automatically after edits — keep typing, or
-            click Test rule to run a full preview.
+            No validation result yet. It runs after edits.
           </div>
         )}
       </div>

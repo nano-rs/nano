@@ -29,6 +29,7 @@ import {
   SheetDescription,
   SheetFooter,
 } from '@/components/ui/sheet';
+import { Term } from '@/components/ui/term';
 
 interface CreateRoleDialogProps {
   open: boolean;
@@ -166,7 +167,7 @@ export function CreateRoleDialog({
           <div className="flex-1 min-w-0">
             <SheetTitle className="text-[14px] font-semibold leading-none">{title}</SheetTitle>
             <SheetDescription className="text-[11px] text-muted-foreground mt-1">
-              Roles are reusable permission sets. Assign them to groups; users inherit through group membership.
+              Assign roles to groups; members inherit them.
             </SheetDescription>
           </div>
         </SheetHeader>
@@ -198,7 +199,7 @@ export function CreateRoleDialog({
 
           <div>
             <div className="flex items-center gap-2 mb-2">
-              <label className="text-[11px] font-medium text-foreground/80">Permissions</label>
+              <label className="text-[11px] font-medium text-foreground/80"><Term id="permission" nested>Permissions</Term></label>
               <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums">{permIds.size}</span>
               <div className="flex-1" />
               <button

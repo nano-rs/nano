@@ -466,8 +466,12 @@ impl LogSourceRepository {
                 -- runs the ACTIVE version (EFFECTIVE_DEPLOYED_PARSERS_SQL), so
                 -- saving a draft does not undeploy anything; only a source
                 -- that has never been published deploys its working copy.
+                -- NAN-5839: the timezone renders straight from log_sources
+                -- (the `_source_tz` step), so a CHANGED value needs a deploy;
+                -- re-sending the stored value does not undeploy.
                 deployed = CASE
                     WHEN $18 THEN false
+                    WHEN $5::text IS NOT NULL AND $5 IS DISTINCT FROM timezone THEN false
                     WHEN $28 AND NOT EXISTS (
                         SELECT 1 FROM log_source_versions lsv
                         WHERE lsv.log_source_id = log_sources.id

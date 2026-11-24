@@ -12,7 +12,7 @@ use super::super::types::{
 use super::helpers::parse_json_i64;
 use super::{LogSourceRepository, LogSourceRepositoryError};
 use crate::auth::ScopeSet;
-use crate::search::service::source_scope_sql_predicate;
+use crate::search::service::{bind_source_scope, source_scope_bound_predicate};
 
 /// The detail page is a live-health surface. Its visible metrics are all 24h
 /// or shorter, so a longer raw-table scan only adds latency and read load.
@@ -34,9 +34,10 @@ const DETAIL_HEALTH_WINDOW_HOURS: i64 = 24;
 /// Returns an empty string for an unrestricted caller, so the emitted SQL stays
 /// byte-identical to the pre-scoping form. Uses the ONE canonical builder
 /// (NAN-1801) rather than a re-derived copy, so this gate keeps the same
-/// lowercased shape as the nPL injector.
+/// lowercased shape as the nPL injector. NAN-5793: the deny list is bound;
+/// every query carrying this binds `scope.deny_set()`.
 fn scope_and(scope: &ScopeSet) -> String {
-    source_scope_sql_predicate("source_type", scope.deny_set())
+    source_scope_bound_predicate("source_type", scope.deny_set())
         .map(|p| format!(" AND {p}"))
         .unwrap_or_default()
 }
@@ -48,7 +49,7 @@ fn rollup_scope_and(scope: &ScopeSet) -> String {
     if !scope.is_restricted() {
         return String::new();
     }
-    let predicate = source_scope_sql_predicate("scope_source_type", scope.deny_set())
+    let predicate = source_scope_bound_predicate("scope_source_type", scope.deny_set())
         .expect("a restricted ScopeSet always renders a predicate");
     format!(" AND scope_source_type_complete = 1 AND {predicate}")
 }
@@ -369,8 +370,7 @@ impl LogSourceRepository {
             rollup_scope_and(scope)
         );
 
-        let mut cursor = ch_client
-            .query(&sql)
+        let mut cursor = bind_source_scope(ch_client.query(&sql), scope.deny_set())
             .fetch_bytes("JSONEachRow")
             .map_err(|e| LogSourceRepositoryError::ClickHouseError(e.to_string()))?;
 
@@ -531,8 +531,7 @@ impl LogSourceRepository {
         );
 
         // Execute query and parse results as JSON
-        let mut cursor = ch_client
-            .query(&sql)
+        let mut cursor = bind_source_scope(ch_client.query(&sql), scope.deny_set())
             .fetch_bytes("JSONEachRow")
             .map_err(|e| LogSourceRepositoryError::ClickHouseError(e.to_string()))?;
 
@@ -878,8 +877,7 @@ impl LogSourceRepository {
     ) -> Result<ParseHealthCounts, LogSourceRepositoryError> {
         let rollup = self.table_names.read_bare("parser_health_5m");
         let sql = Self::build_parse_health_query(log_source, scope, &rollup);
-        let mut cursor = ch_client
-            .query(&sql)
+        let mut cursor = bind_source_scope(ch_client.query(&sql), scope.deny_set())
             .fetch_bytes("JSONEachRow")
             .map_err(|e| LogSourceRepositoryError::ClickHouseError(e.to_string()))?;
 
@@ -1172,8 +1170,7 @@ impl LogSourceRepository {
             )
         };
 
-        let mut cursor = ch_client
-            .query(&sql)
+        let mut cursor = bind_source_scope(ch_client.query(&sql), scope.deny_set())
             .fetch_bytes("JSONEachRow")
             .map_err(|e| LogSourceRepositoryError::ClickHouseError(e.to_string()))?;
 
@@ -1276,7 +1273,7 @@ mod tests {
     /// ClickHouse aliases are visible throughout the query and, with the default
     /// `prefer_column_name_to_alias=0`, an alias BEATS a same-named base column
     /// in the WHERE clause. So `SELECT <expr> AS source_type … WHERE
-    /// lower(source_type) != 'x'` silently authorizes against `<expr>` rather
+    /// lower(source_type) NOT IN {nano_source_deny:Array(String)}` silently authorizes against `<expr>` rather
     /// than the real column — which is how the raw branch briefly re-created the
     /// very leak it exists to close.
     ///
@@ -1312,7 +1309,7 @@ mod tests {
             );
             // The scope predicate is still present and unqualified, which is
             // only safe BECAUSE nothing shadows the column.
-            assert!(sql.contains("lower(source_type) != 'unknown'"), "got: {sql}");
+            assert!(sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"), "got: {sql}");
         }
     }
 
@@ -1353,7 +1350,7 @@ mod tests {
             "legacy/incomplete rows must fail closed: {scoped}"
         );
         assert!(
-            scoped.contains("lower(scope_source_type) != 'unknown'"),
+            scoped.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "scope must use the raw key: {scoped}"
         );
         assert!(!scoped.contains("lower(source_type)"), "got: {scoped}");
@@ -1371,17 +1368,12 @@ mod tests {
     fn scope_and_renders_the_canonical_deny_shapes() {
         assert_eq!(
             scope_and(&deny(&["audit"])),
-            " AND lower(source_type) != 'audit'"
+            " AND lower(source_type) NOT IN {nano_source_deny:Array(String)}"
         );
         let many = scope_and(&deny(&["audit", "windows_sysmon"]));
-        assert!(
-            many.starts_with(" AND lower(source_type) NOT IN ("),
-            "got: {many}"
-        );
-        assert!(
-            many.contains("'audit'") && many.contains("'windows_sysmon'"),
-            "got: {many}"
-        );
+        // NAN-5793: the same bound form; the names travel as a parameter.
+        assert_eq!(many, " AND lower(source_type) NOT IN {nano_source_deny:Array(String)}");
+        assert!(!many.contains("audit") && !many.contains("windows_sysmon"), "got: {many}");
     }
 
     /// NAN-2055 (codex round 9): a hostile `match_field` must not be able to
@@ -1403,7 +1395,7 @@ mod tests {
         // terminal so nothing preceding it can neutralize it.
         assert_eq!(
             scoped,
-            "lower(source_type) IN ('anything') AND lower(source_type) != 'audit'"
+            "lower(source_type) IN ('anything') AND lower(source_type) NOT IN {nano_source_deny:Array(String)}"
         );
 
         // Spelled out separately so a failure names the property that broke.
@@ -1457,7 +1449,7 @@ mod tests {
             let bare = LogSourceRepository::build_log_source_where_clause(ls);
             assert_eq!(
                 scoped,
-                format!("{bare} AND lower(source_type) != 'audit'"),
+                format!("{bare} AND lower(source_type) NOT IN {{nano_source_deny:Array(String)}}"),
                 "scope gate must be ANDed after the match clause for {scoped}"
             );
         }
@@ -1501,7 +1493,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains("lower(scope_source_type) != 'audit'"),
+            sql.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "rollups must enforce scope on the raw source key: {sql}"
         );
         assert!(sql.contains("scope_source_type_complete = 1"), "{sql}");
@@ -1572,7 +1564,7 @@ mod tests {
             assert!(!ocsf_sql.contains("90 DAY"), "{ocsf_sql}");
             if ocsf_scope.is_restricted() {
                 assert!(
-                    ocsf_sql.contains("lower(scope_source_type) != 'audit'"),
+                    ocsf_sql.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
                     "{ocsf_sql}"
                 );
                 assert!(
@@ -1607,7 +1599,7 @@ mod tests {
             "source_type match values should retain primary-key pruning: {sql}"
         );
         assert!(
-            sql.contains("lower(source_type) != 'audit'"),
+            sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
             "the canonical deny-set must gate parser telemetry: {sql}"
         );
         assert!(
@@ -1631,7 +1623,7 @@ mod tests {
             "OCSF-only match fields must not break the UDM failure query: {arbitrary}"
         );
         assert!(
-            arbitrary.contains("lower(source_type) != 'audit'"),
+            arbitrary.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
             "scope enforcement must survive the missing fast path: {arbitrary}"
         );
     }

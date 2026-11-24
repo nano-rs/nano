@@ -61,6 +61,8 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/playbooks/repositories', segments: [{ label: 'Home', href: '/' }, { label: 'Playbooks', href: '/playbooks' }, { label: 'Repositories' }], capability: 'playbooks' },
   { path: '/rules/tuning', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'AI Tuning' }], capability: 'aiTuning' },
   { path: '/rules/tuning/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'AI Tuning', href: '/rules/tuning' }, { label: ':dynamic' }], capability: 'aiTuning' },
+  // NAN-5850: hunt-proposed rules, under Detections beside AI Tuning.
+  { path: '/rules/ideas', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Rule ideas' }], capability: 'hunts' },
 
   // Secondary main nav
   { path: '/notebooks', segments: [{ label: 'Home', href: '/' }, { label: 'Notebooks' }], capability: 'notebooks' },
@@ -72,19 +74,18 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/hunts', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts' }], capability: 'hunts' },
   { path: '/hunts/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: ':dynamic' }], capability: 'hunts' },
   { path: '/hunts/leads', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Findings' }], capability: 'hunts' },
+  // NAN-5850: Decisions is a Findings tab (was Rulings); Knowledge has its own rail entry (was Memory).
+  { path: '/hunts/leads/decisions', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Findings', href: '/hunts/leads' }, { label: 'Decisions' }], capability: 'hunts' },
+  { path: '/hunts/knowledge', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Knowledge' }], capability: 'hunts' },
   { path: '/hunts/leads/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Findings', href: '/hunts/leads' }, { label: ':dynamic' }], capability: 'hunts' },
-  { path: '/hunts/rule-ideas', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Rule ideas' }], capability: 'hunts' },
-  { path: '/hunts/memory', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Memory' }], capability: 'hunts' },
   { path: '/hunts/campaigns', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Campaigns' }], capability: 'hunts' },
   { path: '/hunts/campaigns/candidates', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Campaigns', href: '/hunts/campaigns' }, { label: 'Unassigned candidates' }], capability: 'hunts' },
   { path: '/hunts/campaigns/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Campaigns', href: '/hunts/campaigns' }, { label: ':dynamic' }], capability: 'hunts' },
   { path: '/hunts/escalations', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Escalations' }], capability: 'hunts' },
-  { path: '/hunts/rulings', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Rulings' }], capability: 'hunts' },
-  { path: '/hunts/knowledge', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Knowledge' }], capability: 'hunts' },
-  { path: '/hunts/suppressions', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Suppressions' }], capability: 'hunts' },
   { path: '/hunts/profile', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Profile' }], capability: 'hunts' },
-  { path: '/hunts/runners', segments: [{ label: 'Home', href: '/' }, { label: 'Hunts', href: '/hunts' }, { label: 'Runners' }], capability: 'hunts' },
   { path: '/settings/soar', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'SOAR' }], capability: 'soar' },
+  { path: '/settings/hunts', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Hunting' }], capability: 'hunts' },
+  { path: '/settings/hunts/charter', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Hunting', href: '/settings/hunts' }, { label: 'Charter & defaults' }], capability: 'hunts' },
   // NAN-4540 / NAN-4925: Automation workspace
   { path: '/automation/runs', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs' }], capability: 'soar' },
   { path: '/automation/runs/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs', href: '/automation/runs' }, { label: 'Run' }], capability: 'soar' },

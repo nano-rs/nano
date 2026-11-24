@@ -37,6 +37,10 @@ mod identity_guard_tests;
 #[path = "draft_status_tests.rs"]
 mod draft_status_tests;
 
+#[cfg(test)]
+#[path = "canonical_source_type_tests.rs"]
+mod canonical_source_type_tests;
+
 use clickhouse::Client as ClickHouseClient;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -65,6 +69,10 @@ pub enum LogSourceServiceError {
     InvalidSourceType(String),
     #[error("Invalid source config: {0}")]
     InvalidSourceConfig(String),
+    /// NAN-5839: the timezone setting is not an IANA zone name or a
+    /// supported fixed offset (see [`crate::timezone::normalize_source_timezone`]).
+    #[error("{0}")]
+    InvalidTimezone(String),
     /// NAN-2158: `match_field` names a COLUMN in generated ClickHouse SQL, so a
     /// non-identifier value is an injection payload, not a typo.
     #[error("Invalid match_field: {0}")]
@@ -77,6 +85,12 @@ pub enum LogSourceServiceError {
     NameCollision(String),
     #[error("Log source must be validated before enabling")]
     NotValidated,
+    /// NAN-5789: a fetch log source (kafka, aws_s3, gcp_pubsub,
+    /// azure_event_hubs) saved without a usable `dispatch_source_config_id`.
+    /// Such a source cannot render, so it is refused at save (HTTP 400 with a
+    /// field error), drafts included.
+    #[error("{message}")]
+    MissingSourceConfiguration { field: &'static str, message: String },
     #[error("Vector config error: {0}")]
     VectorConfigError(#[from] VectorConfigError),
     #[error("VRL validation failed: {0}")]

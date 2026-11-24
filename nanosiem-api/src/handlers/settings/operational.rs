@@ -261,6 +261,7 @@ mod organizational_context_authorization_tests {
 
     fn session(permissions: &[&str]) -> AuthContext {
         AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: "test".to_string(),
             aud: "test".to_string(),
             sub: uuid::Uuid::nil(),

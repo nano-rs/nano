@@ -7,7 +7,7 @@ from __future__ import annotations
 import random
 import secrets
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -16,6 +16,30 @@ import httpx
 from nano_e2e.cleanup import CleanupStack
 from nano_e2e.client import Http, Journal, expect
 from nano_e2e.stack import Stack
+
+
+def permission_catalog(api: Http) -> set[str]:
+    """Every permission this build defines (`GET /api/permissions`): the core
+    set plus whatever the enterprise extension registers."""
+    body = expect(api.get("/api/permissions"), 200)
+    items = body.get("permissions", body) if isinstance(body, dict) else body
+    return {str(p["id"] if isinstance(p, dict) else p) for p in items}
+
+
+def edition_permissions(api: Http, wanted: Sequence[str], edition: str) -> list[str]:
+    """`wanted`, as this build can grant it (NAN-5747).
+
+    Persona and role scenarios declare the full enterprise permission set. An
+    open build does not define the enterprise permissions (`hunts:view`,
+    `soar:run`, ...), and creating a role with one is refused, so on open the
+    set is narrowed to the server's catalog. On enterprise every permission
+    must exist: a missing one is drift in the product or the test, not
+    something to drop quietly."""
+    catalog = permission_catalog(api)
+    missing = [p for p in wanted if p not in catalog]
+    if edition != "open":
+        assert not missing, f"permissions not in this {edition} build's /api/permissions: {missing}"
+    return [p for p in wanted if p in catalog]
 
 
 @dataclass

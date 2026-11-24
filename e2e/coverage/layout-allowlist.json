@@ -1,0 +1,44 @@
+{
+  "_doc": [
+    "NAN-5762: intentional exceptions to the e2e layout invariants (nanosiem-web/tests/e2e/ui/layout.mjs).",
+    "Each entry: id, checks (overflow | escape | clipped | overdrawn | any), at least one of selector (CSS the offending element itself matches: for overflow the scroll container, for escape / clipped the escaping element, for overdrawn the covered control), within (CSS of the element or any ancestor) and container (CSS the card / panel matches), optional surfaces (keys of e2e/coverage/ui-surfaces.json; default every page), and a reason.",
+    "An entry for a bug that is being fixed sets temporary: true and issue: NAN-<id>, and is removed when that fix merges (scripts/release/check-e2e-coverage.py lists every temporary entry on each run)."
+  ],
+  "entries": [
+    {
+      "id": "wide-tables",
+      "checks": [
+        "overflow"
+      ],
+      "selector": ":not(main, [data-layout-panel], [role=dialog], [role=alertdialog], [data-detail-sheet]):is(:has(> table), :has(> [role=table]), :has(> [role=grid]), :has(> div > table))",
+      "reason": "Data tables with more columns than fit scroll sideways inside their own table scroller by design: SOC tables keep every column instead of wrapping cells. Never the main pane or a panel / dialog."
+    },
+    {
+      "id": "code-blocks",
+      "checks": [
+        "overflow"
+      ],
+      "within": "pre, code, .cm-editor, [data-code-block]",
+      "reason": "Code, queries, VRL and raw events keep their line breaks and scroll sideways rather than soft-wrapping (wrapping would change what an analyst copies)."
+    },
+    {
+      "id": "theme-swatch-strip",
+      "checks": [
+        "overflow"
+      ],
+      "within": "[role=group][aria-label=Theme]",
+      "reason": "The theme picker is a sideways-scrolling swatch strip by design. The 'Scroll themes right' affordance sits beside the strip, never over a swatch (NAN-5836), so overdrawn is not allowed here."
+    },
+    {
+      "id": "mitre-coverage-matrix",
+      "checks": [
+        "overflow"
+      ],
+      "selector": "[data-testid=mitre-coverage-matrix]",
+      "surfaces": [
+        "/rules/coverage"
+      ],
+      "reason": "The ATT&CK coverage matrix keeps all 14 tactic columns side by side, like the ATT&CK Navigator; it scrolls sideways inside its own pane by design."
+    }
+  ]
+}

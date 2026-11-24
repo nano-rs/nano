@@ -217,6 +217,12 @@ pub use users::*;
 /// inner bounds: firing it mid-way could cancel the outbox write itself.
 const DURABLE_AUDIT_EMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// NAN-5785: the whole budget of one batched durable audit write (outbox
+/// insert, then at most one ClickHouse fallback insert). A batch never waits
+/// longer than this, whatever its size, so a stalled outbox cannot wedge a
+/// bulk delete or graceful shutdown.
+const DURABLE_AUDIT_BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Concurrency cap for in-flight durable (synchronous) audit inserts (NAN-1625).
 ///
 /// Belt-and-suspenders alongside the non-floodable classifier set and the
@@ -536,6 +542,54 @@ impl AuditExt for AppState {
                         true,
                         "not_durable",
                     ),
+                }
+            }
+        }
+    }
+
+    /// NAN-5785: one batched, bounded durable write for many events. Actor
+    /// names are resolved once per distinct actor. Cancellation-safe: the
+    /// outbox write is a single atomic statement, so a dropped call records
+    /// the whole batch or none of it, and the call is bounded by
+    /// [`DURABLE_AUDIT_BATCH_TIMEOUT`]. On failure or timeout every event is
+    /// logged in full at error level (never silently dropped, never demoted
+    /// to fire-and-forget).
+    async fn emit_batch_audited(&self, events: Vec<AuditEvent>) {
+        let (mut critical, routine): (Vec<AuditEvent>, Vec<AuditEvent>) = events
+            .into_iter()
+            .partition(|event| nanosiem_core::audit::is_security_critical(&event.action));
+        for event in routine {
+            self.emit_audit(event);
+        }
+        if critical.is_empty() {
+            return;
+        }
+        let mut names: std::collections::HashMap<uuid::Uuid, Option<String>> = Default::default();
+        for event in &mut critical {
+            let (Some(actor_id), None) = (event.actor_id, event.actor_name.as_ref()) else {
+                continue;
+            };
+            if !names.contains_key(&actor_id) {
+                let name = self.user_repo.get_user_by_id(actor_id).await.ok().map(|user| user.name);
+                names.insert(actor_id, name);
+            }
+            event.actor_name = names.get(&actor_id).cloned().flatten();
+        }
+        match tokio::time::timeout(DURABLE_AUDIT_BATCH_TIMEOUT, self.audit_emitter.emit_durable_batch(&critical)).await {
+            Ok(Ok(_outcome)) => {}
+            Ok(Err(error)) => {
+                for event in &critical {
+                    record_audit_emit_failure(event, &error.to_string(), true, "not_durable");
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    count = critical.len(),
+                    timeout_secs = DURABLE_AUDIT_BATCH_TIMEOUT.as_secs(),
+                    "Durable audit batch timed out; every event is logged in full below"
+                );
+                for event in &critical {
+                    record_audit_emit_failure(event, "durable audit batch timed out", true, "timeout");
                 }
             }
         }

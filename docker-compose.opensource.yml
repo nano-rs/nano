@@ -145,13 +145,13 @@ services:
       - no-new-privileges:true
     command:
       - -c
-      - max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-55}
       - -c
-      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-128MB}
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
       - -c
-      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-384MB}
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-768MB}
       - -c
-      - work_mem=${POSTGRES_WORK_MEM:-4MB}
+      - work_mem=${POSTGRES_WORK_MEM:-3MB}
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-nanosiem}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
@@ -166,7 +166,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${POSTGRES_MEM_LIMIT:-512M}
+          memory: ${POSTGRES_MEM_LIMIT:-1G}
           cpus: ${POSTGRES_CPU_LIMIT:-1}
 
   # NAN-4906: one-shot pre-start check. Aborts on an x86-64 CPU without AVX2
@@ -380,7 +380,7 @@ services:
       - no-new-privileges:true
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
-      PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
+      PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-14}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem
@@ -484,7 +484,7 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m,uid=999,gid=999
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
-      PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
+      PG_MAX_CONNECTIONS: ${NANO_CONNECTOR_PG_MAX_CONNECTIONS:-${PG_MAX_CONNECTIONS:-4}}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CONNECTOR_HEC_URL: http://vector:8088
@@ -626,7 +626,7 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.13-debian@sha256:6f4d8e4e61c3e957a44fd45b1835c3288fde54042eb623ee09af730c32b85d6d
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.14-debian@sha256:8995b2b456d104373056c4e72eded60c59c197ab1605d8de8d362b3a67fc857c
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
@@ -771,7 +771,7 @@ services:
     environment:
       <<: [*nano-egress-env, *nano-update-env, *nano-vector-render-env, *agentlane-base-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
-      PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
+      PG_MAX_CONNECTIONS: ${NANO_API_PG_MAX_CONNECTIONS:-${PG_MAX_CONNECTIONS:-14}}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
       # NAN-5204: the nano-backup service reports each run with this token.
       # Unset (automatic backups never configured) disables the endpoint.
@@ -896,6 +896,10 @@ services:
       NANOSIEM_DATA_DIR: /app/data
       NRT_MAX_CONCURRENT_RULES: "50"
       NRT_PHASE_MAX_SECS: "300"
+      # NAN-5736 / NAN-5746: maximum events a raw-event detection rule fetches
+      # in one run before switching to per-entity representatives (1-999999;
+      # unset keeps the binary default of 2000).
+      DETECTION_MAX_MATCHES_PER_RUN:
       # NAN-5448: HOT_RETENTION_DAYS / WARM_RETENTION_DAYS / COLD_STORAGE_ENABLED
       # are gone. Nothing read HOT_RETENTION_DAYS, and the cold-storage flag made
       # jobs rewrite the 365-day delete TTL to WARM_RETENTION_DAYS. Tiering is
@@ -974,7 +978,7 @@ services:
     environment:
       <<: [*nano-egress-env, *nano-update-env, *nano-vector-render-env, *agentlane-base-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
-      PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
+      PG_MAX_CONNECTIONS: ${NANO_JOBS_PG_MAX_CONNECTIONS:-${PG_MAX_CONNECTIONS:-16}}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem
@@ -1044,6 +1048,10 @@ services:
       NANOSIEM_DATA_DIR: /app/data
       NRT_MAX_CONCURRENT_RULES: "50"
       NRT_PHASE_MAX_SECS: "300"
+      # NAN-5736 / NAN-5746: maximum events a raw-event detection rule fetches
+      # in one run before switching to per-entity representatives (1-999999;
+      # unset keeps the binary default of 2000).
+      DETECTION_MAX_MATCHES_PER_RUN:
       # NAN-5448: HOT_RETENTION_DAYS / WARM_RETENTION_DAYS / COLD_STORAGE_ENABLED
       # are gone. Nothing read HOT_RETENTION_DAYS, and the cold-storage flag made
       # jobs rewrite the 365-day delete TTL to WARM_RETENTION_DAYS. Tiering is
@@ -1117,7 +1125,7 @@ services:
     environment:
       <<: *nano-egress-env
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
-      PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
+      PG_MAX_CONNECTIONS: ${NANO_SEARCH_PG_MAX_CONNECTIONS:-${PG_MAX_CONNECTIONS:-11}}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem

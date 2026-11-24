@@ -32,6 +32,11 @@ pub const SUPPORTED: &[&str] = &[
 /// `opentelemetry` → `otlp`, `splunk` / `hec` → `splunk_hec`, `s3` →
 /// `aws_s3`, `pubsub` → `gcp_pubsub`).
 pub fn canonical(method: &str) -> Option<&'static str> {
+    // NAN-5789: THE alias table. `is_fetch`, `dispatch_compatible`,
+    // `parsers::is_fetch_source_type` and `vector_config::router::transport_of`
+    // all classify through it, so an alias accepted anywhere is classified the
+    // same everywhere. It is the union of every spelling `SourceConfigType`,
+    // `parsers::types::SourceType` and `log_sources::SourceType` accept.
     Some(match method.trim().to_ascii_lowercase().as_str() {
         "routed" | "http" => "routed",
         "vector" => "vector",
@@ -39,10 +44,10 @@ pub fn canonical(method: &str) -> Option<&'static str> {
         "splunk_hec" | "splunk" | "hec" => "splunk_hec",
         "kafka" => "kafka",
         "aws_s3" | "s3" => "aws_s3",
-        "aws_sqs" => "aws_sqs",
+        "aws_sqs" | "sqs" => "aws_sqs",
         "crowdstrike_fdr" | "fdr" => "crowdstrike_fdr",
         "gcp_pubsub" | "pubsub" => "gcp_pubsub",
-        "azure_event_hubs" => "azure_event_hubs",
+        "azure_event_hubs" | "event_hubs" | "eventhubs" => "azure_event_hubs",
         // Legacy labels from the parser-service vocabulary
         // (`parsers::types::SourceType::all_types`); the renderer sends them
         // down the routed lane.
@@ -51,6 +56,40 @@ pub fn canonical(method: &str) -> Option<&'static str> {
         "stdin" => "stdin",
         _ => return None,
     })
+}
+
+/// The canonical methods that read through a source configuration (pull).
+pub const FETCH: &[&str] = &["kafka", "aws_s3", "aws_sqs", "crowdstrike_fdr", "gcp_pubsub", "azure_event_hubs"];
+
+/// Whether `method` (any accepted spelling) reads through a source
+/// configuration rather than a push lane.
+pub fn is_fetch(method: &str) -> bool {
+    canonical(method).is_some_and(|m| FETCH.contains(&m))
+}
+
+/// The canonical `source_configurations.config_type` for any accepted
+/// spelling (the same table: a configuration type is named like the method
+/// it feeds, except `http`, which feeds `routed`).
+pub fn canonical_config_type(config_type: &str) -> Option<&'static str> {
+    canonical(config_type).map(|m| if m == "routed" { "http" } else { m })
+}
+
+/// NAN-5789 / NAN-943: whether a source configuration of `config_type` can
+/// feed a log source of ingestion method `method`. Both sides are
+/// canonicalized first (case, aliases), so the one table covers every
+/// spelling a writer accepts. A fetch method needs a configuration of the
+/// SAME type (a kafka source bound to an S3 configuration filters on the
+/// wrong route and ingests nothing); a routed source pairs with `http`.
+pub fn dispatch_compatible(config_type: &str, method: &str) -> bool {
+    let (Some(config_type), Some(method)) = (canonical_config_type(config_type), canonical(method)) else {
+        return false;
+    };
+    match method {
+        "routed" => config_type == "http",
+        "kafka" | "aws_s3" | "aws_sqs" | "crowdstrike_fdr" | "gcp_pubsub" | "azure_event_hubs" | "splunk_hec" | "otlp"
+        | "vector" => config_type == method,
+        _ => false,
+    }
 }
 
 /// The 400 message for an unsupported method. The value is Debug-quoted so

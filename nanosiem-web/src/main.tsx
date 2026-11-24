@@ -17,10 +17,15 @@ import './index.css';
 import { toast } from 'sonner';
 import { watchForNewBuild } from './lib/build-update';
 import { installSupportCapture } from './lib/support-diagnostics';
+import { startErrorTracking } from './lib/error-tracking';
 
 // NAN-5253: remember the last failed API calls and console errors (in memory,
 // this tab only) for Help > Report a bug. Nothing is sent anywhere.
 installSupportCapture();
+
+// NAN-5798: opt-in Sentry for local/e2e builds; a no-op unless the build set
+// VITE_NANO_SENTRY_DSN (release builds never do).
+startErrorTracking();
 
 if (import.meta.env.PROD) {
   watchForNewBuild(() => {

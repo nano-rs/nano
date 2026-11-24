@@ -206,6 +206,28 @@ pub(crate) fn unquoted_string(input: &str) -> ParseResult<'_, String> {
     .parse(input)
 }
 
+/// The length of the field-name segment at the start of `s`: letters,
+/// digits, `_`, and the RFC 6901 escapes `~0` / `~1`. NAN-5849: when one
+/// event spells a stored path twice (`{"a.b": 1, "a": {"b": 2}}`), the
+/// ingest lane stores the flat key as `a~1b`; `unmapped.a~1b` must parse so
+/// a displaced value can be filtered on. A lone `~` (or `~` before anything
+/// but `0`/`1`) ends the segment, so the `=~` / `!~` operators are untouched.
+pub(crate) fn escaped_segment_len(s: &str) -> usize {
+    let mut len = 0;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            len = i + c.len_utf8();
+        } else if c == '~' && matches!(chars.peek(), Some((_, '0' | '1'))) {
+            chars.next();
+            len = i + 2;
+        } else {
+            break;
+        }
+    }
+    len
+}
+
 /// Parse field name (supports dot notation and metadata_ prefix)
 pub(crate) fn field_name(input: &str) -> ParseResult<'_, String> {
     // Parse initial field name (letters/underscore, then alphanumeric/underscore)
@@ -224,6 +246,12 @@ pub(crate) fn field_name(input: &str) -> ParseResult<'_, String> {
     .parse(input)?;
 
     let mut field = base.to_string();
+    // NAN-5849: a stored key whose dots were escaped (`a.b` -> `a~1b`).
+    let more = escaped_segment_len(remaining);
+    if more > 0 {
+        field.push_str(&remaining[..more]);
+        remaining = &remaining[more..];
+    }
 
     // Handle dots for nested fields (e.g., user.name)
     // But stop if dot is followed by a quote (string concatenation)
@@ -240,15 +268,11 @@ pub(crate) fn field_name(input: &str) -> ParseResult<'_, String> {
             }
 
             // Try to parse the next field segment
-            if let Ok((new_remaining, segment)) =
-                take_while1::<_, _, nom::error::Error<&str>>(|c: char| {
-                    c.is_alphanumeric() || c == '_'
-                })
-                .parse(after_dot)
-            {
+            let len = escaped_segment_len(after_dot);
+            if len > 0 {
                 field.push('.');
-                field.push_str(segment);
-                remaining = new_remaining;
+                field.push_str(&after_dot[..len]);
+                remaining = &after_dot[len..];
             } else {
                 // Dot not followed by valid field chars, stop
                 break;
@@ -265,7 +289,7 @@ pub(crate) fn field_name(input: &str) -> ParseResult<'_, String> {
 /// Parse field name with wildcard support (for table/fields commands)
 /// Supports patterns like: src_*, *_time, dest_*, _*, *
 pub(crate) fn field_name_with_wildcard(input: &str) -> ParseResult<'_, String> {
-    map(
+    let (rest, head) = map(
         recognize(pair(
             alt((
                 // Handle metadata_ prefix with optional wildcard
@@ -285,7 +309,22 @@ pub(crate) fn field_name_with_wildcard(input: &str) -> ParseResult<'_, String> {
         )),
         |s: &str| s.to_string(),
     )
-    .parse(input)
+    .parse(input)?;
+    // NAN-5849: `~0` / `~1` escapes, see `escaped_segment_len`.
+    let mut field = head;
+    let mut rest = rest;
+    loop {
+        let len = escaped_segment_len(rest);
+        let tail = rest[len..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '*'))
+            .unwrap_or(rest.len() - len);
+        if len == 0 && tail == 0 {
+            break;
+        }
+        field.push_str(&rest[..len + tail]);
+        rest = &rest[len + tail..];
+    }
+    Ok((rest, field))
 }
 
 /// Parse comparison operator (excludes regex which uses /pattern/ syntax)

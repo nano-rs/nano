@@ -84,6 +84,7 @@ import {
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useViewPreference } from '@/hooks/use-view-preference';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { Term } from '@/components/ui/term';
 
 
 
@@ -865,8 +866,7 @@ export function SearchHub({
             {visibleJobs.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
                 <Activity className="h-8 w-8 mb-2 opacity-50" />
-                <p>No active or recent search jobs</p>
-                <p className="text-xs mt-1">Jobs appear here when you run searches</p>
+                <p>No active or recent <Term id="search-job">search jobs</Term></p>
               </div>
             ) : (
               <div className="space-y-1 pr-4">

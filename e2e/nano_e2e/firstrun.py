@@ -21,12 +21,13 @@ NANO_E2E_C05_LICENSE_FILE set, the offline C05 license is then imported
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
-from nano_e2e import bootstrap, c05_license
+from nano_e2e import bootstrap, c05_license, trust
 
 
 @dataclass
@@ -56,6 +57,25 @@ def _rewrite_stack_env(path: Path, key: str) -> None:
         tmp.replace(path)
     finally:
         os.umask(old)
+
+
+TrustMismatch = trust.TrustMismatch
+
+
+def check_stack_trust(api: str, key: str) -> str:
+    """NAN-5771: the same fail-closed check `scripts/e2e.sh` runs after its own
+    admin bootstrap (nano_e2e.trust), for stacks whose admin is created here
+    (--defer-admin). Raises TrustMismatch unless the API reports E2E_TRUST;
+    only a 404 on a published image is tolerated, with a visible warning."""
+    want = os.environ.get("E2E_TRUST", "")
+    attempts = int(os.environ.get("E2E_TRUST_PROBE_ATTEMPTS", "5"))
+    got = trust.check(api, key, want, os.environ.get("E2E_APP_MODE", "native"), attempts=attempts)
+    if not got:
+        warnings.warn(
+            f"published image predates {trust.PATH} (404): trust not verified via the API; expected {want}",
+            stacklevel=2,
+        )
+    return got
 
 
 def ensure_admin() -> FirstRun:
@@ -93,6 +113,7 @@ def ensure_admin() -> FirstRun:
         _rewrite_stack_env(stack_env, key)
     os.environ["NANOSIEM_API_KEY"] = key
     os.environ["E2E_ADMIN_DEFERRED"] = "done"
+    check_stack_trust(api, key)
     # NAN-5331: `up --defer-admin` leaves the C05 import to us (it needs the
     # admin). Same contract as the runner: active license, or fail loudly.
     c05_license.import_from_env(api, key, os.environ.get("E2E_EDITION", ""))

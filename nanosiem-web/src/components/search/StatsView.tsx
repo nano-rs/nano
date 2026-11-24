@@ -288,7 +288,7 @@ export function StatsView({
         >
           <span>
             Showing the first <span className="font-mono tabular-nums">{results.length.toLocaleString()}</span> of{' '}
-            <span className="font-mono tabular-nums">{totalCount.toLocaleString()}</span> rows. Sorting and totals here cover only the loaded rows.
+            <span className="font-mono tabular-nums">{totalCount.toLocaleString()}</span> rows; sort and totals cover loaded rows only.
           </span>
           {onLoadAll && totalCount <= STATS_LOAD_ALL_CAP ? (
             <button

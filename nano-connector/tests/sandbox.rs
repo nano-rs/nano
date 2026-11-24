@@ -57,6 +57,30 @@ fn errno(p: &Probe) -> i64 {
     p.out.as_ref().and_then(|v| v["errno"].as_i64()).unwrap_or(-1)
 }
 
+/// Why the kernel would let this process's children fork past
+/// `RLIMIT_NPROC`, if it would: `copy_process` skips the check for the root
+/// user of the initial user namespace and for CAP_SYS_ADMIN / CAP_SYS_RESOURCE
+/// held there. Root inside a user namespace (rootless Docker, an
+/// unprivileged LXC) maps to another user and is limited.
+#[cfg(target_os = "linux")]
+fn nproc_unenforced() -> Option<String> {
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").ok()?;
+    let initial_ns = uid_map.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"];
+    if !initial_ns {
+        return None;
+    }
+    // SAFETY: getuid never fails.
+    if unsafe { libc::getuid() } == 0 {
+        return Some("root in the initial user namespace".into());
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let cap_eff = status.lines().find_map(|l| l.strip_prefix("CapEff:"))?.trim();
+    let caps = u64::from_str_radix(cap_eff, 16).ok()?;
+    const CAP_SYS_ADMIN: u64 = 21;
+    const CAP_SYS_RESOURCE: u64 = 24;
+    (caps & (1 << CAP_SYS_ADMIN | 1 << CAP_SYS_RESOURCE) != 0).then(|| "CAP_SYS_ADMIN or CAP_SYS_RESOURCE held".into())
+}
+
 // seccomp is Linux-only; tests/sandbox_platform.rs covers the other targets.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -96,10 +120,18 @@ async fn worker_sandbox_blocks_escape_attempts() {
     let p = probe("socket", Enforce::Off).await;
     assert_eq!(p.signal, None);
     assert!(p.out.as_ref().unwrap()["ret"].as_i64().unwrap() >= 0, "{:?}", p.out);
-    // ...but rlimits still stop it from forking.
+    // ...but rlimits still stop it from forking, where the kernel enforces
+    // RLIMIT_NPROC at all: never for root of the initial user namespace or
+    // CAP_SYS_ADMIN / CAP_SYS_RESOURCE holders (`copy_process`). A plain
+    // `docker run` as root is exactly that, so on such a host this control
+    // cannot hold; the seccomp `fork` probe above is the guarantee there.
     let p = probe("fork", Enforce::Off).await;
-    assert_eq!(p.out.as_ref().unwrap()["ret"], -1, "fork succeeded without seccomp: {:?}", p.out);
-    assert_eq!(errno(&p), libc::EAGAIN as i64);
+    if let Some(why) = nproc_unenforced() {
+        eprintln!("RLIMIT_NPROC is not enforced here ({why}); skipped the no-seccomp fork control");
+    } else {
+        assert_eq!(p.out.as_ref().unwrap()["ret"], -1, "fork succeeded without seccomp: {:?}", p.out);
+        assert_eq!(errno(&p), libc::EAGAIN as i64);
+    }
 
     if leaked >= 0 {
         // SAFETY: closing our own fd.

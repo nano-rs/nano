@@ -482,9 +482,25 @@ def test_time_picker_preset_absolute_range_and_drag_zoom(analyst, soc: SocData, 
     # a narrower window, re-run, == API.
     eventually(lambda: page.texts(ticks), timeout=30, interval=0.5, desc="the event stream redrawn for the range",
                ok=lambda t: bool(t) and t != ticks_24h)
+    # ...and settled: recharts animates the new series, and a drag that
+    # starts mid-animation can miss (NAN-5869). Settled = the plotted paths
+    # are identical across two samples.
+    paths = {"css": '[data-testid="timeline-chart"] .recharts-surface path'}
+    last: list[list[str | None]] = [[]]
+
+    def _settled() -> bool:
+        now = page.attrs(paths, "d")
+        same = bool(now) and now == last[0]
+        last[0] = now
+        return same
+
+    eventually(_settled, timeout=30, interval=0.4, desc="the event stream animation settled")
     page.screenshot("before-zoom.png")
     before = deep.run_mark(page)
-    page.drag({"testid": "timeline-chart"}, (0.3, 0.5), (0.6, 0.5))
+    # hover first: recharts reports the bucket under the pointer from its last
+    # (frame-throttled) mousemove, so a mousedown with no hover before it has
+    # no active bucket and the drag never starts.
+    page.drag({"testid": "timeline-chart"}, (0.3, 0.5), (0.6, 0.5), hover=True)
     zoomed = deep.wait_new_results(page, before)
     zf = _fragment(page.url)
     z_start, z_end = datetime.fromisoformat(zf["start"].replace("Z", "+00:00")), \
@@ -801,11 +817,13 @@ def test_prevalence_enrich_true_matches_the_prevalence_api(analyst, soc: SocData
 
     # Every artifact type the decoration picks agrees with the API for that
     # artifact at the same window (`enrich=true` defaults to 30d, the API to
-    # 24h; the 72h seed's common binaries have hosts outside 24h): the rare DNS
-    # lookup (domain, or its host's IP if rarer) and the process launches over
-    # the whole source.
-    for q in (f'source_type="{soc.dns}" query.hostname="{soc.rare_domain}" | prevalence enrich=true',
-              f'source_type="{soc.proc}" | prevalence enrich=true | head 50'):
+    # 24h): the rare DNS lookup (domain, or its host's IP if rarer) and the
+    # process launches over the whole source. NAN-5722: at 24h too; both count
+    # the 30-day baseline (the 72h seed's common binaries have hosts outside
+    # 24h, which the API used to drop: 13 hosts vs 14).
+    for q, window in ((f'source_type="{soc.dns}" query.hostname="{soc.rare_domain}" | prevalence enrich=true', "30d"),
+                      (f'source_type="{soc.proc}" | prevalence enrich=true | head 50', "30d"),
+                      (f'source_type="{soc.proc}" | prevalence enrich=true window=24h | head 50', "24h")):
         rows = deep.api_rows(client, soc, q, limit=50)
         assert rows, q
         decorated = [r for r in rows if r.get("prevalence_artifact")]
@@ -813,7 +831,7 @@ def test_prevalence_enrich_true_matches_the_prevalence_api(analyst, soc: SocData
         seen: dict[str, dict] = {}
         for row in decorated:
             art = row["prevalence_artifact"]
-            want = seen.setdefault(art, _bulk_prevalence(client, art, "30d"))
+            want = seen.setdefault(art, _bulk_prevalence(client, art, window))
             timeline.step("agree", query=q, artifact=art, type=row["prevalence_type"],
                           got={k: row.get(k) for k in ("host_count", "is_rare", "prevalence_score")}, want=want)
             assert row["host_count"] == want["host_count"], (q, art, row["host_count"], want)

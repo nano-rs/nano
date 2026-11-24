@@ -779,7 +779,12 @@ impl SourceConfigService {
                 // router references either path, and refreshing would be
                 // wasted I/O.
                 if was_deployed {
-                    if let Err(err) = self.update_dynamic_router().await {
+                    // NAN-5789: the new file is written by the next render,
+                    // so the route is briefly missing; notes only, no page.
+                    if let Err(err) = self
+                        .update_dynamic_router_with(crate::parsers::unrouted::ReportMode::BINDINGS_NOTES)
+                        .await
+                    {
                         tracing::warn!(
                             error = %err,
                             "failed to refresh dynamic router after source-config rename",
@@ -1089,7 +1094,10 @@ impl SourceConfigService {
         // Undeploy first if deployed
         let config = self.repository.get(id).await?;
         if config.deployed {
-            self.undeploy(id).await?;
+            // NAN-5789: no FULL report while the row still exists: it would
+            // page "not deployed, deploy that source configuration" for a
+            // configuration about to be deleted.
+            self.undeploy_with(id, crate::parsers::unrouted::ReportMode::BINDINGS_NOTES).await?;
         }
 
         // Remove config file
@@ -1098,7 +1106,15 @@ impl SourceConfigService {
             tokio::fs::remove_file(&config_file).await?;
         }
 
-        Ok(self.repository.delete(id).await?)
+        self.repository.delete(id).await?;
+        // NAN-5789: deployed or not, a live fetch source bound to it (now
+        // unbound, ON DELETE SET NULL) is left out of the render. Re-render
+        // and report now, with the real reason, instead of waiting for the
+        // publication reconciler.
+        if let Err(e) = self.update_dynamic_router().await {
+            tracing::warn!(source_config_id = %id, error = %e, "source configuration deleted, but the parser tree could not be re-rendered; the publication reconciler retries");
+        }
+        Ok(())
     }
 
     /// Toggle enabled status. Returns the row with secrets masked (NAN-2067).
@@ -1637,7 +1653,7 @@ impl SourceConfigService {
         id: Uuid,
         credential_use: CredentialUseGrant,
     ) -> Result<DeploymentResult, SourceConfigServiceError> {
-        self.deploy_with(id, credential_use, true).await
+        self.deploy_with(id, credential_use, true, crate::parsers::unrouted::ReportMode::FULL).await
     }
 
     /// `confirm_activation = false` skips the per-source wait on Vector's
@@ -1645,11 +1661,16 @@ impl SourceConfigService {
     /// renders every source back-to-back (often before Vector is up), and a
     /// 10-45s wait per source would stall API startup. Isolation and
     /// quarantine still apply.
+    ///
+    /// NAN-5789: `report` is what the parser re-render may vouch for. A batch
+    /// (boot / deploy-all) passes `BINDINGS_NOTES`, because the configurations
+    /// after this one are not on disk yet, and reports FULL once at the end.
     async fn deploy_with(
         &self,
         id: Uuid,
         credential_use: CredentialUseGrant,
         confirm_activation: bool,
+        report: crate::parsers::unrouted::ReportMode,
     ) -> Result<DeploymentResult, SourceConfigServiceError> {
         // NAN-4936 (codex P1): one critical section from the isolation check to
         // Vector's acknowledgement, shared with parser deploys. Without it a
@@ -1739,7 +1760,7 @@ impl SourceConfigService {
             let rendered = self.flag_deployed(config).await?;
 
             // Update dynamic router — include this config's route transform in inputs
-            self.update_dynamic_router_locked().await?;
+            self.update_dynamic_router_locked_with(report).await?;
 
             let mut activation_note: Option<String> = None;
             if let Some(watch) = watch {
@@ -1751,6 +1772,7 @@ impl SourceConfigService {
                         watch,
                         vector_config.as_deref().unwrap_or_default(),
                         true,
+                        report,
                     )
                     .await?
                 {
@@ -1802,7 +1824,7 @@ impl SourceConfigService {
         // Before the live render, which overwrites the credential file in place.
         let vector_built = match self.isolate_pull_source(&config_with_rules).await? {
             activation::Isolation::Broken(reason) => {
-                return self.quarantine(&config_with_rules, &reason, None).await;
+                return self.quarantine(&config_with_rules, &reason, None, report).await;
             }
             activation::Isolation::Clean { vector_built } => vector_built,
         };
@@ -1869,12 +1891,12 @@ impl SourceConfigService {
         let rendered = self.flag_deployed(config).await?;
 
         // Update dynamic router to include this source
-        self.update_dynamic_router_locked().await?;
+        self.update_dynamic_router_locked_with(report).await?;
 
         let mut activation_note: Option<String> = None;
         if let Some(watch) = watch {
             match self
-                .settle_activation(&config_with_rules, watch, &vector_config, vector_built)
+                .settle_activation(&config_with_rules, watch, &vector_config, vector_built, report)
                 .await?
             {
                 activation::Settlement::Final(result) => return Ok(result),
@@ -1937,6 +1959,18 @@ impl SourceConfigService {
 
     /// Undeploy a source configuration from Vector
     pub async fn undeploy(&self, id: Uuid) -> Result<DeploymentResult, SourceConfigServiceError> {
+        self.undeploy_with(id, crate::parsers::unrouted::ReportMode::FULL).await
+    }
+
+    /// [`Self::undeploy`]; NAN-5789: `report` as for `deploy_with`. A delete
+    /// passes `BINDINGS_NOTES` and reports FULL after the row is gone, so the
+    /// alert names the real cause (configuration deleted), never "deploy that
+    /// source configuration".
+    async fn undeploy_with(
+        &self,
+        id: Uuid,
+        report: crate::parsers::unrouted::ReportMode,
+    ) -> Result<DeploymentResult, SourceConfigServiceError> {
         // NAN-4936: one critical section from the first removal to Vector's
         // acknowledgement (see `deploy_with`).
         let _deploy_guard = self.lock_deploys().await;
@@ -1964,7 +1998,7 @@ impl SourceConfigService {
 
             // Update dynamic router (system-level types are filtered out, but ensures
             // other deployed configs have correct inputs)
-            self.update_dynamic_router_locked().await?;
+            self.update_dynamic_router_locked_with(report).await?;
 
             tracing::info!(
                 "Undeployed {} source configuration '{}' (system-level)",
@@ -2019,7 +2053,7 @@ impl SourceConfigService {
         self.clear_startup_quarantine(&config).await;
 
         // Update dynamic router to remove this source's route
-        self.update_dynamic_router_locked().await?;
+        self.update_dynamic_router_locked_with(report).await?;
 
         tracing::info!("Undeployed source configuration '{}'", config.name);
         // NAN-4936 (codex P1): success only once Vector has loaded a topology
@@ -2055,6 +2089,21 @@ impl SourceConfigService {
         credential_use: CredentialUseGrant,
         confirm_activation: bool,
     ) -> Result<Vec<DeploymentResult>, SourceConfigServiceError> {
+        let results = self.deploy_all_batch(credential_use, confirm_activation).await;
+        // NAN-5789: every configuration this batch could deploy is on disk
+        // now, so this is the one point that knows which live fetch sources
+        // are really left out. Run whatever the batch did, including when
+        // nothing was enabled or the batch stopped early: a live source bound
+        // to a configuration that is not on disk is left out either way.
+        self.report_unrouted_full().await;
+        results
+    }
+
+    async fn deploy_all_batch(
+        &self,
+        credential_use: CredentialUseGrant,
+        confirm_activation: bool,
+    ) -> Result<Vec<DeploymentResult>, SourceConfigServiceError> {
         let configs = self.repository.list_enabled().await?;
 
         // Fail closed for the current set before deploying anything. Each
@@ -2067,7 +2116,10 @@ impl SourceConfigService {
         let mut results = Vec::new();
 
         for config in configs {
-            match self.deploy_with(config.id, credential_use, confirm_activation).await {
+            match self
+                .deploy_with(config.id, credential_use, confirm_activation, crate::parsers::unrouted::ReportMode::BINDINGS_NOTES)
+                .await
+            {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     tracing::error!(
@@ -3226,8 +3278,56 @@ impl SourceConfigService {
         // (handed in via `with_deploy_lock`). When not wired (unit tests,
         // legacy callers), proceed without locking — those paths don't
         // collide with parser deploys.
+        self.update_dynamic_router_with(crate::parsers::unrouted::ReportMode::FULL).await
+    }
+
+    /// [`Self::update_dynamic_router`] reporting left-out sources per `report`.
+    async fn update_dynamic_router_with(
+        &self,
+        report: crate::parsers::unrouted::ReportMode,
+    ) -> Result<(), SourceConfigServiceError> {
         let _deploy_guard = self.lock_deploys().await;
-        self.update_dynamic_router_locked().await
+        self.update_dynamic_router_locked_with(report).await
+    }
+
+    /// NAN-5789: the FULL left-out report on its own (no re-render), for the
+    /// end of a batch deploy. Best-effort, like every report.
+    async fn report_unrouted_full(&self) {
+        let _deploy_guard = self.lock_deploys().await;
+        let pool = self.repository.pool();
+        let mut parsers = match crate::parsers::list_effective_deployed_parsers(pool).await {
+            Ok(parsers) => parsers,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not list log sources to report the ones left out");
+                return;
+            }
+        };
+        if let Err(e) = crate::parsers::resolve_parser_dispatch_routes(pool, &mut parsers).await {
+            tracing::warn!(error = %e, "could not resolve log source routes to report the ones left out");
+            return;
+        }
+        // NAN-5789: a batch deploys only ENABLED configurations, but
+        // `deployed` is the runtime authority: a deployed, disabled one is
+        // rendered by the publication reconciler that follows (a cold boot
+        // tree does not have it yet). Count its route as present, or every
+        // cold pod start would page, then resolve, for its live sources.
+        let skipped: Vec<(String, String)> = match sqlx::query_as(
+            "SELECT config_type, name FROM source_configurations WHERE deployed AND NOT enabled",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not list deployed, disabled source configurations to report the left-out log sources");
+                return;
+            }
+        };
+        let manager = crate::parsers::VectorConfigManager::new(&self.vector_config_dir);
+        let mut declared = manager.declared_source_config_routes().await;
+        declared.extend(skipped.iter().map(|(config_type, name)| Self::config_route_name(config_type, name)));
+        crate::parsers::unrouted::report_with_routes(pool, &declared, &parsers, crate::parsers::unrouted::ReportMode::FULL)
+            .await;
     }
 
     /// The shared deploy lock (`None` when not wired: unit tests). Owned, so a
@@ -3300,21 +3400,33 @@ impl SourceConfigService {
     /// longer exist (`VectorConfigManager::without_unroutable_parsers`), and a
     /// config that deploys again brings its bound parsers back.
     pub(super) async fn update_dynamic_router_locked(&self) -> Result<(), SourceConfigServiceError> {
+        self.update_dynamic_router_locked_with(crate::parsers::unrouted::ReportMode::FULL).await
+    }
+
+    /// [`Self::update_dynamic_router_locked`] reporting per `report`
+    /// (NAN-5789: FULL only where every deployed configuration is on disk).
+    pub(super) async fn update_dynamic_router_locked_with(
+        &self,
+        report: crate::parsers::unrouted::ReportMode,
+    ) -> Result<(), SourceConfigServiceError> {
         let pool = self.repository.pool();
         let mut parsers = crate::parsers::list_effective_deployed_parsers(pool)
             .await
             .map_err(SourceConfigRepositoryError::from)?;
-        crate::parsers::resolve_parser_dispatch_routes_lenient(pool, &mut parsers)
+        crate::parsers::resolve_parser_dispatch_routes(pool, &mut parsers)
             .await
             .map_err(SourceConfigRepositoryError::from)?;
-        crate::parsers::VectorConfigManager::new(&self.vector_config_dir)
-            .deploy_parsers(&parsers)
-            .await
-            .map_err(|e| {
-                SourceConfigServiceError::DeploymentFailed(format!(
-                    "could not re-render the parser tree for the source-configuration change: {e}"
-                ))
-            })?;
+        let manager = crate::parsers::VectorConfigManager::new(&self.vector_config_dir);
+        manager.deploy_parsers(&parsers).await.map_err(|e| {
+            SourceConfigServiceError::DeploymentFailed(format!(
+                "could not re-render the parser tree for the source-configuration change: {e}"
+            ))
+        })?;
+        // NAN-5789: the tree now holds every deployed source configuration,
+        // so this is the render that knows exactly which fetch sources are
+        // left out (unbound, configuration deleted or undeployed). A LIVE one
+        // raises a High health condition; each carries its reason.
+        crate::parsers::unrouted::report(pool, &manager, &parsers, report).await;
         Ok(())
     }
 

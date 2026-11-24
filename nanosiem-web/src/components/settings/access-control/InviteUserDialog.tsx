@@ -177,7 +177,7 @@ export function InviteUserDialog({ open, groups, onClose, onCreated }: InviteUse
                 </div>
                 {groups.length === 0 ? (
                   <div className="rounded-md border border-dashed border-border px-3 py-3 text-[11px] text-muted-foreground">
-                    No groups yet — create one in the Groups tab.
+                    No groups yet. Create one in the Groups tab.
                   </div>
                 ) : (
                   <div className="flex flex-wrap gap-1.5">
@@ -218,11 +218,11 @@ export function InviteUserDialog({ open, groups, onClose, onCreated }: InviteUse
                   value={message}
                   onChange={e => setMessage(e.target.value)}
                   rows={3}
-                  placeholder="Added you to the SOC team — see you in #triage."
+                  placeholder="Added you to the SOC team. See you in #triage."
                   className="w-full px-2.5 py-2 rounded-md border border-border bg-card text-[12px] text-foreground placeholder:text-muted-foreground/70 outline-none focus:border-primary/60 resize-none"
                 />
                 <div className="text-[10.5px] text-muted-foreground/70 mt-1">
-                  Email-based invite links aren't shipped yet — for now you'll share the temp password yourself.
+                  Invite emails aren't available yet; share the temp password yourself.
                 </div>
               </div>
             </div>
@@ -258,7 +258,7 @@ export function InviteUserDialog({ open, groups, onClose, onCreated }: InviteUse
                   <AlertCircle className="w-[12px] h-[12px] text-yellow-500 shrink-0 mt-0.5" />
                   <div className="flex-1">
                     <div className="text-[11.5px] text-foreground/80">
-                      Copy this temporary password now — it won't be shown again. Share it via your usual secure channel; the user will replace it on first sign-in.
+                      Copy this temporary password now; it won't be shown again. Share it over a secure channel; the user replaces it on first sign-in.
                     </div>
                     <div className="mt-2 rounded-md border border-border bg-card p-2 flex items-center gap-2 font-mono text-[11.5px] text-foreground break-all">
                       <span className="flex-1" data-testid="invite-temp-password">{success.password}</span>

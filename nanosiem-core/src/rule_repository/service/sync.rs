@@ -373,13 +373,26 @@ impl RuleRepositoryService {
                     )
                     && (existing_rule.conversion_status == "untranslated") != untranslated;
                 let stored_sha = existing_rule.file_sha.as_deref().unwrap_or("");
-                if !status_stale {
-                    if !entry.sha.is_empty() && stored_sha == entry.sha {
-                        continue; // No changes (API path)
+                let unchanged = (!entry.sha.is_empty() && stored_sha == entry.sha) // API path
+                    || (entry.sha.is_empty() && stored_sha == content_hash); // sparse checkout path
+                if !status_stale && unchanged {
+                    // NAN-5869: the file did not change, but the field
+                    // extractor may have (it once read `traffic.bytes_out` as
+                    // the UDM `bytes_out`). Re-derive the list so an upgrade
+                    // corrects rules synced before it; nothing else is
+                    // touched, so no "upstream changed" mark either.
+                    if let Ok(npl) = parse_npl(&content) {
+                        let derived = (!npl.required_fields.is_empty()).then_some(npl.required_fields);
+                        if derived != existing_rule.requires_fields {
+                            if let Err(e) = rules_repository
+                                .refresh_requires_fields(id, &entry.path, derived.as_deref())
+                                .await
+                            {
+                                warn!("Failed to refresh requires_fields for {}: {}", entry.path, e);
+                            }
+                        }
                     }
-                    if entry.sha.is_empty() && stored_sha == content_hash {
-                        continue; // No changes (sparse checkout path)
-                    }
+                    continue;
                 }
             }
 

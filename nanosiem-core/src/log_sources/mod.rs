@@ -16,8 +16,12 @@ pub mod deploy_jobs;
 #[cfg(test)]
 #[path = "connect_tests.rs"]
 mod connect_tests;
+#[cfg(test)]
+#[path = "connect_removed_tests.rs"]
+mod connect_removed_tests;
 pub mod health_series;
 pub mod ingest_transport;
+pub mod source_binding;
 #[cfg(test)]
 #[path = "health_series_tests.rs"]
 mod health_series_tests;

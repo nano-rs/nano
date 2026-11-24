@@ -9,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 from nano_e2e import ingest
 from nano_e2e import ui as uilib
 from nano_e2e.client import Nano, expect, row_text, time_range
+from nano_e2e.edition import wait_unlicensed
 from nano_e2e.personas import DETECTION_ENGINEER_PERMISSIONS, login_persona
+from nano_e2e.rbac import edition_permissions
 from nano_e2e.stack import Stack
 from nano_e2e.waits import DETECTION, INGEST_VISIBLE, eventually
 
@@ -120,7 +122,9 @@ def test_detection_engineer_journey(
         stack, nano, ui, artifact_dir, "detection-engineer", DETECTION_ENGINEER_PERMISSIONS
     ) as persona:
         page = persona.page
-        assert set(persona.permissions) == set(DETECTION_ENGINEER_PERMISSIONS)
+        assert set(persona.permissions) == set(
+            edition_permissions(nano.api, DETECTION_ENGINEER_PERMISSIONS, stack.edition)
+        )
         assert "detections:delete" not in persona.permissions
 
         # Author an nPL rule in the real editor. Register name-based cleanup as
@@ -278,8 +282,8 @@ def test_detection_engineer_journey(
             capability = expect(nano.api.get("/api/capabilities"), 200)
             assert capability["capabilities"]["cases"] is False, capability
             assert persona.client.api.get("/api/cases").status_code == 404
-            page.goto("/cases")
-            page.wait_text("Available in nano paid plans", exact=False)
+            page.goto("/cases")  # -> /inbox, gated on the `cases` capability
+            wait_unlicensed(page, "Cases")
             timeline.step("case boundary", edition=edition, capability=False, api=404)
 
         # Enterprise also proves authoring through the pivt detection wizard.

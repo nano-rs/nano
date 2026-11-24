@@ -405,6 +405,49 @@ pub const CUSTOM_INTEGRATION_PREVIEWED: &str = "custom_integration_previewed";
 pub const CUSTOM_INTEGRATION_CODE_GENERATED: &str = "custom_integration_code_generated";
 
 // =============================================================================
+// Playbook Library Actions (NAN-5786)
+// =============================================================================
+//
+// Analyst changes to response playbooks through `/api/playbooks*` and
+// `/api/playbook-approvals*` (source `playbook`, resource `playbook`). Every
+// event carries `details.kind` and, for a lifecycle change, the status and
+// mode (`adaptive` / `library`) before and after. Bodies (the markdown doc,
+// notes, review messages) are never copied: only the names of changed fields.
+// A 403 is audited centrally as `auth_denied`. Hunt definitions (playbooks of
+// kind `hunt`) are audited by the `hunt_*` actions below.
+
+/// A response playbook was created (by hand, or composed from a case).
+pub const PLAYBOOK_CREATED: &str = "playbook_created";
+/// A response playbook's content or metadata changed. `details.changed`
+/// names the fields; `details.status_before/after` show a live playbook an
+/// edit returned to draft.
+pub const PLAYBOOK_UPDATED: &str = "playbook_updated";
+/// A response playbook went live WITHOUT a review: created as `live`, or a
+/// PATCH that moved it into `live`. Emitted in place of `playbook_created` /
+/// `playbook_updated` (`details.via` says which) so a direct publish is as
+/// durable as a reviewed one (`playbook_approved`).
+pub const PLAYBOOK_PUBLISHED: &str = "playbook_published";
+/// A response playbook was archived (soft delete).
+pub const PLAYBOOK_ARCHIVED: &str = "playbook_archived";
+/// A response playbook was permanently deleted, with its versions, runs,
+/// approvals and permissions.
+pub const PLAYBOOK_DELETED: &str = "playbook_deleted";
+/// A response playbook was forked into a new detached draft.
+pub const PLAYBOOK_FORKED: &str = "playbook_forked";
+/// A response playbook was submitted for review.
+pub const PLAYBOOK_SUBMITTED_FOR_REVIEW: &str = "playbook_submitted_for_review";
+/// A review was approved and its playbook went live.
+pub const PLAYBOOK_APPROVED: &str = "playbook_approved";
+/// A review was rejected and its playbook went back to draft.
+pub const PLAYBOOK_REJECTED: &str = "playbook_rejected";
+/// An adaptive (agent-composed) playbook was promoted into the library.
+pub const PLAYBOOK_PROMOTED: &str = "playbook_promoted";
+/// A per-role ACL entry on a playbook was set (created or changed).
+pub const PLAYBOOK_PERMISSION_SET: &str = "playbook_permission_set";
+/// A per-role ACL entry on a playbook was removed.
+pub const PLAYBOOK_PERMISSION_REMOVED: &str = "playbook_permission_removed";
+
+// =============================================================================
 // Hunt Actions (NAN-2238)
 // =============================================================================
 //
@@ -483,6 +526,12 @@ pub const HUNT_PROFILE_SAVED: &str = "hunt_profile_saved";
 /// is — the drafts are inert, but "who added 25 hunts to the library" is asked
 /// after somebody finds 25 hunts in the library.
 pub const HUNT_DRAFTS_CREATED: &str = "hunt_drafts_created";
+/// NAN-5776: `POST /api/hunts/drafts` with `replace_dismissed` replaced recon
+/// drafts an analyst had deleted (archived). Durable: it overrides an
+/// analyst's decision that a technique is not worth hunting, so who overrode
+/// which dismissal must survive log rotation. `details.replaced` pairs each
+/// technique's archived draft with the new one.
+pub const HUNT_DISMISSAL_REPLACED: &str = "hunt_dismissal_replaced";
 /// An analyst revoked something the hunter had learned (NAN-2239).
 ///
 /// Audited because the revocation is PERMANENT and `hunt_knowledge.revoked_by`
@@ -494,6 +543,10 @@ pub const HUNT_KNOWLEDGE_REVOKED: &str = "hunt_knowledge_revoked";
 pub const HUNT_SOURCE_CAPABILITY_BOUND: &str = "hunt_source_capability_bound";
 /// An analyst removed their override, revealing recon's latest inference again.
 pub const HUNT_SOURCE_CAPABILITY_RESET: &str = "hunt_source_capability_reset";
+/// NAN-5786: a machine was registered as a hunt runner, eligible to claim
+/// unattended sweeps. An administrative act (`hunts:manage`), never one a
+/// runner performs for itself; heartbeats and claims are not audited.
+pub const HUNT_RUNNER_REGISTERED: &str = "hunt_runner_registered";
 /// An analyst authorised one machine to run unattended sweeps on Antigravity
 /// (NAN-2264).
 ///
@@ -740,9 +793,13 @@ pub const SCIM_GROUP_MEMBERSHIP_CHANGED: &str = "scim_group_membership_changed";
 
 /// Playbook repository was registered (first-party catalog reconcile)
 pub const PLAYBOOK_REPO_CREATED: &str = "playbook_repo_created";
-/// Playbook repository was updated (first-party catalog reconcile)
+/// Playbook repository was updated (first-party catalog reconcile, or an
+/// operator's PATCH; NAN-5784)
 pub const PLAYBOOK_REPO_UPDATED: &str = "playbook_repo_updated";
-/// Playbook repository was synced (scheduled)
+/// NAN-5784: an operator deleted a playbook repository
+pub const PLAYBOOK_REPO_DELETED: &str = "playbook_repo_deleted";
+/// Playbook repository was synced (scheduled, air-gap bundle, or a manual
+/// sync / sync-and-import; `details.source` says which)
 pub const PLAYBOOK_REPO_SYNCED: &str = "playbook_repo_synced";
 /// NAN-5648: a sync refreshed a linked, uncustomized imported playbook or hunt
 /// in place to its new upstream content (pivots, hypothesis, body, ...)
@@ -753,6 +810,10 @@ pub const PLAYBOOK_IMPORT_UPDATE_APPLIED: &str = "playbook_import_update_applied
 /// NAN-5648: re-importing a file restored its archived playbook or hunt and
 /// refreshed it to the current upstream content
 pub const PLAYBOOK_IMPORT_RESTORED: &str = "playbook_import_restored";
+/// NAN-5755: the scheduler (or an air-gap bundle import) delivered new
+/// first-party catalog files into the playbook library. NAN-5784: also a
+/// manual import, import-all or sync-and-import (`details.source = "manual"`)
+pub const PLAYBOOK_LIBRARY_DELIVERED: &str = "playbook_library_delivered";
 
 // =============================================================================
 // Parser Repository Actions
@@ -934,6 +995,17 @@ pub const WEBHOOK_TESTED: &str = "webhook_tested";
 pub const SYSTEM_HEALTH_ACKNOWLEDGED: &str = "system_health_acknowledged";
 /// A system-health lifecycle was manually resolved by an owner.
 pub const SYSTEM_HEALTH_RESOLVED: &str = "system_health_resolved";
+/// NAN-5785: an ACTIVE system-health alert's source was deleted, disabled,
+/// or had stale alerting turned off. The alert is left open and flagged
+/// (details.action, details.health_event_id); recorded durably because a
+/// source mutation that coincides with a live "stopped sending" alert is how
+/// a blinded feed would be hidden.
+pub const SYSTEM_HEALTH_SOURCE_REMOVED: &str = "system_health_source_removed";
+/// NAN-5785: an update changed how a log source is monitored: `enabled`,
+/// `stale_alert_enabled` or `stale_threshold_minutes` actually changed
+/// (details carry before/after). Durable: turning monitoring down before
+/// stopping a forwarder is how a feed would be blinded without any alert.
+pub const LOG_SOURCE_MONITORING_CHANGED: &str = "log_source_monitoring_changed";
 /// Organization tier was changed
 pub const TIER_UPDATED: &str = "tier_updated";
 /// Tier limits were customized
@@ -1204,6 +1276,14 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     // stopped arriving.
     INGESTION_PAUSED,
     INGESTION_RESUMED,
+    // Log-source removal (NAN-5785): deleting or disabling a source can blind
+    // a feed; rare admin actions. Durable so a dropped write cannot hide who
+    // silenced a source, nor that it had a live stale-feed alert.
+    LOG_SOURCE_DELETED,
+    LOG_SOURCE_TOGGLED,
+    LOG_SOURCE_UNDEPLOYED,
+    LOG_SOURCE_MONITORING_CHANGED,
+    SYSTEM_HEALTH_SOURCE_REMOVED,
     // Federated identity — JIT provisioning of a new user on first OIDC login.
     OIDC_USER_PROVISIONED,
     // Agent Lane (NAN-5360) — who may run SQL directly against the event
@@ -1242,6 +1322,12 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     // emits them, so an unattended loop cannot amplify them.
     HUNT_EXECUTION_POLICY_CHANGED,
     HUNT_ARCHIVED,
+    // NAN-5776: overriding an analyst's dismissal of a recon draft. Needs
+    // `hunts:manage` AND the explicit `replace_dismissed` flag; emitted once
+    // per request (not per draft) and only when a dismissal was actually
+    // released, so each row costs a committed release. Recon runs never set
+    // the flag.
+    HUNT_DISMISSAL_REPLACED,
     // The schedule decisions themselves (who put an agent on a cadence or
     // turned it on), from the toggle, cadence and PATCH handlers only.
     HUNT_SCHEDULE_ENABLED,
@@ -1254,6 +1340,14 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     PLAYBOOK_IMPORT_REFRESHED,
     PLAYBOOK_IMPORT_UPDATE_APPLIED,
     PLAYBOOK_IMPORT_RESTORED,
+    // NAN-5786: the response-playbook changes that decide what responders
+    // follow or who may change it: a playbook going live (reviewed or direct),
+    // a permanent delete, and the per-playbook ACL. See the pinned-set test.
+    PLAYBOOK_APPROVED,
+    PLAYBOOK_PUBLISHED,
+    PLAYBOOK_DELETED,
+    PLAYBOOK_PERMISSION_SET,
+    PLAYBOOK_PERMISSION_REMOVED,
 ];
 
 /// Returns `true` when `action` must be emitted durably (synchronous insert,
@@ -1323,6 +1417,12 @@ mod durable_classifier_tests {
             "ingest_token_settings_updated",
             "ingestion_paused",
             "ingestion_resumed",
+            // NAN-5785: removing a log source can blind a feed.
+            "log_source_deleted",
+            "log_source_toggled",
+            "log_source_undeployed",
+            "log_source_monitoring_changed",
+            "system_health_source_removed",
             "oidc_user_provisioned",
             "session_terminated",
             "user_sessions_terminated",
@@ -1371,6 +1471,9 @@ mod durable_classifier_tests {
             // and fire-and-forget fallback bound a scripted burst.
             "hunt_execution_policy_changed",
             "hunt_archived",
+            // NAN-5776: `hunts:manage` + explicit `replace_dismissed`, one row
+            // per request that actually released a dismissal.
+            "hunt_dismissal_replaced",
             // Same footing: the schedule toggle / cadence / PATCH handlers
             // (`hunts:run` on an authenticated session or API key), one row
             // per committed hunt_specs write; the scheduler and runners never
@@ -1389,6 +1492,19 @@ mod durable_classifier_tests {
             "playbook_import_refreshed",
             "playbook_import_update_applied",
             "playbook_import_restored",
+            // NAN-5786: a response playbook going live (approved review or
+            // direct publish), permanent delete and ACL writes. Not floodable:
+            // each needs `playbooks:publish` or `playbooks:manage` plus the
+            // per-playbook ACL grant on an authenticated session or API key,
+            // and is emitted only for a transition the repository committed
+            // and returned from inside its own transaction (a re-approve, a
+            // delete of an absent entry or an unchanged grant is not an
+            // event). No scheduler, runner or sync path emits them.
+            "playbook_approved",
+            "playbook_published",
+            "playbook_deleted",
+            "playbook_permission_set",
+            "playbook_permission_removed",
         ];
         let mut actual: Vec<&str> = SECURITY_CRITICAL_ACTIONS.to_vec();
         expected.sort_unstable();

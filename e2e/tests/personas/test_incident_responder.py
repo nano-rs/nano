@@ -10,11 +10,13 @@ from typing import Any
 
 from nano_e2e import ui as uilib
 from nano_e2e.client import Nano, expect, row_text
+from nano_e2e.edition import wait_unlicensed
 from nano_e2e.personas import (
     INCIDENT_APPROVER_PERMISSIONS,
     INCIDENT_RESPONDER_PERMISSIONS,
     login_persona,
 )
+from nano_e2e.rbac import edition_permissions
 from nano_e2e.stack import Stack
 from nano_e2e.waits import DETECTION, INGEST_VISIBLE, eventually
 
@@ -117,15 +119,16 @@ def test_incident_responder_journey(
         assert capabilities["cases"] is False
         assert capabilities["notebooks"] is False
         assert capabilities["playbooks"] is False
-        assert "soar" not in capabilities
+        # Every capability key is published; enterprise-only ones are false.
+        assert capabilities["soar"] is False
         assert nano.api.get("/api/cases").status_code == 404
         assert nano.api.get("/api/soar/settings").status_code == 404
         page = uilib.UiPage.open(ui, artifact_dir / "ui-incident-open", "incident responder open boundary")
         failed = True
         try:
             uilib.login(page, stack.admin_email, stack.admin_password)
-            page.goto("/cases")
-            page.wait_text("Available in nano paid plans", exact=False)
+            page.goto("/cases")  # -> /inbox, gated on the `cases` capability
+            wait_unlicensed(page, "Cases")
             page.goto("/automation")
             page.wait_text("Access Denied", exact=True)
             failed = False
@@ -245,7 +248,9 @@ def test_incident_responder_journey(
         responder = persona_sessions.enter_context(
             login_persona(stack, nano, ui, artifact_dir, "incident-responder", INCIDENT_RESPONDER_PERMISSIONS)
         )
-        assert set(responder.permissions) == set(INCIDENT_RESPONDER_PERMISSIONS)
+        assert set(responder.permissions) == set(
+            edition_permissions(nano.api, INCIDENT_RESPONDER_PERMISSIONS, stack.edition)
+        )
         assert "cases:delete" not in responder.permissions
         assert "soar:approve" not in responder.permissions
         responder_me = expect(responder.client.api.get("/api/auth/me"), 200)
@@ -301,7 +306,9 @@ def test_incident_responder_journey(
         # so both strictly-cleaned persona accounts can then be deleted even if
         # a later browser assertion fails.
         persona_sessions.callback(lambda: expect(nano.api.delete(f"/api/cases/{case_id}"), 200, 204, 404))
-        assert set(approver.permissions) == set(INCIDENT_APPROVER_PERMISSIONS)
+        assert set(approver.permissions) == set(
+            edition_permissions(nano.api, INCIDENT_APPROVER_PERMISSIONS, stack.edition)
+        )
         approver_me = expect(approver.client.api.get("/api/auth/me"), 200)
 
         # Actual peer handoff records sender/target provenance; the second

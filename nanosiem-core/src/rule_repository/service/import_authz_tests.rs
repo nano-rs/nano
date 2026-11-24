@@ -319,6 +319,18 @@ mod derivations {
         assert!(resolved.requires_promote_for_create());
     }
 
+    /// NAN-5826: a blank `schedule:` is a missing one (the import default),
+    /// never an empty cron the scheduler cannot parse.
+    #[test]
+    fn a_blank_schedule_gets_the_import_default() {
+        for blank in ["", "   "] {
+            let npl = npl_rule(None, None, Some("scheduled"), Some(blank), None);
+            let resolved =
+                ImportLifecycle::resolve(&import_request(None, None, None), None, Some(&npl));
+            assert_eq!(resolved.schedule_cron.as_deref(), Some("*/30 * * * *"), "{blank:?}");
+        }
+    }
+
     /// A rule without parseable nPL frontmatter (imported via `custom_npl`)
     /// defaults to staging/scheduled, so a plain import needs only
     /// `detections:create`.

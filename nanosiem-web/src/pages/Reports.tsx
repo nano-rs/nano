@@ -45,6 +45,7 @@ import { api } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import type { ReportArtifactMeta, ReportDefinition, ReportRun } from '@/lib/api';
+import { Term } from '@/components/ui/term';
 
 type FilterTab = 'mine' | 'all';
 
@@ -222,7 +223,9 @@ function RunRow({ run }: { run: ReportRun }) {
                 ))}
               </div>
             ) : (
-              <div className="text-[11px] text-muted-foreground">No artifacts for this run.</div>
+              <div className="text-[11px] text-muted-foreground">
+                No <Term id="report-artifact">artifacts</Term> for this run.
+              </div>
             )}
           </td>
         </tr>
@@ -407,13 +410,10 @@ export function Reports() {
           <div className="flex items-center gap-2 mb-2">
             <CalendarClock className="w-[12px] h-[12px] text-primary" />
             <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground font-semibold">
-              Scheduled Reports
+              <Term id="scheduled-report">Scheduled Reports</Term>
             </span>
           </div>
           <div className="text-[22px] font-semibold text-foreground tracking-[-0.01em]">Reports</div>
-          <div className="text-[12.5px] text-muted-foreground mt-1">
-            Schedule saved searches and dashboards to generate downloadable report artifacts.
-          </div>
         </div>
         <div className="flex items-center gap-2 pt-1">
           <Button variant="outline" size="sm" className="h-[30px]" onClick={() => load()}>
@@ -468,12 +468,7 @@ export function Reports() {
       ) : reports.length === 0 ? (
         <div className="flex flex-col items-center gap-4 py-14 text-center">
           <CalendarClock className="w-10 h-10 text-muted-foreground/40" />
-          <div>
-            <div className="text-[13px] text-foreground font-medium">No scheduled reports yet</div>
-            <div className="text-[11.5px] text-muted-foreground mt-1">
-              Create a report to run a saved search or dashboard on a schedule.
-            </div>
-          </div>
+          <div className="text-[13px] text-foreground font-medium">No scheduled reports yet</div>
           <Button size="sm" className="h-[30px]" onClick={() => setCreateOpen(true)}>
             <Plus className="w-[12px] h-[12px]" />
             New report

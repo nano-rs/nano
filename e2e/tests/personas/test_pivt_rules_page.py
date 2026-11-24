@@ -131,6 +131,8 @@ def test_pivt_offers_no_promote_without_detections_promote(
         _ask(page, "promote this rule")
         page.wait_text("isn't available to you on this page", exact=False, timeout_ms=120_000)
         assert page.count(CARD) == 0
+        # NAN-5637: no rule-editor fallback link for an editor who can't create rules.
+        assert page.count({"text": "Open Rule Editor"}) == 0
         page.screenshot("pivt-rule-editor-no-promote.png")
         refused = persona.client.api.post(
             f"/api/rules/{rule_id}/promote",

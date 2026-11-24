@@ -75,6 +75,7 @@ import {
 import { logSourceTransportLabel } from '@/lib/log-source-transports';
 import { cn } from '@/lib/utils';
 import { descriptionSummary } from '@/lib/description-summary';
+import { Term } from '@/components/ui/term';
 
 type DerivedStatus = 'deployed' | 'ready' | 'paused' | 'draft';
 type FilterId = 'all' | 'deployed' | 'ready' | 'warn' | 'draft';
@@ -313,6 +314,9 @@ export function LogSources() {
       setAssociatedRoutingRules([]);
       refetch();
       queryClient.invalidateQueries({ queryKey: ['parser-repository-parsers'] });
+      // NAN-5760: SIEM Health follows the source registry.
+      queryClient.invalidateQueries({ queryKey: ['siem-health'] });
+      queryClient.invalidateQueries({ queryKey: ['log-source-health-series'] });
     } catch (err) {
       toast({
         title: 'Delete failed',
@@ -489,19 +493,16 @@ export function LogSources() {
 
 function HeroStrip({ stats }: { stats: { total: number; deployed: number; ready: number; warn: number } }) {
   return (
-    <div className="shrink-0 border-b border-border bg-card/40 px-5 py-4 flex items-start gap-4">
+    <div className="shrink-0 border-b border-border bg-card/40 px-5 py-4 flex items-center gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-border bg-card flex items-center justify-center shrink-0">
         <Rss className="w-[18px] h-[18px] text-muted-foreground" />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2.5 flex-wrap">
-          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">Log sources</div>
+          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground"><Term id="log-source">Log sources</Term></div>
           <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground border border-border rounded px-1.5 py-px whitespace-nowrap">
             Feed index
           </span>
-        </div>
-        <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-          Review your sources, check their status, and add a source or another sender.
         </div>
       </div>
       <div className="hidden md:flex items-center gap-4 shrink-0">
@@ -656,7 +657,7 @@ function LogSourceTable({
               Ingest 24h
             </th>
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[140px]">
-              Status
+              <Term id="source-status">Status</Term>
             </th>
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[130px] @max-[640px]/table:w-[60px]">
               Enabled
@@ -786,7 +787,7 @@ function LogSourceRow({
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="top" sideOffset={6} collisionPadding={8} className="text-[11px] max-w-[280px]">
-                    This source type is visibility-scoped — only granted groups can see its events.
+                    Only admins and groups granted this source type can see its events.
                     Manage in Settings → Source Visibility.
                   </TooltipContent>
                 </Tooltip>
@@ -1017,7 +1018,7 @@ function StatusBadge({
   validated: boolean;
   validationError?: string;
 }) {
-  if (notParsed && status !== 'draft') return <Badge variant="warning" className="whitespace-nowrap text-[10.5px] font-medium px-1.5">Receiving · not parsed</Badge>;
+  if (notParsed && status !== 'draft') return <Badge variant="warning" className="whitespace-nowrap text-[10.5px] font-medium px-1.5">Receiving · <Term id="raw-passthrough">not parsed</Term></Badge>;
   // NAN-1920: a wizard draft (onboarded, not yet deployed) is its own first-
   // class state and wins over every other badge — a draft is typically also
   // unvalidated, but we surface the more meaningful "in progress" signal.
@@ -1133,9 +1134,6 @@ function EmptyState({
     <div className="flex flex-col items-center justify-center py-20 px-4 text-center">
       <Rss className="w-10 h-10 text-muted-foreground/50 mb-3" />
       <div className="text-[13px] font-medium text-foreground">No log sources yet</div>
-      <div className="text-[11.5px] text-muted-foreground mt-1 max-w-[420px]">
-        Import a pre-built parser from a repository or build a new feed from sample logs.
-      </div>
       <div className="flex items-center gap-2 mt-4">
         <Button variant="outline" size="sm" className="h-8" onClick={onBrowse}>
           Browse repositories
@@ -1232,7 +1230,7 @@ function DeleteDialog({
           {checking ? (
             <div className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
               <LoadingIcon className="h-3.5 w-3.5" />
-              Checking for associated routing rules…
+              Checking for associated <Term id="routing-rule">routing rules</Term>…
             </div>
           ) : associatedRules.length > 0 ? (
             <div className="rounded-md border border-primary/30 bg-primary/[0.06] p-3">

@@ -251,7 +251,17 @@ impl From<nanosiem_core::SearchError> for SearchError {
                 formatted,
             },
             nanosiem_core::SearchError::SqlGenError(msg) => {
-                tracing::error!(error = %msg, "SQL generation error");
+                let user_facing = nanosiem_core::search::sql_gen_message_is_user_facing(&msg);
+                // NAN-5817: a user's query mistake is not a server error. With
+                // Sentry on, every ERROR is a Sentry event; log guardrails and
+                // nano's other caller-query rejections at WARN and keep ERROR
+                // for internal generation failures. (Either way this is a
+                // 400 QUERY_ERROR, never a 500.)
+                if nanosiem_core::search::sql_gen_message_is_user_error(&msg) {
+                    tracing::warn!(error = %msg, "SQL generation error");
+                } else {
+                    tracing::error!(error = %msg, "SQL generation error");
+                }
                 // InvalidQuery / UnsupportedOperation messages are written FOR
                 // the user — guardrails with usage guidance ("tree requires a
                 // parent field…", "asset … must be the last command", the
@@ -259,9 +269,7 @@ impl From<nanosiem_core::SearchError> for SearchError {
                 // processing failed" hides the very guidance they carry
                 // (NAN-1339). Other SqlGenError variants are internal
                 // generation failures and stay masked.
-                if msg.starts_with("Invalid query:")
-                    || msg.starts_with("Unsupported operation:")
-                {
+                if user_facing {
                     SearchError::QueryError(msg)
                 } else {
                     SearchError::QueryError("Query processing failed".to_string())
@@ -294,6 +302,8 @@ impl From<nanosiem_core::SearchError> for SearchError {
             e @ nanosiem_core::SearchError::ViewTooLarge { .. } => SearchError::ViewTooLarge(e.to_string()),
             e @ nanosiem_core::SearchError::ViewMemoryBusy { .. } => SearchError::ViewMemoryBusy(e.to_string()),
             _ => {
+                // NAN-5817: this arm answers 500, and every 500 logs at ERROR
+                // whatever the error kind (ResponseTooLarge lands here too).
                 tracing::error!(error = %err, "Unhandled search error");
                 SearchError::InternalError("An internal error occurred".to_string())
             }

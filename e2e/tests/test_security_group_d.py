@@ -13,7 +13,8 @@ build (each PASSES). Attackers are low-privilege principals, never the admin.
   6. NAN-5048  the reset token read from the database is redeemable
   7. NAN-5027  a users:edit role demotes an Admin through PUT /users/{id}/groups
   8. NAN-5027  a groups:edit role strips the Admin role from an admins group
-  9. NAN-5027  a local password set before an SSO link still signs in afterwards
+  (9. NAN-5027, a local password set before an SSO link still signing in
+      afterwards, is enterprise-only: tests/enterprise/test_security_group_d_sso.py)
 
 Run: scripts/e2e.sh run security_group_d
 """
@@ -24,17 +25,14 @@ import os
 import secrets
 import subprocess
 import time
-from collections.abc import Iterator
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from nano_e2e.cleanup import CleanupStack
-from nano_e2e.client import Http, Journal, Nano, expect
-from nano_e2e.stack import Stack
+from nano_e2e.client import Http, expect
+from nano_e2e.security_world import World, strong_password as _pw
+from nano_e2e.security_world import world  # noqa: F401 - the fixture
 
 # Probe permissions: each maps to a GET that requires exactly it. A scenario
 # picks one the relevant principal does NOT hold through the Everyone baseline,
@@ -44,97 +42,6 @@ PROBES: dict[str, str] = {
     "groups:view": "/api/groups",
     "users:view": "/api/users",
 }
-
-
-def _pw() -> str:
-    return "Sd-" + secrets.token_hex(10) + "!aA1"
-
-
-@dataclass
-class Principal:
-    id: str
-    email: str
-    password: str
-    group_id: str
-
-
-class World:
-    """Admin session + throwaway principals, all removed afterwards."""
-
-    def __init__(self, stack: Stack, journal: Journal):
-        self.stack = stack
-        self.journal = journal
-        self.cleanup = CleanupStack()
-        jwt = Nano(stack.api_url, stack.search_url, {}, journal).login(stack.admin_email, stack.admin_password)
-        self.admin = Http(stack.api_url, {"Authorization": f"Bearer {jwt}"}, journal)
-        self.anon = Http(stack.api_url, {}, journal)
-        self.admin_id = expect(self.admin.get("/api/auth/me"), 200)["id"]
-
-    def close(self) -> None:
-        try:
-            self.cleanup.close()
-        finally:
-            self.admin.close()
-            self.anon.close()
-
-    def principal(self, label: str, permissions: list[str]) -> Principal:
-        tag = f"e2e-secd-{label}-{secrets.token_hex(3)}"
-        role = expect(
-            self.admin.post("/api/roles", json={"name": tag, "description": "group D", "permissions": permissions}),
-            200,
-            201,
-        )
-        group = expect(
-            self.admin.post("/api/groups", json={"name": tag, "description": "group D", "role_ids": [role["id"]]}),
-            200,
-            201,
-        )
-        password = _pw()
-        user = expect(
-            self.admin.post(
-                "/api/users",
-                json={"email": f"{tag}@e2e.invalid", "name": tag, "password": password, "group_ids": [group["id"]]},
-            ),
-            200,
-            201,
-        )
-        # LIFO: user, then group, then role.
-        self.cleanup.register_http(f"{tag} role", lambda: self.admin.delete(f"/api/roles/{role['id']}"))
-        self.cleanup.register_http(f"{tag} group", lambda: self.admin.delete(f"/api/groups/{group['id']}"))
-        self.cleanup.register_http(f"{tag} user", lambda: self.admin.delete(f"/api/users/{user['id']}"))
-        return Principal(id=user["id"], email=f"{tag}@e2e.invalid", password=password, group_id=group["id"])
-
-    def login(self, p: Principal) -> dict[str, Any]:
-        return expect(self.anon.post("/api/auth/login", json={"email": p.email, "password": p.password}), 200)
-
-    def session(self, p: Principal) -> Http:
-        tok = self.login(p)["tokens"]["access_token"]
-        return Http(self.stack.api_url, {"Authorization": f"Bearer {tok}"}, self.journal)
-
-    def key(self, owner: Http, permissions: list[str], **extra: Any) -> dict[str, Any]:
-        body = {"name": f"e2e-secd-{secrets.token_hex(3)}", "permissions": permissions, **extra}
-        created = expect(owner.post("/api/api-keys", json=body), 200, 201)
-        self.cleanup.register_http("group D key", lambda: self.admin.delete(f"/api/api-keys/{created['id']}"))
-        return created
-
-    def key_client(self, created: dict[str, Any]) -> Http:
-        return Http(self.stack.api_url, {"X-API-Key": created["key"]}, self.journal)
-
-    def perms_of(self, p: Principal) -> set[str]:
-        s = self.session(p)
-        try:
-            return set(expect(s.get("/api/auth/me"), 200).get("permissions", []))
-        finally:
-            s.close()
-
-
-@pytest.fixture
-def world(stack: Stack, artifact_dir: Path) -> Iterator[World]:
-    w = World(stack, Journal(artifact_dir / "api.jsonl"))
-    try:
-        yield w
-    finally:
-        w.close()
 
 
 def _second_admin(world: World) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -159,14 +66,6 @@ def _second_admin(world: World) -> tuple[dict[str, Any], dict[str, Any]]:
     world.cleanup.register_http(f"{tag} group", lambda: world.admin.delete(f"/api/groups/{group['id']}"))
     world.cleanup.register_http(f"{tag} user", lambda: world.admin.delete(f"/api/users/{user['id']}"))
     return user, group
-
-
-def _psql(sql: str) -> str:
-    out = subprocess.run(
-        ["psql", os.environ["DATABASE_URL"], "-XtA", "-v", "ON_ERROR_STOP=1", "-c", sql],
-        capture_output=True, text=True, check=True,
-    )
-    return out.stdout.strip()
 
 
 def _lacking(held: set[str]) -> str:
@@ -364,48 +263,3 @@ def test_groups_edit_cannot_strip_admin_from_an_admins_group(world: World) -> No
         ed.close()
     roles = [r["name"] for r in expect(world.admin.get(f"/api/groups/{admins_group['id']}"), 200)["roles"]]
     assert "Admin" in roles, roles
-
-
-# ---------------------------------------------------------------------------
-# 9. NAN-5027 — local password survives an SSO link
-# ---------------------------------------------------------------------------
-
-
-def test_password_set_before_sso_link_does_not_sign_in_afterwards(world: World) -> None:
-    # A delegated users:create holder creates alice with a password it chose.
-    helpdesk = world.principal("helpdesk-create", ["users:view", "users:create"])
-    hd = world.session(helpdesk)
-    alice_pw = _pw()
-    alice_email = f"e2e-secd-alice-{secrets.token_hex(3)}@e2e.invalid"
-    try:
-        alice = expect(
-            hd.post("/api/users", json={"email": alice_email, "name": "alice", "password": alice_pw, "group_ids": []}),
-            200,
-            201,
-        )
-    finally:
-        hd.close()
-    world.cleanup.register_http("alice", lambda: world.admin.delete(f"/api/users/{alice['id']}"))
-
-    # Alice's account gets linked to the corporate IdP. There is no IdP in the
-    # e2e stack, so apply exactly the row change a pre-fix link made (bind the
-    # provider + subject, keep the hash). Provider is disabled so the login page
-    # is untouched. (The link itself is covered against the real provisioning
-    # code in nanosiem-enterprise/tests/sso_group_admission_integration.rs.)
-    provider = _psql(
-        "INSERT INTO oidc_providers (name, slug, issuer, client_id, client_secret_encrypted, enabled) "
-        f"VALUES ('e2e group D', 'e2e-secd-{secrets.token_hex(3)}', 'https://idp.e2e.invalid', 'client', "
-        "'x'::bytea, FALSE) RETURNING id"
-    ).splitlines()[0]
-    world.cleanup.register("e2e oidc provider", lambda: (
-        _psql(f"UPDATE users SET oidc_provider_id = NULL WHERE oidc_provider_id = '{provider}'"),
-        _psql(f"DELETE FROM oidc_providers WHERE id = '{provider}'"),
-    ) and None)
-    _psql(
-        f"UPDATE users SET oidc_provider_id = '{provider}', oidc_subject = 'alice-subject' "
-        f"WHERE email = '{alice_email}'"
-    )
-
-    # The helpdesk's chosen password must not open the IdP-managed account.
-    r = world.anon.post("/api/auth/login", json={"email": alice_email, "password": alice_pw})
-    assert r.status_code == 401, f"local password still signs in to an SSO-linked account: {r.status_code}"

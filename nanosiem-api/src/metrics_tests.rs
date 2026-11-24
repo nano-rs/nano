@@ -121,7 +121,7 @@ fn every_prometheus_manifest_scrapes_with_the_service_credential() {
     let manifests = [
         "config/prometheus/prometheus.yml",
         "deploy/k8s/prometheus/prometheus.yaml",
-        "deploy/k8s/rackspace/monitoring.yaml",
+        "deploy/k8s/self-managed/monitoring.yaml",
         "ludus/roles/nanosiem_stack/templates/prometheus.yml.j2",
     ];
     let mut checked = 0;

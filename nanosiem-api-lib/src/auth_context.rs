@@ -90,6 +90,7 @@ impl AuthContext {
 
         Self {
             claims: TokenClaims {
+                sid: None,
                 iss: DEFAULT_TOKEN_ISSUER.to_string(),
                 aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
                 sub: subject,
@@ -430,6 +431,7 @@ mod tests {
         ));
         // Interactive (JWT) session → allowed.
         let human = AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: "t".to_string(),
             aud: "t".to_string(),
             sub: user_id,
@@ -515,6 +517,7 @@ mod tests {
 
         let user_id = Uuid::now_v7();
         let claims = TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: user_id,
@@ -538,6 +541,7 @@ mod tests {
         use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
 
         let claims = TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),
@@ -561,6 +565,7 @@ mod tests {
         use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
 
         let claims = TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),
@@ -584,6 +589,7 @@ mod tests {
     fn jwt_auth(perms: Vec<String>) -> AuthContext {
         use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
         AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),

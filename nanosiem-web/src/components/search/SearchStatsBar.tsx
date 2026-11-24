@@ -6,6 +6,7 @@ import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { formatCompactNumber } from '@/lib/date-utils';
 import { useLayoutOptional } from '@/contexts/LayoutContext';
 import type { SearchTimingBreakdown } from '@/lib/search-timing';
+import { Term } from '@/components/ui/term';
 
 interface SearchStatsBarProps {
   isSearching: boolean;
@@ -163,7 +164,9 @@ export function SearchStatsBar({
           )}
           {tailActive && (
             <Stat icon={<Terminal className="w-3 h-3" style={{ color: 'var(--success)' }} />}>
-              <span className="font-mono" style={{ color: 'var(--success)' }}>tail -f</span>
+              <Term id="tail" className="font-mono" data-testid="stats-tail">
+                <span style={{ color: 'var(--success)' }}>tail -f</span>
+              </Term>
               {tailLabel && <span className="text-muted-foreground">&middot; {tailLabel}</span>}
             </Stat>
           )}

@@ -75,6 +75,10 @@ impl SearchService {
         auto_sort_decision: &crate::search::query_processing::AutoSortDecision,
         scope: &crate::auth::ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
+        // NAN-5793 review: every generation below (base, count, rescue probe,
+        // pushdown) is under the caller's deny-set, so `| resolve_identity`
+        // and `[dataset=risk …]` before `| prevalence` stay scoped.
+        let gscope = crate::query::GeneratorScope::viewer(scope);
         // Get rarity threshold from prevalence service config
         let rarity_threshold = if let Some(ref prev_svc) = self.prevalence_service {
             prev_svc.rarity_threshold().await
@@ -93,7 +97,7 @@ impl SearchService {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         if scan.is_wide_newest_scan() {
-            self.admit_prevalence_scan(query, adjusted_time_range, &query_id)
+            self.admit_prevalence_scan(query, adjusted_time_range, &query_id, scope)
                 .await
                 .map_err(SearchError::SqlValidationError)?;
         }
@@ -113,6 +117,7 @@ impl SearchService {
                 post_prevalence_commands,
                 time_range,
                 &query_id,
+                gscope,
             )
             .await;
 
@@ -135,6 +140,7 @@ impl SearchService {
                     rarity_threshold,
                     rescue,
                     Some(window),
+                    gscope,
                 )
             },
         )?;
@@ -159,12 +165,12 @@ impl SearchService {
                 "Prevalence pushdown SQL carries a dict-blind rescue"
             );
         }
-        // Log whether a WHERE clause was generated (detail at debug level)
-        if let Some(where_pos) = sql.to_ascii_uppercase().rfind("\nWHERE ") {
-            let where_clause = &sql[where_pos..sql.len().min(where_pos + 500)];
+        // NAN-5824: the base scan must carry its time-bounded WHERE (single
+        // WHERE, NAN-1412); without it the pushdown scans every partition.
+        if let Some(where_clause) = base_scan_time_where(&sql) {
             tracing::debug!("Generated SQL WHERE clause: {}", where_clause);
         } else {
-            tracing::warn!("No WHERE clause found in generated prevalence SQL!");
+            tracing::warn!("No time-bounded WHERE found in generated prevalence SQL!");
         }
 
         // Execute the query with timing.
@@ -189,10 +195,23 @@ impl SearchService {
         // NAN-5565: generated SQL: the executor lifts `max_query_size` when the
         // rescue needs it and takes the aggregation decision from the
         // rescue-free rendering.
+        // NAN-5751: when the SQL ends in an aggregation and nothing runs after
+        // it in Rust, `limit` (the 1M input ceiling of an aggregation query)
+        // would read up to 1M groups; the caller's page is the groups it reads.
+        let limit = if self.prevalence_aggregation_is_final(
+            post_prevalence_commands,
+            num_commands_pushed,
+            lookup_commands,
+            inputlookup_commands,
+        ) {
+            limit.min(request.limit.unwrap_or(self.config.default_limit).min(self.config.max_limit))
+        } else {
+            limit
+        };
         let data = self.execute_generated_clickhouse_sql(&sql, aggregation, limit, offset, &query_id, grouped_output);
         let (mut results, total_count) = if window_total {
             let (data, base_total) =
-                tokio::join!(data, self.prevalence_base_total(query, time_range, &query_id));
+                tokio::join!(data, self.prevalence_base_total(query, time_range, &query_id, gscope));
             let (results, _window_total) = data?;
             let total_count = match base_total {
                 Ok(total) => total.max(results.len() as u64),
@@ -414,6 +433,7 @@ impl SearchService {
                     crate::query::Dataset::from_selector(
                         request.dataset.as_deref().unwrap_or("logs"),
                     ),
+                    scope.deny_set(),
                 )
                 .await?;
             tracing::info!(
@@ -561,6 +581,36 @@ impl SearchService {
         Ok(time_window.unwrap_or(PrevalenceTimeWindow::ThirtyDays))
     }
 
+    /// NAN-5751: whether the pushdown SQL produces the final rows, so the
+    /// caller's page may bound it: it carries a pushed aggregation, every
+    /// command from there on ran in SQL, and every command before the
+    /// aggregation is one the pushdown inlines (`eval`, or a `where` not on
+    /// `_prevalence.*`). Anything else before it (`dedup`, `head`, `rex`, …)
+    /// is replayed in Rust AFTER the SQL rows arrive, so they must not be cut.
+    fn prevalence_aggregation_is_final(
+        &self,
+        post_prevalence_commands: &[Command],
+        num_commands_pushed: usize,
+        lookup_commands: &[LookupCommandInfo],
+        inputlookup_commands: &[InputLookupCommandInfo],
+    ) -> bool {
+        let is_aggregation = |c: &Command| {
+            matches!(c, Command::Stats { .. } | Command::Top { .. } | Command::Rare { .. } | Command::Timechart { .. })
+        };
+        let Some(agg_idx) = post_prevalence_commands.iter().position(is_aggregation) else {
+            return false;
+        };
+        agg_idx < num_commands_pushed
+            && num_commands_pushed == post_prevalence_commands.len()
+            && lookup_commands.is_empty()
+            && inputlookup_commands.is_empty()
+            && post_prevalence_commands[..agg_idx].iter().all(|c| match c {
+                Command::Eval { .. } => true,
+                Command::Where { condition } => !self.condition_references_prevalence_nested_fields(condition),
+                _ => false,
+            })
+    }
+
     /// Generate the base SQL for the search part (the query with prevalence and
     /// everything after it stripped). Shared by the pushdown build and the
     /// NAN-1705 rescue probe so both scan the identical base.
@@ -581,8 +631,9 @@ impl SearchService {
         &self,
         query: &Query,
         time_range: &TimeRange,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<String, SearchError> {
-        self.generate_prevalence_base_sql_with_limit(query, time_range, None)
+        self.generate_prevalence_base_sql_with_limit(query, time_range, None, gscope)
     }
 
     /// [`Self::generate_prevalence_base_sql`] with the generator's own result
@@ -596,6 +647,7 @@ impl SearchService {
         query: &Query,
         time_range: &TimeRange,
         limit: Option<usize>,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<String, SearchError> {
         let base_query = strip_prevalence_and_after(query);
         let base_options = crate::query::QueryOptions {
@@ -603,7 +655,7 @@ impl SearchService {
             omit_settings: limit.is_some(),
             ..Default::default()
         };
-        self.ch_sql_generator
+        self.sql_generator(gscope)
             .generate_with_options(&base_query, time_range, &base_options)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))
     }
@@ -619,8 +671,9 @@ impl SearchService {
         query: &Query,
         time_range: &TimeRange,
         query_id: &str,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<u64, SearchError> {
-        let count_sql = self.prevalence_base_count_sql(query, time_range)?;
+        let count_sql = self.prevalence_base_count_sql(query, time_range, gscope)?;
         let executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -634,7 +687,7 @@ impl SearchService {
     }
 
     /// The count SQL behind [`Self::prevalence_base_total`].
-    pub(crate) fn prevalence_base_count_sql(&self, query: &Query, time_range: &TimeRange) -> Result<String, SearchError> {
+    pub(crate) fn prevalence_base_count_sql(&self, query: &Query, time_range: &TimeRange, gscope: crate::query::GeneratorScope<'_>) -> Result<String, SearchError> {
         use crate::search::execution::clickhouse_executor::{build_count_query, BoundedCountInput};
         let cap = crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT;
         let base_query = strip_prevalence_and_after(query);
@@ -644,7 +697,7 @@ impl SearchService {
             ..Default::default()
         };
         let sql = self
-            .ch_sql_generator
+            .sql_generator(gscope)
             .generate_with_options(&base_query, time_range, &options)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
         let bounded = crate::search::query_processing::query_has_per_row_filters(&base_query)
@@ -704,6 +757,7 @@ impl SearchService {
         post_prevalence_commands: &[Command],
         time_range: &TimeRange,
         query_id: &str,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> PrevalenceRescue {
         use crate::query::{
             PrevalenceCondition, PrevalenceField, PrevalenceOperator, PrevalenceThreshold,
@@ -785,7 +839,7 @@ impl SearchService {
         let Ok(window_cutoff_sql) = Self::prevalence_window_cutoff_sql(time_window) else {
             return rescue;
         };
-        let Ok(base_sql) = self.generate_prevalence_base_sql(query, time_range) else {
+        let Ok(base_sql) = self.generate_prevalence_base_sql(query, time_range, gscope) else {
             return rescue;
         };
         let base_sql_clean = base_sql.trim().trim_end_matches(';');
@@ -938,6 +992,7 @@ impl SearchService {
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
         window: Option<ResultWindow>,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<(String, usize), SearchError> {
         self.generate_prevalence_pushdown_sql_with_shape(
             query,
@@ -947,6 +1002,7 @@ impl SearchService {
             rarity_threshold,
             rescue,
             window,
+            gscope,
         )
         .map(|(sql, pushed, _)| (sql, pushed))
     }
@@ -969,6 +1025,7 @@ impl SearchService {
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
         window: Option<ResultWindow>,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<(String, usize, bool), SearchError> {
         let render = |rescue: &PrevalenceRescue| {
             self.generate_prevalence_pushdown_sql_unobserved(
@@ -979,6 +1036,7 @@ impl SearchService {
                 rarity_threshold,
                 rescue,
                 window,
+                gscope,
             )
         };
         let (sql, pushed) = render(rescue)?;
@@ -1005,6 +1063,7 @@ impl SearchService {
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
         window: Option<ResultWindow>,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<(String, usize), SearchError> {
         let time_window = Self::resolve_prevalence_window(prevalence_commands)?;
 
@@ -1020,7 +1079,7 @@ impl SearchService {
         // keeps the result correct.
         let windowed_base = match (scan.window_pushed, scan.raw_logs_limit) {
             (true, Some(n)) => {
-                let sql = self.generate_prevalence_base_sql_with_limit(query, time_range, Some(n))?;
+                let sql = self.generate_prevalence_base_sql_with_limit(query, time_range, Some(n), gscope)?;
                 let ends_in_window = sql
                     .trim_end()
                     .ends_with(&format!("ORDER BY timestamp DESC LIMIT {n}"));
@@ -1034,7 +1093,7 @@ impl SearchService {
         let base_windowed = windowed_base.is_some();
         let base_sql = match windowed_base {
             Some(sql) => sql,
-            None => self.generate_prevalence_base_sql(query, time_range)?,
+            None => self.generate_prevalence_base_sql(query, time_range, gscope)?,
         };
 
         // NAN-362: Prior to the dict-based rewrite, this path built CTEs that aggregated the
@@ -1072,6 +1131,7 @@ impl SearchService {
             rarity_threshold,
             rescue,
             &scan,
+            gscope,
         )
     }
 
@@ -1109,6 +1169,7 @@ impl SearchService {
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
         scan: &PrevalenceScanPlan,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<(String, usize), SearchError> {
         tracing::debug!(
             "generate_prevalence_join_sql: {} post-prevalence commands",
@@ -1164,6 +1225,7 @@ impl SearchService {
                             true,
                             &eval_field_names,
                             rarity_threshold,
+                            gscope,
                         )?;
                     eval_expressions.push((field_name.clone(), expr_sql));
                     eval_field_names.insert(field_name);
@@ -1191,6 +1253,7 @@ impl SearchService {
                             condition,
                             &eval_field_names,
                             rarity_threshold,
+                            gscope,
                         )?;
                         tracing::debug!("Adding WHERE condition to SQL: {}", condition_sql);
                         where_conditions.push(condition_sql);
@@ -1571,7 +1634,7 @@ ORDER BY l.timestamp DESC"#,
             // those names here made ClickHouse resolve these outer stages
             // against the inner CTEs (Code 60 UNKNOWN_TABLE).
             let stages = self
-                .ch_sql_generator
+                .sql_generator(gscope)
                 .generate_command_chain_sql(&current_source, &sql_pushable, "pv_stage_", &source_columns)
                 .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
             for (stage_name, cmd_sql) in stages {
@@ -1611,8 +1674,9 @@ ORDER BY l.timestamp DESC"#,
         condition: &crate::query::SearchExpr,
         eval_field_names: &std::collections::HashSet<String>,
         rarity_threshold: u64,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<String, SearchError> {
-        prevalence_condition_sql(&self.ch_sql_generator, condition, eval_field_names, rarity_threshold)
+        prevalence_condition_sql(&self.sql_generator(gscope), condition, eval_field_names, rarity_threshold)
     }
 
     fn eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
@@ -1621,9 +1685,10 @@ ORDER BY l.timestamp DESC"#,
         in_prevalence_context: bool,
         eval_field_names: &std::collections::HashSet<String>,
         rarity_threshold: u64,
+        gscope: crate::query::GeneratorScope<'_>,
     ) -> Result<String, SearchError> {
         prevalence_eval_sql(
-            &self.ch_sql_generator,
+            &self.sql_generator(gscope),
             expr,
             in_prevalence_context,
             eval_field_names,
@@ -2220,3 +2285,146 @@ pub(crate) fn report_partial_rescue(rescue: &PrevalenceRescue) {
         .increment(rescue.dropped as u64);
     crate::search::partial_run::note(prevalence_rescue_partial_message(rescue.dropped));
 }
+
+/// The base scan's time-bounded WHERE clause in generated prevalence SQL, up to
+/// 500 bytes of it for the debug log, or `None` when the SQL has none.
+///
+/// NAN-5824: the pushdown emits that WHERE mid-line inside the `raw_logs` CTE
+/// (`FROM ocsf_logs WHERE timestamp >= …`), so the old newline-prefixed
+/// `"\nWHERE "` lookup never matched and warned on every prevalence search.
+/// This looks only at the base scan (the `raw_logs` CTE, before
+/// `logs_with_keys AS (`), outside string literals, for the `WHERE` keyword
+/// followed by the `timestamp` column itself (not `timestamp_ms`), so a
+/// later filter or a search term cannot stand in for a missing bound.
+fn base_scan_time_where(sql: &str) -> Option<&str> {
+    let scan_end = sql.find("logs_with_keys AS (").unwrap_or(sql.len());
+    let bytes = sql.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    let mut start = None;
+    while i < scan_end {
+        match bytes[i] {
+            // Skip a '…' literal: '' and \' are escaped quotes in ClickHouse.
+            b'\'' => {
+                i += 1;
+                while i < scan_end {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
+                        b'\'' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            b'W' | b'w'
+                if bytes.len() >= i + 5
+                    && bytes[i..i + 5].eq_ignore_ascii_case(b"WHERE")
+                    && i > 0
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && bytes.get(i + 5).is_some_and(u8::is_ascii_whitespace) =>
+            {
+                let rest = sql[i + 5..].trim_start();
+                let column = rest.get(..9).is_some_and(|c| c.eq_ignore_ascii_case("timestamp"));
+                if column && !rest.as_bytes().get(9).copied().is_some_and(is_word) {
+                    start = Some(i);
+                    break;
+                }
+                i += 5;
+            }
+            _ => i += 1,
+        }
+    }
+    let start = start?;
+    let mut end = sql.len().min(start + 500);
+    while !sql.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(&sql[start..end])
+}
+
+#[cfg(test)]
+mod base_scan_where_tests {
+    use super::base_scan_time_where;
+    use crate::auth::ScopeSet;
+    use crate::search::service::npl_golden_corpus_tests::sql_only_service;
+    use crate::search::TimeRangeInput;
+
+    fn range() -> TimeRangeInput {
+        TimeRangeInput::new(
+            chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
+    /// NAN-5824: the e2e searches that logged the false warning all render a
+    /// time-bounded base scan, under both schemas.
+    #[tokio::test]
+    async fn prevalence_pushdown_sql_has_a_time_bounded_where() {
+        for schema in ["ocsf", "udm"] {
+            let svc = sql_only_service(schema);
+            for q in [
+                r#"source_type="deep_proc" "rare-é.exe" | prevalence enrich=true"#,
+                r#"source_type="deep_dns" "c2.badexample.net" | prevalence enrich=true"#,
+                r#"source_type="deep_proc" | prevalence enrich=true | head 50"#,
+                r#"source_type="deep_proc" | prevalence enrich=true window=24h | head 50"#,
+                r#"* | prevalence enrich=true | where host_count < 3"#,
+            ] {
+                let sql = svc
+                    .explain(q, &range(), false, None, &ScopeSet::unrestricted())
+                    .await
+                    .unwrap_or_else(|e| panic!("{schema} {q}: {e}"));
+                assert!(sql.contains("prevalence_dict"), "{schema} {q}: not a pushdown:\n{sql}");
+                assert!(!sql.to_ascii_uppercase().contains("PREWHERE"), "{schema} {q}: {sql}");
+                let clause = base_scan_time_where(&sql)
+                    .unwrap_or_else(|| panic!("{schema} {q}: no time-bounded WHERE:\n{sql}"));
+                assert!(clause.contains("timestamp <"), "{schema} {q}: {clause}");
+            }
+        }
+    }
+
+    #[test]
+    fn detects_only_a_time_bounded_where_keyword() {
+        assert!(base_scan_time_where("SELECT * FROM logs WHERE timestamp >= 1").is_some());
+        assert!(base_scan_time_where("SELECT *\nFROM logs\nWHERE timestamp >= 1").is_some());
+        assert!(base_scan_time_where("SELECT * FROM logs").is_none());
+        assert!(base_scan_time_where("SELECT * FROM logs WHERE user = 'x'").is_none());
+        assert!(base_scan_time_where("SELECT nowhere_timestamp FROM logs").is_none());
+        // The 500-byte debug excerpt never splits a multibyte character: the
+        // 31-byte ASCII prefix before the 2-byte 'é's puts byte 500 inside
+        // one, so the excerpt must back off to 499 (the old slice panicked).
+        let sql = format!("SELECT 1 FROM logs WHERE timestamp >= 1 AND mm = '{}'", "é".repeat(400));
+        let clause = base_scan_time_where(&sql).unwrap();
+        assert_eq!("WHERE timestamp >= 1 AND mm = '".len(), 31);
+        assert_eq!(clause.len(), 499);
+        assert!(clause.starts_with("WHERE timestamp"));
+    }
+
+    /// Review cases: a column that only starts with `timestamp`, a search term
+    /// quoting the shape, or a WHERE after the base scan is not the bound.
+    #[test]
+    fn only_the_base_scan_time_bound_counts() {
+        assert!(base_scan_time_where("SELECT * FROM logs WHERE timestamp_ms >= 1").is_none());
+        assert!(base_scan_time_where("SELECT * FROM logs WHERE timestamped = 1").is_none());
+        assert!(base_scan_time_where(
+            "SELECT * FROM logs WHERE lower(message) = 'x WHERE timestamp >= 1'"
+        )
+        .is_none());
+        assert!(base_scan_time_where("SELECT * FROM logs WHERE m = 'it''s WHERE timestamp >= 1'").is_none());
+        assert!(base_scan_time_where("SELECT * FROM logs WHERE m = 'a\\' WHERE timestamp >= 1'").is_none());
+        let pushdown = |raw: &str| {
+            format!("WITH raw_logs AS (\n    SELECT * FROM ocsf_logs {raw}\n),\nlogs_with_keys AS (\n    SELECT * FROM raw_logs WHERE timestamp >= 1\n)\nSELECT * FROM logs_with_keys")
+        };
+        assert!(base_scan_time_where(&pushdown("WHERE user = 'a'")).is_none());
+        assert!(base_scan_time_where(&pushdown("WHERE timestamp >= 1 AND timestamp < 2")).is_some());
+        assert!(base_scan_time_where("SELECT * FROM logs WHERE timestamp>=1").is_some());
+        assert!(base_scan_time_where("SELECT * FROM logs\n  where TIMESTAMP between 1 and 2").is_some());
+        // A multibyte character right after a 'W' is not sliced into.
+        assert!(base_scan_time_where("SELECT 'é' AS Wé FROM logs WHERE timestamp >= 1").is_some());
+    }
+}
+

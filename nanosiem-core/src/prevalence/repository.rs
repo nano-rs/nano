@@ -376,7 +376,7 @@ impl PrevalenceRepository {
             "SELECT count() AS n FROM (SELECT 1 FROM {table} \
              WHERE time_bucket <= toDateTime('{before}', 'UTC') AND {source_filter} LIMIT 1)"
         );
-        match self.client.query(&query).fetch_one::<u64>().await {
+        match self.scoped_query(&query, scope.deny_bind_values()).fetch_one::<u64>().await {
             Ok(n) => Some(n > 0),
             Err(error) => {
                 debug!(%error, ?kind, "prevalence coverage: scoped probe failed");
@@ -420,21 +420,134 @@ impl PrevalenceRepository {
             return None;
         }
         let profile = crate::schema::active_log_telemetry_profile();
-        let denied = scope
-            .deny_bind_values()
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        let deny =
-            crate::search::service::source_scope_sql_predicate("trimBoth(source_type)", &denied)
-                .expect("restricted ArtifactScope always carries a deny value");
+        // NAN-5722 review: the deny list is a server-side `Array(String)`
+        // parameter ([`Self::scoped_query`] binds it), never SQL text.
+        let deny = crate::search::service::source_scope_param_predicate("trimBoth(source_type)");
         Some(format!(
             "schema_profile = '{profile}' \
              AND lower(trimBoth(source_type)) NOT IN ('', 'unknown') AND {deny}"
         ))
     }
 
-    /// Query hash prevalence for a single hash
+    /// A query whose SQL may reference the source-scope deny parameter
+    /// ([`crate::search::service::SOURCE_SCOPE_DENY_PARAM`]): binds `deny` as
+    /// that `Array(String)` parameter when it is non-empty. Empty (an
+    /// unrestricted caller) adds nothing, and the SQL then never references it.
+    pub(crate) fn scoped_query(&self, sql: &str, deny: &[String]) -> clickhouse::query::Query {
+        let query = self.client.query(sql);
+        if deny.is_empty() {
+            query
+        } else {
+            query.param(crate::search::service::SOURCE_SCOPE_DENY_PARAM, deny)
+        }
+    }
+
+    /// Recency cutoff (epoch microseconds) for a lookup window: an artifact is
+    /// returned only when its baseline `last_seen` falls inside the window.
+    ///
+    /// NAN-5722: the same rule as the dict mask (`prevalence_window_cutoff_sql`
+    /// in search, `get_bulk_prevalence_via_dict_chunk` here): 30d is no
+    /// recency gate at all (the summary is already bounded by its 30-day TTL),
+    /// shorter windows gate on `now - window`.
+    pub(crate) fn lookup_recency_cutoff_micros(time_window: TimeWindow) -> i64 {
+        match time_window {
+            TimeWindow::ThirtyDays => 0,
+            _ => Self::get_cutoff_time(time_window).timestamp_micros(),
+        }
+    }
+
+    /// Point-lookup SQL for the Prevalence API (single + bulk lookups).
+    ///
+    /// NAN-5722: the host count is the 30-day prevalence BASELINE, the same
+    /// number `| prevalence enrich=true`, the prevalence filters, the
+    /// dictionaries and the rare/new explorer report: `uniqMerge` over the
+    /// per-entity `*_prevalence_summary` (the dictionaries' own source, see
+    /// clickhouse/110 and 202). The window only gates recency: an artifact whose
+    /// baseline `last_seen` is older than the window is not returned. Before,
+    /// these lookups merged only the hourly `*_prevalence_agg` buckets inside
+    /// the window, so a common binary read 13 hosts here and 14 in the search
+    /// decoration at 24h.
+    ///
+    /// Unlike the dictionaries, common artifacts (>= 1000 hosts) keep their
+    /// real count and private IPs are included: this is the direct lookup.
+    ///
+    /// Restricted viewers read the source-attributed summaries with the
+    /// NAN-2053 source filter applied before the merge. Bounded: the GROUP BY
+    /// only aggregates the bound `IN ?` keys. Binds, in order: the key list
+    /// (`Vec<String>`, already normalized to the stored form), the recency
+    /// cutoff in epoch microseconds; plus the deny-list parameter when
+    /// restricted ([`Self::scoped_query`]).
+    pub(crate) fn point_lookup_sql(&self, kind: DictArtifactKind, scope: &ArtifactScope) -> String {
+        let restricted = !scope.is_unrestricted();
+        let pick = |legacy: &str, attributed: &str| {
+            if restricted { attributed.to_string() } else { legacy.to_string() }
+        };
+        let source_filter = Self::attributed_source_filter(scope)
+            .map(|filter| format!("{filter} AND "))
+            .unwrap_or_default();
+        let (table, key_col, select_cols, group_cols) = match kind {
+            DictArtifactKind::Hash => (
+                pick(&self.hash_prevalence_summary, &self.hash_prevalence_source_summary),
+                "file_hash",
+                "file_hash, hash_type, uniqMerge(host_count) AS host_count",
+                "file_hash, hash_type",
+            ),
+            DictArtifactKind::Domain => (
+                pick(&self.domain_prevalence_summary, &self.domain_prevalence_source_summary),
+                "domain",
+                "domain, max(is_subdomain) AS is_subdomain, \
+                 uniqMerge(source_host_count) AS source_host_count",
+                "domain",
+            ),
+            DictArtifactKind::Ip => (
+                pick(&self.ip_prevalence_summary, &self.ip_prevalence_source_summary),
+                "ip",
+                "ip, 'dest' AS direction, max(is_private) AS is_private, \
+                 uniqMerge(source_host_count) AS source_host_count",
+                "ip",
+            ),
+        };
+        let outer_cols = match kind {
+            DictArtifactKind::Hash => "file_hash, hash_type, host_count",
+            DictArtifactKind::Domain => "domain, is_subdomain, source_host_count",
+            DictArtifactKind::Ip => "ip, direction, is_private, source_host_count",
+        };
+        // `_fs` / `_ls` keep the aggregates away from the outer
+        // `first_seen` / `last_seen` aliases (an alias would shadow the column
+        // in the outer WHERE).
+        format!(
+            "SELECT {outer_cols}, reinterpretAsInt64(_fs) AS first_seen, \
+             reinterpretAsInt64(_ls) AS last_seen, total_count \
+             FROM (SELECT {select_cols}, min(first_seen) AS _fs, max(last_seen) AS _ls, \
+             toUInt64(sum(total_count)) AS total_count \
+             FROM {table} WHERE {source_filter}{key_col} IN ? GROUP BY {group_cols}) \
+             WHERE _ls >= fromUnixTimestamp64Micro(toInt64(?))"
+        )
+    }
+
+    async fn point_lookup<R>(
+        &self,
+        kind: DictArtifactKind,
+        keys: Vec<String>,
+        time_window: TimeWindow,
+        scope: &ArtifactScope,
+    ) -> Result<Vec<R>, clickhouse::error::Error>
+    where
+        R: clickhouse::RowOwned + clickhouse::RowRead,
+    {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = self.point_lookup_sql(kind, scope);
+        debug!("Executing {:?} prevalence lookup for {} artifacts", kind, keys.len());
+        self.scoped_query(&sql, scope.deny_bind_values())
+            .bind(keys)
+            .bind(Self::lookup_recency_cutoff_micros(time_window))
+            .fetch_all()
+            .await
+    }
+
+    /// Query hash prevalence for a single hash (see [`Self::point_lookup_sql`]).
     #[instrument(skip(self, scope))]
     pub async fn get_hash_prevalence(
         &self,
@@ -442,53 +555,14 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
         scope: &ArtifactScope,
     ) -> Result<Option<HashPrevalenceRow>, clickhouse::error::Error> {
-        let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
-
-        // MV already stores file_hash as lower() — no need to lower() in query
-        let hash_lower = escape_sql_string(hash.to_lowercase());
-
-        let (table, source_filter) = match Self::attributed_source_filter(scope) {
-            Some(filter) => (self.hash_prevalence_source_agg.as_str(), filter),
-            None => (self.hash_prevalence_table.as_str(), "1 = 1".to_string()),
-        };
-        let query = format!(
-            r#"
-            SELECT
-                file_hash,
-                hash_type,
-                host_count,
-                reinterpretAsInt64(first_seen) AS first_seen,
-                reinterpretAsInt64(last_seen) AS last_seen,
-                total_count
-            FROM (
-                SELECT
-                    file_hash,
-                    hash_type,
-                    uniqMerge(host_count) AS host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
-                FROM {hash_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
-                WHERE {source_filter} AND file_hash = '{hash_lower}'
-                GROUP BY file_hash, hash_type
-            )
-            "#,
-            hash_prevalence_table = table,
-            source_filter = source_filter,
-            hash_lower = hash_lower,
-            cutoff_str = cutoff_str
-        );
-
-        debug!("Executing hash prevalence query for hash: {}", hash);
-
-        let rows: Vec<HashPrevalenceRow> = self.client.query(&query).fetch_all().await?;
-
-        Ok(rows.into_iter().next())
+        Ok(self
+            .get_bulk_hash_prevalence(&[hash.to_string()], time_window, scope)
+            .await?
+            .into_iter()
+            .next())
     }
 
-    /// Query domain prevalence for a single domain
+    /// Query domain prevalence for a single domain (see [`Self::point_lookup_sql`]).
     #[instrument(skip(self, scope))]
     pub async fn get_domain_prevalence(
         &self,
@@ -496,52 +570,15 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
         scope: &ArtifactScope,
     ) -> Result<Option<DomainPrevalenceRow>, clickhouse::error::Error> {
-        let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
-
-        let (table, source_filter) = match Self::attributed_source_filter(scope) {
-            Some(filter) => (self.domain_prevalence_source_agg.as_str(), filter),
-            None => (self.domain_prevalence_table.as_str(), "1 = 1".to_string()),
-        };
-        let query = format!(
-            r#"
-            SELECT
-                domain,
-                is_subdomain,
-                source_host_count,
-                reinterpretAsInt64(first_seen) AS first_seen,
-                reinterpretAsInt64(last_seen) AS last_seen,
-                total_count
-            FROM (
-                SELECT
-                    domain,
-                    max(is_subdomain) AS is_subdomain,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
-                FROM {domain_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
-                WHERE {source_filter} AND domain = '{domain}'
-                GROUP BY domain
-            )
-            "#,
-            domain_prevalence_table = table,
-            source_filter = source_filter,
-            // Storage is MV-lowercased (`lower(dest_host) AS domain`); compare the
-            // input lowercased so `Accounts.Google.com` matches (audit P9).
-            domain = escape_sql_string(domain.to_lowercase()),
-            cutoff_str = cutoff_str
-        );
-
-        debug!("Executing domain prevalence query for domain: {}", domain);
-
-        let rows: Vec<DomainPrevalenceRow> = self.client.query(&query).fetch_all().await?;
-
-        Ok(rows.into_iter().next())
+        Ok(self
+            .get_bulk_domain_prevalence(&[domain.to_string()], time_window, scope)
+            .await?
+            .into_iter()
+            .next())
     }
 
-    /// Query hash prevalence for multiple hashes in a single query
+    /// Query hash prevalence for multiple hashes in a single query.
+    /// Storage is MV-lowercased, so the inputs are lowercased.
     #[instrument(skip(self, hashes, scope))]
     pub async fn get_bulk_hash_prevalence(
         &self,
@@ -549,62 +586,14 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
         scope: &ArtifactScope,
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
-        if hashes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
-
-        // Build the IN clause with escaped values (lowercase for case-insensitive matching)
-        let hash_list: String = hashes
-            .iter()
-            .map(|h| format!("'{}'", escape_sql_string(h.to_lowercase())))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let (table, source_filter) = match Self::attributed_source_filter(scope) {
-            Some(filter) => (self.hash_prevalence_source_agg.as_str(), filter),
-            None => (self.hash_prevalence_table.as_str(), "1 = 1".to_string()),
-        };
-        let query = format!(
-            r#"
-            SELECT
-                file_hash,
-                hash_type,
-                host_count,
-                reinterpretAsInt64(first_seen) AS first_seen,
-                reinterpretAsInt64(last_seen) AS last_seen,
-                total_count
-            FROM (
-                SELECT
-                    file_hash,
-                    hash_type,
-                    uniqMerge(host_count) AS host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
-                FROM {hash_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
-                WHERE {source_filter} AND file_hash IN ({hash_list})
-                GROUP BY file_hash, hash_type
-            )
-            "#,
-            hash_prevalence_table = table,
-            source_filter = source_filter,
-            hash_list = hash_list,
-            cutoff_str = cutoff_str
-        );
-
-        debug!(
-            "Executing bulk hash prevalence query for {} hashes",
-            hashes.len()
-        );
-
-        self.client.query(&query).fetch_all().await
+        let keys = hashes.iter().map(|h| h.to_lowercase()).collect();
+        self.point_lookup(DictArtifactKind::Hash, keys, time_window, scope)
+            .await
     }
 
-    /// Query domain prevalence for multiple domains in a single query
+    /// Query domain prevalence for multiple domains in a single query.
+    /// Storage is MV-lowercased (`lower(dest_host) AS domain`), so the inputs
+    /// are lowercased and `Accounts.Google.com` matches (audit P9).
     #[instrument(skip(self, domains, scope))]
     pub async fn get_bulk_domain_prevalence(
         &self,
@@ -612,64 +601,12 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
         scope: &ArtifactScope,
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
-        if domains.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
-
-        // Build the IN clause with escaped values. Storage is MV-lowercased
-        // (`lower(dest_host) AS domain`); lowercase the input so mixed-case
-        // domains like `Accounts.Google.com` match (audit P9).
-        let domain_list: String = domains
-            .iter()
-            .map(|d| format!("'{}'", escape_sql_string(d.to_lowercase())))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let (table, source_filter) = match Self::attributed_source_filter(scope) {
-            Some(filter) => (self.domain_prevalence_source_agg.as_str(), filter),
-            None => (self.domain_prevalence_table.as_str(), "1 = 1".to_string()),
-        };
-        let query = format!(
-            r#"
-            SELECT
-                domain,
-                is_subdomain,
-                source_host_count,
-                reinterpretAsInt64(first_seen) AS first_seen,
-                reinterpretAsInt64(last_seen) AS last_seen,
-                total_count
-            FROM (
-                SELECT
-                    domain,
-                    max(is_subdomain) AS is_subdomain,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
-                FROM {domain_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
-                WHERE {source_filter} AND domain IN ({domain_list})
-                GROUP BY domain
-            )
-            "#,
-            domain_prevalence_table = table,
-            source_filter = source_filter,
-            domain_list = domain_list,
-            cutoff_str = cutoff_str
-        );
-
-        debug!(
-            "Executing bulk domain prevalence query for {} domains",
-            domains.len()
-        );
-
-        self.client.query(&query).fetch_all().await
+        let keys = domains.iter().map(|d| d.to_lowercase()).collect();
+        self.point_lookup(DictArtifactKind::Domain, keys, time_window, scope)
+            .await
     }
 
-    /// Query IP prevalence for a single IP address
+    /// Query IP prevalence for a single IP address (see [`Self::point_lookup_sql`]).
     #[instrument(skip(self, scope))]
     pub async fn get_ip_prevalence(
         &self,
@@ -677,52 +614,15 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
         scope: &ArtifactScope,
     ) -> Result<Option<IpPrevalenceRow>, clickhouse::error::Error> {
-        let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
-
-        let (table, source_filter) = match Self::attributed_source_filter(scope) {
-            Some(filter) => (self.ip_prevalence_source_agg.as_str(), filter),
-            None => (self.ip_prevalence_table.as_str(), "1 = 1".to_string()),
-        };
-        let query = format!(
-            r#"
-            SELECT
-                ip,
-                direction,
-                is_private,
-                source_host_count,
-                reinterpretAsInt64(first_seen) AS first_seen,
-                reinterpretAsInt64(last_seen) AS last_seen,
-                total_count
-            FROM (
-                SELECT
-                    ip,
-                    'dest' AS direction,
-                    max(is_private) AS is_private,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
-                FROM {ip_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
-                WHERE {source_filter} AND ip = '{ip}'
-                GROUP BY ip
-            )
-            "#,
-            ip_prevalence_table = table,
-            source_filter = source_filter,
-            ip = escape_sql_string(ip),
-            cutoff_str = cutoff_str
-        );
-
-        debug!("Executing IP prevalence query for IP: {}", ip);
-
-        let rows: Vec<IpPrevalenceRow> = self.client.query(&query).fetch_all().await?;
-
-        Ok(rows.into_iter().next())
+        Ok(self
+            .get_bulk_ip_prevalence(&[ip.to_string()], time_window, scope)
+            .await?
+            .into_iter()
+            .next())
     }
 
-    /// Query IP prevalence for multiple IPs in a single query
+    /// Query IP prevalence for multiple IPs in a single query (raw values:
+    /// IPs are stored as ingested).
     #[instrument(skip(self, ips, scope))]
     pub async fn get_bulk_ip_prevalence(
         &self,
@@ -730,58 +630,8 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
         scope: &ArtifactScope,
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
-        if ips.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
-
-        // Build the IN clause with escaped values
-        let ip_list: String = ips
-            .iter()
-            .map(|ip| format!("'{}'", escape_sql_string(ip)))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let (table, source_filter) = match Self::attributed_source_filter(scope) {
-            Some(filter) => (self.ip_prevalence_source_agg.as_str(), filter),
-            None => (self.ip_prevalence_table.as_str(), "1 = 1".to_string()),
-        };
-        let query = format!(
-            r#"
-            SELECT
-                ip,
-                direction,
-                is_private,
-                source_host_count,
-                reinterpretAsInt64(first_seen) AS first_seen,
-                reinterpretAsInt64(last_seen) AS last_seen,
-                total_count
-            FROM (
-                SELECT
-                    ip,
-                    'dest' AS direction,
-                    max(is_private) AS is_private,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
-                FROM {ip_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
-                WHERE {source_filter} AND ip IN ({ip_list})
-                GROUP BY ip
-            )
-            "#,
-            ip_prevalence_table = table,
-            source_filter = source_filter,
-            ip_list = ip_list,
-            cutoff_str = cutoff_str
-        );
-
-        debug!("Executing bulk IP prevalence query for {} IPs", ips.len());
-
-        self.client.query(&query).fetch_all().await
+        self.point_lookup(DictArtifactKind::Ip, ips.to_vec(), time_window, scope)
+            .await
     }
 
     /// Query prevalence for multiple artifacts of a single kind via the
@@ -1049,7 +899,7 @@ impl PrevalenceRepository {
             kind
         );
 
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get rare artifacts (below threshold) that were active within the window.
@@ -1134,7 +984,7 @@ impl PrevalenceRepository {
                 limit = limit,
                 settings = SOURCE_SUMMARY_SETTINGS,
             );
-            return self.client.query(&query).fetch_all().await;
+            return self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await;
         }
         let cutoff_micros = cutoff.timestamp_micros();
         let recency = Self::recency_at_least("last_seen", cutoff_micros);
@@ -1176,7 +1026,7 @@ impl PrevalenceRepository {
 
         debug!("Executing rare hashes query with threshold {}", threshold);
 
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get rare domains (below threshold) active within the window.
@@ -1227,7 +1077,7 @@ impl PrevalenceRepository {
                 settings = SOURCE_SUMMARY_SETTINGS,
                 internal = self.internal_domain_filter,
             );
-            return self.client.query(&query).fetch_all().await;
+            return self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await;
         }
         let cutoff_micros = cutoff.timestamp_micros();
         let recency = Self::recency_at_least("last_seen", cutoff_micros);
@@ -1270,7 +1120,7 @@ impl PrevalenceRepository {
 
         debug!("Executing rare domains query with threshold {}", threshold);
 
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get genuinely new hashes — those whose GLOBAL first_seen falls inside
@@ -1320,7 +1170,7 @@ impl PrevalenceRepository {
                 limit = limit,
                 settings = SOURCE_SUMMARY_SETTINGS,
             );
-            return self.client.query(&query).fetch_all().await;
+            return self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await;
         }
         // The recency predicate compares the raw `first_seen` column so the
         // idx_first_seen minmax index (migration 163) can prune; `since_micros`
@@ -1363,7 +1213,7 @@ impl PrevalenceRepository {
 
         debug!("Executing new hashes query since {}", since);
 
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get genuinely new domains — global first_seen inside the window.
@@ -1408,7 +1258,7 @@ impl PrevalenceRepository {
                 settings = SOURCE_SUMMARY_SETTINGS,
                 internal = self.internal_domain_filter,
             );
-            return self.client.query(&query).fetch_all().await;
+            return self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await;
         }
         // Raw `first_seen` predicate (idx_first_seen-eligible) — see get_new_hashes.
         let since_micros = since.timestamp_micros();
@@ -1450,7 +1300,7 @@ impl PrevalenceRepository {
 
         debug!("Executing new domains query since {}", since);
 
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get rare IPs (below threshold) active within the window.
@@ -1500,7 +1350,7 @@ impl PrevalenceRepository {
                 limit = limit,
                 settings = SOURCE_SUMMARY_SETTINGS,
             );
-            return self.client.query(&query).fetch_all().await;
+            return self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await;
         }
         let cutoff_micros = cutoff.timestamp_micros();
         let recency = Self::recency_at_least("last_seen", cutoff_micros);
@@ -1544,7 +1394,7 @@ impl PrevalenceRepository {
 
         debug!("Executing rare IPs query with threshold {}", threshold);
 
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get genuinely new IPs — global first_seen inside the window.
@@ -1586,7 +1436,7 @@ impl PrevalenceRepository {
                 limit = limit,
                 settings = SOURCE_SUMMARY_SETTINGS,
             );
-            return self.client.query(&query).fetch_all().await;
+            return self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await;
         }
         // Raw `first_seen` predicate (idx_first_seen-eligible) — see get_new_hashes.
         let since_micros = since.timestamp_micros();
@@ -1629,7 +1479,7 @@ impl PrevalenceRepository {
 
         debug!("Executing new IPs query since {}", since);
 
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Convert a hash prevalence row to PrevalenceData
@@ -1759,7 +1609,7 @@ impl PrevalenceRepository {
             "Executing hash daily counts query for {} hashes",
             hashes.len()
         );
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get daily breakdown for a set of domains
@@ -1811,7 +1661,7 @@ impl PrevalenceRepository {
             "Executing domain daily counts query for {} domains",
             domains.len()
         );
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Get daily breakdown for a set of IPs
@@ -1858,7 +1708,7 @@ impl PrevalenceRepository {
         );
 
         debug!("Executing IP daily counts query for {} IPs", ips.len());
-        self.client.query(&query).fetch_all().await
+        self.scoped_query(&query, scope.deny_bind_values()).fetch_all().await
     }
 
     /// Empty artifact-detail response — returned when the active schema has no
@@ -1935,12 +1785,14 @@ impl PrevalenceRepository {
         // deny set via `effective_source_deny_set()` (per-source RBAC ∪ audit
         // unless `audit:view`), so audit rows are covered too. Empty deny set
         // appends nothing — byte-identical SQL for unrestricted callers.
-        let where_clause = match crate::search::service::source_scope_sql_predicate(
-            "source_type",
-            scope.deny_set(),
-        ) {
-            Some(pred) => format!("{where_clause} AND ({pred})"),
-            None => where_clause,
+        let deny = crate::search::service::source_scope_param_values(scope.deny_set())
+            .unwrap_or_default();
+        let deny = deny.as_slice();
+        let where_clause = if deny.is_empty() {
+            where_clause
+        } else {
+            let pred = crate::search::service::source_scope_param_predicate("source_type");
+            format!("{where_clause} AND ({pred})")
         };
 
         let time_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
@@ -1964,7 +1816,7 @@ impl PrevalenceRepository {
                      GROUP BY {sh} ORDER BY cnt DESC LIMIT 10",
                     logs_table, time_filter, where_clause, sh = src_host
                 );
-                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                self.scoped_query(&q, deny).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
                         .map(|r| ArtifactHostEntry {
                             host: r.host,
@@ -1990,7 +1842,7 @@ impl PrevalenceRepository {
                      GROUP BY {u} ORDER BY cnt DESC LIMIT 10",
                     logs_table, time_filter, where_clause, u = user
                 );
-                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                self.scoped_query(&q, deny).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
                         .map(|r| ArtifactUserEntry {
                             user: r.user,
@@ -2012,7 +1864,7 @@ impl PrevalenceRepository {
                      GROUP BY source_type ORDER BY cnt DESC LIMIT 10",
                     logs_table, time_filter, where_clause
                 );
-                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                self.scoped_query(&q, deny).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
                         .map(|r| ArtifactSourceEntry {
                             source_type: r.source_type,
@@ -2046,7 +1898,7 @@ impl PrevalenceRepository {
                      GROUP BY {pn}, {cl} ORDER BY cnt DESC LIMIT 5",
                     logs_table, time_filter, where_clause, pn = process_name, cl = command_line
                 );
-                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                self.scoped_query(&q, deny).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
                         .map(|r| {
                             let is_wrapper = is_wrapper_process(&r.process_name);
@@ -2083,7 +1935,7 @@ impl PrevalenceRepository {
                      GROUP BY {fn_} ORDER BY cnt DESC LIMIT 5",
                     logs_table, time_filter, where_clause, fn_ = file_name
                 );
-                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                self.scoped_query(&q, deny).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
                         .map(|r| ArtifactFileNameEntry {
                             file_name: r.file_name,
@@ -2118,7 +1970,7 @@ impl PrevalenceRepository {
                      GROUP BY {dp}, {proto} ORDER BY cnt DESC LIMIT 10",
                     logs_table, time_filter, where_clause, dp = dest_port, proto = protocol
                 );
-                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                self.scoped_query(&q, deny).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
                         .map(|r| ArtifactNetworkEntry {
                             dest_port: r.dest_port,
@@ -2157,7 +2009,7 @@ impl PrevalenceRepository {
                      GROUP BY country, asn ORDER BY cnt DESC LIMIT 5",
                     logs_table, time_filter, where_clause, cc = country_col, asn = asn_col
                 );
-                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                self.scoped_query(&q, deny).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
                         .map(|r| ArtifactGeoEntry {
                             country: r.country,
@@ -2282,12 +2134,14 @@ impl PrevalenceRepository {
         // that would otherwise leak denied-source names, and the counts would
         // include denied-source rows. Empty deny set appends nothing —
         // byte-identical SQL for unrestricted callers.
-        let time_filter = match crate::search::service::source_scope_sql_predicate(
-            "source_type",
-            scope.deny_set(),
-        ) {
-            Some(pred) => format!("{time_filter} AND ({pred})"),
-            None => time_filter,
+        let deny = crate::search::service::source_scope_param_values(scope.deny_set())
+            .unwrap_or_default();
+        let deny = deny.as_slice();
+        let time_filter = if deny.is_empty() {
+            time_filter
+        } else {
+            let pred = crate::search::service::source_scope_param_predicate("source_type");
+            format!("{time_filter} AND ({pred})")
         };
 
         // --- Hashes: top file_name, top process_name+command_line, user_count, top source_type ---
@@ -2325,7 +2179,7 @@ impl PrevalenceRepository {
                 fn_ = file_name,
                 u = user,
             );
-            if let Ok(rows) = self.client.query(&q_files).fetch_all::<FRow>().await {
+            if let Ok(rows) = self.scoped_query(&q_files, deny).fetch_all::<FRow>().await {
                 for r in rows {
                     let entry = out.entry(r.hash.clone()).or_default();
                     if !r.top_file_name.is_empty() {
@@ -2364,7 +2218,7 @@ impl PrevalenceRepository {
                     pn = process_name,
                     cl = command_line,
                 );
-                if let Ok(rows) = self.client.query(&q_procs).fetch_all::<PRow>().await {
+                if let Ok(rows) = self.scoped_query(&q_procs, deny).fetch_all::<PRow>().await {
                     for r in rows {
                         let is_wrapper = is_wrapper_process(&r.top_process_name);
                         let entry = out.entry(r.hash.clone()).or_default();
@@ -2410,7 +2264,7 @@ impl PrevalenceRepository {
                 logs = logs_table,
                 u = user,
             );
-            if let Ok(rows) = self.client.query(&q).fetch_all::<KRow>().await {
+            if let Ok(rows) = self.scoped_query(&q, deny).fetch_all::<KRow>().await {
                 for r in rows {
                     let entry = out.entry(r.artifact.clone()).or_default();
                     entry.user_count = Some(r.user_count);
@@ -2461,6 +2315,10 @@ impl PrevalenceRepository {
 #[cfg(test)]
 #[path = "repository_internal_domains_tests.rs"]
 mod internal_domains_tests;
+
+#[cfg(test)]
+#[path = "repository_point_lookup_tests.rs"]
+mod point_lookup_tests;
 
 #[cfg(test)]
 mod tests {

@@ -52,6 +52,21 @@ pub trait AuditExt {
         std::future::ready(())
     }
 
+    /// NAN-5785: [`Self::emit_audit_durable`] for MANY events (a bulk
+    /// delete's audit rows): the security-critical ones are recorded in ONE
+    /// batched outbox insert under one bounded timeout, so a batch costs a
+    /// fixed budget however many events it holds, and an outbox stall cannot
+    /// hold the caller (or graceful shutdown) for N timeouts. The name ends in
+    /// `_audited(` so the durability source guard counts it as durable.
+    ///
+    /// The default implementation (test states) is the fire-and-forget path.
+    fn emit_batch_audited(&self, events: Vec<AuditEvent>) -> impl std::future::Future<Output = ()> + Send {
+        for event in events {
+            self.emit_audit(event);
+        }
+        std::future::ready(())
+    }
+
     /// Hand an event that the caller ALREADY recorded in the PostgreSQL outbox
     /// inside its own transaction (`SecurityAuditOutbox::enqueue_tx`) to the
     /// ClickHouse delivery path, detached. The default (test states) falls back

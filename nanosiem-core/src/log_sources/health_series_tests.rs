@@ -158,7 +158,8 @@ fn sql_escapes_keys_and_applies_scope() {
     let denied = ScopeSet::from_denied(BTreeSet::from(["secret".to_string()]));
     let sql = hourly_sql("t", "ocsf", 24, &denied, &["pan".into()]);
     assert!(sql.contains("scope_source_type_complete = 1"), "{sql}");
-    assert!(sql.contains("secret"), "{sql}");
+    // NAN-5793: the denied name is a bound parameter, not SQL text.
+    assert!(!sql.contains("secret") && sql.contains("{nano_source_deny:Array(String)}"), "{sql}");
 }
 
 #[test]

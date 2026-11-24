@@ -879,6 +879,7 @@ fn build_data_sources(
                 readiness: evidence.readiness,
                 last_seen_at: evidence.last_seen_at,
                 connected: evidence.readiness == DataSourceReadiness::Active,
+                source_types: telemetry.visible_source_types(mapped),
             }
         })
         .collect()
@@ -1244,6 +1245,79 @@ mod tests {
             .into_iter()
             .next()
             .expect("one data source")
+    }
+
+    #[test]
+    fn source_types_list_every_mapped_type_configured_or_not() {
+        // NAN-5850: the `source` filter answers "what does Sysmon buy me", so a
+        // mapped source type is listed even when nothing is configured.
+        let snapshot =
+            TelemetryReadinessSnapshot::observed(HashSet::new(), HashMap::new(), observed_at());
+        let source = process_data_source(&snapshot);
+        assert_eq!(
+            source.source_types,
+            vec!["windows_sysmon", "linux_auditd", "microsoft_sysmon__json_"]
+        );
+
+        let unmapped = build_data_sources(&["Malware Content".to_string()], &snapshot);
+        assert!(!unmapped[0].mapping_known);
+        assert!(unmapped[0].source_types.is_empty());
+    }
+
+    #[test]
+    fn denied_source_types_are_never_listed() {
+        // NAN-5850: the same deny set that scopes readiness hides the source
+        // type from the mapped list (case-insensitively).
+        let snapshot = TelemetryReadinessSnapshot::observed(
+            configured(&["windows_sysmon"]),
+            HashMap::from([("windows_sysmon".to_string(), observed_at())]),
+            observed_at(),
+        )
+        .with_denied_source_types(["Linux_Auditd", "audit"]);
+        let source = process_data_source(&snapshot);
+        assert_eq!(source.source_types, vec!["windows_sysmon", "microsoft_sysmon__json_"]);
+        assert_eq!(source.readiness, DataSourceReadiness::Active);
+
+        let json = serde_json::to_value(&source).expect("serialize");
+        assert_eq!(json["source_types"], serde_json::json!(["windows_sysmon", "microsoft_sysmon__json_"]));
+    }
+
+    #[test]
+    fn a_denied_configured_source_reads_exactly_like_an_unconfigured_one() {
+        // NAN-5850 review P1: the ONLY configured source for these components
+        // is denied. The viewer must see what they would see if it were not
+        // configured at all: no name, not configured, unknown, no last seen.
+        let snapshot = TelemetryReadinessSnapshot::observed(
+            configured(&["windows_sysmon"]),
+            HashMap::from([("windows_sysmon".to_string(), observed_at())]),
+            observed_at(),
+        )
+        .with_denied_source_types(["windows_sysmon"]);
+        let unconfigured =
+            TelemetryReadinessSnapshot::observed(HashSet::new(), HashMap::new(), observed_at());
+
+        // Single-source component (Module Load -> windows_sysmon only).
+        let module = build_data_sources(&["Module Load".to_string()], &snapshot).remove(0);
+        assert!(module.source_types.is_empty());
+        assert!(module.mapping_known);
+        assert!(!module.configured);
+        assert_eq!(module.readiness, DataSourceReadiness::Unknown);
+        assert_eq!(module.last_seen_at, None);
+        assert!(!module.connected);
+
+        // Multi-source component: the denied one was the only configured one.
+        let process = process_data_source(&snapshot);
+        let baseline = process_data_source(&unconfigured);
+        assert_eq!(process.source_types, vec!["linux_auditd", "microsoft_sysmon__json_"]);
+        assert_eq!(process.configured, baseline.configured);
+        assert_eq!(process.readiness, baseline.readiness);
+        assert_eq!(process.last_seen_at, baseline.last_seen_at);
+
+        // Even with health unavailable, the denied source never counts.
+        let unavailable =
+            TelemetryReadinessSnapshot::unavailable(configured(&["windows_sysmon"]), observed_at())
+                .with_denied_source_types(["windows_sysmon"]);
+        assert!(!process_data_source(&unavailable).configured);
     }
 
     #[test]

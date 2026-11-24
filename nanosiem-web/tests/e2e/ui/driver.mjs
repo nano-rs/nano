@@ -24,12 +24,25 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
+import {
+  SECRET_REVEAL, clearMarks, layoutScan, layoutSignature, loadAllowlist, pageMayShowSecret, redactTokens, showMarks,
+} from './layout.mjs';
 
 // Mutable so an in-process importer (ui/playbooks/*) can point it at a stack.
 let BASE = (process.env.E2E_UI_BASE || '').replace(/\/$/, '');
 export function setBase(url) { BASE = String(url || '').replace(/\/$/, ''); }
 const TIMEOUT = 20_000;
 const VIEWPORT = { width: 1600, height: 2400 }; // tall: result lists are virtualized
+// NAN-5762 layout invariants: `off` skips the scan; `enforce` / `report` are the
+// Python wrapper's business (the driver records either way).
+const LAYOUT_MODE = (process.env.NANO_E2E_LAYOUT || 'enforce').toLowerCase();
+let LAYOUT_ALLOW = [];
+try {
+  LAYOUT_ALLOW = loadAllowlist(process.env.E2E_LAYOUT_ALLOWLIST || '');
+} catch (e) {
+  process.stderr.write(`layout allowlist unreadable: ${e}\n`);
+  throw e;
+}
 
 function chromePath() {
   if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
@@ -94,13 +107,53 @@ async function ensureBrowser() {
 // Wait for captured API bodies (secret learning happens there), bounded: a body
 // still pending after 10 s is a stream the capture filter did not recognise,
 // and waiting on it would wedge the driver for the rest of the run (NAN-5333).
-async function settleBodies(s, ms = 10_000) {
+async function settleBodies(s, ms = BODY_WAIT_MS) {
   let timer;
   await Promise.race([
     Promise.allSettled([...s.responseBodies]),
     new Promise((resolve) => { timer = setTimeout(resolve, ms); }),
   ]);
   clearTimeout(timer);
+}
+
+// NAN-5833: how long one captured body may stay pending. Each capture gives up
+// on its own after this, so a body that never arrives (CDP reported neither
+// loadingFinished nor loadingFailed) leaves `responseBodies` once. Without it
+// the stuck promise stayed in the set for the whole session and every later
+// layout check paid the full settleBodies wait: 20 s per page on the smoke walk.
+const BODY_WAIT_MS = 10_000;
+
+// NAN-5833: the API responses whose bodies the driver captures. Only the app's
+// own origin: a third-party URL whose path starts with /api/ (the browser
+// Sentry envelope POSTs, https://…ingest.sentry.io/api/<id>/envelope/) is not
+// an app response, and a cross-origin keepalive body may never be delivered.
+export function capturesBody(url, contentType, base = BASE) {
+  if (!isAppApi(url, '/api/', base)) return false;
+  const ctype = contentType || '';
+  // Streams (NDJSON search/tail, SSE) never end while the page is open:
+  // awaiting their body would hang every later op (NAN-5333).
+  return ctype.includes('json') && !ctype.includes('ndjson') && !ctype.includes('event-stream');
+}
+
+// NAN-5833: `url` is the app's own API (same origin as BASE when set) under
+// `prefix`. A third-party URL whose path happens to start with /api/ (the
+// Sentry envelope POSTs) is not.
+export function isAppApi(url, prefix = '/api/', base = BASE) {
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  if (base) {
+    try { if (u.origin !== new URL(base).origin) return false; } catch { return false; }
+  }
+  return u.pathname.startsWith(prefix);
+}
+
+// `p` settled, or `undefined` after `ms` (the timer is cleared once `p` settles).
+export function bounded(p, ms = BODY_WAIT_MS) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(p).finally(() => clearTimeout(timer)),
+    new Promise((resolve) => { timer = setTimeout(resolve, ms); }),
+  ]);
 }
 
 function sess(sid) {
@@ -245,6 +298,75 @@ async function click(page, f, opts) {
   }
 }
 
+// NAN-5830: `el.click()` clicks the element's centre with no hit test, so
+// whatever is painted over the target takes the click instead. Two transient
+// layers do that:
+//   * a Sonner toast: the bottom-right stack sits on the parser Test lab's
+//     "Test" button, and the pointer then hovering the toaster paused Sonner's
+//     timers, so the toast never left;
+//   * a dialog still animating closed: Radix keeps the closing overlay
+//     (fixed, data-state="closed") mounted until its exit animation ends, so a
+//     click right after confirming one dialog ("Save changes") lands on the
+//     fading overlay and the next button ("Publish") never opens its dialog.
+// Do what a user does: move the pointer off the toaster and wait for the layer
+// to go. One that outlives the wait is reported and the click proceeds.
+const COVER_WAIT_MS = 15_000;
+
+async function transientCover(page, el) {
+  return page.evaluate((e) => {
+    // A toast's own action (Undo, Retry) is not covered by its toast.
+    if (e.closest('[data-sonner-toast]')) return '';
+    const r = e.getBoundingClientRect();
+    if (!r.width || !r.height) return '';
+    const x = r.left + r.width / 2;
+    const y = r.top + r.height / 2;
+    // Still off-screen (e.g. inside a clipped scroller): the click scrolls it.
+    if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return '';
+    const hit = document.elementFromPoint(x, y);
+    // The target, its content, or an ancestor of it receives the click.
+    if (!hit || e.contains(hit) || hit.contains(e)) return '';
+    const toast = hit.closest('[data-sonner-toast]');
+    if (toast) return `toast ${(toast.textContent || '').trim().slice(0, 80)}`;
+    for (let n = hit; n && n !== document.body; n = n.parentElement) {
+      if (n.getAttribute('data-state') === 'closed' && getComputedStyle(n).position === 'fixed') {
+        return `closing ${n.getAttribute('role') || n.tagName.toLowerCase()}`;
+      }
+    }
+    return '';
+  }, el).catch(() => '');
+}
+
+async function waitForTransientCover(page, el) {
+  // Hit-test where el.click() will click: bring an off-screen target into
+  // view first (the click scrolls it there anyway, possibly under a layer).
+  await page.evaluate((e) => {
+    const r = e.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    if (cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight) {
+      e.scrollIntoView({ block: 'center', inline: 'nearest' });
+    }
+  }, el).catch(() => {});
+  let cover = await transientCover(page, el);
+  if (!cover) return;
+  // Move off the toaster as soon as a toast is the cover, including one a
+  // closing overlay uncovers later: a hovered Sonner stack never times out.
+  let movedOff = false;
+  const check = async () => {
+    cover = await transientCover(page, el);
+    if (cover.startsWith('toast') && !movedOff) {
+      movedOff = true;
+      await page.mouse.move(1, 1);
+    }
+    return !cover;
+  };
+  try {
+    await until(check, { timeout: COVER_WAIT_MS, interval: 100, desc: 'a transient layer to stop covering the click target' });
+  } catch {
+    process.stderr.write(`${scrub(`still covered by ${JSON.stringify(cover)} after ${COVER_WAIT_MS}ms; clicking anyway`)}\n`);
+  }
+}
+
 async function clickElement(page, el, f) {
   await until(async () => page.evaluate((e) => !e.disabled && e.getAttribute('aria-disabled') !== 'true', el), { desc: `${JSON.stringify(f)} enabled` });
   // Dialogs/sheets animate in: click only once the box has stopped moving,
@@ -255,6 +377,7 @@ async function clickElement(page, el, f) {
     const b = await el.boundingBox();
     return !a || !b || (a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height);
   }, { timeout: 3000, desc: 'element to stop moving' }).catch(() => {});
+  await waitForTransientCover(page, el);
   try {
     await el.click();
   } catch (e) {
@@ -329,6 +452,14 @@ const OPS = {
     await page.setViewport(VIEWPORT);
     await page.emulateTimezone('UTC');
     page.setDefaultTimeout(TIMEOUT);
+    // NAN-5798: a Sentry-enabled e2e build tags browser events with the run
+    // and the scenario (lib/error-tracking/sentry.ts reads this). Nothing is
+    // injected unless the harness turned Sentry on.
+    if (process.env.E2E_SENTRY_WEB === '1') {
+      await page.evaluateOnNewDocument((runId, test) => {
+        window.__NANO_E2E__ = { runId, test };
+      }, process.env.E2E_RUN_ID || '', String(name || ''));
+    }
     const s = {
       ctx, page, out, name, console: [], network: [], secretFields: [], bodies: [],
       responseBodies: new Set(), authInflight: 0,
@@ -336,7 +467,7 @@ const OPS = {
     // In-flight /api/auth/* requests: a navigation must not abort a token
     // refresh (the rotated refresh cookie would be lost, and the next page's
     // refresh presents a spent token -> logged out).
-    const isAuth = (r) => { try { return new URL(r.url()).pathname.startsWith('/api/auth/'); } catch { return false; } };
+    const isAuth = (r) => isAppApi(r.url(), '/api/auth/');
     page.on('request', (r) => {
       if (isAuth(r)) s.authInflight += 1;
       // NAN-5586: the session's bearer, kept for end_session (a secret: scrubbed).
@@ -358,13 +489,10 @@ const OPS = {
     page.on('response', (r) => {
       const pending = (async () => {
         try {
+          if (!capturesBody(r.url(), r.headers()['content-type'])) return;
           const u = new URL(r.url());
-          if (!u.pathname.startsWith('/api/')) return;
-          const ctype = r.headers()['content-type'] || '';
-          // Streams (NDJSON search/tail, SSE) never end while the page is open:
-          // awaiting their body would hang every later op (NAN-5333).
-          if (!ctype.includes('json') || ctype.includes('ndjson') || ctype.includes('event-stream')) return;
-          const body = await r.text();
+          const body = await bounded(r.text());
+          if (body === undefined) return; // never arrived (NAN-5833)
           const method = r.request().method();
           // API keys are reveal-once values rendered by the page, not typed by
           // the harness. Learn them at the response boundary so a failure at
@@ -679,6 +807,167 @@ const OPS = {
       return { viewport: vw, document: doc - vw, main: mainOver, offenders };
     });
   },
+  // NAN-5762: the layout invariants (layout.mjs) on whatever the page shows
+  // now. Runs the scan only when the page's fingerprint changed since the last
+  // check (route, viewport, open panels, DOM size bucket, busy state) unless
+  // `force`. A violation must persist across a short re-check (an animating
+  // sheet is not a bug) and is reported once per session; each new batch gets
+  // a screenshot with the offenders outlined and lines in layout.jsonl.
+  async layout_check({ sid, force = false, after = '' }) {
+    const s = sess(sid);
+    if (LAYOUT_MODE === 'off') return { violations: [], allowed: [] };
+    const { page } = s;
+    s.layoutSeen = s.layoutSeen || new Set();
+    try {
+      const sig = await page.evaluate(layoutSignature);
+      if (!force && sig === s.layoutSig) return { violations: [], allowed: [] };
+      // Fail closed on secrets: learn every pending API body first, then treat
+      // the page as secret-bearing if it may show one (layout.mjs).
+      await settleBodies(s);
+      await inject(page);
+      const sensitive = await page.evaluate(pageMayShowSecret, { vals: [...SECRETS], fields: s.secretFields, reveal: SECRET_REVEAL });
+      const scanOnce = async () => {
+        await page.evaluate(clearMarks);
+        return page.evaluate(layoutScan, { allow: LAYOUT_ALLOW, noText: sensitive });
+      };
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      let first = await scanOnce();
+      if (first.errors.length) throw new Error(`layout allowlist selector error: ${first.errors.join('; ')}`);
+      const fresh = (r) => r.violations.filter((v) => !s.layoutSeen.has(v.key));
+      // Persisting only: re-measure unallowed new violations after animations
+      // settle. What both scans see is real on the page as it is now, so it is
+      // never dropped (even if the page changed meanwhile).
+      if (fresh(first).some((v) => !v.allowed)) {
+        await sleep(450);
+        const again = await scanOnce();
+        const before = new Set(first.violations.map((v) => v.key));
+        first = { ...again, violations: again.violations.filter((v) => v.allowed || before.has(v.key)) };
+      }
+      s.layoutSig = await page.evaluate(layoutSignature);
+      // Element text leaves the page only scrubbed of registered secrets and of
+      // token-shaped strings (paths and URLs below are harness-owned).
+      const clean = (t) => (t == null ? t : redactTokens(scrub(t)));
+      const found = fresh(first).map((v) => ({
+        ...v, element: clean(v.element), container: clean(v.container), detail: JSON.parse(clean(JSON.stringify(v.detail ?? null))),
+      }));
+      for (const v of found) s.layoutSeen.add(v.key);
+      const bad = found.filter((v) => !v.allowed);
+      const allowed = found.filter((v) => v.allowed);
+      let shot = null;
+      if (found.length) {
+        fs.mkdirSync(s.out, { recursive: true });
+        if (bad.length) {
+          s.layoutShots = (s.layoutShots || 0) + 1;
+          const target = path.join(s.out, `layout-${s.layoutShots}.png`);
+          // Re-check right before the capture (a reveal can open during the scan).
+          const risky = sensitive || await page.evaluate(pageMayShowSecret, { vals: [...SECRETS], fields: s.secretFields, reveal: SECRET_REVEAL });
+          if (risky) {
+            fs.writeFileSync(`${target}.skipped.txt`, 'screenshot skipped: the page may show a secret (password field, reveal-once value or a registered secret)\n');
+          } else {
+            await page.evaluate(showMarks);
+            await page.screenshot({ path: target, fullPage: false });
+            shot = target;
+          }
+        }
+        const lines = found.map((v) => JSON.stringify({ t: Date.now(), test: s.name, after, url: page.url(), screenshot: shot, ...v }));
+        fs.appendFileSync(path.join(s.out, 'layout.jsonl'), scrub(lines.join('\n')) + '\n');
+      }
+      await page.evaluate(clearMarks);
+      return JSON.parse(scrub(JSON.stringify({ violations: bad, allowed, screenshot: shot, stats: first.stats })));
+    } catch (e) {
+      // A navigation tore the context down mid-scan: the next op re-measures.
+      if (/Execution context was destroyed|Cannot find context|Target closed|detached/i.test(String(e))) {
+        return { violations: [], allowed: [] };
+      }
+      throw e;
+    }
+  },
+  // NAN-5758: horizontal scroll INSIDE one container (a flyout, a panel): its
+  // own scrollWidth vs clientWidth, plus every descendant scroller that can
+  // scroll sideways, and descendants whose box sticks out past its right edge.
+  async scroll_extent({ sid, find: f }) {
+    const { page } = sess(sid);
+    const el = await find(page, f);
+    return page.evaluate((root) => {
+      const describe = (e) => {
+        const id = e.getAttribute('data-testid');
+        const cls = (e.getAttribute('class') || '').split(/\s+/).slice(0, 4).join('.');
+        const txt = (e.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        return `${e.tagName.toLowerCase()}${id ? `[data-testid=${id}]` : ''}${cls ? `.${cls}` : ''} "${txt}"`;
+      };
+      const rr = root.getBoundingClientRect();
+      const scrollers = [];
+      const past = [];
+      for (const e of [root, ...root.querySelectorAll('*')]) {
+        const ox = getComputedStyle(e).overflowX;
+        if ((ox === 'auto' || ox === 'scroll') && e.scrollWidth > e.clientWidth + 1) {
+          scrollers.push({ el: describe(e), scroll_width: e.scrollWidth, client_width: e.clientWidth });
+        }
+        if (e !== root && past.length < 5) {
+          const r = e.getBoundingClientRect();
+          if (r.width && r.right > rr.right + 1) past.push(`${describe(e)} right=${Math.round(r.right)} > ${Math.round(rr.right)}`);
+        }
+      }
+      return { scroll_width: root.scrollWidth, client_width: root.clientWidth, scrollers, past_right_edge: past };
+    }, el);
+  },
+  // NAN-5758: whether each match is actually visible as painted, three ways:
+  // - hit tests: elementFromPoint at its centre and at four corners (inset
+  //   1px) must land on the element or a descendant (anything painted OVER it);
+  // - overlaps: other text in its enclosing row whose box intersects it. The
+  //   row is found from the PARENT (`closest` tests the element itself first,
+  //   so a match carrying its own data-testid would scope to itself and see
+  //   nothing). This catches sibling text painted across a transparent label,
+  //   which a hit test cannot (the later sibling wins the hit test);
+  // - opacity down the ancestor chain, and its size.
+  async occlusion({ sid, find: f }) {
+    const { page } = sess(sid);
+    await inject(page);
+    return page.evaluate((ff) => window.__e2e.all(ff).map((e) => {
+      e.scrollIntoView({ block: 'center' });
+      const r = e.getBoundingClientRect();
+      const label = (el) => (el ? `${el.tagName.toLowerCase()}.${(el.getAttribute('class') || '').split(/\s+/).slice(0, 3).join('.')}` : null);
+      const inset = Math.min(1, r.width / 4, r.height / 4);
+      const points = [
+        ['center', r.left + r.width / 2, r.top + r.height / 2],
+        ['top-left', r.left + inset, r.top + inset],
+        ['top-right', r.right - inset, r.top + inset],
+        ['bottom-left', r.left + inset, r.bottom - inset],
+        ['bottom-right', r.right - inset, r.bottom - inset],
+      ];
+      const covered = [];
+      let inside = true;
+      for (const [where, x, y] of points) {
+        if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) { inside = false; continue; }
+        const hit = document.elementFromPoint(x, y);
+        if (!hit || !(hit === e || e.contains(hit))) covered.push(`${where}: ${label(hit)}`);
+      }
+      let opacity = 1;
+      for (let p = e; p; p = p.parentElement) opacity *= Number(getComputedStyle(p).opacity || 1);
+      const scope = (e.parentElement && e.parentElement.closest('[data-testid]')) || e.parentElement || document.body;
+      const overlaps = [];
+      for (const o of scope.querySelectorAll('*')) {
+        if (o === e || o.contains(e) || e.contains(o)) continue;
+        if (![...o.childNodes].some((c) => c.nodeType === 3 && c.textContent.trim())) continue;
+        const q = o.getBoundingClientRect();
+        if (q.width && q.height && q.left < r.right - 0.5 && q.right > r.left + 0.5 && q.top < r.bottom - 0.5 && q.bottom > r.top + 0.5) {
+          overlaps.push((o.textContent || '').trim().slice(0, 40));
+        }
+      }
+      const sid2 = scope.getAttribute && scope.getAttribute('data-testid');
+      return {
+        text: (e.textContent || '').trim().slice(0, 60),
+        scope: label(scope) + (sid2 ? `[data-testid=${sid2}]` : ''),
+        overlaps,
+        covered,
+        on_top: covered.length === 0,
+        in_viewport: inside,
+        opacity,
+        width: r.width,
+        height: r.height,
+      };
+    }), f);
+  },
   // An /api request AS the logged-in browser user (the bearer the page sent),
   // for state only that user owns (its pivt notebooks). JSON in, JSON out.
   async session_fetch({ sid, method = 'GET', path: p, body }) {
@@ -736,7 +1025,7 @@ const OPS = {
   // fetched, e.g. data loaded before a permission gate rendered (NAN-5686).
   async api_responses_since({ sid, since = 0 }) {
     const s = sess(sid);
-    return s.network.filter((n) => n.t >= since && !n.failed && /\/api\//.test(n.url))
+    return s.network.filter((n) => n.t >= since && !n.failed && isAppApi(n.url))
       .map((n) => ({ t: n.t, method: n.method, url: scrub(n.url), status: n.status || 0 }));
   },
   // Real keystrokes into an element (fill() uses the value setter instead).

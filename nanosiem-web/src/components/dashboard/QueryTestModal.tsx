@@ -251,7 +251,7 @@ export function QueryTestModal({
               <div className="rounded-md bg-amber-500/10 border border-amber-500/30 px-4 py-3 text-center max-w-md flex flex-col items-center gap-2">
                 <AlertTriangle className="w-6 h-6 text-amber-400" />
                 <p className="text-[12px] text-amber-400">
-                  No results found. Try expanding the time range or adjusting your query.
+                  No results. Widen the time range or adjust the query.
                 </p>
               </div>
             </div>

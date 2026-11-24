@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
             };
 
             // SQL generation should never panic
-            let generator = ClickHouseSqlGenerator::new();
+            let generator = ClickHouseSqlGenerator::scoped(nanosiem_core::query::GeneratorScope::unrestricted());
             let _ = generator.generate(&query, &time_range);
         }
     }

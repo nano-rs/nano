@@ -85,7 +85,7 @@ def test_otlp_observability_surfaces(
     page.click({"text": data.metric_names[0], "exact": True})
     page.wait_text(data.metric_names[0], exact=True, timeout_ms=60_000)
     page.wait_text(
-        "No samples for this metric in the selected range and filters. A catalog entry can outlive its latest samples.",
+        "No samples for this metric in the selected range.",
         exact=True,
         timeout_ms=120_000,
         gone=True,

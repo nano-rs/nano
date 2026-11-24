@@ -106,6 +106,33 @@ fn risk_single_stage_scans_the_shared_builder_subquery() {
     assert!(sql.contains("ORDER BY last_finding_at DESC"), "{sql}");
 }
 
+/// NAN-5818: the risk fragments used to carry `--` SQL comments, so every
+/// `dataset=risk` query (the seeded `accumulated_risk_threshold_exceeded` rule
+/// among them) tripped the generated-SQL tripwire's comment rule. Generated
+/// risk SQL must be comment-free for both schemas and the subsearch form.
+#[test]
+fn risk_generated_sql_is_comment_free_and_passes_the_tripwire() {
+    let ocsf = ClickHouseSqlGenerator::new()
+        .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()))
+        .with_risk_config(risk_config())
+        .with_dataset(Dataset::Risk);
+    let logs = ClickHouseSqlGenerator::new().with_risk_config(risk_config());
+    let cases = [
+        (
+            risk_generator(),
+            "* | where score_24h>500 OR score_7d>1000 | table entity, entity_type, score_24h, score_7d",
+        ),
+        (ocsf, "* | where score_24h>500 OR score_7d>1000 | table entity, score_24h"),
+        (risk_generator(), "* | stats count by entity_type"),
+        (logs, "user IN [dataset=risk score_7d > 100 | return entity]"),
+    ];
+    for (gen, q) in cases {
+        let sql = generate(&gen, q);
+        let hits = crate::query::generated_sql_tripwire::check(&sql);
+        assert!(hits.is_empty(), "{q}: tripwire hits {hits:?}\nsql: {sql}");
+    }
+}
+
 #[test]
 fn risk_base_source_inlines_decay_and_cleared_boundaries() {
     let sql = generate(&risk_generator(), "score_24h > 100");

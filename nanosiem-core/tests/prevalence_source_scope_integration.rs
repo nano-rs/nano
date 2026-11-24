@@ -187,6 +187,10 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         "hash_prevalence_source_summary",
         "hash_prevalence_source_agg",
         "hash_prevalence_agg",
+        // NAN-5722: unrestricted lookups read the per-entity summaries.
+        "hash_prevalence_summary",
+        "domain_prevalence_summary",
+        "ip_prevalence_summary",
         "domain_prevalence_source_summary",
         "domain_prevalence_source_agg",
         "domain_prevalence_agg",
@@ -234,7 +238,7 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .expect("SYSTEM prevalence");
     assert_eq!(
         unrestricted.host_count, Some(6),
-        "default/system callers retain the legacy aggregate fast path, including unknown provenance"
+        "default/system callers read the legacy (source-less) baseline, including unknown provenance"
     );
 
     let before_revocation = service

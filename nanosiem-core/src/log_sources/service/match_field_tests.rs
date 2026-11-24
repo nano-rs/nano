@@ -116,3 +116,18 @@ fn write_validator_agrees_with_the_read_sink_validator() {
         );
     }
 }
+
+// NAN-5839: the timezone is validated and normalized at the same boundary.
+#[test]
+fn timezone_is_normalized_or_refused_at_the_write_boundary() {
+    use super::crud::normalize_timezone;
+    assert_eq!(normalize_timezone("america/new_york").unwrap(), "America/New_York");
+    assert_eq!(normalize_timezone("").unwrap(), "UTC");
+    assert_eq!(normalize_timezone("+0530").unwrap(), "+05:30");
+    for bad in ["Mars/Olympus_Mons", "+01:30", "UTC\n[sinks.x]"] {
+        assert!(
+            matches!(normalize_timezone(bad), Err(LogSourceServiceError::InvalidTimezone(_))),
+            "{bad:?}"
+        );
+    }
+}

@@ -42,6 +42,7 @@ import { isPlatformHecProfile } from '@/lib/delivery-attention';
 import { useAuth } from '@/contexts/AuthContext';
 import { formatCompactNumber, formatRelativeCompact, formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 const EYEBROW = 'font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground';
 
@@ -159,12 +160,12 @@ export function LogSourceDelivery({
         <tbody>
           {pushState && (
             <tr className="border-t border-border h-7" data-testid="delivery-row-push">
-              <td className="px-4 py-1.5 text-foreground">Push · ingest tokens</td>
+              <td className="px-4 py-1.5 text-foreground">Push · <Term id="ingest-credential">ingest tokens</Term></td>
               <td className="px-4 py-1.5"><StateBadge state={pushState} /></td>
               <td className="px-4 py-1.5"><When at={lastUsed} testId="delivery-push-last" /></td>
               <td className="px-4 py-1.5 text-muted-foreground">
                 <span className="font-mono text-[10.5px]">{tokens.length} active</span>
-                {' · '}HEC / HTTP JSON / OTLP as <span className="font-mono text-[10.5px] text-foreground/80">source_type={detail?.route_key}</span>
+                {' · '}<Term id="hec">HEC</Term> / HTTP JSON / <Term id="otlp">OTLP</Term> as <span className="font-mono text-[10.5px] text-foreground/80">source_type={detail?.route_key}</span>
                 {' · '}<Link className="text-primary hover:underline" to={INGEST_CREDENTIALS_PATH}>Credentials</Link>
               </td>
             </tr>
@@ -183,7 +184,7 @@ export function LogSourceDelivery({
                   <Link className="text-primary hover:underline" to={sourceConfigPath(config.data.id)}>{config.data.name}</Link>
                 ) : config.error ? 'unavailable' : 'loading…'}
                 {config.data && !config.data.deployed && <span className="ml-2 text-amber-500">not deployed</span>}
-                {' · '}<Link className="text-primary hover:underline" to={CLOUD_PULL_PATH}>Cloud pull</Link>
+                {' · '}<Link className="text-primary hover:underline" to={CLOUD_PULL_PATH}><Term nested id="cloud-pull">Cloud pull</Term></Link>
               </td>
             </tr>
           )}

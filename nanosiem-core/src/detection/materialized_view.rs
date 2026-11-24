@@ -1029,7 +1029,9 @@ FROM (
         // predicate (no FROM), so the generator's table name is irrelevant here;
         // the FROM table is resolved separately in `generate_view_ddl` via
         // `logs_table_name`.
-        ClickHouseSqlGenerator::new()
+        // Unrestricted: a real-time detection rule runs as the system, over
+        // every source (like scheduled detection).
+        ClickHouseSqlGenerator::scoped(crate::query::GeneratorScope::unrestricted())
             .with_profile(self.profile.clone())
             .generate_search_expr(search_expr)
             .map_err(|e| {

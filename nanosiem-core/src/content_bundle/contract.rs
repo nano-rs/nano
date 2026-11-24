@@ -107,6 +107,12 @@ pub fn production_key_ring() -> KeyRing {
     KeyRing::from_hex(CONTENT_PRODUCTION_KEYS).expect("compiled-in content keys are valid")
 }
 
+/// NAN-5771: `nanosiem-api --print-content-trust` / `nanosiem-jobs
+/// --print-content-trust` print [`trust_label`] and exit, before any config,
+/// tracing or pool exists. The e2e harness checks every binary it starts with
+/// it, so a stale binary built for the other trust composition is refused.
+pub const PRINT_TRUST_ARGUMENT: &str = "--print-content-trust";
+
 /// `production` or `production+acceptance` (status display).
 pub fn trust_label() -> &'static str {
     if cfg!(nano_content_acceptance) {

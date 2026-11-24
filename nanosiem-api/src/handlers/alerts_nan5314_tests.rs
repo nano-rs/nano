@@ -28,3 +28,22 @@ fn non_user_prefix_and_free_text_do_not_resolve() {
     assert_eq!(assigned_user_id("bob"), None);
     assert_eq!(assigned_user_id(""), None);
 }
+
+// NAN-5774: an alert assigned to a deleted user reads "deleted user", the
+// notebook / case wording (NAN-5721), never the raw `user_…` id.
+#[test]
+fn a_deleted_assignee_reads_deleted_user() {
+    use super::{assignee_label, DELETED_USER_LABEL};
+    use nanosiem_core::auth::UserRepositoryError;
+    let label = assignee_label(Err(UserRepositoryError::NotFound(Uuid::now_v7())));
+    assert_eq!(label.as_deref(), Some(DELETED_USER_LABEL));
+    assert_eq!(DELETED_USER_LABEL, "deleted user");
+}
+
+#[test]
+fn a_failed_lookup_is_not_reported_as_deleted() {
+    use super::assignee_label;
+    use nanosiem_core::auth::UserRepositoryError;
+    let label = assignee_label(Err(UserRepositoryError::DatabaseError(sqlx::Error::PoolTimedOut)));
+    assert_eq!(label, None);
+}

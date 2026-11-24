@@ -42,7 +42,7 @@ export function CloudOverviewTopStrip({
       <span className="flex-1" />
 
       <span className="text-muted-foreground/70 font-mono normal-case tracking-normal">
-        posture · <span className="text-foreground">CloudTrail · IAM · GuardDuty · Access Analyzer</span> · click any principal to pivot to dossier
+        posture · <span className="text-foreground">CloudTrail · IAM · GuardDuty · Access Analyzer</span>
       </span>
     </div>
   );

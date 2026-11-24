@@ -4,6 +4,7 @@
 // expands on click into three side-by-side cards: Validation / Impact &
 // baseline / Version history. Mirrors `design-ref/shadcn/editor-tray.jsx`.
 
+import { Term } from '@/components/ui/term';
 import { useMemo, useState } from 'react';
 import {
   Check,
@@ -18,7 +19,8 @@ import {
   Minus,
   Zap,
 } from 'lucide-react';
-import { Line, LineChart, ResponsiveContainer, Tooltip } from 'recharts';
+import { Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { dailyBuckets, type DailyBucket } from './helpers';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 import { useCapabilities } from '@/hooks/use-capabilities';
@@ -87,11 +89,14 @@ export function BottomTray({
   const showRealtimeNudge = Boolean(onSwitchToRealtime && validation?.valid && validation?.realtimeEligible);
 
   return (
-    <div className="border-t border-border bg-[var(--panel)] shrink-0">
+    // NAN-5783: sized by the editor column, not the viewport. With pivt open
+    // the column can be ~410px: the header wraps (Tune settings and Test rule
+    // used to run under the inspector rail) and the cards stack.
+    <div className="@container/tray border-t border-border bg-[var(--panel)] shrink-0">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full h-9 flex items-center px-4 gap-4 text-[11.5px] font-mono hover:bg-[color-mix(in_srgb,var(--foreground)_3%,transparent)] transition-colors"
+        className="w-full min-h-9 py-1.5 flex flex-wrap items-center px-4 gap-x-4 gap-y-1 text-[11.5px] font-mono hover:bg-[color-mix(in_srgb,var(--foreground)_3%,transparent)] transition-colors"
         aria-expanded={open}
         aria-controls="rule-editor-bottom-tray-body"
       >
@@ -185,7 +190,7 @@ export function BottomTray({
       {open && (
         <div
           id="rule-editor-bottom-tray-body"
-          className="px-4 pb-3 pt-1 grid grid-cols-1 md:grid-cols-3 gap-3"
+          className="px-4 pb-3 pt-1 grid grid-cols-1 @[40rem]/tray:grid-cols-3 gap-3"
         >
           <ValidateCard
             validation={validation}
@@ -272,8 +277,8 @@ function ValidateCard({
           <div className="flex items-start gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground mt-1.5 shrink-0" />
             <div className="flex-1 font-mono text-muted-foreground leading-snug">
-              Executes as <span className="text-foreground">{validation.detectionMode}</span>
-              {validation.createsMaterializedView ? ' · creates materialized view' : ''}
+              Runs as <span className="text-foreground">{validation.detectionMode}</span>
+              {validation.createsMaterializedView ? ' · sets up a real-time check in the database' : ''}
             </div>
           </div>
         )}
@@ -282,8 +287,7 @@ function ValidateCard({
             <Zap className="w-3.5 h-3.5 text-[var(--primary)] mt-px shrink-0" strokeWidth={1.75} />
             <div className="flex-1 min-w-0">
               <div className="text-[11px] text-foreground/90 leading-snug">
-                Eligible for <span className="font-semibold text-[var(--primary)]">real-time</span> — streams via a
-                materialized view (10–30s latency) instead of running on a cron schedule.
+                This rule can run in <span className="font-semibold text-[var(--primary)]"><Term id="rule-realtime">real time</Term></span>: it checks events as they arrive, within about 10 to 30 seconds.
               </div>
               {onSwitchToRealtime && (
                 <button
@@ -299,11 +303,11 @@ function ValidateCard({
         )}
         {!validation && (
           <div className="text-[11px] text-muted-foreground">
-            Edit the query to trigger validation. Saved rules re-validate on every save.
+            Edit the query to validate.
           </div>
         )}
         {validation?.valid && !validation.error && !validation.warning && !validation.info && (
-          <div className="text-[11px] text-muted-foreground">Parses cleanly against the current schema.</div>
+          <div className="text-[11px] text-muted-foreground">The query is valid and every field it uses exists.</div>
         )}
       </div>
     </div>
@@ -319,16 +323,17 @@ function ImpactCard({
   lastSavedLabel?: string;
   dailyStats?: DailyStat[];
 }) {
-  const { sparkData, last7dTotal, prev7dTotal, trend } = useMemo(() => {
-    const stats = dailyStats || [];
-    // Order ascending; take the last 14 days — last 7 for the current window,
-    // prior 7 for baseline comparison. API already returns sorted descending
-    // or ascending depending on route; normalize by date string.
-    const sorted = [...stats].sort((a, b) => a.date.localeCompare(b.date));
-    const last14 = sorted.slice(-14);
-    const last7 = last14.slice(-7);
-    const prev7 = last14.slice(0, Math.max(0, last14.length - 7));
-    const sum = (rows: DailyStat[]) => rows.reduce((acc, r) => acc + (r.match_count || 0), 0);
+  // The UTC day is a memo input so a tray left open past midnight UTC re-buckets.
+  const utcDay = new Date().toISOString().slice(0, 10);
+  const { sparkData, last7dTotal, prev7dTotal, trend, peak } = useMemo(() => {
+    // NAN-5842: the API returns only the days the rule fired. Bucket 14 UTC
+    // calendar days (zero-filled): the last 7 are the current window, the 7
+    // before are the baseline. Slicing the sparse rows used to compare the
+    // last 7 ACTIVE days, which could span weeks.
+    const days = dailyBuckets(dailyStats, 14, new Date(`${utcDay}T12:00:00Z`));
+    const last7 = days.slice(-7);
+    const prev7 = days.slice(0, 7);
+    const sum = (rows: DailyBucket[]) => rows.reduce((acc, r) => acc + r.count, 0);
     const cur = sum(last7);
     const prev = sum(prev7);
     let trend: 'up' | 'down' | 'flat' = 'flat';
@@ -337,24 +342,31 @@ function ImpactCard({
     else if (cur > prev * 1.1) trend = 'up';
     else if (cur < prev * 0.9) trend = 'down';
     return {
-      sparkData: last7.map((r) => ({ date: r.date, count: r.match_count || 0 })),
+      sparkData: last7,
       last7dTotal: cur,
       prev7dTotal: prev,
       trend,
+      peak: last7.reduce((m, r) => Math.max(m, r.count), 0),
     };
-  }, [dailyStats]);
+  }, [dailyStats, utcDay]);
 
   const trendColor =
     trend === 'up' ? 'var(--destructive)' : trend === 'down' ? 'var(--success)' : 'var(--muted-foreground)';
   const TrendIcon = trend === 'up' ? TrendingUp : trend === 'down' ? TrendingDown : Minus;
   const deltaPct = prev7dTotal > 0 ? Math.round(((last7dTotal - prev7dTotal) / prev7dTotal) * 100) : null;
+  const trendLabel =
+    deltaPct !== null ? `${deltaPct > 0 ? '+' : ''}${deltaPct}%` : last7dTotal > 0 ? 'new' : 'none';
+  // Baseline: the prior 7 days' daily average, drawn as a dashed guide.
+  const baselinePerDay = prev7dTotal / 7;
+  const hasStats = dailyStats !== undefined;
+  const quiet = last7dTotal === 0;
 
   return (
-    <div className="rounded-lg border border-border bg-card p-3">
+    <div className="rounded-lg border border-border bg-card p-3 flex flex-col" data-testid="rule-impact-card">
       <div className="flex items-center gap-2 mb-2">
         <BarChart3 className="w-3.5 h-3.5 text-[var(--primary)]" strokeWidth={1.75} />
         <div className="text-[10.5px] font-mono uppercase tracking-[0.12em] font-semibold text-foreground/80">
-          Impact &amp; baseline
+          Impact &amp; <Term id="match-baseline">baseline</Term>
         </div>
         <span className="ml-auto text-[10px] font-mono text-muted-foreground">last 7d</span>
       </div>
@@ -376,47 +388,75 @@ function ImpactCard({
             </div>
             <div className="inline-flex items-center gap-0.5 text-[10px] font-mono" style={{ color: trendColor }}>
               <TrendIcon className="w-3 h-3" strokeWidth={1.75} />
-              {deltaPct !== null ? `${deltaPct > 0 ? '+' : ''}${deltaPct}%` : 'new'}
+              {trendLabel}
             </div>
           </div>
-          {sparkData.length > 0 ? (
-            <div className="h-6 mt-1">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={sparkData} margin={{ top: 1, right: 1, bottom: 1, left: 1 }}>
-                  <Line
-                    type="monotone"
-                    dataKey="count"
-                    stroke="var(--primary)"
-                    strokeWidth={1.5}
-                    dot={false}
-                    activeDot={{ r: 2, strokeWidth: 0, fill: 'var(--primary)' }}
-                    isAnimationActive={false}
-                  />
-                  <Tooltip
-                    cursor={false}
-                    contentStyle={{
-                      background: 'var(--card)',
-                      border: '1px solid var(--border)',
-                      borderRadius: 4,
-                      fontSize: 10,
-                      fontFamily: 'var(--font-mono)',
-                      padding: '2px 6px',
-                    }}
-                    formatter={(value) => {
-                      const coerced = typeof value === 'number' ? value : Number(value);
-                      const n = Number.isFinite(coerced) ? coerced : 0;
-                      return [`${n.toLocaleString()} matches`, ''];
-                    }}
-                    labelFormatter={(v) => String(v)}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          ) : (
-            <div className="text-[10px] font-mono text-muted-foreground mt-1">no recent activity</div>
-          )}
+          <div className="text-[10px] font-mono text-muted-foreground" data-testid="rule-impact-baseline">
+            baseline {prev7dTotal.toLocaleString()} prev 7d
+          </div>
         </div>
       </div>
+      {/* NAN-5842: the quiet note is in normal flow ABOVE the chart, never
+          drawn over it (it collided with the dashed baseline when the window
+          was empty but the prior 7 days were not). */}
+      {hasStats && quiet && (
+        <div className="mt-2 text-[10px] font-mono text-muted-foreground" data-testid="rule-impact-quiet">
+          {prev7dTotal > 0
+            ? `no matches in the last 7d · 0 vs ${prev7dTotal.toLocaleString()} baseline`
+            : 'no matches in the last 7d'}
+        </div>
+      )}
+      {hasStats ? (
+        <div className={cn('relative flex-1 min-h-14', quiet ? 'mt-1' : 'mt-2')} data-testid="rule-impact-chart">
+          <ResponsiveContainer width="100%" height="100%">
+            {/* Margins keep a peak point, the stroke and the active dot inside
+                the SVG; the y domain starts at 0 so a quiet day sits on the floor. */}
+            <LineChart data={sparkData} margin={{ top: 6, right: 6, bottom: 4, left: 6 }}>
+              <XAxis dataKey="date" hide />
+              <YAxis hide domain={[0, Math.max(1, peak, Math.ceil(baselinePerDay))]} />
+              <ReferenceLine y={0} stroke="var(--border)" strokeWidth={1} ifOverflow="extendDomain" />
+              {prev7dTotal > 0 && (
+                <ReferenceLine
+                  y={baselinePerDay}
+                  stroke="var(--muted-foreground)"
+                  strokeDasharray="3 3"
+                  strokeWidth={1}
+                  strokeOpacity={0.6}
+                />
+              )}
+              <Line
+                type="monotone"
+                dataKey="count"
+                stroke={quiet ? 'var(--muted-foreground)' : 'var(--primary)'}
+                strokeOpacity={quiet ? 0.5 : 1}
+                strokeWidth={1.5}
+                dot={false}
+                activeDot={{ r: 2.5, strokeWidth: 0, fill: 'var(--primary)' }}
+                isAnimationActive={false}
+              />
+              <Tooltip
+                cursor={false}
+                contentStyle={{
+                  background: 'var(--card)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                  fontSize: 10,
+                  fontFamily: 'var(--font-mono)',
+                  padding: '2px 6px',
+                }}
+                formatter={(value) => {
+                  const coerced = typeof value === 'number' ? value : Number(value);
+                  const n = Number.isFinite(coerced) ? coerced : 0;
+                  return [`${n.toLocaleString()} matches`, ''];
+                }}
+                labelFormatter={(v) => String(v)}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <div className="text-[10px] font-mono text-muted-foreground mt-2">no activity data yet</div>
+      )}
     </div>
   );
 }

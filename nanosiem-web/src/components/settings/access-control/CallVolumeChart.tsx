@@ -95,8 +95,7 @@ export function CallVolumeChart({ apiKeyId }: { apiKeyId: string }) {
       </div>
 
       <div className="text-[10.5px] text-muted-foreground/70 mt-1.5">
-        Audited actions per day (mutations + denied requests). Read-only traffic isn't audited and isn't counted —
-        see <span className="font-mono">Last used</span> above for the most recent activity.
+        Audited actions per day (mutations and denied requests). Reads are not counted.
       </div>
     </div>
   );

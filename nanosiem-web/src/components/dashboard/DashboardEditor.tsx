@@ -879,7 +879,7 @@ export function DashboardEditor({
         onOpenChange={setShowDiscardConfirm}
         variant="danger"
         title="Discard changes?"
-        description="You have unsaved changes. Are you sure you want to discard them?"
+        description="Unsaved changes will be lost."
         confirmLabel="Discard changes"
         cancelLabel="Keep editing"
         onConfirm={handleConfirmDiscard}

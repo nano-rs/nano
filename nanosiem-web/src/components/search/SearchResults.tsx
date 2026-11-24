@@ -56,6 +56,7 @@ import {
 import { formatUTCShort, formatCompactNumber } from '@/lib/date-utils';
 // Types needed synchronously for casting (type-only imports don't affect bundling)
 import type { TreeNode, TreeConfig } from './TreeVisualization';
+import { Term } from '@/components/ui/term';
 
 // Heavy visualization components — lazy-loaded since only one renders at a time
 const TreeVisualization = lazy(() => import('./PagedTreeView').then(m => ({ default: m.PagedTreeView })));
@@ -1141,7 +1142,7 @@ export function SearchResults({
               <button
                 onClick={onRefreshCache}
                 className="text-amber-500 dark:text-amber-400 text-xs hover:underline cursor-pointer"
-                title="Click to refresh from server"
+title="These results were saved from an earlier run. Click to run the search again."
               >
                 cached {formatCacheAge(cachedAt)} ago · refresh
               </button>
@@ -1363,9 +1364,9 @@ export function SearchResults({
                   {asyncJobInfo && (
                     <p className="text-[11px] text-muted-foreground mt-1 max-w-md mx-auto leading-relaxed">
                       {asyncJobInfo.origin === 'escalated'
-                        ? 'This search outran the interactive time budget, so it continues in the background. '
+                        ? 'It took too long to wait for, so it moved to the background. '
                         : ''}
-                      You can leave this page and reopen it from Search jobs; results are kept for 24 hours.
+                      Reopen it from <Term id="search-job">Search jobs</Term>; results are kept for 24 hours.
                       <span className="block font-mono text-[10.5px] mt-1">
                         {asyncJobId}
                         {asyncJobInfo.attempt > 1 && (
@@ -1405,7 +1406,7 @@ export function SearchResults({
                       so reassure the user it hasn't hung. */}
                   {query && /\|\s*prevalence\b/i.test(query) && (
                     <p className="text-xs text-muted-foreground/80 mt-4 max-w-sm mx-auto leading-relaxed">
-                      Prevalence searches scan the full window to rank artifact rarity — this can take a while at scale. Let it run.
+                      <Term id="prevalence">Prevalence</Term> checks every event in the time range, so this can take a while.
                     </p>
                   )}
                 </>
@@ -1757,7 +1758,7 @@ export function EmptyState({ hasSearched, isAggregateQuery, histogramHasData, qu
             <p className="text-muted-foreground text-sm mt-2">Try adjusting your query or expanding the time range</p>
             {scopeRestricted && (
               <p className="text-muted-foreground text-xs mt-1" data-testid="empty-scope-note">
-                Your role&apos;s data scope hides some sources, so matching events may not be visible to you.
+                Your data scope hides some sources; matching events may be hidden.
               </p>
             )}
           </>

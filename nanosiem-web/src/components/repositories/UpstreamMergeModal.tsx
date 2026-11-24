@@ -380,7 +380,7 @@ export function UpstreamMergeModal({
       size="xl"
       breadcrumb={['Detections', 'Upstream']}
       title="Merge Upstream Changes"
-      description="Review each change and decide whether to accept the upstream version or keep yours."
+      description="Accept upstream or keep yours, per change."
       meta={diff?.file_path ? <span className="truncate">{diff.file_path}</span> : undefined}
       // Hunk decisions are work the user would lose on an accidental close.
       guardDirty={stats.accepted + stats.rejected > 0}

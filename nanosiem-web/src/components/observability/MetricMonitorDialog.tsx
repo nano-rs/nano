@@ -205,9 +205,7 @@ export function MetricMonitorDialog({
       <SheetContent side="right" className="w-full sm:max-w-[460px] flex flex-col overflow-y-auto gap-0 p-0 bg-card border-border text-foreground">
         <SheetHeader className="space-y-1.5 border-b border-border px-5 py-4 text-left">
           <SheetTitle>{editing ? 'Edit metric monitor' : 'New metric monitor'}</SheetTitle>
-          <SheetDescription>
-            Evaluate the aggregate over a trailing window and alert when it breaches.
-          </SheetDescription>
+          <SheetDescription className="sr-only">Alert when a metric aggregate breaches a threshold.</SheetDescription>
         </SheetHeader>
 
         <div className="flex flex-col gap-3.5 px-5 py-4">

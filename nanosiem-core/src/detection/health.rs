@@ -19,7 +19,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// SQL predicate over `detection_rules r` (binds nothing): the rule's
@@ -92,36 +92,40 @@ pub fn execution_status(currently_failing_rules: i64, failing_rules: i64, covera
 }
 
 /// Number of rules whose executions are failing right now.
-pub async fn count_currently_failing_rules(pool: &PgPool) -> Result<i64, sqlx::Error> {
+pub async fn count_currently_failing_rules<'e>(db: impl PgExecutor<'e>) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*)::bigint FROM detection_rules r WHERE {CURRENTLY_FAILING_PREDICATE}"
     )))
-    .fetch_one(pool)
+    .fetch_one(db)
     .await
 }
 
 /// Number of failing rules (see the module docs).
-pub async fn count_failing_rules(pool: &PgPool) -> Result<i64, sqlx::Error> {
+pub async fn count_failing_rules<'e>(db: impl PgExecutor<'e>) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*)::bigint FROM detection_rules r WHERE {FAILING_PREDICATE}"
     )))
-    .fetch_one(pool)
+    .fetch_one(db)
     .await
 }
 
 /// The health rollup used by `/health/detailed`.
-pub async fn read_execution_health(pool: &PgPool) -> Result<DetectionExecutionHealth, sqlx::Error> {
+pub async fn read_execution_health<'e>(
+    db: impl PgExecutor<'e>,
+) -> Result<DetectionExecutionHealth, sqlx::Error> {
     let (failing_rules, currently_failing_rules, coverage_gaps_24h): (i64, i64, i64) =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             r#"
             SELECT
                 (SELECT COUNT(*)::bigint FROM detection_rules r WHERE {FAILING_PREDICATE}),
                 (SELECT COUNT(*)::bigint FROM detection_rules r WHERE {CURRENTLY_FAILING_PREDICATE}),
-                (SELECT COUNT(*)::bigint FROM detection_coverage_gaps
-                  WHERE recorded_at >= NOW() - make_interval(hours => 24))
+                (SELECT COUNT(*)::bigint FROM detection_coverage_gaps g
+                  JOIN detection_rules r ON r.id = g.rule_id
+                  WHERE g.recorded_at >= NOW() - make_interval(hours => 24)
+                    AND {COVERAGE_GAP_RULE_PREDICATE})
             "#
         )))
-        .fetch_one(pool)
+        .fetch_one(db)
         .await?;
     Ok(DetectionExecutionHealth {
         status: execution_status(currently_failing_rules, failing_rules, coverage_gaps_24h).to_string(),
@@ -131,9 +135,45 @@ pub async fn read_execution_health(pool: &PgPool) -> Result<DetectionExecutionHe
     })
 }
 
+/// NAN-5772: SQL predicate over `detection_rules r` for a coverage gap's rule.
+/// Deleting a rule archives it instead of removing the row, so its gaps no
+/// longer cascade away; a deleted rule's gaps must not degrade health.
+const COVERAGE_GAP_RULE_PREDICATE: &str = "r.archived = false";
+
+/// NAN-5772: SQL predicate over `detection_rules r` (binds nothing): a rule
+/// that exists and is meant to run, the rule set `GET /api/rules/noisy` lists.
+/// Deleting a rule archives it (NAN-5672), so a count must join the rule and
+/// check `archived` rather than read `detection_daily_stats` alone.
+const RUNNING_RULE_PREDICATE: &str = "r.archived = false AND r.mode IN ('live', 'alerting')";
+
+/// NAN-5772: number of noisy rules: running rules whose matches over the last
+/// 7 days sum past `weekly_threshold`. Uses the same rule set as
+/// `GET /api/rules/noisy`, so an archived (deleted) rule drops out at once
+/// rather than after its stats age past the 7-day window.
+pub async fn count_noisy_rules<'e>(db: impl PgExecutor<'e>, weekly_threshold: i64) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"
+        SELECT COUNT(*)::bigint FROM (
+            SELECT s.rule_id
+            FROM detection_daily_stats s
+            JOIN detection_rules r ON r.id = s.rule_id
+            WHERE s.date >= CURRENT_DATE - 7 AND {RUNNING_RULE_PREDICATE}
+            GROUP BY s.rule_id
+            HAVING SUM(s.match_count) > $1
+        ) noisy
+        "#
+    )))
+    .bind(weekly_threshold)
+    .fetch_one(db)
+    .await
+}
+
 /// Failing rules (failing now or within the last 24h), rules failing now
 /// first, then most recent error first (capped at `limit`).
-pub async fn list_failing_rules(pool: &PgPool, limit: i64) -> Result<Vec<FailingRuleSummary>, sqlx::Error> {
+pub async fn list_failing_rules<'e>(
+    db: impl PgExecutor<'e>,
+    limit: i64,
+) -> Result<Vec<FailingRuleSummary>, sqlx::Error> {
     #[allow(clippy::type_complexity)]
     let rows: Vec<(Uuid, String, i16, Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>, bool)> =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -147,7 +187,7 @@ pub async fn list_failing_rules(pool: &PgPool, limit: i64) -> Result<Vec<Failing
             "#
         )))
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(db)
         .await?;
     Ok(rows
         .into_iter()

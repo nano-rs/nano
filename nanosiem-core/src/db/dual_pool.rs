@@ -1466,6 +1466,30 @@ impl DualPool {
         }
     }
 
+    /// Integration-test pool over a REAL PostgreSQL with unconfigured
+    /// ClickHouse clients, for the PostgreSQL-only CI lane
+    /// (`pg-integration-tests.yml`) driving services whose code under test
+    /// never reaches ClickHouse (NAN-5789: log-source delete and render).
+    /// Not a runtime fallback: compiled only for tests and the `test-support`
+    /// feature (enabled by this crate's own dev-dependency, never by a
+    /// service build), and any ClickHouse query on it fails.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_postgres_integration_tests(postgres: PgPool) -> Self {
+        Self {
+            postgres,
+            clickhouse: ClickHouseClient::default(),
+            clickhouse_admin: ClickHouseClient::default(),
+            has_clickhouse_admin: false,
+            clickhouse_rawsql: ClickHouseClient::default(),
+            clickhouse_rawsql_noaudit: ClickHouseClient::default(),
+            clickhouse_search: None,
+            is_clustered: false,
+            logs_table: "logs",
+            server_memory_limit_bytes: 0,
+            query_memory_ceiling_bytes: None,
+        }
+    }
+
     /// Test-only pool whose ClickHouse clients all point at `url` (a mock
     /// HTTP server in emitter tests); PostgreSQL is lazy and never dialled.
     #[cfg(test)]
@@ -1476,6 +1500,28 @@ impl DualPool {
         pool.clickhouse_admin = client.clone();
         pool.clickhouse_rawsql = client.clone();
         pool.clickhouse_rawsql_noaudit = client;
+        pool
+    }
+
+    /// Test-only pool whose ClickHouse clients are all `client` (a disposable
+    /// ClickHouse in live differential tests, NAN-5751); PostgreSQL is lazy
+    /// and never dialled.
+    #[cfg(test)]
+    pub(crate) fn for_live_clickhouse_tests(client: ClickHouseClient) -> Self {
+        let mut pool = Self::for_sql_generation_tests(false);
+        pool.clickhouse = client.clone();
+        pool.clickhouse_admin = client.clone();
+        pool.clickhouse_rawsql = client.clone();
+        pool.clickhouse_rawsql_noaudit = client;
+        pool
+    }
+
+    /// Test-only pool over a disposable PostgreSQL and ClickHouse (NAN-5751
+    /// alerting tests).
+    #[cfg(test)]
+    pub(crate) fn for_live_tests(postgres: PgPool, client: ClickHouseClient) -> Self {
+        let mut pool = Self::for_live_clickhouse_tests(client);
+        pool.postgres = postgres;
         pool
     }
 
@@ -1768,23 +1814,23 @@ mod tests {
             );
         }
 
-        let (Some(generic), Some(aws), Some(rackspace)) = (
+        let (Some(generic), Some(aws), Some(self_managed)) = (
             enterprise_deploy_surface("deploy/k8s/clickhouse/clickhouse.yaml"),
             enterprise_deploy_surface("deploy/k8s/aws-db/clickhouse.yaml.tpl"),
-            enterprise_deploy_surface("deploy/k8s/rackspace-db/clickhouse.yaml.tpl"),
+            enterprise_deploy_surface("deploy/k8s/self-managed-db/clickhouse.yaml.tpl"),
         ) else {
             // Open-core / mirror tree: `deploy/` is absent by design. The
             // users.d assertions above already ran.
             return;
         };
-        let (generic, aws, rackspace) = (generic.as_str(), aws.as_str(), rackspace.as_str());
+        let (generic, aws, self_managed) = (generic.as_str(), aws.as_str(), self_managed.as_str());
 
         // users.d is asserted above, unconditionally — only the deploy-only
         // surfaces belong here.
         let surfaces = [
             ("generic k8s", generic),
             ("aws", aws),
-            ("rackspace", rackspace),
+            ("self-managed", self_managed),
         ];
 
         for (name, config) in surfaces {
@@ -1803,12 +1849,12 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("        nanosiem_admin:\n"))
             .map(|(section, _)| section)
             .expect("AWS runtime section");
-        let rackspace_runtime = rackspace
+        let self_managed_runtime = self_managed
             .split_once("        nanosiem:\n")
             .and_then(|(_, rest)| rest.split_once("        nanosiem_admin:\n"))
             .map(|(section, _)| section)
-            .expect("Rackspace runtime section");
-        for (name, runtime_section) in [("aws", aws_runtime), ("rackspace", rackspace_runtime)] {
+            .expect("self-managed runtime section");
+        for (name, runtime_section) in [("aws", aws_runtime), ("self-managed", self_managed_runtime)] {
             assert!(
                 !runtime_section.contains("GRANT REMOTE"),
                 "{name} must not grant REMOTE to the runtime user"
@@ -1824,7 +1870,7 @@ mod tests {
         for (name, config) in [
             ("generic k8s", generic),
             ("aws", aws),
-            ("rackspace", rackspace),
+            ("self-managed", self_managed),
         ] {
             assert!(
                 config.contains("GRANT REMOTE, CLUSTER ON *.*"),

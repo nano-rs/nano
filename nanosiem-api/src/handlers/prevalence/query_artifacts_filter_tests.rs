@@ -15,11 +15,11 @@ use super::discovery::{candidate_read_error, query_artifacts_filter};
 /// The generator search builds for an OCSF deployment
 /// (`SearchService::ch_generator_for_pool` without the pool).
 fn ocsf_generator() -> ClickHouseSqlGenerator {
-    ClickHouseSqlGenerator::with_table("ocsf_logs").with_profile(Arc::new(OcsfProfile::new()))
+    ClickHouseSqlGenerator::scoped_with_table("ocsf_logs", nanosiem_core::query::GeneratorScope::unrestricted()).with_profile(Arc::new(OcsfProfile::new()))
 }
 
 fn udm_generator() -> ClickHouseSqlGenerator {
-    ClickHouseSqlGenerator::with_table("logs").with_profile(Arc::new(UdmProfile::new()))
+    ClickHouseSqlGenerator::scoped_with_table("logs", nanosiem_core::query::GeneratorScope::unrestricted()).with_profile(Arc::new(UdmProfile::new()))
 }
 
 fn ocsf_filter(query: &str) -> String {

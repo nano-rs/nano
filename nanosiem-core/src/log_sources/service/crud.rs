@@ -45,6 +45,13 @@ pub(super) fn validate_match_field(match_field: Option<&str>) -> Result<(), LogS
     Ok(())
 }
 
+/// NAN-5839: a log source's timezone, validated and in its stored spelling
+/// (see [`crate::timezone::normalize_source_timezone`]). Every writer that goes
+/// through the service (API create/update, wizard drafts, imports) runs it.
+pub(super) fn normalize_timezone(timezone: &str) -> Result<String, LogSourceServiceError> {
+    crate::timezone::normalize_source_timezone(timezone).map_err(LogSourceServiceError::InvalidTimezone)
+}
+
 /// NAN-5012: a non-blank sampling exclude condition must pass
 /// [`crate::parsers::vrl_safety::check_condition`]. Blank means "no condition".
 pub(super) fn check_sampling_condition(
@@ -83,7 +90,38 @@ pub(super) fn reject_vrl_interpolation(
     Ok(())
 }
 
+/// NAN-5789: the canonical spelling of an accepted `source_type` (case,
+/// aliases such as `s3` / `pubsub` / `http`). Callers validated it with
+/// `SourceType::from_str` first; an unexpected value is kept as written.
+pub(super) fn canonical_source_type(source_type: &str) -> String {
+    crate::log_sources::ingest_transport::canonical(source_type)
+        .map(str::to_string)
+        .unwrap_or_else(|| source_type.to_string())
+}
+
 impl LogSourceService {
+    /// NAN-5789: a fetch source must name an existing source configuration
+    /// of its own type (drafts included), and a live one a DEPLOYED one
+    /// ([`crate::log_sources::source_binding`]). 400 with a field error.
+    async fn ensure_source_configuration(
+        &self,
+        kind: &str,
+        source_type: &str,
+        dispatch_source_config_id: Option<Uuid>,
+        must_be_deployed: bool,
+    ) -> Result<(), LogSourceServiceError> {
+        crate::log_sources::source_binding::ensure_binding(
+            &self.pool,
+            kind,
+            source_type,
+            dispatch_source_config_id,
+            must_be_deployed,
+        )
+        .await
+        .map_err(crate::log_sources::LogSourceRepositoryError::from)?
+        .map_err(|e| LogSourceServiceError::MissingSourceConfiguration { field: e.field, message: e.message })
+    }
+
     /// List all log sources with optional filtering.
     pub async fn list(
         &self,
@@ -157,13 +195,17 @@ impl LogSourceService {
         }
     }
 
-    pub async fn create(&self, new: NewLogSource) -> Result<LogSource, LogSourceServiceError> {
+    pub async fn create(&self, mut new: NewLogSource) -> Result<LogSource, LogSourceServiceError> {
         // Validate source type
         if SourceType::from_str(&new.source_type).is_none() {
             return Err(LogSourceServiceError::InvalidSourceType(
                 new.source_type.clone(),
             ));
         }
+        // NAN-5789: store the canonical spelling. The renderer classifies on
+        // it, so `KAFKA` stored raw would not be treated as the fetch source
+        // every check here validated it as.
+        new.source_type = canonical_source_type(&new.source_type);
 
         // The name lands in a generated TOML section/comment header — reject
         // control chars at the boundary, not just via generator escaping (NAN-1371).
@@ -173,11 +215,23 @@ impl LogSourceService {
         // NAN-2158: `match_field` is a SQL column identifier, not a value.
         validate_match_field(new.match_field.as_deref())?;
 
+        // NAN-5839: stored canonical (`america/new_york` -> `America/New_York`,
+        // `-0500` -> `-05:00`, empty -> `UTC`), so the injected value is the
+        // exact spelling the parsers accept.
+        new.timezone = normalize_timezone(&new.timezone)?;
+
         reject_vrl_interpolation(&[
             ("parser_vrl", Some(new.parser_vrl.as_str())),
             ("sampling_exclude_condition", new.sampling_exclude_condition.as_deref()),
         ])?;
         check_sampling_condition(new.sampling_exclude_condition.as_deref())?;
+
+        // NAN-5789: a fetch source without a source configuration cannot
+        // render; refuse it here rather than leave it to break every render.
+        // A new source is never live (it is created disabled), so its
+        // configuration need not be deployed yet.
+        self.ensure_source_configuration("log", &new.source_type, new.dispatch_source_config_id, false)
+            .await?;
 
         // NAN-2311: UNIQUE(name) accepts `my-source` beside `My Source`; the
         // generated Vector namespace does not.
@@ -252,7 +306,7 @@ impl LogSourceService {
     pub async fn update(
         &self,
         id: Uuid,
-        update: UpdateLogSource,
+        mut update: UpdateLogSource,
     ) -> Result<LogSource, LogSourceServiceError> {
         // Validate source type if being updated
         if let Some(ref source_type) = update.source_type {
@@ -261,6 +315,25 @@ impl LogSourceService {
                     source_type.clone(),
                 ));
             }
+        }
+        // NAN-5789: stored canonical, like create.
+        update.source_type = update.source_type.as_deref().map(canonical_source_type);
+        // NAN-5839: the timezone, validated and stored canonical like create.
+        update.timezone = update.timezone.as_deref().map(normalize_timezone).transpose()?;
+
+        // NAN-5789: when a PUT changes the transport or the binding, or
+        // enables the source, the RESULT must still render: a fetch source
+        // needs an existing configuration of its own type, and a live one a
+        // DEPLOYED one (otherwise the render leaves it out and its ingest
+        // stops). A PUT touching none of these (rename, disable) is not
+        // checked, so a legacy unbound row can still be disabled or renamed;
+        // switching it to "routed" or binding it fixes it.
+        if update.source_type.is_some() || update.dispatch_source_config_id.is_some() || update.enabled == Some(true) {
+            let current = self.repository().find_by_id(id).await?;
+            let source_type = update.source_type.as_deref().unwrap_or(current.source_type.as_str());
+            let binding = update.dispatch_source_config_id.or(current.dispatch_source_config_id);
+            let live = update.enabled.unwrap_or(current.enabled);
+            self.ensure_source_configuration(&current.kind, source_type, binding, live).await?;
         }
 
         // NAN-2311: a RENAME can collide just as a create can. `exclude` is the
@@ -494,9 +567,15 @@ impl LogSourceService {
             // still present here.
             let parsers: Vec<_> = match self.effective_deployed_parsers().await {
                 Ok(parsers) => parsers.into_iter().filter(|parser| !doomed.contains(&parser.id)).collect(),
-                Err(e) => {
+                // NAN-5789: only a database error is reported as one; any
+                // other render-prep failure names itself.
+                Err(LogSourceServiceError::RepositoryError(e)) => {
                     tracing::error!(sources = ?names, error = %e, "could not list the deployed log sources for a delete");
                     return fail_all_with(results, &doomed, BatchFailure::Database);
+                }
+                Err(e) => {
+                    tracing::error!(sources = ?names, error = %e, "could not prepare the Vector config for a delete");
+                    return fail_all_with(results, &doomed, BatchFailure::Failed(e.to_string()));
                 }
             };
 

@@ -113,6 +113,7 @@ fn high_share_drags_the_ingestion_score() {
         total_events_24h: 1_000,
         total_events_prior_24h: 1_000,
         silent_sources: vec![],
+        removed_sources: vec![],
         insert_integrity: after_185(),
     };
     let healthy = score_ingestion(&m);

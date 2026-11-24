@@ -208,7 +208,7 @@ pub async fn get_demo_session_status(
 ///
 /// Returns auth credentials for the session. The token is reusable for the
 /// session lifetime (72h), so users can bookmark or re-open their demo link.
-/// This is the endpoint that unique demo links (e.g. saturn.nano.rs/d/{token}) resolve to.
+/// This is the endpoint that unique demo links (e.g. https://nano.example.com/d/{token}) resolve to.
 #[utoipa::path(
     post,
     path = "/api/demo/session/{token}/claim",

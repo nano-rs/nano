@@ -10,6 +10,7 @@ import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { SystemHealthEvent, SystemHealthStatus } from '@/lib/api/system-health';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 const SEVERITY_CLASS: Record<string, string> = {
   critical: 'border-red-500/30 bg-red-500/10 text-red-400',
@@ -157,16 +158,13 @@ export function SystemHealthEventsPanel() {
       <div className="flex items-center justify-between gap-3 border-b border-border bg-card/60 px-3 py-2.5">
         <div className="flex items-center gap-2">
           <BellRing className="h-3.5 w-3.5 text-muted-foreground" />
-          <div>
-            <h2 className="text-[12px] font-semibold text-foreground">System health events</h2>
-            <p className="text-[10.5px] text-muted-foreground">Operational degradation from collectors, enrichments, log sources, and platform services</p>
-          </div>
+          <h2 className="text-[12px] font-semibold text-foreground"><Term id="health-event">System health events</Term></h2>
         </div>
         <div className="flex items-center gap-2">
           {summary.data && (
             <span className="font-mono text-[10px] text-muted-foreground">
               {summary.data.active} active · {summary.data.unacknowledged} unacknowledged
-              {summary.data.delivery_dead > 0 ? ` · ${summary.data.delivery_dead} dead-letter` : ''}
+              {summary.data.delivery_dead > 0 ? ` · ${summary.data.delivery_dead} could not be sent` : ''}
             </span>
           )}
           {canConfigureRouting && (

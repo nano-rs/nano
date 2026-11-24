@@ -13,6 +13,7 @@
 // folding it in would mean gutting that editor. Everything else about the rule
 // (list, promote/pause, matches) reuses the standard /rules surfaces.
 
+import { Term } from '@/components/ui/term';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, useSearchParams, Link } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -37,7 +38,7 @@ function Field({
   hint,
   children,
 }: {
-  label: string;
+  label: React.ReactNode;
   hint?: string;
   children: React.ReactNode;
 }) {
@@ -223,27 +224,23 @@ export function RetroHunt() {
         <div className="min-w-0">
           <h1 className="text-[20px] font-semibold text-foreground tracking-[-0.01em] leading-none flex items-center gap-2">
             <History className="w-4 h-4 text-muted-foreground" strokeWidth={1.5} />
-            {isNew ? 'New retro-hunt' : rule?.name || 'Retro-hunt'}
+            {isNew ? <>New <Term id="retro-hunt">retro-hunt</Term></> : rule?.name || 'Retro-hunt'}
           </h1>
-          <p className="text-[12px] text-muted-foreground mt-1.5 leading-none">
-            Match newly-published threat intel against historical logs
-            {!isNew && view?.state?.last_run_at && (
-              <>
-                <span className="text-muted-foreground/60 mx-1.5">·</span>
-                <span className="font-mono text-[10.5px]">
-                  last run {new Date(view.state.last_run_at).toLocaleString()}
-                </span>
-              </>
-            )}
-            {!isNew && (
-              <>
-                <span className="text-muted-foreground/60 mx-1.5">·</span>
-                <span className="font-mono text-[10.5px]">{totals.hunted} indicators hunted</span>
-                <span className="text-muted-foreground/60 mx-1.5">·</span>
-                <span className="font-mono text-[10.5px] text-foreground">{totals.hits} hits</span>
-              </>
-            )}
-          </p>
+          {!isNew && (
+            <p className="text-[12px] text-muted-foreground mt-1.5 leading-none">
+              {view?.state?.last_run_at && (
+                <>
+                  <span className="font-mono text-[10.5px]">
+                    last run {new Date(view.state.last_run_at).toLocaleString()}
+                  </span>
+                  <span className="text-muted-foreground/60 mx-1.5">·</span>
+                </>
+              )}
+              <span className="font-mono text-[10.5px]">{totals.hunted} indicators hunted</span>
+              <span className="text-muted-foreground/60 mx-1.5">·</span>
+              <span className="font-mono text-[10.5px] text-foreground">{totals.hits} hits</span>
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {!isNew && (
@@ -311,7 +308,7 @@ export function RetroHunt() {
             </Field>
             <Field
               label="Mode"
-              hint="Live bakes in (findings, no alerts). A retro-hunt consumes indicators as it hunts them, so promote to Alerting to alert on intel landing after promotion — or create directly in Alerting to alert on the current backlog."
+              hint="Live records hits but raises no alerts. Each indicator is hunted only once, so pick Alerting now if you want alerts for the indicators already waiting."
             >
               <select
                 data-testid="retro-hunt-mode"
@@ -320,11 +317,11 @@ export function RetroHunt() {
                 value={mode}
                 onChange={(e) => setMode(e.target.value as typeof mode)}
               >
-                <option value="live">live (bake-in)</option>
+                <option value="live">live (no alerts)</option>
                 <option value="alerting">alerting</option>
               </select>
             </Field>
-            <Field label="Schedule" hint="Cron. Retro hunts aren't latency-sensitive.">
+            <Field label="Schedule" hint="A cron expression. Retro hunts don't need to run often.">
               <input
                 data-testid="retro-hunt-schedule"
                 aria-label="Schedule"
@@ -336,7 +333,7 @@ export function RetroHunt() {
           </>
         )}
 
-        <Field label="Feeds" hint="Which intel feeds to watch. None selected = all feeds.">
+        <Field label="Feeds" hint="Which threat intel feeds to watch. Pick none to watch them all.">
           <ChipMulti
             options={availableFeeds}
             selected={feeds}
@@ -345,7 +342,7 @@ export function RetroHunt() {
           />
         </Field>
 
-        <Field label="Artifact types" hint="None selected = all types.">
+        <Field label="Artifact types" hint="Which kinds of indicators to hunt, such as IPs or hashes. Pick none for all.">
           <ChipMulti
             options={[...ARTIFACT_TYPES]}
             selected={artifactTypes}
@@ -354,7 +351,7 @@ export function RetroHunt() {
           />
         </Field>
 
-        <Field label="Lookback" hint={`How far back to hunt. Max ${MAX_LOOKBACK_DAYS}d (log retention).`}>
+        <Field label={<Term id="rule-lookback">Lookback</Term>} hint={`How far back in your logs to search, up to ${MAX_LOOKBACK_DAYS} days. Logs older than your retention period can't be searched.`}>
           <div className="flex items-center gap-2">
             <input
               data-testid="retro-hunt-lookback"
@@ -375,7 +372,7 @@ export function RetroHunt() {
 
         <Field
           label="Max indicators / run"
-          hint="Cost cap. Overflow is carried to the next run — never silently dropped."
+          hint="A limit to keep each run cheap. Extra indicators wait for the next run; none are dropped."
         >
           <div className="flex items-center gap-2">
             <input
@@ -401,7 +398,7 @@ export function RetroHunt() {
           <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
             <div className="text-[12px] font-medium text-foreground">Run history</div>
             <div className="text-[10.5px] text-muted-foreground">
-              Watermark:{' '}
+              <Term id="retro-watermark">Watermark</Term>:{' '}
               <span className="font-mono">
                 {view?.state?.watermark
                   ? new Date(view.state.watermark).toLocaleString()
@@ -472,7 +469,7 @@ export function RetroHunt() {
                       {run.truncated ? (
                         <span
                           className="inline-flex items-center gap-1 text-warning"
-                          title={`Hit the per-run cap. ${run.overflow_remaining} indicator(s) carried to the next run.`}
+                          title={`Hit the per-run limit. ${run.overflow_remaining} indicator(s) wait for the next run.`}
                         >
                           <AlertTriangle className="w-3 h-3" strokeWidth={1.5} />
                           <span className="font-mono text-[10.5px]">

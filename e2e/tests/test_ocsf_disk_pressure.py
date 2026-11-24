@@ -134,13 +134,12 @@ def test_disk_pressure_evicts_the_oldest_ocsf_partitions(stack: Stack, nano: Nan
     timeline.step("old partitions seeded", partitions=sorted(seeded))
     since = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
 
-    app_env = stack.run_dir / "app.env"
-    original = app_env.read_text()
     try:
         forced = {**FORCED, **_watermarks_with_clickhouse_filler(ch)}
         timeline.step("clickhouse filler seeded", filler_bytes=FILLER_BYTES)
-        app_env.write_text(original.rstrip("\n") + "\n" + "".join(f"export {k}={v}\n" for k, v in forced.items()))
-        stack.svc("restart", "jobs")
+        # NAN-5878: through the runner, not app.env (native only): the same
+        # call recreates the image-mode jobs container with the watermarks.
+        stack.svc("restart", "jobs", env=forced)
         timeline.step("jobs restarted with forced watermarks", **forced)
         left = eventually(parts, timeout=240, interval=5, desc="old OCSF / legacy / UDM partitions evicted",
                           ok=lambda p: not (seeded & p))
@@ -166,7 +165,6 @@ def test_disk_pressure_evicts_the_oldest_ocsf_partitions(stack: Stack, nano: Nan
         assert all("ocsf_logs_distributed" not in (t or []) for t in by_date.values()), by_date
         timeline.step("audited", by_date=by_date)
     finally:
-        app_env.write_text(original)
         ch(f"DROP TABLE IF EXISTS nanosiem.{FILLER} SYNC")
         stack.svc("restart", "jobs")
         if created_legacy:

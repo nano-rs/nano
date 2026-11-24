@@ -120,6 +120,24 @@ const AUTO_REFRESH_OPTIONS: { value: AutoRefreshInterval; label: string; ms: num
   { value: '15m', label: '15 minutes', ms: 900000 },
 ];
 
+/**
+ * NAN-5637: true once the fetch for the current route `id` has finished.
+ * `useDashboard` keeps the previous dashboard's data when `id` changes and
+ * only turns `loading` on in its effect, so for one render the old dashboard
+ * looks loaded under the new URL. A fetch for `id` is seen when `loading`
+ * turns on with that id; done when it turns off again.
+ */
+function useLoadedForRoute(id: string | undefined, loading: boolean): boolean {
+  const fetching = useRef<string | undefined>(undefined);
+  const [loadedId, setLoadedId] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (loading) fetching.current = id;
+    else if (fetching.current === id) setLoadedId(id);
+  }, [id, loading]);
+  // A refetch of the same id keeps it true (same dashboard, newer data).
+  return id !== undefined && loadedId === id;
+}
+
 export function DashboardView() {
   const { id } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -282,7 +300,7 @@ export function DashboardView() {
       if (isDashboardConflictError(err)) {
         toast({
           title: 'Dashboard changed on server',
-          description: 'Someone else updated this dashboard. Reload to see the latest version before saving.',
+          description: 'Someone else updated this dashboard. Reload before saving.',
           variant: 'destructive',
         });
       } else {
@@ -735,7 +753,24 @@ export function DashboardView() {
     const vars = Array.isArray(d.layout?.variables) ? d.layout.variables : [];
     return Object.fromEntries(vars.map((v) => [v.name, String(picked[v.name] ?? v.defaultValue ?? '').slice(0, 256)]));
   };
-  const canEditDashboard = !!dashboard && !isEditMode && (!!dashboard.is_owner || hasPermission('settings:system'));
+  // NAN-5637: who the server lets save this dashboard (PUT /api/dashboards/:id:
+  // `dashboards:edit`, and the owner or `settings:system`). Edit, Settings
+  // and the editor itself follow it; pivt's panel actions too.
+  // Only from the dashboard fetched for THIS route: across /dashboards/:id
+  // navigation the instance is reused and `dashboard` still holds the
+  // previous one (not yet `loading`) for a render.
+  const loadedForRoute = useLoadedForRoute(id, loading) && !error;
+  const canSaveDashboard =
+    loadedForRoute &&
+    !!dashboard &&
+    hasPermission('dashboards:edit') &&
+    (!!dashboard.is_owner || hasPermission('settings:system'));
+  const canEditDashboard = canSaveDashboard && !isEditMode;
+  // A non-owner reaching ?edit=true (a shared link, the back button) sees the
+  // dashboard, not an editor whose Save would be refused.
+  useEffect(() => {
+    if (loadedForRoute && dashboard && isEditMode && !canSaveDashboard) setSearchParams({}, { replace: true });
+  }, [loadedForRoute, dashboard, isEditMode, canSaveDashboard, setSearchParams]);
   const dashboardRef = useRef(dashboard ?? null);
   dashboardRef.current = dashboard ?? null;
   const pivtActions = useMemo(
@@ -827,7 +862,7 @@ export function DashboardView() {
 
   // Edit mode — DashboardEditor still owns its own chrome; just wrap with a
   // back button at redesign density.
-  if (isEditMode) {
+  if (isEditMode && canSaveDashboard) {
     return (
       <div className="p-4">
         <div className="mb-3">
@@ -854,7 +889,7 @@ export function DashboardView() {
           onOpenChange={setShowEditDiscard}
           variant="danger"
           title="Discard changes?"
-          description="You have unsaved changes to this dashboard. Leaving now will discard them."
+          description="Unsaved changes will be lost."
           confirmLabel="Discard changes"
           cancelLabel="Keep editing"
           onConfirm={() => {
@@ -945,10 +980,12 @@ export function DashboardView() {
           Share
         </Button>
 
-        <Button variant="outline" size="sm" className="h-[28px] gap-1.5" onClick={handleEnterEditMode}>
-          <Pencil className="w-[12px] h-[12px]" />
-          Edit
-        </Button>
+        {canSaveDashboard && (
+          <Button variant="outline" size="sm" className="h-[28px] gap-1.5" onClick={handleEnterEditMode}>
+            <Pencil className="w-[12px] h-[12px]" />
+            Edit
+          </Button>
+        )}
 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -962,13 +999,15 @@ export function DashboardView() {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="bg-popover border-border">
-            <DropdownMenuItem
-              onClick={handleOpenSettings}
-              className="text-[12px] cursor-pointer"
-            >
-              <Settings className="w-[12px] h-[12px] mr-2" />
-              Settings
-            </DropdownMenuItem>
+            {canSaveDashboard && (
+              <DropdownMenuItem
+                onClick={handleOpenSettings}
+                className="text-[12px] cursor-pointer"
+              >
+                <Settings className="w-[12px] h-[12px] mr-2" />
+                Settings
+              </DropdownMenuItem>
+            )}
             {dashboard.is_owner && (
               <DropdownMenuItem
                 onClick={() => setShareDialogOpen(true)}
@@ -992,14 +1031,18 @@ export function DashboardView() {
               <Clock className="w-[12px] h-[12px] mr-2" />
               Schedule report
             </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={handleEnterEditMode}
-              className="text-[12px] cursor-pointer"
-            >
-              <Pencil className="w-[12px] h-[12px] mr-2" />
-              Edit dashboard
-            </DropdownMenuItem>
+            {canSaveDashboard && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={handleEnterEditMode}
+                  className="text-[12px] cursor-pointer"
+                >
+                  <Pencil className="w-[12px] h-[12px] mr-2" />
+                  Edit dashboard
+                </DropdownMenuItem>
+              </>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
@@ -1026,13 +1069,14 @@ export function DashboardView() {
           <div className="h-full flex flex-col items-center justify-center gap-3 p-10 text-center">
             <LayoutDashboard className="w-10 h-10 text-muted-foreground/40" />
             <div className="text-[13px] font-medium text-foreground">No panels yet</div>
-            <div className="text-[11.5px] text-muted-foreground">
-              Edit this dashboard to add panels.
-            </div>
-            <Button size="sm" className="h-[28px] mt-1" onClick={handleEnterEditMode}>
-              <Pencil className="w-[12px] h-[12px]" />
-              Edit dashboard
-            </Button>
+            {canSaveDashboard ? (
+              <Button size="sm" className="h-[28px] mt-1" onClick={handleEnterEditMode}>
+                <Pencil className="w-[12px] h-[12px]" />
+                Edit dashboard
+              </Button>
+            ) : (
+              <div className="text-[11.5px] text-muted-foreground">Only its owner or an admin can add panels to this dashboard.</div>
+            )}
           </div>
         ) : (
           <div className="p-2">

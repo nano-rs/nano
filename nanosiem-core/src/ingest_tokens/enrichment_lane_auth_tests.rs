@@ -45,7 +45,7 @@ fn prepare_programs() -> Vec<(&'static str, String)> {
     }
     for (label, path) in [
         ("k8s/vector", "deploy/k8s/vector/configmap.yaml"),
-        ("k8s/rackspace", "deploy/k8s/rackspace/vector-configmap.yaml"),
+        ("k8s/self-managed", "deploy/k8s/self-managed/vector-configmap.yaml"),
     ] {
         if let Some(manifest) = repo_file(path) {
             programs.push((label, program(&configmap_enrich(&manifest))));

@@ -542,7 +542,7 @@ export function PrevalenceScatterPlot({
       )}
       {!loading && totalArtifacts > 0 && shownArtifacts === 0 && !dots.some((d) => d.pending) && (
         <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
-          {totalArtifacts} artifacts seen on &gt;{maxHostCount} hosts — raise the slider to see them
+          {totalArtifacts} artifacts seen on &gt;{maxHostCount} hosts; raise the slider to see them
         </div>
       )}
       {/* NAN-1700: dots are already plotted at their event times; this just

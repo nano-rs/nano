@@ -28,6 +28,7 @@ import { ADD_DATA_PATH, INGEST_ENDPOINT_QUERY_KEY } from '@/lib/add-data-sources
 import { INGEST_TOKENS_QUERY_KEY } from '@/lib/api/ingest-tokens';
 import { LISTENER_CONFIG_TYPES } from '@/lib/ingestion-paths';
 import { SourceConfigsPanel } from '@/components/source-configs/SourceConfigsPanel';
+import { Term } from '@/components/ui/term';
 
 export function IngestCredentials() {
   useDocumentTitle('Ingest credentials');
@@ -47,7 +48,7 @@ export function IngestCredentials() {
     <LogSourcesPageShell active="credentials" testId="ingest-credentials-page">
       <LogSourcesPageHeader
         icon={KeyRound}
-        title="Ingest credentials"
+        title={<Term id="ingest-credential">Ingest credentials</Term>}
         actions={<>
           <Button
             variant="outline"
@@ -70,7 +71,7 @@ export function IngestCredentials() {
           <span>{active} active</span>
           <span>{unbound} unbound</span>
           <span>{revoked} revoked</span>
-          <span>install token {tokens.data?.install_token.state.replace(/_/g, ' ')}</span>
+          <span><Term id="install-token">install token</Term> {tokens.data?.install_token.state.replace(/_/g, ' ')}</span>
           {endpoint.data && <span className="truncate">endpoint {endpoint.data.hostname}</span>}
         </> : undefined}
       />
@@ -81,7 +82,7 @@ export function IngestCredentials() {
           <SourceConfigsPanel
             types={LISTENER_CONFIG_TYPES}
             title="Push listeners"
-            description="Routing profiles over Vector's HTTP, Vector, OTLP and HEC listeners. Most sources never need one: a token already decides the source. Add one to route by a field instead."
+            description="Route by a field instead of by token. Most sources never need one."
             addLabel="Add listener"
             testId="push-listeners"
           />

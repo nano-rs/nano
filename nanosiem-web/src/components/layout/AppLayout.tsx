@@ -34,6 +34,10 @@ import {
   Gauge,
   ShieldCheck,
   Menu,
+  Siren,
+  Flag,
+  BookOpen,
+  Lightbulb,
 } from 'lucide-react';
 import {
   NavHome,
@@ -55,6 +59,7 @@ import {
 } from '@/components/layout/nav-icons';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { ingestionNavigation } from './ingestion-navigation';
+import { isHuntsNavItemActive, isUnder } from './hunts-navigation';
 import { LOG_SOURCES_PATH, ingestionHomeFor } from '@/lib/ingestion-paths';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
@@ -74,6 +79,7 @@ import { useNotebookOptional } from '@/enterprise/contexts/NotebookContext';
 import { usePivtState, type PivtState } from '@/enterprise/hooks/use-pivt-state';
 import { AUTOMATION_SECTION_ICON, useAutomationNav } from '@/enterprise/pages/Automation/automation-nav';
 import { ApprovalsBell } from '@/enterprise/pages/Automation/ApprovalsBell';
+import { useHuntsNavCounts, type HuntsNavCounts } from '@/enterprise/hooks/use-hunts-nav-counts';
 import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { PivtShellOverlay } from '@/enterprise/components/pivt/PivtShellOverlay';
 import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
@@ -81,12 +87,13 @@ import { NotificationBell } from '@/components/NotificationBell';
 import { HelpMenu } from '@/components/support/HelpMenu';
 
 import { SettingsLayout } from '@/components/layout/settings/SettingsLayout';
+import { SETTINGS_LANDING_PERMISSIONS, settingsHomeHref } from '@/components/layout/settings/sections';
 const CommandPalette = lazy(() => import('@/components/shared/CommandPalette').then(m => ({ default: m.CommandPalette })));
 import { Button } from '@/components/ui/button';
 import { BetaBadge } from '@/components/ui/beta-badge';
 import { StatusBar } from './StatusBar';
 import { Logo } from '@/components/ui/logo';
-import { ThemeMenu } from './ThemeMenu';
+import { RailThemeFlyout, RailThemeStrip } from './RailThemeSwitcher';
 import {
   Sheet,
   SheetContent,
@@ -95,7 +102,11 @@ import {
 
 /**
  * Flyout menu for collapsed sidebar sections.
- * Shows sub-items on hover when sidebar is collapsed.
+ * Shows sub-items on hover when sidebar is collapsed. NAN-5844: also a
+ * keyboard / screen-reader menu button: Enter, Space, ArrowDown or ArrowRight
+ * on the trigger opens it and focuses the first item, ArrowUp/ArrowDown/Home/
+ * End move between items, Escape closes it and returns focus to the trigger,
+ * and focus leaving both the trigger and the menu closes it.
  */
 function CollapsedSectionFlyout({
   icon: Icon,
@@ -106,6 +117,10 @@ function CollapsedSectionFlyout({
   handleNavClick,
   iconSize = 'w-5 h-5',
   beta = false,
+  isItemActive,
+  badges,
+  testId,
+  onOpenChange,
 }: {
   icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
   label: string;
@@ -116,46 +131,155 @@ function CollapsedSectionFlyout({
   iconSize?: string;
   /** Early-access section: the flyout header carries the BETA badge (NAN-5654). */
   beta?: boolean;
+  /** Section-specific active rule for an item (NAN-5844: Hunts detail routes). */
+  isItemActive?: (pathname: string, item: NavItem) => boolean;
+  /** Count shown beside an item, keyed by href (NAN-5844). */
+  badges?: Partial<Record<string, string>>;
+  /** `data-testid` on the trigger's wrapper and (with `-flyout`) the open panel. */
+  testId?: string;
+  /** Told whenever the flyout opens or closes (NAN-5844: Hunts fetches its counts while open). */
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ top: 0, left: 0 });
   const triggerRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Focus the first item once the menu mounts (keyboard open only).
+  const focusFirstRef = useRef(false);
+  const accessibleLabel = beta ? `${label} (beta)` : label;
+  const menuId = `rail-flyout-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 
-  const handleEnter = () => {
+  const onOpenChangeRef = useRef(onOpenChange);
+  useEffect(() => {
+    onOpenChangeRef.current = onOpenChange;
+  }, [onOpenChange]);
+  const reported = useRef(false);
+  useEffect(() => {
+    if (reported.current === open) return;
+    reported.current = open;
+    onOpenChangeRef.current?.(open);
+  }, [open]);
+  useEffect(() => () => {
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    // Unmounted (the rail expanded): nothing is open any more.
+    if (reported.current) onOpenChangeRef.current?.(false);
+  }, []);
+
+  const place = () => {
     if (triggerRef.current) {
       const rect = triggerRef.current.getBoundingClientRect();
       setPos({ top: rect.top, left: rect.right + 4 });
     }
+  };
+  const handleEnter = () => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    place();
     setOpen(true);
   };
   const handleLeave = () => {
+    // A keyboard user inside the menu keeps it open when the pointer wanders off.
+    if (menuRef.current?.contains(document.activeElement)) return;
     timeoutRef.current = setTimeout(() => setOpen(false), 150);
+  };
+
+  const menuItems = () => Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
+  useEffect(() => {
+    if (open && focusFirstRef.current) {
+      focusFirstRef.current = false;
+      menuItems()[0]?.focus();
+    }
+  }, [open]);
+
+  const openFromKeyboard = () => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    place();
+    if (open) {
+      menuItems()[0]?.focus();
+    } else {
+      focusFirstRef.current = true;
+      setOpen(true);
+    }
+  };
+  const closeToTrigger = () => {
+    setOpen(false);
+    buttonRef.current?.focus();
+  };
+
+  const onTriggerKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      openFromKeyboard();
+    } else if (e.key === 'Escape' && open) {
+      e.preventDefault();
+      setOpen(false);
+    }
+  };
+  const onMenuKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const list = menuItems();
+    const at = list.indexOf(document.activeElement as HTMLElement);
+    let next: number | null = null;
+    if (e.key === 'ArrowDown') next = at < 0 ? 0 : (at + 1) % list.length;
+    else if (e.key === 'ArrowUp') next = at < 0 ? list.length - 1 : (at - 1 + list.length) % list.length;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = list.length - 1;
+    else if (e.key === 'Escape' || e.key === 'ArrowLeft') {
+      e.preventDefault();
+      closeToTrigger();
+      return;
+    }
+    if (next !== null && list.length) {
+      e.preventDefault();
+      list[next].focus();
+    }
+  };
+  // Focus moving outside both the trigger and the (portaled) menu closes it.
+  const onBlurWithin = (e: React.FocusEvent) => {
+    const to = e.relatedTarget as Node | null;
+    if (to && (triggerRef.current?.contains(to) || menuRef.current?.contains(to))) return;
+    if (to) setOpen(false);
   };
 
   return (
     <>
-      <div ref={triggerRef} onMouseEnter={handleEnter} onMouseLeave={handleLeave}>
-        <div
+      <div ref={triggerRef} onMouseEnter={handleEnter} onMouseLeave={handleLeave} data-testid={testId}>
+        <button
+          ref={buttonRef}
+          type="button"
+          aria-label={accessibleLabel}
+          title={open ? undefined : accessibleLabel}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-controls={open ? menuId : undefined}
+          onClick={() => (open ? setOpen(false) : handleEnter())}
+          onKeyDown={onTriggerKeyDown}
+          onBlur={onBlurWithin}
           className={cn(
-            'relative flex items-center justify-center h-8 w-8 mx-auto rounded-md transition-colors cursor-pointer',
+            'relative flex items-center justify-center h-8 w-8 mx-auto rounded-md transition-colors cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-ring',
             isActive
               ? 'bg-primary/10 text-primary'
               : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
           )}
         >
           <Icon className={iconSize} />
-        </div>
+        </button>
       </div>
       {open && ReactDOM.createPortal(
         <div
+          ref={menuRef}
+          id={menuId}
+          role="menu"
+          aria-label={accessibleLabel}
           style={{ position: 'fixed', top: pos.top, left: pos.left }}
           className="z-[9999] min-w-[180px] rounded-md border bg-popover p-1 shadow-md animate-in fade-in-0 zoom-in-95 slide-in-from-left-2"
+          data-testid={testId ? `${testId}-flyout` : undefined}
           onMouseEnter={handleEnter}
           onMouseLeave={handleLeave}
+          onKeyDown={onMenuKeyDown}
+          onBlur={onBlurWithin}
         >
-          <div className="flex items-center gap-2 px-2 py-1.5 text-xs font-semibold text-muted-foreground">
+          <div role="presentation" aria-hidden="true" className="flex items-center gap-2 px-2 py-1.5 text-xs font-semibold text-muted-foreground">
             {label}
             {beta && <BetaBadge />}
           </div>
@@ -168,24 +292,29 @@ function CollapsedSectionFlyout({
                 sibling.href.startsWith(item.href) &&
                 (location.pathname === sibling.href || location.pathname.startsWith(sibling.href + '/'))
             );
-            const itemActive = matchesPath && !hasMoreSpecificMatch;
+            const itemActive = isItemActive ? isItemActive(location.pathname, item) : matchesPath && !hasMoreSpecificMatch;
+            const count = badges?.[item.href];
             return (
               <Link
                 key={item.name}
                 to={item.href}
+                role="menuitem"
+                tabIndex={-1}
+                aria-current={itemActive ? 'page' : undefined}
                 onClick={(e) => {
                   handleNavClick(e, item.href);
                   setOpen(false);
                 }}
                 className={cn(
-                  'flex items-center gap-2 rounded-sm px-2 py-1.5 text-[12px] transition-colors',
+                  'flex items-center gap-2 rounded-sm px-2 py-1.5 text-[12px] transition-colors outline-none focus-visible:bg-accent focus-visible:text-foreground',
                   itemActive
                     ? 'text-primary bg-primary/10'
                     : 'text-muted-foreground hover:bg-accent hover:text-foreground',
                 )}
               >
                 <SubIcon className="w-3.5 h-3.5" />
-                {item.name}
+                <span className="flex-1">{item.name}</span>
+                {count && <span className="font-mono text-[10px] tabular-nums text-muted-foreground">{count}</span>}
               </Link>
             );
           })}
@@ -266,11 +395,9 @@ const casesNavigation: NavItem[] = [
 
 /**
  * Secondary navigation items (after Detections)
- * Order: Hunts > Notebooks > Prevalence > Risk
+ * Order: Notebooks > Prevalence > Risk > Health (Hunts is its own group, NAN-5844)
  */
 const secondaryMainNavigation: NavItem[] = [
-  // NAN-5545: enterprise hunts workspace; the capability is off in open builds.
-  { name: 'Hunts', href: '/hunts', icon: NavCrosshair, permissions: 'hunts:view', capability: 'hunts', beta: true },
   { name: 'Notebooks', href: '/notebooks', icon: NavList, permissions: 'notebooks:view', capability: 'notebooks' },
   { name: 'Prevalence', href: '/prevalence', icon: NavChart, permissions: 'prevalence:view' },
   { name: 'Risk', href: '/risk', icon: NavBars, permissions: 'risk:view', capability: 'risk' },
@@ -279,6 +406,28 @@ const secondaryMainNavigation: NavItem[] = [
   // to an empty page (the 403 renders as "No health reports yet").
   { name: 'Health', href: '/platform/health', icon: NavInfo, permissions: 'settings:system', capability: 'siemHealth' },
 ];
+
+/**
+ * Hunts navigation items (expandable section, NAN-5844). The enterprise hunts
+ * workspace (NAN-5545); the capability is off in open builds, so the whole
+ * group disappears there. NAN-5850: "Hunt settings" is gone; Knowledge takes
+ * its slot (Runners and the charter live in Settings > Hunting, Rule ideas in
+ * Detections, Decisions is a Findings tab).
+ */
+const huntsNavigation: NavItem[] = [
+  { name: 'Hunts', href: '/hunts', icon: NavCrosshair, permissions: 'hunts:view', capability: 'hunts' },
+  { name: 'Findings', href: '/hunts/leads', icon: Inbox, permissions: 'hunts:view', capability: 'hunts' },
+  { name: 'Escalations', href: '/hunts/escalations', icon: Siren, permissions: 'hunts:view', capability: 'hunts' },
+  { name: 'Campaigns', href: '/hunts/campaigns', icon: Flag, permissions: 'hunts:view', capability: 'hunts' },
+  { name: 'Knowledge', href: '/hunts/knowledge', icon: BookOpen, permissions: 'hunts:view', capability: 'hunts' },
+];
+
+/** Rail active rule for a Hunts entry (detail and settings pages light their parent). */
+function isHuntsItemActive(pathname: string, item: NavItem): boolean {
+  return isHuntsNavItemActive(pathname, item.href);
+}
+
+const RULE_IDEAS_PATH = '/rules/ideas';
 
 /**
  * Detection navigation items (expandable section)
@@ -292,6 +441,9 @@ const detectionNavigation: NavItem[] = [
   { name: 'IOC Lists', href: '/rules/ioc-lists', icon: ShieldCheck, permissions: 'enrichments:view', capability: 'iocLists' },
   { name: 'MITRE Coverage', href: '/rules/coverage', icon: Target, permissions: 'detections:view' },
   { name: 'AI Tuning', href: '/rules/tuning', icon: PivtIcon, permissions: 'detections:view', capability: 'aiTuning' },
+  // NAN-5850: hunt-proposed rules, beside AI Tuning; badge = ideas ready to send.
+  // Literal href: the e2e rail parser reads it (nano_e2e/rbac_matrix.py).
+  { name: 'Rule ideas', href: '/rules/ideas', icon: Lightbulb, permissions: 'hunts:view', capability: 'hunts' },
 ];
 
 
@@ -312,6 +464,10 @@ const settingsNavigation: NavItem[] = [
   { name: 'Webhooks', href: '/settings/webhooks', icon: Webhook, permissions: 'settings:webhooks' },
   { name: 'GDPR', href: '/settings/gdpr', icon: ShieldCheck, permissions: 'gdpr:anonymize' },
   { name: 'Access Control', href: '/settings/access-control', icon: LucideShield, permissions: ['users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view'] },
+  // NAN-5850: Settings > Hunting (runners, charter) moved out of the Hunts
+  // group, so a hunts:view role with no settings:* permission still needs the
+  // Settings link to reach it. Only the Hunting section shows for them.
+  { name: 'Hunting', href: '/settings/hunts', icon: NavCrosshair, permissions: 'hunts:view', capability: 'hunts' },
 ];
 
 
@@ -442,15 +598,8 @@ function UserMenuContent({
         <User className="w-3.5 h-3.5" />
         User Settings
       </DropdownMenuItem>
-      {/* NAN-917 F-25: theme control is reachable from every route via the user
-          menu. Menu-native radio items in a submenu (not a row of buttons
-          nested in a menu item, which Radix's roving focus cannot reach), so
-          every theme is selectable by keyboard. `onSelect`+preventDefault keeps
-          the menu OPEN while you try themes: picking one repaints the menu
-          itself, and closing on each pick makes comparing them a chore.
-          `system` is deliberately not here — it has no colour to preview; it
-          stays in Settings → User Settings, next to the swatch row. */}
-      <ThemeMenu itemCls={itemCls} />
+      {/* NAN-5858: no Theme submenu here. The theme has one home, the rail
+          footer (light/dark toggle plus theme strip), on every route. */}
       <DropdownMenuSeparator />
       <DropdownMenuItem asChild className={itemCls}>
         <a href="https://nano.rs/docs/" target="_blank" rel="noopener noreferrer">
@@ -556,6 +705,7 @@ function MainAppShell({ children }: AppLayoutProps) {
   const filteredSecondaryMainNavigation = useMemo(() => filterNavItems(secondaryMainNavigation), [filterNavItems]);
   const filteredCasesNavigation = useMemo(() => filterNavItems(casesNavigation), [filterNavItems]);
   const filteredDetectionNavigation = useMemo(() => filterNavItems(detectionNavigation), [filterNavItems]);
+  const filteredHuntsNavigation = useMemo(() => filterNavItems(huntsNavigation), [filterNavItems]);
   const filteredIngestionNavigation = useMemo(
     () => filterNavItems(ingestionNavigation).map((item) =>
       item.href === LOG_SOURCES_PATH ? { ...item, href: ingestionHomeFor(hasPermission) } : item),
@@ -571,17 +721,22 @@ function MainAppShell({ children }: AppLayoutProps) {
     || location.pathname.startsWith('/cases')
     || location.pathname.startsWith('/playbooks');
   const isDetectionActive = location.pathname.startsWith('/rules');
+  const isHuntsActive = isUnder(location.pathname, '/hunts');
   const isAutomationActive = location.pathname.startsWith('/automation');
   const isIngestionActive = filteredIngestionNavigation.some(item => location.pathname.startsWith(item.href));
   const isSettingsActive = filteredSettingsNavigation.some(item => location.pathname.startsWith(item.href));
+  // NAN-5850: a role that cannot open the /settings landing (hunts:view only)
+  // enters Settings at the first section it can see.
+  const settingsHome = settingsHomeHref(hasAnyPermission([...SETTINGS_LANDING_PERMISSIONS]), filteredSettingsNavigation[0]?.href);
 
   // Accordion state - only one section can be open at a time.
   // Settings is no longer part of the accordion (NAN-537) — it's a single
   // top-level link that hands off to the dedicated /settings shell.
-  type NavSection = 'cases' | 'detections' | 'automation' | 'ingestion' | null;
+  type NavSection = 'cases' | 'detections' | 'hunts' | 'automation' | 'ingestion' | null;
   const getInitialOpenSection = (): NavSection => {
     if (isCasesActive) return 'cases';
     if (isDetectionActive) return 'detections';
+    if (isHuntsActive) return 'hunts';
     if (isAutomationActive) return 'automation';
     if (isIngestionActive) return 'ingestion';
     return null;
@@ -596,6 +751,20 @@ function MainAppShell({ children }: AppLayoutProps) {
   // Derived state for each section
   const casesOpen = openSection === 'cases';
   const detectionsOpen = openSection === 'detections';
+  const huntsOpen = openSection === 'hunts';
+  // NAN-5844: Findings / Escalations counts. Fetched only for a viewer who sees
+  // the group, while on a hunts route or with the group or its collapsed-rail
+  // flyout open (empty in open builds).
+  // NAN-5850: the same summary feeds the Rule ideas badge in Detections, so it
+  // is also fetched while that group (or its flyout) is open for a viewer who
+  // sees the entry.
+  const [huntsFlyoutOpen, setHuntsFlyoutOpen] = useState(false);
+  const [detectionsFlyoutOpen, setDetectionsFlyoutOpen] = useState(false);
+  const ruleIdeasVisible = filteredDetectionNavigation.some((item) => item.href === RULE_IDEAS_PATH);
+  const huntsCounts: HuntsNavCounts = useHuntsNavCounts(
+    (filteredHuntsNavigation.length > 0 && (isHuntsActive || huntsOpen || huntsFlyoutOpen))
+      || (ruleIdeasVisible && (detectionsOpen || detectionsFlyoutOpen)),
+  );
   const ingestionOpen = openSection === 'ingestion';
   const automationOpen = openSection === 'automation';
 
@@ -605,12 +774,14 @@ function MainAppShell({ children }: AppLayoutProps) {
       setOpenSection('cases');
     } else if (isDetectionActive && openSection !== 'detections') {
       setOpenSection('detections');
+    } else if (isHuntsActive && openSection !== 'hunts') {
+      setOpenSection('hunts');
     } else if (isAutomationActive && openSection !== 'automation') {
       setOpenSection('automation');
     } else if (isIngestionActive && openSection !== 'ingestion') {
       setOpenSection('ingestion');
     }
-  }, [isCasesActive, isDetectionActive, isAutomationActive, isIngestionActive]);
+  }, [isCasesActive, isDetectionActive, isHuntsActive, isAutomationActive, isIngestionActive]);
 
   // Mobile menu state
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -848,6 +1019,8 @@ function MainAppShell({ children }: AppLayoutProps) {
                   isActive={isDetectionActive}
                   location={location}
                   handleNavClick={handleNavClick}
+                  badges={huntsCounts}
+                  onOpenChange={setDetectionsFlyoutOpen}
                 />
               ) : (
                 <button
@@ -880,6 +1053,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                     const isActive = item.href === '/rules'
                       ? location.pathname === '/rules'
                       : location.pathname.startsWith(item.href);
+                    const count = huntsCounts[item.href];
                     return (
                       <Link
                         key={item.name}
@@ -893,13 +1067,82 @@ function MainAppShell({ children }: AppLayoutProps) {
                         )}
                       >
                         <Icon className="w-3 h-3" />
-                        {item.name}
+                        <span className="flex-1">{item.name}</span>
+                        {count && <span className="font-mono text-[10px] tabular-nums text-muted-foreground" data-testid="nav-count">{count}</span>}
                       </Link>
                     );
                   })}
                 </div>
               )}
 
+            </div>
+          )}
+
+          {/* Hunts Section (NAN-5844) - expandable; enterprise + hunts:view only */}
+          {filteredHuntsNavigation.length > 0 && (
+            <div data-testid="nav-hunts">
+              {sidebarCollapsed ? (
+                <CollapsedSectionFlyout
+                  icon={NavCrosshair}
+                  label="Hunts"
+                  items={filteredHuntsNavigation}
+                  isActive={isHuntsActive}
+                  location={location}
+                  handleNavClick={handleNavClick}
+                  iconSize="w-[15px] h-[15px]"
+                  beta
+                  isItemActive={isHuntsItemActive}
+                  badges={huntsCounts}
+                  testId="nav-hunts-trigger"
+                  onOpenChange={setHuntsFlyoutOpen}
+                />
+              ) : (
+                <button
+                  onClick={() => toggleSection('hunts')}
+                  aria-label="Hunts (beta)"
+                  aria-expanded={huntsOpen}
+                  className={cn(
+                    'relative flex items-center w-full h-8 px-2 gap-2.5 rounded-md text-[12.5px] font-medium transition-colors justify-between',
+                    isHuntsActive
+                      ? 'bg-primary/10 text-primary'
+                      : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                  )}
+                >
+                  <div className="flex items-center gap-3">
+                    <NavCrosshair className="w-[15px] h-[15px]" />
+                    Hunts
+                    <BetaBadge />
+                  </div>
+                  <ChevronDown className={cn('w-4 h-4 transition-transform', huntsOpen && 'rotate-180')} />
+                </button>
+              )}
+              {huntsOpen && !sidebarCollapsed && (
+                <div className="mt-1 ml-6 space-y-0.5 border-l border-border/40 pl-2" data-testid="nav-hunts-items">
+                  {filteredHuntsNavigation.map((item) => {
+                    const Icon = item.icon;
+                    const isActive = isHuntsItemActive(location.pathname, item);
+                    const count = huntsCounts[item.href];
+                    return (
+                      <Link
+                        key={item.name}
+                        to={item.href}
+                        onClick={(e) => handleNavClick(e, item.href)}
+                        aria-current={isActive ? 'page' : undefined}
+                        className={cn(
+                          'flex items-center h-7 gap-2 rounded-md px-2 text-[12px] transition-colors',
+                          isActive
+                            ? 'bg-primary/10 text-primary'
+                            : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                        )}
+                      >
+                        <Icon className="w-3 h-3" />
+                        <span className="flex-1">{item.name}</span>
+                        {count && <span className="font-mono text-[10px] tabular-nums text-muted-foreground" data-testid="nav-count">{count}</span>}
+                      </Link>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -1099,8 +1342,8 @@ function MainAppShell({ children }: AppLayoutProps) {
           {filteredSettingsNavigation.length > 0 && (
             <div className="mt-2 border-t border-border/40 pt-3">
               <Link
-                to="/settings"
-                onClick={(e) => handleNavClick(e, '/settings')}
+                to={settingsHome}
+                onClick={(e) => handleNavClick(e, settingsHome)}
                 className={cn(
                   'relative flex items-center gap-2.5 h-8 px-2 rounded-md text-[12.5px] font-medium transition-colors',
                   isSettingsActive
@@ -1124,6 +1367,10 @@ function MainAppShell({ children }: AppLayoutProps) {
             sidebarCollapsed ? 'px-0 py-2 flex flex-col items-center gap-1.5' : 'px-2.5 py-2',
           )}
         >
+          {/* NAN-5858: the one light/dark toggle plus the sideways theme strip
+              (the lake-era rail scroller, on today's ThemeSwatches). Collapsed,
+              it folds into one theme button with a popover strip. */}
+          {sidebarCollapsed ? <RailThemeFlyout /> : <RailThemeStrip className="mb-1.5 px-0.5" />}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               {!sidebarCollapsed ? (
@@ -1328,6 +1575,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                       const isActive = item.href === '/rules'
                         ? location.pathname === '/rules'
                         : location.pathname.startsWith(item.href);
+                      const count = huntsCounts[item.href];
                       return (
                         <Link
                           key={item.name}
@@ -1341,7 +1589,59 @@ function MainAppShell({ children }: AppLayoutProps) {
                           )}
                         >
                           <Icon className="w-3.5 h-3.5" />
-                          {item.name}
+                          <span className="flex-1">{item.name}</span>
+                          {count && <span className="font-mono text-[10px] tabular-nums text-muted-foreground">{count}</span>}
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Hunts Section (NAN-5844) */}
+            {filteredHuntsNavigation.length > 0 && (
+              <div>
+                <button
+                  onClick={() => toggleSection('hunts')}
+                  aria-label="Hunts (beta)"
+                  aria-expanded={huntsOpen}
+                  className={cn(
+                    'relative flex items-center w-full h-8 px-2 gap-2.5 rounded-md text-[12.5px] font-medium transition-colors justify-between',
+                    isHuntsActive
+                      ? 'bg-primary/10 text-primary'
+                      : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                  )}
+                >
+                  <div className="flex items-center gap-3">
+                    <NavCrosshair className="w-[15px] h-[15px]" />
+                    Hunts
+                    <BetaBadge />
+                  </div>
+                  <ChevronDown className={cn('w-4 h-4 transition-transform', huntsOpen && 'rotate-180')} />
+                </button>
+                {huntsOpen && (
+                  <div className="mt-1 ml-4 space-y-1">
+                    {filteredHuntsNavigation.map((item) => {
+                      const Icon = item.icon;
+                      const isActive = isHuntsItemActive(location.pathname, item);
+                      const count = huntsCounts[item.href];
+                      return (
+                        <Link
+                          key={item.name}
+                          to={item.href}
+                          onClick={(e) => handleNavClick(e, item.href)}
+                          aria-current={isActive ? 'page' : undefined}
+                          className={cn(
+                            'flex items-center gap-3 px-3 py-2 text-sm font-medium transition-all border-l-2',
+                            isActive
+                              ? 'bg-primary/10 text-primary'
+                              : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                          )}
+                        >
+                          <Icon className="w-3.5 h-3.5" />
+                          <span className="flex-1">{item.name}</span>
+                          {count && <span className="font-mono text-[10px] tabular-nums text-muted-foreground">{count}</span>}
                         </Link>
                       );
                     })}
@@ -1495,8 +1795,8 @@ function MainAppShell({ children }: AppLayoutProps) {
             {filteredSettingsNavigation.length > 0 && (
               <div className="pt-2">
                 <Link
-                  to="/settings"
-                  onClick={(e) => handleNavClick(e, '/settings')}
+                  to={settingsHome}
+                  onClick={(e) => handleNavClick(e, settingsHome)}
                   className={cn(
                     'relative flex items-center gap-3 px-3 py-2 text-sm font-medium transition-all',
                     isSettingsActive
@@ -1513,6 +1813,7 @@ function MainAppShell({ children }: AppLayoutProps) {
 
           {/* User menu in mobile drawer */}
           <div className="mt-auto p-4">
+            <RailThemeStrip className="mb-3" testId="mobile-rail-theme" />
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button className="flex items-center gap-3 w-full hover:bg-accent/50 rounded-xl p-2 -m-2 transition-colors">

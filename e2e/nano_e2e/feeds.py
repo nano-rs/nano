@@ -15,10 +15,12 @@ point-forward window: activation - 300 s .. now - lag), and the feed body.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 
 from nano_e2e.client import Nano, expect
@@ -44,6 +46,47 @@ LANE_PARSER = """.e2e_connector_lane = "{lane}"
 .type_uid = 0
 .severity_id = 1
 """
+
+
+# The OCSF contract this checkout's server embeds (newest wins, as the
+# validator falls back to it).
+_CONTRACTS = Path(__file__).resolve().parents[2] / "nanosiem-core" / "src" / "schema" / "ocsf_contracts"
+
+
+def ocsf_contract_version() -> str:
+    found = sorted(
+        (tuple(int(x) for x in m.group(1).split(".")), m.group(1))
+        for p in _CONTRACTS.glob("ocsf-*-contract.json.gz")
+        if (m := re.fullmatch(r"ocsf-(\d+\.\d+\.\d+)-contract\.json\.gz", p.name))
+    )
+    assert found, f"no embedded OCSF contract under {_CONTRACTS}"
+    return found[-1][1]
+
+
+# A lane parser whose output is a spec-valid OCSF Base Event, for scenarios
+# that REPUBLISH a live lane. Since NAN-5593 (OCSF by default) a changed parser
+# generation goes live only with a passing OCSF sample-validation receipt
+# (NAN-5079); LANE_PARSER's top-level `e2e_connector_lane` is not an OCSF
+# attribute, so it can only go live as an acknowledged unattested FIRST
+# publish. Same lane tag (under `unmapped`), same searchable message.
+ATTESTED_LANE_PARSER = """.metadata.log_source = "{lane}"
+.metadata.product.name = "nano-e2e"
+.metadata.version = "{version}"
+.unmapped.e2e_connector_lane = "{lane}"
+if !exists(.time) {{ .time = to_unix_timestamp(now(), unit: "milliseconds") }}
+.class_uid = 0
+.category_uid = 0
+.activity_id = 0
+.type_uid = 0
+.severity_id = 1
+"""
+
+# A representative raw event for the OCSF publish gate (`ocsf_sample_logs`).
+LANE_OCSF_SAMPLE = json.dumps({"e2e": "lane sample", "seq": 0})
+
+
+def attested_lane_parser(lane: str) -> str:
+    return ATTESTED_LANE_PARSER.format(lane=lane, version=ocsf_contract_version())
 
 
 def through_lane_parser(row: dict[str, Any], lane: str) -> bool:
@@ -305,6 +348,28 @@ def ensure_lane_source(
     res = expect(nano.api.post(f"/api/log-sources/{src['id']}/publish", json={"acknowledge_unattested": True}), 200)
     assert res.get("success") is True, f"publishing lane parser {lane} failed: {res}"
     return src["id"]
+
+
+def release_lane_sources(nano: Nano, lanes: tuple[str, ...] | list[str], keep: str | None = None) -> list[str]:
+    """Delete this harness's lane parsers (`e2e-lane-*`) that claim any of
+    `lanes`, except `keep`. Returns the deleted names.
+
+    Lanes are shared by every scenario on a stack. Deploy refuses two enabled
+    log sources claiming one source_type (each event would be parsed and
+    stored twice), so a scenario that publishes a vendor parser for a lane
+    first releases the harness parser another scenario left on it.
+    ensure_lane_source recreates it on demand."""
+    sources = expect(nano.api.get("/api/log-sources"), 200)
+    items = sources if isinstance(sources, list) else sources.get("sources") or sources.get("items") or []
+    wanted = set(lanes)
+    deleted = []
+    for s in items:
+        if s.get("id") == keep or not str(s.get("name") or "").startswith("e2e-lane-"):
+            continue
+        if wanted & set(s.get("match_values") or []):
+            delete_log_source(nano, s["id"])
+            deleted.append(str(s.get("name")))
+    return deleted
 
 
 def delete_log_source(nano: Nano, source_id: str) -> None:

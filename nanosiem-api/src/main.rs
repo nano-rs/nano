@@ -17,6 +17,13 @@ use std::net::SocketAddr;
 fn main() -> Result<()> {
     // NAN-5214: before anything can negotiate TLS with PostgreSQL.
     nanosiem_core::db::tls_provider::install_default_crypto_provider();
+    // NAN-5771: report the compiled content trust composition and exit.
+    if std::env::args().nth(1).as_deref()
+        == Some(nanosiem_core::content_bundle::contract::PRINT_TRUST_ARGUMENT)
+    {
+        println!("{}", nanosiem_core::content_bundle::contract::trust_label());
+        return Ok(());
+    }
     // NAN-4919: the Nano Pipe preview worker. It must run before tracing,
     // configuration, pools or the server exist, with nothing inherited.
     if std::env::args().nth(1).as_deref()

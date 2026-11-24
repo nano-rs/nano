@@ -26,9 +26,10 @@ use nanosiem_core::audit::{
 use nanosiem_core::auth::permissions;
 use nanosiem_core::ingest_tokens::{IngestToken, InstallTokenMode};
 use nanosiem_core::log_sources::connect::{
-    claimed_route_keys, connect_statuses, convert_unassigned, unassigned_sources, ConvertError, ConnectState,
-    ConvertUnassignedRequest, ConvertUnassignedResponse, LogSourceConnectStatus, SourceActivity,
-    SourceActivityReader, UnassignedSource, ACTIVITY_WINDOW_HOURS,
+    claimed_route_keys, connect_statuses, convert_unassigned, removed_unassigned_keys, set_aside_removed,
+    unassigned_sources, ConvertError, ConnectState, ConvertUnassignedRequest, ConvertUnassignedResponse,
+    LogSourceConnectStatus, RemovedUnassignedSource, SourceActivity, SourceActivityReader, UnassignedSource,
+    ACTIVITY_WINDOW_HOURS,
 };
 use nanosiem_core::typeid::TypeIdParam;
 use serde::Serialize;
@@ -55,6 +56,12 @@ pub struct UnassignedSourcesResponse {
     pub window_hours: i64,
     /// Route keys that arrived with no log source claiming them, busiest first.
     pub sources: Vec<UnassignedSource>,
+    /// Route keys of recently deleted log sources whose events stopped by the
+    /// delete (NAN-5770): the deleted source's stream winding down, not a new
+    /// sender. Same rules as SIEM Health's removed sources (NAN-5760): only a
+    /// deployed or token-bound source's literal, non-reserved key, and a key
+    /// that keeps arriving after the delete stays in `sources`.
+    pub removed_sources: Vec<RemovedUnassignedSource>,
     /// Tokens whose source was deleted: Vector refuses them until they are
     /// bound (convert one into a source, or bind it on Ingest tokens).
     pub unbound_tokens: Vec<IngestToken>,
@@ -196,9 +203,12 @@ pub async fn list_unassigned_sources(
         .filter(|t| t.state == "unbound")
         .collect();
     let settings = service.settings().await.map_err(service_error)?;
+    let removed = removed_unassigned_keys(&state.pool, &activity).await;
+    let (offered, removed_sources) = set_aside_removed(unassigned_sources(&sources, &activity), &removed);
     Ok(Json(UnassignedSourcesResponse {
         window_hours: ACTIVITY_WINDOW_HOURS,
-        sources: unassigned_sources(&sources, &activity),
+        sources: offered,
+        removed_sources,
         unbound_tokens,
         install_token_mode: settings.install_token_mode,
     }))
@@ -303,6 +313,7 @@ pub async fn convert_unassigned_source(
         LogSourceConnectDetail,
         ConnectState,
         UnassignedSource,
+        RemovedUnassignedSource,
         UnassignedSourcesResponse,
         ConvertUnassignedRequest,
         ConvertUnassignedResponse

@@ -22,6 +22,8 @@ mod types;
 #[cfg(test)]
 mod utf8_response_tests;
 #[cfg(test)]
+mod question_mark_escape_tests;
+#[cfg(test)]
 mod max_query_size_wiring_tests;
 #[cfg(test)]
 mod max_query_size_profile_guard_tests;

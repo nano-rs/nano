@@ -6,7 +6,7 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::types::HealthIssue;
+use super::types::{HealthIssue, HealthIssueType};
 use crate::models::notification::NotificationType;
 
 /// One in-app notification per active admin ($1 type, $2 title, $3 message,
@@ -212,6 +212,51 @@ impl HealthRepository {
         .await?;
 
         Ok(())
+    }
+
+    /// NAN-5785: resolve the open data-feed issues (in-app notification
+    /// de-duplication rows; `issue_key` is the source id) of deleted log
+    /// sources.
+    pub async fn resolve_data_feed_issues(
+        &self,
+        source_ids: &[Uuid],
+    ) -> Result<u64, HealthRepositoryError> {
+        if source_ids.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<String> = source_ids.iter().map(Uuid::to_string).collect();
+        let result = sqlx::query(
+            r#"
+            UPDATE health_issue_tracker
+            SET resolved_at = NOW()
+            WHERE issue_type = $1 AND issue_key = ANY($2) AND resolved_at IS NULL
+            "#,
+        )
+        .bind(HealthIssueType::DataFeed.to_string())
+        .bind(&keys)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// NAN-5785: resolve open data-feed issues whose log source no longer
+    /// exists. This row only de-duplicates the in-app admin notification (the
+    /// alert itself lives in `system_health_events` and is never closed by a
+    /// delete), so closing it for a source that is gone is quiet bookkeeping.
+    /// A disabled source keeps its issue.
+    pub async fn resolve_orphaned_data_feed_issues(&self) -> Result<u64, HealthRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE health_issue_tracker t
+            SET resolved_at = NOW()
+            WHERE t.issue_type = $1 AND t.resolved_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM log_sources ls WHERE ls.id::text = t.issue_key)
+            "#,
+        )
+        .bind(HealthIssueType::DataFeed.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Mark that a notification was sent for an issue

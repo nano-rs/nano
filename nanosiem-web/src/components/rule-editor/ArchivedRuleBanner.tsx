@@ -20,8 +20,7 @@ export function ArchivedRuleBanner({ onUnarchive }: { onUnarchive?: () => void }
         Archived
       </span>
       <span className="text-muted-foreground truncate">
-        This rule is deleted and doesn&apos;t run. Its matches and alerts are kept. It&apos;s read-only until
-        it&apos;s unarchived.
+        Doesn&apos;t run and is read-only. Matches and alerts are kept.
       </span>
       <div className="flex-1" />
       {onUnarchive && (

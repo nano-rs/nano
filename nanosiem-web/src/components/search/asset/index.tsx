@@ -411,7 +411,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
               <AlertTriangle className="w-4 h-4 shrink-0 text-amber-500" strokeWidth={1.5} />
               <span>
                 <span className="text-amber-500 font-medium">No activity in the selected range</span>
-                {' — showing the last 6h of activity'}
+                {'; showing the last 6h'}
                 {assetProfile?.effective_time_range
                   ? ` (ending ${formatTimestampHMS(assetProfile.effective_time_range.end)})`
                   : ''}.

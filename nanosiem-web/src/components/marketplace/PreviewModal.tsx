@@ -104,7 +104,7 @@ export function PreviewModal({ slug, name, open, onOpenChange }: PreviewModalPro
       breadcrumb={['Marketplace', name ?? slug ?? undefined]}
       icon={<Eye className="w-[14px] h-[14px] text-primary" />}
       title="Preview output"
-      description="Runs the enrichment once against a sample artifact in the sandbox. Credentials and allowed-domains use the saved configuration."
+      description="Runs once on a sample artifact in the sandbox, with the saved credentials and allowed domains."
       meta={slug ? <span>{slug}</span> : undefined}
       bodyClassName="p-0"
     >

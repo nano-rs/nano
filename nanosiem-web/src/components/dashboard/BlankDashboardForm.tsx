@@ -16,12 +16,13 @@
  * state here would make both of those impossible without a remount hack.
  */
 
-import { Globe, Info, Lock, Plus } from 'lucide-react';
+import { Globe, Lock, Plus } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 export interface BlankDashboardDraft {
   name: string;
@@ -83,7 +84,7 @@ export function BlankDashboardForm({
 
         <div>
           <label className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-semibold block mb-1.5">
-            Visibility
+            <Term id="dashboard-visibility">Visibility</Term>
           </label>
           <div className="grid grid-cols-2 gap-2">
             <button
@@ -122,13 +123,6 @@ export function BlankDashboardForm({
                 Visible to anyone with dashboard access.
               </p>
             </button>
-          </div>
-        </div>
-
-        <div className="rounded-md bg-foreground/[0.03] border border-border px-3 py-2.5 flex items-start gap-2">
-          <Info className="w-[13px] h-[13px] text-muted-foreground shrink-0 mt-0.5" />
-          <div className="text-[11.5px] text-foreground/80 leading-[1.5]">
-            You'll land in edit mode with an empty canvas. Add panels from the library on the left.
           </div>
         </div>
       </div>

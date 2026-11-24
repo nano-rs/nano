@@ -394,6 +394,13 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::vector_config_delivery::post_install_lease)
                 .delete(handlers::vector_config_delivery::delete_install_lease),
         )
+        // NAN-5874: the lease on a path a pre-v2.0.35 api answers 404, so a
+        // consumer's request is retried until it reaches a v2.0.35 replica.
+        .route(
+            "/api/internal/vector-config/install-lease/v2",
+            post(handlers::vector_config_delivery::post_install_lease_v2)
+                .delete(handlers::vector_config_delivery::delete_install_lease_v2),
+        )
         // NAN-4907: nginx auth_request for the OTLP edge. Exempt from
         // user-session auth (PUBLIC_ENDPOINTS): the handler authenticates the
         // sender's source-bound ingest token itself.
@@ -2752,6 +2759,11 @@ pub fn create_router(state: AppState) -> Router {
                 get(handlers::hunts::list_sweep_tasks),
             )
             .route("/api/hunts/funnel", get(handlers::hunts::hunt_funnel))
+            // NAN-5850: the hunt layer of MITRE Coverage (hunts:view).
+            .route(
+                "/api/hunts/technique-coverage",
+                get(handlers::hunts::hunt_technique_coverage),
+            )
             // NAN-5547 Part F: built-in templates (hunts:view to list,
             // hunts:manage to instantiate through the normal create path).
             .route("/api/hunts/templates", get(handlers::hunts::list_hunt_templates))
@@ -3545,6 +3557,11 @@ pub fn create_router(state: AppState) -> Router {
     // Demo routes (only on DEPLOYMENT_MODE=demo deployments)
     if let Some(demo) = demo_routes {
         app = app.merge(demo);
+    }
+    // NAN-5798: debug builds with NANO_SENTRY_TEST_TRIGGER=1 and a DSN only.
+    #[cfg(debug_assertions)]
+    if let Some(trigger) = crate::sentry_test_trigger::routes() {
+        app = app.merge(trigger);
     }
     // Air-gapped large-bundle import sub-router (NAN-1201, enterprise). Merged
     // before with_state so it shares AppState, and before the license guard

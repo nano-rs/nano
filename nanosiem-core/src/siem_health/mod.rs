@@ -32,9 +32,13 @@ pub mod enrichment_wasm_findings;
 pub mod finding_signature;
 // NAN-5431: events Vector discarded after ingest accepted them.
 pub mod pipeline_drops;
+// NAN-5760: deleted log sources set aside from the per-source lists.
+pub mod removed_sources;
 pub mod repository;
 pub mod scheduler;
 pub mod shard_skew;
+// NAN-5839: a log source whose clock looks a whole timezone off.
+pub mod source_clock_skew;
 pub mod suppressions_repository;
 pub mod types;
 // NAN-5567: batches ClickHouse permanently rejected, kept by Vector.

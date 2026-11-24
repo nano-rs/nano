@@ -77,6 +77,7 @@ import { cn } from '@/lib/utils';
 import { THEMES, THEME_LABELS, type Theme } from '@/lib/theme';
 import { ThemeSwatches } from '@/components/ui/theme-swatches';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Term } from '@/components/ui/term';
 
 type MfaStep = 'idle' | 'scan' | 'verify' | 'backup';
 
@@ -624,8 +625,7 @@ export function UserSettings() {
             )}
           </div>
           <p className="text-[12.5px] text-foreground/85 mt-1.5 max-w-[640px] leading-relaxed">
-            Personal defaults, search preferences and account security. Workspace-wide policy
-            lives in
+            Personal defaults and account security. Workspace policy is in
             <RouterLink to="/settings" className="text-primary hover:underline ml-1">
               Workspace settings
             </RouterLink>
@@ -773,7 +773,7 @@ export function UserSettings() {
                 });
               }}
             >
-              <SelectTrigger className="w-[150px] h-8 text-[12.5px]">
+              <SelectTrigger className="w-[150px] h-8 text-[12.5px]" data-testid="user-theme-select">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -798,8 +798,8 @@ export function UserSettings() {
               </SelectContent>
             </Select>
             {/* The swatch row lives here, outside any menu, where its buttons
-                are reachable by Tab and arrow keys. The user menu uses radio
-                items instead (components/layout/ThemeMenu.tsx). */}
+                are reachable by Tab and arrow keys. The rail footer carries the
+                same strip (components/layout/RailThemeSwitcher.tsx, NAN-5858). */}
             <ThemeSwatches />
             </div>
           </Row>
@@ -807,7 +807,7 @@ export function UserSettings() {
           {canRunSetup && (
             <Row
               label="Getting Started"
-              desc="Reopen the setup wizard from the top — useful after dismissing or finishing it."
+              desc="Reopen the setup wizard."
               last
             >
               <Button
@@ -846,7 +846,7 @@ export function UserSettings() {
                   recommended
                 </span>
               }
-              desc="Human-readable pipe syntax with full validation. Detection-ready queries that can be saved as rules."
+              desc="Readable pipe syntax. Queries can be saved as rules."
               chips={[
                 { label: 'Full validation', tone: 'good' },
                 { label: 'Detection-ready', tone: 'brand' },
@@ -869,7 +869,7 @@ export function UserSettings() {
               }
               desc={
                 canSql
-                  ? 'Full ClickHouse SQL power including window functions, CTEs, and complex JOINs.'
+                  ? 'Full ClickHouse SQL.'
                   : 'Requires the search:sql permission. Contact your administrator.'
               }
               chips={[
@@ -887,7 +887,7 @@ export function UserSettings() {
                   Preview
                 </span>
                 <span className="font-mono text-[10px] text-muted-foreground/60">
-                  — same intent, your syntax
+                  : same search, your syntax
                 </span>
               </div>
               {queryMode === 'standard' ? (
@@ -928,7 +928,7 @@ export function UserSettings() {
               eyebrow="Account security"
               icon={<Shield className="w-[15px] h-[15px]" />}
               title="Two-factor authentication"
-              desc="Add an extra layer of security to your account with a TOTP authenticator app."
+              desc="Sign in with your password and a code from an app on your phone."
             />
 
             {mfaError && (
@@ -978,8 +978,7 @@ export function UserSettings() {
                 {showRegen && !regenCodes && (
                   <div className="mt-4 space-y-3 p-4 rounded-md border border-border bg-[var(--card-2)]">
                     <p className="text-[12px] text-foreground/85">
-                      Enter your password to generate new backup codes. This will invalidate your
-                      existing codes.
+                      Enter your password to make new <Term id="backup-codes">backup codes</Term>. Your old codes stop working.
                     </p>
                     <Input
                       type="password"
@@ -1086,7 +1085,7 @@ export function UserSettings() {
                 {showDisableConfirm && (
                   <div className="mt-4 space-y-3 p-4 rounded-md border border-destructive/20 bg-destructive/5">
                     <p className="text-[12px] text-foreground/85">
-                      Enter your password to confirm disabling MFA.
+                      Enter your password to turn off <Term id="mfa">MFA</Term>.
                     </p>
                     <Input
                       type="password"
@@ -1312,8 +1311,7 @@ export function UserSettings() {
                       Save your backup codes
                     </p>
                     <p className="text-[11.5px] text-muted-foreground mt-1">
-                      If you lose access to your authenticator app, use these one-time codes to
-                      sign in. Each code can only be used once.
+                      One-time codes to sign in if you lose your authenticator app.
                     </p>
                   </div>
                 </div>
@@ -1389,7 +1387,7 @@ export function UserSettings() {
                   </span>
                 </div>
                 <div className="text-[12px] text-foreground/85 mt-0.5">
-                  You found it. These knobs aren't shipped — just for the curious.
+                  You found it. These knobs aren't shipped. They're just for the curious.
                 </div>
               </div>
               <span className="flex-1" />

@@ -1778,7 +1778,12 @@ pub(super) fn compile_npl(npl: &str, ctx: &ConvertContext, dataset: Dataset) -> 
     let ast = parse_query(npl).map_err(|e| format!("nPL parse error: {e}"))?;
     // The override also names the source of a `[dataset=signals …]`
     // subsearch from a logs query (NAN-5614).
-    let mut generator = ClickHouseSqlGenerator::with_table(ctx.events_table().to_string())
+    // Unrestricted: a conversion probe compiled for comparison, never a
+    // viewer's read.
+    let mut generator = ClickHouseSqlGenerator::scoped_with_table(
+        ctx.events_table().to_string(),
+        crate::query::GeneratorScope::unrestricted(),
+    )
         .with_profile(ctx.profile.clone())
         .with_cluster_routing(false)
         .with_signals_source_override(super::convert::SIGNALS_SENTINEL);

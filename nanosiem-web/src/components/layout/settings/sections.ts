@@ -46,6 +46,8 @@ import {
   Zap,
   PackageOpen,
   Link2,
+  Crosshair,
+  ScrollText,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -119,6 +121,22 @@ export function isSectionVisible(s: SettingsSection, ctx: SectionVisibilityConte
   if (s.airgapOnly && !ctx.isAirGap) return false;
   return !s.permissions
     || (Array.isArray(s.permissions) ? ctx.hasAnyPermission(s.permissions) : ctx.hasPermission(s.permissions));
+}
+
+/**
+ * Who may open the /settings landing (App.tsx carries the same list as a
+ * literal for the e2e RBAC parser; hunting-section.test.ts keeps them equal).
+ * A role with none of these, such as hunts:view only (NAN-5850), enters the
+ * Settings shell at the first section it can see instead.
+ */
+export const SETTINGS_LANDING_PERMISSIONS: readonly string[] = [
+  'settings:view', 'settings:system', 'settings:ai', 'settings:ai_providers', 'settings:agent_models',
+  'settings:retention', 'settings:webhooks', 'users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view',
+];
+
+/** Where "Settings" links point: the landing, or the first visible section for a role that cannot open it. */
+export function settingsHomeHref(canOpenLanding: boolean, firstVisibleHref: string | undefined): string {
+  return canOpenLanding || !firstVisibleHref ? '/settings' : firstVisibleHref;
 }
 
 export const SETTINGS_GROUPS: Array<{ id: SettingsGroupId; label: string; desc: string }> = [
@@ -197,7 +215,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     label: 'Notifications',
     group: 'workspace',
     icon: Bell,
-    desc: 'Slack, Teams, PagerDuty, and webhook channels — plus routing.',
+    desc: 'Slack, Teams, PagerDuty and webhook channels, plus routing.',
     href: '/settings/notifications',
     permissions: 'settings:webhooks',
     status: 'ok',
@@ -295,6 +313,38 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     permissions: ['settings:system', 'soar:view'],
     capability: 'soar',
     status: 'ok',
+  },
+  // NAN-5850: hunt runners, install defaults and the default charter (were
+  // under the Hunts "Hunt settings" entry; /hunts/runners redirects here).
+  {
+    id: 'hunting',
+    label: 'Hunting',
+    group: 'workspace',
+    icon: Crosshair,
+    desc: 'Hunt runners, install defaults and the default hunt charter.',
+    href: '/settings/hunts',
+    matchPrefixes: ['/settings/hunts'],
+    permissions: 'hunts:view',
+    capability: 'hunts',
+    status: 'ok',
+    children: [
+      {
+        id: 'hunting-runners',
+        label: 'Runners',
+        href: '/settings/hunts',
+        icon: Cpu,
+        permissions: 'hunts:view',
+        capability: 'hunts',
+      },
+      {
+        id: 'hunting-charter',
+        label: 'Charter & defaults',
+        href: '/settings/hunts/charter',
+        icon: ScrollText,
+        permissions: 'hunts:view',
+        capability: 'hunts',
+      },
+    ],
   },
   {
     id: 'risk',

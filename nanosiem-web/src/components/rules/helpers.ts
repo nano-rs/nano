@@ -35,9 +35,9 @@ export interface BandMeta {
 export const BANDS: BandMeta[] = [
   { id: 'firing', label: 'Firing now', hint: 'Matched in the last hour', accent: 'oklch(72% 0.18 28)', defaultOpen: true },
   { id: 'active', label: 'Active', hint: 'Matched in the last 7 days', accent: 'oklch(70% 0.14 160)', defaultOpen: true },
-  { id: 'silent', label: 'Silent', hint: 'No matches in 30+ days — tuned well, or broken', accent: 'oklch(80% 0.15 78)', defaultOpen: true },
-  { id: 'staging', label: 'Staging', hint: 'Not yet promoted to production', accent: 'var(--primary)', defaultOpen: false },
-  { id: 'disabled', label: 'Disabled', hint: 'Inactive', accent: 'var(--muted-foreground)', defaultOpen: false },
+  { id: 'silent', label: 'Silent', hint: 'No matches in over 30 days, or never: the threat is absent, or the rule or its data is broken', accent: 'oklch(80% 0.15 78)', defaultOpen: true },
+  { id: 'staging', label: 'Staging', hint: 'Being written; does not run yet', accent: 'var(--primary)', defaultOpen: false },
+  { id: 'disabled', label: 'Disabled', hint: 'Paused; does not run', accent: 'var(--muted-foreground)', defaultOpen: false },
 ];
 
 // MITRE tactic chip labels — match what rule metadata stores.

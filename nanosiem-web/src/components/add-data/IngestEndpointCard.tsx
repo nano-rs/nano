@@ -5,6 +5,7 @@ import type { IngestEndpoint } from '@/lib/api/types';
 import { INGEST_BASE_URL_ENV, isDevServerOrigin } from '@/lib/ingest-endpoint-origin';
 import { cn } from '@/lib/utils';
 import { CopyButton } from './CopyButton';
+import { Term } from '@/components/ui/term';
 
 /**
  * This deployment's ingest endpoint (main's NAN-2593 card, re-backed for the
@@ -49,7 +50,7 @@ export function IngestEndpointCard({
   return (
     <div className="rounded-md border border-border bg-card" data-testid="ingest-endpoint-card">
       <div className="flex items-center gap-2 px-3 h-7 border-b border-border">
-        <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/70">Your ingest endpoint</span>
+        <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/70">Your <Term id="ingest-endpoint">ingest endpoint</Term></span>
         <span className="flex-1" />
         <span
           className={cn(

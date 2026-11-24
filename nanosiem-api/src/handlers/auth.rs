@@ -29,7 +29,7 @@ use nanosiem_core::audit::{
     LOGIN_ACCOUNT_THROTTLED, TOKEN_REFRESH, USER_LOCKED,
 };
 use nanosiem_core::auth::{
-    AuthError, AuthResponse, LoginRequest, LoginResult, PasswordResetCompletion,
+    AuthError, AuthResponse, CurrentSessionLogout, LoginRequest, LoginResult, PasswordResetCompletion,
     PasswordResetRequest, RefreshTokenRequest,
 };
 
@@ -309,10 +309,26 @@ pub async fn login(
 /// Logout request body
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct LogoutRequest {
+    /// Refresh token of the session to end. Only consulted when the access
+    /// token predates session binding (no `sid` claim); the `refresh_token`
+    /// cookie is used when this is omitted.
     pub refresh_token: Option<String>,
 }
 
-/// Logout and invalidate session
+/// Log out of the current session
+///
+/// Ends only the session the caller's access token belongs to and revokes
+/// that access token. The user's other sessions (other browsers, devices,
+/// CLI logins) stay signed in. To sign out everywhere, use
+/// `DELETE /api/sessions/user/{user_id}` with your own user id.
+///
+/// Access tokens issued before session binding (no `sid` claim) are matched
+/// to their session by the refresh token (body, else the `refresh_token`
+/// cookie), including a refresh token that was already rotated once. If none
+/// identifies a live session the request is rejected with 400 and nothing is
+/// changed. Such a token stops working when it expires (the access-token
+/// TTL, 15 minutes by default); refreshing yields a session-bound token that
+/// logs out normally.
 ///
 /// Requirements: 2.6 - Invalidate the refresh token on logout
 ///
@@ -323,10 +339,11 @@ pub struct LogoutRequest {
     tag = "auth",
     request_body = LogoutRequest,
     responses(
-        (status = 204, description = "Logout successful"),
+        (status = 204, description = "Logout successful: the current session is ended; other sessions are unaffected"),
+        (status = 400, description = "session_not_identified: the access token predates session binding and no refresh token identified its session; nothing was changed. Retry with refresh_token.", body = AuthApiError),
         (status = 401, description = "Invalid token", body = AuthApiError),
         (status = 403, description = "Forbidden — interactive session required (API keys have no session)", body = AuthApiError),
-        (status = 503, description = "HA only: the revocation could not be persisted to PostgreSQL; retry", body = AuthApiError),
+        (status = 503, description = "session_end_failed: the session could not be ended (the access token is revoked; refresh and retry). revocation_unavailable (HA only): the revocation could not be persisted to PostgreSQL; retry", body = AuthApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -338,10 +355,10 @@ pub async fn logout(
     Json(request): Json<LogoutRequest>,
 ) -> Result<Response, (StatusCode, Json<AuthApiError>)> {
     // NAN-2040: an API key has no interactive browser session to end. Its subject
-    // is its owner, so without this a (possibly zero-permission) key could
-    // force-revoke ALL of the owner's browser sessions via the bulk termination
-    // below (the alternate route past the session-handler guards). API keys are
-    // revoked by deleting the key, not by logout.
+    // is its owner, so without this a (possibly zero-permission) key could end
+    // the owner's browser sessions (the alternate route past the
+    // session-handler guards). API keys are revoked by deleting the key, not by
+    // logout.
     if auth.is_api_key {
         return Err((
             StatusCode::FORBIDDEN,
@@ -356,31 +373,54 @@ pub async fn logout(
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
 
-    // C4: Always revoke ALL sessions for the authenticated user on logout.
-    // Previously only the session matching the provided refresh token was deleted,
-    // leaving other refresh tokens alive for up to 7 days.
-    let _ = state
-        .session_service
-        .terminate_all_user_sessions(
-            auth.user_id(),
-            auth.user_id(),
-            true, // user is terminating their own sessions
-            ip_address.as_deref(),
-            user_agent.as_deref(),
-        )
-        .await;
-
-    // Also try single-session logout via refresh token for audit trail
+    // NAN-5573: end the CURRENT session only. The access token's `sid` names
+    // it; a token minted before `sid` existed falls back to the refresh token
+    // (body, else cookie). This used to delete every session the user had
+    // (C4 / NAN-167), which signed them out of every other browser and device.
+    // The C4 concern, a logout that leaves THIS session's refresh token alive,
+    // is covered because `sid` identifies the session without needing the
+    // refresh token. Signing out everywhere is the explicit
+    // `DELETE /api/sessions/user/{user_id}`.
     let refresh_token = request
         .refresh_token
         .or_else(|| extract_refresh_token_cookie(&headers));
-    if let Some(ref token) = refresh_token {
-        let _ = state
-            .auth_service
-            .logout(token, ip_address.as_deref(), user_agent.as_deref())
-            .await;
-    }
+    let session = state
+        .auth_service
+        .logout_current_session(auth.user_id(), auth.claims.sid, refresh_token.as_deref())
+        .await;
+    let audit_logout = |success: bool, details: serde_json::Value| {
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::Auth, LOGOUT)
+                .actor(Some(auth.user_id()), None)
+                .resource(
+                    "session",
+                    session.as_ref().ok().and_then(|s| s.session_id()).or(auth.claims.sid),
+                    None,
+                )
+                .client_context(&client_ctx)
+                .success(success)
+                .details(details)
+                .build(),
+        );
+    };
 
+    // A pre-`sid` token whose session nothing identifies: refuse before any
+    // side effect so the client can retry with its refresh token, instead
+    // of a 204 that leaves a renewable session alive.
+    if let Some(rejection) = logout_rejection(&session) {
+        audit_logout(
+            false,
+            serde_json::json!({ "scope": "current_session", "reason": rejection.1.error.clone() }),
+        );
+        return Err((rejection.0, Json(rejection.1)));
+    }
+    let session_end_failed = match &session {
+        Ok(_) => false,
+        Err(error) => {
+            tracing::error!(user_id = %auth.user_id(), %error, "logout: failed to end the current session");
+            true
+        }
+    };
     // H8 / NAN-5243: persist the revocation to PostgreSQL first. It is the
     // durable record (synchronously replicated in HA) that every API/search
     // process re-reads (spawn_revocation_sync), so a revocation the shared
@@ -401,24 +441,27 @@ pub async fn logout(
     {
         tracing::warn!(jti = %auth.claims.jti, %error, "logout revocation not confirmed on a Valkey replica; PostgreSQL holds it");
     }
-    if state.token_service.revocation_fail_closed() && persisted.is_err() {
-        // Never report a logout whose revocation is not durable; the client retries.
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(AuthApiError::new(
-                "revocation_unavailable",
-                "Logout could not be confirmed; retry.",
-            )),
-        ));
+    if let Some((status, error)) = logout_failure(
+        session_end_failed,
+        persisted.is_ok(),
+        state.token_service.revocation_fail_closed(),
+    ) {
+        // The access token is revoked either way. Cookies are kept so the
+        // client can refresh and retry while the session row survives.
+        audit_logout(
+            false,
+            serde_json::json!({ "scope": "current_session", "reason": error.error.clone() }),
+        );
+        return Err((status, Json(error)));
     }
 
-    // Emit logout audit event
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::Auth, LOGOUT)
-            .actor(Some(auth.user_id()), None)
-            .resource("session", None, None)
-            .client_context(&client_ctx)
-            .build(),
+    // Emit logout audit event, scoped to the one session that was ended.
+    audit_logout(
+        true,
+        serde_json::json!({
+            "scope": "current_session",
+            "session_ended": matches!(session, Ok(CurrentSessionLogout::Ended(_))),
+        }),
     );
 
     // Clear both cookies
@@ -431,6 +474,51 @@ pub async fn logout(
     );
     append_clear_refresh_token_cookies(res.headers_mut());
     Ok(res)
+}
+
+/// NAN-5573: refuse a logout that cannot name the session to end (a token
+/// minted before `sid`, with no refresh token matching a live session).
+/// Checked before any side effect so the same access token can retry.
+pub(crate) fn logout_rejection(
+    session: &Result<CurrentSessionLogout, AuthError>,
+) -> Option<(StatusCode, AuthApiError)> {
+    matches!(session, Ok(CurrentSessionLogout::NotIdentified)).then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            AuthApiError::new(
+                "session_not_identified",
+                "This access token predates session binding and no refresh token identified its \
+                 session. Retry with refresh_token; nothing was changed.",
+            ),
+        )
+    })
+}
+
+/// NAN-5573 review: never report a logout that may have left a live session
+/// or a non-durable revocation. A failed session delete is always a 503
+/// (the session's refresh token would otherwise stay usable for its full
+/// TTL); a non-durable revocation is a 503 only in HA fail-closed mode.
+pub(crate) fn logout_failure(
+    session_end_failed: bool,
+    revocation_persisted: bool,
+    revocation_fail_closed: bool,
+) -> Option<(StatusCode, AuthApiError)> {
+    if session_end_failed {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            AuthApiError::new(
+                "session_end_failed",
+                "Your session could not be ended. Refresh and retry logout.",
+            ),
+        ));
+    }
+    if revocation_fail_closed && !revocation_persisted {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            AuthApiError::new("revocation_unavailable", "Logout could not be confirmed; retry."),
+        ));
+    }
+    None
 }
 
 /// Refresh token response
@@ -1049,6 +1137,11 @@ pub struct AuthApiDoc;
 #[cfg(test)]
 #[path = "auth_refresh_audit_tests.rs"]
 mod refresh_audit_tests;
+
+// NAN-5573: logout fails closed on an unidentified or un-ended session.
+#[cfg(test)]
+#[path = "auth_logout_tests.rs"]
+mod logout_tests;
 
 // NAN-5328: `/api/auth/me` data-scope flag.
 #[cfg(test)]

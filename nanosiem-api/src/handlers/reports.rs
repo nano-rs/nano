@@ -846,6 +846,7 @@ mod authorization_tests {
 
     fn jwt(permissions: &[&str]) -> AuthContext {
         AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: "test".to_string(),
             aud: "test".to_string(),
             sub: Uuid::now_v7(),

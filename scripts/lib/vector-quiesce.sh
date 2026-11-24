@@ -111,7 +111,9 @@ nano_vq_confirm_senders_paused() {
             return 0
         fi
     done
-    if (exec </dev/tty) 2>/dev/null; then
+    # NANO_NONINTERACTIVE=1 (install.sh --non-interactive) never reads the terminal.
+    if [[ "${NANO_NONINTERACTIVE:-0}" != 1 ]] && (exec </dev/tty) 2>/dev/null; then
+        printf '%s\n' "==> waiting for input: are senders that post to Vector directly paused? (set NANO_CONFIRM_SENDERS_PAUSED=1 to skip)" >&2
         printf 'Are senders that post to Vector directly paused? [y/N] ' >/dev/tty
         IFS= read -r answer </dev/tty || answer=""
         case "$answer" in

@@ -20,6 +20,7 @@ import { PermissionAction } from '@/components/repositories/PermissionAction';
 import type { ActionAccess } from '@/components/repositories/repository-action-policy';
 import { CategoryChip, Chk, FilterPills, StatusChip, TransportChip } from './chips';
 import type { CategoryCount, ParserRepoView, RepoParserView } from './helpers';
+import { Term } from '@/components/ui/term';
 
 // ------------------------------------------------------------------
 // Header strip — title + active-repo pill above the three panes
@@ -39,23 +40,18 @@ interface HeaderProps {
 
 export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlot }: HeaderProps) {
   return (
-    <div className="shrink-0 border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
+    <div className="shrink-0 border-b border-border bg-card/30 px-5 py-3.5 flex items-center gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-border bg-card flex items-center justify-center shrink-0">
         <Box className="w-[18px] h-[18px] text-foreground/70" strokeWidth={1.5} />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2.5 flex-wrap">
           <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">
-            Parser repositories
+            <Term id="parser-repository">Parser repositories</Term>
           </div>
           <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground border border-border rounded px-1.5 py-px">
             beta
           </span>
-        </div>
-        <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[760px]">
-          Parser libraries synced from Git. Preview the VRL, inspect the normalized schema, and
-          import as a new log source — linked to upstream (auto-update) or
-          forked (edit locally; we'll flag drift).
         </div>
       </div>
 
@@ -224,7 +220,7 @@ function parserEmptyStateCopy(activeCat: TableProps['activeCat']): { title: stri
     case 'available':
       return { title: 'Nothing new to import', hint: 'All upstream parsers are already imported.' };
     case 'imported':
-      return { title: 'No parsers imported yet', hint: 'Click Import on any parser above to add it to your tenant.' };
+      return { title: 'No parsers imported yet', hint: 'Import a parser from the Available tab.' };
     case 'drift':
       return { title: 'No local drift', hint: 'All imported parsers match their upstream version.' };
     case 'deleted':
@@ -266,7 +262,7 @@ export function ReposTable({
             <th className="py-2 pl-1 text-left font-medium w-[88px]">Status</th>
             <th className="py-2 pl-1 text-left font-medium">Parser</th>
             <th className="py-2 pl-1 text-left font-medium w-[78px] @max-[820px]:hidden">Category</th>
-            <th className="py-2 pl-1 text-left font-medium w-[74px] @max-[900px]:hidden">Transport</th>
+            <th className="py-2 pl-1 text-left font-medium w-[74px] @max-[900px]:hidden"><Term id="transport">Transport</Term></th>
             <th className="py-2 pl-1 text-left font-medium w-[74px] @max-[680px]:hidden">Version</th>
             <th className="py-2 pl-1 text-left font-medium w-[100px] @max-[1060px]:hidden">Commit</th>
             <th className="py-2 pl-1 pr-3 w-[80px]" />
@@ -459,7 +455,7 @@ function RowAction({
             Open
           </button>
           </TooltipTrigger>
-          <TooltipContent>Already imported — open the log source</TooltipContent>
+          <TooltipContent>Already imported. Open the log source.</TooltipContent>
         </Tooltip>
       </PermissionAction>
     );
@@ -497,7 +493,7 @@ function RowAction({
             Resolve
           </button>
           </TooltipTrigger>
-          <TooltipContent>Resolve drift — merge upstream into your fork</TooltipContent>
+          <TooltipContent>Your edited copy differs from the repo's latest version. Review the diff to merge changes or keep yours.</TooltipContent>
         </Tooltip>
       </PermissionAction>
     );

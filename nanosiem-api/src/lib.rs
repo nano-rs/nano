@@ -19,6 +19,9 @@ pub mod middleware;
 pub mod openapi;
 pub mod pipe_tap_relay;
 pub mod routes;
+// NAN-5798: debug-only Sentry test trigger (absent from release builds).
+#[cfg(debug_assertions)]
+pub mod sentry_test_trigger;
 pub mod state;
 pub mod utils;
 

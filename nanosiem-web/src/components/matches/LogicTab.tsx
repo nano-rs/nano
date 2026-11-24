@@ -5,6 +5,7 @@
 // to `useRuleVersions` (NAN-492); historical-data testing routes into the
 // editor's TestDrawer via `?test=1` (NAN-495).
 
+import { Term } from '@/components/ui/term';
 import { useNavigate } from 'react-router-dom';
 import { Copy, Pencil, Play, History, FlaskConical } from 'lucide-react';
 import type { DetectionRule } from '@/lib/api/types';
@@ -38,7 +39,7 @@ export function LogicTab({ rule, match }: LogicTabProps) {
     <div className="p-5 max-w-[980px]">
       <div className="rounded-lg border border-border overflow-hidden bg-card">
         <div className="px-3 py-2 flex items-center gap-2 border-b border-border">
-          <span className="font-mono text-[10.5px] text-muted-foreground">nano-ql</span>
+          <span className="font-mono text-[10.5px] text-muted-foreground"><Term id="npl">nPL</Term></span>
           <span className="ml-auto flex items-center gap-1">
             <button
               type="button"
@@ -160,9 +161,7 @@ export function LogicTab({ rule, match }: LogicTabProps) {
               </span>
             </div>
             <p className="text-[11px] text-muted-foreground leading-[1.55]">
-              Run this rule's query over a historical window to estimate fire rate before changing
-              thresholds. Opens the editor's test drawer where you can pick the window, see matches,
-              and tweak the query without saving.
+              See how often the rule would fire before you change its limits. Nothing is saved.
             </p>
             <div className="mt-2.5">
               <button

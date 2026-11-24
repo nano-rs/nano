@@ -64,6 +64,7 @@ import { PrevalenceExplorerHeatmap } from '@/components/prevalence';
 import {
   PREVALENCE_STATUS_POLL_MS,
   UNKNOWN_HOSTS_LABEL,
+  HOST_COUNT_BASELINE_LABEL,
   prevalenceStatusLabel,
   shouldPollPrevalence,
 } from '@/lib/prevalence/coverageStatus';
@@ -82,6 +83,7 @@ import type {
   ArtifactProcessEntry,
 } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 type TimeWindow = '1h' | '24h' | '7d' | '30d';
 type ArtifactTypeFilter = 'all' | 'hash' | 'domain' | 'ip';
@@ -178,7 +180,7 @@ function KpiTile({
           style={{ fontSize: '32px', lineHeight: '1.05' }}
           title={
             approximate && !loading
-              ? 'At least this many — the fleet exceeds the scan buffer, so this is a floor, not an exact total'
+              ? 'At least this many. There are more than nano can count here, so this is a lower bound.'
               : undefined
           }
         >
@@ -470,13 +472,10 @@ export function Prevalence() {
       {/* Header */}
       <div className="flex items-end gap-3">
         <div className="min-w-0">
-          <Eyebrow icon={GridIcon}>Prevalence index</Eyebrow>
+          <Eyebrow icon={GridIcon}><Term id="prevalence">Prevalence</Term> index</Eyebrow>
           <h1 className="mt-1 text-[20px] font-semibold tracking-[-0.015em] text-foreground">
             What's running across your fleet
           </h1>
-          <p className="mt-0.5 text-[12px] text-muted-foreground">
-            Indicators ranked by how rare they are. Pivot any row into Search.
-          </p>
         </div>
         <span className="flex-1" />
         {data && (
@@ -484,7 +483,7 @@ export function Prevalence() {
             <span
               title={
                 countsApproximate
-                  ? 'At least this many — the fleet exceeds the scan buffer, so this is a floor, not an exact total'
+                  ? 'At least this many. There are more than nano can count here, so this is a lower bound.'
                   : undefined
               }
             >
@@ -562,7 +561,7 @@ export function Prevalence() {
                 ? 'Search artifacts, or paste a hash / IP / domain…'
                 : mode === 'lookup'
                   ? 'Looking up artifact…'
-                  : `${bulkDetected.length} artifacts pasted — looking up…`
+                  : `${bulkDetected.length} artifacts pasted. Looking up…`
             }
             className="flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground"
           />
@@ -748,9 +747,9 @@ export function Prevalence() {
           style={{ gridTemplateColumns: '20px minmax(0,1fr) 90px 80px 80px 130px 130px 200px' }}
         >
           <div className="px-2 py-2" />
-          <div className="px-2 py-2">Artifact</div>
+          <div className="px-2 py-2"><Term id="artifact">Artifact</Term></div>
           <div className="px-2 py-2">Type</div>
-          <div className="px-2 py-2 text-right">Hosts</div>
+          <div className="px-2 py-2 text-right"><Term id="prevalence-hosts">Hosts</Term></div>
           <div className="px-2 py-2 text-right">Count</div>
           <div className="px-2 py-2">First seen</div>
           <div className="px-2 py-2">Last seen</div>
@@ -1133,7 +1132,7 @@ function ExpandedArtifactDetail({
         >
           <Store className="h-3.5 w-3.5 text-muted-foreground/80" />
           <span className="flex-1 truncate">
-            Connect AbuseIPDB / GreyNoise / VirusTotal in the marketplace to see reputation for this artifact
+            Connect AbuseIPDB, GreyNoise or VirusTotal for reputation
           </span>
           <ChevronRight className="h-3 w-3 text-muted-foreground/70" />
         </a>
@@ -1198,7 +1197,7 @@ function ProcessContextCard({ processes }: { processes: ArtifactProcessEntry[] }
           ) : (
             <div key={`wrap-${i}`} className="my-1 first:mt-0">
               <div className="px-1 pb-0.5 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground/60">
-                {g.processName} — split by command line ({g.rows.length})
+                {g.processName}: split by command line ({g.rows.length})
               </div>
               <div className="border-l border-border/60 pl-2">
                 {g.rows.map((r, j) => (
@@ -1300,7 +1299,7 @@ function ArtifactLookupCard({
               'Looking up…'
             ) : seen ? (
               <>
-                <span className="tabular-nums text-foreground">{(lookupData?.host_count ?? 0).toLocaleString()}</span>{' '}
+                <span className="tabular-nums text-foreground" title={HOST_COUNT_BASELINE_LABEL}>{(lookupData?.host_count ?? 0).toLocaleString()}</span>{' '}
                 {lookupData?.host_count === 1 ? 'host' : 'hosts'} ·{' '}
                 <span className="tabular-nums text-foreground">{(lookupData?.total_occurrences ?? 0).toLocaleString()}</span>{' '}
                 {lookupData?.total_occurrences === 1 ? 'event' : 'events'}
@@ -1360,9 +1359,7 @@ function ArtifactLookupCard({
           <div className="px-4 py-10 text-center text-[12px] text-muted-foreground">
             <Search className="mx-auto mb-2 h-5 w-5 opacity-50" />
             <p>Not seen in this environment</p>
-            <p className="mt-1 text-[11px] text-muted-foreground/70">
-              No prevalence record exists for this artifact in the configured retention window.
-            </p>
+            <p className="mt-1 text-[11px] text-muted-foreground/70">No record in the retention window.</p>
           </div>
         )}
       </div>
@@ -1405,13 +1402,13 @@ function BulkLookupTable({
         className="grid items-center border-b border-border bg-card/40 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/80"
         style={{ gridTemplateColumns: 'minmax(0,1fr) 110px 80px 80px 140px 140px 80px' }}
       >
-        <div className="px-3 py-2">Artifact</div>
+        <div className="px-3 py-2"><Term id="artifact">Artifact</Term></div>
         <div className="px-2 py-2">Type</div>
-        <div className="px-2 py-2 text-right">Hosts</div>
+        <div className="px-2 py-2 text-right"><Term id="prevalence-hosts">Hosts</Term></div>
         <div className="px-2 py-2 text-right">Events</div>
         <div className="px-2 py-2">First seen</div>
         <div className="px-2 py-2">Last seen</div>
-        <div className="px-2 py-2 text-right">Rare</div>
+        <div className="px-2 py-2 text-right"><Term id="rare">Rare</Term></div>
       </div>
 
       {lookupLoading ? (

@@ -82,7 +82,7 @@ const STEPS: SetupStep[] = [
     key: 'org_context',
     label: 'AI Guidance',
     icon: Building2,
-    description: 'Tell the AI about your org so it can give more relevant guidance and detection tuning.',
+    description: 'Org context for AI guidance and tuning.',
     href: '/settings/ai?tab=guidance',
     statusKey: 'has_org_context',
     doneLabel: 'Guidance set',
@@ -93,7 +93,7 @@ const STEPS: SetupStep[] = [
     key: 'team_setup',
     label: 'Team Setup',
     icon: Users,
-    description: 'Add analysts, engineers, and admins. Assign groups and roles for access control.',
+    description: 'Add users and assign roles.',
     href: '/settings/access-control',
     statusKey: 'has_users',
     doneLabel: 'Team members added',
@@ -103,7 +103,7 @@ const STEPS: SetupStep[] = [
     key: 'sso_setup',
     label: 'Single Sign-On',
     icon: Shield,
-    description: 'Connect your identity provider (Entra ID, Okta, Google) for centralized authentication.',
+    description: 'Connect your identity provider (Entra ID, Okta, Google).',
     href: '/settings/access-control?tab=sso',
     statusKey: 'has_sso',
     doneLabel: 'SSO configured',
@@ -114,7 +114,7 @@ const STEPS: SetupStep[] = [
     key: 'first_feed',
     label: 'Log Source',
     icon: Activity,
-    description: 'Connect your first log source to start ingesting data into nano.',
+    description: 'Connect your first log source.',
     href: '/ingestion/log-sources/new',
     doneHref: '/ingestion/log-sources',
     statusKey: 'has_log_sources',
@@ -125,7 +125,7 @@ const STEPS: SetupStep[] = [
     key: 'create_parser',
     label: 'Log Parser',
     icon: Code,
-    description: 'Create a parser to map raw logs to OCSF for searching and detection.',
+    description: 'Map raw logs to OCSF.',
     href: '/ingestion/log-sources/new',
     doneHref: '/ingestion/log-sources/repositories',
     statusKey: 'has_parsers',
@@ -136,7 +136,7 @@ const STEPS: SetupStep[] = [
     key: 'first_searches',
     label: 'First Search',
     icon: Search,
-    description: 'Run your first nPL query to explore your data and get familiar with the search experience.',
+    description: 'Run your first nPL query.',
     href: '/search',
     statusKey: 'has_search_history',
     doneLabel: 'Searches run',
@@ -299,7 +299,7 @@ function InstanceSetupWizard() {
           <span className="text-muted-foreground/40">·</span>
           <span>search readiness</span>
         </div>
-        <div className="flex items-start justify-between gap-4">
+        <div className="flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1
               className="font-semibold tracking-tight text-foreground"
@@ -307,9 +307,6 @@ function InstanceSetupWizard() {
             >
               Get nano running.
             </h1>
-            <p className="mt-2 text-[12.5px] text-muted-foreground/80" style={{ textWrap: 'pretty' }}>
-              Set up your nano instance step by step. Click any item to configure it &mdash; come back any time.
-            </p>
           </div>
           <button
             type="button"
@@ -474,7 +471,7 @@ function InstanceSetupWizard() {
       <div className="flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
         <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
         <span className="text-[12.5px] text-muted-foreground">
-          Complete each step or finish early to get started.
+          Finish early any time.
         </span>
         <div className="flex-1" />
         <button

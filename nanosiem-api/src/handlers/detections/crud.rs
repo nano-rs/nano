@@ -171,7 +171,8 @@ pub async fn get_detection(
 ///
 /// Accepts `detection_mode` field to specify execution tier:
 /// - real-time: ClickHouse materialized views (10-30s latency)
-/// - scheduled: Cron-based execution (continuous with */1 * * * * or custom cron)
+/// - scheduled: Cron-based execution (continuous with */1 * * * * or custom cron;
+///   without `schedule_cron` the rule gets the default */5 * * * *)
 ///
 /// Auto-corrects real-time rules with piped commands to scheduled mode.
 ///
@@ -273,7 +274,7 @@ pub async fn create_detection(
         request.detection_mode = Some(DetectionMode::Scheduled);
 
         // Set a fast schedule if not already set (30 seconds)
-        if request.schedule_cron.is_none() {
+        if request.schedule_cron.as_deref().is_none_or(|c| c.trim().is_empty()) {
             request.schedule_cron = Some("*/30 * * * * *".to_string());
         }
 
@@ -456,7 +457,7 @@ pub async fn update_detection(
             request.detection_mode = Some(DetectionMode::Scheduled);
 
             // Set a fast schedule if not already set (30 seconds)
-            if request.schedule_cron.is_none() {
+            if request.schedule_cron.as_deref().is_none_or(|c| c.trim().is_empty()) {
                 request.schedule_cron = Some("*/30 * * * * *".to_string());
             }
 
@@ -488,6 +489,13 @@ pub async fn update_detection(
             )));
         }
     }
+
+    // NAN-5826: whether the caller named the cron (else the service default
+    // applies when this update activates a schedule; see below).
+    let cron_explicit = request
+        .schedule_cron
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty());
 
     // Update rule with mode-based routing
     let rule = state
@@ -540,6 +548,24 @@ pub async fn update_detection(
             "schedule_cron".into(),
             serde_json::json!({"from": old_rule.schedule_cron, "to": rule.schedule_cron}),
         );
+    }
+    if schedule_activated(&old_rule, &rule) {
+        // Audit the activation explicitly: the rule never ran before this.
+        changes.insert(
+            "schedule_activated".into(),
+            serde_json::json!({
+                "schedule_cron": rule.schedule_cron,
+                "defaulted": !cron_explicit,
+                "mode": rule.mode,
+            }),
+        );
+        if !cron_explicit && warning.is_none() {
+            warning = Some(format!(
+                "This rule had no schedule and never ran. It now runs on the default schedule '{}' in {:?} mode; set schedule_cron to change it.",
+                rule.schedule_cron.as_deref().unwrap_or_default(),
+                rule.mode
+            ));
+        }
     }
     if old_rule.description != rule.description {
         changes.insert("description".into(), serde_json::json!("changed"));
@@ -738,6 +764,22 @@ pub(super) fn requires_promote_for_create(req: &NewDetectionRule) -> bool {
     false
 }
 
+/// NAN-5826: the update started a rule executing on a schedule: it was a
+/// scheduled rule with no cron (absent or blank), and it is now a scheduled,
+/// Live or Alerting rule with one. Inert Staging/Paused rules and real-time
+/// rules (already running through their view) are not activations.
+/// Drives the `schedule_activated` audit entry and the default-cron warning.
+pub(super) fn schedule_activated(old: &DetectionRule, new: &DetectionRule) -> bool {
+    use nanosiem_core::models::detection_rule::DetectionMode;
+    let has_cron = |r: &DetectionRule| r.schedule_cron.as_deref().is_some_and(|c| !c.trim().is_empty());
+    old.detection_mode == DetectionMode::Scheduled
+        && !has_cron(old)
+        && !new.archived
+        && new.detection_mode == DetectionMode::Scheduled
+        && matches!(new.mode, RuleMode::Live | RuleMode::Alerting)
+        && has_cron(new)
+}
+
 /// Returns true when the request mutates a field that should be gated on
 /// `detections:promote` rather than `detections:edit`. The dedicated lifecycle
 /// endpoints (pause/resume/promote/demote/bulk-update) already require promote;
@@ -758,10 +800,17 @@ fn requires_promote_for_update(old: &DetectionRule, req: &UpdateDetectionRule) -
             return true;
         }
     }
-    if let Some(ref new_cron) = req.schedule_cron {
-        if Some(new_cron) != old.schedule_cron.as_ref() {
+    // A blank cron keeps the stored one (NAN-5826), so it changes nothing.
+    if let Some(new_cron) = req.schedule_cron.as_deref().filter(|c| !c.trim().is_empty()) {
+        if Some(new_cron) != old.schedule_cron.as_deref() {
             return true;
         }
+    }
+    // NAN-5826: giving a cron-less Live/Alerting scheduled rule its first
+    // schedule (the caller's or the default one the service fills in) starts
+    // it running on the spot: a promotion, even on a metadata-only edit.
+    if nanosiem_core::detection::DetectionService::update_activation_needs_promote(old, req) {
+        return true;
     }
     if let Some(new_sev) = req.severity {
         if severity_rank(new_sev) < severity_rank(old.severity) {
@@ -923,6 +972,126 @@ mod tests {
             ..Default::default()
         };
         assert!(requires_promote_for_update(&old, &req));
+    }
+
+    /// NAN-5826 (review P1): a metadata-only edit of a cron-less Live or
+    /// Alerting scheduled rule activates its schedule (the service fills in
+    /// the default), so it starts running: a promotion.
+    #[test]
+    fn activating_a_cronless_live_or_alerting_rule_requires_promote() {
+        for mode in [RuleMode::Live, RuleMode::Alerting] {
+            let old = DetectionRule {
+                schedule_cron: None,
+                mode,
+                ..baseline_rule()
+            };
+            let typo_fix = UpdateDetectionRule {
+                description: Some("typo fix".into()),
+                ..Default::default()
+            };
+            assert!(requires_promote_for_update(&old, &typo_fix), "{mode:?} metadata edit");
+            let blank = UpdateDetectionRule {
+                schedule_cron: Some("  ".into()),
+                ..Default::default()
+            };
+            assert!(requires_promote_for_update(&old, &blank), "{mode:?} blank cron");
+        }
+    }
+
+    #[test]
+    fn a_cronless_staging_or_paused_rule_edit_needs_no_promote() {
+        for mode in [RuleMode::Staging, RuleMode::Paused] {
+            let old = DetectionRule {
+                schedule_cron: None,
+                mode,
+                ..baseline_rule()
+            };
+            let req = UpdateDetectionRule {
+                description: Some("typo fix".into()),
+                ..Default::default()
+            };
+            assert!(!requires_promote_for_update(&old, &req), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_cronless_realtime_rule_edit_needs_no_promote() {
+        let old = DetectionRule {
+            schedule_cron: None,
+            detection_mode: DetectionMode::RealTime,
+            ..baseline_rule()
+        };
+        let req = UpdateDetectionRule {
+            description: Some("typo fix".into()),
+            ..Default::default()
+        };
+        assert!(!requires_promote_for_update(&old, &req));
+    }
+
+    fn rule_with(mode: RuleMode, dm: DetectionMode, cron: Option<&str>) -> DetectionRule {
+        DetectionRule {
+            mode,
+            detection_mode: dm,
+            schedule_cron: cron.map(str::to_string),
+            ..baseline_rule()
+        }
+    }
+
+    /// NAN-5826 (review round 2): the audit entry and warning fire exactly
+    /// when a rule that will execute goes from no cron to a cron.
+    #[test]
+    fn schedule_activated_fires_only_for_executing_rules() {
+        use DetectionMode::{RealTime, Scheduled};
+        let cron = Some("*/5 * * * *");
+        // Live/Alerting, from absent or blank cron: fires.
+        for mode in [RuleMode::Live, RuleMode::Alerting] {
+            for before in [None, Some(""), Some("   ")] {
+                assert!(
+                    schedule_activated(&rule_with(mode, Scheduled, before), &rule_with(mode, Scheduled, cron)),
+                    "{mode:?} from {before:?}"
+                );
+            }
+        }
+        // A cron-less staging rule promoted in the same edit: fires.
+        assert!(schedule_activated(
+            &rule_with(RuleMode::Staging, Scheduled, None),
+            &rule_with(RuleMode::Alerting, Scheduled, cron)
+        ));
+        // Inert modes: no.
+        for mode in [RuleMode::Staging, RuleMode::Paused] {
+            assert!(!schedule_activated(&rule_with(mode, Scheduled, None), &rule_with(mode, Scheduled, cron)), "{mode:?}");
+        }
+        // Real-time -> scheduled: the rule was already running; no.
+        assert!(!schedule_activated(
+            &rule_with(RuleMode::Live, RealTime, None),
+            &rule_with(RuleMode::Live, Scheduled, cron)
+        ));
+        // Had a cron already, or still none, or ended real-time / deleted: no.
+        assert!(!schedule_activated(
+            &rule_with(RuleMode::Live, Scheduled, Some("0 * * * *")),
+            &rule_with(RuleMode::Live, Scheduled, cron)
+        ));
+        assert!(!schedule_activated(
+            &rule_with(RuleMode::Live, Scheduled, None),
+            &rule_with(RuleMode::Live, Scheduled, Some(" "))
+        ));
+        assert!(!schedule_activated(
+            &rule_with(RuleMode::Live, Scheduled, None),
+            &rule_with(RuleMode::Live, RealTime, cron)
+        ));
+        let deleted = DetectionRule { archived: true, ..rule_with(RuleMode::Live, Scheduled, cron) };
+        assert!(!schedule_activated(&rule_with(RuleMode::Live, Scheduled, None), &deleted));
+    }
+
+    /// A blank cron keeps the stored one, so it is not a schedule change.
+    #[test]
+    fn a_blank_cron_on_a_scheduled_rule_is_not_a_change() {
+        let old = baseline_rule();
+        let req = UpdateDetectionRule {
+            schedule_cron: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!requires_promote_for_update(&old, &req));
     }
 
     #[test]

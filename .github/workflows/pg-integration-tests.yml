@@ -17,6 +17,10 @@ on:
   schedule:
     - cron: '17 4 * * *'
   pull_request:
+    # NAN-5791: on a PR, runs only while it carries the optional `ready-to-merge`
+    # opt-in label (jobs' `if:`); the heavy run is the push-to-main one below.
+    # docs-internal/ci-runner-pools.md#ready-to-merge-label-nan-5791
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - "**/*.rs"
       # A dependency bump, feature flip, workspace-membership change or a new
@@ -29,14 +33,45 @@ on:
       # (nanosiem-core lib tests): a corpus-only edit must run that gate too.
       - "benchmarks/results/soc_ir_corpus*.json"
       - ".github/workflows/pg-integration-tests.yml"
+      # Attaches the host sccache to the cargo container.
+      - "scripts/ci/cargo-cache-docker-args.sh"
+  # Heavy suite on main after merges; same paths as the PR trigger.
+  # docs-internal/ci-runner-pools.md#heavy-gates-on-main
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      # A dependency bump, feature flip, workspace-membership change or a new
+      # test target changes what compiles and what runs without touching a
+      # single .rs file, and would otherwise skip this gate entirely.
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "migrations/**"
+      # The IR/SOC benchmark corpora are checked by soc_ir_corpus_tests.rs
+      # (nanosiem-core lib tests): a corpus-only edit must run that gate too.
+      - "benchmarks/results/soc_ir_corpus*.json"
+      - ".github/workflows/pg-integration-tests.yml"
+      # Attaches the host sccache to the cargo container.
+      - "scripts/ci/cargo-cache-docker-args.sh"
   workflow_dispatch:
 
+# Read-only token on every trigger: no run of this gate (PR, push to main,
+# schedule, dispatch) can push, publish, sign or release.
+permissions:
+  contents: read
+
+# NAN-5791: a labeled/unlabeled event for any other label gets its own group
+# (its jobs skip), so it never cancels a real run. A push to main joins the
+# `heavy-` group without cancel-in-progress: one run going plus at most one
+# pending, the pending one replaced by the newest merge, so a burst of merges
+# coalesces into two runs (docs-internal/ci-runner-pools.md#heavy-gates-on-main).
 concurrency:
-  group: pg-integration-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && 'heavy-' || '' }}pg-integration-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   test:
+    if: ${{ github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge')) }}
     # Self-hosted only (repo rule — never ubuntu-latest). A throwaway Postgres
     # container with a unique name and a random host port keeps concurrent runs
     # on the same host isolated (unlike the compose stack's fixed container_names).
@@ -49,8 +84,12 @@ jobs:
     # The cargo container joins the host network so it reaches the Postgres port
     # published on 127.0.0.1, and writes its target dir to an in-container path
     # so no root-owned build artifacts land in the workspace.
-    runs-on: [self-hosted, Linux, X64, nano-pr]
-    timeout-minutes: 45
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
+    # 90, not 45: a cold compile of the whole workspace test set ran past 45
+    # minutes on main twice with every test still passing (runs 44983042431
+    # and the next one). sccache below makes warm runs much shorter; this is
+    # the headroom for a cold host or a Cargo.lock bump.
+    timeout-minutes: 90
     env:
       PG_CONTAINER: nan1272-pgit-${{ github.run_id }}
       RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
@@ -161,10 +200,20 @@ jobs:
           # --workspace --lib --tests is 5,616 tests across 116 suites. Test
           # EXECUTION is seconds; the real cost is COMPILING ~116 test binaries
           # where this job previously built ~14. CARGO_TARGET_DIR is inside the
-          # container and is not persisted between runs, so that is paid every
-          # time. The 45-minute job timeout has the headroom, but if this job
-          # starts timing out, that is the reason — persist a target-dir volume
-          # (as the registry already is) before trimming what gets tested.
+          # container and is not persisted between runs (a target dir is
+          # mtime-based and unsafe to share across branches or concurrent jobs,
+          # docs-internal/ci-runner-fleet.md). Instead the host sccache is
+          # attached: content-addressed, shared safely, bounded by its own LRU,
+          # so rustc outputs survive between runs. It ran past the old 45-minute
+          # timeout cold on main; see timeout-minutes above.
+          #
+          # cargo-cache-docker-args.sh: on a fleet host with a ci_cache profile,
+          # --env-file /etc/nano-ci/cargo.env (RUSTC_WRAPPER=sccache,
+          # CARGO_INCREMENTAL=0, SCCACHE_BASEDIRS=/ws) plus the pinned sccache
+          # client; this step adds the sccache volume at /sccache only then.
+          # The bare -e CARGO_BUILD_JOBS comes after it, so the runner cap
+          # (NAN-5806) wins when set and the profile value applies otherwise.
+          # Anywhere else nothing changes from before.
           #
           # --no-fail-fast so one red binary does not mask the rest, which is
           # exactly how the second and third failing binaries stayed hidden
@@ -216,14 +265,28 @@ jobs:
           # key in-process and shares provider fixtures, so single-threaded.
           # NAN-5274: scim_provisioning_integration drives the SCIM 2.0 router
           # (Okta/Entra shapes, deprovisioning, grants, email trust, limits).
+          # NAN-5767: hunts::hunt_schedule_slot_live_tests (hunt cadence writer
+          # shared by PATCH and the schedule endpoint, plus the scheduler
+          # cadence CAS race) are lib tests gated on NANO_TEST_DATABASE_URL and
+          # applying the enterprise overlay themselves. They share hunt rows
+          # with the scheduler poll, so single-threaded.
+          # NAN-5776: hunts::recon::dismissal_live_tests (a deleted recon draft
+          # frees its technique for POST /api/hunts/drafts; recon runs still do
+          # not recreate it). Same gate and overlay as the cadence suite.
+          mapfile -t cargo_cache_args < <(bash scripts/ci/cargo-cache-docker-args.sh)
+          if [ "${cargo_cache_args[0]:-}" = --env-file ]; then
+            cargo_cache_args+=(-v nanosiem-pgit-sccache:/sccache)
+          fi
           docker run \
             --label nano-ci=1 --label "nano-ci.repo=$GITHUB_REPOSITORY" --label "nano-ci.runner=$RUNNER_NAME" \
             --label "nano-ci.run_id=$GITHUB_RUN_ID" --label "nano-ci.run_attempt=$GITHUB_RUN_ATTEMPT" --label "nano-ci.job=$GITHUB_JOB" \
             --rm --network host \
             -v "$PWD":/ws -w /ws \
+            "${cargo_cache_args[@]}" \
             -e CREDENTIAL_SUITE_ENCRYPTION_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
             -v nanosiem-pgit-cargo-registry:/usr/local/cargo/registry \
             -e CARGO_TARGET_DIR=/tmp/target \
+            -e CARGO_BUILD_JOBS \
             -e DATABASE_URL="$DATABASE_URL" \
             -e TEST_DATABASE_URL="$DATABASE_URL" \
             -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
@@ -238,9 +301,13 @@ jobs:
               # NAN-5734: meloD config poller fingerprint (enterprise-only module;
               # its DB tests skip unless NANOSIEM_TEST_DATABASE_URL is set).
               NANOSIEM_TEST_DATABASE_URL="$DATABASE_URL" cargo test -p nanosiem-api --features enterprise --lib state::melod::config_poller_tests
+              NANO_TEST_DATABASE_URL="$DATABASE_URL" cargo test -p nanosiem-core --features enterprise --lib hunts::hunt_schedule_slot_live_tests -- --ignored --test-threads=1
+              NANO_TEST_DATABASE_URL="$DATABASE_URL" cargo test -p nanosiem-core --features enterprise --lib hunts::recon::dismissal_live_tests -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test migration_seed_parity -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
               cargo test -p nanosiem-core --test first_admin_claim_integration -- --ignored
+              # NAN-5825: token refresh never queries demo.sessions where it does not exist.
+              cargo test -p nanosiem-core --test demo_session_probe_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test entitlement_grant_ai_credits_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-api-lib --test grant_authority_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test source_scope_integration -- --ignored
@@ -253,17 +320,29 @@ jobs:
               NANOSIEM_ALLOW_DEFAULT_KEYS=true cargo test -p nanosiem-core --test source_config_deployed_edit_requires_deploy_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test lookup_create_owns_physical_table_integration -- --ignored
               cargo test -p nanosiem-core --test log_source_deploy_jobs_integration -- --ignored --test-threads=1
+              # NAN-5785 (sweep is table-wide: serial) and NAN-5760.
+              cargo test -p nanosiem-core --test log_source_delete_resolves_health_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-core --test siem_health_deleted_sources_integration -- --ignored --test-threads=1
+              if command -v sccache >/dev/null; then sccache --show-stats || true; fi
+              cargo test -p nanosiem-core --test security_audit_outbox_batch_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-core --test unassigned_deleted_sources_integration -- --ignored --test-threads=1
+              NANOSIEM_ALLOW_DEFAULT_KEYS=true cargo test -p nanosiem-core --test fetch_source_without_config_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test custom_enrichment_catalog_slug_guard_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-enterprise --test soar_deleted_flow_run_name_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --features enterprise --test tuning_atomic_state_integration -- --ignored --test-threads=1
               NANOSIEM_ENCRYPTION_KEY="$CREDENTIAL_SUITE_ENCRYPTION_KEY" cargo test -p nanosiem-core --features enterprise --test credential_delete_in_use_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test notebook_tab_revocation_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test notebook_visibility_lifecycle_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test settings_integration -- --ignored
               cargo test -p nanosiem-enterprise --test playbook_acl_integration -- --ignored --test-threads=1
+              # NAN-5786: playbook audit transitions (what the API audits).
+              cargo test -p nanosiem-enterprise --test playbook_audit_transitions -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test case_stats_visibility_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test incident_confidence_integration -- --ignored
               cargo test -p nanosiem-enterprise --test f34_case_source_scoping_integration -- --ignored
               cargo test -p nanosiem-enterprise --test case_visibility_scope_integration -- --ignored --test-threads=1
+              # NAN-5790: case delete names the removed case for its audit row.
+              cargo test -p nanosiem-enterprise --test case_delete_audit_identity_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test case_entity_provenance_integration -- --ignored
               cargo test -p nanosiem-enterprise --test melod_parser_draft_jobs_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test sso_trust_authority_integration -- --ignored --test-threads=1 &&

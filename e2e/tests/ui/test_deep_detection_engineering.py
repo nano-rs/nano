@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 from nano_e2e import ui as uilib
 from nano_e2e.client import Nano, expect, row_text, time_range
+from nano_e2e.hunt_coverage import wait_catalog
 from nano_e2e.personas import login_persona
 from nano_e2e.stack import Stack
 from nano_e2e.waits import DETECTION, INGEST_VISIBLE, eventually, stays
@@ -117,12 +118,11 @@ def _coverage(client: Nano, technique: str, modes: str | None = None) -> dict[st
 
 
 def _open_technique(page: uilib.UiPage, technique: str) -> None:
-    page.goto("/rules/coverage")
-    page.fill(uilib.field({"placeholder": "Search T-id, technique…"}, technique))
-    # The cell's name is "<T-id><technique name>" (no separator): not a sub-technique.
-    page.click({"role": "button", "name": uilib.rx(rf"^{technique}(?![.\d])")})
-    page.wait_for({"role": "dialog", "name": f"Technique {technique}", "exact": True})
-    page.wait_text(f"Rules mapped to {technique}", exact=True)
+    """The unified coverage page (NAN-5850) opens a technique's panel from
+    `?tech=`; Detections view so the hunt layer never decides what shows."""
+    page.goto(f"/rules/coverage?view=detections&tech={technique}")
+    page.wait_for({"css": f'[data-testid="coverage-panel"][data-technique="{technique}"]'}, timeout_ms=30_000)
+    page.wait_for({"testid": "coverage-panel-detection"})
 
 
 def _matches_total(client: Nano, rule_id: str) -> int:
@@ -147,6 +147,7 @@ def test_author_validate_test_lifecycle_mitre_and_matches(
         ocsf_lane.send(stack, mark, user, f"198.51.100.{60 + i}", "det-host", note=f"seed={i}")
     eventually(lambda: nano.search(f'actor.user.name="{user}"')["total_count"], timeout=INGEST_VISIBLE,
                desc="seeded events searchable", ok=lambda n: n == 3)
+    wait_catalog(nano)
     name = _snake("deep_brute_force", mark)
     technique, tactic = "T1110", "TA0006"
     query = f'source_type="{ocsf_lane.lane}" actor.user.name="{user}"'
@@ -412,8 +413,13 @@ def test_alert_cooldown_round_trips(nano: Nano, mark: str, rule_cleanup) -> None
 def test_mitre_coverage_shows_staging_rules_in_review(
     stack: Stack, nano: Nano, mark: str, ui: uilib.Driver, artifact_dir, timeline, rule_cleanup
 ) -> None:
-    """The coverage page sorts rules into Live / In review (staging) /
-    Disabled; a staging rule mapped to a technique shows "1 review" there."""
+    """The coverage panel groups rules by mode (Alerting / Live / Staging /
+    Paused); a staging rule mapped to a technique shows "Staging · 1" there,
+    its cell reads D = review, and it is not live coverage."""
+    # A fresh stack installs the ATT&CK catalog after boot; until then the
+    # coverage API lists no techniques at all (this failed as `{}` when the
+    # test ran first on a new open stack).
+    wait_catalog(nano)
     name = _snake("mitre_review", mark)
     technique = "T1201"  # Password Policy Discovery: no other e2e rule maps it
     rule = expect(nano.api.post("/api/rules", json={
@@ -428,7 +434,12 @@ def test_mitre_coverage_shows_staging_rules_in_review(
         text = " ".join(persona.page.texts({"role": "dialog", "name": f"Technique {technique}", "exact": True}))
         persona.page.screenshot("mitre-review-staging.png", full_page=False)
         timeline.step("staging rule on the coverage page", sheet=text[:200])
-        review = re.search(r"(\d+) review", text)
-        assert review, f"the technique sheet has no review count: {text[:300]}"
-        assert name in text and review.group(0) == "1 review", \
-            f"technique sheet: rule listed={name in text}, {review.group(0)}"
+        # The panel groups rules by mode (NAN-5850): "Staging · 1", and the
+        # staging rule does not count as live.
+        review = re.search(r"(?i)staging · (\d+)", text)
+        assert review, f"the technique panel has no Staging group: {text[:300]}"
+        assert name in text and review.group(1) == "1", \
+            f"technique panel: rule listed={name in text}, {review.group(0)}"
+        assert "0 live" in text, f"a staging rule counted as live: {text[:300]}"
+        cell = {"testid": f"coverage-cell-{technique}"}
+        assert set(persona.page.attrs(cell, "data-d")) == {"review"}, persona.page.attrs(cell, "data-d")

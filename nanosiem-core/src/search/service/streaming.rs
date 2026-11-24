@@ -306,6 +306,7 @@ impl SearchService {
                 &adjusted_time_range,
                 crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs")),
                 &query_id,
+                scope,
             )
             .await
         {
@@ -600,10 +601,7 @@ impl SearchService {
             // resolve_identity ASOF join to identity_observations (a dataset the
             // nPL-text gate does not cover) filters its build side. Empty
             // deny-set = byte-identical SQL.
-            let mut generator = self
-                .ch_sql_generator
-                .clone()
-                .with_source_scope_deny(scope.deny_set().clone());
+            let mut generator = self.sql_generator(crate::query::GeneratorScope::viewer(scope));
             if super::touches_risk_dataset(request.dataset.as_deref(), &request.query) {
                 generator = generator.with_risk_config(self.risk_query_config.resolve().await);
             }
@@ -664,6 +662,7 @@ impl SearchService {
             let histogram_query = cleaned_query.to_string();
             let histogram_time_range = adjusted_time_range.clone();
             let hist_qid = crate::search::companion_query_id::CompanionQuery::Hist.query_id(&query_id);
+            let hist_deny = scope.deny_set().clone();
             // NAN-1557: the timeline reads the same dataset as the results.
             let histogram_dataset = crate::query::Dataset::from_selector(
                 request.dataset.as_deref().unwrap_or("logs"),
@@ -675,6 +674,7 @@ impl SearchService {
                         &histogram_time_range,
                         Some(&hist_qid),
                         histogram_dataset,
+                        &hist_deny,
                     )
                     .await
                 {
@@ -723,16 +723,7 @@ impl SearchService {
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    // NAN-5161: same guardrail-vs-internal rule as the batch path.
-                    tracing::error!(error = %e, "Streaming chunk SQL generation failed");
-                    let _ = event_tx
-                        .send(SearchStreamEvent::Error {
-                            code: "SQL_GEN_ERROR".to_string(),
-                            message: crate::search::client_error_message(
-                                &SearchError::SqlGenError(e.to_string()),
-                            ),
-                        })
-                        .await;
+                    let _ = event_tx.send(chunk_sql_gen_failure_event(&e)).await;
                     return;
                 }
             };
@@ -862,7 +853,8 @@ impl SearchService {
             }
             if let Ok(Err(e)) = exec_handle.await {
                 // NAN-5161: masked like the batch path; full detail logged.
-                tracing::error!(error = %e, "Streaming search chunk failed");
+                // NAN-5817: at WARN when the query, not the platform, failed.
+                crate::search::log_search_failure!(e, "Streaming search chunk failed");
                 let _ = event_tx
                     .send(SearchStreamEvent::Error {
                         code: "QUERY_ERROR".to_string(),
@@ -1070,7 +1062,8 @@ impl SearchService {
             }
             Err(e) => {
                 // NAN-5161: masked like the batch path; full detail logged.
-                tracing::error!(error = %e, "Buffered streaming search failed");
+                // NAN-5817: at WARN when the query, not the platform, failed.
+                crate::search::log_search_failure!(e, "Buffered streaming search failed");
                 let _ = event_tx
                     .send(SearchStreamEvent::Error {
                         code: "QUERY_ERROR".to_string(),
@@ -1126,6 +1119,28 @@ pub(crate) fn streaming_ch_settings(
 ) -> super::admission::ClickHouseQuerySettings {
     priority.to_ch_settings_with_memory_ceiling(ceiling)
 }
+
+/// The stream event for a chunk whose SQL generation failed, logged on the way
+/// out.
+///
+/// NAN-5161: the client message follows the batch path's guardrail-vs-internal
+/// rule. NAN-5817: so does the log level. A user's query mistake
+/// (`Invalid query: Unknown eval function ...`) logs at WARN; only an internal
+/// generation failure logs at ERROR, which Sentry turns into an error event.
+fn chunk_sql_gen_failure_event(
+    e: &crate::query::SqlGenError,
+) -> crate::search::streaming::SearchStreamEvent {
+    let error = SearchError::SqlGenError(e.to_string());
+    crate::search::log_search_failure!(error, "Streaming chunk SQL generation failed");
+    crate::search::streaming::SearchStreamEvent::Error {
+        code: "SQL_GEN_ERROR".to_string(),
+        message: crate::search::client_error_message(&error),
+    }
+}
+
+#[cfg(test)]
+#[path = "streaming_log_level_tests.rs"]
+mod streaming_log_level_tests;
 
 #[cfg(test)]
 #[path = "streaming_ceiling_tests.rs"]

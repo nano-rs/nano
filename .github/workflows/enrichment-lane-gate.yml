@@ -25,9 +25,14 @@ on:
         default: "60"
         required: false
 
+# NAN-5743: one run at a time across ALL refs. The gate runs docker-compose.yml
+# directly (fixed container_name and loopback ports), and the PR pool host
+# (the DGX Spark) has two nanosiem runners: two branches at once would collide
+# and the always() `down -v` would tear down the other run's stack. Queue
+# instead of cancelling, so no run is lost.
 concurrency:
-  group: enrichment-lane-gate-${{ github.ref }}
-  cancel-in-progress: true
+  group: enrichment-lane-gate
+  cancel-in-progress: false
 
 jobs:
   gate:
@@ -35,7 +40,7 @@ jobs:
     # toolchain available on the runner for the image build. Assumes a dedicated
     # runner: the compose services use fixed container_names (nanosiem-*), so
     # this must not run on a host that already has a nanosiem compose stack up.
-    runs-on: [self-hosted, Linux, X64, nano-pr]
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
     timeout-minutes: 45
     env:
       # Isolate this run's containers/network from anything else on the runner.

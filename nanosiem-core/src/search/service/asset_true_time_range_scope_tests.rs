@@ -63,7 +63,7 @@ fn restricted_query_uses_raw_logs_with_real_identity_and_scope_predicates() {
     assert!(!sql.contains("entity_time_range_agg"));
     assert!(sql.contains(
         "WHERE ((lower(src_host) = ? OR startsWith(lower(src_host), ?))) \
-         AND lower(source_type) NOT IN ('audit', 'insider_threat')"
+         AND lower(source_type) NOT IN {nano_source_deny:Array(String)}"
     ));
     assert_eq!(binds, vec!["ws-01", "ws-01."]);
 }
@@ -84,7 +84,7 @@ fn implicit_audit_deny_alone_routes_to_raw_logs() {
     .expect("user produces a query");
 
     assert!(sql.contains("FROM nanosiem.logs"));
-    assert!(sql.contains("lower(source_type) != 'audit'"));
+    assert!(sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"));
     assert!(sql.contains("lower(\"user\") = ?"));
     assert_eq!(binds, vec!["alice"]);
 }
@@ -232,11 +232,18 @@ mod pg {
         .expect("restricted query");
         assert!(restricted_sql.contains("FROM nanosiem.logs"));
         assert!(!restricted_sql.contains("entity_time_range_agg"));
-        assert!(restricted_sql.contains(&format!("'{denied_a}'")));
-        assert!(restricted_sql.contains(&format!("'{denied_b}'")));
+        // NAN-5793: the deny list is a bound parameter; the resolved scope's
+        // values are what the read binds.
+        assert!(restricted_sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"));
+        assert!(!restricted_sql.contains(denied_a.as_str()), "{restricted_sql}");
+        assert!(!restricted_sql.contains(denied_b.as_str()), "{restricted_sql}");
+        let bound = crate::search::service::source_scope_param_values(scope.deny_set())
+            .expect("a restricted scope binds a deny list");
+        assert!(bound.contains(&denied_a.to_lowercase()), "{bound:?}");
+        assert!(bound.contains(&denied_b.to_lowercase()), "{bound:?}");
         assert!(
-            !restricted_sql.contains(&format!("'{granted}'")),
-            "a group-granted source must not be excluded: {restricted_sql}"
+            !bound.contains(&granted.to_lowercase()),
+            "a group-granted source must not be excluded: {bound:?}"
         );
 
         let bypass_scope = resolver

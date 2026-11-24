@@ -199,6 +199,11 @@ impl DetectionService {
         events: &[serde_json::Value],
         global_weight: f64,
     ) -> Option<super::super::risk::RiskResult> {
+        // NAN-5751: a coverage-incomplete row raises the rule's alert but is
+        // no entity: no risk finding is scored against it.
+        if field == super::COVERAGE_INCOMPLETE_MARKER {
+            return None;
+        }
         let result = if has_query_scores {
             self.score_calculator
                 .calculate_from_query_result(&events[0], global_weight)
@@ -529,7 +534,12 @@ impl DetectionService {
         let cooldown_minutes = rule.alert_cooldown_minutes.unwrap_or(0);
         let mut cooldown_suppressed = 0usize;
         if cooldown_minutes > 0 && !new_findings.is_empty() {
-            let entities: Vec<String> = new_findings.iter().map(|f| f.entity.clone()).collect();
+            // NAN-5751: the coverage-incomplete finding is never cooled down.
+            let entities: Vec<String> = new_findings
+                .iter()
+                .filter(|f| f.field != super::COVERAGE_INCOMPLETE_MARKER)
+                .map(|f| f.entity.clone())
+                .collect();
             let cooled = self
                 .entities_in_alert_cooldown(rule.id, cooldown_minutes, &entities)
                 .await?;
@@ -614,8 +624,11 @@ impl DetectionService {
                 // than the earlier alert's created_at.
                 self.record_finding_emissions(rule.id, &new_findings).await;
                 if cooldown_minutes > 0 {
-                    let entities: Vec<String> =
-                        new_findings.iter().map(|f| f.entity.clone()).collect();
+                    let entities: Vec<String> = new_findings
+                        .iter()
+                        .filter(|f| f.field != super::COVERAGE_INCOMPLETE_MARKER)
+                        .map(|f| f.entity.clone())
+                        .collect();
                     self.record_alert_cooldown_anchors(rule.id, &entities).await;
                 }
                 self.rule_repo
@@ -644,7 +657,11 @@ impl DetectionService {
         // NAN-1805: anchor the alert cooldown for the entities that just
         // alerted (durable upsert; best-effort like the emissions record).
         if cooldown_minutes > 0 {
-            let entities: Vec<String> = new_findings.iter().map(|f| f.entity.clone()).collect();
+            let entities: Vec<String> = new_findings
+                .iter()
+                .filter(|f| f.field != super::COVERAGE_INCOMPLETE_MARKER)
+                .map(|f| f.entity.clone())
+                .collect();
             self.record_alert_cooldown_anchors(rule.id, &entities).await;
         }
 
@@ -827,8 +844,11 @@ impl DetectionService {
         let mut failures = super::per_event::PerEventFailures::new(window);
 
         for event in results.iter().take(alert_cap) {
+            // NAN-5751: a coverage-incomplete row always alerts (its alert
+            // dedups per window on its own content) and anchors no cooldown.
+            let is_marker = super::run_bound::is_coverage_incomplete_row(event);
             // NAN-1805: cooldown gate before any per-event writes.
-            let event_entities: Vec<String> = if cooldown_minutes > 0 {
+            let event_entities: Vec<String> = if cooldown_minutes > 0 && !is_marker {
                 let (_, ev_groups) =
                     self.partition_entity_groups(rule, std::slice::from_ref(event), global_weight);
                 ev_groups.into_iter().map(|(entity, _, _)| entity).collect()

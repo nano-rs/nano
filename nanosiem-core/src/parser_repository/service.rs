@@ -153,33 +153,9 @@ impl ParserRepositoryService {
     /// it rejects both "kafka parser + s3 dispatch" AND "s3 parser + kafka
     /// dispatch".
     fn is_dispatch_compatible(config_type: &str, ingestion_method: &str) -> bool {
-        let normalized_ct = match config_type {
-            // `SourceConfigType::from_str` accepts the legacy short forms;
-            // database rows have always stored the canonical name, but
-            // defense-in-depth.
-            "s3" => "aws_s3",
-            "pubsub" => "gcp_pubsub",
-            "fdr" => "crowdstrike_fdr",
-            "splunk" | "hec" => "splunk_hec",
-            "opentelemetry" | "otel" => "otlp",
-            other => other,
-        };
-        let normalized_method = match ingestion_method {
-            "opentelemetry" | "otel" => "otlp",
-            other => other,
-        };
-        matches!(
-            (normalized_ct, normalized_method),
-            ("kafka", "kafka")
-                | ("aws_s3", "aws_s3")
-                | ("gcp_pubsub", "gcp_pubsub")
-                | ("crowdstrike_fdr", "crowdstrike_fdr")
-                | ("azure_event_hubs", "azure_event_hubs")
-                | ("splunk_hec", "splunk_hec")
-                | ("otlp", "otlp")
-                | ("http", "routed")
-                | ("vector", "vector")
-        )
+        // NAN-5789: one table shared with the log-source writers (it also
+        // accepts `aws_sqs`, which this copy used to refuse).
+        crate::log_sources::ingest_transport::dispatch_compatible(config_type, ingestion_method)
     }
 
     /// Find a live log-source definition that already claims `source_type`.
@@ -1149,6 +1125,18 @@ impl ParserRepositoryService {
         } else {
             Self::repository_vrl_verdict(&new_log_source.parser_vrl)
         };
+        // NAN-5789: a fetch import with no source configuration yet (none of
+        // its type exists to auto-bind) still lands, DISABLED (the column
+        // default; imports never enable), with the reason on its row. The
+        // render leaves it out and lists it, and enabling or deploying it is
+        // refused until it is bound, so it can never break a render or read as
+        // live while ingesting nothing.
+        let validation_note: Option<String> = import_validation.as_ref().err().cloned().or_else(|| {
+            (!is_enrichment
+                && crate::parsers::is_fetch_source_type(&new_log_source.source_type)
+                && new_log_source.dispatch_source_config_id.is_none())
+            .then(|| crate::parsers::unrouted::unbound_note(&new_log_source.source_type))
+        });
 
         let mut tx = self
             .pg_pool
@@ -1217,7 +1205,7 @@ impl ParserRepositoryService {
         .bind(&target_table)
         .bind(&normalize_vrl)
         .bind(import_validation.is_ok())
-        .bind(import_validation.as_ref().err())
+        .bind(validation_note.as_deref())
         // NAN-3659: catalog sparse audit streams start with their cadence.
         .bind(crate::log_sources::cadence::initial_stale_threshold_minutes(
             &new_log_source.source_type,

@@ -33,6 +33,8 @@ import {
   type Latency,
 } from '@/components/matches/helpers';
 import { LatencyPill } from '@/components/matches/LatencyPill';
+import { Term } from '@/components/ui/term';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 interface AlertHeroAlert {
   id: string;
@@ -264,7 +266,9 @@ export function AlertHero({
               </span>
             </div>
             <div className="mt-2 flex items-center gap-2">
-              <span className="text-[10.5px] text-muted-foreground">Avg latency</span>
+              <span className="text-[10.5px] text-muted-foreground">
+                Avg <Term id="detection-latency">latency</Term>
+              </span>
               {avgLatency ? (
                 <LatencyPill latency={avgLatency} />
               ) : (
@@ -304,7 +308,7 @@ export function AlertHero({
 
             {alert.triageVerdict && (
               <div className="mt-2 flex items-center gap-2 text-[10.5px]">
-                <span className="text-muted-foreground">AI verdict</span>
+                <span className="text-muted-foreground"><EnterpriseTerm id="ai-verdict">AI verdict</EnterpriseTerm></span>
                 <span
                   className="font-mono uppercase tracking-[0.08em] text-[9.5px] font-semibold px-1.5 py-[1px] rounded-sm"
                   style={{
@@ -360,7 +364,7 @@ export function AlertHero({
               )}
               {isClosed && alert.disposition && (
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-muted-foreground">disposition</span>
+                  <span className="text-muted-foreground"><Term id="disposition">disposition</Term></span>
                   <span className="text-foreground">
                     {DISPOSITION_LABEL[alert.disposition] ?? alert.disposition}
                   </span>

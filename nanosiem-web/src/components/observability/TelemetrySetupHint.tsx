@@ -9,7 +9,7 @@
 export function TelemetrySetupHint() {
   return (
     <div className="mt-2 text-[11px] text-fg-4">
-      Check the selected range and filters. If your exporter is running, check its delivery errors and queued data.
+      Check the range, filters and your exporter's delivery errors.
       {' '}<a href="https://nano.rs/docs/integrations/otlp#observability-pages" target="_blank" rel="noopener noreferrer" className="text-brand hover:underline">Set up OpenTelemetry</a>
     </div>
   );

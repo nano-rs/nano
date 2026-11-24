@@ -20,7 +20,7 @@ use super::{DetectionRuleRepository, DetectionRuleRepositoryError};
 use crate::models::detection_rule::{DetectionMode, NewDetectionRule, RuleMode, Severity};
 use crate::rule_repository::{RepositoryRulesRepository, RuleImportsRepository};
 
-async fn pool() -> Option<PgPool> {
+pub(crate) async fn pool() -> Option<PgPool> {
     let url = std::env::var("NANOSIEM_TEST_DATABASE_URL").ok()?;
     let pool = PgPoolOptions::new().max_connections(4).connect(&url).await.expect("connect");
     crate::db::run_postgres_migrations(&pool).await.expect("migrations");

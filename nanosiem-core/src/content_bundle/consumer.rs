@@ -45,6 +45,7 @@ use chrono::Utc;
 use super::channels::{self, Channel, Route};
 use super::credential::{self, CredentialLookup, CredentialOrigin, CredentialSource, DistributionCredential};
 use super::contract::{self, ContentError, SignedContentDescriptor, VerifiedContent, MAX_CONTAINER_BYTES};
+use super::license_watch::{self, CheckTiming, EnterpriseWatch, Fingerprint};
 use super::store::{installed_from, ChannelRow, ContentStore};
 use crate::leader::LeaderFence;
 use crate::platform_enrichment::consumer::{ensure_private_dir, http_error, FeedHttp, InstallLease, ReqwestFeedHttp};
@@ -61,7 +62,6 @@ const MAX_LICENSE_BYTES: u64 = 9216;
 const DEFAULT_POLL_SECS: u64 = 3600;
 const MIN_POLL_SECS: u64 = 300;
 const RETRY_SECS: u64 = 300;
-const FIRST_CHECK_SECS: u64 = 20;
 
 pub const SOURCE_ONLINE: &str = "online";
 pub const SOURCE_OFFLINE: &str = "offline";
@@ -258,6 +258,15 @@ pub trait ContentApplier: Send + Sync {
     /// Returns a short human summary, or an error recorded as `apply_error`
     /// (the snapshot itself stays installed).
     async fn apply(&self, channel: &'static Channel, verified: &VerifiedContent, tree_changed: bool) -> Result<String, String>;
+
+    /// True when the installed snapshot of `channel` must be handed to the
+    /// applier again although it applied cleanly and is unchanged (e.g. the
+    /// enterprise SOAR catalog while a release stays quarantined: a binary
+    /// upgrade may now verify it). Checked on every check and on a re-import
+    /// of the same bundle; it never turns a successful apply into an error.
+    async fn needs_reapply(&self, _channel: &'static Channel) -> bool {
+        false
+    }
 }
 
 static EXTENSION_APPLIER: std::sync::OnceLock<Arc<dyn ContentApplier>> = std::sync::OnceLock::new();
@@ -610,7 +619,18 @@ pub struct ContentConsumer {
     applier: Arc<dyn ContentApplier>,
     fence: LeaderFence,
     credentials: Option<Arc<dyn CredentialSource>>,
+    timing: CheckTiming,
 }
+
+/// One check pass ([`ContentConsumer::check_all_with`] and the leader loop).
+struct CheckRun {
+    results: Vec<(String, Result<ChannelOutcome, String>)>,
+    /// When the pass covered the enterprise channels: the credential it
+    /// presented and whether every enterprise channel succeeded.
+    enterprise: Option<(Fingerprint, bool)>,
+}
+
+type Resolved = Result<(DistributionCredential, CredentialOrigin), String>;
 
 impl ContentConsumer {
     pub fn new(store: ContentStore, config: ContentConfig, applier: Arc<dyn ContentApplier>) -> Self {
@@ -623,6 +643,7 @@ impl ContentConsumer {
             applier,
             fence: LeaderFence::disabled(),
             credentials: credential::credential_source(),
+            timing: CheckTiming::default(),
         }
     }
 
@@ -668,6 +689,11 @@ impl ContentConsumer {
 
     pub fn with_fence(mut self, fence: LeaderFence) -> Self {
         self.fence = fence;
+        self
+    }
+    /// Override the loop's timings (tests).
+    pub fn with_timing(mut self, timing: CheckTiming) -> Self {
+        self.timing = timing;
         self
     }
     pub fn with_ring(mut self, ring: KeyRing) -> Self {
@@ -741,24 +767,34 @@ impl ContentConsumer {
 
     /// Check every subscribed channel under an already-held lease.
     pub async fn check_all_with(&self, lease: InstallLease) -> Vec<(String, Result<ChannelOutcome, String>)> {
-        let mut out = Vec::new();
-        let credential = if self.has_enterprise_channels() {
-            let resolved = self.enterprise_credential().await;
-            match &resolved {
-                Ok((_, origin)) => tracing::debug!(?origin, "enterprise content channels: license available"),
-                Err(reason) => tracing::warn!(%reason, "enterprise content channels skipped: no license to present"),
-            }
-            Some(resolved)
-        } else {
-            None
-        };
+        let credential = if self.has_enterprise_channels() { Some(self.enterprise_credential().await) } else { None };
+        self.run_with(lease, false, credential).await.results
+    }
+
+    /// Check the subscribed channels (only the enterprise ones when
+    /// `enterprise_only`) under `lease`, presenting `credential` on the
+    /// enterprise route. Releases the lease.
+    async fn run_with(&self, lease: InstallLease, enterprise_only: bool, credential: Option<Resolved>) -> CheckRun {
+        match &credential {
+            Some(Ok((_, origin))) => tracing::debug!(?origin, "enterprise content channels: license available"),
+            Some(Err(reason)) => tracing::warn!(%reason, "enterprise content channels skipped: no license to present"),
+            None => {}
+        }
+        let mut results = Vec::new();
+        let mut enterprise_ok = true;
         for ch in self.config.channels.clone() {
+            if enterprise_only && ch.route != Route::Enterprise {
+                continue;
+            }
             let result = self.check_channel_locked(ch, credential.as_ref()).await;
             self.record(ch, &result).await;
-            out.push((ch.id.to_string(), result.map_err(|e| e.to_string())));
+            if ch.route == Route::Enterprise {
+                enterprise_ok &= result.is_ok();
+            }
+            results.push((ch.id.to_string(), result.map_err(|e| e.to_string())));
         }
         lease.release().await;
-        out
+        CheckRun { results, enterprise: credential.map(|c| (license_watch::fingerprint(&c), enterprise_ok)) }
     }
 
     /// Mark every subscribed channel as being checked.
@@ -838,7 +874,7 @@ impl ContentConsumer {
         let d = &release.signed.descriptor;
         let installed = row.as_ref().and_then(|r| installed_from(r.signed_descriptor.as_ref()));
         if installed.as_ref() == Some(&release.signed) && row.as_ref().is_some_and(|r| r.tree_sha256.is_some()) {
-            if row.as_ref().is_some_and(needs_apply) {
+            if row.as_ref().is_some_and(needs_apply) || self.applier.needs_reapply(ch).await {
                 return self.reapply_installed(ch, release.signed.clone()).await;
             }
             return Ok(ChannelOutcome::Current { sequence: d.sequence });
@@ -901,7 +937,7 @@ impl ContentConsumer {
         let row = self.store.get(ch.id).await.map_err(db)?;
         let apply_pending = row.as_ref().is_some_and(needs_apply);
         if installed.as_ref() == Some(verified.signed()) && row.as_ref().is_some_and(|r| r.tree_sha256.is_some()) {
-            if apply_pending {
+            if apply_pending || self.applier.needs_reapply(ch).await {
                 self.run_apply(ch, &verified, true).await?;
                 return Ok(ChannelOutcome::Reapplied { sequence: d.sequence });
             }
@@ -1006,7 +1042,9 @@ impl ContentConsumer {
     }
 
     /// Leader-only loop: first check shortly after start, then every poll
-    /// interval (sooner after a failure).
+    /// interval (sooner after a failure). Enterprise channels are also
+    /// re-checked as soon as a license appears or changes
+    /// ([`license_watch`], NAN-5769).
     pub fn start(self: Arc<Self>, shutdown: ShutdownToken) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!(config = ?self.config, trust = contract::trust_label(), "content channel consumer started (leader-only)");
@@ -1016,16 +1054,28 @@ impl ContentConsumer {
             if !self.config.auto_update {
                 return;
             }
+            let wake = Arc::new(tokio::sync::Notify::new());
+            // Held for the life of this loop: aborting the loop (leader
+            // step-down) aborts the listener and frees its connection.
+            let mut _listener = None;
             if self.has_enterprise_channels() {
                 match self.enterprise_credential().await {
                     Ok((_, origin)) => tracing::info!(?origin, "enterprise content channels will use this install's license"),
                     Err(reason) => tracing::warn!(
                         %reason,
-                        "enterprise content channels (soar-catalog) will be skipped until a license is installed"
+                        "enterprise content channels (soar-catalog) will be checked as soon as a license is installed"
                     ),
                 }
+                _listener = Some(license_watch::spawn_license_listener(
+                    self.store.pool().clone(),
+                    wake.clone(),
+                    shutdown.clone(),
+                    Duration::from_secs(license_watch::LISTENER_KEEPALIVE_SECS),
+                ));
             }
-            let mut next = tokio::time::Instant::now() + Duration::from_secs(FIRST_CHECK_SECS);
+            let mut watch = EnterpriseWatch::new(self.timing);
+            let mut busy = license_watch::Backoff::new(self.timing.licence_probe_min, Duration::from_secs(RETRY_SECS));
+            let mut next = tokio::time::Instant::now() + self.timing.first_check;
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -1034,24 +1084,89 @@ impl ContentConsumer {
                             next = tokio::time::Instant::now() + Duration::from_secs(RETRY_SECS);
                             continue;
                         }
-                        let ok = match self.check_all().await {
-                            Ok(results) => {
-                                let failed = results.iter().filter(|(_, r)| r.is_err()).count();
-                                tracing::info!(channels = results.len(), failed, "content channel check");
-                                failed == 0
-                            }
-                            Err(ChannelError::Busy) => true,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "content channel check failed");
-                                false
+                        let wait = match self.scheduled_check(&mut watch).await {
+                            // Another install holds the lease (check now, an
+                            // import): not a check, so retry soon.
+                            None => busy.next_delay(),
+                            Some(ok) => {
+                                busy.reset();
+                                if ok { self.config.poll_interval } else { self.config.poll_interval.min(Duration::from_secs(RETRY_SECS)) }
                             }
                         };
-                        let wait = if ok { self.config.poll_interval } else { self.config.poll_interval.min(Duration::from_secs(RETRY_SECS)) };
                         next = tokio::time::Instant::now() + wait;
+                    }
+                    _ = license_watch::sleep_opt(watch.probe_at()) => {
+                        self.enterprise_recheck(&mut watch, false, &mut next).await;
+                    }
+                    _ = wake.notified() => {
+                        self.enterprise_recheck(&mut watch, true, &mut next).await;
                     }
                 }
             }
         })
+    }
+
+    /// The scheduled check of every channel: `Some(true)` when nothing
+    /// failed, `None` when another install held the lease (nothing checked).
+    async fn scheduled_check(&self, watch: &mut EnterpriseWatch) -> Option<bool> {
+        let lease = match self.lease().await {
+            Ok(lease) => lease,
+            Err(ChannelError::Busy) => {
+                tracing::debug!("content channel check deferred: another install holds the lease");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "content channel check failed");
+                return Some(false);
+            }
+        };
+        let credential = if self.has_enterprise_channels() { Some(self.enterprise_credential().await) } else { None };
+        let run = self.run_with(lease, false, credential).await;
+        let failed = run.results.iter().filter(|(_, r)| r.is_err()).count();
+        tracing::info!(channels = run.results.len(), failed, "content channel check");
+        if let Some((fp, ok)) = run.enterprise {
+            watch.checked(fp, ok, tokio::time::Instant::now());
+        }
+        Some(failed == 0)
+    }
+
+    /// A local license probe or a license-changed signal: check the enterprise
+    /// channels now if a license appeared or changed (or, after a signal, the
+    /// last enterprise check was not clean). Only a fenced leader acts; the
+    /// probe itself never contacts the platform.
+    async fn enterprise_recheck(&self, watch: &mut EnterpriseWatch, woken: bool, next: &mut tokio::time::Instant) {
+        if !self.fence.still_leader(self.store.pool()).await {
+            watch.idle(tokio::time::Instant::now());
+            return;
+        }
+        let resolved = self.enterprise_credential().await;
+        let fp = license_watch::fingerprint(&resolved);
+        if !watch.wants_check(fp, woken) {
+            watch.idle(tokio::time::Instant::now());
+            return;
+        }
+        let lease = match self.lease().await {
+            Ok(lease) => lease,
+            Err(e) => {
+                tracing::debug!(error = %e, "enterprise content re-check deferred");
+                watch.retry_later(tokio::time::Instant::now());
+                return;
+            }
+        };
+        let run = self.run_with(lease, true, Some(resolved)).await;
+        let now = tokio::time::Instant::now();
+        let (fp, ok) = run.enterprise.unwrap_or((fp, false));
+        watch.checked(fp, ok, now);
+        tracing::info!(
+            channels = run.results.len(),
+            ok,
+            licensed = fp.is_some(),
+            trigger = if woken { "license_changed" } else { "license_probe" },
+            "enterprise content channel re-check after a license change"
+        );
+        if !ok && fp.is_some() {
+            *next = (*next).min(now + Duration::from_secs(RETRY_SECS));
+        }
     }
 }
 

@@ -52,7 +52,23 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 INGEST_USER = "nanosiem_ingest"
+_IPV4_MAPPED = ipaddress.IPv6Network("::ffff:0.0.0.0/96")
 LOOPBACK = ("127.0.0.1", "::1")
+# NAN-5477: the address a cluster-secret hop presents for a forwarded INSERT
+# that carries client data (a Distributed table insert: Vector OTLP into
+# otel_*_raw_distributed, Tenzir into ocsf_logs_raw_distributed). On a
+# <secret> hop the receiving shard authenticates the INITIAL user and checks
+# that user's <networks> against the initial address the sending server
+# reports, and for these inserts ClickHouse 26.10 reports the unset address
+# 0.0.0.0. Without it in the list every such insert on 2+ shards is refused
+# (516, "Connections from 0.0.0.0 are not allowed").
+# This one exact address (never a range, never 0.0.0.0/0) only matches that
+# hop: every other login is checked against its socket peer address, which is
+# never 0.0.0.0 (nano enables neither auth_use_forwarded_address nor the PROXY
+# protocol), and a reported initial address is used only on a hop that proved
+# the cluster secret. Operators still cannot list it (normalize refuses the
+# unspecified address); it is added here, to every nano user.
+INTERSERVER_INSERT_ADDRESS = ("ip", "0.0.0.0")
 # Docker's built-in default-address-pools (used when the daemon has none
 # configured): 172.17.0.0/16 for the default bridge, 172.18-31.0.0/16 and
 # 192.168.0.0/16 (in /20s) for user-defined networks such as Compose's.
@@ -82,7 +98,18 @@ def normalize(entry: str, label: str = "network") -> tuple[str, str]:
         if re.fullmatch(r"[0-9.]+", value):
             raise NetworkError(f"{label}: {value!r} is not a valid IPv4 address or CIDR") from None
         return ("host", value.lower())
-    if network.prefixlen == 0 or network.is_unspecified:
+    # ClickHouse matches every IPv4 client as ::ffff:a.b.c.d, so an IPv6 range
+    # holding the whole IPv4-mapped space (::ffff:0.0.0.0/96, ::/80, ::/64,
+    # ::/1) admits every IPv4 client, and an IPv4-mapped entry is checked as
+    # the IPv4 network it maps to (::ffff:0.0.0.0 is the unspecified address).
+    checked = network
+    if network.version == 6 and network.prefixlen >= 96 and network.network_address.ipv4_mapped is not None:
+        checked = ipaddress.ip_network(f"{network.network_address.ipv4_mapped}/{network.prefixlen - 96}")
+    if (
+        checked.prefixlen == 0
+        or checked.is_unspecified
+        or (checked.version == 6 and checked.prefixlen <= 96 and checked.overlaps(_IPV4_MAPPED))
+    ):
         raise NetworkError(
             f"{label}: {value!r} admits every address; list the specific networks instead"
         )
@@ -227,7 +254,7 @@ def workload_users(
             if old is not None:
                 user.remove(old)
             nets = ET.SubElement(user, "networks")
-            for kind, entry in _dedupe(own):
+            for kind, entry in _dedupe([*own, INTERSERVER_INSERT_ADDRESS]):
                 ET.SubElement(nets, kind).text = entry
     # Comments in the template (documentation) stay in the source tree.
     for parent in [root, users]:
@@ -289,6 +316,7 @@ def build(
     users_el = ET.SubElement(root, "users")
     for user in users:
         entries = common + ingest_extra if user == INGEST_USER else common
+        entries = [*entries, INTERSERVER_INSERT_ADDRESS]
         nets = ET.SubElement(ET.SubElement(users_el, user), "networks", replace="replace")
         for kind, value in _dedupe(entries):
             ET.SubElement(nets, kind).text = value

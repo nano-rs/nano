@@ -2,8 +2,9 @@
 
 import React from 'react';
 import { Table as UITable, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, BookOpen, ArrowUp, ArrowDown, ArrowUpDown, Info, Copy, Check, Table, Download } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, BookOpen, ArrowUp, ArrowDown, ArrowUpDown, Copy, Check, Table, Download } from 'lucide-react';
 import { IpIdentityPopover } from './IpIdentityPopover';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { SEMANTIC_FIELDS, semanticFieldsFor } from '@/lib/schema-fields';
@@ -622,14 +623,9 @@ export function PaginatedTable({
                       <div className="flex items-center gap-1.5 pr-3">
                         <span className="truncate">{key}</span>
                         {columnTooltips?.[key] && (
-                          <Tooltip>
-                            <TooltipTrigger asChild onClick={(e) => e.stopPropagation()}>
-                              <Info className="w-3 h-3 text-muted-foreground/50 hover:text-muted-foreground flex-shrink-0" />
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom" className="max-w-[280px] text-xs font-normal normal-case tracking-normal">
-                              {columnTooltips[key]}
-                            </TooltipContent>
-                          </Tooltip>
+                          <InfoTip label={`About ${key}`} side="bottom">
+                            {columnTooltips[key]}
+                          </InfoTip>
                         )}
                         <span className="flex-shrink-0">
                           {isSorted ? (
@@ -815,9 +811,6 @@ export function PaginatedTable({
           </div>
         </div>
 
-        {onDrilldown && (
-          <p className="text-[10px] font-mono text-muted-foreground mt-1 px-4">Click any cell to drill down into matching events</p>
-        )}
       </div>
     </TooltipProvider>
   );

@@ -1,29 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * Settings topbar — breadcrumb + Recent Changes button + theme/PIVT/bell.
- * Mirrors `design-ref/shadcn/settings-shell.jsx` `SettingsTopbar`.
+ * Settings topbar: breadcrumb + Recent Changes button + PIVT/bell/help.
+ * Mirrors `design-ref/shadcn/settings-shell.jsx` `SettingsTopbar`. The
+ * light/dark toggle and theme strip live in the rail footer (NAN-5858).
  */
 
 import { Link, useLocation } from 'react-router-dom';
-import { Clock, Sun, Moon } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+import { Clock } from 'lucide-react';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
-import { useTheme } from 'next-themes';
-
-import { isDarkAppearance } from '@/lib/theme';
 import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import type { PivtState } from '@/enterprise/hooks/use-pivt-state';
 import { NotificationBell } from '@/components/NotificationBell';
 import { HelpMenu } from '@/components/support/HelpMenu';
-import { GROUP_LABEL, SECTION_BY_ID, resolveActiveSection } from './sections';
+import { GROUP_LABEL, SECTION_BY_ID, SETTINGS_LANDING_PERMISSIONS, resolveActiveSection } from './sections';
 import { useRecentAuditChanges } from '@/hooks/use-api';
 import { useAuth } from '@/contexts/AuthContext';
 import { SHELL_READ_PERMISSIONS } from '@/lib/shell-permissions';
@@ -37,9 +29,6 @@ interface SettingsTopbarProps {
 export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarProps) {
   const location = useLocation();
   const { capabilities } = useCapabilities();
-  const { resolvedTheme, setTheme } = useTheme();
-  // Binary toggle: matte reads as dark (see AppLayout for the same reasoning).
-  const theme = isDarkAppearance(resolvedTheme) ? 'dark' : 'light';
 
   const { sectionId, parentId } = resolveActiveSection(location.pathname, location.search);
   const section = sectionId ? SECTION_BY_ID[sectionId] : null;
@@ -48,7 +37,10 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
 
   // Pull a count for the "Recent changes" button. Cheap query — last 24h, 50 entries.
   // NAN-5325: only for roles that can read the audit log.
-  const canReadAudit = useAuth().hasPermission(SHELL_READ_PERMISSIONS.audit);
+  const { hasPermission, hasAnyPermission } = useAuth();
+  const canReadAudit = hasPermission(SHELL_READ_PERMISSIONS.audit);
+  // NAN-5850: a role that cannot open the landing (hunts:view only) gets a plain crumb, not a link to Access Denied.
+  const canOpenLanding = hasAnyPermission([...SETTINGS_LANDING_PERMISSIONS]);
   const { data: auditData } = useRecentAuditChanges({ limit: 50 }, { skip: !canReadAudit });
   const auditCount = auditData?.logs?.length ?? 0;
 
@@ -59,7 +51,11 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
     >
       {/* Breadcrumb */}
       <nav className="text-[13px] flex items-center gap-2 whitespace-nowrap min-w-0 overflow-hidden" aria-label="Breadcrumb">
-        <Link to="/settings" className="text-muted-foreground hover:text-foreground transition-colors">Settings</Link>
+        {canOpenLanding ? (
+          <Link to="/settings" className="text-muted-foreground hover:text-foreground transition-colors">Settings</Link>
+        ) : (
+          <span className="text-muted-foreground">Settings</span>
+        )}
         {groupLabel && (
           <>
             <span className="text-muted-foreground/40">/</span>
@@ -117,22 +113,6 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
       <NotificationBell />
       <HelpMenu />
 
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-[26px] w-[26px]"
-            aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-          >
-            {theme === 'dark' ? <Sun className="w-[14px] h-[14px]" /> : <Moon className="w-[14px] h-[14px]" />}
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">
-          {theme === 'dark' ? 'Switch to light' : 'Switch to dark'}
-        </TooltipContent>
-      </Tooltip>
     </div>
   );
 }

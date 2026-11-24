@@ -24,7 +24,7 @@ import httpx
 from nano_e2e import ui as uilib
 from nano_e2e.cleanup import CleanupStack
 from nano_e2e.client import Journal, Nano, expect, row_text
-from nano_e2e.rbac import limited_user
+from nano_e2e.rbac import edition_permissions, limited_user
 from nano_e2e.stack import Stack
 from nano_e2e.waits import INGEST_VISIBLE, eventually
 
@@ -189,9 +189,14 @@ def login_persona(
     name: str,
     permissions: Sequence[str],
 ) -> Iterator[PersonaBrowser]:
-    """Create role/group/user, perform a real UI login, and remove all three."""
-    granted = list(permissions)
-    assert granted, "a persona must declare an explicit non-empty permission set"
+    """Create role/group/user, perform a real UI login, and remove all three.
+
+    The role gets `permissions` as this build can grant them
+    (`edition_permissions`): on open the enterprise ones are dropped, and
+    `PersonaBrowser.permissions` is what was actually granted."""
+    assert permissions, "a persona must declare an explicit non-empty permission set"
+    granted = edition_permissions(nano.api, permissions, stack.edition)
+    assert granted, f"none of {list(permissions)} exists in this {stack.edition} build"
     with limited_user(stack, name, granted, Journal(artifact_dir / f"{name}-rbac.jsonl")) as user:
         page = uilib.UiPage.open(driver, artifact_dir / f"ui-{name}", name=f"persona:{name}")
         cleanup = CleanupStack()

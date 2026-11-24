@@ -193,7 +193,7 @@ del(.cookie)
 type = "remap"
 inputs = ["auth_check"]
 source = '''
-# NAN-4945: the client address used for the throttle and kept on the event.
+# NAN-4945: the trusted client address recorded with the event.
 # Only the TCP peer (`nano_ingest_peer`, from the source's host_key) cannot be
 # forged. `X-Real-IP` is believed only when that peer is a trusted proxy: the
 # nginx edge sets it to the peer it saw (remote_addr), replacing what the sender
@@ -227,9 +227,10 @@ if (get_env_var("NANO_HEC_TRUST_EDGE_IDENTITY") ?? "") == "true" && (is_ipv4(edg
 if client_ip == "" {
     client_ip = "unknown"
 }
-.client_ip = client_ip
-# Kept in event metadata (a body field cannot overwrite it); parse_content
-# writes them back as `ingest_client_ip` / `ingest_peer` after the body merge.
+# NAN-5846: kept ONLY in event metadata (a body field cannot overwrite it and
+# it never collides with a vendor field). The OCSF storage boundary writes it
+# as `unmapped.nano.ingest.client_ip` (+ `.peer` when it differs); see
+# ingest_provenance_vrl! in nanosiem-core vector_config/mod.rs.
 %nano_ingest_client_ip = client_ip
 %nano_ingest_peer = peer
 # The raw forwarding headers are transport metadata: dropped before
@@ -453,13 +454,6 @@ if contains(to_string(.request_path) ?? "", "/webhook") {
 # transport marker used by the durable-delivery route after the merge.
 if !is_object(.metadata) { .metadata = {} }
 .metadata.forwarded_via = "http"
-
-# NAN-4945: the trusted client address and the TCP peer, restored after the
-# body merge so a sender cannot overwrite them.
-ingest_client_ip = to_string(%nano_ingest_client_ip) ?? ""
-if ingest_client_ip != "" { .ingest_client_ip = ingest_client_ip }
-ingest_peer = to_string(%nano_ingest_peer) ?? ""
-if ingest_peer != "" { .ingest_peer = ingest_peer }
 '''
 
 # =============================================================================
@@ -534,13 +528,6 @@ if to_bool(%nano_json_batch_member) ?? false {
     .content_format = "json"
     if !is_object(.metadata) { .metadata = {} }
     .metadata.forwarded_via = "http"
-
-    # The array member is untrusted body data; restore the edge-derived values
-    # after merging it so it cannot forge transport identity.
-    ingest_client_ip = to_string(%nano_ingest_client_ip) ?? ""
-    if ingest_client_ip != "" { .ingest_client_ip = ingest_client_ip }
-    ingest_peer = to_string(%nano_ingest_peer) ?? ""
-    if ingest_peer != "" { .ingest_peer = ingest_peer }
 }
 '''
 

@@ -39,6 +39,7 @@ import type { MfaSetupResponse, MfaSetupCompleteResponse } from '@/lib/api/types
 import { cn } from '@/lib/utils';
 import { Checkbox } from '@/components/ui/checkbox';
 import { OUTSIDE_ARRIVAL_STATE } from '@/lib/search-auto-run';
+import { Term } from '@/components/ui/term';
 
 type Step = 'scan' | 'verify' | 'backup';
 
@@ -221,14 +222,12 @@ export function MfaSetup() {
             <div className="rounded-md border border-[color-mix(in_srgb,var(--warning)_30%,transparent)] bg-[color-mix(in_srgb,var(--warning)_8%,transparent)] px-3 py-2 flex items-start gap-2">
               <AlertTriangle className="w-3.5 h-3.5 text-[var(--warning)] mt-px shrink-0" />
               <div className="text-[11.5px] text-foreground/85 leading-relaxed">
-                Your administrator requires MFA to be enabled on every account. Finish enrolling
-                below to complete sign-in.
+                Your administrator requires <Term id="mfa">MFA</Term>. Finish setting it up to sign in.
               </div>
             </div>
           ) : (
             <p className="text-[12px] text-muted-foreground leading-relaxed">
-              Add an extra layer of security with a TOTP code from an authenticator app
-              (Google Authenticator, Authy, 1Password, etc.).
+              You will sign in with your password and a code from an authenticator app on your phone.
             </p>
           )}
         </div>
@@ -349,7 +348,7 @@ export function MfaSetup() {
           <div className="space-y-4">
             <div className="rounded-md border border-border bg-card px-5 py-5">
               <p className="text-[12px] text-foreground/85 mb-3">
-                Enter the 6-digit code from your authenticator app to verify the pairing.
+                Enter the 6-digit code from your authenticator app.
               </p>
               <div className="relative">
                 <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
@@ -405,10 +404,9 @@ export function MfaSetup() {
               <div className="flex items-start gap-2 mb-3">
                 <KeyRound className="w-3.5 h-3.5 text-[var(--warning)] mt-0.5 shrink-0" />
                 <div>
-                  <p className="text-[12.5px] font-medium text-foreground">Save your backup codes</p>
+                  <p className="text-[12.5px] font-medium text-foreground">Save your <Term id="backup-codes">backup codes</Term></p>
                   <p className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed">
-                    If you lose access to your authenticator app, use these one-time codes to sign
-                    in. Each code can only be used once.
+                    One-time codes to sign in if you lose your authenticator app.
                   </p>
                 </div>
               </div>

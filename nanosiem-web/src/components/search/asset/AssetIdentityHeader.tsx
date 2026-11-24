@@ -238,7 +238,7 @@ export function AssetIdentityHeader({
             <HeaderAction
               icon={<Filter className="w-[12px] h-[12px]" />}
               label=""
-              title="Scoped filters — not yet wired"
+              title="Filters: coming soon"
               disabled
             />
             {/* NAN-3228: add / remove this entity on risk watchlists. */}

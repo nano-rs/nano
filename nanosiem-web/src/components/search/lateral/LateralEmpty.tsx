@@ -30,7 +30,7 @@ export function LateralEmpty({ reason }: LateralEmptyProps) {
             No seed resolved for <span className="text-primary">| lateral</span>
           </div>
           <div className="font-mono text-[10.5px] text-muted-foreground/80 max-w-md leading-relaxed">
-            Add a host, user, or IP before the pipe — e.g.{' '}
+            Add a host, user, or IP before the pipe, e.g.{' '}
             <span className="text-foreground">{srcHostField}=WIN-HR11 | lateral</span>, or supply{' '}
             <span className="text-foreground">| lateral seed=user entity=user</span>.
           </div>
@@ -39,8 +39,7 @@ export function LateralEmpty({ reason }: LateralEmptyProps) {
         <>
           <div className="font-mono text-[12px] text-foreground">No lateral movement edges</div>
           <div className="font-mono text-[10.5px] text-muted-foreground/80 max-w-md leading-relaxed">
-            The seed entity didn't reach any peers in the selected window. Broaden the time range,
-            relax the method set, or pivot from a different seed.
+            Broaden the time range, relax the method set, or pivot from another seed.
           </div>
         </>
       )}

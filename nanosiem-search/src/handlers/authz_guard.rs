@@ -32,6 +32,7 @@ use nanosiem_core::auth::{permissions, types::TokenClaims};
 
 fn auth_with(perms: &[&str]) -> crate::AuthContext {
     crate::AuthContext::from_jwt(TokenClaims {
+        sid: None,
         iss: "test".to_string(),
         aud: "test".to_string(),
         sub: uuid::Uuid::nil(),

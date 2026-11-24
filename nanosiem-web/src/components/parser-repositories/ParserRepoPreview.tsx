@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { PermissionAction } from '@/components/repositories/PermissionAction';
 import type { ActionAccess } from '@/components/repositories/repository-action-policy';
@@ -27,6 +28,7 @@ import { CategoryChip, StatusChip, TransportChip } from './chips';
 import type { RepoParserView, RepoTransport } from './helpers';
 import { VrlLine } from '@/components/editor/VrlHighlight';
 import { useVrlHighlight } from '@/components/editor/use-vrl-highlight';
+import { Term } from '@/components/ui/term';
 
 interface PreviewProps {
   parser: RepoParserView;
@@ -502,8 +504,7 @@ function OverviewPane({
             Forked copy diverges from upstream
           </div>
           <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-            The upstream repository has new changes that differ from your forked copy. Open the diff
-            to compare and decide whether to merge upstream into your fork or keep your local edits.
+            Open the diff to merge upstream or keep your local edits.
           </div>
           {linkedId && (
             <PermissionAction access={diffAccess}>
@@ -529,8 +530,7 @@ function OverviewPane({
             Upstream update available
           </div>
           <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-            A newer version of this parser is available upstream. Use the Update button to apply it
-            to the linked log source.
+            Use Update to apply it to the linked log source.
           </div>
           {parser.upstreamVersion && parser.version && (
             <div className="mt-1.5 font-mono text-[10px] text-muted-foreground">
@@ -603,17 +603,16 @@ function DispatchFromField({
 }) {
   return (
     <div>
-      <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
+      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
         Dispatch from
-      </div>
-      <div className="text-[11px] text-muted-foreground mb-2 leading-relaxed">
-        The input (pull source or push listener) that routes events into this parser. Compatible ones are
-        highlighted based on the parser's transport.
+        <InfoTip label="About dispatch inputs" side="top">
+          The input that sends events to this parser: a pull source or a push listener. Inputs that match the way
+          this parser expects events to arrive are highlighted.
+        </InfoTip>
       </div>
       {configs.length === 0 ? (
         <div className="rounded-md border border-border bg-card px-3 py-2.5 text-[11px] text-muted-foreground leading-relaxed">
-          No deployed inputs. Add one under Log Sources → Cloud pull (or a push listener under
-          Credentials) — the parser still imports as a draft, but no events route into it until one exists.
+          No deployed <Term id="input">inputs</Term>. Add one under <Term id="cloud-pull">Cloud pull</Term> or Credentials; until then the draft receives no events.
         </div>
       ) : (
         <div className="space-y-1.5">
@@ -708,14 +707,8 @@ function SchemaPane({ parser }: { parser: RepoParserView }) {
   const fields = useMemo(() => extractFieldsFromVrl(parser.raw.parser_vrl), [parser.raw.parser_vrl]);
   return (
     <div className="p-4 space-y-3">
-      <div>
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5">
-          Normalized fields
-        </div>
-        <div className="text-[11.5px] text-muted-foreground leading-relaxed">
-          After this parser runs, events will expose the following fields. Search autocomplete and
-          dashboards suggest from the union across imported log sources.
-        </div>
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        Normalized fields
       </div>
       {fields.length > 0 ? (
         <div className="flex flex-wrap gap-1.5">
@@ -731,20 +724,9 @@ function SchemaPane({ parser }: { parser: RepoParserView }) {
         </div>
       ) : (
         <div className="text-[11px] text-muted-foreground">
-          Could not extract a field list from the VRL. The schema is determined at parse-time.
+          Could not extract fields from the <Term id="vrl">VRL</Term>; the schema is set at parse time.
         </div>
       )}
-
-      <div className="rounded-md border border-border px-3 py-2.5 bg-card">
-        <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-foreground/80 mb-1">
-          <Info className="w-[12px] h-[12px]" strokeWidth={1.5} />
-          Field index
-        </div>
-        <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-          Normalized fields from every imported parser feed the shared field index. Search
-          autocomplete and dashboard builders suggest from the union across all your log sources.
-        </div>
-      </div>
     </div>
   );
 }
@@ -814,7 +796,7 @@ function ImportOptionsPane({
             onClick={() => onChangeImportMode('linked')}
             title="Linked"
             tagline="Stay in sync with upstream"
-            body="Auto-update whenever the upstream repo publishes a new version. You cannot edit the parser locally; changes must land in the upstream repo."
+            body="Updates automatically from upstream. Not editable here."
             Icon={LinkIcon}
           />
           <ModeCard
@@ -822,7 +804,7 @@ function ImportOptionsPane({
             onClick={() => onChangeImportMode('forked')}
             title="Forked"
             tagline="Edit the copy in your workspace"
-            body="Take a snapshot of the current version. Edit freely. We'll surface DRIFT when upstream diverges so you can merge, rebase, or ignore."
+            body="A local copy you can edit. Upstream changes show as drift."
             Icon={GitFork}
           />
         </div>
@@ -839,7 +821,7 @@ function ImportOptionsPane({
             This parser normalizes pushed <span className="font-mono text-foreground">{parser.raw.enrich_source || '—'}</span>{' '}
             {parser.raw.enrich_kind || ''} records into{' '}
             <span className="font-mono text-foreground">{parser.raw.target_table || '—'}</span>. Routing is
-            fixed by the parser definition — there is no source-type or dispatch config to pick.
+            fixed by the parser.
           </div>
         </div>
       )}
@@ -864,9 +846,8 @@ function ImportOptionsPane({
           <Info className="w-[12px] h-[12px]" strokeWidth={1.5} />
           Imports as a draft
         </div>
-        Drafts let you test-run the parser against live events before deploying. Nothing changes in
-        production until you click <span className="font-mono text-foreground">Deploy</span> on the
-        log source.
+        Nothing changes in production until you{' '}
+        <span className="font-mono text-foreground">Deploy</span> the log source.
       </div>
     </div>
   );

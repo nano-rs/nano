@@ -586,6 +586,20 @@ pub struct TokenClaims {
     /// Token purpose: "access" (default) or "mfa_challenge"
     #[serde(default = "default_token_purpose")]
     pub purpose: String,
+    /// Session ID (`sessions.id`) this access token was minted for (NAN-5573).
+    ///
+    /// Unlike `jti`, which is unique per access token, `sid` is stable for the
+    /// life of the login session across refreshes. It lets logout end only the
+    /// caller's session and lets `GET /api/sessions/me` mark it as current.
+    /// `None` for tokens minted outside an interactive session (MFA challenge,
+    /// API keys, service principals) and for tokens issued before this claim.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "typeid::session::opt"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub sid: Option<Uuid>,
 }
 
 fn default_token_purpose() -> String {

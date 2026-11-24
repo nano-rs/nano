@@ -21,6 +21,7 @@ impl DeniedSourceAuditSink for Capture {
 
 fn restricted_member(user: u128) -> AuthContext {
     let mut auth = AuthContext::from_jwt(TokenClaims {
+        sid: None,
         iss: "iss".into(),
         aud: "aud".into(),
         sub: Uuid::from_u128(user),

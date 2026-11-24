@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { CloudOverviewAccount } from '@/lib/api/types';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+import { InfoTip } from '@/components/ui/info-tip';
 import { CloudCard, cloudSevTone, fmtCount } from './shared';
 
 interface AccountsGridProps {
@@ -22,21 +16,13 @@ export function AccountsGrid({ accounts, onPickAccount }: AccountsGridProps) {
     <CloudCard
       title="Accounts"
       subtitle={
-        <TooltipProvider delayDuration={100}>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="inline-flex items-center gap-1 cursor-help">
-                {accounts.length} tracked · click to scope
-                <Info className="w-3 h-3 opacity-60" />
-              </span>
-            </TooltipTrigger>
-            <TooltipContent side="top" className="max-w-[260px] text-[11px] font-normal normal-case tracking-normal leading-snug">
-              Color = risk band from detection findings. Bar fill = event volume
-              relative to the busiest account in the window. Risk shows 0 until a
-              rule fires on the account or one of its principals.
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+        <span className="inline-flex items-center gap-1">
+          {accounts.length} tracked · click to scope
+          <InfoTip label="About the accounts grid">
+            Color shows risk from detection rules that fired on the account. The bar
+            shows its event count next to the busiest account.
+          </InfoTip>
+        </span>
       }
       accent="oklch(68% 0.14 240)"
     >

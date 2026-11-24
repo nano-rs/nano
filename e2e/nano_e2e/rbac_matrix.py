@@ -33,7 +33,8 @@ _ATTR_ANY = re.compile(r"\banyPermission=\{\[([^\]]*)\]\}")
 _ATTR_CAP = re.compile(r'\bcapability="([^"]+)"')
 _TUPLES = re.compile(r"\{\(\[(.*?)\]\s*as const\)\.map\((.*?)\)\)\}", re.S)
 _TUPLE_PATH = re.compile(r"\[\s*'(/[^']*)',\s*[A-Z]\w*\s*\]")
-_NAV = re.compile(r"\{\s*name:\s*'([^']+)',\s*href:\s*'(/[^']*)'([^}]*)\}")
+# href: a quoted path, or a const declared in the same file (RULE_IDEAS_PATH, NAN-5850).
+_NAV = re.compile(r"\{\s*name:\s*'([^']+)',\s*href:\s*('/[^']*'|[A-Z][A-Z0-9_]*)([^}]*)\}")
 _NAV_PERMS = re.compile(r"permissions:\s*(\[[^\]]*\]|'[^']+'|[A-Z_]+)")
 
 
@@ -113,6 +114,11 @@ def route_gates(src: str | None = None) -> dict[str, Gate]:
         if path in ("*", "/*"):
             continue
         nxt = starts[i + 1][0] if i + 1 < len(starts) else len(src)
+        # Stop at the next <Route of any shape too: a generated `<Route key={path}`
+        # block must not lend its gate to the redirect route above it (NAN-5850).
+        any_next = src.find("<Route", end)
+        if 0 <= any_next < nxt:
+            nxt = any_next
         gates.setdefault(path, _gate_from(path, src[end:nxt]))
     for m in _TUPLES.finditer(src):
         body = m.group(2)
@@ -195,15 +201,27 @@ def settings_items(src: str | None = None) -> list[NavItem]:
     return out
 
 
-def all_gate_permissions() -> set[str]:
-    """Every permission string a route, rail item or settings entry names."""
+def all_gate_permissions(capabilities: dict[str, bool] | None = None) -> set[str]:
+    """Every permission string a route, rail item or settings entry names.
+
+    With `capabilities`, gates behind a capability that is off are left out:
+    licensing refuses those before RBAC, and an open build does not define
+    their enterprise permissions (`hunts:view`, `soar:view`, ...; NAN-5747),
+    so they cannot be classified against its `/api/permissions`."""
+
+    def live(capability: str | None) -> bool:
+        return capabilities is None or not capability or capabilities.get(capability, False)
+
     perms: set[str] = set()
     for g in route_gates().values():
+        if not live(g.capability):
+            continue
         if g.permission and g.permission != "<dynamic>":
             perms.add(g.permission)
         perms.update(g.any_permission)
     for item in nav_items() + settings_items():
-        perms.update(item.permissions)
+        if live(item.capability):
+            perms.update(item.permissions)
     return perms
 
 
@@ -218,6 +236,10 @@ def _nav_items(src: str) -> list[NavItem]:
                 consts[name] = m.group(1)
     out = []
     for name, href, rest in _NAV.findall(src):
+        href = href if href.startswith("'") else consts.get(href, "")
+        if not href.startswith("'/"):
+            continue  # a const that is not a path literal: nothing to audit
+        href = href.strip("'")
         pm = _NAV_PERMS.search(rest)
         raw = pm.group(1) if pm else ""
         if raw and raw[0].isupper():

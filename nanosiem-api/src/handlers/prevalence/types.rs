@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// Query parameters for single artifact prevalence endpoints
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct PrevalenceQuery {
-    /// Time window for prevalence calculation (1h, 24h, 7d, 30d)
+    /// Recency window (1h, 24h, 7d, 30d): the artifact must have been seen
+    /// inside it. The host count is always the 30-day prevalence baseline.
     pub window: Option<String>,
 }
 
@@ -59,7 +60,9 @@ pub struct ExportQuery {
 pub struct BulkPrevalenceRequest {
     /// List of artifacts to look up
     pub artifacts: Vec<String>,
-    /// Time window for prevalence calculation
+    /// Recency window (1h, 24h, 7d, 30d; default 24h): the artifact must have
+    /// been seen inside it. The host count is always the 30-day prevalence
+    /// baseline, the same count `| prevalence enrich=true` reports.
     pub window: Option<String>,
 }
 

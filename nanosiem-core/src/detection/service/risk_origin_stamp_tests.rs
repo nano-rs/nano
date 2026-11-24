@@ -161,7 +161,7 @@ fn only_entity_local_pipelines_key_rows_by_entity() {
         "score_24h > 0 | chart count by entity",
         "score_24h > 0 | stats count by entity, entity_type",
         "score_24h > 0 | stats values(entity) as e by entity_type",
-        "score_24h > 0 | lookup watchlist entity",
+        "score_24h > 0 | lookup entity_tags entity",
         // Rank-dependent selection (explicit sort or the grain's default order).
         "* | sort -score_24h | head 10 | table entity, score_24h",
         "* | sort -score_24h | head 2 | tail 1",

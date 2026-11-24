@@ -77,14 +77,14 @@ describe('labels shared with the event inspector', () => {
     );
     expect(ocsf.map(c => [c.label, c.tooltip])).toEqual([
       ['Core', FIELD_BUCKET_TOOLTIPS.core],
-      ['Extended', 'Valid OCSF fields stored in the event JSON'],
-      ['Unmapped', "Source fields the parser didn't map to OCSF"],
+      ['Extended', FIELD_BUCKET_TOOLTIPS.extendedOcsf],
+      ['Unmapped', FIELD_BUCKET_TOOLTIPS.unmapped],
     ]);
-    expect(FIELD_BUCKET_TOOLTIPS.core).toBe('Indexed columns');
+    expect(FIELD_BUCKET_TOOLTIPS.core).toMatch(/^A core field is/);
 
     const udm = buildFieldCategories([['src_ip', '10.0.0.1'], ['custom_key', 'x']], new Set(), false);
     expect(udm.map(c => [c.label, c.tooltip])).toEqual([
-      ['Core', 'Indexed columns'],
+      ['Core', FIELD_BUCKET_TOOLTIPS.core],
       ['Extended', extendedTooltip(false)],
     ]);
   });

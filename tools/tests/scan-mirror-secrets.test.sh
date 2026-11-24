@@ -8,6 +8,10 @@
 #
 #   bash tools/tests/scan-mirror-secrets.test.sh
 set -euo pipefail
+# NAN-5797: this test runs git in throwaway repositories. An inherited GIT_DIR /
+# GIT_WORK_TREE would point those calls at a real repository (a release preflight
+# run with them set wrote core.worktree into the shared repo config).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCAN="$ROOT/tools/scan-mirror-secrets.sh"

@@ -6,6 +6,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Filter, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 interface PrevalenceSliderProps {
   value: number; // 0-100, default 100 (show all)
@@ -101,7 +102,7 @@ export function PrevalenceSlider({ value, onChange, disabled }: PrevalenceSlider
             {/* Header */}
             <div className="px-3 pt-2.5 pb-2 border-b border-border flex items-center justify-between font-mono">
               <span className="text-[10.5px] tracking-[0.12em] uppercase text-muted-foreground font-semibold">
-                Rarity Filter
+                <Term id="rarity">Rarity</Term> filter
               </span>
               <span
                 className={cn(
@@ -163,12 +164,12 @@ export function PrevalenceSlider({ value, onChange, disabled }: PrevalenceSlider
 
             {/* Info */}
             <div className="border-t border-border px-3 py-2 font-mono text-[10px] text-muted-foreground/70 leading-relaxed">
-              Rarity is derived from how common an artifact is across your environment. Lower values surface rarer artifacts first.
+              Keeps values seen on this many hosts or fewer. Lower numbers show only the rarest ones.
             </div>
           </PopoverContent>
           <TooltipContent side="bottom">
-            <p>Filter by artifact rarity</p>
-            <p className="text-xs text-primary-foreground/70">Surface rare hashes, domains, or IPs</p>
+            <p>Show only rare values</p>
+            <p className="text-xs text-primary-foreground/70">Find file hashes, domains or IPs that few hosts have seen</p>
           </TooltipContent>
         </Popover>
       </Tooltip>

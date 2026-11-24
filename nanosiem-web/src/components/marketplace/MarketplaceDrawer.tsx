@@ -31,6 +31,7 @@ import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard
 import { BundleFeedStatus } from './BundleFeedStatus';
 import { bundleProvisions, platformFeedForEntry, type BundleProvision } from '@/lib/api/marketplace-inventory';
 import { useCapabilitiesOptional } from '@/hooks/use-capabilities';
+import { Term } from '@/components/ui/term';
 
 const TABS = [
   { id: 'about',  label: 'About',       icon: Info },
@@ -641,8 +642,8 @@ function BundleOnlyConfig({ provision, ipinfo }: { provision: BundleProvision | 
         <BundleFeedStatus provision={provision} />
       ) : (
         <p className="text-[12px] text-muted-foreground" data-testid="inventory-bundle-note">
-          This feed is provided by nano's signed feed bundle from app.nano.rs and stamped at ingest. There is no
-          download URL or token to configure. Feed status is under Platform feeds on the Marketplace page.
+          From nano&apos;s signed <Term id="feed-bundle">feed bundle</Term>, stamped at ingest; no download URL or token to configure. Status is under
+          Platform feeds.
         </p>
       )}
       {ipinfo && <IpInfoCredit />}
@@ -689,7 +690,7 @@ function AboutTab({ entry }: { entry: MarketplaceCatalogEntry }) {
         </div>
       )}
       <p>
-        Once installed, this enrichment is invoked automatically by detection rules and notebooks that call{' '}
+        Called by rules and notebooks via{' '}
         <code className="font-mono text-primary text-[12px] px-1 bg-primary/10 rounded">
           {`enrich(ev, {provider:"${entry.slug}"})`}
         </code>{' '}
@@ -976,7 +977,7 @@ function ConfigTab(props: ConfigTabProps) {
                     variant="outline"
                     size="sm"
                     className="h-8 rounded-md"
-                    title="Live sync needs outbound internet. Import a signed data bundle instead."
+                    title="Live sync needs internet access. Import a signed data bundle instead."
                   >
                     <FileDown className="w-3.5 h-3.5" /> Import bundle
                   </Button>

@@ -21,7 +21,7 @@
  * take effect within seconds.
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, Copy, KeyRound, Link2, Plus, RotateCcw, ShieldOff } from 'lucide-react';
 
@@ -43,6 +43,7 @@ import {
 } from '@/lib/api/ingest-tokens';
 import { hecCurl, httpCurl, tokenEnvVar, vectorAggregator } from '@/lib/ingest-token-snippets';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 function shortTime(iso?: string | null): string {
   if (!iso) return '—';
@@ -131,6 +132,14 @@ function IssueTokenDialog({
   const [sourceId, setSourceId] = useState(initialSourceId ?? '');
   const [issued, setIssued] = useState<IssuedIngestToken | null>(null);
   const [copied, setCopied] = useState(false);
+  // NAN-5867: the title holds a glossary Term, which is focusable. Open on the
+  // name field, and move to Copy once the token is issued, so the first focus
+  // never lands on (and opens) the title's definition.
+  const nameRef = useRef<HTMLInputElement>(null);
+  const copyRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (issued) copyRef.current?.focus();
+  }, [issued]);
   const create = useMutation({
     mutationFn: ({ value, source }: { value: string; source: string }) => api.ingestTokens.create(value, source),
     onSuccess: (result) => {
@@ -168,17 +177,24 @@ function IssueTokenDialog({
 
   return (
     <Dialog open={open} onOpenChange={close}>
-      <DialogContent className="max-w-md gap-0 p-0" data-testid="issue-ingest-token-dialog">
+      <DialogContent
+        className="max-w-md gap-0 p-0"
+        data-testid="issue-ingest-token-dialog"
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          (issued ? copyRef.current : nameRef.current)?.focus();
+        }}
+      >
         <DialogHeader className="border-b border-border px-5 py-4">
           <DialogTitle className="flex items-center gap-2">
-            <KeyRound className="w-4 h-4 text-muted-foreground" strokeWidth={1.5} /> New ingest token
+            <KeyRound className="w-4 h-4 text-muted-foreground" strokeWidth={1.5} /> New <Term id="ingest-credential">ingest token</Term>
           </DialogTitle>
           <DialogDescription>
             {issued
               ? issued.ingest_ready?.ready
                 ? 'Copy the token now. It is shown once and cannot be read again. Ingest already accepts it.'
                 : `Copy the token now. It is shown once and cannot be read again. HEC/HTTP may answer 401 for about ${issued.ingest_ready?.retry_after_secs ?? issued.active_within_secs ?? 10} s; retry.`
-              : 'Name the sender and pick its source. Every event sent with the token lands in that source, whatever sourcetype it declares. The binding never changes.'}
+              : 'Name the sender and pick its source. Its events land there whatever sourcetype they declare; the binding never changes.'}
           </DialogDescription>
         </DialogHeader>
         <div className="px-5 py-4 space-y-2">
@@ -198,16 +214,16 @@ function IssueTokenDialog({
                 >
                   {issued.token}
                 </code>
-                <Button variant="outline" size="sm" className="h-7 gap-1 text-[11.5px]" onClick={() => void copy()}>
+                <Button ref={copyRef} variant="outline" size="sm" className="h-7 gap-1 text-[11.5px]" onClick={() => void copy()}>
                   {copied ? <Check className="w-3 h-3" strokeWidth={1.5} /> : <Copy className="w-3 h-3" strokeWidth={1.5} />}
                   {copied ? 'Copied' : 'Copy'}
                 </Button>
               </div>
               <div className="text-[11px] text-muted-foreground">
-                Send it as <span className="font-mono">Authorization: Splunk &lt;token&gt;</span> (HEC, :8088),{' '}
+                Send it as <span className="font-mono">Authorization: Splunk &lt;token&gt;</span> (<Term id="hec">HEC</Term>, :8088),{' '}
                 <span className="font-mono">Authorization: Bearer &lt;token&gt;</span> (HTTP, :8080), or the same
-                Bearer header to <span className="font-mono">/otlp</span>. Until the source has a parser, events land
-                unparsed and are searchable as <span className="font-mono">source_type={issued.credential.route_key}</span>.
+                Bearer header to <span className="font-mono">/otlp</span>. Before a parser exists, search for{' '}
+                <span className="font-mono">source_type={issued.credential.route_key}</span>.
               </div>
             </>
           ) : (
@@ -224,9 +240,9 @@ function IssueTokenDialog({
                 </label>
                 <Input
                   id="ingest-token-name"
+                  ref={nameRef}
                   value={name}
                   maxLength={100}
-                  autoFocus
                   placeholder="fw-edge-01"
                   className="h-7 font-mono text-[12px]"
                   onChange={(e) => setName(e.target.value)}
@@ -467,8 +483,7 @@ function SendDataSection({
         )}
       </div>
       <div className="text-[11px] text-muted-foreground">
-        One token per source. The token decides where events land; a sourcetype in the event is kept as{' '}
-        <span className="font-mono">claimed_source_type</span> and never routes.
+        One token per source. The token decides where events land; an in-event sourcetype never does.
       </div>
       {source && (
         <div className="space-y-2">
@@ -485,7 +500,7 @@ function SendDataSection({
       )}
       {aggregatorSources.length > 0 && (
         <Snippet
-          title="Vector aggregator · one sink per log type"
+          title="Vector aggregator · one output per log type"
           body={vectorAggregator(host, aggregatorSources)}
           testId="snippet-vector-aggregator"
         />
@@ -576,7 +591,7 @@ export function IngestTokensPanel() {
     <div className="space-y-3" data-testid="ingest-tokens-panel">
       <div className="flex items-center gap-3">
         <span className="font-mono text-[10.5px] text-muted-foreground tabular-nums">
-          {count('active')} active · {unbound} unbound · {count('revoked')} revoked · install token {installToken.state.replace('_', ' ')}
+          {count('active')} active · {unbound} unbound · {count('revoked')} revoked · <Term id="install-token">install token</Term> {installToken.state.replace('_', ' ')}
         </span>
         <span className="flex-1" />
         {canManage && !undelivered && (
@@ -594,9 +609,8 @@ export function IngestTokensPanel() {
         >
           <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" strokeWidth={1.5} />
           <span>
-            Token delivery to Vector is not configured for this deployment (
-            <span className="font-mono">NANO_INGEST_TOKENS_DELIVERY</span>), so named tokens cannot be issued: Vector
-            would never see them.
+            Token delivery to Vector is not configured (<span className="font-mono">NANO_INGEST_TOKENS_DELIVERY</span>),
+            so named tokens cannot be issued.
           </span>
         </div>
       )}
@@ -609,10 +623,9 @@ export function IngestTokensPanel() {
         >
           <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" strokeWidth={1.5} />
           <span>
-            The install token (<span className="font-mono">VECTOR_AUTH_TOKEN</span>) is a publicly known default, so
-            nano refuses it (HTTP 401). Re-run <span className="font-mono">install.sh</span> or{' '}
-            <span className="font-mono">nano upgrade</span> to replace it with a generated value, and move each sender
-            to a named token.
+            The install token (<span className="font-mono">VECTOR_AUTH_TOKEN</span>) is a publicly known default and is
+            refused (HTTP 401). Re-run <span className="font-mono">install.sh</span> or{' '}
+            <span className="font-mono">nano upgrade</span> to replace it, then move senders to named tokens.
           </span>
         </div>
       )}
@@ -625,10 +638,10 @@ export function IngestTokensPanel() {
         >
           <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" strokeWidth={1.5} />
           <span className="flex-1">
-            Deprecated: the install token (<span className="font-mono">VECTOR_AUTH_TOKEN</span>) is in legacy multiplex
-            mode. Its senders choose their own source with <span className="font-mono">X-Source-Type</span> /{' '}
-            <span className="font-mono">sourcetype</span>, and revoking it cuts off all of them at once. Issue one named
-            token per sender and source, then bind the install token to a source or stop multiplexing.
+            Deprecated: the install token (<span className="font-mono">VECTOR_AUTH_TOKEN</span>) is in{' '}
+            <Term id="legacy-multiplex">legacy multiplex mode</Term>. Every sender shares it and names its source with{' '}
+            <span className="font-mono">X-Source-Type</span> or <span className="font-mono">sourcetype</span>, so revoking it cuts them all off. Give each sender its own
+            token.
           </span>
           {canManage && (
             <span className="flex shrink-0 gap-1">
@@ -664,7 +677,7 @@ export function IngestTokensPanel() {
           <span>
             {unbound + (installUnbound ? 1 : 0)} token{unbound + (installUnbound ? 1 : 0) === 1 ? ' is' : 's are'} not
             bound to a source and {unbound + (installUnbound ? 1 : 0) === 1 ? 'is' : 'are'} refused (HTTP 401). Bind
-            each one to the source its sender feeds: the token decides where events land, a sourcetype never does.
+            each one to its sender&apos;s source.
           </span>
         </div>
       )}
@@ -784,9 +797,7 @@ export function IngestTokensPanel() {
 
       {tokens.length === 0 && (
         <div className="text-[11.5px] text-muted-foreground">
-          No named tokens yet. Issue one per sender and source: its events land in that source, you can tell senders
-          apart in search (<span className="font-mono">ext.nano_credential_id</span>), and you can revoke one
-          without touching the others.
+          No named tokens yet. Issue one per sender and source so each can be revoked on its own.
         </div>
       )}
 
@@ -851,14 +862,15 @@ export function IngestTokensPanel() {
       <ConfirmDialog
         open={strictConfirm}
         onOpenChange={setStrictConfirm}
-        title="Stop multiplexing the install token"
+        title="Stop sharing the install token"
         icon={<AlertTriangle className="w-4 h-4 text-amber-500" strokeWidth={1.5} />}
         description={
           <>
-            Senders using <span className="font-mono text-foreground">VECTOR_AUTH_TOKEN</span> are refused on the HEC,
-            HTTP and OTLP endpoints within a few seconds, until it is bound to a source. Built-in collector integrations
-            use their own platform credential and keep delivering. Move every sender to a named token first. This
-            cannot be undone.
+            Within a few seconds, nano refuses every sender that uses{' '}
+            <span className="font-mono text-foreground">VECTOR_AUTH_TOKEN</span> on the HEC, HTTP and <Term id="otlp">OTLP</Term> endpoints, until
+            you tie the token to one source.
+            Built-in <Term id="collector">collectors</Term> use their own credential and keep working. Give each sender its own token first. This
+            can&apos;t be undone.
           </>
         }
         confirmLabel="Stop multiplexing"

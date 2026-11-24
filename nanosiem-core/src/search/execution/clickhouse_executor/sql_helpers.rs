@@ -161,35 +161,169 @@ pub(crate) fn build_count_query(sql: &str, bounded: Option<BoundedCountInput>) -
     }
 }
 
-/// Escape `?` characters within SQL string literals for the clickhouse-rs crate.
-/// The crate uses `?` as parameter placeholders, so literal `?` in strings (e.g., regex patterns)
-/// need to be escaped as `??`.
+/// Double every `?` that is not a bind placeholder, for the clickhouse-rs
+/// crate: it reads every bare `?` in a query template as a client-side bind
+/// (and `?fields` as the row's field list), wherever it appears, so a `?` in
+/// generated SQL text must reach it as `??`.
+///
+/// NAN-5793 review: a real lexer, not a quote toggle. It doubles `?` inside
+/// `'…'` string literals (`''` and backslash escapes), `"…"` and `` `…` ``
+/// quoted identifiers (doubled-quote and backslash escapes), and `--` / `/* */`
+/// comments. A comment or a quoted identifier can therefore neither carry a
+/// bare `?` through nor flip the quote state, so a denied source name after
+/// `-- entity's` or `AS "don't"` stays escaped. Bare `?` outside all of these
+/// are left alone: in hand-built SQL they are real placeholders.
 pub fn escape_question_marks_in_strings(sql: &str) -> String {
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        Quoted(char),
+        LineComment,
+        /// Nesting depth: ClickHouse block comments nest.
+        BlockComment(usize),
+        /// A `$tag$…$tag$` (or `$$…$$`) raw string: no escapes inside.
+        DollarQuoted(String),
+    }
+    let chars: Vec<char> = sql.chars().collect();
     let mut result = String::with_capacity(sql.len());
-    let mut in_string = false;
-    let mut chars = sql.chars().peekable();
+    let mut state = State::Code;
+    let mut i = 0;
 
-    while let Some(c) = chars.next() {
-        if c == '\'' && !in_string {
-            // Start of string literal
-            in_string = true;
-            result.push(c);
-        } else if c == '\'' && in_string {
-            // Check for escaped quote ('')
-            if chars.peek() == Some(&'\'') {
-                result.push(c);
-                result.push(chars.next().unwrap());
-            } else {
-                // End of string literal
-                in_string = false;
-                result.push(c);
+    // A dollar-quote delimiter starting at `at` (`$$` or `$tag$`), if any.
+    let dollar_tag = |at: usize| -> Option<String> {
+        if chars.get(at) != Some(&'$') {
+            return None;
+        }
+        let mut j = at + 1;
+        while let Some(&c) = chars.get(j) {
+            if c == '$' {
+                let tag: String = chars[at..=j].iter().collect();
+                let body = &tag[1..tag.len() - 1];
+                let valid = body.is_empty()
+                    || (body.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                        && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+                return valid.then_some(tag);
             }
-        } else if c == '?' && in_string {
-            // Escape ? as ?? inside string literals
-            result.push('?');
-            result.push('?');
-        } else {
-            result.push(c);
+            if !(c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            j += 1;
+        }
+        None
+    };
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match &mut state {
+            State::Code => {
+                if c == '$' {
+                    // `$` after an identifier char is part of a name, not a quote.
+                    let after_ident = i > 0
+                        && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
+                    if !after_ident {
+                        if let Some(tag) = dollar_tag(i) {
+                            result.push_str(&tag);
+                            i += tag.chars().count();
+                            state = State::DollarQuoted(tag);
+                            continue;
+                        }
+                    }
+                }
+                result.push(c);
+                i += 1;
+                match c {
+                    '\'' | '"' | '`' => state = State::Quoted(c),
+                    '-' if next == Some('-') => {
+                        result.push('-');
+                        i += 1;
+                        state = State::LineComment;
+                    }
+                    '/' if next == Some('*') => {
+                        result.push('*');
+                        i += 1;
+                        state = State::BlockComment(1);
+                    }
+                    _ => {}
+                }
+            }
+            State::Quoted(quote) => {
+                let quote = *quote;
+                i += 1;
+                if c == '?' {
+                    result.push_str("??");
+                    continue;
+                }
+                result.push(c);
+                if c == '\\' {
+                    // A backslash escapes the next character, quote included.
+                    if let Some(n) = next {
+                        i += 1;
+                        if n == '?' {
+                            result.push_str("??");
+                        } else {
+                            result.push(n);
+                        }
+                    }
+                } else if c == quote {
+                    if next == Some(quote) {
+                        // A doubled quote is an escaped quote, still inside.
+                        result.push(quote);
+                        i += 1;
+                    } else {
+                        state = State::Code;
+                    }
+                }
+            }
+            State::LineComment => {
+                i += 1;
+                if c == '?' {
+                    result.push_str("??");
+                } else {
+                    result.push(c);
+                    if c == '\n' {
+                        state = State::Code;
+                    }
+                }
+            }
+            State::BlockComment(depth) => {
+                if c == '/' && next == Some('*') {
+                    *depth += 1;
+                    result.push_str("/*");
+                    i += 2;
+                } else if c == '*' && next == Some('/') {
+                    *depth -= 1;
+                    result.push_str("*/");
+                    i += 2;
+                    if *depth == 0 {
+                        state = State::Code;
+                    }
+                } else {
+                    i += 1;
+                    if c == '?' {
+                        result.push_str("??");
+                    } else {
+                        result.push(c);
+                    }
+                }
+            }
+            State::DollarQuoted(tag) => {
+                let tag_len = tag.chars().count();
+                let closes = chars.len() >= i + tag_len
+                    && chars[i..i + tag_len].iter().copied().eq(tag.chars());
+                if closes {
+                    result.push_str(tag);
+                    i += tag_len;
+                    state = State::Code;
+                } else {
+                    i += 1;
+                    if c == '?' {
+                        result.push_str("??");
+                    } else {
+                        result.push(c);
+                    }
+                }
+            }
         }
     }
 

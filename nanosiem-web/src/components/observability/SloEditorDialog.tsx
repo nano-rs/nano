@@ -33,6 +33,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import type { Slo, SloInput, SloKind } from '@/lib/api/observability';
+import { Term } from '@/components/ui/term';
 
 export interface SloEditorDialogProps {
   open: boolean;
@@ -135,7 +136,8 @@ export function SloEditorDialog({ open, onOpenChange, slo, onSubmit }: SloEditor
         <SheetHeader className="space-y-1.5 border-b border-border px-5 py-4 text-left">
           <SheetTitle>{editing ? 'Edit SLO' : 'New SLO'}</SheetTitle>
           <SheetDescription>
-            Error-budget objective computed from spans over the rolling window.
+            A reliability goal for one service, measured from its <Term id="span">spans</Term> over a rolling window. Each failed or
+            too-slow request uses up part of its <Term id="error-budget">error budget</Term>.
           </SheetDescription>
         </SheetHeader>
 
@@ -168,7 +170,9 @@ export function SloEditorDialog({ open, onOpenChange, slo, onSubmit }: SloEditor
 
           <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-1.5">
-              <Label className={FIELD_LABEL}>SLI kind</Label>
+              <Label className={FIELD_LABEL}>
+                <Term id="sli">SLI</Term> kind
+              </Label>
               <Select
                 value={form.sli_kind}
                 onValueChange={(v) => set('sli_kind', v as SloKind)}

@@ -55,7 +55,9 @@ async fn unparseable_text_takes_the_scoped_fallback_scan() {
     let sql = svc
         .build_cloud_base_cte("((( not nPL", &range(), &analyst())
         .expect("fallback scan");
-    assert!(sql.contains("hr_payroll"), "{sql}");
+    // NAN-5793: the fallback scan binds the deny list; no name in the text.
+    assert!(sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"), "{sql}");
+    assert!(!sql.contains("hr_payroll"), "{sql}");
 }
 
 #[tokio::test]
@@ -111,4 +113,59 @@ fn no_caller_turns_a_scope_enforcement_error_into_an_unscoped_query() {
         "source-scope enforcement errors swallowed (NAN-5021):\n{}",
         offenders.join("\n")
     );
+}
+
+/// NAN-5793 review (P1): the `| resolve_identity` ASOF build side reads
+/// `identity_observations`, which the AST gate does not cover. The cloud CTE
+/// must carry the caller's deny-set on the generator so that join is scoped.
+#[tokio::test]
+async fn the_identity_build_side_is_scoped_in_the_cloud_cte() {
+    let svc = sql_only_service("udm");
+    let sql = svc
+        .build_cloud_base_cte("* | resolve_identity field=src_ip", &range(), &analyst())
+        .expect("identity CTE");
+    assert!(sql.contains("identity_observations"), "{sql}");
+    assert!(
+        sql.contains("lower(source) NOT IN ('audit', 'hr_payroll')"),
+        "the identity_observations build side must exclude denied sources:\n{sql}"
+    );
+    let open = svc
+        .build_cloud_base_cte("* | resolve_identity field=src_ip", &range(), &ScopeSet::unrestricted())
+        .expect("identity CTE");
+    assert!(!open.contains("lower(source)"), "{open}");
+}
+
+/// NAN-5793 review (P1): a `[dataset=risk …]` subsearch has its AST gate
+/// stripped in favour of the risk source's origin-manifest gate, which is
+/// built from the generator's deny-set. Without it the subsearch read every
+/// finding, denied origins included.
+#[tokio::test]
+async fn a_risk_subsearch_in_the_cloud_cte_keeps_the_origin_gate() {
+    let svc = sql_only_service("udm");
+    let sql = svc
+        .build_cloud_base_cte(
+            "user IN [dataset=risk score_24h > 0 | return entity]",
+            &range(),
+            &analyst(),
+        )
+        .expect("risk subsearch CTE");
+    assert!(
+        sql.contains("origin_source_types") && sql.contains("'__nano:unresolved_source__'"),
+        "the risk subsearch must exclude findings from denied origins:\n{sql}"
+    );
+}
+
+/// NAN-5793 review (P1): the cloud CTE runs the same dataset permission check
+/// as every other nPL path.
+#[tokio::test]
+async fn a_signals_subsearch_needs_detections_view_in_the_cloud_cte() {
+    let svc = sql_only_service("udm");
+    let err = svc
+        .build_cloud_base_cte(
+            "user IN [dataset=signals | return risk_entity]",
+            &range(),
+            &analyst().with_signals_denied(true),
+        )
+        .expect_err("signals without detections:view");
+    assert!(matches!(err, SearchError::Forbidden(_)), "{err:?}");
 }

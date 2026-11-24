@@ -212,7 +212,11 @@ fn check(profile: &OcsfProfile, gen: &ClickHouseSqlGenerator, range: &TimeRange,
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile = OcsfProfile::new();
-    let gen = ClickHouseSqlGenerator::with_table("nanosiem.ocsf_logs".to_string())
+    // Unrestricted: an offline rule-compile check, no viewer.
+    let gen = ClickHouseSqlGenerator::scoped_with_table(
+        "nanosiem.ocsf_logs".to_string(),
+        nanosiem_core::query::GeneratorScope::unrestricted(),
+    )
         .with_profile(Arc::new(OcsfProfile::new()));
     let range = TimeRange {
         start: "2026-01-01T00:00:00Z".parse()?,

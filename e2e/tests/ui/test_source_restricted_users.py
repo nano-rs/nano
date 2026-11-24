@@ -41,7 +41,7 @@ from typing import Any
 import pytest
 from nano_e2e import ui as uilib
 from nano_e2e.client import Journal, Nano, expect, row_text, time_range
-from nano_e2e.rbac import role_user, typeid_uuid
+from nano_e2e.rbac import edition_permissions, role_user, typeid_uuid
 from nano_e2e.stack import Stack
 from nano_e2e.waits import DETECTION, INGEST_VISIBLE, eventually
 
@@ -134,8 +134,11 @@ def test_source_restricted_user_sees_only_granted_sources(
 
     created: list[str] = []
     try:
+        # ANALYST names enterprise permissions (hunts:view); open cannot grant them.
+        analyst = edition_permissions(nano.api, ANALYST, stack.edition)
         role = expect(nano.api.post("/api/roles", json={
-            "name": f"e2e-scope-analyst-{tag}", "description": "nano-e2e (NAN-5686)", "permissions": list(ANALYST)}),
+            "name": f"e2e-scope-analyst-{tag}", "description": "nano-e2e (NAN-5686)",
+            "permissions": analyst}),
             200, 201)
         created.append(f"/api/roles/{role['id']}")
         # One alerting rule per lane. The queries name the source only, never

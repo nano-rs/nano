@@ -132,18 +132,11 @@ impl ParserService {
         self.ensure_generated_identity_free(&new_parser.name, None)
             .await?;
 
-        if matches!(
-            new_parser.source_type.as_str(),
-            "kafka" | "aws_s3" | "aws_sqs" | "crowdstrike_fdr" | "gcp_pubsub" | "azure_event_hubs"
-        ) && new_parser.dispatch_source_config_id.is_none()
-        {
-            return Err(ParserServiceError::InvalidSourceType(
-                format!(
-                    "{} parsers require dispatch_source_config_id; transport configuration belongs to source_configurations",
-                    new_parser.source_type
-                ),
-            ));
-        }
+        // NAN-5789: the same binding check every log-source writer runs. A
+        // parser created here is enabled at once, so its configuration must
+        // be deployed too.
+        self.ensure_binding("log", &new_parser.source_type, new_parser.dispatch_source_config_id, true)
+            .await?;
 
         // Basic VRL syntax validation
         let validation = self.validate_vrl(&new_parser.parser_vrl);
@@ -215,19 +208,18 @@ impl ParserService {
             if !valid_types.contains(&source_type.as_str()) {
                 return Err(ParserServiceError::InvalidSourceType(source_type.clone()));
             }
+        }
 
-            if matches!(source_type.as_str(), "kafka" | "aws_s3" | "aws_sqs" | "crowdstrike_fdr" | "gcp_pubsub" | "azure_event_hubs")
-                && update.dispatch_source_config_id.is_none()
-            {
-                let existing = self.get(id).await?;
-                if existing.dispatch_source_config_id.is_none() {
-                    return Err(ParserServiceError::InvalidSourceType(
-                        format!(
-                            "{source_type} parsers require dispatch_source_config_id; transport configuration belongs to source_configurations"
-                        ),
-                    ));
-                }
-            }
+        // NAN-5789: a change of transport or binding, or enabling, must leave
+        // a renderable source (shared check; a live one needs a deployed
+        // configuration). Enrichment rows route via the enrichment lane and
+        // are exempt inside the check.
+        if update.source_type.is_some() || update.dispatch_source_config_id.is_some() || update.enabled == Some(true) {
+            let existing = self.get(id).await?;
+            let source_type = update.source_type.as_deref().unwrap_or(existing.source_type.as_str());
+            let binding = update.dispatch_source_config_id.or(existing.dispatch_source_config_id);
+            let live = update.enabled.unwrap_or(existing.enabled);
+            self.ensure_binding(&existing.kind, source_type, binding, live).await?;
         }
 
         // Validate VRL if provided
@@ -301,6 +293,9 @@ impl ParserService {
         if !parser.validated {
             return Err(ParserServiceError::NotValidated);
         }
+        // NAN-5789: a fetch source goes live only with a deployed source
+        // configuration of its own type.
+        self.ensure_binding(&parser.kind, &parser.source_type, parser.dispatch_source_config_id, true).await?;
         let result = self.repository().enable(id).await?;
 
         // Deploy updated config to Vector
@@ -321,6 +316,21 @@ impl ParserService {
         }
 
         Ok(result)
+    }
+
+    /// NAN-5789: [`crate::log_sources::source_binding::ensure_binding`] for
+    /// the parser service's writers.
+    pub(super) async fn ensure_binding(
+        &self,
+        kind: &str,
+        source_type: &str,
+        binding: Option<Uuid>,
+        must_be_deployed: bool,
+    ) -> Result<(), ParserServiceError> {
+        crate::log_sources::source_binding::ensure_binding(&self.pool, kind, source_type, binding, must_be_deployed)
+            .await
+            .map_err(|e| ParserServiceError::DeploymentFailed(format!("could not read the source configuration: {e}")))?
+            .map_err(|e| ParserServiceError::InvalidSourceType(e.message))
     }
 }
 

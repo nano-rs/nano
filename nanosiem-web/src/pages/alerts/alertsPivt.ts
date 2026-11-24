@@ -11,6 +11,7 @@
 import { definePivtAction, PivtRefusal, type PivtActionSpec, type PivtParamSchema } from '@/contexts/pivt-page';
 import { pivtApi } from '@/lib/api/pivt-api';
 import type { Alert } from '@/lib/api/types';
+import { alertAssigneeLabel } from '@/lib/alert-assignee';
 
 export type Disposition = 'true_positive' | 'false_positive' | 'benign';
 const DISPOSITIONS: Disposition[] = ['true_positive', 'false_positive', 'benign'];
@@ -23,7 +24,7 @@ export function alertSummary(a: Alert) {
     severity: a.severity,
     status: a.status,
     disposition: a.disposition ?? null,
-    assignee: a.assignee_name ?? a.assigned_to ?? null,
+    assignee: alertAssigneeLabel(a) ?? null,
     created_at: a.created_at,
     events: a.matched_event_count ?? a.matched_events?.length ?? 0,
     triage_verdict: a.triage_verdict ?? null,

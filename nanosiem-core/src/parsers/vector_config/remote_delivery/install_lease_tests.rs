@@ -126,3 +126,155 @@ async fn concurrent_requests_grant_exactly_one() {
         .count();
     assert_eq!(granted, 1);
 }
+
+#[test]
+fn the_vector_release_is_read_from_the_build_info_revision() {
+    assert_eq!(parse_vector_release("nano 0.61.0-nano.14 0123456789ab"), Some((0, 61, 0, 14)));
+    assert_eq!(parse_vector_release("nano 0.61.0-nano.13 a7bc4dc791f4"), Some((0, 61, 0, 13)));
+    assert_eq!(parse_vector_release("nano 0.62.0-nano.1 b05ff8da88aa"), Some((0, 62, 0, 1)));
+    assert_eq!(parse_vector_release("0.61.0-nano.14-debian"), Some((0, 61, 0, 14)));
+    for none in ["", "nan5874-local", "nano", "0.61-nano.14", "1.2.3.4-nano.5", "0.61.0-nano.x"] {
+        assert_eq!(parse_vector_release(none), None, "{none}");
+    }
+}
+
+#[test]
+fn only_a_vector_that_keeps_acked_events_on_a_repointing_reload_installs() {
+    // A consumer from before v2.0.35 sends nothing; Vector's metrics not up yet sends "".
+    assert!(!vector_release_allows_install(None));
+    assert!(!vector_release_allows_install(Some("")));
+    assert!(!vector_release_allows_install(Some("  ")));
+    assert!(!vector_release_allows_install(Some("nano 0.61.0-nano.13 a7bc4dc791f4")));
+    assert!(!vector_release_allows_install(Some("nano 0.60.9-nano.20 0")));
+    assert!(vector_release_allows_install(Some("nano 0.61.0-nano.14 0123456789ab")));
+    assert!(vector_release_allows_install(Some("nano 0.61.0-nano.15 0")));
+    assert!(vector_release_allows_install(Some("nano 0.62.0-nano.1 0")));
+    // A custom build names no fork release: the operator's own Vector.
+    assert!(vector_release_allows_install(Some("nan5874-local")));
+}
+
+#[test]
+fn a_refused_vector_reads_as_busy_to_every_consumer() {
+    let busy = serde_json::to_string(&LeaseOutcome::Busy {
+        holder: VECTOR_UPGRADE_HOLDER.into(),
+        generation: 7,
+        expires_in_secs: 0,
+    })
+    .unwrap();
+    // Consumers from before v2.0.35 install only on `"status":"granted"` and
+    // read the holder with `[A-Za-z0-9._:-]*`.
+    assert!(!busy.contains("granted"), "{busy}");
+    assert_eq!(validate_holder(VECTOR_UPGRADE_HOLDER), Ok(()));
+    assert_eq!(validate_holder(LEGACY_FENCE_HOLDER), Ok(()));
+    assert_ne!(LEASE_SCOPE, LEGACY_LEASE_SCOPE);
+}
+
+#[tokio::test]
+async fn an_old_vector_is_refused_without_taking_the_lease() {
+    let Some(pool) = lease_pool().await else { return };
+    let outcome = request(&pool, "vm-1", 7, Some(60), Some("nano 0.61.0-nano.13 a7bc4dc791f4"))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        LeaseOutcome::Busy { holder: VECTOR_UPGRADE_HOLDER.into(), generation: 7, expires_in_secs: 0 }
+    );
+    let outcome = request(&pool, "vm-1", 7, Some(60), None).await.unwrap();
+    assert!(matches!(outcome, LeaseOutcome::Busy { ref holder, .. } if holder == VECTOR_UPGRADE_HOLDER));
+    // Nobody holds the lease: a nano.14 host gets it at once.
+    let outcome = request(&pool, "vm-2", 7, Some(60), Some("nano 0.61.0-nano.14 0")).await.unwrap();
+    assert!(matches!(outcome, LeaseOutcome::Granted { .. }), "{outcome:?}");
+}
+
+/// An API from before v2.0.35 grants the `ingest` scope with this statement
+/// (NAN-5285). While this version's API fences it, that answers busy for every
+/// consumer, including one that held it.
+#[tokio::test]
+async fn an_api_from_before_v2_0_35_grants_no_install_while_fenced() {
+    let Some(pool) = lease_pool().await else { return };
+    async fn legacy_acquire(pool: &PgPool, holder: &str) -> bool {
+        sqlx::query_as::<_, (String,)>(
+            "INSERT INTO vector_config_install_leases \
+                 (scope, holder, generation, acquired_at, expires_at) \
+             VALUES ('ingest', $1, 7, now(), now() + make_interval(secs => 60)) \
+             ON CONFLICT (scope) DO UPDATE SET \
+                 holder = EXCLUDED.holder, generation = EXCLUDED.generation, \
+                 acquired_at = now(), expires_at = EXCLUDED.expires_at \
+             WHERE vector_config_install_leases.holder = EXCLUDED.holder \
+                OR vector_config_install_leases.expires_at < now() \
+             RETURNING holder",
+        )
+        .bind(holder)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .is_some()
+    }
+    assert!(legacy_acquire(&pool, "old-vector-0").await, "unfenced, an old API grants");
+    fence_legacy_scope(&pool).await.unwrap();
+    assert!(!legacy_acquire(&pool, "old-vector-0").await, "the old holder lost it to the fence");
+    assert!(!legacy_acquire(&pool, "old-vector-1").await);
+    // The fence leaves this version's own lease alone.
+    assert_eq!(acquire(&pool, "vm-1", 8, 60).await.unwrap(), None);
+    // A lease request refreshes the fence.
+    sqlx::query("UPDATE vector_config_install_leases SET expires_at = now() - interval '1 second' WHERE scope = 'ingest'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    request(&pool, "vm-1", 8, Some(60), Some("nano 0.61.0-nano.14 0")).await.unwrap();
+    assert!(!legacy_acquire(&pool, "old-vector-1").await, "refreshed by the lease request");
+
+    // Rollback to a version before v2.0.35: no v2.0.35 API refreshes the fence
+    // any more, and once it lapses an old API grants the legacy scope again.
+    let left: (f64,) = sqlx::query_as(
+        "SELECT EXTRACT(EPOCH FROM (expires_at - now()))::float8 FROM vector_config_install_leases WHERE scope = 'ingest'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(left.0 <= LEGACY_FENCE_TTL_SECS as f64 + 1.0, "the fence lapses within its TTL: {left:?}");
+    sqlx::query("UPDATE vector_config_install_leases SET expires_at = now() - interval '1 second' WHERE scope = 'ingest'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(legacy_acquire(&pool, "old-vector-1").await, "an old API grants again after a rollback");
+}
+
+#[test]
+fn a_rollback_recovers_inside_the_consumer_and_healthcheck_budgets() {
+    // The Compose consumer healthcheck allows 210 s and a consumer polls every 5 s; the
+    // fence must lapse well inside that, and outlive several 5 s refresh ticks.
+    assert!((15..=60).contains(&LEGACY_FENCE_TTL_SECS), "{LEGACY_FENCE_TTL_SECS}");
+}
+
+#[test]
+fn a_custom_vector_build_is_allowed() {
+    // The consumer reports `custom <version>` for a build_info with no revision label.
+    assert!(vector_release_allows_install(Some("custom 0.61.0")));
+    assert!(vector_release_allows_install(Some("custom ")));
+}
+
+/// NAN-5874 review: the legacy path on this version never grants, and still fences.
+#[tokio::test]
+async fn the_legacy_path_never_grants_on_this_version() {
+    let Some(pool) = lease_pool().await else { return };
+    let old = request_on_legacy_path(&pool, "vm-1", 7, None).await.unwrap();
+    assert_eq!(
+        old,
+        LeaseOutcome::Busy { holder: VECTOR_UPGRADE_HOLDER.into(), generation: 7, expires_in_secs: 0 }
+    );
+    let new = request_on_legacy_path(&pool, "vm-1", 7, Some("nano 0.61.0-nano.14 0")).await.unwrap();
+    assert_eq!(
+        new,
+        LeaseOutcome::Busy { holder: LEASE_V2_HOLDER.into(), generation: 7, expires_in_secs: 0 }
+    );
+    assert_eq!(validate_holder(LEASE_V2_HOLDER), Ok(()));
+    // Nothing was granted: the v2 lease is free, and the legacy scope is fenced.
+    assert_eq!(acquire(&pool, "vm-2", 7, 60).await.unwrap(), None);
+    let fenced: (String,) =
+        sqlx::query_as("SELECT holder FROM vector_config_install_leases WHERE scope = 'ingest'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(fenced.0, LEGACY_FENCE_HOLDER);
+}

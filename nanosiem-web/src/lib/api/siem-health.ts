@@ -41,6 +41,8 @@ export interface IngestWatchdogHealth {
     error: string;
     hot: boolean;
     sample_age_secs: number;
+    /** NAN-5819: the latest sample is past the staleness bound (old evidence). */
+    stale?: boolean;
   }>;
 }
 
@@ -79,11 +81,25 @@ export interface DictionaryMemory {
   bytes_allocated: number;
 }
 
+/**
+ * NAN-5760: data from a deleted log source still inside the 48h health
+ * window. Informational: never silent, never scored, not in the totals.
+ */
+export interface RemovedSourceMetric {
+  source_type: string;
+  log_source_name: string;
+  deleted_at: string;
+  count_24h: number;
+  count_prior_24h: number;
+}
+
 export interface IngestionMetrics {
   source_volumes: SourceVolumeMetric[];
   total_events_24h: number;
   total_events_prior_24h: number;
   silent_sources: string[];
+  /** Absent on reports written before NAN-5760. */
+  removed_sources?: RemovedSourceMetric[];
   insert_integrity?: InsertIntegrityMetrics;
 }
 

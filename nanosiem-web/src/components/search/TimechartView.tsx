@@ -546,7 +546,7 @@ export function TimechartView({
           <span>Timechart</span>
         </div>
         <div className="p-8 text-center text-muted-foreground text-sm">
-          No time buckets returned — check the aggregation field or widen the query scope.
+          No time buckets. Check the aggregation field or widen the query.
         </div>
       </div>
     );

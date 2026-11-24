@@ -79,6 +79,7 @@ import {
   sourceConfigInventoryAccess,
   type ActionAccess,
 } from '@/components/repositories/repository-action-policy';
+import { Term } from '@/components/ui/term';
 
 // Maps a SourceConfiguration.config_type to the source_type / ingestion_method
 // values the parser-import endpoint expects. Mirrors the legacy SOURCE_TYPE_MAP.
@@ -413,7 +414,7 @@ export function ParserRepositories() {
     onSuccess: (repo: ParserRepository) => {
       queryClient.invalidateQueries({ queryKey: ['parser-repositories'] });
       setActiveRepoId(repo.id);
-      toast({ title: `${repo.name} added — syncing…` });
+      toast({ title: `${repo.name} added. Syncing…` });
       // Kick off the first sync immediately so the parser list populates.
       api.parserRepositories
         .syncRepository(repo.id)
@@ -666,16 +667,14 @@ export function ParserRepositories() {
     return (
       <TooltipProvider>
         <div className="-m-3 flex h-[calc(100%+1.5rem)] min-h-0 flex-col overflow-hidden [contain:layout]">
-          <div className="border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
+          <div className="border-b border-border bg-card/30 px-5 py-3.5 flex items-center gap-4">
             <div className="flex-1 min-w-0">
               <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">
-                Parser repositories
+                <Term id="parser-repository">Parser repositories</Term>
               </div>
-              <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-                {airGap
-                  ? 'Offline deployment. Upload a signed parser bundle to populate the catalog, then preview the source, inspect the schema, and import as log sources.'
-                  : 'Sync VRL parsers from Git. Preview the source, inspect the normalized schema, and import as draft log sources.'}
-              </div>
+              {airGap && (
+                <div className="text-[10.5px] font-mono text-muted-foreground mt-0.5">offline · signed bundles only</div>
+              )}
             </div>
             {airGap && (
               <ImportBundleButton
@@ -693,9 +692,7 @@ export function ParserRepositories() {
               {airGap ? (
                 <>
                   <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
-                    This deployment is air-gapped. Upload a signed parser bundle
-                    (<code className="font-mono text-foreground/80">.tar.gz</code>) to populate the
-                    catalog — parsers then appear here available to import.
+                    Import a signed parser bundle (<code className="font-mono text-foreground/80">.tar.gz</code>).
                   </div>
                   <div className="flex items-center justify-center">
                     <ImportBundleButton
@@ -708,9 +705,7 @@ export function ParserRepositories() {
               ) : (
                 <>
                   <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
-                    Sync the official{' '}
-                    <code className="font-mono text-foreground/80">nano-sh/parsers</code> library to
-                    pull in pre-built parsers for common log sources.
+                    Official library: <code className="font-mono text-foreground/80">nano-rs/parsers</code>
                   </div>
                   <button
                     type="button"
@@ -911,7 +906,7 @@ export function ParserRepositories() {
           onOpenChange={() => setDeleteRepoId(null)}
           variant="danger"
           title="Remove repository"
-          description="The repository and its cached parsers will be removed. Imported log sources keep running locally — they will only stop tracking upstream changes."
+          description="Removes the repository and its cached parsers. Imported log sources keep running but stop tracking upstream."
           confirmLabel="Remove"
           onConfirm={() => deleteRepoId && deleteMutation.mutate(deleteRepoId)}
         />

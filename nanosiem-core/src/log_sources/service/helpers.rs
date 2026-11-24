@@ -18,9 +18,13 @@ impl LogSourceService {
         &self,
         parsers: &mut [Parser],
     ) -> Result<(), LogSourceServiceError> {
+        // NAN-5789: a fetch source without a usable source configuration is
+        // left out of the render, so one unfinished draft can no longer fail
+        // every deploy and delete on the install. A resolve failure is a
+        // database error (the only query it runs), never a deploy one.
         crate::parsers::resolve_parser_dispatch_routes(&self.pool, parsers)
             .await
-            .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))
+            .map_err(|e| LogSourceServiceError::RepositoryError(e.into()))
     }
 
     /// The effective deployed parser set, with dispatch routes stamped —
@@ -36,8 +40,19 @@ impl LogSourceService {
     ) -> Result<Vec<Parser>, LogSourceServiceError> {
         let mut parsers = crate::parsers::list_effective_deployed_parsers(&self.pool)
             .await
-            .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))?;
+            .map_err(|e| LogSourceServiceError::RepositoryError(e.into()))?;
         self.resolve_dispatch_route_names(&mut parsers).await?;
+        // NAN-5789: every source this render leaves out carries the reason on
+        // its own row. Health conditions come from the publication
+        // reconciler's full render (this one may be a deploy of a source that
+        // is disabled again if it does not go live).
+        crate::parsers::unrouted::report(
+            &self.pool,
+            &self.vector_config,
+            &parsers,
+            crate::parsers::unrouted::ReportMode::BINDINGS_NOTES,
+        )
+        .await;
         Ok(parsers)
     }
 }

@@ -3,6 +3,7 @@
 // NAN-504 — header strip, toolbar, table, row, and per-row action.
 // Port of design-ref/shadcn/repos-view.jsx (header) and repos-table.jsx.
 
+import { Term } from '@/components/ui/term';
 import type { ReactNode } from 'react';
 import {
   Box,
@@ -59,8 +60,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
           </span>
         </div>
         <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-          Track detections from Git. Sync upstream rules, preview diffs, remap sources, and import — bulk
-          or one-by-one. Local edits are preserved; drift is surfaced when upstream changes.
+          Sync rules from Git. Your local edits are kept, and rules that differ from the repo show as <Term id="rule-drift">drift</Term>.
         </div>
       </div>
 
@@ -230,7 +230,7 @@ function emptyStateCopy(activeCat: TableProps['activeCat']): { title: string; hi
     case 'updated':
       return { title: 'No upstream updates', hint: 'Your imported rules match the upstream HEAD.' };
     case 'imported':
-      return { title: 'No rules imported yet', hint: 'Click Import on any rule above to add it to your tenant.' };
+      return { title: 'No rules imported yet', hint: 'Import a rule above to add it here.' };
     case 'drift':
       return { title: 'No local drift', hint: 'All imported rules match their upstream version.' };
     case 'deleted':
@@ -437,7 +437,7 @@ function RowAction({
             Open
           </button>
           </TooltipTrigger>
-          <TooltipContent>Already imported — open in editor</TooltipContent>
+          <TooltipContent>Already imported. Open it in the editor.</TooltipContent>
         </Tooltip>
       </PermissionAction>
     );
@@ -475,7 +475,7 @@ function RowAction({
             Resolve
           </button>
           </TooltipTrigger>
-          <TooltipContent>Resolve drift — merge or discard local changes</TooltipContent>
+          <TooltipContent>Resolve drift: merge or discard your local changes</TooltipContent>
         </Tooltip>
       </PermissionAction>
     );

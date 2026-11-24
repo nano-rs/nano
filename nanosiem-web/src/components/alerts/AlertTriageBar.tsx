@@ -40,6 +40,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { Term } from '@/components/ui/term';
 
 type Disposition = 'true_positive' | 'false_positive' | 'benign';
 
@@ -244,7 +245,7 @@ export function AlertTriageBar({
           </DialogHeader>
           <div className="space-y-2 py-2">
             <Label htmlFor="alert-close-disposition" className="text-[11.5px]">
-              Disposition
+              <Term id="disposition">Disposition</Term>
             </Label>
             <Select
               value={closeDisposition}

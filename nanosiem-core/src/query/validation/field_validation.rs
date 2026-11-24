@@ -53,7 +53,7 @@ impl std::error::Error for FieldValidationError {}
 /// ```
 /// Check that a field name has a safe syntactic format (no parentheses, SQL operators, etc.)
 ///
-/// Field names must match `^[a-zA-Z_][a-zA-Z0-9_.]*$`. This prevents injection of
+/// Field names must match `^[a-zA-Z_]([a-zA-Z0-9_.]|~[01])*$`. This prevents injection of
 /// function calls like `version()` or SQL fragments through field name positions.
 pub fn validate_field_name_format(field_name: &str) -> Result<(), FieldValidationError> {
     if field_name.is_empty() {
@@ -77,8 +77,16 @@ pub fn validate_field_name_format(field_name: &str) -> Result<(), FieldValidatio
         });
     }
 
-    // Remaining characters must be alphanumeric, underscore, or dot (for nested fields)
-    for ch in field_name.chars().skip(1) {
+    // Remaining characters must be alphanumeric, underscore, or dot (for nested
+    // fields). NAN-5849: `~` only as the RFC 6901 escape `~0` / `~1` of a key
+    // whose dots the ingest lane escaped (`unmapped.a~1b`); codegen quotes
+    // every JSON path segment, so it never reaches SQL bare.
+    let mut chars = field_name.chars().skip(1).peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '~' && matches!(chars.peek(), Some('0' | '1')) {
+            chars.next();
+            continue;
+        }
         if !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.' {
             return Err(FieldValidationError {
                 field_name: field_name.to_string(),

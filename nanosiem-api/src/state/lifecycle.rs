@@ -605,6 +605,9 @@ impl AppState {
             // NAN-5561: the weekly hunt evals (leader-only, fenced).
             handles.push(self.start_hunt_eval_scheduler());
             tracing::info!("Hunt eval scheduler started (leader-only)");
+            // NAN-5757: recon on its own once ingest has data, then daily.
+            handles.push(self.start_hunt_recon_scheduler());
+            tracing::info!("Hunt recon schedule started (leader-only)");
         }
 
         // Cleanup tasks (leader-only to avoid duplicate work across nodes).

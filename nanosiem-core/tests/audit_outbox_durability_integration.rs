@@ -493,3 +493,40 @@ async fn ocsf_install_writes_audit_only_to_ocsf_logs() {
     assert_eq!(landed, 1, "routine audit row in ocsf_logs");
     assert_eq!(udm_rows(&dp, &marker).await, 0, "no routine audit row in logs");
 }
+
+/// NAN-5785 review (round 3): a batch of security-critical events is ONE
+/// bounded durable write. Healthy: every event recorded in PostgreSQL in one
+/// insert. Outbox stalled: the batch gives up on PostgreSQL after ONE
+/// `OUTBOX_WRITE_TIMEOUT` (not one per event) and lands the whole batch in
+/// ClickHouse with one insert, so it is still durable and still bounded.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL + ClickHouse; run with --ignored"]
+async fn a_durable_batch_is_one_bounded_write_even_with_a_stalled_outbox() {
+    let dp = healthy_pool().await;
+    clear_outbox(&dp).await;
+    let emitter = AuditEmitter::new(dp.clone());
+
+    let marker = format!("nan5785-batch-{}", Uuid::new_v4().simple());
+    let healthy: Vec<AuditEvent> = (0..50).map(|_| critical_event(APIKEY_CREATED, &marker)).collect();
+    let outcome = emitter.emit_durable_batch(&healthy).await.expect("healthy batch");
+    assert!(matches!(outcome, DurableOutcome::Deferred { .. }), "{outcome:?}");
+    for event in &healthy {
+        let _ = outbox_row(&dp, event.event_id).await; // panics if missing
+    }
+
+    let stalled_marker = format!("nan5785-stall-{}", Uuid::new_v4().simple());
+    let stalled: Vec<AuditEvent> = (0..50).map(|_| critical_event(APIKEY_CREATED, &stalled_marker)).collect();
+    let mut stall = dp.postgres().begin().await.unwrap();
+    sqlx::query("LOCK TABLE security_audit_events IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *stall)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let outcome = emitter.emit_durable_batch(&stalled).await.expect("ClickHouse takes the batch");
+    let waited = started.elapsed();
+    stall.rollback().await.unwrap();
+
+    assert!(matches!(outcome, DurableOutcome::DeliveredWithoutRecord { .. }), "{outcome:?}");
+    assert!(waited < std::time::Duration::from_secs(20), "one outbox timeout, not 50: {waited:?}");
+    assert_eq!(ocsf_rows(&dp, &stalled_marker).await, 50, "the whole batch is in ClickHouse");
+}

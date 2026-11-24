@@ -12,7 +12,7 @@ use clickhouse::Client as ClickHouseClient;
 use std::collections::{BTreeSet, HashMap};
 use tracing::warn;
 
-use crate::search::service::source_scope_sql_predicate;
+use crate::search::service::{bind_source_scope, source_scope_bound_predicate};
 
 use super::types::{BucketSize, DailyIngestTotal, HourlyPoint, SourceTypeStats};
 use crate::db::TableNames;
@@ -72,7 +72,7 @@ impl LogTelemetryRepository {
             // Empty input or every entry rejected — nothing to ask about.
             return Ok(HashMap::new());
         };
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, deny_set).await?;
         Ok(parse_stats_rows(&rows))
     }
 
@@ -90,7 +90,7 @@ impl LogTelemetryRepository {
             crate::schema::active_log_telemetry_profile(),
             window_hours,
         );
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, &BTreeSet::new()).await?;
         Ok(parse_stats_rows(&rows))
     }
 
@@ -114,7 +114,7 @@ impl LogTelemetryRepository {
         else {
             return Ok(Vec::new());
         };
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, deny_set).await?;
         Ok(parse_bucket_rows(&rows))
     }
 
@@ -147,7 +147,7 @@ impl LogTelemetryRepository {
                 deny_set,
             )
         };
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, deny_set).await?;
         Ok(parse_bucket_all_rows(&rows))
     }
 
@@ -174,7 +174,7 @@ impl LogTelemetryRepository {
                 deny_set,
             )
         };
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, deny_set).await?;
         Ok(parse_total_events(&rows))
     }
 
@@ -205,7 +205,7 @@ impl LogTelemetryRepository {
                 deny_set,
             )
         };
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, deny_set).await?;
         Ok(parse_total_events(&rows))
     }
 
@@ -255,7 +255,7 @@ impl LogTelemetryRepository {
                 limit,
             )
         };
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, deny_set).await?;
         Ok(parse_source_volume_rows(&rows))
     }
 }
@@ -275,7 +275,7 @@ impl LogTelemetryRepository {
             from,
             to,
         );
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, &BTreeSet::new()).await?;
         Ok(parse_daily_totals(&rows))
     }
 
@@ -287,7 +287,7 @@ impl LogTelemetryRepository {
             &self.table_names.read(INGEST_VOLUME_TABLE),
             crate::schema::active_log_telemetry_profile(),
         );
-        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        let rows = run_jsoneachrow(&self.client, &sql, &BTreeSet::new()).await?;
         Ok(parse_ingest_meter_start(&rows))
     }
 }
@@ -336,7 +336,7 @@ pub fn sanitize_source_types(source_types: &[String]) -> Vec<String> {
 ///
 /// NAN-1801: per-source builder — `deny_set` appends the shared
 /// `lower(source_type) NOT IN (...)` scope predicate (see
-/// [`source_scope_sql_predicate`]). Empty deny set = byte-identical SQL.
+/// [`source_scope_bound_predicate`]). Empty deny set = byte-identical SQL.
 pub fn build_stats_sql(
     table: &str,
     profile: &str,
@@ -501,7 +501,7 @@ fn rollup_scope_and(deny_set: &BTreeSet<String>) -> String {
     if deny_set.is_empty() {
         return String::new();
     }
-    let predicate = source_scope_sql_predicate("scope_source_type", deny_set)
+    let predicate = source_scope_bound_predicate("scope_source_type", deny_set)
         .expect("a non-empty deny set always renders a predicate");
     format!(" AND scope_source_type_complete = 1 AND {predicate}")
 }
@@ -616,7 +616,7 @@ pub fn build_total_events_raw_sql(
     window_hours: i64,
     deny_set: &BTreeSet<String>,
 ) -> String {
-    let scope_and = source_scope_sql_predicate("source_type", deny_set)
+    let scope_and = source_scope_bound_predicate("source_type", deny_set)
         .map(|pred| format!(" AND {pred}"))
         .unwrap_or_default();
     format!(
@@ -636,7 +636,7 @@ pub fn build_total_events_range_raw_sql(
     end: chrono::DateTime<chrono::Utc>,
     deny_set: &BTreeSet<String>,
 ) -> String {
-    let scope_and = source_scope_sql_predicate("source_type", deny_set)
+    let scope_and = source_scope_bound_predicate("source_type", deny_set)
         .map(|pred| format!(" AND {pred}"))
         .unwrap_or_default();
     format!(
@@ -694,7 +694,7 @@ pub fn build_source_volumes_range_raw_sql(
     deny_set: &BTreeSet<String>,
     limit: usize,
 ) -> String {
-    let scope_and = source_scope_sql_predicate("source_type", deny_set)
+    let scope_and = source_scope_bound_predicate("source_type", deny_set)
         .map(|pred| format!(" AND {pred}"))
         .unwrap_or_default();
     format!(
@@ -735,7 +735,7 @@ pub fn build_buckets_all_raw_sql(
         BucketSize::FiveMin => "toStartOfFiveMinute(timestamp)",
         BucketSize::Hour => "toStartOfHour(timestamp)",
     };
-    let scope_and = source_scope_sql_predicate("source_type", deny_set)
+    let scope_and = source_scope_bound_predicate("source_type", deny_set)
         .map(|pred| format!(" AND {pred}"))
         .unwrap_or_default();
     format!(
@@ -753,9 +753,14 @@ pub fn build_buckets_all_raw_sql(
 // JSONEachRow execution + parsing.
 // ============================================================================
 
-async fn run_jsoneachrow(client: &ClickHouseClient, sql: &str) -> Result<String, RepoError> {
-    let mut cursor = client
-        .query(sql)
+/// `deny_set` binds the source-scope parameter the scoped builders'
+/// predicates reference (NAN-5793); empty binds nothing.
+async fn run_jsoneachrow(
+    client: &ClickHouseClient,
+    sql: &str,
+    deny_set: &BTreeSet<String>,
+) -> Result<String, RepoError> {
+    let mut cursor = bind_source_scope(client.query(sql), deny_set)
         .fetch_bytes("JSONEachRow")
         .map_err(|e| RepoError::ClickHouse(e.to_string()))?;
     let mut buf = Vec::new();
@@ -1052,8 +1057,8 @@ mod tests {
         let sql = build_stats_sql("nanosiem.logs_per_source_5m", "udm", &safe, 24, &deny).unwrap();
         // BTreeSet order is lexicographic; predicate lowercases values.
         assert!(
-            sql.contains("AND lower(scope_source_type) NOT IN ('limacharlie_edr', 'audit')")
-                || sql.contains("AND lower(scope_source_type) NOT IN ('audit', 'limacharlie_edr')"),
+            sql.contains("AND lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}")
+                || sql.contains("AND lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "expected scope predicate, got: {sql}"
         );
         let pred_pos = sql.find("NOT IN").unwrap();
@@ -1070,7 +1075,7 @@ mod tests {
         let deny: BTreeSet<String> = ["audit".to_string()].into_iter().collect();
         let sql = build_stats_sql("nanosiem.logs_per_source_5m", "udm", &safe, 24, &deny).unwrap();
         assert!(
-            sql.contains("AND lower(scope_source_type) != 'audit'"),
+            sql.contains("AND lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "expected single-value inequality form, got: {sql}"
         );
     }
@@ -1089,7 +1094,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            sql.contains("AND lower(scope_source_type) != 'audit'"),
+            sql.contains("AND lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "expected scope predicate, got: {sql}"
         );
         let empty = build_buckets_sql(
@@ -1148,13 +1153,16 @@ mod tests {
             &one,
         );
         assert!(
-            a.contains("lower(scope_source_type) != 'audit'"),
+            a.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "got: {a}"
         );
 
         let b = build_total_events_sql("nanosiem.logs_per_source_5m", "udm", 24, &many);
-        assert!(b.contains("lower(scope_source_type) NOT IN ("), "got: {b}");
-        assert!(b.contains("'windows_sysmon'"), "got: {b}");
+        assert!(
+            b.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
+            "got: {b}"
+        );
+        assert!(!b.contains("windows_sysmon"), "got: {b}");
 
         // The explicit-range form used for the previous-period comparison is
         // scoped on the same terms — otherwise the "previous" tile becomes the
@@ -1168,7 +1176,7 @@ mod tests {
         let c =
             build_total_events_range_sql("nanosiem.logs_per_source_5m", "udm", start, end, &one);
         assert!(
-            c.contains("lower(scope_source_type) != 'audit'"),
+            c.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "got: {c}"
         );
         assert!(
@@ -1220,7 +1228,7 @@ mod tests {
             "legacy/incomplete rows must fail closed: {sql}"
         );
         assert!(
-            sql.contains("lower(scope_source_type) != 'unknown'"),
+            sql.contains("lower(scope_source_type) NOT IN {nano_source_deny:Array(String)}"),
             "authorization must use the preserved raw key: {sql}"
         );
         assert!(
@@ -1239,7 +1247,7 @@ mod tests {
 
         let buckets = build_buckets_all_raw_sql("nanosiem.ocsf_logs", 24, BucketSize::Hour, &deny);
         assert!(
-            buckets.contains("lower(source_type) != 'unknown'"),
+            buckets.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
             "got: {buckets}"
         );
         assert!(
@@ -1259,7 +1267,7 @@ mod tests {
         // one that briefly shipped scoped-but-not-diverted.
         let window = build_total_events_raw_sql("nanosiem.ocsf_logs", 24, &deny);
         assert!(
-            window.contains("lower(source_type) != 'unknown'"),
+            window.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
             "got: {window}"
         );
         assert!(window.contains("count() AS events"), "got: {window}");
@@ -1271,7 +1279,7 @@ mod tests {
 
         let total = build_total_events_range_raw_sql("nanosiem.ocsf_logs", start, end, &deny);
         assert!(
-            total.contains("lower(source_type) != 'unknown'"),
+            total.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
             "got: {total}"
         );
         assert!(total.contains("count() AS events"), "got: {total}");

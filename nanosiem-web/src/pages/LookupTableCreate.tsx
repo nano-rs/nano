@@ -9,6 +9,7 @@
 // mode pre-filled with the existing table's name. Replace-data flows from
 // the detail page hit this same surface.
 
+import { Term } from '@/components/ui/term';
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
@@ -20,7 +21,6 @@ import {
   Download,
   Pencil,
   Plus,
-  RotateCw,
   X,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
@@ -253,21 +253,21 @@ const MODE_CARDS = [
   {
     id: 'upload' as Mode,
     title: 'Upload a file',
-    blurb: "Drop in a CSV, TSV, or JSON. We'll parse headers, infer column types, and let you review before saving.",
+    blurb: 'Types are inferred; review before saving.',
     Icon: Download,
     meta: 'CSV · TSV · JSON · up to 100 MB',
   },
   {
     id: 'define' as Mode,
     title: 'Define a schema',
-    blurb: 'Start from an empty spreadsheet. Add columns, pick types, enter rows inline. Tab and arrows work.',
+    blurb: 'Start empty and enter rows inline.',
     Icon: Pencil,
     meta: 'blank table · best for small lists',
   },
   {
     id: 'url' as Mode,
     title: 'Import from URL',
-    blurb: "Fetch from an HTTP endpoint. We'll pull a sample now and refresh on a schedule you configure later.",
+    blurb: 'Pull from an HTTP endpoint on a schedule.',
     Icon: ArrowUpRight,
     meta: 'remote CSV / JSON · scheduled refresh',
   },
@@ -284,15 +284,10 @@ function ModePicker({
     <div className="flex-1 min-h-0 overflow-y-auto bg-background">
       <div className="max-w-[960px] mx-auto px-8 pt-8 pb-10">
         <div className="flex items-baseline gap-3">
-          <h1 className="text-[22px] font-semibold tracking-[-0.015em] text-foreground">Create a lookup table</h1>
+          <h1 className="text-[22px] font-semibold tracking-[-0.015em] text-foreground">Create a <Term id="lookup-table">lookup table</Term></h1>
           <span className="text-[11.5px] font-mono text-muted-foreground">step 1 · pick a source</span>
         </div>
-        <p className="text-[12.5px] text-muted-foreground mt-1 max-w-[520px]">
-          Lookup tables enrich rule matches with extra context — threat intel, allowlists, CIDR mappings.
-          Pick how you want to load rows.
-        </p>
-
-        <div className="grid grid-cols-1 @min-[760px]:grid-cols-3 gap-3 mt-6">
+        <div className="grid grid-cols-1 @min-[760px]:grid-cols-3 gap-3 mt-5">
           {MODE_CARDS.map((m) => {
             const Icon = m.Icon;
             return (
@@ -324,7 +319,7 @@ function ModePicker({
           })}
         </div>
 
-        <div className="mt-6 pt-4 border-t border-border flex items-center justify-between">
+        <div className="mt-6 pt-4 border-t border-border flex items-center">
           <button
             type="button"
             onClick={onCancel}
@@ -333,7 +328,6 @@ function ModePicker({
             <ArrowLeft className="w-3 h-3" strokeWidth={2} />
             back to library
           </button>
-          <div className="text-[11px] font-mono text-muted-foreground/70">tip: most teams start with define for small lists</div>
         </div>
       </div>
     </div>
@@ -555,9 +549,6 @@ function UploadMode({ onBack, onCancel, onSaved, initialName, isUpdate }: Upload
           <h1 className="text-[22px] font-semibold tracking-[-0.015em] text-foreground">
             {isUpdate ? `Replace data in ${initialName}` : 'Upload a file'}
           </h1>
-          <p className="text-[12.5px] text-muted-foreground mt-1">
-            Headers will be parsed, column types inferred. You'll review before saving.
-          </p>
 
           <input
             ref={fileInputRef}
@@ -574,7 +565,7 @@ function UploadMode({ onBack, onCancel, onSaved, initialName, isUpdate }: Upload
             onClick={() => fileInputRef.current?.click()}
             onDragOver={(e) => e.preventDefault()}
             onDrop={onDrop}
-            className="mt-6 w-full rounded-lg border-2 border-dashed border-border hover:border-primary/40 hover:bg-primary/[0.02] transition-colors py-16 flex flex-col items-center gap-3"
+            className="mt-4 w-full rounded-lg border-2 border-dashed border-border hover:border-primary/40 hover:bg-primary/[0.02] transition-colors py-16 flex flex-col items-center gap-3"
           >
             <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center">
               <Download className="w-5 h-5 text-primary" strokeWidth={2} />
@@ -664,7 +655,7 @@ function UploadMode({ onBack, onCancel, onSaved, initialName, isUpdate }: Upload
                 <p className="text-[11.5px] text-foreground">
                   A lookup table named{' '}
                   <span className="font-mono text-[var(--warning)]">{trimmedName}</span>{' '}
-                  already exists ({collidingTable!.row_count.toLocaleString()} rows). Append will silently merge new rows in.
+                  already exists ({collidingTable!.row_count.toLocaleString()} rows). Append merges new rows into it.
                 </p>
                 <div className="mt-2 flex items-center gap-1.5">
                   <button
@@ -695,15 +686,18 @@ function UploadMode({ onBack, onCancel, onSaved, initialName, isUpdate }: Upload
               Settings
             </div>
             <div className="grid grid-cols-1 @min-[640px]:grid-cols-2 gap-3">
-              <label className="flex flex-col gap-1.5">
-                <span className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70">primary key (optional)</span>
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70">
+                  <Term id="lookup-primary-key">primary key</Term> (optional)
+                </span>
                 <input
+                  aria-label="Primary key (optional)"
                   value={primaryKey}
                   onChange={(e) => setPrimaryKey(e.target.value)}
                   placeholder="e.g. ip, user, hash"
                   className="h-[30px] rounded-md border border-border bg-background px-2 text-[12px] text-foreground placeholder:text-muted-foreground/60 outline-none focus:border-primary/50 font-mono"
                 />
-              </label>
+              </div>
               <label className="flex flex-col gap-1.5">
                 <span className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70">mode</span>
                 <select
@@ -745,7 +739,7 @@ function UploadMode({ onBack, onCancel, onSaved, initialName, isUpdate }: Upload
           <div className="rounded-md border border-border bg-card p-4">
             <div className="flex items-baseline gap-2 mb-2">
               <div className="text-[9.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70 font-semibold">Column type overrides</div>
-              <span className="text-[10.5px] text-muted-foreground">Optional. Backend infers types from the file by default.</span>
+              <span className="text-[10.5px] text-muted-foreground">Optional; inferred by default.</span>
             </div>
             <ColumnOverrideEditor types={columnTypes} onChange={setColumnTypes} />
           </div>
@@ -1144,7 +1138,7 @@ function DefineMode({ onBack, onCancel, onSaved }: { onBack: () => void; onCance
             onChange={(e) => setPrimaryKey(e.target.value)}
             className="h-[22px] rounded border border-border bg-background px-1.5 text-[11px] text-foreground outline-none focus:border-primary/50"
           >
-            <option value="">— none —</option>
+            <option value="">none</option>
             {cols.map((c) => (
               <option key={c.name} value={c.name}>{c.name}</option>
             ))}
@@ -1398,7 +1392,7 @@ function UrlMode({ onBack, onCancel, onSaved }: { onBack: () => void; onCancel: 
               </div>
             </div>
             <div className="mt-2 text-[10.5px] font-mono text-muted-foreground/70">
-              <span className="text-muted-foreground">tip:</span> we'll GET this URL now and on the schedule below.
+              Fetched on save, then on the schedule below.
             </div>
           </div>
 
@@ -1449,16 +1443,6 @@ function UrlMode({ onBack, onCancel, onSaved }: { onBack: () => void; onCancel: 
                 <span className="text-[12px] text-foreground">Enable scheduled refresh</span>
               </label>
             </div>
-          </div>
-
-          {/* Help */}
-          <div className="rounded-md border border-dashed border-border bg-foreground/[0.02] p-4 text-[11.5px] text-muted-foreground">
-            <div className="flex items-center gap-1.5 font-mono text-[10.5px] uppercase tracking-[0.12em] text-muted-foreground/70 mb-1.5 font-semibold">
-              <RotateCw className="w-3 h-3" strokeWidth={2} />
-              How URL ingestion works
-            </div>
-            On save we'll create the table, attach the schedule, and trigger an initial fetch. Column
-            types are inferred from the first response. You can adjust them later from the table detail view.
           </div>
         </div>
       </div>

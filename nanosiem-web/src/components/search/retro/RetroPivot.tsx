@@ -147,8 +147,7 @@ export function RetroPivot({
       <div className="px-4 py-3 flex items-start gap-2 text-[11px] text-fg-3 leading-snug">
         <Info className="w-[13px] h-[13px] mt-px shrink-0" style={{ color: 'oklch(64% 0.19 25)' }} />
         <span>
-          Sorted oldest-first: rows with a red rail have been exposed <span className="text-fg-2 font-semibold">over 90 days</span> —
-          ongoing compromise, top of the response list.
+          Oldest first. Red rail: exposed <span className="text-fg-2 font-semibold">over 90 days</span>, likely ongoing compromise.
         </span>
       </div>
     </div>

@@ -7,6 +7,7 @@
 // detection, test-run sparkline, NEW vs AVAILABLE distinction) are stubbed or
 // hidden — see issue NAN-504 for the full carve-out.
 
+import { Term } from '@/components/ui/term';
 import { useEffect, useMemo, useState } from 'react';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { contentBranchFor } from '@/lib/schema-fields';
@@ -92,11 +93,10 @@ export function RuleRepositories() {
     <button
       type="button"
       onClick={() => setDacOpen(true)}
-      title="Detection-as-Code push targets — open PRs in your own repo"
       className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 flex items-center gap-1.5 shrink-0"
     >
       <GitPullRequest className="w-[12px] h-[12px]" strokeWidth={1.5} />
-      Push targets
+      <Term id="push-target" nested>Push targets</Term>
     </button>
   ) : null;
 
@@ -443,7 +443,7 @@ export function RuleRepositories() {
       toast({
         title: 'Cannot open rule',
         description:
-          'This rule is marked imported but has no linked detection rule. Try syncing again.',
+          'Marked imported but has no linked detection rule. Sync again.',
         variant: 'destructive',
       });
     }
@@ -542,12 +542,12 @@ export function RuleRepositories() {
         <div className="border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
           <div className="flex-1 min-w-0">
             <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">
-              Rule repositories
+              <Term id="rule-repository">Rule repositories</Term>
             </div>
             <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
               {airGap
-                ? 'Offline deployment. Upload a signed rule bundle to populate the catalog, then preview, remap sources, and import — bulk or one-by-one.'
-                : 'Track detections from Git. Sync upstream rules, preview diffs, remap sources, and import — bulk or one-by-one.'}
+                ? 'Offline deployment: import a signed rule bundle.'
+                : 'Sync and import detection rules from Git.'}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -569,9 +569,8 @@ export function RuleRepositories() {
             {airGap ? (
               <>
                 <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
-                  This deployment is air-gapped. Upload a signed rule bundle
-                  (<code className="font-mono text-foreground/80">.tar.gz</code>) to populate the
-                  catalog — rules then appear here available to import.
+                  Air-gapped: import a signed rule bundle
+                  (<code className="font-mono text-foreground/80">.tar.gz</code>).
                 </div>
                 <div className="flex items-center justify-center">
                   <ImportBundleButton
@@ -584,8 +583,8 @@ export function RuleRepositories() {
             ) : (
               <>
                 <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
-                  Detection content comes from nano&apos;s first-party catalog. Follow the official{' '}
-                  <code className="font-mono text-foreground/80">nano-rs/rules</code> catalog to sync it.
+                  Follow the official{' '}
+                  <code className="font-mono text-foreground/80">nano-rs/rules</code> catalog to sync rules.
                 </div>
                 {canManageRepos ? (
                 <div className="flex items-center justify-center gap-2">

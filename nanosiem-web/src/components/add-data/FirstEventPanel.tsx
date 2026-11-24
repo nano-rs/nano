@@ -31,6 +31,7 @@ import {
   type TroubleshootingHint,
 } from '@/lib/first-event';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 /** Stop polling a credential nobody has sent to after this long (resume with the button). */
 const MAX_WAIT_MS = 30 * 60 * 1000;
@@ -171,7 +172,7 @@ export function FirstEventPanel({
         <div className="flex flex-wrap gap-x-4 gap-y-1 px-3 pb-2 font-mono text-[10.5px] text-muted-foreground" data-testid="first-event-counts">
           <span>
             source <span className="text-foreground/80 tabular-nums">{facts.events24h.toLocaleString()}</span> events 24h
-            {facts.unparsed && <> · <span className="text-amber-500">not parsed</span></>}
+            {facts.unparsed && <> · <span className="text-amber-500"><Term id="raw-passthrough">not parsed</Term></span></>}
           </span>
         </div>
       )}

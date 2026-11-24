@@ -8,6 +8,7 @@ import {
   Filter as FilterIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 // ─────────────────────────── types ───────────────────────────
 
@@ -483,15 +484,11 @@ function FunnelEmpty({ conditions, byKey }: { conditions: string[]; byKey: strin
       <div className="text-[13px] text-foreground/80 mb-2">
         No <span className="text-foreground font-medium">{byKey}</span> matched stage 1
       </div>
-      <div className="text-[11px] text-muted-foreground max-w-[480px] text-center leading-relaxed">
-        Funnel needs at least one {byKey} matching the first condition before it can measure drop-off.
-        {conditions[0] && (
-          <>
-            {' '}Try broadening{' '}
-            <span className="font-mono text-foreground/80">{conditions[0].slice(0, 60)}</span>.
-          </>
-        )}
-      </div>
+      {conditions[0] && (
+        <div className="text-[11px] text-muted-foreground max-w-[480px] text-center leading-relaxed">
+          Try broadening <span className="font-mono text-foreground/80">{conditions[0].slice(0, 60)}</span>.
+        </div>
+      )}
     </div>
   );
 }
@@ -527,7 +524,7 @@ export function FunnelView({
       <div className="py-2 px-3 border-b border-border flex flex-wrap items-center gap-2 font-mono text-[10.5px] tracking-[0.12em] uppercase text-foreground/70 font-semibold whitespace-nowrap">
         <span className="flex items-center gap-1.5 shrink-0">
           <FilterIcon className="w-[12px] h-[12px] text-primary" />
-          <span>Funnel</span>
+          <Term id="funnel">Funnel</Term>
           <span className="text-muted-foreground/60">·</span>
           <span className="normal-case tracking-normal text-foreground">
             by {parsed.byFields.join(', ') || '(fields)'}

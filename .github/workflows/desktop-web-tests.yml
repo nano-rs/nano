@@ -21,15 +21,37 @@ name: desktop + web tests
 
 on:
   pull_request:
+    # NAN-5791: on a PR, runs only while it carries the optional `ready-to-merge`
+    # opt-in label (jobs' `if:`); the heavy run is the push-to-main one below.
+    # docs-internal/ci-runner-pools.md#ready-to-merge-label-nan-5791
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "nano-desktop/**"
+      - "nanosiem-web/**"
+      - ".github/workflows/desktop-web-tests.yml"
+  # Heavy suite on main after merges; same paths as the PR trigger.
+  # docs-internal/ci-runner-pools.md#heavy-gates-on-main
+  push:
+    branches: [main]
     paths:
       - "nano-desktop/**"
       - "nanosiem-web/**"
       - ".github/workflows/desktop-web-tests.yml"
   workflow_dispatch:
 
+# Read-only token on every trigger: no run of this gate (PR, push to main,
+# schedule, dispatch) can push, publish, sign or release.
+permissions:
+  contents: read
+
+# NAN-5791: a labeled/unlabeled event for any other label gets its own group
+# (its jobs skip), so it never cancels a real run. A push to main joins the
+# `heavy-` group without cancel-in-progress: one run going plus at most one
+# pending, the pending one replaced by the newest merge, so a burst of merges
+# coalesces into two runs (docs-internal/ci-runner-pools.md#heavy-gates-on-main).
 concurrency:
-  group: desktop-web-tests-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && 'heavy-' || '' }}desktop-web-tests-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -39,9 +61,11 @@ jobs:
   # tests that a TypeScript change cannot possibly affect. Same `dorny` idiom as
   # build-and-push.yml's `changes` job.
   #
-  # `workflow_dispatch` has no base ref to diff against, so the filter outputs
-  # are empty there; every `if:` below carries an explicit dispatch escape so a
-  # manual run still executes everything.
+  # Only a pull_request is filtered. `workflow_dispatch` has no base ref to diff
+  # against, and a push to main is coalesced (heavy- concurrency group): the run
+  # that survives a burst of merges would diff only its own push and miss what
+  # the replaced pending runs changed. So the filter step skips off-PR and every
+  # `if:` below carries a non-PR escape: dispatch and push run everything.
   #
   # Every gate below FAILS OPEN (`needs.changes.result != 'success'`). If this
   # job breaks, the dependents run instead of silently skipping — a broken gate
@@ -49,7 +73,8 @@ jobs:
   # this workflow exists to end. Wasting a run costs minutes; not running the
   # tests costs a shipped bug.
   changes:
-    runs-on: [self-hosted, Linux, X64, nano-pr]
+    if: ${{ github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge')) }}
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
     permissions:
       contents: read
       # Required, and NOT optional the way it is in build-and-push.yml's copy of
@@ -71,6 +96,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Detect changes
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -84,9 +110,9 @@ jobs:
 
   web:
     needs: [changes]
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge'))) && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     # Self-hosted only (repo rule — never ubuntu-latest).
-    runs-on: [self-hosted, Linux, X64, nano-pr]
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
     # Raised from 15 for the open-edition build step added at the end (NAN-2356).
     timeout-minutes: 25
     steps:
@@ -171,8 +197,8 @@ jobs:
     # `nanosiem-web/src` (vite aliases at runtime, direct resolution during
     # `tsc`), so a web-only change can break this typecheck. Cheap to run — it
     # is on the self-hosted X64 box — so err toward running it.
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.web == 'true') }}
-    runs-on: [self-hosted, Linux, X64, nano-pr]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge'))) && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.web == 'true') }}
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -229,7 +255,7 @@ jobs:
     needs: [changes]
     # NAN-5050: only once the macOS PR-pool runner (mac-studio-pr) exists;
     # never on the release-pool Mac. `changes` posts a notice meanwhile.
-    if: ${{ !cancelled() && vars.NANO_PR_MACOS_POOL == 'true' && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true') }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge'))) && vars.NANO_PR_MACOS_POOL == 'true' && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true') }}
     runs-on: [self-hosted, macOS, ARM64, nano-pr]
     timeout-minutes: 30
     steps:

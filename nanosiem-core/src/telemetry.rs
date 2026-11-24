@@ -16,6 +16,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Drop this to close the root span (typically held in main).
 pub struct TracingGuard {
     _root_span_guard: tracing::span::EnteredSpan,
+    // NAN-5798: declared after the span guard so it drops (and flushes)
+    // after the root span closes. `None` unless a Sentry DSN is set.
+    _error_tracking: Option<crate::error_tracking::ErrorTracking>,
 }
 
 /// Initialize the tracing subscriber for a nano service.
@@ -28,6 +31,8 @@ pub struct TracingGuard {
 /// - `NANO_DEPLOYMENT_ID`: deployment identifier for centralized log collection
 /// - `SIEM_FORWARD_URL`: HTTP endpoint to forward logs to (disabled if unset)
 /// - `SIEM_FORWARD_TOKEN`: Bearer token for the forwarding endpoint
+/// - `NANO_SENTRY_DSN` / `SENTRY_DSN`: opt-in error tracking for local and e2e
+///   stacks (see [`crate::error_tracking`]); nothing is initialized when unset
 ///
 /// Returns a guard that must be held for the process lifetime to keep the root span active.
 pub fn init_tracing(service_name: &str) -> TracingGuard {
@@ -41,6 +46,9 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
 
     let forwarding_layer = SiemForwardingLayer::from_env(service_name);
 
+    // NAN-5798: after the panic hook above, so Sentry's panic hook chains it.
+    let error_tracking = crate::error_tracking::init_from_env(service_name);
+
     if log_format.eq_ignore_ascii_case("json") {
         tracing_subscriber::registry()
             .with(
@@ -50,6 +58,7 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
                     .with_current_span(true),
             )
             .with(forwarding_layer)
+            .with(sentry_layer(&error_tracking))
             .with(env_filter)
             .init();
     } else {
@@ -58,6 +67,7 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
         tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_writer(OneLineStdout))
             .with(forwarding_layer)
+            .with(sentry_layer(&error_tracking))
             .with(env_filter)
             .init();
     }
@@ -68,6 +78,7 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
 
     // Create a root span that all subsequent logs inherit
     let root_span = tracing::info_span!(
+        // NAN-5798: error_tracking::ROOT_SPAN_NAME (never sent as a trace).
         "service",
         service.name = service_name,
         deployment_id = %deployment_id,
@@ -80,8 +91,28 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
     // per-request future: there, use `.instrument(span)`.
     let guard = root_span.entered();
 
+    if let Some(tracking) = &error_tracking {
+        tracing::info!("error tracking enabled (Sentry)");
+        tracking.emit_boot_test_error(service_name);
+    }
+
     TracingGuard {
         _root_span_guard: guard,
+        _error_tracking: error_tracking,
+    }
+}
+
+/// NAN-5798: the Sentry tracing layer, or a no-op `Identity` layer when error
+/// tracking is off. Not `Option`: a `None` layer reports a max level of OFF.
+pub(crate) fn sentry_layer<S>(
+    tracking: &Option<crate::error_tracking::ErrorTracking>,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+{
+    match tracking {
+        Some(t) => t.tracing_layer(),
+        None => Box::new(tracing_subscriber::layer::Identity::new()),
     }
 }
 

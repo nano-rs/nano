@@ -76,7 +76,8 @@ pub enum DetectionMode {
     /// Best for: Simple IOC matching (IP/hash blacklists), atomic detections
     /// Limitations: No aggregations, no joins, must specify risk_entity_field
     RealTime,
-    /// Scheduled detection via cron (default: every minute for continuous, custom for scheduled)
+    /// Scheduled detection via cron. A scheduled rule saved without a
+    /// `schedule_cron` gets the default `*/5 * * * *` (every 5 minutes).
     /// Best for: All detection types - complex queries, aggregations, correlations
     /// The scheduler checks every 15 seconds and fires rules based on their cron schedule
     /// Use */1 * * * * for continuous (1-minute) detection
@@ -313,6 +314,9 @@ pub struct NewDetectionRule {
     pub severity: Severity,
     pub mitre_tactics: Option<Vec<String>>,
     pub mitre_techniques: Option<Vec<String>>,
+    /// Cron schedule (5- or 6-field). A scheduled rule created without one
+    /// (omitted or blank) gets the default `*/5 * * * *` (every 5 minutes).
+    /// Ignored by real-time rules.
     pub schedule_cron: Option<String>,
     /// Rule mode - defaults to Staging for new rules being developed
     pub mode: Option<RuleMode>,
@@ -388,6 +392,10 @@ pub struct UpdateDetectionRule {
     pub severity: Option<Severity>,
     pub mitre_tactics: Option<Vec<String>>,
     pub mitre_techniques: Option<Vec<String>>,
+    /// Cron schedule (5- or 6-field). Omitted or blank keeps the stored
+    /// schedule. A scheduled rule that has none gets the default
+    /// `*/5 * * * *`; on a Live or Alerting rule that starts it running, so
+    /// it needs `detections:promote` like any schedule change.
     pub schedule_cron: Option<String>,
     /// Rule mode - set to Alerting when bake-in is complete
     pub mode: Option<RuleMode>,

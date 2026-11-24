@@ -211,7 +211,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
                     <AlertCircle className="w-[12px] h-[12px] text-yellow-500 shrink-0 mt-0.5" />
                     <div className="flex-1 min-w-0">
                       <div className="text-[11.5px] text-foreground/80">
-                        Copy this password now — it won't be shown again. Share it via your usual secure channel. Saving ends all of this user's sessions.
+                        Copy this password now; it won't be shown again. Share it over a secure channel. Saving ends all of this user's sessions.
                       </div>
                       <div className="mt-2 rounded-md border border-border bg-card p-2 flex items-center gap-2 font-mono text-[11.5px] text-foreground break-all">
                         <span className="flex-1">{password}</span>
@@ -272,7 +272,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
               <div className="max-h-[280px] overflow-y-auto scrollbar-thin">
                 {sortedGroups.length === 0 ? (
                   <div className="px-3 py-4 text-center text-[11px] text-muted-foreground">
-                    No groups yet — create one in the Groups tab.
+                    No groups yet. Create one in the Groups tab.
                   </div>
                 ) : (
                   sortedGroups.map(g => {
@@ -319,7 +319,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
 
         <SheetFooter className="border-t border-border px-5 py-3 flex flex-row items-center gap-2 sm:justify-end space-x-0">
           <div className="text-[10.5px] text-muted-foreground mr-auto">
-            {ssoLocked ? 'SSO-managed user — only memberships are editable.' : 'Changes apply immediately on save.'}
+            {ssoLocked ? 'SSO manages this user, so you can only change their groups.' : 'Changes apply immediately on save.'}
           </div>
           <Button variant="ghost" size="sm" onClick={onClose} className="h-7 text-[11.5px]" disabled={saving}>
             Cancel

@@ -23,7 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from nano_e2e import feeds_live, ingest, schema
+from nano_e2e import feeds, feeds_live, ingest, schema
+from nano_e2e.cleanup import after_body
 from nano_e2e.client import Nano
 from nano_e2e.feeds_live import OKTA_PARSER, row_get
 from nano_e2e.stack import Stack
@@ -60,38 +61,47 @@ def _okta_deactivate(event_uuid: str, login: str) -> dict:
 def test_connector_hec_event_lands_on_its_lane(stack: Stack, nano: Nano, mark: str, timeline) -> None:
     if not schema.is_ocsf():
         pytest.skip("the lane is an OCSF field: this stack is udm, not the ocsf default")
+    # ensure_vendor_parser first releases any harness lane parser another
+    # scenario left on `okta` (deploy refuses two sources claiming it).
     source_id = feeds_live.ensure_vendor_parser(nano, OKTA_PARSER)
-    timeline.step("okta_ocsf published", source=source_id, lanes=OKTA_PARSER.lanes)
-    timeline.step("vector reloads settled", waited=round(vector_reloads_quiet(stack.project)))
-    token = _platform_token(stack.run_dir)
-    login = f"{mark[-8:]}.target@example.com"
-    sent: list[str] = []
+    passed = False
+    try:
+        timeline.step("okta_ocsf published", source=source_id, lanes=OKTA_PARSER.lanes)
+        timeline.step("vector reloads settled", waited=round(vector_reloads_quiet(stack.project)))
+        token = _platform_token(stack.run_dir)
+        login = f"{mark[-8:]}.target@example.com"
+        sent: list[str] = []
 
-    def probe() -> list:
-        # A fresh event per poll: one sent during a reload may strand.
-        event_uuid = str(uuid.uuid4())
-        sent.append(event_uuid)
-        r = ingest.hec(stack.hec_url, token, _okta_deactivate(event_uuid, login), sourcetype="okta")
-        assert r.status_code == 200, r.text
-        uids = " OR ".join(f'metadata.uid="{u}"' for u in sent)
-        return nano.rows(f'metadata.log_source="okta" ({uids})', limit=50, minutes_back=30)
+        def probe() -> list:
+            # A fresh event per poll: one sent during a reload may strand.
+            event_uuid = str(uuid.uuid4())
+            sent.append(event_uuid)
+            r = ingest.hec(stack.hec_url, token, _okta_deactivate(event_uuid, login), sourcetype="okta")
+            assert r.status_code == 200, r.text
+            uids = " OR ".join(f'metadata.uid="{u}"' for u in sent)
+            return nano.rows(f'metadata.log_source="okta" ({uids})', limit=50, minutes_back=30)
 
-    rows = eventually(
-        probe, timeout=INGEST_VISIBLE + 120, interval=5, desc="okta event searchable on metadata.log_source=okta"
-    )
-    row = rows[0]
-    uid = str(row_get(row, "metadata.uid"))
-    sample = {k: row_get(row, k) for k in ("class_uid", "metadata.log_source", "source_type", "user.name")}
-    timeline.step("landed", uid=uid, sample=json.loads(json.dumps(sample, default=str)))
-    assert uid in sent
-    assert int(row_get(row, "class_uid")) == 3007, sample
-    assert str(row_get(row, "user.name")).lower() == login, sample
-    assert row_get(row, "metadata.log_source") == "okta", sample
+        rows = eventually(
+            probe, timeout=INGEST_VISIBLE + 120, interval=5, desc="okta event searchable on metadata.log_source=okta"
+        )
+        row = rows[0]
+        uid = str(row_get(row, "metadata.uid"))
+        sample = {k: row_get(row, k) for k in ("class_uid", "metadata.log_source", "source_type", "user.name")}
+        timeline.step("landed", uid=uid, sample=json.loads(json.dumps(sample, default=str)))
+        assert uid in sent
+        assert int(row_get(row, "class_uid")) == 3007, sample
+        assert str(row_get(row, "user.name")).lower() == login, sample
+        assert row_get(row, "metadata.log_source") == "okta", sample
 
-    # On OCSF `source_type` and `metadata.log_source` both resolve to the
-    # row's routing column: the UDM-era name finds the same event.
-    by_source_type = nano.rows(f'source_type="okta" metadata.uid="{uid}"', limit=5, minutes_back=30)
-    unknown = nano.rows(f'metadata.log_source="unknown" metadata.uid="{uid}"', limit=5, minutes_back=30)
-    timeline.step("aliases", source_type_hits=len(by_source_type), unknown_hits=len(unknown))
-    assert len(by_source_type) == 1, by_source_type
-    assert not unknown, unknown
+        # On OCSF `source_type` and `metadata.log_source` both resolve to the
+        # row's routing column: the UDM-era name finds the same event.
+        by_source_type = nano.rows(f'source_type="okta" metadata.uid="{uid}"', limit=5, minutes_back=30)
+        unknown = nano.rows(f'metadata.log_source="unknown" metadata.uid="{uid}"', limit=5, minutes_back=30)
+        timeline.step("aliases", source_type_hits=len(by_source_type), unknown_hits=len(unknown))
+        assert len(by_source_type) == 1, by_source_type
+        assert not unknown, unknown
+        passed = True
+    finally:
+        # Give the lane back: a later scenario's harness lane parser for
+        # `okta` would otherwise collide with this vendor parser.
+        after_body("okta_ocsf source", lambda: feeds.delete_log_source(nano, source_id), body_passed=passed)

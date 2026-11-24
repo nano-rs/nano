@@ -129,7 +129,7 @@ fn build_source_types_sql(
     scope: &nanosiem_core::auth::ScopeSet,
 ) -> String {
     let scope_predicate =
-        nanosiem_core::search::service::source_scope_sql_predicate("source_type", scope.deny_set())
+        nanosiem_core::search::service::source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|p| format!("\n              AND {p}"))
             .unwrap_or_default();
     format!(
@@ -205,11 +205,15 @@ pub async fn get_source_types(
 
         // Both profiles expose `source_type` and a `timestamp` column, so only
         // the FROM target varies between schemas here.
-        let sql = build_source_types_sql(&table, &time_range, &auth.effective_viewer_scope());
+        let scope = auth.effective_viewer_scope();
+        let sql = build_source_types_sql(&table, &time_range, &scope);
 
-        // Use JSONEachRow format for dynamic results
-        let mut cursor = ch_client
-            .query(&sql)
+        // Use JSONEachRow format for dynamic results. NAN-5793: the scope
+        // predicate references the bound deny parameter.
+        let mut cursor = nanosiem_core::search::service::bind_source_scope(
+            ch_client.query(&sql),
+            scope.deny_set(),
+        )
             .fetch_bytes("JSONEachRow")
             .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
@@ -817,12 +821,12 @@ mod tests {
             &test_range(),
             &deny(&["audit", "windows_sysmon"]),
         );
-        assert!(sql.contains("lower(source_type) NOT IN ("), "got: {sql}");
-        assert!(sql.contains("'audit'") && sql.contains("'windows_sysmon'"), "got: {sql}");
-
-        // A single denied source uses the inequality form.
-        let one = build_source_types_sql("nanosiem.logs", &test_range(), &deny(&["audit"]));
-        assert!(one.contains("lower(source_type) != 'audit'"), "got: {one}");
+        // NAN-5793: the deny list is a bound parameter, never SQL text.
+        assert!(
+            sql.contains("lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
+            "got: {sql}"
+        );
+        assert!(!sql.contains("'audit'") && !sql.contains("windows_sysmon"), "got: {sql}");
     }
 
     #[test]

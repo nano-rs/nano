@@ -15,7 +15,9 @@ pub struct PrevalenceData {
     pub artifact: String,
     /// Type of artifact
     pub artifact_type: ArtifactType,
-    /// Number of unique hosts that have seen this artifact. `null` when the
+    /// Number of unique hosts that have seen this artifact over the 30-day
+    /// prevalence baseline (the requested window only requires the artifact
+    /// to have been seen inside it; NAN-5722). `null` when the
     /// artifact was not found and prevalence does not cover the requested
     /// window yet (warming / partial; see `product_state`): unknown, never
     /// "zero hosts". `0` only when the window is covered and the artifact was

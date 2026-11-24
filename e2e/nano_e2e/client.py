@@ -11,11 +11,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,12 @@ class Journal:
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
 
+    def remember(self, *values: str) -> None:
+        """Also scrub secrets minted after the journal opened (a session's
+        tokens, an issued ingest token): the env snapshot cannot hold them."""
+        new = {v for v in values if isinstance(v, str) and len(v) >= 8} - set(self._secrets)
+        self._secrets = sorted([*self._secrets, *new], key=len, reverse=True)
+
     def write(self, record: dict[str, Any]) -> None:
         if not self.path:
             return
@@ -73,6 +81,37 @@ class Journal:
             f.write(line + "\n")
 
 
+# A token within this many seconds of `exp` counts as expired (clock skew).
+JWT_EXPIRY_SKEW_SECS = 30
+
+
+def jwt_claims(token: str) -> dict[str, Any] | None:
+    """The payload of a JWT, decoded locally with NO signature check (it only
+    reads our own cached token's lifetime); None if it is not a JWT."""
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except (ValueError, TypeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def bearer_jwt_expired(authorization: str | None, *, now: float | None = None,
+                       skew: float = JWT_EXPIRY_SKEW_SECS) -> bool:
+    """Whether `Authorization: Bearer <jwt>` carries a JWT at or near its `exp`.
+
+    Anything that is not a decodable JWT with a numeric `exp` is NOT expired,
+    so its 401 surfaces unchanged (NAN-5827)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return False
+    exp = (jwt_claims(authorization[len("Bearer "):]) or {}).get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return False
+    return (time.time() if now is None else now) >= exp - skew
+
+
 class Http:
     """Thin httpx wrapper: base URL, auth header, infra-only retries, journaling."""
 
@@ -80,11 +119,18 @@ class Http:
         self.base_url = base_url.rstrip("/")
         self._client = httpx.Client(base_url=self.base_url, headers=headers, timeout=timeout)
         self.journal = journal
+        # Opt-in: fresh auth headers for a long-lived JWT client. Access tokens
+        # live 15 min, so a fixture that outlasts one re-authenticates once on
+        # a 401, but ONLY when the Bearer JWT it sent is expired (or within
+        # JWT_EXPIRY_SKEW_SECS of it). Any other 401 (bad credentials, revoked
+        # session, invalid token) is returned unchanged (NAN-5827).
+        self.reauth: Callable[[], dict[str, str]] | None = None
 
     def close(self) -> None:
         self._client.close()
 
-    def request(self, method: str, path: str, *, retries: int = 5, **kw: Any) -> httpx.Response:
+    def request(self, method: str, path: str, *, retries: int = 5, _reauthed: bool = False,
+                **kw: Any) -> httpx.Response:
         delay = 1.0
         for attempt in range(retries + 1):
             started = time.monotonic()
@@ -100,6 +146,10 @@ class Http:
                 delay = min(delay * 2, 10)
                 continue
             self._log(method, path, kw, resp, time.monotonic() - started)
+            if (resp.status_code == 401 and self.reauth is not None and not _reauthed
+                    and bearer_jwt_expired(self._client.headers.get("Authorization"))):
+                self._client.headers.update(self.reauth())
+                return self.request(method, path, retries=retries, _reauthed=True, **kw)
             return resp
         raise AssertionError("unreachable")
 

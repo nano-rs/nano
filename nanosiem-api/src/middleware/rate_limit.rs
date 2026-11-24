@@ -806,6 +806,7 @@ mod tests {
 
     fn session(permissions: &[&str]) -> crate::middleware::AuthContext {
         crate::middleware::AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),

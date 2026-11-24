@@ -23,8 +23,9 @@
 //! NO explicit PREWHERE — `optimize_move_to_prewhere` does placement.
 
 use super::*;
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::{bind_source_scope, source_scope_bound_predicate};
 use crate::auth::ScopeSet;
+use std::collections::BTreeSet;
 use crate::query::{IocFeed, IocLookup, RetroAxis, SearchExpr, Value};
 use crate::query::clickhouse_sql_gen::search_expr::{
     classify_indicator, ioc_feed_indicator_subquery, resolve_ioc_observables, scope_observables,
@@ -343,7 +344,11 @@ impl SearchService {
     /// the WHERE) so a scoped viewer's rarity ratio is measured against the
     /// population they can see — hosts that only appear in denied sources must
     /// not leak into the count. `None` (unrestricted) emits byte-identical SQL.
-    async fn retro_total_hosts(&self, scope_predicate: Option<&str>) -> u64 {
+    async fn retro_total_hosts(
+        &self,
+        scope_predicate: Option<&str>,
+        deny_set: &BTreeSet<String>,
+    ) -> u64 {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return 0,
@@ -362,8 +367,7 @@ impl SearchService {
             end = crate::sql_hygiene::format_ch_bound(&now),
             scope_and = scope_and(scope_predicate),
         );
-        clickhouse
-            .query(&sql)
+        bind_source_scope(clickhouse.query(&sql), deny_set)
             .fetch_one::<u64>()
             .await
             .unwrap_or_else(|e| {
@@ -471,18 +475,20 @@ impl SearchService {
         // NAN-1801: render the deny-set ONCE; every logs scan below ANDs it.
         // The indicator-set resolution above is deliberately NOT scoped — it
         // reads `custom_enrichment_results` / lookup tables (threat intel, not
-        // log events), which carry no `source_type`.
-        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+        // log events), which carry no `source_type`. NAN-5793: bound — every
+        // scan below binds `deny_set`.
+        let scope_predicate = source_scope_bound_predicate("source_type", scope.deny_set());
         let scope_predicate = scope_predicate.as_deref();
+        let deny_set = scope.deny_set();
 
-        let total_hosts = self.retro_total_hosts(scope_predicate).await;
+        let total_hosts = self.retro_total_hosts(scope_predicate, deny_set).await;
 
         let offset = req.offset.unwrap_or(0);
         let limit = req.limit.unwrap_or(RETRO_PAGE_SIZE).clamp(1, 500);
 
         let response = match plan.submode {
             RetroSubmode::Summary => {
-                self.retro_summary(&plan, &indicators, &range, total_hosts, scope_predicate)
+                self.retro_summary(&plan, &indicators, &range, total_hosts, scope_predicate, deny_set)
                     .await
             }
             RetroSubmode::List => {
@@ -494,6 +500,7 @@ impl SearchService {
                     offset,
                     limit,
                     scope_predicate,
+                    deny_set,
                 )
                 .await
             }
@@ -506,6 +513,7 @@ impl SearchService {
                     offset,
                     limit,
                     scope_predicate,
+                    deny_set,
                 )
                 .await
             }
@@ -526,6 +534,7 @@ impl SearchService {
         range: &TimeRange,
         total_hosts: u64,
         scope_predicate: Option<&str>,
+        deny_set: &BTreeSet<String>,
     ) -> Result<RetroResponse, SearchError> {
         let value = plan
             .values
@@ -549,10 +558,10 @@ impl SearchService {
 
         // Aggregate row: hits, distinct_hosts, first_seen, last_seen, field_counts.
         let (hits, distinct_hosts, first_seen, last_seen, matched_fields) =
-            self.retro_summary_agg(&sql).await?;
+            self.retro_summary_agg(&sql, deny_set).await?;
 
         let top_entities = self
-            .retro_top_entities(&observables, &value, range, scope_predicate)
+            .retro_top_entities(&observables, &value, range, scope_predicate, deny_set)
             .await
             .unwrap_or_default();
 
@@ -601,13 +610,13 @@ impl SearchService {
     async fn retro_summary_agg(
         &self,
         sql: &str,
+        deny_set: &BTreeSet<String>,
     ) -> Result<(u64, u64, Option<String>, Option<String>, Vec<(String, u64)>), SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok((0, 0, None, None, Vec::new())),
         };
-        let rows = clickhouse
-            .query(sql)
+        let rows = bind_source_scope(clickhouse.query(sql), deny_set)
             .fetch_all::<RetroSummaryRow>()
             .await
             .map_err(|e| crate::search::search_error_from_error(&e))?;
@@ -640,6 +649,7 @@ impl SearchService {
         value: &str,
         range: &TimeRange,
         scope_predicate: Option<&str>,
+        deny_set: &BTreeSet<String>,
     ) -> Result<Vec<RetroTopEntity>, SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
@@ -654,7 +664,10 @@ impl SearchService {
             "SELECT _host AS id, uniqExact(_rid) AS hits FROM ({union}) \
              WHERE _host != '' GROUP BY _host ORDER BY hits DESC LIMIT 10",
         );
-        match clickhouse.query(&sql).fetch_all::<(String, u64)>().await {
+        match bind_source_scope(clickhouse.query(&sql), deny_set)
+            .fetch_all::<(String, u64)>()
+            .await
+        {
             Ok(rows) => Ok(rows
                 .into_iter()
                 .filter(|(id, _)| !id.is_empty())
@@ -730,6 +743,7 @@ impl SearchService {
         offset: usize,
         limit: usize,
         scope_predicate: Option<&str>,
+        deny_set: &BTreeSet<String>,
     ) -> Result<RetroResponse, SearchError> {
         let logs_table = self
             .table_names
@@ -759,8 +773,7 @@ impl SearchService {
             .ch_client
             .as_ref()
             .ok_or_else(|| SearchError::SqlValidationError("ClickHouse unavailable".to_string()))?;
-        let all = clickhouse
-            .query(&sql)
+        let all = bind_source_scope(clickhouse.query(&sql), deny_set)
             .fetch_all::<RetroListRowRaw>()
             .await
             .map_err(|e| crate::search::search_error_from_error(&e))?;
@@ -826,6 +839,7 @@ impl SearchService {
         offset: usize,
         limit: usize,
         scope_predicate: Option<&str>,
+        deny_set: &BTreeSet<String>,
     ) -> Result<RetroResponse, SearchError> {
         let logs_table = self
             .table_names
@@ -850,8 +864,7 @@ impl SearchService {
             .ch_client
             .as_ref()
             .ok_or_else(|| SearchError::SqlValidationError("ClickHouse unavailable".to_string()))?;
-        let mut fetched = clickhouse
-            .query(&sql)
+        let mut fetched = bind_source_scope(clickhouse.query(&sql), deny_set)
             .fetch_all::<RetroPivotRowRaw>()
             .await
             .map_err(|e| crate::search::search_error_from_error(&e))?;
@@ -1189,7 +1202,7 @@ impl SearchService {
             .map_err(|e| crate::search::search_error_from_error(&e))?;
 
         // Unscoped denominator too (system path — see the build_list_sql note).
-        let total_hosts = self.retro_total_hosts(None).await;
+        let total_hosts = self.retro_total_hosts(None, &BTreeSet::new()).await;
 
         Ok(rows
             .into_iter()
@@ -1942,9 +1955,9 @@ mod tests {
     #[test]
     fn retro_sql_scope_gate_lands_in_every_logs_scan() {
         let obs = udm_obs();
-        let rendered = source_scope_sql_predicate("source_type", &deny(&["audit"]));
+        let rendered = source_scope_bound_predicate("source_type", &deny(&["audit"]));
         let scope = rendered.as_deref();
-        let gate = "lower(source_type) != 'audit'";
+        let gate = "lower(source_type) NOT IN {nano_source_deny:Array(String)}";
 
         // Summary: one gate per UNION leg (legs = observables).
         let sql = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range(), scope);
@@ -1975,15 +1988,14 @@ mod tests {
             assert_eq!(pivot.matches(gate).count(), 1, "axis {axis:?}: {pivot}");
         }
 
-        // Multi-source deny renders the NOT IN form (lexicographic order).
-        let multi = source_scope_sql_predicate("source_type", &deny(&["otel", "audit"]));
+        // NAN-5793: a multi-source deny renders the same bound form; no
+        // denied name reaches the SQL text.
+        let multi = source_scope_bound_predicate("source_type", &deny(&["otel", "audit"]));
         let list_multi = build_list_sql(
             &udm(), &obs, "logs", &pred, &inds, &range(), 0, 51, multi.as_deref(),
         );
-        assert!(
-            list_multi.contains("lower(source_type) NOT IN ('audit', 'otel')"),
-            "got: {list_multi}"
-        );
+        assert!(list_multi.contains(gate), "got: {list_multi}");
+        assert!(!list_multi.contains("'otel'") && !list_multi.contains("'audit'"), "got: {list_multi}");
     }
 
     /// NAN-1801 back-compat: an unrestricted caller (empty deny → `None`) must
@@ -1993,7 +2005,7 @@ mod tests {
     fn retro_sql_unrestricted_scope_emits_no_gate() {
         let obs = udm_obs();
         // Empty deny set renders no predicate at all.
-        assert_eq!(source_scope_sql_predicate("source_type", &deny(&[])), None);
+        assert_eq!(source_scope_bound_predicate("source_type", &deny(&[])), None);
 
         let inds = vec!["1.2.3.4".to_string()];
         let pred = SearchService::retro_match_predicate(&obs, &inds);

@@ -237,6 +237,7 @@ pub(crate) async fn census_source(
             table,
             crate::search::service::DynamicFieldBucket::Spill,
             &census_predicate(source_type, start, end),
+            &std::collections::BTreeSet::new(),
         )
         .await
         {

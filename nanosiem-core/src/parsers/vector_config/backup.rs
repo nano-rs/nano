@@ -402,7 +402,7 @@ impl VectorConfigManager {
     /// workspace. `parsers_dir` is its own bind mount in the Vector container
     /// (`docker-compose.yml`: `./config/vector/sources/parsers` is mounted
     /// separately because the parent is read-only) and its own mount path in the
-    /// Kubernetes pod (`deploy/k8s/rackspace/vector.yaml`). A bind mount follows
+    /// Kubernetes pod (`deploy/k8s/self-managed/vector.yaml`). A bind mount follows
     /// the inode it was created from, so renaming the directory aside would
     /// leave Vector looking at the tree we are about to delete, and deleting it
     /// would empty Vector's config directory outright. Publishing INTO the

@@ -415,9 +415,9 @@ impl ClickHouseExecutor {
                     break;
                 }
                 Err(e) => {
-                    let error_str = e.to_string();
-                    tracing::error!("Error reading streaming ClickHouse chunk: {}", error_str);
                     let parsed = crate::search::search_error_from_error(&e);
+                    // NAN-5817: see `log_chunk_read_failure`.
+                    super::query_execution::log_chunk_read_failure(&parsed, &e);
                     // NAN-5161: the chunk error reaches the client as a stream
                     // event; send the masked message, never the raw text.
                     let _ = chunk_tx

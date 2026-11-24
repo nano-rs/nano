@@ -50,7 +50,7 @@ pub(crate) use clickhouse_sql_gen::{
 // `pub` (not `pub(crate)`): consumed by the DDL↔Rust column drift gate
 // (`tests/logs_ddl_column_consistency.rs`, NAN-1623) — see MATERIALIZED_COLUMNS above.
 pub use clickhouse_sql_gen::EXPLICIT_COLUMNS;
-pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
+pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, GeneratorScope, QueryOptions};
 #[doc(hidden)]
 pub use clickhouse_sql_gen::ioc_feed_indicator_sql;
 // OTLP observability (NAN-1528): dataset selector + trace/metrics fetch SQL the

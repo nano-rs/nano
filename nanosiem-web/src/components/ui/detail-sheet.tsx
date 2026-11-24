@@ -81,6 +81,22 @@ export interface DetailSheetProps {
   className?: string;
   /** Classes on the scroll body (e.g. `p-0` for full-bleed tables). */
   bodyClassName?: string;
+  /**
+   * Scrim behind the sheet. `light` (default) dims the page; `none` keeps the
+   * page fully visible (e.g. the support flyout, written about the page behind it).
+   */
+  scrim?: 'light' | 'none';
+  /**
+   * When false, a click outside the sheet does not close it (Esc and the X
+   * still do). Use with `scrim="none"`, where the page looks clickable and a
+   * stray click would otherwise discard the form.
+   */
+  dismissOnOutsideClick?: boolean;
+  /**
+   * Radix `onOpenAutoFocus`: call `preventDefault()` and focus a field to pick
+   * the initial focus (otherwise the first tabbable, the header close button).
+   */
+  onOpenAutoFocus?: (event: Event) => void;
   /** Force a side; defaults to right (bottom below the mobile breakpoint). */
   side?: 'right' | 'bottom';
   /** Test hook, set on the sheet frame. */
@@ -121,6 +137,9 @@ export function DetailSheet({
   discardDescription = 'Closing this panel will lose the changes you made.',
   className,
   bodyClassName,
+  scrim = 'light',
+  dismissOnOutsideClick = true,
+  onOpenAutoFocus,
   side,
   'data-testid': testId,
   children,
@@ -157,8 +176,10 @@ export function DetailSheet({
         <SheetContent
           side={resolvedSide}
           hideClose
-          overlayClassName="bg-black/40 backdrop-blur-none"
+          overlayClassName={scrim === 'none' ? 'bg-transparent backdrop-blur-none' : 'bg-black/40 backdrop-blur-none'}
           data-detail-sheet=""
+          {...(dismissOnOutsideClick ? {} : { onPointerDownOutside: (e: Event) => e.preventDefault() })}
+          onOpenAutoFocus={onOpenAutoFocus}
           data-size={size}
           data-testid={testId}
           className={cn(

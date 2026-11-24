@@ -34,7 +34,12 @@ pub type ExitFn = Arc<dyn Fn(i32) + Send + Sync>;
 
 /// The production exit: `std::process::exit` (k8s restarts the pod).
 pub fn process_exit() -> ExitFn {
-    Arc::new(|code| std::process::exit(code))
+    Arc::new(|code| {
+        // NAN-5798: exit skips destructors; send what error tracking holds
+        // (the panic that caused this, usually). No-op without a DSN.
+        crate::error_tracking::flush(std::time::Duration::from_secs(2));
+        std::process::exit(code)
+    })
 }
 
 /// What a supervised task finishing (outside shutdown) means.

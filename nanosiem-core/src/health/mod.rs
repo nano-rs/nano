@@ -12,6 +12,7 @@
 //! and creates notifications for admin users when issues are detected.
 
 pub mod ai_monitor;
+pub mod deleted_sources;
 pub mod disk_monitor;
 pub mod feed_monitor;
 pub mod repository;

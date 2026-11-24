@@ -17,7 +17,6 @@ import {
   GitBranch,
   Globe,
   GripVertical,
-  HelpCircle,
   Lock,
   Plug,
   Plus,
@@ -61,6 +60,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { InfoTip } from '@/components/ui/info-tip';
 import {
   Tooltip,
   TooltipContent,
@@ -86,6 +86,7 @@ import { SourceConfigForm } from '@/components/log-sources/SourceConfigForm';
 import { SourceTypeCombobox } from '@/components/log-sources/SourceTypeCombobox';
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { sourceConfigSearchUrl } from '@/lib/source-config-search';
+import { Term } from '@/components/ui/term';
 
 // ============================================================================
 // Constants & helpers
@@ -168,34 +169,27 @@ const BINDING_CALLOUT: Partial<
   >
 > = {
   gcp_pubsub: {
-    binding:
-      'This Pub/Sub source binds to a single subscription. To ingest from multiple topics, create one Source Configuration per subscription.',
-    multipleHint:
-      'To split a single subscription into multiple source types, switch to Multiple-source-types mode below.',
+    binding: 'Binds to one subscription; use one configuration per subscription.',
+    multipleHint: 'Use Multiple source types to split it.',
   },
   kafka: {
     binding:
-      'This Kafka source binds to one consumer group on one cluster. To ingest from another cluster, create a separate Source Configuration. Each Source Configuration must use a unique consumer group ID — two configs sharing a group will split partitions and each will only receive a fraction of the records.',
-    multipleHint:
-      'To split a single set of topics into multiple source types, switch to Multiple-source-types mode below.',
+      'Binds to one consumer group on one cluster. Each configuration needs its own consumer group, or they split partitions and each gets only part of the records.',
+    multipleHint: 'Use Multiple source types to split the topics.',
   },
   azure_event_hubs: {
     binding:
-      'This Event Hubs source binds to one consumer group on one Event Hub. To ingest from another hub, create a separate Source Configuration. Give each its own consumer group — readers sharing one compete for partitions.',
-    multipleHint:
-      'To split one hub into multiple source types, switch to Multiple-source-types mode below (e.g. by an application property).',
+      'Binds to one consumer group on one Event Hub. Give each configuration its own consumer group; readers sharing one compete for partitions.',
+    multipleHint: 'Use Multiple source types to split it (e.g. by an application property).',
   },
   crowdstrike_fdr: {
     binding:
-      'This FDR source binds to one CrowdStrike FDR queue. Lookup snapshots (fdrv2-*: aidmaster, managedassets) are dropped; every other event goes to the CrowdStrike Falcon parser unless a rule says otherwise.',
-    multipleHint:
-      'FDR events are all Falcon telemetry; splitting them is rarely needed.',
+      'Binds to one FDR queue. Lookup snapshots (fdrv2-*: aidmaster, managedassets) are dropped; other events go to the CrowdStrike Falcon parser unless a rule says otherwise.',
+    multipleHint: 'Splitting FDR events is rarely needed.',
   },
   aws_s3: {
-    binding:
-      'This S3 source binds to a single SQS queue. To ingest from another queue or account, create a separate Source Configuration.',
-    multipleHint:
-      'To split objects from one queue into multiple source types, switch to Multiple-source-types mode below (e.g. by bucket or key prefix).',
+    binding: 'Binds to one SQS queue; use one configuration per queue or account.',
+    multipleHint: 'Use Multiple source types to split it (e.g. by bucket or key prefix).',
   },
 };
 
@@ -205,7 +199,7 @@ const BINDING_CALLOUT: Partial<
 // not a new socket. Only one HEC routing config is expected per
 // deployment; backend rejects duplicates with 409.
 const HEC_BINDING_CALLOUT =
-  'Splunk HEC events arrive on the platform-managed listener (:8088, shared token). This config decides how each event is routed based on its sourcetype. Only one HEC routing config is supported per deployment.';
+  'Events arrive on the shared :8088 listener and route by sourcetype. One HEC routing config per deployment.';
 
 const ROUTING_MODEL_DOCS_URL = 'https://nano.rs/docs/integrations/routing-model';
 
@@ -786,8 +780,7 @@ export default function SourceConfigurationDetail() {
                 <div className="text-amber-500 flex items-start gap-2">
                   <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
                   <span>
-                    No routing rules defined. Logs won&rsquo;t be routed to any parsers until
-                    rules are added.
+                    No <Term id="routing-rule">routing rules</Term>; logs reach no parser until you add one.
                   </span>
                 </div>
               )}
@@ -1136,7 +1129,7 @@ function HeaderStat({
   mono?: boolean;
   hint?: string;
 }) {
-  const inner = (
+  return (
     <div className="flex flex-col items-end">
       <div
         className={cn(
@@ -1148,22 +1141,13 @@ function HeaderStat({
       </div>
       <div className="flex items-center gap-1 text-[9px] font-mono uppercase tracking-[0.12em] text-muted-foreground mt-0.5">
         {label}
-        {hint && <HelpCircle className="w-2.5 h-2.5" />}
+        {hint && (
+          <InfoTip label={`About ${label.toLowerCase()}`} variant="inline" side="bottom" sideOffset={6}>
+            {hint}
+          </InfoTip>
+        )}
       </div>
     </div>
-  );
-  if (!hint) return inner;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button type="button" className="cursor-help">
-          {inner}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={6} className="text-[11px] max-w-[280px]">
-        {hint}
-      </TooltipContent>
-    </Tooltip>
   );
 }
 
@@ -1310,18 +1294,10 @@ function ConnectionField({
         <div className="flex items-center gap-1 text-[9px] font-mono uppercase tracking-[0.12em] text-muted-foreground">
           {label}
           {hostHint && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button type="button" className="cursor-help">
-                  <HelpCircle className="w-2.5 h-2.5" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={6} className="text-[11px] max-w-[260px]">
-                Replace <code className="font-mono">{'{your-ingest-host}'}</code> with your
-                deployment&rsquo;s ingest host (find it in your tenant at{' '}
-                <span className="font-mono">app.nano.rs</span>).
-              </TooltipContent>
-            </Tooltip>
+            <InfoTip label="About the ingest host" variant="inline" side="bottom" sideOffset={6}>
+              Replace <code className="font-mono">{'{your-ingest-host}'}</code> with the host name your senders use to
+              reach nano. Find it in your tenant at <span className="font-mono">app.nano.rs</span>.
+            </InfoTip>
           )}
         </div>
         {copy && (
@@ -1690,7 +1666,7 @@ function RulesList({
       </div>
       <div className="px-3 py-1.5 border-b border-border bg-foreground/[0.02] shrink-0">
         <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-          Ordered list — <span className="text-foreground/80">first match wins</span>. A
+          Ordered list: <span className="text-foreground/80">first match wins</span>. A
           default rule catches anything unmatched.
         </div>
       </div>
@@ -1961,7 +1937,7 @@ function RuleEditor({
               : 'Comparison is case-sensitive. Values are exact strings unless using regex.'}
           {showPresetSelect && matchedPreset != null && (
             <span className="font-mono text-foreground/70">
-              .{matchedPreset.path} — {matchedPreset.description}
+              .{matchedPreset.path}: {matchedPreset.description}
             </span>
           )}
           {!showPresetSelect && canonical && !isCanonicalLocked && !fallback && canEdit && (
@@ -1998,7 +1974,7 @@ function RuleEditor({
               disabled={!canEdit}
             />
             <div className="text-[10.5px] text-muted-foreground leading-relaxed mt-1.5">
-              Events carry this tag downstream — log sources subscribe by it.
+              Log sources subscribe by this tag.
             </div>
           </div>
         </div>
@@ -2175,8 +2151,8 @@ function AddRuleSheet({
             ) : (
               canonical && (
                 <p className="text-[10.5px] text-muted-foreground">
-                  Canonical field for this transport: <span className="font-mono">{canonical.field}</span>{' '}
-                  — {canonical.hint}
+                  Canonical field for this transport: <span className="font-mono">{canonical.field}</span>.{' '}
+                  {canonical.hint}
                 </p>
               )
             )}
@@ -2557,10 +2533,6 @@ function SingleSourceTypeMode({
         <h2 className="text-[14px] font-semibold text-foreground">
           Route every event from this feed to one parser
         </h2>
-        <p className="text-[11.5px] text-muted-foreground leading-relaxed">
-          All events arriving at this binding are tagged with a single source_type
-          and dispatched to the matching log source.
-        </p>
       </div>
 
       <div className="bg-card border border-border rounded-md p-4 space-y-3">
@@ -2576,7 +2548,7 @@ function SingleSourceTypeMode({
             disabled={!canEdit}
           />
           <p className="text-[10.5px] text-muted-foreground">
-            Events carry this tag downstream — log sources subscribe by it.
+            Log sources subscribe by this tag.
           </p>
         </div>
         <div className="flex items-center justify-end gap-2 pt-1">
@@ -2600,7 +2572,7 @@ function SingleSourceTypeMode({
           <CircleAlert className="h-3.5 w-3.5 text-amber-500 mt-0.5 shrink-0" />
           <div className="text-[11.5px] text-foreground/80 leading-relaxed">
             This config also has {nonDefaultCount} non-default rule
-            {nonDefaultCount === 1 ? '' : 's'} — they&rsquo;re still active. Switch to{' '}
+            {nonDefaultCount === 1 ? '' : 's'}, still active. Switch to{' '}
             <button
               type="button"
               className="text-primary hover:underline"

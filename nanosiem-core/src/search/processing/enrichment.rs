@@ -386,7 +386,8 @@ pub async fn apply_inputlookup_enrichment(
                 return Err(SearchError::SqlValidationError(message));
             }
             Err(e) => {
-                tracing::error!("InputLookup failed for url='{}': {}", cmd.url.template, e);
+                // NAN-5817: the caller's `| inputlookup` URL / format; a 400.
+                tracing::warn!("InputLookup failed for url='{}': {}", cmd.url.template, e);
                 return Err(SearchError::SqlValidationError(format!(
                     "inputlookup failed for URL '{}': {}. Verify the URL is reachable \
                      and returns the expected format, or remove the `| inputlookup` stage.",
@@ -467,6 +468,9 @@ mod tests {
             cache_ttl_secs: 0,
         };
         let mut warnings = Vec::new();
+        // NAN-5817: the caller's URL failing is a 400, not a Sentry error.
+        let capture = crate::search::log_capture::LevelCapture::default();
+        let guard = capture.install();
         let err = apply_inputlookup_enrichment(
             vec![serde_json::json!({"src_ip": "1.2.3.4"})],
             &[cmd],
@@ -475,6 +479,13 @@ mod tests {
         )
         .await
         .expect_err("failed fetch must error, not silently return un-enriched rows");
+        drop(guard);
+        assert!(
+            !capture.levels().contains(&tracing::Level::ERROR),
+            "inputlookup user failure logged at ERROR: {:?}",
+            capture.levels()
+        );
+        assert!(capture.levels().contains(&tracing::Level::WARN));
         match err {
             SearchError::SqlValidationError(msg) => {
                 assert!(

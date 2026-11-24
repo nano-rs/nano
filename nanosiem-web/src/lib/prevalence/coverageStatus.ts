@@ -67,4 +67,10 @@ export function shouldPollPrevalence(state: PrevalenceProductState | undefined |
 }
 
 /** Label for one artifact whose host count is unknown (`host_count: null`). */
-export const UNKNOWN_HOSTS_LABEL = 'Unknown: prevalence does not cover this window yet';
+export const UNKNOWN_HOSTS_LABEL = "Unknown: prevalence data doesn't cover this time window yet";
+
+/** NAN-5722: every prevalence surface (search `enrich=true`, the filters, this
+    page, the Prevalence API) reports the same host count: the 30-day baseline.
+    The time window only gates recency. */
+export const HOST_COUNT_BASELINE_LABEL =
+  'How many different hosts saw this in the last 30 days. The time window only decides which items are listed.';

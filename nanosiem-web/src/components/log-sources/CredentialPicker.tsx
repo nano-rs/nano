@@ -57,7 +57,7 @@ const PROVIDER_LABELS: Record<string, string> = {
 const NONE_OPTION_LABEL: Record<string, string> = {
   aws_s3: 'None (use environment / IAM role)',
   gcp_pubsub: 'None (use Application Default Credentials)',
-  kafka: 'None (unauthenticated — local / dev brokers)',
+  kafka: 'None (no login, for local or dev brokers)',
   azure_event_hubs: 'None (use managed identity)',
 };
 
@@ -171,7 +171,7 @@ export function CredentialPicker({ provider, value, onChange, disabled }: Creden
             </button>
           )}
           {provider === 'kafka'
-            ? ' — or leave as None for an unauthenticated broker.'
+            ? ', or leave as None for a broker with no login.'
             : ' or use environment variables/IAM roles.'}
         </p>
       )}

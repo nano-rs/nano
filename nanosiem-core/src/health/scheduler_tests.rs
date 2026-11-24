@@ -197,3 +197,27 @@ fn disk_notification_names_volume_level_and_runbook() {
     let e = HealthScheduler::disk_health_event(&v);
     assert_eq!(e.dedup_key, "storage:disk:postgres:pg-0:database");
 }
+
+/// NAN-5785: a source that never sent anything did not "stop sending"; the
+/// event title says so, while a source that went quiet keeps the old title.
+#[test]
+fn feed_stale_title_distinguishes_never_sent_from_stopped() {
+    let mut status = FeedStalenessStatus {
+        feed_id: Uuid::nil(),
+        feed_name: "apache".to_string(),
+        last_event_at: None,
+        stale_threshold_minutes: 15,
+        minutes_since_last_event: None,
+        is_stale: true,
+    };
+    assert_eq!(
+        HealthScheduler::feed_stale_health_event(&status).title,
+        "Log source has not sent any events: apache"
+    );
+    status.last_event_at = Some(chrono::Utc::now());
+    status.minutes_since_last_event = Some(45);
+    assert_eq!(
+        HealthScheduler::feed_stale_health_event(&status).title,
+        "Log source stopped sending: apache"
+    );
+}

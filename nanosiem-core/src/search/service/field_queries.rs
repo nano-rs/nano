@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::source_scope_bound_predicate;
 use super::*;
 use crate::auth::ScopeSet;
 use crate::search::companion_query_id::CompanionQuery;
@@ -394,8 +394,8 @@ impl SearchService {
     /// source_type in the caller's deny-set is filtered at the SQL layer so a
     /// scoped caller cannot retrieve a denied row by direct id lookup. The
     /// handler unions `audit` into the deny-set for callers without
-    /// `audit:view`, preserving the NAN-694 behavior byte-identically
-    /// (`lower(source_type) != 'audit'`).
+    /// `audit:view`, preserving the NAN-694 behavior (NAN-5793: as the bound
+    /// `lower(source_type) NOT IN {nano_source_deny:Array(String)}`).
     ///
     /// NAN-1032: callers should pass `source_type` whenever known so the query can
     /// use the `(source_type, timestamp, ...)` PK index for a tight range read.
@@ -449,7 +449,11 @@ impl SearchService {
                     "ClickHouse client not configured".into(),
                 ))
             })?;
-            ch_executor.execute_sql_to_json(&sql).await?
+            // NAN-5793: `build_fetch_log_sql`'s scope predicate is bound.
+            ch_executor
+                .with_source_scope(scope.deny_set())
+                .execute_sql_to_json(&sql)
+                .await?
         };
 
         Ok(results.into_iter().next())
@@ -485,7 +489,7 @@ impl SearchService {
 
         // Execute the query
         let (results, total_count) = self
-            .execute_clickhouse_sql(&sql, limit, offset, false)
+            .execute_clickhouse_sql(&sql, limit, offset, false, scope.deny_set())
             .await?;
 
         // Calculate field statistics
@@ -682,6 +686,10 @@ impl SearchService {
                 "ClickHouse executor not available".into(),
             ))
         })?;
+        // NAN-5793: the scope predicate below is bound; every inventory scan
+        // runs on an executor that binds the deny list.
+        let scoped_executor = ch_executor.with_source_scope(scope.deny_set());
+        let ch_executor = &scoped_executor;
 
         // NAN-1241/1443: enumerate the active table's dynamic-JSON tail column —
         // `ext` under UDM, the `unmapped` spill under OCSF (was the full `event`,
@@ -735,13 +743,19 @@ impl SearchService {
         let mut derived_fields = false;
         let where_predicate = match (query, time_range) {
             (Some(q), Some(tr)) => {
-                let Ok(parsed) = parse_query(q) else {
+                // NAN-5793 review: the same viewer gate every nPL path runs
+                // (dataset permission + the AST source gate on subsearches).
+                let gated = crate::search::query_processing::enforce_viewer_scope(q, None, scope)?;
+                let Ok(parsed) = parse_query(&gated) else {
                     return Ok(DynamicFieldInventory::partial(Vec::new(), InventoryGap::QueryNotScanned));
                 };
                 subsearch_rows = adds_subsearch_rows(&parsed);
                 derived_fields = creates_fields(&parsed);
                 match extract_base_search(&parsed) {
-                    Query::Search(expr) => match self.ch_sql_generator.generate_search_expr(&expr) {
+                    Query::Search(expr) => match self
+                        .sql_generator(crate::query::GeneratorScope::viewer(scope))
+                        .generate_search_expr(&expr)
+                    {
                         Ok(filter) => format!("{} AND ({})", time_only(tr), filter),
                         Err(_) => {
                             return Ok(DynamicFieldInventory::partial(Vec::new(), InventoryGap::QueryNotScanned))
@@ -778,7 +792,7 @@ impl SearchService {
         // branch built the predicate (query-scoped, time-only, or the 3h
         // fallback). Empty deny-set → predicate unchanged (byte-identical).
         let where_predicate =
-            match source_scope_sql_predicate("source_type", scope.deny_set()) {
+            match source_scope_bound_predicate("source_type", scope.deny_set()) {
                 Some(pred) => format!("{where_predicate} AND {pred}"),
                 None => where_predicate,
             };
@@ -942,7 +956,8 @@ impl SearchService {
 
         // NAN-1799: the caller's source-scope exclusion. Empty → "" (SQL
         // byte-identical to the pre-scoping form).
-        let scope_clause = source_scope_sql_predicate("source_type", deny_set)
+        // NAN-5793: bound; `query_udm_field` executes it with the deny list.
+        let scope_clause = source_scope_bound_predicate("source_type", deny_set)
             .map(|pred| format!("\n              AND {pred}"))
             .unwrap_or_default();
 
@@ -1271,15 +1286,19 @@ async fn enumerate_dynamic_field_names(
 /// ClickHouse client but no [`SearchService`] (NAN-5271: pivt's per-source
 /// field context). Same scan and filtering as
 /// [`SearchService::get_dynamic_field_names`]; the caller supplies the full
-/// predicate, including its time bounds and source scope.
+/// predicate, including its time bounds and source scope. `deny_set` is bound
+/// for a predicate built with [`source_scope_bound_predicate`] (NAN-5793);
+/// pass an empty set when it carries none.
 pub async fn dynamic_field_names_for_predicate(
     client: &clickhouse::Client,
     profile: &dyn crate::schema::SchemaProfile,
     table: &str,
     bucket: DynamicFieldBucket,
     where_predicate: &str,
+    deny_set: &BTreeSet<String>,
 ) -> Result<Vec<String>, SearchError> {
-    let executor = crate::search::execution::ClickHouseExecutor::new(client.clone());
+    let executor =
+        crate::search::execution::ClickHouseExecutor::new(client.clone()).with_source_scope(deny_set);
     enumerate_dynamic_field_names(&executor, profile, table, bucket, where_predicate).await
 }
 
@@ -1373,9 +1392,9 @@ fn select_field_stats_columns(
 /// without a live ClickHouse/Postgres backend (NAN-694).
 ///
 /// `deny_set` (NAN-1799, replaces the old `exclude_audit: bool`): the caller's
-/// full source-scope deny-set, rendered via [`source_scope_sql_predicate`].
-/// A `{"audit"}` set emits the legacy ` AND lower(source_type) != 'audit'`
-/// byte-identically; an empty set emits nothing.
+/// full source-scope deny-set, rendered via [`source_scope_bound_predicate`] (bound by the caller's scoped executor).
+/// A non-empty set emits ` AND lower(source_type) NOT IN {nano_source_deny:Array(String)}`;
+/// an empty set emits nothing.
 ///
 /// When `source_type` is provided it is added to the WHERE clause so the
 /// `(source_type, timestamp, ...)` PK index can do a tight range read instead
@@ -1400,7 +1419,7 @@ fn build_fetch_log_sql(
     default_view_renames: &[(&str, &str)],
 ) -> String {
     let escaped_id = escape_sql_string(id);
-    let audit_filter = source_scope_sql_predicate("source_type", deny_set)
+    let audit_filter = source_scope_bound_predicate("source_type", deny_set)
         .map(|pred| format!(" AND {pred}"))
         .unwrap_or_default();
     let source_type_filter = source_type
@@ -1674,7 +1693,7 @@ mod tests {
         );
         assert!(
             sql.ends_with(
-                "FROM logs WHERE id = 'abc-123' AND lower(source_type) != 'audit' LIMIT 1"
+                "FROM logs WHERE id = 'abc-123' AND lower(source_type) NOT IN {nano_source_deny:Array(String)} LIMIT 1"
             ),
             "{sql}"
         );
@@ -1693,7 +1712,7 @@ mod tests {
         assert!(
             sql.ends_with(
                 "FROM logs WHERE id = 'abc-123' AND lower(source_type) NOT IN \
-                 ('audit', 'windows_sysmon') LIMIT 1"
+                 {nano_source_deny:Array(String)} LIMIT 1"
             ),
             "{sql}"
         );
@@ -1707,7 +1726,7 @@ mod tests {
         };
         let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, &audit_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
         assert!(
-            sql.contains("AND lower(source_type) != 'audit'"),
+            sql.contains("AND lower(source_type) NOT IN {nano_source_deny:Array(String)}"),
             "audit exclusion missing: {sql}"
         );
         assert!(

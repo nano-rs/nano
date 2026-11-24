@@ -613,9 +613,18 @@ struct SingleStringRow {
 async fn fetch_candidates(
     ch: &clickhouse::Client,
     sql: &str,
+    deny: Option<&[String]>,
     class: &str,
 ) -> Result<Vec<String>, (StatusCode, String)> {
-    match ch.query(sql).fetch_all::<SingleStringRow>().await {
+    // NAN-5722 review: the SQL is rendered from the caller's nPL and carries
+    // its literals, so it is sent verbatim (`query_raw`: a `?` in a literal is
+    // not a client-side bind). The source-scope deny list is a server-side
+    // `Array(String)` parameter, never SQL text.
+    let mut query = ch.query_raw(sql);
+    if let Some(deny) = deny {
+        query = query.param(nanosiem_core::search::service::SOURCE_SCOPE_DENY_PARAM, deny);
+    }
+    match query.fetch_all::<SingleStringRow>().await {
         Ok(rows) => Ok(rows.into_iter().map(|r| r.value).collect()),
         Err(e) => {
             let raw = e.to_string();
@@ -763,9 +772,12 @@ pub async fn get_query_artifacts(
     // NAN-5285: build the filter with the generator search uses (active
     // schema profile + its logs table), so OCSF fields resolve to their columns
     // and a bare keyword also matches `raw_data`, as it does in search.
+    // NAN-5793 review: built under the caller's deny-set.
+    let deny_set = auth.effective_source_deny_set();
     let sql_gen = nanosiem_core::search::SearchService::ch_generator_for_pool(
         dual_pool,
         state.config.schema_profile(),
+        nanosiem_core::query::GeneratorScope::deny_set(&deny_set),
     );
     let query_filter = query_artifacts_filter(&request.query, &sql_gen)?;
 
@@ -780,12 +792,12 @@ pub async fn get_query_artifacts(
     // by probing with crafted queries. Fold the caller's effective deny set
     // into the combined filter before BOTH DISTINCT extraction reads below.
     // Empty deny set appends nothing — byte-identical SQL.
-    let deny_set = auth.effective_source_deny_set();
-    let combined_filter = match nanosiem_core::search::service::source_scope_sql_predicate(
-        "source_type",
-        &deny_set,
-    ) {
-        Some(pred) => format!("{combined_filter} AND ({pred})"),
+    let deny = nanosiem_core::search::service::source_scope_param_values(&deny_set);
+    let combined_filter = match &deny {
+        Some(_) => format!(
+            "{combined_filter} AND ({})",
+            nanosiem_core::search::service::source_scope_param_predicate("source_type")
+        ),
         None => combined_filter,
     };
     tracing::debug!("Combined filter for prevalence query: {}", combined_filter);
@@ -820,7 +832,7 @@ pub async fn get_query_artifacts(
         &combined_filter,
         distinct_cap,
     ) {
-        Some(hash_query) => fetch_candidates(ch, &hash_query, "hash").await?,
+        Some(hash_query) => fetch_candidates(ch, &hash_query, deny.as_deref(), "hash").await?,
         None => Vec::new(),
     };
 
@@ -836,7 +848,7 @@ pub async fn get_query_artifacts(
         &internal,
         distinct_cap,
     ) {
-        Some(domain_query) => fetch_candidates(ch, &domain_query, "domain").await?,
+        Some(domain_query) => fetch_candidates(ch, &domain_query, deny.as_deref(), "domain").await?,
         None => Vec::new(),
     };
     let domain_results: Vec<String> = domain_results

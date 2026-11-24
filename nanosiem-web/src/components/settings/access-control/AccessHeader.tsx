@@ -7,15 +7,17 @@
 
 import { SECTION_BY_ID, GROUP_LABEL } from '@/components/layout/settings/sections';
 import { useCapabilitiesOptional } from '@/hooks/use-capabilities';
+import { Term } from '@/components/ui/term';
+import type { GlossaryId } from '@/lib/glossary';
 
 export type AccessTabId = 'users' | 'groups' | 'roles' | 'api-keys' | 'sessions';
 
-const TAB_TITLES: Record<AccessTabId, { label: string; desc: string }> = {
-  users: { label: 'Users', desc: 'Manage user accounts, status, and group memberships.' },
-  groups: { label: 'Groups', desc: 'Group users to share roles and scopes.' },
-  roles: { label: 'Roles', desc: 'Permission sets that determine what users can do.' },
-  'api-keys': { label: 'API Keys', desc: 'Programmatic access for CI, automation, and integrations.' },
-  sessions: { label: 'Sessions', desc: 'Active browser and API sessions across users and clients.' },
+const TAB_TITLES: Record<AccessTabId, { label: string; desc: string; term?: GlossaryId }> = {
+  users: { label: 'Users', desc: 'Add people, turn their accounts on or off, and choose their groups.' },
+  groups: { label: 'Groups', term: 'user-group', desc: 'Put users in groups so they share a role and the sources they can see.' },
+  roles: { label: 'Roles', term: 'role', desc: 'Each role is a set of permissions that decides what people can do.' },
+  'api-keys': { label: 'API Keys', term: 'api-key', desc: 'Keys that let scripts and other tools call nano without a person signing in.' },
+  sessions: { label: 'Sessions', term: 'session', desc: 'Everyone signed in right now, in a browser or through the API.' },
 };
 
 interface AccessHeaderProps {
@@ -33,7 +35,7 @@ export function AccessHeader({ tab }: AccessHeaderProps) {
     tab === 'groups' && sso
       ? {
           ...TAB_TITLES.groups,
-          desc: 'Group users to share roles and scopes. SSO group mappings and SCIM provisioning can manage membership.',
+          desc: 'Put users in groups so they share a role and the sources they can see. SSO and SCIM can manage who is in each group.',
         }
       : TAB_TITLES[tab];
 
@@ -43,7 +45,7 @@ export function AccessHeader({ tab }: AccessHeaderProps) {
         {groupLabel}
       </div>
       <div className="text-[18px] font-semibold text-foreground tracking-tight leading-none">
-        Access Control · {titleEntry.label}
+        Access Control · {titleEntry.term ? <Term id={titleEntry.term}>{titleEntry.label}</Term> : titleEntry.label}
       </div>
       {titleEntry.desc && (
         <div className="text-[12px] text-muted-foreground mt-1.5 max-w-[720px]">

@@ -102,7 +102,20 @@ pub enum SearchError {
 /// any message pattern. The `source()` chain is walked so a wrapped client
 /// error is still recognised; IO errors anywhere in it are transport too.
 /// Server responses go through [`parse_clickhouse_error`].
+///
+/// NAN-5817: a ClickHouse rejection of nano-generated SQL is logged at ERROR
+/// here (see [`crate::search::clickhouse_rejection`]). A caller that expects
+/// the failure and recovers uses [`classify_clickhouse_failure`] instead.
 pub fn search_error_from_error(error: &(dyn std::error::Error + 'static)) -> SearchError {
+    let parsed = classify_clickhouse_failure(error);
+    crate::search::clickhouse_rejection::report(&parsed, &error);
+    parsed
+}
+
+/// [`search_error_from_error`] without the NAN-5817 rejection report, for a
+/// failure the caller expects and recovers from (the typed-row fast path that
+/// falls back to the dynamic decoder).
+pub fn classify_clickhouse_failure(error: &(dyn std::error::Error + 'static)) -> SearchError {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(e) = current {
         if let Some(ch) = e.downcast_ref::<clickhouse::error::Error>() {
@@ -474,6 +487,94 @@ fn parse_clickhouse_error_message(error_msg: &str) -> SearchError {
     SearchError::DatabaseError(sqlx::Error::Protocol(cleaned_msg))
 }
 
+/// Whether a SQL generation error message is written for the user (NAN-1339):
+/// `InvalidQuery` / `UnsupportedOperation` guardrails carry usage guidance and
+/// surface verbatim. Every other generation failure is internal.
+pub fn sql_gen_message_is_user_facing(msg: &str) -> bool {
+    msg.starts_with("Invalid query:") || msg.starts_with("Unsupported operation:")
+}
+
+/// NAN-5817, logging only: SQL generation errors that nano's own validation
+/// raises for the caller's query but whose message is still masked for the
+/// client (no `Invalid query:` prefix): post-processing stage functions,
+/// arity, regex and CIDR literals (NAN-4902), `rex` patterns, and the
+/// prevalence-join string operators. They log at WARN; the client message is
+/// unchanged. Every other unprefixed generation failure is internal.
+pub fn sql_gen_message_is_user_error(msg: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "Invalid rex pattern '",
+        "Invalid or unsupported post-processing regex",
+        "Invalid or unsupported regex in ",
+        "Invalid CIDR '",
+    ];
+    const PREVALENCE_STRING_OPS: &[&str] = &[
+        "Contains requires string value",
+        "StartsWith requires string value",
+        "EndsWith requires string value",
+        "Like requires string value",
+        "Regex requires string/regex value",
+    ];
+    sql_gen_message_is_user_facing(msg)
+        || PREFIXES.iter().any(|p| msg.starts_with(p))
+        || PREVALENCE_STRING_OPS.contains(&msg)
+        || (msg.starts_with("Function '")
+            && msg.ends_with("is not supported after a post-processing stage (e.g. prevalence, risk)"))
+        || is_post_stage_arity_message(msg)
+}
+
+/// `name() requires N argument(s)` / `N to M arguments` / `at least N ...`,
+/// the post-processing capability table's arity message.
+fn is_post_stage_arity_message(msg: &str) -> bool {
+    let Some((name, rest)) = msg.split_once("() requires ") else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && (rest.ends_with(" argument") || rest.ends_with(" arguments"))
+        && rest.starts_with(|c: char| c.is_ascii_digit() || c == 'a')
+}
+
+impl SearchError {
+    /// Whether this failure is the platform's fault rather than the caller's
+    /// (NAN-5817).
+    ///
+    /// Mostly the same split as [`client_error_message`]: the errors it masks
+    /// (database, backend unavailable, prevalence, non-guardrail SQL
+    /// generation other than [`sql_gen_message_is_user_error`]) are internal
+    /// and log at ERROR. A ClickHouse rejection of generated SQL maps to a
+    /// caller-facing variant but is reported at ERROR where it is parsed
+    /// ([`crate::search::clickhouse_rejection`]). Timeouts are internal too,
+    /// although their message is shown: a slow or overloaded backend must stay
+    /// visible in Sentry. Everything else it shows verbatim (parse and field
+    /// errors, validation, guardrails, resource and size limits from an
+    /// oversized query, admission, cancel, scope) is caused by the query or
+    /// the request and logs at WARN. With Sentry on, every tracing ERROR is a
+    /// Sentry error event, so a mistyped query must never log at ERROR.
+    pub fn is_internal(&self) -> bool {
+        match self {
+            SearchError::SqlGenError(msg) => !sql_gen_message_is_user_error(msg),
+            SearchError::DatabaseError(_)
+            | SearchError::Unavailable(_)
+            | SearchError::PrevalenceError(_)
+            | SearchError::Timeout(_) => true,
+            SearchError::ParseError(_)
+            | SearchError::StructuredParseError { .. }
+            | SearchError::FieldNotFound { .. }
+            | SearchError::InvalidTimeRange
+            | SearchError::SqlValidationError(_)
+            | SearchError::ResponseTooLarge(..)
+            | SearchError::AdmissionDenied(_)
+            | SearchError::Cancelled
+            | SearchError::JobResultsUnavailable(_)
+            | SearchError::ViewTooLarge { .. }
+            | SearchError::ViewMemoryBusy { .. }
+            | SearchError::ResourceLimit(_)
+            | SearchError::DataError { .. }
+            | SearchError::Forbidden(_) => false,
+        }
+    }
+}
+
 /// The message safe to show the caller for a search failure (NAN-5161).
 ///
 /// Mirrors the HTTP batch mapping (`nanosiem-search` `From<SearchError>`):
@@ -498,7 +599,7 @@ pub fn client_error_message(error: &SearchError) -> String {
             }
         }
         SearchError::SqlGenError(msg) => {
-            if msg.starts_with("Invalid query:") || msg.starts_with("Unsupported operation:") {
+            if sql_gen_message_is_user_facing(msg) {
                 msg.clone()
             } else {
                 "Query processing failed".to_string()

@@ -37,6 +37,7 @@ from collections import Counter
 import pytest
 
 from nano_e2e import feeds
+from nano_e2e.cleanup import after_body
 from nano_e2e.client import Nano, expect, row_text
 from nano_e2e.mockvendor import MockVendor
 from nano_e2e.stack import Stack
@@ -61,25 +62,37 @@ def _landed(nano: Nano, mark: str) -> Counter[int]:
 class _Churn:
     """Republish the LANE's own log source every `every` seconds (a Vector
     reload of the very transform the feed's events pass through) until
-    stopped; the canonical lane parser is restored afterwards."""
+    stopped.
+
+    Each churn generation is a parser CHANGE on a live source, so the OCSF
+    publish gate (NAN-5079, on by default since NAN-5593) needs a passing
+    sample: the churn publishes the spec-valid lane parser with a
+    representative raw event, which attests every generation."""
 
     def __init__(self, nano: Nano, lane: str, src: str, every: float = 0.5):
         self.nano, self.lane, self.src, self.every = nano, lane, src, every
         self.stop = threading.Event()
         self.publishes = 0
+        self.refused: list[str] = []
         self.published = threading.Condition()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
         i = 0
+        base = feeds.attested_lane_parser(self.lane)
         while not self.stop.is_set():
             i += 1
-            vrl = feeds.LANE_PARSER.format(lane=self.lane) + f"\n# churn {i}\n"
-            self.nano.api.put(f"/api/log-sources/{self.src}", json={"parser_vrl": vrl})
-            if self.nano.api.post(f"/api/log-sources/{self.src}/publish", json={"acknowledge_unattested": True}).status_code == 200:
+            vrl = base + f"\n# churn {i}\n"
+            put = self.nano.api.put(f"/api/log-sources/{self.src}", json={"parser_vrl": vrl})
+            pub = self.nano.api.post(
+                f"/api/log-sources/{self.src}/publish", json={"ocsf_sample_logs": [feeds.LANE_OCSF_SAMPLE]}
+            )
+            if put.status_code == 200 and pub.status_code == 200:
                 with self.published:
                     self.publishes += 1
                     self.published.notify_all()
+            elif len(self.refused) < 5:
+                self.refused.append(f"PUT {put.status_code} / publish {pub.status_code}: {pub.text[:300]}")
             self.stop.wait(self.every)
 
     def wait_publishes(self, n: int, timeout: float) -> bool:
@@ -94,7 +107,6 @@ class _Churn:
     def __exit__(self, *exc: object) -> None:
         self.stop.set()
         self.thread.join(timeout=60)
-        feeds.ensure_lane_source(self.nano, self.lane)  # canonical parser back
 
 
 def test_pull_events_acked_during_reload_all_land(
@@ -121,6 +133,7 @@ def test_pull_events_acked_during_reload_all_land(
             gated.append((index, churn.publishes, ok))
 
     feed_id = None
+    passed = False
     mock_vendor.okta_page_gate = gate
     try:
         # Created before the churn starts: the source is deployed right now.
@@ -139,7 +152,7 @@ def test_pull_events_acked_during_reload_all_land(
         mock_vendor.okta_page_gate = None
         timeline.step("run done during churn", acked=acked, publishes=churn.publishes, gated=gated, runs=runs[:1])
         assert acked >= N, f"the run did not deliver all {N} events: {runs[:1]}"
-        assert churn.publishes >= 3, "the churn did not reload Vector during the run"
+        assert churn.publishes >= 3, f"the churn did not reload Vector during the run; refused: {churn.refused}"
 
         # No reload after this point can flush a stranded event.
         settled = time.monotonic()
@@ -156,7 +169,13 @@ def test_pull_events_acked_during_reload_all_land(
             timeline.step("stranded", acked=acked, searchable=len(got), missing=sorted(set(range(N)) - set(got)))
             raise
         timeline.step("all landed", seconds=round(time.monotonic() - settled), seen=dict(seen))
+        passed = True
     finally:
         mock_vendor.okta_page_gate = None
         if feed_id:
             nano.api.delete(f"/api/connector-feeds/{feed_id}")
+        # The lane source was recreated for this scenario and churned: remove
+        # it, so no later scenario inherits an enabled `e2e-lane-okta` that
+        # claims the same source_type as a vendor parser it publishes.
+        # ensure_lane_source recreates it on demand.
+        after_body("lane source", lambda: feeds.delete_log_source(nano, src), body_passed=passed)

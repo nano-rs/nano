@@ -198,10 +198,12 @@ interface EditParams {
 /**
  * Add / edit panel actions (`dashboards:edit`). Offered only where the server
  * would accept the save: the analyst owns the dashboard or holds
- * `settings:system` (`canEdit`).
+ * `settings:system` (`canEdit`). Otherwise they are registered but withheld
+ * (`available`), so pivt refuses "add a panel" instead of sending a
+ * non-owner to the builder (NAN-5637).
  */
 export function dashboardEditActions(t: DashboardTarget, opts: { canEdit: boolean }): PivtActionSpec[] {
-  if (!opts.canEdit) return [];
+  const available = () => opts.canEdit;
   const add = definePivtAction<AddParams>({
     name: 'dashboards.add_panel',
     description: 'Add a panel to this dashboard: a title, an nPL query and a visualization.',
@@ -213,6 +215,7 @@ export function dashboardEditActions(t: DashboardTarget, opts: { canEdit: boolea
     // The panel's nPL runs through the search service (panel_query).
     permission: ['dashboards:edit', 'search:execute'],
     mutates: true,
+    available,
     bind: (p) => {
       const d = open(t);
       const title = p.title.trim();
@@ -257,6 +260,7 @@ export function dashboardEditActions(t: DashboardTarget, opts: { canEdit: boolea
     },
     permission: ['dashboards:edit', 'search:execute'],
     mutates: true,
+    available,
     bind: (p) => {
       const d = open(t);
       const panel = (Array.isArray(d.panels) ? d.panels : []).find((x) => x.id === p.panel_id);

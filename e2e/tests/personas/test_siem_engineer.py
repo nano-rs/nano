@@ -15,10 +15,15 @@ from nano_e2e.personas import (
     source_by_route,
     start_push_source,
 )
+from nano_e2e.rbac import edition_permissions
 from nano_e2e.runid import route_key
 from nano_e2e.stack import Stack
 from nano_e2e.waits import INGEST_VISIBLE, eventually
 
+# A complete OCSF 1.9.0 Authentication event (NAN-5747): the deploy gate's
+# strict OCSF validation (NAN-5079) refuses a parser missing metadata, time,
+# user or service/dst_endpoint, or one that sets `device` (not defined for
+# 3002). Open builds have no AI to regenerate it, so this one must pass as is.
 CUSTOM_VRL = """
 parsed = parse_json!(string!(.message))
 .class_uid = 3002
@@ -26,9 +31,15 @@ parsed = parse_json!(string!(.message))
 .activity_id = 1
 .type_uid = 300201
 .severity_id = 1
-.actor.user.name = string!(parsed.user)
+.time = to_unix_timestamp(now(), unit: "milliseconds")
+.metadata.version = "1.9.0"
+.metadata.product.name = "nano-e2e"
+.metadata.product.vendor_name = "nano"
+.user.name = string!(parsed.user)
+.actor.user.name = .user.name
 .src_endpoint.ip = string!(parsed.src_ip)
-.device.hostname = string!(parsed.host)
+.src_endpoint.hostname = string!(parsed.host)
+.service.name = "persona-siem-auth"
 .message = string!(parsed.message)
 """.strip()
 
@@ -54,7 +65,9 @@ def test_siem_engineer_journey(
         stack, nano, ui, artifact_dir, "siem-engineer", SIEM_ENGINEER_PERMISSIONS
     ) as persona:
         page = persona.page
-        assert set(persona.permissions) == set(SIEM_ENGINEER_PERMISSIONS)
+        assert set(persona.permissions) == set(
+            edition_permissions(nano.api, SIEM_ENGINEER_PERMISSIONS, stack.edition)
+        )
         assert "users:create" not in persona.permissions
 
         # Retention is checked against persisted settings, then the adjacent

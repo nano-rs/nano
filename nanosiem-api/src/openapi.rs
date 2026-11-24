@@ -957,8 +957,9 @@ mod tests {
         // NAN-5675 adds 2 ENTERPRISE templates (/api/cases/{id}/tags,
         // /api/cases/{id}/tags/{tag}): 760.
         // NAN-5678 adds /api/log-sources/bulk-delete: 761 / 426.
+        // NAN-5850 adds the ENTERPRISE /api/hunts/technique-coverage: 763.
         #[cfg(feature = "enterprise")]
-        let min_paths = 762;
+        let min_paths = 763;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's

@@ -55,7 +55,7 @@ export function OneTimeToken({
           </span>
         ))}
         <span className="flex-1" />
-        <span className="font-mono text-[10.5px] text-muted-foreground/70 truncate" title="token prefix (all that is shown again)">
+        <span className="font-mono text-[10.5px] text-muted-foreground/70 truncate" title="Token prefix. This is all nano shows again.">
           {credential.tokenPrefix}…
         </span>
       </div>

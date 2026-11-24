@@ -286,6 +286,9 @@ fn api_user_searches_use_the_search_identity() {
         "nanosiem-api/src/handlers/observability_synthetics.rs",
         "nanosiem-api/src/handlers/reports.rs",
         "nanosiem-api/src/handlers/hunts/recon.rs",
+        // Hunt source inventory (GET /api/hunts/source-inventory): discover
+        // probes over the caller's event data.
+        "nanosiem-api/src/handlers/hunts/authoring.rs",
         "nanosiem-api/src/handlers/prevalence/discovery.rs",
         "nanosiem-api/src/handlers/prevalence/export.rs",
         "nanosiem-api/src/handlers/prevalence/lookups.rs",

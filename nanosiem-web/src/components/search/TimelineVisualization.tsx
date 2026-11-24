@@ -44,6 +44,17 @@ import { isInternalName } from '@/lib/internal-domains';
 import { api } from '@/lib/api';
 import type { ArtifactOccurrence as ApiArtifactOccurrence } from '@/lib/api/types';
 import { CHART_AXIS_LINE, CHART_AXIS_TEXT } from '@/lib/chart-colors';
+
+// Chart props that never change, hoisted so they keep one identity. recharts
+// memoizes XAxis/YAxis on shallow prop equality and re-registers an axis whose
+// props changed (a store write that recomputes the whole chart); a fresh
+// `tick={{...}}` object made every render (every drag mousemove re-renders
+// this component) defeated that memo (NAN-5869).
+const AXIS_TICK = { fill: CHART_AXIS_TEXT };
+const BAR_TOOLTIP_CURSOR = { fill: 'rgba(255,255,255,0.05)' };
+const LINE_ACTIVE_DOT = { fill: 'var(--primary)', strokeWidth: 0, r: 5 };
+const CHART_STYLE_STATIC = { cursor: 'default' } as const;
+const CHART_STYLE_DRAG = { cursor: 'crosshair' } as const;
 import { artifactCandidates } from '@/lib/prevalence/artifactFields';
 import { buildTimelinePlotData, timelinePlotDomain, timelineSeriesData, resolveBucketStart, type TimelinePlotPoint } from './timeline-fill';
 import { formatTimelineAxisLabel, formatTimelineTooltipTime, timelineAxisTicks } from './timeline-axis';
@@ -57,6 +68,7 @@ import {
   type BaselinePrevalence,
   type InWindowObservation,
 } from '@/lib/prevalence/inWindowObservation';
+import { Term } from '@/components/ui/term';
 
 interface TimelineDataPoint {
   time: string;
@@ -854,6 +866,11 @@ export function TimelineVisualization({
     [axisWindow],
   );
 
+  const tooltipContent = useMemo(
+    () => <HistogramTooltip bucketInterval={bucketInterval} formatTime={formatTooltipTime} />,
+    [bucketInterval, formatTooltipTime],
+  );
+
   // Helper: build scatter points from per-event artifact occurrences.
   // One dot per event, positioned at the event's actual timestamp.
   const buildScatterPoints = useCallback((
@@ -1180,7 +1197,7 @@ export function TimelineVisualization({
               )}
               {!collapsed && mode === 'prevalence' && scatterData && (
                 <span className="text-muted-foreground/50 font-medium normal-case tracking-[0.02em] ml-1.5 hidden md:inline truncate">
-                  prevalence across {(scatterData.hashPoints.length + scatterData.domainPoints.length).toLocaleString()} artifacts
+                  <Term id="prevalence">prevalence</Term> across {(scatterData.hashPoints.length + scatterData.domainPoints.length).toLocaleString()} artifacts
                 </span>
               )}
             </div>
@@ -1273,7 +1290,11 @@ export function TimelineVisualization({
                     className="h-auto rounded-sm py-0.5 px-2.5 text-[10.5px] tracking-[0.06em] gap-1.5 font-medium normal-case data-[state=active]:bg-primary/10 data-[state=active]:text-primary data-[state=inactive]:text-muted-foreground hover:text-foreground data-[state=active]:hover:text-primary"
                   >
                     <Fingerprint className="w-[11px] h-[11px]" />
-                    <span className="hidden md:inline">Rarity</span>
+                    <span className="hidden md:inline">
+                      <Term id="rarity" nested>
+                        Rarity
+                      </Term>
+                    </span>
                   </TabsTrigger>
                 </TabsList>
               </Tabs>
@@ -1331,12 +1352,12 @@ export function TimelineVisualization({
                       onMouseMove={staticMode ? undefined : handleChartMouseMove}
                       onMouseUp={staticMode ? undefined : onMouseUp}
                       onMouseLeave={staticMode ? undefined : onMouseUp}
-                      style={{ cursor: staticMode ? 'default' : 'crosshair' }}
+                      style={staticMode ? CHART_STYLE_STATIC : CHART_STYLE_DRAG}
                     >
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
-                      <XAxis dataKey="x" type="number" domain={xDomain} ticks={xAxisTicks} tickFormatter={formatAxisLabel} stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} minTickGap={50} tick={{ fill: CHART_AXIS_TEXT }} allowDataOverflow={true} />
-                      <YAxis stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} width={55} tickFormatter={formatYAxisTick} tick={{ fill: CHART_AXIS_TEXT }} />
-                      <Tooltip content={<HistogramTooltip bucketInterval={bucketInterval} formatTime={formatTooltipTime} />} cursor={{ fill: 'rgba(255,255,255,0.05)' }} />
+                      <XAxis dataKey="x" type="number" domain={xDomain} ticks={xAxisTicks} tickFormatter={formatAxisLabel} stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} minTickGap={50} tick={AXIS_TICK} allowDataOverflow={true} />
+                      <YAxis stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} width={55} tickFormatter={formatYAxisTick} tick={AXIS_TICK} />
+                      <Tooltip content={tooltipContent} cursor={BAR_TOOLTIP_CURSOR} />
                       <Bar dataKey="events" fill="var(--primary)" radius={0} minPointSize={2} />
                       {plotData.filter(p => p.partialSpan).map(p => (
                         <ReferenceArea key={p.timestamp} x1={p.partialSpan![0]} x2={p.partialSpan![1]} strokeOpacity={0} fill="var(--primary)" fillOpacity={0.06} />
@@ -1351,15 +1372,15 @@ export function TimelineVisualization({
                       onMouseMove={staticMode ? undefined : handleChartMouseMove}
                       onMouseUp={staticMode ? undefined : onMouseUp}
                       onMouseLeave={staticMode ? undefined : onMouseUp}
-                      style={{ cursor: staticMode ? 'default' : 'crosshair' }}
+                      style={staticMode ? CHART_STYLE_STATIC : CHART_STYLE_DRAG}
                     >
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
-                      <XAxis dataKey="x" type="number" domain={xDomain} ticks={xAxisTicks} tickFormatter={formatAxisLabel} stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} minTickGap={30} tick={{ fill: CHART_AXIS_TEXT }} allowDataOverflow={true} />
-                      <YAxis stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} width={55} tickFormatter={formatYAxisTick} tick={{ fill: CHART_AXIS_TEXT }} />
-                      <Tooltip content={<HistogramTooltip bucketInterval={bucketInterval} formatTime={formatTooltipTime} />} />
-                      <Line type="linear" dataKey="solid" stroke="var(--primary)" strokeWidth={2} dot={renderLineDot} activeDot={{ fill: 'var(--primary)', strokeWidth: 0, r: 5 }} />
-                      <Line type="linear" dataKey="leadingPartial" stroke="var(--primary)" strokeOpacity={0.5} strokeDasharray="3 3" strokeWidth={2} dot={renderLineDot} activeDot={{ fill: 'var(--primary)', strokeWidth: 0, r: 5 }} />
-                      <Line type="linear" dataKey="trailingPartial" stroke="var(--primary)" strokeOpacity={0.5} strokeDasharray="3 3" strokeWidth={2} dot={renderLineDot} activeDot={{ fill: 'var(--primary)', strokeWidth: 0, r: 5 }} />
+                      <XAxis dataKey="x" type="number" domain={xDomain} ticks={xAxisTicks} tickFormatter={formatAxisLabel} stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} minTickGap={30} tick={AXIS_TICK} allowDataOverflow={true} />
+                      <YAxis stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} width={55} tickFormatter={formatYAxisTick} tick={AXIS_TICK} />
+                      <Tooltip content={tooltipContent} />
+                      <Line type="linear" dataKey="solid" stroke="var(--primary)" strokeWidth={2} dot={renderLineDot} activeDot={LINE_ACTIVE_DOT} />
+                      <Line type="linear" dataKey="leadingPartial" stroke="var(--primary)" strokeOpacity={0.5} strokeDasharray="3 3" strokeWidth={2} dot={renderLineDot} activeDot={LINE_ACTIVE_DOT} />
+                      <Line type="linear" dataKey="trailingPartial" stroke="var(--primary)" strokeOpacity={0.5} strokeDasharray="3 3" strokeWidth={2} dot={renderLineDot} activeDot={LINE_ACTIVE_DOT} />
                       {!staticMode && refArea && <ReferenceArea x1={refArea[0]} x2={refArea[1]} strokeOpacity={0.3} fill="var(--primary)" fillOpacity={0.2} />}
                     </LineChart>
                   ) : (
@@ -1370,12 +1391,12 @@ export function TimelineVisualization({
                       onMouseMove={staticMode ? undefined : handleChartMouseMove}
                       onMouseUp={staticMode ? undefined : onMouseUp}
                       onMouseLeave={staticMode ? undefined : onMouseUp}
-                      style={{ cursor: staticMode ? 'default' : 'crosshair' }}
+                      style={staticMode ? CHART_STYLE_STATIC : CHART_STYLE_DRAG}
                     >
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
-                      <XAxis dataKey="x" type="number" domain={xDomain} ticks={xAxisTicks} tickFormatter={formatAxisLabel} stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} minTickGap={30} tick={{ fill: CHART_AXIS_TEXT }} allowDataOverflow={true} />
-                      <YAxis stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} width={55} tickFormatter={formatYAxisTick} tick={{ fill: CHART_AXIS_TEXT }} />
-                      <Tooltip content={<HistogramTooltip bucketInterval={bucketInterval} formatTime={formatTooltipTime} />} />
+                      <XAxis dataKey="x" type="number" domain={xDomain} ticks={xAxisTicks} tickFormatter={formatAxisLabel} stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} minTickGap={30} tick={AXIS_TICK} allowDataOverflow={true} />
+                      <YAxis stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} width={55} tickFormatter={formatYAxisTick} tick={AXIS_TICK} />
+                      <Tooltip content={tooltipContent} />
                       <Area type="linear" dataKey="solid" stroke="var(--primary)" strokeWidth={2} fill="var(--primary)" fillOpacity={0.2} />
                       <Area type="linear" dataKey="leadingPartial" stroke="var(--primary)" strokeWidth={2} strokeOpacity={0.5} strokeDasharray="3 3" fill="var(--primary)" fillOpacity={0.07} />
                       <Area type="linear" dataKey="trailingPartial" stroke="var(--primary)" strokeWidth={2} strokeOpacity={0.5} strokeDasharray="3 3" fill="var(--primary)" fillOpacity={0.07} />
@@ -1399,7 +1420,7 @@ export function TimelineVisualization({
                   <div className="flex flex-col items-center justify-center py-8 gap-2 text-center px-4">
                     <div className="text-muted-foreground text-sm">Rarity auto-loads for windows ≤ {RARITY_AUTO_MAX_HOURS}h</div>
                     <div className="text-muted-foreground/70 text-xs max-w-md">
-                      This search spans {searchWindowHours != null ? (searchWindowHours >= 24 ? `${Math.round(searchWindowHours / 24)}d` : `${Math.round(searchWindowHours)}h`) : ''} — prevalence is a small-window tool, and scoring every artifact over a wide window is heavier.
+                      This search spans <span className="font-mono">{searchWindowHours != null ? (searchWindowHours >= 24 ? `${Math.round(searchWindowHours / 24)}d` : `${Math.round(searchWindowHours)}h`) : ''}</span>; scoring a wide window is heavier.
                     </div>
                     {/* Only flip the opt-in flag — the prefetch effect (which depends
                         on rarityGatedByWindow) fires the single load, so we don't
@@ -1413,7 +1434,7 @@ export function TimelineVisualization({
                   <>
                     {extractedData.droppedCount > 0 && (
                       <div className="text-[10px] text-amber-400/80 text-center pb-1">
-                        showing first {RARITY_MAX_ARTIFACTS.toLocaleString()} of {(RARITY_MAX_ARTIFACTS + extractedData.droppedCount).toLocaleString()} artifacts — narrow the window to score the rest
+                        showing first {RARITY_MAX_ARTIFACTS.toLocaleString()} of {(RARITY_MAX_ARTIFACTS + extractedData.droppedCount).toLocaleString()} artifacts; narrow the window to score the rest
                       </div>
                     )}
                     <PrevalenceScatterPlot data={(scatterData ?? pendingScatterData)!} onArtifactClick={handleArtifactClick} onSelectionChange={handleSelectionChange} height={180} loading={isLoading} timeRange={timeRange} onMaxHostCountChange={isAssetMode ? handleMaxHostCountChange : undefined} />

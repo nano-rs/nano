@@ -35,7 +35,7 @@ const GRANT_FILES: &[&str] = &[
     "deploy/helm/nano/files/clickhouse/users.json",
     "deploy/k8s/clickhouse/clickhouse.yaml",
     "deploy/k8s/aws-db/clickhouse.yaml.tpl",
-    "deploy/k8s/rackspace-db/clickhouse.yaml.tpl",
+    "deploy/k8s/self-managed-db/clickhouse.yaml.tpl",
 ];
 
 /// Reads a repo file. `None` only when the file is genuinely absent AND it lives

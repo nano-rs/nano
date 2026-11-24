@@ -17,7 +17,10 @@ use uuid::Uuid;
 use crate::auth::{
     repository::{SessionRepository, UserRepository},
     service::hash_token,
-    types::{AuthResponse, CreateUserRequest, LandingPage, QueryMode, TimeRangePreset, UserInfo},
+    types::{
+        AuthResponse, CreateUserRequest, LandingPage, QueryMode, TimeRangePreset, TokenPair,
+        UserInfo,
+    },
     TokenService,
 };
 
@@ -227,21 +230,13 @@ impl DemoService {
         let roles = vec!["demo_analyst".to_string()];
         let permissions: Vec<String> = crate::auth::permissions::demo_permissions();
 
-        let token_pair = self
-            .token_service
-            .create_token_pair(user.id, roles.clone())
-            .map_err(|e| DemoError::TokenError(e.to_string()))?;
-
         // Create a row in the main sessions table so that the standard
         // auth refresh_token flow can look up the refresh token hash and
         // rotate it.  Without this, demo users get logged out when the
         // access token expires (~15 min) because the refresh silently fails.
-        let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let session_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
-        self.session_repo
-            .create_session(user.id, &refresh_token_hash, ip_address, user_agent, session_expires_at)
-            .await
-            .map_err(|e| DemoError::UserError(format!("session creation failed: {e}")))?;
+        let token_pair = self
+            .open_auth_session(user.id, roles.clone(), ip_address, user_agent)
+            .await?;
 
         let auth_response = AuthResponse {
             user: UserInfo {
@@ -269,6 +264,43 @@ impl DemoService {
             session,
             auth: auth_response,
         })
+    }
+
+    /// Open an auth session row and mint its tokens. The access token is
+    /// bound to the new session (`sid`, NAN-5573) so logout ends only it.
+    async fn open_auth_session(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<TokenPair, DemoError> {
+        let refresh_token = self
+            .token_service
+            .create_refresh_token(user_id)
+            .map_err(|e| DemoError::TokenError(e.to_string()))?;
+        let session_expires_at =
+            Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
+        let auth_session = self
+            .session_repo
+            .create_session(
+                user_id,
+                &hash_token(&refresh_token),
+                ip_address,
+                user_agent,
+                session_expires_at,
+            )
+            .await
+            .map_err(|e| DemoError::UserError(format!("session creation failed: {e}")))?;
+        let access_token = self
+            .token_service
+            .create_access_token_for_session(user_id, roles, auth_session.id)
+            .map_err(|e| DemoError::TokenError(e.to_string()))?;
+        Ok(TokenPair::new(
+            access_token,
+            refresh_token,
+            self.token_service.access_token_ttl(),
+        ))
     }
 
     /// Claim a demo session by token.
@@ -301,28 +333,19 @@ impl DemoService {
         let roles = vec!["demo_analyst".to_string()];
         let permissions: Vec<String> = crate::auth::permissions::demo_permissions();
 
-        let token_pair = self
-            .token_service
-            .create_token_pair(session.user_id, roles.clone())
-            .map_err(|e| DemoError::TokenError(e.to_string()))?;
-
         // Clean up any previous auth sessions for this user (re-claims
         // would otherwise stack orphan rows until the 7-day TTL expires)
         let _ = self.session_repo.delete_user_sessions(session.user_id).await;
 
         // Create a session row so the standard refresh_token flow works
-        let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let session_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
-        self.session_repo
-            .create_session(
+        let token_pair = self
+            .open_auth_session(
                 session.user_id,
-                &refresh_token_hash,
+                roles.clone(),
                 session.ip_address.as_deref(),
                 session.user_agent.as_deref(),
-                session_expires_at,
             )
-            .await
-            .map_err(|e| DemoError::UserError(format!("session creation failed: {e}")))?;
+            .await?;
 
         // Get user info
         let user = self
@@ -761,16 +784,134 @@ impl DemoService {
     }
 }
 
+/// How long a `demo.sessions` existence answer is reused (NAN-5825). Token
+/// refresh asks on every refresh; both answers are cached so a non-demo
+/// install pays one `to_regclass` round trip per database per TTL, and expire
+/// so a demo schema created later (or dropped) is picked up within it.
+pub(crate) const DEMO_SCHEMA_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-database (`host:port/database`) cache of the demo-schema probe. An
+/// errored probe is never cached, so a transient failure cannot hide a demo
+/// schema for the TTL.
+#[derive(Default)]
+pub(crate) struct DemoSchemaCache {
+    entries: std::collections::HashMap<String, (bool, std::time::Instant)>,
+}
+
+impl DemoSchemaCache {
+    pub(crate) fn get(&self, key: &str, now: std::time::Instant) -> Option<bool> {
+        self.entries
+            .get(key)
+            .filter(|(_, at)| now.saturating_duration_since(*at) < DEMO_SCHEMA_PROBE_TTL)
+            .map(|(present, _)| *present)
+    }
+
+    pub(crate) fn put(&mut self, key: &str, present: bool, now: std::time::Instant) {
+        self.entries.insert(key.to_owned(), (present, now));
+    }
+
+    pub(crate) fn forget(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+}
+
+static DEMO_SCHEMA_CACHE: std::sync::LazyLock<std::sync::Mutex<DemoSchemaCache>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn demo_cache() -> std::sync::MutexGuard<'static, DemoSchemaCache> {
+    DEMO_SCHEMA_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The database a pool talks to, as the cache key.
+fn database_key(pool: &PgPool) -> String {
+    let options = pool.connect_options();
+    format!(
+        "{}:{}/{}",
+        options.get_host(),
+        options.get_port(),
+        options.get_database().unwrap_or("")
+    )
+}
+
+/// NAN-5825: whether this database has the demo schema. Probed with
+/// `to_regclass`, which returns NULL instead of failing, so a non-demo install
+/// never sends a statement PostgreSQL rejects (and logs as an ERROR).
+async fn demo_sessions_present(pool: &PgPool) -> bool {
+    let key = database_key(pool);
+    let now = std::time::Instant::now();
+    if let Some(present) = demo_cache().get(&key, now) {
+        return present;
+    }
+    match sqlx::query_scalar::<_, bool>("SELECT to_regclass('demo.sessions') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(present) => {
+            demo_cache().put(&key, present, now);
+            present
+        }
+        Err(_) => false,
+    }
+}
+
 /// Check if a user has an active (non-expired, non-cleaned-up) demo session.
 /// Works with just a PgPool — no DemoService needed.
+///
+/// NAN-5825: token refresh calls this for every user, so on an install
+/// without the demo schema it answers `false` from the (cached) schema probe
+/// instead of querying a relation that does not exist. Fails closed: any
+/// error is `false`; an `undefined_table` error (the schema was dropped since
+/// the probe) also forgets the cached answer.
 pub async fn is_demo_session_active(pool: &PgPool, user_id: Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
+    if !demo_sessions_present(pool).await {
+        return false;
+    }
+    match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM demo.sessions WHERE user_id = $1 AND cleaned_up = FALSE AND expires_at > NOW())",
     )
     .bind(user_id)
     .fetch_one(pool)
     .await
-    .unwrap_or(false)
+    {
+        Ok(active) => active,
+        Err(error) => {
+            if error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .is_some_and(|code| code == "42P01")
+            {
+                demo_cache().forget(&database_key(pool));
+            }
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod demo_schema_cache_tests {
+    use super::{DemoSchemaCache, DEMO_SCHEMA_PROBE_TTL};
+    use std::time::{Duration, Instant};
+
+    /// NAN-5825 review: both answers are cached per database and expire, so a
+    /// demo schema created later is seen within the TTL and one database's
+    /// answer never leaks into another's.
+    #[test]
+    fn answers_are_per_database_and_expire() {
+        let t0 = Instant::now();
+        let mut cache = DemoSchemaCache::default();
+        assert_eq!(cache.get("pg:5432/a", t0), None);
+        cache.put("pg:5432/a", false, t0);
+        cache.put("pg:5432/b", true, t0);
+        assert_eq!(cache.get("pg:5432/a", t0 + Duration::from_secs(1)), Some(false));
+        assert_eq!(cache.get("pg:5432/b", t0 + Duration::from_secs(1)), Some(true));
+        assert_eq!(cache.get("pg:5432/c", t0), None);
+        let later = t0 + DEMO_SCHEMA_PROBE_TTL;
+        assert_eq!(cache.get("pg:5432/a", later), None, "a cached absence expires");
+        assert_eq!(cache.get("pg:5432/b", later), None, "a cached presence expires");
+        cache.put("pg:5432/b", true, t0);
+        cache.forget("pg:5432/b");
+        assert_eq!(cache.get("pg:5432/b", t0), None);
+    }
 }
 
 /// Get resource IDs created by OTHER demo users. Standalone version for use

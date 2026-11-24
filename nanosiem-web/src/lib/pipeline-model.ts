@@ -23,13 +23,13 @@ export const MAX_PIPE_STEPS = 50;
 export const NATIVE_STEP_KINDS: readonly PipelineStepKind[] = ['dedupe', 'combine', 'route', 'lookup'];
 
 /** The one line the preview shows about what it does not run. */
-export const PREVIEW_SCOPE_NOTE = 'Preview runs the draft over a frozen batch in an isolated worker. No normalization or sinks. Times in UTC.';
+export const PREVIEW_SCOPE_NOTE = 'Preview runs your draft on a fixed batch of events, apart from production. Nothing is stored. Times are in UTC.';
 /** Detail behind the scope note's info icon. */
 export const PREVIEW_SCOPE_DETAILS = [
-  'Platform normalization, sink encoding, existing production sampling and live Vector state are excluded.',
-  'Dedupe, combine, route and lookup are simulated with fresh state per run; partial groups flush at the end of the sample.',
-  'The source extension (when enabled) runs after the pipeline as a separate program, as in production.',
-  'Implicit timezones use UTC; specify a timezone in VRL when you need another.',
+  "It skips nano's final cleanup step, storage and the source's own sampling.",
+  'Dedupe, combine, route and lookup start fresh on every run. Groups still open at the end of the batch are closed.',
+  'If the source has an extension, it runs after the pipeline, the same as in production.',
+  'Timestamps without a time zone are read as UTC. Set a zone in VRL if you need another.',
 ] as const;
 /** Standing caveats the scope note already covers; the server repeats them on every preview. */
 const PREVIEW_BOILERPLATE = ['Preview simulates the pipeline in isolation'];

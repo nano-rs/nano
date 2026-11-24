@@ -114,14 +114,18 @@ mod timechart;
 mod tree_view;
 mod window_clamp;
 
-/// Crate-public re-export of the ONE source-scope SQL predicate builder
-/// (NAN-1801, P3). The hand-built "side-door" SQL paths in other crates
-/// (identity API, prevalence, telemetry, AI) render a caller's deny-set with
-/// THIS function so their gate stays byte-identical to the nPL injector's
-/// negated-`InList` shape — never a re-derived copy. Reachable as
-/// `nanosiem_core::search::service::source_scope_sql_predicate` (requires
-/// `search::service` to be a `pub mod`).
-pub use lateral::source_scope_sql_predicate;
+/// Crate-public re-exports of the source-scope predicate builders (NAN-1801,
+/// P3; NAN-5793). Hand-built ClickHouse "side-door" SQL in other crates
+/// (identity API, prevalence, telemetry, AI) renders a caller's deny-set with
+/// [`source_scope_bound_predicate`] and binds it with [`bind_source_scope`]:
+/// the denied names travel as a server-side `Array(String)` parameter, never
+/// SQL text. [`source_scope_literal_predicate`] is only for PostgreSQL and
+/// nPL-generated SQL (see its docs).
+pub use lateral::{
+    bind_source_scope, source_scope_bound_predicate, source_scope_param_predicate,
+    source_scope_param_values, source_scope_literal_predicate, SourceScopedClient,
+    SOURCE_SCOPE_DENY_PARAM,
+};
 
 /// Determine the display type for a query based on its commands
 ///
@@ -939,8 +943,11 @@ pub struct SearchService {
     ch_client: Option<clickhouse::Client>,
     /// Service configuration
     config: SearchConfig,
-    /// ClickHouse SQL generator
-    ch_sql_generator: ClickHouseSqlGenerator,
+    /// ClickHouse SQL generator TEMPLATE (table, profile, cluster routing).
+    /// NAN-5793 review: never read directly; every generation goes through
+    /// [`Self::sql_generator`], which clones it under a scope decision
+    /// (`generator_scope_guard_tests` pins this).
+    ch_sql_generator_base: ClickHouseSqlGenerator,
     /// Lookup service for enrichment (uses PostgreSQL)
     lookup_service: Option<LookupService>,
     /// Prevalence service for filtering and enrichment (uses ClickHouse)
@@ -1119,10 +1126,7 @@ impl SearchService {
         // resolve_identity ASOF join to identity_observations (reached via the
         // explain and field-values paths, which build their generator here)
         // filters its build side. Empty deny-set = byte-identical SQL.
-        let mut generator = self
-            .ch_sql_generator
-            .clone()
-            .with_source_scope_deny(deny_set.clone());
+        let mut generator = self.sql_generator(crate::query::GeneratorScope::deny_set(deny_set));
         if touches_risk_dataset(dataset, raw_query) {
             generator = generator.with_risk_config(self.risk_query_config.resolve().await);
         }
@@ -1186,9 +1190,13 @@ impl SearchService {
     /// outside the search service (the Rarity view's query-artifacts) builds it
     /// exactly as search does. A bare `ClickHouseSqlGenerator::with_table` is
     /// UDM-only and emits `ext.<field>` for every OCSF path.
+    ///
+    /// NAN-5793 review: built under `scope`; a request passes its viewer's
+    /// deny-set.
     pub fn ch_generator_for_pool(
         dual_pool: &DualPool,
         profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+        scope: crate::query::GeneratorScope<'_>,
     ) -> ClickHouseSqlGenerator {
         let table = dual_pool
             .table_names()
@@ -1197,9 +1205,21 @@ impl SearchService {
         // metrics, identity ASOF join) route their FROM to the `_distributed`
         // wrapper too — the logs lane is already routed via `read_bare` above.
         // No-op on single-shard (flag false → bare local table names).
-        ClickHouseSqlGenerator::with_table(table)
+        ClickHouseSqlGenerator::scoped_with_table(table, scope)
             .with_profile(profile)
             .with_cluster_routing(dual_pool.table_names().is_clustered())
+    }
+
+    /// NAN-5793 review: THE way the search service gets a SQL generator. A
+    /// fresh clone of the template (generation state is per generation),
+    /// carrying the caller's source-scope deny-set, so the reads the nPL AST
+    /// gate cannot reach (`| resolve_identity`'s `identity_observations`
+    /// build side, a `[dataset=risk …]` subsearch's origin manifest) are
+    /// scoped. Pass [`crate::query::GeneratorScope::unrestricted`] only for a
+    /// path with no viewer.
+    pub(crate) fn sql_generator(&self, scope: crate::query::GeneratorScope<'_>) -> ClickHouseSqlGenerator {
+        // The template itself is unscoped; the clone takes the decision.
+        self.ch_sql_generator_base.clone().apply_scope(scope)
     }
 
     /// Create a new search service with DualPool (ClickHouse for logs, PostgreSQL
@@ -1229,7 +1249,12 @@ impl SearchService {
         Self {
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),
+            // The template is unscoped; every use re-scopes it (`sql_generator`).
+            ch_sql_generator_base: Self::ch_generator_for_pool(
+                dual_pool,
+                profile.clone(),
+                crate::query::GeneratorScope::unrestricted(),
+            ),
             lookup_service: None,
             prevalence_service: None,
             inputlookup_service: None,
@@ -1311,7 +1336,12 @@ impl SearchService {
         Self {
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),
+            // The template is unscoped; every use re-scopes it (`sql_generator`).
+            ch_sql_generator_base: Self::ch_generator_for_pool(
+                dual_pool,
+                profile.clone(),
+                crate::query::GeneratorScope::unrestricted(),
+            ),
             lookup_service: Some(lookup_service),
             prevalence_service: Some(prevalence_service),
             inputlookup_service: None,
@@ -1524,6 +1554,9 @@ mod prevalence_decorated_field_tests;
 #[path = "prevalence_enrich_rescue_tests.rs"]
 mod prevalence_enrich_rescue_tests;
 #[cfg(test)]
+#[path = "prevalence_stale_dict_rescue_tests.rs"]
+mod prevalence_stale_dict_rescue_tests;
+#[cfg(test)]
 #[path = "prevalence_stage_alias_tests.rs"]
 mod prevalence_stage_alias_tests;
 #[cfg(test)]
@@ -1537,6 +1570,30 @@ pub(crate) mod npl_injection_canary_tests;
 #[cfg(test)]
 #[path = "npl_scoped_golden_tests.rs"]
 mod npl_scoped_golden_tests;
+
+#[cfg(test)]
+#[path = "source_scope_inline_guard_tests.rs"]
+mod source_scope_inline_guard_tests;
+
+#[cfg(test)]
+#[path = "histogram_scope_tests.rs"]
+mod histogram_scope_tests;
+
+#[cfg(test)]
+#[path = "generator_scope_p1_tests.rs"]
+mod generator_scope_p1_tests;
+
+#[cfg(test)]
+#[path = "generator_scope_guard_tests.rs"]
+mod generator_scope_guard_tests;
+
+#[cfg(test)]
+#[path = "source_scope_ch_fixture.rs"]
+pub(crate) mod source_scope_ch_fixture;
+
+#[cfg(test)]
+#[path = "source_scope_bound_ch_tests.rs"]
+mod source_scope_bound_ch_tests;
 
 #[cfg(test)]
 mod tests {

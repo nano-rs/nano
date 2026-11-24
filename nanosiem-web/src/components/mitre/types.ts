@@ -30,6 +30,12 @@ export interface RequiredDataSource {
   last_seen_at?: string | null;
   /** Compatibility alias from the API; true only for active readiness. */
   connected?: boolean;
+  /**
+   * NAN-5850: the lowercase nano source types this ATT&CK data component maps
+   * to (configured or not), minus any the viewer is denied. Powers the `source`
+   * filter ("what does Sysmon buy me"). Optional for rolling upgrades.
+   */
+  source_types?: string[];
 }
 
 export interface TechniqueCoverage {

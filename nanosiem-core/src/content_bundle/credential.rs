@@ -81,6 +81,28 @@ pub fn credential_source() -> Option<Arc<dyn CredentialSource>> {
     SOURCE.get().cloned()
 }
 
+/// PostgreSQL NOTIFY channel raised (after commit) whenever this install's
+/// license changes: a C05 import or renewal, an air-gap license import, or an
+/// online check-in that newly admits the install (NAN-5769). The content
+/// channel consumer on the jobs leader listens on it and re-checks the
+/// enterprise channels at once, so a license imported on any replica reaches
+/// the leader without waiting for the next poll.
+pub const LICENSE_CHANGED_CHANNEL: &str = "license_status_changed";
+
+/// Raise [`LICENSE_CHANGED_CHANNEL`] inside `executor`'s transaction (or at
+/// once outside one). PostgreSQL delivers it only after commit.
+pub async fn notify_license_changed<'e, E>(executor: E, reason: &str) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(LICENSE_CHANGED_CHANNEL)
+        .bind(reason)
+        .execute(executor)
+        .await
+        .map(|_| ())
+}
+
 /// Shown when an enterprise channel has no license to present.
 pub const NO_LICENCE_REASON: &str = "no license installed on this install: set the online license values \
      (LICENSE_URL, LICENSE_TOKEN, NANO_DEPLOYMENT_ID) or import a license file under Settings → License";

@@ -2160,6 +2160,40 @@ body {
   border-color: var(--normal-border);
   color: var(--normal-text);
 }
+/* NAN-5834: a toast is a one-line notice, never an error dump. A long
+   description scrolls inside a capped body instead of growing the toast over
+   the page (one VRL compiler error rendered 419px tall). */
+:root [data-sonner-toaster] [data-sonner-toast] [data-description] {
+  max-height: 72px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+/* An open Dialog/Sheet sets pointer-events:none on <body>; the toaster sits
+   above the modal layer, so its toasts (close button, actions, scroll body)
+   stay usable. DialogContent/SheetContent treat a toast click as inside.
+   Only toasts Sonner shows: it keeps the queued (4th+) and removed ones in
+   the DOM, invisible, and relies on pointer-events:none for them. */
+:root [data-sonner-toaster] [data-sonner-toast]:not([data-visible='false']):not([data-removed='true']) {
+  pointer-events: auto;
+}
+/* Focus and hover on the theme tokens: Sonner's ring is a 20%-black shadow
+   (invisible on dark themes), and the close-button rule above outranks its
+   hover state. */
+:root [data-sonner-toaster] [data-sonner-toast]:focus-visible,
+:root [data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-close-button]:focus-visible,
+:root [data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-button]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ring);
+}
+:root [data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-close-button]:hover {
+  background: var(--normal-bg-hover);
+  border-color: var(--normal-border-hover);
+}
+/* A floating bulk-action bar (Rules, Cases) owns the bottom-center band while
+   rows are selected: lift the toasts above it (see lib/toast-lift.ts). */
+:root[data-toast-lift] [data-sonner-toaster][data-y-position='bottom'] {
+  --offset-bottom: 96px !important;
+}
 /* Semantic icon tint — the only per-variant signal on a plain (non-rich) toast. */
 :root [data-sonner-toaster] [data-sonner-toast][data-type='success'] [data-icon] { color: var(--success); }
 :root [data-sonner-toaster] [data-sonner-toast][data-type='info'] [data-icon] { color: var(--primary); }

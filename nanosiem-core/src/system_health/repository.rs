@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -42,8 +42,20 @@ impl SystemHealthRepository {
         &self,
         event: &PublishHealthEvent,
     ) -> Result<SystemHealthEvent, SystemHealthError> {
+        let mut conn = self.pool.acquire().await?;
+        self.publish_on(&mut conn, event).await
+    }
+
+    /// [`Self::publish`] on `conn`. Inside a caller's transaction this runs
+    /// as a savepoint (a failure rolls back only the publish) and needs no
+    /// second pool connection (NAN-5738).
+    pub async fn publish_on(
+        &self,
+        conn: &mut PgConnection,
+        event: &PublishHealthEvent,
+    ) -> Result<SystemHealthEvent, SystemHealthError> {
         validate_publish(event)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = conn.begin().await?;
 
         // Serialize publishers for one logical condition before checking the
         // partial unique index. Without this lock, two scheduler/task replicas
@@ -78,11 +90,32 @@ impl SystemHealthRepository {
             let updated = sqlx::query_as::<_, SystemHealthEvent>(
                 r#"
                 UPDATE system_health_events
-                SET category = $2, severity = $3, title = $4, summary = $5,
+                SET category = $2, severity = $3,
+                    -- NAN-5785: a pass that raced a source delete, disable
+                    -- or stale-alerting-off must not erase the attributed
+                    -- `source_removed` flag. It clears only once the source is
+                    -- actively monitored again.
+                    title = CASE
+                        WHEN diagnostic_context ? 'source_removed' AND NOT EXISTS (
+                            SELECT 1 FROM log_sources ls
+                            WHERE ls.id::text = system_health_events.resource_id
+                              AND ls.enabled AND ls.stale_alert_enabled)
+                        THEN title
+                        ELSE $4 END,
+                    summary = $5,
                     resource_type = $6, resource_id = $7, resource_name = $8,
-                    diagnostic_context = $9, remediation = $10, source = $11,
+                    diagnostic_context = CASE
+                        WHEN diagnostic_context ? 'source_removed' AND NOT EXISTS (
+                            SELECT 1 FROM log_sources ls
+                            WHERE ls.id::text = system_health_events.resource_id
+                              AND ls.enabled AND ls.stale_alert_enabled)
+                        THEN $9 || jsonb_build_object('source_removed', diagnostic_context->'source_removed')
+                        ELSE $9 END,
+                    remediation = $10, source = $11,
                     occurrence_count = occurrence_count + 1,
-                    last_seen_at = NOW(), updated_at = NOW()
+                    -- NAN-5738: a publisher whose transaction began earlier
+                    -- never moves last_seen_at backwards.
+                    last_seen_at = GREATEST(last_seen_at, NOW()), updated_at = NOW()
                 WHERE id = $1
                 RETURNING id, tenant_id, dedup_key, category, severity, status, title, summary,
                           resource_type, resource_id, resource_name, diagnostic_context,
@@ -220,7 +253,20 @@ impl SystemHealthRepository {
         prefix: &str,
         stale_before: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        self.resolve_stale_by_prefix_on(&mut conn, prefix, stale_before).await
+    }
+
+    /// [`Self::resolve_stale_by_prefix`] on `conn` (a savepoint inside a
+    /// caller's transaction, NAN-5738).
+    pub async fn resolve_stale_by_prefix_on(
+        &self,
+        conn: &mut PgConnection,
+        prefix: &str,
+        stale_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
+        validate_resolve_prefix(prefix)?;
+        let mut tx = conn.begin().await?;
         // `left(...) = $2`, not LIKE: dedup keys contain `_`, a LIKE wildcard.
         let events = sqlx::query_as::<_, SystemHealthEvent>(
             r#"
@@ -248,6 +294,214 @@ impl SystemHealthRepository {
         Ok(events)
     }
 
+    /// Resolve every active condition of producer `source` whose dedup key
+    /// starts with `prefix` and is not in `keep`, on `conn` (a savepoint
+    /// inside a caller's transaction). For a producer that serializes its
+    /// passes and knows the full set of conditions that still hold:
+    /// membership, not timestamps, decides, so a pass whose transaction began
+    /// earlier cannot leave a cleared condition active (NAN-5738).
+    ///
+    /// Scoped so it can never touch another producer's alerts: `prefix` must
+    /// be a specific namespace (non-empty, at most 256 bytes, ending in `:`)
+    /// and only events whose `source` is `source` are resolved.
+    pub async fn resolve_absent_by_prefix_on(
+        &self,
+        conn: &mut PgConnection,
+        prefix: &str,
+        source: &str,
+        keep: &[String],
+    ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
+        validate_resolve_prefix(prefix)?;
+        if source.trim().is_empty() || source.len() > 128 {
+            return Err(SystemHealthError::Invalid("source must be between 1 and 128 bytes".to_string()));
+        }
+        let mut tx = conn.begin().await?;
+        let events = sqlx::query_as::<_, SystemHealthEvent>(
+            r#"
+            UPDATE system_health_events
+            SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
+            WHERE tenant_id = $1 AND status = 'active'
+              AND left(dedup_key, length($2)) = $2
+              AND NOT (dedup_key = ANY($3))
+              AND source = $4
+            RETURNING id, tenant_id, dedup_key, category, severity, status, title, summary,
+                      resource_type, resource_id, resource_name, diagnostic_context,
+                      remediation, source, occurrence_count, first_seen_at, last_seen_at,
+                      last_notified_at, acknowledged_at, acknowledged_by, resolved_at,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(DEFAULT_TENANT_ID)
+        .bind(prefix)
+        .bind(keep)
+        .bind(source)
+        .fetch_all(&mut *tx)
+        .await?;
+        for event in &events {
+            enqueue_matching_destinations(&mut tx, event, "resolved").await?;
+        }
+        tx.commit().await?;
+        Ok(events)
+    }
+
+    /// NAN-5785: a stale-feed recovery. Resolves the active lifecycle only
+    /// when the source's newest event is later than the moment the alert
+    /// opened: data has demonstrably arrived since. A source that merely
+    /// stopped being judged stale (its threshold was raised, a grace window,
+    /// an unreadable probe) never closes an open alert this way; only new
+    /// data or an owner with `system_health:manage` does.
+    pub async fn resolve_recovered(
+        &self,
+        dedup_key: &str,
+        last_event_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<SystemHealthEvent>, SystemHealthError> {
+        self.resolve_active_inner(DEFAULT_TENANT_ID, Some(dedup_key), None, Some(last_event_at))
+            .await
+    }
+
+    /// NAN-5785: an active `log_source` alert whose source was deleted,
+    /// disabled, or had stale alerting turned off. The alert is NOT resolved:
+    /// a source mutation (`log_sources:edit` / `log_sources:delete`) must never
+    /// close a real alert or its paging incident. It stays active, retitled
+    /// with who removed the source (`"<title> (source deleted by alice)"`),
+    /// with `diagnostic_context.source_removed` set, and its destinations get a
+    /// reminder carrying the new title. Closing it is an owner's audited
+    /// `system_health:manage` action.
+    ///
+    /// A flag only escalates (deleted > disabled > stale alerting off): an
+    /// alert already flagged as strongly or more is left alone, so repeats
+    /// send no further reminder. The original title is kept so a later flag
+    /// replaces the suffix instead of stacking it.
+    pub async fn flag_log_source_events_removed(
+        &self,
+        source_ids: &[Uuid],
+        action: &str,
+        label: &str,
+        by: &str,
+    ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
+        if source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = source_ids.iter().map(Uuid::to_string).collect();
+        self.flag_removed_in("ids", &ids, action, label, by).await
+    }
+
+    /// NAN-5785: flag (never resolve) active `log_source` alerts whose source
+    /// no longer exists but which no delete path flagged: a raw SQL delete, a
+    /// path without an actor, a failed flag, or a stale pass that raced the
+    /// delete.
+    pub async fn flag_orphaned_log_source_events(
+        &self,
+        label: &str,
+        by: &str,
+    ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
+        self.flag_removed_in("orphaned", &[], "deleted", label, by).await
+    }
+
+    /// NAN-5785: flag (never resolve) active stale alerts of sources that are
+    /// disabled (`action = "disabled"`) or have stale alerting off
+    /// (`"stale_alerting_off"`) but carry no such flag: a stale pass raised
+    /// them after the API's flag ran. `action` picks which.
+    pub async fn flag_unmonitored_stale_events(
+        &self,
+        action: &str,
+        label: &str,
+        by: &str,
+    ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
+        let scope = if action == "disabled" { "unmonitored_disabled" } else { "unmonitored_alerting_off" };
+        self.flag_removed_in(scope, &[], action, label, by).await
+    }
+
+    async fn flag_removed_in(
+        &self,
+        scope: &'static str,
+        ids: &[String],
+        action: &str,
+        label: &str,
+        by: &str,
+    ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
+        let mut tx = self.pool.begin().await?;
+        let events = sqlx::query_as::<_, SystemHealthEvent>(
+            r#"
+            WITH target AS (
+                SELECT e.id,
+                       COALESCE(e.diagnostic_context->'source_removed'->>'original_title', e.title)
+                           AS original_title
+                FROM system_health_events e
+                WHERE e.tenant_id = $1 AND e.status = 'active' AND e.resource_type = 'log_source'
+                  -- Precedence deleted > disabled > stale_alerting_off: a flag
+                  -- only ever escalates, so repeated or alternating updates
+                  -- cannot re-flag (no reminder or audit spam) and a weaker
+                  -- removal never hides a stronger one.
+                  AND (CASE e.diagnostic_context->'source_removed'->>'action'
+                          WHEN 'deleted' THEN 3 WHEN 'disabled' THEN 2
+                          WHEN 'stale_alerting_off' THEN 1 ELSE 0 END)
+                      < (CASE $4::text
+                          WHEN 'deleted' THEN 3 WHEN 'disabled' THEN 2
+                          WHEN 'stale_alerting_off' THEN 1 ELSE 0 END)
+                  AND CASE $2::text
+                      WHEN 'ids' THEN e.resource_id = ANY($3::text[])
+                      WHEN 'orphaned' THEN e.resource_id IS NOT NULL AND NOT EXISTS (
+                          SELECT 1 FROM log_sources ls WHERE ls.id::text = e.resource_id)
+                      -- A stale alert a racing pass raised for a source that
+                      -- was already disabled or had stale alerting off.
+                      WHEN 'unmonitored_disabled' THEN EXISTS (
+                          SELECT 1 FROM log_sources ls
+                          WHERE ls.id::text = e.resource_id AND NOT ls.enabled
+                            AND e.dedup_key = 'log_source:' || ls.id::text || ':stale')
+                      WHEN 'unmonitored_alerting_off' THEN EXISTS (
+                          SELECT 1 FROM log_sources ls
+                          WHERE ls.id::text = e.resource_id AND ls.enabled AND NOT ls.stale_alert_enabled
+                            AND e.dedup_key = 'log_source:' || ls.id::text || ':stale')
+                      ELSE false
+                  END
+                FOR UPDATE OF e
+            )
+            UPDATE system_health_events e
+            SET title = target.original_title || ' (' || $5::text || ')',
+                diagnostic_context = e.diagnostic_context || jsonb_build_object(
+                    'source_removed', jsonb_build_object(
+                        'action', $4::text,
+                        'by', $6::text,
+                        'at', NOW(),
+                        'original_title', target.original_title,
+                        'note', 'The alert stays open until an owner with system_health:manage resolves it.'
+                    )),
+                updated_at = NOW()
+            FROM target
+            WHERE e.id = target.id
+            RETURNING e.id, e.tenant_id, e.dedup_key, e.category, e.severity, e.status, e.title,
+                      e.summary, e.resource_type, e.resource_id, e.resource_name,
+                      e.diagnostic_context, e.remediation, e.source, e.occurrence_count,
+                      e.first_seen_at, e.last_seen_at, e.last_notified_at, e.acknowledged_at,
+                      e.acknowledged_by, e.resolved_at, e.created_at, e.updated_at
+            "#,
+        )
+        .bind(DEFAULT_TENANT_ID)
+        .bind(scope)
+        .bind(ids)
+        .bind(action)
+        .bind(label)
+        .bind(by)
+        .fetch_all(&mut *tx)
+        .await?;
+        for event in &events {
+            // Same as a reminder (`claim_reminder`): one reminder row per
+            // destination, so clear the finished ones first.
+            sqlx::query(
+                "DELETE FROM system_health_outbox WHERE tenant_id = $1 AND event_id = $2 \
+                 AND event_action = 'reminder' AND status IN ('delivered', 'dead')",
+            )
+            .bind(&event.tenant_id)
+            .bind(event.id)
+            .execute(&mut *tx)
+            .await?;
+            enqueue_matching_destinations(&mut tx, event, "reminder").await?;
+        }
+        tx.commit().await?;
+        Ok(events)
+    }
+
     pub async fn resolve_by_id(&self, id: Uuid) -> Result<SystemHealthEvent, SystemHealthError> {
         self.resolve_active(DEFAULT_TENANT_ID, None, Some(id))
             .await?
@@ -260,6 +514,17 @@ impl SystemHealthRepository {
         dedup_key: Option<&str>,
         id: Option<Uuid>,
     ) -> Result<Option<SystemHealthEvent>, SystemHealthError> {
+        self.resolve_active_inner(tenant_id, dedup_key, id, None).await
+    }
+
+    /// `recovered_after`: resolve only a lifecycle that opened before it.
+    async fn resolve_active_inner(
+        &self,
+        tenant_id: &str,
+        dedup_key: Option<&str>,
+        id: Option<Uuid>,
+        recovered_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<SystemHealthEvent>, SystemHealthError> {
         let mut tx = self.pool.begin().await?;
         let event = sqlx::query_as::<_, SystemHealthEvent>(
             r#"
@@ -268,6 +533,7 @@ impl SystemHealthRepository {
             WHERE tenant_id = $1 AND status = 'active'
               AND ($2::text IS NULL OR dedup_key = $2)
               AND ($3::uuid IS NULL OR id = $3)
+              AND ($4::timestamptz IS NULL OR first_seen_at < $4)
             RETURNING id, tenant_id, dedup_key, category, severity, status, title, summary,
                       resource_type, resource_id, resource_name, diagnostic_context,
                       remediation, source, occurrence_count, first_seen_at, last_seen_at,
@@ -278,6 +544,7 @@ impl SystemHealthRepository {
         .bind(tenant_id)
         .bind(dedup_key)
         .bind(id)
+        .bind(recovered_after)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(ref event) = event {
@@ -598,6 +865,18 @@ fn severity_rank(severity: &str) -> u8 {
     }
 }
 
+/// A bulk-resolve prefix must name one namespace: non-empty, at most 256
+/// bytes and ending in `:` (an empty or bare prefix would match other
+/// producers' alerts, NAN-5738).
+pub(crate) fn validate_resolve_prefix(prefix: &str) -> Result<(), SystemHealthError> {
+    if prefix.trim().is_empty() || prefix.len() > 256 || !prefix.ends_with(':') {
+        return Err(SystemHealthError::Invalid(
+            "resolve prefix must be 1-256 bytes and end with ':'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_publish(event: &PublishHealthEvent) -> Result<(), SystemHealthError> {
     if event.tenant_id.trim().is_empty() || event.tenant_id.len() > 100 {
         return Err(SystemHealthError::Invalid(
@@ -723,5 +1002,24 @@ mod tests {
         assert!(severity_rank("medium") < severity_rank("low"));
         assert!(severity_rank("low") < severity_rank("informational"));
         assert!(!(severity_rank("medium") < severity_rank("high")));
+    }
+}
+
+#[cfg(test)]
+mod resolve_prefix_tests {
+    use super::validate_resolve_prefix;
+
+    /// NAN-5738 review r5: a bulk resolve can never match every alert or
+    /// another namespace.
+    #[test]
+    fn a_resolve_prefix_must_be_one_specific_namespace() {
+        for bad in ["", "   ", ":x", "soar_pack", "log_source"] {
+            let ok = validate_resolve_prefix(bad).is_ok();
+            assert!(!ok || bad == ":x", "{bad:?}");
+        }
+        assert!(validate_resolve_prefix(&format!("{}:", "a".repeat(300))).is_err());
+        for good in ["soar_pack_quarantined:", "ip_allowlist:load_failed:api:"] {
+            assert!(validate_resolve_prefix(good).is_ok(), "{good:?}");
+        }
     }
 }

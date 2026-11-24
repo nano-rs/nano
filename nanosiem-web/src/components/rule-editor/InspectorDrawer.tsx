@@ -163,7 +163,7 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
               onToggle();
             }}
             disabled={disabled}
-            title="pivt triage guidance"
+            title="Triage hints for pivt"
             className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-[var(--primary)] inline-flex items-center justify-center disabled:opacity-40"
           >
             <PivtIcon className="w-4 h-4" />

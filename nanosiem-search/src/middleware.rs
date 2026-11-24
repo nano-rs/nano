@@ -95,6 +95,7 @@ impl AuthContext {
 
         Self {
             claims: TokenClaims {
+                sid: None,
                 iss: DEFAULT_TOKEN_ISSUER.to_string(),
                 aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
                 sub: info.id,
@@ -906,6 +907,7 @@ mod tests {
     fn ownership_user_id_is_sub_for_jwt_sessions() {
         let sub = Uuid::now_v7();
         let claims = TokenClaims {
+            sid: None,
             iss: "iss".to_string(),
             aud: "aud".to_string(),
             sub,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
-use super::lateral::source_scope_sql_predicate;
+use super::lateral::{source_scope_bound_predicate, SourceScopedClient};
 use crate::auth::ScopeSet;
 
 /// Parse an asset time-range timestamp (`query_asset_true_time_range` emits
@@ -187,7 +187,7 @@ impl SearchService {
     /// query's injected source-scope gate — on the fast path there is no base
     /// query at all. The caller's `ScopeSet` is threaded down here and its
     /// deny-set exclusion is ANDed into every scan those helpers issue (see
-    /// [`source_scope_sql_predicate`]). An empty deny set emits nothing
+    /// [`source_scope_bound_predicate`]). An empty deny set emits nothing
     /// (byte-identical SQL to the pre-scoping form).
     pub(crate) async fn build_asset_view(
         &self,
@@ -638,6 +638,8 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok((Vec::new(), 0, AssetFacets::default())),
         };
+        // NAN-5793: the scope predicate is bound; every query binds the deny list.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         let (ips, hostnames, users) = Self::collect_asset_identifiers(
             identities,
@@ -726,7 +728,7 @@ impl SearchService {
         // caller's hidden sources), the user facet, and the unfiltered count.
         // `None` (unrestricted) leaves every SQL string byte-identical to the
         // pre-scoping form.
-        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+        let scope_predicate = source_scope_bound_predicate("source_type", scope.deny_set());
 
         let where_clause =
             build_asset_events_where(&filter_conditions, scope_predicate.as_deref());
@@ -1082,7 +1084,7 @@ impl SearchService {
     /// must not contribute identity correlations (the user↔host↔ip rows shown
     /// in the asset profile, which also widen the events-scan identity clause)
     /// to a scoped caller. An empty deny set emits nothing (byte-identical SQL).
-    async fn resolve_asset_identities(
+    pub(super) async fn resolve_asset_identities(
         &self,
         identifier_field: &str,
         identifier_value: &str,
@@ -1104,6 +1106,8 @@ impl SearchService {
                 })]);
             }
         };
+        // NAN-5793: the scope predicate is bound; every query binds the deny list.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         // Determine the query column based on identifier type
         let (query_column, _is_ip_query) = match identifier_field {
@@ -1152,7 +1156,7 @@ impl SearchService {
         // NAN-1797: `source` is identity_observations' name for source_type
         // (stamped by identity_observations_mv). Empty deny set → empty splice
         // (byte-identical SQL).
-        let scope_and = source_scope_sql_predicate("source", scope.deny_set())
+        let scope_and = source_scope_bound_predicate("source", scope.deny_set())
             .map(|pred| format!("\n              AND {pred}"))
             .unwrap_or_default();
         let identity_observations_table = self.table_names.read("identity_observations");
@@ -1252,6 +1256,8 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok((None, None)),
         };
+        // NAN-5793: the scope predicate is bound; every query binds the deny list.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         let (ips, hostnames, users) =
             Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
@@ -1320,6 +1326,8 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok(json!({ "hashes": [], "domains": [] })),
         };
+        // NAN-5793: the scope predicate is bound; every query binds the deny list.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         let profile = self.active_profile.as_ref();
         let (ips, hostnames, users) =
@@ -1348,7 +1356,7 @@ impl SearchService {
 
         // NAN-1801: caller's source-scope gate, ANDed into every branch's WHERE.
         // Empty deny set → empty splice (byte-identical SQL).
-        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+        let scope_and = source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|pred| format!(" AND {pred}"))
             .unwrap_or_default();
 
@@ -1521,6 +1529,8 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok(json!({ "hashes": [], "domains": [] })),
         };
+        // NAN-5793: the scope predicate is bound; every query binds the deny list.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
 
         let profile = self.active_profile.as_ref();
         let (ips, hostnames, users) =
@@ -1540,7 +1550,7 @@ impl SearchService {
 
         // NAN-1801: caller's source-scope gate, ANDed into every branch's WHERE.
         // Empty deny set → empty splice (byte-identical SQL).
-        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+        let scope_and = source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|pred| format!(" AND {pred}"))
             .unwrap_or_default();
 
@@ -1829,7 +1839,7 @@ impl SearchService {
     ///
     /// SECURITY (NAN-1801): this bypasses the nPL scope gate, so the caller's
     /// `ScopeSet` deny-set is ANDed into the WHERE directly via
-    /// [`source_scope_sql_predicate`] — byte-identical to unscoped SQL when the
+    /// [`source_scope_bound_predicate`] — byte-identical to unscoped SQL when the
     /// deny set is empty. This is the SAME mechanism the asset artifact scans use.
     ///
     /// `source_side_only` picks the entity filter: `true` pins the entity to the
@@ -1943,6 +1953,8 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok(Vec::new()),
         };
+        // NAN-5793: the scope predicate is bound; every query binds the deny list.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
         let profile = self.active_profile.as_ref();
 
         // NEW-TO-ENTITY: match the account's whole footprint (not agg-aligned), so
@@ -1976,7 +1988,7 @@ impl SearchService {
             .table_names
             .read(Self::logs_table_key(profile));
 
-        let scope_pred = source_scope_sql_predicate("source_type", scope.deny_set())
+        let scope_pred = source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|p| format!(" AND {p}"))
             .unwrap_or_default();
 
@@ -2294,7 +2306,7 @@ impl SearchService {
     /// Deliberately source-side only (`source_side_only=true` semantics baked in
     /// via the actor predicate) so the counts are comparable to the agg's
     /// source-keyed distribution and to the agg-aligned incident volume. Scoped
-    /// via [`source_scope_sql_predicate`]. Kept to a SHORT window by the caller —
+    /// via [`source_scope_bound_predicate`]. Kept to a SHORT window by the caller —
     /// a scoped raw hourly scan over 30 days is the multi-GiB cost the agg exists
     /// to avoid, so restricted tenants get a bounded (7-day) baseline.
     pub async fn entity_hourly_activity_scoped(
@@ -2309,6 +2321,8 @@ impl SearchService {
             Some(ch) => ch,
             None => return Ok(Vec::new()),
         };
+        // NAN-5793: the scope predicate is bound; every query binds the deny list.
+        let clickhouse = SourceScopedClient::new(clickhouse, scope.deny_set());
         let profile = self.active_profile.as_ref();
         let value_lower = entity_value.to_lowercase();
         // ACTIVITY/VOLUME: agg-aligned (bare `user`, source-side host/ip) so these
@@ -2322,7 +2336,7 @@ impl SearchService {
         let logs_table = self
             .table_names
             .read(Self::logs_table_key(profile));
-        let scope_pred = source_scope_sql_predicate("source_type", scope.deny_set())
+        let scope_pred = source_scope_bound_predicate("source_type", scope.deny_set())
             .map(|p| format!(" AND {p}"))
             .unwrap_or_default();
 
@@ -2402,7 +2416,7 @@ fn build_asset_true_time_range_query(
 
     let (identity_clause, identity_binds) =
         SearchService::build_log_identity_clause_for(profile, ips, hostnames, users)?;
-    let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set())?;
+    let scope_predicate = source_scope_bound_predicate("source_type", scope.deny_set())?;
     let sql = format!(
         "SELECT \
             formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') as first_seen, \
@@ -2705,14 +2719,14 @@ mod source_scope_tests {
     /// events.
     #[test]
     fn nonempty_deny_set_gates_every_asset_scan() {
-        let pred = source_scope_sql_predicate(
+        let pred = source_scope_bound_predicate(
             "source_type",
             &deny(&["audit", "insider_threat"]),
         )
         .expect("nonempty deny set must render");
         assert_eq!(
             pred,
-            "lower(source_type) NOT IN ('audit', 'insider_threat')"
+            "lower(source_type) NOT IN {nano_source_deny:Array(String)}"
         );
 
         // Events page / filtered count (shared WHERE builder).
@@ -2752,7 +2766,7 @@ mod source_scope_tests {
     #[test]
     fn empty_deny_set_leaves_every_asset_scan_byte_identical() {
         assert_eq!(
-            source_scope_sql_predicate("source_type", &BTreeSet::new()),
+            source_scope_bound_predicate("source_type", &BTreeSet::new()),
             None
         );
 
@@ -2795,8 +2809,8 @@ mod source_scope_tests {
     #[test]
     fn identity_observation_gate_targets_source_column() {
         assert_eq!(
-            source_scope_sql_predicate("source", &deny(&["audit"])).as_deref(),
-            Some("lower(source) != 'audit'")
+            source_scope_bound_predicate("source", &deny(&["audit"])).as_deref(),
+            Some("lower(source) NOT IN {nano_source_deny:Array(String)}")
         );
     }
 }
@@ -2946,11 +2960,11 @@ mod baseline_predicate_tests {
     fn scope_predicate_is_anded_when_the_deny_set_is_nonempty() {
         // The NAN-1801 gate the scoped scans rely on. Empty deny → no predicate
         // (byte-identical unscoped SQL); nonempty → an exclusion to AND in.
-        assert!(source_scope_sql_predicate("source_type", &BTreeSet::new()).is_none());
+        assert!(source_scope_bound_predicate("source_type", &BTreeSet::new()).is_none());
         let deny: BTreeSet<String> = ["insider_threat".to_string()].into_iter().collect();
         assert_eq!(
-            source_scope_sql_predicate("source_type", &deny).unwrap(),
-            "lower(source_type) != 'insider_threat'"
+            source_scope_bound_predicate("source_type", &deny).unwrap(),
+            "lower(source_type) NOT IN {nano_source_deny:Array(String)}"
         );
     }
 }

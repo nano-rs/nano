@@ -5,6 +5,7 @@
 // DetectionMatches EventViewer into the new density. Field categorisation
 // (metadata / prevalence / enriched / lookup / ext / UDM) matches Search.
 
+import { Term } from '@/components/ui/term';
 import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronLeft } from 'lucide-react';
 import { cn, isClickHouseDefault } from '@/lib/utils';
@@ -154,7 +155,7 @@ export function EventViewer({ events, matchDetectedAt, hoveredId, onHover, pageS
     <div className="rounded-md border border-border/70 overflow-hidden bg-card">
       <div className="px-2.5 py-1.5 flex items-center gap-2 border-b border-border/60">
         <span className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
-          Contributing events
+          <Term id="contributing-events">Contributing events</Term>
         </span>
         <span className="font-mono text-[10px] text-muted-foreground">
           {events.length === 0 ? '0' : `${start + 1}–${end} of ${events.length}`}

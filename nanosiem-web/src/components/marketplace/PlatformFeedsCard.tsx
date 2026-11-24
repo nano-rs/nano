@@ -22,10 +22,11 @@
  */
 
 import { Fragment, useRef, useState, type ReactNode } from 'react';
-import { HelpCircle, RefreshCw, TriangleAlert, Upload } from 'lucide-react';
+import { RefreshCw, TriangleAlert, Upload } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { CopyButton } from '@/components/add-data/CopyButton';
 import { copyText } from '@/lib/clipboard';
@@ -33,6 +34,7 @@ import { formatNumber, formatRelativeCompact, formatUntil, formatUTCCompact } fr
 import type { PlatformFeedState, PlatformFeedStatus, PlatformFeedsStatus } from '@/lib/api/enrichment';
 import { parseFeedNotice, type FeedNotice } from '@/lib/platform-feed-notice';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 /** Same pill palette as the Marketplace StateBadge (IntegrationCard). */
 const PILL = 'inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[9.5px] uppercase tracking-[0.1em] border whitespace-nowrap';
@@ -59,21 +61,6 @@ function Linkified({ text }: { text: string }) {
   return <>{parts.map((part, i) => i % 2 === 1
     ? <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="text-primary underline underline-offset-2 break-all">{part}</a>
     : <Fragment key={i}>{part}</Fragment>)}</>;
-}
-
-function HelpTip({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button type="button" aria-label={label} className="inline-flex align-[-2px] text-muted-foreground/70 hover:text-foreground">
-          <HelpCircle className="w-3 h-3" strokeWidth={1.5} />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-[300px] px-2.5 py-1.5 text-[11px] leading-relaxed font-sans normal-case tracking-normal">
-        {children}
-      </TooltipContent>
-    </Tooltip>
-  );
 }
 
 function Pill({ state, children, testId }: { state: keyof typeof STATE_PILL; children?: ReactNode; testId?: string }) {
@@ -190,7 +177,7 @@ export function PlatformFeedsCard({ status, onCheck, onImport, busy }: PlatformF
         <header className="flex items-center gap-3 px-4 py-2.5 border-b border-border/60">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <span className="text-[12.5px] font-medium text-foreground">Platform feeds</span>
+              <span className="text-[12.5px] font-medium text-foreground"><Term id="platform-feeds">Platform feeds</Term></span>
               <Pill state={status.installed ? worst : 'not_installed'} testId="platform-feeds-state" />
             </div>
             <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 font-mono text-[10.5px] text-muted-foreground" data-testid="platform-feeds-meta">
@@ -203,8 +190,8 @@ export function PlatformFeedsCard({ status, onCheck, onImport, busy }: PlatformF
                 </>
               ) : (
                 <span className="inline-flex items-center gap-1">
-                  No feed bundle installed
-                  <HelpTip label="What happens without a bundle">Geo/ASN, ThreatFox and Tor are not stamped on new events until a feed bundle is installed.</HelpTip>
+                  No <Term id="feed-bundle">feed bundle</Term> installed
+                  <InfoTip label="What happens without a bundle">Until a bundle is installed, new events get no location (Geo/ASN), ThreatFox or Tor data.</InfoTip>
                 </span>
               )}
               {status.last_check_at && (
@@ -224,7 +211,7 @@ export function PlatformFeedsCard({ status, onCheck, onImport, busy }: PlatformF
                   {sep}
                   <span className="inline-flex items-center gap-1" data-testid="platform-feeds-manual">
                     online updates off
-                    <HelpTip label="Online updates are off">Online updates are off on this deployment: import a bundle file.</HelpTip>
+                    <InfoTip label="Online updates are off">This install can't download updates, so import a bundle file instead.</InfoTip>
                   </span>
                 </>
               )}
@@ -277,20 +264,15 @@ export function PlatformFeedsCard({ status, onCheck, onImport, busy }: PlatformF
                 <TableHead className={HEAD}>
                   <span className="inline-flex items-center gap-1">
                     State
-                    <HelpTip label="About feed state">
-                      A feed is stale after {status.stale_after_days} days. A feed past its hard expiry stops stamping new events; values already stamped stay searchable.
-                    </HelpTip>
+                    <InfoTip label="About feed state">
+                      A feed turns stale when its data is more than {status.stale_after_days} days old. It keeps working until its hard expiry, but you should update the bundle.
+                    </InfoTip>
                   </span>
                 </TableHead>
                 <TableHead className={HEAD}>Revision</TableHead>
                 <TableHead className={HEAD}>Produced</TableHead>
                 <TableHead className={HEAD}>
-                  <span className="inline-flex items-center gap-1">
-                    Hard expiry
-                    <HelpTip label="About hard expiry">
-                      Past its hard expiry a feed stops stamping new events; values already stamped stay searchable.
-                    </HelpTip>
-                  </span>
+                  <Term id="feed-hard-expiry">Hard expiry</Term>
                 </TableHead>
                 <TableHead className={cn(HEAD, 'pr-4 text-right')}>Records</TableHead>
               </TableRow>

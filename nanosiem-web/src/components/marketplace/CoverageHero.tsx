@@ -156,7 +156,7 @@ export function CoverageHero({
               onClick={onRefresh}
               disabled={isFetching}
               aria-label="Refresh coverage"
-              title="Recompute now — invalidates the shared 6h cache"
+              title="Recompute now. This refreshes the shared 6-hour cache."
               className={cn(
                 'inline-flex items-center justify-center w-6 h-6 rounded border border-border/60 bg-muted/20 ml-0.5',
                 'text-muted-foreground hover:text-foreground hover:bg-muted/40',
@@ -210,7 +210,7 @@ function CoverageRow({ row, measured, isAfterFirstRow, onAddMissing }: CoverageR
         ) : (
           <span
             className="font-mono text-[10.5px] text-muted-foreground ml-auto shrink-0 whitespace-nowrap"
-            title="This deployment has no coverage measurement for this artifact type yet"
+            title="nano has not measured coverage for this kind of content on this install yet."
           >
             not measured yet
           </span>

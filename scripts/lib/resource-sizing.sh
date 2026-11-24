@@ -25,6 +25,11 @@ ingest_path=""
 avg_event_bytes=""
 vector_sources=""
 edition=open
+app_hosts=1
+postgres_mib=""
+postgres_shared_mib=""
+operator_env=""
+pg_pool_plan_only=""
 
 # NAN-5345: planned-volume tiers. Large-deployment settings apply only when
 # the operator declares a planned daily volume that needs them; an install
@@ -78,14 +83,23 @@ OPEN_API_MIN_MIB=384
 # needs a busy API (~300 MiB) plus a 400-day pack's headroom (~239 MiB); below
 # this it cannot run, so the host is refused rather than sized.
 ENTERPRISE_API_REFUSE_MIB=640
-# NAN-5668: nano-jobs runs every leader scheduler (content channels, the MITRE
-# catalog, repository syncs, enrichment, retention). The proportional 15% share
-# gave an 8 GB single node 214 MiB (155 MiB with monitoring), below what a
-# busy jobs process plus one content apply needs, and it OOM-looped every
-# ~25 s on the 53 MB MITRE ATT&CK catalog. The apply now peaks at ~56 MiB of
-# heap (it was ~183 MiB), and jobs gets at least this much where the host can
-# fund it (see the funding order where it is applied).
-JOBS_MIN_MIB=384
+# NAN-5822: the most the PostgreSQL pool floor may take back from an enterprise
+# API above its funded target, as its last source (enterprise + monitoring on
+# 8-12.6 GiB, where ClickHouse is at its floor). 768 MiB still leaves a busy
+# API (~300 MiB) more than the 400-day pack's ~239 MiB of headroom, while
+# pools below their floors would starve nano-jobs' advisory-lock connections.
+PG_FLOOR_API_FLOOR_MIB=768
+# NAN-5668 / NAN-5746: nano-jobs runs every leader scheduler (content channels,
+# the MITRE catalog, repository syncs, enrichment, retention) and every
+# scheduled detection rule. The proportional 15% app share gave an 8 GB single
+# node 214 MiB (155 MiB with monitoring), OOM-looping on the 53 MB MITRE
+# ATT&CK catalog until NAN-5668 added a 384 MiB floor. During v2.0.34 RC2
+# validation on a 4 vCPU / 8 GB single-node box, a 400k-event Sysmon flood
+# peaked at 356 MiB under that 384 MiB cap (28 MiB headroom). Raising the floor
+# to 512 MiB matches the Compose fallback and Helm request, gives 156 MiB
+# (30.5%) of headroom over the flood peak, and is funded from co-located
+# PostgreSQL / ClickHouse headroom without raising host minimums.
+JOBS_MIN_MIB=512
 # NAN-5506: a nano-api CPU limit below a quarter core starves its start-up
 # (migration checks, cache warm-up) past the health-check window. Funded from
 # a co-located ClickHouse share above its 500m floor, then PostgreSQL above
@@ -95,6 +109,110 @@ API_MIN_MCPU=250
 fail() {
     printf 'resource sizing error: %s\n' "$*" >&2
     exit 2
+}
+
+# NAN-5822: PostgreSQL connection pools sized from the PostgreSQL memory budget.
+#
+# A warm PostgreSQL backend keeps 9-19 MiB of private memory (catalog and plan
+# caches; pools keep idle backends for PG_IDLE_TIMEOUT, 600 s) on top of
+# shared_buffers. Measured on an e2e stack: 45 backends plus 128 MiB
+# shared_buffers filled a 512 MiB cgroup and the kernel OOM-killed a backend,
+# which resets every session. So every backend that can exist is budgeted at
+# PG_BACKEND_MIB (a third over the measured 9 MiB average):
+#   - PG_SERVER_PROCESSES: postmaster, checkpointer, background writer, WAL
+#     writer, autovacuum launcher and its 3 workers, logical replication
+#     launcher;
+#   - PG_OPERATOR_SLOTS: the migrator, psql, backups;
+#   - per app host, PG_APP_DEDICATED_SESSIONS outside the pools (backup
+#     mutation fence, two case_changes listeners, three license watchers,
+#     leader election) and the four pools: nano-jobs, nano-api, nano-search,
+#     connector-runner.
+# nano-jobs gets the largest pool: it pins pooled connections for session
+# advisory locks across long ClickHouse and network I/O (MITRE sync, install
+# leases, usage report, ingestion pause, rule runtime locks; up to ~5 at
+# once) while 10 concurrent detection rules and the leader schedulers query
+# alongside them, so its floor of 10 keeps at least 5 free under that load.
+# nano-api serves short request queries (floor 8), nano-search reads settings
+# and saved searches (floor 6). Above the floors the surplus goes 2:2:1 to
+# jobs:api:search, each capped at the historical 20.
+PG_BACKEND_MIB=12
+PG_SERVER_PROCESSES=9
+PG_OPERATOR_SLOTS=3
+PG_APP_DEDICATED_SESSIONS=7
+PG_CONNECTOR_POOL=4
+PG_JOBS_POOL_MIN=10
+PG_API_POOL_MIN=8
+PG_SEARCH_POOL_MIN=6
+PG_POOL_MAX=20
+
+# shared_buffers for a PostgreSQL budget (MiB).
+pg_shared_buffers_mib() {
+    local shared=$(( $1 / 4 ))
+    (( shared < 128 )) && shared=128
+    (( shared > 32768 )) && shared=32768
+    printf '%s\n' "$shared"
+}
+
+# Backends a PostgreSQL budget (MiB) holds after shared_buffers ($2 MiB when
+# given, else the sized quarter of the budget).
+pg_backend_capacity() {
+    local shared="${2:-}"
+    [[ -n "$shared" ]] || shared=$(pg_shared_buffers_mib "$1")
+    local capacity=$(( ($1 - shared) / PG_BACKEND_MIB ))
+    (( capacity < 0 )) && capacity=0
+    printf '%s\n' "$capacity"
+}
+
+# Smallest PostgreSQL budget (MiB) whose floors fit APP_HOSTS app hosts.
+pg_budget_floor_mib() {
+    local app_hosts="$1" per_host need mib
+    per_host=$(( PG_APP_DEDICATED_SESSIONS + PG_CONNECTOR_POOL + PG_JOBS_POOL_MIN + PG_API_POOL_MIN + PG_SEARCH_POOL_MIN ))
+    need=$(( (PG_SERVER_PROCESSES + PG_OPERATOR_SLOTS + app_hosts * per_host) * PG_BACKEND_MIB ))
+    mib=$(( (need * 4 + 2) / 3 ))
+    (( mib / 4 < 128 )) && mib=$(( need + 128 ))
+    while (( $(pg_backend_capacity "$mib") * PG_BACKEND_MIB < need )); do mib=$(( mib + 1 )); done
+    printf '%s\n' "$mib"
+}
+
+# Pools for PG_MIB of PostgreSQL shared by APP_HOSTS app hosts (optional
+# SHARED_MIB: an explicit shared_buffers). Sets
+# pg_plan_jobs/api/search/connector, pg_plan_min (PG_MIN_CONNECTIONS),
+# pg_plan_capacity (backends the budget holds) and pg_plan_underfunded (1 when
+# the budget is below pg_budget_floor_mib and the pools were shrunk to fit).
+pg_pool_plan() {
+    local pg_mib="$1" app_hosts="$2" per_host surplus
+    pg_plan_capacity=$(pg_backend_capacity "$pg_mib" "${3:-}")
+    per_host=$(( (pg_plan_capacity - PG_SERVER_PROCESSES - PG_OPERATOR_SLOTS) / app_hosts - PG_APP_DEDICATED_SESSIONS ))
+    pg_plan_connector=$PG_CONNECTOR_POOL
+    per_host=$(( per_host - pg_plan_connector ))
+    pg_plan_underfunded=0
+    if (( per_host >= PG_JOBS_POOL_MIN + PG_API_POOL_MIN + PG_SEARCH_POOL_MIN )); then
+        surplus=$(( per_host - PG_JOBS_POOL_MIN - PG_API_POOL_MIN - PG_SEARCH_POOL_MIN ))
+        pg_plan_jobs=$(( PG_JOBS_POOL_MIN + surplus * 2 / 5 ))
+        pg_plan_api=$(( PG_API_POOL_MIN + surplus * 2 / 5 ))
+        (( pg_plan_jobs > PG_POOL_MAX )) && pg_plan_jobs=$PG_POOL_MAX
+        (( pg_plan_api > PG_POOL_MAX )) && pg_plan_api=$PG_POOL_MAX
+        pg_plan_search=$(( per_host - pg_plan_jobs - pg_plan_api ))
+        (( pg_plan_search > PG_POOL_MAX )) && pg_plan_search=$PG_POOL_MAX
+    else
+        # Below the floor (an existing small install, an operator's smaller
+        # POSTGRES_MEM_LIMIT): shrink the pools in the floor ratio so the
+        # backends still fit, and say so.
+        pg_plan_underfunded=1
+        (( per_host < 4 )) && per_host=4
+        # One feed run plus the runner's two bookkeeping connections.
+        pg_plan_connector=3
+        per_host=$(( per_host + PG_CONNECTOR_POOL - pg_plan_connector ))
+        pg_plan_jobs=$(( per_host * PG_JOBS_POOL_MIN / (PG_JOBS_POOL_MIN + PG_API_POOL_MIN + PG_SEARCH_POOL_MIN) ))
+        pg_plan_api=$(( per_host * PG_API_POOL_MIN / (PG_JOBS_POOL_MIN + PG_API_POOL_MIN + PG_SEARCH_POOL_MIN) ))
+        (( pg_plan_jobs < 2 )) && pg_plan_jobs=2
+        (( pg_plan_api < 1 )) && pg_plan_api=1
+        pg_plan_search=$(( per_host - pg_plan_jobs - pg_plan_api ))
+        (( pg_plan_search < 1 )) && pg_plan_search=1
+    fi
+    pg_plan_min=2
+    (( pg_plan_search <= 8 )) && pg_plan_min=1
+    return 0
 }
 
 usage() {
@@ -131,6 +249,20 @@ Usage: resource-sizing.sh [options]
   --edition open|enterprise    Install edition (default open). Enterprise gives
                                the API at least 1 GiB for the Evidence Pack
                                where co-located roles can fund it (NAN-5433)
+  --operator-env PATH          Apply only the operator lines of an install .env
+                               (outside its NANO AUTO SIZING block) as overrides
+  --app-hosts COUNT            Hosts running the app role against this
+                               PostgreSQL (default 1; NAN-5822)
+  --postgres-mib MIB           PostgreSQL budget of the remote PostgreSQL an
+                               app-only host connects to; sizes its pools
+                               (NAN-5822). Unset keeps 20-wide pools. With the
+                               postgres role too (HA), the app pools fit the
+                               smaller of the two
+  --postgres-shared-mib MIB    That PostgreSQL's shared_buffers (default: a
+                               quarter of --postgres-mib)
+  --pg-pool-plan MIB           Print only the PostgreSQL settings and pools a
+                               PostgreSQL budget of MIB holds, then exit
+                               (Compose defaults, Helm values, e2e)
 EOF
 }
 
@@ -150,6 +282,7 @@ while [[ $# -gt 0 ]]; do
             vector_data_free_bytes="$2"
             shift 2 ;;
         --override-env) [[ $# -ge 2 ]] || fail "--override-env needs a path"; override_env="$2"; shift 2 ;;
+        --operator-env) [[ $# -ge 2 ]] || fail "--operator-env needs a path"; operator_env="$2"; shift 2 ;;
         --override)
             [[ $# -ge 2 && "$2" == *=* ]] || fail "--override needs KEY=VALUE"
             cli_overrides="${cli_overrides}${cli_overrides:+
@@ -167,6 +300,10 @@ while [[ $# -gt 0 ]]; do
             avg_event_bytes="$2"; shift 2 ;;
         --vector-sources) [[ $# -ge 2 ]] || fail "--vector-sources needs a value"; vector_sources="$2"; shift 2 ;;
         --edition) [[ $# -ge 2 ]] || fail "--edition needs a value"; edition="$2"; shift 2 ;;
+        --app-hosts) [[ $# -ge 2 ]] || fail "--app-hosts needs a value"; app_hosts="$2"; shift 2 ;;
+        --postgres-mib) [[ $# -ge 2 ]] || fail "--postgres-mib needs a value"; postgres_mib="$2"; shift 2 ;;
+        --postgres-shared-mib) [[ $# -ge 2 ]] || fail "--postgres-shared-mib needs a value"; postgres_shared_mib="$2"; shift 2 ;;
+        --pg-pool-plan) [[ $# -ge 2 ]] || fail "--pg-pool-plan needs a value"; pg_pool_plan_only="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown option $1" ;;
     esac
@@ -176,6 +313,36 @@ done
 [[ "$format" == env ]] || fail "only --format env is supported"
 [[ "$edition" == open || "$edition" == enterprise ]] || fail "--edition must be open or enterprise"
 [[ "$shards" =~ ^[1-9][0-9]*$ ]] || fail "--shards must be a positive integer"
+[[ "$app_hosts" =~ ^[1-9][0-9]*$ ]] || fail "--app-hosts must be a positive integer"
+[[ -z "$postgres_mib" || "$postgres_mib" =~ ^[1-9][0-9]*$ ]] || fail "--postgres-mib must be a positive integer"
+[[ -z "$postgres_shared_mib" || "$postgres_shared_mib" =~ ^[1-9][0-9]*$ ]] || fail "--postgres-shared-mib must be a positive integer"
+
+# NAN-5822: the PostgreSQL settings for one budget, for every consumer that
+# does not run the full host sizing (Compose defaults, Helm values, e2e).
+if [[ -n "$pg_pool_plan_only" ]]; then
+    [[ "$pg_pool_plan_only" =~ ^[1-9][0-9]*$ ]] || fail "--pg-pool-plan must be a positive integer"
+    pg_pool_plan "$pg_pool_plan_only" "$app_hosts"
+    plan_shared=$(pg_shared_buffers_mib "$pg_pool_plan_only")
+    plan_connections=$(( pg_plan_capacity - PG_SERVER_PROCESSES ))
+    (( plan_connections < 10 )) && plan_connections=10
+    printf 'POSTGRES_MEM_LIMIT=%sM\n' "$pg_pool_plan_only"
+    printf 'POSTGRES_MAX_CONNECTIONS=%s\n' "$plan_connections"
+    printf 'POSTGRES_SHARED_BUFFERS=%sMB\n' "$plan_shared"
+    printf 'POSTGRES_EFFECTIVE_CACHE_SIZE=%sMB\n' "$(( pg_pool_plan_only * 3 / 4 ))"
+    plan_work=$(( (pg_pool_plan_only - plan_shared) / (plan_connections * 4) ))
+    (( plan_work < 1 )) && plan_work=1
+    (( plan_work > 64 )) && plan_work=64
+    printf 'POSTGRES_WORK_MEM=%sMB\n' "$plan_work"
+    printf 'PG_MAX_CONNECTIONS=%s\n' "$pg_plan_api"
+    printf 'PG_MIN_CONNECTIONS=%s\n' "$pg_plan_min"
+    printf 'NANO_API_PG_MAX_CONNECTIONS=%s\n' "$pg_plan_api"
+    printf 'NANO_JOBS_PG_MAX_CONNECTIONS=%s\n' "$pg_plan_jobs"
+    printf 'NANO_SEARCH_PG_MAX_CONNECTIONS=%s\n' "$pg_plan_search"
+    printf 'NANO_CONNECTOR_PG_MAX_CONNECTIONS=%s\n' "$pg_plan_connector"
+    printf 'NANO_PG_BUDGET_FLOOR_MIB=%s\n' "$(pg_budget_floor_mib "$app_hosts")"
+    printf 'NANO_PG_UNDERFUNDED=%s\n' "$pg_plan_underfunded"
+    exit 0
+fi
 
 # This file is the one source of truth for both the rendered graph inventory
 # and Vector's exact per-buffer floor. Helm carries a mechanically synced copy.
@@ -511,6 +678,16 @@ has_role ingest && (( ingest_mib < 312 )) && ingest_mib=312
 has_role app && (( app_mib < 800 )) && app_mib=800
 has_role keeper && (( keeper_mib < 384 )) && keeper_mib=384
 has_role tenzir && (( tenzir_mib < 512 )) && tenzir_mib=512
+# NAN-5822: the smallest PostgreSQL budget whose pool floors fit the app
+# hosts it serves. The Vector target and the API and jobs floors below still
+# borrow PostgreSQL down to 512 MiB, exactly as before (they outrank the pool
+# floor: shrunk pools still fit, an API below its floor does not boot); the
+# last step then tops PostgreSQL back up to this floor, from ClickHouse first.
+pg_floor_mib=512
+if has_role postgres; then
+    pg_floor_mib=$(pg_budget_floor_mib "$app_hosts")
+    (( pg_floor_mib < 512 )) && pg_floor_mib=512
+fi
 
 reduce_memory_budget() {
     local variable="$1" floor="$2" current reducible take
@@ -726,6 +903,27 @@ if has_role app && (( jobs_mib < JOBS_MIN_MIB )); then
     memory_excess=0
 fi
 
+# NAN-5822: PostgreSQL up to its pool floor, funded as the jobs floor is:
+# ClickHouse down to its floor (the 6 GiB platform-feed floor where that
+# applies), then Vector down to its target and nano-search down to 256 MiB,
+# then an enterprise API down to PG_FLOOR_API_FLOOR_MIB. A host that still
+# cannot fund it (below the 8 GB minimum) gets pools shrunk to fit, with a
+# warning.
+if has_role postgres && (( pg_mib < pg_floor_mib )); then
+    pg_shortfall=$(( pg_floor_mib - pg_mib ))
+    memory_excess=$pg_shortfall
+    if has_role clickhouse; then
+        ch_floor_mib=2048
+        [[ "$topology" == single ]] && (( memory_mib >= 12288 )) && ch_floor_mib=6144
+        reduce_memory_budget ch_mib "$ch_floor_mib"
+    fi
+    has_role ingest && reduce_memory_budget ingest_mib "$ingest_target_mib"
+    has_role app && reduce_memory_budget search_mib 256
+    has_role app && [[ "$edition" == enterprise ]] && reduce_memory_budget api_mib "$PG_FLOOR_API_FLOOR_MIB"
+    pg_mib=$(( pg_mib + pg_shortfall - memory_excess ))
+    memory_excess=0
+fi
+
 ch_cores=$(ceil_div "$ch_mcpu" 1000)
 ch_cores=$(clamp "$ch_cores" 2 64)
 if (( ch_mib <= 4096 )); then
@@ -778,16 +976,54 @@ ch_server_memory_ratio=0.8
 (( ch_mib <= 2048 )) && ch_server_memory_ratio=0.99
 
 pg_cores=$(ceil_div "$pg_mcpu" 1000)
-if has_role app && has_role postgres && (( memory_mib <= 4096 )); then
-    # Three co-located application processes use this pool cap independently.
-    # 3x8 leaves ample server slots for migrations, autovacuum and operators.
-    pg_connections=50
-    pg_pool_max=8
-    pg_pool_min=1
-else
+# NAN-5822: connection pools from the PostgreSQL budget (pg_pool_plan above).
+# A postgres host plans for the app hosts it serves; an app-only host plans
+# from the remote PostgreSQL budget it is given (--postgres-mib), and keeps
+# the historical 20-wide pools when that is unknown.
+size_pg_pools() { # $1 = PostgreSQL budget MiB ("" = unknown), $2 = shared_buffers MiB (optional)
+    local needed
     pg_connections=$(clamp "$(( pg_cores * 50 ))" 100 1000)
-    pg_pool_max=20
-    pg_pool_min=2
+    if [[ -z "$1" ]]; then
+        pg_pool_api=$PG_POOL_MAX; pg_pool_jobs=$PG_POOL_MAX; pg_pool_search=$PG_POOL_MAX
+        pg_pool_connector=$PG_CONNECTOR_POOL; pg_pool_min=2
+        return 0
+    fi
+    pg_pool_plan "$1" "$app_hosts" "${2:-}"
+    pg_pool_api=$pg_plan_api; pg_pool_jobs=$pg_plan_jobs; pg_pool_search=$pg_plan_search
+    pg_pool_connector=$pg_plan_connector; pg_pool_min=$pg_plan_min
+    if (( pg_plan_underfunded )); then
+        printf 'resource sizing warning: PostgreSQL has %s MiB, below the %s MiB its connection pools need for %s app host(s); pools are shrunk to fit (nano-jobs %s, nano-api %s, nano-search %s). Give PostgreSQL more memory: a larger host, fewer co-located roles, or a higher POSTGRES_MEM_LIMIT (an install sized before NAN-5822: re-run install.sh on this host).\n' \
+            "$1" "$(pg_budget_floor_mib "$app_hosts")" "$app_hosts" "$pg_pool_jobs" "$pg_pool_api" "$pg_pool_search" >&2
+    fi
+    if has_role postgres; then
+        # Never accept more sessions than the budget holds: past it the server
+        # refuses a connection instead of being OOM-killed.
+        needed=$(( app_hosts * (pg_pool_api + pg_pool_jobs + pg_pool_search + pg_pool_connector + PG_APP_DEDICATED_SESSIONS) + PG_OPERATOR_SLOTS ))
+        (( pg_connections < needed )) && pg_connections=$needed
+        (( pg_connections > pg_plan_capacity - PG_SERVER_PROCESSES )) && pg_connections=$(( pg_plan_capacity - PG_SERVER_PROCESSES ))
+        # A budget too small for even the server processes (an operator's
+        # tiny POSTGRES_MEM_LIMIT) still gets a usable, positive setting.
+        (( pg_connections < 10 )) && pg_connections=10
+    fi
+    return 0
+}
+# An app host given another PostgreSQL's budget (an app-only host, or an HA
+# member that may not lead) sizes its pools for it; a postgres host keeps the
+# max_connections its own budget holds.
+apply_remote_pool_plan() {
+    local own_connections=$pg_connections
+    [[ -n "$postgres_mib" ]] && has_role app || return 0
+    size_pg_pools "$postgres_mib" "$postgres_shared_mib"
+    has_role postgres && pg_connections=$own_connections
+    return 0
+}
+if has_role postgres; then
+    size_pg_pools "$pg_mib"
+    apply_remote_pool_plan
+elif has_role app; then
+    size_pg_pools "$postgres_mib" "$postgres_shared_mib"
+else
+    size_pg_pools ""
 fi
 pg_shared_mib=$(clamp "$(( pg_mib / 4 ))" 128 32768)
 pg_effective_mib=$(clamp "$(( pg_mib * 3 / 4 ))" 256 98304)
@@ -977,8 +1213,12 @@ POSTGRES_MAX_CONNECTIONS=$pg_connections
 POSTGRES_SHARED_BUFFERS="${pg_shared_mib}MB"
 POSTGRES_EFFECTIVE_CACHE_SIZE="${pg_effective_mib}MB"
 POSTGRES_WORK_MEM="${pg_work_mib}MB"
-PG_MAX_CONNECTIONS=$pg_pool_max
+PG_MAX_CONNECTIONS=$pg_pool_api
 PG_MIN_CONNECTIONS=$pg_pool_min
+NANO_API_PG_MAX_CONNECTIONS=$pg_pool_api
+NANO_JOBS_PG_MAX_CONNECTIONS=$pg_pool_jobs
+NANO_SEARCH_PG_MAX_CONNECTIONS=$pg_pool_search
+NANO_CONNECTOR_PG_MAX_CONNECTIONS=$pg_pool_connector
 
 VECTOR_MEM_LIMIT=$(memory_string "$vector_mib")
 VECTOR_CPU_LIMIT=$(cpu_string "$vector_mcpu")
@@ -1060,7 +1300,7 @@ NANO_DETECTED_CPU_CORES=$cpu_cores
 NANO_DETECTED_MEMORY_MIB=$memory_mib
 NANO_SIZING_TOPOLOGY=$topology
 
-SIZING_KEYS='CLICKHOUSE_MEM_LIMIT CLICKHOUSE_CPU_LIMIT CLICKHOUSE_MAX_THREADS CLICKHOUSE_ANALYTICS_MAX_THREADS CLICKHOUSE_REALTIME_MAX_THREADS CLICKHOUSE_INGEST_MAX_THREADS CLICKHOUSE_MAX_INSERT_THREADS CLICKHOUSE_BACKGROUND_POOL_SIZE CLICKHOUSE_BACKGROUND_MERGES_MUTATIONS_CONCURRENCY_RATIO CLICKHOUSE_BACKGROUND_SCHEDULE_POOL_SIZE CLICKHOUSE_BACKGROUND_FETCHES_POOL_SIZE CLICKHOUSE_BACKGROUND_MOVE_POOL_SIZE CLICKHOUSE_BACKGROUND_COMMON_POOL_SIZE CLICKHOUSE_MAX_CONCURRENT_QUERIES CLICKHOUSE_MAX_CONCURRENT_INSERT_QUERIES CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES CLICKHOUSE_ASYNC_INSERT_THREADS CLICKHOUSE_MARK_CACHE_SIZE CLICKHOUSE_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_INDEX_MARK_CACHE_SIZE CLICKHOUSE_INDEX_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_MAX_MEMORY_USAGE CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_INGEST_MAX_MEMORY_USAGE CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE POSTGRES_MEM_LIMIT POSTGRES_CPU_LIMIT POSTGRES_MAX_CONNECTIONS POSTGRES_SHARED_BUFFERS POSTGRES_EFFECTIVE_CACHE_SIZE POSTGRES_WORK_MEM PG_MAX_CONNECTIONS PG_MIN_CONNECTIONS VECTOR_MEM_LIMIT VECTOR_CPU_LIMIT VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES_PER_SHARD VECTOR_DISK_BUFFER_TOTAL_BUDGET_BYTES VECTOR_DISK_BUFFER_COUNT VECTOR_DISK_BUFFER_MAX_BYTES VECTOR_DATA_CAPACITY_BYTES VECTOR_DISK_HEADROOM_BYTES VECTOR_BATCH_MAX_BYTES VECTOR_BATCH_MAX_EVENTS VECTOR_MEMORY_BUFFER_MAX_EVENTS NANO_API_MEM_LIMIT NANO_API_CPU_LIMIT NANO_SEARCH_MEM_LIMIT NANO_SEARCH_CPU_LIMIT NANO_JOBS_MEM_LIMIT NANO_JOBS_CPU_LIMIT VALKEY_MEM_LIMIT VALKEY_CPU_LIMIT VALKEY_MAXMEMORY VALKEY_IO_THREADS NANO_WEB_MEM_LIMIT NANO_WEB_CPU_LIMIT NANO_NGINX_MEM_LIMIT NANO_NGINX_CPU_LIMIT CONNECTOR_MEM_LIMIT CONNECTOR_CPU_LIMIT NANO_MIGRATE_MEM_LIMIT NANO_MIGRATE_CPU_LIMIT NANO_VECTOR_TAP_MEM_LIMIT NANO_VECTOR_TAP_CPU_LIMIT NANO_VECTOR_CONSUMER_MEM_LIMIT NANO_VECTOR_CONSUMER_CPU_LIMIT NANO_INGEST_EDGE_MEM_LIMIT NANO_INGEST_EDGE_CPU_LIMIT NANO_CLICKHOUSE_PROXY_MEM_LIMIT NANO_CLICKHOUSE_PROXY_CPU_LIMIT KEEPER_MEM_LIMIT KEEPER_CPU_LIMIT TENZIR_MEM_LIMIT TENZIR_CPU_LIMIT NANO_SIZING_DIR NANO_DETECTED_CPU_CORES NANO_DETECTED_MEMORY_MIB NANO_SIZING_TOPOLOGY'
+SIZING_KEYS='CLICKHOUSE_MEM_LIMIT CLICKHOUSE_CPU_LIMIT CLICKHOUSE_MAX_THREADS CLICKHOUSE_ANALYTICS_MAX_THREADS CLICKHOUSE_REALTIME_MAX_THREADS CLICKHOUSE_INGEST_MAX_THREADS CLICKHOUSE_MAX_INSERT_THREADS CLICKHOUSE_BACKGROUND_POOL_SIZE CLICKHOUSE_BACKGROUND_MERGES_MUTATIONS_CONCURRENCY_RATIO CLICKHOUSE_BACKGROUND_SCHEDULE_POOL_SIZE CLICKHOUSE_BACKGROUND_FETCHES_POOL_SIZE CLICKHOUSE_BACKGROUND_MOVE_POOL_SIZE CLICKHOUSE_BACKGROUND_COMMON_POOL_SIZE CLICKHOUSE_MAX_CONCURRENT_QUERIES CLICKHOUSE_MAX_CONCURRENT_INSERT_QUERIES CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES CLICKHOUSE_ASYNC_INSERT_THREADS CLICKHOUSE_MARK_CACHE_SIZE CLICKHOUSE_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_INDEX_MARK_CACHE_SIZE CLICKHOUSE_INDEX_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_MAX_MEMORY_USAGE CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_INGEST_MAX_MEMORY_USAGE CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_QUERY CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE_FOR_USER CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE POSTGRES_MEM_LIMIT POSTGRES_CPU_LIMIT POSTGRES_MAX_CONNECTIONS POSTGRES_SHARED_BUFFERS POSTGRES_EFFECTIVE_CACHE_SIZE POSTGRES_WORK_MEM PG_MAX_CONNECTIONS PG_MIN_CONNECTIONS NANO_API_PG_MAX_CONNECTIONS NANO_JOBS_PG_MAX_CONNECTIONS NANO_SEARCH_PG_MAX_CONNECTIONS NANO_CONNECTOR_PG_MAX_CONNECTIONS VECTOR_MEM_LIMIT VECTOR_CPU_LIMIT VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES_PER_SHARD VECTOR_DISK_BUFFER_TOTAL_BUDGET_BYTES VECTOR_DISK_BUFFER_COUNT VECTOR_DISK_BUFFER_MAX_BYTES VECTOR_DATA_CAPACITY_BYTES VECTOR_DISK_HEADROOM_BYTES VECTOR_BATCH_MAX_BYTES VECTOR_BATCH_MAX_EVENTS VECTOR_MEMORY_BUFFER_MAX_EVENTS NANO_API_MEM_LIMIT NANO_API_CPU_LIMIT NANO_SEARCH_MEM_LIMIT NANO_SEARCH_CPU_LIMIT NANO_JOBS_MEM_LIMIT NANO_JOBS_CPU_LIMIT VALKEY_MEM_LIMIT VALKEY_CPU_LIMIT VALKEY_MAXMEMORY VALKEY_IO_THREADS NANO_WEB_MEM_LIMIT NANO_WEB_CPU_LIMIT NANO_NGINX_MEM_LIMIT NANO_NGINX_CPU_LIMIT CONNECTOR_MEM_LIMIT CONNECTOR_CPU_LIMIT NANO_MIGRATE_MEM_LIMIT NANO_MIGRATE_CPU_LIMIT NANO_VECTOR_TAP_MEM_LIMIT NANO_VECTOR_TAP_CPU_LIMIT NANO_VECTOR_CONSUMER_MEM_LIMIT NANO_VECTOR_CONSUMER_CPU_LIMIT NANO_INGEST_EDGE_MEM_LIMIT NANO_INGEST_EDGE_CPU_LIMIT NANO_CLICKHOUSE_PROXY_MEM_LIMIT NANO_CLICKHOUSE_PROXY_CPU_LIMIT KEEPER_MEM_LIMIT KEEPER_CPU_LIMIT TENZIR_MEM_LIMIT TENZIR_CPU_LIMIT NANO_SIZING_DIR NANO_DETECTED_CPU_CORES NANO_DETECTED_MEMORY_MIB NANO_SIZING_TOPOLOGY'
 
 is_sizing_key() {
     case " $SIZING_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -1094,6 +1334,10 @@ apply_override() {
     is_sizing_key "$key" || fail "unsupported override key $key"
     validate_override "$key" "$value"
     printf -v "$key" '%s' "$value"
+    # NAN-5822: a key from the installer-managed block is the installer's own
+    # output, not an operator choice: it sets the value but never counts as
+    # an override (so values derived from an overridden key still follow it).
+    (( override_tracks )) && overridden_keys="$overridden_keys $key "
     # NAN-5514: remember where an explicit nano-api limit came from, so a
     # too-small one is blamed on the setting, not on the host.
     [[ "$key" == NANO_API_MEM_LIMIT ]] && api_mem_set_in="${override_origin:-an override}"
@@ -1146,14 +1390,30 @@ legacy_value_from_environment() {
 # NAN-5514: the nano-api limit this host's sizing computed, before overrides.
 sized_api_mem_limit="$NANO_API_MEM_LIMIT"
 api_mem_set_in=""
-override_origin=""
-if [[ -n "$override_env" ]]; then
-    [[ -f "$override_env" ]] || fail "override env does not exist: $override_env"
-    override_origin="$override_env"
-    apply_legacy_overrides legacy_value_from_file
+overridden_keys=" "
+override_tracks=1
+# NAN-5822: keys set by the operator's own .env lines (--operator-env). The
+# block install.sh writes keeps this host's sized value for them (the
+# operator line below the block wins), while everything derived from them
+# follows the override.
+operator_keys=" "
+for key in $SIZING_KEYS; do
+    printf -v "presized_$key" '%s' "${!key}"
+done
+
+# Apply the sizing keys of an .env file. MODE all: every line, the managed
+# block's untracked (install.sh pass 2, nano upgrade). MODE operator: only the
+# lines outside the block (install.sh pass 1).
+apply_env_file_overrides() {
+    local path="$1" mode="$2" line key value in_block=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
+        case "$line" in
+            '# BEGIN NANO AUTO SIZING'*) in_block=1; continue ;;
+            '# END NANO AUTO SIZING'*) in_block=0; continue ;;
+        esac
         [[ "$line" == *=* ]] || continue
+        (( in_block )) && [[ "$mode" == operator ]] && continue
         key=${line%%=*}; value=${line#*=}
         is_sizing_key "$key" || continue
         case "$key" in
@@ -1163,8 +1423,25 @@ if [[ -n "$override_env" ]]; then
             VECTOR_DISK_BUFFER_MAX_BYTES|VECTOR_DATA_CAPACITY_BYTES|VECTOR_DISK_HEADROOM_BYTES) continue ;;
         esac
         value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
-        [[ -n "$value" ]] && apply_override "$key" "$value"
-    done < "$override_env"
+        [[ -n "$value" ]] || continue
+        override_tracks=$(( in_block ? 0 : 1 ))
+        apply_override "$key" "$value"
+        override_tracks=1
+        if [[ "$mode" == operator ]]; then operator_keys="$operator_keys $key "; fi
+    done < "$path"
+    return 0
+}
+override_origin=""
+if [[ -n "$override_env" ]]; then
+    [[ -f "$override_env" ]] || fail "override env does not exist: $override_env"
+    override_origin="$override_env"
+    apply_legacy_overrides legacy_value_from_file
+    apply_env_file_overrides "$override_env" all
+fi
+if [[ -n "$operator_env" ]]; then
+    [[ -f "$operator_env" ]] || fail "operator env does not exist: $operator_env"
+    override_origin="$operator_env"
+    apply_env_file_overrides "$operator_env" operator
 fi
 
 # The invoking environment is the normal one-shot override path. It wins over
@@ -1213,6 +1490,43 @@ mib_from_memory_string() { # Docker memory value -> MiB (rounded down); "" when 
         *) printf '%s\n' "$(( n / 1048576 ))" ;;
     esac
 }
+# NAN-5822: a PostgreSQL limit from an override (an operator line, or the
+# installed block during nano upgrade) re-derives everything sized from the
+# PostgreSQL budget that was not itself overridden, so the pools always fit
+# the limit PostgreSQL actually runs with.
+is_overridden() { case "$overridden_keys" in *" $1 "*) return 0 ;; esac; return 1; }
+set_unless_overridden() { is_overridden "$1" || printf -v "$1" '%s' "$2"; }
+if has_role postgres && { is_overridden POSTGRES_MEM_LIMIT || is_overridden POSTGRES_SHARED_BUFFERS; }; then
+    overridden_pg_mib=$(mib_from_memory_string "$POSTGRES_MEM_LIMIT")
+    effective_shared_mib=""
+    if is_overridden POSTGRES_SHARED_BUFFERS; then
+        case "$POSTGRES_SHARED_BUFFERS" in
+            *GB) effective_shared_mib=$(( ${POSTGRES_SHARED_BUFFERS%GB} * 1024 )) ;;
+            *MB|*mb) effective_shared_mib=${POSTGRES_SHARED_BUFFERS%??} ;;
+            *kB) effective_shared_mib=$(( ${POSTGRES_SHARED_BUFFERS%kB} / 1024 )) ;;
+        esac
+    fi
+    if [[ -n "$overridden_pg_mib" ]]; then
+        pg_mib=$overridden_pg_mib
+        size_pg_pools "$pg_mib" "$effective_shared_mib"
+        pg_shared_mib=$(clamp "$(( pg_mib / 4 ))" 128 32768)
+        [[ -n "$effective_shared_mib" ]] && pg_shared_mib=$effective_shared_mib
+        pg_effective_mib=$(clamp "$(( pg_mib * 3 / 4 ))" 256 98304)
+        pg_work_mib=$(clamp "$(( (pg_mib - pg_shared_mib) / (pg_connections * 4) ))" 1 64)
+        set_unless_overridden POSTGRES_MAX_CONNECTIONS "$pg_connections"
+        set_unless_overridden POSTGRES_SHARED_BUFFERS "${pg_shared_mib}MB"
+        set_unless_overridden POSTGRES_EFFECTIVE_CACHE_SIZE "${pg_effective_mib}MB"
+        set_unless_overridden POSTGRES_WORK_MEM "${pg_work_mib}MB"
+        apply_remote_pool_plan
+        set_unless_overridden PG_MAX_CONNECTIONS "$pg_pool_api"
+        set_unless_overridden PG_MIN_CONNECTIONS "$pg_pool_min"
+        set_unless_overridden NANO_API_PG_MAX_CONNECTIONS "$pg_pool_api"
+        set_unless_overridden NANO_JOBS_PG_MAX_CONNECTIONS "$pg_pool_jobs"
+        set_unless_overridden NANO_SEARCH_PG_MAX_CONNECTIONS "$pg_pool_search"
+        set_unless_overridden NANO_CONNECTOR_PG_MAX_CONNECTIONS "$pg_pool_connector"
+    fi
+fi
+
 if has_role app; then
     final_api_mib=$(mib_from_memory_string "$NANO_API_MEM_LIMIT")
     if [[ -n "$final_api_mib" ]] && (( final_api_mib < api_refuse_mib )); then
@@ -1431,7 +1745,12 @@ EOF
 fi
 
 for key in $SIZING_KEYS; do
-    printf '%s=%s\n' "$key" "${!key}"
+    case "$operator_keys" in
+        # (Keys only derived after the overrides, such as the ClickHouse
+        # spill caps, have no pre-override value: those print the final one.)
+        *" $key "*) presized="presized_$key"; printf '%s=%s\n' "$key" "${!presized:-${!key}}" ;;
+        *) printf '%s=%s\n' "$key" "${!key}" ;;
+    esac
 done
 
 # NAN-5345: planning keys exist only when the operator declared a volume, so

@@ -40,6 +40,8 @@ import {
 } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { TimezonePicker } from '@/components/log-sources/TimezonePicker';
+import { timezoneDisplay } from '@/lib/source-timezones';
 import {
   AlertTriangle,
   ArrowRight,
@@ -47,7 +49,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Clock,
   Cloud,
   Code,
   Database,
@@ -117,7 +118,9 @@ import type {
   VrlDiagnostic,
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { vrlErrorToastDescription } from '@/lib/vrl-error-toast';
 import { VrlEditor } from '@/components/editor/VrlEditor';
+import { Term } from '@/components/ui/term';
 
 // ------------------------------------------------------------------
 // Constants — lifted verbatim from design-ref/shadcn/add-feed-view.jsx
@@ -131,55 +134,6 @@ const NAMESPACE_PREFIXES = [
 ] as const;
 
 type NamespacePrefixId = typeof NAMESPACE_PREFIXES[number]['id'];
-
-const TIMEZONES: Array<{ region: string; items: Array<{ id: string; label: string; hint: string }> }> = [
-  {
-    region: 'UTC',
-    items: [{ id: 'UTC', label: 'UTC', hint: '±00:00' }],
-  },
-  {
-    region: 'Americas',
-    items: [
-      { id: 'America/New_York', label: 'New York', hint: 'EST · −05:00' },
-      { id: 'America/Chicago', label: 'Chicago', hint: 'CST · −06:00' },
-      { id: 'America/Denver', label: 'Denver', hint: 'MST · −07:00' },
-      { id: 'America/Los_Angeles', label: 'Los Angeles', hint: 'PST · −08:00' },
-      { id: 'America/Anchorage', label: 'Anchorage', hint: 'AKST · −09:00' },
-      { id: 'Pacific/Honolulu', label: 'Honolulu', hint: 'HST · −10:00' },
-      { id: 'America/Phoenix', label: 'Phoenix', hint: 'MST · −07:00' },
-      { id: 'America/Toronto', label: 'Toronto', hint: 'EST · −05:00' },
-      { id: 'America/Sao_Paulo', label: 'São Paulo', hint: 'BRT · −03:00' },
-    ],
-  },
-  {
-    region: 'Europe',
-    items: [
-      { id: 'Europe/London', label: 'London', hint: 'GMT · ±00:00' },
-      { id: 'Europe/Berlin', label: 'Berlin', hint: 'CET · +01:00' },
-      { id: 'Europe/Paris', label: 'Paris', hint: 'CET · +01:00' },
-      { id: 'Europe/Moscow', label: 'Moscow', hint: 'MSK · +03:00' },
-    ],
-  },
-  {
-    region: 'Asia',
-    items: [
-      { id: 'Asia/Dubai', label: 'Dubai', hint: 'GST · +04:00' },
-      { id: 'Asia/Kolkata', label: 'Kolkata', hint: 'IST · +05:30' },
-      { id: 'Asia/Singapore', label: 'Singapore', hint: 'SGT · +08:00' },
-      { id: 'Asia/Shanghai', label: 'Shanghai', hint: 'CST · +08:00' },
-      { id: 'Asia/Tokyo', label: 'Tokyo', hint: 'JST · +09:00' },
-      { id: 'Asia/Seoul', label: 'Seoul', hint: 'KST · +09:00' },
-    ],
-  },
-  {
-    region: 'Oceania',
-    items: [
-      { id: 'Australia/Sydney', label: 'Sydney', hint: 'AEST · +10:00' },
-      { id: 'Australia/Perth', label: 'Perth', hint: 'AWT · +08:00' },
-      { id: 'Pacific/Auckland', label: 'Auckland', hint: 'NZST · +12:00' },
-    ],
-  },
-];
 
 const CATEGORIES = ['network', 'endpoint', 'cloud', 'application', 'security', 'system'] as const;
 
@@ -350,6 +304,8 @@ export function AddFeed() {
   const genElapsedMs = useElapsedWhile(genState === 'streaming');
   const [timezone, setTimezone] = useState('UTC');
   const [sidePane, setSidePane] = useState<'diag' | 'tests' | 'ai'>('diag');
+  // NAN-5834: bumped when a failed Validate should bring Diagnostics into view.
+  const [diagReveal, setDiagReveal] = useState(0);
 
   // Validation results — populated on demand.
   const [validation, setValidation] = useState<{
@@ -564,9 +520,12 @@ export function AddFeed() {
           if (result.valid) {
             toast({ title: 'VRL valid', description: 'Parser syntax is correct' });
           } else {
+            // The toast only summarizes: show the full errors in Diagnostics.
+            setSidePane('diag');
+            setDiagReveal((n) => n + 1);
             toast({
               title: 'VRL invalid',
-              description: result.errors.join(', ') || 'See diagnostics for details',
+              description: vrlErrorToastDescription(result.errors),
               variant: 'destructive',
             });
           }
@@ -1507,6 +1466,7 @@ export function AddFeed() {
               setTimezone={setTimezone}
               sidePane={sidePane}
               setSidePane={setSidePane}
+              diagReveal={diagReveal}
               feedId={feedId}
               validation={validation}
               tests={tests}
@@ -1590,7 +1550,7 @@ function AddFeedHero({
   hostname?: string;
 }) {
   return (
-    <div className="shrink-0 border-b border-border bg-card/40 px-5 py-4 flex items-start gap-4">
+    <div className="shrink-0 border-b border-border bg-card/40 px-5 py-4 flex items-center gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-primary/30 bg-primary/[0.08] flex items-center justify-center shrink-0">
         <Plus className="w-[18px] h-[18px] text-primary" />
       </div>
@@ -1600,10 +1560,6 @@ function AddFeedHero({
           <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground border border-border rounded px-1.5 py-px whitespace-nowrap">
             Wizard
           </span>
-        </div>
-        <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-          Choose a source, choose how to send it, then connect. Events arrive before any parser exists; keep your samples,
-          parser validation and publish together.
         </div>
       </div>
       <div className="hidden md:flex items-center gap-3 shrink-0">
@@ -1858,7 +1814,7 @@ function ExistingTargetsPanel({
       >
         <RouteIcon className="w-3 h-3 text-muted-foreground" />
         <span className="text-[11px] text-foreground/80">
-          This transport already routes to <span className="font-mono">{targets.length}</span> existing target
+          This <Term nested id="transport">transport</Term> already routes to <span className="font-mono">{targets.length}</span> existing target
           {targets.length === 1 ? '' : 's'}
         </span>
         <span className="flex-1" />
@@ -2041,8 +1997,7 @@ function DetailsStep({
             />
           </div>
           <FieldHint>
-            Lowercase letters, numbers, <span className="font-mono">_</span> and <span className="font-mono">-</span>. The route key
-            every event of this source's tokens carries, and its parser name.
+            Lowercase letters, numbers, <span className="font-mono">_</span> and <span className="font-mono">-</span>. Also the parser name.
           </FieldHint>
           {feedId && <div className="mt-3 flex items-center gap-2 text-[11px] text-muted-foreground">
             <span>Find these events with <span className="font-mono text-foreground/80">{searchSourceField}={feedId}</span></span>
@@ -2073,9 +2028,9 @@ function DetailsStep({
           <CollapsibleTrigger asChild><Button variant="ghost" size="sm" className="h-7 gap-1 text-[11.5px]">Advanced configuration <ChevronDown className="w-3 h-3" /></Button></CollapsibleTrigger>
           <CollapsibleContent className="space-y-4 mt-3">
             <div>
-              <FieldLabel>Network namespace</FieldLabel>
+              <FieldLabel><Term id="network-namespace">Network namespace</Term></FieldLabel>
               <NamespaceCombobox prefix={nsPrefix} setPrefix={setNsPrefix} suffix={nsSuffix} setSuffix={setNsSuffix} />
-              <FieldHint>Isolates identity resolution for overlapping private IPs (10.x, 192.168.x).</FieldHint>
+              <FieldHint>Keeps the same private IPs (10.x, 192.168.x) at different sites from being mixed up.</FieldHint>
             </div>
             <div>
               <FieldLabel>Description</FieldLabel>
@@ -2178,7 +2133,7 @@ function TransportStep({
           ) : sourceConfigs.length === 0 ? (
             <div className="rounded-md border border-dashed border-border bg-card/40 p-4 text-[11.5px] text-muted-foreground">
               No pull sources yet.{' '}
-              <Link to="/ingestion/log-sources/cloud-pull" className="text-primary hover:underline">Add one under Cloud pull</Link>, then come back.
+              <Link to="/ingestion/log-sources/cloud-pull" className="text-primary hover:underline">Add one under <Term nested id="cloud-pull">Cloud pull</Term></Link>, then come back.
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -2255,7 +2210,7 @@ function Step4Connect({
     >
       <div className="space-y-3">
         {endpointError ? (
-          <div className="text-[11.5px] text-red-500" role="alert">Could not load your ingest endpoint: {endpointError.message}</div>
+          <div className="text-[11.5px] text-red-500" role="alert">Could not load your <Term id="ingest-endpoint">ingest endpoint</Term>: {endpointError.message}</div>
         ) : !endpoint ? (
           <div className="text-[11.5px] text-muted-foreground">Loading your ingest endpoint…</div>
         ) : !source || !logSourceId ? (
@@ -2305,6 +2260,7 @@ type Step2Props = {
   setTimezone: (v: string) => void;
   sidePane: 'diag' | 'tests' | 'ai';
   setSidePane: (v: 'diag' | 'tests' | 'ai') => void;
+  diagReveal: number;
   feedId: string;
   validation: { diagnostics: VrlDiagnostic[]; syntaxValid: boolean | null; errorMessages: string[] };
   tests: Array<{ name: string; status: 'pass' | 'fail'; extracted: number; error?: string }>;
@@ -2345,6 +2301,7 @@ function Step2Parse(props: Step2Props) {
     setTimezone,
     sidePane,
     setSidePane,
+    diagReveal,
     feedId,
     validation,
     tests,
@@ -2408,7 +2365,7 @@ function Step2Parse(props: Step2Props) {
             <span className={warnings > 0 ? 'text-amber-500' : 'text-muted-foreground'}>{warnings} warn</span>
           </div>
           <div className="flex-1" />
-          <TimezonePicker value={timezone} onChange={setTimezone} />
+          <TimezonePicker value={timezone} onChange={setTimezone} placement="up" />
           <Button
             variant="default"
             size="sm"
@@ -2482,6 +2439,7 @@ function Step2Parse(props: Step2Props) {
             isValidating={isValidating}
             sidePane={sidePane}
             setSidePane={setSidePane}
+            diagReveal={diagReveal}
             validation={validation}
             tests={tests}
             feedId={feedId}
@@ -2579,7 +2537,7 @@ function SamplesPaste({
       if (truncated) {
         toast({
           title: 'Trimmed to first 50 lines',
-          description: `${file.name} had ${nonEmpty} lines. Using the first ${MAX_LINES} as samples — pivt only needs a handful to draft a parser.`,
+          description: `${file.name} had ${nonEmpty} lines; using the first ${MAX_LINES}.`,
         });
       }
     };
@@ -2618,8 +2576,7 @@ function SamplesPaste({
         <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 border-t border-amber-500/30 bg-amber-500/[0.04] text-[10.5px]" data-testid="sample-wrapped">
           <AlertTriangle className="w-3 h-3 text-amber-500 shrink-0" />
           <span className="text-foreground/80">
-            {wrap.continuations.length} line{wrap.continuations.length === 1 ? '' : 's'} look like terminal-wrapped tails of the
-            line above; each would be sent as its own event.
+            {wrap.continuations.length} wrapped line{wrap.continuations.length === 1 ? '' : 's'} would be sent as separate events.
           </span>
           <div className="flex-1" />
           <Button variant="outline" size="sm" className="h-6 px-2 text-[11px]" onClick={() => setSampleText(joinWrappedLines(sampleText, wrap))}>
@@ -2817,7 +2774,7 @@ function SamplesManual({ feedId }: { feedId: string }) {
         <div>
           <div className="text-[12.5px] font-medium text-foreground">Expert mode</div>
           <div className="text-[11px] text-muted-foreground leading-relaxed mt-0.5">
-            Skip samples and write VRL by hand. We can't validate against real events, so deploy will warn but not block.{' '}
+            Write <Term id="vrl">VRL</Term> by hand. Without samples, deploy warns but does not block.{' '}
             <a
               href="https://vector.dev/docs/reference/vrl/"
               target="_blank"
@@ -2858,6 +2815,7 @@ type VrlPanelProps = {
   isValidating: boolean;
   sidePane: 'diag' | 'tests' | 'ai';
   setSidePane: (v: 'diag' | 'tests' | 'ai') => void;
+  diagReveal: number;
   validation: { diagnostics: VrlDiagnostic[]; syntaxValid: boolean | null; errorMessages: string[] };
   tests: Array<{ name: string; status: 'pass' | 'fail'; extracted: number; error?: string }>;
   feedId: string;
@@ -2884,6 +2842,7 @@ function VrlPanel(props: VrlPanelProps) {
     isValidating,
     sidePane,
     setSidePane,
+    diagReveal,
     validation,
     tests,
     feedId,
@@ -2909,6 +2868,11 @@ function VrlPanel(props: VrlPanelProps) {
   useEffect(() => {
     if (!canUseParserAi && sidePane === 'ai') setSidePane('tests');
   }, [canUseParserAi, setSidePane, sidePane]);
+  // A failed Validate expands a collapsed side pane (not persisted: the
+  // user's collapse preference stands for the next visit).
+  useEffect(() => {
+    if (diagReveal > 0) setSidePaneCollapsedState(false);
+  }, [diagReveal]);
 
   const tabs: Array<{
     id: 'diag' | 'tests' | 'ai';
@@ -2982,7 +2946,7 @@ function VrlPanel(props: VrlPanelProps) {
           </div>
           <div className="text-[10.5px] font-mono text-muted-foreground/70 mt-1">{genStatus}</div>
           <div className="text-[10px] text-muted-foreground/60 mt-0.5">
-            Drafts can take several minutes. You can keep this page open; the job runs on the server.
+            Can take several minutes; runs on the server.
           </div>
         </div>
       )}
@@ -3248,16 +3212,14 @@ function AiPane({
           <div className="rounded-md bg-amber-500/[0.08] border border-amber-500/30 p-2.5 flex items-start gap-2">
             <Info className="w-3 h-3 text-amber-500 shrink-0 mt-0.5" />
             <div className="text-[10.5px] text-foreground/80 leading-relaxed">
-              <span className="text-foreground font-medium">Save a draft first.</span> pivt edits an existing parser, so we
-              need to persist this feed before chatting. Use <span className="font-medium">Save draft</span> on Step 3.
+              <span className="text-foreground font-medium">Save a draft first</span> (Step 3) to edit it with pivt.
             </div>
           </div>
         ) : (
           <div className="rounded-md bg-primary/[0.08] border border-primary/20 p-2.5 flex items-start gap-2">
             <PivtIcon className="w-3 h-3 text-primary shrink-0 mt-0.5" />
             <div className="text-[10.5px] text-foreground/80 leading-relaxed">
-              <span className="text-foreground font-medium">Ask pivt</span> to tweak the parser — add fields, rename,
-              redact, or explain.
+              <span className="text-foreground font-medium">Ask pivt</span> to add fields, rename, redact, or explain.
             </div>
           </div>
         )}
@@ -3307,107 +3269,6 @@ function AiPane({
           </Button>
         </div>
       </div>
-    </div>
-  );
-}
-
-// ==================================================================
-// TimezonePicker
-// ==================================================================
-function TimezonePicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const [open, setOpen] = useState(false);
-  const [q, setQ] = useState('');
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, []);
-
-  const groups = useMemo(() => {
-    if (!q) return TIMEZONES;
-    const lower = q.toLowerCase();
-    return TIMEZONES.map((g) => ({
-      region: g.region,
-      items: g.items.filter(
-        (it) =>
-          it.id.toLowerCase().includes(lower) ||
-          it.label.toLowerCase().includes(lower) ||
-          it.hint.toLowerCase().includes(lower),
-      ),
-    })).filter((g) => g.items.length > 0);
-  }, [q]);
-
-  const selected = TIMEZONES.flatMap((g) => g.items).find((it) => it.id === value);
-
-  return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="h-8 px-2.5 rounded-md border border-border bg-card hover:bg-foreground/[0.04] inline-flex items-center gap-1.5 text-[11px] text-foreground/80"
-      >
-        <Clock className="w-3 h-3 text-muted-foreground" />
-        <span className="font-mono">{value}</span>
-        <span className="text-muted-foreground/60">·</span>
-        <span className="text-muted-foreground/60">{selected?.hint || ''}</span>
-        <ChevronDown className={cn('w-3 h-3 text-muted-foreground ml-0.5 transition-transform', open && 'rotate-180')} />
-      </button>
-      {open && (
-        <div className="absolute right-0 bottom-full mb-1.5 w-[320px] rounded-md border border-border bg-popover shadow-[0_8px_30px_rgba(0,0,0,0.45)] z-30 flex flex-col max-h-[360px]">
-          <div className="shrink-0 px-2 py-1.5 border-b border-border">
-            <div className="relative">
-              <SearchIcon className="w-3 h-3 text-muted-foreground absolute left-2 top-1/2 -translate-y-1/2" />
-              <input
-                autoFocus
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                placeholder="Search timezones…"
-                className="h-7 w-full rounded border border-input bg-background pl-7 pr-2 text-[11.5px] text-foreground focus:border-primary focus:outline-none"
-              />
-            </div>
-          </div>
-          <div className="flex-1 overflow-auto scrollbar-thin py-1">
-            {groups.map((g) => (
-              <div key={g.region}>
-                <div className="px-2.5 py-1 text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60">
-                  {g.region}
-                </div>
-                {g.items.map((it) => (
-                  <button
-                    key={it.id}
-                    type="button"
-                    onClick={() => {
-                      onChange(it.id);
-                      setOpen(false);
-                    }}
-                    className={cn(
-                      'w-full flex items-center gap-2 px-2.5 py-1 text-left',
-                      value === it.id ? 'bg-primary/10' : 'hover:bg-foreground/[0.04]',
-                    )}
-                  >
-                    <span className="text-[11.5px] text-foreground flex-1 truncate">{it.label}</span>
-                    <span className="text-[10px] font-mono text-muted-foreground">{it.hint}</span>
-                    {value === it.id && <Check className="w-3 h-3 text-primary" />}
-                  </button>
-                ))}
-              </div>
-            ))}
-            {groups.length === 0 && <div className="px-3 py-4 text-center text-[11px] text-muted-foreground/60">No matches</div>}
-          </div>
-          {value !== 'UTC' && (
-            <div className="shrink-0 border-t border-border px-2.5 py-1.5 bg-card/40">
-              <div className="text-[10px] text-muted-foreground leading-relaxed">
-                Events without offset info will be treated as <span className="font-mono text-foreground/80">{value}</span> and
-                converted to UTC.
-              </div>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }
@@ -3515,7 +3376,7 @@ function Step3Deploy(props: Step3Props) {
               ['name', name || '—'],
               ['source_type', feedId || '—'],
               ['namespace', namespaceFull],
-              ['timezone', timezone],
+              ['timezone', timezoneDisplay(timezone)],
               ['category', category || '—'],
               ['vendor', vendor || '—'],
               ['product', product || '—'],
@@ -3565,7 +3426,7 @@ function Step3Deploy(props: Step3Props) {
               </li>
               <li className="flex gap-1.5">
                 <ArrowRight className="w-3 h-3 mt-0.5 shrink-0 text-muted-foreground/60" />
-                Iterate the parser anytime — versions are tracked
+                Iterate the parser anytime; versions are tracked
               </li>
             </ul>
           </div>

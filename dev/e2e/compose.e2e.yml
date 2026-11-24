@@ -150,6 +150,19 @@ services:
     labels: *e2e-labels
     image: ${E2E_IMAGE_API:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-api:${NANO_VERSION:?NANO_VERSION is required}}
 
+  # NAN-5829: the Pipelines live tap relay. The base template gives nano-api
+  # NANO_VECTOR_TAP_URL=http://vector:8687 and the generated secrets give it a
+  # tap token, so the API reports live tap as enabled; without this relay
+  # every tap answered 503 "Live tap relays are unreachable". Shares Vector's
+  # network namespace (vector-netns) exactly as the shipped stack does. Native
+  # mode never sets the tap URL, so it starts only with the docker app.
+  vector-tap:
+    profiles: ["docker-app"]
+    container_name: ${E2E_PROJECT}-vector-tap
+    labels: *e2e-labels
+    restart: "no"
+    image: ${E2E_IMAGE_API:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-api:${NANO_VERSION:?NANO_VERSION is required}}
+
   nano-api:
     profiles: ["docker-app"]
     container_name: ${E2E_PROJECT}-api
@@ -162,6 +175,19 @@ services:
       DEPLOYMENT_MODE: selfhosted
       NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS: "${E2E_ALLOW_PRIVATE_AI_ENDPOINTS:-false}"
       SEARCH_SERVICE_URL: http://nano-search:3002/health
+      # NAN-5744: same as native write_app_env. Without these the API falls
+      # back to the install defaults (the Compose edge on :80), so the Add
+      # source wizard's copied snippets miss this stack's ephemeral ports.
+      NANO_INGEST_PUBLIC_BASE_URL: http://127.0.0.1:${E2E_EDGE_PORT:?}
+      NANO_INGEST_HEC_PORT: ${E2E_HEC_PORT:?}
+      # Native sets this too; tests/ui/test_pipelines_ui.py needs draft preview.
+      NANO_PIPE_PREVIEW_ENABLED: "true"
+      # NAN-5798: opt-in Sentry (empty unless the harness found DSNs; see
+      # scripts/lib/e2e-sentry.sh). Release images compile out the test trigger.
+      NANO_SENTRY_DSN: "${E2E_SENTRY_DSN_BACKEND:-}"
+      NANO_SENTRY_ENVIRONMENT: e2e
+      NANO_SENTRY_RELEASE: "${E2E_SENTRY_RELEASE:-}"
+      NANO_E2E_RUN_ID: "${E2E_SENTRY_RUN_ID:-}"
     ports:
       - "127.0.0.1:${E2E_API_PORT:?}:3000"
     volumes: !override
@@ -183,10 +209,26 @@ services:
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
       NANOSIEM_DEV_MODE: "true"
       DEPLOYMENT_MODE: selfhosted
+      # NAN-5744: the server hunt runner and evals call the AI provider from
+      # jobs. Native gives every service this flag; without it jobs refuses the
+      # loopback-published ai-stub as a private endpoint and every sweep errors.
+      NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS: "${E2E_ALLOW_PRIVATE_AI_ENDPOINTS:-false}"
+      # NAN-5757: scheduled hunt recon, off unless `--profile recon-fast` (same
+      # values native gets through app.env; empty means the built-in default).
+      HUNT_RECON_SCHEDULE_ENABLED: "${E2E_HUNT_RECON_SCHEDULE_ENABLED:-false}"
+      HUNT_RECON_FIRST_RUN_DELAY_SECS: "${E2E_HUNT_RECON_FIRST_RUN_DELAY_SECS:-}"
+      HUNT_RECON_TICK_SECS: "${E2E_HUNT_RECON_TICK_SECS:-}"
+      HUNT_RECON_NEW_SOURCE_MIN_GAP_SECS: "${E2E_HUNT_RECON_NEW_SOURCE_MIN_GAP_SECS:-}"
       # NAN-2042: the jobs listener binds container loopback by default, which
       # the published port below cannot reach (the runner's health wait and
       # test_base hit it from the host). The host side is still 127.0.0.1 only.
       JOBS_BIND_ADDR: "0.0.0.0"
+      # NAN-5798: opt-in Sentry (empty unless the harness found DSNs; see
+      # scripts/lib/e2e-sentry.sh). Release images compile out the test trigger.
+      NANO_SENTRY_DSN: "${E2E_SENTRY_DSN_BACKEND:-}"
+      NANO_SENTRY_ENVIRONMENT: e2e
+      NANO_SENTRY_RELEASE: "${E2E_SENTRY_RELEASE:-}"
+      NANO_E2E_RUN_ID: "${E2E_SENTRY_RUN_ID:-}"
     ports:
       - "127.0.0.1:${E2E_JOBS_PORT:?}:3003"
     volumes: !override
@@ -202,6 +244,12 @@ services:
     image: ${E2E_IMAGE_SEARCH:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-search:${NANO_VERSION:?NANO_VERSION is required}}
     environment:
       NANOSIEM_DEV_MODE: "true"
+      # NAN-5798: opt-in Sentry (empty unless the harness found DSNs; see
+      # scripts/lib/e2e-sentry.sh). Release images compile out the test trigger.
+      NANO_SENTRY_DSN: "${E2E_SENTRY_DSN_BACKEND:-}"
+      NANO_SENTRY_ENVIRONMENT: e2e
+      NANO_SENTRY_RELEASE: "${E2E_SENTRY_RELEASE:-}"
+      NANO_E2E_RUN_ID: "${E2E_SENTRY_RUN_ID:-}"
     ports:
       - "127.0.0.1:${E2E_SEARCH_PORT:?}:3002"
 

@@ -488,6 +488,11 @@ impl PrevalenceService {
     ///
     /// Returns results for all requested artifacts (zero counts for missing).
     /// Limited to MAX_BULK_ARTIFACTS per request.
+    ///
+    /// NAN-5722: `host_count`, `first_seen` and `total_occurrences` are the
+    /// 30-day prevalence baseline, the same numbers `| prevalence enrich=true`
+    /// and the dictionaries report; `time_window` only requires the artifact
+    /// to have been seen inside it (see `PrevalenceRepository::point_lookup_sql`).
     #[instrument(skip(self, artifacts, scope))]
     pub async fn get_bulk_prevalence(
         &self,

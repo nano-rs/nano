@@ -9,6 +9,10 @@ name: opensource stack gate
 
 on:
   pull_request:
+    # NAN-5791: on a PR, runs only while it carries the optional `ready-to-merge`
+    # opt-in label (jobs' `if:`); the heavy run is the push-to-main one below.
+    # docs-internal/ci-runner-pools.md#ready-to-merge-label-nan-5791
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - docker-compose.opensource.yml
       - docker-compose.siem-only.yml
@@ -24,6 +28,138 @@ on:
       - scripts/check-cargo-package-scoping.sh
       - config/vector/**
       - scripts/check-opensource-pins.sh
+      - scripts/tests/reload-acked-loss.live.sh
+      - scripts/tests/fixtures/reload-acked-loss/**
+      - clickhouse/preflight/**
+      - clickhouse/users.d/**
+      - scripts/tests/clickhouse-default-user.live.sh
+      - scripts/tests/test_install_clickhouse_default_preflight.py
+      - scripts/tests/test_install_compose_up_hint.py
+      - nanosiem-web/**
+      - tools/sync-to-nano-mirror.sh
+      - tools/scan-mirror-secrets.sh
+      - tools/check-mirror-enterprise-strip.py
+      - tools/tests/**
+      - scripts/tests/install-edition.test.sh
+      - scripts/tests/install-env-set-keys.test.sh
+      - scripts/tests/install-ingest-ack-durability.test.sh
+      - scripts/lib/generated-secrets.sh
+      - scripts/tests/install-api-call.test.sh
+      - scripts/tests/install-bind-address-probes.test.sh
+      - scripts/tests/test_nano_upgrade_bind_address.py
+      - scripts/tests/install-image-pull.test.sh
+      - scripts/tests/install-registry-login.test.sh
+      - scripts/tests/install-errors-prereqs.test.sh
+      - scripts/tests/test_nano_upgrade_license_registry_login.py
+      - scripts/tests/install-rerun-upgrade.test.sh
+      - scripts/tests/install-legacy-upgrade.test.sh
+      - scripts/tests/install_legacy_upgrade.py
+      - scripts/tests/install-senders-paused.test.sh
+      - scripts/tests/install_senders_paused.py
+      - scripts/tests/install-legacy-vector-native.test.sh
+      - scripts/tests/install_legacy_vector_native.py
+      - scripts/tests/nano-ocsf-legacy.test.sh
+      - scripts/tests/test_ocsf_legacy_backfill.py
+      - scripts/ocsf-legacy-backfill.py
+      - scripts/lib/ocsf-legacy.sh
+      - scripts/lib/ocsf_contracts/**
+      - scripts/tests/install-v2030-audit.test.sh
+      - scripts/tests/test_nano_upgrade_v2030_audit.py
+      - scripts/nano-upgrade-readiness.py
+      - scripts/tests/test_nano_upgrade_readiness.py
+      - scripts/tests/test_nano_upgrade_readiness_encrypt.py
+      - scripts/tests/test_nano_upgrade_readiness_ingest.py
+      - scripts/tests/test_nano_upgrade_readiness_url_scrub.py
+      - nanosiem-core/src/config_secrets.rs
+      - scripts/lib/install-preflight.sh
+      - scripts/lib/registry-login.sh
+      - scripts/lib/vector-native-pki.sh
+      - scripts/tests/vector-native-mtls.test.sh
+      - scripts/tests/vector-native-mtls.live.sh
+      - scripts/tests/test_nano_upgrade_vector_native_pki.py
+      - scripts/lib/data-mount.sh
+      - scripts/tests/install-data-mount.test.sh
+      - scripts/lib/image-pull.sh
+      - scripts/tests/install-umask.test.sh
+      - scripts/tests/install-umask.live.sh
+      - scripts/tests/install-resource-sizing.test.sh
+      - scripts/tests/resource-sizing.test.sh
+      - scripts/tests/clickhouse-sizing-mount.test.sh
+      - scripts/tests/fixtures/resource-sizing.snap
+      - scripts/tests/resource-sizing-planned-volume.test.sh
+      - scripts/lib/retention-sizing.sh
+      - scripts/tests/retention-sizing.test.sh
+      - scripts/tests/fixtures/resource-sizing-unplanned.golden
+      - scripts/tests/resource-sizing-evidence-pack.test.sh
+      - nanosiem-enterprise/src/evidence_pack/memory.rs
+      - skills/nano-deploy/**
+      - scripts/tests/nano_deploy_plan_support.py
+      - scripts/tests/test_nano_deploy_plan*.py
+      - scripts/tests/test_nano_deploy_customer_run.py
+      - scripts/tests/test_nano_deploy_health_checks.py
+      - scripts/tests/test_smoke_otlp.py
+      - scripts/tests/test_nano_deploy_pg_preflight.py
+      - scripts/tests/test_nano_deploy_k8s_health.py
+      - scripts/tests/fixtures/nano-deploy-health/**
+      - scripts/tests/test_otlp_edge_content_type.py
+      - scripts/tests/test_otlp_edge_auth_unavailable.py
+      - config/nginx/nginx.opensource*.conf
+      - deploy/compose/config/nginx.ingest.conf.template
+      - deploy/helm/nano/templates/ingest/**
+      - scripts/tests/test_nano_deploy_fetch_bundle.py
+      - scripts/tests/test_valkey_ha_entrypoint.py
+      - scripts/tests/test_etcd_leader_steer.py
+      - deploy/compose/postgres-ha/nano-etcd-leader-steer
+      - scripts/nano-support-bundle
+      - scripts/nano-cluster-health
+      - scripts/tests/test_nano_support_bundle.py
+      - scripts/tests/fixtures/nano-deploy-plan/**
+      - scripts/check-opencore-web-build.sh
+      - docker-compose.yml
+      - docker-compose.tls.yml
+      - config/nginx/**
+      - deploy/compose/**
+      - deploy/helm/nano/templates/edge/**
+      - ludus/roles/nanosiem_stack/files/nginx/**
+      - scripts/tests/compose-published-ports.sh
+      - scripts/tests/fixtures/compose-published-ports.allow
+      - scripts/tests/nginx-internal-404.sh
+      - scripts/tests/nginx-edge-health.test.sh
+      - scripts/tests/nginx-no-http2.test.sh
+      - scripts/tests/compose-config-refresh.test.sh
+      - scripts/tests/compose-legacy-overlay-nginx.test.sh
+      - scripts/tests/test_compose_stale_mounts.py
+      - scripts/lib/compose_stale_mounts.py
+      # Open-core relation inventory (relation-inventory job): any Rust or
+      # schema change can make open code name a relation the open schema lacks.
+      - "**/*.rs"
+      - migrations/postgres/**
+      - migrations/postgres-open/**
+      - nanosiem-core/src/db/migrations.rs
+      - nanosiem-core/tests/open_core_relation_inventory.rs
+      - "**/Cargo.toml"
+      - .github/workflows/opensource-stack-gate.yml
+  # Heavy suite on main after merges; same paths as the PR trigger.
+  # docs-internal/ci-runner-pools.md#heavy-gates-on-main
+  push:
+    branches: [main]
+    paths:
+      - docker-compose.opensource.yml
+      - docker-compose.siem-only.yml
+      - images.lock
+      - install.sh
+      - scripts/lib/resource-sizing.sh
+      - scripts/lib/clickhouse_config_dirs.py
+      - scripts/tests/test_compose_mount_reextract_guard.py
+      - scripts/tests/test_clickhouse_config_dirs.py
+      - clickhouse/config.d/zzzz-nano-sizing.xml
+      - clickhouse/users.d/zzzz-nano-sizing.xml
+      - Dockerfile*
+      - scripts/check-cargo-package-scoping.sh
+      - config/vector/**
+      - scripts/check-opensource-pins.sh
+      - scripts/tests/reload-acked-loss.live.sh
+      - scripts/tests/fixtures/reload-acked-loss/**
       - clickhouse/preflight/**
       - clickhouse/users.d/**
       - scripts/tests/clickhouse-default-user.live.sh
@@ -135,16 +271,29 @@ on:
       - .github/workflows/opensource-stack-gate.yml
   workflow_dispatch:
 
+# Read-only token on every trigger: no run of this gate (PR, push to main,
+# schedule, dispatch) can push, publish, sign or release.
+permissions:
+  contents: read
+
+# NAN-5791: a labeled/unlabeled event for any other label gets its own group
+# (its jobs skip), so it never cancels a real run. A push to main joins the
+# `heavy-` group without cancel-in-progress: one run going plus at most one
+# pending, the pending one replaced by the newest merge, so a burst of merges
+# coalesces into two runs (docs-internal/ci-runner-pools.md#heavy-gates-on-main).
 concurrency:
-  group: opensource-stack-gate-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && 'heavy-' || '' }}opensource-stack-gate-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   gate:
+    if: ${{ github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge')) }}
     # Self-hosted only (repo rule — never ubuntu-latest). Needs docker +
     # docker compose v2 on the runner (same as enrichment-lane-gate).
-    runs-on: [self-hosted, Linux, X64, nano-pr]
-    timeout-minutes: 30
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
+    # NAN-5840: 30 was ~28 min of steps with no headroom; the NAN-5822 sizing
+    # sweep pushed every main run over it. Trim the slow steps, then lower.
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -245,6 +394,19 @@ jobs:
             TMPDIR="$RUNNER_TEMP" bash scripts/tests/vector-native-mtls.live.sh
           else
             echo "vector-native-mtls live test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5874: the pinned Vector keeps every acknowledged HEC and HTTP event
+      # across a hot reload that re-points an unchanged input (the v2.0.35
+      # upgrade's _source_tz insert, a parser extension toggle) and across an
+      # ordinary VRL publish. 0.61.0-nano.13 lost every event sent during such
+      # a reload's build while answering 200 / ackId true.
+      - name: Vector hot reload keeps acknowledged events, live (Docker)
+        run: |
+          if [ -f scripts/tests/reload-acked-loss.live.sh ]; then
+            TMPDIR="$RUNNER_TEMP" bash scripts/tests/reload-acked-loss.live.sh
+          else
+            echo "reload-acked-loss live test not in this tree (public mirror); skipping"
           fi
 
       # NAN-5509: installer errors, prerequisites and recovery hints (TLS
@@ -514,10 +676,11 @@ jobs:
             '
 
   relation-inventory:
+    if: ${{ github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge')) }}
     # A compile-only mirror check cannot catch SQL that names a table omitted
     # from the fresh-open migration snapshot. Run the inventory against both
     # the exact stripped source tree and an isolated PostgreSQL 18 instance.
-    runs-on: [self-hosted, Linux, X64, nano-pr]
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
     timeout-minutes: 45
     env:
       PG_CONTAINER: opencore-relations-${{ github.run_id }}
@@ -566,6 +729,7 @@ jobs:
             -v "$PWD:/source:ro" \
             -v nanosiem-opencore-relations-cargo-registry:/usr/local/cargo/registry \
             -e CARGO_TARGET_DIR=/tmp/target \
+            -e CARGO_BUILD_JOBS \
             -e TEST_DATABASE_URL="$TEST_DATABASE_URL" \
             -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
             -e NANOSIEM_REQUIRE_RELATION_INVENTORY=1 \

@@ -380,7 +380,7 @@ export function RankedBarChart({
           <span>{isRare ? 'Rare' : 'Top'}</span>
         </div>
         <div className="p-8 text-center text-muted-foreground text-sm">
-          No values returned — try widening the time range or checking the field name.
+          No values. Widen the time range or check the field name.
         </div>
       </div>
     );

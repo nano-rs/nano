@@ -192,7 +192,9 @@ impl LogSourceRepository {
     /// Mark as deployed
     pub async fn mark_deployed(&self, id: Uuid) -> Result<(), LogSourceRepositoryError> {
         let result = sqlx::query(
-            "UPDATE log_sources SET deployed = true, deployed_at = NOW() WHERE id = $1",
+            "UPDATE log_sources SET deployed = true, deployed_at = NOW(), \
+             first_deployed_at = COALESCE(first_deployed_at, CASE WHEN deployed_at IS NOT NULL THEN created_at ELSE NOW() END) \
+             WHERE id = $1",
         )
         .bind(id)
         .execute(&self.pool)
@@ -213,7 +215,8 @@ impl LogSourceRepository {
     /// preserved). Returns the number of sources flipped.
     pub async fn mark_enabled_deployed(&self) -> Result<u64, LogSourceRepositoryError> {
         let result = sqlx::query(
-            "UPDATE log_sources SET deployed = true, deployed_at = NOW() \
+            "UPDATE log_sources SET deployed = true, deployed_at = NOW(), \
+             first_deployed_at = COALESCE(first_deployed_at, CASE WHEN deployed_at IS NOT NULL THEN created_at ELSE NOW() END) \
              WHERE enabled = true AND deployed = false",
         )
         .execute(&self.pool)
@@ -259,7 +262,8 @@ impl LogSourceRepository {
 /// See [`LogSourceRepository::mark_lifecycle_active`]. `deployed_at` and the
 /// trigger-set `updated_at` both take this statement's `NOW()`.
 const MARK_LIFECYCLE_ACTIVE_SQL: &str = "UPDATE log_sources SET lifecycle_status = 'active', \
-     deployed_at = NOW() WHERE id = $1 AND lifecycle_status = 'draft'";
+     deployed_at = NOW(), first_deployed_at = COALESCE(first_deployed_at, CASE WHEN deployed_at IS NOT NULL THEN created_at ELSE NOW() END) \
+     WHERE id = $1 AND lifecycle_status = 'draft'";
 
 #[cfg(test)]
 mod lifecycle_sql_tests {
@@ -268,5 +272,6 @@ mod lifecycle_sql_tests {
         let sql = super::MARK_LIFECYCLE_ACTIVE_SQL;
         assert!(sql.contains("deployed_at = NOW()"), "{sql}");
         assert!(sql.contains("lifecycle_status = 'draft'"), "only drafts flip: {sql}");
+        assert!(sql.contains("first_deployed_at = COALESCE(first_deployed_at,"), "{sql}");
     }
 }

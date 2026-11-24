@@ -68,10 +68,14 @@ import type {
   DiskHealthReport,
   FindingSuppression,
   Recommendation,
+  RemovedSourceMetric,
   SiemHealthReport,
 } from '@/lib/api/siem-health';
 import { cn } from '@/lib/utils';
-import { formatBytes } from '@/lib/date-utils';
+import { formatBytes, formatUTCShort } from '@/lib/date-utils';
+import { isSuppressibleFinding } from '@/lib/siem-health-findings';
+import { watchdogReplicaState } from '@/lib/siemHealthWatchdog';
+import { Term } from '@/components/ui/term';
 
 /* ============================================================================
    TONE / TOKENS
@@ -125,6 +129,7 @@ const STATUS_META: Record<
   ok: { tone: 'good', label: 'HEALTHY', pulse: false },
   unknown: { tone: 'fg-3', label: 'N/A', pulse: false },
 };
+
 
 function statusFromScore(score: number | null | undefined): StageStatus {
   if (score == null) return 'unknown';
@@ -611,7 +616,7 @@ function Narrative({
         <p className="text-[12.5px] text-muted-foreground">
           {aiAuthored
             ? 'No narrative available yet.'
-            : 'No summary yet — the first check runs within 12h, or run one now.'}
+            : 'No summary yet. The first check runs within 12h, or run one now.'}
         </p>
       )}
     </div>
@@ -643,7 +648,7 @@ function Recommendations({
   // prompt injection prevents them on the next run; this hides them now so
   // the UI doesn't lag a report cycle behind the user's action.
   const visibleItems = useMemo(
-    () => items.filter((r) => !suppressedTitles.has(r.title)),
+    () => items.filter((r) => !suppressedTitles.has(r.title) || !isSuppressibleFinding(r.title)),
     [items, suppressedTitles]
   );
   const suppressedHere = items.length - visibleItems.length;
@@ -682,7 +687,7 @@ function Recommendations({
                     <h4 className="text-[12.5px] font-semibold text-foreground">
                       {rec.title}
                     </h4>
-                    {canManage && (
+                    {canManage && isSuppressibleFinding(rec.title) && (
                       <SuppressFindingButton
                         title={rec.title}
                         onSuppress={onSuppress}
@@ -748,7 +753,7 @@ function Recommendations({
                           onClick={() => onUndo(s.id)}
                           disabled={isMutating}
                           className="flex items-center gap-1 rounded-md border border-border px-2 py-1 font-mono text-[10px] text-muted-foreground hover:bg-foreground/[.04] hover:text-foreground disabled:opacity-50"
-                          title="Re-enable this finding class"
+                          title="Show this kind of finding again"
                         >
                           <RotateCcw className="h-3 w-3" />
                           undo
@@ -791,7 +796,7 @@ function SuppressFindingButton({
           type="button"
           aria-label="Mark as not an issue"
           className="ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-transparent text-muted-foreground/0 hover:border-border hover:text-muted-foreground group-hover:text-muted-foreground/60"
-          title="Not an issue — suppress this finding class"
+          title="Not an issue: stop showing this kind of finding"
         >
           <X className="h-[11px] w-[11px]" />
         </button>
@@ -943,6 +948,52 @@ function StageDetail({
   );
 }
 
+/**
+ * NAN-5760: deleted log sources whose events are still inside the 48h health
+ * window. A quiet, informational state: never silent and never scored.
+ */
+export function RemovedSourcesPanel({ sources }: { sources: RemovedSourceMetric[] }) {
+  if (sources.length === 0) return null;
+  return (
+    <SubPanel
+      title="Removed sources"
+      subtitle={`${sources.length} deleted source${sources.length === 1 ? '' : 's'} · data still in window, not monitored`}
+    >
+      <div className="divide-y divide-border" data-testid="siem-health-removed-sources">
+        {sources.map((rs) => (
+          <div
+            key={rs.source_type}
+            className="flex items-center gap-3 px-5 py-2.5 hover:bg-foreground/[.02]"
+          >
+            <span
+              className="h-[6px] w-[6px] shrink-0 rounded-full"
+              style={{ background: TONE_DOT['fg-3'] }}
+            />
+            <span className="flex-1 truncate font-mono text-[12px] text-muted-foreground">
+              {rs.source_type}
+            </span>
+            <span
+              className="max-w-[200px] truncate text-[11.5px] text-muted-foreground"
+              title={`Deleted ${formatUTCShort(rs.deleted_at)}`}
+            >
+              {rs.log_source_name}
+            </span>
+            <span className="w-[100px] text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+              {rs.count_24h.toLocaleString()}
+            </span>
+            <span className="w-[100px] text-right font-mono text-[11px] tabular-nums text-muted-foreground/60">
+              prior {rs.count_prior_24h.toLocaleString()}
+            </span>
+            <span className="rounded bg-foreground/5 px-1.5 py-px font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+              removed
+            </span>
+          </div>
+        ))}
+      </div>
+    </SubPanel>
+  );
+}
+
 function IngestionDetail({
   metrics,
   audit,
@@ -996,7 +1047,7 @@ function IngestionDetail({
           },
           {
             key: 'inserts-vs-parts',
-            label: 'INSERTs vs new parts on disk (1h)',
+            label: 'Writes vs new data files on disk (1h)',
             value: `${ii.logs_inserts_1h.toLocaleString()} inserts · ${ii.new_parts_1h.toLocaleString()} parts`,
             bad: insertsWithoutParts,
           },
@@ -1033,7 +1084,7 @@ function IngestionDetail({
           },
           {
             key: 'ingest-watchdog',
-            label: 'Refreshable views stopped by ingest watchdog',
+            label: 'Summary tables paused to protect intake',
             value:
               stoppedWatchdogs.length > 0
                 ? stoppedWatchdogs
@@ -1053,13 +1104,15 @@ function IngestionDetail({
                   .flatMap((state) =>
                     (state.replicas ?? []).map(
                       (replica) =>
-                        `${state.node}/${replica.replica}: ${replica.reachable ? (replica.hot ? 'HOT' : 'calm') : `unreachable (${replica.error})`}`,
+                        `${state.node}/${replica.replica}: ${watchdogReplicaState(replica)}`,
                     ),
                   )
                   .join('; ')
               : 'no samples',
             bad: (ii.ingest_watchdog ?? []).some((state) =>
-              (state.replicas ?? []).some((replica) => !replica.reachable || replica.hot),
+              (state.replicas ?? []).some(
+                (replica) => replica.stale || !replica.reachable || replica.hot,
+              ),
             ),
           },
         ]
@@ -1130,8 +1183,8 @@ function IngestionDetail({
           title="Insert integrity"
           subtitle={
             integrityBadCount > 0
-              ? `${integrityBadCount} storage-layer signal${integrityBadCount === 1 ? '' : 's'} firing — possible silent loss`
-              : 'storage-layer loss probes · all clear'
+              ? `${integrityBadCount} storage check${integrityBadCount === 1 ? '' : 's'} failing: events may be getting lost`
+              : 'storage checks for lost events · all clear'
           }
         >
           <div className="divide-y divide-border">
@@ -1178,7 +1231,7 @@ function IngestionDetail({
           title="Dictionary memory"
           subtitle={
             dictPct !== null
-              ? `${formatBytes(dictTotal)} of ${formatBytes(dictLimit)} ClickHouse limit · ${dictPct}%${dictWarn ? ' — a reload needs the same again' : ''}`
+              ? `${formatBytes(dictTotal)} of ${formatBytes(dictLimit)} ClickHouse limit · ${dictPct}%${dictWarn ? ' · a reload needs this much free again' : ''}`
               : `${formatBytes(dictTotal)} resident`
           }
         >
@@ -1208,7 +1261,7 @@ function IngestionDetail({
       )}
       {metrics.silent_sources.length > 0 && (
         <SubPanel
-          title="Silent sources"
+          title={<Term id="silent-source">Silent sources</Term>}
           subtitle={`${metrics.silent_sources.length} fell silent in last 24h`}
         >
           <div className="divide-y divide-border">
@@ -1232,6 +1285,7 @@ function IngestionDetail({
           </div>
         </SubPanel>
       )}
+      <RemovedSourcesPanel sources={metrics.removed_sources ?? []} />
       {metrics.source_volumes.length > 0 && (
         <SubPanel
           title="Active sources"
@@ -1342,7 +1396,7 @@ function ParsingDetail({
       />
       {cov.length > 0 && (
         <SubPanel
-          title="Field coverage"
+          title={<Term id="field-coverage">Field coverage</Term>}
           subtitle={`${cov.length} sources · per-field fill rate`}
         >
           <div className="divide-y divide-border">
@@ -1447,7 +1501,7 @@ function DetectionDetail({
       )}
       {metrics.stale_rules.length > 0 && (
         <SubPanel
-          title="Stale rules"
+          title={<Term id="stale-rule">Stale rules</Term>}
           subtitle={`${metrics.stale_rules.length} haven't matched in 30d+`}
         >
           <div className="divide-y divide-border">
@@ -1473,7 +1527,7 @@ function DetectionDetail({
       )}
       {metrics.noisy_rules.length > 0 && (
         <SubPanel
-          title="Noisy rules"
+          title={<Term id="noisy-rule">Noisy rules</Term>}
           subtitle={`${metrics.noisy_rules.length} firing heavily`}
         >
           <div className="divide-y divide-border">
@@ -1836,7 +1890,7 @@ function SubPanel({
   subtitle,
   children,
 }: {
-  title: string;
+  title: React.ReactNode;
   subtitle?: string;
   children: React.ReactNode;
 }) {
@@ -1989,9 +2043,8 @@ export function SiemHealth() {
             <h1 className="mt-1 text-[20px] font-semibold tracking-[-0.015em] text-foreground">
               No health reports yet
             </h1>
-            <p className="mt-0.5 text-[12px] text-muted-foreground">
-              Health checks run automatically every 12 hours.
-              {isAdmin ? ' You can also trigger one manually below.' : ''}
+            <p className="mt-0.5 font-mono text-[10.5px] text-muted-foreground">
+              checks run every <span className="text-foreground">12h</span>
             </p>
           </div>
         </div>
@@ -1999,9 +2052,8 @@ export function SiemHealth() {
         {sourceHealth}
         <div className="mt-8 rounded-xl border border-border bg-card px-6 py-12 text-center">
           <HeartPulse className="mx-auto mb-3 h-8 w-8 text-muted-foreground/40" />
-          <p className="text-[13px] text-foreground">
-            Once a health check completes, this page will surface ingestion,
-            parsing, and detection signals across the pipeline.
+          <p className="text-[12px] text-muted-foreground">
+            Results appear after the first check.
           </p>
           {isAdmin && (
             <button
@@ -2059,8 +2111,11 @@ export function SiemHealth() {
             </h1>
             <p className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
               <span>
-                Score{' '}
-                <span className="font-mono tabular-nums text-foreground">
+                <Term id="siem-health-score">Score</Term>{' '}
+                <span
+                  className="font-mono tabular-nums text-foreground"
+                  data-testid="siem-health-overall-score"
+                >
                   {report.overall_score}
                 </span>
               </span>

@@ -262,6 +262,10 @@ pub struct TelemetryReadinessSnapshot {
     configured_source_types: HashSet<String>,
     last_seen_by_source_type: Option<HashMap<String, DateTime<Utc>>>,
     observed_at: DateTime<Utc>,
+    /// NAN-5850: source types the viewer is denied. Removed from each data
+    /// source's `source_types` AND ignored by readiness, so the coverage
+    /// payload neither names them nor reveals that they are configured.
+    denied_source_types: HashSet<String>,
 }
 
 impl TelemetryReadinessSnapshot {
@@ -277,6 +281,7 @@ impl TelemetryReadinessSnapshot {
             configured_source_types: normalize_source_set(configured_source_types),
             last_seen_by_source_type: Some(normalize_last_seen(last_seen_by_source_type)),
             observed_at,
+            denied_source_types: HashSet::new(),
         }
     }
 
@@ -290,13 +295,44 @@ impl TelemetryReadinessSnapshot {
             configured_source_types: normalize_source_set(configured_source_types),
             last_seen_by_source_type: None,
             observed_at,
+            denied_source_types: HashSet::new(),
         }
+    }
+
+    /// NAN-5850: hide these source types (the viewer's deny set) from every
+    /// data source's mapped `source_types`.
+    pub fn with_denied_source_types<I, S>(mut self, denied: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.denied_source_types = denied
+            .into_iter()
+            .map(|source| source.as_ref().trim().to_ascii_lowercase())
+            .collect();
+        self
+    }
+
+    /// The mapped source types the viewer may see, lowercase, in mapping order.
+    pub(crate) fn visible_source_types(&self, mapped_source_types: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(mapped_source_types.len());
+        for source in mapped_source_types {
+            let source = source.to_ascii_lowercase();
+            if !self.denied_source_types.contains(&source) && !out.contains(&source) {
+                out.push(source);
+            }
+        }
+        out
     }
 
     pub(crate) fn classify(&self, mapped_source_types: &[&str]) -> ReadinessEvidence {
         let configured: Vec<String> = mapped_source_types
             .iter()
             .map(|source| source.to_ascii_lowercase())
+            // NAN-5850 review: a denied source is invisible, configured or
+            // not. Counting it here would let `configured: true` / `stale`
+            // reveal that it exists while `source_types` hides its name.
+            .filter(|source| !self.denied_source_types.contains(source))
             .filter(|source| self.configured_source_types.contains(source))
             .collect();
 
@@ -381,6 +417,11 @@ pub struct DataSource {
     /// Compatibility alias for older clients. True only when `readiness` is
     /// `active`; stale and unknown sources never claim to be connected.
     pub connected: bool,
+    /// NAN-5850: the lowercase nano source types this ATT&CK label maps to
+    /// (configured or not), minus any source the viewer is denied (the same
+    /// deny set that scopes readiness). Empty when `mapping_known` is false.
+    #[serde(default)]
+    pub source_types: Vec<String>,
 }
 
 /// Coverage information for a single technique

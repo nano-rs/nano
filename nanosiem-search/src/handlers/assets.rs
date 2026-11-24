@@ -950,6 +950,7 @@ mod true_time_range_scope_tests {
 
     fn jwt_auth(permissions: &[&str]) -> crate::AuthContext {
         crate::AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: "test".to_string(),
             aud: "test".to_string(),
             sub: Uuid::now_v7(),

@@ -23,13 +23,13 @@ function withSso(sso: boolean) {
 // NAN-5274: open builds never claim SCIM; enterprise (SSO) builds do.
 test('open builds do not mention SCIM on the Groups page', () => {
   withSso(false);
-  expect(screen.getByText('Group users to share roles and scopes.')).toBeTruthy();
+  expect(screen.getByText('Put users in groups so they share a role and the sources they can see.')).toBeTruthy();
   expect(screen.queryByText(/SCIM/)).toBeNull();
 });
 
 test('SSO builds describe IdP-managed membership', () => {
   withSso(true);
-  expect(screen.getByText(/SSO group mappings and SCIM provisioning can manage membership/)).toBeTruthy();
+  expect(screen.getByText(/SSO and SCIM can manage who is in each group/)).toBeTruthy();
 });
 
 test('without a capabilities provider nothing SCIM renders', () => {

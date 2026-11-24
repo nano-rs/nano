@@ -104,9 +104,11 @@ def session(
             pb = es.enter_context(
                 personas.login_persona(stack, nano, driver, out, persona.replace("_", "-"), PERSONAS[persona])
             )
+            pb.page.layout = "report"  # an exploring agent reads layout.jsonl; it is not a pass/fail run
             yield pb.page
         else:
             page = uilib.UiPage.open(driver, out / "ui-admin", name="explore:admin")
+            page.layout = "report"  # NAN-5762: recorded in layout.jsonl, never raised at an agent
             es.callback(page.finish, False)
             driver.register_secret(stack.admin_password)
             uilib.login(page, stack.admin_email, stack.admin_password)

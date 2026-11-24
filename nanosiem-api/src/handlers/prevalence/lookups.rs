@@ -161,7 +161,9 @@ pub async fn get_domain_prevalence(
 /// POST /api/prevalence/bulk
 ///
 /// Get prevalence data for multiple artifacts in a single request.
-/// Limited to 100 artifacts per request.
+/// Limited to 100 artifacts per request. Host counts are the 30-day
+/// prevalence baseline (NAN-5722); `window` only requires the artifact to
+/// have been seen inside it.
 /// Requirements: 4.3
 #[utoipa::path(
     post,

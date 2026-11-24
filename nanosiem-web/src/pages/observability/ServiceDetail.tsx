@@ -37,6 +37,7 @@ import { HEALTH, fmtNum, fmtRate, fmtMs, fmtPct, type DesignHealth } from '@/com
 import type { ServiceDetailResponse, SeriesPoint, Slo } from '@/lib/api/observability';
 import type { TimeRange } from '@/lib/api/types';
 import { parseUTCTimestamp } from '@/lib/date-utils';
+import { Term } from '@/components/ui/term';
 
 export interface ServiceDetailProps {
   service: string;
@@ -183,7 +184,7 @@ function ExemplarTraces({
       <div className="px-3.5 py-2.5 border-b border-border flex items-center gap-2">
         <GitBranch className="w-[13px] h-[13px] text-brand" />
         <span className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-2 font-semibold">
-          Exemplar traces
+          <Term id="exemplar-trace">Exemplar traces</Term>
         </span>
         <span className="text-[10.5px] text-fg-4">slowest · errored</span>
       </div>
@@ -250,7 +251,9 @@ function SloStrip({ slos }: { slos: Slo[] }) {
     <div className="rounded-lg border border-border bg-card px-3.5 py-2.5 flex items-center gap-x-4 gap-y-2 flex-wrap text-[11.5px]">
       <div className="flex items-center gap-1.5">
         <Target className="w-[13px] h-[13px] text-brand" />
-        <span className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-2 font-semibold">SLO</span>
+        <span className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-2 font-semibold">
+          <Term id="slo">SLO</Term>
+        </span>
       </div>
       <span className="font-mono text-fg truncate max-w-[220px]">{worst.name}</span>
       <span className="px-1.5 py-0.5 rounded border border-border font-mono text-[10px] text-fg-3">
@@ -275,7 +278,8 @@ function SloStrip({ slos }: { slos: Slo[] }) {
             consumed >= 100 ? 'text-danger' : consumed >= 75 ? 'text-warn' : 'text-fg-3'
           )}
         >
-          {unavailable ? '–' : `${Math.max(0, worst.budget_remaining_pct ?? 0).toFixed(0)}%`} budget
+          {unavailable ? '–' : `${Math.max(0, worst.budget_remaining_pct ?? 0).toFixed(0)}%`}{' '}
+          <Term id="error-budget">budget</Term> left
         </span>
         <span className={cn('font-mono text-[10.5px] uppercase tracking-wider', statusTone[worst.status])}>
           {worst.status.replace('_', ' ')}

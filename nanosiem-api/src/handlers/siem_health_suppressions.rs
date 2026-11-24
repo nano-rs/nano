@@ -120,6 +120,7 @@ pub async fn create_suppression(
         )));
     }
 
+    ensure_suppressible(title)?;
     let signature = signature_for_title(title);
     let repo = SuppressionRepository::new(state.pool.clone());
     let suppression = repo
@@ -215,8 +216,27 @@ pub async fn deactivate_suppression(
 )]
 pub struct SiemHealthSuppressionsApiDoc;
 
+/// NAN-5738: some findings must stay visible while their condition holds
+/// (an installed SOAR pack running while its release failed signed catalog
+/// verification); a suppression for one is refused.
+fn ensure_suppressible(title: &str) -> Result<(), ApiError> {
+    if nanosiem_core::siem_health::finding_signature::is_non_suppressible(title) {
+        return Err(ApiError::BadRequest(
+            "this finding stays visible while its condition holds and cannot be suppressed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_soar_pack_verification_finding_cannot_be_suppressed() {
+        let title = nanosiem_core::siem_health::finding_signature::SOAR_PACK_VERIFICATION_TITLE;
+        assert!(super::ensure_suppressible(title).is_err());
+        assert!(super::ensure_suppressible("Fix src_ip extraction for windows_sysmon (7.7% fill rate)").is_ok());
+    }
+
     use std::collections::BTreeSet;
 
     use nanosiem_core::auth::api_key::ApiKeyInfo;
@@ -238,6 +258,7 @@ mod tests {
 
     fn jwt_auth(denied: &[&str], audit_view: bool) -> AuthContext {
         let mut auth = AuthContext::from_jwt(TokenClaims {
+            sid: None,
             iss: DEFAULT_TOKEN_ISSUER.to_string(),
             aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
             sub: Uuid::now_v7(),

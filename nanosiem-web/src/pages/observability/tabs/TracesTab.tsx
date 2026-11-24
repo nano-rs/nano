@@ -37,6 +37,7 @@ import { LatencyScatter, type ScatterTrace } from '@/components/observability/ch
 import { TraceWaterfall } from '@/components/observability/TraceWaterfall';
 import type { ObservabilityTabProps } from '../types';
 import type { RecentTrace } from '@/lib/api/types';
+import { Term } from '@/components/ui/term';
 
 const NS_PER_MS = 1_000_000;
 
@@ -361,7 +362,7 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
           <span />
         </div>
         {!tracesQuery.isLoading && traces.length === 0 ? (
-          <div className="text-center py-12 text-[12px] text-fg-3">No traces match this range and filters. Export OTLP traces with service.name to populate this view.<TelemetrySetupHint /></div>
+          <div className="text-center py-12 text-[12px] text-fg-3">No traces match. Traces need an <Term id="otlp">OTLP</Term> service.name.<TelemetrySetupHint /></div>
         ) : (
           traces.map((t) => {
             const durMs = t.duration_ns / NS_PER_MS;

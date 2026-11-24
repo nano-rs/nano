@@ -88,6 +88,14 @@ export interface PivtActionSpec<P = Record<string, unknown>> {
   /** Changes state → confirmation card before `run`. */
   mutates: boolean;
   /**
+   * NAN-5637: a check beyond `permission`, e.g. ownership ("the server
+   * accepts this save only from the owner or an admin"). `false` withholds
+   * the action exactly like a missing permission: it is not offered, a card
+   * for it does not resolve, and pivt refuses a request for it instead of
+   * redirecting to an editor. Optional; absent means available.
+   */
+  available?: () => boolean;
+  /**
    * Freeze the page state the action depends on into its params, once, when
    * the card first shows. `preview` and `run` then both receive the frozen
    * params, so Apply does exactly what the card showed even if the page has

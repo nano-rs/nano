@@ -10,6 +10,7 @@
 
 import { formatRelativeCompact, formatUntil, formatUTCCompact } from '@/lib/date-utils';
 import type { BundleProvision } from '@/lib/api/marketplace-inventory';
+import { Term } from '@/components/ui/term';
 
 const STATE_LABEL: Record<string, string> = {
   fresh: 'fresh',
@@ -60,8 +61,8 @@ export function BundleFeedStatus({ provision, className }: { provision: BundlePr
         <p className="mt-2 text-[11px] text-muted-foreground" data-testid="bundle-feed-detail">{p.detail}</p>
       )}
       <p className="mt-3 text-[11px] leading-[1.45] text-muted-foreground" data-testid="inventory-bundle-note">
-        Provided by nano's signed feed bundle from app.nano.rs and stamped at ingest. There is no download URL or
-        token to configure. Check now and Import file are under Platform feeds on this page.
+        From nano's signed <Term id="feed-bundle">feed bundle</Term>, stamped at ingest; no download URL or token to configure. Check now and Import
+        file are under Platform feeds.
       </p>
     </section>
   );

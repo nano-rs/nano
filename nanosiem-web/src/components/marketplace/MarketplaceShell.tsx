@@ -9,6 +9,7 @@ import { formatUTCCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import { isFirstPartyRepo } from '@/lib/api/marketplace-inventory';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { Term } from '@/components/ui/term';
 
 export type CategoryFilter = 'all' | 'data' | 'agent' | 'identity' | 'collector';
 
@@ -117,7 +118,7 @@ export function MarketplacePageShell<Filter extends string>({
             Marketplace · SIEM
           </div>
           <h1 className="mt-1 text-[20px] font-semibold tracking-[-0.015em] text-foreground">
-            Install, configure and orchestrate your integrations
+            <Term id="integration">Integrations</Term>
           </h1>
           <p className="mt-0.5 text-[12px] text-muted-foreground">
             <span className="tabular-nums text-foreground">{totalCount}</span> integrations from{' '}
@@ -162,10 +163,9 @@ export function MarketplacePageShell<Filter extends string>({
         <div className="mt-4 bg-card border border-border/60 rounded-lg px-4 py-3 flex items-center gap-3 shadow-none">
           <FileDown className="w-[14px] h-[14px] text-primary shrink-0" />
           <div className="min-w-0 flex-1">
-            <div className="text-[12.5px] text-foreground font-medium">Air-gapped install</div>
+            <div className="text-[12.5px] text-foreground font-medium"><Term id="air-gapped">Air-gapped</Term> install</div>
             <div className="text-[11.5px] text-muted-foreground mt-0.5">
-              Repository sync is disabled. Bring in threat-intel and data feeds by importing
-              signed, offline bundles.
+              Repository sync is off. Import signed bundles instead.
             </div>
           </div>
           <Link to={AIRGAP_IMPORT_ROUTE} className="shrink-0">
@@ -367,13 +367,13 @@ function repoPurpose(repo: EnrichmentMarketplaceRepo): { kind: string; detail: s
   if (identity.includes('nano-integrations') || identity.includes('nano integrations')) {
     return {
       kind: 'Data collection',
-      detail: 'Scheduled pull collectors that connect to external platforms and bring their primary events and logs into nano.',
+      detail: 'Scheduled pull collectors for events and logs from external platforms.',
     };
   }
   if (identity.includes('nano-enrichments') || identity.includes('nano enrichments')) {
     return {
       kind: 'Data enrichment',
-      detail: 'Threat-intel, lookup, and transformation content that adds context to telemetry already in nano; it does not collect source events.',
+      detail: 'Threat intel, lookups and transforms for telemetry already in nano.',
     };
   }
   return {
@@ -583,7 +583,7 @@ export function EmptyState() {
       <SearchIcon className="w-6 h-6 text-muted-foreground/60 mx-auto mb-3" />
       <div className="text-[14px] text-foreground">No integrations matched.</div>
       <div className="text-[12px] text-muted-foreground mt-1">
-        Try clearing filters or check the repository sources in the filter bar.
+        Try clearing filters.
       </div>
     </div>
   );

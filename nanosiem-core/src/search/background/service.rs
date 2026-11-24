@@ -789,11 +789,7 @@ impl BackgroundSearchJobs {
             }
             Err(e) => {
                 let (kind, message) = classify_search_error(&e);
-                if kind == JobErrorKind::Internal {
-                    tracing::error!(job_id = %public_id, attempt, error = %e, "Background search attempt failed");
-                } else {
-                    tracing::info!(job_id = %public_id, attempt, kind = kind.as_str(), error = %e, "Background search attempt failed");
-                }
+                log_attempt_failure(&public_id, attempt, kind, &e);
                 if let Err(write_err) = inner
                     .repo
                     .fail(job_id, &inner.worker_id, attempt, kind, &message)
@@ -879,4 +875,23 @@ pub(super) fn strip_field_stats(response: &mut SearchResponse) {
             impact: None,
         },
     );
+}
+
+/// Log a failed background search attempt (NAN-5817).
+///
+/// The level follows [`SearchError::is_internal`], not the job error kind the
+/// owner sees: a backend timeout (`JobErrorKind::Timeout`) and an internal SQL
+/// generation failure (`JobErrorKind::InvalidQuery`, masked) are still ERRORs
+/// for Sentry. A failure the caller's query caused stays at INFO.
+pub(super) fn log_attempt_failure(
+    public_id: &dyn std::fmt::Display,
+    attempt: i32,
+    kind: JobErrorKind,
+    error: &SearchError,
+) {
+    if error.is_internal() {
+        tracing::error!(job_id = %public_id, attempt, kind = kind.as_str(), error = %error, "Background search attempt failed");
+    } else {
+        tracing::info!(job_id = %public_id, attempt, kind = kind.as_str(), error = %error, "Background search attempt failed");
+    }
 }

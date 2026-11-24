@@ -9,6 +9,7 @@ import {
   assertInlineScriptsAllowed,
   extractInlineScripts,
   scriptSrcOf,
+  sentryConnectOrigin,
 } from './csp';
 
 const indexHtml = readFileSync(path.resolve(__dirname, 'index.html'), 'utf8');
@@ -54,5 +55,25 @@ describe('index.html CSP', () => {
     const html = readFileSync(dist, 'utf8');
     expect(extractInlineScripts(html).length).toBeGreaterThan(0);
     expect(() => assertInlineScriptsAllowed(html)).not.toThrow();
+  });
+});
+
+// NAN-5798: an opt-in Sentry DSN adds exactly its origin to connect-src; every
+// other build keeps connect-src 'self'.
+describe('sentry connect-src', () => {
+  it('is empty without a DSN', () => {
+    expect(sentryConnectOrigin(undefined)).toEqual([]);
+    expect(sentryConnectOrigin('')).toEqual([]);
+    expect(sentryConnectOrigin('not a url')).toEqual([]);
+    expect(sentryConnectOrigin('javascript:alert(1)')).toEqual([]);
+  });
+
+  it('adds only the DSN origin (never the key or path)', () => {
+    const origins = sentryConnectOrigin('https://publickey@o1.ingest.us.sentry.io/42');
+    expect(origins).toEqual(['https://o1.ingest.us.sentry.io']);
+    const html = applyCsp(indexHtml, false, origins);
+    expect(html).toContain("connect-src 'self' https://o1.ingest.us.sentry.io;");
+    expect(html).not.toContain('publickey');
+    expect(applyCsp(indexHtml, false)).toContain("connect-src 'self';");
   });
 });

@@ -1506,6 +1506,10 @@ def serve(install_dir: pathlib.Path, *, clock: Callable[[], dt.datetime] | None 
 def have_tty() -> bool:
     """A controlling terminal, not merely a /dev/tty node (services and CI
     have the node, but opening it fails with ENXIO)."""
+    # install.sh --non-interactive (NANO_NONINTERACTIVE=1): never prompt,
+    # even with a terminal attached.
+    if os.environ.get("NANO_NONINTERACTIVE") == "1":
+        return False
     try:
         os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
         return True

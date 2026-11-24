@@ -406,6 +406,37 @@ impl HealthScheduler {
 
     /// Check all feeds for staleness
     async fn check_feed_staleness(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // NAN-5785: the loop below only visits sources that still exist and
+        // are monitored. Flag (never resolve) the open alerts no API path
+        // flagged (deleted sources; a racing pass's alert on an unmonitored
+        // source), and audit each durably. First, so a failure inside the loop
+        // cannot skip it.
+        let flagged = super::deleted_sources::sweep_orphaned_log_source_health(
+            &self.system_health_repo,
+            &self.health_repo,
+        )
+        .await;
+        // Durable (the alert is already flagged, so a later sweep never
+        // revisits it) and batched: one bounded write however many alerts a
+        // mass delete orphaned.
+        let audits: Vec<_> = flagged
+            .iter()
+            .map(|(event, removal)| {
+                super::deleted_sources::source_removed_audit(
+                    event,
+                    *removal,
+                    super::deleted_sources::UNRECORDED_ACTOR,
+                )
+                .build()
+            })
+            .collect();
+        if let Err(error) = self.audit_emitter.emit_durable_batch(&audits).await {
+            for audit in &audits {
+                tracing::error!(%error, event = %serde_json::to_string(audit).unwrap_or_default(),
+                    "Failed to durably audit a flagged stale-feed alert; full event logged for recovery");
+            }
+        }
+
         let statuses = self.feed_monitor.check_all_feeds().await;
 
         for status in statuses {
@@ -445,14 +476,17 @@ impl HealthScheduler {
                         "Failed to publish stale-feed system health event"
                     );
                 }
-            } else {
-                // Feed is healthy - resolve any existing issue
+            } else if let Some(last_event_at) = status.last_event_at {
+                // Feed is healthy - resolve any existing issue. NAN-5785: only
+                // a source with an observed event can recover, and the alert
+                // only closes when that event is newer than the alert itself
+                // (a raised threshold or a grace window is not a recovery).
                 self.health_repo
                     .resolve_issue(&HealthIssueType::DataFeed.to_string(), &issue_key)
                     .await?;
                 if let Err(error) = self
                     .system_health_repo
-                    .resolve_by_dedup_key(&Self::feed_stale_dedup_key(status.feed_id))
+                    .resolve_recovered(&Self::feed_stale_dedup_key(status.feed_id), last_event_at)
                     .await
                 {
                     warn!(
@@ -699,7 +733,7 @@ impl HealthScheduler {
             Self::feed_stale_dedup_key(status.feed_id),
             HealthCategory::LogSource,
             HealthSeverity::High,
-            format!("Log source stopped sending: {}", status.feed_name),
+            Self::feed_stale_title(status),
             format!(
                 "{staleness_detail}; configured stale threshold is {} minutes.",
                 status.stale_threshold_minutes
@@ -719,6 +753,16 @@ impl HealthScheduler {
                 .to_string(),
         );
         event
+    }
+
+    /// NAN-5785: a source that has never sent anything did not "stop"
+    /// sending; say what is actually true of it.
+    fn feed_stale_title(status: &super::types::FeedStalenessStatus) -> String {
+        if status.last_event_at.is_none() {
+            format!("Log source has not sent any events: {}", status.feed_name)
+        } else {
+            format!("Log source stopped sending: {}", status.feed_name)
+        }
     }
 
     /// Stable identity shared by the stale producer and healthy recovery path.

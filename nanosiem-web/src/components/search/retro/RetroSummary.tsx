@@ -147,8 +147,7 @@ export function RetroSummary({
         <div className="mt-2 flex items-start gap-2 px-1 text-[11px] text-fg-3 leading-snug">
           <Info className="w-[13px] h-[13px] mt-px shrink-0" style={{ color: vc.c }} />
           <span>
-            First contact <span className="text-fg-2 font-semibold">{reAge(d.first_seen)} days ago</span>. Old first-seen + rare
-            prevalence is the signature of an ongoing compromise, not a one-time blip.
+            First contact <span className="text-fg-2 font-semibold">{reAge(d.first_seen)} days ago</span>. Old and rare suggests ongoing compromise.
           </span>
         </div>
 
@@ -157,7 +156,7 @@ export function RetroSummary({
           <div className="mt-3 rounded-lg border border-border overflow-hidden">
             <div className="px-3 py-2 border-b border-border flex items-center gap-2" style={{ background: 'var(--color-panel)' }}>
               <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-fg-3 font-semibold">top entities</span>
-              <span className="font-mono text-[10px] text-fg-4 normal-case">where it landed — pivot to investigate</span>
+              <span className="font-mono text-[10px] text-fg-4 normal-case">where it landed</span>
             </div>
             <div className="divide-y divide-border/60">
               {d.top_entities.map((e, i) => (

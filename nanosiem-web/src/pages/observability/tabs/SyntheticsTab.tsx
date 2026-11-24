@@ -26,6 +26,7 @@ import { UptimeBar } from '@/components/observability/UptimeBar';
 import { SyntheticEditorDialog } from '@/components/observability/SyntheticEditorDialog';
 import { cn } from '@/lib/utils';
 import type { ObservabilityTabProps } from '../types';
+import { Term } from '@/components/ui/term';
 
 type SynStatus = 'up' | 'degraded' | 'down' | 'nodata';
 
@@ -219,7 +220,9 @@ export function SyntheticsTab(_props: ObservabilityTabProps) {
       ) : sorted.length === 0 && error == null ? (
         <div className="flex flex-col items-center gap-3 py-12 text-center">
           <Radar className="h-6 w-6 text-fg-4" />
-          <span className="text-[12.5px] text-fg-3">No synthetic checks defined yet.</span>
+          <span className="text-[12.5px] text-fg-3">
+            No <Term id="synthetic-check">synthetic checks</Term> defined yet.
+          </span>
           <Button size="sm" className="h-7 gap-1.5 text-[11.5px]" onClick={openCreate}>
             <Plus className="h-[13px] w-[13px]" />
             Create your first check

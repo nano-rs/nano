@@ -911,9 +911,11 @@ impl SearchService {
         // Generate base WHERE clause using ClickHouse generator
         // A clone: generation state (incl. the NAN-5628 nested-CTE sequence)
         // is per generation, and this generator is shared.
+        // NAN-5793 review: the deny-set rides on the generator, as on every
+        // other nPL path, so an `| identity` build side or a `[dataset=risk …]`
+        // subsearch inside the base search stays scoped.
         let base_sql = self
-            .ch_sql_generator
-            .clone()
+            .sql_generator(crate::query::GeneratorScope::viewer(scope))
             .generate(&query, &time_range)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
@@ -968,9 +970,13 @@ impl SearchService {
 
         tracing::debug!("Prevalence artifacts SQL: {}", artifacts_sql);
 
-        // Execute the query
+        // Execute the query. NAN-5793 review: verbatim (`query_raw`). The
+        // nPL-rendered WHERE carries literals (user terms and the denied
+        // source names `enforce_viewer_scope` put in the text), and the
+        // statement has no client-side `?` binds, so a `?` or `?fields` in a
+        // literal must not be read as one.
         let rows = clickhouse
-            .query(&artifacts_sql)
+            .query_raw(&artifacts_sql)
             .fetch_all::<(String, String)>()
             .await
             .map_err(|e| SearchError::SqlGenError(format!("ClickHouse query error: {}", e)))?;

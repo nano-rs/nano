@@ -344,6 +344,13 @@ fn numeric_value(text: &str) -> bool {
 /// ASCII punctuation character literally), which defuses links, emphasis,
 /// HTML, line-start syntax and autolinks (`://`, `www.`, `@`, `tel:`)
 /// (NAN-5737 review).
+///
+/// A backslash only escapes ASCII punctuation, so a non-ASCII lookalike
+/// (`attacker．com`, `attacker。com`, `https：／／x`) would pass through
+/// unescaped and a client that normalizes it (as URL and IDNA processing
+/// does) could still build a link. Every such character is first folded to
+/// its ASCII form ([`fold_lookalike`]) and then escaped like any other
+/// punctuation (NAN-5738).
 fn teams_fact_text(text: &str) -> String {
     if markdown_inert(text) || numeric_value(text) {
         return text.to_string();
@@ -351,12 +358,48 @@ fn teams_fact_text(text: &str) -> String {
     let line = crate::text_bounds::single_line(text);
     let mut out = String::with_capacity(line.len() + 8);
     for c in line.chars() {
-        if c.is_ascii_punctuation() {
-            out.push('\\');
+        let mut push = |c: char| {
+            if c.is_ascii_punctuation() {
+                out.push('\\');
+            }
+            out.push(c);
+        };
+        match fold_lookalike(c) {
+            Some(folded) => folded.chars().for_each(&mut push),
+            None => push(c),
         }
-        out.push(c);
     }
     out
+}
+
+/// The ASCII form of a non-ASCII character that reads as ASCII: its NFKC
+/// compatibility form when that is pure ASCII (fullwidth `．：／＠`, small
+/// form `﹒﹕`, one-dot leader `․`, fullwidth letters and digits), plus the
+/// dot, colon and slash lookalikes NFKC leaves alone, including the IDNA
+/// label separators (`。` `｡`) that hostname processing maps to `.`.
+/// `None` for ASCII and for every other character (kept as written).
+pub(super) fn fold_lookalike(c: char) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    if c.is_ascii() {
+        return None;
+    }
+    let ascii = match c {
+        // Full stops and dot-like marks (IDNA separators first).
+        '\u{3002}' | '\u{FF61}' | '\u{FE12}' | '\u{06D4}' | '\u{0701}' | '\u{0702}' | '\u{A4F8}'
+        | '\u{A60E}' | '\u{1427}' | '\u{00B7}' | '\u{0387}' | '\u{2219}' | '\u{22C5}' | '\u{2E31}'
+        | '\u{30FB}' | '\u{FF65}' => Some('.'),
+        // Colons.
+        '\u{2236}' | '\u{A789}' | '\u{02F8}' | '\u{02D0}' | '\u{0589}' | '\u{05C3}' | '\u{0703}'
+        | '\u{0704}' | '\u{16EC}' | '\u{A4FD}' | '\u{FE30}' => Some(':'),
+        // Slashes.
+        '\u{2044}' | '\u{2215}' | '\u{29F8}' | '\u{2571}' | '\u{1735}' => Some('/'),
+        _ => None,
+    };
+    if let Some(ascii) = ascii {
+        return Some(ascii.to_string());
+    }
+    let folded: String = std::iter::once(c).nfkc().collect();
+    (folded.is_ascii() && !folded.is_empty()).then_some(folded)
 }
 
 fn severity_of(payload: &WebhookPayload) -> &str {

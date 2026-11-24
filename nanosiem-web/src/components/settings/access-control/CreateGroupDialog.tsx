@@ -34,6 +34,7 @@ import {
   SheetDescription,
   SheetFooter,
 } from '@/components/ui/sheet';
+import { Term } from '@/components/ui/term';
 
 interface CreateGroupDialogProps {
   open: boolean;
@@ -204,14 +205,14 @@ export function CreateGroupDialog({
             <input
               value={description}
               onChange={e => setDescription(e.target.value)}
-              placeholder="One-line summary — who's in this group"
+              placeholder="One line: who is in this group"
               className="w-full h-8 px-2.5 rounded-md border border-border bg-card text-[12px] text-foreground placeholder:text-muted-foreground/70 outline-none focus:border-primary/60"
             />
           </div>
 
           {assignableRoles.length > 0 && (
             <div>
-              <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">Default role</label>
+              <label className="block text-[11px] font-medium text-foreground/80 mb-1.5"><Term id="default-role" nested>Default role</Term></label>
               <div className="grid grid-cols-3 gap-2">
                 {assignableRoles.map(r => (
                   <button

@@ -85,6 +85,15 @@ pub enum ApiError {
         details: serde_json::Value,
     },
 
+    /// A 400 with a machine-readable `code` and structured `details`, e.g.
+    /// `{"field_errors": [{"field": "...", "message": "..."}]}` (NAN-5789).
+    #[error("{message}")]
+    BadRequestWithDetails {
+        code: &'static str,
+        message: String,
+        details: serde_json::Value,
+    },
+
     /// A 409 with a machine-readable `code` and structured `details`
     /// (NAN-5561: the hunts escalation gate's numbers).
     #[error("{message}")]
@@ -131,6 +140,7 @@ impl ApiError {
             ApiError::TierLimitExceeded(_) => "TIER_LIMIT_EXCEEDED",
             ApiError::UnscopedPrevalence(_) => "UNSCOPED_PREVALENCE",
             ApiError::UnprocessableWithDetails { code, .. } => code,
+            ApiError::BadRequestWithDetails { code, .. } => code,
             ApiError::ConflictWithDetails { code, .. } => code,
         }
     }
@@ -155,6 +165,7 @@ impl ApiError {
             ApiError::TierLimitExceeded(_) => StatusCode::FORBIDDEN,
             ApiError::UnscopedPrevalence(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::UnprocessableWithDetails { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::BadRequestWithDetails { .. } => StatusCode::BAD_REQUEST,
             ApiError::ConflictWithDetails { .. } => StatusCode::CONFLICT,
         }
     }
@@ -209,6 +220,7 @@ impl IntoResponse for ApiError {
                 "wildcard_fields": fields,
             })),
             ApiError::UnprocessableWithDetails { details, .. } => Some(details.clone()),
+            ApiError::BadRequestWithDetails { details, .. } => Some(details.clone()),
             ApiError::ConflictWithDetails { details, .. } => Some(details.clone()),
             _ => None,
         };
@@ -253,7 +265,16 @@ impl From<nanosiem_core::SearchError> for ApiError {
                 ApiError::ValidationError(message)
             }
             nanosiem_core::SearchError::SqlGenError(msg) => {
-                tracing::error!(error = %msg, "SQL generation error");
+                // NAN-5817: this answers 500, so `into_response` logs it at
+                // ERROR either way. Do not log a caller's query mistake at
+                // ERROR a second time; keep the full message at WARN.
+                // (Mapping these to a 4xx changes dashboard responses: a
+                // follow-up.)
+                if nanosiem_core::search::sql_gen_message_is_user_error(&msg) {
+                    tracing::warn!(error = %msg, "SQL generation error");
+                } else {
+                    tracing::error!(error = %msg, "SQL generation error");
+                }
                 ApiError::InternalError("Query processing failed".to_string())
             }
             nanosiem_core::SearchError::DatabaseError(e) => {
@@ -532,6 +553,10 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             nanosiem_core::LogSourceServiceError::InvalidSourceConfig(msg) => {
                 ApiError::ValidationError(format!("Invalid source config: {}", msg))
             }
+            // NAN-5839: the message already names the value and the forms accepted.
+            nanosiem_core::LogSourceServiceError::InvalidTimezone(msg) => {
+                ApiError::ValidationError(msg.clone())
+            }
             // NAN-2158: a rejected `match_field` is an injection payload, not a
             // server fault — 400 with the offending value named, so an operator
             // fixing a legacy row can see what to change.
@@ -543,6 +568,16 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             }
             nanosiem_core::LogSourceServiceError::InvalidMatchField(msg) => {
                 ApiError::ValidationError(format!("Invalid match_field: {}", msg))
+            }
+            // NAN-5789: a fetch source saved without its source configuration.
+            nanosiem_core::LogSourceServiceError::MissingSourceConfiguration { field, message } => {
+                ApiError::BadRequestWithDetails {
+                    code: "SOURCE_CONFIGURATION_REQUIRED",
+                    message: message.clone(),
+                    details: serde_json::json!({
+                        "field_errors": [{ "field": field, "message": message }],
+                    }),
+                }
             }
             nanosiem_core::LogSourceServiceError::NotValidated => ApiError::ValidationError(
                 "Log source must be validated before enabling".to_string(),
@@ -1162,6 +1197,20 @@ mod tests {
         assert_eq!(error.code(), "CONFLICT");
     }
 
+    // NAN-5839: an invalid log-source timezone is a 422 naming the value and
+    // the accepted forms, from every writer the service covers.
+    #[test]
+    fn invalid_log_source_timezone_maps_to_validation_error() {
+        let message = nanosiem_core::timezone::normalize_source_timezone("Mars/Olympus_Mons").unwrap_err();
+        let error: ApiError = nanosiem_core::LogSourceServiceError::InvalidTimezone(message).into();
+
+        assert_eq!(error.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code(), "VALIDATION_ERROR");
+        let text = error.to_string();
+        assert!(text.contains("Mars/Olympus_Mons"), "{text}");
+        assert!(text.contains("America/New_York"), "{text}");
+    }
+
     #[test]
     fn stale_source_configuration_version_maps_to_conflict() {
         let error: ApiError = nanosiem_core::SourceConfigServiceError::RepositoryError(
@@ -1316,3 +1365,46 @@ mod tests {
 #[cfg(test)]
 #[path = "api_error_details_tests.rs"]
 mod details_tests;
+
+#[cfg(test)]
+mod sql_gen_log_level_tests {
+    //! NAN-5817 review P2: a caller's query mistake mapped from SqlGenError
+    //! does not log ERROR in the conversion (the 500 response still logs once
+    //! in `into_response`); an internal generation failure does.
+    use super::ApiError;
+    use std::sync::{Arc, Mutex};
+    use tracing::Level;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct LevelCapture(Arc<Mutex<Vec<Level>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for LevelCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+
+    fn from_levels(msg: &str) -> Vec<Level> {
+        let capture = LevelCapture::default();
+        let err = nanosiem_core::SearchError::SqlGenError(msg.to_string());
+        let mapped = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || ApiError::from(err),
+        );
+        assert!(matches!(mapped, ApiError::InternalError(ref m) if m == "Query processing failed"));
+        let levels = capture.0.lock().unwrap().clone();
+        levels
+    }
+
+    #[test]
+    fn guardrail_sql_gen_error_logs_warn_in_conversion() {
+        assert_eq!(from_levels("Invalid query: Unknown eval function 'nosuchfn'"), vec![Level::WARN]);
+        assert_eq!(from_levels("Invalid rex pattern '(': bad"), vec![Level::WARN]);
+    }
+
+    #[test]
+    fn internal_sql_gen_error_logs_error_in_conversion() {
+        assert_eq!(from_levels("Internal error: boom"), vec![Level::ERROR]);
+    }
+}

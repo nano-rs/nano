@@ -252,7 +252,10 @@ fn every_lane_renders_the_stamp_between_its_input_and_the_parser() {
         assert_eq!(inputs(&t, &stamp), vec![upstream.to_string()], "{name}");
         assert_eq!(t[&stamp]["type"].as_str(), Some("remap"), "{name}");
         assert_eq!(source(&t, &stamp).trim(), OCSF_LANE_STAMP_VRL, "{name}");
-        assert_eq!(inputs(&t, &format!("{name}_parse")), vec![stamp.clone()], "{name}");
+        // NAN-5839: the control-field step sits between the stamp and the parser.
+        let tz = format!("{name}{}", super::parser_config::SOURCE_TIMEZONE_SUFFIX);
+        assert_eq!(inputs(&t, &tz), vec![stamp.clone()], "{name}");
+        assert_eq!(inputs(&t, &format!("{name}_parse")), vec![tz], "{name}");
         // Nothing else reads the lane input directly (no bypass of the stamp).
         let readers: Vec<_> = t
             .iter()
@@ -275,7 +278,8 @@ fn stub_extension_and_native_plans_read_the_stamp() {
     stub.extension_enabled = true;
     let t = transforms(&render(&stub, true));
     assert!(!t.contains_key("stub_app_parse"));
-    assert_eq!(inputs(&t, "stub_app_extension"), vec!["stub_app_source_lane".to_string()]);
+    assert_eq!(inputs(&t, "stub_app_extension"), vec!["stub_app_source_tz".to_string()]);
+    assert_eq!(inputs(&t, "stub_app_source_tz"), vec!["stub_app_source_lane".to_string()]);
 
     // A plan with native steps: the identity `_parse` the chain reads from
     // reads the stamp; the chain itself is unchanged.
@@ -298,7 +302,8 @@ fn stub_extension_and_native_plans_read_the_stamp() {
     let p = parser("plan_app", "splunk_hec", &["plan_app"], &plan.stored().unwrap());
     let config = render(&p, true);
     let t = transforms(&config);
-    assert_eq!(inputs(&t, "plan_app_parse"), vec!["plan_app_source_lane".to_string()]);
+    assert_eq!(inputs(&t, "plan_app_parse"), vec!["plan_app_source_tz".to_string()]);
+    assert_eq!(inputs(&t, "plan_app_source_tz"), vec!["plan_app_source_lane".to_string()]);
     // The NAN-4919 deploy guard accepts the stamped document.
     crate::parsers::pipe::guard::check_document(
         "plan_app",

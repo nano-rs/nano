@@ -28,20 +28,47 @@ on:
     # an already-red PR does not re-run the gate and the escape hatch appears
     # not to work. Note this is `pull_request`, NOT `pull_request_target` — the
     # gate runs on untrusted branch content and must not see secrets.
+    # NAN-5791: also runs only while the PR carries `ready-to-merge`; the
+    # override label still re-runs it then.
     types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - 'clickhouse/**.sql'
+      - .github/workflows/migration-immutability-gate.yml
+  # Heavy suite on main after merges; same paths as the PR trigger.
+  # docs-internal/ci-runner-pools.md#heavy-gates-on-main
+  push:
+    branches: [main]
     paths:
       - 'clickhouse/**.sql'
       - .github/workflows/migration-immutability-gate.yml
   workflow_dispatch:
 
+# Read-only token on every trigger: no run of this gate (PR, push to main,
+# schedule, dispatch) can push, publish, sign or release.
+permissions:
+  contents: read
+
+# NAN-5791: a labeled/unlabeled event for any other label gets its own group
+# (its jobs skip), so it never cancels a real run. A push to main joins the
+# `heavy-` group without cancel-in-progress: one run going plus at most one
+# pending, the pending one replaced by the newest merge, so a burst of merges
+# coalesces into two runs (docs-internal/ci-runner-pools.md#heavy-gates-on-main).
+# Exception here: a push run diffs only its own push range (before..sha), so a
+# replaced pending run would leave that merge unchecked. Each push gets its own
+# group (-<sha>); this gate is a seconds-long git diff, rare (clickhouse/**.sql).
 concurrency:
-  group: migration-immutability-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && 'heavy-' || '' }}migration-immutability-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'migration-immutability-override' && format('-label-{0}', github.run_id) || '' }}${{ github.event_name == 'push' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   gate:
-    runs-on: [self-hosted, Linux, X64, nano-pr]
+    if: ${{ github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'ready-to-merge') && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ready-to-merge' || github.event.label.name == 'migration-immutability-override')) }}
+    runs-on: [self-hosted, Linux, nano-pr] # any arch (NAN-5743)
     timeout-minutes: 5
+    # Read-only token: checkout, plus the push run's override-label lookup.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,13 +76,55 @@ jobs:
           # Need the merge-base to diff against, not just the tip commit.
           fetch-depth: 0
 
+      # On a push to main there is no PR payload: diff the pushed range, and honour
+      # the override label of the PR the commit was merged from (looked up read-only;
+      # a failed lookup counts as no override, so the gate fails closed).
       - name: Block modifications to applied migrations
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'migration-immutability-override') }}
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo "workflow_dispatch: no range to diff; nothing to check."
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = push ]; then
+            if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
+              echo "::error::push has no parent commit to diff against"; exit 1
+            fi
+            # A force-push (or rewritten history) leaves `before` dangling and not
+            # fetched by checkout. Fetch it explicitly; if it still cannot be
+            # resolved, fail closed rather than diffing nothing and passing.
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --quiet origin "$BASE_SHA" 2>/dev/null || true
+            fi
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::cannot resolve BASE_SHA ($BASE_SHA) to diff against (force-push or rewritten history)"
+              exit 1
+            fi
+            # The PR override only covers a push that is exactly one PR merge:
+            # one first-parent commit on top of `before`, and that commit is the
+            # merge_commit_sha of a MERGED PR into main carrying the label. Any
+            # other push (multi-commit, direct push, force-push) is checked in full.
+            FP_COUNT=$(git rev-list --first-parent --count "$BASE_SHA..$HEAD_SHA")
+            if [ "$FP_COUNT" = 1 ] && [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+                && [ "$(git rev-parse "${HEAD_SHA}^1" 2>/dev/null)" = "$(git rev-parse "$BASE_SHA")" ]; then
+              # HEAD_SHA is validated hex above, so interpolating it into jq is safe
+              # (`gh api --jq` has no --arg).
+              if gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
+                  --jq "any(.[] | select(.merged_at != null and .base.ref == \"main\" and .merge_commit_sha == \"$HEAD_SHA\") | .labels[].name; . == \"migration-immutability-override\")" 2>/dev/null \
+                  | grep -qx true; then
+                echo "Merged from a PR labeled migration-immutability-override; skipping."
+                exit 0
+              fi
+            fi
+          fi
 
           # Numbered migrations only. `init.sql` is deliberately excluded: it is
           # only ever executed on a FRESH install (existing boxes are past it),
@@ -64,12 +133,21 @@ jobs:
           # Status letters: A=added (fine), M=modified, R=renamed, D=deleted.
           # R and D are blocked too — renaming changes the parsed version/name
           # pair and deleting strands the applied row.
-          # THREE-dot: diff from the merge-base, so this reports only what the
+          # THREE-dot on a PR: diff from the merge-base, so this reports only what the
           # PR itself changed. A two-dot diff would compare the two trees
           # directly, and any migration added to main after the PR branched
           # would surface as `D` (deleted) — falsely blocking an innocent PR.
+          # On push, BASE_SHA IS the previous tip of main, so diff it TWO-dot:
+          # identical to three-dot on fast-forward/merge/squash pushes, but a
+          # force-push that amends a migration (M) or rolls main back past one
+          # (D) is compared tip to tip instead of from the merge-base, where it
+          # would look like an addition or no change at all.
+          DIFF_RANGE="$BASE_SHA...$HEAD_SHA"
+          if [ "$EVENT_NAME" = push ]; then DIFF_RANGE="$BASE_SHA..$HEAD_SHA"; fi
           CHANGED=$(git diff --name-status --find-renames \
-            "$BASE_SHA...$HEAD_SHA" -- 'clickhouse/[0-9]*.sql' || true)
+            "$DIFF_RANGE" -- 'clickhouse/[0-9]*.sql')
+          # No `|| true`: git diff exits 0 when nothing matches, so a non-zero
+          # exit is a real error (e.g. unreachable SHA) and must fail the gate.
 
           if [ -z "$CHANGED" ]; then
             echo "No numbered ClickHouse migrations touched."

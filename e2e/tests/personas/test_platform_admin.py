@@ -9,11 +9,13 @@ import secrets
 
 from nano_e2e import ui as uilib
 from nano_e2e.client import Http, Journal, Nano, expect, time_range
+from nano_e2e.edition import PLACEHOLDER, wait_unlicensed
 from nano_e2e.personas import (
     PLATFORM_ADMIN_PERMISSIONS,
     PLATFORM_VIEWER_PERMISSIONS,
     login_persona,
 )
+from nano_e2e.rbac import edition_permissions
 from nano_e2e.stack import Stack
 from nano_e2e.waits import eventually
 
@@ -67,7 +69,9 @@ def test_platform_admin_journey(
     with login_persona(
         stack, nano, ui, artifact_dir, "platform-viewer", PLATFORM_VIEWER_PERMISSIONS
     ) as viewer:
-        assert set(viewer.permissions) == set(PLATFORM_VIEWER_PERMISSIONS)
+        assert set(viewer.permissions) == set(
+            edition_permissions(nano.api, PLATFORM_VIEWER_PERMISSIONS, stack.edition)
+        )
         viewer.page.goto("/settings/access-control?tab=api-keys")
         viewer.page.wait_text("API Keys", exact=True)
         assert viewer.page.count({"css": 'button[title="New API key"]'}) == 0
@@ -81,7 +85,9 @@ def test_platform_admin_journey(
     with login_persona(
         stack, nano, ui, artifact_dir, "platform-admin", PLATFORM_ADMIN_PERMISSIONS
     ) as platform:
-        assert set(platform.permissions) == set(PLATFORM_ADMIN_PERMISSIONS)
+        assert set(platform.permissions) == set(
+            edition_permissions(nano.api, PLATFORM_ADMIN_PERMISSIONS, stack.edition)
+        )
         page = platform.page
 
         # API key creation is a real browser flow with an explicit two-scope
@@ -96,7 +102,8 @@ def test_platform_admin_journey(
         page.click({"role": "checkbox", "name": uilib.rx(r"^search:view\b")})
         page.click({"role": "checkbox", "name": uilib.rx(r"^search:execute\b")})
         page.click({"role": "button", "name": "Create key", "exact": True})
-        page.wait_text("New API key — copy it now", exact=True)
+        # The reveal-once card, by test id (its copy changes with the glossary).
+        page.wait_for({"testid": "api-key-reveal-card"})
         created_key = eventually(
             lambda: next((item for item in _api_keys(platform.client) if item.get("name") == key_name), None),
             timeout=30,
@@ -215,7 +222,7 @@ def test_platform_admin_journey(
             capabilities = expect(nano.api.get("/api/capabilities"), 200)["capabilities"]
             assert capabilities["sso"] is False
             page.goto("/settings/oidc")
-            page.wait_text("Single sign-on is not available", exact=True)
+            wait_unlicensed(page, "Single sign-on")
             assert page.count({"role": "button", "name": "Add provider", "exact": True}) == 0
             missing = platform.client.api.get("/api/settings/oidc")
             assert missing.status_code == 404, missing.text[:1000]
@@ -233,7 +240,7 @@ def test_platform_admin_journey(
             assert page.count({"role": "button", "name": uilib.rx("Upload license|Upload renewal")}) == 1
             timeline.step("license status", state=status.get("runtime_state") or status["state"])
         else:
-            page.wait_text("Available in nano paid plans", exact=True)
+            page.wait_text(PLACEHOLDER, exact=True)
             assert page.count({"role": "button", "name": "Refresh", "exact": True}) == 0
             assert page.count({"role": "button", "name": uilib.rx("Upload license|Upload renewal")}) == 0
             missing = platform.client.api.get("/api/license")

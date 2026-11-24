@@ -27,6 +27,7 @@ import type { SqlToNplResponse } from '@/lib/api/types';
 import { copyText } from '@/lib/clipboard';
 import { sqlNplSearchUrl, useSqlToNpl } from '@/lib/sql-to-npl';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
 
 export interface SqlAsNplProps {
   /** The SQL the agent ran (Agent Lane placeholders and all). */
@@ -143,7 +144,9 @@ export function SqlAsNpl({ sql, windowStart, windowEnd, maxLines = 6, className 
     <div ref={setEl} className={cn('flex min-w-0 flex-col gap-1', className)} data-testid="sql-as-npl">
       {!result ? (
         conversion.isError ? (
-          <div className="text-[11px] text-muted-foreground">Could not convert to nPL.</div>
+          <div className="text-[11px] text-muted-foreground">
+            Could not convert to <Term id="npl">nPL</Term>.
+          </div>
         ) : (
           <div className="font-mono text-[11px] text-muted-foreground">Converting to nPL…</div>
         )
@@ -165,7 +168,7 @@ export function SqlAsNpl({ sql, windowStart, windowEnd, maxLines = 6, className 
           className={cn('text-[11px]', result.no_search_dataset ? 'text-muted-foreground' : 'text-warn')}
           data-testid="sql-as-npl-unsupported"
         >
-          Can't convert to nPL: {result.unsupported_reason}
+          Can't convert to <Term id="npl">nPL</Term>: {result.unsupported_reason}
         </div>
       )}
 

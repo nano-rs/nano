@@ -42,6 +42,7 @@ fn api_key(name: &str) -> AuthContext {
 
 fn session() -> AuthContext {
     AuthContext::from_jwt(TokenClaims {
+        sid: None,
         iss: "t".into(),
         aud: "t".into(),
         sub: Uuid::now_v7(),

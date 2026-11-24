@@ -13,6 +13,7 @@ from nano_e2e.personas import (
     login_persona,
     seed_ground_truth,
 )
+from nano_e2e.rbac import edition_permissions
 from nano_e2e.stack import Stack
 from nano_e2e.waits import eventually
 
@@ -29,7 +30,9 @@ def test_soc_analyst_journey(
         stack, nano, ui, artifact_dir, "soc-analyst", SOC_ANALYST_PERMISSIONS
     ) as persona:
         page = persona.page
-        assert set(persona.permissions) == set(SOC_ANALYST_PERMISSIONS)
+        assert set(persona.permissions) == set(
+            edition_permissions(nano.api, SOC_ANALYST_PERMISSIONS, stack.edition)
+        )
         assert "dashboards:delete" not in persona.permissions
         assert_ground_truth_ui(page, persona.client, truth)
         timeline.step("keyword search", expected=truth.total, shown=uilib.results_count(page))

@@ -710,7 +710,7 @@ export function LookupTableView() {
                   <div className="text-center py-6">
                     <Globe className="w-7 h-7 mx-auto text-muted-foreground mb-2.5" strokeWidth={1.5} />
                     <p className="text-[11.5px] text-muted-foreground mb-3">
-                      Set up automated ingestion to keep this lookup table up-to-date from a remote URL.
+                      Keep this table in sync with a remote URL.
                     </p>
                     <button
                       type="button"
@@ -1277,7 +1277,7 @@ export function LookupTableView() {
       description={
         <>
           Permanently delete <span className="font-mono">{table.name}</span>? All rows
-          and ingestion config are removed; rules referencing it will fail until rewired.
+          and its import settings are removed, and rules that use it will fail until you point them at another table.
         </>
       }
       confirmLabel="Delete"

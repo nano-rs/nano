@@ -38,7 +38,7 @@ function DemoHint({ id, children }: DemoHintProps) {
   };
 
   return (
-    <div className="relative rounded-xl border border-primary/20 bg-primary/5 p-4 mb-4">
+    <div className="relative rounded-md border border-primary/20 bg-primary/5 p-3 mb-4">
       <button
         onClick={dismiss}
         className="absolute top-3 right-3 rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
@@ -103,7 +103,7 @@ export function SearchDemoHint({ onRunQuery }: { onRunQuery: (query: string) => 
         <div>
           <h3 className="text-sm font-semibold mb-1">Try a search query</h3>
           <p className="text-xs text-muted-foreground mb-3">
-            Click any query below to run it against the demo dataset, or type your own using nPL (nano Pipe Language).
+            Click a query to run it on the demo data.
           </p>
           <div className="flex flex-wrap gap-2">
             {SAMPLE_QUERIES.map((sq) => (
@@ -129,8 +129,7 @@ export function DetectionsDemoHint() {
         <div>
           <h3 className="text-sm font-semibold mb-1">Detection rules</h3>
           <p className="text-xs text-muted-foreground mb-3">
-            Rules run on a schedule or in real-time to detect threats. They progress through
-            Staging → Live → Alerting. Try creating one — it'll execute against the demo data.
+            Rules move from Staging to Live to Alerting. New rules run on the demo data.
           </p>
           <div className="flex gap-2">
             <button
@@ -167,8 +166,7 @@ export function CasesDemoHint() {
         <div>
           <h3 className="text-sm font-semibold mb-1">Case management</h3>
           <p className="text-xs text-muted-foreground mb-3">
-            Cases track investigations. When you create one, our AI "Shadow Investigator"
-            automatically extracts entities and hunts for related activity across all log sources.
+            New cases get an automatic AI investigation of related activity.
           </p>
           <button
             onClick={() => navigate('/cases', { state: { openNewCase: true } })}
@@ -196,8 +194,7 @@ export function HomeDemoHint() {
         <div>
           <h3 className="text-sm font-semibold mb-1">Welcome to your demo environment</h3>
           <p className="text-xs text-muted-foreground mb-3">
-            This instance has sample log data flowing from multiple sources.
-            Explore detection rules, search for threats, create cases, and try AI-powered investigation.
+            Sample logs are flowing from several sources.
           </p>
           <div className="flex flex-wrap gap-2">
             <button

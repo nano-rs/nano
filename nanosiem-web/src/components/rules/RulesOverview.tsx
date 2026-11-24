@@ -5,6 +5,7 @@
 // callout remain placeholder-today; Fleet health was wired to real data in
 // NAN-612 (see /api/rules/fleet-health).
 
+import { Term } from '@/components/ui/term';
 import { useMemo, type ReactNode } from 'react';
 import { AlertTriangle, ArrowRight } from 'lucide-react';
 import type { DetectionRule, FleetHealthSummary, AlertVelocityBucket, ScheduleLagSummary } from '@/lib/api/types';
@@ -179,7 +180,7 @@ export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velo
           <div className="mt-2 text-[10.5px] text-muted-foreground leading-[1.5]">
             <span className="text-foreground font-medium">{byBand.firing + byBand.active}</span> active ·{' '}
             <span className="text-foreground font-medium">{byBand.silent}</span> silent ·{' '}
-            <span className="text-foreground font-medium">{byBand.staging + byBand.disabled}</span> staged
+            <span className="text-foreground font-medium">{byBand.staging + byBand.disabled}</span> staging or paused
           </div>
         </div>
 
@@ -221,11 +222,10 @@ export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velo
             <span className="text-[26px] font-semibold text-foreground tabular-nums leading-none">
               {silentCount}
             </span>
-            <span className="text-[11px] text-muted-foreground">silent rules</span>
+            <span className="text-[11px] text-muted-foreground"><Term id="silent-rule">silent rules</Term></span>
           </div>
           <div className="mt-2 text-[10.5px] text-muted-foreground leading-[1.5]">
-            No matches in <span className="text-foreground font-medium">30+ days</span>. Review to confirm
-            they're tuned, not broken.
+            No matches in <span className="text-foreground font-medium">30+ days</span>.
           </div>
           {silentCount > 0 && (
             <button
@@ -351,7 +351,7 @@ function CompactRulesOverview({
           </OverviewLabel>
           <div className="mt-1 flex items-baseline gap-1.5">
             <OverviewValue>{silentCount}</OverviewValue>
-            <span className="text-[10.5px] text-muted-foreground">silent rules</span>
+            <span className="text-[10.5px] text-muted-foreground"><Term id="silent-rule">silent rules</Term></span>
           </div>
           <div className="mt-1.5 flex min-w-0 items-center justify-between gap-2 text-[9.5px]">
             <span className="truncate text-muted-foreground">No matches in 30+ days</span>
@@ -368,7 +368,7 @@ function CompactRulesOverview({
         </div>
 
         <div className="min-w-0 bg-card px-3 py-2.5">
-          <OverviewLabel>Fleet health</OverviewLabel>
+          <OverviewLabel><Term id="fleet-health">Fleet health</Term></OverviewLabel>
           <div className="mt-1 flex items-baseline gap-1.5">
             <OverviewValue>{healthPct ?? '—'}</OverviewValue>
             {healthPct != null && <span className="text-[12px] text-muted-foreground">%</span>}
@@ -440,13 +440,13 @@ function FleetHealthCell({ fleetHealth, schedulingLag }: { fleetHealth: FleetHea
   const errorPct = hasData ? (errors / total) * 100 : 0;
 
   const footer = !hasData
-    ? 'Scheduler health — no scheduled rules yet.'
-    : `Healthy: recent run on schedule, fast. Slow: last run ≥ 5s. Errors: scheduler stuck.`;
+    ? 'No scheduled rules yet.'
+    : 'Healthy: on time and fast. Slow: the latest measured run took 5 seconds or more. Errors: over 5 minutes overdue, or runs are failing.';
 
   return (
     <div className="p-3.5 relative bg-card">
       <div className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
-        Fleet health
+        <Term id="fleet-health">Fleet health</Term>
       </div>
       <div className="flex items-baseline gap-1.5 mt-1">
         <span className="text-[26px] font-semibold text-foreground tabular-nums leading-none">
@@ -539,7 +539,7 @@ function ScheduleLagLine({ lag }: { lag: ScheduleLagSummary | null }) {
       data-testid="schedule-lag"
     >
       <span className="size-[5px] shrink-0 rounded-full" style={{ background: tone }} />
-      <span>Lag</span>
+      <Term id="schedule-lag">Lag</Term>
       <span className="text-foreground tabular-nums">{lag.behind_schedule}</span>
       <span>behind</span>
       <span className="text-muted-foreground/50">·</span>

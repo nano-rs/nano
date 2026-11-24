@@ -184,6 +184,8 @@ services:
       NRT_MAX_BATCH_SIZE: ${NRT_MAX_BATCH_SIZE:-100000}
       NRT_MAX_CONCURRENT_RULES: ${NRT_MAX_CONCURRENT_RULES:-10}
       NRT_PHASE_MAX_SECS: ${NRT_PHASE_MAX_SECS:-300}
+      # NAN-5736 / NAN-5746: per-run raw-event detection cap (1-999999; unset = 2000).
+      DETECTION_MAX_MATCHES_PER_RUN:
       # API server settings
       API_HOST: 0.0.0.0
       API_PORT: 3000
@@ -357,6 +359,8 @@ services:
       CF_AIG_AUTH_TOKEN: ${CF_AIG_AUTH_TOKEN:-}
       JOBS_PORT: 3003
       LEADER_ELECTION_ENABLED: "true"
+      # NAN-5736 / NAN-5746: per-run raw-event detection cap (1-999999; unset = 2000).
+      DETECTION_MAX_MATCHES_PER_RUN:
       RUST_LOG: ${RUST_LOG:-info}
     # NAN-2042: the jobs health/metrics listener binds loopback inside the
     # container (JOBS_BIND_ADDR unset), so it is not published. The healthcheck
@@ -484,7 +488,7 @@ services:
     #            the token. Silent.
     # So never drop the flag, and after any Vector bump confirm env-driven values
     # resolve at runtime (send HEC with the real token and with the literal).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.13-debian@sha256:6f4d8e4e61c3e957a44fd45b1835c3288fde54042eb623ee09af730c32b85d6d
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.14-debian@sha256:8995b2b456d104373056c4e72eded60c59c197ab1605d8de8d362b3a67fc857c
     container_name: nanosiem-vector
     network_mode: "service:vector-netns"
     # NAN-5566: Vector never cuts its own shutdown short (an in-process cancel

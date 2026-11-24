@@ -210,19 +210,24 @@ impl SessionService {
     /// Parameters:
     /// - `limit`: Maximum number of sessions to return
     /// - `offset`: Number of sessions to skip (for pagination)
+    /// - `current_session_id`: the caller's own session, marked as current
+    ///   (NAN-5578) so an admin's "revoke all except current" spares it
     pub async fn get_all_sessions(
         &self,
         limit: i64,
         offset: i64,
+        current_session_id: Option<Uuid>,
     ) -> Result<Vec<SessionResponse>, SessionError> {
         let sessions = self.session_repo.get_all_sessions(limit, offset).await?;
 
-        // For admin view, no session is marked as "current"
         let session_responses: Vec<SessionResponse> = sessions
             .into_iter()
-            .map(|session| SessionResponse {
-                session,
-                is_current: false,
+            .map(|session| {
+                let is_current = current_session_id == Some(session.id);
+                SessionResponse {
+                    session,
+                    is_current,
+                }
             })
             .collect();
 

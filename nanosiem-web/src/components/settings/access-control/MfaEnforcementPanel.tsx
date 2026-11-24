@@ -25,6 +25,8 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { Term } from '@/components/ui/term';
+import { EnterpriseTerm } from '@/enterprise/components/glossary/EnterpriseTerm';
 
 export function MfaEnforcementPanel() {
   const { hasPermission } = useAuth();
@@ -62,8 +64,8 @@ export function MfaEnforcementPanel() {
       toast({
         title: next ? 'MFA required for all users' : 'MFA enforcement disabled',
         description: next
-          ? 'Non-MFA users will be required to enrol on next login.'
-          : 'Users may sign in without MFA. Existing enrolments are unaffected.',
+          ? 'Users without MFA must set it up the next time they sign in.'
+          : 'Users may sign in without MFA. People who already set it up keep it.',
       });
     } catch (err) {
       setRequired(prev);
@@ -98,7 +100,7 @@ export function MfaEnforcementPanel() {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <span className="text-[12.5px] font-semibold text-foreground">
-              Require multi-factor authentication
+              Require <Term id="mfa">multi-factor authentication</Term>
             </span>
             {enabled && (
               <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--success)] bg-[color-mix(in_srgb,var(--success)_15%,transparent)] px-1.5 py-px rounded-sm">
@@ -109,13 +111,14 @@ export function MfaEnforcementPanel() {
           <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-snug">
             {enabled ? (
               <>
-                Local-account users without MFA will be forced to enrol on next login. SSO
-                users follow their identity provider's policy.
+                Users with a nano password must set up MFA the next time they sign in.{' '}
+                <EnterpriseTerm id="sso">SSO</EnterpriseTerm> users follow the rules of their{' '}
+                <EnterpriseTerm id="identity-provider">identity provider</EnterpriseTerm>.
               </>
             ) : (
               <>
-                Users may sign in with email + password alone. Toggle on to require TOTP
-                enrolment for every local account.
+                Users may sign in with only an email and password. Turn this on to require a phone
+                code for everyone with a nano password.
               </>
             )}
           </div>

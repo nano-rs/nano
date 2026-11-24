@@ -79,6 +79,7 @@ fn render_rule_shape(rescue: &PrevalenceRescue) -> Result<(String, usize, bool),
         3,
         rescue,
         None,
+        crate::query::GeneratorScope::unrestricted(),
     )
 }
 

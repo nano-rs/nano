@@ -36,6 +36,7 @@ import {
   GripVertical,
 } from 'lucide-react';
 import type { DashboardVariable, DashboardVariableType } from '@/lib/api';
+import { Term } from '@/components/ui/term';
 
 export interface VariableEditorProps {
   open: boolean;
@@ -220,7 +221,7 @@ export function VariableEditor({
           <Variable className="w-[13px] h-[13px] text-primary" />
           <div className="flex-1 min-w-0">
             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground font-semibold">
-              Dashboard Variables
+              Dashboard <Term id="dashboard-variable">variables</Term>
             </div>
             <div className="text-[11px] text-muted-foreground mt-0.5">
               Reference in queries via <code className="font-mono text-primary">$variable_name</code>.
@@ -409,7 +410,7 @@ export function VariableEditor({
                               className="font-mono text-[11.5px] resize-none"
                             />
                             <p className="text-[10.5px] text-muted-foreground">
-                              Query to fetch options. Should return distinct values for the field.
+                              Returns the distinct values to offer.
                             </p>
                           </div>
                           <div className="flex flex-col gap-1.5">
@@ -423,7 +424,7 @@ export function VariableEditor({
                               className="h-[28px] text-[12px]"
                             />
                             <p className="text-[10.5px] text-muted-foreground">
-                              Field from query results to use as dropdown options.
+                              Result column used for the options.
                             </p>
                           </div>
                         </>

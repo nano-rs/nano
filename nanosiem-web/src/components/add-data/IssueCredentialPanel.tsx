@@ -45,6 +45,7 @@ import { IngestEndpointCard } from './IngestEndpointCard';
 import { FirstEventPanel } from './FirstEventPanel';
 import { OneTimeToken } from './OneTimeToken';
 import { SenderSnippets } from './SenderSnippets';
+import { Term } from '@/components/ui/term';
 
 /** Issuing an ingest token is a token-management action on this product. */
 export const ISSUE_TOKEN_PERMISSION = 'settings:system';
@@ -250,7 +251,7 @@ export function IssueCredentialPanel({
         <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/[0.04] px-3 py-2" role="alert" data-testid="precheck-blocked">
           <AlertTriangle className="w-3.5 h-3.5 mt-px text-red-500 shrink-0" strokeWidth={1.5} />
           <div className="text-[11px] leading-relaxed text-muted-foreground">
-            <span className="font-mono">{source.slug}</span> is nano&apos;s own lane and takes no ingest tokens.
+            <span className="font-mono">{source.slug}</span> is nano&apos;s own lane and takes no <Term id="ingest-credential">ingest tokens</Term>.
           </div>
         </div>
       )}
@@ -322,7 +323,7 @@ export function IssueCredentialPanel({
               <>
                 {stage === 'none' && (
                   <div className="text-[11px] text-muted-foreground">
-                    Senders authenticate with this token, and it decides the source, so create it first. Nothing has to be sent yet.
+                    Senders authenticate with this token, and it decides the source.
                   </div>
                 )}
                 {form}
@@ -344,8 +345,7 @@ export function IssueCredentialPanel({
               </>
             ) : (
               <div className="text-[11px] text-muted-foreground">
-                Your {PROTOCOL_LABEL[sendProtocol] ?? sendProtocol} endpoint, the token header and an example request appear
-                here once the token is ready.
+                {PROTOCOL_LABEL[sendProtocol] ?? sendProtocol} endpoint, header and example request appear here.
               </div>
             )}
           </ConnectStep>
@@ -358,7 +358,7 @@ export function IssueCredentialPanel({
                 <div className="text-[11px] text-muted-foreground">Copy the token to start watching for its first event.</div>
               )
             ) : (
-              <div className="text-[11px] text-muted-foreground">Starts once the token is ready and you send data with it.</div>
+              <div className="text-[11px] text-muted-foreground">Starts after you send data with the token.</div>
             )}
           </ConnectStep>
         </ol>

@@ -11,7 +11,11 @@ def test_route_gates_are_read_from_app_tsx() -> None:
     gates = rm.route_gates()
     assert gates["/rules"].permission == "detections:view"
     assert gates["/rules/editor/new"].permission == "detections:create"
-    assert gates["/hunts/runners"].permission == "hunts:view" and gates["/hunts/runners"].capability == "hunts"
+    # NAN-5850: the hunt settings pages moved; their old routes are redirects.
+    assert gates["/settings/hunts"].permission == "hunts:view" and gates["/settings/hunts"].capability == "hunts"
+    assert gates["/rules/ideas"].permission == "hunts:view" and gates["/rules/ideas"].capability == "hunts"
+    assert gates["/hunts/runners"].redirect and gates["/hunts/rule-ideas"].redirect
+    assert gates["/automation"].redirect  # a generated <Route key=...> block lends no gate upward
     assert "users:view" in gates["/settings/access-control"].any_permission
     assert gates["/settings/users"].redirect
     walk = {g.path for g in rm.walkable(gates)}
@@ -24,6 +28,8 @@ def test_rail_gates_and_builtin_roles() -> None:
     nav = {n.href: n for n in rm.nav_items()}
     assert nav["/rules"].permissions == ("detections:view",)
     assert nav["/getting-started"].permissions == ("settings:view",)
+    # A const href resolves (AppLayout's RULE_IDEAS_PATH, NAN-5850).
+    assert nav["/rules/ideas"].permissions == ("hunts:view",) and nav["/rules/ideas"].capability == "hunts"
     assert set(rm.builtin_roles()) >= {"Admin", "Editor", "ReadOnly"}
 
 
