@@ -55,6 +55,8 @@ _LAYOUT_QUIET_OPS = frozenset(
         "page_errors", "responses_containing", "requests_containing", "screenshot", "mask_secrets", "dump",
         "session_fetch", "end_session", "clipboard", "page_contains", "storage_clear", "capture_window_open",
         "opened",
+        # NAN-5864: only updates the driver's stub table; the page is untouched.
+        "stub_api",
     }
 )
 
@@ -445,6 +447,17 @@ class UiPage:
 
     def hover(self, find: dict[str, Any]) -> None:
         self.op("hover", find=find)
+
+    def stub_api(self, method: str, path: str, body: Any, status: int = 200) -> int:
+        """Answer `method path` (an /api path, with its query string when the
+        app sends one) with this JSON body from now on, in this session only
+        (NAN-5864: banner and bell states a throwaway stack cannot reach).
+        Returns how many requests the stub answered before this call."""
+        return self.op("stub_api", method=method, path=path, body=body, status=status)
+
+    def unstub_api(self, method: str, path: str) -> int:
+        """Drop a stub; returns how many requests it answered."""
+        return self.op("stub_api", method=method, path=path, clear=True)
 
     def scroll_bottom(self) -> int:
         """Scroll the app's scrollers to the bottom (infinite-scroll lists)."""

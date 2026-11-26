@@ -408,6 +408,11 @@ def sync_users_dir(
 
 
 CLICKHOUSE_CONTAINER = "nano-clickhouse"
+# NAN-5880: since v2.0.36 ClickHouse joins the clickhouse-netns anchor's
+# network namespace, so the anchor holds the network attachments. Both are
+# read: an install not yet recreated onto the anchor still has them on
+# ClickHouse itself.
+CLICKHOUSE_NETNS_CONTAINER = "nano-clickhouse-netns"
 
 
 def _docker(arguments: list[str]) -> str:
@@ -435,10 +440,14 @@ def discover_docker(compose_args: list[str], scratch_dir: Path) -> tuple[str, li
     """
     pools_json = _docker(["info", "--format", "{{json .DefaultAddressPools}}"]).strip()
     live: list[str] = []
-    network_ids = _docker([
-        "inspect", CLICKHOUSE_CONTAINER, "--format",
-        "{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}",
-    ]).split()
+    network_ids: list[str] = []
+    for container in (CLICKHOUSE_NETNS_CONTAINER, CLICKHOUSE_CONTAINER):
+        for network_id in _docker([
+            "inspect", container, "--format",
+            "{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}",
+        ]).split():
+            if network_id not in network_ids:
+                network_ids.append(network_id)
     for network_id in network_ids:
         for subnet in _docker([
             "network", "inspect", network_id, "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}",

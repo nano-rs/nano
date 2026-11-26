@@ -992,8 +992,18 @@ size_pg_pools() { # $1 = PostgreSQL budget MiB ("" = unknown), $2 = shared_buffe
     pg_pool_api=$pg_plan_api; pg_pool_jobs=$pg_plan_jobs; pg_pool_search=$pg_plan_search
     pg_pool_connector=$pg_plan_connector; pg_pool_min=$pg_plan_min
     if (( pg_plan_underfunded )); then
-        printf 'resource sizing warning: PostgreSQL has %s MiB, below the %s MiB its connection pools need for %s app host(s); pools are shrunk to fit (nano-jobs %s, nano-api %s, nano-search %s). Give PostgreSQL more memory: a larger host, fewer co-located roles, or a higher POSTGRES_MEM_LIMIT (an install sized before NAN-5822: re-run install.sh on this host).\n' \
-            "$1" "$(pg_budget_floor_mib "$app_hosts")" "$app_hosts" "$pg_pool_jobs" "$pg_pool_api" "$pg_pool_search" >&2
+        # NAN-5892: name the exact setting and value, not just the problem.
+        local floor_mib how
+        floor_mib=$(pg_budget_floor_mib "$app_hosts")
+        if [[ "$topology" == single ]]; then
+            how="set POSTGRES_MEM_LIMIT=${floor_mib}M (or more) below the \"# END NANO AUTO SIZING\" line in .env (raise your own line there if you already set one) and re-run install.sh on this host, or use a larger host or fewer co-located roles"
+        else
+            # Role-split (review P2-1): PostgreSQL runs on the postgres host,
+            # sized from the inventory, not from this host's .env.
+            how="give the PostgreSQL host POSTGRES_MEM_LIMIT=${floor_mib}M (or more) in the inventory (that host's resources or overrides), re-render the inventory with render-inventory.py and roll it out, or use a larger PostgreSQL host"
+        fi
+        printf 'resource sizing warning: PostgreSQL has %s MiB, below the %s MiB its connection pools need for %s app host(s); pools are shrunk to fit (nano-jobs %s, nano-api %s, nano-search %s), so background jobs can wait for a database connection. To fix it, %s.\n' \
+            "$1" "$floor_mib" "$app_hosts" "$pg_pool_jobs" "$pg_pool_api" "$pg_pool_search" "$how" >&2
     fi
     if has_role postgres; then
         # Never accept more sessions than the budget holds: past it the server

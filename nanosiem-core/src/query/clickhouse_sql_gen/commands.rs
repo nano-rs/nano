@@ -624,7 +624,9 @@ impl ClickHouseSqlGenerator {
                         } else {
                             field_to_sql_expr(field_name, self)
                         };
-                        let source_expr = if from_json {
+                        // NAN-5895: a stage column holding a JSON path's text
+                        // is a String too (`eval y = unmapped.x | bin y`).
+                        let source_expr = if from_json || self.is_upstream_json_text(field_name) {
                             format!("toFloat64OrNull(toString({source_expr}))")
                         } else {
                             source_expr
@@ -716,7 +718,10 @@ impl ClickHouseSqlGenerator {
                         );
                         // REPLACE needs a real column of that name in the input
                         // block; any other field is added under its name.
+                        // NAN-5895: a projected JSON path (`fields`, `top`, …)
+                        // is a real stage column of that name too.
                         if self.is_upstream_computed_field(source_field)
+                            || self.is_upstream_json_text(source_field)
                             || matches!(
                                 self.profile.resolve(source_field),
                                 crate::schema::FieldResolution::ExplicitColumn(_)
@@ -1103,7 +1108,14 @@ impl ClickHouseSqlGenerator {
                     let coalesce_exprs: Vec<String> = field_list
                         .iter()
                         .map(|f| {
-                            let (expr, _) = field_to_sql_expr(f, self);
+                            // NAN-5895: a stage column holding a JSON path's
+                            // text (after `fields`, `top`, …) is read as that
+                            // column, not re-resolved against the event.
+                            let (expr, _) = if self.is_upstream_json_text(f) {
+                                (escape_identifier(f).to_string(), false)
+                            } else {
+                                field_to_sql_expr(f, self)
+                            };
                             // NAN-5277: on OCSF '' is absent (non-Nullable
                             // columns, unmapped reads default to ''), the same
                             // rule `isnull()` applies, so fill it too.
@@ -1120,8 +1132,24 @@ impl ClickHouseSqlGenerator {
                             )
                         })
                         .collect();
+                    // NAN-5895: a field that is already a stage column (an
+                    // upstream `table`, `fields`, `top`, `eval`, `rename`, ...) is replaced, not
+                    // duplicated. `SELECT *, … AS "f"` next to an existing
+                    // `"f"` gave two columns of that name, and a later stage
+                    // read the unfilled one. A field the stage reads from the
+                    // event (no such column) keeps the plain `SELECT *`.
+                    let replaced: Vec<String> = field_list
+                        .iter()
+                        .filter(|f| self.is_upstream_computed_field(f) || self.is_upstream_json_text(f))
+                        .map(|f| escape_identifier(f))
+                        .collect();
+                    let star = if replaced.is_empty() {
+                        "*".to_string()
+                    } else {
+                        format!("* EXCEPT ({})", replaced.join(", "))
+                    };
                     Ok(format!(
-                        "  SELECT *, {} FROM {}",
+                        "  SELECT {star}, {} FROM {}",
                         coalesce_exprs.join(", "),
                         source
                     ))

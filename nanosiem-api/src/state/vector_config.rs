@@ -14,7 +14,7 @@ pub enum VectorConfigReconcileError {
     Source(#[from] nanosiem_core::source_configs::SourceConfigServiceError),
     #[error("parser render failed: {0}")]
     Parser(#[from] nanosiem_core::ParserServiceError),
-    #[error("could not fence the pre-v2.0.35 install lease scope: {0}")]
+    #[error("could not fence the older APIs' install lease scopes: {0}")]
     LegacyLeaseFence(sqlx::Error),
 }
 
@@ -27,12 +27,14 @@ impl AppState {
         &self,
     ) -> Result<PublicationOutcome, VectorConfigReconcileError> {
         // NAN-5874: while this API runs (every reconcile tick, 5 s by default, and
-        // before anything is published), hold the install lease scope APIs from
-        // before v2.0.35 grant, so none of them lets a consumer install a
-        // generation this version rendered (a Vector before 0.61.0-nano.14 drops
-        // acknowledged events on that reload). Fail closed: never publish
+        // before anything is published), hold every install lease scope an older
+        // API grants (`ingest` before v2.0.35, `ingest-v2` in v2.0.35; NAN-5810
+        // review P1-1), so none of them lets a consumer install a generation this
+        // version rendered (a Vector before 0.61.0-nano.14 drops acknowledged
+        // events on that reload; NAN-5810: any 0.61 Vector cannot load it, see
+        // `install_lease::MIN_VECTOR_RELEASE`). Fail closed: never publish
         // unfenced. The fence lapses `LEGACY_FENCE_TTL_SECS` after the last
-        // v2.0.35 API stops, which is how a rollback recovers.
+        // v2.0.36 API stops, which is how a rollback recovers.
         if nanosiem_core::parsers::vector_config_remote_delivery::generation_delivery_configured() {
             nanosiem_core::parsers::vector_config_remote_delivery::install_lease::fence_legacy_scope(
                 &self.pool,

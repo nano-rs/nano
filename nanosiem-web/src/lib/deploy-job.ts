@@ -25,27 +25,30 @@ export function isTerminal(job: Pick<DeployJob, 'state'>): boolean {
   return TERMINAL_STATES.has(job.state);
 }
 
-/** Operator-facing label for a phase. */
+/**
+ * Operator-facing label for a phase. NAN-5889: plain words for what is
+ * happening, since a large parser can sit in one phase for a minute.
+ */
 export function phaseLabel(phase: DeployJobPhase): string {
   switch (phase) {
     case 'queued':
-      return 'Queued';
+      return 'Waiting to start';
     case 'waiting_for_lock':
       return 'Waiting for another deploy';
     case 'validating':
-      return 'Validating';
+      return 'Checking the parser';
     case 'rendering':
-      return 'Rendering config';
+      return 'Building the Vector config';
     case 'validating_config':
-      return 'Validating config';
+      return 'Checking the Vector config';
     case 'promoting':
-      return 'Promoting';
+      return 'Saving the new config';
     case 'reloading':
       return 'Reloading Vector';
     case 'activating':
-      return 'Activating';
+      return 'Switching events to the new config';
     case 'rolling_back':
-      return 'Rolling back';
+      return 'Undoing the change';
     case 'done':
       return 'Done';
   }

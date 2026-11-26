@@ -122,6 +122,10 @@ services:
       VECTOR_CONFIG_DIR: /etc/vector
       # NAN-5635: the search memory guard's budget (see nanosiem-search).
       SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
+      # NAN-5860: planned GB/day from the resource sizer (install.sh records it
+      # in .env). Hunt budget defaults scale with its tier; empty keeps the
+      # static defaults.
+      NANO_SIZING_PLANNED_GB_PER_DAY: ${NANO_SIZING_PLANNED_GB_PER_DAY:-${NANO_PLANNED_GB_PER_DAY:-}}
       # NAN-5132: stable fan-in slots, off by default (opt-in for installs that
       # add sources often). Every API replica must use the same value.
       VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
@@ -328,6 +332,10 @@ services:
       DATABASE_URL: postgres://nanosiem:nanosiem@postgres:5432/nanosiem
       # NAN-5635: the search memory guard's budget (see nanosiem-search).
       SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
+      # NAN-5860: planned GB/day from the resource sizer (install.sh records it
+      # in .env). Hunt budget defaults scale with its tier; empty keeps the
+      # static defaults.
+      NANO_SIZING_PLANNED_GB_PER_DAY: ${NANO_SIZING_PLANNED_GB_PER_DAY:-${NANO_PLANNED_GB_PER_DAY:-}}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem
       CLICKHOUSE_USER: nanosiem
@@ -479,16 +487,20 @@ services:
     # Vector 0.57+ disables environment variable interpolation by default. The
     # static configs use `${NAME:-default}` everywhere, so the command below opts
     # back in with --dangerously-allow-env-var-interpolation (trusted,
-    # installation-owned configs only). Without the flag the hazard is
-    # asymmetric and `vector validate` does NOT catch the bad half:
-    #   numeric  max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}  -> TOML parse
-    #            error, Vector refuses to start. Loud.
-    #   string   valid_tokens = ["${VECTOR_AUTH_TOKEN}"]          -> validates
-    #            CLEAN and accepts the literal text `${VECTOR_AUTH_TOKEN}` as
-    #            the token. Silent.
+    # installation-owned configs only).
+    #
+    # Vector 0.62 (NAN-5810, upstream #26475) parses the TOML BEFORE it
+    # interpolates, then substitutes inside string values only and coerces the
+    # result to the field's type. So every placeholder must be a quoted string,
+    # numbers included:
+    #   max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"   (unquoted: a TOML
+    #            parse error, Vector refuses the whole config)
+    # String placeholders still need the flag above. Without it
+    #   valid_tokens = ["${VECTOR_AUTH_TOKEN}"]  validates CLEAN and accepts the
+    #            literal text `${VECTOR_AUTH_TOKEN}` as the token. Silent.
     # So never drop the flag, and after any Vector bump confirm env-driven values
     # resolve at runtime (send HEC with the real token and with the literal).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.14-debian@sha256:8995b2b456d104373056c4e72eded60c59c197ab1605d8de8d362b3a67fc857c
+    image: ghcr.io/nano-rs/vector:0.62.0-nano.2-debian@sha256:adcb061606d26026ac37c91d72073c8fe593cd0c09b262cc8ecf229ae2229801
     container_name: nanosiem-vector
     network_mode: "service:vector-netns"
     # NAN-5566: Vector never cuts its own shutdown short (an in-process cancel

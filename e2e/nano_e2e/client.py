@@ -220,6 +220,12 @@ def time_range(minutes_back: int = 60, minutes_ahead: int = 10) -> dict[str, str
     }
 
 
+# A deploy job holds the deploy lock, renders, validates and reloads Vector
+# (and waits for the ingest hosts' ack); a large parser on a small host takes
+# minutes, never hours.
+DEPLOY_JOB_TIMEOUT = 600.0
+
+
 class Nano:
     """Domain helpers over the api + search services. One instance per test."""
 
@@ -256,6 +262,48 @@ class Nano:
 
     def delete_source(self, source_id: str) -> None:
         self.api.delete(f"/api/log-sources/{source_id}")
+
+    def run_deploy_job(self, path: str, *, body: Any = None, timeout: float = DEPLOY_JOB_TIMEOUT,
+                       poll: float = 1.0) -> Any:
+        """Start a log-source deploy job (`POST path?wait=false`, NAN-5132) and
+        poll it to the end, so no single request outlives the client timeout
+        (NAN-5889: a large parser's publish runs past 60 s). Returns the job's
+        `result` (the body the blocking call answers with). A job that failed
+        raises ApiError carrying its `error_status` and message; one that is
+        still running at `timeout` raises with its last phase. A server
+        without deploy jobs answers 200 with the result, which is returned."""
+        sep = "&" if "?" in path else "?"
+        started = self.api.post(f"{path}{sep}wait=false", **({"json": body} if body is not None else {}))
+        job = expect(started, 200, 202)
+        if started.status_code == 200 or not isinstance(job, dict) or "status_path" not in job:
+            return job
+        deadline = time.monotonic() + timeout
+        while job.get("state") in ("queued", "running"):
+            if time.monotonic() > deadline:
+                raise ApiError(
+                    f"deploy job {job.get('id')} for {path} still {job.get('state')} after {timeout:.0f}s "
+                    f"(phase {job.get('phase')}): {job.get('message')}"
+                )
+            time.sleep(poll)
+            job = expect(self.api.get(job["status_path"]), 200)
+        if job.get("state") == "succeeded":
+            return job.get("result") if job.get("result") is not None else {}
+        if job.get("result") is not None and job.get("error_status") is None:
+            # rolled_back: the per-source result says what Vector refused.
+            return job["result"]
+        raise ApiError(
+            f"deploy job {job.get('id')} for {path} ended {job.get('state')} "
+            f"(error_status {job.get('error_status')}): {job.get('message')}"
+        )
+
+    def publish_source(self, source_id: str, body: dict[str, Any] | None = None, **kw: Any) -> Any:
+        """Publish a log source's working copy and follow the job (see
+        `run_deploy_job`)."""
+        return self.run_deploy_job(f"/api/log-sources/{source_id}/publish", body=body, **kw)
+
+    def deploy_source(self, source_id: str, body: dict[str, Any] | None = None, **kw: Any) -> Any:
+        """Deploy a log source and follow the job (see `run_deploy_job`)."""
+        return self.run_deploy_job(f"/api/log-sources/{source_id}/deploy", body=body, **kw)
 
     def issue_token(self, source_id: str, name: str) -> tuple[str, str]:
         """-> (credential_id, raw token)."""

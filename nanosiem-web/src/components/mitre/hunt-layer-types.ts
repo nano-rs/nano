@@ -26,7 +26,6 @@ export interface HuntFindingClassCounts {
 export interface HuntRuleIdeaStateCounts {
   keep_hunting: number;
   ready: number;
-  needs_lookup: number;
   sent: number;
 }
 

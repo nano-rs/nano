@@ -60,6 +60,11 @@ impl AppState {
     /// Keep a licensed-only worker group aligned with live admission. C05
     /// renewals and online checks are hot, so a one-time startup decision is
     /// insufficient: workers stop at hard expiry and resume after renewal.
+    ///
+    /// NAN-5868: the group follows admission through hysteresis
+    /// (`license_workers`), so a denial shorter than
+    /// `STOP_AFTER_DENIED` never aborts running workers and a stopped group
+    /// restarts only once admission has held for `RESTART_AFTER_ALLOWED`.
     #[cfg(feature = "enterprise")]
     pub fn start_component_worker_supervisor<F>(
         &self,
@@ -70,60 +75,37 @@ impl AppState {
     where
         F: Fn(&AppState) -> Vec<tokio::task::JoinHandle<()>> + Send + Sync + 'static,
     {
+        use super::license_workers::{
+            supervise_component_workers, Admission, AdmissionHysteresis, RESTART_AFTER_ALLOWED,
+            STOP_AFTER_DENIED, SUPERVISOR_TICK,
+        };
+
         let state = self.clone();
         let shutdown = self.shutdown_token();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut workers = ComponentWorkers::default();
-
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        abort_component_workers(&mut workers).await;
-                        return;
+            let license_status = state.license_status.clone();
+            supervise_component_workers(
+                name,
+                capability,
+                shutdown,
+                SUPERVISOR_TICK,
+                AdmissionHysteresis::new(STOP_AFTER_DENIED, RESTART_AFTER_ALLOWED),
+                move || {
+                    let license_status = license_status.clone();
+                    async move {
+                        let status = license_status.read().await;
+                        Admission {
+                            allowed: crate::license_admission::licensed_features_available(
+                                &status,
+                                chrono::Utc::now(),
+                            ),
+                            reason: status.locked_reason.clone(),
+                        }
                     }
-                    _ = interval.tick() => {}
-                }
-
-                let allowed = crate::license_admission::licensed_features_available(
-                    &*state.license_status.read().await,
-                    chrono::Utc::now(),
-                );
-                if !allowed {
-                    if !workers.is_empty() {
-                        tracing::warn!(
-                            worker_group = name,
-                            ?capability,
-                            "Stopping licensed workers at license hard stop"
-                        );
-                        abort_component_workers(&mut workers).await;
-                    }
-                    continue;
-                }
-
-                if workers
-                    .handles
-                    .iter()
-                    .any(tokio::task::JoinHandle::is_finished)
-                {
-                    abort_component_workers(&mut workers).await;
-                    panic!("licensed worker group {name} stopped unexpectedly");
-                }
-                if workers.is_empty() {
-                    workers.handles = start(&state);
-                    assert!(
-                        !workers.is_empty(),
-                        "licensed worker group {name} started no tasks"
-                    );
-                    tracing::info!(
-                        worker_group = name,
-                        ?capability,
-                        tasks = workers.len(),
-                        "Licensed worker group started"
-                    );
-                }
-            }
+                },
+                || start(&state),
+            )
+            .await;
         })
     }
 
@@ -687,46 +669,6 @@ impl AppState {
             failed = summary.failed,
             "All tracked background tasks stopped"
         );
-    }
-}
-
-#[cfg(feature = "enterprise")]
-#[derive(Default)]
-struct ComponentWorkers {
-    handles: Vec<tokio::task::JoinHandle<()>>,
-}
-
-#[cfg(feature = "enterprise")]
-impl ComponentWorkers {
-    fn is_empty(&self) -> bool {
-        self.handles.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.handles.len()
-    }
-}
-
-#[cfg(feature = "enterprise")]
-impl Drop for ComponentWorkers {
-    fn drop(&mut self) {
-        for worker in &self.handles {
-            worker.abort();
-        }
-    }
-}
-
-#[cfg(feature = "enterprise")]
-async fn abort_component_workers(workers: &mut ComponentWorkers) {
-    for worker in workers.handles.iter() {
-        worker.abort();
-    }
-    while let Some(worker) = workers.handles.pop() {
-        match worker.await {
-            Ok(()) => {}
-            Err(error) if error.is_cancelled() => {}
-            Err(error) => tracing::warn!(?error, "Licensed worker stopped with an error"),
-        }
     }
 }
 

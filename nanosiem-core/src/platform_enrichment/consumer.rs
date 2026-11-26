@@ -550,6 +550,9 @@ pub fn ensure_private_dir(dir: &Path) -> Result<PathBuf, ConsumerError> {
 pub struct InstallLease {
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
     lock_id: i64,
+    /// NAN-5892: the lease pins `conn` for the whole install. Declared after
+    /// `conn`, so it is released after the connection.
+    _slot: crate::db::pinned_session::PinnedSlot,
 }
 
 impl InstallLease {
@@ -560,6 +563,7 @@ impl InstallLease {
     /// Take the single-flight lease on advisory lock `lock_id` (NAN-4955: the
     /// content channel consumer uses the same lease on its own lock).
     pub async fn acquire_lock(pool: &sqlx::PgPool, lock_id: i64) -> Result<Self, ConsumerError> {
+        let slot = crate::db::pinned_session::pinned_slot(pool).await;
         let mut conn = pool.acquire().await.map_err(db_error)?;
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(lock_id)
@@ -569,7 +573,7 @@ impl InstallLease {
         if !got {
             return Err(ConsumerError::Busy);
         }
-        Ok(Self { conn: Some(conn), lock_id })
+        Ok(Self { conn: Some(conn), lock_id, _slot: slot })
     }
 
     /// Release the lease (dropping it also ends the session's lock).

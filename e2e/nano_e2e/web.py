@@ -51,7 +51,7 @@ def route(path: str) -> str | None:
         return "api"
     if path == "/api/search" or path.startswith("/api/search"):
         return "search"
-    if path.startswith(("/api/", "/swagger-ui", "/api-docs")) or path in ("/api", "/health"):
+    if path.startswith(("/api/", "/swagger-ui", "/api-docs")) or path in ("/api", "/health", "/health/detailed"):
         return "api"
     return None
 

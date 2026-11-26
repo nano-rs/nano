@@ -143,10 +143,16 @@ fn native_plan_splices_a_chain_into_the_parser_slot() {
     let p = parser(&plan.stored().unwrap(), Some(".team = \"soc\""));
     let config = manager().generate_parser_config_string(&p);
     let t = transforms(&config);
-    // `_parse` is an identity remap from the router; the chain reads it.
+    // `_parse` is an identity remap from the router (through the UDM
+    // `_hec_payload` step that drops the lossless HEC record, NAN-5902); the
+    // chain reads it.
     assert_eq!(t["hec_app_parse"]["source"].as_str().unwrap().trim(), ".");
     assert_eq!(
         t["hec_app_parse"]["inputs"].as_array().unwrap()[0].as_str(),
+        Some("hec_app_hec_payload")
+    );
+    assert_eq!(
+        t["hec_app_hec_payload"]["inputs"].as_array().unwrap()[0].as_str(),
         Some("source_router.hec_app")
     );
     assert_eq!(

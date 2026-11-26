@@ -51,7 +51,7 @@ export class RiskApi {
   getRiskyEntities(_params?: RiskEntitiesQuery): Promise<RiskEntitiesResponse> {
     return ENTERPRISE_ONLY();
   }
-  getRiskOverview(): Promise<RiskOverviewResponse> {
+  getRiskOverview(_refresh?: boolean): Promise<RiskOverviewResponse> {
     return ENTERPRISE_ONLY();
   }
   getTimeWindowedRiskScores(

@@ -65,12 +65,12 @@
                 "ClickHouse sinks must not use adaptive concurrency"
             );
             assert!(
-                content.contains("VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6"),
+                content.contains("concurrency = \"${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}\""),
                 "ClickHouse sinks must use the bounded concurrency setting"
             );
             if content.contains("type = \"disk\"") {
                 assert!(
-                    content.contains("VECTOR_DISK_BUFFER_MAX_BYTES:-268435488"),
+                    content.contains("max_size = \"${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}\""),
                     "durable ClickHouse buffers must use the host-sized per-component setting"
                 );
             }
@@ -830,7 +830,7 @@
 
         assert!(
             block.contains("includes(reserved,"),
-            "hec_normalize must gate the .event-keys lift on the reserved-key deny-list"
+            "hec_normalize must gate the record-keys root copy on the reserved-key deny-list"
         );
     }
 
@@ -1253,7 +1253,7 @@ enabled = true
         assert!(!routed.contains("[sinks.clickhouse_logs]\n"));
         assert_eq!(
             routed
-                .matches("max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}")
+                .matches("max_size = \"${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}\"")
                 .count(),
             4,
             "logs and parser-health each consume one declared share per shard"

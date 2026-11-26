@@ -4,6 +4,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DEPLOY_REQUEST_TIMEOUT_MS, LogSourcesApi } from './log-sources';
 import { SourceConfigsApi } from './source-configs';
+import { ConnectorFeedsApi } from './connector-feeds';
 
 function apis() {
   const request = vi.fn().mockResolvedValue({});
@@ -60,5 +61,30 @@ describe('deploy request timeout (NAN-5131)', () => {
     await ls.listLogSources();
     expect(request).toHaveBeenCalledWith('/api/log-sources');
     expect(longRequest).not.toHaveBeenCalled();
+  });
+});
+
+// NAN-5903: a pull feed start that sets up log sources deploys them first, so
+// it runs under the deploy budget; a plain start keeps the default timeout.
+describe('connector feed starts', () => {
+  it('use the deploy budget only when they set up log sources', async () => {
+    const request = vi.fn().mockResolvedValue({});
+    const longRequest = vi.fn().mockResolvedValue({});
+    const feeds = new ConnectorFeedsApi(request, longRequest);
+    await feeds.create({ name: 'f', connector: 'okta_system_log', config: {}, set_up_log_sources: true });
+    await feeds.setEnabled('cfeed_1', true, true);
+    await feeds.adoptSpec('cfeed_1', true);
+    expect(longRequest.mock.calls.map(([endpoint, init]) => [endpoint, init.method])).toEqual([
+      ['/api/connector-feeds', 'POST'],
+      ['/api/connector-feeds/cfeed_1', 'PATCH'],
+      ['/api/connector-feeds/cfeed_1/adopt-spec', 'POST'],
+    ]);
+    for (const call of longRequest.mock.calls) expect(call[2]).toBe(DEPLOY_REQUEST_TIMEOUT_MS);
+    expect(request).not.toHaveBeenCalled();
+    await feeds.create({ name: 'f', connector: 'okta_system_log', config: {}, set_up_log_sources: false });
+    await feeds.setEnabled('cfeed_1', false);
+    await feeds.plan('okta_system_log', {});
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(longRequest).toHaveBeenCalledTimes(3);
   });
 });

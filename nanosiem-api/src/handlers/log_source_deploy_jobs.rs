@@ -101,6 +101,9 @@ pub(crate) struct DeployAudit {
     /// Extra detail fields merged into every event this job emits (NAN-5079:
     /// how the OCSF gate passed).
     pub extra: Option<serde_json::Value>,
+    /// Extra detail fields the job's work learns while it runs (NAN-5889:
+    /// publish runs its OCSF gate inside the job), merged like `extra`.
+    pub late_extra: Option<Arc<std::sync::OnceLock<serde_json::Value>>>,
 }
 
 impl DeployAudit {
@@ -115,7 +118,15 @@ impl DeployAudit {
         if let Some(id) = log_source_id {
             event = event.resource("log_source", Some(id), None::<String>);
         }
-        let details = match (details, self.extra.clone()) {
+        let extra = match (self.extra.clone(), self.late_extra.as_ref().and_then(|late| late.get().cloned())) {
+            (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(late))) => {
+                base.extend(late);
+                Some(serde_json::Value::Object(base))
+            }
+            (None, late) => late,
+            (early, _) => early,
+        };
+        let details = match (details, extra) {
             (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(extra))) => {
                 base.extend(extra);
                 Some(serde_json::Value::Object(base))
@@ -127,6 +138,16 @@ impl DeployAudit {
             event = event.details(details);
         }
         state.emit_audit_durable(event.build()).await;
+    }
+}
+
+/// The message a failed job shows (NAN-5889 review): a refusal reads as the
+/// reason itself, without the "Validation error: " wrapper of the HTTP body
+/// (the job's `error_status` already says it was a 422).
+pub(crate) fn job_error_message(error: &ApiError) -> String {
+    match error {
+        ApiError::ValidationError(message) => message.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -189,7 +210,7 @@ where
                         Ok(DeployOk::Done(_, message)) => JobOutcome::Done(message.clone()),
                         Err(error) => JobOutcome::Error {
                             status: error.status_code().as_u16(),
-                            message: error.to_string(),
+                            message: job_error_message(error),
                         },
                     };
                     // The waiting request may be gone (client disconnect);
@@ -321,3 +342,25 @@ pub struct LogSourceDeployJobsApiDoc;
 #[cfg(test)]
 #[path = "log_source_deploy_jobs_budget_tests.rs"]
 mod budget_tests;
+
+#[cfg(test)]
+mod job_message_tests {
+    use super::*;
+
+    /// NAN-5889 review: a failed OCSF sample reads as the reason, once.
+    #[test]
+    fn a_refusal_is_the_reason_without_the_wrapper() {
+        let error = ApiError::from(nanosiem_core::LogSourceServiceError::OcsfValidationFailed(
+            "sample event 1 (1,2026/11/24) did not pass: missing class_uid".into(),
+        ));
+        assert_eq!(error.status_code().as_u16(), 422);
+        let message = job_error_message(&error);
+        assert_eq!(
+            message,
+            "OCSF validation failed: sample event 1 (1,2026/11/24) did not pass: missing class_uid"
+        );
+        assert!(!message.starts_with("Validation error"));
+        let other = ApiError::InternalError("boom".into());
+        assert_eq!(job_error_message(&other), other.to_string());
+    }
+}

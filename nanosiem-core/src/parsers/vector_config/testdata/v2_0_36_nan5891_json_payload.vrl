@@ -1,0 +1,25 @@
+# #10462 (ee6783e170) HEC_JSON_PAYLOAD_VRL, verbatim (NAN-5902 reference).
+# NAN-5891: this parser reads a JSON object; give it the whole HEC record,
+# unmodified, as HTTP /ingest does.
+nano_hec_record = %nano_hec_record
+if is_object(nano_hec_record) && is_string(nano_hec_record.text) {
+    .message = string!(nano_hec_record.text)
+    nano_hec_unfiled = nano_hec_record.unfiled
+    if is_object(nano_hec_unfiled) && length(object!(nano_hec_unfiled)) > 0 {
+        %nano_hec_event = nano_hec_unfiled
+    } else {
+        del(%nano_hec_event)
+    }
+} else {
+    nano_hec_event = %nano_hec_event
+    if is_object(nano_hec_event) {
+        nano_hec_parsed, nano_hec_err = parse_json(to_string(.message) ?? "")
+        if nano_hec_err != null || !is_object(nano_hec_parsed) {
+            .message = encode_json(nano_hec_event)
+            del(%nano_hec_event)
+        }
+    } else {
+        del(%nano_hec_event)
+    }
+}
+del(%nano_hec_record)

@@ -9,10 +9,22 @@
 //! install-owned static configs and the generated sinks (`_pipeline.toml`,
 //! `_ocsf_sink.toml`, `_enrichment.toml`) read `${VECTOR_AUTH_TOKEN}` and
 //! `${CLICKHOUSE_*}` from the container environment. Vector substitutes
-//! `${NAME}`, `${NAME:-default}` and `$NAME` over the RAW file text before it
-//! parses the TOML, so the substitution reaches string literals inside VRL as
-//! well. A tenant who writes `.leak = "${CLICKHOUSE_PASSWORD}"` in a parser
-//! would otherwise ship the ClickHouse password inside every event.
+//! `${NAME}`, `${NAME:-default}` and `$NAME` inside every string value of the
+//! config, and a VRL program is one (`source = '''...'''`), so the
+//! substitution reaches string literals inside VRL as well. A tenant who
+//! writes `.leak = "${CLICKHOUSE_PASSWORD}"` in a parser would otherwise ship
+//! the ClickHouse password inside every event.
+//!
+//! NAN-5810: Vector 0.62 (vectordotdev/vector#26475) PARSES the file first and
+//! then substitutes only inside string values, coercing the result to the
+//! field's type (0.61 and older substituted over the raw text before parsing).
+//! So a placeholder must be a quoted TOML string even where the field is a
+//! number: `max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"`. The bare form
+//! `max_bytes = ${...}` is a TOML parse error on 0.62 and Vector refuses the
+//! whole config. [`quote_bare_placeholders`] rewrites files an older release
+//! left behind; `config/vector/.nano/vector-entrypoint.sh` does the same to
+//! the persisted dynamic tree before Vector starts. A `#` comment is no
+//! longer interpolated at all.
 //!
 //! # The rule
 //!
@@ -48,7 +60,7 @@
 //!   That is why [`reject_vrl_interpolation`] already refuses `SECRET[`.
 //! * **The install owns the interpolating files, not nano-api.** The static
 //!   configs (`config/vector/*.toml`: HEC `valid_tokens`, the OTLP and metrics
-//!   ClickHouse sinks, numeric batch tunables that must be unquoted TOML) are a
+//!   ClickHouse sinks, numeric batch tunables quoted for Vector 0.62) are a
 //!   read-only bind mount in compose and a ConfigMap in Kubernetes, and the
 //!   managed deployer (nano-main) generates the same command line. Rendering
 //!   them at deploy time means a new renderer in every deployer plus a new
@@ -170,8 +182,14 @@ pub fn unescape_file(content: &str) -> String {
 }
 
 /// What Vector's interpolation does to `raw` with an EMPTY environment, for
-/// in-process checks that must parse the raw files the way Vector will (the
-/// raw text is not valid TOML: `max_bytes = ${...}`). Mirrors Vector's
+/// in-process checks that must read the raw files the way Vector will.
+/// Applied to the raw text, not per string value as Vector 0.62 does
+/// (NAN-5810), which is equivalent for nano's files: every placeholder is a
+/// whole quoted value and the defaults hold no TOML syntax. A quoted numeric
+/// placeholder stays a TOML string after substitution (`max_bytes =
+/// "52428800"`, which Vector coerces to the field's type). A file an older
+/// release left with a bare placeholder (`max_bytes = ${...}`) substitutes to
+/// a bare number, so these checks read either form. Mirrors Vector's
 /// `ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX`:
 ///
 /// * `$$` becomes `$`;
@@ -240,6 +258,118 @@ pub fn substitute_like_vector(raw: &str) -> String {
     }
     out.push_str(&raw[literal_start..]);
     out
+}
+
+/// NAN-5810: a line whose whole TOML value is one bare placeholder,
+/// `key = ${NAME}` / `key = ${NAME:-default}` (optionally followed by a `#`
+/// comment). Vector 0.62 parses before it interpolates, so such a line is a
+/// TOML parse error there. Captures: 1 = `key = ` (with its indentation),
+/// 2 = the placeholder, 3 = the trailing whitespace and comment.
+///
+/// The default may not hold `"`, `\` or `}` (it is wrapped in a basic string
+/// as is); `${NAME-default}` and the `?` error forms are accepted too.
+static BARE_PLACEHOLDER_LINE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(
+        r#"^(\s*[A-Za-z0-9_."-]+\s*=\s*)(\$\{[A-Za-z0-9_.]+(?:(?::?-|:?\?)[^}"\\\r\n]*)?\})(\s*(?:#.*)?)$"#,
+    )
+    .expect("static regex")
+});
+
+/// Visit every line of `content` that is outside a TOML multi-line string
+/// (`'''` / `"""`, where VRL programs live) with its 0-based index and its
+/// text without the line ending. Lines that open, sit inside, or close such a
+/// string are never visited.
+fn for_each_toml_value_line(content: &str, mut visit: impl FnMut(usize, &str)) {
+    // The delimiter of the multi-line string the scan is inside, if any.
+    let mut open: Option<&str> = None;
+    for (index, line) in content.split_inclusive('\n').enumerate() {
+        let body = line.trim_end_matches(['\n', '\r']);
+        match open {
+            Some(delim) => {
+                if body.matches(delim).count() % 2 == 1 {
+                    open = None;
+                }
+            }
+            // A full-line comment outside a multi-line string opens nothing,
+            // whatever quotes it mentions (NAN-5810 review: `# its ''' VRL
+            // blocks` must not flip the scan for the rest of the file).
+            None if body.trim_start().starts_with('#') => {}
+            None => {
+                // An odd count of a delimiter opens a multi-line string; a
+                // line holding one at all is never a bare-value line.
+                let opened = ["'''", "\"\"\""]
+                    .into_iter()
+                    .find(|delim| body.matches(delim).count() % 2 == 1);
+                match opened {
+                    Some(delim) => open = Some(delim),
+                    None => visit(index, body),
+                }
+            }
+        }
+    }
+}
+
+/// NAN-5810: the 1-based line numbers (with the line) whose whole TOML value
+/// is a bare `${...}` placeholder, which Vector 0.62 cannot parse. Empty for
+/// a file whose placeholders 0.62 can load.
+pub fn bare_placeholder_lines(content: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for_each_toml_value_line(content, |index, body| {
+        if BARE_PLACEHOLDER_LINE.is_match(body) {
+            out.push((index + 1, body.to_string()));
+        }
+    });
+    out
+}
+
+/// NAN-5810: make a Vector TOML written by an older release (whose Vector
+/// interpolated before parsing) loadable by Vector 0.62. Every line whose
+/// whole value is one bare placeholder,
+/// `max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}`, becomes the quoted form
+/// `max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"`, which 0.62
+/// substitutes and coerces to the field's type.
+///
+/// Everything else stays byte-identical: other lines, line endings, the
+/// bodies of `'''` / `"""` multi-line strings (VRL is never touched), and an
+/// already-quoted value. Idempotent. Keep in sync with the quoting awk in
+/// `config/vector/.nano/vector-entrypoint.sh` (`nano-quote-bare-placeholders`).
+pub fn quote_bare_placeholders(content: &str) -> String {
+    let mut targets = std::collections::HashSet::new();
+    for_each_toml_value_line(content, |index, body| {
+        if BARE_PLACEHOLDER_LINE.is_match(body) {
+            targets.insert(index);
+        }
+    });
+    if targets.is_empty() {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len() + 2 * targets.len());
+    for (index, line) in content.split_inclusive('\n').enumerate() {
+        if !targets.contains(&index) {
+            out.push_str(line);
+            continue;
+        }
+        let body = line.trim_end_matches(['\n', '\r']);
+        let ending = &line[body.len()..];
+        let caps = BARE_PLACEHOLDER_LINE.captures(body).expect("matched in the scan");
+        out.push_str(&caps[1]);
+        out.push('"');
+        out.push_str(&caps[2]);
+        out.push('"');
+        out.push_str(&caps[3]);
+        out.push_str(ending);
+    }
+    out
+}
+
+/// Test helper: an integer TOML field as Vector 0.62 reads it after
+/// substitution: a TOML integer, or a string holding one (a quoted
+/// placeholder substitutes to `"52428800"`, which Vector coerces).
+#[cfg(test)]
+pub(crate) fn toml_integer(value: &toml::Value) -> Option<i64> {
+    value
+        .as_integer()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 #[cfg(test)]

@@ -12,6 +12,9 @@ use super::*;
 
 const HTTP_BASE: &str = include_str!("../../../../../config/vector/00-base.toml");
 const OTLP: &str = include_str!("../../../../../config/vector/03-otlp-source.toml");
+// NAN-5899: the OTLP sinks' env-set numbers only load in both Vector 0.61 and 0.62
+// as bare YAML scalars, so the sinks live in YAML beside the source TOML.
+const OTLP_SINKS: &str = include_str!("../../../../../config/vector/03-otlp-sinks.yaml");
 const ENRICH_SOURCE: &str = include_str!("../../../../../config/vector/04-enrichment-source.toml");
 const SEED_PIPELINE: &str =
     include_str!("../../../../../config/vector/sources/parsers/_pipeline.toml");
@@ -33,6 +36,22 @@ fn repo_file(path: &str) -> Option<String> {
 fn load(raw: &str) -> toml::Table {
     toml::from_str(&crate::vector_env::substitute_like_vector(raw))
         .unwrap_or_else(|e| panic!("not valid TOML after substitution: {e}\n{raw}"))
+}
+
+/// A YAML config file as Vector 0.61 reads it (substitute, then parse), as a TOML
+/// table so the helpers below apply.
+fn load_yaml(raw: &str) -> toml::Table {
+    serde_yaml::from_str(&crate::vector_env::substitute_like_vector(raw))
+        .unwrap_or_else(|e| panic!("not valid YAML after substitution: {e}\n{raw}"))
+}
+
+/// The OTLP lane as Vector loads it: the source TOML and its YAML sinks.
+fn load_otlp(source: &str, sinks: &str) -> toml::Table {
+    let mut doc = load(source);
+    let sinks = load_yaml(sinks);
+    assert!(doc.get("sinks").is_none(), "the OTLP sinks belong in 03-otlp-sinks.yaml");
+    doc.insert("sinks".into(), sinks["sinks"].clone());
+    doc
 }
 
 fn enabled(table: &toml::Table, section: &str, name: &str) -> Option<bool> {
@@ -63,7 +82,7 @@ fn buffer_type<'a>(table: &'a toml::Table, sink: &str) -> Option<&'a str> {
 }
 
 fn assert_disk_buffers_meet_vector_minimum(label: &str, raw: &str) {
-    let doc = load(raw);
+    let doc = if label.ends_with("(YAML)") { load_yaml(raw) } else { load(raw) };
     let sinks = doc
         .get("sinks")
         .and_then(toml::Value::as_table)
@@ -80,7 +99,7 @@ fn assert_disk_buffers_meet_vector_minimum(label: &str, raw: &str) {
         disk_buffers += 1;
         let max_size = buffer
             .get("max_size")
-            .and_then(toml::Value::as_integer)
+            .and_then(crate::vector_env::toml_integer)
             .unwrap_or_else(|| panic!("{label}: {sink} disk buffer has no integer max_size"));
         assert!(
             max_size >= VECTOR_DISK_BUFFER_MIN_BYTES,
@@ -239,7 +258,7 @@ fn durable_protocols_bypass_dedupe_and_event_buffers_never_drop_newest() {
 
 #[test]
 fn otlp_success_is_explicit_and_capacity_backpressures() {
-    let doc = load(OTLP);
+    let doc = load_otlp(OTLP, OTLP_SINKS);
     assert_eq!(enabled(&doc, "sources", "otlp_ingest"), Some(true));
     assert!(
         doc["transforms"]["otlp_logs_prep"]["source"]
@@ -285,7 +304,7 @@ fn every_rendered_disk_buffer_meets_vector_runtime_minimum() {
             "generated pipeline",
             VectorConfigManager::pipeline_config_content().to_string(),
         ),
-        ("compose OTLP", OTLP.to_string()),
+        ("compose OTLP sinks (YAML)", OTLP_SINKS.to_string()),
         (
             "static enrichment lane",
             VectorConfigManager::static_enrichment_lane(),
@@ -310,8 +329,11 @@ fn helm_vector_seeds_match_compose_seeds() {
         .expect("Helm seed set is complete");
     let enrich = repo_file("deploy/helm/nano/files/vector/04-enrichment-source.toml")
         .expect("Helm seed set is complete");
+    let otlp_sinks = repo_file("deploy/helm/nano/files/vector/03-otlp-sinks.yaml")
+        .expect("Helm seed set is complete");
     assert_eq!(http, HTTP_BASE, "Helm HTTP seed drifted");
     assert_eq!(otlp, OTLP, "Helm OTLP seed drifted");
+    assert_eq!(otlp_sinks, OTLP_SINKS, "Helm OTLP sinks seed drifted");
     assert_eq!(enrich, ENRICH_SOURCE, "Helm enrichment source drifted");
 }
 

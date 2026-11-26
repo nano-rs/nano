@@ -17,10 +17,20 @@
 //!   operator explicitly acknowledges it (audited by the caller); the receipt
 //!   stays empty, so the next parser change needs a passing sample.
 //!
-//! Since NAN-5132 publish and deploy run as background jobs; the API runs the
-//! gate BEFORE enqueueing ([`LogSourceService::ocsf_publish_precheck`],
-//! [`LogSourceService::ocsf_deploy_precheck`]) so a refusal is a 422 on both
-//! `wait=true` and `wait=false` and creates no job.
+//! Since NAN-5132 publish and deploy run as background jobs. Deploy runs the
+//! gate BEFORE enqueueing ([`LogSourceService::ocsf_deploy_precheck`]) so a
+//! refusal is a 422 on both `wait=true` and `wait=false` and creates no job.
+//!
+//! Publish (NAN-5889) splits the gate in two. The checks that need no VRL
+//! compile run before the job ([`LogSourceService::ocsf_publish_admission`]):
+//! a missing source (404), a stale revision (409) and a generation that has
+//! no receipt, no sample and no acknowledgement (422) still answer before any
+//! job exists. Compiling the parser and running its samples
+//! ([`LogSourceService::ocsf_publish_precheck`]) is the job's first step: a
+//! 99 KB parser compiled three times there (validate, safety check, sample
+//! run), about 24 s before the job even existed, so `wait=false` could not
+//! answer quickly. A sample that fails in the job fails it with
+//! `error_status: 422` (and `wait=true` still answers 422).
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -66,6 +76,19 @@ pub enum OcsfGateOutcome {
     Attested { samples: usize },
     /// D2: first publish acknowledged without a sample.
     Unattested,
+}
+
+/// Whether `parser_vrl` is a stored Nano Pipe plan, valid or not, from its
+/// marker alone (no VRL is compiled; NAN-5889 review).
+pub(crate) fn is_stored_pipe_plan(parser_vrl: &str) -> bool {
+    parser_vrl.starts_with(crate::parsers::pipe::HEADER)
+}
+
+/// The gate's decision before anything is compiled (see
+/// [`LogSourceService::plan_ocsf_gate`]).
+enum GatePlan {
+    Done(OcsfGateOutcome),
+    Run(Vec<String>),
 }
 
 fn hash_part(digest: &mut Sha256, value: &[u8]) {
@@ -424,9 +447,38 @@ impl LogSourceService {
         Vec::new()
     }
 
-    /// Publish's OCSF gate, run by the API BEFORE a publish job is enqueued
-    /// (NAN-5079 x NAN-5132), so a refused generation answers 422 at once on
-    /// both `wait=true` and `wait=false` and no job is created.
+    /// Publish's pre-job check (NAN-5889): everything the gate can decide
+    /// without compiling VRL. 404 for a missing source, 409 for a stale
+    /// `expected_updated_at`, and 422 for a generation the gate would refuse
+    /// before running anything (no receipt, no sample, no bundled sample, no
+    /// acknowledgement) or for samples over the size limits. Returns the
+    /// working-copy revision read here: the job must publish AT it, so an edit
+    /// in between is a 409. Database reads only; no VRL is compiled.
+    pub async fn ocsf_publish_admission(
+        &self,
+        id: Uuid,
+        expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+        input: &OcsfGateInput,
+    ) -> Result<chrono::DateTime<chrono::Utc>, LogSourceServiceError> {
+        let log_source = self.repository().find_by_id(id).await?;
+        super::versioning::ensure_unchanged(id, log_source.updated_at, expected_updated_at)?;
+        let active = self.version_repository().get_active_version(id).await?;
+        let live = active.as_ref().map(|version| {
+            (
+                version.parser_vrl.as_str(),
+                version.extension_enabled,
+                version.extension_vrl.as_deref(),
+            )
+        });
+        if let GatePlan::Run(samples) = self.plan_ocsf_gate(&log_source, live, input).await? {
+            check_sample_limits(&samples)?;
+        }
+        Ok(log_source.updated_at)
+    }
+
+    /// Publish's full OCSF gate (NAN-5079 x NAN-5132). Since NAN-5889 it runs
+    /// as the publish job's first step, after [`Self::ocsf_publish_admission`]
+    /// answered the refusals that need no compile before the job.
     ///
     /// The returned `revision` is the working-copy revision the gate checked;
     /// the caller must publish AT that revision (`expected_updated_at`), so an
@@ -469,8 +521,29 @@ impl LogSourceService {
         Ok(OcsfPrecheck { outcome, revision, ..checked })
     }
 
-    /// Deploy's OCSF gate, run by the API before a deploy job is enqueued.
-    /// It applies only when a source that is not deployed and has no
+    /// Deploy's pre-job check (NAN-5889 review, as for publish): database
+    /// reads only. 404 for a missing source; on a first go-live, 422 for a
+    /// generation the gate would refuse before running anything, or samples
+    /// over the size limits. The full gate ([`Self::ocsf_deploy_precheck`])
+    /// is the deploy job's first step.
+    pub async fn ocsf_deploy_admission(
+        &self,
+        id: Uuid,
+        input: &OcsfGateInput,
+    ) -> Result<(), LogSourceServiceError> {
+        let log_source = self.repository().find_by_id(id).await?;
+        if !log_source.deployed
+            && self.version_repository().get_active_version(id).await?.is_none()
+        {
+            if let GatePlan::Run(samples) = self.plan_ocsf_gate(&log_source, None, input).await? {
+                check_sample_limits(&samples)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deploy's full OCSF gate. Since NAN-5889 it runs as the deploy job's
+    /// first step, after [`Self::ocsf_deploy_admission`]. It applies only when a source that is not deployed and has no
     /// published version goes live: then the working copy is what Vector
     /// renders (the Add data flow's create + deploy). A source with an active
     /// version renders that version, which already passed the publish gate
@@ -517,6 +590,83 @@ impl LogSourceService {
         Ok(())
     }
 
+    /// What the gate must do for `log_source`'s working copy, decided from
+    /// database state alone (NAN-5889: nothing here compiles VRL, so publish
+    /// can run it before its job). `Done` is the outcome; `Run` is the
+    /// samples that must pass (supplied, or the library parser's bundled
+    /// ones). `Err` is the refusal for a generation with no receipt, no
+    /// sample and no acknowledgement.
+    async fn plan_ocsf_gate(
+        &self,
+        log_source: &LogSource,
+        live: Option<(&str, bool, Option<&str>)>,
+        input: &OcsfGateInput,
+    ) -> Result<GatePlan, LogSourceServiceError> {
+        if !is_ocsf_deployment()? || log_source.kind != "log" {
+            return Ok(GatePlan::Done(OcsfGateOutcome::NotRequired));
+        }
+        let version = crate::parsers::ocsf_validation_version();
+        let parser_sha256 = source_parser_sha256(log_source);
+        if let Some((parser_vrl, extension_enabled, extension_vrl)) = live {
+            if ocsf_parser_sha256(version, parser_vrl, extension_enabled, extension_vrl) == parser_sha256 {
+                return Ok(GatePlan::Done(OcsfGateOutcome::NotRequired));
+            }
+        }
+        // A Nano Pipe plan routes/filters/masks events that a parser already
+        // shaped; its output is not a parser's, so the parser gate does not
+        // apply (and the plan is not VRL the sample runner can execute).
+        // NAN-5889 review: decided from the stored text alone. Validating
+        // the plan here compiled its VRL steps on the async thread before
+        // the 202, and a broken plan fell through to "no OCSF receipt". A
+        // broken plan is still a plan: the publish job validates it in the
+        // bounded worker and reports what is wrong with it.
+        if is_stored_pipe_plan(&log_source.parser_vrl) {
+            return Ok(GatePlan::Done(OcsfGateOutcome::NotRequired));
+        }
+        // D1 for rollback: a generation that was published before (a revert)
+        // already went live once; never block going back to it.
+        if live.is_some() {
+            let history = self
+                .version_repository()
+                .get_version_history(log_source.id, 200)
+                .await?;
+            if history.iter().any(|v| {
+                ocsf_parser_sha256(
+                    version,
+                    &v.parser_vrl,
+                    v.extension_enabled,
+                    v.extension_vrl.as_deref(),
+                ) == parser_sha256
+            }) {
+                return Ok(GatePlan::Done(OcsfGateOutcome::NotRequired));
+            }
+        }
+
+        if input.samples.is_empty() {
+            if self
+                .repository()
+                .has_ocsf_validation_attestation(log_source.id, version, &parser_sha256)
+                .await?
+            {
+                return Ok(GatePlan::Done(OcsfGateOutcome::Reused));
+            }
+            let bundled = self.library_parser_samples(log_source).await;
+            if bundled.is_empty() {
+                if input.acknowledge_unattested && live.is_none() {
+                    return Ok(GatePlan::Done(OcsfGateOutcome::Unattested));
+                }
+                return Err(LogSourceServiceError::OcsfValidationFailed(if live.is_none() {
+                    "this parser has no OCSF sample-validation receipt; supply at least one representative raw event, or acknowledge an unattested first publish".to_string()
+                } else {
+                    "this parser change has no OCSF sample-validation receipt; supply at least one representative raw event".to_string()
+                }));
+            }
+            Ok(GatePlan::Run(bundled))
+        } else {
+            Ok(GatePlan::Run(input.samples.clone()))
+        }
+    }
+
     /// The OCSF gate for a generation about to go live.
     ///
     /// `live` is the generation currently live for this source, as
@@ -535,82 +685,38 @@ impl LogSourceService {
         input: &OcsfGateInput,
     ) -> Result<(OcsfGateOutcome, chrono::DateTime<chrono::Utc>), LogSourceServiceError> {
         let unchanged = log_source.updated_at;
-        if !is_ocsf_deployment()? || log_source.kind != "log" {
-            return Ok((OcsfGateOutcome::NotRequired, unchanged));
-        }
+        let samples = match self.plan_ocsf_gate(log_source, live, input).await? {
+            GatePlan::Done(outcome) => return Ok((outcome, unchanged)),
+            GatePlan::Run(samples) => samples,
+        };
+        let samples = samples.as_slice();
         let version = crate::parsers::ocsf_validation_version();
         let parser_sha256 = source_parser_sha256(log_source);
-        if let Some((parser_vrl, extension_enabled, extension_vrl)) = live {
-            if ocsf_parser_sha256(version, parser_vrl, extension_enabled, extension_vrl) == parser_sha256 {
-                return Ok((OcsfGateOutcome::NotRequired, unchanged));
-            }
-        }
-        // A Nano Pipe plan routes/filters/masks events that a parser already
-        // shaped; its output is not a parser's, so the parser gate does not
-        // apply (and the plan is not VRL the sample runner can execute).
-        if matches!(crate::parsers::pipe::stored_plan(&log_source.parser_vrl), Ok(Some(_))) {
-            return Ok((OcsfGateOutcome::NotRequired, unchanged));
-        }
-        // D1 for rollback: a generation that was published before (a revert)
-        // already went live once; never block going back to it.
-        if live.is_some() {
-            let history = self
-                .version_repository()
-                .get_version_history(log_source.id, 200)
-                .await?;
-            if history.iter().any(|v| {
-                ocsf_parser_sha256(
-                    version,
-                    &v.parser_vrl,
-                    v.extension_enabled,
-                    v.extension_vrl.as_deref(),
-                ) == parser_sha256
-            }) {
-                return Ok((OcsfGateOutcome::NotRequired, unchanged));
-            }
-        }
-
-        let bundled;
-        let samples: &[String] = if input.samples.is_empty() {
-            if self
-                .repository()
-                .has_ocsf_validation_attestation(log_source.id, version, &parser_sha256)
-                .await?
-            {
-                return Ok((OcsfGateOutcome::Reused, unchanged));
-            }
-            bundled = self.library_parser_samples(log_source).await;
-            if bundled.is_empty() {
-                if input.acknowledge_unattested && live.is_none() {
-                    return Ok((OcsfGateOutcome::Unattested, unchanged));
-                }
-                return Err(LogSourceServiceError::OcsfValidationFailed(if live.is_none() {
-                    "this parser has no OCSF sample-validation receipt; supply at least one representative raw event, or acknowledge an unattested first publish".to_string()
-                } else {
-                    "this parser change has no OCSF sample-validation receipt; supply at least one representative raw event".to_string()
-                }));
-            }
-            &bundled
-        } else {
-            &input.samples
-        };
 
         check_sample_limits(samples)?;
         // Safety before conformance: a program the VRL safety layer would
-        // quarantine at render never earns an OCSF receipt.
-        crate::parsers::vrl_safety::check_program("parser_vrl", &log_source.parser_vrl)
-            .map_err(LogSourceServiceError::OcsfValidationFailed)?;
-        if let Some(extension) = effective_extension(log_source) {
-            crate::parsers::vrl_safety::check_program("extension_vrl", extension)
-                .map_err(LogSourceServiceError::OcsfValidationFailed)?;
-        }
+        // quarantine at render never earns an OCSF receipt. The check compiles
+        // in this process (memoized with the render's own check), so it runs
+        // off the async workers.
+        let parser_vrl = log_source.parser_vrl.clone();
+        let extension = effective_extension(log_source).map(str::to_owned);
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            crate::parsers::vrl_safety::check_program("parser_vrl", &parser_vrl)?;
+            if let Some(extension) = extension {
+                crate::parsers::vrl_safety::check_program("extension_vrl", &extension)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| LogSourceServiceError::OcsfValidationFailed(format!("VRL safety check stopped: {e}")))?
+        .map_err(LogSourceServiceError::OcsfValidationFailed)?;
         let results = self
             .test_ocsf_samples(&log_source.parser_vrl, effective_extension(log_source), samples)
             .await?;
         for (index, result) in results.iter().enumerate() {
             if !result.success {
                 return Err(LogSourceServiceError::OcsfValidationFailed(format!(
-                    "sample {} ({}) failed: {}",
+                    "sample event {} ({}) did not pass: {}",
                     index + 1,
                     truncate(&samples[index], 80),
                     result.error.as_deref().unwrap_or("unknown validation error")

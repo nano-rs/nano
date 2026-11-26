@@ -126,6 +126,11 @@ async fn async_main() -> Result<()> {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
 
     tracing::info!("Starting NanoSIEM Jobs Service");
+    // NAN-5892: background work that pins a pooled connection takes turns,
+    // so a small pool keeps connections for short queries. Only this
+    // process: nano-api runs the same code in request handlers, which never
+    // wait for a slot.
+    nanosiem_core::db::pinned_session::enable_background_gate();
     // NAN-5250: install the Prometheus recorder before anything can record.
     // The leader election below sets nano_jobs_leader as soon as it wins,
     // and a gauge set before the recorder exists is silently dropped.

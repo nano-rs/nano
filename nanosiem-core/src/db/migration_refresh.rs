@@ -207,7 +207,9 @@ pub async fn process_pending(
                     summary.exhausted += 1;
                     tracing::error!(migration = %version, %view, %reload_target, attempts = next_attempt, error = %detail, "Post-migration refresh activation exhausted automatic retries; manual retry required");
                 } else {
-                    tracing::error!(migration = %version, %view, %reload_target, phase = failed_phase.as_str(), attempts = next_attempt, error = %detail, "Post-migration refresh activation failed; retry scheduled");
+                    // NAN-5886: retried with back-off; only exhausting the
+                    // retries (above) is an error worth reporting.
+                    tracing::warn!(migration = %version, %view, %reload_target, phase = failed_phase.as_str(), attempts = next_attempt, error = %detail, "Post-migration refresh activation failed; retry scheduled");
                 }
             }
         }

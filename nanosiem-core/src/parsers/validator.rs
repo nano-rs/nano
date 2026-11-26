@@ -193,6 +193,30 @@ const MAX_VRL_SIZE: usize = 1024 * 1024;
 /// Maximum allowed nesting depth
 const MAX_NESTING_DEPTH: i32 = 20;
 
+/// NAN-5889 review: a fingerprint of the safety rules every validation
+/// applies (the blocked and suspicious pattern tables and the size and
+/// nesting limits), for the compile-verdict caches' keys: a verdict is
+/// reused only under the rules that produced it.
+pub(crate) fn safety_rules_fingerprint(digest: &mut sha2::Sha256) {
+    use sha2::Digest;
+    for (table, rows) in [
+        ("dangerous", DANGEROUS_PATTERNS),
+        ("dangerous_function", DANGEROUS_FUNCTION_PATTERNS),
+        ("suspicious", SUSPICIOUS_PATTERNS),
+    ] {
+        digest.update(table.as_bytes());
+        digest.update([0u8]);
+        for (pattern, reason) in rows {
+            digest.update(pattern.as_bytes());
+            digest.update([0u8]);
+            digest.update(reason.as_bytes());
+            digest.update([0u8]);
+        }
+    }
+    digest.update((MAX_VRL_SIZE as u64).to_be_bytes());
+    digest.update(MAX_NESTING_DEPTH.to_be_bytes());
+}
+
 /// VRL Validator for syntax checking and security validation
 ///
 /// Uses native VRL compilation for validation - no Docker required.

@@ -26,6 +26,10 @@ use nanosiem_enterprise::integrations::CollectorScheduler;
 use nanosiem_enterprise::melod::ModelCatalogScheduler;
 use std::sync::Arc;
 
+/// NAN-5886: consecutive failed post-migration refresh passes (one a minute)
+/// before a non-transient failure is reported at ERROR.
+const MIGRATION_REFRESH_REPORT_AFTER_PASSES: u64 = 3;
+
 impl AppState {
     /// Start the enterprise tenant-health exporter on the jobs leader.
     ///
@@ -69,24 +73,57 @@ impl AppState {
         let shutdown = self.shutdown_token();
 
         tokio::spawn(async move {
+            // NAN-5886: the pass retries every minute. A ClickHouse outage
+            // warns until it has lasted the report threshold; any other
+            // failure is reported once it failed three passes in a row.
+            let mut failures = nanosiem_core::transient_outage::OutageTracker::default()
+                .with_persistent_after_failures(MIGRATION_REFRESH_REPORT_AFTER_PASSES);
             loop {
-                match nanosiem_core::db::migration_refresh::process_pending(
+                let result = nanosiem_core::db::migration_refresh::process_pending(
                     &admin, &runtime, &database,
                 )
-                .await
-                {
-                    Ok(summary) if summary.attempted > 0 => tracing::info!(
-                        attempted = summary.attempted,
-                        succeeded = summary.succeeded,
-                        failed = summary.failed,
-                        exhausted = summary.exhausted,
-                        "Processed durable post-migration refresh activations"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => tracing::error!(
-                        %error,
-                        "Post-migration refresh activation pass failed; will retry"
-                    ),
+                .await;
+                let now = std::time::Instant::now();
+                match result {
+                    Ok(summary) => {
+                        if let Some(ended) = failures.record_success(now) {
+                            tracing::info!(
+                                failed_passes = ended.failures,
+                                outage_secs = ended.elapsed.as_secs(),
+                                "Post-migration refresh activation pass recovered"
+                            );
+                        }
+                        if summary.attempted > 0 {
+                            tracing::info!(
+                                attempted = summary.attempted,
+                                succeeded = summary.succeeded,
+                                failed = summary.failed,
+                                exhausted = summary.exhausted,
+                                "Processed durable post-migration refresh activations"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let transient = nanosiem_core::transient_outage::is_transient_anyhow(&error);
+                        match failures.record_error(now, transient) {
+                            nanosiem_core::transient_outage::OutageStep::Report { failures, elapsed } => {
+                                tracing::error!(
+                                    %error,
+                                    failed_passes = failures,
+                                    failing_secs = elapsed.as_secs(),
+                                    "Post-migration refresh activation pass still failing after retries; will keep retrying"
+                                )
+                            }
+                            nanosiem_core::transient_outage::OutageStep::Warn { failures, .. } => {
+                                tracing::warn!(
+                                    %error,
+                                    failed_passes = failures,
+                                    transient,
+                                    "Post-migration refresh activation pass failed; will retry"
+                                )
+                            }
+                        }
+                    }
                 }
 
                 tokio::select! {

@@ -206,7 +206,10 @@ fn classify_clickhouse(error: &clickhouse::error::Error) -> SignalFailure {
     // a rejection of generated search SQL at ERROR, which is not what this is
     // and would log event text the signal path deliberately keeps out.
     let class = match crate::search::classify_clickhouse_failure(error) {
+        // NAN-5886: a rejected connection (TLS) is held like an outage, not
+        // dead-lettered; it is reported at once by the processor.
         SearchError::Unavailable(_)
+        | SearchError::ConnectionRejected(_)
         | SearchError::Timeout(_)
         | SearchError::Cancelled
         | SearchError::ResourceLimit(_) => SignalFailureClass::Infrastructure,

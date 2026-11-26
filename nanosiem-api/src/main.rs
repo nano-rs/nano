@@ -47,6 +47,18 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some(nanosiem_api::pipe_tap_relay::RELAY_ARGUMENT) {
         return nanosiem_api::pipe_tap_relay::relay_main();
     }
+    // NAN-5880: the Agent Lane gate sidecar (ClickHouse's network namespace).
+    // No database, no server state; it runs its own runtime.
+    #[cfg(feature = "enterprise")]
+    if std::env::args().nth(1).as_deref() == Some(nanosiem_enterprise::agentlane::gate::GATE_ARGUMENT) {
+        return nanosiem_enterprise::agentlane::gate::gate_main();
+    }
+    // An open-core build has no gate: refuse the argument (non-zero exit)
+    // instead of silently booting the full API inside the ClickHouse pod.
+    #[cfg(not(feature = "enterprise"))]
+    if let Some(error) = enterprise_only_argument(std::env::args().nth(1).as_deref()) {
+        return Err(error);
+    }
     // NAN-4917: query parsing/compilation/evaluation walk the nPL AST
     // recursively on runtime threads. Size worker + blocking stacks for the
     // depth the query complexity budget admits, so a hostile query can never
@@ -56,6 +68,42 @@ fn main() -> Result<()> {
         .thread_stack_size(nanosiem_core::query::complexity::RUNTIME_THREAD_STACK_SIZE)
         .build()?
         .block_on(async_main())
+}
+
+/// The Agent Lane gate sidecar argument (`nanosiem-enterprise`'s
+/// `GATE_ARGUMENT`; a test of the enterprise build checks they agree).
+const AGENTLANE_GATE_ARGUMENT: &str = "--agentlane-gate";
+
+/// NAN-5880 (review P3): an error for a sidecar argument this build cannot
+/// run (the Agent Lane gate is enterprise-only), so the process exits
+/// non-zero with a plain message.
+#[cfg_attr(feature = "enterprise", allow(dead_code))]
+fn enterprise_only_argument(arg: Option<&str>) -> Option<anyhow::Error> {
+    (arg == Some(AGENTLANE_GATE_ARGUMENT)).then(|| {
+        anyhow::anyhow!(
+            "{AGENTLANE_GATE_ARGUMENT}: the Agent Lane gate is part of nano Enterprise and this is an open-core build. \
+             Use the Enterprise image for the ClickHouse gate sidecar, or remove the sidecar."
+        )
+    })
+}
+
+#[cfg(test)]
+mod edition_argument_tests {
+    use super::*;
+
+    #[test]
+    fn the_gate_argument_is_refused_with_a_plain_message() {
+        let e = enterprise_only_argument(Some("--agentlane-gate")).expect("refused");
+        assert!(e.to_string().contains("nano Enterprise"), "{e}");
+        assert!(enterprise_only_argument(None).is_none());
+        assert!(enterprise_only_argument(Some("--other")).is_none());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn the_argument_matches_the_enterprise_gate() {
+        assert_eq!(AGENTLANE_GATE_ARGUMENT, nanosiem_enterprise::agentlane::gate::GATE_ARGUMENT);
+    }
 }
 
 async fn async_main() -> Result<()> {
@@ -379,7 +427,12 @@ async fn async_main() -> Result<()> {
             run_sovereign_license_refresh(refresh_state).await;
         });
         state.add_task_handle(refresh_handle).await;
-        tracing::info!("C05/legacy license refresh started (30s interval)");
+        // NAN-5893: keep the frozen-clock runtime across restarts.
+        let checkpoint_handle = tokio::spawn(
+            nanosiem_api::license_admission::run_runtime_checkpoints(state.clone()),
+        );
+        state.add_task_handle(checkpoint_handle).await;
+        tracing::info!("C05/legacy license refresh started (30s interval, runtime checkpoint 2s)");
     } else {
         tracing::error!("Incomplete online license configuration remains locked until restart");
     }

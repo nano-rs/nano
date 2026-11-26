@@ -1,0 +1,343 @@
+# #10462 (ee6783e170) config/vector/02-hec-source.toml hec_normalize, verbatim (NAN-5902 reference for declared parsers and the no-parser lanes).
+# NAN-5891: which kind of HEC event this is. A source that marks HEC events
+# (nano-rs/vector NAN-5891, image 0.62.0-nano.2+) stamps every one with
+# `%splunk_hec.event_kind`: "object" takes the record path below; "string",
+# "raw" (a `/services/collector/raw` body), "array" and "scalar" take exactly
+# the pre-NAN-5891 path.
+#
+# Defense in depth: on a Vector that marks nothing (an older image), an
+# event's `.message` is the `bytes`-decoded event and nothing says whether it
+# was an object. Compact canonical JSON-object text there is taken as an
+# object event and spread over the root exactly as the legacy source did (the
+# envelope keys win, a string `line` becomes `message`), then the
+# pre-NAN-5891 path runs: the handling of today's release. Other text (a
+# line, pretty-printed JSON) is a string event.
+hec_marker = to_string(%splunk_hec.event_kind) ?? ""
+if hec_marker == "" {
+    log("HEC event without %splunk_hec.event_kind: this Vector is not a nano build of 0.62.0-nano.2 or later, so HEC events take the legacy handling (a record's own timestamp and host are overwritten; compact JSON string events are handled as object events). Run the pinned nano Vector image.", level: "warn", rate_limit_secs: 300)
+}
+if is_object(%splunk_hec) { del(%splunk_hec.event_kind) }
+if is_object(%splunk_hec) && is_empty(object!(%splunk_hec)) { del(%splunk_hec) }
+hec_is_object = false
+hec_body = null
+hec_raw_message = to_string(.message) ?? ""
+if hec_marker == "object" || (hec_marker == "" && match(hec_raw_message, r'^\{"')) {
+    hec_parsed, hec_parse_err = parse_json(hec_raw_message)
+    if hec_parse_err == null && is_object(hec_parsed) {
+        hec_body = object!(hec_parsed)
+        hec_is_object = true
+    }
+}
+if hec_marker == "" && hec_is_object {
+    hec_is_object = false
+    hec_legacy = object(hec_body) ?? {}
+    # Compact canonical JSON only (what the source's re-serialization of an
+    # object event looks like): the same length once re-encoded.
+    if length(encode_json(hec_legacy)) == length(hec_raw_message) {
+        # The legacy namespace: `line` (a string) became `message`, the other
+        # keys went to the root, then every envelope key overwrote its name.
+        hec_spread = {}
+        if exists(hec_legacy.line) {
+            hec_line = hec_legacy.line
+            hec_legacy = remove!(hec_legacy, ["line"])
+            if is_object(hec_line) || is_array(hec_line) {
+                hec_spread.line = hec_line
+            } else {
+                hec_spread.message = hec_line
+            }
+        }
+        hec_spread = merge(hec_spread, hec_legacy)
+        hec_envelope_now = object(remove(., ["message"]) ?? .)
+        . = merge(hec_spread, hec_envelope_now)
+    }
+}
+
+# The role-split edge replaces X-Splunk-Request-Channel with the sender's
+# channel plus an authenticated client-address suffix. This is disabled unless
+# the deployment guarantees that Vector is reachable only through that edge;
+# direct HEC listeners must never trust a sender-created suffix.
+if (get_env_var("NANO_HEC_TRUST_EDGE_IDENTITY") ?? "") == "true" {
+    hec_channel = to_string(.splunk_channel) ?? ""
+    hec_edge, hec_edge_err = parse_regex(hec_channel, r'^(?P<channel>.*);nano-client=(?P<client>[^;]+)$')
+    if hec_edge_err == null {
+        hec_client = to_string(hec_edge.client)
+        if !(is_ipv4(hec_client) || is_ipv6(hec_client)) {
+            log("Refusing a HEC event with an invalid edge client identity", level: "error")
+            abort
+        }
+        %nano_ingest_client_ip = hec_client
+        original_channel = to_string(hec_edge.channel)
+        if original_channel == "" {
+            del(.splunk_channel)
+        } else {
+            .splunk_channel = original_channel
+        }
+    }
+}
+
+# The source already enforced auth (valid_tokens_file, else the static
+# valid_tokens fallback while the tokens file is missing) — mark and move on.
+.auth_status = "authenticated"
+nano_credential_id = to_string(%nano_credential_id) ?? ""
+if nano_credential_id == "" && (get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? "") != "true" {
+    log("Refusing a HEC event without an ingest credential: the tokens file is missing and NANO_INGEST_STATIC_FALLBACK is not enabled", level: "error")
+    abort
+}
+
+# Vector's `splunk_hec` source emits the envelope's sourcetype as
+# `.splunk_sourcetype` (prefixed to avoid collisions with the event's
+# own fields — Vector 0.50+). Earlier versions used `.sourcetype`.
+# Check both so we work across versions. (NAN-924)
+source_type = "unknown"
+if exists(.splunk_sourcetype) {
+    st = to_string(.splunk_sourcetype) ?? ""
+    if st != "" {
+        source_type = downcase(st)
+    }
+}
+if source_type == "unknown" && exists(.sourcetype) {
+    st = to_string(.sourcetype) ?? ""
+    if st != "" {
+        source_type = downcase(st)
+    }
+}
+# NAN-4907 (port of main NAN-3806): the token decides the source. The bound
+# source's route key replaces whatever the envelope declared; a differing claim
+# is kept only as the raw `claimed_source_type`. The route `*` is a multiplex
+# credential (nano-api's own senders, or the install token in legacy multiplex
+# mode) and keeps its declared type; so does an unstamped event (only reached
+# with the explicit static fallback). A listed token without a route is
+# refused.
+del(.claimed_source_type)
+# NAN-4912: the claim is also kept in event METADATA (a sender cannot set it)
+# so it survives a parser that replaces the root; the UDM `_output` and the
+# OCSF `_ocsf_prepare` restore it.
+del(%nano_claimed_source_type)
+if nano_credential_id != "" {
+    bound_source_type = to_string(%nano_credential_name) ?? ""
+    if bound_source_type == "" {
+        log("Refusing a HEC event: its ingest token is not bound to a source", level: "warn")
+        abort
+    }
+    if bound_source_type != "*" {
+        if source_type != "unknown" && source_type != bound_source_type {
+            .claimed_source_type = source_type
+            %nano_claimed_source_type = source_type
+            # NAN-5264: the claim is ignored, so say so. Source health counts
+            # these per source (source_claims_ignored_24h); this is the
+            # operator-side trace. Rate-limited: one sender repeats it per event.
+            log("Ignoring declared source_type " + replace(truncate(source_type, 64), r'[^\w.-]', "_") + " (HEC sourcetype): the ingest token is bound to " + bound_source_type + ". Use that source's token, or a token for the declared source.", level: "warn", rate_limit_secs: 60)
+        }
+        source_type = bound_source_type
+    }
+}
+.source_type = source_type
+
+if hec_is_object {
+    # NAN-5891: an HEC OBJECT event. `hec_body` is the sender's record, whole:
+    # its own `timestamp`, `host`, `event`, `metadata`, `line`, null values and
+    # object `message` are record keys, never envelope keys, and nothing below
+    # deletes or rewrites a key of the record. The envelope is on the root
+    # (rebuilt above) and in `%nano_hec`.
+    hec_rec = object(hec_body) ?? {}
+    hec_wrapped = false
+    # `{"message": {...}}` and nothing else is a wrapper: the object inside is
+    # the record (as before NAN-5891). A record with any other key keeps its
+    # object `message` (Atlassian audit).
+    if length(hec_rec) == 1 && is_object(hec_rec.message) {
+        hec_rec = object!(hec_rec.message)
+        hec_wrapped = true
+    }
+    # The record text as received (the sender's key order kept); re-encoded
+    # only when the wrapper was unwrapped.
+    hec_text = if hec_wrapped { encode_json(hec_rec) } else { hec_raw_message }
+    hec_rec_keys = keys(hec_rec)
+
+    # Every root key that is not the envelope or a pipeline field is an HEC
+    # indexed field (the record is not on the root yet).
+    hec_envelope_keys = ["message", "auth_status", "source_type", "claimed_source_type",
+                         "sourcetype", "splunk_sourcetype", "splunk_source", "splunk_index",
+                         "splunk_channel", "host",
+                         "timestamp", "metadata", "content_format", "routing_timestamp",
+                         "ingest_time", "_inserted_at"]
+    hec_fields = {}
+    for_each(.) -> |key, value| {
+        if !includes(hec_envelope_keys, key) && value != null {
+            hec_fields = set!(hec_fields, [key], value)
+        }
+    }
+
+    # The HEC envelope in event METADATA (a sender cannot set it), for parsers.
+    # `message_was_object`: the record's own `message` is (or wrapped) an object.
+    %nano_hec = {
+        "time": .timestamp,
+        "host": .host,
+        "source": .splunk_source,
+        "sourcetype": .splunk_sourcetype,
+        "index": .splunk_index,
+        "channel": .splunk_channel,
+        "fields": hec_fields,
+        "record": true,
+        "message_was_object": hec_wrapped || is_object(hec_rec.message)
+    }
+
+    # Compatibility (NAN-938 / NAN-3646): the record's keys are also copied
+    # onto the root, as the legacy source spread them, for routing rules and
+    # root-reading parsers. A copy never replaces a root key (the envelope, an
+    # indexed field) and skips the reserved routing names and nulls.
+    reserved = ["source_type", "namespace", "auth_status", "timestamp",
+                "metadata", "ingest_time", "_inserted_at", "id", "ext",
+                "message", "sourcetype", "splunk_sourcetype", "splunk_source",
+                "splunk_index", "splunk_channel",
+                "content_format", "routing_timestamp", "claimed_source_type"]
+    hec_root_keys = keys(.)
+    hec_copy = {}
+    for_each(hec_rec) -> |key, value| {
+        if value != null && !includes(reserved, key) && !includes(hec_root_keys, key) {
+            hec_copy = set!(hec_copy, [key], value)
+        }
+    }
+    # `merge` (not `. = set!(...)`) keeps the root typed as an object for the
+    # downstream transforms (the Vector namespace types the source as any).
+    . = merge(., hec_copy)
+
+    # NAN-5340: what a TEXT parser reads, and what it did not read. Its
+    # `.message` is the record's line: its string `message`, or (a record with
+    # no `message`, the Docker logging driver's shape) its string `line`. The
+    # record's other keys, and the indexed fields, wait in `%nano_hec_event`
+    # for `_ocsf_prepare` / `_output` to file under `unmapped` / `ext`. A
+    # `json` / `json_or_text` parser's generated `_hec_payload` step hands it
+    # the whole record from `%nano_hec_record` (nanosiem-core
+    # parsers/vector_config/hec_payload.rs). A record without a line is the
+    # payload for every parser. An indexed field whose name the record has is
+    # filed under `hec_fields` instead of being dropped.
+    del(%nano_hec_event)
+    del(%nano_hec_record)
+    hec_unfiled = {}
+    hec_collided = {}
+    for_each(hec_fields) -> |key, value| {
+        if includes(hec_rec_keys, key) {
+            hec_collided = set!(hec_collided, [key], value)
+        } else {
+            hec_unfiled = set!(hec_unfiled, [key], value)
+        }
+    }
+    if length(hec_collided) > 0 {
+        hec_unfiled.hec_fields = hec_collided
+    }
+    hec_line_key = ""
+    if is_string(hec_rec.message) {
+        hec_line_key = "message"
+    } else if !includes(hec_rec_keys, "message") && is_string(hec_rec.line) {
+        hec_line_key = "line"
+    }
+    %nano_hec_record = { "text": hec_text, "unfiled": hec_unfiled }
+    if hec_line_key != "" {
+        .message = string!(get!(hec_rec, [hec_line_key]))
+        hec_stash = merge(hec_unfiled, remove!(hec_rec, [hec_line_key]))
+        if length(hec_stash) > 0 {
+            %nano_hec_event = hec_stash
+        }
+    } else {
+        .message = hec_text
+        if length(hec_unfiled) > 0 {
+            %nano_hec_event = hec_unfiled
+        }
+    }
+} else {
+    # A string event or a `/raw` body: exactly the pre-NAN-5891 handling.
+    %nano_hec = { "time": .timestamp, "host": .host, "source": .splunk_source,
+                  "sourcetype": .splunk_sourcetype, "index": .splunk_index,
+                  "channel": .splunk_channel, "record": false, "message_was_object": false }
+    del(%nano_hec_record)
+    # Splunk's .event holds the actual log payload. Lift it into .message
+    # (raw forms) or merge its keys (structured forms) so downstream parsers
+    # see the same shape as HTTP-ingested events.
+    #
+    # Reserved root keys must not be lifted from .event — otherwise a Splunk
+    # forwarder can clobber routing-critical fields (.source_type, .namespace,
+    # .auth_status, etc.) and bypass per-parser HEC filters that fire on
+    # source_type. NAN-938.
+    # NAN-5340: set when `.message` below already carries the whole event as JSON.
+    hec_message_is_payload = false
+    if exists(.event) {
+        if is_object(.event) {
+            reserved = ["source_type", "namespace", "auth_status", "timestamp",
+                        "metadata", "ingest_time", "_inserted_at", "id", "ext",
+                        "message", "sourcetype", "splunk_sourcetype",
+                        "content_format", "routing_timestamp", "claimed_source_type"]
+            event_keys = keys(object!(.event))
+            hec_lifted = {}
+            for_each(event_keys) -> |_idx, key| {
+                if !includes(reserved, key) {
+                    val, get_err = get(.event, [key])
+                    if get_err == null && val != null {
+                        hec_lifted = set!(hec_lifted, [key], val)
+                    }
+                }
+            }
+            . = merge(., hec_lifted)
+            if exists(.event.message) && is_string(.event.message) {
+                .message = to_string!(.event.message)
+            } else {
+                .message = encode_json(.event)
+                hec_message_is_payload = true
+            }
+        } else if is_string(.event) {
+            .message = to_string!(.event)
+        } else {
+            .message = encode_json(.event)
+            hec_message_is_payload = true
+        }
+        del(.event)
+    }
+
+    # NAN-3646 (ported): a sender that posts a structured (object) event can reach
+    # this point with no `.message`: Vector's splunk_hec source spreads an object
+    # event over the log root instead of keeping `.event`. Every parser reads
+    # `.message`, so rebuild the payload from the root minus the HEC envelope and
+    # pipeline fields. VRL objects are key-sorted, so the JSON is deterministic. A
+    # non-string `.message` (an object or number) is serialized the same way.
+    hec_envelope_keys = ["message", "auth_status", "source_type", "claimed_source_type",
+                         "sourcetype", "splunk_sourcetype", "splunk_source", "splunk_index",
+                         "splunk_channel", "host",
+                         "timestamp", "metadata", "content_format", "routing_timestamp",
+                         "ingest_time", "_inserted_at"]
+    hec_payload = {}
+    for_each(object!(.)) -> |key, value| {
+        if !includes(hec_envelope_keys, key) && value != null {
+            hec_payload = set!(hec_payload, [key], value)
+        }
+    }
+    # NAN-5340: an object event WITH a `message` keeps `.message` (a text parser
+    # reads its log line there) and its other keys sit beside it on the root,
+    # where a root-replacing parser loses them. Keep the whole object in event
+    # METADATA (a sender cannot set it): a JSON-input parser's generated
+    # `_hec_payload` step hands it the object as its payload (as HTTP /ingest
+    # does); for a text parser, `_ocsf_prepare` / `_output` merge the other keys
+    # into `unmapped` / `ext` without replacing what the parser set.
+    del(%nano_hec_event)
+    if !exists(.message) || .message == null || .message == "" {
+        if length(hec_payload) > 0 {
+            .message = encode_json(hec_payload)
+        } else {
+            .message = ""
+        }
+    } else {
+        if length(hec_payload) > 0 && !hec_message_is_payload {
+            hec_payload.message = .message
+            %nano_hec_event = hec_payload
+        }
+        if !is_string(.message) {
+            .message = encode_json(.message)
+        }
+    }
+}
+
+.content_format = "splunk_hec"
+.routing_timestamp = now()
+
+if !is_object(.metadata) {
+    .metadata = {}
+}
+.metadata.forwarded_via = "splunk_hec"

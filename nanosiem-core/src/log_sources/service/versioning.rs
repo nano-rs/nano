@@ -47,7 +47,16 @@ impl LogSourceService {
                 success: false,
                 log_source_id: id,
                 action: "publish".to_string(),
-                message: format!("VRL validation failed: {}", validation.errors.join("; ")),
+                // NAN-5889 review: a broken Nano Pipe plan says so plainly
+                // (the OCSF gate leaves plans to this check).
+                message: if super::ocsf_attestation::is_stored_pipe_plan(&ls.parser_vrl) {
+                    format!(
+                        "The processing plan is not valid, so nothing was published: {}",
+                        validation.errors.join("; ")
+                    )
+                } else {
+                    format!("VRL validation failed: {}", validation.errors.join("; "))
+                },
                 validation_result: Some(validation),
                 deployment_id: None,
                 delivery: None,

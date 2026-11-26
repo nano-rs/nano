@@ -42,9 +42,13 @@ def _services(path: Path) -> dict[str, Any]:
 
 def _docker_app_up() -> list[str]:
     """Services the runner starts with the docker app (after the migrator)."""
-    m = re.search(r"dc up -d (vector [^>]*nano-api) >>", RUNNER.read_text())
-    assert m, "the docker-app `dc up -d vector ... nano-api` line moved; update this test"
-    return m.group(1).split()
+    text = RUNNER.read_text()
+    m = re.search(r"local app=\((vector [^)]*nano-api)\)", text)
+    assert m, "the docker-app `local app=(vector ... nano-api)` list moved; update this test"
+    # NAN-5880: enterprise runs add the Agent Lane gate to the same `dc up`.
+    extra = re.findall(r"app\+=\(([a-z-]+)\)", text)
+    assert 'dc up -d "${app[@]}"' in text, "the docker-app services are no longer started from `app`"
+    return m.group(1).split() + extra
 
 
 def test_base_api_points_at_the_vector_tap_relay() -> None:

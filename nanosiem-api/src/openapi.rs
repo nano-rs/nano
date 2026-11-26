@@ -228,6 +228,8 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         sub_docs.push(handlers::notebooks::NotebooksApiDoc::openapi());
         sub_docs.push(handlers::playbooks::PlaybooksApiDoc::openapi());
         sub_docs.push(handlers::hunts::HuntsApiDoc::openapi());
+        // NAN-5859 Actors: 27 path templates under /api/hunts.
+        sub_docs.push(handlers::hunts::ActorsApiDoc::openapi());
         sub_docs.push(handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi());
         sub_docs.push(handlers::melod::MelodApiDoc::openapi());
         sub_docs.push(handlers::risk::RiskApiDoc::openapi());
@@ -958,8 +960,21 @@ mod tests {
         // /api/cases/{id}/tags/{tag}): 760.
         // NAN-5678 adds /api/log-sources/bulk-delete: 761 / 426.
         // NAN-5850 adds the ENTERPRISE /api/hunts/technique-coverage: 763.
+        // NAN-5859 adds 27 ENTERPRISE Actors templates (timeline, undo,
+        // attributions and decisions, indicators and decisions and IOC list,
+        // notes and confirm / revoke, pin, reopen, unarchive, merge, split,
+        // campaign-merges and apply / reject / undo, cases, case-actors,
+        // campaign-review, campaign-lookup, actor-names preview): 790.
+        // NAN-5810 review P1-1 adds /api/internal/vector-config/install-lease/v3
+        // (POST + DELETE, one template) to both editions: 791 / 428.
+        // NAN-5880 adds 8 ENTERPRISE Agent Lane templates: 6 Settings
+        // (/api/settings/agentlane/network, …/certificate,
+        // …/certificate/download, …/check-address, …/connection-test,
+        // …/connection-test/{test_id}) and the gates' 2 internal ones
+        // (/api/internal/agentlane/gate-config, …/gate-status): 799.
+        // NAN-5903 adds /api/connector-feeds/plan to both editions: 800 / 429.
         #[cfg(feature = "enterprise")]
-        let min_paths = 763;
+        let min_paths = 800;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
@@ -975,7 +990,9 @@ mod tests {
         // NAN-5575's two sql-to-npl search paths: 425.
         // NAN-5678's log-source bulk delete: 426.
         // NAN-5724's /api/system/deployment: 427.
-        let min_paths = 427;
+        // NAN-5810 review P1-1's install-lease/v3 template: 428.
+        // NAN-5903's /api/connector-feeds/plan: 429.
+        let min_paths = 429;
 
         assert!(
             path_count >= min_paths,

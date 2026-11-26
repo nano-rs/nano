@@ -214,6 +214,15 @@ pub const TARGETS: &[Target] = &[
         "secret_encrypted",
         "webhook signing secret",
     ),
+    // NAN-5880 (enterprise): the Agent Lane gate's uploaded or nano-made
+    // TLS private key. Absent in open builds (skipped at run time).
+    json(
+        "agentlane_network.key_enc",
+        "agentlane_network",
+        "id",
+        "key_enc",
+        "Agent Lane certificate private key",
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]

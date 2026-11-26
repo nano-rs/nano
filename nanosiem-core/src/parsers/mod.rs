@@ -70,6 +70,11 @@ pub(crate) use vector_config::test_hooks as vector_config_test_hooks;
 pub(crate) use vector_config::config_lock::DeployGuard as VectorDeployGuard;
 pub(crate) use vector_config::tree_write as vector_tree_write;
 pub use vector_config::hec_route as vector_hec_route;
+pub use vector_config::remote_delivery::install_lease::custom_vector_allowed as vector_config_custom_vector_allowed;
+pub use vector_config::{
+    input_contract as parser_input_contract, InputContract as ParserInputContract,
+    InputContractVerdict as ParserInputContractVerdict,
+};
 pub use vrl_functions::vrl_function_catalog;
 
 #[cfg(test)]

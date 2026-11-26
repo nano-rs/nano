@@ -82,8 +82,17 @@ where
 ///
 /// Unix services handle both SIGINT (interactive shutdown) and SIGTERM
 /// (Kubernetes/container shutdown). Other platforms use Tokio's Ctrl-C handler.
-#[cfg(unix)]
+///
+/// NAN-5886: once a signal arrives, error tracking stops sending events
+/// (see [`crate::error_tracking::mark_shutting_down`]).
 pub async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
+    let signal = wait_for_platform_signal().await?;
+    crate::error_tracking::mark_shutting_down();
+    Ok(signal)
+}
+
+#[cfg(unix)]
+async fn wait_for_platform_signal() -> io::Result<ShutdownSignal> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -110,7 +119,7 @@ pub async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
 
 /// Wait for an interactive shutdown request on non-Unix platforms.
 #[cfg(not(unix))]
-pub async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
+async fn wait_for_platform_signal() -> io::Result<ShutdownSignal> {
     tokio::signal::ctrl_c().await?;
     Ok(ShutdownSignal::Interrupt)
 }

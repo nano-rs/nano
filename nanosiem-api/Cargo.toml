@@ -64,6 +64,8 @@ utoipa-swagger-ui.workspace = true
 default = []
 [dev-dependencies]
 proptest.workspace = true
+# NAN-5868: paused virtual time for the license-outage supervisor tests.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.25"
 
 [lints.rust]

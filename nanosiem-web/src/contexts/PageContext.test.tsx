@@ -96,7 +96,11 @@ describe('PageContext Here card overrides', () => {
     ['/hunts/h1', 'hunt'],
     ['/hunts/leads', 'hunt-leads'],
     ['/hunts/leads/l1', 'hunt-lead'],
-    ['/hunts/campaigns/candidates', 'hunt-campaigns'],
+    ['/hunts/actors', 'hunt-actors'],
+    ['/hunts/actors/review', 'hunt-actor-review'],
+    // NAN-5859: the old campaign routes redirect to Actors.
+    ['/hunts/campaigns', 'hunt-actors'],
+    ['/hunts/campaigns/candidates', 'hunt-actor-review'],
     // NAN-5850: the moved hunt pages and their legacy redirect routes.
     ['/hunts/leads/decisions', 'hunt-decisions'],
     ['/hunts/rulings', 'hunt-decisions'],
@@ -108,7 +112,8 @@ describe('PageContext Here card overrides', () => {
     ['/settings/hunts', 'settings-hunts'],
     ['/settings/hunts/charter', 'settings-hunts'],
     ['/hunts/runners', 'settings-hunts'],
-    ['/hunts/campaigns/c1', 'hunt-campaign'],
+    ['/hunts/actors/hcmp_1', 'hunt-actor'],
+    ['/hunts/campaigns/c1', 'hunt-actor'],
     ['/inbox', 'inbox'],
     ['/cases/search', 'case-search'],
     ['/cases/c1', 'case'],
@@ -149,7 +154,7 @@ describe('PageContext Here card overrides', () => {
     const literal = new Set<string>();
     for (const m of app.matchAll(/path(?:=|:\s*)["'](\/[^"'*:]*)["']/g)) literal.add(m[1]);
     // Keys that only a `:param` route produces.
-    const detailKeys = new Set(['alert', 'matches', 'tuning-proposal', 'hunt', 'hunt-lead', 'hunt-campaign', 'case', 'automation-flow', 'dashboard', 'notebook', 'source-config', 'log-source', 'pipeline']);
+    const detailKeys = new Set(['alert', 'matches', 'tuning-proposal', 'hunt', 'hunt-lead', 'hunt-actor', 'case', 'automation-flow', 'dashboard', 'notebook', 'source-config', 'log-source', 'pipeline']);
     const misread = [...literal].filter((p) => detailKeys.has(pageKeyFor(p)));
     expect(misread).toEqual([]);
   });

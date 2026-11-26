@@ -179,3 +179,65 @@ def deploy(page: UiPage) -> None:
     page.wait_for(confirm, gone=True, timeout_ms=60_000)
     page.wait_text("Deployed", timeout_ms=60_000)
     page.wait_text("Pending", gone=True, timeout_ms=60_000)
+
+
+# ---------------------------------------------------------------- pull feed form (NAN-5903)
+# The New pull feed form labels fields in plain English ("Admin email to act
+# as") with the config key on the input (`data-config-key`), and a list field
+# with known values (Google Workspace STREAMS, Netskope STREAMS) is a
+# checkbox group (`choices-<KEY>`, one `data-choice` per value).
+
+
+def feed_config_field(key: str, value: str, within: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A text config field by its config key."""
+    return field({"css": f"[data-config-key='{key}']", **({"within": within} if within else {})}, value)
+
+
+def feed_credential_field(key: str, value: str, within: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A credential field by its key (typed as a secret)."""
+    return field({"css": f"[data-credential-key='{key}']", **({"within": within} if within else {})}, value, secret=True)
+
+
+def is_choice_field(page: UiPage, key: str, within: dict[str, Any] | None = None) -> bool:
+    return page.count({"testid": f"choices-{key}", **({"within": within} if within else {})}) > 0
+
+
+def set_feed_choices(page: UiPage, key: str, values: str, within: dict[str, Any] | None = None) -> None:
+    """Tick exactly `values` (comma-separated) in the `key` checkbox group."""
+    wanted = {v.strip() for v in values.split(",") if v.strip()}
+    scope = {"within": within} if within else {}
+    group = f"[data-testid='choices-{key}']"
+    offered = [v for v in page.attrs({"css": f"{group} [data-choice]", **scope}, "data-choice") if v]
+    unknown = wanted - set(offered)
+    assert not unknown, f"{key} offers no {sorted(unknown)} (offered: {offered})"
+    for value in offered:
+        box = {"css": f"{group} [data-choice='{value}']", **scope}
+        on = page.attr(box, "aria-checked") == "true"
+        if on != (value in wanted):
+            page.click(box)
+
+
+def submit_feed_form(page: UiPage, dlg: dict[str, Any], *, expect_setup: bool | None = None) -> bool:
+    """Click Create feed. When the feed needs log sources, nano asks first
+    ("This will also create N log sources"): confirm it. Returns whether the
+    setup confirm was shown. `expect_setup` asserts it either way."""
+    import time
+
+    page.click({"role": "button", "name": "Create feed", "within": dlg})
+    confirm = {"testid": "feed-setup-confirm"}
+    deadline = time.monotonic() + 30
+    shown = False
+    while time.monotonic() < deadline:
+        if page.count(confirm):
+            shown = True
+            break
+        if not page.count({"testid": "new-pull-feed-sheet"}):
+            break
+        time.sleep(0.5)
+    if expect_setup is not None:
+        assert shown == expect_setup, f"setup confirm shown={shown}, expected {expect_setup}"
+    if shown:
+        page.click({"role": "button", "name": "Set up and continue", "within": {"role": "alertdialog"}})
+    # Setting up deploys a log source (OCSF sample check, Vector reload).
+    page.wait_for({"testid": "new-pull-feed-sheet"}, gone=True, timeout_ms=240_000 if shown else 30_000)
+    return shown

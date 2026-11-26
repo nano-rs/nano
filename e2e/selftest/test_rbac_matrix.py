@@ -51,6 +51,24 @@ def test_every_rail_is_parsed_with_its_gates() -> None:
     assert "settings:system" in rm.all_gate_permissions()
 
 
+def test_enterprise_only_settings_entries_follow_the_build() -> None:
+    # Agent Lane is hidden in open builds by `enterpriseOnly`, not by a
+    # capability, and an open build does not define `agentlane:manage`.
+    lane = {s.href: s for s in rm.settings_items()}["/settings/agentlane"]
+    assert lane.enterprise_only and lane.capability is None
+    assert lane.permissions == ("agentlane:manage",)
+    assert not lane.in_edition("open") and lane.in_edition("enterprise") and lane.in_edition(None)
+    assert not rm.nav_visible(lane, {"*"}, {}, "open")
+    assert rm.nav_visible(lane, {"agentlane:manage"}, {}, "enterprise")
+    assert not rm.nav_visible(lane, {"search:view"}, {}, "enterprise")
+    open_caps = {"agentLane": False}
+    assert "agentlane:manage" not in rm.all_gate_permissions(open_caps, edition="open")
+    assert "agentlane:manage" in rm.all_gate_permissions(None, edition="enterprise")
+    assert "agentlane:manage" in rm.all_gate_permissions()
+    # Plain entries are never marked.
+    assert not {s.href: s for s in rm.settings_items()}["/settings/audit"].enterprise_only
+
+
 def test_rbac_baseline_is_hand_maintained_and_complete() -> None:
     import json
     from pathlib import Path

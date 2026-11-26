@@ -9,9 +9,11 @@
 //! Prometheus exporter, so a faster scrape writes and ships nothing.
 
 const METRICS: &str = include_str!("../../../../../config/vector/92-metrics.toml");
+// NAN-5899: 92-metrics.toml's ClickHouse sink is YAML (both Vector 0.61 and 0.62 load it).
+const METRICS_SINKS: &str = include_str!("../../../../../config/vector/92-metrics-sinks.yaml");
 
 /// The file as Vector reads it: `${NAME:-default}` interpolated to its default
-/// (unquoted interpolations are not TOML until then).
+/// (NAN-5810: placeholders are quoted, so a substituted number is a string).
 fn metrics_config() -> toml::Table {
     regex::Regex::new(r"\$\{[A-Z0-9_]+:-([^}]*)\}")
         .unwrap()
@@ -52,9 +54,11 @@ fn reload_ack_timeout_stays_far_above_the_scrape_interval() {
 #[test]
 fn internal_metrics_feeds_only_the_in_memory_prometheus_exporter() {
     let config = metrics_config();
+    let yaml: toml::Value = serde_yaml::from_str(&crate::vector_env::substitute_like_vector(METRICS_SINKS))
+        .expect("92-metrics-sinks.yaml parses");
     let mut consumers = Vec::new();
-    for kind in ["transforms", "sinks"] {
-        let Some(table) = config.get(kind).and_then(|v| v.as_table()) else {
+    for table in [config.get("transforms"), config.get("sinks"), yaml.get("sinks")] {
+        let Some(table) = table.and_then(|v| v.as_table()) else {
             continue;
         };
         for (name, component) in table {

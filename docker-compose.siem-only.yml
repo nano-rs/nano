@@ -52,11 +52,9 @@ x-logging-verbose: &verbose-logging
 
 # Agent Lane (enterprise; the open edition ignores it), read by nano-api AND
 # nano-jobs (the leader's Agent Lane reconciler keeps each token's ClickHouse
-# user), so one definition for both (NAN-5402). The listener state follows
-# .env (unset = off). Off is deliberate: the reconciler drops every token user.
-# The generated docker-compose.agentlane.yml sets it on and adds the URL and
-# allow-list; a listener that is on without them (an overlay from before this
-# fix) keeps existing users and raises a SIEM Health finding instead.
+# user), so one definition for both (NAN-5402). NAN-5880: Agent Lane is
+# managed in Settings > Agent Lane; these .env values are import-only. This
+# open-edition file never runs the Agent Lane gate.
 x-agentlane-base-env: &agentlane-base-env
   NANO_AGENTLANE_LISTENER: ${NANO_AGENTLANE_LISTENER:-off}
   NANO_AGENTLANE_NODE_URLS: ${NANO_AGENTLANE_NODE_URLS:-}
@@ -402,6 +400,10 @@ services:
       # NAN-5635: the search memory guard's budget (see nano-search); the api
       # and jobs run searches too (dashboards, reports, AI, SOAR).
       SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
+      # NAN-5860: planned GB/day from the resource sizer (install.sh records it
+      # in .env). Hunt budget defaults scale with its tier; empty keeps the
+      # static defaults.
+      NANO_SIZING_PLANNED_GB_PER_DAY: ${NANO_SIZING_PLANNED_GB_PER_DAY:-${NANO_PLANNED_GB_PER_DAY:-}}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config staging. With no Vector to consume them, the parser-editor
       # surface still writes here harmlessly (a no-op in BYO-aggregator mode —
@@ -510,6 +512,10 @@ services:
       # NAN-5635: the search memory guard's budget (see nano-search); the api
       # and jobs run searches too (dashboards, reports, AI, SOAR).
       SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
+      # NAN-5860: planned GB/day from the resource sizer (install.sh records it
+      # in .env). Hunt budget defaults scale with its tier; empty keeps the
+      # static defaults.
+      NANO_SIZING_PLANNED_GB_PER_DAY: ${NANO_SIZING_PLANNED_GB_PER_DAY:-${NANO_PLANNED_GB_PER_DAY:-}}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       # NAN-1913: see nano-api note above.

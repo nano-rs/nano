@@ -17,7 +17,6 @@ import {
   CommandItem,
   CommandList,
   CommandSeparator,
-  CommandShortcut,
 } from '@/components/ui/command';
 import {
   AlertTriangle,
@@ -34,14 +33,18 @@ import {
   Zap,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
+import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
 
 interface CommandItem {
   id: string;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
-  shortcut?: string;
   action: () => void;
-  permission?: string;
+  /** Every permission listed is required (a create command also needs the
+      view permission of the page it lands on). */
+  permission?: string | string[];
+  /** Build capability the target page needs (open-core builds drop it). */
+  capability?: keyof Capabilities;
   group: 'navigation' | 'actions' | 'settings';
 }
 
@@ -49,6 +52,7 @@ export function CommandPalette() {
   const [open, setOpen] = useState(false);
   const navigate = useNavigate();
   const { hasPermission } = useAuth();
+  const { capabilities } = useCapabilities();
 
   // Toggle command palette with Cmd+K / Ctrl+K
   useEffect(() => {
@@ -82,16 +86,15 @@ export function CommandPalette() {
       id: 'cases',
       label: 'Go to Cases',
       icon: Briefcase,
-      shortcut: 'G C',
-      action: () => navigate('/cases'),
+      action: () => navigate('/inbox'),
       permission: 'cases:view',
+      capability: 'cases',
       group: 'navigation',
     },
     {
       id: 'search',
       label: 'Go to Search',
       icon: Search,
-      shortcut: 'G S',
       action: () => navigate('/search'),
       permission: 'search:view',
       group: 'navigation',
@@ -100,7 +103,6 @@ export function CommandPalette() {
       id: 'detections',
       label: 'Go to Rules',
       icon: Shield,
-      shortcut: 'G D',
       action: () => navigate('/rules'),
       permission: 'detections:view',
       group: 'navigation',
@@ -109,7 +111,6 @@ export function CommandPalette() {
       id: 'alerts',
       label: 'Go to Alerts',
       icon: AlertTriangle,
-      shortcut: 'G A',
       action: () => navigate('/alerts'),
       permission: 'alerts:view',
       group: 'navigation',
@@ -120,6 +121,7 @@ export function CommandPalette() {
       icon: Zap,
       action: () => navigate('/risk'),
       permission: 'risk:view',
+      capability: 'risk',
       group: 'navigation',
     },
     {
@@ -136,6 +138,7 @@ export function CommandPalette() {
       icon: FileText,
       action: () => navigate('/notebooks'),
       permission: 'notebooks:view',
+      capability: 'notebooks',
       group: 'navigation',
     },
     {
@@ -152,12 +155,11 @@ export function CommandPalette() {
       id: 'new-case',
       label: 'Create New Case',
       icon: Plus,
-      shortcut: 'C',
-      action: () => {
-        // Navigate to cases and trigger new case dialog
-        navigate('/cases', { state: { openNewCase: true } });
-      },
-      permission: 'cases:create',
+      // The Signal Inbox opens its New investigation flyout on this state
+      // (/cases is a redirect that drops navigation state, NAN-5864).
+      action: () => navigate('/inbox', { state: { openNewCase: true } }),
+      permission: ['cases:view', 'cases:create'],
+      capability: 'cases',
       group: 'actions',
     },
     {
@@ -173,7 +175,8 @@ export function CommandPalette() {
       label: 'Create New Notebook',
       icon: Plus,
       action: () => navigate('/notebooks', { state: { openNewNotebook: true } }),
-      permission: 'notebooks:create',
+      permission: ['notebooks:view', 'notebooks:create'],
+      capability: 'notebooks',
       group: 'actions',
     },
 
@@ -184,6 +187,7 @@ export function CommandPalette() {
       icon: Settings,
       action: () => navigate('/settings/cases'),
       permission: 'settings:system',
+      capability: 'cases',
       group: 'settings',
     },
     {
@@ -204,9 +208,11 @@ export function CommandPalette() {
     },
   ];
 
-  // Filter commands based on permissions
+  // Filter commands on permissions and on the build: an open-core build never
+  // offers a command whose page it does not ship (NAN-5864).
   const filteredCommands = commands.filter(
-    (cmd) => !cmd.permission || hasPermission(cmd.permission)
+    (cmd) => [cmd.permission ?? []].flat().every((p) => hasPermission(p))
+      && (!cmd.capability || Boolean(capabilities[cmd.capability]))
   );
 
   const navigationCommands = filteredCommands.filter((cmd) => cmd.group === 'navigation');
@@ -225,7 +231,6 @@ export function CommandPalette() {
               <CommandItem key={cmd.id} onSelect={() => runCommand(cmd.action)}>
                 <cmd.icon className="mr-2 h-4 w-4" />
                 <span>{cmd.label}</span>
-                {cmd.shortcut && <CommandShortcut>{cmd.shortcut}</CommandShortcut>}
               </CommandItem>
             ))}
           </CommandGroup>
@@ -239,8 +244,7 @@ export function CommandPalette() {
                 <CommandItem key={cmd.id} onSelect={() => runCommand(cmd.action)}>
                   <cmd.icon className="mr-2 h-4 w-4" />
                   <span>{cmd.label}</span>
-                  {cmd.shortcut && <CommandShortcut>{cmd.shortcut}</CommandShortcut>}
-                </CommandItem>
+                  </CommandItem>
               ))}
             </CommandGroup>
           </>
@@ -254,8 +258,7 @@ export function CommandPalette() {
                 <CommandItem key={cmd.id} onSelect={() => runCommand(cmd.action)}>
                   <cmd.icon className="mr-2 h-4 w-4" />
                   <span>{cmd.label}</span>
-                  {cmd.shortcut && <CommandShortcut>{cmd.shortcut}</CommandShortcut>}
-                </CommandItem>
+                  </CommandItem>
               ))}
             </CommandGroup>
           </>

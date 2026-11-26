@@ -78,12 +78,12 @@ fn parser(name: &str, source_type: &str, enabled: bool, vrl: &str) -> Parser {
     }
 }
 
-/// Every static top-level `config/vector/*.toml` the product ships.
+/// Every static top-level `config/vector/*.toml` and `*.yaml` (NAN-5899) the product ships.
 fn copy_static(dest: &Path) {
     std::fs::create_dir_all(dest).unwrap();
     for entry in std::fs::read_dir(repo().join("config/vector")).unwrap().flatten() {
         let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|e| e == "toml") {
+        if path.is_file() && path.extension().is_some_and(|e| e == "toml" || e == "yaml") {
             std::fs::copy(&path, dest.join(entry.file_name())).unwrap();
         }
     }

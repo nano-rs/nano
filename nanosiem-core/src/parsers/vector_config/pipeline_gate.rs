@@ -93,8 +93,10 @@ pub(super) async fn clear_identity(config_dir: &Path) {
 /// `buffer.<key> = ...` dotted keys and `buffer = { ... }` inline tables inside
 /// `[sinks.<id>]`. A sink with none maps to "" (Vector's default memory
 /// buffer), so a disk buffer that goes away is still a change. Text-based on
-/// purpose: nano's interpolating files hold unquoted `${VAR:-n}` values that
-/// are not TOML.
+/// purpose: a tree an older release rendered holds unquoted `${VAR:-n}` values
+/// that are not TOML (NAN-5810: the current render quotes them, so a bare and
+/// a quoted `max_size` compare as different settings and the change restarts
+/// Vector, the safe direction).
 pub(super) fn buffer_sections(content: &str) -> BTreeMap<String, String> {
     fn norm(line: &str) -> String {
         line.split_whitespace().collect::<Vec<_>>().join(" ")

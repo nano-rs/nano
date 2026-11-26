@@ -310,6 +310,9 @@ pub(crate) fn detection_error_from_search(e: crate::search::SearchError) -> Dete
         ref timeout @ SearchError::Timeout(ms) if ms > 0 => {
             DetectionError::WindowTooLarge(timeout.to_string())
         }
+        ref rejected @ SearchError::ConnectionRejected(_) => {
+            DetectionError::BackendRejected(rejected.to_string())
+        }
         ref unavailable @ (SearchError::Unavailable(_)
         | SearchError::Timeout(_)
         | SearchError::Cancelled

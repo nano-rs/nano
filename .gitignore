@@ -97,6 +97,9 @@ config/vector/dynamic/ingest-tokens/
 # NAN-5361: Agent Lane listener render (single host, enterprise installer)
 /docker-compose.agentlane.yml
 /.nano-agentlane/
+# NAN-5880: the enterprise gate overlays install.sh copies into the install dir
+/docker-compose.agentlane-gate.yml
+/docker-compose.agentlane-imported-tls.yml
 
 # NAN-5515: Vector-native mutual-TLS PKI (CA key) and listener files.
 /.nano-pki/

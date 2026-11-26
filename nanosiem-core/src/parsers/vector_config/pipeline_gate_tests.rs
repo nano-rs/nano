@@ -37,7 +37,7 @@ fn buffer_sections_read_nanos_interpolating_files() {
         sections["clickhouse_logs"],
         "max_size = 2147483648\ntype = \"disk\"\nwhen_full = \"drop_newest\""
     );
-    // The committed pipeline (unquoted ${VAR:-n} values, not TOML).
+    // The committed pipeline (quoted "${VAR:-n}" values, NAN-5810).
     let committed = buffer_sections(&VectorConfigManager::full_pipeline_config_content());
     assert!(committed["clickhouse_logs"].contains("type = \"disk\""), "{committed:?}");
     assert!(committed["clickhouse_logs"].contains("when_full = \"block\""), "{committed:?}");

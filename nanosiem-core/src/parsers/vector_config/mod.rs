@@ -16,6 +16,76 @@
 //! - [`staging`] - Staging directory for validation before deployment
 //! - [`validation`] - Vector validate integration via Docker
 
+/// NAN-5902: the NAN-5891 (v2.0.36 #10462) view of an HEC object record,
+/// rebuilt from its ONE copy in `%nano_hec_record` (review P1-1): the root
+/// `hec_normalize` gave such an event in #10462 (the envelope, the indexed
+/// fields and the routing fields as they are now, plus a copy of each record
+/// key the root lacks, never a reserved name or a null), `.message` = the
+/// record's line (its string `message`, else, with no `message`, its string
+/// `line`) or the whole record text, and the record's other keys plus the
+/// indexed fields it does not hold in `%nano_hec_event`. Spliced into the
+/// `_hec_payload` step of a parser that declares a contract and at the head of
+/// the no-parser lanes (`generic_parser`); every other parser keeps the
+/// v2.0.35 root `hec_normalize` built. Leaves `%nano_hec_record` in place. A
+/// no-op for anything but a marked HEC object event. A macro so it can be
+/// `concat!`-ed into the static config literals.
+macro_rules! hec_record_view_vrl {
+    () => {
+        r#"# NAN-5902: the NAN-5891 view of an HEC object record (hec_record_view_vrl!
+# in nanosiem-core parsers/vector_config/mod.rs).
+nano_hecv_record = %nano_hec_record
+if is_object(nano_hecv_record) && is_string(nano_hecv_record.text) {
+    nano_hecv_text = string!(nano_hecv_record.text)
+    nano_hecv_rec = object(parse_json(nano_hecv_text) ?? {}) ?? {}
+    nano_hecv_rec_keys = keys(nano_hecv_rec)
+    nano_hecv_env = object(%nano_hec) ?? {}
+    nano_hecv_root = object(nano_hecv_env.fields) ?? {}
+    nano_hecv_live = .
+    for_each(["source_type", "auth_status", "claimed_source_type", "splunk_channel", "content_format", "routing_timestamp"]) -> |_nano_i, nano_k| {
+        nano_v = get(nano_hecv_live, [nano_k]) ?? null
+        if nano_v != null { nano_hecv_root = set!(nano_hecv_root, [nano_k], nano_v) }
+    }
+    # The envelope as sent (never the record's): `%nano_hec` (hec_normalize).
+    if nano_hecv_env.time != null { nano_hecv_root.timestamp = nano_hecv_env.time }
+    if nano_hecv_env.host != null { nano_hecv_root.host = nano_hecv_env.host }
+    if nano_hecv_env.source != null { nano_hecv_root.splunk_source = nano_hecv_env.source }
+    if nano_hecv_env.sourcetype != null { nano_hecv_root.splunk_sourcetype = nano_hecv_env.sourcetype }
+    if nano_hecv_env.index != null { nano_hecv_root.splunk_index = nano_hecv_env.index }
+    nano_hecv_root.metadata = { "forwarded_via": "splunk_hec" }
+    nano_hecv_root_keys = keys(nano_hecv_root)
+    nano_hecv_reserved = ["source_type", "namespace", "auth_status", "timestamp",
+                          "metadata", "ingest_time", "_inserted_at", "id", "ext",
+                          "message", "sourcetype", "splunk_sourcetype", "splunk_source",
+                          "splunk_index", "splunk_channel",
+                          "content_format", "routing_timestamp", "claimed_source_type"]
+    nano_hecv_copy = {}
+    for_each(nano_hecv_rec) -> |nano_k, nano_v| {
+        if nano_v != null && !includes(nano_hecv_reserved, nano_k) && !includes(nano_hecv_root_keys, nano_k) {
+            nano_hecv_copy = set!(nano_hecv_copy, [nano_k], nano_v)
+        }
+    }
+    . = merge(nano_hecv_root, nano_hecv_copy)
+    del(%nano_hec_event)
+    nano_hecv_unfiled = object(nano_hecv_record.unfiled) ?? {}
+    nano_hecv_line_key = ""
+    if is_string(nano_hecv_rec.message) {
+        nano_hecv_line_key = "message"
+    } else if !includes(nano_hecv_rec_keys, "message") && is_string(nano_hecv_rec.line) {
+        nano_hecv_line_key = "line"
+    }
+    if nano_hecv_line_key != "" {
+        .message = to_string(get(nano_hecv_rec, [nano_hecv_line_key]) ?? "") ?? ""
+        nano_hecv_stash = merge(nano_hecv_unfiled, remove(nano_hecv_rec, [nano_hecv_line_key]) ?? {})
+        if length(nano_hecv_stash) > 0 { %nano_hec_event = nano_hecv_stash }
+    } else {
+        .message = nano_hecv_text
+        if length(nano_hecv_unfiled) > 0 { %nano_hec_event = nano_hecv_unfiled }
+    }
+}
+"#
+    };
+}
+
 /// NAN-4038: VRL that removes credential-named fields from the event at any
 /// depth before it is stored.
 ///
@@ -644,6 +714,8 @@ pub(crate) mod test_hooks {
     pub(crate) use super::deploy::request_reload_in;
 }
 pub use router::{base_router_inputs, hec_normalize_present};
+/// NAN-5883: the parser input contract (`# nano:input=json|text|json_or_text`).
+pub use hec_payload::{input_contract, InputContract, InputContractVerdict};
 
 /// NAN-5132 (two-phase activation): stable fan-in slots are on, so the parked
 /// filter a held source reads exists.

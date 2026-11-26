@@ -95,6 +95,7 @@ fn profile_pins_every_lockdown_setting_and_cap() {
         "max_concurrent_queries_for_user = 2 CONST",
         "http_wait_end_of_query = 1 CONST",
         "http_response_buffer_size = 67108864 CONST",
+        "cancel_http_readonly_queries_on_client_close = 1 CONST",
         "log_comment CHANGEABLE_IN_READONLY",
         "session_timezone CHANGEABLE_IN_READONLY",
         "default_format CHANGEABLE_IN_READONLY",
@@ -820,4 +821,21 @@ fn the_hunts_token_boundary_is_enforced_by_clickhouse() {
     }
     let [create, alter] = role_statements("");
     assert!(create.ends_with("SETTINGS PROFILE 'agentlane'") && alter.ends_with("SETTINGS PROFILE 'agentlane'"));
+}
+
+/// NAN-5880 (spike D5): both Agent Lane profiles cancel a read-only HTTP
+/// query when its client connection closes (the gate dropping connections on
+/// switch-off). The setting rides the ALTER that runs on every migrate, so
+/// an existing install converges on upgrade, and it is CONST.
+#[test]
+fn both_profiles_cancel_queries_when_the_client_hangs_up() {
+    let caps = AgentlaneSettings::default();
+    let [_, alter] = profile_statements("", &caps);
+    let [_, internal_alter] = internal_profile_statements("", &caps);
+    for sql in [alter, internal_alter] {
+        assert!(sql.starts_with("ALTER SETTINGS PROFILE"), "{sql}");
+        assert!(sql.contains("cancel_http_readonly_queries_on_client_close = 1 CONST"), "{sql}");
+        // It only works with readonly > 0, which stays pinned.
+        assert!(sql.contains("readonly = 1 CONST"), "{sql}");
+    }
 }

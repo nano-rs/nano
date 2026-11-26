@@ -102,6 +102,33 @@ pub enum ApiError {
         message: String,
         details: serde_json::Value,
     },
+
+    /// NAN-5877: a 503 for an optional feature this install has not set up
+    /// (for example `AI_NOT_CONFIGURED`). It is an expected state, not a
+    /// fault: it is logged at INFO, never ERROR, and the response carries
+    /// [`ExpectedServerError`] so the request log does not report it either.
+    #[error("{message}")]
+    NotConfigured { code: &'static str, message: String },
+}
+
+/// NAN-5877: response extension marking a 5xx as an expected state (a
+/// feature that is not set up), so request logging does not count it as a
+/// server failure. Never sent to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedServerError;
+
+/// NAN-5877: the code for an AI feature called while AI is not set up.
+pub const AI_NOT_CONFIGURED: &str = "AI_NOT_CONFIGURED";
+
+impl ApiError {
+    /// NAN-5877: the 503 an AI endpoint returns when this install has no AI
+    /// provider set up. Plain English, the same for every AI feature.
+    pub fn ai_not_configured() -> Self {
+        ApiError::NotConfigured {
+            code: AI_NOT_CONFIGURED,
+            message: "AI isn't set up on this install yet. An admin can add an AI provider in Settings \u{2192} AI.".to_string(),
+        }
+    }
 }
 
 /// Error response body
@@ -142,6 +169,7 @@ impl ApiError {
             ApiError::UnprocessableWithDetails { code, .. } => code,
             ApiError::BadRequestWithDetails { code, .. } => code,
             ApiError::ConflictWithDetails { code, .. } => code,
+            ApiError::NotConfigured { code, .. } => code,
         }
     }
 
@@ -167,6 +195,7 @@ impl ApiError {
             ApiError::UnprocessableWithDetails { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::BadRequestWithDetails { .. } => StatusCode::BAD_REQUEST,
             ApiError::ConflictWithDetails { .. } => StatusCode::CONFLICT,
+            ApiError::NotConfigured { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -201,7 +230,14 @@ impl IntoResponse for ApiError {
         // limits) are deliberately NOT logged here: they are the caller's
         // mistake, not ours, and logging them at ERROR would bury the real
         // faults under noise.
-        if status.is_server_error() {
+        let expected = matches!(self, ApiError::NotConfigured { .. });
+        if expected {
+            tracing::info!(
+                status = status.as_u16(),
+                code = self.code(),
+                "request refused: feature not set up"
+            );
+        } else if status.is_server_error() {
             tracing::error!(
                 status = status.as_u16(),
                 code = self.code(),
@@ -245,7 +281,11 @@ impl IntoResponse for ApiError {
             },
         };
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if expected {
+            response.extensions_mut().insert(ExpectedServerError);
+        }
+        response
     }
 }
 
@@ -318,6 +358,10 @@ impl From<nanosiem_core::SearchError> for ApiError {
             }
             // NAN-5424: typed ClickHouse classes. Same envelopes as before the
             // split (transport → database error, size → validation).
+            nanosiem_core::SearchError::ConnectionRejected(e) => {
+                tracing::error!(error = %e, "ClickHouse connection rejected in search");
+                ApiError::DatabaseError("A database error occurred".to_string())
+            }
             nanosiem_core::SearchError::Unavailable(e) => {
                 tracing::error!(error = %e, "ClickHouse unavailable in search");
                 ApiError::DatabaseError("A database error occurred".to_string())
@@ -393,8 +437,13 @@ impl From<nanosiem_core::DetectionError> for ApiError {
             | nanosiem_core::DetectionError::QueryDataError(msg) => {
                 ApiError::SqlValidationError(msg.clone())
             }
+            nanosiem_core::DetectionError::BackendRejected(msg) => {
+                tracing::error!(error = %msg, "Detection backend connection rejected");
+                ApiError::ServiceUnavailable("Search backend unavailable; retry shortly".to_string())
+            }
             nanosiem_core::DetectionError::BackendUnavailable(msg) => {
-                tracing::error!(error = %msg, "Detection backend unavailable");
+                // NAN-5886: a transient outage, surfaced as a 503; not a bug report.
+                tracing::warn!(error = %msg, "Detection backend unavailable");
                 ApiError::ServiceUnavailable("Search backend unavailable; retry shortly".to_string())
             }
             _ => {

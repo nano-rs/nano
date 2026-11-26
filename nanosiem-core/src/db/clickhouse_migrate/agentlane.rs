@@ -469,6 +469,11 @@ fn parse_cap(
 /// response encoding: it is applied after the result and buffer caps, so it
 /// cannot lift a limit.
 ///
+/// `cancel_http_readonly_queries_on_client_close = 1 CONST` (NAN-5880 D5):
+/// a closed client connection (the gate dropping it on switch-off, or an
+/// agent hanging up) cancels the running query. The profile ALTER below runs
+/// on every migrate, so existing installs pick it up on upgrade.
+///
 /// `distributed_product_mode = 'global' CONST`: the server default profile sets
 /// `allow`, under which a plain `IN` / `JOIN` over two Distributed tables runs
 /// double-distributed (every shard re-runs the subquery cluster-wide, and on
@@ -516,6 +521,12 @@ pub(super) fn profile_settings_sql_for(caps: &AgentlaneSettings, workload: &str)
         format!("max_concurrent_queries_for_user = {MAX_CONCURRENT_QUERIES_PER_USER} CONST"),
         "http_wait_end_of_query = 1 CONST".into(),
         format!("http_response_buffer_size = {MAX_RESULT_BYTES} CONST"),
+        // NAN-5880 (spike D5): when the Agent Lane gate aborts the upstream
+        // socket (switch off, revoke) or an agent hangs up mid-query,
+        // ClickHouse cancels the query within about a second instead of
+        // running it to the end. Needs readonly > 0 (pinned above). The
+        // control plane's KILL QUERY stays as the second path.
+        "cancel_http_readonly_queries_on_client_close = 1 CONST".into(),
     ];
     parts.extend(
         CHANGEABLE_OUTPUT_SETTINGS

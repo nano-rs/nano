@@ -282,6 +282,10 @@ impl From<nanosiem_core::SearchError> for SearchError {
             // NAN-5424: typed ClickHouse classes, same responses as before.
             nanosiem_core::SearchError::ResourceLimit(msg) => SearchError::QueryError(msg),
             e @ nanosiem_core::SearchError::DataError { .. } => SearchError::QueryError(e.to_string()),
+            nanosiem_core::SearchError::ConnectionRejected(e) => {
+                tracing::error!(error = %e, "ClickHouse connection rejected in search");
+                SearchError::InternalError("A database error occurred".to_string())
+            }
             nanosiem_core::SearchError::Unavailable(e) => {
                 tracing::error!(error = %e, "ClickHouse unavailable in search");
                 SearchError::InternalError("A database error occurred".to_string())

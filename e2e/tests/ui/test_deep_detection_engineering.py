@@ -276,7 +276,8 @@ def test_author_validate_test_lifecycle_mitre_and_matches(
         # 8. Risk (enterprise): the risk stage scored the user.
         if stack.edition == "enterprise":
             def _risk() -> float:
-                body = expect(nano.api.get("/api/risk/entities", params={"limit": 500}), 200)
+                # NAN-5841: live answer (the page itself is precomputed).
+                body = expect(nano.api.get("/api/risk/entities", params={"limit": 500, "refresh": "true"}), 200)
                 ents = body.get("entities", body) if isinstance(body, dict) else body
                 return max((float(e.get("risk_score") or 0) for e in ents if e.get("entity") == user), default=0.0)
 

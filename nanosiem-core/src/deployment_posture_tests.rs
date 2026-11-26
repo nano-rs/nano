@@ -310,3 +310,18 @@ fn invalid_destination_proxy_is_a_high_finding() {
     let f = posture_findings(&inputs).into_iter().find(|f| f.title.contains("destination egress proxy")).unwrap();
     assert_eq!(f.priority, "high");
 }
+
+/// NAN-5891 review r3: the custom-Vector escape hatch is visible in SIEM Health.
+#[test]
+fn allowing_custom_vector_builds_is_a_high_finding() {
+    let inputs = PostureInputs {
+        install_token: Some("9f2c-random-install".into()),
+        delivery_switch: Some("off".into()),
+        allow_custom_vector: true,
+        ..Default::default()
+    };
+    let findings = posture_findings(&inputs);
+    assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.title).collect::<Vec<_>>());
+    assert_eq!(findings[0].priority, "high");
+    assert!(findings[0].title.contains("Custom or upstream Vector builds"));
+}

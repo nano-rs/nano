@@ -7,7 +7,9 @@ the product enforces:
   element is a `<PermissionRoute permission=... | anyPermission=[...]
   capability=...>` (and the `[path, Page]` tuple lists mapped through one);
 - rail gates: every `{ name, href, permissions, capability }` item in
-  `components/layout/AppLayout.tsx`;
+  `components/layout/AppLayout.tsx`, and every Settings entry in
+  `components/layout/settings/sections.ts` (which also carries
+  `enterpriseOnly`: shown only in the enterprise build, whatever the license);
 - role grants: `GET /api/roles` (built-in roles carry `is_system`), read at
   run time, so a migration that changes a built-in role changes the matrix.
 
@@ -66,6 +68,14 @@ class NavItem:
     href: str
     permissions: tuple[str, ...]
     capability: str | None
+    # `enterpriseOnly: true` (sections.ts): the build, not the license, hides
+    # it. An open build neither shows it nor defines its permission.
+    enterprise_only: bool = False
+
+    def in_edition(self, edition: str | None) -> bool:
+        """False only for an enterpriseOnly entry on a known non-enterprise
+        build; `None` (edition unknown) keeps every entry."""
+        return not self.enterprise_only or edition in (None, "enterprise")
 
 
 def holds(perms: set[str], permission: str | None, any_permission: tuple[str, ...] = ()) -> bool:
@@ -197,17 +207,22 @@ def settings_items(src: str | None = None) -> list[NavItem]:
             continue
         pm = _NAV_PERMS.search(body)
         cap = re.search(r"capability:\s*'([^']+)'", body)
-        out.append(NavItem(m.group(1), m.group(1), _quoted(pm.group(1)) if pm else (), cap.group(1) if cap else None))
+        ent = re.search(r"\benterpriseOnly:\s*(true|false)\b", body)
+        out.append(NavItem(m.group(1), m.group(1), _quoted(pm.group(1)) if pm else (), cap.group(1) if cap else None,
+                           enterprise_only=bool(ent and ent.group(1) == "true")))
     return out
 
 
-def all_gate_permissions(capabilities: dict[str, bool] | None = None) -> set[str]:
+def all_gate_permissions(capabilities: dict[str, bool] | None = None, *, edition: str | None = None) -> set[str]:
     """Every permission string a route, rail item or settings entry names.
 
     With `capabilities`, gates behind a capability that is off are left out:
     licensing refuses those before RBAC, and an open build does not define
     their enterprise permissions (`hunts:view`, `soar:view`, ...; NAN-5747),
-    so they cannot be classified against its `/api/permissions`."""
+    so they cannot be classified against its `/api/permissions`. With
+    `edition="open"`, `enterpriseOnly` Settings entries are left out for the
+    same reason (Agent Lane's `agentlane:manage`); on enterprise they are
+    kept, so their permission must be in the catalog."""
 
     def live(capability: str | None) -> bool:
         return capabilities is None or not capability or capabilities.get(capability, False)
@@ -220,7 +235,7 @@ def all_gate_permissions(capabilities: dict[str, bool] | None = None) -> set[str
             perms.add(g.permission)
         perms.update(g.any_permission)
     for item in nav_items() + settings_items():
-        if live(item.capability):
+        if live(item.capability) and item.in_edition(edition):
             perms.update(item.permissions)
     return perms
 
@@ -249,8 +264,10 @@ def _nav_items(src: str) -> list[NavItem]:
     return out
 
 
-def nav_visible(item: NavItem, perms: set[str], capabilities: dict[str, bool]) -> bool:
+def nav_visible(item: NavItem, perms: set[str], capabilities: dict[str, bool], edition: str | None = None) -> bool:
     if item.capability and not capabilities.get(item.capability, False):
+        return False
+    if not item.in_edition(edition):
         return False
     return not item.permissions or holds(perms, None, item.permissions)
 

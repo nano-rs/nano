@@ -60,6 +60,7 @@ import {
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { ingestionNavigation } from './ingestion-navigation';
 import { isHuntsNavItemActive, isUnder } from './hunts-navigation';
+import { pivtShortcutFor } from './pivt-shortcut';
 import { LOG_SOURCES_PATH, ingestionHomeFor } from '@/lib/ingestion-paths';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
@@ -418,7 +419,7 @@ const huntsNavigation: NavItem[] = [
   { name: 'Hunts', href: '/hunts', icon: NavCrosshair, permissions: 'hunts:view', capability: 'hunts' },
   { name: 'Findings', href: '/hunts/leads', icon: Inbox, permissions: 'hunts:view', capability: 'hunts' },
   { name: 'Escalations', href: '/hunts/escalations', icon: Siren, permissions: 'hunts:view', capability: 'hunts' },
-  { name: 'Campaigns', href: '/hunts/campaigns', icon: Flag, permissions: 'hunts:view', capability: 'hunts' },
+  { name: 'Actors', href: '/hunts/actors', icon: Flag, permissions: 'hunts:view', capability: 'hunts' },
   { name: 'Knowledge', href: '/hunts/knowledge', icon: BookOpen, permissions: 'hunts:view', capability: 'hunts' },
 ];
 
@@ -646,8 +647,8 @@ function MainAppShell({ children }: AppLayoutProps) {
   // those contexts, and hijacking it while typing would be surprising.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey)) return;
-      if (e.key !== '.') return;
+      const action = pivtShortcutFor(e);
+      if (!action) return;
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName?.toLowerCase();
       const isEditable =
@@ -657,7 +658,7 @@ function MainAppShell({ children }: AppLayoutProps) {
         target?.isContentEditable === true;
       if (isEditable) return;
       e.preventDefault();
-      if (e.shiftKey) {
+      if (action === 'switch') {
         pivt.switchDockFloat();
       } else {
         pivt.toggle();
@@ -1374,7 +1375,7 @@ function MainAppShell({ children }: AppLayoutProps) {
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               {!sidebarCollapsed ? (
-                <button className="w-full h-10 px-1.5 rounded-md hover:bg-foreground/5 flex items-center gap-2.5 text-left transition-colors">
+                <button data-testid="user-menu" className="w-full h-10 px-1.5 rounded-md hover:bg-foreground/5 flex items-center gap-2.5 text-left transition-colors">
                   <div className="w-7 h-7 rounded-full bg-primary/15 text-primary flex items-center justify-center font-mono font-semibold text-[10.5px] shrink-0">
                     {getUserInitials()}
                   </div>
@@ -1386,6 +1387,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                 </button>
               ) : (
                 <button
+                  data-testid="user-menu"
                   className="w-7 h-7 rounded-full bg-primary/15 text-primary flex items-center justify-center font-mono font-semibold text-[10px] hover:bg-primary/25 transition-colors"
                   title={user?.name || 'User'}
                 >
@@ -1816,7 +1818,7 @@ function MainAppShell({ children }: AppLayoutProps) {
             <RailThemeStrip className="mb-3" testId="mobile-rail-theme" />
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <button className="flex items-center gap-3 w-full hover:bg-accent/50 rounded-xl p-2 -m-2 transition-colors">
+                <button data-testid="mobile-user-menu" className="flex items-center gap-3 w-full hover:bg-accent/50 rounded-xl p-2 -m-2 transition-colors">
                   <div className="w-8 h-8 bg-primary/20 rounded-full flex items-center justify-center">
                     <span className="text-xs font-medium text-primary">{getUserInitials()}</span>
                   </div>

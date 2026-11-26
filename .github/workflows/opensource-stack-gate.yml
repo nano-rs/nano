@@ -30,6 +30,9 @@ on:
       - scripts/check-opensource-pins.sh
       - scripts/tests/reload-acked-loss.live.sh
       - scripts/tests/fixtures/reload-acked-loss/**
+      - deploy/helm/nano/files/vector/**
+      - scripts/tests/test_vector_static_config_dual_version.py
+      - scripts/tests/vector-static-config-dual-version.live.sh
       - clickhouse/preflight/**
       - clickhouse/users.d/**
       - scripts/tests/clickhouse-default-user.live.sh
@@ -103,6 +106,7 @@ on:
       - scripts/tests/fixtures/nano-deploy-health/**
       - scripts/tests/test_otlp_edge_content_type.py
       - scripts/tests/test_otlp_edge_auth_unavailable.py
+      - scripts/tests/test_relay_secret_header_cleared.py
       - config/nginx/nginx.opensource*.conf
       - deploy/compose/config/nginx.ingest.conf.template
       - deploy/helm/nano/templates/ingest/**
@@ -160,6 +164,9 @@ on:
       - scripts/check-opensource-pins.sh
       - scripts/tests/reload-acked-loss.live.sh
       - scripts/tests/fixtures/reload-acked-loss/**
+      - deploy/helm/nano/files/vector/**
+      - scripts/tests/test_vector_static_config_dual_version.py
+      - scripts/tests/vector-static-config-dual-version.live.sh
       - clickhouse/preflight/**
       - clickhouse/users.d/**
       - scripts/tests/clickhouse-default-user.live.sh
@@ -233,6 +240,7 @@ on:
       - scripts/tests/fixtures/nano-deploy-health/**
       - scripts/tests/test_otlp_edge_content_type.py
       - scripts/tests/test_otlp_edge_auth_unavailable.py
+      - scripts/tests/test_relay_secret_header_cleared.py
       - config/nginx/nginx.opensource*.conf
       - deploy/compose/config/nginx.ingest.conf.template
       - deploy/helm/nano/templates/ingest/**
@@ -409,6 +417,20 @@ jobs:
             echo "reload-acked-loss live test not in this tree (public mirror); skipping"
           fi
 
+      # NAN-5899: an upgrade puts the new static config/vector bundle in place while
+      # the PREVIOUS release's Vector still runs, and that Vector closes its ingest
+      # gate by reloading it. The bundle must load (and hot-reload) on the previous
+      # release's pinned Vector as well as on this tree's: 2.0.36-rc1's did not on
+      # 0.61, and every 2.0.35 upgrade under ingest stopped at the drain.
+      - name: Static Vector bundle loads on the previous and the current Vector
+        run: |
+          if [ -f scripts/tests/test_vector_static_config_dual_version.py ]; then
+            python3 -I scripts/tests/test_vector_static_config_dual_version.py
+            TMPDIR="$RUNNER_TEMP" bash scripts/tests/vector-static-config-dual-version.live.sh
+          else
+            echo "dual-version tests not in this tree (public mirror); skipping"
+          fi
+
       # NAN-5509: installer errors, prerequisites and recovery hints (TLS
       # certificate preflight, python3/git, docker permissions, log hint,
       # host-minimum re-run commands, license login on upgrade, ports).
@@ -528,6 +550,7 @@ jobs:
             python3 -I scripts/tests/test_nano_deploy_k8s_health.py -v
             python3 -I scripts/tests/test_otlp_edge_content_type.py -v
             python3 -I scripts/tests/test_otlp_edge_auth_unavailable.py -v
+            python3 -I scripts/tests/test_relay_secret_header_cleared.py -v
             python3 -I scripts/tests/test_nano_deploy_fetch_bundle.py -v
           else
             echo "nano-deploy planner tests not in this tree (public mirror); skipping"

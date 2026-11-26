@@ -65,6 +65,13 @@ pub enum DetectionError {
     #[error("Backend unavailable: {0}")]
     BackendUnavailable(String),
 
+    /// NAN-5886: the backend connection was rejected for a reason a retry
+    /// will not fix (TLS / certificate, permission). The window is kept like
+    /// [`Self::BackendUnavailable`] (catch up once it is fixed), but it is a
+    /// configuration fault: reported at once, never as a transient outage.
+    #[error("Backend connection rejected: {0}")]
+    BackendRejected(String),
+
     /// NAN-4910 / NAN-5424: ClickHouse refused the window for its size
     /// (identified by error code / typed variant). A smaller window can work.
     #[error("Window too large: {0}")]
@@ -116,7 +123,7 @@ impl DetectionError {
     /// gapped). Never decided by message text.
     pub fn is_transient_infrastructure(&self) -> bool {
         match self {
-            Self::BackendUnavailable(_) => true,
+            Self::BackendUnavailable(_) | Self::BackendRejected(_) => true,
             Self::DatabaseError(e) => sqlx_error_is_transient(e),
             _ => false,
         }
@@ -141,6 +148,7 @@ impl DetectionError {
                 }
             }
             Self::BackendUnavailable(_) => "Backend unavailable (connection failed or timed out)".to_string(),
+            Self::BackendRejected(_) => "Backend connection rejected (TLS, certificate or permission)".to_string(),
             // Our own templates (code-mapped), no event text.
             Self::WindowTooLarge(m) | Self::QueryDataError(m) | Self::InvalidQuery(m) | Self::QueryParseError(m) => {
                 m.clone()

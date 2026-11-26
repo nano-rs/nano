@@ -1195,6 +1195,55 @@ pub fn entity_types_query(
     }
 }
 
+/// Tail for the precomputed Risk page snapshot (NAN-5841): every entity,
+/// hottest-first by the 7d base score, bounded so one statement can never
+/// return an unbounded set. Binds: `(limit)`.
+const TAIL_SNAPSHOT: &str = r#"            ORDER BY base_decayed_score_7d DESC, entity ASC
+            LIMIT ?
+        "#;
+
+/// Risk page snapshot (NAN-5841): the SAME entity-grain decayed computation
+/// as [`risky_entities_query`] with no score floor, no window filter and no
+/// pagination, so one scan yields every row the leaderboard, the band
+/// overview and the entity-type facet derive from.
+///
+/// `cleared` must carry NO score weights: the snapshot stores BASE scores and
+/// the reader applies the live score weights (and any clear stamped after
+/// the snapshot) at read time, which is what lets the cache serve risk state
+/// changes immediately.
+pub fn entity_snapshot_query(
+    source: &RiskFindingsSource,
+    now: DateTime<Utc>,
+    decay: &RiskDecayConfig,
+    cleared: &ClearedBoundaries,
+    limit: i64,
+) -> RiskChQuery {
+    let mut sql = String::new();
+    sql.push_str(CTE_OPEN);
+    sql.push_str(ENTITY_SELECT_COLS);
+    sql.push_str(DECAY_FACTOR_EXPR);
+    sql.push_str(ENTITY_FINDINGS_WHERE);
+    sql.push_str(ENTITY_AGGREGATED_SELECT);
+    sql.push_str(TAIL_SNAPSHOT);
+
+    let cutoffs = DecayCutoffs::at(now);
+    let mut binds = decay_factor_binds(&cutoffs, decay);
+    binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
+    binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
+    binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
+    source.push_scope_bind(&mut binds);
+    binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
+    binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
+    cleared.push_watch_binds(&mut binds);
+    binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
+    binds.push(RiskSqlBind::I64(limit));
+
+    RiskChQuery {
+        sql: source.substitute(sql),
+        binds,
+    }
+}
+
 /// Lateral-graph risk batch (NAN-1798 P4): one 7d decayed score per matching
 /// entity value, restricted in SQL to the graph's normalized node ids
 /// (lowered, or lowered first DNS label — the FQDN double-match the retired

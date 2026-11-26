@@ -110,6 +110,14 @@ class Action:
     cleanup: Callable[[Nano, httpx.Response], None] | None = None
     enterprise: bool = False
     ok: tuple[int, ...] = ()  # extra non-2xx answers that still mean "allowed"
+    also: tuple[str, ...] = ()  # further permissions the handler ALSO requires (all of them)
+
+    @property
+    def perms(self) -> tuple[str, ...]:
+        return (self.perm, *self.also)
+
+    def allowed(self, held: set[str]) -> bool:
+        return all(rm.holds(held, p) for p in self.perms)
 
 
 def _rule_body(tag: str) -> dict[str, Any]:
@@ -214,6 +222,37 @@ ACTIONS: list[Action] = [
     Action("soar.approvals", "soar:view", _get("/api/soar/approvals"), enterprise=True, ok=(404, 409)),
     Action("ioc_lists.list", "enrichments:view", _get("/api/ioc-lists"), enterprise=True),
     Action("ai.providers", "settings:ai_providers", _get("/api/settings/ai-providers"), enterprise=True),
+    # Agent Lane (NAN-5880). Status needs agentlane:manage; the switch, networks,
+    # certificate and the checks need settings:system too. Every write here is a
+    # no-op: the switch is set to what it already is, the network save carries a
+    # stale revision (409) and so does the empty certificate upload, so an
+    # allowed persona never changes the stack.
+    Action("agentlane.status", "agentlane:manage", _get("/api/settings/agentlane"), enterprise=True),
+    Action("agentlane.switch", "agentlane:manage",
+           lambda c, ctx: c.api.put("/api/settings/agentlane",
+                                    json={"enabled": bool(ctx["agentlane"].get("enabled", False))}),
+           enterprise=True, also=("settings:system",), ok=(409, 422)),
+    Action("agentlane.network", "agentlane:manage",
+           lambda c, ctx: c.api.put("/api/settings/agentlane/network", json={
+               "allow_cidrs": ctx["agentlane"].get("network", {}).get("allow_cidrs", []),
+               "expected_revision": -1}),
+           enterprise=True, also=("settings:system",), ok=(409, 422)),
+    Action("agentlane.certificate", "agentlane:manage",
+           lambda c, ctx: c.api.put("/api/settings/agentlane/certificate",
+                                    json={"mode": "upload", "cert_pem": "", "key_pem": "", "expected_revision": -1}),
+           enterprise=True, also=("settings:system",), ok=(409,)),
+    Action("agentlane.certificate_download", "agentlane:manage",
+           _get("/api/settings/agentlane/certificate/download"),
+           enterprise=True, also=("settings:system",), ok=(404, 409)),
+    Action("agentlane.check_address", "agentlane:manage",
+           lambda c, ctx: c.api.post("/api/settings/agentlane/check-address", json={"ip": "192.0.2.1"}),
+           enterprise=True, also=("settings:system",)),
+    Action("agentlane.connection_test", "agentlane:manage",
+           lambda c, ctx: c.api.post("/api/settings/agentlane/connection-test", json={}),
+           enterprise=True, also=("settings:system",), ok=(409, 422)),
+    Action("agentlane.connection_test_result", "agentlane:manage",
+           _get("/api/settings/agentlane/connection-test/00000000-0000-0000-0000-000000000000"),
+           enterprise=True, also=("settings:system",), ok=(404,)),
 ]
 
 # UI controls behind the same gates: (page, control finder, permission).
@@ -384,12 +423,15 @@ def _main_rail_shown(page: uilib.UiPage, items: list[rm.NavItem]) -> set[str]:
 
 
 def _rail_problems(shown: set[str], items: list[rm.NavItem], container: str, perms: set[str],
-                   capabilities: dict[str, bool], gates: dict[str, rm.Gate]) -> list[str]:
+                   capabilities: dict[str, bool], gates: dict[str, rm.Gate], edition: str | None = None) -> list[str]:
     problems = []
     for item in items:
         if item.href not in shown:
             continue
-        if not rm.nav_visible(item, perms, capabilities):
+        if not item.in_edition(edition):
+            problems.append(f"{container} shows the enterprise-only {item.name} ({item.href}) on a {edition} build")
+            continue
+        if not rm.nav_visible(item, perms, capabilities, edition):
             problems.append(f"{container} shows {item.name} ({item.href}) without {item.permissions}")
         gate = gates.get(item.href.split("?")[0])
         if gate and not gate.redirect and gate.permission != "<dynamic>" and not gate.allows(perms, capabilities):
@@ -477,8 +519,10 @@ def test_rbac_persona_matrix(
         problems.append("the role is granted the wildcard '*', which the baseline does not allow")
     # Open only: an open build does not define the permissions of gates behind
     # an off capability. Enterprise defines every permission, licensed or not.
-    gate_perms = rm.all_gate_permissions(None if enterprise else capabilities)
-    classify = expected | gate_perms | {a.perm for a in actions}
+    # `edition` drops enterpriseOnly Settings entries (Agent Lane) on open and
+    # keeps them on enterprise, where their permission must be defined.
+    gate_perms = rm.all_gate_permissions(None if enterprise else capabilities, edition=stack.edition)
+    classify = expected | gate_perms | {p for a in actions for p in a.perms}
     unknown = sorted(classify - catalog - {"*"})
     if unknown:
         problems.append(f"permission strings not in /api/permissions (cannot be classified): {unknown}")
@@ -495,11 +539,11 @@ def test_rbac_persona_matrix(
         if got != want:
             problems.append(f"baseline: {path} is '{want}' for {persona_name}, the code now says '{got}' "
                             f"(gate {gates_by_path[path].needs})")
-    perm_of = {a.id: a.perm for a in actions}
+    action_of = {a.id: a for a in actions}
     for aid, want in base["actions"].items():
-        if aid not in perm_of:
+        if aid not in action_of:
             continue  # an enterprise action on an open stack
-        got = "allow" if rm.holds(expected, perm_of[aid]) else "deny"
+        got = "allow" if action_of[aid].allowed(expected) else "deny"
         if got != want:
             problems.append(f"baseline: API {aid} is '{want}' for {persona_name}, the code now says '{got}'")
     perms = expected
@@ -566,7 +610,7 @@ def test_rbac_persona_matrix(
                            desc="the Settings rail")
                 sshown = _shown(page, rm.settings_items(), "settings-rail")
                 srail = _rail_problems(sshown, rm.settings_items(), "settings-rail", perms, capabilities,
-                                       gates_by_path)
+                                       gates_by_path, stack.edition)
                 problems += rail + srail
                 record["rail"] = {"main": sorted(shown), "settings": sorted(sshown), "problems": rail + srail}
 
@@ -603,21 +647,27 @@ def test_rbac_persona_matrix(
             results = []
             try:
                 ctx = {"tag": tag, "victim_rule": victim["id"], "victim_source": victim_source["id"],
-                       "retention_days": overview["clickhouse"]["ttl_days"]}
+                       "retention_days": overview["clickhouse"]["ttl_days"],
+                       # The Agent Lane actions write back what is already there (NAN-5880).
+                       "agentlane": (expect(matrix_admin.api.get("/api/settings/agentlane"), 200)
+                                     if enterprise else {})}
                 for act in actions:
-                    want = rm.holds(perms, act.perm)
+                    want = act.allowed(perms)
                     resp = act.run(client, ctx)
                     ok = resp.status_code < 300 or resp.status_code in act.ok
                     note = None
                     if want and not ok:
-                        note = f"{act.id}: refused ({resp.status_code}) but the persona holds {act.perm}: {resp.text[:200]}"
+                        held = " + ".join(act.perms)
+                        note = (f"{act.id}: refused ({resp.status_code}) but the persona holds {held}: "
+                                f"{resp.text[:200]}")
                     elif not want:
                         bad = _clean_403(resp)
                         if bad:
-                            note = f"{act.id} without {act.perm}: {bad}"
+                            note = f"{act.id} without {' + '.join(act.perms)}: {bad}"
                     if act.cleanup:
                         act.cleanup(matrix_admin, resp)
-                    results.append({"id": act.id, "perm": act.perm, "want": want, "status": resp.status_code})
+                    results.append({"id": act.id, "perm": " + ".join(act.perms), "want": want,
+                                    "status": resp.status_code})
                     if note:
                         problems.append(note)
             finally:

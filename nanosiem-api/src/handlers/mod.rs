@@ -36,6 +36,7 @@ pub mod capabilities;
 // etc.) continue to resolve.
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::cases;
+pub mod connector_feed_setup;
 pub mod connector_feeds;
 pub mod content_channels;
 pub mod credentials;

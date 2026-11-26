@@ -6,6 +6,14 @@
 # remain afterward. Cleanup helpers only act on exact PIDs or the exact Compose
 # project label supplied by the caller; they never prune or prefix-match shared
 # Docker state.
+#
+# NAN-5884: several lanes can run on one host. Each guard checks only its own
+# run: browsers launched with its run token (NANO_LEAK_GUARD_RUN, which the UI
+# driver puts in Chrome's --user-data-dir, inherited by every Chrome helper
+# process), and, once the run has
+# named its Compose projects (leak_guard_own_project, or the capture/cleanup
+# helpers), only volumes and networks of those projects. A guard that named no
+# project keeps the host-wide volume and network check.
 
 if [[ -n "${NANO_LEAK_GUARD_LOADED:-}" ]]; then
   return 0
@@ -18,15 +26,53 @@ LEAK_GUARD_NAME=""
 declare -ag LEAK_GUARD_TRACKED_PIDS=()
 declare -Ag LEAK_GUARD_PID_STARTS=()
 declare -Ag LEAK_GUARD_PROJECT_VOLUMES=()
+# NAN-5884: this run's Compose projects, and every volume captured for them
+# (anonymous volumes carry no project label once their container is gone).
+declare -Ag LEAK_GUARD_PROJECTS=()
+LEAK_GUARD_OWNED_VOLUMES=" "
+LEAK_GUARD_RUN_TOKEN=""
 
 _leak_guard_process_start() {
   LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//'
 }
 
 _leak_guard_browser_pids() {
-  ps -axo pid=,command= 2>/dev/null \
-    | awk '/[p]uppeteer_dev_chrome_profile-/ {print $1}' \
+  # With a run token, only this run's browsers; without one, every Puppeteer
+  # Chrome on the host. The UI driver puts the token in the browser's
+  # --user-data-dir (puppeteer_dev_chrome_profile-nano-<token>-...), which
+  # Chrome passes to every renderer, GPU and utility process, so an orphaned
+  # helper whose browser died still counts as this run's leak (review P2-2).
+  #
+  # Self-match-proof (review r2): neither the marker nor the token appears
+  # in awk's own command line (the marker is built from two pieces, the
+  # token comes through the environment), so the filter never lists itself.
+  # -ww: never cut a command line to $COLUMNS or the terminal width (review
+  # r3); Chrome's --user-data-dir sits near the end of a long argv.
+  ps -axww -o pid=,args= 2>/dev/null \
+    | LEAK_GUARD_AWK_TOKEN="$LEAK_GUARD_RUN_TOKEN" awk '
+        BEGIN { p = "puppeteer_dev_" "chrome_profile-"; tag = ENVIRON["LEAK_GUARD_AWK_TOKEN"] }
+        index($0, p) && (tag == "" || index($0, p "nano-" tag "-")) { print $1 }' \
     | LC_ALL=C sort -u
+}
+
+# NAN-5884: name a Compose project this run owns.
+leak_guard_own_project() {
+  [[ -n "${1:-}" ]] || return 2
+  LEAK_GUARD_PROJECTS["$1"]=1
+}
+
+# Whether a new dangling resource belongs to this run (always, when the run
+# named no project).
+_leak_guard_owned() {
+  local kind="$1" id="$2" label
+  (( ${#LEAK_GUARD_PROJECTS[@]} )) || return 0
+  [[ "$kind" == volumes && "$LEAK_GUARD_OWNED_VOLUMES" == *" $id "* ]] && return 0
+  case "$kind" in
+    volumes) label="$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$id" 2>/dev/null || true)" ;;
+    networks) label="$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "$id" 2>/dev/null || true)" ;;
+    *) return 0 ;;
+  esac
+  [[ -n "$label" && -n "${LEAK_GUARD_PROJECTS[$label]:-}" ]]
 }
 
 _leak_guard_snapshot() {
@@ -54,6 +100,13 @@ leak_guard_begin() {
   fi
   LEAK_GUARD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nano-leak-guard.XXXXXX")"
   LEAK_GUARD_NAME="$name"
+  LEAK_GUARD_PROJECTS=()
+  LEAK_GUARD_OWNED_VOLUMES=" "
+  # NAN-5884: a token the run's browsers carry (inherited by the scenario
+  # processes and the UI driver).
+  LEAK_GUARD_RUN_TOKEN="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  [[ -n "$LEAK_GUARD_RUN_TOKEN" ]] || LEAK_GUARD_RUN_TOKEN="$$$(date +%s)"
+  export NANO_LEAK_GUARD_RUN="$LEAK_GUARD_RUN_TOKEN"
   _leak_guard_snapshot "$LEAK_GUARD_DIR/before"
   LEAK_GUARD_ACTIVE=1
 }
@@ -110,6 +163,7 @@ leak_guard_stop_tracked_pids() {
 leak_guard_capture_compose_project() {
   local project="$1" container volume label recorded
   [[ -n "$project" ]] || return 2
+  leak_guard_own_project "$project"
   recorded="${LEAK_GUARD_PROJECT_VOLUMES[$project]:-}"
   while IFS= read -r container; do
     [[ -n "$container" ]] || continue
@@ -126,6 +180,9 @@ leak_guard_capture_compose_project() {
     done < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' "$container" 2>/dev/null)
   done < <(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)
   LEAK_GUARD_PROJECT_VOLUMES["$project"]="$recorded"
+  for volume in $recorded; do
+    [[ "$LEAK_GUARD_OWNED_VOLUMES" == *" $volume "* ]] || LEAK_GUARD_OWNED_VOLUMES+="$volume "
+  done
 }
 
 leak_guard_cleanup_compose_project() {
@@ -182,6 +239,8 @@ leak_guard_assert() {
   for kind in volumes networks browsers; do
     while IFS= read -r id; do
       [[ -n "$id" ]] || continue
+      # NAN-5884: another lane's resources are that lane's guard's business.
+      _leak_guard_owned "$kind" "$id" || continue
       printf 'LEAK-GUARD[%s]: new dangling %s resource: %s\n' \
         "$LEAK_GUARD_NAME" "$kind" "$id" >&2
       failed=1
@@ -190,6 +249,8 @@ leak_guard_assert() {
   rm -rf "$LEAK_GUARD_DIR"
   LEAK_GUARD_ACTIVE=0
   LEAK_GUARD_DIR=""
+  LEAK_GUARD_RUN_TOKEN=""
+  unset NANO_LEAK_GUARD_RUN
   (( failed == 0 ))
 }
 

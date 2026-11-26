@@ -48,6 +48,7 @@ import {
   Link2,
   Crosshair,
   ScrollText,
+  Flag,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -321,7 +322,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     label: 'Hunting',
     group: 'workspace',
     icon: Crosshair,
-    desc: 'Hunt runners, install defaults and the default hunt charter.',
+    desc: 'Hunt runners, install defaults, the default hunt charter and actor settings.',
     href: '/settings/hunts',
     matchPrefixes: ['/settings/hunts'],
     permissions: 'hunts:view',
@@ -341,6 +342,15 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
         label: 'Charter & defaults',
         href: '/settings/hunts/charter',
         icon: ScrollText,
+        permissions: 'hunts:view',
+        capability: 'hunts',
+      },
+      // NAN-5859: actor naming, retention and how agent attributions apply.
+      {
+        id: 'hunting-actors',
+        label: 'Actors',
+        href: '/settings/hunts/actors',
+        icon: Flag,
         permissions: 'hunts:view',
         capability: 'hunts',
       },
@@ -493,7 +503,10 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     matchPrefixes: ['/settings/agentlane'],
     permissions: 'agentlane:manage',
     status: 'ok',
-    capability: 'agentLane',
+    // NAN-5880: not `capability` — at the license hard stop the page shows its
+    // Paused state, where tokens can still be revoked and the lane switched
+    // off, so the entry stays reachable in the enterprise build.
+    enterpriseOnly: true,
   },
   {
     id: 'audit',

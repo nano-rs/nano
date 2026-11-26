@@ -34,38 +34,67 @@
 //! it serves the new generation from the same database, so the lease moved to
 //! a new scope ([`LEASE_SCOPE`]) and this API holds the old one
 //! ([`fence_legacy_scope`]): an old API then answers every request "busy".
+//!
+//! NAN-5810: the floor is now `0.62.0-nano.2`. Vector 0.62 parses a config
+//! before it interpolates env vars, so nano renders numeric placeholders
+//! quoted (`max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"`), and a 0.61
+//! Vector cannot load that (`unknown variant`): a 0.62-format generation would
+//! take its whole config down. HEC record preservation (nanosiem#10462) also
+//! needs the `splunk_hec` event_kind marker first shipped in 0.62.0-nano.2. A
+//! 0.61 host (nano.14 / nano.15 included) or a 0.62.0-nano.1 one is therefore
+//! told to wait like a nano.13 one and keeps serving its installed generation
+//! until its pod or host is replaced with the new image.
+//!
+//! The same rolling-upgrade race as NAN-5874 applies: a v2.0.35 API replica
+//! still running beside this one grants `ingest-v2` with its own, lower floor
+//! (0.61.0-nano.14), and serves this version's generations from the same
+//! database. So the lease moved again, to `ingest-v3` on
+//! `/install-lease/v3`, and this API fences every superseded scope
+//! ([`FENCED_LEGACY_SCOPES`]: `ingest` and `ingest-v2`). A floor bump that
+//! changes what a Vector can load adds the next scope here the same way.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-/// The one lease every ingest consumer competes for (NAN-5874: `ingest`
-/// before v2.0.35).
-pub const LEASE_SCOPE: &str = "ingest-v2";
-/// The scope APIs before v2.0.35 grant. This API holds it (see
-/// [`fence_legacy_scope`]) so they never grant a consumer an install.
+/// The one lease every ingest consumer competes for (`ingest` before
+/// v2.0.35, `ingest-v2` in v2.0.35; NAN-5810 review P1-1: `ingest-v3` from
+/// v2.0.36).
+pub const LEASE_SCOPE: &str = "ingest-v3";
+/// The scope APIs before v2.0.35 grant (on `/install-lease`).
 pub const LEGACY_LEASE_SCOPE: &str = "ingest";
-/// The holder of the fenced legacy scope; an old API reports it as the host
-/// that is installing.
-pub const LEGACY_FENCE_HOLDER: &str = "nano-2.0.35-upgrade";
-/// How long the fence outlives the last API that refreshed it. Every v2.0.35+
+/// The scope v2.0.35 APIs grant (on `/install-lease/v2`).
+pub const LEASE_V2_SCOPE: &str = "ingest-v2";
+/// Every scope an older API grants. This API holds all of them (see
+/// [`fence_legacy_scope`]) so no older API grants a consumer an install of a
+/// generation this version rendered.
+pub const FENCED_LEGACY_SCOPES: &[&str] = &[LEGACY_LEASE_SCOPE, LEASE_V2_SCOPE];
+/// The holder of the fenced scopes; an old API reports it as the host that is
+/// installing.
+pub const LEGACY_FENCE_HOLDER: &str = "nano-2.0.36-upgrade";
+/// How long the fence outlives the last API that refreshed it. Every v2.0.36+
 /// API refreshes it on each publication reconcile tick (5 s by default) and
 /// on every lease request, so it holds while any such API runs. After a
-/// rollback to a version before v2.0.35 the old APIs grant the legacy scope
-/// again within this long (well inside the consumer's and the Compose
-/// healthcheck's budgets).
+/// rollback to an older version the old APIs grant their scope again within
+/// this long (well inside the consumer's and the Compose healthcheck's
+/// budgets).
 pub const LEGACY_FENCE_TTL_SECS: u64 = 60;
-/// The first Vector release that keeps acknowledged events across a
-/// re-pointing reload (nano-rs/vector NAN-5874), as (major, minor, patch, nano).
-pub const MIN_VECTOR_RELEASE: (u32, u32, u32, u32) = (0, 61, 0, 14);
+/// The first Vector release that can install this API's generations, as
+/// (major, minor, patch, nano): one that loads quoted numeric placeholders
+/// (Vector 0.62, NAN-5810), carries the `splunk_hec` event_kind marker HEC
+/// record preservation needs (nanosiem#10462, first in 0.62.0-nano.2), and
+/// keeps acknowledged events across a re-pointing reload (nano-rs/vector
+/// NAN-5874, first in 0.61.0-nano.14).
+pub const MIN_VECTOR_RELEASE: (u32, u32, u32, u32) = (0, 62, 0, 2);
 /// The holder named in a busy answer to a consumer whose Vector must be
 /// upgraded first (a consumer from before v2.0.35 logs it as the installing
 /// host).
-pub const VECTOR_UPGRADE_HOLDER: &str = "vector-0.61.0-nano.14-required";
-/// The holder named in a busy answer on the legacy path to a consumer that reports its Vector
-/// release (a v2.0.35+ consumer that fell back there): it takes the lease on `/install-lease/v2`.
-pub const LEASE_V2_HOLDER: &str = "install-lease-v2-required";
+pub const VECTOR_UPGRADE_HOLDER: &str = "vector-0.62.0-nano.2-required";
+/// The holder named in a busy answer on a superseded path (`/install-lease`
+/// or `/install-lease/v2`) to a consumer that reports its Vector release: it
+/// takes the lease on `/install-lease/v3`.
+pub const LEASE_V3_HOLDER: &str = "install-lease-v3-required";
 /// Bounds on the lease a consumer may ask for. The consumer asks for its ack
 /// wait plus the drain and rejoin windows; the bound keeps a bad request from
 /// blocking every other host for long.
@@ -168,6 +197,9 @@ pub async fn acquire(
 }
 
 /// Release the lease if `holder` holds it. Returns whether a row was removed.
+///
+/// Only `/install-lease/v3` releases: this version grants on no other path, and
+/// the fenced scopes' rows belong to [`LEGACY_FENCE_HOLDER`].
 pub async fn release(pool: &PgPool, holder: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "DELETE FROM vector_config_install_leases WHERE scope = $1 AND holder = $2",
@@ -201,7 +233,7 @@ pub async fn ready_hosts(urls: &[String]) -> usize {
 }
 
 /// The `X.Y.Z-nano.N` release in a Vector `build_info` revision label (the fork
-/// image sets `nano 0.61.0-nano.14 <sha>`); `None` when the label names none.
+/// image sets `nano 0.62.0-nano.2 <sha>`); `None` when the label names none.
 pub fn parse_vector_release(label: &str) -> Option<(u32, u32, u32, u32)> {
     label.split_whitespace().find_map(|word| {
         let (version, nano) = word.split_once("-nano.")?;
@@ -215,32 +247,72 @@ pub fn parse_vector_release(label: &str) -> Option<(u32, u32, u32, u32)> {
     })
 }
 
+/// NAN-5891 (review r3): the explicit opt-in that lets a Vector build with no
+/// `-nano.` release (an upstream or custom build) install this release's
+/// generations. Off by default: such a build does not mark HEC event kinds
+/// (`%splunk_hec.event_kind`, nano-rs/vector NAN-5891), and the shipped
+/// `hec_normalize` needs that marker. SIEM Health reports it when set.
+pub const ALLOW_CUSTOM_VECTOR_ENV: &str = "NANO_ALLOW_CUSTOM_VECTOR";
+
+/// Whether [`ALLOW_CUSTOM_VECTOR_ENV`] is set to `true`.
+pub fn custom_vector_allowed() -> bool {
+    std::env::var(ALLOW_CUSTOM_VECTOR_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
+
 /// Whether a consumer whose Vector reports `reported` may install. Unreported
 /// (a consumer from before v2.0.35, or Vector's metrics not up yet) or an
-/// older fork release waits. A label with no `-nano.` release (a custom build)
-/// is the operator's own Vector and is allowed.
+/// older fork release waits. A label with no parsable `-nano.` release (an
+/// upstream or custom build) FAILS CLOSED unless [`ALLOW_CUSTOM_VECTOR_ENV`]
+/// is set (NAN-5891 review r3).
 pub fn vector_release_allows_install(reported: Option<&str>) -> bool {
+    vector_release_allows_install_with(reported, custom_vector_allowed())
+}
+
+/// [`vector_release_allows_install`] with the opt-in passed in (testable
+/// without the process environment).
+pub fn vector_release_allows_install_with(reported: Option<&str>, allow_custom: bool) -> bool {
     match reported.map(str::trim) {
         None | Some("") => false,
-        Some(label) => parse_vector_release(label).is_none_or(|release| release >= MIN_VECTOR_RELEASE),
+        Some(label) => match parse_vector_release(label) {
+            Some(release) => release >= MIN_VECTOR_RELEASE,
+            None => allow_custom,
+        },
     }
 }
 
-/// Hold the scope APIs before v2.0.35 grant, so none of them lets a consumer
-/// install while this version's generations are published (see the module
-/// docs). Unconditional: a consumer that held it is mid-install of a
-/// generation it already downloaded and finishes; its release then removes
-/// nothing.
+/// Why `reported` is refused, for the log line (see [`request`]).
+fn refusal_reason(reported: Option<&str>) -> &'static str {
+    match reported.map(str::trim) {
+        Some(label) if !label.is_empty() && parse_vector_release(label).is_none() => {
+            "vector-0.62.0-nano.2-required: custom or upstream Vector builds aren't supported \
+             (this release's HEC config needs the nano Vector build's event-kind marker); run \
+             the pinned nano Vector image, or set NANO_ALLOW_CUSTOM_VECTOR=true on nano-api to \
+             accept the risk"
+        }
+        _ => {
+            "vector-0.62.0-nano.2-required: this ingest host's Vector predates 0.62.0-nano.2 \
+             and cannot load this release's config (or would drop acknowledged events on the \
+             reload); it keeps its installed generation until its pod runs the new image"
+        }
+    }
+}
+
+/// Hold every scope an older API grants ([`FENCED_LEGACY_SCOPES`]), so none
+/// of them lets a consumer install while this version's generations are
+/// published (see the module docs). One statement for all of them.
+/// Unconditional: a consumer that held one is mid-install of a generation it
+/// already downloaded and finishes; its release then removes nothing.
 pub async fn fence_legacy_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO vector_config_install_leases \
              (scope, holder, generation, acquired_at, expires_at) \
-         VALUES ($1, $2, 0, now(), now() + make_interval(secs => $3)) \
+         SELECT fenced.scope, $2, 0, now(), now() + make_interval(secs => $3) \
+         FROM unnest($1::text[]) AS fenced(scope) \
          ON CONFLICT (scope) DO UPDATE SET \
              holder = EXCLUDED.holder, generation = 0, \
              acquired_at = now(), expires_at = EXCLUDED.expires_at",
     )
-    .bind(LEGACY_LEASE_SCOPE)
+    .bind(FENCED_LEGACY_SCOPES)
     .bind(LEGACY_FENCE_HOLDER)
     .bind(LEGACY_FENCE_TTL_SECS as f64)
     .execute(pool)
@@ -248,11 +320,15 @@ pub async fn fence_legacy_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-/// The legacy path (`/install-lease`) on a v2.0.35+ API never grants (NAN-5874 review): a grant
-/// there would be an `ingest-v2` lease the consumer files as a legacy one and releases on the
-/// legacy path, where an older replica answers 204 without releasing it. A consumer from before
-/// v2.0.35 is told to wait for a new Vector, one that reports its release to retry on `/v2`.
-pub async fn request_on_legacy_path(
+/// A superseded path on this version never grants, and refreshes the fence. A
+/// consumer whose Vector could install this version's generations (0.62.0-nano.2
+/// or later) is sent to `/install-lease/v3` ([`LEASE_V3_HOLDER`]). Any other
+/// (a v2.0.35 consumer beside a 0.61 Vector, one that reports no release yet,
+/// or one from before v2.0.35) is told the actionable reason: its Vector must
+/// be upgraded first ([`VECTOR_UPGRADE_HOLDER`], NAN-5810 review r2: a v2.0.35
+/// consumer logs that holder as "must be 0.62.0-nano.2 or later", while it
+/// does not know `install-lease-v3-required`).
+async fn refuse_on_superseded_path(
     pool: &PgPool,
     holder: &str,
     generation: i64,
@@ -263,7 +339,8 @@ pub async fn request_on_legacy_path(
         return Err(LeaseError::Request(LeaseRequestError::InvalidGeneration));
     }
     fence_legacy_scope(pool).await?;
-    let holder_named = if vector_release.is_some() { LEASE_V2_HOLDER } else { VECTOR_UPGRADE_HOLDER };
+    let holder_named =
+        if vector_release_allows_install(vector_release) { LEASE_V3_HOLDER } else { VECTOR_UPGRADE_HOLDER };
     Ok(LeaseOutcome::Busy {
         holder: holder_named.to_string(),
         generation,
@@ -271,8 +348,32 @@ pub async fn request_on_legacy_path(
     })
 }
 
-/// The full lease decision: refuse a Vector that loses events on a
-/// re-pointing reload, take the lease, and on success decide the drain from
+/// The legacy path (`/install-lease`) on a v2.0.35+ API never grants (NAN-5874 review): a grant
+/// there would be a lease the consumer files as a legacy one and releases on the legacy path,
+/// where an older replica answers 204 without releasing it.
+pub async fn request_on_legacy_path(
+    pool: &PgPool,
+    holder: &str,
+    generation: i64,
+    vector_release: Option<&str>,
+) -> Result<LeaseOutcome, LeaseError> {
+    refuse_on_superseded_path(pool, holder, generation, vector_release).await
+}
+
+/// The v2.0.35 path (`/install-lease/v2`) on a v2.0.36+ API never grants (NAN-5810 review P1-1):
+/// a v2.0.35 consumer's Vector is 0.61, which cannot load this version's generations, and a
+/// v2.0.36 consumer that reached it retries on `/install-lease/v3`.
+pub async fn request_on_v2_path(
+    pool: &PgPool,
+    holder: &str,
+    generation: i64,
+    vector_release: Option<&str>,
+) -> Result<LeaseOutcome, LeaseError> {
+    refuse_on_superseded_path(pool, holder, generation, vector_release).await
+}
+
+/// The full lease decision: refuse a Vector that cannot load this release's
+/// generation or loses events on a re-pointing reload, take the lease, and on success decide the drain from
 /// the configured ingest hosts' live readiness.
 pub async fn request(
     pool: &PgPool,
@@ -286,14 +387,27 @@ pub async fn request(
         return Err(LeaseError::Request(LeaseRequestError::InvalidGeneration));
     }
     fence_legacy_scope(pool).await?;
+    let custom = vector_release
+        .map(str::trim)
+        .is_some_and(|label| !label.is_empty() && parse_vector_release(label).is_none());
+    if custom && custom_vector_allowed() {
+        tracing::warn!(
+            holder,
+            generation,
+            vector_release = vector_release.unwrap_or(""),
+            "Vector config install ALLOWED for a custom or upstream Vector build because \
+             NANO_ALLOW_CUSTOM_VECTOR=true: it does not mark HEC event kinds, so HEC object \
+             events take the legacy handling and HEC string events whose text is compact JSON \
+             are handled as object events"
+        );
+    }
     if !vector_release_allows_install(vector_release) {
         tracing::warn!(
             holder,
             generation,
             vector_release = vector_release.unwrap_or("not reported"),
-            "Vector config install refused: this ingest host's Vector predates 0.61.0-nano.14 \
-             and would drop acknowledged events on the reload; it keeps its installed \
-             generation until its pod runs the new image"
+            "Vector config install refused: {}",
+            refusal_reason(vector_release)
         );
         return Ok(LeaseOutcome::Busy {
             holder: VECTOR_UPGRADE_HOLDER.to_string(),

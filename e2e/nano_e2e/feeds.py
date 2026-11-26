@@ -387,3 +387,25 @@ def delete_log_source(nano: Nano, source_id: str) -> None:
         expect(nano.api.delete(f"/api/log-sources/{source_id}"), 200, 204)
         return
     raise AssertionError(f"delete log source {source_id} -> {r.status_code}: {r.text[:500]}")
+
+
+def release_setup_sources(nano: Nano, lanes: tuple[str, ...] | list[str], connector: str) -> list[str]:
+    """NAN-5903: give `lanes` back to nobody, so a one-submit setup starts from
+    zero log sources (precondition) and leaves nothing behind (cleanup).
+
+    Deletes every log source claiming any of `lanes` that a scenario made:
+    this harness's lane parsers (`e2e-lane-*`), the connector-owned pull source
+    (`<connector>_pull`) and catalog imports (`source_parser_repository_id`
+    set), which pull feed setup makes or extends. Returns the deleted names."""
+    release_lane_sources(nano, lanes)
+    sources = expect(nano.api.get("/api/log-sources"), 200)
+    items = sources if isinstance(sources, list) else sources.get("sources") or sources.get("items") or []
+    wanted = set(lanes)
+    deleted = []
+    for s in items:
+        name = str(s.get("name") or "")
+        ours = name.startswith("e2e-lane-") or name == f"{connector}_pull" or bool(s.get("source_parser_repository_id"))
+        if ours and wanted & set(s.get("match_values") or []):
+            delete_log_source(nano, s["id"])
+            deleted.append(name)
+    return deleted

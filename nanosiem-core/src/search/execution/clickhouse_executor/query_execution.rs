@@ -527,10 +527,54 @@ impl ClickHouseExecutor {
 /// query rejection was already reported by `search_error_from_error` (ERROR
 /// for generated SQL, nothing for the caller's own); the caller logs it again
 /// with context, so it stays at DEBUG here.
+///
+/// NAN-5886: a dropped connection mid-stream (`Unavailable`: refused, reset,
+/// client timeout) is a transient outage, not a bug: WARN. The worker that
+/// ran the query aggregates the outage and reports it once if it lasts.
 pub(super) fn log_chunk_read_failure(parsed: &SearchError, raw: &dyn std::fmt::Display) {
-    if parsed.is_internal() {
-        tracing::error!(error = %parsed, raw = %raw, "Error reading ClickHouse response chunk");
+    match chunk_failure_level(parsed) {
+        tracing::Level::WARN => {
+            tracing::warn!(error = %parsed, "Error reading ClickHouse response chunk (backend unavailable)")
+        }
+        tracing::Level::ERROR => {
+            tracing::error!(error = %parsed, raw = %raw, "Error reading ClickHouse response chunk")
+        }
+        _ => tracing::debug!(error = %parsed, raw = %raw, "Error reading ClickHouse response chunk"),
+    }
+}
+
+/// The level [`log_chunk_read_failure`] logs `parsed` at.
+fn chunk_failure_level(parsed: &SearchError) -> tracing::Level {
+    if matches!(parsed, SearchError::Unavailable(_)) {
+        tracing::Level::WARN
+    } else if parsed.is_internal() {
+        tracing::Level::ERROR
     } else {
-        tracing::debug!(error = %parsed, raw = %raw, "Error reading ClickHouse response chunk");
+        tracing::Level::DEBUG
+    }
+}
+
+#[cfg(test)]
+mod chunk_failure_level_tests {
+    use super::*;
+
+    #[test]
+    fn a_dropped_connection_warns_and_a_real_error_stays_error() {
+        let refused = crate::search::classify_clickhouse_failure(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        ));
+        assert_eq!(chunk_failure_level(&refused), tracing::Level::WARN);
+        assert_eq!(
+            chunk_failure_level(&SearchError::Unavailable("timeout".into())),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            chunk_failure_level(&SearchError::PrevalenceError("bad dictionary".into())),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            chunk_failure_level(&SearchError::ParseError("caller's own query".into())),
+            tracing::Level::DEBUG
+        );
     }
 }

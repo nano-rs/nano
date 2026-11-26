@@ -140,6 +140,8 @@ impl ClickHouseSqlGenerator {
     pub(super) fn reset_subsearch_array_slots(&self) {
         self.set_subsearch_arrays(UpstreamArrays::new());
         self.set_pending_arrays(None);
+        // NAN-5895: the JSON-text hand-off slots follow the same lifetime.
+        self.reset_subsearch_json_text_slots();
     }
 
     /// `join`: the columns it takes from the subsearch (`taken`; `None` when

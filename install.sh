@@ -256,6 +256,7 @@ cleanup_env_temp() {
     [[ -z "$ENV_TEMP_FILE" ]] || rm -f -- "$ENV_TEMP_FILE"
     [[ -z "$SETUP_HEADER_FILE" ]] || rm -f -- "$SETUP_HEADER_FILE"
     [[ -z "$SETUP_RESPONSE_FILE" ]] || rm -f -- "$SETUP_RESPONSE_FILE"
+    [[ -z "${PRE_RUN_ENV_COPY:-}" ]] || rm -f -- "$PRE_RUN_ENV_COPY"
     # NAN-5524: the private docker config holding a license-API pull
     # credential (scripts/lib/image-pull.sh), on success, failure and
     # interrupt alike. bash runs this trap on SIGINT/SIGTERM too.
@@ -4306,6 +4307,15 @@ RECORDED_EDITION=$(env_value NANO_EDITION)
 # or one that predates the key). Only installs from before v2 (no ingest tokens
 # yet) can still be in the deprecated legacy multiplex ingest mode.
 PRE_RUN_NANO_VERSION=$(env_value NANO_VERSION)
+# NAN-5899: .env as it was before this run changed anything (nothing writes it
+# before this point). An upgrade that stops at the Vector drain puts it back, so
+# its "nothing was changed" is true. 0600, next to .env, removed on exit.
+PRE_RUN_ENV_COPY=""
+if [[ -f .env ]]; then
+    PRE_RUN_ENV_COPY=$(umask 077 && mktemp "$PWD/.env.pre-run.XXXXXX") \
+        && cp -p .env "$PRE_RUN_ENV_COPY" \
+        || { rm -f -- "${PRE_RUN_ENV_COPY:-}"; PRE_RUN_ENV_COPY=""; }
+fi
 RECORDED_PREFIX=$(env_value NANO_IMAGE_PREFIX)
 if [[ -f .env && -z "$RECORDED_EDITION" ]]; then
     # A .env without NANO_EDITION was written before editions existed, when
@@ -4650,9 +4660,15 @@ fi
 
 # NAN-5367: the role-split renderer admits this host's Docker address pools to
 # ClickHouse when bridge-network services here reach it on the host address.
+# NAN-5880 (D1): and lists this host's own addresses as networks its Agent
+# Lane gate never admits (no root: `ip -o addr`).
 if [[ "$MULTI_NODE" == "1" ]]; then
     NANO_DOCKER_ADDRESS_POOLS_JSON=$(docker info --format '{{json .DefaultAddressPools}}' </dev/null 2>/dev/null || true)
     export NANO_DOCKER_ADDRESS_POOLS_JSON
+    if [[ -z "${NANO_AGENTLANE_HOST_ADDRESSES+set}" && -f deploy/compose/agentlane.py ]]; then
+        NANO_AGENTLANE_HOST_ADDRESSES=$(python3 -I deploy/compose/agentlane.py host-addresses </dev/null 2>/dev/null | paste -sd, - || true)
+        export NANO_AGENTLANE_HOST_ADDRESSES
+    fi
 fi
 
 # NAN-5213: with several app hosts only the FIRST app host in inventory order
@@ -4739,6 +4755,34 @@ if [[ "$MULTI_NODE" != "1" && "${NANO_SKIP_PORT_CHECK:-0}" != "1" ]]; then
     fail_on_port_conflicts "$early_config" "$early_ports" "Nothing was changed."
 fi
 
+# NAN-5880: the bearer secret between nano-api and every gate (>= 32 bytes).
+# Generated once, kept on every re-run; .env stays mode 600. Role split: only
+# the canonical app host generates it (it travels in the shared .env).
+agentlane_ensure_gate_token() {
+    local token
+    [[ "$NANO_EDITION" == enterprise ]] || return 0
+    token=$(env_value NANO_AGENTLANE_GATE_TOKEN)
+    if (( ${#token} >= 32 )); then
+        token=""
+        return 0
+    fi
+    if [[ "$MULTI_NODE" == "1" && "${APP_SECRET_OWNER:-0}" != "1" ]]; then
+        token=""
+        warn "Agent Lane: this host's .env has no NANO_AGENTLANE_GATE_TOKEN, so the gate here stays closed. Copy the updated shared .env from the first app host (its install.sh run generates it), then rerun install.sh here."
+        return 0
+    fi
+    command -v openssl >/dev/null 2>&1 || fail "openssl is required to generate NANO_AGENTLANE_GATE_TOKEN."
+    token=$(openssl rand -hex 32) || fail "Could not generate NANO_AGENTLANE_GATE_TOKEN."
+    [[ ${#token} -eq 64 ]] || fail "Could not generate NANO_AGENTLANE_GATE_TOKEN."
+    nano_env_set_keys .env "NANO_AGENTLANE_GATE_TOKEN=$token" \
+        || { token=""; fail "Could not record NANO_AGENTLANE_GATE_TOKEN in .env."; }
+    token=""
+    chmod 600 .env 2>/dev/null || true
+    # Named (never the value) in the role-split prepare-only summary, which
+    # tells the operator to copy .env to every host.
+    NANO_BACKFILLED_SECRET_KEYS="${NANO_BACKFILLED_SECRET_KEYS:+$NANO_BACKFILLED_SECRET_KEYS, }NANO_AGENTLANE_GATE_TOKEN"
+    ok "Generated NANO_AGENTLANE_GATE_TOKEN in .env (the Agent Lane gate's key to nano-api)"
+}
 # NAN-5508: every interactive question, then the review screen, before
 # anything below writes .env, generates a secret or starts a container.
 if [[ -f .env ]]; then
@@ -4808,6 +4852,9 @@ if [[ -f .env ]]; then
     if [[ -n "$NANO_BACKFILLED_SECRET_KEYS" ]]; then
         log "Backfilled required generated secrets in .env: $NANO_BACKFILLED_SECRET_KEYS"
     fi
+    # NAN-5880: before the role-split prepare-only stop below, so the shared
+    # .env copied to the ClickHouse hosts carries it.
+    agentlane_ensure_gate_token
     # Security review 2026-11-08: values nano once shipped as defaults or
     # examples are public. They are replaced here, before any service starts.
     if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,JWT_SECRET,* ]]; then
@@ -5085,20 +5132,22 @@ configure_detection_max_matches
 configure_storage_tiering
 
 # ----------------------------------------------------------------------------
-# NAN-5361: Agent Lane listener (enterprise). A dedicated HTTPS ClickHouse
-# listener for AI agents, off unless .env (single host) or the inventory (role
-# split) turns it on with an allow-list. The port is published only after
-# deploy/compose/agentlane/nano-agentlane-host (root) has loaded the matching
-# firewall and staged the certificate; otherwise nothing is published.
+# NAN-5880: the Agent Lane gate (enterprise). Agent Lane is turned on and set
+# up in Settings > Agent Lane (the switch, allowed networks, certificate and
+# tokens live in PostgreSQL); nothing in .env or here opens it, and no step
+# needs root. Every enterprise single host runs the gate
+# (deploy/compose/agentlane/docker-compose.agentlane-gate.yml, copied into the
+# install directory and kept in NANO_COMPOSE_OVERLAYS whether Agent Lane is on
+# or off) and publishes the Agent Lane port (NANO_AGENTLANE_PORT, default
+# 8444). While Agent Lane is off nothing listens there: a client gets a reset.
+# The open edition never gets the gate or the port.
 # ----------------------------------------------------------------------------
-AGENTLANE_OVERLAY=""
+AGENTLANE_OVERLAYS=()
+AGENTLANE_NOTICES=""
 AGENTLANE_HELPER=deploy/compose/agentlane/nano-agentlane-host
-agentlane_flag_on() {
-    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-        1|true|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
+AGENTLANE_OLD_OVERLAY=docker-compose.agentlane.yml
+AGENTLANE_GATE_OVERLAY=docker-compose.agentlane-gate.yml
+AGENTLANE_IMPORTED_TLS_OVERLAY=docker-compose.agentlane-imported-tls.yml
 # Add (add) or drop (remove) an installer-managed overlay in .env's
 # NANO_COMPOSE_OVERLAYS, which scripts/nano and nano upgrade read; every other
 # overlay the operator listed is kept as it was.
@@ -5113,69 +5162,73 @@ record_managed_overlay() {
     nano_env_set_keys .env "NANO_COMPOSE_OVERLAYS=$updated" \
         || fail "Could not record NANO_COMPOSE_OVERLAYS in .env."
 }
-agentlane_record_overlay() { record_managed_overlay docker-compose.agentlane.yml "$1"; }
-# Withdraw a render the firewall does not match, so no later `docker compose
-# up` (scripts/nano, nano upgrade, a manual restart) publishes a port or starts
-# a listener this host's firewall does not guard: single host drops the
-# overlay (and its NANO_COMPOSE_OVERLAYS entry), role split the listener file
-# the renderer already wrote into the published config.d.
-agentlane_unpublish() {
-    if [[ "$MULTI_NODE" == "1" ]]; then
-        rm -f .nano-generated/clickhouse/config.d/zz-agentlane-listener.xml
-    else
-        agentlane_record_overlay remove
-        rm -f docker-compose.agentlane.yml
-    fi
+# The v2.0.23-v2.0.35 overlay published ClickHouse's own TLS listener. It can
+# never run beside the gate (and a leftover copy cannot start: ClickHouse now
+# joins clickhouse-netns, and a port on a joined service is a Compose error).
+agentlane_drop_old_overlay() {
+    record_managed_overlay "$AGENTLANE_OLD_OVERLAY" remove
+    rm -f "$AGENTLANE_OLD_OVERLAY"
+    rm -rf .nano-agentlane/clickhouse
 }
-# Fail closed unless the root helper applied exactly this render's firewall
-# and certificate. Root runs it directly; anyone else gets the command.
-agentlane_require_applied() {
-    local state
-    state=$(bash "$AGENTLANE_HELPER" status "$NANO_INSTALL_DIR" 2>/dev/null) || true
-    [[ "$state" == applied ]] && return 0
-    if [[ "$(id -u)" == 0 ]]; then
-        log "Applying the Agent Lane firewall and certificate (${state:-not-applied})"
-        if ! bash "$AGENTLANE_HELPER" apply "$NANO_INSTALL_DIR"; then
-            agentlane_unpublish
-            fail "Agent Lane: nano-agentlane-host apply failed. The listener was not published."
-        fi
-        return 0
-    fi
-    agentlane_unpublish
-    fail "Agent Lane is on, but this host's listener firewall is ${state:-not applied} (not-applied/stale: first run, or the allow-list, port or certificate paths changed; live-*: the live nftables table is missing or nano-agentlane-check.timer has not verified it in the last 2 minutes). Nothing was published. Run: sudo bash $NANO_INSTALL_DIR/$AGENTLANE_HELPER apply $NANO_INSTALL_DIR, then re-run install.sh (no root needed)."
-}
-agentlane_warn_leftover() {
-    [[ -f /etc/nano/agentlane/applied.json ]] || return 0
-    warn "Agent Lane is off, but this host still has its listener firewall and certificate. Remove them with: sudo bash $NANO_INSTALL_DIR/$AGENTLANE_HELPER remove"
+# Run deploy/compose/agentlane.py prepare-single and apply its summary:
+# managed overlays, the non-secret Agent Lane .env values, and notices.
+# NETWORKS: the rendered NAN-5367 allow-list (absent on the first pass of a
+# fresh install: the internal networks are then recorded by the second pass,
+# after the allow-list render, still before anything starts).
+agentlane_prepare_single() {
+    local networks="$1" summary line key value
+    summary=$(python3 -I deploy/compose/agentlane.py prepare-single --install-dir "$NANO_INSTALL_DIR" \
+        --env-file .env --networks-xml "$networks" </dev/null) \
+        || fail "Agent Lane: could not wire the gate (above). Nothing was started."
+    while IFS=$'\t' read -r key value; do
+        case "$key" in
+            add) record_managed_overlay "$value" add
+                 [[ " ${AGENTLANE_OVERLAYS[*]-} " == *" $value "* ]] || AGENTLANE_OVERLAYS+=("$value") ;;
+            remove) record_managed_overlay "$value" remove ;;
+            env) [[ "$(env_value "${value%%=*}")" == "${value#*=}" ]] \
+                     || nano_env_set_keys .env "$value" \
+                     || fail "Could not record ${value%%=*} in .env." ;;
+            notice) [[ "$AGENTLANE_NOTICES" == *"$value"* ]] || AGENTLANE_NOTICES+="$value"$'\n' ;;
+        esac
+    done < <(python3 -I -c 'import json, sys
+s = json.loads(sys.argv[1])
+for name in s["overlays_add"]: print("add", name, sep="\t")
+for name in s["overlays_remove"]: print("remove", name, sep="\t")
+for key, value in sorted(s["env"].items()): print("env", f"{key}={value}", sep="\t")
+for line in s["notices"]: print("notice", " ".join(line.split()), sep="\t")' "$summary")
+    # An overlay the summary no longer adds (the imported certificate after
+    # `nano-agentlane-host remove`) leaves this run's list too.
+    local kept=() item
+    for item in ${AGENTLANE_OVERLAYS[@]+"${AGENTLANE_OVERLAYS[@]}"}; do
+        [[ " $(env_value NANO_COMPOSE_OVERLAYS) " == *" $item "* ]] && kept+=("$item")
+    done
+    AGENTLANE_OVERLAYS=(${kept[@]+"${kept[@]}"})
 }
 configure_agentlane_single() {
-    local summary enabled port bind public_url
-    [[ "$MULTI_NODE" == "1" ]] && return 0
-    if ! agentlane_flag_on "$(env_value NANO_AGENTLANE_LISTENER)"; then
-        # Off (every install before v2.0.23): drop a previous render, if any.
-        if [[ -f deploy/compose/agentlane.py || -f docker-compose.agentlane.yml ]]; then
-            agentlane_record_overlay remove
-            rm -f docker-compose.agentlane.yml
-            rm -rf .nano-agentlane
-            agentlane_warn_leftover
-        fi
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        agentlane_ensure_gate_token
         return 0
     fi
-    [[ "$NANO_EDITION" == enterprise ]] \
-        || fail "NANO_AGENTLANE_LISTENER=true in .env, but Agent Lane is an enterprise feature and this install is the $NANO_EDITION edition. Remove it from .env."
-    [[ -f deploy/compose/agentlane.py && -f "$AGENTLANE_HELPER" ]] \
-        || fail "NANO_AGENTLANE_LISTENER=true, but this bundle has no Agent Lane listener files (deploy/compose/agentlane*). Use the enterprise bundle for v2.0.23 or later."
-    command -v python3 >/dev/null 2>&1 || fail "The Agent Lane listener needs python3 on this host."
-    summary=$(python3 -I deploy/compose/agentlane.py render-single --install-dir "$NANO_INSTALL_DIR" --env-file .env </dev/null) \
-        || fail "Agent Lane listener settings in .env are invalid (above). Nothing was published."
-    IFS=$'\t' read -r enabled port bind public_url < <(
-        python3 -I -c 'import json,sys; v=json.loads(sys.argv[1]); print(v["enabled"], v.get("port",""), v.get("bind_address",""), v.get("public_url",""), sep="\t")' "$summary"
-    )
-    [[ "$enabled" == True ]] || fail "Agent Lane render did not enable the listener."
-    agentlane_require_applied
-    agentlane_record_overlay add
-    AGENTLANE_OVERLAY=docker-compose.agentlane.yml
-    ok "Agent Lane listener: https on ${bind}:${port}, allow-listed sources only (shown in Settings as $public_url)"
+    agentlane_drop_old_overlay
+    if [[ "$NANO_EDITION" != enterprise ]]; then
+        # Never on the open edition (its bundle has no gate; an overlay left
+        # by hand is dropped, not started).
+        record_managed_overlay "$AGENTLANE_GATE_OVERLAY" remove
+        record_managed_overlay "$AGENTLANE_IMPORTED_TLS_OVERLAY" remove
+        rm -f "$AGENTLANE_GATE_OVERLAY" "$AGENTLANE_IMPORTED_TLS_OVERLAY"
+        return 0
+    fi
+    if [[ ! -f deploy/compose/agentlane.py || ! -f "deploy/compose/agentlane/$AGENTLANE_GATE_OVERLAY" ]]; then
+        # Closed, never open: without the gate nothing listens or is published.
+        record_managed_overlay "$AGENTLANE_GATE_OVERLAY" remove
+        record_managed_overlay "$AGENTLANE_IMPORTED_TLS_OVERLAY" remove
+        warn "This enterprise bundle has no Agent Lane gate files (deploy/compose/agentlane*), so Agent Lane is unavailable on this host. Extract the full enterprise bundle and rerun install.sh to get it."
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || fail "The Agent Lane gate setup needs python3 on this host."
+    agentlane_ensure_gate_token
+    agentlane_prepare_single "${NANO_CLICKHOUSE_NETWORKS_XML:-.nano-generated/clickhouse/networks.xml}"
+    ok "Agent Lane gate: port $(env_value NANO_AGENTLANE_PORT) is published; it stays closed until Agent Lane is turned on in Settings > Agent Lane"
 }
 configure_agentlane_single
 
@@ -5277,11 +5330,19 @@ if [[ "$MULTI_NODE" != "1" && " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.
         --prune-overlay docker-compose.legacy-preserved.yml </dev/null \
         || warn "Could not check docker-compose.legacy-preserved.yml for pinned config mounts."
 fi
-if [[ -n "$AGENTLANE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " != *" $AGENTLANE_OVERLAY "* ]]; then
-    NANO_OVERLAY_LIST+=("$AGENTLANE_OVERLAY")
-elif [[ -z "$AGENTLANE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.agentlane.yml "* ]]; then
-    fail "NANO_COMPOSE_OVERLAYS names docker-compose.agentlane.yml, but Agent Lane is off. install.sh manages that overlay: remove it from NANO_COMPOSE_OVERLAYS."
+# NAN-5880: the Agent Lane overlays are installer-managed (enterprise single
+# host: always the gate; the imported certificate while the old host setup
+# is there). The v2.0.35 listener overlay is gone for good.
+if [[ " ${NANO_OVERLAY_LIST[*]-} " == *" $AGENTLANE_OLD_OVERLAY "* ]]; then
+    fail "NANO_COMPOSE_OVERLAYS names $AGENTLANE_OLD_OVERLAY, which v2.0.36 removed (it published ClickHouse's own listener; Agent Lane now runs through the gate, set up in Settings > Agent Lane). Remove it from NANO_COMPOSE_OVERLAYS and rerun."
 fi
+for agentlane_overlay in "$AGENTLANE_GATE_OVERLAY" "$AGENTLANE_IMPORTED_TLS_OVERLAY"; do
+    if [[ " ${AGENTLANE_OVERLAYS[*]-} " == *" $agentlane_overlay "* ]]; then
+        [[ " ${NANO_OVERLAY_LIST[*]-} " == *" $agentlane_overlay "* ]] || NANO_OVERLAY_LIST+=("$agentlane_overlay")
+    elif [[ " ${NANO_OVERLAY_LIST[*]-} " == *" $agentlane_overlay "* ]]; then
+        fail "NANO_COMPOSE_OVERLAYS names $agentlane_overlay, which install.sh manages (the enterprise Agent Lane gate). Remove it from NANO_COMPOSE_OVERLAYS and rerun."
+    fi
+done
 if [[ -n "$METRICS_EXPOSE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " != *" $METRICS_EXPOSE_OVERLAY "* ]]; then
     NANO_OVERLAY_LIST+=("$METRICS_EXPOSE_OVERLAY")
 elif [[ -z "$METRICS_EXPOSE_OVERLAY" && " ${NANO_OVERLAY_LIST[*]-} " == *" docker-compose.metrics-expose.yml "* ]]; then
@@ -5559,14 +5620,16 @@ PY
     if [[ ",${ROLE_ARG}," == *,clickhouse,* ]]; then
         log "Using host-local ClickHouse memory limit $CLICKHOUSE_MEM_LIMIT"
     fi
-    # NAN-5361: a host the inventory gives the Agent Lane listener binds it
-    # (host network) as soon as ClickHouse restarts with the rendered config,
-    # so its firewall and certificate must be in place first.
-    if [[ "${NANO_AGENTLANE_HOST:-}" == "true" ]]; then
-        agentlane_require_applied
-        ok "Agent Lane listener on this host: port ${NANO_AGENTLANE_PORT}, allow-listed sources only"
-    elif [[ ",${ROLE_ARG}," == *,clickhouse,* ]]; then
-        agentlane_warn_leftover
+    # NAN-5880: every ClickHouse host runs the Agent Lane gate on the host
+    # network (closed until Agent Lane is turned on in Settings). No root step:
+    # the one static `ufw allow <port>/tcp` belongs to the host preparation.
+    if [[ "${NANO_AGENTLANE_GATE_REPLICAS:-0}" == "1" ]]; then
+        ok "Agent Lane gate on this host: port ${NANO_AGENTLANE_PORT:-8444}, closed until Agent Lane is turned on in Settings > Agent Lane"
+        [[ -n "$(env_value NANO_AGENTLANE_GATE_TOKEN)" ]] \
+            || warn "Agent Lane: NANO_AGENTLANE_GATE_TOKEN is missing from this host's .env, so its gate stays closed. Copy the updated shared .env from the first app host, then rerun install.sh here."
+    fi
+    if [[ ",${ROLE_ARG}," == *,clickhouse,* && -f /etc/nano/agentlane/applied.json ]]; then
+        AGENTLANE_NOTICES+="An older Agent Lane host firewall is still on this host (/etc/nano/agentlane/applied.json). It keeps blocking any network you add in Settings > Agent Lane that it does not list. Keep it as an extra layer, or remove it once: sudo bash $NANO_INSTALL_DIR/$AGENTLANE_HELPER remove"$'\n'
     fi
     if [[ "$NANO_PRIVATE_TLS" == "true" ]]; then
         for tls_path in "$NANO_TLS_CERT" "$NANO_TLS_KEY" "$NANO_TLS_CA"; do
@@ -6189,14 +6252,17 @@ elif [[ "$MULTI_NODE" != "1" ]]; then
         || nano_env_set_keys .env "NANO_CLICKHOUSE_USERS_DIR=./.nano-generated/clickhouse/users.d" \
         || fail "Could not record NANO_CLICKHOUSE_USERS_DIR in .env."
     log "ClickHouse users accept connections from loopback and ${COMPOSE_SUBNET:-the Docker networks} only${ch_ingest_networks:+ (nanosiem_ingest also from $ch_ingest_networks)}"
-    # NAN-5361: that lock is what refuses nano's own users on the Agent Lane
-    # port, so an Agent Lane allow-list must not overlap it.
-    if [[ -n "$AGENTLANE_OVERLAY" ]] \
-        && ! python3 -I deploy/compose/agentlane.py check-networks --env-file .env \
-            --networks-xml .nano-generated/clickhouse/networks.xml </dev/null; then
-        agentlane_unpublish
-        fail "Agent Lane was not published (above). Nothing was started."
+    # NAN-5880 (D1): the same lock, plus this host's own addresses, is what
+    # the Agent Lane gate refuses as a source and Settings refuses as an
+    # allowed network (NANO_AGENTLANE_INTERNAL_CIDRS on the gate and nano-api).
+    if [[ " ${AGENTLANE_OVERLAYS[*]-} " == *" $AGENTLANE_GATE_OVERLAY "* ]]; then
+        agentlane_prepare_single .nano-generated/clickhouse/networks.xml
+        log "Agent Lane gate: never admits nano's own networks or this host's addresses ($(env_value NANO_AGENTLANE_INTERNAL_CIDRS))"
     fi
+fi
+if [[ "$MULTI_NODE" != "1" && " ${AGENTLANE_OVERLAYS[*]-} " == *" $AGENTLANE_GATE_OVERLAY "* \
+    && -z "$(env_value NANO_AGENTLANE_INTERNAL_CIDRS)" ]]; then
+    warn "Agent Lane: no internal networks were rendered (NANO_AGENTLANE_INTERNAL_CIDRS is empty), so the Agent Lane gate stays closed. Rerun install.sh from a complete bundle."
 fi
 
 # NAN-5445: render ClickHouse storage tiering (config.d/zzz-nano-tiering.xml)
@@ -6289,12 +6355,136 @@ fi
 # until the new Vector's entrypoint sees the new api's render
 # (config/vector/.nano/vector-entrypoint.sh, pipeline gate).
 # BEGIN nano-vector-pipeline-stop
+# NAN-5885: also stop Vector first whenever the `up` below recreates Vector or
+# ClickHouse (a changed definition or image, or the network move), not only on
+# an identity change. One `up` recreated both: ClickHouse went down first,
+# Vector got SIGTERM while its sink retried a batch it had already taken from
+# the disk buffer, could not drain to a ClickHouse that was down, and Docker
+# killed it at the stop timeout. That batch was never replayed, though its
+# senders had their acknowledgements (RC2 -> RC3 kept 2.0.35/fsync/off). A
+# Vector drained while ClickHouse is still up has nothing in flight.
+#
+# nano_up_recreates SERVICE RENDERED_IMAGE HASH_RELIABLE: does `up` replace (or
+# otherwise stop) the running container? It fails safe: any doubt drains Vector,
+# which costs a minute of ingest, while a miss can lose acknowledged events.
+#   - Compose's dry run (`up -d --dry-run`, forced to plain, uncoloured output) must
+#     name the container only with states that change nothing (Running, Waiting,
+#     Healthy) and at least once as Running. Any other state, Recreate, Restart,
+#     Stop, Start, Create, Remove or a word this code does not know, means drain.
+#   - The image the service renders must be the one the container runs.
+#   - Its Compose config hash must match the container's label, except for a
+#     service that shares another container's network namespace (Vector): Compose
+#     hashes the resolved container there, so that hash never matches outside `up`.
+# A container the dry run does not name (it failed, or printed nothing parseable)
+# is judged by the hash and image alone, and an unreliable hash then means drain.
+NANO_UP_DRY_RUN=""
+NANO_UP_DRY_RUN_OK=0
+nano_up_dry_run() {
+    local limit=() out="" rc=0
+    command -v timeout >/dev/null 2>&1 && limit=(timeout 180)
+    out=$(COMPOSE_PROGRESS=plain COMPOSE_ANSI=never NO_COLOR=1 ${limit[@]+"${limit[@]}"} \
+        docker compose --progress plain --ansi never "${COMPOSE_ARGS[@]}" up -d --dry-run </dev/null 2>&1) || rc=$?
+    if ((rc != 0)); then
+        # An older Compose without the global --progress flag: the variables still apply.
+        rc=0
+        out=$(COMPOSE_PROGRESS=plain COMPOSE_ANSI=never NO_COLOR=1 ${limit[@]+"${limit[@]}"} \
+            docker compose "${COMPOSE_ARGS[@]}" up -d --dry-run </dev/null 2>&1) || rc=$?
+    fi
+    NANO_UP_DRY_RUN_OK=0
+    ((rc == 0)) && NANO_UP_DRY_RUN_OK=1
+    # Defensive: drop any terminal escape sequences that still came through.
+    NANO_UP_DRY_RUN=$(printf '%s\n' "$out" | tr '\r' '\n' | sed -e $'s/\x1b\\[[0-9;?]*[A-Za-z]//g')
+}
+# untouched | changed | absent, for one container name, from the dry run's output.
+nano_up_dry_run_state() {
+    ((NANO_UP_DRY_RUN_OK)) || { echo absent; return 0; }
+    awk -v want="Container $1" '
+        {
+            i = index($0, want)
+            if (!i) next
+            if (i > 1 && substr($0, i - 1, 1) !~ /[[:space:]]/) next
+            rest = substr($0, i + length(want))
+            if (rest !~ /^[[:space:]]/) next
+            sub(/^[[:space:]]+/, "", rest)
+            split(rest, word, /[[:space:]]+/)
+            seen = 1
+            if (word[1] == "Running") running = 1
+            else if (word[1] != "Waiting" && word[1] != "Healthy") changed = 1
+        }
+        END {
+            if (!seen) print "absent"
+            else if (changed || !running) print "changed"
+            else print "untouched"
+        }' <<<"$NANO_UP_DRY_RUN"
+}
+nano_up_recreates() {
+    local service="$1" image="$2" hash_reliable="$3" cid name state want have want_image have_image
+    cid=$(docker compose "${COMPOSE_ARGS[@]}" ps -q "$service" </dev/null 2>/dev/null | awk 'NR == 1') || cid=""
+    [[ -n "$cid" ]] || return 1
+    name=$(docker inspect --format '{{.Name}}' "$cid" </dev/null 2>/dev/null) || name=""
+    name=${name#/}
+    state=absent
+    [[ -n "$name" ]] && state=$(nano_up_dry_run_state "$name")
+    [[ "$state" == changed ]] && return 0
+    [[ -n "$image" ]] || return 0
+    want_image=$(docker image inspect --format '{{.Id}}' "$image" </dev/null 2>/dev/null) || want_image=""
+    have_image=$(docker inspect --format '{{.Image}}' "$cid" </dev/null 2>/dev/null) || have_image=""
+    [[ -n "$want_image" && "$want_image" == "$have_image" ]] || return 0
+    if [[ "$hash_reliable" == 1 ]]; then
+        want=$(docker compose "${COMPOSE_ARGS[@]}" config --hash "$service" </dev/null 2>/dev/null \
+            | awk -v s="$service" '$1 == s { print $2; exit }') || want=""
+        have=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$cid" </dev/null 2>/dev/null) || have=""
+        [[ -n "$want" && "$want" == "$have" ]] || return 0
+        return 1
+    fi
+    [[ "$state" == untouched ]] && return 1
+    return 0
+}
+# NAN-5899: the upgrade stops before Vector was stopped: reopen ingest, put .env
+# back as it was before this run (atomically, with its mode), and say exactly
+# what is left. The release's files (the package extracted over the install, or
+# this run's checkout update) stay; the running Vector keeps the configuration
+# it loaded (the static bundle loads in the old Vector too, NAN-5899).
+drain_refused_restore_env() {
+    local target tmp env_state gate_state=""
+    if declare -F nano_vq_reopen >/dev/null; then nano_vq_reopen 30 || true; fi
+    # nano_vq_reopen warns but returns 0 when Vector's gate did not open: say so here too.
+    if declare -F nano_vq_running >/dev/null && nano_vq_running vector \
+        && [[ "$(nano_vq_compose exec -T vector sh /etc/vector/.nano/ingest-gate.sh status </dev/null 2>/dev/null)" == closed* ]]; then
+        gate_state=" Vector's published ingest ports are STILL CLOSED: run docker compose exec vector sh /etc/vector/.nano/ingest-gate.sh open."
+    fi
+    env_state="it was not changed"
+    if [[ -z "${PRE_RUN_ENV_COPY:-}" || ! -f "$PRE_RUN_ENV_COPY" ]]; then
+        env_state="this run may have changed it (no copy from before the run could be taken)"
+    elif ! cmp -s "$PRE_RUN_ENV_COPY" .env; then
+        env_state="it could NOT be put back as it was before this run (the copy is $PRE_RUN_ENV_COPY; restore it by hand)"
+        if target=$(resolve_env_target .env) \
+            && tmp=$(umask 077 && mktemp "$(dirname "$target")/.env.restore.XXXXXX") \
+            && cp -p "$PRE_RUN_ENV_COPY" "$tmp" && mv -f "$tmp" "$target"; then
+            env_state="it is back as it was before this run"
+        else
+            rm -f -- "${tmp:-}"
+            PRE_RUN_ENV_COPY=""  # keep the copy for the operator
+        fi
+    fi
+    fail "Stopped before the upgrade restarted anything: Vector was not drained (above). .env: $env_state. The new release's files are in place and the running Vector keeps the configuration it loaded; ClickHouse's assembled configuration (.nano-generated/clickhouse) may already hold this run's sizing, which a ClickHouse restart would load, so re-run install.sh to upgrade rather than restarting services by hand.$gate_state"
+}
 stop_vector_for_pipeline_change() {
-    local target cid have running
-    target=$(docker compose "${COMPOSE_ARGS[@]}" config --format json </dev/null 2>/dev/null \
+    local rendered target cid have running reason="" vector_image netns_image clickhouse_image vector_hash netns_hash clickhouse_hash
+    rendered=$(docker compose "${COMPOSE_ARGS[@]}" config --format json </dev/null 2>/dev/null \
         | python3 -I -c 'import json, sys
-env = json.load(sys.stdin).get("services", {}).get("vector", {}).get("environment") or {}
-print(env.get("NANO_PIPELINE_IDENTITY") or "")' 2>/dev/null) || target=""
+services = json.load(sys.stdin).get("services", {})
+env = (services.get("vector") or {}).get("environment") or {}
+print(env.get("NANO_PIPELINE_IDENTITY") or "")
+for name in ("vector", "vector-netns", "clickhouse"):
+    svc = services.get(name) or {}
+    mode = str(svc.get("network_mode") or "")
+    # 1: the Compose config hash can be compared outside `up` (see nano_up_recreates).
+    print((svc.get("image") or "") + "\t" + ("0" if mode.startswith(("service:", "container:")) else "1"))' 2>/dev/null) || rendered=""
+    { IFS= read -r target
+      IFS=$'\t' read -r vector_image vector_hash
+      IFS=$'\t' read -r netns_image netns_hash
+      IFS=$'\t' read -r clickhouse_image clickhouse_hash; } <<<"$rendered" || true
     [[ -n "$target" ]] || return 0
     cid=$(docker compose "${COMPOSE_ARGS[@]}" ps -q vector </dev/null 2>/dev/null | awk 'NR == 1') || cid=""
     # A 0.1.x install's Vector may belong to another Compose project.
@@ -6304,8 +6494,21 @@ print(env.get("NANO_PIPELINE_IDENTITY") or "")' 2>/dev/null) || target=""
     [[ "$running" == true ]] || return 0
     have=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" </dev/null 2>/dev/null \
         | awk 'sub(/^NANO_PIPELINE_IDENTITY=/, "") && !seen++') || have=""
-    [[ "$have" == "$target" ]] && return 0
-    log "Stopping Vector before the upgrade (pipeline ${have:-from before NAN-5564} -> $target): it drains to its disk buffers, and ingest refuses connections until the new pipeline is rendered and running"
+    [[ "$have" == "$target" ]] && nano_up_dry_run
+    if [[ "$have" != "$target" ]]; then
+        reason="pipeline ${have:-from before NAN-5564} -> $target"
+    elif nano_up_recreates vector "$vector_image" "${vector_hash:-0}"; then
+        reason="the upgrade replaces the Vector container"
+    elif nano_up_recreates vector-netns "$netns_image" "${netns_hash:-0}"; then
+        # Vector shares this container's network namespace: replacing it replaces Vector.
+        reason="the upgrade replaces Vector's network namespace"
+    elif nano_up_recreates clickhouse "$clickhouse_image" "${clickhouse_hash:-0}"; then
+        reason="the upgrade restarts ClickHouse"
+    elif [[ "${NETWORK_PIN_ACTION:-none}" == replace || "${NETWORK_PIN_ACTION:-none}" == release ]]; then
+        reason="the stack moves to another network"
+    fi
+    [[ -n "$reason" ]] || return 0
+    log "Stopping Vector before the upgrade ($reason): it drains to its disk buffers, and ingest refuses connections until the new pipeline is rendered and running"
     # NAN-5566: a Vector without an identity predates the ingest gate (2.0.31
     # or older): its direct senders cannot be closed, so they are paused first.
     if [[ -z "$have" && "$(type -t nano_vq_confirm_senders_paused)" == function ]]; then
@@ -6318,6 +6521,8 @@ print(env.get("NANO_PIPELINE_IDENTITY") or "")' 2>/dev/null) || target=""
         && docker compose "${COMPOSE_ARGS[@]}" ps -q vector </dev/null 2>/dev/null | grep -x "$cid" >/dev/null; then
         nano_vq_close
         nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+        # NAN-5885: a stop that has to kill Vector loses what it had not delivered.
+        nano_vq_require_drained || drain_refused_restore_env
     fi
     docker stop --time 120 "$cid" </dev/null >/dev/null \
         || fail "Could not stop Vector ($cid) before the upgrade (above). Stop it (docker stop --time 120 $cid) and re-run install.sh; re-runs are safe."
@@ -6327,7 +6532,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
     if [[ -r scripts/lib/vector-quiesce.sh ]]; then
         # shellcheck source=scripts/lib/vector-quiesce.sh
         . scripts/lib/vector-quiesce.sh
-        nano_vq_compose() { docker compose "${COMPOSE_ARGS[@]}" "$@"; }
+        nano_vq_compose() { ${NANO_VQ_LIMIT:+timeout "$NANO_VQ_LIMIT"} docker compose "${COMPOSE_ARGS[@]}" "$@"; }
     fi
     stop_vector_for_pipeline_change
 fi
@@ -6514,6 +6719,8 @@ recreate_stale_mount_services() {
     if [[ " ${services[*]} " == *" vector "* && "$(type -t nano_vq_close)" == function ]] && nano_vq_running vector; then
         nano_vq_close
         nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+        # NAN-5885: never force-stop a Vector that still holds undelivered events.
+        nano_vq_require_drained || fail "Vector was not drained (above), so ${services[*]} were not recreated onto the updated configuration. Re-run install.sh once ClickHouse is healthy."
         nano_vq_stop
     fi
     # The stack is already up: a failed recreate leaves these services on
@@ -6535,6 +6742,8 @@ if [[ "$VECTOR_NATIVE_RESTART" == "1" ]] \
         # below runs once the restarted Vector is healthy.
         nano_vq_close
         nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+        # NAN-5885: never force-stop a Vector that still holds undelivered events.
+        nano_vq_require_drained || fail "Vector was not drained (above), so it was not restarted onto the re-issued Vector-native certificate. Re-run install.sh once ClickHouse is healthy."
         vector_restart_args=(restart --timeout "$NANO_VQ_STOP_TIMEOUT" vector)
     fi
     docker compose "${COMPOSE_ARGS[@]}" "${vector_restart_args[@]}" </dev/null \
@@ -6547,14 +6756,13 @@ if [[ "$(type -t nano_vq_reopen)" == function ]]; then
     nano_vq_reopen || warn "Ingest may still be closed at nginx: docker compose exec nginx rm -f /run/nano-ingest/closed"
 fi
 
-# NAN-5404: ClickHouse cannot confine a user to a listener, so with the Agent
-# Lane port published EVERY ClickHouse user other than a token user must
-# refuse the agent networks. The renders above lock the users nano defines;
-# this reads every user ClickHouse actually has (system.users: users.d, the
-# built-in `default`, SQL-created ones such as nano_backup or one added by
-# hand) and withdraws the listener if any of them admits an agent source.
-# Role-split hosts: the app's Agent Lane control plane runs the same check on
-# every ClickHouse node before it provisions a token.
+# NAN-5404: ClickHouse cannot confine a user to a listener. Since NAN-5880 the
+# Agent Lane gate forwards only approved token requests, and the control plane
+# keeps Agent Lane closed while any ClickHouse user other than a token user
+# accepts an agent address (409 clickhouse_users_exposed). Here: give nano's
+# own SQL-created users (nano_backup, legacy raw-SQL users) the app user's
+# networks, so that check only ever fires on users nano did not create, and
+# name any such user now. Warn only: nothing here opens Agent Lane.
 agentlane_read_users() {
     local out=$1 query
     query=$(python3 -I deploy/compose/agentlane.py users-query </dev/null)
@@ -6571,54 +6779,41 @@ agentlane_read_users() {
     done
     return 1
 }
-AGENTLANE_DEFERRED_FAILURE=""
 agentlane_check_live_users() {
     local rows statement statements
-    [[ -n "$AGENTLANE_OVERLAY" ]] || return 0
+    [[ " ${AGENTLANE_OVERLAYS[*]-} " == *" $AGENTLANE_GATE_OVERLAY "* ]] || return 0
+    # Only on an install upgraded with Agent Lane on (the import-only .env
+    # switch): the migrator keeps nano's SQL users aligned anyway, and the
+    # control plane checks every user again before it opens the gate.
+    case "$(env_value NANO_AGENTLANE_LISTENER | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) ;;
+        *) return 0 ;;
+    esac
     rows=$(mktemp .nano-agentlane-users.XXXXXX)
-    # Users nano created with SQL (nano_backup, legacy raw-SQL users) get the
-    # app user's networks first, so the check below only fires on users nano
-    # did not create. Older releases created them on the private ranges,
-    # which overlap an agent on a private LAN.
-    if agentlane_read_users "$rows"; then
-        statements=$(python3 -I deploy/compose/agentlane.py align-sql --users-json "$rows" </dev/null) || statements=""
-        while IFS= read -r statement; do
-            [[ -n "$statement" ]] || continue
-            # shellcheck disable=SC2016
-            if docker compose "${COMPOSE_ARGS[@]}" exec -T clickhouse sh -c \
-                'clickhouse-client --user nanosiem_admin --password "$CLICKHOUSE_ADMIN_PASSWORD" --query "$1"' \
-                sh "$statement" </dev/null >/dev/null; then
-                log "Agent Lane: ${statement%% HOST *} now accepts the same networks as nanosiem"
-            else
-                warn "Agent Lane: could not run: $statement"
-            fi
-        done <<<"$statements"
-        [[ -z "$statements" ]] || agentlane_read_users "$rows" || :
-    fi
-    if python3 -I deploy/compose/agentlane.py check-users --env-file .env --users-json "$rows" </dev/null; then
+    if ! agentlane_read_users "$rows"; then
         rm -f "$rows"
-        ok "Agent Lane: no ClickHouse user other than token users accepts the allow-listed networks"
+        warn "Agent Lane: could not read ClickHouse's users; Settings > Agent Lane checks them again before it opens."
         return 0
     fi
-    rm -f "$rows"
-    # Withdraw the listener: drop the overlay and recreate ClickHouse without
-    # it. The rest of the install (nginx reload, PostgreSQL HA identity, API
-    # health, admin init) still runs; install.sh exits non-zero at the end.
-    local args=() skip=0 item
-    for item in "${COMPOSE_ARGS[@]}"; do
-        if (( skip )); then skip=0; [[ "$item" == "$AGENTLANE_OVERLAY" ]] && continue; args+=(-f "$item"); continue; fi
-        if [[ "$item" == -f ]]; then skip=1; continue; fi
-        args+=("$item")
-    done
-    agentlane_unpublish
-    if docker compose "${args[@]}" up -d --no-deps --force-recreate clickhouse </dev/null; then
-        COMPOSE_ARGS=("${args[@]}")
-        AGENTLANE_OVERLAY=""
+    statements=$(python3 -I deploy/compose/agentlane.py align-sql --users-json "$rows" </dev/null) || statements=""
+    while IFS= read -r statement; do
+        [[ -n "$statement" ]] || continue
+        # shellcheck disable=SC2016
+        if docker compose "${COMPOSE_ARGS[@]}" exec -T clickhouse sh -c \
+            'clickhouse-client --user nanosiem_admin --password "$CLICKHOUSE_ADMIN_PASSWORD" --query "$1"' \
+            sh "$statement" </dev/null >/dev/null; then
+            log "Agent Lane: ${statement%% HOST *} now accepts the same networks as nanosiem"
+        else
+            warn "Agent Lane: could not run: $statement"
+        fi
+    done <<<"$statements"
+    [[ -z "$statements" ]] || agentlane_read_users "$rows" || :
+    if python3 -I deploy/compose/agentlane.py check-users --env-file .env --users-json "$rows" </dev/null; then
+        ok "Agent Lane: no ClickHouse user other than token users accepts outside addresses"
     else
-        warn "Could not recreate ClickHouse without the Agent Lane listener; stop it now: docker compose ${args[*]} up -d --no-deps --force-recreate clickhouse"
+        warn "Agent Lane stays closed until the ClickHouse users named above are restricted or dropped (Settings > Agent Lane shows the same)."
     fi
-    AGENTLANE_DEFERRED_FAILURE="Agent Lane was withdrawn (see the users named above): the listener is closed and the rest of the stack is running. Restrict or drop those users, then re-run install.sh."
-    warn "$AGENTLANE_DEFERRED_FAILURE"
+    rm -f "$rows"
 }
 agentlane_check_live_users
 
@@ -7047,8 +7242,16 @@ echo "  Logs:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} logs
 echo "  Stop:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down"
 echo "  Reset:    cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down -v   (DELETES ALL DATA)"
 echo
-# NAN-5404: reported last, after every other step ran.
-[[ -z "$AGENTLANE_DEFERRED_FAILURE" ]] || fail "$AGENTLANE_DEFERRED_FAILURE"
+# NAN-5880: Agent Lane notices (import-only .env values, an old host
+# firewall), printed once, after everything else.
+if [[ -n "${AGENTLANE_NOTICES:-}" ]]; then
+    # `if`, not `[[ ]] && warn`: the list ends with an empty line, and a
+    # false test as the loop's (and main's) last command made a successful
+    # install exit 1 on every upgrade that has a notice.
+    while IFS= read -r agentlane_notice; do
+        if [[ -n "$agentlane_notice" ]]; then warn "$agentlane_notice"; fi
+    done <<<"$AGENTLANE_NOTICES"
+fi
 }
 
 # Keep this invocation as the final parsed command. When install.sh arrives via

@@ -72,6 +72,15 @@ pub async fn ip_allowlist_middleware(
         return next.run(request).await;
     }
 
+    // NAN-5880: the Agent Lane gates (in ClickHouse's network namespace)
+    // long-poll their config and send heartbeats here. Infrastructure, like
+    // the Vector config consumer: a UI/API allowlist must not close Agent
+    // Lane. The endpoints carry their own NANO_AGENTLANE_GATE_TOKEN bearer
+    // gate (enterprise; absent in open builds, so the path 404s there).
+    if path.starts_with("/api/internal/agentlane/") {
+        return next.run(request).await;
+    }
+
     // NAN-4907: the OTLP edge's auth_request. Its caller is an ingest sender
     // (like /ingest, which never reaches this API); the source-bound ingest
     // token it carries is the gate, not the UI/API allowlist.

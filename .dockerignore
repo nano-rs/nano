@@ -87,8 +87,10 @@ config/
 !config/vector/01-vector-source.toml
 !config/vector/02-hec-source.toml
 !config/vector/03-otlp-source.toml
+!config/vector/03-otlp-sinks.yaml
 !config/vector/04-enrichment-source.toml
 !config/vector/92-metrics.toml
+!config/vector/92-metrics-sinks.yaml
 !config/vector/disk-buffer-budget.env
 !config/vector/sources/parsers/_router.toml
 !config/vector/sources/parsers/_combiner.toml

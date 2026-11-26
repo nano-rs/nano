@@ -192,6 +192,18 @@ impl MitreSync {
     }
 
     async fn run(&self, mode: RunMode<'_>) -> Result<MitreSyncOutcome, MitreSyncError> {
+        // NAN-5892: the sync pins a pooled connection for its whole run (the
+        // catalog download included); take a pinned slot first so a small
+        // pool keeps connections for short queries. Dropped after the
+        // connection (declared first). An Apply runs inside the content
+        // channel's install lease, which already pins one connection: its
+        // second pin takes a nested slot (review: two pins on one slot broke
+        // the reserve), which never waits on the lease's own slot.
+        let pool = self.repository.pool();
+        let _slot = match mode {
+            RunMode::Apply(_) => crate::db::pinned_session::nested_pinned_slot(pool).await,
+            _ => crate::db::pinned_session::pinned_slot(pool).await,
+        };
         let Some(mut connection) = self
             .repository
             .try_acquire_sync_connection(MITRE_SYNC_LOCK_ID)

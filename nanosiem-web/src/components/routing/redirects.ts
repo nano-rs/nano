@@ -30,6 +30,18 @@ export function redirectTarget(to: string, search: string, hash: string, query: 
 }
 
 /**
+ * NAN-5859: fill `:name` segments in a redirect target from the matched
+ * route's params (`/hunts/campaigns/:id` lands on `/hunts/actors/:id`). Each
+ * value is URI-encoded; a param the route did not match is left as is.
+ */
+export function fillParams(to: string, params: Readonly<Record<string, string | undefined>>): string {
+  return to.replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (whole, name: string) => {
+    const v = params[name];
+    return v == null ? whole : encodeURIComponent(v);
+  });
+}
+
+/**
  * NAN-5850 PR A: the Hunts IA moves (design section 3). `/hunts/profile`
  * is not here: its page turns into the redirect in PR C, once the coverage
  * Telemetry tab that replaces it exists.
@@ -40,4 +52,9 @@ export const LEGACY_HUNT_REDIRECTS: readonly LegacyRedirect[] = [
   { from: '/hunts/rulings', to: '/hunts/leads/decisions', query: 'keep' },
   { from: '/hunts/runners', to: '/settings/hunts', query: 'drop' },
   { from: '/hunts/rule-ideas', to: '/rules/ideas', query: 'keep' },
+  // NAN-5859: Campaigns became Actors. The API keeps /api/hunts/campaigns;
+  // only the pages move. Unassigned candidates are part of the review queue.
+  { from: '/hunts/campaigns', to: '/hunts/actors', query: 'keep' },
+  { from: '/hunts/campaigns/candidates', to: '/hunts/actors/review?kind=unassigned', query: 'keep' },
+  { from: '/hunts/campaigns/:id', to: '/hunts/actors/:id', query: 'keep' },
 ];

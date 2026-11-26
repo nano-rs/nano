@@ -23,25 +23,38 @@ pub(crate) const VERDICT_MEMO_CAPACITY: usize = 1024;
 type Key = [u8; 32];
 type Verdict = Result<(), String>;
 
-/// Fingerprint of the parser function allowlist the guarded checks compile
-/// against, so a verdict can never outlive a change to that allowlist.
-static ALLOWLIST_TAG: LazyLock<Key> = LazyLock::new(|| {
+/// The `vrl` crate this binary compiles with (checked against Cargo.lock by
+/// `vrl_verdict_memo_tests`). Part of [`VALIDATOR_TAG`]: a compiler upgrade
+/// may change what compiles.
+pub(crate) const VRL_CRATE_VERSION: &str = "0.38.0";
+
+/// Fingerprint of everything a compile verdict depends on besides the source
+/// text (NAN-5889 review): the function registry and its sorted allowlist, the
+/// validator's safety rules ([`super::validator::safety_rules_fingerprint`]),
+/// the `vrl` compiler version and this crate's version. Every verdict cache
+/// keys on it, so a verdict never outlives a change to any of them.
+pub(crate) static VALIDATOR_TAG: LazyLock<Key> = LazyLock::new(|| {
     let mut names: Vec<&'static str> = crate::parsers::vrl_functions::parser_vrl_functions()
         .iter()
         .map(|f| f.identifier())
         .collect();
     names.sort_unstable();
     let mut hasher = Sha256::new();
-    hasher.update(b"nano-vrl-verdict-v1\0");
+    hasher.update(b"nano-vrl-verdict-v2\0registry=parser\0");
     for name in names {
         hasher.update(name.as_bytes());
         hasher.update([0u8]);
     }
+    super::validator::safety_rules_fingerprint(&mut hasher);
+    hasher.update(b"vrl=");
+    hasher.update(VRL_CRATE_VERSION.as_bytes());
+    hasher.update(b"\0nanosiem-core=");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.finalize().into()
 });
 
 static GLOBAL: LazyLock<VerdictMemo> =
-    LazyLock::new(|| VerdictMemo::new(VERDICT_MEMO_CAPACITY, *ALLOWLIST_TAG));
+    LazyLock::new(|| VerdictMemo::new(VERDICT_MEMO_CAPACITY, *VALIDATOR_TAG));
 
 /// Memoize `check` for `(kind, src)` in the process-wide memo.
 pub(crate) fn verdict(kind: &str, src: &str, check: impl FnOnce() -> Verdict) -> Verdict {

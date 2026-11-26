@@ -109,6 +109,8 @@ pub mod telemetry;
 pub mod error_tracking;
 pub mod text_bounds;
 pub mod timezone;
+// NAN-5886: transient backend outages warn first, report once if sustained.
+pub mod transient_outage;
 pub mod tuning;
 pub mod typeid;
 pub mod udm;

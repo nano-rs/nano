@@ -11,13 +11,15 @@
  * credentials are managed (masked, versions, rollback, delete) below the list.
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowUpCircle, CloudDownload, KeyRound, Pause, Play, Plus, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
-import { api } from '@/lib/api';
+import { api, ApiClientError } from '@/lib/api';
+import { LOG_SOURCES_MISSING } from '@/components/connector-feeds/pull-links';
 import type {
   ConnectorFeed,
   ConnectorSpecInfo,
@@ -54,6 +56,18 @@ import {
   withAllowShrink,
 } from '@/components/connector-feeds/AllowShrinkField';
 import { Term } from '@/components/ui/term';
+import {
+  ConfigField,
+  FieldLabel,
+  feedConfig,
+  useLaneSetup,
+  credentialFieldInfo,
+  defaultConfig,
+  fieldLabel,
+  setupSummary,
+  useFeedSubmit,
+} from '@/components/connector-feeds/ConnectorFields';
+import { scheduleDefaultText } from '@/components/connector-feeds/schedule';
 
 const FIELD_LABEL = 'text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground';
 const HELP_TEXT = 'text-[10.5px] text-muted-foreground leading-relaxed';
@@ -137,14 +151,51 @@ export function ConnectorFeeds() {
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['connectorFeeds'] });
 
+  // NAN-5903: resuming and adopting a spec update start the feed. The API
+  // refuses a start whose lanes have no log source (LOG_SOURCES_MISSING);
+  // Fix setup then repeats it with consent, through the same setup confirm
+  // as New pull feed (one server path: the lane setup in the API).
+  const laneSetup = useLaneSetup();
+  const [fix, setFix] = useState<{ feed: ConnectorFeed; kind: 'resume' | 'adopt'; message: string } | null>(null);
+  const refusedForMissingSources = (feed: ConnectorFeed, kind: 'resume' | 'adopt', e: unknown) => {
+    if (e instanceof ApiClientError && e.code === LOG_SOURCES_MISSING) {
+      setFix({ feed, kind, message: e.message });
+      return true;
+    }
+    return false;
+  };
   const toggle = useMutation({
     mutationFn: (feed: ConnectorFeed) => api.connectorFeeds.setEnabled(feed.id, !feed.enabled),
     onSuccess: (feed) => {
       invalidate();
+      setFix(null);
       toast({ title: feed.enabled ? 'Feed resumed' : 'Feed paused', description: feed.name });
     },
-    onError: (e) => toast({ title: 'Could not change the feed', description: errorText(e), variant: 'destructive' }),
+    onError: (e, feed) => {
+      if (!refusedForMissingSources(feed, 'resume', e)) {
+        toast({ title: 'Could not change the feed', description: errorText(e), variant: 'destructive' });
+      }
+    },
   });
+  const runFix = (target: { feed: ConnectorFeed; kind: 'resume' | 'adopt' }) =>
+    void laneSetup.start({
+      plan: () => api.connectorFeeds.plan(target.feed.connector, feedConfig(target.feed)),
+      run: (setUp) =>
+        target.kind === 'resume'
+          ? api.connectorFeeds.setEnabled(target.feed.id, true, setUp).then(() => undefined)
+          : api.connectorFeeds.adoptSpec(target.feed.id, setUp).then(() => undefined),
+      onDone: (_r, plan) => {
+        invalidate();
+        setFix(null);
+        toast({
+          title: target.kind === 'resume' ? 'Feed resumed' : 'Spec update adopted',
+          description: [target.feed.name, plan?.changes_log_sources ? setupSummary({ id: target.feed.id, credential_id: null, log_sources: plan.log_sources }) : undefined]
+            .filter(Boolean)
+            .join('. '),
+        });
+      },
+      onError: (e) => toast({ title: 'Could not fix the setup', description: errorText(e), variant: 'destructive' }),
+    });
   const remove = useMutation({
     mutationFn: (feed: ConnectorFeed) => api.connectorFeeds.remove(feed.id),
     onSuccess: () => {
@@ -171,8 +222,40 @@ export function ConnectorFeeds() {
       setAdoptTarget(null);
       toast({ title: r.adopted ? 'Spec update adopted' : 'Already on the current spec', description: r.adopted ? `${r.checkpoints_reset} stream cursor(s) reset` : undefined });
     },
-    onError: (e) => toast({ title: 'Could not adopt the spec update', description: errorText(e), variant: 'destructive' }),
+    onError: (e, feed) => {
+      setAdoptTarget(null);
+      if (!refusedForMissingSources(feed, 'adopt', e)) {
+        toast({ title: 'Could not adopt the spec update', description: errorText(e), variant: 'destructive' });
+      }
+    },
   });
+
+  // Deep links from other pages (NAN-5903): `?new=<connector>` opens New pull
+  // feed with it preselected; `?fix=<feed id>` offers Fix setup for that feed.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [newConnector, setNewConnector] = useState<string | null>(null);
+  useEffect(() => {
+    const wanted = searchParams.get('new');
+    const fixId = searchParams.get('fix');
+    if (wanted && specs.length > 0 && canCreate) {
+      setNewConnector(specs.some((s) => s.name === wanted) ? wanted : null);
+      setCreateOpen(true);
+    }
+    const fixFeed = fixId ? feeds.find((f) => f.id === fixId) : undefined;
+    if (fixFeed) {
+      const kind = searchParams.get('action') === 'adopt' ? 'adopt' : 'resume';
+      setFix({ feed: fixFeed, kind, message: 'Some log sources this feed needs are missing.' });
+    }
+    if ((wanted && specs.length > 0) || fixFeed) {
+      const next = new URLSearchParams(searchParams);
+      next.delete('new');
+      if (fixFeed) {
+        next.delete('fix');
+        next.delete('action');
+      }
+      setSearchParams(next, { replace: true });
+    }
+  }, [searchParams, setSearchParams, specs, feeds, canCreate]);
 
   const failing = feeds.filter((f) => f.enabled && f.last_status && f.last_status !== 'success').length;
 
@@ -202,6 +285,28 @@ export function ConnectorFeeds() {
       />
 
       <div className="px-5 py-4 space-y-4">
+      {fix && (
+        <div
+          role="alert"
+          data-testid="feed-fix-setup"
+          className="flex items-center gap-3 rounded-md border border-red-600/40 px-3 py-2 text-[12px]"
+        >
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-foreground">Some log sources this feed needs are missing</div>
+            <div className="text-[11px] text-muted-foreground">
+              <span className="font-mono">{fix.feed.name}</span>: {fix.message}
+            </div>
+          </div>
+          {canEdit && canDeploy && (
+            <Button size="sm" className="h-7 text-[11.5px]" disabled={laneSetup.isPending} onClick={() => runFix(fix)}>
+              Fix setup
+            </Button>
+          )}
+          <Button size="sm" variant="ghost" className="h-7 text-[11.5px]" onClick={() => setFix(null)}>
+            Dismiss
+          </Button>
+        </div>
+      )}
       {canViewFeeds && (
       <div className="rounded-md border border-border bg-card overflow-x-auto" data-testid="pull-feeds-region">
 
@@ -211,7 +316,7 @@ export function ConnectorFeeds() {
           <div className="p-5 text-[12px] text-red-600">{errorText(feedsQuery.error)}</div>
         ) : feeds.length === 0 ? (
           <div className="p-5 text-[12px] text-muted-foreground">
-            No pull feeds yet. Deploy the vendor&apos;s <Term id="hec">HEC</Term> log source first.
+            No pull feeds yet. Create one with New pull feed; nano sets up the log sources it needs.
           </div>
         ) : (
           <table className="w-full text-[12px]">
@@ -320,7 +425,8 @@ export function ConnectorFeeds() {
       {createOpen && (
         <CreateFeedSheet
           specs={specs}
-          onClose={() => setCreateOpen(false)}
+          initialConnector={newConnector}
+          onClose={() => { setCreateOpen(false); setNewConnector(null); }}
           onCreated={() => {
             invalidate();
             // A feed created with a new secret adds a connector credential.
@@ -329,6 +435,8 @@ export function ConnectorFeeds() {
           }}
         />
       )}
+
+      {laneSetup.confirm}
 
       <ConfirmDialog
         open={removeTarget !== null}
@@ -419,20 +527,24 @@ function ResetDialog({
 
 function CreateFeedSheet({
   specs,
+  initialConnector,
   onClose,
   onCreated,
 }: {
   specs: ConnectorSpecInfo[];
+  /** Preselected by a deep link (`?new=<connector>`). */
+  initialConnector?: string | null;
   onClose: () => void;
   onCreated: () => void;
 }) {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const canCreateCredential = hasPermission('credentials:create');
-  const [connector, setConnector] = useState(specs[0]?.name ?? '');
+  const first = specs.find((s) => s.name === initialConnector) ?? specs[0];
+  const [connector, setConnector] = useState(first?.name ?? '');
   const spec = specs.find((s) => s.name === connector);
   const [name, setName] = useState('');
-  const [config, setConfig] = useState<Record<string, string>>({});
+  const [config, setConfig] = useState<Record<string, string>>(() => defaultConfig(first));
   const [credentialChoice, setCredentialChoice] = useState<string>(NEW_CREDENTIAL);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [schedule, setSchedule] = useState('');
@@ -450,14 +562,22 @@ function CreateFeedSheet({
   const effectiveChoice =
     credentialChoice === NEW_CREDENTIAL && !canCreateCredential ? (matching[0]?.id ?? '') : credentialChoice;
 
-  const create = useMutation({
-    mutationFn: (request: CreateConnectorFeedRequest) => api.connectorFeeds.create(request),
-    onSuccess: () => {
-      toast({ title: 'Pull feed created', description: 'It starts at current activity on its next tick.' });
+  const create = useFeedSubmit({
+    onCreated: (created) => {
+      const setUp = setupSummary(created);
+      toast({
+        title: 'Pull feed created',
+        description: [setUp, 'It starts with new activity on its next run.'].filter(Boolean).join(' '),
+      });
       onCreated();
     },
     onError: (e) => toast({ title: 'Could not create the feed', description: errorText(e), variant: 'destructive' }),
   });
+
+  // A list field (which apps to collect) needs at least one value ticked.
+  const emptyList = !!spec?.config_field_info?.some(
+    (f) => f.choices.length > 0 && !spec.optional_config_fields.includes(f.key) && !(config[f.key] ?? '').trim(),
+  );
 
   const submit = () => {
     if (!spec) return;
@@ -473,7 +593,7 @@ function CreateFeedSheet({
       else if (effectiveChoice) request.credential_id = effectiveChoice;
     }
     if (schedule.trim()) request.schedule = schedule.trim();
-    create.mutate(request);
+    create.submit(request);
   };
 
   return (
@@ -492,8 +612,8 @@ function CreateFeedSheet({
               <SheetTitle className="text-[14px] font-semibold leading-tight">New pull feed</SheetTitle>
               <SheetDescription className="text-[11.5px] leading-relaxed text-muted-foreground">
                 {spec?.kind === 'identity'
-                  ? 'Directory feeds sync users and group memberships into the user directory; no log source is needed.'
-                  : 'The vendor lane needs a deployed HEC log source first; the feed is refused otherwise.'}
+                  ? 'Directory feeds copy users and group memberships into the user directory. They need no log source.'
+                  : 'Collects the app\'s audit logs on a schedule. If the logs need a log source that is not set up yet, nano sets it up too, and asks you first.'}
               </SheetDescription>
             </div>
           </div>
@@ -506,7 +626,7 @@ function CreateFeedSheet({
                 value={connector}
                 onValueChange={(v) => {
                   setConnector(v);
-                  setConfig({});
+                  setConfig(defaultConfig(specs.find((s) => s.name === v)));
                   setSecrets({});
                   setCredentialChoice(NEW_CREDENTIAL);
                   setAllowShrink(false);
@@ -522,11 +642,11 @@ function CreateFeedSheet({
               {spec && (
                 <p className={HELP_TEXT}>
                   {spec.kind === 'identity' ? (
-                    <>Into <span className="font-mono">user_registry</span></>
+                    <>Into the user directory</>
                   ) : (
-                    <>Lane <span className="font-mono">{spec.source_type}</span></>
+                    <>Sends events as <span className="font-mono">{spec.source_type.replace('{{item}}', '<item>')}</span></>
                   )}
-                  {spec.schedule && <> · runs at most <span className="font-mono">{spec.schedule}</span></>}
+                  {spec.schedule && <> · {scheduleDefaultText(spec.schedule).toLowerCase()}</>}
                 </p>
               )}
             </div>
@@ -535,17 +655,15 @@ function CreateFeedSheet({
               <Input className="h-8 text-[12px]" value={name} onChange={(e) => setName(e.target.value)} placeholder="Okta production" />
             </div>
             {spec && textConfigFields.map((f) => (
-              <div key={f} className="space-y-1.5">
-                <Label className={FIELD_LABEL}>
-                  {f}
-                  {spec.optional_config_fields.includes(f) && <span className="normal-case tracking-normal"> (optional)</span>}
-                </Label>
-                <Input
-                  className="h-8 text-[12px] font-mono"
-                  value={config[f] ?? ''}
-                  onChange={(e) => setConfig({ ...config, [f]: e.target.value })}
-                />
-              </div>
+              <ConfigField
+                key={f}
+                spec={spec}
+                fieldKey={f}
+                id={`pull-feed-${spec.name}-${f}`}
+                value={config[f] ?? ''}
+                onChange={(v) => setConfig({ ...config, [f]: v })}
+                labelClassName="text-[12px] font-medium"
+              />
             ))}
             {spec && spec.credential_fields.length > 0 && (
               <div className="space-y-2 border-l border-border pl-3">
@@ -581,8 +699,16 @@ function CreateFeedSheet({
                 {effectiveChoice === NEW_CREDENTIAL && spec.credential_provider !== 'google_workspace' &&
                   spec.credential_fields.map((f) => (
                     <div key={f} className="space-y-1.5">
-                      <Label className={FIELD_LABEL}>{f}</Label>
+                      <FieldLabel
+                        htmlFor={`pull-feed-${spec.name}-cred-${f}`}
+                        info={credentialFieldInfo(spec, f)}
+                        fieldKey={f}
+                        className="text-[12px] font-medium"
+                      />
                       <Input
+                        id={`pull-feed-${spec.name}-cred-${f}`}
+                        data-credential-key={f}
+                        aria-label={fieldLabel(credentialFieldInfo(spec, f), f)}
                         type="password"
                         autoComplete="off"
                         className="h-8 text-[12px] font-mono"
@@ -598,12 +724,27 @@ function CreateFeedSheet({
               <AllowShrinkField id="pull-feed-allow-shrink" checked={allowShrink} onCheckedChange={setAllowShrink} />
             )}
             <div className="space-y-1.5">
-              <Label className={FIELD_LABEL}>Schedule override (cron, optional)</Label>
-              <Input className="h-8 text-[12px] font-mono" value={schedule} onChange={(e) => setSchedule(e.target.value)} placeholder={spec?.schedule ?? '*/5 * * * *'} />
+              <div className="flex items-center gap-1">
+                <Label htmlFor="pull-feed-schedule" className="text-[12px] font-medium">
+                  How often to run <span className="font-normal text-muted-foreground">(optional)</span>
+                </Label>
+                <InfoTip label="About the schedule" side="top" contentClassName="max-w-[280px]">
+                  A cron expression, such as */15 * * * * for every 15 minutes. Leave it blank to use the default. It
+                  cannot run more often than the default.
+                </InfoTip>
+              </div>
+              <Input
+                id="pull-feed-schedule"
+                className="h-8 text-[12px] font-mono placeholder:font-sans placeholder:text-muted-foreground/70"
+                value={schedule}
+                onChange={(e) => setSchedule(e.target.value)}
+                placeholder={scheduleDefaultText(spec?.schedule ?? null)}
+              />
             </div>
           </div>
         </div>
         <SheetFooter className="border-t border-border px-5 py-3">
+          {create.confirm}
           <Button variant="outline" size="sm" className="h-8 text-[11.5px]" onClick={onClose} disabled={create.isPending}>
             Cancel
           </Button>
@@ -611,7 +752,7 @@ function CreateFeedSheet({
             size="sm"
             className="h-8 text-[11.5px] gap-1.5"
             onClick={submit}
-            disabled={!spec || !name.trim() || create.isPending}
+            disabled={!spec || !name.trim() || create.isPending || emptyList}
           >
             <Plus className="w-[12px] h-[12px]" strokeWidth={1.5} />
             Create feed

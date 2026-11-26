@@ -45,6 +45,15 @@
 //!   (default 100), `NANO_SENTRY_MAX_LOGS` (default 2000) and
 //!   `NANO_SENTRY_MAX_TRANSACTIONS` (default 2000): the per-process caps
 //! - `NANO_SENTRY_IGNORE`: extra comma-separated substrings to drop as benign
+//! - `NANO_TRANSIENT_OUTAGE_REPORT_SECS` (default 300): how long a transient
+//!   backend outage lasts before a background worker reports it at ERROR
+//!   (NAN-5886, see [`crate::transient_outage`])
+//!
+//! NAN-5886: once the process received SIGTERM / SIGINT
+//! ([`mark_shutting_down`]), events are not sent for the graceful-drain
+//! window (`NANO_SENTRY_SHUTDOWN_QUIET_SECS`, default 60): backends going away
+//! during a planned shutdown is expected. Panics are still sent, and a
+//! shutdown still running after the window is hung, so events resume.
 //! - `NANO_SENTRY_TEST_TRIGGER=1`: debug builds only, emit one
 //!   "Sentry test error" at boot (and the API serves `/api/_sentry-test`).
 //!   Compiled out of release builds.
@@ -53,6 +62,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Instant;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -351,8 +362,55 @@ pub fn flush(timeout: Duration) {
 // Gate: benign filter, scrubbing, caps, run tags
 // ---------------------------------------------------------------------------
 
+/// NAN-5886: set once a shutdown signal arrived.
+static SHUTDOWN_STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// Default graceful-drain window: the 30 s task-shutdown deadline plus slack.
+const DEFAULT_SHUTDOWN_QUIET_SECS: u64 = 60;
+
+/// `NANO_SENTRY_SHUTDOWN_QUIET_SECS`, clamped to 1..=600.
+fn shutdown_quiet_window() -> Duration {
+    static WINDOW: LazyLock<Duration> = LazyLock::new(|| {
+        let secs = std::env::var("NANO_SENTRY_SHUTDOWN_QUIET_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(1, 600))
+            .unwrap_or(DEFAULT_SHUTDOWN_QUIET_SECS);
+        Duration::from_secs(secs)
+    });
+    *WINDOW
+}
+
+/// Record that the process is shutting down gracefully: from now on only
+/// panics are sent to Sentry. Called by
+/// [`crate::shutdown::wait_for_shutdown_signal`]; never cleared.
+pub fn mark_shutting_down() {
+    let _ = SHUTDOWN_STARTED.set(Instant::now());
+}
+
+/// True once [`mark_shutting_down`] ran.
+pub fn is_shutting_down() -> bool {
+    SHUTDOWN_STARTED.get().is_some()
+}
+
+/// True while inside the graceful-drain window after `started`.
+fn in_quiet_window(started: Option<&Instant>, window: Duration, now: Instant) -> bool {
+    started.is_some_and(|t| now.saturating_duration_since(*t) < window)
+}
+
+/// A panic captured by the panic integration (mechanism `panic`).
+fn is_panic_capture(event: &Event<'_>) -> bool {
+    event
+        .exception
+        .values
+        .iter()
+        .any(|e| e.mechanism.as_ref().is_some_and(|m| m.ty == "panic"))
+}
+
 /// The `before_send` pipeline.
 pub struct EventGate {
+    shutdown_started: &'static OnceLock<Instant>,
+    shutdown_quiet: Duration,
     ignores: Vec<String>,
     max_per_issue: u32,
     max_total: u32,
@@ -380,6 +438,8 @@ impl EventGate {
         let mut ignores: Vec<String> = BENIGN_ERRORS.iter().map(|s| s.to_string()).collect();
         ignores.extend(settings.extra_ignores.iter().cloned());
         Self {
+            shutdown_started: &SHUTDOWN_STARTED,
+            shutdown_quiet: shutdown_quiet_window(),
             ignores,
             max_per_issue: settings.max_events_per_issue,
             max_total: settings.max_events,
@@ -395,8 +455,23 @@ impl EventGate {
         }
     }
 
+    /// Read the shutdown state from `flag` instead of the process-wide one
+    /// (tests).
+    pub fn with_shutdown_clock(mut self, started: &'static OnceLock<Instant>, quiet: Duration) -> Self {
+        self.shutdown_started = started;
+        self.shutdown_quiet = quiet;
+        self
+    }
+
     /// Drop benign errors, scrub, enforce the caps and add the run tags.
     pub fn process(&self, mut event: Event<'static>) -> Option<Event<'static>> {
+        // NAN-5886: errors logged while the service stops (backends already
+        // gone, in-flight work cancelled) are expected, not issues.
+        if in_quiet_window(self.shutdown_started.get(), self.shutdown_quiet, Instant::now())
+            && !is_panic_capture(&event)
+        {
+            return None;
+        }
         let text = event_text(&event);
         if self.ignores.iter().any(|needle| text.contains(needle.as_str())) {
             return None;

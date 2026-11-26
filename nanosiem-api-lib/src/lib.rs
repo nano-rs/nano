@@ -31,7 +31,7 @@ pub mod request_id;
 pub mod source_inventory;
 pub mod sse;
 
-pub use api_error::{error_chain, ApiError, ErrorDetail, ErrorResponse};
+pub use api_error::{error_chain, ApiError, ErrorDetail, ErrorResponse, ExpectedServerError, AI_NOT_CONFIGURED};
 pub use audit_ext::AuditExt;
 pub use auth_context::{
     check_all_permissions, check_any_permission, check_permission, ensure_interactive_session,

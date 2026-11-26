@@ -192,9 +192,11 @@ pub(super) fn with_ack_durability(nano_owned: &str, mode: &str) -> String {
 }
 
 fn disk_buffer_component_count(content: &str) -> usize {
+    // NAN-5899: TOML, or the static YAML sinks (`type: disk`).
     content
         .lines()
-        .filter(|line| line.trim() == "type = \"disk\"")
+        .map(str::trim)
+        .filter(|line| *line == "type = \"disk\"" || *line == "type: disk")
         .count()
 }
 
@@ -1763,8 +1765,10 @@ pub(super) fn enrichment_lane_backpressure_violations(
     // Sources with their own backpressure domain.
     const DEDICATED_ENRICHMENT_SOURCES: &[&str] = &["enrichment_ingest"];
 
-    // Vector substitutes `${VAR:-default}` before parsing TOML, so mirror that
-    // (value after `:-`, else empty) to make the raw configs parseable.
+    // Mirror Vector's `${VAR:-default}` substitution (value after `:-`, else
+    // empty) so a raw config reads as Vector sees it. NAN-5810: the current
+    // files quote every placeholder; a bare one (an older release's) substitutes
+    // to a bare number and parses too.
     // NAN-4953: one implementation of Vector's grammar, `$$` included.
     fn substitute_env(raw: &str) -> String {
         crate::vector_env::substitute_like_vector(raw)
@@ -1992,9 +1996,9 @@ fn is_safe_enrich_source(s: &str) -> bool {
 /// here before the config is written. Only the GENERATED path calls this — the
 /// committed static fallback is trusted.
 fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
-    // Install-owned sink limits are intentionally unquoted Vector environment
-    // expressions. Mirror Vector's pre-parse interpolation before inspecting
-    // the topology; parsing the raw template rejects valid numeric settings.
+    // Install-owned sink limits are Vector environment expressions, quoted for
+    // Vector 0.62 (NAN-5810). Mirror Vector's interpolation before inspecting
+    // the topology, so the check reads the values Vector will.
     let interpolated = crate::vector_env::substitute_like_vector(toml_str);
     let doc: toml::Table = toml::from_str(&interpolated)
         .map_err(|e| format!("candidate TOML parse failed after environment substitution: {e}"))?;
@@ -2346,7 +2350,7 @@ impl VectorConfigManager {
              # drop_newest finalizer (Vector folds Dropped into Delivered).\n\
              [sinks.clickhouse_ocsf_logs.buffer]\n\
              type = \"disk\"\n\
-             max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\n\
+             max_size = \"${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\"\n\
              when_full = \"block\"\n\
              {ack}\
              \n\
@@ -2354,12 +2358,12 @@ impl VectorConfigManager {
              enabled = false\n\
              \n\
              [sinks.clickhouse_ocsf_logs.batch]\n\
-             max_bytes = ${{VECTOR_BATCH_MAX_BYTES:-52428800}}\n\
-             max_events = ${{VECTOR_BATCH_MAX_EVENTS:-50000}}\n\
-             timeout_secs = ${{VECTOR_BATCH_TIMEOUT_SECS:-10}}\n\
+             max_bytes = \"${{VECTOR_BATCH_MAX_BYTES:-52428800}}\"\n\
+             max_events = \"${{VECTOR_BATCH_MAX_EVENTS:-50000}}\"\n\
+             timeout_secs = \"${{VECTOR_BATCH_TIMEOUT_SECS:-10}}\"\n\
              \n\
              [sinks.clickhouse_ocsf_logs.request]\n\
-             concurrency = ${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\n\
+             concurrency = \"${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\"\n\
              timeout_secs = 120\n\
              retry_initial_backoff_secs = 1\n\
              retry_max_duration_secs = 300\n",
@@ -2521,7 +2525,9 @@ inputs = ["source_router.generic"]
 drop_on_abort = false
 drop_on_error = false
 source = '''
-if !is_object(.metadata) {
+"#,
+            hec_record_view_vrl!(),
+            r#"if !is_object(.metadata) {
     .metadata = {}
 }
 .metadata.parser_type = "generic"
@@ -2648,6 +2654,14 @@ num_events = 5000
 type = "remap"
 inputs = ["durable_delivery_route.durable", "dedupe"]
 source = '''
+# NAN-5891: an HEC object record whose line hec_normalize lifted into
+# `.message` is kept whole in `raw_content` on this no-parser lane (BEFORE
+# the credential redaction below). The HEC metadata ends here.
+nano_hec_whole = to_string(%nano_hec_record.text) ?? ""
+if nano_hec_whole != "" && .raw_content == null { .raw_content = nano_hec_whole }
+del(%nano_hec_record)
+del(%nano_hec_event)
+del(%nano_hec)
 "#,
             credential_field_redaction_vrl!(),
             ingest_transport_strip_vrl!(),
@@ -3053,19 +3067,19 @@ deduplicate = true
 
 [sinks.clickhouse_logs.buffer]
 type = "disk"
-max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+max_size = "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}"
 when_full = "block"
 
 [sinks.clickhouse_logs.acknowledgements]
 enabled = false
 
 [sinks.clickhouse_logs.batch]
-max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
-max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
-timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"
+max_events = "${VECTOR_BATCH_MAX_EVENTS:-50000}"
+timeout_secs = "${VECTOR_BATCH_TIMEOUT_SECS:-10}"
 
 [sinks.clickhouse_logs.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+concurrency = "${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}"
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
@@ -3107,19 +3121,19 @@ deduplicate = true
 
 [sinks.clickhouse_parser_health.buffer]
 type = "disk"
-max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+max_size = "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}"
 when_full = "block"
 
 [sinks.clickhouse_parser_health.acknowledgements]
 enabled = false
 
 [sinks.clickhouse_parser_health.batch]
-max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
-max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
-timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"
+max_events = "${VECTOR_BATCH_MAX_EVENTS:-50000}"
+timeout_secs = "${VECTOR_BATCH_TIMEOUT_SECS:-10}"
 
 [sinks.clickhouse_parser_health.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+concurrency = "${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}"
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
@@ -3151,6 +3165,42 @@ inputs = ["generic_parser"]
 drop_on_abort = false
 drop_on_error = false
 source = '''
+# NAN-5891: an HEC object record keeps EVERY key on this no-parser lane,
+# whether or not hec_normalize lifted a line into `.message`: each record key
+# the root lacks is added (its own `id`, `sourcetype`, null values, ...);
+# one the root holds with the same value is not repeated; one the root holds
+# with a different value (the record's own `timestamp`, `host`, `metadata`,
+# an object `message`, a key an indexed field also names) goes under
+# `hec_record`, or the first such name the record does not use. BEFORE the
+# credential redaction below, which then covers them. The HEC metadata ends
+# here (not carried into the disk buffer). Only for an object record
+# (`%nano_hec_record`): a string event is handled as before NAN-5891.
+nano_hec_rest = {}
+if is_object(%nano_hec_record) {
+    nano_hec_rest = object(parse_json(to_string(%nano_hec_record.text) ?? "") ?? {}) ?? {}
+}
+nano_root_keys = keys(.)
+nano_hec_add = {}
+nano_hec_kept = {}
+nano_root = .
+for_each(nano_hec_rest) -> |nano_key, nano_value| {
+    if !includes(nano_root_keys, nano_key) {
+        nano_hec_add = set!(nano_hec_add, [nano_key], nano_value)
+    } else if (get(nano_root, [nano_key]) ?? null) != nano_value {
+        nano_hec_kept = set!(nano_hec_kept, [nano_key], nano_value)
+    }
+}
+. = merge(., nano_hec_add)
+if length(nano_hec_kept) > 0 {
+    nano_after_keys = keys(.)
+    nano_hec_slot = "hec_record"
+    if includes(nano_after_keys, nano_hec_slot) { nano_hec_slot = "hec_record_kept" }
+    if includes(nano_after_keys, nano_hec_slot) { nano_hec_slot = "hec_record_kept_" + to_string(length(nano_after_keys)) }
+    . = merge(., set!({}, [nano_hec_slot], nano_hec_kept))
+}
+del(%nano_hec_record)
+del(%nano_hec_event)
+del(%nano_hec)
 "#,
         credential_field_redaction_vrl!(),
         ingest_transport_strip_vrl!(),
@@ -3751,7 +3801,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                  skip_unknown_fields = true\n\n\
                  [sinks.{sink}.buffer]\n\
                  type = \"disk\"\n\
-                 max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\n\
+                 max_size = \"${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\"\n\
                  when_full = \"block\"\n\
                  {ack}\n\
                  [sinks.{sink}.acknowledgements]\n\
@@ -3760,7 +3810,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
                  max_events = 1000\n\
                  timeout_secs = 5\n\n\
                  [sinks.{sink}.request]\n\
-                 concurrency = ${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\n\
+                 concurrency = \"${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\"\n\
                  timeout_secs = 60\n\
                  retry_initial_backoff_secs = 1\n\
                  retry_max_duration_secs = 60\n\n",
@@ -3805,7 +3855,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
              skip_unknown_fields = true\n\n\
              [sinks.enrichment_dead_letter.buffer]\n\
              type = \"disk\"\n\
-             max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-{VECTOR_DISK_BUFFER_MIN_BYTES}}}\n\
+             max_size = \"${{VECTOR_DISK_BUFFER_MAX_BYTES:-{VECTOR_DISK_BUFFER_MIN_BYTES}}}\"\n\
              when_full = \"block\"\n\
              {}\n\
              [sinks.enrichment_dead_letter.acknowledgements]\n\
@@ -3814,7 +3864,7 @@ if skew_seconds < 0 { skew_seconds = 86400 }
              max_events = 1000\n\
              timeout_secs = 5\n\n\
              [sinks.enrichment_dead_letter.request]\n\
-             concurrency = ${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\n\
+             concurrency = \"${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\"\n\
              timeout_secs = 60\n\
              retry_initial_backoff_secs = 1\n\
              retry_max_duration_secs = 60\n",
@@ -4709,3 +4759,5 @@ mod json_ingest_contract_tests;
 mod metrics_scrape_contract_tests;
 #[cfg(test)]
 mod ack_durability_contract_tests;
+#[cfg(test)]
+mod placeholder_quoting_contract_tests;

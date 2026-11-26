@@ -13,6 +13,7 @@ pub mod change_batch;
 mod cadence_tests;
 pub mod connect;
 pub mod deploy_jobs;
+pub mod feed_lane_setup;
 #[cfg(test)]
 #[path = "connect_tests.rs"]
 mod connect_tests;

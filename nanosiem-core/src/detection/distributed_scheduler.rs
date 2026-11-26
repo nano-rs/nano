@@ -30,6 +30,24 @@ use crate::models::{DetectionMode, DetectionRule};
 use crate::search::TimeRangeInput;
 use crate::settings::DeveloperSettingsRepository;
 use crate::shutdown::ShutdownToken;
+use crate::transient_outage::{KeyedOutages, OutageStep, OutageTracker};
+
+/// NAN-5886: one outage tracker PER RULE on this node (review P1-3): a rule
+/// that keeps failing escalates even while others succeed, and a partial
+/// outage is not reset by the rules that get through. Entries exist only for
+/// rules currently failing (bounded, see [`KeyedOutages`]).
+static RULE_BACKEND_OUTAGES: std::sync::LazyLock<std::sync::Mutex<KeyedOutages<Uuid>>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(KeyedOutages::new(crate::transient_outage::report_after()))
+    });
+
+fn rule_backend_outages<T>(f: impl FnOnce(&mut KeyedOutages<Uuid>) -> T) -> T {
+    let mut outages = match RULE_BACKEND_OUTAGES.lock() {
+        Ok(outages) => outages,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut outages)
+}
 
 use super::scheduler::{
     calculate_next_run_phased, configured_phase_cap_secs, DEFAULT_PHASE_CAP_SECS,
@@ -209,6 +227,9 @@ impl DistributedDetectionScheduler {
             const MAX_BACKOFF_SECS: u64 = 300;
             // NAN-3064: scheduling-lag health signal once a minute.
             let mut lag_checked_at: Option<std::time::Instant> = None;
+            // NAN-5886: a claim poll failing on a down database warns until
+            // the outage lasts, then reports once.
+            let mut poll_outage = OutageTracker::default();
 
             info!(
                 node_id = %scheduler.node_id,
@@ -262,6 +283,15 @@ impl DistributedDetectionScheduler {
                             debug!(node_id = %scheduler.node_id, executed, "Executed rules");
                         }
                         consecutive_errors = 0;
+                        if let Some(ended) = poll_outage.record_success(std::time::Instant::now()) {
+                            info!(
+                                failures = ended.failures,
+                                outage_secs = ended.elapsed.as_secs(),
+                                "Distributed scheduler recovered after {}s ({} failed polls)",
+                                ended.elapsed.as_secs(),
+                                ended.failures
+                            );
+                        }
                     }
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
@@ -271,10 +301,27 @@ impl DistributedDetectionScheduler {
                                 .saturating_mul(scheduler.config.poll_interval_secs),
                             MAX_BACKOFF_SECS,
                         );
-                        error!(
-                            "Distributed scheduler error (attempt {}, backoff {}s): {}",
-                            consecutive_errors, backoff_secs, e
-                        );
+                        if crate::transient_outage::is_transient_anyhow(&e) {
+                            match poll_outage.record_failure(std::time::Instant::now()) {
+                                OutageStep::Report { failures, elapsed } => error!(
+                                    failures,
+                                    outage_secs = elapsed.as_secs(),
+                                    "Distributed scheduler backend unavailable for {}s ({} failed polls): {}",
+                                    elapsed.as_secs(),
+                                    failures,
+                                    e
+                                ),
+                                OutageStep::Warn { .. } => warn!(
+                                    "Distributed scheduler backend unavailable (attempt {}, backoff {}s): {}",
+                                    consecutive_errors, backoff_secs, e
+                                ),
+                            }
+                        } else {
+                            error!(
+                                "Distributed scheduler error (attempt {}, backoff {}s): {}",
+                                consecutive_errors, backoff_secs, e
+                            );
+                        }
                         if shutdown
                             .run_until_cancelled(tokio::time::sleep(
                                 tokio::time::Duration::from_secs(backoff_secs),
@@ -570,13 +617,53 @@ async fn execute_and_release(
             );
         }
         Ok(None) => {}
+        // NAN-5886: the backend (search / ClickHouse / PostgreSQL) was
+        // unreachable. The window is kept and retried (NAN-5424), so this is
+        // WARN until THIS rule's outage has lasted the report threshold; then
+        // ERROR once. A rejected connection (TLS) is not transient: below.
+        Err(e) if crate::transient_outage::is_transient_error(e) => {
+            let step = rule_backend_outages(|t| t.record_failure(&rule.id, std::time::Instant::now()));
+            let text = crate::db::repository::detection_rules::rule_error_text(&e.to_string());
+            match step {
+                OutageStep::Report { failures, elapsed } => error!(
+                    rule_id = %rule.id,
+                    rule_name = %rule.name,
+                    failures,
+                    outage_secs = elapsed.as_secs(),
+                    "Rule execution backend unavailable for {}s ({} failed runs): {}",
+                    elapsed.as_secs(),
+                    failures,
+                    text
+                ),
+                OutageStep::Warn { .. } => warn!(
+                    rule_id = %rule.id,
+                    rule_name = %rule.name,
+                    "Rule execution failed, backend unavailable (will retry): {}",
+                    text
+                ),
+            }
+        }
         Err(e) => {
+            // A real error ends any transient streak of this rule.
+            rule_backend_outages(|t| t.record_success(&rule.id, std::time::Instant::now()));
             // Errors can quote event bytes; log the sanitized single line.
             error!(
                 rule_id = %rule.id,
                 rule_name = %rule.name,
                 "Rule execution failed: {}",
                 crate::db::repository::detection_rules::rule_error_text(&e.to_string())
+            );
+        }
+    }
+    if result.is_ok() {
+        if let Some(ended) = rule_backend_outages(|t| t.record_success(&rule.id, std::time::Instant::now())) {
+            info!(
+                failures = ended.failures,
+                outage_secs = ended.elapsed.as_secs(),
+                rule_id = %rule.id,
+                "Rule execution backend recovered after {}s ({} failed runs)",
+                ended.elapsed.as_secs(),
+                ended.failures
             );
         }
     }

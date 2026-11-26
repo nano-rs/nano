@@ -813,15 +813,32 @@ export function useUpdateRiskNotableConfig() {
 }
 
 // Risk Analytics hooks
+/** NAN-5841: a query whose next fetch can be forced past the precomputed
+ * snapshot (`refreshLive`), for the Risk page refresh control. */
+function useLiveRefreshable<T>(fetchFn: (live: boolean) => Promise<T>, deps: unknown[]) {
+  const live = useRef(false);
+  const query = useQuery(() => {
+    const forced = live.current;
+    live.current = false;
+    return fetchFn(forced);
+  }, deps);
+  const { refetch } = query;
+  const refreshLive = useCallback(() => {
+    live.current = true;
+    return refetch();
+  }, [refetch]);
+  return { ...query, refreshLive };
+}
+
 export function useRiskyEntities(params?: import('@/lib/api').RiskEntitiesQuery) {
-  return useQuery(
-    () => api.getRiskyEntities(params),
-    [params?.window, params?.entity_type, params?.min_score, params?.limit, params?.offset]
+  return useLiveRefreshable(
+    (live) => api.getRiskyEntities({ ...params, refresh: live || undefined }),
+    [params?.window, params?.entity_type, params?.min_score, params?.max_score, params?.limit, params?.offset]
   );
 }
 
 export function useRiskOverview() {
-  return useQuery(() => api.getRiskOverview(), []);
+  return useLiveRefreshable((live) => api.getRiskOverview(live), []);
 }
 
 export function useTimeWindowedRiskScores(params?: import('@/lib/api').TimeWindowedRiskQuery) {

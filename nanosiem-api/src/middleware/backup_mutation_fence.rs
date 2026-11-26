@@ -194,10 +194,25 @@ fn is_fence_exempt(method: &Method, path: &str) -> bool {
     // `backup_status` singleton (no PG-to-CH pointer). It must get through
     // even when a failed backup left the fence active, or the failure report
     // that would surface the problem is itself refused.
+    //
+    // NAN-5880 (review P3): the Agent Lane gates' heartbeat is authenticated
+    // by its own bearer (checked before anything else in the handler), and an
+    // unauthenticated POST must cost no database round trip, which the fence
+    // (a PostgreSQL flag read, and the shared lock) would add before the
+    // bearer check. The heartbeat writes only PG-only gate bookkeeping
+    // (`agentlane_gates`, its event log and login-audit marks, append-only
+    // audit; no PG-to-CH pointer), like the backup status above. Its sibling
+    // `GET .../gate-config` is a safe method. Like the Vector config delivery
+    // GETs (NAN-1931), these internal routes then never touch the fence.
     is_safe_method(method)
         || is_authentication_lifecycle(method, path)
         || (*method == Method::POST && path == "/api/internal/backup-status")
+        || (*method == Method::POST && path == AGENTLANE_GATE_STATUS_PATH)
 }
+
+/// The Agent Lane gate heartbeat route (enterprise; the path is only a
+/// string here, like the IP allowlist's Agent Lane exemption).
+const AGENTLANE_GATE_STATUS_PATH: &str = "/api/internal/agentlane/gate-status";
 
 async fn fence_active_on_pool(pool: &PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>("SELECT active FROM backup_mutation_fence WHERE singleton = true")
@@ -294,6 +309,57 @@ mod tests {
         assert!(is_fence_exempt(&Method::POST, "/api/internal/backup-status"));
         assert!(!is_fence_exempt(&Method::PUT, "/api/internal/backup-status"));
         assert!(!is_fence_exempt(&Method::POST, "/api/internal/backup-status/x"));
+    }
+
+    #[test]
+    fn agentlane_gate_heartbeat_bypasses_the_fence_exactly() {
+        assert!(is_fence_exempt(&Method::POST, "/api/internal/agentlane/gate-status"));
+        assert!(is_fence_exempt(&Method::GET, "/api/internal/agentlane/gate-config"));
+        for (method, path) in [
+            (Method::PUT, "/api/internal/agentlane/gate-status"),
+            (Method::POST, "/api/internal/agentlane/gate-status/x"),
+            (Method::POST, "/api/internal/agentlane/gate-config"),
+            (Method::POST, "/api/internal/agentlane/other"),
+            (Method::PUT, "/api/settings/agentlane/network"),
+        ] {
+            assert!(!is_fence_exempt(&method, path), "{method} {path}");
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn agentlane_heartbeat_path_matches_the_enterprise_route() {
+        assert_eq!(AGENTLANE_GATE_STATUS_PATH, nanosiem_enterprise::agentlane::gate_protocol::GATE_STATUS_PATH);
+    }
+
+    /// An unauthenticated heartbeat never reaches the database: the fence is
+    /// skipped (its pool points at an unreachable server here, so any fence
+    /// work would turn into a 503) and the handler's bearer check answers.
+    #[tokio::test]
+    async fn unauthenticated_agentlane_heartbeat_costs_no_fence_round_trip() {
+        use axum::{routing::post, Router};
+        use tower::ServiceExt;
+        let check_pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .unwrap();
+        let fence = BackupMutationFence::new(check_pool, "postgres://unused@127.0.0.1:1/unused");
+        let app = Router::new()
+            .route(AGENTLANE_GATE_STATUS_PATH, post(|| async { axum::http::StatusCode::UNAUTHORIZED }))
+            .route("/api/rules", post(|| async { axum::http::StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(fence, backup_mutation_fence));
+        let call = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(Request::builder().method(Method::POST).uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(call(AGENTLANE_GATE_STATUS_PATH).await, axum::http::StatusCode::UNAUTHORIZED);
+        // Control: a fenced mutation does reach the (unreachable) database.
+        assert_eq!(call("/api/rules").await, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

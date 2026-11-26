@@ -17,6 +17,7 @@ import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { usePrevalenceSettings, useUpdatePrevalenceSettings } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
 import { Term } from '@/components/ui/term';
+import { SettingsGroup, SettingsPageHeader, SettingsRow } from '@/components/settings/SettingsForm';
 
 const DEFAULTS = {
   rarity_threshold: 3,
@@ -162,52 +163,45 @@ export function PrevalenceSettings() {
 
   return (
     <div className="px-6 py-5 space-y-7">
-      <div>
-        <h1 className="text-[18px] font-semibold tracking-tight text-foreground"><Term id="rarity-threshold">Rarity Thresholds</Term></h1>
-        <p className="text-[11.5px] text-muted-foreground mt-0.5">
-          How nano decides what is rare (<Term id="prevalence">prevalence</Term>) and what it tracks
-        </p>
-      </div>
+      <SettingsPageHeader
+        title={<Term id="rarity-threshold">Rarity Thresholds</Term>}
+        description={
+          <>
+            How nano decides what is rare (<Term id="prevalence">prevalence</Term>) and what it tracks
+          </>
+        }
+      />
 
-      <section>
-        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
-          Rarity policy
-        </div>
-
+      <SettingsGroup title="Rarity policy">
         <div className="flex flex-col">
-          <div className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
-            <div className="min-w-0 flex-1">
-              <label htmlFor={rarityInputId} className="text-[12.5px] font-medium text-foreground cursor-pointer">
-                Host count threshold
-              </label>
-              <div id={rarityDescId} className="text-[11px] text-muted-foreground mt-0.5">
+          <SettingsRow
+            label="Host count threshold"
+            hint={
+              <>
                 Anything seen on fewer hosts than this counts as <em>rare</em>. 3 to 5 suits most networks.
-              </div>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <NumberInput
-                id={rarityInputId}
-                min={1}
-                max={1000}
-                value={rarityThreshold}
-                onChange={setRarityThreshold}
-                aria-describedby={rarityDescId}
-                className="h-8 w-[80px] text-center font-mono text-[12px]"
-              />
-              <span className="font-mono text-[10.5px] text-muted-foreground">hosts</span>
-            </div>
-          </div>
+              </>
+            }
+            hintId={rarityDescId}
+            htmlFor={rarityInputId}
+          >
+            <NumberInput
+              id={rarityInputId}
+              min={1}
+              max={1000}
+              value={rarityThreshold}
+              onChange={setRarityThreshold}
+              aria-describedby={rarityDescId}
+              className="h-8 w-[80px] text-center font-mono text-[12px]"
+            />
+            <span className="font-mono text-[10.5px] text-muted-foreground">hosts</span>
+          </SettingsRow>
         </div>
-      </section>
+      </SettingsGroup>
 
-      <section>
-        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
-          Tracking scope
-        </div>
-        <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Turning off a category stops tracking it and frees up database space.
-        </p>
-
+      <SettingsGroup
+        title="Tracking scope"
+        description="Turning off a category stops tracking it and frees up database space."
+      >
         <div className="flex flex-col">
           {TRACKING_OPTIONS.map(({ key, icon: Icon, color, label, hint }) => {
             const [checked, onChange] = trackingValues[key];
@@ -233,61 +227,50 @@ export function PrevalenceSettings() {
             );
           })}
         </div>
-      </section>
+      </SettingsGroup>
 
-      <section>
-        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
-          Retention & performance
-        </div>
-
+      <SettingsGroup title="Retention & performance">
         <div className="flex flex-col">
-          <div className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
-            <div className="min-w-0 flex-1">
-              <label htmlFor={retentionInputId} className="text-[12.5px] font-medium text-foreground cursor-pointer">
-                Data retention period
-              </label>
-              <div id={retentionDescId} className="text-[11px] text-muted-foreground mt-0.5">
-                Counts older than this are deleted. (1–365 days)
-              </div>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <NumberInput
-                id={retentionInputId}
-                min={1}
-                max={365}
-                value={retentionDays}
-                onChange={setRetentionDays}
-                aria-describedby={retentionDescId}
-                className="h-8 w-[80px] text-center font-mono text-[12px]"
-              />
-              <span className="font-mono text-[10.5px] text-muted-foreground">days</span>
-            </div>
-          </div>
-
-          <div className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
-            <div className="min-w-0 flex-1">
-              <label htmlFor={cacheInputId} className="text-[12.5px] font-medium text-foreground cursor-pointer">
-                Cache TTL
-              </label>
-              <div id={cacheDescId} className="text-[11px] text-muted-foreground mt-0.5">
+          <SettingsRow
+            label="Data retention period"
+            hint="Counts older than this are deleted. (1–365 days)"
+            hintId={retentionDescId}
+            htmlFor={retentionInputId}
+          >
+            <NumberInput
+              id={retentionInputId}
+              min={1}
+              max={365}
+              value={retentionDays}
+              onChange={setRetentionDays}
+              aria-describedby={retentionDescId}
+              className="h-8 w-[80px] text-center font-mono text-[12px]"
+            />
+            <span className="font-mono text-[10.5px] text-muted-foreground">days</span>
+          </SettingsRow>
+          <SettingsRow
+            label="Cache TTL"
+            hint={
+              <>
                 How long a lookup answer is reused (<Term id="cache-ttl">TTL</Term>). 0 turns the cache off. (0–3600 s)
-              </div>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <NumberInput
-                id={cacheInputId}
-                min={0}
-                max={3600}
-                value={cacheTtlSeconds}
-                onChange={setCacheTtlSeconds}
-                aria-describedby={cacheDescId}
-                className="h-8 w-[80px] text-center font-mono text-[12px]"
-              />
-              <span className="font-mono text-[10.5px] text-muted-foreground">sec</span>
-            </div>
-          </div>
+              </>
+            }
+            hintId={cacheDescId}
+            htmlFor={cacheInputId}
+          >
+            <NumberInput
+              id={cacheInputId}
+              min={0}
+              max={3600}
+              value={cacheTtlSeconds}
+              onChange={setCacheTtlSeconds}
+              aria-describedby={cacheDescId}
+              className="h-8 w-[80px] text-center font-mono text-[12px]"
+            />
+            <span className="font-mono text-[10.5px] text-muted-foreground">sec</span>
+          </SettingsRow>
         </div>
-      </section>
+      </SettingsGroup>
 
       <div className="flex justify-end items-center gap-2 pt-1">
         {hasChanges && (

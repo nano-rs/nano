@@ -95,54 +95,7 @@ inputs = ["filter_internal_logs"]
 encoding.codec = "json"
 
 # =============================================================================
-# Internal Logs Sink (ClickHouse — the collector error channel)
+# Internal Logs Sink (ClickHouse — the collector error channel): clickhouse_internal_logs
+# is in 92-metrics-sinks.yaml (NAN-5899: an environment-set number, which only
+# YAML can spell so both Vector 0.61 and 0.62 load it).
 # =============================================================================
-# NAN-2196. Without this, a broken collector and a quiet one are the same object
-# in the API: `LogSourceHealth` was entirely volume-based, so diagnosing "why is
-# ingest broken" meant reading container logs by hand — impossible for a
-# customer, and unavailable in a managed deployment.
-#
-# The event keys Vector emits (`message`, `error_code`, `error_type`, `stage`,
-# `host`, plus flattened `metadata.level` / `vector.component_*`) line up with
-# the columns in `clickhouse/171_collector_errors.sql`, so the sink's implicit
-# no-column-list INSERT populates the table directly. No staging table or
-# materialized view — unlike the OTLP lanes there is nothing to derive.
-#
-# `component_id` is the join back to a log source: generated sources are named
-# `<safe_name(name)>_source`.
-[sinks.clickhouse_internal_logs]
-type = "clickhouse"
-inputs = ["filter_internal_logs"]
-
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "${CLICKHOUSE_COLLECTOR_ERRORS_TABLE:-collector_errors}"
-
-auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
-
-compression = "gzip"
-date_time_best_effort = true
-# Vector emits per-error-type extras we deliberately do not model; without this
-# a novel key would fail the whole batch and we would lose the error we were
-# trying to record.
-skip_unknown_fields = true
-
-# Diagnostics must never apply backpressure to ingest. If this sink cannot
-# keep up or ClickHouse is down, drop the diagnostics rather than stall the
-# pipeline they describe — the console sink above still has them.
-buffer.type = "memory"
-buffer.max_events = 1000
-buffer.when_full = "drop_newest"
-
-# The healthcheck runs at boot. Failing it would take the whole collector down
-# over an error-reporting side channel, so a missing table must degrade to
-# "no error history", never to "no ingest".
-healthcheck.enabled = false
-
-[sinks.clickhouse_internal_logs.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
-timeout_secs = 60
-retry_initial_backoff_secs = 1
-retry_max_duration_secs = 60

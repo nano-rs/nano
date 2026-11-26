@@ -327,6 +327,86 @@ for pd in $PARSER_DIRS; do
     done
 done
 
+# --- quote bare placeholders (NAN-5810) ------------------------------------------------
+# Vector 0.62 parses a config file BEFORE it interpolates env vars (upstream #26475), then
+# substitutes inside string values only and coerces them to the field's type. A file an older
+# release rendered has bare numeric placeholders (`max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}`),
+# a TOML parse error that makes Vector refuse the WHOLE config. Such a file can still be here
+# when the pipeline gate above timed out, or on a legacy install's persisted tree. Every line
+# whose whole value is ONE bare `${NAME}` / `${NAME:-default}` (an optional `# comment` after it)
+# gets quotes; nothing else changes, and lines in or opening a ''' / """ multi-line string (VRL)
+# are never touched. Idempotent. Same rule as Rust `vector_env::quote_bare_placeholders`.
+# BEGIN nano-quote-bare-placeholders
+QUOTE_AWK='
+function count(s, d,    n, i) {
+    n = 0
+    while ((i = index(s, d)) > 0) { n++; s = substr(s, i + length(d)) }
+    return n
+}
+{ line = $0; cr = "" }
+sub(/\r$/, "", line) { cr = "\r" }
+open != "" { if (count(line, open) % 2 == 1) open = ""; print; next }
+line ~ /^[ \t]*#/ { print; next }
+count(line, q3) % 2 == 1 { open = q3; print; next }
+count(line, dq3) % 2 == 1 { open = dq3; print; next }
+line ~ /^[ \t]*[A-Za-z0-9_."-]+[ \t]*=[ \t]*[$][{][A-Za-z0-9_.]+((:?-|:?[?])[^}"\\]*)?[}][ \t]*(#.*)?$/ {
+    at = index(line, "${")
+    rest = substr(line, at)
+    cl = index(rest, "}")
+    printf "%s\"%s\"%s%s\n", substr(line, 1, at - 1), substr(rest, 1, cl), substr(rest, cl + 1), cr
+    next
+}
+{ print }'
+nano_quote_bare_placeholders() {
+    f="$1"; dir=$(dirname "$f"); base=$(basename "$f")
+    [ -f "$f" ] && [ ! -L "$f" ] || return 0
+    q="$dir/.$base.quote"
+    rm -f "$q"
+    mode=$(stat -c '%a' "$f" 2>/dev/null) || mode=""
+    case "$mode" in [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) mask=$(printf '%03o' $(( 0777 & ~0$mode ))) ;; *) mask=022 ;; esac
+    if ! ( umask "$mask"; set -C; awk -v q3="'''" -v dq3='"""' "$QUOTE_AWK" "$f" > "$q" ); then
+        rm -f "$q"
+        echo "nano-vector: WARNING: could not check $f for bare env placeholders (NAN-5810)" >&2
+        return 0
+    fi
+    if cmp -s "$f" "$q"; then
+        rm -f "$q"
+        return 0
+    fi
+    if nano_own_like_dir "$q" "$dir" quiet && mv -f "$q" "$f"; then
+        echo "nano-vector: quoted bare env placeholders in $f (rendered for Vector 0.61 or older; Vector 0.62 parses before it interpolates, NAN-5810)" >&2
+    else
+        rm -f "$q"
+        echo "nano-vector: WARNING: could not quote bare env placeholders in $f; Vector 0.62 cannot parse it (NAN-5810)" >&2
+    fi
+}
+# END nano-quote-bare-placeholders
+# The api-written dirs only (*/parsers, */configs, as above); never the static base dir.
+# NAN-5899: only for a Vector that needs it (0.62 or newer). This script reaches an
+# older image too: a release package extracted over a running install, whose upgrade
+# then stopped before the drain, leaves the new script on disk, and a restart of the
+# old container runs it; quoting its api's renders would make Vector 0.61 refuse them.
+# BEGIN nano-quote-needs-vector-062
+nano_vector_quotes_placeholders() {
+    v=$("$VECTOR" --version 2>/dev/null | awk 'NR == 1 { print $2 }')
+    major=${v%%.*}; rest=${v#*.}; minor=${rest%%.*}
+    # Anything but MAJOR.MINOR[...] with both numeric is unknown: the current image (0.62+).
+    [ "$v" != "$major" ] || return 0
+    case "$major" in ''|*[!0-9]*) return 0 ;; esac
+    case "$minor" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$major" -gt 0 ] || [ "$minor" -ge 62 ]
+}
+# END nano-quote-needs-vector-062
+if nano_vector_quotes_placeholders; then
+    for qd in $SOURCE_DIRS $PARSER_DIRS; do
+        for f in "$qd"/*.toml; do
+            nano_quote_bare_placeholders "$f"
+        done
+    done
+else
+    echo "nano-vector: $("$VECTOR" --version 2>/dev/null | awk 'NR == 1 { print $2 }') reads bare env placeholders; the api-written configs are left as they are (NAN-5899)" >&2
+fi
+
 # --- cold-start guard -------------------------------------------------------------------
 for sd in $SOURCE_DIRS; do
 for f in "$sd"/*.toml; do

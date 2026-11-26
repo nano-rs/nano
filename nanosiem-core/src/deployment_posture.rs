@@ -170,6 +170,9 @@ pub struct PostureInputs {
     /// NAN-5441 egress proxy settings (`NANO_EGRESS_PROXY_REQUIRED`,
     /// `DESTINATION_EGRESS_PROXY_URL`/`_MODE`, the env proxy).
     pub egress: crate::egress_proxy::EgressSettings,
+    /// NAN-5891: `NANO_ALLOW_CUSTOM_VECTOR=true` (custom or upstream Vector
+    /// builds may install generations).
+    pub allow_custom_vector: bool,
 }
 
 impl PostureInputs {
@@ -185,6 +188,7 @@ impl PostureInputs {
             base_url: var("BASE_URL"),
             db_passwords: db_passwords_from_env(),
             egress: crate::egress_proxy::EgressSettings::from_env(),
+            allow_custom_vector: crate::parsers::vector_config_custom_vector_allowed(),
         }
     }
 }
@@ -224,6 +228,20 @@ fn is_loopback_url(url: &str) -> bool {
 /// Every insecure-but-accepted deployment setting, most severe first.
 pub fn posture_findings(inputs: &PostureInputs) -> Vec<PostureFinding> {
     let mut findings = Vec::new();
+    if inputs.allow_custom_vector {
+        findings.push(PostureFinding {
+            title: "Custom or upstream Vector builds are allowed to install config".into(),
+            description: "NANO_ALLOW_CUSTOM_VECTOR=true lets a Vector without a nano release \
+                 label (an upstream or custom build) install this release's Vector config. Such \
+                 a build does not mark HEC event kinds, so HEC object events take the legacy \
+                 handling (a record's own timestamp and host are overwritten by the envelope) \
+                 and HEC string or /raw events whose text is compact JSON are handled as object \
+                 events. Run the pinned nano Vector image (0.62.0-nano.2 or later) and remove \
+                 the setting."
+                .into(),
+            priority: "high",
+        });
+    }
     let install_public = inputs
         .install_token
         .as_deref()

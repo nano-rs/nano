@@ -45,6 +45,8 @@ from nano_e2e.web import WebServer, route, static_file
         ("/api/search/explanation", "api"),
         ("/api/log-sources", "api"),
         ("/health", "api"),
+        ("/health/detailed", "api"),  # NAN-5864: the user menu's version line
+        ("/healthz", None),
         ("/swagger-ui/index.html", "api"),
         ("/search", None),
         ("/assets/index.js", None),
@@ -331,6 +333,46 @@ def test_runner_ui_suite_and_selection(runner: Path) -> None:
     assert "SEL" in out.stdout and "NOPULL" in out.stdout
     out = _bash(runner, "POSITIONAL=(all); selects_suite pull && selects_suite ui && echo BOTH")
     assert "BOTH" in out.stdout
+
+
+def test_runner_security_group_d_includes_the_enterprise_sso_scenario(runner: Path, tmp_path: Path) -> None:
+    # NAN-5869: scenario 9 moved under tests/enterprise/; the named suite must
+    # still run it on enterprise stacks, and only there.
+    root = Path(runner).parents[1]
+    open_file = str(root / "e2e" / "tests" / "test_security_group_d.py")
+    sso = str(root / "e2e" / "tests" / "enterprise" / "test_security_group_d_sso.py")
+    ent = _bash(runner, "EDITION=enterprise; POSITIONAL=(security_group_d); suite_paths")
+    opn = _bash(runner, "EDITION=open; POSITIONAL=(security_group_d); suite_paths")
+    assert ent.returncode == 0 and opn.returncode == 0, ent.stderr + opn.stderr
+    assert opn.stdout.splitlines() == [open_file]
+    # A full checkout (enterprise sources present) MUST select the SSO file:
+    # a rename that the runner misses fails here instead of going quiet.
+    if (root / "nanosiem-enterprise").is_dir():
+        assert ent.stdout.splitlines() == [open_file, sso], ent.stdout
+    else:  # the stripped open-core mirror
+        assert ent.stdout.splitlines() == [open_file], ent.stdout
+    # The stripped-tree branch, exercised on every checkout: an enterprise
+    # run over a test tree without tests/enterprise/ selects the open file only.
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_security_group_d.py").write_text("")
+    stripped = _bash(runner, f'PY_DIR="{tmp_path}"; EDITION=enterprise; POSITIONAL=(security_group_d); suite_paths')
+    assert stripped.returncode == 0, stripped.stderr
+    assert stripped.stdout.splitlines() == [str(tmp_path / "tests" / "test_security_group_d.py")]
+
+
+def test_runner_reused_stack_selects_by_the_stack_edition(runner: Path, tmp_path: Path) -> None:
+    # NAN-5869: `run security_group_d` on a kept open stack from a full
+    # checkout (default edition enterprise) gated on the enterprise-only SSO
+    # file, which the open stack skips: the suite coverage gate failed.
+    open_file = str(Path(runner).parents[1] / "e2e" / "tests" / "test_security_group_d.py")
+    (tmp_path / "run.env").write_text("E2E_EDITION=open\n")
+    out = _bash(runner, f'RUN_DIR="{tmp_path}"; EDITION=enterprise; POSITIONAL=(security_group_d); stack_suite_paths')
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [open_file], out.stdout
+    # No recorded edition (no run.env yet): the invocation's edition stands.
+    (tmp_path / "run.env").unlink()
+    out = _bash(runner, f'RUN_DIR="{tmp_path}"; EDITION=open; POSITIONAL=(security_group_d); stack_suite_paths')
+    assert out.stdout.splitlines() == [open_file], out.stdout + out.stderr
 
 
 def test_runner_profile_validation(runner: Path) -> None:

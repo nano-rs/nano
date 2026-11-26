@@ -20,6 +20,7 @@
 //   E2E_UI_HEADED=1 to watch it
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -96,10 +97,25 @@ async function ensureBrowser() {
   if (browser) return browser;
   const exe = chromePath();
   if (!exe) throw new Error('no Chrome/Chromium found: set CHROME_PATH');
+  // NAN-5884: tag the browser with the run's leak-guard token, so a guard
+  // only counts its own run's browsers when lanes share a host. The token is
+  // in the profile directory: Chrome passes --user-data-dir to every helper
+  // (renderer, GPU, utility), so an orphaned helper is still attributable.
+  // The name keeps Puppeteer's own prefix, which the guard looks for; a
+  // profile we pass ourselves is ours to remove.
+  const token = process.env.NANO_LEAK_GUARD_RUN || '';
+  let userDataDir;
+  if (/^[0-9a-f]{8,64}$/.test(token)) {
+    userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), `puppeteer_dev_chrome_profile-nano-${token}-`));
+    process.once('exit', () => {
+      try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    });
+  }
   browser = await puppeteer.launch({
     executablePath: exe,
     headless: process.env.E2E_UI_HEADED !== '1',
     args: ['--no-sandbox', '--disable-dev-shm-usage', `--window-size=${VIEWPORT.width},1000`],
+    ...(userDataDir ? { userDataDir } : {}),
   });
   return browser;
 }
@@ -1310,6 +1326,41 @@ const OPS = {
     await page.keyboard.press(keys[keys.length - 1]);
     for (const m of mods.reverse()) await page.keyboard.up(m);
     return true;
+  },
+  // NAN-5864: answer one app API call with a canned JSON body, for states a
+  // throwaway stack cannot reach on its own (a stale backup, a full disk, an
+  // update on offer, a license in grace). Keyed by method and path, with the
+  // query string when `path` has one. `body: null` with `clear: true` removes
+  // the stub; requests the session never stubbed go to the server unchanged.
+  // Returns how many requests the stub answered so far.
+  async stub_api({ sid, method = 'GET', path: p, status = 200, body = null, clear = false }) {
+    const s = sess(sid);
+    if (typeof p !== 'string' || !p.startsWith('/api/')) throw new Error(`stub_api: path must start with /api/: ${p}`);
+    const key = `${String(method).toUpperCase()} ${p}`;
+    if (!s.stubs) {
+      s.stubs = new Map();
+      await s.page.setRequestInterception(true);
+      s.page.on('request', (r) => {
+        if (r.isInterceptResolutionHandled()) return;
+        let stub;
+        if (isAppApi(r.url(), '/api/', BASE)) {
+          const u = new URL(r.url());
+          const m = r.method().toUpperCase();
+          stub = s.stubs.get(`${m} ${u.pathname}${u.search}`) || s.stubs.get(`${m} ${u.pathname}`);
+        }
+        if (!stub) { void r.continue().catch(() => {}); return; }
+        stub.hits += 1;
+        void r.respond({ status: stub.status, contentType: 'application/json', body: JSON.stringify(stub.body) }).catch(() => {});
+      });
+    }
+    if (clear) {
+      const had = s.stubs.get(key);
+      s.stubs.delete(key);
+      return had ? had.hits : 0;
+    }
+    const prev = s.stubs.get(key);
+    s.stubs.set(key, { status, body, hits: prev ? prev.hits : 0 });
+    return prev ? prev.hits : 0;
   },
   // Move the pointer over an element (reveals hover-only controls).
   async hover({ sid, find: f }) {

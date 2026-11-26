@@ -28,6 +28,16 @@ x-e2e-labels: &e2e-labels
   # The checkout that started the stack: `gc` only removes its own (NAN-4937).
   nano.e2e.owner: ${E2E_OWNER:-}
 
+# NAN-5880 Agent Lane (enterprise; the open edition ignores it): what
+# docker-compose.agentlane-gate.yml gives nano-api and nano-jobs. The harness
+# computes NANO_AGENTLANE_INTERNAL_CIDRS the way install.sh does (the
+# ClickHouse network allow-list + this host's addresses) and mints the gate's
+# bearer, so Settings > Agent Lane can switch on as it does on a real install.
+x-e2e-agentlane-env: &e2e-agentlane-env
+  NANO_AGENTLANE_GATE_TOKEN: ${NANO_AGENTLANE_GATE_TOKEN:-}
+  NANO_AGENTLANE_INTERNAL_CIDRS: ${NANO_AGENTLANE_INTERNAL_CIDRS:-}
+  NANO_AGENTLANE_PORT: ${NANO_AGENTLANE_PORT:-8444}
+
 services:
   postgres:
     container_name: ${E2E_PROJECT}-postgres
@@ -48,13 +58,23 @@ services:
       - ${E2E_RUN_DIR}/clickhouse/users.d:/users.d:ro
       - ./clickhouse/preflight:/preflight:ro
 
-  clickhouse:
-    container_name: ${E2E_PROJECT}-clickhouse
+  # NAN-5880: ClickHouse joins the clickhouse-netns anchor's namespace (as in
+  # the shipped stack), so the anchor publishes its ports.
+  clickhouse-netns:
+    container_name: ${E2E_PROJECT}-clickhouse-netns
     labels: *e2e-labels
     restart: "no"
     ports: !override
       - "127.0.0.1:${E2E_CH_HTTP_PORT:?}:8123"
       - "127.0.0.1:${E2E_CH_NATIVE_PORT:?}:9000"
+      # Native enterprise runs only: native-gate-upstream (below) listens here
+      # and forwards to ClickHouse's loopback Agent Lane gate listener.
+      - "127.0.0.1:${E2E_CH_GATE_PORT:?}:28444"
+
+  clickhouse:
+    container_name: ${E2E_PROJECT}-clickhouse
+    labels: *e2e-labels
+    restart: "no"
     volumes: !override
       - nano-clickhouse-data:/var/lib/clickhouse
       - nano-clickhouse-logs:/var/log/clickhouse-server
@@ -71,6 +91,11 @@ services:
     restart: "no"
     ports: !override
       - "127.0.0.1:${E2E_REDIS_PORT:?}:6379"
+    # NAN-5884: the image declares VOLUME /data, so every stack left an
+    # unlabeled anonymous volume. Persistence is off (--save "" and
+    # --appendonly no), so a tmpfs there holds nothing and creates no volume.
+    tmpfs:
+      - /data:mode=1777,size=16m
 
   # Deterministic provider-boundary fake used only by the persona suite.  It
   # receives the same OpenAI-compatible requests an on-prem provider would.
@@ -170,6 +195,7 @@ services:
     restart: "no"
     image: ${E2E_IMAGE_API:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-api:${NANO_VERSION:?NANO_VERSION is required}}
     environment:
+      <<: *e2e-agentlane-env
       VECTOR_CONTAINER_NAME: ${E2E_PROJECT}-vector
       NANOSIEM_DEV_MODE: "true"
       DEPLOYMENT_MODE: selfhosted
@@ -203,6 +229,7 @@ services:
     restart: "no"
     image: ${E2E_IMAGE_JOBS:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-jobs:${NANO_VERSION:?NANO_VERSION is required}}
     environment:
+      <<: *e2e-agentlane-env
       VECTOR_CONTAINER_NAME: ${E2E_PROJECT}-vector
       VECTOR_INGEST_URL: http://vector:8080/
       VECTOR_ENRICH_URL: http://vector:8090/
@@ -253,6 +280,43 @@ services:
     ports:
       - "127.0.0.1:${E2E_SEARCH_PORT:?}:3002"
 
+  # NAN-5880: the Agent Lane gate, as deploy/compose/agentlane/
+  # docker-compose.agentlane-gate.yml runs it on an enterprise single host:
+  # nanosiem-api --agentlane-gate in ClickHouse's network namespace,
+  # forwarding to its loopback-only listener (zz-agentlane-gate.xml, which the
+  # harness assembles on enterprise runs). Its port is not published on the
+  # host (agents never connect in the e2e stack); it only has to check in so
+  # Settings > Agent Lane can reach "On". Enterprise docker/image runs only.
+  agentlane-gate:
+    profiles: ["agentlane-gate"]
+    container_name: ${E2E_PROJECT}-agentlane-gate
+    labels: *e2e-labels
+    restart: "no"
+    image: ${E2E_IMAGE_API:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-api:${NANO_VERSION:?NANO_VERSION is required}}
+    command: ["nanosiem-api", "--agentlane-gate"]
+    network_mode: "service:clickhouse-netns"
+    depends_on:
+      clickhouse:
+        condition: service_started
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NANO_AGENTLANE_GATE_TOKEN: ${NANO_AGENTLANE_GATE_TOKEN:-}
+      NANO_AGENTLANE_GATE_API_URL: http://nano-api:3000
+      NANO_AGENTLANE_GATE_LISTEN: 0.0.0.0:8444
+      NANO_AGENTLANE_GATE_UPSTREAM: 127.0.0.1:18444
+      NANO_AGENTLANE_INTERNAL_CIDRS: ${NANO_AGENTLANE_INTERNAL_CIDRS:-}
+      NANO_AGENTLANE_GATE_NODE: e2e-single-host
+      NANO_AGENTLANE_GATE_WEB_CERT_DIR: /etc/nano/agentlane-gate/web
+      RUST_LOG: info
+    volumes:
+      # No web certificate on the e2e stack: an empty run-dir directory.
+      - ${E2E_RUN_DIR}/agentlane-gate/web:/etc/nano/agentlane-gate/web:ro
+
   # The shipped nginx is replaced by `edge` below (same config, upstreams
   # rewritten for the e2e stack), so the base service stays off.
   nano-web:
@@ -279,5 +343,59 @@ services:
       - ${E2E_RUN_DIR}/edge/web:/srv/web:ro
     ports:
       - "127.0.0.1:${E2E_EDGE_PORT:?}:80"
+  # Native app on a Linux host only: the edge reaches the host processes
+  # through host.docker.internal (host-gateway, the docker0 address), but they
+  # listen on 127.0.0.1, which Linux (unlike Docker Desktop) does not forward.
+  # This TCP relay runs in the host's network namespace and listens on the
+  # docker0 address only, on its own ports, admitting only this stack's
+  # network (the edge) and this host's own addresses (the harness's health
+  # check; host processes reach 127.0.0.1 anyway); everything else is refused. It forwards to the api and search on
+  # 127.0.0.1. Unprivileged: uid 65534, no capabilities, read-only root.
+  # The harness renders its config (${E2E_RUN_DIR}/edge/relay.conf).
+  native-relay:
+    profiles: ["native-relay"]
+    image: nginx:alpine@sha256:1bb9390209f866c8c0bf76ba89d3f33a3f6cd6a0e6c1b457af7ee763b9579f41
+    container_name: ${E2E_PROJECT}-native-relay
+    labels: *e2e-labels
+    restart: "no"
+    network_mode: host
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${E2E_RUN_DIR}/edge/relay.conf:/etc/nginx/nginx.conf:ro
+
+  # Native enterprise runs only (NAN-5880): the native Agent Lane gate is a
+  # host process, so it cannot share ClickHouse's network namespace and reach
+  # the loopback-only gate listener (zz-agentlane-gate.xml, 127.0.0.1:18444)
+  # the way the shipped gate does. This relay joins that namespace, listens on
+  # 28444 (published on host 127.0.0.1:E2E_CH_GATE_PORT only) and forwards to
+  # 127.0.0.1:18444, admitting only this stack's own network (the
+  # published-port path); the native gate's upstream is that port. Same
+  # hardening as native-relay.
+  native-gate-upstream:
+    profiles: ["native-gate-upstream"]
+    image: nginx:alpine@sha256:1bb9390209f866c8c0bf76ba89d3f33a3f6cd6a0e6c1b457af7ee763b9579f41
+    container_name: ${E2E_PROJECT}-native-gate-upstream
+    labels: *e2e-labels
+    restart: "no"
+    network_mode: "service:clickhouse-netns"
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${E2E_RUN_DIR}/agentlane-gate/upstream-relay.conf:/etc/nginx/nginx.conf:ro
   tenzir:
     profiles: ["never"]

@@ -149,3 +149,15 @@ async fn the_gate_compiles_each_stage_once_whatever_the_sample_count() {
     run_ocsf_samples(&validator, parser_only, None, &samples).await.expect("gate run");
     assert_eq!(compile_counter::count(parser_only), 1);
 }
+
+/// NAN-5889 review (P1): a stored Nano Pipe plan is recognised by its marker
+/// alone, valid or broken, so the pre-job check never compiles it and never
+/// mistakes a broken plan for a parser missing its OCSF receipt.
+#[test]
+fn a_pipe_plan_is_recognised_without_compiling_it() {
+    let header = crate::parsers::pipe::HEADER;
+    assert!(is_stored_pipe_plan(&format!("{header}{{\"version\":2}}\nnot the body")));
+    assert!(is_stored_pipe_plan(&format!("{header}not json at all")));
+    assert!(!is_stored_pipe_plan(".parsed = true"));
+    assert!(!is_stored_pipe_plan(&format!("# a comment\n{header}")));
+}

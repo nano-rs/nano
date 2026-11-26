@@ -93,7 +93,7 @@ import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { UserPreferencesProvider, useUserPreferences } from '@/contexts/UserPreferencesContext';
 import { useOnboardingProgress } from '@/hooks/use-api';
 import { INSTANCE_SETUP_PERMISSION, shouldRedirectToSetup } from '@/lib/onboarding-access';
-import { LicensedFeatureUnavailable } from '@/components/LicensedFeatureUnavailable';
+import { CapabilityRoute } from '@/components/CapabilityRoute';
 import { SsoRouteGate } from '@/pages/Settings/SsoRouteGate';
 import { useRegisterSchemaHighlightFields } from '@/hooks/useRegisterSchemaHighlightFields';
 import { NotebookProvider } from '@/enterprise/contexts/NotebookContext';
@@ -194,14 +194,15 @@ const HuntLeadDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/
 const HuntRuleIdeasRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntRuleIdeasRoute');
 const HuntKnowledgeRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntKnowledgeRoute');
 const HuntProfileRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntProfileRoute');
-const HuntCampaignsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignsRoute');
-const HuntCampaignCandidatesRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignCandidatesRoute');
-const HuntCampaignDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntCampaignDetailRoute');
+const HuntActorsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntActorsRoute');
+const HuntActorReviewRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntActorReviewRoute');
+const HuntActorDetailRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntActorDetailRoute');
 // NAN-5850: Rulings became the Decisions tab of Findings; runners, install
 // settings and the default charter moved to Settings > Hunting.
 const HuntDecisionsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntDecisionsRoute');
 const HuntSettingsRunnersRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntSettingsRunnersRoute');
 const HuntSettingsCharterRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntSettingsCharterRoute');
+const HuntSettingsActorsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntSettingsActorsRoute');
 const HuntEscalationsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Hunts'), 'HuntEscalationsRoute');
 const RiskWatchlists = lazyWithRetryNamed(() => import('@/enterprise/pages/RiskWatchlists'), 'RiskWatchlists');
 const Prevalence = lazyWithRetryNamed(() => import('@/pages/Prevalence'), 'Prevalence');
@@ -341,14 +342,17 @@ function PermissionRoute({
   permission,
   anyPermission,
   capability,
+  openWhenLicensePaused = false,
 }: {
   element: React.ReactNode;
   permission?: string;
   anyPermission?: string[];
   capability?: keyof Capabilities;
+  /** See {@link CapabilityRoute}. */
+  openWhenLicensePaused?: boolean;
 }) {
   const guarded = capability ? (
-    <CapabilityRoute capability={capability}>{element}</CapabilityRoute>
+    <CapabilityRoute capability={capability} openWhenLicensePaused={openWhenLicensePaused}>{element}</CapabilityRoute>
   ) : element;
   return (
     <ProtectedRoute permission={permission} anyPermission={anyPermission}>
@@ -357,17 +361,6 @@ function PermissionRoute({
   );
 }
 
-function CapabilityRoute({
-  capability,
-  children,
-}: {
-  capability: keyof Capabilities;
-  children: React.ReactNode;
-}) {
-  const { capabilities } = useCapabilities();
-  if (capabilities[capability]) return <>{children}</>;
-  return <LicensedFeatureUnavailable capability={capability} />;
-}
 
 
 function NotFoundPage() {
@@ -740,7 +733,7 @@ function ProtectedAppRoutes() {
             } />
           } />
           {/* Hunts (enterprise, NAN-5545 / NAN-5547 / NAN-5850): library,
-              findings (Inbox and Decisions tabs), escalations, campaigns,
+              findings (Inbox and Decisions tabs), escalations, actors (NAN-5859),
               knowledge, profile. Static paths sort ahead of /hunts/:id and
               /hunts/leads/:id in react-router's ranking. */}
           {([
@@ -749,9 +742,9 @@ function ProtectedAppRoutes() {
             ['/hunts/leads/decisions', HuntDecisionsRoute],
             ['/hunts/leads/:id', HuntLeadDetailRoute],
             ['/hunts/knowledge', HuntKnowledgeRoute],
-            ['/hunts/campaigns', HuntCampaignsRoute],
-            ['/hunts/campaigns/candidates', HuntCampaignCandidatesRoute],
-            ['/hunts/campaigns/:id', HuntCampaignDetailRoute],
+            ['/hunts/actors', HuntActorsRoute],
+            ['/hunts/actors/review', HuntActorReviewRoute],
+            ['/hunts/actors/:id', HuntActorDetailRoute],
             ['/hunts/escalations', HuntEscalationsRoute],
             ['/hunts/profile', HuntProfileRoute],
             ['/hunts/:id', HuntDetailRoute],
@@ -768,6 +761,7 @@ function ProtectedAppRoutes() {
           {([
             ['/settings/hunts', HuntSettingsRunnersRoute],
             ['/settings/hunts/charter', HuntSettingsCharterRoute],
+            ['/settings/hunts/actors', HuntSettingsActorsRoute],
           ] as const).map(([path, Page]) => (
             <Route key={path} path={path} element={
               <PermissionRoute permission="hunts:view" capability="hunts" element={
@@ -789,6 +783,10 @@ function ProtectedAppRoutes() {
           <Route path="/hunts/rulings" element={<QueryPreservingRedirect to="/hunts/leads/decisions" />} />
           <Route path="/hunts/runners" element={<QueryPreservingRedirect to="/settings/hunts" query="drop" />} />
           <Route path="/hunts/rule-ideas" element={<QueryPreservingRedirect to="/rules/ideas" />} />
+          {/* NAN-5859: Campaigns became Actors; the API paths stay. */}
+          <Route path="/hunts/campaigns" element={<QueryPreservingRedirect to="/hunts/actors" />} />
+          <Route path="/hunts/campaigns/candidates" element={<QueryPreservingRedirect to="/hunts/actors/review?kind=unassigned" />} />
+          <Route path="/hunts/campaigns/:id" element={<QueryPreservingRedirect to="/hunts/actors/:id" />} />
           {/* Automation (enterprise, NAN-4911 / NAN-4925): runs, flows,
               approvals, capabilities. Each route renders an "off" state
               itself; open builds render the paid-plan stub. */}
@@ -832,9 +830,11 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-          {/* NAN-5360: Agent Lane switch and agentlane tokens (enterprise) */}
+          {/* NAN-5360: Agent Lane switch and agentlane tokens (enterprise).
+              NAN-5880: at the license hard stop the page shows its Paused
+              state, where revoke and switch-off stay available. */}
           <Route path="/settings/agentlane" element={
-            <PermissionRoute permission="agentlane:manage" capability="agentLane" element={
+            <PermissionRoute permission="agentlane:manage" capability="agentLane" openWhenLicensePaused element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <AgentLaneSettings key={resetKey} />
               </Suspense>

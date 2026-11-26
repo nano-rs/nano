@@ -22,7 +22,7 @@ const HEC: &str = include_str!("../../../config/vector/02-hec-source.toml");
 const OTLP: &str = include_str!("../../../config/vector/03-otlp-source.toml");
 
 /// Parses a shipped config after Vector's `${VAR:-default}` substitution
-/// (unquoted numeric defaults are not TOML until substituted).
+/// (quoted since Vector 0.62, NAN-5810; a substituted number stays a string).
 fn parse(config: &str) -> toml::Table {
     let substituted = regex::Regex::new(r"\$\{[A-Z0-9_]+:-([^}]*)\}")
         .unwrap()

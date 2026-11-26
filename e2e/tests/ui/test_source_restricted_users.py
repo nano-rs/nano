@@ -105,8 +105,12 @@ def _surfaces(client: Nano, mark: str, lane_b: str, ip_b: str, enterprise: bool)
     pv = client.api.get("/api/prevalence/explorer", params={"search": ip_b, "window": "7d", "limit": 50})
     out["prevalence explorer"] = pv.text if pv.status_code == 200 else f"<{pv.status_code}>"
     if enterprise:
-        rk = client.api.get("/api/risk/entities", params={"limit": 500})
+        # NAN-5841: the live answer is the control-bearing surface; the
+        # precomputed snapshot (the default read) is checked for leaks too.
+        rk = client.api.get("/api/risk/entities", params={"limit": 500, "refresh": "true"})
         out["risk entities"] = rk.text if rk.status_code == 200 else f"<{rk.status_code}>"
+        rc = client.api.get("/api/risk/entities", params={"limit": 500})
+        out["risk entities (precomputed)"] = rc.text if rc.status_code == 200 else f"<{rc.status_code}>"
         hl = client.api.get("/api/hunts/leads", params={"limit": 200})
         out["hunts leads"] = hl.text if hl.status_code == 200 else f"<{hl.status_code}>"
     return out
@@ -165,7 +169,7 @@ def test_source_restricted_user_sees_only_granted_sources(
                 lambda: next((a for a in _alerts(nano, rule_id=rule_b["id"]) if a.get("case_id")), None),
                 timeout=DETECTION, interval=5, desc="B alert grouped into a case")["case_id"]
             created.append(f"/api/cases/{case_b}")
-            eventually(lambda: nano.api.get("/api/risk/entities", params={"limit": 500}).text, timeout=DETECTION,
+            eventually(lambda: nano.api.get("/api/risk/entities", params={"limit": 500, "refresh": "true"}).text, timeout=DETECTION,
                        interval=5, desc="B's user has risk (admin view)", ok=lambda t: user_b in t)
         dash = expect(nano.api.post("/api/dashboards", json={
             "name": f"e2e scope {tag}", "description": "nano-e2e (NAN-5686)", "visibility": "public",
@@ -290,7 +294,10 @@ def test_source_restricted_user_sees_only_granted_sources(
             # Prevalence and hunts leads are computed by background jobs; a fresh
             # stack may not have them yet. Every other surface must have B data
             # for the control, or the check proved nothing.
-            hard = [v for v in vacuous if not v.startswith(("prevalence explorer", "hunts leads"))]
+            # The precomputed risk snapshot refreshes on its own schedule, so it is
+            # a leak-only surface (it must never show B; it may not have B yet).
+            hard = [v for v in vacuous
+                    if not v.startswith(("prevalence explorer", "hunts leads", "risk entities (precomputed)"))]
             assert not hard, "vacuous controls (the granted analyst saw no B data):\n" + "\n".join(hard)
     finally:
         for path in reversed(created):

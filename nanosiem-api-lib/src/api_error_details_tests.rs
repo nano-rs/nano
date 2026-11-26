@@ -20,6 +20,25 @@ async fn unprocessable_with_details_keeps_code_and_details() {
     assert_eq!(body["error"]["details"]["refused"][1]["suffix"], "b");
 }
 
+/// NAN-5877: AI not set up is a clean 503 with its own code and a plain
+/// message, marked as expected so request logging does not report it.
+#[tokio::test]
+async fn ai_not_configured_is_an_expected_503() {
+    let response = ApiError::ai_not_configured().into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.extensions().get::<ExpectedServerError>().is_some());
+    let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "AI_NOT_CONFIGURED");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("AI isn't set up"), "{message}");
+    assert!(!message.contains('\u{2014}'), "no em dashes in user copy");
+
+    // Every other 5xx stays unmarked.
+    let internal = ApiError::InternalError("boom".into()).into_response();
+    assert!(internal.extensions().get::<ExpectedServerError>().is_none());
+}
+
 /// NAN-5561: a 409 can carry structured details too.
 #[tokio::test]
 async fn conflict_with_details_is_a_409_with_its_details() {

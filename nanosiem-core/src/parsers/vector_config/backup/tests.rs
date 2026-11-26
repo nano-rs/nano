@@ -583,10 +583,13 @@ async fn the_gate_catches_an_ocsf_sink_fork_no_parser_emits() {
     assert!(format!("{err}").contains("apache_ocsf_prepare"), "{err}");
 }
 
-/// The gate must read `_pipeline.toml`, and `_pipeline.toml` is not valid TOML.
+/// The gate must read `_pipeline.toml` as an older release rendered it, which
+/// is not valid TOML.
 ///
 /// It carries `max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}` — an unquoted
-/// interpolation Vector substitutes before parsing. Without mirroring that
+/// interpolation Vector 0.61 substituted before parsing (NAN-5810: the current
+/// render quotes it; `the_gate_reads_quoted_placeholders` covers that form).
+/// Without mirroring that
 /// substitution the file never parses, the gate loses every declaration it
 /// makes, and it has to fall silent to avoid reporting `prepare_output` and
 /// friends as missing. The dangling combiner input below is what silence costs.
@@ -629,6 +632,75 @@ async fn the_gate_reads_files_that_use_env_interpolation() {
         .backup_current()
         .await
         .expect("prepare_output is declared by the interpolated pipeline");
+}
+
+/// NAN-5810: the current render quotes every placeholder for Vector 0.62;
+/// the gate reads that form too.
+#[tokio::test]
+async fn the_gate_reads_quoted_placeholders() {
+    let pipeline = "[transforms.prepare_output]\ntype = \"remap\"\ninputs = [\"generic_parser\"]\n\n\
+                    [transforms.generic_parser]\ntype = \"remap\"\ninputs = [\"source_router.generic\"]\n\n\
+                    [sinks.clickhouse_logs]\ntype = \"clickhouse\"\ninputs = [\"prepare_output\"]\n\n\
+                    [sinks.clickhouse_logs.batch]\nmax_bytes = \"${VECTOR_BATCH_MAX_BYTES:-52428800}\"\n";
+    let (_tmp, manager) = manager_with_active(&[
+        (
+            "_router.toml",
+            "[transforms.source_router]\ntype = \"route\"\n\n\
+             [transforms.source_router.route]\ngeneric = 'true'\n",
+        ),
+        ("_pipeline.toml", pipeline),
+        (
+            "_combiner.toml",
+            "[transforms.db_parsers_combined]\ntype = \"remap\"\ninputs = [\"ghost_output\"]\n",
+        ),
+    ])
+    .await;
+    let err = manager.backup_current().await.expect_err("ghost_output is dangling");
+    assert!(format!("{err}").contains("ghost_output"), "{err}");
+}
+
+/// NAN-5810: a rollback target an older release rendered has bare numeric
+/// placeholders, which Vector 0.62 cannot parse. The restore quotes them and
+/// leaves every other byte (VRL included) as the snapshot had it.
+#[tokio::test]
+async fn a_restored_pre_0_62_tree_is_quoted_for_vector_0_62() {
+    let old_pipeline = "[transforms.generic_parser]\ntype = \"remap\"\ninputs = [\"source_router.generic\"]\n\
+                        source = '''\nx = ${NOT_TOML}\n.a = \"keep ${THIS}\"\n'''\n\n\
+                        [sinks.clickhouse_logs]\ntype = \"clickhouse\"\ninputs = [\"generic_parser\"]\n\
+                        endpoint = \"${CLICKHOUSE_URL:-http://clickhouse:8123}\"\n\n\
+                        [sinks.clickhouse_logs.buffer]\ntype = \"disk\"\nmax_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}\n\n\
+                        [sinks.clickhouse_logs.batch]\nmax_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800} # tier\n";
+    let router = "[transforms.source_router]\ntype = \"route\"\n\n[transforms.source_router.route]\ngeneric = 'true'\n";
+    let (_tmp, manager) =
+        manager_with_active(&[("_router.toml", router), ("_pipeline.toml", old_pipeline)]).await;
+    let gen = manager.backup_current().await.expect("backup");
+    // The snapshot itself is kept as taken.
+    assert_eq!(
+        fs::read_to_string(manager.backup_dir().join("_pipeline.toml")).await.unwrap(),
+        old_pipeline
+    );
+    fs::write(manager.parsers_dir.join("_pipeline.toml"), "CLOBBERED").await.unwrap();
+    manager.restore_backup(&gen).await.expect("restore");
+
+    let restored = fs::read_to_string(manager.parsers_dir.join("_pipeline.toml")).await.unwrap();
+    assert!(
+        restored.contains("max_size = \"${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}\"\n"),
+        "{restored}"
+    );
+    assert!(
+        restored.contains("max_bytes = \"${VECTOR_BATCH_MAX_BYTES:-52428800}\" # tier\n"),
+        "{restored}"
+    );
+    assert!(restored.contains("\nx = ${NOT_TOML}\n.a = \"keep ${THIS}\"\n"), "VRL untouched: {restored}");
+    assert!(crate::vector_env::bare_placeholder_lines(&restored).is_empty(), "{restored}");
+    // Only the two placeholder lines changed, by one pair of quotes each.
+    assert_eq!(restored.len(), old_pipeline.len() + 4);
+    assert_eq!(restored.replace('"', ""), old_pipeline.replace('"', ""));
+    assert_eq!(
+        fs::read_to_string(manager.parsers_dir.join("_router.toml")).await.unwrap(),
+        router,
+        "a file with nothing to quote is restored byte for byte"
+    );
 }
 
 /// The gate covers the parser tree, not the whole Vector config.

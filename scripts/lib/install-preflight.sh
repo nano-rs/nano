@@ -366,6 +366,8 @@ nano_running_compose_overlays() {
         [[ "$base" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]] || continue
         case "$base" in
             docker-compose.opensource.yml | docker-compose.agentlane.yml | docker-compose.metrics-expose.yml) continue ;;
+            # NAN-5880: installer-managed (enterprise single host only).
+            docker-compose.agentlane-gate.yml | docker-compose.agentlane-imported-tls.yml) continue ;;
         esac
         [[ -f "$dir/$base" && ! -L "$dir/$base" ]] || continue
         printf '%s\n' "$base"

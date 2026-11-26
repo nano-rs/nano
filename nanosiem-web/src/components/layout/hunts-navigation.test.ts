@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'vitest';
 import { isHuntsNavItemActive } from './hunts-navigation';
 
-const ENTRIES = ['/hunts', '/hunts/leads', '/hunts/escalations', '/hunts/campaigns', '/hunts/knowledge'];
+const ENTRIES = ['/hunts', '/hunts/leads', '/hunts/escalations', '/hunts/actors', '/hunts/knowledge'];
 const owner = (path: string) => ENTRIES.filter((href) => isHuntsNavItemActive(path, href));
 
 describe('isHuntsNavItemActive', () => {
@@ -16,8 +16,11 @@ describe('isHuntsNavItemActive', () => {
     ['/hunts/leads/lead_01', '/hunts/leads'],
     ['/hunts/leads/decisions', '/hunts/leads'],
     ['/hunts/escalations', '/hunts/escalations'],
-    ['/hunts/campaigns/candidates', '/hunts/campaigns'],
-    ['/hunts/campaigns/cmp_01', '/hunts/campaigns'],
+    ['/hunts/actors/review', '/hunts/actors'],
+    ['/hunts/actors/hcmp_01', '/hunts/actors'],
+    // NAN-5859: the old campaign paths light Actors for the render before the redirect.
+    ['/hunts/campaigns', '/hunts/actors'],
+    ['/hunts/campaigns/hcmp_01', '/hunts/actors'],
     ['/hunts/knowledge', '/hunts/knowledge'],
     // Redirect-only legacy routes light their new home for the one render.
     ['/hunts/memory', '/hunts/knowledge'],

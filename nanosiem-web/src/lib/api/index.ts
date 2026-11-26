@@ -349,7 +349,6 @@ class ApiClient {
     );
     this._detections = new DetectionsApi(this.request.bind(this));
     this._credentials = new CredentialsApi(this.request.bind(this));
-    this._connectorFeeds = new ConnectorFeedsApi(this.request.bind(this));
     this._melod = new MelodApi(
       this.request.bind(this),
       this.getAccessToken.bind(this),
@@ -375,6 +374,8 @@ class ApiClient {
       (message, code, status) => new ApiClientError(message, code, undefined, status),
     );
     this._sourceConfigs = new SourceConfigsApi(this.request.bind(this), longRequest);
+    // NAN-5903: a pull feed start that sets up log sources deploys them first.
+    this._connectorFeeds = new ConnectorFeedsApi(this.request.bind(this), longRequest);
     this._sourceScopes = new SourceScopesApi(this.request.bind(this));
     this._accessControl = new AccessControlApi(this.request.bind(this));
     this._dashboards = new DashboardsApi(this.request.bind(this));
@@ -2361,8 +2362,8 @@ class ApiClient {
     return this._risk.getRiskyEntities(params);
   }
 
-  async getRiskOverview(): Promise<import('./types').RiskOverviewResponse> {
-    return this._risk.getRiskOverview();
+  async getRiskOverview(refresh = false): Promise<import('./types').RiskOverviewResponse> {
+    return this._risk.getRiskOverview(refresh);
   }
 
   async getTimeWindowedRiskScores(params?: import('./types').TimeWindowedRiskQuery): Promise<import('./types').TimeWindowedRiskResponse> {

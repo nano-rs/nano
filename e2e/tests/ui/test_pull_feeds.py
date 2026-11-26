@@ -27,6 +27,10 @@ pytestmark = pytest.mark.mock_vendor
 
 SEQ = re.compile(r"seq=(\d+)")
 N = 5
+# NAN-5903: a start that sets up log sources deploys them first (the OCSF
+# sample check plus a Vector reload); a large parser takes over a minute on a
+# debug build. The edge allows these paths 300 s.
+SETUP_TIMEOUT = 300.0
 
 
 def _feed_by_name(nano: Nano, name: str) -> dict | None:
@@ -35,23 +39,29 @@ def _feed_by_name(nano: Nano, name: str) -> dict | None:
     return next((f for f in items if f.get("name") == name), None)
 
 
+# NAN-5903: fields are found by their config / credential key (the labels are
+# plain English); a list field with known values is a checkbox group, set
+# separately (CHOICES).
 def _okta(a: Any) -> tuple[str, list[dict[str, Any]]]:
     return "Okta System Log", [
-        field({"labelAfter": "OKTA_DOMAIN"}, a.domain),
-        field({"labelAfter": "API_TOKEN"}, a.token, secret=True),
+        ui_pull.feed_config_field("OKTA_DOMAIN", a.domain),
+        ui_pull.feed_credential_field("API_TOKEN", a.token),
     ]
 
 
 def _gws(a: Any) -> tuple[str, list[dict[str, Any]]]:
     return "Google Workspace audit", [
-        field({"labelAfter": "ADMIN_EMAIL"}, a.admin),
-        field({"labelAfter": "STREAMS"}, "login"),
+        ui_pull.feed_config_field("ADMIN_EMAIL", a.admin),
         field({"css": "textarea[placeholder^='{\"type\"']"}, a.sa.credentials_json(), secret=True),
     ]
 
 
 def _slack(a: Any) -> tuple[str, list[dict[str, Any]]]:
-    return "Slack access logs", [field({"labelAfter": "USER_TOKEN"}, a.token, secret=True)]
+    return "Slack access logs", [ui_pull.feed_credential_field("USER_TOKEN", a.token)]
+
+
+# Only the lane the harness parser serves, so no log source setup is asked.
+CHOICES = {"google_workspace": {"STREAMS": "login"}}
 
 
 CASES = {
@@ -86,8 +96,9 @@ def test_ui_pull_feed(
         page.choose({"role": "combobox", "within": dlg, "nth": 0}, rx(f"^{re.escape(label)}"))
         page.fill(field({"placeholder": "Okta production", "within": dlg}, name))
         page.fill(*[{**f, "find": {**f["find"], "within": dlg}} for f in fields])
-        page.click({"role": "button", "name": "Create feed", "within": dlg})
-        page.wait_for(dlg, gone=True, timeout_ms=30_000)
+        for key, value in CHOICES.get(vendor, {}).items():
+            ui_pull.set_feed_choices(page, key, value, dlg)
+        ui_pull.submit_feed_form(page, dlg, expect_setup=False)
         timeline.step("ui: feed created", feed=name, connector=label)
 
         # The lane was just published, so Vector is still reloading: an event
@@ -185,8 +196,7 @@ def test_ui_new_pull_feed_is_a_right_flyout(
         page.choose({"role": "combobox", "within": sheet, "nth": 0}, rx(f"^{re.escape(label)}"))
         page.fill(field({"placeholder": "Okta production", "within": sheet}, name))
         page.fill(*[{**f, "find": {**f["find"], "within": sheet}} for f in fields])
-        page.click({"role": "button", "name": "Create feed", "within": sheet})
-        page.wait_for(sheet, gone=True, timeout_ms=30_000)
+        ui_pull.submit_feed_form(page, sheet, expect_setup=False)
         page.wait_text("Pull feed created", exact=False)
         api = eventually(lambda: _feed_by_name(nano, name), timeout=30, desc="feed in the API", ok=bool)
         assert api["connector"] == adapter.connector, api
@@ -285,3 +295,149 @@ def _row_actions(
     timeline.step(
         "rotated from the row: next run authenticated with the new token", feed=feed and feed.get("id")
     )
+
+
+def _gws_one_submit(
+    page: uilib.UiPage, nano: Nano, mock_vendor: MockVendor, mark: str, timeline, *, via_marketplace: bool
+) -> None:
+    """A Google Workspace feed created in ONE submit on a stack where no
+    Workspace lane has a log source, started from Pull feeds or from the
+    Marketplace card (which hops to Pull feeds with the connector
+    preselected). Streams is a multi-select with the usual apps ticked;
+    Create feed asks first ("This will also create 1 log source"), then sets
+    the source up from the catalog parser and creates the feed. The seeded
+    sign-ins land."""
+    adapter = feeds.GoogleWorkspace()
+    adapter.provision(mock_vendor, mark)
+    adapter.seed(mock_vendor, mark, N)
+    defaults = ["login", "admin", "token", "drive", "groups", "saml", "user_accounts"]
+    lanes = [f"gws_{s}" for s in defaults]
+    # Precondition: zero log sources on these lanes.
+    timeline.step("lanes released", released=feeds.release_setup_sources(nano, lanes, adapter.connector))
+    name = f"{mark}-gws-onesubmit-{'mp' if via_marketplace else 'ui'}"
+    sheet = {"testid": "new-pull-feed-sheet"}
+    try:
+        if via_marketplace:
+            page.goto("/marketplace")
+            card = {"css": "[data-mp-slug='collector:google_workspace']"}
+            page.wait_for(card, timeout_ms=60_000)
+            # The card has no form of its own: it hops to Pull feeds.
+            page.click(card)
+            page.wait_url(r"/ingestion/log-sources/pull-feeds", timeout_ms=30_000)
+            page.wait_for(sheet, timeout_ms=30_000)
+        else:
+            page.goto(ui_pull.PULL_FEEDS_PATH)
+            page.wait_for({"testid": "pull-feeds-page"}, timeout_ms=60_000)
+            page.click({"role": "button", "name": rx("New pull feed")})
+            page.wait_for(sheet)
+            page.choose({"role": "combobox", "within": sheet, "nth": 0}, rx("^Google Workspace audit"))
+        # Plain-English labels, never the raw keys; no jargon banner.
+        assert page.count({"text": "Admin email to act as", "within": sheet}), "plain label"
+        assert page.count({"text": "Which Workspace apps to collect", "within": sheet}), "plain label (and preselected)"
+        for raw in ("ADMIN_EMAIL", "STREAMS"):
+            assert not page.count({"text": raw, "exact": True, "within": sheet}), f"raw key {raw} shown"
+        assert not page.count({"text": "HEC log source first", "exact": False, "within": sheet})
+        assert page.count({"placeholder": "Default: every 5 minutes", "within": sheet})
+        ticked = [
+            v
+            for v in page.attrs(
+                {"css": "[data-testid='choices-STREAMS'] [data-choice][aria-checked='true']", "within": sheet}, "data-choice"
+            )
+            if v
+        ]
+        assert sorted(ticked) == sorted(defaults), ticked
+        page.fill(
+            field({"placeholder": "Okta production", "within": sheet}, name),
+            *[{**f, "find": {**f["find"], "within": sheet}} for f in _gws(adapter)[1]],
+        )
+        shown = ui_pull.submit_feed_form(page, sheet, expect_setup=True)
+        timeline.step("ui: confirmed setup and created", confirm=shown, via_marketplace=via_marketplace)
+        page.wait_text("Created the log source", exact=False, timeout_ms=30_000)
+
+        feed = eventually(lambda: _feed_by_name(nano, name), timeout=30, desc="feed in the API", ok=bool)
+        assert feed is not None
+        assert sorted(str(feed["config"]["STREAMS"]).split(",")) == sorted(defaults), feed["config"]
+        body = api_expect(nano.api.get("/api/log-sources"), 200)
+        items = body if isinstance(body, list) else body.get("sources") or body.get("items") or []
+        for lane in lanes:
+            claim = [s for s in items if s.get("enabled") and lane in (s.get("match_values") or [])]
+            assert len(claim) == 1 and claim[0].get("deployed"), f"{lane}: {claim}"
+        seen = eventually(
+            lambda: Counter(
+                int(m.group(1)) for r in nano.rows(f'"{mark}"', limit=100) if (m := SEQ.search(row_text(r)))
+            ),
+            timeout=240 + INGEST_VISIBLE,
+            interval=5,
+            desc=f"{N} Workspace sign-ins",
+            ok=lambda c: set(c) == set(range(N)),
+        )
+        assert all(c == 1 for c in seen.values()), seen
+    finally:
+        f = _feed_by_name(nano, name)
+        if f:
+            nano.api.delete(f"/api/connector-feeds/{f['id']}")
+        # Give the shared lanes back (found by lane: also after a mid-test failure).
+        feeds.release_setup_sources(nano, lanes, adapter.connector)
+
+
+def test_ui_google_workspace_feed_one_submit_sets_up_log_sources(
+    stack: Stack, page: uilib.UiPage, nano: Nano, mock_vendor: MockVendor, mark: str, timeline
+) -> None:
+    """NAN-5903: the Pull feeds entry point, from zero log sources."""
+    _gws_one_submit(page, nano, mock_vendor, mark, timeline, via_marketplace=False)
+
+
+def test_ui_marketplace_hops_to_pull_feeds_and_sets_up_in_one_submit(
+    stack: Stack, page: uilib.UiPage, nano: Nano, mock_vendor: MockVendor, mark: str, timeline
+) -> None:
+    """NAN-5903: the Marketplace entry point lands on Pull feeds with the
+    connector preselected, from zero log sources."""
+    _gws_one_submit(page, nano, mock_vendor, mark, timeline, via_marketplace=True)
+
+
+def test_ui_resume_with_missing_log_sources_offers_fix_setup(
+    stack: Stack, page: uilib.UiPage, nano: Nano, mock_vendor: MockVendor, mark: str, timeline
+) -> None:
+    """NAN-5903: resuming a feed whose lane source was deleted is refused
+    ("Some log sources this feed needs are missing"); Fix setup confirms,
+    sets the source up again and resumes the feed."""
+    adapter = feeds.Okta()
+    adapter.provision(mock_vendor, mark)
+    lanes = list(adapter.lanes)
+    feeds.release_setup_sources(nano, lanes, adapter.connector)
+    name = f"{mark}-okta-fix-ui"
+    try:
+        created = api_expect(
+            nano.api.post("/api/connector-feeds", json={**adapter.feed_body(name), "set_up_log_sources": True}, timeout=SETUP_TIMEOUT), 201
+        )
+        fid = created["id"]
+        api_expect(nano.api.patch(f"/api/connector-feeds/{fid}", json={"enabled": False}), 200)
+        for s in created.get("log_sources") or []:
+            if s.get("log_source_id"):
+                feeds.delete_log_source(nano, s["log_source_id"])
+        region = {"testid": "pull-feeds-region"}
+        page.goto(ui_pull.PULL_FEEDS_PATH)
+        page.wait_for({"testid": "pull-feeds-page"}, timeout_ms=60_000)
+        row = {"role": "row", "name": rx(re.escape(name)), "within": region}
+        page.wait_for(row, timeout_ms=60_000)
+        page.click({"role": "button", "name": "Resume", "within": row})
+        banner = {"testid": "feed-fix-setup"}
+        page.wait_for(banner, timeout_ms=30_000)
+        page.wait_text("Some log sources this feed needs are missing", exact=False)
+        page.click({"role": "button", "name": "Fix setup", "within": banner})
+        page.wait_for({"testid": "feed-setup-confirm"}, timeout_ms=30_000)
+        page.click({"role": "button", "name": "Set up and continue", "within": {"role": "alertdialog"}})
+        page.wait_for(banner, gone=True, timeout_ms=240_000)
+        feed = eventually(
+            lambda: _feed_by_name(nano, name), timeout=30, desc="resumed in the API", ok=lambda f: bool(f) and f.get("enabled")
+        )
+        timeline.step("fixed from the UI", feed=feed and feed.get("id"))
+        body = api_expect(nano.api.get("/api/log-sources"), 200)
+        items = body if isinstance(body, list) else body.get("sources") or body.get("items") or []
+        claim = [s for s in items if s.get("enabled") and lanes[0] in (s.get("match_values") or [])]
+        assert len(claim) == 1 and claim[0].get("deployed"), claim
+    finally:
+        f = _feed_by_name(nano, name)
+        if f:
+            nano.api.delete(f"/api/connector-feeds/{f['id']}")
+        feeds.release_setup_sources(nano, lanes, adapter.connector)

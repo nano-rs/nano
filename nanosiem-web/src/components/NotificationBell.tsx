@@ -154,6 +154,7 @@ export function NotificationBell() {
             unreadCount > 0 ? `${unreadCount} unread notifications` : 'Notifications'
           }
           type="button"
+          data-testid="notification-bell"
         >
           <Bell className="w-[14px] h-[14px]" />
           {unreadCount > 0 && (

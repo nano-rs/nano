@@ -2404,13 +2404,23 @@ export interface EntityTypeCount {
   count: number;
 }
 
-export interface RiskOverviewResponse {
+/** NAN-5841: data age of a Risk page response. */
+export interface RiskDataAge {
+  /** When the numbers were computed (ISO). Precompute time when `cached`. */
+  as_of?: string;
+  /** Served from the precomputed snapshot; clears and weights are still live. */
+  cached?: boolean;
+  /** The snapshot is past its refresh time; a background refresh is queued. */
+  stale?: boolean;
+}
+
+export interface RiskOverviewResponse extends RiskDataAge {
   overview_24h: RiskAnalyticsOverview;
   overview_7d: RiskAnalyticsOverview;
   entity_types: EntityTypeCount[];
 }
 
-export interface RiskEntitiesResponse {
+export interface RiskEntitiesResponse extends RiskDataAge {
   entities: EntityRiskSummary[];
   /** Rows in this page (not the universe size when `has_more`). */
   total: number;
@@ -2438,6 +2448,8 @@ export interface RiskEntitiesQuery {
   max_score?: number;
   limit?: number;
   offset?: number;
+  /** NAN-5841: skip the precomputed snapshot and answer live. */
+  refresh?: boolean;
 }
 
 // Entity context types
@@ -2794,6 +2806,11 @@ export interface CorrectQueryResponse {
    * "unverified" (NAN-1496).
    */
   validated: boolean;
+  /**
+   * NAN-5877: set, with an empty `corrected_query`, when the AI could not
+   * suggest a fix (`ai_reply_unreadable`, `ai_provider_error`, `timed_out`).
+   */
+  no_suggestion_reason?: string;
 }
 
 /** Request to review a successful query for best practices */

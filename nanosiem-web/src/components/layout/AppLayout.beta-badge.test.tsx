@@ -134,7 +134,7 @@ describe('BETA badge in the left rail (NAN-5654)', () => {
     expect(screen.queryByRole('link', { name: /Hunts/ })).toBeNull();
     expect(screen.queryByRole('button', { name: /Hunts/ })).toBeNull();
     expect(screen.queryByTestId('nav-hunts')).toBeNull();
-    expect(screen.queryByRole('link', { name: /Findings|Escalations|Campaigns|Knowledge|Rule ideas/ })).toBeNull();
+    expect(screen.queryByRole('link', { name: /Findings|Escalations|Actors|Knowledge|Rule ideas/ })).toBeNull();
     expect(screen.queryByTestId('nav-automation')).toBeNull();
     expect(screen.queryAllByTestId('beta-badge')).toHaveLength(0);
   });

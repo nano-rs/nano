@@ -43,6 +43,11 @@
 #                          = this checkout, or a run dir under target/e2e); --cloud
 #                          touches ONLY cloud stragglers prefixed nano-e2e-;
 #                          --all-local also removes other worktrees' local stacks
+#   scripts/e2e.sh gc --sweep [--force] [--hours N]
+#                          host-level sweep for shared RC hosts (NAN-5884): dangling
+#                          anonymous volumes, orphaned e2e Chrome processes and
+#                          stale e2e Chrome profiles. Refuses while any nanoe2e
+#                          stack is running (lanes may be mid-start) unless --force
 #   scripts/e2e.sh svc     <restart|stop|start|kill> <api|search|jobs|vector> [--run <id>]
 #   scripts/e2e.sh status  [--run <id>]
 #   scripts/e2e.sh license-ids [--run <id>]      installation_id + organization_id of a
@@ -117,7 +122,7 @@ CMD="${1:-}"; [[ $# -gt 0 ]] && shift
 # nanosiem-enterprise, so a stripped checkout builds and tests EDITION=open.
 if [[ -d "$ROOT/nanosiem-enterprise" ]]; then DEFAULT_EDITION=enterprise; else DEFAULT_EDITION=open; fi
 APP_MODE=""; APP_MODE_EXPLICIT=0; EDITION="${E2E_EDITION:-$DEFAULT_EDITION}"; RUN_ID=""; NEW_RUN_ID="${E2E_NEW_RUN_ID:-}"
-KEEP=0; FRESH=0; ALLOW_SKIPS="${E2E_ALLOW_SKIPS:-0}"; PURGE=0; NO_BUILD=0; RELEASE=0; GC_HOURS=6; GC_CLOUD=0; GC_ALL_LOCAL=0; INFRA_ONLY=0
+KEEP=0; FRESH=0; ALLOW_SKIPS="${E2E_ALLOW_SKIPS:-0}"; PURGE=0; NO_BUILD=0; RELEASE=0; GC_HOURS=6; GC_CLOUD=0; GC_ALL_LOCAL=0; GC_SWEEP=0; SWEEP_FORCE=0; INFRA_ONLY=0
 DEFER_ADMIN=0; PROFILES=(); TARGET=own; ACCEPTANCE_TRUST=0; SEED_PROFILE="${E2E_SEED_PROFILE:-}"
 POSITIONAL=(); PYTEST_EXTRA=()
 while [[ $# -gt 0 ]]; do
@@ -136,6 +141,8 @@ while [[ $# -gt 0 ]]; do
         --hours) GC_HOURS="${2:?--hours needs a value}"; shift 2 ;;
         --cloud) GC_CLOUD=1; shift ;;
         --all-local) GC_ALL_LOCAL=1; shift ;;
+        --sweep) GC_SWEEP=1; shift ;;
+        --force) SWEEP_FORCE=1; shift ;;
         --profile) PROFILES+=("${2:?--profile needs a value}"); shift 2 ;;
         --profile=*) PROFILES+=("${1#*=}"); shift ;;
         --defer-admin) DEFER_ADMIN=1; shift ;;
@@ -197,6 +204,8 @@ resolve_run() {
     validate_run_id "$RUN_ID"
     RUN_DIR="$E2E_HOME/$RUN_ID"
     PROJECT="nanoe2e-$RUN_ID"
+    # NAN-5884: the leak guard checks this run's project, not other lanes'.
+    leak_guard_own_project "$PROJECT"
     [[ -d "$RUN_DIR" ]] || die "unknown run $RUN_ID ($RUN_DIR missing)"
 }
 
@@ -233,6 +242,15 @@ dc() (
     [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" != native ]] && profile+=(--profile docker-app)
     run_has_profile ai-stub && profile+=(--profile ai-stub)
     run_has_profile soar-lab && profile+=(--profile soar-lab)
+    # Native app on Linux: the edge's relay to the host processes (start_edge).
+    [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" == native && "$(uname -s)" == Linux ]] \
+        && profile+=(--profile native-relay)
+    # NAN-5880: native enterprise: the native gate's path to zz-agentlane-gate.xml.
+    [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" == native && "$(env_get "$RUN_DIR/run.env" E2E_EDITION)" == enterprise ]] \
+        && profile+=(--profile native-gate-upstream)
+    # NAN-5880: the Agent Lane gate container (enterprise docker/image runs).
+    [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" != native && "$(env_get "$RUN_DIR/run.env" E2E_EDITION)" == enterprise ]] \
+        && profile+=(--profile agentlane-gate)
     docker compose -p "$PROJECT" --project-directory "$ROOT" --env-file /dev/null \
         -f "$COMPOSE_BASE" -f "$COMPOSE_E2E" "${profile[@]}" "$@"
 )
@@ -356,7 +374,9 @@ initialize_e2e_clickhouse_config() {
         >/dev/null || die "could not render the ClickHouse network allow-list"
     # NAN-5494: assembled exactly as install.sh assembles them (shipped files
     # + the allow-list copied in, the stamp the preflight requires).
-    printf 'NANO_CLICKHOUSE_NETWORKS_FILE=%s\n' "$target/networks.xml" > "$target/assemble.env"
+    # NAN-5880: NANO_EDITION as in the installer's .env, so an enterprise run
+    # also gets the Agent Lane gate's loopback listener (zz-agentlane-gate.xml).
+    printf 'NANO_CLICKHOUSE_NETWORKS_FILE=%s\nNANO_EDITION=%s\n' "$target/networks.xml" "$EDITION" > "$target/assemble.env"
     python3 -I "$ROOT/scripts/lib/clickhouse_config_dirs.py" --root "$ROOT" --env-file "$target/assemble.env" \
         --config-output "$target/config.d" --users-output "$target/users.d" >/dev/null \
         || die "could not assemble the ClickHouse config.d / users.d"
@@ -400,20 +420,111 @@ render_resource_sizing() {
     log "applied installer sizing for ${E2E_SIZING_CPU_CORES} CPU / ${E2E_SIZING_MEMORY_MIB} MiB"
 }
 
+# NAN-5880: the Agent Lane values install.sh gives an enterprise single host,
+# so Settings > Agent Lane can be switched on from the page (without
+# NANO_AGENTLANE_INTERNAL_CIDRS nano-api refuses with 409
+# internal_networks_missing, and without a gate checking in the lane never
+# reads "On"). Internal networks are computed exactly as
+# deploy/compose/agentlane.py prepare-single does: the rendered ClickHouse
+# network allow-list plus this host's own addresses. Enterprise only.
+render_agentlane_env() {
+    [[ "$EDITION" == enterprise ]] || return 0
+    local helper="$ROOT/deploy/compose/agentlane.py" internal
+    [[ -f "$helper" ]] || die "deploy/compose/agentlane.py is missing (enterprise tree expected)"
+    internal="$(python3 -I - "$helper" "$RUN_DIR/clickhouse/networks.xml" <<'PY'
+import importlib.util, sys, xml.etree.ElementTree as ET
+spec = importlib.util.spec_from_file_location("agentlane", sys.argv[1])
+al = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(al)
+pools = al.networks_xml_entries(ET.parse(sys.argv[2]).getroot())
+print(",".join(al.internal_cidrs(pools, al.host_own_networks())))
+PY
+)" || die "could not compute NANO_AGENTLANE_INTERNAL_CIDRS"
+    [[ -n "$internal" ]] || die "no internal networks for Agent Lane (empty ClickHouse allow-list and no host addresses)"
+    {
+        put NANO_AGENTLANE_INTERNAL_CIDRS "$internal"
+        put NANO_AGENTLANE_GATE_TOKEN "$(openssl rand -hex 32)"
+    } >> "$RUN_DIR/compose.env"
+    mkdir -p "$RUN_DIR/agentlane-gate/web"
+    log "Agent Lane internal networks: $internal (NANO_AGENTLANE_INTERNAL_CIDRS)"
+}
+
+# wait_agentlane_gate_container: docker/image enterprise runs. The gate exits
+# at once on a bad env (token, URL, upstream); fail here, not in the Agent
+# Lane scenario minutes later. Running for 5 s after nano-api is healthy.
+wait_agentlane_gate_container() {
+    local c="${PROJECT}-agentlane-gate" state
+    sleep 5
+    state="$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo missing)"
+    if [[ "$state" != true ]]; then
+        dc logs --no-color --tail 30 agentlane-gate >&2 2>/dev/null || true
+        die "Agent Lane gate container $c is not running ($state)"
+    fi
+    ok "Agent Lane gate running (container)"
+}
+
+# Native Agent Lane gate environment: what the compose gate gets, pointed at
+# the native nano-api and at ClickHouse's gate listener (zz-agentlane-gate.xml)
+# through native-gate-upstream on host loopback (the gate requires a loopback
+# upstream). No database or ClickHouse credentials, as in production.
+write_gate_env() {
+    local f="$RUN_DIR/gate.env"
+    (
+        umask 077
+        {
+            local kv
+            for kv in \
+                "NANO_AGENTLANE_GATE_TOKEN=$(env_get "$RUN_DIR/compose.env" NANO_AGENTLANE_GATE_TOKEN)" \
+                "NANO_AGENTLANE_GATE_API_URL=http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_API_PORT)" \
+                "NANO_AGENTLANE_GATE_LISTEN=127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_AGENTLANE_PORT)" \
+                "NANO_AGENTLANE_GATE_UPSTREAM=127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_CH_GATE_PORT)" \
+                "NANO_AGENTLANE_INTERNAL_CIDRS=$(env_get "$RUN_DIR/compose.env" NANO_AGENTLANE_INTERNAL_CIDRS)" \
+                NANO_AGENTLANE_GATE_NODE=e2e-native \
+                "NANO_AGENTLANE_GATE_WEB_CERT_DIR=$RUN_DIR/agentlane-gate/web" \
+                "NANO_AGENTLANE_GATE_IMPORTED_CERT_DIR=$RUN_DIR/agentlane-gate/imported" \
+                RUST_LOG=info; do
+                printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
+            done
+        } > "$f"
+    )
+}
+
 # ---------------------------------------------------------------- native app
-# Native process identity. A pid file holds "<pid> <start time> <owner token>":
-# the token is minted per start and exported into the process as
-# E2E_PROC_OWNER. A pid is trusted (and signalled) only while ALL of these
-# still hold: same start time, a command under this checkout's target dir,
-# and the token in its environment. A reused pid (another run, or a dev
-# nanosiem-api built from the same target dir) fails at least one, so it is
-# never signalled. Checked again immediately before every signal.
+# Native process identity. A pid file holds "<pid> <start time> <owner token>
+# [<start tick>]": the token is minted per start and exported into the process
+# as E2E_PROC_OWNER; the start tick (Linux only) is the kernel's start time.
+# A pid is trusted (and signalled) only while ALL of these still hold: same
+# start time, a command under this checkout's target dir, and the token in
+# its environment (or, where the kernel hides that environment, the same
+# start tick and owner uid). A reused pid (another run, or a dev nanosiem-api
+# built from the same target dir) fails at least one, so it is never
+# signalled. Checked again immediately before every signal.
 proc_start() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//'; }
 
+# proc_ticks <pid>: a Linux process's start time in clock ticks since boot
+# (field 22 of /proc/<pid>/stat); empty where there is no /proc. stat stays
+# world-readable for a non-dumpable process, unlike environ.
+proc_ticks() {
+    local stat
+    [[ -r "/proc/$1/stat" ]] || return 0
+    stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    # Fields after the command name, which may itself hold spaces or ')'.
+    stat="${stat##*) }"
+    awk '{ print $20 }' <<<"$stat"
+}
+
 proc_has_owner() {
-    local pid="$1" token="$2"
+    local pid="$1" token="$2" ticks="${3:-}"
     if [[ -r "/proc/$pid/environ" ]]; then
         tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "E2E_PROC_OWNER=$token"
+    elif [[ -e "/proc/$pid/stat" ]]; then
+        # Linux, environ unreadable: the process made itself non-dumpable
+        # (nano-connector-runner sets PR_SET_DUMPABLE 0), which hands its
+        # /proc/<pid>/environ to root. Prove it is the process we started by
+        # the start tick recorded at spawn (a reused pid cannot match it)
+        # and our uid, never by reading the environment.
+        [[ -n "$ticks" && "$(proc_ticks "$pid")" == "$ticks" ]] || return 1
+        [[ "$(awk '/^Uid:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null)" == "$(id -u)" ]]
     else
         # macOS: ps -E appends the environment of the user's own processes.
         local out; out="$(ps -E -ww -o command= -p "$pid" 2>/dev/null)" || return 1
@@ -424,13 +535,13 @@ proc_has_owner() {
 # pid_owned <pidfile>: prints the pid when it is still the process we started.
 pid_owned() {
     [[ -s "$1" ]] || return 1
-    local pid start token cmd
-    pid="$(cut -f1 "$1")"; start="$(cut -f2 "$1")"; token="$(cut -f3 "$1")"
+    local pid start token ticks cmd
+    pid="$(cut -f1 "$1")"; start="$(cut -f2 "$1")"; token="$(cut -f3 "$1")"; ticks="$(cut -s -f4 "$1")"
     [[ "$pid" =~ ^[1-9][0-9]*$ && "$token" =~ ^[0-9a-f]{32}$ && -n "$start" ]] || return 1
     [[ "$(proc_start "$pid")" == "$start" ]] || return 1
-    cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || return 1
+    cmd="$(ps -ww -o args= -p "$pid" 2>/dev/null)" || return 1
     [[ "$cmd" == "$(target_dir)/"* ]] || return 1
-    proc_has_owner "$pid" "$token" || return 1
+    proc_has_owner "$pid" "$token" "$ticks" || return 1
     printf '%s' "$pid"
 }
 
@@ -639,6 +750,13 @@ write_app_env() {
                 printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
             done
             [[ -n "$hunts_cidr" ]] && printf 'export NANO_HUNTS_RUNNER_CIDR=%q\n' "$hunts_cidr"
+            # NAN-5880: Agent Lane (render_agentlane_env; enterprise only). The
+            # native gate listens on its own free loopback port.
+            if [[ -n "${NANO_AGENTLANE_INTERNAL_CIDRS:-}" ]]; then
+                printf 'export NANO_AGENTLANE_INTERNAL_CIDRS=%q\n' "$NANO_AGENTLANE_INTERNAL_CIDRS"
+                printf 'export NANO_AGENTLANE_GATE_TOKEN=%q\n' "$NANO_AGENTLANE_GATE_TOKEN"
+                printf 'export NANO_AGENTLANE_PORT=%q\n' "$(env_get "$RUN_DIR/run.env" E2E_AGENTLANE_PORT)"
+            fi
             if [[ "$(env_get "$RUN_DIR/run.env" E2E_CONTENT_ACCEPTANCE)" == 1 ]]; then
                 local fixture proxy
                 fixture="http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_CONTENT_FIXTURE_PORT)"
@@ -720,7 +838,11 @@ render_edge_conf() {
     # container here). Everything else (/ingest, /otlp auth_request, search
     # routing) is the customer config verbatim.
     local out="$1" api search
-    if [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" == native ]]; then
+    if [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" == native && "$(uname -s)" == Linux ]]; then
+        # Through the native relay (start_native_relay), on its own ports.
+        api="host.docker.internal:$(env_get "$RUN_DIR/run.env" E2E_RELAY_API_PORT)"
+        search="host.docker.internal:$(env_get "$RUN_DIR/run.env" E2E_RELAY_SEARCH_PORT)"
+    elif [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" == native ]]; then
         api="host.docker.internal:$(env_get "$RUN_DIR/run.env" E2E_API_PORT)"
         search="host.docker.internal:$(env_get "$RUN_DIR/run.env" E2E_SEARCH_PORT)"
     else
@@ -750,9 +872,75 @@ render_edge_conf() {
     fi
 }
 
+# start_native_relay: native app on a Linux host only. host.docker.internal
+# is the docker0 address there, and the native api/search listen on
+# 127.0.0.1, so the edge cannot reach them (Docker Desktop forwards to the
+# Mac's loopback; Linux does not). A host-network TCP relay listens on the
+# docker0 address only (this host's containers, never the outside) on its
+# own ports (a service may already listen on every address, as nano-search
+# does) and forwards to the services on 127.0.0.1.
+# net_ipv4 <docker network> <Subnet|Gateway>: the network's first IPv4
+# subnet or gateway, refused unless it is a private (RFC 1918) address.
+net_ipv4() {
+    local v
+    v="$(docker network inspect "$1" --format "{{range .IPAM.Config}}{{.$2}} {{end}}" 2>/dev/null \
+        | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' | head -n1)" || true
+    [[ "$v" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]] \
+        || die "network $1: no private IPv4 $2 (got '${v:-none}')"
+    printf '%s' "$v"
+}
+
+start_native_relay() {
+    [[ "$(env_get "$RUN_DIR/run.env" E2E_APP_MODE)" == native && "$(uname -s)" == Linux ]] || return 0
+    local gw subnet api search rapi rsearch own ip
+    gw="$(net_ipv4 bridge Gateway)"
+    subnet="$(net_ipv4 "${PROJECT}_default" Subnet)"
+    # This host's own IPv4 addresses: a host process connecting to the docker0
+    # address arrives from the primary address, not from docker0. They can
+    # reach 127.0.0.1 directly anyway, so admitting them adds no reach.
+    own=""
+    for ip in $(ip -o -4 addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }'); do
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && own+=" allow ${ip};"
+    done
+    api="$(env_get "$RUN_DIR/run.env" E2E_API_PORT)"; search="$(env_get "$RUN_DIR/run.env" E2E_SEARCH_PORT)"
+    rapi="$(env_get "$RUN_DIR/run.env" E2E_RELAY_API_PORT)"; rsearch="$(env_get "$RUN_DIR/run.env" E2E_RELAY_SEARCH_PORT)"
+    printf '%s\n' \
+        'worker_processes 1;' 'pid /tmp/nginx.pid;' 'error_log /dev/stderr warn;' \
+        'events { worker_connections 1024; }' 'stream {' \
+        "    allow ${subnet}; allow ${gw};${own} deny all;" \
+        "    server { listen ${gw}:${rapi}; proxy_pass 127.0.0.1:${api}; }" \
+        "    server { listen ${gw}:${rsearch}; proxy_pass 127.0.0.1:${search}; }" \
+        '}' > "$RUN_DIR/edge/relay.conf"
+    dc up -d native-relay >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
+        || { tail -n 30 "$RUN_DIR/artifacts/compose-up.log" >&2; die "compose up native-relay failed"; }
+    wait_http "http://${gw}:${rapi}/health" "native relay (${gw} -> 127.0.0.1)" 30
+}
+
+# start_native_gate_upstream: native enterprise only. Relays host
+# 127.0.0.1:E2E_CH_GATE_PORT to ClickHouse's loopback gate listener (see
+# native-gate-upstream in compose.e2e.yml), admitting only this stack's own
+# network (the published-port path arrives from its gateway; Docker Desktop's
+# proxy may use another address in it), never other networks.
+start_native_gate_upstream() {
+    local subnet
+    subnet="$(net_ipv4 "${PROJECT}_default" Subnet)"
+    printf '%s\n' \
+        'worker_processes 1;' 'pid /tmp/nginx.pid;' 'error_log /dev/stderr warn;' \
+        'events { worker_connections 256; }' 'stream {' \
+        "    allow ${subnet}; deny all;" \
+        '    server { listen 28444; proxy_pass 127.0.0.1:18444; }' \
+        '}' > "$RUN_DIR/agentlane-gate/upstream-relay.conf"
+    dc up -d native-gate-upstream >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
+        || { tail -n 30 "$RUN_DIR/artifacts/compose-up.log" >&2; die "compose up native-gate-upstream failed"; }
+    # ClickHouse's gate listener answers /ping like its HTTP interface.
+    wait_http "http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_CH_GATE_PORT)/ping" \
+        "ClickHouse gate listener (zz-agentlane-gate.xml, via native-gate-upstream)" 30
+}
+
 start_edge() {
     mkdir -p "$RUN_DIR/edge/web"
     [[ -f "$RUN_DIR/edge/web/index.html" ]] || printf '<!doctype html><title>nano e2e edge</title>\n' > "$RUN_DIR/edge/web/index.html"
+    start_native_relay
     render_edge_conf "$RUN_DIR/edge/nginx.conf"
     dc up -d edge >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
         || { tail -n 30 "$RUN_DIR/artifacts/compose-up.log" >&2; die "compose up edge failed"; }
@@ -780,6 +968,7 @@ native_start() {
     case "$svc" in
         api) bin=nanosiem-api ;; search) bin=nanosiem-search ;; jobs) bin=nanosiem-jobs ;;
         connector) bin=nano-connector-runner ;;
+        gate) bin=nanosiem-api ;;  # nanosiem-api --agentlane-gate (NAN-5880)
         *) die "unknown native service $svc" ;;
     esac
     local exe; exe="$(target_dir)/$(env_get "$RUN_DIR/run.env" E2E_PROFILE_DIR)/$bin"
@@ -794,6 +983,14 @@ native_start() {
     token="$(openssl rand -hex 16)"
     local -a app_keys; svc_app_env_keys app_keys
     (
+        if [[ "$svc" == gate ]]; then
+            # Only the gate's own env: it holds no database credentials.
+            # shellcheck disable=SC1091
+            . "$RUN_DIR/gate.env"
+            export E2E_PROC_OWNER="$token"
+            cd "$ROOT"
+            exec "$exe" --agentlane-gate >>"$RUN_DIR/pids/$svc.log" 2>&1 </dev/null
+        fi
         # NAN-5878: a scenario's `svc ... env=` settings win over app.env, as
         # the compose override does in docker/image mode: keep them, re-apply.
         declare -A caller=(); local k
@@ -836,7 +1033,7 @@ native_start() {
     disown "$pid" 2>/dev/null || true
     start="$(proc_start "$pid")"
     [[ -n "$start" ]] || die "$svc exited immediately (log: $RUN_DIR/pids/$svc.log)"
-    printf '%s\t%s\t%s\n' "$pid" "$start" "$token" > "$RUN_DIR/pids/$svc.pid"
+    printf '%s\t%s\t%s\t%s\n' "$pid" "$start" "$token" "$(proc_ticks "$pid")" > "$RUN_DIR/pids/$svc.pid"
 }
 
 native_stop() {
@@ -1008,6 +1205,7 @@ cmd_up() {
     RUN_ID="${NEW_RUN_ID:-$(new_run_id)}"
     validate_run_id "$RUN_ID"
     RUN_DIR="$E2E_HOME/$RUN_ID"; PROJECT="nanoe2e-$RUN_ID"
+    leak_guard_own_project "$PROJECT"  # NAN-5884: scope the guard to this run
     [[ "$PROJECT" != nanoch* ]] || die "refusing project name $PROJECT"
     [[ ! -e "$RUN_DIR" ]] || die "run dir $RUN_DIR already exists"
     license_env_check
@@ -1030,6 +1228,7 @@ cmd_up() {
     gen_secrets
     render_e2e_workload_users
     render_resource_sizing
+    render_agentlane_env
     if [[ "$APP_MODE" != native ]]; then docker_images >> "$RUN_DIR/compose.env"; fi
     {
         put E2E_RUN_ID "$RUN_ID"; put E2E_PROJECT "$PROJECT"; put E2E_APP_MODE "${APP_MODE%%:*}"
@@ -1126,17 +1325,31 @@ cmd_up() {
             native_start connector
             wait_connector
         fi
+        if [[ "$EDITION" == enterprise ]]; then
+            start_native_gate_upstream
+            write_gate_env
+            native_start gate
+            # It refuses a bad env at once (token, URL, upstream): fail here,
+            # not in the Agent Lane scenario minutes later.
+            sleep 2
+            pid_alive "$RUN_DIR/pids/gate.pid" \
+                || { tail -n 20 "$RUN_DIR/pids/gate.log" >&2 || true; die "Agent Lane gate exited during startup (log: $RUN_DIR/pids/gate.log)"; }
+            ok "Agent Lane gate running (native)"
+        fi
     else
         log "running migrator container"
         dc run --rm clickhouse-migrate > "$RUN_DIR/artifacts/migrator.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/migrator.log" >&2; die "migrator failed"; }
         seed_installation_identity
-        dc up -d vector vector-tap nano-search nano-jobs nano-api >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
+        local app=(vector vector-tap nano-search nano-jobs nano-api)
+        [[ "$EDITION" == enterprise ]] && app+=(agentlane-gate)
+        dc up -d "${app[@]}" >> "$RUN_DIR/artifacts/compose-up.log" 2>&1 \
             || { tail -n 30 "$RUN_DIR/artifacts/compose-up.log" >&2; die "compose up (app) failed"; }
         local p
         for p in API SEARCH JOBS; do
             wait_http "http://127.0.0.1:$(env_get "$RUN_DIR/run.env" "E2E_${p}_PORT")/health" "nano-${p,,}" 150
         done
+        [[ "$EDITION" == enterprise ]] && wait_agentlane_gate_container
     fi
     wait_http "http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_HEC_PORT)/services/collector/health" "Vector HEC" 60
     start_edge
@@ -1178,7 +1391,7 @@ up_exit_guard() {
 allocate_ports() {
     # One distinct free port per published endpoint (and the native app).
     local name port seen=" "
-    for name in PG CH_HTTP CH_NATIVE REDIS VECTOR_HTTP HEC OTLP_HTTP VECTOR_METRICS API SEARCH JOBS MOCK_VENDOR AI_STUB EDGE CONTENT_FIXTURE SOAR_VENDOR SOAR_SMTP SOAR_MAILPIT_API; do
+    for name in PG CH_HTTP CH_NATIVE REDIS VECTOR_HTTP HEC OTLP_HTTP VECTOR_METRICS API SEARCH JOBS MOCK_VENDOR AI_STUB EDGE CONTENT_FIXTURE SOAR_VENDOR SOAR_SMTP SOAR_MAILPIT_API AGENTLANE RELAY_API RELAY_SEARCH CH_GATE; do
         while :; do
             port="$(free_port)"
             [[ "$seen" != *" $port "* ]] && break
@@ -1327,14 +1540,14 @@ venv_ensure() {
 fixture_pid_owned() {
     local file="$RUN_DIR/pids/content-fixture.pid"
     [[ -s "$file" ]] || return 1
-    local pid start token cmd
-    pid="$(cut -f1 "$file")"; start="$(cut -f2 "$file")"; token="$(cut -f3 "$file")"
+    local pid start token ticks cmd
+    pid="$(cut -f1 "$file")"; start="$(cut -f2 "$file")"; token="$(cut -f3 "$file")"; ticks="$(cut -s -f4 "$file")"
     [[ "$pid" =~ ^[1-9][0-9]*$ && "$token" =~ ^[0-9a-f]{32}$ && -n "$start" ]] || return 1
     [[ "$(proc_start "$pid")" == "$start" ]] || return 1
-    cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || return 1
+    cmd="$(ps -ww -o args= -p "$pid" 2>/dev/null)" || return 1
     [[ "$cmd" == *"$ROOT/e2e/nano_e2e/content_fixture.py"* \
         && "$cmd" == *"$RUN_DIR/artifacts/content-fixture.jsonl"* ]] || return 1
-    proc_has_owner "$pid" "$token" || return 1
+    proc_has_owner "$pid" "$token" "$ticks" || return 1
     printf '%s' "$pid"
 }
 
@@ -1355,7 +1568,7 @@ start_content_fixture() {
     disown "$pid" 2>/dev/null || true
     start="$(proc_start "$pid")"
     [[ -n "$start" ]] || die "content acceptance fixture exited immediately"
-    printf '%s\t%s\t%s\n' "$pid" "$start" "$token" > "$RUN_DIR/pids/content-fixture.pid"
+    printf '%s\t%s\t%s\t%s\n' "$pid" "$start" "$token" "$(proc_ticks "$pid")" > "$RUN_DIR/pids/content-fixture.pid"
     local healthy=0
     for _ in $(seq 1 40); do
         if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$port/health" 2>/dev/null; then
@@ -1448,6 +1661,12 @@ suite_paths() {
                 # Enterprise journeys (the threat hunter) live under
                 # tests/enterprise/ (the mirror strips it).
                 [[ -d "$PY_DIR/tests/enterprise/personas" ]] && out+=("$PY_DIR/tests/enterprise/personas") ;;
+            security_group_d)
+                out+=("$PY_DIR/tests/test_security_group_d.py")
+                # Scenario 9 (SSO link) is enterprise-only and lives under
+                # tests/enterprise/ (the mirror strips it, NAN-5869).
+                [[ "$EDITION" == enterprise && -f "$PY_DIR/tests/enterprise/test_security_group_d_sso.py" ]] \
+                    && out+=("$PY_DIR/tests/enterprise/test_security_group_d_sso.py") ;;
             soar)
                 [[ -d "$PY_DIR/tests/enterprise/soar" ]] \
                     || die "suite 'soar' needs the enterprise test tree"
@@ -1459,6 +1678,16 @@ suite_paths() {
         esac
     done
     printf '%s\n' "${out[@]}"
+}
+
+# suite_paths for the stack in $RUN_DIR: its recorded edition wins over this
+# invocation's default, so a reused stack selects its own edition's scenarios
+# (NAN-5869: a kept open stack gated on enterprise-only files and failed the
+# suite coverage gate; a kept enterprise stack under EDITION=open dropped them).
+stack_suite_paths() {
+    local stack_edition
+    stack_edition="$(env_get "${RUN_DIR:-}/run.env" E2E_EDITION 2>/dev/null || true)"
+    EDITION="${stack_edition:-$EDITION}" suite_paths
 }
 
 # A live stack from a previous `up` (the `current` run with a stack.env and a
@@ -1754,6 +1983,7 @@ cmd_run() {
         else
             web_dist="$(web_build "$EDITION")"
         fi
+        web_bundle_note "$web_dist"
         ui_ensure
     fi
     if [[ -z "$RUN_ID" ]] && { (( FRESH )) || ! current_live; }; then
@@ -1815,9 +2045,10 @@ cmd_run() {
         && [[ -z "${E2E_WEB_DIST:-}" && "$(env_get "$RUN_DIR/run.env" E2E_EDITION)" != "$EDITION" ]]; then
         # A reused stack decides the edition: build its UI instead.
         web_dist="$(web_build "$(env_get "$RUN_DIR/run.env" E2E_EDITION)")"
+        web_bundle_note "$web_dist"
     fi
     local paths=() gated=() status=0 listing p
-    listing="$(suite_paths)"
+    listing="$(stack_suite_paths)"
     while IFS= read -r p; do
         [[ -n "$p" ]] || continue
         paths+=("${p#+}")
@@ -1881,21 +2112,78 @@ tool_bins_ensure() {
 }
 
 # ---------------------------------------------------------------- web UI
-# web_build <edition>: build nanosiem-web for the edition once per source tree
-# state; prints the dist dir. Cached under target/e2e/web/ by the tree hash of
-# nanosiem-web (+ uncommitted changes), so a re-run against the same tree
-# reuses it.
-web_build() {
-    local edition="$1" web="$ROOT/nanosiem-web" key dist log
-    command -v npm >/dev/null || die "npm not found (the ui suite builds nanosiem-web)"
+# The SHA-256 of empty input: a cache key computed from nothing (NAN-5884).
+EMPTY_INPUT_KEY="e3b0c44298fc1c14"
+
+# git_toplevel_is <dir>: true when <dir> is itself the top of a git checkout
+# (a normal clone or a linked worktree), not a directory inside one.
+git_toplevel_is() {
+    local top here
+    top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    here="$(cd "$1" && pwd -P)" || return 1
+    [[ "$(cd "$top" && pwd -P)" == "$here" ]]
+}
+
+# web_source_key [root]: prints "<source> <key>" for the web bundle's inputs.
+# In a git checkout (source "git"): the tree hash of nanosiem-web plus
+# uncommitted and untracked changes. Without one (an RC tree unpacked from an
+# archive, source "tree"): every file under nanosiem-web by path and content,
+# skipping node_modules and build output (NAN-5884: the git-only key hashed
+# empty input there, so an archive tree reused another tree's bundle).
+web_source_key() {
+    local root="${1:-$ROOT}" web key
+    web="$root/nanosiem-web"
     local sha=(shasum -a 256); command -v shasum >/dev/null 2>&1 || sha=(sha256sum)
-    key="$( { git -C "$ROOT" rev-parse HEAD:nanosiem-web; git -C "$ROOT" diff HEAD -- nanosiem-web;
-              git -C "$ROOT" ls-files -o --exclude-standard -- nanosiem-web | sort \
-                  | while IFS= read -r f; do printf '%s\n' "$f"; cat "$ROOT/$f" 2>/dev/null || true; done
-            } | "${sha[@]}" | cut -c1-16)$(sentry_web_cache_suffix)"
+    # Only when $root itself is the checkout: an archive unpacked inside some
+    # other repository must not take that repository's key (review P2-1).
+    if git_toplevel_is "$root" && git -C "$root" rev-parse --verify -q HEAD:nanosiem-web >/dev/null 2>&1; then
+        key="$( { git -C "$root" rev-parse HEAD:nanosiem-web; git -C "$root" diff HEAD -- nanosiem-web;
+                  git -C "$root" ls-files -o --exclude-standard -- nanosiem-web | sort \
+                      | while IFS= read -r f; do printf '%s\n' "$f"; cat "$root/$f" 2>/dev/null || true; done
+                } | "${sha[@]}" | cut -c1-16)"
+        printf 'git %s\n' "$key"
+        return 0
+    fi
+    [[ -f "$web/package.json" && -d "$web/src" ]] || return 1
+    # `shasum` prints "<hash>  ./<path>" per file, so the outer hash covers
+    # every path and its content, in a fixed order. `xargs -r`: with no file
+    # GNU xargs would still run the hasher once, on empty stdin (review P1).
+    local listed
+    listed="$(cd "$web" && find . \( -name node_modules -o -name dist -o -name .vite -o -name coverage \
+                        -o -name test-results -o -name playwright-report \) -prune -o -type f -print0 \
+            | LC_ALL=C sort -z | xargs -0 -r "${sha[@]}")" || return 1
+    [[ -n "$listed" ]] || return 1
+    key="$(printf '%s\n' "$listed" | "${sha[@]}" | cut -c1-16)"
+    printf 'tree %s\n' "$key"
+}
+
+# web_bundle_note <dist>: log which bundle this lane drives, and from what
+# (NAN-5884: a stale bundle must be visible in every lane's log).
+web_bundle_note() {
+    local dist="$1" note=""
+    [[ -f "$dist.source" ]] && note="$(tr '\n' ' ' < "$dist.source")"
+    log "web UI bundle for this lane: ${note:-no build record (prebuilt or older cache) }dir=$dist"
+}
+
+# web_build <edition>: build nanosiem-web for the edition once per source tree
+# state; prints the dist dir. Cached under target/e2e/web/ by
+# web_source_key (+ the Sentry build suffix), so a re-run against the same
+# tree reuses it. A key computed from no input is never used for the cache.
+web_build() {
+    local edition="$1" web="$ROOT/nanosiem-web" key dist log source_key source cached=1
+    command -v npm >/dev/null || die "npm not found (the ui suite builds nanosiem-web)"
+    source_key="$(web_source_key "$ROOT")" || source_key=""
+    source="${source_key%% *}"; key="${source_key#* }"
+    if [[ -z "$source_key" || -z "$key" || "$key" == "$EMPTY_INPUT_KEY" ]]; then
+        # Never share a cache entry nobody can tell apart from another tree's.
+        warn "web UI: could not hash the nanosiem-web sources; building without the cache"
+        source="uncached"; key="uncached-$$-$(date +%s)"; cached=0
+    fi
+    key="$key$(sentry_web_cache_suffix)"
     dist="$E2E_HOME/web/$edition-$key"
     log="$E2E_HOME/web/$edition-$key.log"
-    if [[ -f "$dist/index.html" ]]; then ok "web UI ($edition) cached: $dist"; printf '%s' "$dist"; return 0; fi
+    log "web UI cache key: $edition-$key (from the $source sources)"
+    if (( cached )) && [[ -f "$dist/index.html" ]]; then ok "web UI ($edition) cached: $dist"; printf '%s' "$dist"; return 0; fi
     mkdir -p "$E2E_HOME/web"
     log "building nanosiem-web (VITE_EDITION=$edition); log: $log"
     (
@@ -1913,6 +2201,8 @@ web_build() {
         sentry_web_postbuild "$dist.tmp" "$dist.sourcemaps"
     ) > "$log" 2>&1 || { tail -n 30 "$log" >&2; rm -rf "$dist.tmp"; die "web build failed"; }
     rm -rf "$dist"; mv "$dist.tmp" "$dist" 2>/dev/null || [[ -f "$dist/index.html" ]]
+    printf 'key=%s\nsource=%s\nedition=%s\nbuilt_at=%s\n' "$edition-$key" "$source" "$edition" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$dist.source"
     ok "web UI built: $dist"
     printf '%s' "$dist"
 }
@@ -1937,10 +2227,10 @@ ui_ensure() {
 collect_artifacts() {
     local a="$RUN_DIR/artifacts" svc
     mkdir -p "$a/logs"
-    for svc in postgres clickhouse dragonfly vector vector-tap nano-api nano-search nano-jobs ai-stub soar-mailpit edge; do
+    for svc in postgres clickhouse dragonfly vector vector-tap nano-api nano-search nano-jobs ai-stub soar-mailpit edge native-relay agentlane-gate native-gate-upstream; do
         dc logs --no-color "$svc" > "$a/logs/$svc.log" 2>/dev/null || rm -f "$a/logs/$svc.log"
     done
-    for svc in api search jobs connector content-fixture; do
+    for svc in api search jobs connector gate content-fixture; do
         [[ -f "$RUN_DIR/pids/$svc.log" ]] && cp "$RUN_DIR/pids/$svc.log" "$a/logs/native-$svc.log"
     done
     # Rendered Vector config, through the structured redactor: pull source
@@ -2003,7 +2293,7 @@ cmd_down() {
     log "tearing down $PROJECT"
     [[ -f "$RUN_DIR/compose.env" ]] && { collect_artifacts >/dev/null 2>&1 || true; }
     stop_content_fixture
-    native_stop TERM connector api jobs search
+    native_stop TERM gate connector api jobs search
     leak_guard_capture_compose_project "$PROJECT"
     dc down -v --remove-orphans > "$RUN_DIR/artifacts/compose-down.log" 2>&1 || warn "compose down reported errors"
     # Compose can fail partway through daemon shutdown. Remove only resources
@@ -2011,8 +2301,8 @@ cmd_down() {
     # container volumes (`docker rm -v`) and the project network.
     leak_guard_cleanup_compose_project "$PROJECT"
     # Files written by containers can be root-owned on Linux.
-    rm -rf "$RUN_DIR/vector-dynamic" "$RUN_DIR/vector-validation" "$RUN_DIR/data" "$RUN_DIR/clickhouse" "$RUN_DIR/soar-lab" 2>/dev/null \
-        || docker run --rm -v "$RUN_DIR:/w" --entrypoint sh alpine:3.20 -c 'rm -rf /w/vector-dynamic /w/vector-validation /w/data /w/clickhouse /w/soar-lab' >/dev/null 2>&1 || true
+    rm -rf "$RUN_DIR/vector-dynamic" "$RUN_DIR/vector-validation" "$RUN_DIR/data" "$RUN_DIR/clickhouse" "$RUN_DIR/soar-lab" "$RUN_DIR/agentlane-gate" 2>/dev/null \
+        || docker run --rm -v "$RUN_DIR:/w" --entrypoint sh alpine:3.20 -c 'rm -rf /w/vector-dynamic /w/vector-validation /w/data /w/clickhouse /w/soar-lab /w/agentlane-gate' >/dev/null 2>&1 || true
     # NAN-5798: the run's Sentry issues, after the services stopped (and
     # flushed) and BEFORE the secret files go: the artifact guard scrubs the
     # report like every other artifact. Report only.
@@ -2024,7 +2314,7 @@ cmd_down() {
         fi
     fi
     rm -f "$RUN_DIR/compose.env" "$RUN_DIR/app.env" "$RUN_DIR/admin.env" "$RUN_DIR/stack.env" "$RUN_DIR/ch-admin.curlrc" \
-        "$RUN_DIR/connector.env" "$RUN_DIR/pids/connector.health" "$RUN_DIR/content-acceptance-license" "$RUN_DIR/.secrets.jsonl"
+        "$RUN_DIR/connector.env" "$RUN_DIR/gate.env" "$RUN_DIR/pids/connector.health" "$RUN_DIR/content-acceptance-license" "$RUN_DIR/.secrets.jsonl"
     rm -rf "$RUN_DIR/svc-env"  # NAN-5878: per-call `svc` env overrides
     [[ "$(readlink "$E2E_HOME/current" 2>/dev/null)" == "$RUN_ID" ]] && rm -f "$E2E_HOME/current"
     if (( PURGE )); then rm -rf "$RUN_DIR"; ok "purged $RUN_DIR"; else ok "down; artifacts kept in $RUN_DIR/artifacts"; fi
@@ -2302,7 +2592,58 @@ gc_local_targets() {
     done
 }
 
+# NAN-5884 (review): a host-level sweep for leftovers no single run can
+# attribute (a crash mid-teardown leaves an unlabeled anonymous volume; a
+# killed driver leaves Chrome helpers). Run it in an idle window on a shared
+# RC host; it never touches a named volume, a labeled one, or a browser that
+# is not an e2e driver's (puppeteer_dev_chrome_profile-nano-<token>-...).
+cmd_sweep() {
+    local running
+    running="$(docker ps --filter 'label=nano.e2e.project' --format '{{.Label "nano.e2e.project"}}' 2>/dev/null | sort -u | tr '\n' ' ')"
+    if [[ -n "${running// /}" ]] && (( ! SWEEP_FORCE )); then
+        die "e2e stacks are running on this host ($running): sweep only in an idle window, or pass --force"
+    fi
+    local id labels volumes=0 browsers=0 profiles=0
+    while IFS= read -r id; do
+        [[ "$id" =~ ^[0-9a-f]{64}$ ]] || continue
+        labels="$(docker volume inspect --format '{{len .Labels}}' "$id" 2>/dev/null || echo 1)"
+        [[ "$labels" == 0 ]] || continue
+        docker volume rm "$id" >/dev/null 2>&1 && { volumes=$((volumes + 1)); log "sweep: removed dangling anonymous volume $id"; }
+    done < <(docker volume ls -q --filter dangling=true 2>/dev/null)
+    local pid ppid cmd
+    while read -r pid ppid cmd; do
+        [[ "$cmd" == *puppeteer_dev_chrome_profile-nano-* && "$ppid" == 1 ]] || continue
+        kill -TERM "$pid" 2>/dev/null && { browsers=$((browsers + 1)); log "sweep: stopped orphaned e2e Chrome process $pid"; }
+    done < <(ps -axww -o pid=,ppid=,args= 2>/dev/null)
+    local tmp="${TMPDIR:-/tmp}" dir procs name
+    # One full-width snapshot before the loop: a `ps | grep "$dir"` pipeline
+    # lists grep itself (review r2), and without -ww ps cuts command lines to
+    # $COLUMNS, which hid a live profile and deleted it (review r3).
+    # Fail safe: when the snapshot is not trustworthy, keep every profile.
+    if ! procs="$(ps -axww -o args= 2>/dev/null)" || [[ -z "$procs" ]]; then
+        warn "sweep: could not read the process table in full; keeping every Chrome profile"
+        procs=""
+    fi
+    for dir in "${tmp%/}"/puppeteer_dev_chrome_profile-nano-*; do
+        [[ -d "$dir" && -n "$procs" ]] || continue
+        name="$(basename "$dir")"
+        # In use (keep) when any process names the profile: matched on its
+        # unique directory name, not the full path, so a /private/tmp vs
+        # /tmp spelling cannot hide a live browser.
+        [[ "$procs" == *"$name"* ]] && continue
+        # Chrome's own lock: SingletonLock -> "<host>-<pid>"; a live pid keeps it.
+        local lock lockpid
+        lock="$(readlink "$dir/SingletonLock" 2>/dev/null || true)"
+        lockpid="${lock##*-}"
+        if [[ "$lockpid" =~ ^[0-9]+$ ]] && kill -0 "$lockpid" 2>/dev/null; then continue; fi
+        [[ -n "$(find "$dir" -maxdepth 0 -mmin +$(( GC_HOURS * 60 )) 2>/dev/null)" ]] || continue
+        rm -rf -- "$dir" && profiles=$((profiles + 1))
+    done
+    ok "sweep done: $volumes anonymous volume(s), $browsers Chrome process(es), $profiles stale profile(s)"
+}
+
 cmd_gc() {
+    if (( GC_SWEEP )); then cmd_sweep; return; fi
     local cutoff=$(( $(date +%s) - GC_HOURS * 3600 )) project
     if (( GC_CLOUD )); then
         # Cloud only: --cloud never touches a local stack.

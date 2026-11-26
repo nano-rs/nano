@@ -577,6 +577,54 @@ fn the_parser_lane_resolves_an_hec_sibling_that_spells_a_parser_path() {
     assert_eq!(row["event"]["unmapped"]["seq"], "7", "{row}");
 }
 
+/// The stored ClickHouse path of every value in `value` (path -> leaf JSON).
+fn stored_paths(value: &Value) -> BTreeMap<String, String> {
+    fn walk(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    walk(&if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") }, v, out);
+                }
+            }
+            Value::Null => {}
+            leaf => {
+                out.insert(prefix.to_string(), leaf.to_string());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk("", value, &mut out);
+    out
+}
+
+/// NAN-5894: a flat key that clashes with a nested path has ONE stored name
+/// on every ingest path. With no parser the NAN-5849 step escapes it; a
+/// nano-rs/parsers residual spill (as of NAN-5894) already writes it escaped,
+/// as a flat `"a.b"` key beside `"a~1b"`, and the NAN-5849 step must then
+/// leave both names alone (no second escape to `a~01b`, no `a.b_2`).
+#[test]
+fn a_clashing_flat_key_has_one_name_with_or_without_a_parser() {
+    let record = json!({ "a.b": "flat", "a": { "b": "nested" }, "seq": "7" });
+    let no_parser = generic_lane(true, &record);
+
+    // What the parser hands its `_ocsf_prepare` (the spill's output for `record`).
+    let p = parser("probe_spill", ". = .");
+    let config = VectorConfigManager::new("/tmp/nanosiem-test").generate_parser_config_for(&p, true);
+    let t = transforms(&config);
+    let parsed = json!({ "class_uid": 0, "category_uid": 0, "metadata": { "version": "1.9.0" },
+        "unmapped": { "a.b": "nested", "a~1b": "flat", "seq": "7" } });
+    let (with_parser, _) = run(&source(&t, "probe_spill_ocsf_prepare"), parsed, json!({ "source_type": "probe_spill" }));
+
+    for (lane, row) in [("no parser", &no_parser), ("parser", &with_parser)] {
+        let unmapped = &row["event"]["unmapped"];
+        assert!(collisions(row).is_empty(), "{lane}: {row}");
+        let paths = stored_paths(unmapped);
+        assert_eq!(paths.get("a.b").map(String::as_str), Some("\"nested\""), "{lane}: {paths:?}");
+        assert_eq!(paths.get("a~1b").map(String::as_str), Some("\"flat\""), "{lane}: {paths:?}");
+        assert!(!paths.keys().any(|k| k.ends_with("_2") || k.contains("~0")), "{lane}: {paths:?}");
+    }
+}
+
 // ---- the live ClickHouse proof (scripts/tests/json-path-collision-ch.live.sh) ----
 
 fn live_rows(fixed: bool) -> Vec<Value> {

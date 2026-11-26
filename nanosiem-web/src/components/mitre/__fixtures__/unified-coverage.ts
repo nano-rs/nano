@@ -149,7 +149,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 30,
         findings_window: { lead: 1, benign: 3, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
       {
         // 2 of these 4 findings were filed by the T1021 hunt above (the
@@ -165,7 +165,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 30,
         findings_window: { lead: 2, benign: 1, duplicate: 0, escalated: 1 },
         findings_from_other_hunts: 2,
-        rule_ideas: { keep_hunting: 0, ready: 1, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 1, sent: 0 },
       },
       {
         technique_id: 'T1053',
@@ -178,7 +178,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 0,
         findings_window: { lead: 0, benign: 0, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
       {
         technique_id: 'T1053.005',
@@ -191,7 +191,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 0,
         findings_window: { lead: 0, benign: 0, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
       {
         technique_id: 'T1059.001',
@@ -206,7 +206,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 1410,
         findings_window: { lead: 4, benign: 6, duplicate: 1, escalated: 1 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 1 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 1 },
       },
       {
         technique_id: 'T1105',
@@ -219,7 +219,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 4,
         findings_window: { lead: 1, benign: 0, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 1, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 1, ready: 0, sent: 0 },
       },
       {
         // The hunt's spec still says T1562.001 (ATT&CK v18); the server
@@ -234,7 +234,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 30,
         findings_window: { lead: 0, benign: 2, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
     ],
     unattributed: { hunts: 1, findings_window: 3, rule_ideas: 0 },
@@ -262,7 +262,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 7,
         findings_window: { lead: 0, benign: 1, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
       {
         technique_id: 'T1021.002',
@@ -275,7 +275,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 7,
         findings_window: { lead: 1, benign: 0, duplicate: 0, escalated: 1 },
         findings_from_other_hunts: 1,
-        rule_ideas: { keep_hunting: 0, ready: 1, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 1, sent: 0 },
       },
       {
         technique_id: 'T1053',
@@ -288,7 +288,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 0,
         findings_window: { lead: 0, benign: 0, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
       {
         technique_id: 'T1053.005',
@@ -301,7 +301,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 0,
         findings_window: { lead: 0, benign: 0, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
       {
         technique_id: 'T1059.001',
@@ -316,7 +316,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 331,
         findings_window: { lead: 1, benign: 2, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 1 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 1 },
       },
       {
         // Weekly hunt, last swept 9 days ago: in the 30 day window, not in 7.
@@ -330,7 +330,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 0,
         findings_window: { lead: 0, benign: 0, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 1, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 1, ready: 0, sent: 0 },
       },
       {
         technique_id: 'T1685',
@@ -343,7 +343,7 @@ export const unifiedCoverageFixture: { coverage: MitreCoverageResponse; hunts: H
         sweeps_window: 7,
         findings_window: { lead: 0, benign: 0, duplicate: 0, escalated: 0 },
         findings_from_other_hunts: 0,
-        rule_ideas: { keep_hunting: 0, ready: 0, needs_lookup: 0, sent: 0 },
+        rule_ideas: { keep_hunting: 0, ready: 0, sent: 0 },
       },
     ],
     unattributed: { hunts: 1, findings_window: 0, rule_ideas: 0 },

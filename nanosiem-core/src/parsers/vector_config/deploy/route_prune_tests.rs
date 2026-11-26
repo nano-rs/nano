@@ -74,7 +74,7 @@ fn named_inputs(parsers_dir: &std::path::Path) -> BTreeSet<String> {
         }
         let raw = std::fs::read_to_string(entry.path()).unwrap();
         let Ok(doc) = toml::from_str::<toml::Table>(&crate::vector_env::substitute_like_vector(&raw)) else {
-            continue; // _pipeline.toml etc. carry unquoted interpolation; not parser inputs.
+            continue; // not TOML even after substitution; not parser inputs.
         };
         for section in ["transforms", "sinks"] {
             for (_, c) in doc.get(section).and_then(|t| t.as_table()).into_iter().flatten() {

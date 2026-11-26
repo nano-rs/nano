@@ -1022,6 +1022,46 @@ def check_vector_config_delivery_credential(env: dict[str, str]) -> str:
     )
 
 
+AGENTLANE_GATE_TOKEN_KEY = "NANO_AGENTLANE_GATE_TOKEN"
+AGENTLANE_GATE_TOKEN_MIN_BYTES = 32
+
+
+def check_agentlane_gate_token(env: dict[str, str]) -> str:
+    """Refuse a role-split enterprise upgrade after which the Agent Lane gate
+    could never reach nano-api (NAN-5880 review P1-2).
+
+    From v2.0.36 every ClickHouse host's Agent Lane gate gets everything it
+    enforces from nano-api, and both present NANO_AGENTLANE_GATE_TOKEN from
+    the shared .env (at least 32 bytes; nano-api answers 404 and the gate stays
+    closed without it). A single host generates it during `prepare`; a
+    role-split cluster must share ONE value, generated on the first app host
+    and copied to every host, so a host whose .env lacks it is refused here,
+    before anything changes.
+
+    Checked whether or not Agent Lane is on: the on/off switch is in
+    PostgreSQL (Settings > Agent Lane), which this host cannot read before the
+    upgrade, and an old inventory `agentlane:` block is only imported once. A
+    missing token on a cluster that uses Agent Lane would close it silently
+    after a green upgrade; on one that does not, generating it costs nothing.
+    Fail closed. Values are never reported.
+    """
+    token = env.get(AGENTLANE_GATE_TOKEN_KEY, "").strip()
+    if len(token.encode("utf-8")) >= AGENTLANE_GATE_TOKEN_MIN_BYTES:
+        return "present"
+    problem = "has no NANO_AGENTLANE_GATE_TOKEN" if not token else (
+        f"has a NANO_AGENTLANE_GATE_TOKEN shorter than {AGENTLANE_GATE_TOKEN_MIN_BYTES} bytes"
+    )
+    raise UpgradeError(
+        f"Agent Lane would stop working after this upgrade: this host's .env {problem}. "
+        "From v2.0.36 the Agent Lane gate on every ClickHouse host gets its settings from "
+        "nano-api, and both use this shared key. Fix, on the first app host in the inventory: "
+        "run the install.sh from the NEW release bundle as `NANO_PREPARE_ONLY=1 ./install.sh "
+        "--inventory <inventory> --role <its roles>` (it generates the key into .env and "
+        "starts nothing), securely copy that .env to every inventory host, then re-run "
+        "nano upgrade. See docs/administration/upgrade-v2.md"
+    )
+
+
 def check_vector_install_token(env: dict[str, str], role_split: bool) -> str:
     """Refuse a role-split upgrade whose .env still holds a publicly known
     VECTOR_AUTH_TOKEN (NAN-5013).
@@ -1085,6 +1125,70 @@ PG_POOL_SIZING_KEYS = (
 )
 SIZING_BLOCK_END = "# END NANO AUTO SIZING"
 SIZING_DIR_DEFAULT = ".nano-generated/sizing"
+
+
+def memory_limit_mib(value: str) -> int | None:
+    """A Docker memory value (POSTGRES_MEM_LIMIT: 512M, 1g, 1073741824) in MiB,
+    or None when it is not one."""
+    match = re.fullmatch(r"([1-9][0-9]*)([KkMmGgTt]?)(i?[Bb]?)", value.strip())
+    if not match:
+        return None
+    number, unit = int(match.group(1)), match.group(2).upper()
+    return {"": number // 1048576, "K": number // 1024, "M": number,
+            "G": number * 1024, "T": number * 1048576}[unit]
+
+
+def key_set_by_operator(lines: Sequence[str], key: str) -> bool:
+    """Whether the operator sets `key` themselves: any assignment OUTSIDE the
+    installer-managed sizing block. Such a line wins over the block (Compose
+    reads the last assignment) and install.sh keeps it on every re-run, even
+    though the block still carries its own sized value (NAN-5892 review)."""
+    inside = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(SIZING_BLOCK_BEGIN):
+            inside = True
+        elif stripped.startswith(SIZING_BLOCK_END):
+            inside = False
+        elif not inside:
+            match = ENV_ASSIGNMENT.match(line)
+            if match and match.group(1) == key:
+                return True
+    return False
+
+
+def small_postgres_pool_warning(limit: str, floor_mib: int, pools: dict[str, str], operator_line: bool) -> str:
+    """NAN-5892: the upgrade's warning for a PostgreSQL limit below the pool
+    floor, with the exact setting to change. Plain words: the person reading
+    it runs the install, not the code."""
+    sizes = ", ".join(
+        f"{name} {pools[key]}" for name, key in (
+            ("nano-jobs", "NANO_JOBS_PG_MAX_CONNECTIONS"),
+            ("nano-api", "NANO_API_PG_MAX_CONNECTIONS"),
+            ("nano-search", "NANO_SEARCH_PG_MAX_CONNECTIONS"),
+        ) if pools.get(key)
+    )
+    if operator_line:
+        how = (
+            f"  To fix it: raise your POSTGRES_MEM_LIMIT override in .env (the line POSTGRES_MEM_LIMIT={limit} "
+            f"below '{SIZING_BLOCK_END}') to POSTGRES_MEM_LIMIT={floor_mib}M or more. Edit that line; do not "
+            "add a second one. Then re-run install.sh on this host to resize PostgreSQL and the pools together. "
+            "Re-running install.sh alone keeps your override."
+        )
+    else:
+        how = (
+            "  To fix it: re-run install.sh on this host to resize PostgreSQL and the pools together. "
+            f"To choose the size yourself, add POSTGRES_MEM_LIMIT={floor_mib}M (or more) below the "
+            f"'{SIZING_BLOCK_END}' line in .env first."
+        )
+    return "\n".join((
+        "WARNING: PostgreSQL has too little memory for nano's database connections (NAN-5892).",
+        f"  PostgreSQL's memory limit is POSTGRES_MEM_LIMIT={limit}. nano needs at least {floor_mib}M "
+        "for its connection pools.",
+        f"  The pools are made smaller to fit ({sizes}), so PostgreSQL is not overloaded. nano works, "
+        "but background jobs can wait for a connection, mostly in the first minute after a restart.",
+        how,
+    ))
 
 
 def vector_data_storage_mode(compose_model: dict[str, Any]) -> str:
@@ -1988,8 +2092,13 @@ def recover_legacy_backup_services(
 
 # NAN-5521: overlays install.sh adds and removes itself (from Agent Lane and
 # NANO_METRICS_BIND_ADDRESS), never carried over from a running stack.
+# NAN-5880: docker-compose.agentlane.yml (v2.0.23-v2.0.35) is dropped on
+# upgrade; the enterprise gate overlays are managed by install.sh and by
+# _prepare_agentlane_gate below.
+AGENTLANE_OLD_OVERLAY = "docker-compose.agentlane.yml"
+AGENTLANE_GATE_OVERLAYS = ("docker-compose.agentlane-gate.yml", "docker-compose.agentlane-imported-tls.yml")
 SELF_MANAGED_COMPOSE_FILES = frozenset({
-    "docker-compose.opensource.yml", "docker-compose.agentlane.yml", METRICS_EXPOSE_OVERLAY,
+    "docker-compose.opensource.yml", AGENTLANE_OLD_OVERLAY, *AGENTLANE_GATE_OVERLAYS, METRICS_EXPOSE_OVERLAY,
 })
 COMPOSE_OVERLAY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml")
 VECTOR_NATIVE_PORT = 6000
@@ -3186,6 +3295,7 @@ class LocalOps:
                 "keeps its installed limits. Re-run install.sh on this host once that is fixed."
             )
             return []
+        self.warn_small_postgres_pools()
         if not missing:
             return []
         eprint(
@@ -3196,6 +3306,37 @@ class LocalOps:
         )
         self.assemble_clickhouse_dirs()
         return list(missing)
+
+    def warn_small_postgres_pools(self) -> bool:
+        """NAN-5892: on EVERY single-node upgrade (not only the one that first
+        sized the pools), warn loudly when the installed PostgreSQL limit is
+        below what nano's connection pools need, with the exact setting to
+        raise. Best effort: an unreadable limit or sizing prints nothing.
+        Returns whether it warned."""
+        limit = self.env.get("POSTGRES_MEM_LIMIT", "").strip()
+        mib = memory_limit_mib(limit)
+        if mib is None:
+            return False
+        try:
+            result = self.runner.run(
+                ["bash", str(self.install_dir / RESOURCE_SIZING_SCRIPT), "--pg-pool-plan", str(mib)],
+                timeout=60, check=False,
+            )
+            plan = self._sizing_values(result.stdout) if result.returncode == 0 else {}
+        except (UpgradeError, OSError, ValueError, subprocess.SubprocessError):
+            return False
+        if plan.get("NANO_PG_UNDERFUNDED") != "1" or not plan.get("NANO_PG_BUDGET_FLOOR_MIB", "").isdigit():
+            return False
+        try:
+            lines = secure_read_text(self.install_dir / ".env", "environment file").splitlines()
+        except (UpgradeError, OSError):
+            lines = []
+        pools = {key: self.env.get(key, "").strip() or plan.get(key, "") for key in PG_POOL_SIZING_KEYS}
+        eprint(small_postgres_pool_warning(
+            limit, int(plan["NANO_PG_BUDGET_FLOOR_MIB"]), pools,
+            operator_line=key_set_by_operator(lines, "POSTGRES_MEM_LIMIT"),
+        ))
+        return True
 
     def _run_sizing(self, extra: Sequence[str], environment: dict[str, str]) -> tuple[dict[str, str], str]:
         """resource-sizing.sh with install.sh's arguments: (values, stdout)."""
@@ -5034,6 +5175,15 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         if not getattr(self, "role_env", None):
             return {"host": self.host_name, "role_split": False, "changed": [], "diff": "", "applied": False}
         renderer = self._renderer()
+        # NAN-5880 (D1): this host's own addresses are internal to its Agent
+        # Lane gate, as install.sh renders them (it exports the same value).
+        if "NANO_AGENTLANE_HOST_ADDRESSES" not in os.environ and hasattr(renderer, "_load_agentlane"):
+            try:
+                os.environ["NANO_AGENTLANE_HOST_ADDRESSES"] = ",".join(
+                    renderer._load_agentlane().host_own_networks()
+                )
+            except Exception as error:  # noqa: BLE001 - the inventory addresses still apply
+                eprint(f"warning: could not list this host's addresses for the Agent Lane gate: {error}")
         output = self.install_dir / ".nano-generated"
         env_output = self.install_dir / ".nano-role.env"
         retained = self.install_dir / ".nano-generated.previous"
@@ -5571,6 +5721,20 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 lambda: check_vector_install_token(
                     self.env_file.values(), bool(getattr(self, "role_env", None)),
                 ),
+            )
+        # NAN-5880 review P1-2: role-split enterprise only (a single host
+        # generates the key in prepare). The hosts that use it: nano-api on
+        # app hosts, the gate on ClickHouse hosts.
+        if (
+            getattr(self, "role_env", None)
+            and (
+                getattr(self, "edition", "") or self.env_file.values().get("NANO_EDITION", "")
+            ) == "enterprise"
+            and self.roles.intersection({"app", "clickhouse"})
+        ):
+            check(
+                "agentlane-gate-token",
+                lambda: check_agentlane_gate_token(self.env_file.values()),
             )
         check(
             "clickhouse-workload-identities",
@@ -6571,6 +6735,7 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         rotated_install_token = False
         pinned_delivery_mode = False
         filled_sizing_keys: list[str] = []
+        agentlane_gate: dict[str, Any] | None = None
         if getattr(self, "role_env", None):
             pinned_delivery_mode = pin_compatible_delivery_mode(self.env_file)
             if pinned_delivery_mode:
@@ -6591,6 +6756,9 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 self.env[key] = self.env_file.values()[key]
                 eprint(f"note: generated {key} in .env (v2.0.28 ClickHouse workload identity).")
             eprint(f"ClickHouse workload identities: {self._render_workload_users(self.env.get('NANO_COMPOSE_SUBNET', ''))}")
+            # NAN-5880: before the ClickHouse rollout, which recreates
+            # ClickHouse into the clickhouse-netns anchor and starts the gate.
+            agentlane_gate = self._prepare_agentlane_gate()
             # NAN-5669: after the bundle load (the sizer's disk probe runs the
             # release's pinned Vector image), before the ClickHouse rollout.
             filled_sizing_keys = self.fill_missing_sizing_keys()
@@ -6628,7 +6796,118 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             "pinned_schema_profile": pinned_schema_profile,
             "pruned_control_pins": pruned_control_pins,
             "filled_sizing_keys": filled_sizing_keys,
+            "agentlane_gate": agentlane_gate,
         }
+
+    def _prepare_agentlane_gate(self) -> dict[str, Any]:
+        """NAN-5880: wire the Agent Lane gate into an ENTERPRISE single host,
+        as install.sh does: drop the v2.0.35 listener overlay, copy and record
+        the gate overlay (and the imported-certificate one while the old host
+        setup is there), generate NANO_AGENTLANE_GATE_TOKEN once, and record
+        the gate's internal networks (D1). Nothing here turns Agent Lane on:
+        the gate stays closed until Settings > Agent Lane says otherwise."""
+        if getattr(self, "role_env", None) or getattr(self, "legacy_layout", None) is not None:
+            return {"action": "skipped (role-split hosts are wired by render-inventory.py)"}
+        overlays = self.env.get("NANO_COMPOSE_OVERLAYS", "").split()
+        if self.env.get("NANO_EDITION") != "enterprise":
+            kept = [item for item in overlays if item != AGENTLANE_OLD_OVERLAY and item not in AGENTLANE_GATE_OVERLAYS]
+            if kept != overlays and not getattr(self, "dry_run", False):
+                self.env_file.replace("NANO_COMPOSE_OVERLAYS", " ".join(kept))
+                self.env = self.env_file.values()
+                self.compose_args = self._compose_args()
+            return {"action": "skipped (open edition)"}
+        script = self.install_dir / "deploy/compose/agentlane.py"
+        if not script.is_file():
+            raise UpgradeError(
+                "this enterprise bundle has no deploy/compose/agentlane.py (the Agent Lane gate); "
+                "extract the full enterprise bundle and rerun the upgrade with --resume"
+            )
+        if getattr(self, "dry_run", False):
+            return {"action": "would wire the Agent Lane gate (dry run, nothing written)"}
+        updates: dict[str, str] = {}
+        if len(self.env_file.values().get("NANO_AGENTLANE_GATE_TOKEN", "")) < 32:
+            # Generated here, never printed; .env keeps its mode.
+            updates["NANO_AGENTLANE_GATE_TOKEN"] = secrets.token_hex(32)
+        result = self.runner.run(
+            ["python3", "-I", str(script), "prepare-single",
+             "--install-dir", str(self.install_dir),
+             "--env-file", str(self.install_dir / ".env"),
+             "--networks-xml", str(self.install_dir / ".nano-generated/clickhouse/networks.xml")],
+            timeout=60, check=False,
+        )
+        if result.returncode != 0:
+            raise UpgradeError(
+                f"could not wire the Agent Lane gate: {self._safe_service_failure(result)}. "
+                "Nothing was restarted; fix it and rerun the upgrade with --resume."
+            )
+        try:
+            summary = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as error:
+            raise UpgradeError(f"could not read the Agent Lane gate summary: {error}") from error
+        wanted = [item for item in overlays if item not in summary.get("overlays_remove", [])]
+        for item in summary.get("overlays_add", []):
+            if item not in wanted:
+                wanted.append(item)
+        if wanted != overlays:
+            updates["NANO_COMPOSE_OVERLAYS"] = " ".join(wanted)
+        for key, value in (summary.get("env") or {}).items():
+            if self.env.get(key) != value:
+                updates[key] = value
+        if updates:
+            self.env_file.replace_many(updates)
+            self.env = self.env_file.values()
+            self.compose_args = self._compose_args()
+        for line in summary.get("notices", []):
+            eprint(f"note: {line}")
+        return {
+            "action": "wired",
+            "overlays": [item for item in wanted if item in AGENTLANE_GATE_OVERLAYS],
+            "port": summary.get("port"),
+            "changed_keys": sorted(key for key in updates if key != "NANO_AGENTLANE_GATE_TOKEN")
+            + (["NANO_AGENTLANE_GATE_TOKEN (generated)"] if "NANO_AGENTLANE_GATE_TOKEN" in updates else []),
+        }
+
+    def _agentlane_gate_detached(self) -> bool:
+        """NAN-5880: the running single-host gate is not in the CURRENT
+        clickhouse-netns namespace (the anchor was recreated): only a gate
+        recreate rejoins it (spike F). Best effort: False when unknown."""
+        try:
+            anchor = self.compose(["ps", "-q", "clickhouse-netns"], timeout=30).stdout.split()
+            gates = self.compose(["ps", "-q", "agentlane-gate"], timeout=30).stdout.split()
+            if len(anchor) != 1 or not gates:
+                return False
+            for container in gates:
+                mode = self.runner.run(
+                    ["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", container],
+                    timeout=30, check=False,
+                ).stdout.strip()
+                if not mode.startswith("container:"):
+                    continue
+                target = mode.split(":", 1)[1]
+                if not (target.startswith(anchor[0]) or anchor[0].startswith(target)):
+                    return True
+            return False
+        except Exception:  # noqa: BLE001 - a probe; never fails the rollout
+            return False
+
+    def _up_agentlane_gate(self, timeout: int) -> list[str]:
+        """NAN-5880: (re)start the Agent Lane gate after ClickHouse. Single
+        host: it shares the clickhouse-netns namespace, so a gate left in a
+        retired anchor is recreated. Role split: host networking; the replica
+        count from the render says whether this host runs one."""
+        started: list[str] = []
+        for service in ("agentlane-gate-tls", "agentlane-gate"):
+            if not self._service_expected(service):
+                continue
+            recreate = self._recreate_args([service])
+            if not recreate and service == "agentlane-gate" and self._agentlane_gate_detached():
+                recreate = ["--force-recreate"]
+            self.compose(
+                ["up", "-d", "--no-deps", "--pull", "never", *recreate, service],
+                timeout=timeout,
+            )
+            started.append(service)
+        return started
 
     def _prune_legacy_control_pins(self) -> list[str]:
         """NAN-5397: a settled legacy transition's overlay pins every canonical
@@ -8447,6 +8726,9 @@ printf 'consumer generation %s ready\n' "$generation"
                 )
                 self._wait_container("clickhouse", timeout)
                 self._check_clickhouse()
+            # NAN-5880: the Agent Lane gate (enterprise), closed until Agent
+            # Lane is turned on in Settings; never on the open edition.
+            services = list(services) + self._up_agentlane_gate(timeout)
         elif role == "postgres" and self.pg_ha:
             services = self._rollout_postgres_ha_member(selected, timeout)
         elif role == "postgres":

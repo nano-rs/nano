@@ -184,32 +184,62 @@
       ],
       "edition": "enterprise"
     },
-    "/hunts/campaigns": {
+    "/hunts/actors": {
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
         "tests/enterprise/personas/test_threat_hunter.py",
         "tests/enterprise/ui/test_hunts_ui_walk.py",
-        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/enterprise/ui/test_v2036_actors_redirects.py::test_v2036_campaign_urls_redirect_to_actors_with_query_and_light_the_rail",
+        "tests/enterprise/ui/test_v2036_actors_ui_walk.py::test_v2036_actor_pages_tabs_review_and_settings"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5859: Campaigns became Actors (was /hunts/campaigns, which redirects here)"
     },
-    "/hunts/campaigns/:id": {
+    "/hunts/actors/:id": {
       "tests": [
         "tests/enterprise/ui/test_hunts_ui_walk.py",
         "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_agent_sql_approximate_distinct_count_reads_as_estdc",
-        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/enterprise/ui/test_v2036_actors_redirects.py::test_v2036_campaign_urls_redirect_to_actors_with_query_and_light_the_rail",
+        "tests/enterprise/ui/test_v2036_actors_ui_walk.py::test_v2036_actor_pages_tabs_review_and_settings"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5859: one actor's profile (was /hunts/campaigns/:id, which redirects here)"
     },
-    "/hunts/campaigns/candidates": {
+    "/hunts/actors/review": {
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
         "tests/enterprise/ui/test_hunts_ui_walk.py",
-        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/enterprise/ui/test_v2036_actors_redirects.py::test_v2036_campaign_urls_redirect_to_actors_with_query_and_light_the_rail",
+        "tests/enterprise/ui/test_v2036_actors_ui_walk.py::test_v2036_actor_pages_tabs_review_and_settings"
       ],
-      "edition": "enterprise"
+      "edition": "enterprise",
+      "note": "NAN-5859: the actor review queue (was /hunts/campaigns/candidates, which redirects here with kind=unassigned)"
+    },
+    "/hunts/campaigns": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_actors_redirects.py::test_v2036_campaign_urls_redirect_to_actors_with_query_and_light_the_rail"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5859: redirects to /hunts/actors, query kept"
+    },
+    "/hunts/campaigns/:id": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_actors_redirects.py::test_v2036_campaign_urls_redirect_to_actors_with_query_and_light_the_rail"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5859: redirects to /hunts/actors/:id, query kept"
+    },
+    "/hunts/campaigns/candidates": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_actors_redirects.py::test_v2036_campaign_urls_redirect_to_actors_with_query_and_light_the_rail"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5859: redirects to /hunts/actors/review?kind=unassigned, query kept"
     },
     "/hunts/escalations": {
       "smoke": true,
@@ -248,6 +278,17 @@
         "tests/enterprise/ui/test_deep_hunts.py::test_finding_page_layout",
         "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ]
+    },
+    "/hunts/leads/decisions": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Findings > Decisions (was Rulings)"
     },
     "/hunts/memory": {
       "smoke": true,
@@ -378,7 +419,12 @@
     "/ingestion/log-sources/pull-feeds": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/ui/test_pull_feeds.py::test_ui_pull_feed",
+        "tests/ui/test_pull_feeds.py::test_ui_new_pull_feed_is_a_right_flyout",
+        "tests/ui/test_pull_feeds.py::test_ui_google_workspace_feed_one_submit_sets_up_log_sources",
+        "tests/ui/test_pull_feeds.py::test_ui_marketplace_hops_to_pull_feeds_and_sets_up_in_one_submit",
+        "tests/ui/test_pull_feeds.py::test_ui_resume_with_missing_log_sources_offers_fix_setup"
       ]
     },
     "/ingestion/log-sources/repositories": {
@@ -433,7 +479,8 @@
       "smoke": true,
       "tests": [
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_deep_ioc_lists.py::test_enrichments_marketplace_lists_platform_and_custom"
+        "tests/enterprise/ui/test_deep_ioc_lists.py::test_enrichments_marketplace_lists_platform_and_custom",
+        "tests/ui/test_pull_feeds.py::test_ui_marketplace_hops_to_pull_feeds_and_sets_up_in_one_submit"
       ]
     },
     "/mfa-setup": {
@@ -577,6 +624,16 @@
         "tests/ui/test_deep_detection_engineering.py::test_author_validate_test_lifecycle_mitre_and_matches"
       ]
     },
+    "/rules/ideas": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Rule ideas under Detections (was /hunts/rule-ideas)"
+    },
     "/rules/ioc-lists": {
       "smoke": true,
       "tests": [
@@ -702,7 +759,8 @@
     "/settings/agentlane": {
       "smoke": true,
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2036_agentlane_setup.py::test_agentlane_setup_from_the_page"
       ],
       "edition": "enterprise"
     },
@@ -833,6 +891,33 @@
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
       ]
     },
+    "/settings/hunts": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/personas/test_threat_hunter.py"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Settings > Hunting > Runners (was /hunts/runners)"
+    },
+    "/settings/hunts/actors": {
+      "edition": "enterprise",
+      "tests": [
+        "tests/enterprise/ui/test_v2036_actors_ui_walk.py::test_v2036_actor_pages_tabs_review_and_settings"
+      ],
+      "note": "NAN-5859: Settings > Hunting > Actors (name sets, preview, retention)"
+    },
+    "/settings/hunts/charter": {
+      "tests": [
+        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
+        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
+        "tests/enterprise/ui/test_v2036_hunt_budget_defaults.py::test_v2036_hunt_budget_defaults_by_tier_with_overrides"
+      ],
+      "smoke": true,
+      "edition": "enterprise",
+      "note": "NAN-5850: Settings > Hunting > Charter & defaults"
+    },
     "/settings/license": {
       "smoke": true,
       "tests": [
@@ -889,6 +974,7 @@
       "tests": [
         "tests/enterprise/ui/test_soar.py",
         "tests/enterprise/ui/test_v2033_soar_limits.py",
+        "tests/enterprise/ui/test_v2036_soar_settings_layout.py",
         "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean"
       ],
       "edition": "enterprise"
@@ -1005,6 +1091,64 @@
       "tests": [
         "tests/ui/test_deep_admin_settings.py::test_users_invite_disable_enable_delete"
       ]
+    },
+    "action:agentlane.allowed-networks": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_agentlane_setup.py::test_agentlane_setup_from_the_page"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5880: add/save an allowed network; 0.0.0.0/0 refused in the browser"
+    },
+    "action:agentlane.certificate": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_agentlane_setup.py::test_agentlane_setup_from_the_page"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5880: \"Let nano make one\" (the web and upload modes are covered by the web vitest AgentLaneSettings.test.tsx)"
+    },
+    "action:agentlane.connection-test": {
+      "skip": "NAN-5880: the test needs an outside machine to run curl from a non-internal address; the web vitest AgentLaneSettings.test.tsx covers the outcomes and that \"Add it?\" only pre-fills",
+      "edition": "enterprise"
+    },
+    "action:agentlane.off-confirm": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_agentlane_setup.py::test_agentlane_setup_from_the_page"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5880: Off asks to confirm (\"cut off right away\", tokens kept) before it acts"
+    },
+    "action:agentlane.state-not-set-up": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_agentlane_setup.py::test_agentlane_setup_from_the_page"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5880: no allowed networks yet: 3-step checklist, On disabled with the reason"
+    },
+    "action:agentlane.state-off": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_agentlane_setup.py::test_agentlane_setup_from_the_page"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5880: networks and a certificate set, switch off"
+    },
+    "action:agentlane.state-on": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_agentlane_setup.py::test_agentlane_setup_from_the_page"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5880: switch on and every gate listening (needs the agentlane gate in the stack)"
+    },
+    "action:agentlane.state-paused-license": {
+      "skip": "NAN-5880: the license hard stop cannot be reached on a licensed e2e stack without ending its license; the web vitest AgentLaneSettings.test.tsx covers the paused render",
+      "edition": "enterprise"
+    },
+    "action:agentlane.state-problem": {
+      "skip": "NAN-5880: a problem (expired certificate, hidden source address, gates missing) needs fault injection the throwaway stack does not have; the web vitest AgentLaneSettings.test.tsx covers the banner and its one action",
+      "edition": "enterprise"
+    },
+    "action:agentlane.state-starting": {
+      "skip": "NAN-5880: the gates report \"starting\" for about 2 s after the switch goes on, too short to assert in a browser walk; the web vitest AgentLaneSettings.test.tsx covers the render and the 3 s poll",
+      "edition": "enterprise"
     },
     "action:ai.demo-mode-tuning-hidden": {
       "skip": "the harness hard-codes DEPLOYMENT_MODE=selfhosted (dev/e2e/compose.e2e.yml, scripts/e2e.sh) and seeds no demo_analyst role, so a demo-mode session cannot be driven (NAN-5676)"
@@ -1124,6 +1268,38 @@
         "tests/enterprise/ui/test_deep_cases_team.py::test_deep_case_unassigned_case_takes_a_note"
       ]
     },
+    "action:coverage.drilldown": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel",
+        "tests/ui/test_v2035_mitre_coverage_open_core.py::test_v2035_mitre_coverage_without_the_hunt_layer"
+      ],
+      "note": "NAN-5850: the technique panel from ?tech=, its layers and next-step actions"
+    },
+    "action:coverage.filters": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "note": "NAN-5850: mode, source, tactic, hunted window, legend class, search; every one in the URL and kept on reload"
+    },
+    "action:coverage.gap-to-rule-idea": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "note": "NAN-5850: Gaps view chips and tab; Review rule idea and Draft rule from a gap"
+    },
+    "action:coverage.rbac": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_rbac"
+      ],
+      "note": "NAN-5850: no hunt layer without hunts:view; no Coverage link without detections:view"
+    },
+    "action:coverage.view-switch": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel",
+        "tests/ui/test_v2035_mitre_coverage_open_core.py::test_v2035_mitre_coverage_without_the_hunt_layer"
+      ],
+      "note": "NAN-5850: Detections / Hunts / Both / Gaps segments, URL view param, legend"
+    },
     "action:dashboards.build-every-panel-type": {
       "tests": [
         "tests/ui/test_deep_dashboards.py::test_build_a_dashboard_from_scratch_with_every_panel_type"
@@ -1150,6 +1326,23 @@
         "tests/ui/test_deep_dashboards.py::test_panel_open_in_search_carries_the_query"
       ]
     },
+    "action:help.get-support-flyout": {
+      "tests": [
+        "tests/ui/test_v2035_support_flyout.py::test_v2035_support_flyout_report_a_bug_and_get_support"
+      ],
+      "launchers": [
+        "menuitem:components/support/HelpMenu.tsx:Get support"
+      ]
+    },
+    "action:help.report-a-bug-flyout": {
+      "tests": [
+        "tests/ui/test_v2035_support_flyout.py::test_v2035_support_flyout_report_a_bug_and_get_support"
+      ],
+      "note": "Help > Report a bug (NAN-5253) as a right-side flyout without a scrim (NAN-5857): context (version, edition, sanitized route, failed call request IDs), copy, download, air-gap toggle.",
+      "launchers": [
+        "menuitem:components/support/HelpMenu.tsx:Report a bug"
+      ]
+    },
     "action:hunts.ai-sweep-findings": {
       "skip": "the investigator/reviewer sweep needs the AI stub plus the hunt lane injector; covered end to end by tests/enterprise/personas/test_threat_hunter.py, not by a browser walk"
     },
@@ -1167,6 +1360,13 @@
         "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_from_template_configured_and_run"
       ]
     },
+    "action:hunts.coverage-deep-link": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5850: Hunts header Coverage link to /rules/coverage?view=hunts"
+    },
     "action:hunts.escalation-ack-case-close": {
       "tests": [
         "tests/enterprise/ui/test_v2034_pivt_and_hunts.py::test_hunts_escalation_acknowledge_and_case_close_smoke"
@@ -1176,6 +1376,12 @@
       "tests": [
         "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2033_beta_badges_and_escalation_queues"
       ]
+    },
+    "action:hunts.escalation-readout": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_escalation_readout.py::test_v2035_escalation_readout_in_list_finding_and_case"
+      ],
+      "edition": "enterprise"
     },
     "action:hunts.floor-duplicate-charter": {
       "tests": [
@@ -1216,17 +1422,19 @@
         "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_mark_wrong_opens_preset_to_wrong"
       ]
     },
-    "action:hunts.escalation-readout": {
-      "tests": [
-        "tests/enterprise/ui/test_v2035_escalation_readout.py::test_v2035_escalation_readout_in_list_finding_and_case"
-      ],
-      "edition": "enterprise"
-    },
     "action:hunts.profile-run-recon": {
       "tests": [
         "tests/enterprise/personas/test_hunt_recon_web.py::test_coverage_telemetry_runs_recon_for_the_recon_scope_only"
       ],
       "edition": "enterprise"
+    },
+    "action:hunts.run-recon-from-list": {
+      "tests": [
+        "tests/enterprise/personas/test_hunt_recon_web.py::test_coverage_telemetry_runs_recon_for_the_recon_scope_only",
+        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5850: Run recon on the Hunts list (shown for hunts:profile_write only)"
     },
     "action:hunts.scheduled-recon": {
       "tests": [
@@ -1441,6 +1649,20 @@
       "tests": [
         "tests/enterprise/ui/test_v2033_hunts_ui.py::test_v2033_beta_badges_and_escalation_queues",
         "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
+      ]
+    },
+    "action:nav.hunts-rail-group": {
+      "tests": [
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
+        "tests/ui/test_v2035_hunts_rail_open_core.py::test_v2035_hunts_rail_group_only_with_the_hunts_capability"
+      ]
+    },
+    "action:nav.rail-theme-switcher": {
+      "tests": [
+        "tests/ui/test_v2035_rail_theme_switcher.py::test_v2035_rail_theme_strip_flyout_and_single_toggle"
+      ],
+      "launchers": [
+        "dialog:components/layout/RailThemeSwitcher.tsx:Choose theme"
       ]
     },
     "action:notebooks.case-notebook": {
@@ -1851,114 +2073,200 @@
         "tests/enterprise/ui/test_v2034_soar_admission.py::test_v2034_soar_unconnected_action_flagged_and_live_save_refused"
       ]
     },
-    "action:nav.hunts-rail-group": {
+    "action:hunts.budget-defaults": {
       "tests": [
-        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
-        "tests/ui/test_v2035_hunts_rail_open_core.py::test_v2035_hunts_rail_group_only_with_the_hunts_capability"
+        "tests/enterprise/ui/test_v2036_hunt_budget_defaults.py::test_v2036_hunt_budget_defaults_by_tier_with_overrides"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5860: default budgets by planned-volume tier, admin overrides, ceilings"
+    },
+    "action:hunts.budget-line-tooltips": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_hunt_budget_defaults.py::test_v2036_hunt_budget_defaults_by_tier_with_overrides"
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5860: the hunt budget line explains each limit"
+    },
+    "action:shell.user-menu": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_user_menu_items",
+        "tests/ui/test_auth.py::test_login_shows_the_admin_then_logout"
+      ],
+      "launchers": [
+        "menu:components/layout/AppLayout.tsx:user-menu",
+        "menuitem:components/layout/AppLayout.tsx:User Settings",
+        "menuitem:components/layout/AppLayout.tsx:Docs",
+        "menuitem:components/layout/AppLayout.tsx:API",
+        "menuitem:components/layout/AppLayout.tsx:Sign out"
+      ],
+      "note": "NAN-5864: User Settings, Docs, API (/swagger-ui/), the version line, Sign out; no Theme submenu (NAN-5858)."
+    },
+    "action:shell.help-menu": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_help_menu_in_the_main_and_settings_shells"
+      ],
+      "launchers": [
+        "menu:components/support/HelpMenu.tsx:Help",
+        "menuitem:components/support/HelpMenu.tsx:Docs"
+      ],
+      "note": "NAN-5864: the Help menu in the main and the Settings top bar."
+    },
+    "action:shell.settings-topbar": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_settings_topbar_breadcrumb_and_recent_changes"
+      ],
+      "launchers": [
+        "dialog:components/layout/settings/RecentChangesDrawer.tsx:Recent configuration changes"
+      ],
+      "note": "NAN-5864: the Settings breadcrumb and the Recent changes drawer (X, scrim, entry, full audit log)."
+    },
+    "action:shell.notification-bell": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_notification_bell_mark_all_read_and_click_through"
+      ],
+      "launchers": [
+        "dialog:components/NotificationBell.tsx:notification-bell"
+      ],
+      "note": "NAN-5864: unread count, Mark all read, click-through (notifications stubbed in the browser session)."
+    },
+    "action:shell.sidebar-shortcut-and-collapse": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_sidebar_shortcut_and_collapse_buttons"
+      ],
+      "launchers": [
+        "shortcut:components/layout/AppLayout.tsx:mod+b"
+      ],
+      "note": "NAN-5864: Cmd/Ctrl+B, the rail Collapse/Expand button and the top bar Toggle sidebar."
+    },
+    "action:shell.cmd-k": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_cmd_k_opens_the_palette_or_the_settings_search",
+        "tests/enterprise/ui/test_deep_notebooks.py::test_command_palette_create_new_notebook_opens_the_dialog"
+      ],
+      "launchers": [
+        "shortcut:components/shared/CommandPalette.tsx:mod+k",
+        "shortcut:components/layout/settings/SettingsRail.tsx:mod+k"
       ]
     },
-    "/hunts/leads/decisions": {
+    "action:shell.collapsed-rail-flyouts": {
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
-        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links",
-        "tests/enterprise/ui/test_deep_hunts.py::test_deep_hunt_findings_rulings_and_case_close"
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_collapsed_rail_flyouts_open_their_pages",
+        "tests/enterprise/ui/test_v2035_hunts_rail_nav.py::test_v2035_hunts_rail_group_flyout_findings_tabs_and_deep_links"
       ],
-      "smoke": true,
-      "edition": "enterprise",
-      "note": "NAN-5850: Findings > Decisions (was Rulings)"
-    },
-    "/rules/ideas": {
-      "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
+      "launchers": [
+        "menu:components/layout/AppLayout.tsx:Rules",
+        "menu:components/layout/AppLayout.tsx:Ingestion",
+        "menu:components/layout/AppLayout.tsx:Cases",
+        "menu:components/layout/AppLayout.tsx:Automation",
+        "menu:components/layout/AppLayout.tsx:Hunts",
+        "menuitem:components/layout/AppLayout.tsx:{item.name}"
       ],
-      "smoke": true,
-      "edition": "enterprise",
-      "note": "NAN-5850: Rule ideas under Detections (was /hunts/rule-ideas)"
+      "note": "NAN-5864: every section flyout of the collapsed rail lists its pages and opens one."
     },
-    "/settings/hunts": {
+    "action:shell.mobile-drawer": {
       "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail",
-        "tests/enterprise/personas/test_threat_hunter.py"
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_mobile_menu_drawer"
       ],
-      "smoke": true,
-      "edition": "enterprise",
-      "note": "NAN-5850: Settings > Hunting > Runners (was /hunts/runners)"
-    },
-    "/settings/hunts/charter": {
-      "tests": [
-        "tests/ui/test_page_smoke.py::test_every_top_level_page_loads_clean",
-        "tests/enterprise/ui/test_v2035_hunts_ia_redirects.py::test_v2035_hunts_old_urls_redirect_with_query_and_new_pages_light_the_rail"
-      ],
-      "smoke": true,
-      "edition": "enterprise",
-      "note": "NAN-5850: Settings > Hunting > Charter & defaults"
-    },
-    "action:coverage.view-switch": {
-      "tests": [
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel",
-        "tests/ui/test_v2035_mitre_coverage_open_core.py::test_v2035_mitre_coverage_without_the_hunt_layer"
-      ],
-      "note": "NAN-5850: Detections / Hunts / Both / Gaps segments, URL view param, legend"
-    },
-    "action:coverage.filters": {
-      "tests": [
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
-      ],
-      "note": "NAN-5850: mode, source, tactic, hunted window, legend class, search; every one in the URL and kept on reload"
-    },
-    "action:coverage.drilldown": {
-      "tests": [
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel",
-        "tests/ui/test_v2035_mitre_coverage_open_core.py::test_v2035_mitre_coverage_without_the_hunt_layer"
-      ],
-      "note": "NAN-5850: the technique panel from ?tech=, its layers and next-step actions"
-    },
-    "action:coverage.gap-to-rule-idea": {
-      "tests": [
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
-      ],
-      "note": "NAN-5850: Gaps view chips and tab; Review rule idea and Draft rule from a gap"
-    },
-    "action:coverage.rbac": {
-      "tests": [
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_rbac"
-      ],
-      "note": "NAN-5850: no hunt layer without hunts:view; no Coverage link without detections:view"
-    },
-    "action:hunts.coverage-deep-link": {
-      "tests": [
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
-      ],
-      "edition": "enterprise",
-      "note": "NAN-5850: Hunts header Coverage link to /rules/coverage?view=hunts"
-    },
-    "action:hunts.run-recon-from-list": {
-      "tests": [
-        "tests/enterprise/personas/test_hunt_recon_web.py::test_coverage_telemetry_runs_recon_for_the_recon_scope_only",
-        "tests/enterprise/ui/test_v2035_unified_mitre_coverage.py::test_v2035_unified_coverage_views_filters_gaps_and_panel"
-      ],
-      "edition": "enterprise",
-      "note": "NAN-5850: Run recon on the Hunts list (shown for hunts:profile_write only)"
-    },
-    "action:help.report-a-bug-flyout": {
-      "tests": [
-        "tests/ui/test_v2035_support_flyout.py::test_v2035_support_flyout_report_a_bug_and_get_support"
-      ],
-      "note": "Help > Report a bug (NAN-5253) as a right-side flyout without a scrim (NAN-5857): context (version, edition, sanitized route, failed call request IDs), copy, download, air-gap toggle."
-    },
-    "action:nav.rail-theme-switcher": {
-      "tests": [
-        "tests/ui/test_v2035_rail_theme_switcher.py::test_v2035_rail_theme_strip_flyout_and_single_toggle"
+      "launchers": [
+        "dialog:components/layout/AppLayout.tsx:Navigation",
+        "menu:components/layout/AppLayout.tsx:mobile-user-menu"
       ]
     },
-    "action:help.get-support-flyout": {
+    "action:shell.breadcrumbs": {
       "tests": [
-        "tests/ui/test_v2035_support_flyout.py::test_v2035_support_flyout_report_a_bug_and_get_support"
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_breadcrumb_links_navigate"
       ]
+    },
+    "action:shell.status-bar-health-link": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_status_bar_opens_platform_health"
+      ]
+    },
+    "action:shell.banners": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_backup_disk_and_capacity_banners"
+      ],
+      "launchers": [
+        "banner:components/BackupStatusBanner.tsx:BackupStatusBanner",
+        "banner:components/DiskSpaceBanner.tsx:DiskSpaceBanner",
+        "banner:components/CapacityWarningBanner.tsx:CapacityWarningBanner"
+      ],
+      "note": "NAN-5864: banner states stubbed in the browser session (stale backup, critical disk, over capacity)."
+    },
+    "action:shell.command-palette": {
+      "tests": [
+        "tests/ui/test_v2036_shell_launchers.py::test_v2036_command_palette_commands_match_the_edition"
+      ],
+      "launchers": [
+        "menu:components/shared/CommandPalette.tsx:#1",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Dashboard",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Cases",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Search",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Rules",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Alerts",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Risk Scoring",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Prevalence",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Notebooks",
+        "menuitem:components/shared/CommandPalette.tsx:Go to Log Sources",
+        "menuitem:components/shared/CommandPalette.tsx:Create New Case",
+        "menuitem:components/shared/CommandPalette.tsx:Create New Rule",
+        "menuitem:components/shared/CommandPalette.tsx:Create New Notebook",
+        "menuitem:components/shared/CommandPalette.tsx:Case Settings",
+        "menuitem:components/shared/CommandPalette.tsx:Access Control",
+        "menuitem:components/shared/CommandPalette.tsx:Storage Settings"
+      ],
+      "note": "NAN-5864: every command opens its page; open core offers no Cases, Notebooks or Risk command."
+    },
+    "action:shell.pivt-shortcuts": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_shell_launchers_enterprise.py::test_v2036_pivt_shortcuts_and_summon_button"
+      ],
+      "launchers": [
+        "shortcut:components/layout/pivt-shortcut.ts:mod+."
+      ],
+      "edition": "enterprise",
+      "note": "NAN-5864: Cmd/Ctrl+. (open/close), Cmd/Ctrl+Shift+. (dock/float), the pivt button in both top bars."
+    },
+    "action:shell.pivt-commands": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_shell_launchers_enterprise.py::test_v2036_pivt_at_command_list"
+      ],
+      "launchers": [
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@search",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@pivot",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@detection",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@case",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@entity",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@enrich",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@summarize",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@pin",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@handoff",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@evidence",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@runbook",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@note",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@tune",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@dashboard",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@playbook",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@flow",
+        "menuitem:enterprise/components/pivt/commands/registry.ts:@pipe"
+      ],
+      "edition": "enterprise"
+    },
+    "action:shell.approvals-button": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_shell_launchers_enterprise.py::test_v2036_approvals_button_opens_and_closes_the_flyout"
+      ],
+      "edition": "enterprise"
+    },
+    "action:shell.enterprise-banners": {
+      "tests": [
+        "tests/enterprise/ui/test_v2036_shell_launchers_enterprise.py::test_v2036_update_and_license_banners"
+      ],
+      "launchers": [
+        "banner:components/UpdateAvailableBanner.tsx:UpdateAvailableBanner",
+        "banner:components/LicenseBanner.tsx:LicenseBanner"
+      ],
+      "edition": "enterprise"
     }
   }
 }

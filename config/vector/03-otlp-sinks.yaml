@@ -1,0 +1,150 @@
+# NAN-5899: Vector sinks whose numeric settings come from the environment.
+#
+# YAML, not TOML, so one file loads in BOTH Vector 0.61 and Vector 0.62:
+#   * Vector 0.61 (2.0.35 and older) substitutes `${VAR:-default}` in the raw
+#     text, then parses: `max_size: ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}`
+#     becomes `max_size: 268435488`, an integer.
+#   * Vector 0.62 (vectordotdev/vector#26475) parses first, then substitutes
+#     inside string values and coerces them to the field's type: the plain YAML
+#     scalar `${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}` is a string, becomes
+#     "268435488" and is coerced to the integer.
+# In TOML no spelling works in both: the bare form is a TOML parse error on
+# 0.62, the quoted form (NAN-5810) a string 0.61 rejects. An upgrade puts these
+# files into config/vector while the old Vector still runs, and that Vector
+# closes its ingest gate by reloading them (config/vector/.nano/ingest-gate.sh);
+# when it cannot parse them, its ports stay open and the drain never finishes.
+# So keep every numeric env placeholder of the static bundle in YAML, BARE
+# (never quoted: a quoted value stays a string on 0.61), and never one in the
+# static TOML files (scripts/tests/test_vector_static_config_dual_version.py).
+
+# The OTLP lane's sinks; its source and transforms: 03-otlp-source.toml.
+# =============================================================================
+# ClickHouse Sink — spans raw (ENGINE=Null; MV derives otel_spans)
+# COPIED from the `clickhouse_logs` sink (sources/parsers/_pipeline.toml):
+# basic auth, gzip, disk buffer, batch, fixed concurrency. Table is
+# env-overridable.
+# O3/NAN-5004: source acknowledgements resolve after the blocking disk buffer
+# accepts the event, not after a ClickHouse insert or the 10-second batch timer.
+# A saturated buffer cannot be reported as success.
+# O24: batch idempotency (dedup of a batch re-POSTed after a client-side request
+# timeout) is NOT achievable from the Vector clickhouse sink — it exposes no
+# per-batch, content-derived insert_deduplication_token, and the staging tables
+# are ENGINE=Null so block-hash dedup can't apply. The durable fix is a
+# ReplacingMergeTree keyed (trace_id, span_id, start_time) for spans /
+# (metric identity, timeUnixNano) for metrics in clickhouse/138 & 140 — tracked
+# outside this file (see O24 in OBSERVABILITY_AUDIT_FINDINGS.md).
+# =============================================================================
+# NAN-5203: this sink has one endpoint. On more than one ClickHouse shard the
+# deployment (compose renderer, Helm) sets CLICKHOUSE_OTEL_SPANS_TABLE /
+# CLICKHOUSE_OTEL_METRICS_TABLE to the write-only `*_raw_distributed` wrappers,
+# which split each batch by a content key (trace id / event) and commit on the
+# target shard before acknowledging. A direct `*_raw` write on a cluster would
+# keep every row on whichever node received the batch.
+sinks:
+  clickhouse_otel_spans:
+    type: clickhouse
+    inputs: [otlp_traces_prep]
+
+    endpoint: "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+    database: "${CLICKHOUSE_DATABASE:-nanosiem}"
+    table: "${CLICKHOUSE_OTEL_SPANS_TABLE:-otel_spans_raw}"
+
+    auth:
+      strategy: basic
+      user: "${CLICKHOUSE_USER:-nanosiem}"
+      password: "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+    compression: gzip
+    date_time_best_effort: true
+    skip_unknown_fields: true
+
+    # NAN-1728 (C4/W10): async-insert block dedup for the raw span lane.
+    # `deduplicate = true` emits `async_insert_deduplicate=1` so an identical batch
+    # re-POSTed after an HTTP timeout is dropped at the async-insert layer instead of
+    # duplicating (otel_spans_raw is ENGINE=Null → MV → otel_spans). Its MV-cascade
+    # companion `deduplicate_blocks_in_dependent_materialized_views=1` is set in the
+    # server-side ingestion profile (query_limits.xml) — Vector's clickhouse sink
+    # cannot express it (query_settings exposes only async_insert_settings, and
+    # endpoint query params corrupt the sink's own generated query string). These
+    # reduce but do not eliminate dupes on cross-shard retries — the raw Null lane
+    # has no content-hash wrapper to re-pin a retry to the origin shard, so this lane
+    # is at-least-once by construction (O24). Harmless on single-shard.
+    query_settings:
+      async_insert_settings:
+        deduplicate: true
+
+    buffer:
+      type: disk
+      max_size: ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+      # NAN-5004: source success means this durable spool accepted the record. Block
+      # at capacity instead of finalizing Dropped (which Vector folds into Delivered).
+      when_full: block
+
+    # The source waits for the disk-buffer write, not ClickHouse or the batch timer.
+    acknowledgements:
+      enabled: false
+
+    batch:
+      max_bytes: ${VECTOR_BATCH_MAX_BYTES:-52428800}
+      max_events: ${VECTOR_BATCH_MAX_EVENTS:-50000}
+      timeout_secs: ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+
+    request:
+      concurrency: ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+      timeout_secs: 120
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 300
+
+  # =============================================================================
+  # ClickHouse Sink — metrics raw (ENGINE=Null; MV derives otel_metrics)
+  # O3/NAN-5004: disk-buffer handoff (see the spans sink note above); the buffer
+  # blocks rather than silently shedding. O24: same insert_deduplication_token
+  # limitation — the durable dedup fix is a ReplacingMergeTree in clickhouse/140.
+  # =============================================================================
+  clickhouse_otel_metrics:
+    type: clickhouse
+    inputs: [otlp_metrics_prep]
+
+    endpoint: "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+    database: "${CLICKHOUSE_DATABASE:-nanosiem}"
+    table: "${CLICKHOUSE_OTEL_METRICS_TABLE:-otel_metrics_raw}"
+
+    auth:
+      strategy: basic
+      user: "${CLICKHOUSE_USER:-nanosiem}"
+      password: "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+    compression: gzip
+    date_time_best_effort: true
+    skip_unknown_fields: true
+
+    # NAN-1728 (C4/W10): async-insert block dedup for the raw metrics lane — see the
+    # clickhouse_otel_spans sink note above. `deduplicate = true` emits
+    # `async_insert_deduplicate=1` (otel_metrics_raw is ENGINE=Null → MV →
+    # otel_metrics); the MV-cascade companion setting lives server-side in
+    # query_limits.xml. Reduces (not eliminates) cross-shard-retry dupes; harmless
+    # on single-shard.
+    query_settings:
+      async_insert_settings:
+        deduplicate: true
+
+    buffer:
+      type: disk
+      max_size: ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+      # NAN-5004: see the spans sink buffer note above.
+      when_full: block
+
+    # The source waits for the disk-buffer write, not ClickHouse or the batch timer.
+    acknowledgements:
+      enabled: false
+
+    batch:
+      max_bytes: ${VECTOR_BATCH_MAX_BYTES:-52428800}
+      max_events: ${VECTOR_BATCH_MAX_EVENTS:-50000}
+      timeout_secs: ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+
+    request:
+      concurrency: ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+      timeout_secs: 120
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 300

@@ -145,7 +145,7 @@ skip_unknown_fields = true
 
 [sinks.clickhouse_ip_enrichments.buffer]
 type = "disk"
-max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+max_size = "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}"
 when_full = "block"
 
 [sinks.clickhouse_ip_enrichments.acknowledgements]
@@ -156,7 +156,7 @@ max_events = 1000
 timeout_secs = 5
 
 [sinks.clickhouse_ip_enrichments.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+concurrency = "${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}"
 timeout_secs = 60
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 60
@@ -181,7 +181,7 @@ skip_unknown_fields = true
 
 [sinks.clickhouse_user_registry.buffer]
 type = "disk"
-max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+max_size = "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}"
 when_full = "block"
 
 [sinks.clickhouse_user_registry.acknowledgements]
@@ -192,7 +192,7 @@ max_events = 1000
 timeout_secs = 5
 
 [sinks.clickhouse_user_registry.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+concurrency = "${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}"
 timeout_secs = 60
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 60
@@ -231,7 +231,7 @@ skip_unknown_fields = true
 
 [sinks.enrichment_dead_letter.buffer]
 type = "disk"
-max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+max_size = "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}"
 when_full = "block"
 
 [sinks.enrichment_dead_letter.acknowledgements]
@@ -242,7 +242,7 @@ max_events = 1000
 timeout_secs = 5
 
 [sinks.enrichment_dead_letter.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+concurrency = "${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}"
 timeout_secs = 60
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 60

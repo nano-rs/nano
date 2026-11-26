@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use nanosiem_core::log_sources::feed_lane_setup::hec_source_claims as hec_parser_claims;
 
 #[test]
 fn readiness_matches_hec_transport_and_claimed_lane() {
@@ -79,4 +80,40 @@ fn identity_feed_mutations_need_enrichments_configure() {
     assert!(ensure_identity_permission(&ops, "okta_system_log").is_ok(), "a collector needs no enrichment permission");
     let admin = key_with(&["log_sources:edit", permissions::ENRICHMENTS_CONFIGURE]);
     assert!(ensure_identity_permission(&admin, "okta_users").is_ok());
+}
+
+/// NAN-5903: a start refused for lanes with no log source is structured, so
+/// Pull feeds can answer it with Fix setup: code LOG_SOURCES_MISSING, the
+/// lanes in `details.missing_lanes`, plain English in the message.
+#[test]
+fn missing_log_sources_refusal_is_structured() {
+    let spec = first_party::get("google_workspace").unwrap();
+    let err = log_sources_missing(spec, &["gws_admin".to_string(), "gws_saml".to_string()]);
+    assert_eq!(err.code(), LOG_SOURCES_MISSING);
+    match err {
+        ApiError::BadRequestWithDetails { message, details, .. } => {
+            assert!(message.starts_with("Some log sources this feed needs are missing"), "{message}");
+            assert!(message.contains("`gws_admin`, `gws_saml`") && message.contains("Fix setup"), "{message}");
+            assert!(!message.contains('\u{2014}'));
+            assert_eq!(details["missing_lanes"], serde_json::json!(["gws_admin", "gws_saml"]));
+            assert_eq!(details["connector"], "google_workspace");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Resume and adopt take the consent flag; it defaults off.
+#[test]
+fn resume_and_adopt_take_the_setup_consent() {
+    let r: SetConnectorFeedEnabled = serde_json::from_value(serde_json::json!({"enabled": true})).unwrap();
+    assert!(!r.set_up_log_sources);
+    let r: SetConnectorFeedEnabled =
+        serde_json::from_value(serde_json::json!({"enabled": true, "set_up_log_sources": true})).unwrap();
+    assert!(r.set_up_log_sources);
+    assert!(!AdoptConnectorFeedSpec::default().set_up_log_sources);
+    let a: AdoptConnectorFeedSpec = serde_json::from_value(serde_json::json!({"set_up_log_sources": true})).unwrap();
+    assert!(a.set_up_log_sources);
+    let c: CreateConnectorFeed =
+        serde_json::from_value(serde_json::json!({"name": "f", "connector": "okta_system_log"})).unwrap();
+    assert!(!c.set_up_log_sources, "consent is never implied");
 }

@@ -465,6 +465,16 @@ export function Search() {
   useEffect(() => { searchResultsRef.current = searchResults; }, [searchResults]);
   const [searchError, setSearchError] = useState<ApiError | null>(null);
   const [isCorrectingQuery, setIsCorrectingQuery] = useState(false);
+  // NAN-5877: the server answered AI_NOT_CONFIGURED. Stop asking for AI
+  // fixes / reviews this session and say why, instead of logging an error.
+  const [aiNotConfigured, setAiNotConfigured] = useState(false);
+  const aiNotConfiguredRef = useRef(false);
+  const noteAiNotConfigured = useCallback((err: unknown): boolean => {
+    if ((err as { code?: unknown } | null)?.code !== 'AI_NOT_CONFIGURED') return false;
+    aiNotConfiguredRef.current = true;
+    setAiNotConfigured(true);
+    return true;
+  }, []);
   const [isReviewingQuery, setIsReviewingQuery] = useState(false);
   const [queryReviewSuggestions, setQueryReviewSuggestions] = useState<import('@/lib/api/types').ReviewQuerySuggestion[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -818,6 +828,7 @@ export function Search() {
     if (!correctableCodes.includes(errorCode)) return;
     // Don't correct empty queries or permission errors
     if (!failedQuery?.trim()) return;
+    if (aiNotConfiguredRef.current) return;
 
     setIsCorrectingQuery(true);
     api.correctQuery({
@@ -848,11 +859,12 @@ export function Search() {
         });
       }
     }).catch((err) => {
+      if (noteAiNotConfigured(err)) return;
       console.error('[QueryCorrection] Failed:', err);
     }).finally(() => {
       setIsCorrectingQuery(false);
     });
-  }, []);
+  }, [noteAiNotConfigured]);
 
   // Request AI best practices review after a successful complex query
   const requestQueryReview = useCallback((successfulQuery: string) => {
@@ -862,6 +874,7 @@ export function Search() {
     // Count pipes to determine complexity — skip simple queries
     const pipeCount = successfulQuery.split('|').length - 1;
     if (pipeCount < 2) return;
+    if (aiNotConfiguredRef.current) return;
 
     setIsReviewingQuery(true);
     setQueryReviewSuggestions([]);
@@ -872,12 +885,13 @@ export function Search() {
         }
       })
       .catch((err: unknown) => {
+        if (noteAiNotConfigured(err)) return;
         console.error('[QueryReview] Failed:', err);
       })
       .finally(() => {
         setIsReviewingQuery(false);
       });
-  }, [queryMode]);
+  }, [queryMode, noteAiNotConfigured]);
 
   // Detect if query looks like natural language (for AI suggestion pill)
   // Strategy: detect structured queries (finite syntax) and treat everything else as natural language
@@ -5043,6 +5057,11 @@ export function Search() {
                         <div className="flex items-center gap-1.5 mt-2 text-xs text-muted-foreground">
                           <LoadingIcon className="w-3 h-3 text-violet-400" />
                           AI analyzing query...
+                        </div>
+                      )}
+                      {aiNotConfigured && !isCorrectingQuery && (
+                        <div className="mt-2 text-xs text-muted-foreground" data-testid="search-ai-not-configured">
+                          AI fix suggestions are off because AI isn't set up. An admin can turn it on in Settings → AI.
                         </div>
                       )}
                     </>

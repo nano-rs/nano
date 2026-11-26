@@ -75,6 +75,12 @@ pub enum SearchError {
     /// to work.
     #[error("Search backend unavailable: {0}")]
     Unavailable(String),
+    /// NAN-5886: the ClickHouse connection failed for a reason a retry will
+    /// not fix: TLS / certificate, or a non-transport IO error (permission,
+    /// invalid data). A configuration fault, reported at once; never treated
+    /// as a transient outage.
+    #[error("Search backend connection rejected: {0}")]
+    ConnectionRejected(String),
     /// NAN-5612: the caller's scope does not allow what the query reads
     /// (today: `dataset=signals` without `detections:view`). A 403.
     #[error("{0}")]
@@ -120,6 +126,12 @@ pub fn classify_clickhouse_failure(error: &(dyn std::error::Error + 'static)) ->
     while let Some(e) = current {
         if let Some(ch) = e.downcast_ref::<clickhouse::error::Error>() {
             return match ch {
+                clickhouse::error::Error::Network(_)
+                    if crate::transient_outage::connect_failure(e)
+                        == crate::transient_outage::ConnectFailure::Rejected =>
+                {
+                    SearchError::ConnectionRejected(crate::db::pg_text::pg_safe_error_text(&ch.to_string()))
+                }
                 clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => {
                     SearchError::Unavailable(crate::db::pg_text::pg_safe_error_text(&ch.to_string()))
                 }
@@ -128,7 +140,12 @@ pub fn classify_clickhouse_failure(error: &(dyn std::error::Error + 'static)) ->
             };
         }
         if e.downcast_ref::<std::io::Error>().is_some() {
-            return SearchError::Unavailable(crate::db::pg_text::pg_safe_error_text(&error.to_string()));
+            let text = crate::db::pg_text::pg_safe_error_text(&error.to_string());
+            // NAN-5886: TLS or a non-transport IO kind is not an outage.
+            return match crate::transient_outage::connect_failure(e) {
+                crate::transient_outage::ConnectFailure::Rejected => SearchError::ConnectionRejected(text),
+                crate::transient_outage::ConnectFailure::Transient => SearchError::Unavailable(text),
+            };
         }
         current = e.source();
     }
@@ -555,6 +572,7 @@ impl SearchError {
             SearchError::SqlGenError(msg) => !sql_gen_message_is_user_error(msg),
             SearchError::DatabaseError(_)
             | SearchError::Unavailable(_)
+            | SearchError::ConnectionRejected(_)
             | SearchError::PrevalenceError(_)
             | SearchError::Timeout(_) => true,
             SearchError::ParseError(_)
@@ -619,7 +637,7 @@ pub fn client_error_message(error: &SearchError) -> String {
         | SearchError::ResourceLimit(_)
         | SearchError::DataError { .. }
         | SearchError::Forbidden(_) => error.to_string(),
-        SearchError::DatabaseError(_) | SearchError::Unavailable(_) => {
+        SearchError::DatabaseError(_) | SearchError::Unavailable(_) | SearchError::ConnectionRejected(_) => {
             "A database error occurred".to_string()
         }
         SearchError::PrevalenceError(_) => "An internal error occurred".to_string(),

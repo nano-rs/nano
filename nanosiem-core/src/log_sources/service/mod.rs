@@ -135,6 +135,10 @@ pub struct LogSourceService {
     /// NAN-5678: concurrent deletes share one render and one Vector reload
     /// (`crud.rs::delete_many`). Shared by every clone of the service.
     delete_batcher: Arc<crate::log_sources::change_batch::ChangeBatcher<uuid::Uuid, Result<crud::DeletedLogSource, crud::BatchFailure>>>,
+    /// NAN-5889: passing verdicts of [`Self::validate_vrl`], shared by every
+    /// clone of the service, so a publish does not compile the same parser
+    /// again after its save or its OCSF gate did.
+    valid_vrl_memo: Arc<validation::ValidVrlMemo>,
 }
 
 impl LogSourceService {
@@ -163,6 +167,7 @@ impl LogSourceService {
             vector_config,
             vrl_validator: Arc::new(VrlValidator::new()),
             delete_batcher: Arc::new(crate::log_sources::change_batch::ChangeBatcher::new(DELETE_BATCH_WINDOW)),
+            valid_vrl_memo: Arc::new(validation::ValidVrlMemo::new(validation::VALID_VRL_MEMO_CAPACITY)),
         }
     }
 

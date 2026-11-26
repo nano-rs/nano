@@ -18,6 +18,8 @@ use super::*;
 
 const PAGE_CACHE: &str = "acknowledgement_durability = \"page_cache\"";
 const METRICS: &str = include_str!("../../../../../config/vector/92-metrics.toml");
+// NAN-5899: the memory-buffered `clickhouse_internal_logs` sink lives here.
+const METRICS_SINKS: &str = include_str!("../../../../../config/vector/92-metrics-sinks.yaml");
 
 fn endpoints(shards: usize) -> Vec<String> {
     (0..shards)
@@ -144,6 +146,14 @@ fn page_cache_renders_on_every_disk_buffer() {
 #[test]
 fn memory_buffers_never_carry_the_durability_setting() {
     assert!(!METRICS.contains("acknowledgement_durability"));
+    assert!(!METRICS_SINKS.contains("acknowledgement_durability"));
+    let sinks: toml::Value = serde_yaml::from_str(&crate::vector_env::substitute_like_vector(METRICS_SINKS))
+        .expect("92-metrics-sinks.yaml parses");
+    assert_eq!(
+        sinks["sinks"]["clickhouse_internal_logs"]["buffer"]["type"].as_str(),
+        Some("memory"),
+        "the collector error channel keeps its memory buffer"
+    );
     for (label, raw) in with_mode("page_cache", rendered) {
         for (sink, buffer) in buffers(&raw) {
             if buffer.get("type").and_then(toml::Value::as_str) == Some("memory") {

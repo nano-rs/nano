@@ -103,7 +103,10 @@ export function RecentChangesDrawer({ open, onClose }: RecentChangesDrawerProps)
           <span className="text-[12px] font-medium text-foreground">Recent configuration changes</span>
           <span className="ml-auto text-[10.5px] text-muted-foreground">last 50</span>
           <button
+            type="button"
             onClick={onClose}
+            aria-label="Close"
+            title="Close"
             className="ml-1 w-5 h-5 rounded flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/5"
           >
             <X className="w-[12px] h-[12px]" />

@@ -1,6 +1,6 @@
 """The Hunts rail group exists only where hunts do (v2.0.35, NAN-5844).
 
-Hunts is a rail group (Hunts, Findings, Escalations, Campaigns, Knowledge;
+Hunts is a rail group (Hunts, Findings, Escalations, Actors, Knowledge;
 NAN-5850 replaced "Hunt settings" with Knowledge) gated on the enterprise `hunts` capability and `hunts:view`. As the
 install admin (every permission, so only the capability decides):
 
@@ -23,7 +23,7 @@ from nano_e2e.waits import eventually
 
 RAIL_HUNT_LINKS = {"css": '[data-testid="app-rail"] a[href^="/hunts"]', "visible": False}
 TOGGLES = {"css": '[data-testid="app-rail"] nav button:has(svg.lucide-chevron-down)'}
-HUNTS = ["/hunts", "/hunts/leads", "/hunts/escalations", "/hunts/campaigns", "/hunts/knowledge"]
+HUNTS = ["/hunts", "/hunts/leads", "/hunts/escalations", "/hunts/actors", "/hunts/knowledge"]
 # NAN-5850: hunt surfaces that moved out of the Hunts group.
 MOVED_LINKS = {"css": '[data-testid="app-rail"] a[href="/rules/ideas"], [data-testid="settings-rail"] a[href^="/settings/hunts"]', "visible": False}
 

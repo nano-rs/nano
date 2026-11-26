@@ -169,6 +169,42 @@ async fn tree_contents(
     Some(out)
 }
 
+/// NAN-5810: rewrite every `*.toml` under `root` with
+/// [`crate::vector_env::quote_bare_placeholders`], so a tree rendered for
+/// Vector 0.61 or older loads on 0.62. Files that need nothing are not
+/// rewritten; a rewritten one keeps its permissions (it is replaced in place).
+async fn quote_bare_placeholders_in_tree(root: &Path) -> Result<(), VectorConfigError> {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let mut entries = fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let kind = entry.file_type().await?;
+            if kind.is_dir() && depth < 8 {
+                stack.push((path, depth + 1));
+                continue;
+            }
+            if !kind.is_file() || path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path).await else {
+                // Not UTF-8: not a file nano rendered; restore it as it was.
+                continue;
+            };
+            let quoted = crate::vector_env::quote_bare_placeholders(&content);
+            if quoted != content {
+                fs::write(&path, quoted.as_bytes()).await?;
+                fsync_file(&path).await;
+                tracing::info!(
+                    "Quoted bare env placeholders in restored {} for Vector 0.62 (NAN-5810)",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 impl VectorConfigManager {
     /// Snapshot the active configuration as the rollback target.
     ///
@@ -378,6 +414,13 @@ impl VectorConfigManager {
             let _ = fs::remove_dir_all(&staging).await;
             return Err(e);
         }
+        // NAN-5810: a snapshot an older release rendered has bare numeric
+        // placeholders (`max_bytes = ${...}`), which Vector 0.62 refuses to
+        // parse. Quote them in the workspace, before anything is published.
+        if let Err(e) = quote_bare_placeholders_in_tree(&staging).await {
+            let _ = fs::remove_dir_all(&staging).await;
+            return Err(e);
+        }
 
         let published = self.publish_restored_tree(&staging).await;
         // Best-effort: a stranded workspace is inert (dot-prefixed, outside
@@ -563,12 +606,14 @@ const KNOWN_EXTERNAL_CONFIGS: &[(&str, &str)] = &[(
     include_str!("../../../../config/vector/04-enrichment-source.toml"),
 )];
 
-/// Vector substitutes `${VAR:-default}` before it parses the TOML, so the raw
-/// files on disk are NOT valid TOML and must be substituted first.
+/// Substitute `${VAR:-default}` the way Vector does before the coherence gate
+/// parses a tree.
 ///
-/// This is not a nicety. `_pipeline.toml` contains
+/// This is not a nicety. A tree an older release rendered contains
 /// `max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}` — an unquoted
-/// interpolation, which `toml::from_str` rejects. Before NAN-2302 the gate
+/// interpolation, which `toml::from_str` rejects (NAN-5810: the current render
+/// quotes it for Vector 0.62, and substitution leaves a string there, which
+/// the gate does not read). Before NAN-2302 the gate
 /// therefore silently skipped `_pipeline.toml` on every real deployment, which
 /// is also why it could not be widened into a graph check: without
 /// `_pipeline.toml`'s declarations, `prepare_output` and friends look dangling.

@@ -11,6 +11,8 @@ mod constructors;
 mod credential_keys;
 mod lifecycle;
 #[cfg(feature = "enterprise")]
+mod license_workers;
+#[cfg(feature = "enterprise")]
 mod melod;
 pub(crate) mod schedulers;
 mod vector_config;

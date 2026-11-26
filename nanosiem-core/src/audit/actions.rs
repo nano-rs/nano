@@ -737,8 +737,26 @@ pub const SSO_GROUP_GRANTS_SYNCHRONIZED: &str = "sso_group_grants_synchronized";
 
 /// An administrator switched Agent Lane on (agentlane tokens may connect)
 pub const AGENTLANE_ENABLED: &str = "agentlane_enabled";
-/// An administrator switched Agent Lane off (every agentlane ClickHouse user dropped)
+/// An administrator switched Agent Lane off (every agentlane ClickHouse user
+/// dropped; NAN-5880: details carry `closed_connections`, the open agent
+/// connections the gates dropped)
 pub const AGENTLANE_DISABLED: &str = "agentlane_disabled";
+/// NAN-5880: an administrator changed the Agent Lane network settings
+/// (allowed networks, connect address, limits, trusted proxies). Details
+/// carry the before/after diff.
+pub const AGENTLANE_NETWORK_UPDATED: &str = "agentlane_network_updated";
+/// NAN-5880: nano copied the pre-v2.0.36 Agent Lane install settings
+/// (`NANO_AGENTLANE_ALLOW_CIDRS` / `_PUBLIC_URL`) into its database, once.
+pub const AGENTLANE_NETWORK_IMPORTED: &str = "agentlane_network_imported";
+/// NAN-5880: an administrator chose the Agent Lane certificate (mode,
+/// old/new fingerprint, not_after; never the key or the PEM).
+pub const AGENTLANE_CERTIFICATE_UPDATED: &str = "agentlane_certificate_updated";
+/// NAN-5880: an administrator started an Agent Lane connection test.
+pub const AGENTLANE_CONNECTION_TEST: &str = "agentlane_connection_test";
+/// NAN-5880: an Agent Lane gate reported a problem (or recovered from one):
+/// invalid config or certificate, config expired, ClickHouse unreachable.
+/// System actor; one event per transition.
+pub const AGENTLANE_GATE_PROBLEM: &str = "agentlane_gate_problem";
 /// An agentlane token (and its ClickHouse user) was created
 pub const AGENTLANE_TOKEN_CREATED: &str = "agentlane_token_created";
 /// An agentlane token was revoked (its ClickHouse user dropped, queries killed)
@@ -1293,6 +1311,12 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     AGENTLANE_TOKEN_CREATED,
     AGENTLANE_TOKEN_REVOKED,
     AGENTLANE_TOKEN_EXPIRED,
+    // NAN-5880: who may reach Agent Lane from where, and with which
+    // certificate. Admin-gated (settings:system + administrator authority),
+    // optimistic-revision guarded; the import happens once per install.
+    AGENTLANE_NETWORK_UPDATED,
+    AGENTLANE_NETWORK_IMPORTED,
+    AGENTLANE_CERTIFICATE_UPDATED,
     // SCIM provisioning (NAN-5274) — IdP-pushed account and access changes,
     // plus the token that authorizes them. Authenticated, low-volume (the
     // floodable `scim_request_denied` is deliberately excluded).
@@ -1436,6 +1460,10 @@ mod durable_classifier_tests {
             "agentlane_token_created",
             "agentlane_token_revoked",
             "agentlane_token_expired",
+            // NAN-5880: Agent Lane network, import and certificate.
+            "agentlane_network_updated",
+            "agentlane_network_imported",
+            "agentlane_certificate_updated",
             // bb506d7c5 (#9259): SCIM provisioning. Token-authenticated, rate
             // limited per provider; the floodable scim_request_denied stays out.
             "scim_token_issued",

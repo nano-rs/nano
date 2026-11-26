@@ -25,6 +25,7 @@ describe('Hunting settings section', () => {
     expect(hunting.children?.map((c) => [c.label, c.href])).toEqual([
       ['Runners', '/settings/hunts'],
       ['Charter & defaults', '/settings/hunts/charter'],
+      ['Actors', '/settings/hunts/actors'],
     ]);
   });
 
@@ -37,6 +38,7 @@ describe('Hunting settings section', () => {
   test.each([
     ['/settings/hunts', 'hunting-runners'],
     ['/settings/hunts/charter', 'hunting-charter'],
+    ['/settings/hunts/actors', 'hunting-actors'],
   ])('%s lights %s under Hunting', (path, id) => {
     expect(resolveActiveSection(path)).toEqual({ sectionId: id, parentId: 'hunting' });
   });

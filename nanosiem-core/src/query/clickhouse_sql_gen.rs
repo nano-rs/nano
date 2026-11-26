@@ -39,6 +39,7 @@ pub(crate) mod identity;
 pub mod otel;
 pub(crate) mod search_expr;
 mod upstream_arrays;
+pub(crate) mod json_text;
 
 /// The `ioc in <feed>("…")` indicator subquery (version-collapsed, committed
 /// rows only). Public so the real-ClickHouse suites execute the production SQL.
@@ -1438,6 +1439,15 @@ pub struct ClickHouseSqlGenerator {
     /// renamed name (see `upstream_arrays`). Same scope rules as
     /// `upstream_computed_fields`.
     upstream_arrays: RwLock<upstream_arrays::UpstreamArrays>,
+    /// NAN-5895: stage columns holding an untyped JSON path's text under a
+    /// projected, renamed or copied name (see `json_text`). Same scope rules
+    /// as `upstream_computed_fields`.
+    upstream_json_text: RwLock<HashSet<String>>,
+    /// NAN-5895: the JSON-text columns the last generated subsearch ended
+    /// with, and the scope after the `join`/`append` just generated (same
+    /// hand-off as `subsearch_arrays` / `pending_subsearch_arrays`).
+    subsearch_json_text: RwLock<HashSet<String>>,
+    pending_subsearch_json_text: RwLock<Option<HashSet<String>>>,
     /// NAN-5350: the arrays the last generated subsearch ended with, for the
     /// `join`/`append` embedding it (taken by `record_join_arrays` /
     /// `record_append_arrays`).
@@ -1574,6 +1584,9 @@ impl Clone for ClickHouseSqlGenerator {
             upstream_mvexpanded: RwLock::new(HashSet::new()),
             upstream_eval_arrays: RwLock::new(HashSet::new()),
             upstream_arrays: RwLock::new(Default::default()),
+            upstream_json_text: RwLock::new(HashSet::new()),
+            subsearch_json_text: RwLock::new(HashSet::new()),
+            pending_subsearch_json_text: RwLock::new(None),
             subsearch_arrays: RwLock::new(Default::default()),
             pending_subsearch_arrays: RwLock::new(None),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
@@ -1696,6 +1709,9 @@ impl ClickHouseSqlGenerator {
             upstream_mvexpanded: RwLock::new(HashSet::new()),
             upstream_eval_arrays: RwLock::new(HashSet::new()),
             upstream_arrays: RwLock::new(Default::default()),
+            upstream_json_text: RwLock::new(HashSet::new()),
+            subsearch_json_text: RwLock::new(HashSet::new()),
+            pending_subsearch_json_text: RwLock::new(None),
             subsearch_arrays: RwLock::new(Default::default()),
             pending_subsearch_arrays: RwLock::new(None),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
@@ -2756,6 +2772,7 @@ impl ClickHouseSqlGenerator {
         }
         // NAN-5350: typed against the scope BEFORE this command's outputs.
         let arrays = self.upstream_arrays_after(cmd, &added);
+        let json_text = self.upstream_json_text_after(cmd, &added);
         {
             let mut guard = self
                 .upstream_string_fields
@@ -2786,6 +2803,7 @@ impl ClickHouseSqlGenerator {
         }
         self.swap_upstream_time_alias(time_alias);
         self.swap_upstream_arrays(arrays);
+        self.swap_upstream_json_text(json_text);
     }
 
     /// Whether `cmd` rewrites the `timestamp` column WITHOUT registering it in
@@ -3193,6 +3211,7 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_mvexpanded(HashSet::new());
         self.swap_upstream_eval_arrays(HashSet::new());
         self.swap_upstream_arrays(Default::default());
+        self.swap_upstream_json_text(HashSet::new());
         self.reset_subsearch_array_slots();
 
         let result = self.generate_query(query, &mut ctx);
@@ -3219,6 +3238,7 @@ impl ClickHouseSqlGenerator {
         self.swap_stage_tail_aliases(Default::default());
         self.swap_upstream_time_alias(None);
         self.swap_upstream_arrays(Default::default());
+        self.swap_upstream_json_text(HashSet::new());
         self.reset_subsearch_array_slots();
         result
     }
@@ -4058,6 +4078,7 @@ impl ClickHouseSqlGenerator {
                     format!("({})", trimmed)
                 };
                 self.record_append_arrays(Some((&union_cols, &main_cols, &sub_cols)));
+                self.record_append_json_text(Some((&union_cols, &main_cols, &sub_cols)));
                 Ok(format!(
                     "  SELECT {} FROM {}\n  UNION ALL\n  SELECT {} FROM {} AS _append_sub",
                     project(&main_cols),
@@ -4072,6 +4093,7 @@ impl ClickHouseSqlGenerator {
                 // Both sides are passthroughs over the same base select clause
                 // (plus identical eval/rename extras) — positionally aligned.
                 self.record_append_arrays(None);
+                self.record_append_json_text(None);
                 Ok(format!(
                     "  SELECT * FROM {}\n  UNION ALL\n{}",
                     source_cte, subsearch_sql
@@ -4385,6 +4407,29 @@ impl ClickHouseSqlGenerator {
         escape_identifier(normalized)
     }
 
+    /// NAN-5896: whether a join key, as `join_key_column` resolves it on one
+    /// side, may read a JSON path of the event (an OCSF `unmapped.*` key, a
+    /// typed JSON attribute): a `Dynamic` subcolumn, which ClickHouse refuses
+    /// as a join key (Code 44). Only a projection (`table`, `fields`, `stats`,
+    /// …) proves the key is a concrete column; a shape the pipeline does not
+    /// model (`fields -`, `rex`, `fillnull`, `bin`, `eventstats`, … keep the
+    /// event row) fails safe toward the text cast, which is a no-op on a
+    /// String.
+    fn join_key_reads_json_path(resolver: &ClickHouseSqlGenerator, field: &str, shape: &OutputShape) -> bool {
+        let normalized = resolver.canonicalize_field(field);
+        match shape {
+            OutputShape::Columns(_) => return false,
+            OutputShape::Wide(extra) | OutputShape::WideJoined(extra) if extra.iter().any(|c| c == normalized) => {
+                return false;
+            }
+            _ => {}
+        }
+        resolver.class_split_column(normalized).is_none()
+            && !resolver.resolves_to_column(normalized)
+            && !resolver.profile.is_array_field(normalized)
+            && matches!(resolver.profile.resolve(normalized), FieldResolution::JsonPath { .. })
+    }
+
     /// Generate SQL for a JOIN command
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
@@ -4495,6 +4540,25 @@ impl ClickHouseSqlGenerator {
             .iter()
             .map(|f| self.join_key_column(sub_gen, f, &sub_shape_for_keys))
             .collect();
+        // NAN-5896: a key that reads a JSON path on EITHER side is a
+        // `Dynamic` value, which ClickHouse cannot join on (Code 44). Compare
+        // such a key as text on both sides, `toString(main.k) = toString(sub.k)`,
+        // the same text a stage column of that path holds (`table`, `stats
+        // by`). So the JSON number 5 and the JSON string "5" match, and 5 and
+        // "5.0" do not (their texts differ). A row without the key reads as
+        // '' (toString of an absent Dynamic is not NULL): `sub_key_filter`
+        // evicts '' from the subsearch and the narrowing set skips it, so it
+        // never matches. Other keys are byte-identical.
+        let text_keys: Vec<bool> = fields
+            .iter()
+            .map(|f| {
+                Self::join_key_reads_json_path(self, f, &main_shape)
+                    || Self::join_key_reads_json_path(sub_gen, f, &sub_shape_for_keys)
+            })
+            .collect();
+        let as_text = |i: usize, key: String| if text_keys[i] { format!("toString({key})") } else { key };
+        let main_key_exprs: Vec<String> = main_keys.iter().enumerate().map(|(i, k)| as_text(i, k.clone())).collect();
+        let sub_key_exprs: Vec<String> = sub_keys.iter().enumerate().map(|(i, k)| as_text(i, k.clone())).collect();
 
         // A join CHAINED after a wide-sub join needs a stage-unique subsearch
         // alias (NAN-1420). The prior join's `SELECT *` leaked its sub's
@@ -4520,7 +4584,14 @@ impl ClickHouseSqlGenerator {
         let join_conditions: Vec<String> = main_keys
             .iter()
             .zip(&sub_keys)
-            .map(|(mk, sk)| format!("main.{} = {}.{}", mk, sub_alias, sk))
+            .enumerate()
+            .map(|(i, (mk, sk))| {
+                format!(
+                    "{} = {}",
+                    as_text(i, format!("main.{mk}")),
+                    as_text(i, format!("{sub_alias}.{sk}"))
+                )
+            })
             .collect();
         let join_condition = join_conditions.join(" AND ");
 
@@ -4562,12 +4633,27 @@ impl ClickHouseSqlGenerator {
             };
             let bound = JOIN_NARROW_KEY_BOUND;
             let in_op = if self.is_clustered { "GLOBAL IN" } else { "IN" };
-            let keys = main_keys.join(", ");
+            let keys = main_key_exprs.join(", ");
+            // NAN-5896: a main row without a JSON-path key ('') can never
+            // match; keep it out of the narrowing set, or a sparse key paired
+            // with a high-cardinality one floods the set past the bound and
+            // turns the narrowing off.
+            let present: Vec<String> = main_key_exprs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| text_keys[*i])
+                .map(|(_, k)| format!("{k} != ''"))
+                .collect();
+            let key_source = if present.is_empty() {
+                key_source.to_string()
+            } else {
+                format!("{key_source} WHERE {}", present.join(" AND "))
+            };
             write!(
                 sub_key_filter,
                 " AND ({sub} {in_op} (SELECT DISTINCT {keys} FROM {key_source} LIMIT {bound}) \
                  OR (SELECT count() FROM (SELECT DISTINCT {keys} FROM {key_source} LIMIT {over})) > {bound})",
-                sub = tuple(&sub_keys),
+                sub = tuple(&sub_key_exprs),
                 over = bound + 1,
             )
             .unwrap();
@@ -4587,7 +4673,7 @@ impl ClickHouseSqlGenerator {
         // `timestamp` (an aggregated subsearch has one row per key anyway).
         // LIMIT … BY the SUB-side resolved keys (same columns the ON clause
         // compares, NAN-1413) so the per-key cap binds to the join key.
-        let key_list = sub_keys.join(", ");
+        let key_list = sub_key_exprs.join(", ");
         let sub_shape = sub_shape_for_keys;
         // NAN-1555: order the subsearch on the active dataset's time column
         // (`start_time` for spans). Logs/metrics keep `timestamp` → byte-identical.
@@ -4678,6 +4764,14 @@ impl ClickHouseSqlGenerator {
         // default hash algorithm for that shape. Logs subsearches keep CH's
         // default (hash) → byte-identical. Emitted on the JOIN CTE.
         self.record_join_arrays(sub_gen, taken_from_sub.as_deref());
+        // The main side's own columns, when the pipeline knows them: a wide
+        // subsearch column surfaces bare only where main has none of that name.
+        let main_columns: Option<Vec<String>> = match &main_shape {
+            OutputShape::Columns(cols) => Some(cols.clone()),
+            OutputShape::Wide(_) | OutputShape::WideJoined(_) => None,
+            _ => Some(Vec::new()),
+        };
+        self.record_join_json_text(sub_gen, taken_from_sub.as_deref(), main_columns.as_deref());
         let join_settings = match subsearch_dataset {
             Some(otel::Dataset::Spans) | Some(otel::Dataset::Metrics) if cross_dataset && !ctx.omit_settings => {
                 "\n  SETTINGS join_algorithm = 'partial_merge'"
@@ -4719,6 +4813,7 @@ impl ClickHouseSqlGenerator {
         let outer_mvexpanded = self.swap_upstream_mvexpanded(HashSet::new());
         let outer_eval_arrays = self.swap_upstream_eval_arrays(HashSet::new());
         let outer_arrays = self.swap_upstream_arrays(Default::default());
+        let outer_json_text = self.swap_upstream_json_text(HashSet::new());
         // NAN-4903: the base-column scope is per pipeline too — a projection
         // inside the subsearch must not mark the outer stages as projected.
         let outer_projected = self.swap_upstream_projected(false);
@@ -4735,6 +4830,8 @@ impl ClickHouseSqlGenerator {
         self.swap_upstream_mvexpanded(outer_mvexpanded);
         self.swap_upstream_eval_arrays(outer_eval_arrays);
         let sub_arrays = self.swap_upstream_arrays(outer_arrays);
+        let sub_json_text = self.swap_upstream_json_text(outer_json_text);
+        self.set_subsearch_json_text(sub_json_text);
         self.set_subsearch_arrays(sub_arrays);
         result
     }

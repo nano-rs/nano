@@ -91,9 +91,14 @@ const PAGE_ROUTES: ReadonlyArray<readonly [pattern: string, pageKey: string]> = 
   ['/hunts/rulings', 'hunt-decisions'],
   ['/hunts/runners', 'settings-hunts'],
   ['/hunts/rule-ideas', 'rule-ideas'],
-  ['/hunts/campaigns', 'hunt-campaigns'],
-  ['/hunts/campaigns/candidates', 'hunt-campaigns'],
-  ['/hunts/campaigns/:id', 'hunt-campaign'],
+  // NAN-5859: Campaigns became Actors. The old paths redirect; listed so
+  // they never read as a hunt id.
+  ['/hunts/actors', 'hunt-actors'],
+  ['/hunts/actors/review', 'hunt-actor-review'],
+  ['/hunts/actors/:id', 'hunt-actor'],
+  ['/hunts/campaigns', 'hunt-actors'],
+  ['/hunts/campaigns/candidates', 'hunt-actor-review'],
+  ['/hunts/campaigns/:id', 'hunt-actor'],
   ['/hunts/escalations', 'hunt-escalations'],
   ['/hunts/profile', 'hunt-profile'],
   ['/hunts/:id', 'hunt'],

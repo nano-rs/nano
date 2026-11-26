@@ -2,7 +2,7 @@
 
 /**
  * NAN-5844 / NAN-5850: route ownership for the Hunts rail group. The group
- * itself (Hunts, Findings, Escalations, Campaigns, Knowledge) is declared in
+ * itself (Hunts, Findings, Escalations, Actors, Knowledge) is declared in
  * AppLayout.tsx and gated on the enterprise `hunts` capability; this module
  * only knows which paths each entry owns.
  *
@@ -16,7 +16,8 @@
 const OWNED_PATHS: Record<string, readonly string[]> = {
   '/hunts/leads': ['/hunts/leads', '/hunts/rulings'],
   '/hunts/escalations': ['/hunts/escalations'],
-  '/hunts/campaigns': ['/hunts/campaigns'],
+  // NAN-5859: Campaigns became Actors; the old paths redirect.
+  '/hunts/actors': ['/hunts/actors', '/hunts/campaigns'],
   '/hunts/knowledge': ['/hunts/knowledge', '/hunts/memory', '/hunts/suppressions'],
 };
 
@@ -30,7 +31,7 @@ export function isUnder(pathname: string, prefix: string): boolean {
 
 /**
  * Whether the Hunts rail entry at `href` owns `pathname`: a hunt's detail page
- * (/hunts/:id) and Profile belong to Hunts, finding and campaign detail pages
+ * (/hunts/:id) and Profile belong to Hunts, finding and actor detail pages
  * to their lists, Decisions to Findings.
  */
 export function isHuntsNavItemActive(pathname: string, href: string): boolean {

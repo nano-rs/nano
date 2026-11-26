@@ -44,6 +44,14 @@
         "/settings/storage": "allow"
       },
       "actions": {
+        "agentlane.certificate": "allow",
+        "agentlane.certificate_download": "allow",
+        "agentlane.check_address": "allow",
+        "agentlane.connection_test": "allow",
+        "agentlane.connection_test_result": "allow",
+        "agentlane.network": "allow",
+        "agentlane.status": "allow",
+        "agentlane.switch": "allow",
         "ai.providers": "allow",
         "alerts.view": "allow",
         "apikeys.create": "allow",
@@ -158,6 +166,14 @@
         "/settings/storage": "deny"
       },
       "actions": {
+        "agentlane.certificate": "deny",
+        "agentlane.certificate_download": "deny",
+        "agentlane.check_address": "deny",
+        "agentlane.connection_test": "deny",
+        "agentlane.connection_test_result": "deny",
+        "agentlane.network": "deny",
+        "agentlane.status": "deny",
+        "agentlane.switch": "deny",
         "ai.providers": "deny",
         "alerts.view": "allow",
         "apikeys.create": "deny",
@@ -290,6 +306,14 @@
         "/settings/storage": "deny"
       },
       "actions": {
+        "agentlane.certificate": "deny",
+        "agentlane.certificate_download": "deny",
+        "agentlane.check_address": "deny",
+        "agentlane.connection_test": "deny",
+        "agentlane.connection_test_result": "deny",
+        "agentlane.network": "deny",
+        "agentlane.status": "deny",
+        "agentlane.switch": "deny",
         "ai.providers": "deny",
         "alerts.view": "allow",
         "apikeys.create": "deny",
@@ -422,6 +446,14 @@
         "/settings/storage": "deny"
       },
       "actions": {
+        "agentlane.certificate": "deny",
+        "agentlane.certificate_download": "deny",
+        "agentlane.check_address": "deny",
+        "agentlane.connection_test": "deny",
+        "agentlane.connection_test_result": "deny",
+        "agentlane.network": "deny",
+        "agentlane.status": "deny",
+        "agentlane.switch": "deny",
         "ai.providers": "deny",
         "alerts.view": "allow",
         "apikeys.create": "deny",

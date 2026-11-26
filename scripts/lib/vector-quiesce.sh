@@ -34,14 +34,49 @@ NANO_VQ_ENGAGED=0
 # Set when nginx had to be stopped to close ingest (its config ignores the marker).
 NANO_VQ_NGINX_STOPPED=0
 
-# Vector's metrics, from inside its container (curl, wget or bash /dev/tcp).
+# Vector's metrics, from inside its container (curl, wget or bash /dev/tcp). NAN-5885:
+# every way is bounded, so a stalled listener cannot hang the drain.
 NANO_VQ_METRICS='
-if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:9598/metrics
-elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:9598/metrics
+if command -v curl >/dev/null 2>&1; then curl -fsS --connect-timeout 3 --max-time 10 http://127.0.0.1:9598/metrics
+elif command -v wget >/dev/null 2>&1; then wget -T 10 -qO- http://127.0.0.1:9598/metrics
 else exec 3<>/dev/tcp/127.0.0.1/9598
 printf "GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3
-cat <&3
+if command -v timeout >/dev/null 2>&1; then timeout 10 cat <&3; else cat <&3; fi
 fi'
+# NAN-5885: host-side bound for each `docker compose exec` the drain makes (a hung
+# exec, not only a hung listener). The callers' nano_vq_compose put
+# `timeout $NANO_VQ_LIMIT` in front of docker when NANO_VQ_LIMIT is set; see
+# nano_vq_limited.
+NANO_VQ_HAVE_TIMEOUT=0
+command -v timeout >/dev/null 2>&1 && NANO_VQ_HAVE_TIMEOUT=1
+# NAN-5885: 1 once nano_vq_drain confirmed Vector holds nothing undelivered (or no
+# Vector runs); 0 when it could not (unreadable counters, or the bound ran out).
+NANO_VQ_DRAINED=0
+
+# nano_vq_limited SECS ARGS...: nano_vq_compose ARGS, bounded to SECS when the host
+# has `timeout`.
+nano_vq_limited() {
+    local secs="$1"
+    shift
+    if ((NANO_VQ_HAVE_TIMEOUT)); then
+        NANO_VQ_LIMIT="$secs" nano_vq_compose "$@"
+    else
+        nano_vq_compose "$@"
+    fi
+}
+
+# NAN-5885: refuse to stop Vector while it may hold events it acknowledged but has not
+# delivered: a stop that has to be forced loses them. Returns 1 (with the reason) unless
+# the last nano_vq_drain confirmed the drain, or NANO_ALLOW_UNCONFIRMED_DRAIN=1.
+nano_vq_require_drained() {
+    ((NANO_VQ_DRAINED)) && return 0
+    if [[ "${NANO_ALLOW_UNCONFIRMED_DRAIN:-0}" == 1 ]]; then
+        warn "NANO_ALLOW_UNCONFIRMED_DRAIN=1: stopping Vector although it may still hold events it has not delivered to ClickHouse; those events can be lost"
+        return 0
+    fi
+    printf '%s\n' "Vector could not hand every event it accepted to ClickHouse (or its counters could not be read), so it was not stopped: stopping it now could lose events that senders were told were received. Ingest is reopened. Check that ClickHouse is up and healthy, then re-run. To stop Vector anyway (for example when ClickHouse is down for good), re-run with NANO_ALLOW_UNCONFIRMED_DRAIN=1." >&2
+    return 1
+}
 
 nano_vq_running() {
     nano_vq_compose ps --status running --services </dev/null 2>/dev/null | grep -x "$1" >/dev/null
@@ -174,7 +209,7 @@ nano_vq_close_vector() {
 # sinks took and settled (delivered, or discarded after an error, which no wait
 # changes). Nothing when Vector cannot be asked.
 nano_vq_counters() {
-    nano_vq_compose exec -T vector bash -c "$NANO_VQ_METRICS" </dev/null 2>/dev/null \
+    nano_vq_limited 20 exec -T vector bash -c "$NANO_VQ_METRICS" </dev/null 2>/dev/null \
         | awk '
             $0 ~ /^#/ { next }
             { v = (NF >= 3 ? $(NF-1) : $NF) }
@@ -190,26 +225,38 @@ nano_vq_counters() {
 # delivered (a disk buffer's count falls when the sink reads, not when it delivers),
 # on two scrapes in a row with the counters standing still.
 nano_vq_drain() {
-    local limit="${1:-120}" started now line prev="" buffered received sent stable=0
-    nano_vq_running vector || return 0
+    local limit="${1:-120}" started now line prev="" buffered received sent stable=0 unread=0
+    NANO_VQ_DRAINED=0
+    nano_vq_running vector || { NANO_VQ_DRAINED=1; return 0; }
     started=$(date +%s)
     while :; do
         line=$(nano_vq_counters) || line=""
         if [[ -z "$line" ]]; then
-            warn "cannot read Vector's buffer metrics; stopping it without a drain check"
+            # NAN-5899: a Vector that only just started (an install's restart right
+            # after `up`, its exporter not listening yet) answers in a moment: ask
+            # again within the bound before giving up.
+            now=$(date +%s)
+            if ((now - started < limit)); then
+                ((unread++)) || log "waiting for Vector's buffer metrics (it may still be starting)"
+                # A gap breaks the run of settled scrapes: two readable ones in a row again.
+                prev="" stable=0
+                sleep 1
+                continue
+            fi
+            warn "cannot read Vector's buffer metrics, so its drain cannot be confirmed"
             return 0
         fi
         read -r buffered received sent <<<"$line"
         if [[ "$buffered" == 0 && "$received" == "$sent" && "$line" == "$prev" ]]; then
             stable=$((stable + 1))
-            ((stable >= 1)) && { log "Vector is drained: its buffers are empty and its sinks delivered every event they took"; return 0; }
+            ((stable >= 1)) && { NANO_VQ_DRAINED=1; log "Vector is drained: its buffers are empty and its sinks delivered every event they took"; return 0; }
         else
             stable=0
         fi
         prev="$line"
         now=$(date +%s)
         if ((now - started >= limit)); then
-            warn "Vector is not drained after ${limit}s ($buffered buffered, $((received - sent)) taken but not yet delivered): buffered events stay in its disk buffers across the restart"
+            warn "Vector is not drained after ${limit}s ($buffered buffered, $((received - sent)) taken but not yet delivered)"
             return 0
         fi
         (((now - started) % 10 == 0)) && log "draining Vector: $buffered buffered, $((received - sent)) in flight to ClickHouse"
@@ -240,7 +287,7 @@ nano_vq_reopen() {
     if ((NANO_VQ_CLOSED)); then
         started=$(date +%s)
         while nano_vq_running vector && (( $(date +%s) - started < limit )); do
-            nano_vq_compose exec -T vector bash -c \
+            nano_vq_limited 15 exec -T vector bash -c \
                 "exec 3<>/dev/tcp/127.0.0.1/8686 && printf 'GET /health HTTP/1.0\r\n\r\n' >&3 && grep -q ' 200 ' <&3" \
                 </dev/null >/dev/null 2>&1 && break
             sleep 2

@@ -259,6 +259,80 @@ pub(crate) fn ioc_feed_indicator_subquery(feed: &IocFeed, is_clustered: bool) ->
     )
 }
 
+/// NAN-5894: the name a parser built before NAN-5894 gave a clashing flat key.
+///
+/// When one event holds a key with a dot in it and the same path nested
+/// (`{"a.b": 1, "a": {"b": 2}}`), both read as `a.b` in ClickHouse, so one copy
+/// is renamed. The one name nano uses now is the flat key with its dots escaped
+/// (`unmapped.a~1b`), on every ingest path. Parsers built before NAN-5894 named
+/// that copy with a number instead (`unmapped.a.b_2`), and those rows are never
+/// rewritten. So a search filter on an escaped `unmapped.*` name also matches
+/// the older `<decoded name>_2` spelling.
+///
+/// The older parsers suffixed whichever copy came second in key order. That
+/// is the flat copy, except when the two spellings differ only in case
+/// (`{"Foo.Bar": 1, "foo": {"bar": 2}}` stored `foo.bar = 1, foo.bar_2 = 2`);
+/// there the alias also reads the nested value. So does a real vendor key
+/// that is literally named `a.b_2`. For a positive filter that widens the
+/// match; for a negative one (`!=`, `NOT IN`, `NOT ...`) it can exclude such a
+/// row, since a negative filter must exclude a row when either spelling holds
+/// the value (or it would keep every legacy row it should drop).
+///
+/// Only the first suffix is aliased: a third spelling of one path in one
+/// event (`_3`) is rare enough to leave to the documented legacy note. A name
+/// holding `~0` (a `~` in the vendor key) is not aliased: an older parser
+/// stored that `~` unescaped, which is not a field name nPL can address. The
+/// reverse (`unmapped.a.b_2` also matching `a~1b`) is not done: names ending
+/// in `_2` are common real vendor fields (`address_2`), and every such search
+/// would read one more JSON path for nothing.
+pub(crate) fn legacy_clash_suffix_name(field: &str) -> Option<String> {
+    let tail = field.strip_prefix("unmapped.")?;
+    if !tail.contains("~1") || tail.contains("~0") {
+        return None;
+    }
+    let decoded = tail.replace("~1", ".");
+    // A leading, trailing or doubled dot (`~1b`, `a~1`, `a~1~1b`, `a.~1b`)
+    // decodes to an empty path segment: no older parser stored such a name,
+    // and an empty segment is a ClickHouse syntax error (`unmapped.""."b_2"`).
+    if decoded.split('.').any(str::is_empty) {
+        return None;
+    }
+    Some(format!("unmapped.{decoded}_2"))
+}
+
+/// A negative comparator excludes a row when EITHER spelling holds the value,
+/// so the legacy alias joins with AND; a positive one with OR. A `NOT` around
+/// a positive filter gives the same result through the OR.
+fn comparator_is_negative(op: &Comparator) -> bool {
+    matches!(
+        op,
+        Comparator::Ne
+            | Comparator::NotRegex
+            | Comparator::NotLike
+            | Comparator::NotContains
+            | Comparator::NotStartsWith
+            | Comparator::NotEndsWith
+    )
+}
+
+/// `a OR b` for a positive filter, `a AND b` for a negative one, NULL-safe.
+///
+/// A row holds at most one of the two spellings, so one leg reads an absent
+/// path. A numeric leg (`accurateCastOrNull(...)`, `toFloat64OrNull(...)`) is
+/// NULL there, and SQL's three-valued logic would turn `TRUE AND NULL` (a
+/// negative filter) and `NOT (FALSE OR NULL)` (a `NOT` around a positive one)
+/// into NULL, dropping every row. So an absent leg counts as "no match" for a
+/// positive filter and as "not equal" for a negative one; only when BOTH legs
+/// are NULL is the result NULL, exactly what the single-name filter gave on a
+/// row without the field. String legs are never NULL, so for them this is the
+/// plain `a OR b` / `a AND b`.
+fn join_legacy_alias(primary: String, legacy: String, negative: bool) -> String {
+    let (absent, join) = if negative { ("1", "AND") } else { ("0", "OR") };
+    format!(
+        "multiIf(isNull({primary}) AND isNull({legacy}), NULL, ifNull({primary}, {absent}) {join} ifNull({legacy}, {absent}))"
+    )
+}
+
 /// Build optimized SQL for a regex match against a field expression.
 ///
 /// Applies optimizations in priority order:
@@ -865,6 +939,33 @@ impl ClickHouseSqlGenerator {
             )
     }
 
+    /// NAN-5894: the legacy `_2` spelling of an escaped `unmapped.*` filter
+    /// field (see [`legacy_clash_suffix_name`]), only when the field really
+    /// reads the OCSF `unmapped` JSON column of the event.
+    fn legacy_clash_alias(&self, field: &str) -> Option<String> {
+        let legacy = legacy_clash_suffix_name(field)?;
+        let reads_unmapped = |f: &str| {
+            matches!(
+                self.profile.resolve(f),
+                crate::schema::FieldResolution::JsonPath { ref col, .. } if col == "unmapped"
+            )
+        };
+        (reads_unmapped(field) && reads_unmapped(&legacy)).then_some(legacy)
+    }
+
+    /// Same as [`Self::legacy_clash_alias`] for a piped `where`: only while the
+    /// stage still carries the raw event (after `stats` / `table` the legacy
+    /// name is no stage column).
+    fn where_legacy_clash_alias(&self, field: &str) -> Option<String> {
+        if self.is_computed_field(field)
+            || self.is_upstream_computed_field(field)
+            || self.is_upstream_projected()
+        {
+            return None;
+        }
+        self.legacy_clash_alias(field)
+    }
+
     /// Generate SQL for a search expression (WHERE clause content)
     pub fn generate_search_expr(&self, expr: &SearchExpr) -> Result<String, SqlGenError> {
         // NAN-4917: guarded recursion point — And/Or/Not/Group recurse here.
@@ -896,7 +997,15 @@ impl ClickHouseSqlGenerator {
                 ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
-                self.generate_field_filter(field, op, value)
+                let primary = self.generate_field_filter(field, op, value)?;
+                match self.legacy_clash_alias(field) {
+                    Some(legacy) => Ok(join_legacy_alias(
+                        primary,
+                        self.generate_field_filter(&legacy, op, value)?,
+                        comparator_is_negative(op),
+                    )),
+                    None => Ok(primary),
+                }
             }
             SearchExpr::FunctionFilter {
                 function,
@@ -978,7 +1087,17 @@ impl ClickHouseSqlGenerator {
                 field,
                 values,
                 negated,
-            } => self.generate_in_list_filter(field, values, *negated),
+            } => {
+                let primary = self.generate_in_list_filter(field, values, *negated)?;
+                match self.legacy_clash_alias(field) {
+                    Some(legacy) => Ok(join_legacy_alias(
+                        primary,
+                        self.generate_in_list_filter(&legacy, values, *negated)?,
+                        *negated,
+                    )),
+                    None => Ok(primary),
+                }
+            }
             // NAN-4289: one flat `(a AND b AND …)` / `(a OR b OR …)` per chain.
             // Each binary node used to add a parenthesis level, so 250-1000
             // pasted `NOT f=v` terms exceeded ClickHouse's max parse depth
@@ -2708,6 +2827,40 @@ impl ClickHouseSqlGenerator {
         &self,
         expr: &SearchExpr,
     ) -> Result<String, SqlGenError> {
+        // NAN-5894: an escaped `unmapped.*` filter also matches the legacy
+        // `_2` spelling while the stage still carries the raw event.
+        match expr {
+            SearchExpr::FieldFilter { field, op, value } => {
+                if let Some(legacy) = self.where_legacy_clash_alias(field) {
+                    let primary = self.generate_where_condition_inner(expr)?;
+                    let legacy = self.generate_where_condition_inner(&SearchExpr::FieldFilter {
+                        field: legacy,
+                        op: op.clone(),
+                        value: value.clone(),
+                    })?;
+                    return Ok(join_legacy_alias(primary, legacy, comparator_is_negative(op)));
+                }
+            }
+            SearchExpr::InList { field, values, negated } => {
+                if let Some(legacy) = self.where_legacy_clash_alias(field) {
+                    let primary = self.generate_where_condition_inner(expr)?;
+                    let legacy = self.generate_where_condition_inner(&SearchExpr::InList {
+                        field: legacy,
+                        values: values.clone(),
+                        negated: *negated,
+                    })?;
+                    return Ok(join_legacy_alias(primary, legacy, *negated));
+                }
+            }
+            _ => {}
+        }
+        self.generate_where_condition_inner(expr)
+    }
+
+    fn generate_where_condition_inner(
+        &self,
+        expr: &SearchExpr,
+    ) -> Result<String, SqlGenError> {
         match expr {
             SearchExpr::Keyword(kw) => {
                 if kw == "*" {
@@ -2886,6 +3039,34 @@ impl ClickHouseSqlGenerator {
                     }
                 }
 
+                // NAN-5895: a numeric literal against an untyped JSON path
+                // compares the path's numeric value, as the search term does
+                // (`unmapped.x>5`: `accurateCastOrNull(unmapped."x", 'Float64') > 5`;
+                // a value that is no number gives NULL and the row is
+                // excluded). While the stage still reads the event's path,
+                // emit exactly the search-term predicate; a stage column that
+                // passes the path's text through (`table`, `rename`, an eval
+                // copy, a `stats … by` field; see `json_text`) is cast. A name
+                // a stage computed keeps the bare compare below.
+                if let Value::Number(_) = value {
+                    if matches!(
+                        op,
+                        Comparator::Eq | Comparator::Ne | Comparator::Gt | Comparator::Lt | Comparator::Gte | Comparator::Lte
+                    ) {
+                        if self.reads_event_json_path(raw_field) {
+                            return self.generate_field_filter(raw_field, op, value);
+                        }
+                        if self.is_upstream_json_text(raw_field) {
+                            return Ok(format!(
+                                "accurateCastOrNull(toString({}), 'Float64') {} {}",
+                                escape_identifier(raw_field),
+                                comparator_to_sql(op),
+                                value_to_sql(value)
+                            ));
+                        }
+                    }
+                }
+
                 // NAN-4276: a numeric literal against a String column.
                 // Equality compares it as the text it was written as (exactly
                 // the search-term form `status=7`); a range compares the
@@ -2897,7 +3078,7 @@ impl ClickHouseSqlGenerator {
                     if self.where_scope_text_operand(field) {
                         match op {
                             Comparator::Eq | Comparator::Ne => {
-                                return self.generate_where_condition(&SearchExpr::FieldFilter {
+                                return self.generate_where_condition_inner(&SearchExpr::FieldFilter {
                                     field: field.to_string(),
                                     op: op.clone(),
                                     value: Value::String(value_to_sql(value)),
@@ -3183,7 +3364,7 @@ impl ClickHouseSqlGenerator {
                 // NAN-4285: CIDR entries are network membership here too.
                 if list_has_cidr(values) && !self.is_upstream_computed_field(field) {
                     if let Some(sql) = self.cidr_in_list_predicate(field, &column_ref, values, *negated, |exact| {
-                        self.generate_where_condition(&SearchExpr::InList {
+                        self.generate_where_condition_inner(&SearchExpr::InList {
                             field: field.clone(),
                             values: exact.to_vec(),
                             negated: false,

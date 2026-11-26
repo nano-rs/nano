@@ -38,7 +38,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
-    decayed_overview_query, decayed_overview_windows_query, entity_scores_query, entity_set_scores_query, entity_types_query,
+    decayed_overview_query, decayed_overview_windows_query, entity_scores_query, entity_set_scores_query,
+    entity_snapshot_query, entity_types_query,
     lateral_scores_query, risk_dataset_base_query, risk_for_entities_query, risky_entities_query,
     risk_origin_query, rule_contributions_query, ClearedBoundaries, EntityScoreSelection,
     RiskChQuery, RiskFindingsSource, RiskSqlBind,
@@ -1727,4 +1728,52 @@ fn risk_origin_query_ignores_viewer_scope_and_is_ocsf_aware() {
         q.sql
     );
     assert!(q.sql.contains("JSONExtractString(ifNull(toJSONString(unmapped.risk_entity), 'null')) IN ?"), "{}", q.sql);
+}
+
+// ---------------------------------------------------------------------------
+// NAN-5841: precomputed Risk page snapshot
+// ---------------------------------------------------------------------------
+
+/// The snapshot is the leaderboard's statement with only the tail swapped:
+/// every byte before the tail (findings CTE, clear boundary, source scope,
+/// entity-grain aggregate) is shared, so a cached view can never drift from
+/// the live computation it stands in for.
+#[test]
+fn entity_snapshot_query_shares_the_leaderboard_prefix_and_binds_in_order() {
+    let decay = RiskDecayConfig::default();
+    let (cleared, _) = one_cleared_entity();
+    for scope in [
+        ScopeSet::unrestricted(),
+        ScopeSet::from_denied(["windows_event".to_string()].into_iter().collect()),
+    ] {
+        let source = RiskFindingsSource::new(true, "ocsf_events").with_source_scope(&scope);
+        let snapshot = entity_snapshot_query(&source, fixed_now(), &decay, &cleared, 50_001);
+        let leaderboard = risky_entities_query(
+            &source,
+            fixed_now(),
+            &decay,
+            &cleared,
+            RiskTimeWindow::Last7Days,
+            None,
+            0,
+            None,
+            10,
+            0,
+        );
+        assert_placeholder_bind_parity(&snapshot);
+        let split = |sql: &str| sql.split("FROM aggregated").next().unwrap().to_string();
+        assert_eq!(split(&snapshot.sql), split(&leaderboard.sql));
+        assert!(snapshot.sql.contains("ORDER BY base_decayed_score_7d DESC, entity ASC"), "{}", snapshot.sql);
+        assert!(!snapshot.sql.contains("PREWHERE"), "{}", snapshot.sql);
+        assert_eq!(snapshot.binds.last(), Some(&RiskSqlBind::I64(50_001)));
+        // The leaderboard binds the same prefix; only the tail differs.
+        let prefix = snapshot.binds.len() - 1;
+        assert_eq!(snapshot.binds[..prefix], leaderboard.binds[..prefix]);
+        assert_eq!(
+            snapshot.sql.contains("hasAny("),
+            scope.is_restricted(),
+            "a restricted scope must carry the origin predicate: {}",
+            snapshot.sql
+        );
+    }
 }

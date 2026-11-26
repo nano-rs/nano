@@ -1,0 +1,76 @@
+# NAN-5899: Vector sinks whose numeric settings come from the environment.
+#
+# YAML, not TOML, so one file loads in BOTH Vector 0.61 and Vector 0.62:
+#   * Vector 0.61 (2.0.35 and older) substitutes `${VAR:-default}` in the raw
+#     text, then parses: `max_size: ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}`
+#     becomes `max_size: 268435488`, an integer.
+#   * Vector 0.62 (vectordotdev/vector#26475) parses first, then substitutes
+#     inside string values and coerces them to the field's type: the plain YAML
+#     scalar `${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}` is a string, becomes
+#     "268435488" and is coerced to the integer.
+# In TOML no spelling works in both: the bare form is a TOML parse error on
+# 0.62, the quoted form (NAN-5810) a string 0.61 rejects. An upgrade puts these
+# files into config/vector while the old Vector still runs, and that Vector
+# closes its ingest gate by reloading them (config/vector/.nano/ingest-gate.sh);
+# when it cannot parse them, its ports stay open and the drain never finishes.
+# So keep every numeric env placeholder of the static bundle in YAML, BARE
+# (never quoted: a quoted value stays a string on 0.61), and never one in the
+# static TOML files (scripts/tests/test_vector_static_config_dual_version.py).
+
+# The collector error channel; its source and filter: 92-metrics.toml.
+# =============================================================================
+# Internal Logs Sink (ClickHouse — the collector error channel)
+# =============================================================================
+# NAN-2196. Without this, a broken collector and a quiet one are the same object
+# in the API: `LogSourceHealth` was entirely volume-based, so diagnosing "why is
+# ingest broken" meant reading container logs by hand — impossible for a
+# customer, and unavailable in a managed deployment.
+#
+# The event keys Vector emits (`message`, `error_code`, `error_type`, `stage`,
+# `host`, plus flattened `metadata.level` / `vector.component_*`) line up with
+# the columns in `clickhouse/171_collector_errors.sql`, so the sink's implicit
+# no-column-list INSERT populates the table directly. No staging table or
+# materialized view — unlike the OTLP lanes there is nothing to derive.
+#
+# `component_id` is the join back to a log source: generated sources are named
+# `<safe_name(name)>_source`.
+sinks:
+  clickhouse_internal_logs:
+    type: clickhouse
+    inputs: [filter_internal_logs]
+
+    endpoint: "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+    database: "${CLICKHOUSE_DATABASE:-nanosiem}"
+    table: "${CLICKHOUSE_COLLECTOR_ERRORS_TABLE:-collector_errors}"
+
+    auth:
+      strategy: basic
+      user: "${CLICKHOUSE_USER:-nanosiem}"
+      password: "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+    compression: gzip
+    date_time_best_effort: true
+    # Vector emits per-error-type extras we deliberately do not model; without this
+    # a novel key would fail the whole batch and we would lose the error we were
+    # trying to record.
+    skip_unknown_fields: true
+
+    # Diagnostics must never apply backpressure to ingest. If this sink cannot
+    # keep up or ClickHouse is down, drop the diagnostics rather than stall the
+    # pipeline they describe — the console sink still has them (92-metrics.toml).
+    buffer:
+      type: memory
+      max_events: 1000
+      when_full: drop_newest
+
+    # The healthcheck runs at boot. Failing it would take the whole collector down
+    # over an error-reporting side channel, so a missing table must degrade to
+    # "no error history", never to "no ingest".
+    healthcheck:
+      enabled: false
+
+    request:
+      concurrency: ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+      timeout_secs: 60
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 60

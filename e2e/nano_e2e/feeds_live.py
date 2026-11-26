@@ -95,7 +95,9 @@ def ensure_vendor_parser(nano: Nano, parser: VendorParser) -> str:
     # the same source_type, and deploy refuses duplicates.
     feeds.release_lane_sources(nano, parser.lanes, keep=str(source_id))
     if not (src.get("deployed") and src.get("enabled")):
-        res = expect(nano.api.post(f"/api/log-sources/{source_id}/publish", json={"acknowledge_unattested": True}), 200)
+        # NAN-5889: a large vendor parser (palo_alto, ~99 KB of VRL) publishes
+        # for over a minute; follow the job instead of one blocking request.
+        res = nano.publish_source(str(source_id), {"acknowledge_unattested": True})
         assert res.get("success") is True, f"publishing {parser.name} failed: {res}"
     eventually(
         lambda: expect(nano.api.get(f"/api/log-sources/{source_id}"), 200),
@@ -238,15 +240,18 @@ def ui_create_feed(
     page.choose({"role": "combobox", "within": dlg, "nth": 0}, rx(f"^{re.escape(label)}"))
     fields = [field({"placeholder": "Okta production", "within": dlg}, name)]
     for key, value in config.items():
-        # Optional fields render as "<KEY> (optional)".
-        fields.append(field({"labelAfter": key, "exact": False, "within": dlg}, value))
+        # NAN-5903: list fields with known values are checkbox groups.
+        if ui_pull.is_choice_field(page, key, dlg):
+            ui_pull.set_feed_choices(page, key, value, dlg)
+        else:
+            fields.append(ui_pull.feed_config_field(key, value, dlg))
     if gws_key_json:
         fields.append(field({"css": "textarea[placeholder^='{\"type\"']", "within": dlg}, gws_key_json, secret=True))
     for key, value in secrets.items():
-        fields.append(field({"labelAfter": key, "within": dlg}, value, secret=True))
+        fields.append(ui_pull.feed_credential_field(key, value, dlg))
     page.fill(*fields)
-    page.click({"role": "button", "name": "Create feed", "within": dlg})
-    page.wait_for(dlg, gone=True, timeout_ms=30_000)
+    # NAN-5903: a feed whose lanes have no log source asks to set them up.
+    ui_pull.submit_feed_form(page, dlg)
 
 
 def ui_feed_row(page: Any, name: str) -> dict[str, str]:

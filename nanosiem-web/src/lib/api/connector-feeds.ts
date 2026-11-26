@@ -5,6 +5,8 @@
  * by the nano-connector-runner service, delivering into the local Vector.
  */
 
+import { DEPLOY_REQUEST_TIMEOUT_MS, type LongRequest } from './log-sources';
+
 /** `collector`: events into a parser lane. `identity` (G22): users and group
  * memberships into the user directory (`user_registry`); no lane. */
 export type ConnectorKind = 'collector' | 'identity';
@@ -19,6 +21,60 @@ export interface ConnectorSpecInfo {
   config_fields: string[];
   optional_config_fields: string[];
   credential_fields: string[];
+  /** NAN-5903: plain-English label, help and known values per config key. */
+  config_field_info?: ConnectorFieldInfo[];
+  /** NAN-5903: plain-English label and help per credential field. */
+  credential_field_info?: ConnectorFieldInfo[];
+  /** NAN-5903: catalog parsers a missing lane's log source is set up from. */
+  parsers?: string[];
+}
+
+/** How a form shows one config or credential key (NAN-5903). */
+export interface ConnectorFieldInfo {
+  key: string;
+  label: string;
+  /** Tooltip text. */
+  help: string;
+  placeholder: string | null;
+  /** Known values of a comma-separated list field (a multi-select). */
+  choices: ConnectorFieldChoice[];
+}
+
+export interface ConnectorFieldChoice {
+  value: string;
+  label: string;
+  /** Ticked on a new feed. */
+  default: boolean;
+}
+
+export type LaneSourceAction = 'reuse' | 'create' | 'extend' | 'turn_on';
+
+/** One log source a feed's lanes use, and what setup does to it. */
+export interface LaneSourceStep {
+  action: LaneSourceAction;
+  log_source_id: string | null;
+  log_source_name: string;
+  lanes: string[];
+  added_lanes: string[];
+  parser: string | null;
+  /** For a source setup creates or changes: a catalog import, or a connector-owned pull source. */
+  origin?: 'catalog_import' | 'pull_source' | null;
+}
+
+/** `POST /api/connector-feeds/plan`: what a create would set up. */
+export interface ConnectorFeedSetupPlan {
+  lanes: string[];
+  log_sources: LaneSourceStep[];
+  creates: number;
+  changes_log_sources: boolean;
+  required_permissions: string[];
+  missing_permissions: string[];
+}
+
+export interface ConnectorFeedCreated {
+  id: string;
+  credential_id: string | null;
+  log_sources?: LaneSourceStep[];
 }
 
 export interface ConnectorFeed {
@@ -79,10 +135,24 @@ export interface CreateConnectorFeedRequest {
   credentials?: Record<string, string>;
   schedule?: string;
   max_run_secs?: number;
+  /** NAN-5903: set up the log sources of lanes that have none first. */
+  set_up_log_sources?: boolean;
 }
 
 export class ConnectorFeedsApi {
-  constructor(private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>) {}
+  constructor(
+    private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
+    /** NAN-5903: a start that sets up log sources deploys them first, which
+     * outlasts the default 60 s client timeout (the edges allow 300 s). */
+    private longRequest?: LongRequest,
+  ) {}
+
+  /** A start with consent to set up log sources runs under the deploy budget. */
+  private startRequest<T>(endpoint: string, options: RequestInit, setsUp: boolean): Promise<T> {
+    return setsUp && this.longRequest
+      ? this.longRequest<T>(endpoint, options, DEPLOY_REQUEST_TIMEOUT_MS)
+      : this.request<T>(endpoint, options);
+  }
 
   listSpecs(): Promise<ConnectorSpecInfo[]> {
     return this.request('/api/connector-specs');
@@ -96,15 +166,26 @@ export class ConnectorFeedsApi {
     return this.request(`/api/connector-feeds/${encodeURIComponent(id)}`);
   }
 
-  create(request: CreateConnectorFeedRequest): Promise<{ id: string; credential_id: string | null }> {
-    return this.request('/api/connector-feeds', { method: 'POST', body: JSON.stringify(request) });
+  create(request: CreateConnectorFeedRequest): Promise<ConnectorFeedCreated> {
+    return this.startRequest(
+      '/api/connector-feeds',
+      { method: 'POST', body: JSON.stringify(request) },
+      !!request.set_up_log_sources,
+    );
   }
 
-  setEnabled(id: string, enabled: boolean): Promise<ConnectorFeed> {
-    return this.request(`/api/connector-feeds/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ enabled }),
-    });
+  /** What a create with this config would do to the lanes' log sources. */
+  plan(connector: string, config: CreateConnectorFeedRequest['config']): Promise<ConnectorFeedSetupPlan> {
+    return this.request('/api/connector-feeds/plan', { method: 'POST', body: JSON.stringify({ connector, config }) });
+  }
+
+  /** `setUpLogSources` (NAN-5903): on resume, set up lanes that lost their log source. */
+  setEnabled(id: string, enabled: boolean, setUpLogSources = false): Promise<ConnectorFeed> {
+    return this.startRequest(
+      `/api/connector-feeds/${encodeURIComponent(id)}`,
+      { method: 'PATCH', body: JSON.stringify(setUpLogSources ? { enabled, set_up_log_sources: true } : { enabled }) },
+      setUpLogSources,
+    );
   }
 
   remove(id: string): Promise<void> {
@@ -112,8 +193,12 @@ export class ConnectorFeedsApi {
   }
 
   /** Adopt this build's bundled spec for the feed (resets its checkpoints). */
-  adoptSpec(id: string): Promise<{ adopted: boolean; checkpoints_reset: number }> {
-    return this.request(`/api/connector-feeds/${encodeURIComponent(id)}/adopt-spec`, { method: 'POST' });
+  adoptSpec(id: string, setUpLogSources = false): Promise<{ adopted: boolean; checkpoints_reset: number }> {
+    return this.startRequest(
+      `/api/connector-feeds/${encodeURIComponent(id)}/adopt-spec`,
+      { method: 'POST', ...(setUpLogSources ? { body: JSON.stringify({ set_up_log_sources: true }) } : {}) },
+      setUpLogSources,
+    );
   }
 
   resetStream(id: string, stream: string): Promise<{ stream: string; anchor: string; next_run_at: string }> {

@@ -787,12 +787,19 @@ compose_restart_vector() {
     # shellcheck source=scripts/lib/vector-quiesce.sh
     . "$LIB_DIR/vector-quiesce.sh"
     NANO_VQ_PKI_COMPOSE_ARGS=("${args[@]}")
-    nano_vq_compose() { docker compose "${NANO_VQ_PKI_COMPOSE_ARGS[@]}" "$@"; }
+    nano_vq_compose() { ${NANO_VQ_LIMIT:+timeout "$NANO_VQ_LIMIT"} docker compose "${NANO_VQ_PKI_COMPOSE_ARGS[@]}" "$@"; }
     declare -F log >/dev/null || log() { note "$*"; }
     declare -F warn >/dev/null || warn() { note "warning: $*"; }
     trap 'cleanup_tmp; nano_vq_reopen 30 || true' EXIT
     nano_vq_close
     nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+    # NAN-5885: never force-restart a Vector that still holds undelivered events.
+    if ! nano_vq_require_drained; then
+        note "!! Vector was not restarted, so it keeps its previous Vector-native certificates until it restarts. Re-run once ClickHouse is healthy."
+        nano_vq_reopen 30 || true
+        trap cleanup_tmp EXIT
+        return 1
+    fi
     nano_vq_compose restart --timeout "$NANO_VQ_STOP_TIMEOUT" vector </dev/null >/dev/null 2>&1 || rc=$?
     nano_vq_reopen || true
     trap cleanup_tmp EXIT

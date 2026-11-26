@@ -15,6 +15,12 @@
 //! enabled, deployed parser for every lane the feed emits into, so a feed
 //! never pulls into Vector's default drop path.
 //!
+//! NAN-5903: a create with `set_up_log_sources: true` sets up the missing
+//! lane sources first, from the catalog parser that matches the connector
+//! (`nanosiem_core::log_sources::feed_lane_setup`), with the permissions the
+//! same setup takes by hand. `POST /api/connector-feeds/plan` says what a
+//! create would set up, for the confirm step.
+//!
 //! G22: an identity feed (`kind: identity`, e.g. `okta_users`,
 //! `entra_directory`) emits into no lane: the runner writes the user
 //! directory (`user_registry`) under the feed's own identity provider row.
@@ -36,6 +42,7 @@ use nanosiem_core::audit::{
     CONNECTOR_FEED_DELETED, CONNECTOR_FEED_PAUSED, CONNECTOR_FEED_RESUMED, CREDENTIAL_CREATED,
 };
 use nanosiem_core::auth::permissions;
+use nanosiem_core::log_sources::feed_lane_setup::{FeedLaneSetup, LaneSetupError, LaneSourceStep, SetupLease};
 use nanosiem_core::parsers::{
     normalize_credential_payload, validate_credential_payload, CreateCloudCredential,
     CredentialRepository, CredentialRepositoryError,
@@ -93,6 +100,50 @@ pub struct ConnectorSpecInfo {
     pub optional_config_fields: Vec<String>,
     /// Fields the bound credential must carry.
     pub credential_fields: Vec<String>,
+    /// NAN-5903: plain-English label, help and known values per config key,
+    /// in form order.
+    pub config_field_info: Vec<ConnectorFieldInfo>,
+    /// NAN-5903: plain-English label and help per credential field.
+    pub credential_field_info: Vec<ConnectorFieldInfo>,
+    /// NAN-5903: the catalog parsers (in preference order) a missing lane's
+    /// log source is set up from. Empty for an identity connector.
+    pub parsers: Vec<String>,
+}
+
+/// How a form shows one config or credential key (NAN-5903).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectorFieldInfo {
+    pub key: String,
+    pub label: String,
+    /// Tooltip text.
+    pub help: String,
+    /// Example value for an empty field.
+    pub placeholder: Option<String>,
+    /// Known values of a comma-separated list field (a multi-select); empty
+    /// for free text.
+    pub choices: Vec<ConnectorFieldChoice>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectorFieldChoice {
+    pub value: String,
+    pub label: String,
+    /// Ticked on a new feed.
+    pub default: bool,
+}
+
+fn field_info(f: &first_party::FieldInfo) -> ConnectorFieldInfo {
+    ConnectorFieldInfo {
+        key: f.key.to_string(),
+        label: f.label.to_string(),
+        help: f.help.to_string(),
+        placeholder: f.placeholder.map(str::to_string),
+        choices: f
+            .choices
+            .iter()
+            .map(|c| ConnectorFieldChoice { value: c.value.to_string(), label: c.label.to_string(), default: c.default })
+            .collect(),
+    }
 }
 
 /// Create request. Never carries a spec, an ingest destination or a backfill.
@@ -116,12 +167,59 @@ pub struct CreateConnectorFeed {
     pub schedule: Option<String>,
     #[serde(default)]
     pub max_run_secs: Option<i32>,
+    /// NAN-5903: set up the log sources of lanes that have none (from the
+    /// connector's catalog parser) before creating the feed. Without it a
+    /// feed with such a lane is refused, naming the lanes.
+    #[serde(default)]
+    pub set_up_log_sources: bool,
+}
+
+/// What a create would set up (NAN-5903). Read only.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanConnectorFeed {
+    pub connector: String,
+    #[serde(default)]
+    pub config: Map<String, Value>,
+}
+
+/// `POST /api/connector-feeds/plan`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectorFeedSetupPlan {
+    /// The lanes the feed would emit into (none for an identity feed).
+    pub lanes: Vec<String>,
+    /// One entry per log source the lanes use: `reuse` (already serves
+    /// them), `create`, `extend` (claims more lanes) or `turn_on`.
+    pub log_sources: Vec<LaneSourceStep>,
+    /// How many log sources a create would make.
+    pub creates: usize,
+    /// Whether a create would change any log source (the UI confirms first).
+    pub changes_log_sources: bool,
+    /// Permissions the setup needs beyond creating the feed.
+    pub required_permissions: Vec<String>,
+    /// Of those, the ones the caller lacks (a create would be refused).
+    pub missing_permissions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetConnectorFeedEnabled {
     pub enabled: bool,
+    /// NAN-5903: when resuming, set up the log sources of lanes that have
+    /// none (as on create). Without it such a resume is refused.
+    #[serde(default)]
+    pub set_up_log_sources: bool,
+}
+
+/// Optional body of `POST /api/connector-feeds/{id}/adopt-spec` (NAN-5903).
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptConnectorFeedSpec {
+    /// Set up the log sources of lanes the updated spec emits into that
+    /// have none. Without it adopting an enabled feed onto such lanes is
+    /// refused.
+    #[serde(default)]
+    pub set_up_log_sources: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -200,6 +298,9 @@ pub struct ConnectorFeedCreated {
     pub id: String,
     /// `cred_...` of the bound credential (new when entered inline).
     pub credential_id: Option<String>,
+    /// NAN-5903: the log sources the feed's lanes use, and what this create
+    /// did to each (`reuse`, `create`, `extend`, `turn_on`).
+    pub log_sources: Vec<LaneSourceStep>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -315,15 +416,6 @@ fn checkpoint_view(c: CheckpointSummary) -> ConnectorFeedCheckpointView {
     }
 }
 
-/// Whether a log source is a deployed HEC parser for `lane`: the Splunk HEC
-/// transport, claiming the lane by `match_values` (or by name without any).
-pub(crate) fn hec_parser_claims(transport: &str, name: &str, values: Option<&[String]>, lane: &str) -> bool {
-    matches!(transport, "splunk_hec" | "splunk" | "hec")
-        && values
-            .filter(|v| !v.is_empty())
-            .map_or(name == lane, |v| v.iter().any(|s| s == lane))
-}
-
 /// G22: whether `connector` is an identity directory sync (`kind: identity`).
 pub(crate) fn is_identity_connector(connector: &str) -> bool {
     first_party::plan(connector).is_ok_and(|p| p.spec.kind == nano_connector::spec::Kind::Identity)
@@ -364,29 +456,114 @@ async fn retire_identity_feed_users(state: &AppState, feed_id: Uuid, connector: 
     Ok(Some(retired))
 }
 
-/// Every lane needs an enabled, deployed, active HEC parser. Events of a
-/// lane with no parser fall into Vector's default drop path.
-async fn require_deployed_parsers(state: &AppState, lanes: &BTreeSet<String>) -> Result<(), ApiError> {
+/// The lanes no enabled, deployed, active HEC parser serves. Events of such
+/// a lane fall into Vector's default drop path.
+async fn unserved_lanes(state: &AppState, lanes: &BTreeSet<String>) -> Result<Vec<String>, ApiError> {
     let sources = state.log_source_service.list(None).await?;
-    let missing: Vec<&str> = lanes
+    Ok(lanes
         .iter()
-        .filter(|lane| {
-            !sources.iter().any(|s| {
-                hec_parser_claims(&s.source_type, &s.name, s.match_values.as_deref(), lane)
-                    && s.enabled
-                    && s.deployed
-                    && s.lifecycle_status == "active"
-            })
-        })
-        .map(String::as_str)
-        .collect();
-    if !missing.is_empty() {
-        return Err(ApiError::BadRequest(format!(
-            "Deploy an enabled HEC log source for {} before starting this feed",
-            missing.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ")
-        )));
+        .filter(|lane| !sources.iter().any(|s| nanosiem_core::log_sources::feed_lane_setup::serves(s, lane)))
+        .cloned()
+        .collect())
+}
+
+fn lane_list(lanes: &[String]) -> String {
+    lanes.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ")
+}
+
+/// NAN-5903: every lane a feed starts on (create, resume, adopting a spec
+/// update) needs an enabled, deployed, active HEC parser. With the caller's
+/// consent (`set_up`) the missing ones are set up from the connector's catalog
+/// parser; without it the start is refused, naming the lanes. Returns what
+/// setup did (empty when nothing was missing).
+async fn ensure_lanes_served(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    spec: &'static first_party::BundledSpec,
+    lanes: &BTreeSet<String>,
+    feed_name: &str,
+    set_up: bool,
+) -> Result<(Vec<LaneSourceStep>, Option<SetupLease>), ApiError> {
+    // An identity feed has no lane.
+    if lanes.is_empty() {
+        return Ok((Vec::new(), None));
     }
-    Ok(())
+    // Every start onto lanes runs under the setup lease, so it never sees a
+    // half-done setup (a lane widened but not deployed yet reads as served).
+    // The caller keeps the lease until the feed is started, then releases it.
+    let lease = SetupLease::acquire(&state.pool, &format!("start {feed_name}"), SETUP_LEASE_WAIT)
+        .await
+        .map_err(lane_setup_error)?;
+    let missing = match unserved_lanes(state, lanes).await {
+        Ok(missing) => missing,
+        Err(e) => {
+            lease.release().await;
+            return Err(e);
+        }
+    };
+    if missing.is_empty() {
+        return Ok((Vec::new(), Some(lease)));
+    }
+    if !set_up {
+        lease.release().await;
+        return Err(log_sources_missing(spec, &missing));
+    }
+    let (outcome, lease) =
+        super::connector_feed_setup::set_up_lane_sources(state, auth, client, spec, lanes, feed_name, lease).await?;
+    Ok((outcome.steps, Some(lease)))
+}
+
+/// How long a start waits for another feed's setup before a 409.
+const SETUP_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The feed is started only while the lease is still ours (fencing: a
+/// setup that stalled past its lease and was taken over starts nothing).
+async fn still_held(lease: &Option<SetupLease>) -> Result<(), ApiError> {
+    match lease {
+        Some(lease) => lease.ensure_held().await.map_err(lane_setup_error),
+        None => Ok(()),
+    }
+}
+
+async fn release(lease: Option<SetupLease>) {
+    if let Some(lease) = lease {
+        lease.release().await;
+    }
+}
+
+/// Code of the structured refusal for a start whose lanes lack a log source.
+pub const LOG_SOURCES_MISSING: &str = "LOG_SOURCES_MISSING";
+
+/// NAN-5903: the structured refusal for a start (create without consent,
+/// resume, adopt) whose lanes have no log source. `details.missing_lanes`
+/// names them; Pull feeds answers it with Fix setup, which repeats the call
+/// with `set_up_log_sources: true`.
+pub(crate) fn log_sources_missing(spec: &'static first_party::BundledSpec, missing: &[String]) -> ApiError {
+    ApiError::BadRequestWithDetails {
+        code: LOG_SOURCES_MISSING,
+        message: format!(
+            "Some log sources this feed needs are missing, so its events to {} would be dropped. \
+             Set them up with Fix setup on the Pull feeds page of the nano web app (it uses the {} parser), \
+             or under Log sources.",
+            lane_list(missing),
+            super::connector_feed_setup::short_name(spec)
+        ),
+        details: serde_json::json!({ "missing_lanes": missing, "connector": spec.slug }),
+    }
+}
+
+pub(crate) fn lane_setup_error(error: LaneSetupError) -> ApiError {
+    if error.is_forbidden() {
+        ApiError::Forbidden(error.to_string())
+    } else if error.is_conflict() {
+        ApiError::Conflict(error.to_string())
+    } else if error.is_internal() {
+        tracing::error!(error = %error, "pull feed log source setup failed");
+        ApiError::InternalError(error.to_string())
+    } else {
+        ApiError::BadRequest(error.to_string())
+    }
 }
 
 /// The bound credential must be of the connector's provider and carry every
@@ -459,6 +636,9 @@ pub async fn list_connector_specs(
                     .into_iter()
                     .collect(),
                 credential_fields: admin::credential_fields(&plan.spec).map_err(admin_error)?.into_iter().collect(),
+                config_field_info: s.config_fields.iter().map(field_info).collect(),
+                credential_field_info: s.credential_fields.iter().map(field_info).collect(),
+                parsers: s.parsers.iter().map(|p| (*p).to_string()).collect(),
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
@@ -498,10 +678,73 @@ pub async fn get_connector_feed(
     }))
 }
 
+/// NAN-5903: what a create would do to the log sources of the feed's lanes,
+/// for the confirm step ("This will also create 1 log source: ..."). Read
+/// only. A refusal a create would hit before any write (no matching catalog
+/// parser, a lane another source holds) is returned the same way a create
+/// returns it; a missing permission is listed in `missing_permissions`.
+#[utoipa::path(post, path = "/api/connector-feeds/plan", tag = "connector_feeds", request_body = PlanConnectorFeed,
+    responses((status = 200, description = "What a create would set up", body = ConnectorFeedSetupPlan),
+        (status = 400, description = "Invalid config, or no catalog parser matches the connector"),
+        (status = 403, description = "Requires log_sources:view + log_sources:deploy + (log_sources:create or log_sources:edit) (+ enrichments:configure for an identity connector). What the plan itself needs is listed in required_permissions / missing_permissions"),
+        (status = 404, description = "Unknown connector"),
+        (status = 409, description = "A lane is held by a log source that is not deployed")),
+    security(("api_key" = [])))]
+pub async fn plan_connector_feed(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<PlanConnectorFeed>,
+) -> Result<Json<ConnectorFeedSetupPlan>, ApiError> {
+    // It names existing log sources: as readable as the log source list.
+    // Every start can ask (create needs log_sources:create, resume and adopt
+    // log_sources:edit, all log_sources:deploy); what THIS plan needs is in
+    // `required_permissions` / `missing_permissions`, and the setup itself
+    // enforces it before any write.
+    ensure_permission(&auth, VIEW)?;
+    ensure_permission(&auth, DEPLOY)?;
+    if !auth.has_any_permission(&[CREATE, EDIT]) {
+        return Err(ApiError::Forbidden(format!("Missing permission: {CREATE} or {EDIT}")));
+    }
+    let spec = first_party::get(&request.connector).map_err(admin_error)?;
+    ensure_identity_permission(&auth, spec.slug)?;
+    let plan = first_party::plan(spec.slug).map_err(admin_error)?;
+    let lanes = admin::lanes(&plan, &request.config).map_err(admin_error)?;
+    let empty = ConnectorFeedSetupPlan {
+        lanes: lanes.iter().cloned().collect(),
+        log_sources: Vec::new(),
+        creates: 0,
+        changes_log_sources: false,
+        required_permissions: Vec::new(),
+        missing_permissions: Vec::new(),
+    };
+    if lanes.is_empty() {
+        return Ok(Json(empty));
+    }
+    let parsers = nanosiem_core::parser_repository::ParserRepositoryService::new(state.pool.clone());
+    let setup = FeedLaneSetup::new(&state.pool, &parsers)
+        .plan(super::connector_feed_setup::feed_connector(spec), &lanes)
+        .await
+        .map_err(lane_setup_error)?;
+    Ok(Json(ConnectorFeedSetupPlan {
+        creates: setup.creates(),
+        changes_log_sources: setup.changes_anything(),
+        missing_permissions: setup
+            .required_permissions
+            .iter()
+            .filter(|p| !auth.has_permission(p))
+            .map(|p| (*p).to_string())
+            .collect(),
+        required_permissions: setup.required_permissions.iter().map(|p| (*p).to_string()).collect(),
+        log_sources: setup.steps,
+        ..empty
+    }))
+}
+
 #[utoipa::path(post, path = "/api/connector-feeds", tag = "connector_feeds", request_body = CreateConnectorFeed,
-    responses((status = 201, description = "Connector feed created", body = ConnectorFeedCreated), (status = 400, description = "Invalid input or parser lane not deployed"),
-        (status = 403, description = "Requires log_sources:create + log_sources:deploy, credentials:use (+ credentials:create for an inline credential), and enrichments:configure for an identity feed"),
-        (status = 409, description = "Name already in use")),
+    responses((status = 201, description = "Connector feed created (with set_up_log_sources, after setting up its lanes' log sources)", body = ConnectorFeedCreated),
+        (status = 400, description = "Invalid input; a lane with no log source without set_up_log_sources; no catalog parser matches the connector; or a set-up log source did not go live"),
+        (status = 403, description = "Requires log_sources:create + log_sources:deploy, credentials:use (+ credentials:create for an inline credential), and enrichments:configure for an identity feed. Setting up lane sources also needs what that takes by hand: parser_repositories:import (+ source_configs:edit when the import binds a source configuration) to create one, log_sources:edit to widen one"),
+        (status = 409, description = "Name already in use, or a lane is held by a log source that is not deployed")),
     security(("api_key" = [])))]
 pub async fn create_connector_feed(
     State(state): State<AppState>,
@@ -528,7 +771,7 @@ pub async fn create_connector_feed(
 
     let name = request.name.trim().to_string();
     // Everything that can be checked before a credential is created is.
-    let mut feed = NewFeed {
+    let feed = NewFeed {
         name: name.clone(),
         config: request.config,
         credential_id: request.credential_id.or(request.credentials.as_ref().map(|_| Uuid::nil())),
@@ -541,16 +784,123 @@ pub async fn create_connector_feed(
     }
     admin::check_inputs(&plan, &feed).map_err(admin_error)?;
     let lanes = admin::lanes(&plan, &feed.config).map_err(admin_error)?;
-    require_deployed_parsers(&state, &lanes).await?;
+    let store = store(&state);
+    // NAN-5903: everything a create can refuse without a write is refused
+    // before any log source is set up: a name in use, an unserved lane
+    // without consent, a bad credential.
+    if store.list_feeds().await.map_err(admin_error)?.iter().any(|f| f.name == name) {
+        return Err(admin_error(AdminError::DuplicateName));
+    }
+    // A cheap early refusal without consent (re-checked under the lease below).
+    let unserved = unserved_lanes(&state, &lanes).await?;
+    if !unserved.is_empty() && !request.set_up_log_sources {
+        return Err(log_sources_missing(spec, &unserved));
+    }
+    let inline_payload = match request.credentials {
+        Some(fields) => {
+            let mut payload = serde_json::to_value(fields).unwrap_or(Value::Null);
+            normalize_credential_payload(spec.credential_provider, &mut payload)
+                .and_then(|()| validate_credential_payload(spec.credential_provider, &payload))
+                .map_err(ApiError::BadRequest)?;
+            admin::vendor_secrets(&plan.spec, &payload)
+                .map_err(|e| ApiError::BadRequest(e.replace("the bound credential", "the credential")))?;
+            // The credential's name is fixed by the feed's; a clash is refused
+            // now, not after the log sources were set up.
+            let credential_name = format!("{name} ({})", spec.slug);
+            let taken: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cloud_credentials WHERE name = $1)")
+                .bind(&credential_name)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(|e| ApiError::InternalError(e.to_string()))?;
+            if taken {
+                return Err(ApiError::Conflict(format!(
+                    "A credential named `{credential_name}` already exists; bind it with credential_id"
+                )));
+            }
+            Some(payload)
+        }
+        None => {
+            if let Some(credential_id) = feed.credential_id {
+                check_bound_credential(&state, spec, &plan, credential_id).await?;
+            }
+            None
+        }
+    };
 
+    // Under the setup lease from here until the feed exists: the lanes are
+    // checked (and, with consent, set up) and the feed created with no other
+    // setup in between.
+    let (mut log_sources, lease) =
+        ensure_lanes_served(&state, &auth, &client, spec, &lanes, &name, request.set_up_log_sources).await?;
+    if log_sources.is_empty() && !lanes.is_empty() {
+        // Nothing was set up: report the sources the lanes already use.
+        let parsers = nanosiem_core::parser_repository::ParserRepositoryService::new(state.pool.clone());
+        match FeedLaneSetup::new(&state.pool, &parsers)
+            .plan(super::connector_feed_setup::feed_connector(spec), &lanes)
+            .await
+        {
+            Ok(plan) => log_sources = plan.steps,
+            Err(e) => tracing::warn!(error = %e, "could not list the log sources of a pull feed's lanes"),
+        }
+    }
+    let credential_created = inline_payload.is_some();
+    let created = match still_held(&lease).await {
+        Ok(()) => create_feed_with_credential(&state, &auth, &client, spec, &plan, feed, inline_payload, &name).await,
+        Err(e) => Err(e),
+    };
+    release(lease).await;
+    let (id, feed) = created?;
+    audit(
+        &state,
+        &auth,
+        &client,
+        CONNECTOR_FEED_CREATED,
+        id,
+        Some(name),
+        serde_json::json!({
+            "connector": spec.slug,
+            "spec_sha256": plan.spec_sha256,
+            "lanes": lanes,
+            "credential_created": credential_created,
+            "log_sources": log_sources
+                .iter()
+                .map(|s| serde_json::json!({
+                    "action": s.action,
+                    "log_source_id": s.log_source_id.map(|i| i.to_string()),
+                    "lanes": s.lanes,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+    Ok((
+        StatusCode::CREATED,
+        Json(ConnectorFeedCreated {
+            id: typeid::encode(typeid::connector_feed::PREFIX, &id),
+            credential_id: feed.credential_id.map(|c| typeid::encode(typeid::cloud_credential::PREFIX, &c)),
+            // The steps name existing log sources: only for a caller who may list them.
+            log_sources: if auth.has_permission(VIEW) { log_sources } else { Vec::new() },
+        }),
+    ))
+}
+
+
+/// Create the inline credential (if any) and the feed; a refused feed takes
+/// its new credential with it. Returns the feed id and the feed as created.
+#[allow(clippy::too_many_arguments)]
+async fn create_feed_with_credential(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    spec: &'static first_party::BundledSpec,
+    plan: &admin::FeedPlan,
+    mut feed: NewFeed,
+    inline_payload: Option<Value>,
+    name: &str,
+) -> Result<(Uuid, NewFeed), ApiError> {
+    let store = store(state);
     let mut created_credential = None;
-    if let Some(fields) = request.credentials {
-        let mut payload = serde_json::to_value(fields).unwrap_or(Value::Null);
-        normalize_credential_payload(spec.credential_provider, &mut payload)
-            .and_then(|()| validate_credential_payload(spec.credential_provider, &payload))
-            .map_err(ApiError::BadRequest)?;
-        admin::vendor_secrets(&plan.spec, &payload).map_err(|e| ApiError::BadRequest(e.replace("the bound credential", "the credential")))?;
-        let credential = credentials_repo(&state)
+    if let Some(payload) = inline_payload {
+        let credential = credentials_repo(state)
             .create(
                 &CreateCloudCredential {
                     name: format!("{name} ({})", spec.slug),
@@ -576,50 +926,27 @@ pub async fn create_connector_feed(
                 .actor(Some(auth.user_id()), None)
                 .api_key(auth.api_key_id, auth.api_key_name.clone())
                 .resource("credential", Some(credential.id), Some(credential.name.clone()))
-                .client_context(&client)
+                .client_context(client)
                 .details(serde_json::json!({ "provider": credential.provider, "via": "connector_feed" }))
                 .build(),
         );
         feed.credential_id = Some(credential.id);
         created_credential = Some(credential.id);
-    } else if let Some(credential_id) = feed.credential_id {
-        check_bound_credential(&state, spec, &plan, credential_id).await?;
     }
 
-    let store = store(&state);
-    let id = match store.create_feed(&plan, &feed, Some(auth.user_id())).await {
+    let id = match store.create_feed(plan, &feed, Some(auth.user_id())).await {
         Ok(id) => id,
         Err(e) => {
             // Do not leave an orphan credential behind a refused feed.
             if let Some(credential_id) = created_credential {
-                if let Err(del) = credentials_repo(&state).delete(credential_id).await {
+                if let Err(del) = credentials_repo(state).delete(credential_id).await {
                     tracing::warn!(error = %del, "could not remove the credential of a refused pull feed");
                 }
             }
             return Err(admin_error(e));
         }
     };
-    audit(
-        &state,
-        &auth,
-        &client,
-        CONNECTOR_FEED_CREATED,
-        id,
-        Some(name),
-        serde_json::json!({
-            "connector": spec.slug,
-            "spec_sha256": plan.spec_sha256,
-            "lanes": lanes,
-            "credential_created": created_credential.is_some(),
-        }),
-    );
-    Ok((
-        StatusCode::CREATED,
-        Json(ConnectorFeedCreated {
-            id: typeid::encode(typeid::connector_feed::PREFIX, &id),
-            credential_id: feed.credential_id.map(|c| typeid::encode(typeid::cloud_credential::PREFIX, &c)),
-        }),
-    ))
+    Ok((id, feed))
 }
 
 #[utoipa::path(patch, path = "/api/connector-feeds/{id}", tag = "connector_feeds",
@@ -640,11 +967,23 @@ pub async fn set_connector_feed_enabled(
     ensure_identity_permission(&auth, &feed.connector)?;
     if request.enabled {
         ensure_permission(&auth, DEPLOY)?;
-        let plan = first_party::plan(&feed.connector).map_err(admin_error)?;
+        let spec = first_party::get(&feed.connector).map_err(admin_error)?;
+        let plan = first_party::plan(spec.slug).map_err(admin_error)?;
         let lanes = admin::lanes(&plan, &feed.config).map_err(admin_error)?;
-        require_deployed_parsers(&state, &lanes).await?;
+        // NAN-5903: a lane whose source was deleted or turned off since is
+        // set up again with consent, as on create.
+        let (_, lease) =
+            ensure_lanes_served(&state, &auth, &client, spec, &lanes, &feed.name, request.set_up_log_sources).await?;
+        // Started under the lease, after its lanes are verified live.
+        let started = match still_held(&lease).await {
+            Ok(()) => store.set_enabled(*id, true, Some(auth.user_id())).await.map_err(admin_error),
+            Err(e) => Err(e),
+        };
+        release(lease).await;
+        started?;
+    } else {
+        store.set_enabled(*id, false, Some(auth.user_id())).await.map_err(admin_error)?;
     }
-    store.set_enabled(*id, request.enabled, Some(auth.user_id())).await.map_err(admin_error)?;
     audit(
         &state,
         &auth,
@@ -752,8 +1091,9 @@ pub struct ConnectorFeedAdoptResult {
 /// stream keeps its shrink-guard baseline, so its next full run is guarded).
 #[utoipa::path(post, path = "/api/connector-feeds/{id}/adopt-spec", tag = "connector_feeds",
     params(("id" = String, Path, description = "Feed ID (cfeed_...)")),
+    request_body(content = Option<AdoptConnectorFeedSpec>, description = "Optional: set_up_log_sources for lanes the updated spec adds"),
     responses((status = 200, description = "Feed adopted the current connector spec", body = ConnectorFeedAdoptResult),
-        (status = 400, description = "The feed no longer fits the bundled spec; recreate it"),
+        (status = 400, description = "The feed no longer fits the bundled spec; recreate it. Or (NAN-5903) an enabled feed would emit into a lane with no log source and set_up_log_sources was not sent"),
         (status = 404, description = "Not found"),
         (status = 403, description = "Requires log_sources:edit + log_sources:deploy (+ enrichments:configure for an identity feed)")),
     security(("api_key" = [])))]
@@ -762,13 +1102,33 @@ pub async fn adopt_connector_feed_spec(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
+    body: Option<Json<AdoptConnectorFeedSpec>>,
 ) -> Result<Json<ConnectorFeedAdoptResult>, ApiError> {
     ensure_permission(&auth, EDIT)?;
     ensure_permission(&auth, DEPLOY)?;
+    let request = body.map(|Json(b)| b).unwrap_or_default();
     let store = store(&state);
     let feed = store.get_feed(*id).await.map_err(admin_error)?;
     ensure_identity_permission(&auth, &feed.connector)?;
-    let outcome = store.adopt_bundled_spec(*id, Some(auth.user_id())).await.map_err(admin_error)?;
+    // NAN-5903: an updated spec may emit into lanes the current one does not
+    // (a new stream). An enabled feed must not start dropping them.
+    let mut lease = None;
+    if feed.enabled {
+        let spec = first_party::get(&feed.connector).map_err(admin_error)?;
+        let bundled = first_party::plan(spec.slug).map_err(admin_error)?;
+        if let Ok(lanes) = admin::lanes(&bundled, &feed.config) {
+            lease = ensure_lanes_served(&state, &auth, &client, spec, &lanes, &feed.name, request.set_up_log_sources)
+                .await?
+                .1;
+        }
+    }
+    // Adopted under the lease, after the new lanes are verified live.
+    let adopted = match still_held(&lease).await {
+        Ok(()) => store.adopt_bundled_spec(*id, Some(auth.user_id())).await.map_err(admin_error),
+        Err(e) => Err(e),
+    };
+    release(lease).await;
+    let outcome = adopted?;
     let Some(outcome) = outcome else {
         return Ok(Json(ConnectorFeedAdoptResult { adopted: false, previous_spec_sha256: None, spec_sha256: None, checkpoints_reset: 0 }));
     };
@@ -800,6 +1160,7 @@ pub async fn adopt_connector_feed_spec(
         list_connector_specs,
         list_connector_feeds,
         get_connector_feed,
+        plan_connector_feed,
         create_connector_feed,
         set_connector_feed_enabled,
         delete_connector_feed,
@@ -808,8 +1169,15 @@ pub async fn adopt_connector_feed_spec(
     ),
     components(schemas(
         ConnectorSpecInfo,
+        ConnectorFieldInfo,
+        ConnectorFieldChoice,
         CreateConnectorFeed,
+        PlanConnectorFeed,
+        ConnectorFeedSetupPlan,
+        LaneSourceStep,
+        nanosiem_core::log_sources::feed_lane_setup::LaneSourceAction,
         SetConnectorFeedEnabled,
+        AdoptConnectorFeedSpec,
         ResetConnectorFeedStream,
         ConnectorFeedView,
         ConnectorFeedRunView,

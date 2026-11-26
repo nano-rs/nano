@@ -484,6 +484,7 @@ fn rotation_targets_cover_every_encrypted_column() {
         "webhooks.url_encrypted",
         "webhooks.headers_encrypted",
         "webhooks.secret_encrypted",
+        "agentlane_network.key_enc",
     ];
     let names: Vec<_> = rotation::TARGETS.iter().map(|t| t.name).collect();
     assert_eq!(names, expected);

@@ -15,12 +15,18 @@ fn static_vector_graph() -> String {
         .expect("read static Vector config")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        // NAN-5899: the sinks with env-set numbers are YAML (03-otlp-sinks.yaml).
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("toml" | "yaml" | "yml")
+            )
+        })
         .collect();
     files.sort();
     files
         .into_iter()
-        .map(|path| std::fs::read_to_string(path).expect("read static Vector TOML"))
+        .map(|path| std::fs::read_to_string(path).expect("read static Vector config"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -131,15 +137,29 @@ fn rendered_graph_fits_aggregate_budget_across_host_classes() {
             "{name}: capacity not conserved"
         );
 
-        let rendered = graph.replace(
-            "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}",
-            &per_component.to_string(),
-        );
+        // NAN-5810: in the generated TOML the placeholder is a quoted string
+        // (Vector 0.62 parses before it interpolates and coerces the result).
+        // NAN-5899: in the static YAML sinks it is a bare scalar (both 0.61 and
+        // 0.62 load it). Exactly these two spellings count as budgeted.
+        let rendered = graph
+            .replace(
+                "\"${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}\"",
+                &per_component.to_string(),
+            )
+            .replace(
+                "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}",
+                &per_component.to_string(),
+            );
+        let budgeted = rendered
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                *line == format!("max_size = {per_component}")
+                    || *line == format!("max_size: {per_component}")
+            })
+            .count() as u64;
         assert_eq!(
-            rendered
-                .matches(&format!("max_size = {per_component}"))
-                .count() as u64,
-            actual_count,
+            budgeted, actual_count,
             "{name}: a disk buffer escaped the common allocation"
         );
 

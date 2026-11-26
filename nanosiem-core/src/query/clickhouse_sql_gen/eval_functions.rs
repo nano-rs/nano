@@ -350,6 +350,11 @@ fn typed_eval_expression_to_sql_inner_unguarded(
             })? {
                 return Ok(sql);
             }
+            if let Some(sql) = json_numeric_equality(gen, left, *op, right, field_override, |side| {
+                typed_eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             let left_sql = typed_eval_expression_to_sql_inner(
                 gen,
                 left,
@@ -644,6 +649,11 @@ fn eval_expression_to_sql_inner_unguarded(
                 return Ok(sql);
             }
             if let Some(sql) = string_literal_comparison(left, *op, right, |side| {
+                eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
+            if let Some(sql) = json_numeric_equality(gen, left, *op, right, field_override, |side| {
                 eval_expression_to_sql_inner(gen, side, false, field_override)
             })? {
                 return Ok(sql);
@@ -977,6 +987,40 @@ fn enum_label_comparison(
     Ok(Some(format!(
         "({subject_sql} {} {id})",
         if op == BinaryOperator::Eq { "=" } else { "!=" }
+    )))
+}
+
+/// NAN-5895: `==` / `!=` between an untyped JSON path (`unmapped.x`) and a
+/// numeric literal compares numbers. The path's value is its text, and a bare
+/// `<String> = 5` was a ClickHouse NO_COMMON_TYPE error; the ordered
+/// comparisons already cast (numeric context). A value that is no number gives
+/// NULL, as `| where unmapped.x=5` and the search term do.
+fn json_numeric_equality(
+    gen: &ClickHouseSqlGenerator,
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+    lower_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
+) -> Result<Option<String>, SqlGenError> {
+    if !matches!(op, BinaryOperator::Eq | BinaryOperator::Ne) {
+        return Ok(None);
+    }
+    let (subject, number) = match (left, right) {
+        (EvalExpression::Field(name), number @ EvalExpression::Literal(Value::Number(_)))
+        | (number @ EvalExpression::Literal(Value::Number(_)), EvalExpression::Field(name)) => (name, number),
+        _ => return Ok(None),
+    };
+    if field_override.is_some_and(|resolve| resolve(subject, false).is_some())
+        || !(gen.reads_event_json_path(subject) || gen.is_upstream_json_text(subject))
+    {
+        return Ok(None);
+    }
+    let subject_sql = lower_side(&EvalExpression::Field(subject.clone()))?;
+    Ok(Some(format!(
+        "(toFloat64OrNull(toString({subject_sql})) {} {})",
+        if op == BinaryOperator::Eq { "=" } else { "!=" },
+        lower_side(number)?
     )))
 }
 

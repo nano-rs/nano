@@ -138,8 +138,13 @@ pub fn render_condition(src: &str) -> String {
 /// processing plan) exactly as the parser editor's validate step does: the
 /// security patterns, the guarded compile against the parser allowlist, and a
 /// plan's native predicates.
+///
+/// Memoized with the render-time quarantine (NAN-5889): the verdict is a pure
+/// function of the source text, so a parser checked at import or by the
+/// publish gate is not compiled again when its config renders (a 99 KB
+/// parser costs several seconds per compile).
 pub fn check_program(field: &str, src: &str) -> Result<(), String> {
-    program_verdict(src).map_err(|e| format!("{field}: {e}"))
+    program_verdict_memo(src).map_err(|e| format!("{field}: {e}"))
 }
 
 /// The text a plain-VRL remap actually carries: the renderer rewrites `\r\n`

@@ -177,6 +177,43 @@ fn benign_errors_are_dropped() {
 }
 
 #[test]
+fn nothing_but_panics_is_sent_once_shutdown_starts() {
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let gate = EventGate::new(&settings(&[])).with_shutdown_clock(&STARTED, Duration::from_secs(60));
+    assert!(gate.process(message_event("rule execution failed before shutdown")).is_some());
+
+    STARTED.set(std::time::Instant::now()).unwrap();
+    assert!(gate.process(message_event("Error reading ClickHouse response chunk")).is_none());
+    let mut panic = Event::default();
+    panic.exception.values.push(Exception {
+        ty: "panic".into(),
+        value: Some("worker panicked during drain".into()),
+        mechanism: Some(sentry::protocol::Mechanism { ty: "panic".into(), ..Default::default() }),
+        ..Default::default()
+    });
+    assert!(gate.process(panic).is_some(), "panics are still real bugs during shutdown");
+}
+
+#[test]
+fn a_hung_shutdown_reports_again_after_the_quiet_window() {
+    // A zero-length window: shutdown already outlasted it (no dependence on
+    // machine uptime).
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    STARTED.set(std::time::Instant::now()).unwrap();
+    let gate = EventGate::new(&settings(&[])).with_shutdown_clock(&STARTED, Duration::ZERO);
+    assert!(gate.process(message_event("release claims still stuck")).is_some());
+}
+
+#[test]
+fn the_quiet_window_is_bounded() {
+    let now = std::time::Instant::now();
+    let window = Duration::from_secs(60);
+    assert!(!in_quiet_window(None, window, now));
+    assert!(in_quiet_window(Some(&now), window, now + Duration::from_secs(59)));
+    assert!(!in_quiet_window(Some(&now), window, now + Duration::from_secs(60)));
+}
+
+#[test]
 fn per_issue_cap_groups_by_normalized_message() {
     let gate = EventGate::new(&settings(&[]));
     let sent = (0..20)

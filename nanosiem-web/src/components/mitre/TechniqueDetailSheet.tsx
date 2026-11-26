@@ -227,10 +227,8 @@ function NextStep({ technique, facts, huntLayer, tacticIds, perms, onDraftFromFi
         {draftBtn()}
       </>
     );
-  } else if (huntLayer && ideas && (ideas.keep_hunting > 0 || ideas.needs_lookup > 0)) {
-    body = ideas.needs_lookup > 0
-      ? 'A rule idea is waiting on a lookup table before it can be sent.'
-      : 'A rule idea is still gathering evidence. It needs the same lead in 3 sweeps, with 2 promoted to cases.';
+  } else if (huntLayer && ideas && ideas.keep_hunting > 0) {
+    body = 'A rule idea is still gathering evidence. It needs the same lead in 3 sweeps, with 2 promoted to cases.';
     acts = (
       <>
         <Button

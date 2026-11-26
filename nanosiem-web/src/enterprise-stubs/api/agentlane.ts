@@ -33,6 +33,24 @@ export class AgentLaneApi {
   setLimits(): Promise<never> {
     return ENTERPRISE_ONLY();
   }
+  updateNetwork(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  updateCertificate(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  downloadCertificate(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  checkAddress(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  startConnectionTest(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
+  connectionTest(): Promise<never> {
+    return ENTERPRISE_ONLY();
+  }
   revokeToken(): Promise<never> {
     return ENTERPRISE_ONLY();
   }

@@ -121,11 +121,11 @@ x-nano-update-env: &nano-update-env
 
 # Agent Lane (enterprise; the open edition ignores it), read by nano-api AND
 # nano-jobs (the leader's Agent Lane reconciler keeps each token's ClickHouse
-# user), so one definition for both (NAN-5402). The listener state follows
-# .env (unset = off). Off is deliberate: the reconciler drops every token user.
-# The generated docker-compose.agentlane.yml sets it on and adds the URL and
-# allow-list; a listener that is on without them (an overlay from before this
-# fix) keeps existing users and raises a SIEM Health finding instead.
+# user), so one definition for both (NAN-5402). NAN-5880: Agent Lane is
+# managed in Settings > Agent Lane (PostgreSQL); NANO_AGENTLANE_LISTENER and
+# the allow-list / URL in .env are import-only (a one-time import on the first
+# start after an upgrade). The enterprise docker-compose.agentlane-gate.yml
+# adds the gate and the rest of the Agent Lane env.
 x-agentlane-base-env: &agentlane-base-env
   NANO_AGENTLANE_LISTENER: ${NANO_AGENTLANE_LISTENER:-off}
   NANO_AGENTLANE_NODE_URLS: ${NANO_AGENTLANE_NODE_URLS:-}
@@ -203,18 +203,54 @@ services:
       - ./clickhouse/preflight:/preflight:ro
     restart: "no"
 
+  # NAN-5880: stable network namespace for ClickHouse (the NAN-5004
+  # vector-netns pattern). The pinned, inert anchor owns ClickHouse's network
+  # attachment and the `clickhouse` DNS alias; ClickHouse joins it, so
+  # replacing only the ClickHouse container (an upgrade, a config change, a
+  # restart) never retires the namespace under a container that shares it.
+  # Enterprise installs run the Agent Lane gate in this namespace too (the
+  # enterprise-only docker-compose.agentlane-gate.yml publishes the Agent
+  # Lane port on this anchor). The open edition publishes nothing here: this
+  # anchor holds no port and runs no code beyond a sleep loop.
+  clickhouse-netns:
+    image: nginx:alpine@sha256:1bb9390209f866c8c0bf76ba89d3f33a3f6cd6a0e6c1b457af7ee763b9579f41
+    container_name: nano-clickhouse-netns
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $$!; done"]
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      default:
+        aliases:
+          - clickhouse
+    deploy:
+      resources:
+        limits:
+          memory: 16M
+          cpus: "0.05"
+
   clickhouse:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
     # Rollback: the ONLY supported downgrade target from 26.10 is
     # 26.8.36.3@sha256:d426d2f6… (see docs/dev/CLICKHOUSE-UPGRADE-NOTES.md).
     image: clickhouse/clickhouse-server:26.10.4.207@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035
     container_name: nano-clickhouse
+    # NAN-5880: ClickHouse runs in the clickhouse-netns anchor's namespace.
+    # Other services still reach it as `clickhouse` (the anchor's alias).
+    # Publish nothing here: a port on a joined service is a Compose error.
+    network_mode: "service:clickhouse-netns"
     restart: unless-stopped
     # NAN-5397: an upgrade recreates ClickHouse when its mounted config
     # changed. Let a busy server flush and stop cleanly instead of the 10 s
     # default followed by SIGKILL.
     stop_grace_period: 60s
     depends_on:
+      clickhouse-netns:
+        condition: service_started
       clickhouse-preflight:
         condition: service_completed_successfully
     logging: *verbose-logging
@@ -626,7 +662,7 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.14-debian@sha256:8995b2b456d104373056c4e72eded60c59c197ab1605d8de8d362b3a67fc857c
+    image: ghcr.io/nano-rs/vector:0.62.0-nano.2-debian@sha256:adcb061606d26026ac37c91d72073c8fe593cd0c09b262cc8ecf229ae2229801
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
@@ -832,6 +868,10 @@ services:
       # NAN-5635: the search memory guard's budget (see nano-search); the api
       # and jobs run searches too (dashboards, reports, AI, SOAR).
       SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
+      # NAN-5860: planned GB/day from the resource sizer (install.sh records it
+      # in .env). Hunt budget defaults scale with its tier; empty keeps the
+      # static defaults.
+      NANO_SIZING_PLANNED_GB_PER_DAY: ${NANO_SIZING_PLANNED_GB_PER_DAY:-${NANO_PLANNED_GB_PER_DAY:-}}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config delivery — api writes here, vector reads from same volume.
       VECTOR_CONFIG_DIR: /app/config/vector
@@ -1024,6 +1064,10 @@ services:
       # NAN-5635: the search memory guard's budget (see nano-search); the api
       # and jobs run searches too (dashboards, reports, AI, SOAR).
       SEARCH_COST_GUARD_BUDGET_BYTES: ${SEARCH_COST_GUARD_BUDGET_BYTES:-}
+      # NAN-5860: planned GB/day from the resource sizer (install.sh records it
+      # in .env). Hunt budget defaults scale with its tier; empty keeps the
+      # static defaults.
+      NANO_SIZING_PLANNED_GB_PER_DAY: ${NANO_SIZING_PLANNED_GB_PER_DAY:-${NANO_PLANNED_GB_PER_DAY:-}}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       # NAN-5678: see nano-api (same shared /app/data volume).

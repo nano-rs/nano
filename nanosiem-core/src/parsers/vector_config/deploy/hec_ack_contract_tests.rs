@@ -152,7 +152,7 @@ fn every_event_sink_is_disk_buffered_and_blocks_instead_of_dropping() {
                 Some("block"),
                 "ocsf={ocsf}: sink `{name}` must backpressure at capacity, not silently drop (NAN-5004)"
             );
-            let size = buffer.and_then(|b| b.get("max_size")).and_then(|v| v.as_integer()).unwrap_or(0);
+            let size = buffer.and_then(|b| b.get("max_size")).and_then(crate::vector_env::toml_integer).unwrap_or(0);
             assert!(size >= 268_435_488, "ocsf={ocsf}: `{name}` max_size {size} is below Vector's disk minimum");
         }
     }

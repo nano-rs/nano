@@ -401,6 +401,13 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::vector_config_delivery::post_install_lease_v2)
                 .delete(handlers::vector_config_delivery::delete_install_lease_v2),
         )
+        // NAN-5810 review P1-1: the lease on a path a pre-v2.0.36 api answers
+        // 404 (a v2.0.35 api would grant a 0.61 Vector a generation it cannot load).
+        .route(
+            "/api/internal/vector-config/install-lease/v3",
+            post(handlers::vector_config_delivery::post_install_lease_v3)
+                .delete(handlers::vector_config_delivery::delete_install_lease_v3),
+        )
         // NAN-4907: nginx auth_request for the OTLP edge. Exempt from
         // user-session auth (PUBLIC_ENDPOINTS): the handler authenticates the
         // sender's source-bound ingest token itself.
@@ -1130,6 +1137,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/connector-feeds",
             get(handlers::connector_feeds::list_connector_feeds)
                 .post(handlers::connector_feeds::create_connector_feed),
+        )
+        .route(
+            "/api/connector-feeds/plan",
+            post(handlers::connector_feeds::plan_connector_feed),
         )
         .route(
             "/api/connector-feeds/{id}",
@@ -2857,6 +2868,37 @@ pub fn create_router(state: AppState) -> Router {
             .route("/api/hunts/campaigns/{id}/rechecks", get(handlers::hunts::list_campaign_rechecks))
             .route("/api/hunts/campaign-candidates", get(handlers::hunts::list_campaign_candidates))
             .route("/api/hunts/leads/{id}/campaign", post(handlers::hunts::attach_finding_to_campaign))
+            // NAN-5859 Actors (campaigns): timeline and undo, attributions, indicators,
+            // notes, pin, reopen, unarchive, merge and split, case links, the review
+            // queue, lookup and the name preview. View reads; triage decides;
+            // manage merges, splits, reopens. See handlers/hunts/actors.rs.
+            .route("/api/hunts/campaigns/{id}/timeline", get(handlers::hunts::get_campaign_timeline))
+            .route("/api/hunts/campaign-changes/{id}/undo", post(handlers::hunts::undo_campaign_change))
+            .route("/api/hunts/campaigns/{id}/attributions", get(handlers::hunts::list_campaign_attributions).post(handlers::hunts::attribute_to_campaign))
+            .route("/api/hunts/campaigns/{id}/attributions/{attr_id}/confirm", post(handlers::hunts::confirm_campaign_attribution))
+            .route("/api/hunts/campaigns/{id}/attributions/{attr_id}/reject", post(handlers::hunts::reject_campaign_attribution))
+            .route("/api/hunts/campaigns/{id}/indicators", get(handlers::hunts::list_campaign_indicators).post(handlers::hunts::add_campaign_indicator))
+            .route("/api/hunts/campaigns/{id}/indicators/{ind_id}/confirm", post(handlers::hunts::confirm_campaign_indicator))
+            .route("/api/hunts/campaigns/{id}/indicators/{ind_id}/reject", post(handlers::hunts::reject_campaign_indicator))
+            .route("/api/hunts/campaigns/{id}/indicators/{ind_id}/ioc-list", post(handlers::hunts::set_campaign_indicator_ioc_list))
+            .route("/api/hunts/campaigns/{id}/notes", get(handlers::hunts::list_campaign_notes).post(handlers::hunts::add_campaign_note))
+            .route("/api/hunts/campaigns/{id}/notes/{note_id}/confirm", post(handlers::hunts::confirm_campaign_note))
+            .route("/api/hunts/campaigns/{id}/notes/{note_id}/revoke", post(handlers::hunts::revoke_campaign_note))
+            .route("/api/hunts/campaigns/{id}/pin", post(handlers::hunts::pin_campaign).delete(handlers::hunts::unpin_campaign))
+            .route("/api/hunts/campaigns/{id}/reopen", post(handlers::hunts::reopen_campaign))
+            .route("/api/hunts/campaigns/{id}/unarchive", post(handlers::hunts::unarchive_campaign))
+            .route("/api/hunts/campaigns/{id}/merge", post(handlers::hunts::merge_campaign))
+            .route("/api/hunts/campaigns/{id}/split", post(handlers::hunts::split_campaign))
+            .route("/api/hunts/campaign-merges", get(handlers::hunts::list_campaign_merges))
+            .route("/api/hunts/campaign-merges/{id}/apply", post(handlers::hunts::apply_campaign_merge))
+            .route("/api/hunts/campaign-merges/{id}/reject", post(handlers::hunts::reject_campaign_merge))
+            .route("/api/hunts/campaign-merges/{id}/undo", post(handlers::hunts::undo_campaign_merge))
+            .route("/api/hunts/campaigns/{id}/cases", get(handlers::hunts::list_campaign_cases).post(handlers::hunts::link_campaign_case))
+            .route("/api/hunts/campaigns/{id}/cases/{case_id}", delete(handlers::hunts::unlink_campaign_case))
+            .route("/api/hunts/case-actors/{case_id}", get(handlers::hunts::list_case_actors))
+            .route("/api/hunts/campaign-review", get(handlers::hunts::get_campaign_review))
+            .route("/api/hunts/campaign-lookup", get(handlers::hunts::lookup_campaigns))
+            .route("/api/hunts/settings/actor-names/preview", get(handlers::hunts::preview_actor_names))
             // NAN-2239 knowledge. Recall is `hunts:view`; recording is the one
             // write a sweep key can make besides its report; revocation is
             // `hunts:triage`. Nothing here suppresses — see handlers/hunts/knowledge.rs.
@@ -3647,7 +3689,9 @@ pub fn create_router(state: AppState) -> Router {
 
     // Enterprise routes that authenticate THEMSELVES (not with a session) are
     // merged after the session auth layer, so it never sees them. They keep
-    // the backup mutation fence; the layers below (IP allowlist, request id,
+    // the backup mutation fence (except the Agent Lane gate heartbeat, whose
+    // own bearer check must come first: see is_fence_exempt); the layers
+    // below (IP allowlist, request id,
     // logging, ...) wrap them like any route. Instead of the blanket
     // licensed-surface guard they get the effective license state as a
     // request extension and enforce the hard stop themselves: at it they

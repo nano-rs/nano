@@ -2,6 +2,9 @@
 
 P1-1  native pid files are bound to (pid, start time, owner token): a reused
       pid, or a dev service built from the same target dir, is never signalled.
+      A non-dumpable service (nano-connector-runner, PR_SET_DUMPABLE 0) hides
+      its environ on Linux: it is proven by its kernel start tick instead, so
+      it is neither reported dead at startup nor leaked at teardown.
 P2-6  the ClickHouse admin password never appears in a process's argv.
 P1-2  `gc --hours 0` is refused.
 """
@@ -18,6 +21,10 @@ from pathlib import Path
 import pytest
 
 C_SLEEPER = "#include <unistd.h>\nint main(void){sleep(300);return 0;}\n"
+C_NONDUMPABLE = (
+    "#include <sys/prctl.h>\n#include <unistd.h>\n"
+    "int main(void){prctl(PR_SET_DUMPABLE,0,0,0,0);sleep(300);return 0;}\n"
+)
 
 
 def _bash(runner: Path, script: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -44,6 +51,24 @@ def fake_target(tmp_path: Path) -> Path:
     src = tmp_path / "s.c"
     src.write_text(C_SLEEPER)
     subprocess.run([cc, "-o", str(target / "debug" / "nanosiem-api"), str(src)], check=True)
+    return target
+
+
+@pytest.fixture
+def nondumpable_target(tmp_path: Path) -> Path:
+    """A fake target dir whose nano-connector-runner makes itself
+    non-dumpable, as the real one does (Linux only: there is no /proc on
+    macOS, where `ps -E` reads the environment)."""
+    if not Path("/proc/self/stat").exists():
+        pytest.skip("Linux /proc only")
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler to build the sleeper helper")
+    target = tmp_path / "ndtarget"
+    (target / "debug").mkdir(parents=True)
+    src = tmp_path / "nd.c"
+    src.write_text(C_NONDUMPABLE)
+    subprocess.run([cc, "-o", str(target / "debug" / "nano-connector-runner"), str(src)], check=True)
     return target
 
 
@@ -169,3 +194,52 @@ def test_gc_refuses_unsafe_cutoff(runner: Path, hours: str) -> None:
     r = subprocess.run([str(runner), "gc", "--hours", hours], capture_output=True, text=True, check=False)
     assert r.returncode != 0
     assert "--hours" in r.stderr
+
+
+def _nondumpable(runner: Path, target: Path, tmp_path: Path, token: str) -> tuple[subprocess.Popen, Path, str, str]:
+    env = {"CARGO_TARGET_DIR": str(target)}
+    p = _spawn(target / "debug" / "nano-connector-runner", {"E2E_PROC_OWNER": token})
+    if os.access(f"/proc/{p.pid}/environ", os.R_OK):
+        _cleanup(p)
+        pytest.skip("environ of a non-dumpable process is readable here (running as root?)")
+    start = _start_time(runner, p.pid, env)
+    ticks = _bash(runner, f"proc_ticks {p.pid}", env).stdout.strip()
+    assert ticks.isdigit(), ticks
+    return p, _run_dir(tmp_path), start, ticks
+
+
+def test_nondumpable_service_is_alive_and_stopped(runner: Path, nondumpable_target: Path, tmp_path: Path) -> None:
+    env = {"CARGO_TARGET_DIR": str(nondumpable_target)}
+    token = "e" * 32
+    p, run, start, ticks = _nondumpable(runner, nondumpable_target, tmp_path, token)
+    try:
+        (run / "pids" / "connector.pid").write_text(f"{p.pid}\t{start}\t{token}\t{ticks}\n")
+        r = _bash(runner, f'RUN_DIR="{run}"; pid_alive "{run}/pids/connector.pid"', env)
+        assert r.returncode == 0, f"a running non-dumpable service must read as alive: {r.stderr}"
+        r = _bash(runner, f'RUN_DIR="{run}"; native_stop TERM connector', env)
+        assert r.returncode == 0, r.stderr
+        p.wait(timeout=10)
+        assert not _alive(p), "the non-dumpable service must be stopped at teardown"
+        assert not (run / "pids" / "connector.pid").exists()
+    finally:
+        _cleanup(p)
+
+
+@pytest.mark.parametrize("ticks", ["", "1"])
+def test_nondumpable_without_matching_start_tick_is_never_signalled(
+    runner: Path, nondumpable_target: Path, tmp_path: Path, ticks: str
+) -> None:
+    """No recorded tick (an older pid file) or another tick (a reused pid):
+    the environ cannot be read, so nothing proves ownership."""
+    env = {"CARGO_TARGET_DIR": str(nondumpable_target)}
+    token = "f" * 32
+    p, run, start, _ = _nondumpable(runner, nondumpable_target, tmp_path, token)
+    try:
+        line = f"{p.pid}\t{start}\t{token}" + (f"\t{ticks}" if ticks else "")
+        (run / "pids" / "connector.pid").write_text(line + "\n")
+        r = _bash(runner, f'RUN_DIR="{run}"; native_stop TERM connector; native_stop KILL connector', env)
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.5)
+        assert _alive(p), "an unproven non-dumpable process must never be signalled"
+    finally:
+        _cleanup(p)

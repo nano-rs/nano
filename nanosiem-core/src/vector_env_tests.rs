@@ -95,3 +95,88 @@ fn vrl_rejection_covers_secret_backend_syntax() {
     assert!(err.contains("SECRET["), "{err}");
     reject_vrl_interpolation("parser_vrl", ".a = \"SECRET\" + \"[nano.pw]\"").unwrap();
 }
+
+// --- NAN-5810: Vector 0.62 parses before it interpolates -------------------
+
+#[test]
+fn bare_numeric_placeholders_are_quoted() {
+    let old = "[sinks.a.batch]\n\
+               max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}\n\
+               \x20 max_events   =   ${VECTOR_BATCH_MAX_EVENTS:-50000}   # tier-driven\n\
+               timeout_secs=${VECTOR_BATCH_TIMEOUT_SECS}\n\
+               buffer.max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES-268435488}\r\n\
+               \"quoted.key\" = ${X:?required}\n";
+    let want = "[sinks.a.batch]\n\
+                max_bytes = \"${VECTOR_BATCH_MAX_BYTES:-52428800}\"\n\
+                \x20 max_events   =   \"${VECTOR_BATCH_MAX_EVENTS:-50000}\"   # tier-driven\n\
+                timeout_secs=\"${VECTOR_BATCH_TIMEOUT_SECS}\"\n\
+                buffer.max_size = \"${VECTOR_DISK_BUFFER_MAX_BYTES-268435488}\"\r\n\
+                \"quoted.key\" = \"${X:?required}\"\n";
+    assert_eq!(quote_bare_placeholders(old), want);
+    assert_eq!(quote_bare_placeholders(want), want, "idempotent");
+    assert_eq!(bare_placeholder_lines(old).iter().map(|(n, _)| *n).collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
+    assert!(bare_placeholder_lines(want).is_empty());
+    // The quoted file is TOML; substituted, the numbers are strings Vector coerces.
+    let doc: toml::Table = toml::from_str(&substitute_like_vector(want)).unwrap();
+    assert_eq!(toml_integer(&doc["sinks"]["a"]["batch"]["max_bytes"]), Some(52_428_800));
+}
+
+#[test]
+fn quoting_leaves_everything_else_byte_identical() {
+    let content = "# nano-env-escaped: v1 tenant-vrl\n\
+                   # comment: max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}\n\
+                   endpoint = \"${CLICKHOUSE_URL:-http://clickhouse:8123}\"\n\
+                   valid_tokens = [\"${VECTOR_AUTH_TOKEN}\"]\n\
+                   escaped = $${LITERAL}\n\
+                   partial = ${A}${B}\n\
+                   prefixed = x${A}\n\
+                   inline = { max = ${A} }\n\
+                   [transforms.t]\n\
+                   source = '''\n\
+                   x = ${NOT_TOML}\n\
+                   .a = \"${SECRET}\"\n\
+                   '''\n\
+                   other = \"\"\"\n\
+                   y = ${ALSO_NOT}\n\
+                   \"\"\"\n\
+                   one_line = '''z = ${Q}'''\n\
+                   no_newline_at_end = 1";
+    assert_eq!(quote_bare_placeholders(content), content);
+    assert!(bare_placeholder_lines(content).is_empty(), "{:?}", bare_placeholder_lines(content));
+}
+
+#[test]
+fn quoting_resumes_after_a_vrl_block() {
+    let content = "source = '''\n.a = 1\n'''\nmax_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}";
+    assert_eq!(
+        quote_bare_placeholders(content),
+        "source = '''\n.a = 1\n'''\nmax_size = \"${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}\""
+    );
+}
+
+/// NAN-5810 review (P2-2): a `#` comment that mentions a triple quote opens
+/// no multi-line string, so the lines after it are still scanned and a real
+/// VRL block after it is still protected.
+#[test]
+fn a_triple_quote_in_a_comment_does_not_flip_the_scan() {
+    for q in ["'''", "\"\"\""] {
+        let content = format!(
+            "# only its {q} VRL blocks\nmax_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\n\
+             source = '''\nx = ${{INSIDE_VRL}}\n'''\nconcurrency = ${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\n"
+        );
+        let want = format!(
+            "# only its {q} VRL blocks\nmax_size = \"${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\"\n\
+             source = '''\nx = ${{INSIDE_VRL}}\n'''\nconcurrency = \"${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\"\n"
+        );
+        assert_eq!(quote_bare_placeholders(&content), want, "{q}");
+        assert_eq!(bare_placeholder_lines(&want), Vec::<(usize, String)>::new(), "{q}");
+        assert_eq!(bare_placeholder_lines(&content).len(), 2, "{q}");
+    }
+}
+
+#[test]
+fn a_default_that_cannot_sit_in_a_basic_string_is_left_alone() {
+    for line in ["a = ${X:-has\"quote}", "a = ${X:-back\\slash}", "a = ${X:-}}"] {
+        assert_eq!(quote_bare_placeholders(line), line, "{line}");
+    }
+}

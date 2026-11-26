@@ -54,7 +54,8 @@ use utoipa::{IntoParams, ToSchema};
 use super::log_source_deploy_jobs::{run_deploy_job, DeployAudit, DeployOk, DeployWaitQuery};
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
-use nanosiem_core::log_sources::deploy_jobs::{DeployJob, DeployJobKind};
+use nanosiem_core::log_sources::deploy_jobs::{DeployJob, DeployJobKind, DeployPhase};
+use std::sync::Arc;
 
 // Permission constants for log sources
 const LOG_SOURCES_VIEW: &str = "log_sources:view";
@@ -658,7 +659,7 @@ pub async fn validate_log_source(
         (status = 200, description = "Deployment result (wait=true)", body = DeploymentResult),
         (status = 202, description = "Deploy job accepted (wait=false, or wait=true still running after 270 s)", body = DeployJob),
         (status = 400, description = "NAN-5789 (wait=true): a fetch source with no existing source configuration of its own type is refused before it is enabled (code SOURCE_CONFIGURATION_REQUIRED)", body = crate::error::ErrorResponse),
-        (status = 422, description = "OCSF validation failed, or no OCSF receipt for a first go-live (checked before any job is created)"),
+        (status = 422, description = "No OCSF receipt, sample or acknowledgement for a first go-live, or samples over the limits (checked before any job is created); with wait=true also an OCSF sample that failed in the job"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -686,26 +687,34 @@ pub async fn deploy_log_source(
     }
 
     let id = *id;
-    // NAN-5079: the OCSF gate runs BEFORE the job is enqueued, so a refusal is
-    // a 422 on both wait=true and wait=false and no job is created.
+    let system_install = request.unattested_system_install;
     let gate = nanosiem_core::log_sources::OcsfGateInput {
         samples: request.ocsf_sample_logs,
         acknowledge_unattested: request.acknowledge_unattested
             || request.unattested_system_install,
     };
-    let checked = state.log_source_service.ocsf_deploy_precheck(id, &gate).await?;
-    if checked.outcome == nanosiem_core::log_sources::OcsfGateOutcome::Unattested {
-        audit_unattested_go_live(&state, &auth, &client, id, "deploy", request.unattested_system_install);
-    }
+    // NAN-5889 review: database checks only before the job (404, and on a
+    // first go-live the no-sample 422); the gate's compile and sample run is
+    // the job's first step, so `wait=false` answers at once.
+    state.log_source_service.ocsf_deploy_admission(id, &gate).await?;
 
+    let gate_outcome = Arc::new(std::sync::OnceLock::new());
     let audit = DeployAudit {
         action: LOG_SOURCE_DEPLOYED,
         auth: auth.clone(),
-        client,
-        extra: Some(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) })),
+        client: client.clone(),
+        extra: None,
+        late_extra: Some(Arc::clone(&gate_outcome)),
     };
     run_deploy_job(&state, audit, DeployJobKind::Deploy, Some(id), wait.wait, request_started, move |state, progress| async move {
-        // A save between the check and the job must not go live unchecked.
+        progress.phase(DeployPhase::Validating);
+        // NAN-5079: the full OCSF gate (first go-live only).
+        let checked = state.log_source_service.ocsf_deploy_precheck(id, &gate).await?;
+        let _ = gate_outcome.set(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) }));
+        if checked.outcome == nanosiem_core::log_sources::OcsfGateOutcome::Unattested {
+            audit_unattested_go_live(&state, &auth, &client, id, "deploy", system_install);
+        }
+        // A save between the check and the deploy must not go live unchecked.
         state
             .log_source_service
             .ensure_ocsf_generation_unchanged(id, &checked)
@@ -754,7 +763,7 @@ pub async fn undeploy_log_source(
     let id = *id;
     let flag_auth = auth.clone();
     let flag_client = client.clone();
-    let audit = DeployAudit { action: LOG_SOURCE_UNDEPLOYED, auth: auth.clone(), client, extra: None };
+    let audit = DeployAudit { action: LOG_SOURCE_UNDEPLOYED, auth: auth.clone(), client, extra: None, late_extra: None };
     run_deploy_job(&state, audit, DeployJobKind::Undeploy, Some(id), wait.wait, request_started, move |state, progress| async move {
         let result = state
             .log_source_service
@@ -1190,7 +1199,7 @@ pub async fn deploy_all_log_sources(
     let request_started = std::time::Instant::now();
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
-    let audit = DeployAudit { action: LOG_SOURCE_DEPLOY_ALL, auth: auth.clone(), client, extra: None };
+    let audit = DeployAudit { action: LOG_SOURCE_DEPLOY_ALL, auth: auth.clone(), client, extra: None, late_extra: None };
     run_deploy_job(&state, audit, DeployJobKind::DeployAll, None, wait.wait, request_started, move |state, progress| async move {
         state
             .log_source_service
@@ -1375,8 +1384,16 @@ impl ExpectedRevision {
 /// Publish working copy as new version and deploy
 ///
 /// NAN-5132: the publish (validation, version, deploy) is a background deploy
-/// job; `?wait=` as for deploy. A 409 for a stale `expected_updated_at` comes
-/// back from the job (`error_status: 409`) when `wait=false`.
+/// job; `?wait=` as for deploy. `?wait=false` answers 202 with the job; poll
+/// `GET /api/log-sources/deploy-jobs/{job_id}` for its state, phase, message
+/// and result. The default (`wait=true`) waits and answers as before.
+///
+/// NAN-5889: only the checks that need no VRL compile run before the job
+/// (404, a 409 for a stale `expected_updated_at`, and a 422 for a parser that
+/// has no OCSF receipt, no sample and no acknowledgement), so `wait=false`
+/// answers at once. Compiling the parser and running its OCSF samples is the
+/// job's first step: a sample that fails there fails the job with
+/// `error_status: 422` (a `wait=true` caller still gets the 422).
 #[utoipa::path(
     post,
     path = "/api/log-sources/{id}/publish",
@@ -1389,8 +1406,8 @@ impl ExpectedRevision {
     responses(
         (status = 409, description = "The working copy changed since expected_updated_at"),
         (status = 200, description = "Publish and deploy result (wait=true)", body = DeploymentResult),
-        (status = 202, description = "Publish job accepted (wait=false, or wait=true still running after 270 s)", body = DeployJob),
-        (status = 422, description = "OCSF validation failed or no OCSF receipt for a changed parser (checked before any job is created)"),
+        (status = 202, description = "Publish job accepted (wait=false, or wait=true still running after 270 s); poll status_path", body = DeployJob),
+        (status = 422, description = "No OCSF receipt, sample or acknowledgement for a changed parser, or samples over the limits (checked before any job is created); with wait=true also an OCSF sample that failed in the job"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -1409,36 +1426,43 @@ pub async fn publish_log_source(
 
     let request = PublishLogSourceRequest::from_body(&body)?;
     let id = *id;
-    // NAN-5079: the OCSF gate runs BEFORE the job is enqueued (422, no job, on
-    // both wait paths). The job then publishes AT the revision the gate
-    // checked, so an edit in between is a 409, never an unchecked publish.
-    // This also answers 404 before a job exists for a missing source.
     let gate = nanosiem_core::log_sources::OcsfGateInput {
         samples: request.ocsf_sample_logs,
         acknowledge_unattested: request.acknowledge_unattested,
     };
-    let checked = state
+    // NAN-5889: database checks only (404, 409, the no-sample 422); nothing
+    // here compiles VRL. The job then publishes AT this revision, so an edit
+    // in between is a 409, never an unchecked publish.
+    let revision = state
         .log_source_service
-        .ocsf_publish_precheck(id, request.expected_updated_at, &gate)
+        .ocsf_publish_admission(id, request.expected_updated_at, &gate)
         .await?;
-    // Audited at the acknowledgement itself: once the job creates the version
-    // it is active even if its deploy then fails.
-    if checked.outcome == nanosiem_core::log_sources::OcsfGateOutcome::Unattested {
-        audit_unattested_go_live(&state, &auth, &client, id, "publish", false);
-    }
 
-    let expected = Some(checked.revision);
+    let gate_outcome = Arc::new(std::sync::OnceLock::new());
     let audit = DeployAudit {
         action: LOG_SOURCE_PUBLISHED,
         auth: auth.clone(),
-        client,
-        extra: Some(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) })),
+        client: client.clone(),
+        extra: None,
+        late_extra: Some(Arc::clone(&gate_outcome)),
     };
     let user_id = auth.user_id();
     run_deploy_job(&state, audit, DeployJobKind::Publish, Some(id), wait.wait, request_started, move |state, progress| async move {
+        progress.phase(DeployPhase::Validating);
+        // NAN-5079: the full OCSF gate (compile, safety check, samples).
+        let checked = state
+            .log_source_service
+            .ocsf_publish_precheck(id, Some(revision), &gate)
+            .await?;
+        let _ = gate_outcome.set(serde_json::json!({ "ocsf_gate": format!("{:?}", checked.outcome) }));
+        // Audited at the acknowledgement itself: once the job creates the
+        // version it is active even if its deploy then fails.
+        if checked.outcome == nanosiem_core::log_sources::OcsfGateOutcome::Unattested {
+            audit_unattested_go_live(&state, &auth, &client, id, "publish", false);
+        }
         let result = state
             .log_source_service
-            .publish_with_progress(id, Some(user_id), expected, progress.as_ref())
+            .publish_with_progress(id, Some(user_id), Some(checked.revision), progress.as_ref())
             .await?;
         Ok(DeployOk::Result(result))
     })

@@ -469,19 +469,19 @@ deduplicate = true
 # total to every disk buffer. The fallback is Vector's exact per-buffer floor.
 [sinks.clickhouse_logs.buffer]
 type = "disk"
-max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+max_size = "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}"
 when_full = "block"
 
 [sinks.clickhouse_logs.acknowledgements]
 enabled = false
 
 [sinks.clickhouse_logs.batch]
-max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
-max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
-timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"
+max_events = "${VECTOR_BATCH_MAX_EVENTS:-50000}"
+timeout_secs = "${VECTOR_BATCH_TIMEOUT_SECS:-10}"
 
 [sinks.clickhouse_logs.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+concurrency = "${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}"
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
@@ -523,19 +523,19 @@ deduplicate = true
 
 [sinks.clickhouse_parser_health.buffer]
 type = "disk"
-max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+max_size = "${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}"
 when_full = "block"
 
 [sinks.clickhouse_parser_health.acknowledgements]
 enabled = false
 
 [sinks.clickhouse_parser_health.batch]
-max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
-max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
-timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+max_bytes = "${VECTOR_BATCH_MAX_BYTES:-52428800}"
+max_events = "${VECTOR_BATCH_MAX_EVENTS:-50000}"
+timeout_secs = "${VECTOR_BATCH_TIMEOUT_SECS:-10}"
 
 [sinks.clickhouse_parser_health.request]
-concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+concurrency = "${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}"
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300

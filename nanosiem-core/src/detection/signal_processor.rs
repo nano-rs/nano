@@ -367,6 +367,9 @@ impl SignalProcessor {
             // NAN-5428: poll-level infrastructure outage alarm raised (every
             // active real-time rule marked failing).
             let mut poll_outage_alarm = false;
+            // NAN-5886: an infrastructure outage logs WARN until it has
+            // lasted the report threshold, then ERROR once.
+            let mut outage = crate::transient_outage::OutageTracker::default();
 
             while running.load(Ordering::SeqCst) {
                 // Poll for new signals
@@ -385,6 +388,15 @@ impl SignalProcessor {
                 {
                     Ok(processed) => {
                         consecutive_errors = 0;
+                        if let Some(ended) = outage.record_success(std::time::Instant::now()) {
+                            info!(
+                                failures = ended.failures,
+                                outage_secs = ended.elapsed.as_secs(),
+                                "Signal processor backend recovered after {}s ({} failed polls)",
+                                ended.elapsed.as_secs(),
+                                ended.failures
+                            );
+                        }
                         // Fully-successful poll → we're unstuck; forget any
                         // dead-letter candidate.
                         let held_rule = {
@@ -428,6 +440,16 @@ impl SignalProcessor {
                             (wm.last_error_signal.is_some(), wm.last_error_attempts)
                         };
                         let failure = classify_signal_error(&e);
+                        // NAN-5886: only a transport failure is an outage.
+                        // The Infrastructure class (which holds the
+                        // watermark) also covers server pressure and a
+                        // rejected TLS connection: those report at once.
+                        let outage_step = if crate::transient_outage::is_transient_anyhow(&e) {
+                            Some(outage.record_failure(std::time::Instant::now()))
+                        } else {
+                            outage.record_success(std::time::Instant::now());
+                            None
+                        };
                         if !signal_held
                             && failure.class != SignalFailureClass::Infrastructure
                             && consecutive_errors >= config.max_skip_threshold
@@ -454,12 +476,31 @@ impl SignalProcessor {
                                 ),
                             }
                         } else if consecutive_errors >= config.max_retries {
-                            error!(
-                                consecutive_errors,
-                                failure_key = %failure.key,
-                                "Signal processor experiencing repeated errors: {}",
-                                crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
-                            );
+                            match outage_step {
+                                Some(crate::transient_outage::OutageStep::Report { failures, elapsed }) => error!(
+                                    consecutive_errors,
+                                    failure_key = %failure.key,
+                                    failures,
+                                    outage_secs = elapsed.as_secs(),
+                                    "Signal processor backend unavailable for {}s ({} failed polls): {}",
+                                    elapsed.as_secs(),
+                                    failures,
+                                    crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
+                                ),
+                                Some(step) => warn!(
+                                    consecutive_errors,
+                                    failure_key = %failure.key,
+                                    outage_secs = step.elapsed().as_secs(),
+                                    "Signal processor backend unavailable (will retry): {}",
+                                    crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
+                                ),
+                                None => error!(
+                                    consecutive_errors,
+                                    failure_key = %failure.key,
+                                    "Signal processor experiencing repeated errors: {}",
+                                    crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
+                                ),
+                            }
                             // NAN-5428: the poll itself is down (no signal held):
                             // raise detection health once for the outage.
                             if !signal_held
@@ -478,6 +519,21 @@ impl SignalProcessor {
                                     ),
                                 }
                             }
+                        } else if let Some(crate::transient_outage::OutageStep::Report { failures, elapsed }) =
+                            outage_step
+                        {
+                            // The outage passed the report threshold before
+                            // the retry streak did (short threshold).
+                            error!(
+                                consecutive_errors,
+                                failure_key = %failure.key,
+                                failures,
+                                outage_secs = elapsed.as_secs(),
+                                "Signal processor backend unavailable for {}s ({} failed polls): {}",
+                                elapsed.as_secs(),
+                                failures,
+                                crate::db::pg_text::pg_safe_error_text(&format!("{e:#}"))
+                            );
                         } else {
                             warn!(
                                 consecutive_errors,

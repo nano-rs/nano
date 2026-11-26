@@ -83,8 +83,16 @@ case "$subcommand" in
         [[ -n "$cid" && "$cid" != *$'\n'* ]] || die "the clickhouse service is not running (start the stack, then re-run)"
         [[ "$(docker inspect --format '{{.State.Running}}' "$cid" </dev/null 2>/dev/null)" == true ]] \
             || die "the clickhouse container is not running (start the stack, then re-run)"
-        address=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$cid" </dev/null \
-            | awk 'NF && !found { print; found = 1 }')
+        # NAN-5880: ClickHouse joins the clickhouse-netns anchor's namespace,
+        # which holds the address; an install not yet moved onto it has it on
+        # ClickHouse itself.
+        netns_cid=$(docker compose "${compose_args[@]}" ps -q clickhouse-netns </dev/null 2>/dev/null || true)
+        address=""
+        for addr_cid in $netns_cid "$cid"; do
+            [[ -n "$address" ]] && break
+            address=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$addr_cid" </dev/null \
+                | awk 'NF && !found { print; found = 1 }')
+        done
         [[ "$address" =~ ^[0-9.]+$ ]] || die "could not read the clickhouse container's address on the Compose network"
         password=$(env_value CLICKHOUSE_ADMIN_PASSWORD)
         [[ -n "$password" ]] || die "CLICKHOUSE_ADMIN_PASSWORD is missing from $env_file"

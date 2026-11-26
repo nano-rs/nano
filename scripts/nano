@@ -126,7 +126,8 @@ VECTOR_QUIESCE_LIB="$SCRIPT_DIR/lib/vector-quiesce.sh"
 }
 # shellcheck source=scripts/lib/vector-quiesce.sh
 source "$VECTOR_QUIESCE_LIB"
-nano_vq_compose() { dc "$@"; }
+# NAN-5885: NANO_VQ_LIMIT (set by vector-quiesce.sh for its scrapes) bounds the call.
+nano_vq_compose() { if [[ -n "${NANO_VQ_LIMIT:-}" ]]; then timeout "$NANO_VQ_LIMIT" "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" "$@"; else dc "$@"; fi; }
 INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 COMMAND="${1:-}"
 [[ $# -gt 0 ]] && shift
@@ -1149,8 +1150,11 @@ stop_legacy_vector_gracefully() {
     ok "legacy Vector completed its SIGTERM drain and exited cleanly"
 }
 
+# quiesce_local_writers [require-drained]: with require-drained (backup), refuse to
+# stop a Vector whose drain was not confirmed (NAN-5885). Restore does not pass it:
+# disaster recovery must not be blocked by a broken ClickHouse.
 quiesce_local_writers() {
-    local running service candidates=()
+    local running service candidates=() require="${1:-}"
     running="$(dc ps --status running --services 2>/dev/null || true)"
     local writer_services=(vector connector-runner nano-api nano-jobs nano-search)
     if ((LEGACY_LAYOUT)); then
@@ -1167,6 +1171,10 @@ quiesce_local_writers() {
             # stop it with more time than its own graceful-shutdown limit.
             nano_vq_close
             nano_vq_drain "${NANO_VECTOR_DRAIN_SECS:-120}"
+            # NAN-5885: a stop that has to kill Vector loses what it had not delivered.
+            if [[ "$require" == require-drained ]] && ! nano_vq_require_drained; then
+                die "The backup stopped before it stopped any service: Vector was not drained (above). Nothing was backed up."
+            fi
             STOPPED_SERVICES=(vector)
             nano_vq_stop
         fi
@@ -2176,7 +2184,7 @@ PY
     # services behind its back.
     if [[ -z "$snapshot_gate" ]]; then
         ((LEGACY_LAYOUT)) && legacy_backup_recovery_begin
-        quiesce_local_writers
+        quiesce_local_writers require-drained
     fi
     if [[ "$pg_in" == true ]]; then
         start_pg_exported_snapshot

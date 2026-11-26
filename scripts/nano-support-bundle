@@ -103,7 +103,18 @@ PATTERNS = [
                 r"|password|code|client_secret|x-amz-signature|x-amz-credential|sv|se)=)(?!\[REDACTED)[^&\s\"'#]+"),
      r"\1[REDACTED]"),
     # key=value / "key": "value" / `KEY:  value` pairs whose key names a secret: see _kv_sub.
-    (re.compile(r"(?i)([A-Za-z0-9_.-]*(?:" + _KV_WORDS + r")[A-Za-z0-9_.-]*)([\"']?[ \t]*[:=][ \t]*)"
+    # The key starts at a token boundary, and three shapes are not keys at all (the
+    # match moves on, so a real secret later on the same line is still redacted):
+    #   a Rust log target, lowercase after "::" then ": " (`nanosiem_core::ingest_tokens: ...`);
+    #   a path segment followed by "::" (`ingest_tokens::cache: ...`);
+    #   a Rust source location (`src/ingest_tokens.rs:42:9:`).
+    # `foo::token=X`, `foo::token:X` and `{"foo::token": "X"}` stay key/value pairs.
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])"
+                r"(?!(?-i:(?<=::)[a-z0-9_]+:[ \t]))"
+                r"(?![A-Za-z0-9_.-]*::[A-Za-z0-9_])"
+                r"(?![A-Za-z0-9_.-]*\.rs:\d+(?::\d+)?(?::|\s|$))"
+                r"([A-Za-z0-9_.-]*(?:" + _KV_WORDS + r")[A-Za-z0-9_.-]*)"
+                r"([\"']?[ \t]*[:=][ \t]*)"
                 r"(\"(?:[^\"\\\r\n]|\\.)*\"?|'[^'\r\n]*'?|[^\s\"'][^\r\n\t&]*)"), None),
     # Well-known token shapes.
     (re.compile(r"\bnit_[A-Za-z0-9_-]{8,}"), "[REDACTED:INGEST_TOKEN]"),
@@ -190,9 +201,18 @@ class Redactor:
                 self.count += text.count(value)
                 text = text.replace(value, f"[REDACTED:{self.secrets[value]}]")
         for rx, rep in PATTERNS[2:]:
-            text, n = rx.subn(rep if rep is not None else _kv_sub, text)
+            if rep is None:          # key/value pairs: count only the ones actually redacted
+                text = rx.sub(self._kv_counted, text)
+                continue
+            text, n = rx.subn(rep, text)
             self.count += n
         return text
+
+    def _kv_counted(self, m) -> str:
+        out = _kv_sub(m)
+        if out != m.group(0):
+            self.count += 1
+        return out
 
 
 # Logs of the ingest data plane can quote fragments of a customer's events inside an error
@@ -311,6 +331,21 @@ def run(cmd: list, timeout: int = 60, input_text: str | None = None) -> tuple:
         return 126, f"[failed: {err}]\n"
 
 
+def run_split(cmd: list, timeout: int = 60) -> tuple:
+    """(returncode, stdout, stderr), the streams kept apart. Never raises. For output that must
+    never be written whole (docker inspect JSON carries each container's Env)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace",
+                           stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]} not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    except OSError as err:
+        return 126, "", f"failed: {err}"
+
+
 def out_of(cmd: list, timeout: int = 60, input_text: str | None = None) -> str:
     return run(cmd, timeout, input_text)[1]
 
@@ -381,6 +416,12 @@ def install_typeid(uuid_text: str) -> str:
 # Shared database diagnostics (Compose and Kubernetes provide the runners)
 # --------------------------------------------------------------------------------------------
 
+# Which audit actions count as configuration changes (reads, searches and sessions do not).
+AUDIT_CONFIG_ACTIONS = ("(setting|config|creat|updat|delet|deploy|publish|enabl|disabl|licen|role|permission"
+                        "|api_key|token|install|upgrade|restore|backup|retention|source|parser|rule|pipeline)")
+AUDIT_READ_ACTIONS = "(search|query|login|logout|view|read|list|export)"
+
+
 def clickhouse_queries(since_s: int) -> list:
     s = int(since_s)
     return [
@@ -427,6 +468,15 @@ def clickhouse_queries(since_s: int) -> list:
                     "'PartMutation', 'ReplicatedFetch', 'ReplicatedSend', 'DelayedInserts', 'ReadonlyReplica', "
                     "'MemoryTracking', 'TCPConnection', 'HTTPConnection', 'ZooKeeperSession', "
                     "'DistributedFilesToInsert', 'BackgroundMergesAndMutationsPoolTask')"),
+        # Configuration changes from the audit trail (OCSF API Activity, class_uid 6003, which leads
+        # the ocsf_logs ORDER BY with source_type and timestamp): action, service and outcome
+        # only, never the actor, source address, message or details.
+        ("audit-config-changes", "SELECT timestamp, `api.operation` AS action, `api.service.name` AS service, "
+                                 "if(status_id = 1, 'success', 'failure') AS status FROM nanosiem.ocsf_logs "
+                                 f"WHERE timestamp > now() - INTERVAL {s} SECOND AND class_uid = 6003 AND source_type = 'audit' "
+                                 f"AND match(lower(`api.operation`), '{AUDIT_CONFIG_ACTIONS}') "
+                                 f"AND NOT match(lower(`api.operation`), '{AUDIT_READ_ACTIONS}') "
+                                 "ORDER BY timestamp DESC LIMIT 200"),
         ("asynchronous-metrics", "SELECT metric, value FROM system.asynchronous_metrics WHERE metric LIKE "
                                  "'%MaxPartCountForPartition%' OR metric IN ('Uptime', 'ReplicasMaxAbsoluteDelay', "
                                  "'ReplicasMaxQueueSize', 'OSMemoryAvailable', 'OSMemoryTotal', "
@@ -466,9 +516,7 @@ def postgres_queries(since_s: int) -> list:
         # Configuration changes: action and object only (no details, user agent or source address).
         ("audit-config-changes", "SELECT \"timestamp\", action, resource_type, resource_id, success FROM audit_logs "
                                  f"WHERE \"timestamp\" > now() - interval '{s} seconds' "
-                                 "AND action ~* '(setting|config|creat|updat|delet|deploy|publish|enabl|disabl|licen"
-                                 "|role|permission|api_key|token|install|upgrade|restore|backup|retention|source|parser"
-                                 "|rule|pipeline)' AND action !~* '(search|query|login|logout|view|read|list|export)' "
+                                 f"AND action ~* '{AUDIT_CONFIG_ACTIONS}' AND action !~* '{AUDIT_READ_ACTIONS}' "
                                  "ORDER BY \"timestamp\" DESC LIMIT 200"),
     ]
 
@@ -489,14 +537,33 @@ def collect_postgres(run_sql, since_s: int) -> tuple:
     else:
         body += section("install-identity", "not available (install_identity table absent or unreadable)")
     for name, sql in postgres_queries(since_s):
+        table = PG_QUERY_REQUIRES.get(name)
+        if table and not _pg_table_exists(run_sql, table):
+            body += section(name, f"skipped: no {table} table on this install "
+                                  "(the audit trail is in ClickHouse: see clickhouse.txt audit-config-changes)")
+            continue
         ok, text = run_sql(sql)
         body += section(f"{name}{'' if ok else ' (FAILED)'}", text or "(no rows)")
     return body, install_id
 
 
+# Queries that read a table some installs do not have. PostgreSQL `audit_logs` was
+# dropped (migration 216) and never exists on a fresh install; only older databases
+# still carry it. The table name is a constant, never input.
+PG_QUERY_REQUIRES = {"audit-config-changes": "public.audit_logs"}
+
+
+def _pg_table_exists(run_sql, table: str) -> bool:
+    ok, text = run_sql(f"SELECT to_regclass('{table}') IS NOT NULL AS present")
+    return ok and any(line.strip() == "t" for line in text.splitlines())
+
+
 VECTOR_METRIC_RE = re.compile(
     r"^(# (HELP|TYPE) )?[a-z_]*(component_errors_total|component_discarded_events_total|buffer_byte_size"
-    r"|buffer_events|buffer_max_byte_size|buffer_max_event_size|buffer_discarded_events_total|buffer_received"
+    r"|buffer_events|buffer_max_byte_size|buffer_max_event_size"
+    # Vector 0.62 (vectordotdev/vector#27076) names the buffer gauges
+    # buffer_size_{bytes,events} and buffer_max_size_{bytes,events}; keep both.
+    r"|buffer_size_bytes|buffer_size_events|buffer_max_size_bytes|buffer_max_size_events|buffer_discarded_events_total|buffer_received"
     r"|buffer_sent|component_received_events_total|component_sent_events_total|utilization|http_client_errors"
     r"|http_client_responses_total|config_reload|reload|started_total|stopped_total|uptime_seconds"
     r"|build_info)"
@@ -506,6 +573,17 @@ VECTOR_METRIC_RE = re.compile(
 def filter_vector_metrics(text: str) -> str:
     keep = [line for line in text.splitlines() if VECTOR_METRIC_RE.search(line)]
     return "\n".join(keep) + "\n" if keep else text[:2000]
+
+
+# The Vector image (Debian) has no wget or curl, only bash. Ask from vector-netns
+# (nginx:alpine, busybox wget; it shares Vector's network namespace on Compose) when it runs,
+# else from Vector itself over bash's /dev/tcp. A /dev/tcp answer carries the HTTP header,
+# which filter_vector_metrics drops.
+VECTOR_METRICS_SH = (
+    "(wget -qO- -T 5 http://127.0.0.1:9598/metrics || curl -fsS -m 5 http://127.0.0.1:9598/metrics)"
+    " || bash -c 'exec 3<>/dev/tcp/127.0.0.1/9598 && printf \"GET /metrics HTTP/1.0\\r\\nHost: 127.0.0.1"
+    "\\r\\n\\r\\n\" >&3 && cat <&3'"
+)
 
 
 # --------------------------------------------------------------------------------------------
@@ -526,6 +604,47 @@ printf "<clickhouse><password>%s</password></clickhouse>\n" "$escaped" > "$confi
 clickhouse-client --config-file "$config" --host 127.0.0.1 --user nanosiem_admin \
     --format TSVWithNames --max_execution_time 60 --query "$1"
 '''
+
+
+def parse_inspect(stdout: str) -> dict:
+    """{container name: inspect object} from `docker inspect` stdout (JSON only, no stderr)."""
+    body = stdout.strip()
+    try:
+        items = json.loads(body) if body else []
+    except ValueError:
+        return {}
+    return {str(i.get("Name", "")).lstrip("/"): i for i in items if isinstance(i, dict)} \
+        if isinstance(items, list) else {}
+
+
+def format_container_state(item: dict) -> str:
+    """The containers.txt block for one container (the same lines the old Go template printed).
+    Health is optional: a container without a health check prints `health=`."""
+    def g(obj, *keys, default=""):
+        for k in keys:
+            obj = obj.get(k) if isinstance(obj, dict) else None
+        return default if obj is None else obj
+
+    def b(value) -> str:
+        return str(value).lower() if isinstance(value, bool) else str(value)
+
+    st = g(item, "State", default={})
+    labels = g(item, "Config", "Labels", default={}) or {}
+    lines = [f"service={labels.get('com.docker.compose.service', '')} restarts={g(item, 'RestartCount', default=0)} "
+             f"oom={b(g(st, 'OOMKilled', default=False))} exit={g(st, 'ExitCode', default=0)} "
+             f"started={g(st, 'StartedAt')} finished={g(st, 'FinishedAt')} error={g(st, 'Error')}"]
+    health = st.get("Health") if isinstance(st, dict) else None
+    if isinstance(health, dict):
+        h = f"health={g(health, 'Status')} failing_streak={g(health, 'FailingStreak', default=0)}"
+        for entry in health.get("Log") or []:
+            if isinstance(entry, dict):
+                h += f"\n  {g(entry, 'End')} exit={g(entry, 'ExitCode')} {' '.join(str(g(entry, 'Output')).split())[:200]}"
+        lines.append(h)
+    else:
+        lines.append("health=")
+    lines.append(f"mem_limit={g(item, 'HostConfig', 'Memory', default=0)} "
+                 f"nano_cpus={g(item, 'HostConfig', 'NanoCpus', default=0)}")
+    return "\n".join(lines)
 
 
 class ComposeHost:
@@ -667,19 +786,19 @@ class ComposeHost:
                                                  "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.PIDs}}",
                                                  *running], timeout=60))
         self.put("compose.txt", t)
+        # Inspect JSON, formatted here. A Go template that touches .State.Health fails
+        # on Docker 29 for a container with no health check ("map has no entry for key Health").
+        names = [c["name"] for c in self.containers]
+        # The raw JSON carries each container's Env (secrets): stdout is only ever parsed, and
+        # only stderr (docker's own error text) is written for a container it did not return.
+        rc, stdout, stderr = run_split(["docker", "inspect", *names], timeout=60) if names else (0, "[]", "")
+        inspected = parse_inspect(stdout)
         state = ""
         for c in self.containers:
-            state += section(c["name"], out_of(["docker", "inspect", "--format",
-                                               "service={{index .Config.Labels \"com.docker.compose.service\"}} "
-                                               "restarts={{.RestartCount}} oom={{.State.OOMKilled}} "
-                                               "exit={{.State.ExitCode}} started={{.State.StartedAt}} "
-                                               "finished={{.State.FinishedAt}} error={{.State.Error}}\n"
-                                               "health={{if .State.Health}}{{.State.Health.Status}} "
-                                               "failing_streak={{.State.Health.FailingStreak}}"
-                                               "{{range .State.Health.Log}}\n  {{.End}} exit={{.ExitCode}} "
-                                               "{{printf \"%.200s\" .Output}}{{end}}{{end}}\n"
-                                               "mem_limit={{.HostConfig.Memory}} "
-                                               "nano_cpus={{.HostConfig.NanoCpus}}", c["name"]]))
+            item = inspected.get(c["name"])
+            state += section(c["name"], format_container_state(item) if item is not None
+                             else (f"[stderr] {stderr.strip()}" if stderr.strip()
+                                   else f"[not in docker inspect output, rc={rc}]"))
         self.put("containers.txt", state)
 
     def disk(self) -> None:
@@ -812,9 +931,8 @@ class ComposeHost:
             return
         self.progress("vector metrics")
         t = section("vector version", out_of(["docker", "exec", name, "vector", "--version"]))
-        rc, out = run(["docker", "exec", name, "sh", "-c",
-                       "(wget -qO- http://127.0.0.1:9598/metrics || curl -fsS http://127.0.0.1:9598/metrics) 2>&1"],
-                      timeout=30)
+        via = self.container("vector-netns") or name
+        rc, out = run(["docker", "exec", via, "sh", "-c", VECTOR_METRICS_SH], timeout=30)
         t += section("internal metrics (errors, discards, buffers, throughput)",
                      filter_vector_metrics(out) if rc == 0 else out)
         self.put("vector.txt", t)
@@ -1245,9 +1363,16 @@ class Kubernetes:
             self.notes.append("no in-cluster PostgreSQL pod (external database): PostgreSQL diagnostics skipped")
         vec = self._pods_like(lambda p: any(c == "vector" for c, _img in p["containers"]))
         for pod in vec[:4]:
-            rc, out = run(self.ns + ["exec", pod["name"], "-c", "vector", "--", "sh", "-c",
-                                     "(wget -qO- http://127.0.0.1:9598/metrics || curl -fsS "
-                                     "http://127.0.0.1:9598/metrics) 2>&1"], timeout=30)
+            # The API server's pod proxy needs no client in the image; exec is the fallback
+            # where pods/proxy is not granted.
+            rc, out = run(self.kube + ["get", "--raw", f"/api/v1/namespaces/{self.args.namespace}/pods/"
+                                       f"{pod['name']}:9598/proxy/metrics"], timeout=30)
+            if rc != 0 or not out.strip():
+                proxy_err = out
+                rc, out = run(self.ns + ["exec", pod["name"], "-c", "vector", "--", "sh", "-c",
+                                         VECTOR_METRICS_SH], timeout=30)
+                if rc != 0:
+                    out = f"pod proxy: {proxy_err.strip()}\nexec: {out}"
             self.put(f"vector/{pod['name']}.txt", filter_vector_metrics(out) if rc == 0 else out)
 
     def collect(self) -> dict:

@@ -75,6 +75,11 @@ if is_object(nano_hec_event) && (is_object(.unmapped) || .unmapped == null) {
     }
     if length(nano_unmapped) > 0 { .unmapped = nano_unmapped }
 }
+# NAN-5891: the HEC metadata ends here; none of it is carried into the disk
+# buffer in front of ClickHouse.
+del(%nano_hec_record)
+del(%nano_hec_event)
+del(%nano_hec)
 "#,
     credential_field_redaction_vrl!(),
     ingest_transport_strip_vrl!(),
@@ -230,6 +235,11 @@ pub(super) const OCSF_LANE_STAMP_VRL: &str = r#"# NAN-4963: record the lane this
 nano_lane = downcase(to_string(.source_type) ?? "")
 if nano_lane != "" && nano_lane != "unknown" { %source_type = nano_lane }"#;
 
+/// NAN-5902 review P1-1: the lossless HEC record is consumed by the
+/// `_hec_payload` step (or by no one); appended to `_source_tz`, the last step
+/// before the parser, so no OCSF parser lane carries it through `_parse`.
+pub(super) const HEC_RECORD_DROP_VRL: &str = "# NAN-5902: the lossless HEC record ends before the parser.\ndel(%nano_hec_record)";
+
 /// NAN-5839: the per-source timezone step, `<name>_source_tz`.
 pub(super) const SOURCE_TIMEZONE_SUFFIX: &str = "_source_tz";
 
@@ -302,6 +312,8 @@ pub(super) fn source_timezone_vrl(timezone: Option<&str>) -> String {
              if is_object(%nano_hec_event) {{ del(%nano_hec_event.{marker}) }}\n"
         ));
     }
+    vrl.push_str(HEC_RECORD_DROP_VRL);
+    vrl.push('\n');
     if let Some(timezone) = timezone {
         let literal = serde_json::to_string(timezone).unwrap_or_else(|_| "\"UTC\"".into());
         vrl.push_str(&format!(
@@ -392,16 +404,18 @@ impl VectorConfigManager {
             source_name
         };
 
-        // NAN-5340: a JSON-input parser receives an HEC object event whole
-        // (see `hec_payload`); a text parser keeps `.message` = the log line.
+        // NAN-5340 / NAN-5891 / NAN-5883 / NAN-5902: what the parser
+        // receives over HEC (see `hec_payload`). A declared contract gets the
+        // lossless view; no declaration gets exactly the v2.0.35 delivery.
+        let delivery =
+            super::hec_payload::parser_hec_delivery(parser, &runtime_vrl(&parser.parser_vrl).0);
         let source_name =
-            if super::hec_payload::parser_reads_json_object(parser, &runtime_vrl(&parser.parser_vrl).0) {
-                let (payload, name) =
-                    super::hec_payload::hec_payload_transform(&safe_name, &source_name);
-                source_config.push_str(&payload);
-                name
-            } else {
-                source_name
+            match super::hec_payload::hec_payload_transform(&safe_name, &source_name, delivery, ocsf) {
+                Some((payload, name)) => {
+                    source_config.push_str(&payload);
+                    name
+                }
+                None => source_name,
             };
 
         // NAN-5839: under OCSF, every source owns its parser control fields
@@ -870,6 +884,10 @@ impl VectorConfigManager {
                  }}\n\
                  ext_val = nano_ext\n\
              }}\n\
+             # NAN-5891: the HEC metadata ends here (not carried into the disk buffer).\n\
+             del(%nano_hec_record)\n\
+             del(%nano_hec_event)\n\
+             del(%nano_hec)\n\
              \n\
              # Handle source_type - use .source_type if set, otherwise default\n\
              st_val = .source_type\n\

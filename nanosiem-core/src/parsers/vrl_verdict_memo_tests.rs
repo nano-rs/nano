@@ -87,6 +87,32 @@ fn the_memo_is_bounded_and_evicts_the_least_recently_used() {
 
 #[test]
 fn the_allowlist_tag_is_stable_within_a_process() {
-    assert_eq!(*ALLOWLIST_TAG, *ALLOWLIST_TAG);
-    assert_ne!(*ALLOWLIST_TAG, [0u8; 32]);
+    assert_eq!(*VALIDATOR_TAG, *VALIDATOR_TAG);
+    assert_ne!(*VALIDATOR_TAG, [0u8; 32]);
+}
+
+/// NAN-5889 review: the compiler version in the verdict tag is the one this
+/// workspace locks, so a `vrl` upgrade cannot keep old verdicts.
+#[test]
+fn the_tagged_vrl_version_is_the_locked_one() {
+    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.lock"))
+        .expect("Cargo.lock");
+    let locked = lock
+        .split("[[package]]")
+        .find(|block| block.contains("\nname = \"vrl\"\n"))
+        .and_then(|block| block.lines().find_map(|l| l.strip_prefix("version = \"")))
+        .map(|v| v.trim_end_matches('"').to_string())
+        .expect("vrl in Cargo.lock");
+    assert_eq!(locked, VRL_CRATE_VERSION, "update VRL_CRATE_VERSION with the vrl upgrade");
+}
+
+/// The safety rules are part of the tag's input.
+#[test]
+fn the_safety_rules_feed_the_tag() {
+    use sha2::{Digest, Sha256};
+    let mut with = Sha256::new();
+    crate::parsers::validator::safety_rules_fingerprint(&mut with);
+    let empty: [u8; 32] = Sha256::new().finalize().into();
+    let with: [u8; 32] = with.finalize().into();
+    assert_ne!(with, empty);
 }

@@ -81,7 +81,10 @@ def test_new_york_source_stores_true_utc(stack: Stack, nano: Nano, mark: str, ti
     refused = nano.api.put(f"/api/log-sources/{source_id}", json={"timezone": "Mars/Olympus_Mons"})
     assert refused.status_code == 422, refused.text
     try:
-        expect(nano.api.post(f"/api/log-sources/{source_id}/deploy"), 200)
+        # NAN-5889: the palo_alto parser's deploy job runs close to a minute;
+        # poll it rather than holding one request past the client timeout.
+        deployed = nano.deploy_source(source_id)
+        assert deployed.get("success") is True, deployed
         timeline.step("timezone set and deployed", source=source_id, timezone=ZONE)
         timeline.step("vector reloads settled", waited=round(vector_reloads_quiet(stack.project)))
         token = _platform_token(stack.run_dir)
@@ -107,7 +110,7 @@ def test_new_york_source_stores_true_utc(stack: Stack, nano: Nano, mark: str, ti
         assert assumed == ZONE, row
     finally:
         expect(nano.api.put(f"/api/log-sources/{source_id}", json={"timezone": original}), 200)
-        nano.api.post(f"/api/log-sources/{source_id}/deploy")
+        nano.deploy_source(source_id)
 
 
 def test_invalid_timezone_is_refused(nano: Nano) -> None:

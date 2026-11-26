@@ -77,8 +77,8 @@ fn without_source_tz(dir: &std::path::Path) {
         if path.extension().is_none_or(|e| e != "toml") {
             continue;
         }
-        // Other files carry unquoted `${VAR:-n}` placeholders (Vector
-        // interpolates them before parsing), so only the stage's file is parsed.
+        // Only the stage's file is parsed (and re-serialized); every other
+        // file is copied as rendered.
         let text = std::fs::read_to_string(&path).unwrap();
         if !text.contains(&format!("[transforms.{tz}]")) {
             continue;

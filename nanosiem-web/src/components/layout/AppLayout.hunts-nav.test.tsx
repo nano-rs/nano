@@ -2,7 +2,7 @@
 // @vitest-environment jsdom
 //
 // NAN-5844: Hunts is a rail group like Rules: Hunts, Findings, Escalations,
-// Campaigns and (NAN-5850) Knowledge, in the expanded rail and the collapsed
+// Actors (Campaigns before NAN-5859) and (NAN-5850) Knowledge, in the expanded rail and the collapsed
 // flyout, with the right entry lit for nested routes (detail pages, the
 // Decisions tab) and the Findings / Escalations counts the old top tabs
 // carried. NAN-5850: "Hunt settings" is gone; Rule ideas sits in Rules.
@@ -70,8 +70,8 @@ vi.mock('./RailThemeSwitcher', () => ({ RailThemeStrip: Nothing, RailThemeFlyout
 
 import { AppLayout } from './AppLayout';
 
-const ENTRIES = ['Hunts', 'Findings', 'Escalations', 'Campaigns', 'Knowledge'];
-const HREFS = ['/hunts', '/hunts/leads', '/hunts/escalations', '/hunts/campaigns', '/hunts/knowledge'];
+const ENTRIES = ['Hunts', 'Findings', 'Escalations', 'Actors', 'Knowledge'];
+const HREFS = ['/hunts', '/hunts/leads', '/hunts/escalations', '/hunts/actors', '/hunts/knowledge'];
 
 function renderShell(path: string) {
   return render(
@@ -118,7 +118,7 @@ describe('Hunts rail group (NAN-5844)', () => {
     const items = railItems();
     expect(items.getByRole('link', { name: /^Findings/ }).textContent).toBe('Findings7');
     expect(items.getByRole('link', { name: /^Escalations/ }).textContent).toBe('Escalations2');
-    expect(items.getByRole('link', { name: /^Campaigns/ }).textContent).toBe('Campaigns');
+    expect(items.getByRole('link', { name: /^Actors/ }).textContent).toBe('Actors');
     expect(mock.countsEnabled.every(Boolean)).toBe(true);
   });
 
@@ -128,9 +128,10 @@ describe('Hunts rail group (NAN-5844)', () => {
     ['/hunts/leads', 'Findings'],
     ['/hunts/leads/lead_01a', 'Findings'],
     ['/hunts/escalations', 'Escalations'],
-    ['/hunts/campaigns', 'Campaigns'],
-    ['/hunts/campaigns/candidates', 'Campaigns'],
-    ['/hunts/campaigns/cmp_01a', 'Campaigns'],
+    ['/hunts/actors', 'Actors'],
+    ['/hunts/actors/review', 'Actors'],
+    ['/hunts/actors/hcmp_01a', 'Actors'],
+    ['/hunts/campaigns', 'Actors'],
     ['/hunts/leads/decisions', 'Findings'],
     ['/hunts/knowledge', 'Knowledge'],
     // Profile has no entry of its own until it folds into MITRE Coverage.
@@ -184,7 +185,7 @@ describe('Hunts rail group (NAN-5844)', () => {
     localStorage.setItem('nanosiem-sidebar-collapsed', 'true');
     renderShell('/hunts');
     fireEvent.mouseEnter(screen.getByTestId('nav-hunts-trigger'));
-    fireEvent.click(flyout().getByRole('menuitem', { name: /^Campaigns/ }));
+    fireEvent.click(flyout().getByRole('menuitem', { name: /^Actors/ }));
     expect(screen.queryByTestId('nav-hunts-trigger-flyout')).toBeNull();
   });
 
@@ -221,7 +222,7 @@ describe('Hunts rail group (NAN-5844)', () => {
     mock.hunts = false;
     renderShell('/');
     expect(screen.queryByTestId('nav-hunts')).toBeNull();
-    expect(screen.queryByRole('link', { name: /^(Findings|Escalations|Campaigns|Knowledge|Rule ideas)/ })).toBeNull();
+    expect(screen.queryByRole('link', { name: /^(Findings|Escalations|Actors|Knowledge|Rule ideas)/ })).toBeNull();
     expect(mock.countsEnabled.some(Boolean)).toBe(false);
   });
 });

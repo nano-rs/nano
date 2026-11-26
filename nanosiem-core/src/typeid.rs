@@ -391,6 +391,12 @@ typeid_prefix!(hunt_lead_review, "lrev");
 typeid_prefix!(hunt_ruling, "hrul");
 // NAN-5560 hunt campaigns: one known actor and its trip conditions.
 typeid_prefix!(hunt_campaign, "hcmp");
+// NAN-5859 Actors (a hunt campaign is one actor): an indicator, a note, a
+// merge or split, and one timeline / undo ledger row.
+typeid_prefix!(hunt_campaign_indicator, "cind");
+typeid_prefix!(hunt_campaign_note, "cnote");
+typeid_prefix!(hunt_campaign_merge, "cmrg");
+typeid_prefix!(hunt_campaign_change, "cchg");
 // NAN-5642 hunt charters: one stored version of a hunt's (or the install's) charter.
 typeid_prefix!(hunt_charter, "hchr");
 // NAN-5561 hunt evals: one blind replay, and one frozen finding in it.

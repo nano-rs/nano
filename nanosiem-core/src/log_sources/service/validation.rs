@@ -215,6 +215,76 @@ fn prepare_for_validation(vrl_code: &str) -> Result<String, VrlValidationResult>
     Ok(crate::parsers::vrl_safety::as_rendered(vrl_code).into_owned())
 }
 
+/// Passing verdicts kept per service (NAN-5889). Small: it only has to span
+/// one save, publish gate and publish of the same parser.
+pub(crate) const VALID_VRL_MEMO_CAPACITY: usize = 64;
+
+/// A bounded memo of PASSING [`LogSourceService::validate_vrl`] verdicts,
+/// keyed by the SHA-256 of the exact source text (NAN-5889).
+///
+/// A 99 KB parser costs several seconds per compile, and one publish used to
+/// compile it in its save, its OCSF gate and the publish itself. A verdict is
+/// a pure function of the text and this binary's validator, so a passing one
+/// can be reused for byte-identical text. Failures are never kept: a refusal
+/// may come from a resource bound (a slow host, a busy worker) rather than
+/// the program, and must be retried. Least-recently-used eviction.
+pub(crate) struct ValidVrlMemo {
+    capacity: usize,
+    inner: std::sync::Mutex<(std::collections::HashMap<[u8; 32], (VrlValidationResult, u64)>, u64)>,
+}
+
+impl ValidVrlMemo {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self { capacity: capacity.max(1), inner: std::sync::Mutex::new((std::collections::HashMap::new(), 0)) }
+    }
+
+    fn key(vrl_code: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"nano.log-source.valid-vrl.v2\0");
+        // NAN-5889 review: the registry, allowlist, safety rules and
+        // compiler version the verdict was reached under.
+        digest.update(*crate::parsers::vrl_verdict_memo::VALIDATOR_TAG);
+        digest.update(vrl_code.as_bytes());
+        digest.finalize().into()
+    }
+
+    pub(crate) fn get(&self, vrl_code: &str) -> Option<VrlValidationResult> {
+        let key = Self::key(vrl_code);
+        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (map, tick) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        map.get_mut(&key).map(|(result, used)| {
+            *used = now;
+            result.clone()
+        })
+    }
+
+    /// Keep `result` for `vrl_code` when it passed; anything else is ignored.
+    pub(crate) fn put(&self, vrl_code: &str, result: &VrlValidationResult) {
+        if !result.valid {
+            return;
+        }
+        let key = Self::key(vrl_code);
+        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (map, tick) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if !map.contains_key(&key) && map.len() >= self.capacity {
+            if let Some(oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| *k) {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(key, (result.clone(), now));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.len()
+    }
+}
+
 /// The endpoint's shape for a validator verdict: the error, then every
 /// warning as `Warning: ...`, each with a diagnostic.
 fn validation_result(
@@ -257,14 +327,25 @@ impl LogSourceService {
     /// when it waited the full budget without one
     /// ([`LogSourceServiceError::ValidationBusy`], a retryable 503): a busy
     /// pool is never reported as invalid VRL.
+    ///
+    /// NAN-5889: a passing verdict is memoized for byte-identical text
+    /// ([`ValidVrlMemo`]), so the save, the publish gate and the publish of
+    /// one parser compile it once.
     pub async fn validate_vrl(&self, vrl_code: &str) -> Result<VrlValidationResult, LogSourceServiceError> {
         let rendered = match prepare_for_validation(vrl_code) {
             Ok(rendered) => rendered,
             Err(refused) => return Ok(refused),
         };
+        if let Some(passed) = self.valid_vrl_memo.get(&rendered) {
+            return Ok(passed);
+        }
         match self.vrl_validator.validate_vrl_bounded(&rendered).await {
             Err(VrlValidatorError::Busy(message)) => Err(LogSourceServiceError::ValidationBusy(message)),
-            other => Ok(validation_result(other)),
+            other => {
+                let result = validation_result(other);
+                self.valid_vrl_memo.put(&rendered, &result);
+                Ok(result)
+            }
         }
     }
 
@@ -700,6 +781,28 @@ mod tests {
                 .await
                 .expect("scoped read");
         assert!(rows.is_empty(), "a denied source returned raw samples");
+    }
+
+    fn verdict(valid: bool) -> crate::log_sources::types::VrlValidationResult {
+        crate::log_sources::types::VrlValidationResult { valid, errors: Vec::new(), diagnostics: Vec::new() }
+    }
+
+    /// NAN-5889: only passing verdicts are reused, for byte-identical text,
+    /// and the memo stays bounded (least recently used goes first).
+    #[test]
+    fn valid_vrl_memo_keeps_only_passing_verdicts_and_is_bounded() {
+        let memo = super::ValidVrlMemo::new(2);
+        memo.put(".a = 1", &verdict(false));
+        assert!(memo.get(".a = 1").is_none(), "a failed verdict is never reused");
+        memo.put(".a = 1", &verdict(true));
+        assert!(memo.get(".a = 1").is_some_and(|r| r.valid));
+        assert!(memo.get(".a = 1 ").is_none(), "different text is a different program");
+        memo.put(".b = 1", &verdict(true));
+        assert!(memo.get(".a = 1").is_some(), "touch .a so .b is the oldest");
+        memo.put(".c = 1", &verdict(true));
+        assert_eq!(memo.len(), 2);
+        assert!(memo.get(".b = 1").is_none(), "least recently used evicted");
+        assert!(memo.get(".a = 1").is_some() && memo.get(".c = 1").is_some());
     }
 
     #[test]

@@ -21,6 +21,10 @@ scripts/e2e.sh run ingest -- -k rotate -x   # reuses the live stack from `up`
 scripts/e2e.sh down --run <runid> [--purge]
 ```
 
+A Linux VM for a release-candidate lane (Ubuntu 24.04) is prepared with
+`scripts/e2e/vm-bootstrap.sh` (build tools, Docker, Node, Chrome, rustup and
+`psql`); `doctor` then passes.
+
 Suites map to `e2e/tests`: `base`, `ingest`, `onboarding`, `detection`,
 `search_jobs`, `pull` (the directory), `ui` (browser, phase 2), `enterprise`,
 `content_acceptance` (NAN-4955's signed local publisher + GitHub sinkhole),
@@ -79,6 +83,13 @@ Use a default `up` for any fresh-install or trust check.
    - **native** (the macOS default): `cargo build` with the repo's
      `rust-toolchain.toml` (1.100), then the migrator, `nanosiem-search`,
      `nanosiem-jobs` and `nanosiem-api` as host processes on free ports.
+     It also runs on a Linux host: there a small `native-relay` container
+     (host network, unprivileged, listening on the docker0 address only and
+     admitting only this stack's network) lets the edge reach the host
+     processes, which Docker Desktop does by itself on macOS.
+     A non-dumpable process (nano-connector-runner) hides its environment on
+     Linux, so the harness proves it is its own by the kernel start tick in
+     the pid file instead of the owner token.
    - **docker** (the Linux default): `docker build --target api|search|jobs`
      from this tree.
    - **image:\<tag\>**: published release images. `--edition open` pulls the
@@ -86,6 +97,22 @@ Use a default `up` for any fresh-install or trust check.
      enterprise build (`E2E_ENTERPRISE_IMAGE_PREFIX`, default
      `us-central1-docker.pkg.dev/nano-rs/nanosiem-customer/nanosiem`; needs a
      registry login). A released enterprise image starts license-locked.
+
+   On an enterprise run it also starts the **Agent Lane gate** (NAN-5880),
+   as install.sh does on a single host: `nanosiem-api --agentlane-gate`
+   (the `agentlane-gate` container in ClickHouse's network namespace, or a
+   host process in native mode), ClickHouse's loopback gate listener, a
+   generated `NANO_AGENTLANE_GATE_TOKEN`, and `NANO_AGENTLANE_INTERNAL_CIDRS`
+   computed the installer's way (the rendered ClickHouse network allow-list
+   plus this host's addresses). Without it Settings > Agent Lane refuses
+   to switch on (409) and never reads "On". Both modes forward to
+   ClickHouse's loopback gate listener (`zz-agentlane-gate.xml`): the
+   container shares ClickHouse's network namespace; the native process
+   reaches it through `native-gate-upstream`, a relay in that namespace
+   published on host loopback only. `up` fails at once if the gate does not
+   stay up. Agents never connect to the gate here (its port is not
+   published); the data plane is covered by
+   `scripts/tests/agentlane-gate-compose.live.sh`.
 3. It creates the local admin through `/api/setup/initialize` and mints an
    admin API key.
 4. It writes `target/e2e/<runid>/stack.env` (mode 0600). This one file holds
@@ -263,6 +290,19 @@ When you build a feature with UI:
    drift. The gate is release tooling: the open-core mirror strips it with
    `scripts/release/` (its selftest and the release sidecars go too; the
    manifest stays for the smoke walk).
+5. **Launchers (NAN-5864).** What a page opens counts too. The gate finds
+   every menu, menu item, dialog and banner of the app shell, every
+   command-palette and pivt @-command, and every keyboard shortcut in
+   `nanosiem-web/src`, as ids like
+   `menuitem:components/layout/AppLayout.tsx:User Settings` or
+   `shortcut:components/layout/AppLayout.tsx:mod+b`. A failure names the id.
+   Put it in the `"launchers"` list of the `action:` entry whose test opens it,
+   or, when there is a real reason it has no test, in
+   `e2e/coverage/launcher-allowlist.json` with that reason. Give a new menu or
+   dialog a `data-testid` or `aria-label`, so its id does not depend on order.
+   States a throwaway stack cannot reach (a stale backup, a nearly full disk,
+   unread notifications) are stubbed per browser session with
+   `page.stub_api(method, path, body)`.
 
 ## Layout invariants on every page (NAN-5762)
 

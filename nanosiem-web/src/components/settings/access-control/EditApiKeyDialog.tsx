@@ -12,7 +12,7 @@
  * Scope selection is delegated to the shared `ScopeSelector`.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { KeyRound } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useToast } from '@/hooks/use-toast';
@@ -56,9 +56,19 @@ export function EditApiKeyDialog({ open, apiKey, permissions, onClose, onSaved }
     setDescription(apiKey.description ?? '');
   }, [open, apiKey]);
 
+  // NAN-5901: scopes the permission list no longer has (retired by a
+  // migration but left on the key). The server refuses to save a key that
+  // still lists them, so block Save until they are cleared rather than send a
+  // request that is sure to fail. Only checked once the catalogue has loaded.
+  const unknownSelected = useMemo(() => {
+    if (permissions.length === 0) return [];
+    const known = new Set(permissions.map(p => p.id));
+    return scopes.filter(s => !known.has(s));
+  }, [permissions, scopes]);
+
   const nameValid = name.trim().length >= 2;
   const scopeValid = scopes.length > 0;
-  const canSubmit = nameValid && scopeValid && !saving;
+  const canSubmit = nameValid && scopeValid && unknownSelected.length === 0 && !saving;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -132,6 +142,12 @@ export function EditApiKeyDialog({ open, apiKey, permissions, onClose, onSaved }
               initialScopes={apiKey.permissions}
               onChange={setScopes}
             />
+            {unknownSelected.length > 0 && (
+              <div className="text-[10.5px] text-yellow-500 mt-1.5" data-testid="unknown-scopes-block">
+                Clear {unknownSelected.length === 1 ? 'the 1 scope' : `the ${unknownSelected.length} scopes`} under
+                "Unknown or retired" to save this key.
+              </div>
+            )}
             {!scopeValid && (
               <div className="text-[10.5px] text-yellow-500 mt-1.5">
                 Pick at least one scope. A key with no scopes can't call any API.
