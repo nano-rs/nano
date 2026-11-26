@@ -26,6 +26,10 @@
   <a href="https://nano.rs/pricing">Pricing</a>
 </p>
 
+<p align="center">
+  <img alt="nano search: event timechart, results table and event inspector" src="./docs/img/screenshot-search.png" width="900">
+</p>
+
 ---
 
 nano is a SIEM (security information and event management system). It takes
@@ -52,6 +56,16 @@ On a Linux server with Docker, run this as a normal user in the `docker` group
 ```sh
 curl -fsSL https://get.nano.rs | bash
 ```
+
+<p align="center">
+  <a href="https://youtu.be/cyL6lkPZfbw">
+    <img alt="Watch the 45-second install demo on YouTube" src="https://img.youtube.com/vi/cyL6lkPZfbw/maxresdefault.jpg" width="900">
+  </a>
+</p>
+
+<p align="center">
+  <em>One command, about 45 seconds, and you have a working nano. <a href="https://youtu.be/cyL6lkPZfbw">Watch on YouTube</a></em>
+</p>
 
 On a Mac (for a trial), the built-in bash is too old. Install a newer one with
 Homebrew and run the installer with it:
@@ -90,6 +104,32 @@ variable, run `bash install.sh --help`.
 needs the setup token the installer wrote to `~/nano/.env`
 (`NANO_SETUP_TOKEN`). Run `./install.sh` again, or open the web UI and enter
 the token on the setup page.
+
+## A quick look
+
+<p align="center">
+  <img alt="nano detection rule editor: lifecycle status, MITRE ATT&amp;CK tags, baseline impact, validation and version history" src="./docs/img/screenshot-detection.png" width="900">
+</p>
+
+<p align="center">
+  <em>The detection rule editor. Rules move from Staging to Live to Alerting, with MITRE ATT&amp;CK tags, a baseline impact check, validation and version history.</em>
+</p>
+
+<p align="center">
+  <img alt="nano timechart: process creation by parent command line over time" src="./docs/img/screenshot-timechart.png" width="900">
+</p>
+
+<p align="center">
+  <em>Hunting with nPL: a timechart of process creation split by parent command line, with the results table underneath.</em>
+</p>
+
+<p align="center">
+  <img alt="nano marketplace: enrichment providers for IPs, domains, file hashes, identity, assets and geolocation" src="./docs/img/screenshot-marketplace.png" width="900">
+</p>
+
+<p align="center">
+  <em>The Marketplace: a catalog of enrichment providers for threat intel, identity, assets and geolocation.</em>
+</p>
 
 ## Requirements
 
@@ -331,7 +371,9 @@ or newer, PostgreSQL 16 to 18 and ClickHouse 26.3 LTS or newer. See
 
 ## Community and contributing
 
+- **Star this repo** if nano is useful to you. It helps other people find it.
 - Ask questions and share what you built on [Discord](https://discord.gg/5rk8bwmkj7).
+- See [open issues](https://github.com/nano-rs/nano/issues) for what people are working on.
 - Report bugs and request features with the
   [issue templates](./.github/ISSUE_TEMPLATE/).
 - Contributions are welcome under a contributor license agreement (CLA). See
